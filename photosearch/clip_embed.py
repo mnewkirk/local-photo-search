@@ -1,0 +1,114 @@
+"""CLIP embedding generation for images and text queries.
+
+Uses open_clip for local inference — no API calls.
+Embeddings are 512-dimensional float vectors stored in sqlite-vec.
+"""
+
+from pathlib import Path
+from typing import Optional
+
+import torch
+from PIL import Image
+
+# Lazy-loaded model state
+_model = None
+_preprocess = None
+_tokenizer = None
+_device = None
+
+# Default model — good balance of quality and speed for N100/macOS
+MODEL_NAME = "ViT-B-32"
+PRETRAINED = "laion2b_s34b_b79k"
+
+
+def _load_model():
+    """Lazy-load the CLIP model on first use."""
+    global _model, _preprocess, _tokenizer, _device
+
+    if _model is not None:
+        return
+
+    import open_clip
+
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Use MPS (Apple Silicon GPU) if available
+    if _device == "cpu" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        _device = "mps"
+
+    _model, _, _preprocess = open_clip.create_model_and_transforms(
+        MODEL_NAME, pretrained=PRETRAINED, device=_device
+    )
+    _tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+    _model.eval()
+
+
+def embed_image(image_path: str) -> Optional[list[float]]:
+    """Generate a CLIP embedding for an image file.
+
+    Returns a list of 512 floats, or None if the image can't be processed.
+    """
+    _load_model()
+    try:
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = _preprocess(image).unsqueeze(0).to(_device)
+        with torch.no_grad():
+            embedding = _model.encode_image(image_tensor)
+            # Normalize to unit vector for cosine similarity
+            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        return embedding.squeeze().cpu().tolist()
+    except Exception as e:
+        print(f"  Warning: could not embed {image_path}: {e}")
+        return None
+
+
+def embed_text(text: str) -> Optional[list[float]]:
+    """Generate a CLIP embedding for a text query.
+
+    Returns a list of 512 floats, or None on failure.
+    """
+    _load_model()
+    try:
+        tokens = _tokenizer([text]).to(_device)
+        with torch.no_grad():
+            embedding = _model.encode_text(tokens)
+            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        return embedding.squeeze().cpu().tolist()
+    except Exception as e:
+        print(f"  Warning: could not embed text '{text}': {e}")
+        return None
+
+
+def embed_images_batch(image_paths: list[str], batch_size: int = 8) -> list[Optional[list[float]]]:
+    """Embed multiple images in batches for efficiency.
+
+    Returns a list parallel to image_paths — each entry is either
+    a 512-float list or None if that image failed.
+    """
+    _load_model()
+    results: list[Optional[list[float]]] = [None] * len(image_paths)
+
+    for batch_start in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[batch_start:batch_start + batch_size]
+        batch_images = []
+        valid_indices = []
+
+        for i, path in enumerate(batch_paths):
+            try:
+                img = Image.open(path).convert("RGB")
+                batch_images.append(_preprocess(img))
+                valid_indices.append(batch_start + i)
+            except Exception as e:
+                print(f"  Warning: could not load {path}: {e}")
+
+        if not batch_images:
+            continue
+
+        batch_tensor = torch.stack(batch_images).to(_device)
+        with torch.no_grad():
+            embeddings = _model.encode_image(batch_tensor)
+            embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
+
+        for j, idx in enumerate(valid_indices):
+            results[idx] = embeddings[j].cpu().tolist()
+
+    return results
