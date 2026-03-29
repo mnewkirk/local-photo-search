@@ -19,9 +19,9 @@ except ImportError:
 
 # Dimensions for our embedding vectors
 CLIP_DIMENSIONS = 512
-FACE_DIMENSIONS = 128
+FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:

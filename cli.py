@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """CLI entry point for local-photo-search."""
 
-# Suppress pkg_resources deprecation warning from face_recognition_models.
-# Must be set before any imports that trigger it.
-# The warning is raised from face_recognition_models, so we match on message content.
 import warnings
-warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+# Suppress FutureWarning from insightface/utils/face_align.py (scikit-image API change).
+# Must be set before any imports that might trigger it.
+warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
 
 import json
 import os
@@ -198,13 +197,32 @@ def add_person(name, photos, db):
 
 @cli.command("match-faces")
 @click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
-@click.option("--tolerance", default=0.65, help="Match tolerance (lower = stricter). Default: 0.65")
-def match_faces(db, tolerance):
+@click.option("--tolerance", default=1.15, help="Match tolerance — L2 distance on 512-dim ArcFace vectors (lower = stricter). Default: 1.15")
+@click.option("--temporal", is_flag=True, default=False,
+              help="After standard matching, propagate identities to nearby unmatched faces "
+                   "using EXIF timestamps (same-session context). Safe for family photos; "
+                   "use with caution if photos include team sports or uniformed crowds.")
+@click.option("--temporal-tolerance", default=1.45,
+              help="Looser ArcFace L2 tolerance used for temporal propagation. Default: 1.45")
+@click.option("--temporal-window", default=30,
+              help="Time window in minutes defining a 'session' for temporal matching. Default: 30")
+def match_faces(db, tolerance, temporal, temporal_tolerance, temporal_window):
     """Match all unidentified faces against registered persons.
 
     Run this after 'add-person' to apply name labels to indexed faces.
+
+    \b
+    Two-pass matching:
+      Pass 1 (always): strict ArcFace distance matching against reference photos.
+      Pass 2 (--temporal): looser matching for faces where the best-match person
+        appears in a photo taken within --temporal-window minutes, AND their
+        ArcFace distance is clearly better than the runner-up. This handles small
+        or angled faces that fall just outside the strict threshold when photos
+        were taken in the same session (same clothes, same lighting).
     """
-    from photosearch.faces import match_faces_to_persons, check_available
+    from photosearch.faces import (
+        match_faces_to_persons, match_faces_temporal, check_available,
+    )
 
     try:
         check_available()
@@ -215,7 +233,22 @@ def match_faces(db, tolerance):
     with PhotoDB(db) as photo_db:
         click.echo(f"Matching faces (tolerance={tolerance})...")
         matched = match_faces_to_persons(photo_db, tolerance=tolerance)
-        click.echo(f"Matched {matched} face(s) to known persons.")
+        click.echo(f"  Pass 1: matched {matched} face(s) to known persons.")
+
+        if temporal:
+            click.echo(
+                f"Running temporal propagation "
+                f"(tolerance={temporal_tolerance}, window={temporal_window}min)..."
+            )
+            t_matched = match_faces_temporal(
+                photo_db,
+                temporal_tolerance=temporal_tolerance,
+                window_minutes=temporal_window,
+            )
+            click.echo(f"  Pass 2: matched {t_matched} additional face(s) via session context.")
+            matched += t_matched
+
+        click.echo(f"Total: {matched} face(s) matched.")
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +461,8 @@ def diagnose_photo(filename, db):
     """
     import struct
     import numpy as np
+    from photosearch.db import FACE_DIMENSIONS
+    from photosearch.faces import MATCH_TOLERANCE
 
     with PhotoDB(db) as photo_db:
         # Find the photo
@@ -454,7 +489,7 @@ def diagnose_photo(filename, db):
 
         if not face_rows:
             click.echo("  No faces detected in this photo.")
-            click.echo("  Try re-indexing with --faces to run CNN detection.")
+            click.echo("  Try re-indexing with --faces to detect faces.")
             return
 
         click.echo(f"  {len(face_rows)} face(s) detected:\n")
@@ -471,8 +506,12 @@ def diagnose_photo(filename, db):
                 "SELECT encoding FROM face_ref_encodings WHERE ref_id = ?", (ref_row["id"],)
             ).fetchone()
             if enc_row:
-                enc = list(struct.unpack("128f", enc_row["encoding"]))
+                enc = np.array(struct.unpack(f"{FACE_DIMENSIONS}f", enc_row["encoding"]))
                 ref_data.append((ref_row["person_id"], ref_row["name"], enc))
+
+        # Thresholds for the ✓/~/✗ symbols (L2 distance on 512-dim ArcFace)
+        match_thresh = MATCH_TOLERANCE          # 0.9 — definite match
+        close_thresh = MATCH_TOLERANCE + 0.15   # 1.05 — borderline
 
         for i, face in enumerate(face_rows, 1):
             label = face["person_name"] or f"Unidentified (cluster {face['cluster_id']})"
@@ -490,22 +529,25 @@ def diagnose_photo(filename, db):
                 click.echo(f"    (No encoding stored or no persons registered)")
                 continue
 
-            face_enc = np.array(list(struct.unpack("128f", enc_row["encoding"])))
-            click.echo(f"    Distances to known persons:")
+            face_enc = np.array(struct.unpack(f"{FACE_DIMENSIONS}f", enc_row["encoding"]))
+            click.echo(f"    Distances to known persons (ArcFace L2):")
 
-            import face_recognition as fr
-            seen_persons = {}
-            for person_id, person_name, ref_enc in ref_data:
-                dist = float(fr.face_distance([np.array(ref_enc)], face_enc)[0])
-                # Keep the best (lowest) distance per person
+            # One distance per person — keep the best (lowest) across all their references
+            seen_persons: dict[str, float] = {}
+            for _, person_name, ref_enc in ref_data:
+                dist = float(np.linalg.norm(face_enc - ref_enc))
                 if person_name not in seen_persons or dist < seen_persons[person_name]:
                     seen_persons[person_name] = dist
 
             for person_name, dist in sorted(seen_persons.items(), key=lambda x: x[1]):
-                match_symbol = "✓" if dist <= 0.65 else ("~" if dist <= 0.72 else "✗")
-                click.echo(f"      {match_symbol} {person_name}: {dist:.4f}")
+                symbol = "✓" if dist <= match_thresh else ("~" if dist <= close_thresh else "✗")
+                click.echo(f"      {symbol} {person_name}: {dist:.4f}")
 
-            click.echo(f"    (✓ = match at 0.65 | ~ = close, try --tolerance 0.70-0.72 | ✗ = no match)")
+            click.echo(
+                f"    (✓ = match ≤{match_thresh} | "
+                f"~ = borderline ≤{close_thresh:.2f}, try --tolerance {close_thresh:.2f} | "
+                f"✗ = no match)"
+            )
         click.echo("")
 
 
