@@ -1,7 +1,6 @@
 """Search logic for local-photo-search.
 
-Combines CLIP semantic search, text search, color search,
-and (future) face search into a unified interface.
+Combines CLIP semantic search, text search, color search, and face/person search.
 """
 
 import json
@@ -46,19 +45,89 @@ def search_by_place(db: PhotoDB, place: str, limit: int = 10) -> list[dict]:
     return db.search_text(place, limit=limit)
 
 
+def search_by_person(db: PhotoDB, name: str, limit: int = 10) -> list[dict]:
+    """Find all photos containing a named person.
+
+    Looks up the person by name, then finds all faces linked to that person,
+    then returns the distinct photos those faces appear in.
+    """
+    person = db.get_person_by_name(name)
+    if not person:
+        print(f"  Person '{name}' not found. Use 'add-person' to register them.")
+        return []
+
+    rows = db.conn.execute(
+        """SELECT DISTINCT p.*
+           FROM photos p
+           JOIN faces f ON f.photo_id = p.id
+           WHERE f.person_id = ?
+           ORDER BY p.date_taken
+           LIMIT ?""",
+        (person["id"], limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_by_face_reference(db: PhotoDB, image_path: str, limit: int = 10) -> list[dict]:
+    """Find photos containing a face similar to the one in the given reference image.
+
+    Encodes the face in the reference image, then searches face_encodings for matches.
+    """
+    from .faces import encode_reference_photo, match_face
+    import struct
+
+    encoding = encode_reference_photo(image_path)
+    if encoding is None:
+        print(f"  No face found in reference image: {image_path}")
+        return []
+
+    matches = db.search_faces(encoding, limit=limit * 3)
+    if not matches:
+        return []
+
+    # Get distinct photos for matched face IDs
+    seen_photo_ids = set()
+    results = []
+    for match in matches:
+        face_id = match["face_id"]
+        face_row = db.conn.execute(
+            "SELECT photo_id FROM faces WHERE id = ?", (face_id,)
+        ).fetchone()
+        if face_row and face_row["photo_id"] not in seen_photo_ids:
+            photo = db.get_photo(face_row["photo_id"])
+            if photo:
+                photo["face_distance"] = match["distance"]
+                results.append(photo)
+                seen_photo_ids.add(face_row["photo_id"])
+        if len(results) >= limit:
+            break
+
+    return results
+
+
 def search_combined(
     db: PhotoDB,
     query: Optional[str] = None,
     color: Optional[str] = None,
     place: Optional[str] = None,
+    person: Optional[str] = None,
+    face_image: Optional[str] = None,
     limit: int = 10,
 ) -> list[dict]:
     """Run multiple search types and merge results.
 
     When multiple criteria are given, returns the intersection
-    ranked by the primary search type (semantic > color > place).
+    ranked by the primary search type (person > semantic > color > place).
     """
     result_sets = []
+
+    if person:
+        results = search_by_person(db, person, limit=limit * 3)
+        result_sets.append({r["id"]: r for r in results})
+
+    if face_image:
+        results = search_by_face_reference(db, face_image, limit=limit * 3)
+        result_sets.append({r["id"]: r for r in results})
 
     if query:
         results = search_semantic(db, query, limit=limit * 3)

@@ -1,7 +1,8 @@
 """Indexing pipeline — processes a folder of photos and populates the database.
 
-For M1: EXIF extraction, CLIP embeddings, dominant colors.
-Face detection and LLaVA descriptions are added in later milestones.
+M1: EXIF extraction, CLIP embeddings, dominant colors.
+M2: Face detection and encoding.
+LLaVA descriptions are added in M3.
 """
 
 import hashlib
@@ -32,13 +33,20 @@ def file_hash(filepath: str, chunk_size: int = 8192) -> str:
     return h.hexdigest()
 
 
+# Subfolder names that are excluded from indexing
+EXCLUDED_DIRS = {"results", "references", ".references", "thumbnails"}
+
+
 def find_photos(directory: str) -> list[str]:
     """Recursively find all supported image files in a directory.
 
     Returns JPEG files. ARW files are associated as raw pairs, not indexed separately.
+    Skips folders named 'results', 'references', or 'thumbnails'.
     """
     photos = []
-    for root, _, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        # Skip excluded subdirectories in-place so os.walk doesn't descend into them
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
         for fname in sorted(files):
             ext = Path(fname).suffix.lower()
             if ext in JPEG_EXTENSIONS:
@@ -53,16 +61,19 @@ def index_directory(
     skip_existing: bool = True,
     enable_clip: bool = True,
     enable_colors: bool = True,
+    enable_faces: bool = False,
+    force_faces: bool = False,
 ):
     """Index all photos in a directory.
 
-    Steps per photo (M1):
+    Steps per photo:
       1. Extract EXIF metadata
       2. Check for ARW raw pair
       3. Compute file hash
       4. Insert into database
-      5. Generate CLIP embedding
-      6. Extract dominant colors
+      5. Generate CLIP embedding (if enable_clip)
+      6. Extract dominant colors (if enable_colors)
+      7. Detect and encode faces (if enable_faces)
 
     Args:
         photo_dir: Directory to scan for photos.
@@ -71,6 +82,8 @@ def index_directory(
         skip_existing: If True, skip photos already in the database.
         enable_clip: If True, generate CLIP embeddings.
         enable_colors: If True, extract dominant colors.
+        enable_faces: If True, detect and encode faces.
+        force_faces: If True, clear existing face data and re-run detection on all photos.
     """
     photo_dir = str(Path(photo_dir).resolve())
     photos = find_photos(photo_dir)
@@ -140,5 +153,80 @@ def index_directory(
 
             elapsed = time.time() - t0
             print(f"  Extracted colors for {color_count}/{len(new_photos)} photos in {elapsed:.1f}s")
+
+        # Step 4: Face detection and encoding
+        if enable_faces:
+            from .faces import detect_faces, cluster_encodings, check_available
+            try:
+                check_available()
+            except RuntimeError as e:
+                print(f"\nSkipping face detection: {e}")
+            else:
+                if force_faces:
+                    # Wipe all existing face data and re-detect everything
+                    print("\nClearing existing face data for re-detection...")
+                    db.conn.execute("DELETE FROM faces")
+                    db.conn.commit()
+                    all_rows = db.conn.execute(
+                        "SELECT id, filepath FROM photos"
+                    ).fetchall()
+                    all_face_candidates = [(row["id"], row["filepath"]) for row in all_rows]
+                else:
+                    # Only process photos that have never had face detection run
+                    unprocessed_rows = db.conn.execute(
+                        """SELECT p.id, p.filepath FROM photos p
+                           WHERE NOT EXISTS (
+                               SELECT 1 FROM faces f WHERE f.photo_id = p.id
+                           )"""
+                    ).fetchall()
+                    new_ids = {pid for pid, _ in new_photos}
+                    all_face_candidates = list(new_photos) + [
+                        (row["id"], row["filepath"])
+                        for row in unprocessed_rows
+                        if row["id"] not in new_ids
+                    ]
+
+                total = len(all_face_candidates)
+                print(f"\nDetecting faces in {total} photo(s)...")
+                t0 = time.time()
+                all_encodings = []
+                all_face_ids = []
+
+                face_count = 0
+                for idx, (photo_id, path) in enumerate(all_face_candidates, 1):
+                    fname = os.path.basename(path)
+                    print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                    t_photo = time.time()
+                    faces = detect_faces(path, use_cnn=False)
+                    elapsed_photo = time.time() - t_photo
+                    if faces:
+                        print(f" {len(faces)} face(s) found ({elapsed_photo:.1f}s)")
+                    else:
+                        print(f" no faces ({elapsed_photo:.1f}s)")
+                    for face in faces:
+                        face_id = db.add_face(
+                            photo_id=photo_id,
+                            bbox=face["bbox"],
+                            encoding=face["encoding"],
+                        )
+                        all_encodings.append(face["encoding"])
+                        all_face_ids.append(face_id)
+                        face_count += 1
+
+                elapsed = time.time() - t0
+                print(f"  Found {face_count} face(s) across {len(all_face_candidates)} photos in {elapsed:.1f}s")
+
+                # Cluster all detected faces
+                if all_encodings:
+                    print("  Clustering faces...")
+                    cluster_ids = cluster_encodings(all_encodings)
+                    for face_id, cluster_id in zip(all_face_ids, cluster_ids):
+                        db.conn.execute(
+                            "UPDATE faces SET cluster_id = ? WHERE id = ?",
+                            (cluster_id, face_id),
+                        )
+                    db.conn.commit()
+                    n_clusters = len(set(cluster_ids))
+                    print(f"  Grouped into {n_clusters} cluster(s)")
 
         print(f"\nDone! Database: {db_path} ({db.photo_count()} total photos)")
