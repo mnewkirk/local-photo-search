@@ -640,5 +640,37 @@ def show_descriptions(db, filename):
             click.echo()
 
 
+# ---------------------------------------------------------------------------
+# serve (web UI)
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--host", default="0.0.0.0", help="Host to bind to.")
+@click.option("--port", default=8000, help="Port to listen on.")
+@click.option("--reload", is_flag=True, help="Enable auto-reload for development.")
+def serve(db, host, port, reload):
+    """Launch the web UI for browsing and searching photos.
+
+    \b
+    Example:
+      python cli.py serve
+      python cli.py serve --port 3000
+      python cli.py serve --db /path/to/photo_index.db
+    """
+    import uvicorn
+    os.environ["PHOTOSEARCH_DB"] = db
+    click.echo(f"Starting photo search UI at http://{host}:{port}")
+    click.echo(f"Database: {db}")
+    click.echo("Press Ctrl+C to stop.\n")
+    uvicorn.run(
+        "photosearch.web:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )
+
+
 if __name__ == "__main__":
     cli()

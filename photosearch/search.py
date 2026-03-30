@@ -77,19 +77,139 @@ _NEGATION_PEOPLE_RE = re.compile(
 _FALSE_NEGATION_RE = re.compile(r"\bno other\b", re.IGNORECASE)
 
 
+def _dedupe_by_hash(results: list[dict]) -> list[dict]:
+    """Remove duplicate photos (same file indexed from multiple paths).
+
+    Keeps the first occurrence (highest score if pre-sorted).
+    """
+    seen: set[str] = set()
+    out = []
+    for r in results:
+        h = r.get("file_hash")
+        if h and h in seen:
+            continue
+        if h:
+            seen.add(h)
+        out.append(r)
+    return out
+
+
+# Patterns that negate people in the QUERY itself (not the description).
+# "no people", "without people", "no kids", etc.
+_QUERY_NEGATES_PEOPLE_RE = re.compile(
+    r"\b(?:no|without|exclude|excluding)\s+(?:"
+    + "|".join(re.escape(kw) for kw in sorted(_PEOPLE_KEYWORDS, key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_query(query: str) -> tuple[str, list[str]]:
+    """Parse a query into positive terms and excluded terms.
+
+    Supports two negation syntaxes:
+      - Dash prefix:      "beach -people -dogs"
+      - Natural language:  "no people", "without kids"
+
+    Returns (positive_query, excluded_terms) where:
+      - positive_query: the query to send to CLIP (without negation tokens)
+      - excluded_terms: lowercased words that must NOT appear in descriptions
+    """
+    excluded: list[str] = []
+
+    # Extract -term tokens
+    tokens = query.split()
+    positive_tokens = []
+    for token in tokens:
+        if token.startswith("-") and len(token) > 1:
+            word = token[1:].lower()
+            excluded.append(word)
+            # Also expand people-related exclusions: -people should exclude
+            # all people keywords so "person", "child", etc. also get filtered
+            if word in _PEOPLE_KEYWORDS:
+                excluded.extend(_PEOPLE_KEYWORDS)
+        else:
+            positive_tokens.append(token)
+
+    # Extract "no <word>" / "without <word>" natural language negation
+    remaining = " ".join(positive_tokens)
+    nl_neg_re = re.compile(
+        r"\b(?:no|without|exclude|excluding)\s+(\w+)\b", re.IGNORECASE,
+    )
+    for m in nl_neg_re.finditer(remaining):
+        word = m.group(1).lower()
+        excluded.append(word)
+        if word in _PEOPLE_KEYWORDS:
+            excluded.extend(_PEOPLE_KEYWORDS)
+
+    # Build positive query: strip out "no <word>" / "without <word>" phrases
+    # so CLIP only sees the positive intent
+    positive_query = nl_neg_re.sub("", remaining).strip()
+    # Clean up extra whitespace
+    positive_query = re.sub(r"\s+", " ", positive_query).strip()
+
+    return positive_query, list(set(excluded))
+
+
 def _query_mentions_people(query: str) -> bool:
     """Return True if the query contains people-related keywords."""
     words = set(query.lower().split())
     return bool(words & _PEOPLE_KEYWORDS)
 
 
-def _description_relevance(description: str, query: str) -> float:
+def _query_negates_people(query: str) -> bool:
+    """Return True if the query is asking for the ABSENCE of people.
+
+    "no people", "without kids", "empty beach no people" → True
+    "people outdoors", "kids playing" → False
+    """
+    return bool(_QUERY_NEGATES_PEOPLE_RE.search(query))
+
+
+def _description_contains_excluded(description: str, excluded: list[str]) -> bool:
+    """Return True if the description contains any excluded term.
+
+    Uses stem matching (strip trailing 's') for basic plural handling.
+    For people-related exclusions, also checks that the term isn't negated
+    in the description (e.g. "no people visible" should NOT be excluded).
+    """
+    if not excluded or not description:
+        return False
+
+    desc_lower = description.lower()
+
+    # Check if the description negates people — if so, people-related
+    # excluded terms should NOT cause a filter-out.
+    desc_negates_people = bool(
+        _NEGATION_PEOPLE_RE.search(desc_lower)
+        and not _FALSE_NEGATION_RE.search(
+            _NEGATION_PEOPLE_RE.search(desc_lower).group()
+        )
+    )
+
+    for term in excluded:
+        stem = term.rstrip("s") if len(term) > 4 else term
+        if stem in desc_lower:
+            # If this is a people term and the description negates people,
+            # don't count it as a match (the description says "no people")
+            if term in _PEOPLE_KEYWORDS and desc_negates_people:
+                continue
+            return True
+    return False
+
+
+def _description_relevance(description: str, query: str,
+                           negate_people: bool = False) -> float:
     """Score how relevant a description is to a query, using three tiers.
 
+    When negate_people is True (query is "no people", "without kids", etc.),
+    the people logic is inverted: descriptions saying "no people" get a boost,
+    and descriptions mentioning people get a penalty.
+
     Returns:
-      +DESCRIPTION_BOOST           all query words found in description (strong positive)
-      -DESCRIPTION_PENALTY         description explicitly negates a query word (strong negative)
-      -DESCRIPTION_ABSENCE_PENALTY description exists but matches zero query words (weak negative)
+      +DESCRIPTION_BOOST           description matches what the query wants
+      -DESCRIPTION_PENALTY         description contradicts what the query wants
+      -DESCRIPTION_ABSENCE_PENALTY description exists but matches zero query words
       0.0                          no description, or partial match (neutral)
     """
     if not description:
@@ -97,6 +217,24 @@ def _description_relevance(description: str, query: str) -> float:
 
     desc_lower = description.lower()
     query_words = query.lower().split()
+
+    # --- Negated people query ("no people", "without kids") ---
+    # Invert the normal logic: boost empty scenes, penalize people.
+    if negate_people:
+        # Check if description negates people → that's what we WANT
+        neg_match = _NEGATION_PEOPLE_RE.search(desc_lower)
+        if neg_match and not _FALSE_NEGATION_RE.search(neg_match.group()):
+            return DESCRIPTION_BOOST  # Description says "no people" — good!
+
+        # Check if description mentions people → that's what we DON'T want
+        has_people_word = any(kw in desc_lower for kw in _PEOPLE_KEYWORDS)
+        if has_people_word:
+            return -DESCRIPTION_PENALTY  # Description mentions people — bad!
+
+        # Description doesn't mention people at all — mildly positive
+        return DESCRIPTION_ABSENCE_PENALTY  # Small boost for absence
+
+    # --- Normal (non-negated) query logic ---
 
     # Check for explicit negation: "no people", "no visible people", etc.
     for word in query_words:
@@ -184,8 +322,16 @@ def search_semantic(
 
     This hybrid approach means "people outdoors" surfaces photos that CLIP ranks
     highly AND photos that LLaVA described as having "people" and "outdoors".
+
+    Supports exclusion syntax: "beach -people" or "beach without people" will
+    find beach photos and hard-filter any whose description mentions people.
     """
-    query_embedding = embed_text(query)
+    # Parse exclusions from the query
+    positive_query, excluded_terms = _parse_query(query)
+
+    # Use the positive query for CLIP embedding (CLIP can't handle negation)
+    clip_query = positive_query if positive_query else query
+    query_embedding = embed_text(clip_query)
     if query_embedding is None:
         print("Error: could not generate embedding for query.")
         return []
@@ -195,11 +341,14 @@ def search_semantic(
     fetch_limit = max(limit * 3, 30)
     matches = db.search_clip(query_embedding, limit=fetch_limit)
 
-    boost_people = _query_mentions_people(query)
+    # Use the positive query (without exclusions) for people detection
+    boost_people = _query_mentions_people(positive_query) if positive_query else False
+    negate_people = bool(excluded_terms and any(t in _PEOPLE_KEYWORDS for t in excluded_terms))
+    has_exclusions = bool(excluded_terms)
 
     # Pre-load face counts if we need them
     face_counts: dict[int, int] = {}
-    if boost_people:
+    if boost_people or negate_people:
         rows = db.conn.execute(
             "SELECT photo_id, COUNT(*) as cnt FROM faces GROUP BY photo_id"
         ).fetchall()
@@ -220,17 +369,23 @@ def search_semantic(
         score = raw_score
         photo_id = match["photo_id"]
 
-        # Apply face boost: each detected face adds FACE_BOOST to the score.
+        # Hard-filter: if the query has excluded terms (e.g. "beach -people"),
+        # skip any photo whose description contains the excluded content.
+        if has_exclusions and photo_id in desc_cache:
+            if _description_contains_excluded(desc_cache[photo_id], excluded_terms):
+                continue
+
+        # Hard-filter: if people are excluded, skip photos with detected faces
+        if negate_people and photo_id in face_counts:
+            continue
+
+        # Normal people boost: each detected face adds FACE_BOOST
         if boost_people and photo_id in face_counts:
             score += face_counts[photo_id] * FACE_BOOST
 
-        # Description relevance: positive boost if description matches query,
-        # negative penalty if description negates it ("no people", etc.)
-        # Only apply positive boosts when CLIP thinks the photo is at least
-        # somewhat relevant — this prevents hallucinated descriptions from
-        # surfacing visually irrelevant photos.
-        if photo_id in desc_cache:
-            desc_rel = _description_relevance(desc_cache[photo_id], query)
+        # Description relevance against the positive query
+        if photo_id in desc_cache and positive_query:
+            desc_rel = _description_relevance(desc_cache[photo_id], positive_query)
             if desc_rel > 0 and raw_score < CLIP_MIN_FOR_DESC_BOOST:
                 pass  # CLIP score too low — don't trust description boost
             else:
@@ -248,23 +403,29 @@ def search_semantic(
     # Also surface photos that match on description but weren't in CLIP results.
     # These have no CLIP support, so we require face confirmation for people
     # queries to avoid hallucinated descriptions surfacing irrelevant photos.
-    desc_matches = search_descriptions(db, query, limit=fetch_limit)
-    for desc_photo in desc_matches:
-        pid = desc_photo["id"]
-        if pid not in results_by_id:
-            rel = _description_relevance(desc_photo.get("description", ""), query)
-            if rel > 0:  # only add positive matches, not negated ones
-                # For people queries, require at least one detected face
-                # when surfacing description-only matches (no CLIP support).
-                if boost_people and pid not in face_counts:
-                    continue  # description says "person" but no face detected — skip
-                desc_photo["score"] = rel
-                desc_photo["clip_score"] = None
-                results_by_id[pid] = desc_photo
+    # Also surface photos that match on description but weren't in CLIP results.
+    if positive_query:
+        desc_matches = search_descriptions(db, positive_query, limit=fetch_limit)
+        for desc_photo in desc_matches:
+            pid = desc_photo["id"]
+            if pid not in results_by_id:
+                # Apply exclusion filter
+                desc_text = desc_photo.get("description", "")
+                if has_exclusions and _description_contains_excluded(desc_text, excluded_terms):
+                    continue
+                if negate_people and pid in face_counts:
+                    continue
+                rel = _description_relevance(desc_text, positive_query)
+                if rel > 0:
+                    if boost_people and pid not in face_counts:
+                        continue
+                    desc_photo["score"] = rel
+                    desc_photo["clip_score"] = None
+                    results_by_id[pid] = desc_photo
 
     # Re-sort by combined score, descending
     results = sorted(results_by_id.values(), key=lambda r: r["score"], reverse=True)
-    return results[:limit]
+    return _dedupe_by_hash(results)[:limit]
 
 
 def search_by_color(db: PhotoDB, color: str, tolerance: int = 60, limit: int = 10) -> list[dict]:
@@ -382,7 +543,7 @@ def search_combined(
         return []
 
     if len(result_sets) == 1:
-        return list(result_sets[0].values())[:limit]
+        return _dedupe_by_hash(list(result_sets[0].values()))[:limit]
 
     # Intersect: only keep photos present in all result sets
     common_ids = set(result_sets[0].keys())
@@ -391,7 +552,7 @@ def search_combined(
 
     # Use first result set for ranking/data
     merged = [result_sets[0][pid] for pid in common_ids if pid in result_sets[0]]
-    return merged[:limit]
+    return _dedupe_by_hash(merged)[:limit]
 
 
 def make_results_subdir(base_dir: str, query_parts: dict) -> str:

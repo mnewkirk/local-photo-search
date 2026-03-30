@@ -143,7 +143,7 @@ def index_directory(
             ]
             new_photos = list(all_photos)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
-        elif not new_photos and not enable_describe:
+        elif not new_photos and not enable_describe and not enable_faces:
             print("All photos already indexed. Nothing to do.")
             return
 
