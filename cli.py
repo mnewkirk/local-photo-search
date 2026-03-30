@@ -40,7 +40,11 @@ def cli():
 @click.option("--faces", is_flag=True, help="Detect and encode faces.")
 @click.option("--force-faces", is_flag=True, help="Clear all face data and re-run detection on every photo.")
 @click.option("--force-clip", is_flag=True, help="Clear all CLIP embeddings and regenerate for every photo. Use after switching CLIP models.")
-def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip):
+@click.option("--describe", is_flag=True, help="Generate scene descriptions via LLaVA (requires Ollama).")
+@click.option("--force-describe", is_flag=True, help="Regenerate descriptions for all photos, even those that already have one.")
+@click.option("--describe-model", default="llava", show_default=True, help="Ollama model for descriptions.")
+def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip,
+          describe, force_describe, describe_model):
     """Index a directory of photos."""
     index_directory(
         photo_dir=photo_dir,
@@ -51,6 +55,9 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
         enable_faces=faces or force_faces,
         force_faces=force_faces,
         force_clip=force_clip,
+        enable_describe=describe or force_describe,
+        force_describe=force_describe,
+        describe_model=describe_model,
     )
 
 
@@ -576,11 +583,15 @@ def stats(db):
         unmatched = photo_db.conn.execute(
             "SELECT COUNT(*) as c FROM faces WHERE person_id IS NULL"
         ).fetchone()["c"]
+        described = photo_db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE description IS NOT NULL"
+        ).fetchone()["c"]
 
         click.echo(f"Database:        {db}")
         click.echo(f"Photos indexed:  {photo_count}")
         click.echo(f"Faces detected:  {face_count} ({unmatched} unmatched)")
         click.echo(f"Persons named:   {person_count}")
+        click.echo(f"Descriptions:    {described}/{photo_count}")
 
         if photo_count > 0:
             rows = photo_db.conn.execute(
@@ -589,6 +600,44 @@ def stats(db):
             click.echo(f"\nSample photos:")
             for row in rows:
                 click.echo(f"  {row['filename']}  {row['date_taken'] or ''}  {row['camera_model'] or ''}")
+
+
+# ---------------------------------------------------------------------------
+# show-descriptions
+# ---------------------------------------------------------------------------
+
+@cli.command("show-descriptions")
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.argument("filename", required=False)
+def show_descriptions(db, filename):
+    """Show LLaVA-generated descriptions for photos.
+
+    If FILENAME is given, show that photo's description. Otherwise show all.
+
+    \b
+    Examples:
+      python cli.py show-descriptions
+      python cli.py show-descriptions DSC04894.JPG
+    """
+    with PhotoDB(db) as photo_db:
+        if filename:
+            row = photo_db.conn.execute(
+                "SELECT filename, description FROM photos WHERE filename = ?", (filename,)
+            ).fetchone()
+            if not row:
+                click.echo(f"Photo '{filename}' not found.")
+                return
+            desc = row["description"] or "(no description)"
+            click.echo(f"\n{row['filename']}:\n  {desc}\n")
+        else:
+            rows = photo_db.conn.execute(
+                "SELECT filename, description FROM photos ORDER BY filename"
+            ).fetchall()
+            for row in rows:
+                desc = row["description"] or "(no description)"
+                click.echo(f"\n{row['filename']}:")
+                click.echo(f"  {desc}")
+            click.echo()
 
 
 if __name__ == "__main__":

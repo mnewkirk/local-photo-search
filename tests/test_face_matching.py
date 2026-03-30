@@ -78,13 +78,18 @@ MANUALLY_CORRECTED: dict[str, list[tuple[int, str]]] = {
 # Model: ViT-B/16 + openai pretrained (clip_embed.py).
 # CLIP alone scores all 7 sample photos within a 0.018-point band for "people
 # outdoors" — it sees them all as "outdoor coastal scene" and can't reliably
-# isolate the "people" component. The face-aware boost in search.py (FACE_BOOST)
-# lifts photos with detected faces above pure landscapes, fixing 3 of 4 people
-# photos. DSC04895 (person facing away, no detectable face) remains a known gap
-# that LLaVA descriptions (M3) will close.
+# isolate the "people" component. Three signals work together to fix this:
+#   1. Face boost (+0.02/face) lifts photos with detected faces
+#   2. Description boost (+0.05) lifts photos whose LLaVA description matches
+#   3. Description penalty (-0.04) pushes down photos whose description says
+#      "no people" / "no one" / etc., and absence penalty (-0.02) for photos
+#      whose description matches none of the query words
 #
 # If tests start failing after a model change, check raw scores with:
 #   python cli.py search -q "people outdoors" --json-output
+#
+# Semantic tests require LLaVA descriptions to be generated:
+#   python cli.py index ../sample --describe --no-clip --no-colors
 
 # Semantic search tests use RANKING checks: relevant photos must outrank
 # irrelevant ones. With only 7 photos from the same coastal shoot, CLIP returns
@@ -95,22 +100,20 @@ MANUALLY_CORRECTED: dict[str, list[tuple[int, str]]] = {
 #   "top": set of filenames that MUST appear in the top N results (N = len(top)),
 #   "bottom": set of filenames that must rank BELOW every "top" photo,
 # }
-# Photos not in either set (like DSC04895 — person facing away) are unconstrained.
 EXPECTED_SEMANTIC: dict[str, dict[str, set[str]]] = {
     "people outdoors": {
         "top": {
             "DSC04894.JPG",   # Calvin + Nicole outdoors — 2 detected faces
+            "DSC04895.JPG",   # Eleanor from behind — no face detected, but LLaVA
+                              # describes "a young girl" so no negation penalty applies
             "DSC04907.JPG",   # Eleanor + Calvin outdoors — 2 detected faces
             "DSC04922.JPG",   # Eleanor + Calvin outdoors — 2 detected faces
         },
         "bottom": {
-            "DSC04878.JPG",   # landscape, no people
-            "DSC04880.JPG",   # landscape, no people
-            "DSC04899.JPG",   # landscape, no people
+            "DSC04878.JPG",   # landscape — description says "no people"
+            "DSC04880.JPG",   # landscape — description says "no one"
+            "DSC04899.JPG",   # landscape — description says "no people"
         },
-        # DSC04895.JPG: Eleanor from behind — person IS present but no detectable
-        # face. CLIP + face-boost can't distinguish this from a landscape.
-        # LLaVA descriptions (M3) will close this gap.
     },
     # Add more queries here as ground truth is established.
 }

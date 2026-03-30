@@ -2,7 +2,7 @@
 
 M1: EXIF extraction, CLIP embeddings, dominant colors.
 M2: Face detection and encoding.
-LLaVA descriptions are added in M3.
+M3: LLaVA scene descriptions via Ollama.
 """
 
 import hashlib
@@ -64,6 +64,9 @@ def index_directory(
     enable_faces: bool = False,
     force_faces: bool = False,
     force_clip: bool = False,
+    enable_describe: bool = False,
+    force_describe: bool = False,
+    describe_model: str = "llava",
 ):
     """Index all photos in a directory.
 
@@ -75,6 +78,7 @@ def index_directory(
       5. Generate CLIP embedding (if enable_clip)
       6. Extract dominant colors (if enable_colors)
       7. Detect and encode faces (if enable_faces)
+      8. Generate LLaVA description (if enable_describe)
 
     Args:
         photo_dir: Directory to scan for photos.
@@ -87,6 +91,10 @@ def index_directory(
         force_faces: If True, clear existing face data and re-run detection on all photos.
         force_clip: If True, clear existing CLIP embeddings and regenerate for all photos.
                     Use this when switching CLIP models to avoid stale embeddings.
+        enable_describe: If True, generate scene descriptions via LLaVA/Ollama.
+        force_describe: If True, regenerate descriptions for all photos (even those
+                        that already have one).
+        describe_model: Ollama model name for descriptions (default: "llava").
     """
     photo_dir = str(Path(photo_dir).resolve())
     photos = find_photos(photo_dir)
@@ -124,15 +132,18 @@ def index_directory(
         # force_clip: wipe all existing CLIP embeddings and re-embed every photo.
         # Required when switching CLIP models — old embeddings live in a different
         # vector space and will give nonsensical search results if mixed with new ones.
+        all_photos = None  # lazy-loaded list of (id, filepath) for all indexed photos
         if force_clip and enable_clip:
             print("\nClearing existing CLIP embeddings for full regeneration (--force-clip)...")
             db.conn.execute("DELETE FROM clip_embeddings")
             db.conn.commit()
-            # Re-embed all photos, not just new ones
-            all_rows = db.conn.execute("SELECT id, filepath FROM photos").fetchall()
-            new_photos = [(row["id"], row["filepath"]) for row in all_rows]
+            all_photos = [
+                (row["id"], row["filepath"])
+                for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+            ]
+            new_photos = list(all_photos)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
-        elif not new_photos:
+        elif not new_photos and not enable_describe:
             print("All photos already indexed. Nothing to do.")
             return
 
@@ -243,5 +254,54 @@ def index_directory(
                     db.conn.commit()
                     n_clusters = len(set(cluster_ids))
                     print(f"  Grouped into {n_clusters} cluster(s)")
+
+        # Step 5: LLaVA scene descriptions via Ollama
+        if enable_describe:
+            from .describe import describe_photo, check_available as desc_check
+            try:
+                desc_check(model=describe_model)
+            except RuntimeError as e:
+                print(f"\nSkipping descriptions: {e}")
+            else:
+                if force_describe:
+                    # Regenerate descriptions for ALL photos
+                    if all_photos is None:
+                        all_photos = [
+                            (row["id"], row["filepath"])
+                            for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+                        ]
+                    desc_candidates = list(all_photos)
+                    print(f"\nGenerating descriptions for all {len(desc_candidates)} photo(s) (--force-describe)...")
+                else:
+                    # Only describe photos that don't have a description yet
+                    undescribed = db.conn.execute(
+                        "SELECT id, filepath FROM photos WHERE description IS NULL"
+                    ).fetchall()
+                    desc_candidates = [(row["id"], row["filepath"]) for row in undescribed]
+                    if desc_candidates:
+                        print(f"\nGenerating descriptions for {len(desc_candidates)} undescribed photo(s)...")
+                    else:
+                        print("\nAll photos already have descriptions.")
+
+                if desc_candidates:
+                    t0 = time.time()
+                    desc_count = 0
+                    total = len(desc_candidates)
+                    for idx, (photo_id, path) in enumerate(desc_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        t_photo = time.time()
+                        desc = describe_photo(path, model=describe_model)
+                        elapsed_photo = time.time() - t_photo
+                        if desc:
+                            db.update_photo(photo_id, description=desc)
+                            preview = desc[:80].replace("\n", " ")
+                            print(f" ({elapsed_photo:.1f}s) {preview}...")
+                            desc_count += 1
+                        else:
+                            print(f" ({elapsed_photo:.1f}s) no description")
+
+                    elapsed = time.time() - t0
+                    print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
 
         print(f"\nDone! Database: {db_path} ({db.photo_count()} total photos)")

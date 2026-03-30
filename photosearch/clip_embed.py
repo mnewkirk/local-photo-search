@@ -51,7 +51,7 @@ def _load_model():
         _device = "mps"
 
     _model, _, _preprocess = open_clip.create_model_and_transforms(
-        MODEL_NAME, pretrained=PRETRAINED, device=_device
+        MODEL_NAME, pretrained=PRETRAINED, device=_device, quick_gelu=True,
     )
     _tokenizer = open_clip.get_tokenizer(MODEL_NAME)
     _model.eval()
