@@ -39,7 +39,8 @@ def cli():
 @click.option("--no-colors", is_flag=True, help="Skip dominant color extraction.")
 @click.option("--faces", is_flag=True, help="Detect and encode faces.")
 @click.option("--force-faces", is_flag=True, help="Clear all face data and re-run detection on every photo.")
-def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces):
+@click.option("--force-clip", is_flag=True, help="Clear all CLIP embeddings and regenerate for every photo. Use after switching CLIP models.")
+def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip):
     """Index a directory of photos."""
     index_directory(
         photo_dir=photo_dir,
@@ -49,6 +50,7 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces):
         enable_colors=not no_colors,
         enable_faces=faces or force_faces,
         force_faces=force_faces,
+        force_clip=force_clip,
     )
 
 
@@ -67,7 +69,10 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces):
 @click.option("--results-dir", default="results", help="Base directory for result subfolders.")
 @click.option("--no-results", is_flag=True, help="Don't write a results folder.")
 @click.option("--json-output", is_flag=True, help="Output results as JSON.")
-def search(query, person, place, color, face, db, limit, results_dir, no_results, json_output):
+@click.option("--min-score", default=-0.25, show_default=True,
+              help="Minimum CLIP similarity score to return a result (-1 to 1). "
+                   "Raise toward 0 for stricter matching; lower to be more permissive.")
+def search(query, person, place, color, face, db, limit, results_dir, no_results, json_output, min_score):
     """Search indexed photos."""
     if not any([query, person, place, color, face]):
         click.echo("Please provide at least one search criterion. See --help for options.")
@@ -82,6 +87,7 @@ def search(query, person, place, color, face, db, limit, results_dir, no_results
             person=person,
             face_image=face,
             limit=limit,
+            min_score=min_score,
         )
 
         if not results:

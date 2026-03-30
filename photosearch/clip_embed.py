@@ -16,9 +16,24 @@ _preprocess = None
 _tokenizer = None
 _device = None
 
-# Default model — good balance of quality and speed for N100/macOS
-MODEL_NAME = "ViT-B-32"
-PRETRAINED = "laion2b_s34b_b79k"
+# Model choice: ViT-B/16 with OpenAI pretrained weights.
+#
+# OpenAI's CLIP weights are specifically trained for semantic image-text
+# alignment and significantly outperform LAION-pretrained weights on natural
+# language queries like "people outdoors" or "child playing in park".
+#
+# ViT-B/16 vs ViT-B/32:
+#   - B/16 uses a 16px patch size (vs 32px), giving 4× more image patches
+#     and substantially better fine-grained understanding
+#   - Both produce 512-dim embeddings — no DB schema change required
+#   - B/16 is ~2-3× slower to index than B/32 but still fast on N100/MPS
+#   - Model download: ~330 MB (one-time, cached to ~/.cache/huggingface/)
+#
+# If you need faster indexing at some quality cost, switch back to:
+#   MODEL_NAME = "ViT-B-32"
+#   PRETRAINED = "openai"
+MODEL_NAME = "ViT-B-16"
+PRETRAINED = "openai"
 
 
 def _load_model():

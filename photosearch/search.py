@@ -13,22 +13,92 @@ from .clip_embed import embed_text
 from .db import PhotoDB
 
 
-def search_semantic(db: PhotoDB, query: str, limit: int = 10) -> list[dict]:
-    """Semantic search using CLIP — find photos matching a natural language query."""
+# Minimum CLIP similarity score (1 - L2_distance) required to return a result.
+# For L2-normalized 512-dim CLIP vectors, L2 distance = sqrt(2*(1-cos_sim)), so:
+#   score -0.25 ≈ cosine similarity 0.22  (loose relevance)
+#   score  0.00 ≈ cosine similarity 0.50  (clearly related)
+# Queries like "ships" against unrelated family photos score ≈ -0.30, well below
+# this threshold, so they return nothing rather than the whole collection.
+CLIP_MIN_SCORE = -0.25
+
+# Face-aware reranking: when a query mentions people, photos with detected faces
+# get a score boost. This helps CLIP distinguish "people outdoors" from "outdoors"
+# — something it can't do from embeddings alone when all photos are visually similar.
+_PEOPLE_KEYWORDS = {
+    "people", "person", "child", "children", "kid", "kids", "family",
+    "man", "woman", "boy", "girl", "baby", "toddler", "adult",
+    "group", "crowd", "portrait", "face", "faces",
+}
+FACE_BOOST = 0.02  # Score bonus per detected face (enough to lift a photo above
+                    # neighbors in a tight cluster, but not so much that a random
+                    # face-having photo leapfrogs a genuinely relevant result).
+
+
+def _query_mentions_people(query: str) -> bool:
+    """Return True if the query contains people-related keywords."""
+    words = set(query.lower().split())
+    return bool(words & _PEOPLE_KEYWORDS)
+
+
+def search_semantic(
+    db: PhotoDB,
+    query: str,
+    limit: int = 10,
+    min_score: float = CLIP_MIN_SCORE,
+) -> list[dict]:
+    """Semantic search using CLIP — find photos matching a natural language query.
+
+    Only returns photos whose CLIP similarity score exceeds min_score.
+    Raise min_score (toward 0) for stricter matching; lower it (toward -1) to
+    be more permissive. Default (-0.25) filters out clearly unrelated results.
+
+    When the query mentions people-related terms, photos with detected faces
+    receive a small score boost to help separate them from similar-looking
+    scenes without people. This is a lightweight hybrid that leverages
+    existing face detection data.
+    """
     query_embedding = embed_text(query)
     if query_embedding is None:
         print("Error: could not generate embedding for query.")
         return []
 
-    matches = db.search_clip(query_embedding, limit=limit)
+    # Fetch more candidates than needed so the boost + re-sort can promote
+    # face-having photos that would otherwise be cut off at the limit.
+    fetch_limit = max(limit * 3, 30)
+    matches = db.search_clip(query_embedding, limit=fetch_limit)
+
+    boost_people = _query_mentions_people(query)
+
+    # Pre-load face counts if we need them
+    face_counts: dict[int, int] = {}
+    if boost_people:
+        rows = db.conn.execute(
+            "SELECT photo_id, COUNT(*) as cnt FROM faces GROUP BY photo_id"
+        ).fetchall()
+        face_counts = {row["photo_id"]: row["cnt"] for row in rows}
 
     results = []
     for match in matches:
-        photo = db.get_photo(match["photo_id"])
+        raw_score = 1.0 - match["distance"]
+        score = raw_score
+        photo_id = match["photo_id"]
+
+        # Apply face boost: each detected face adds FACE_BOOST to the score.
+        if boost_people and photo_id in face_counts:
+            score += face_counts[photo_id] * FACE_BOOST
+
+        if score < min_score:
+            continue  # Too dissimilar even after boost — skip
+
+        photo = db.get_photo(photo_id)
         if photo:
-            photo["score"] = 1.0 - match["distance"]  # Convert distance to similarity
+            photo["score"] = score
+            photo["clip_score"] = raw_score  # preserve raw CLIP score for diagnostics
             results.append(photo)
-    return results
+
+    # Re-sort by boosted score (CLIP + face bonus), descending
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results[:limit]
 
 
 def search_by_color(db: PhotoDB, color: str, tolerance: int = 60, limit: int = 10) -> list[dict]:
@@ -113,6 +183,7 @@ def search_combined(
     person: Optional[str] = None,
     face_image: Optional[str] = None,
     limit: int = 10,
+    min_score: float = CLIP_MIN_SCORE,
 ) -> list[dict]:
     """Run multiple search types and merge results.
 
@@ -130,7 +201,7 @@ def search_combined(
         result_sets.append({r["id"]: r for r in results})
 
     if query:
-        results = search_semantic(db, query, limit=limit * 3)
+        results = search_semantic(db, query, limit=limit * 3, min_score=min_score)
         result_sets.append({r["id"]: r for r in results})
 
     if color:

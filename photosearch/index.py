@@ -63,6 +63,7 @@ def index_directory(
     enable_colors: bool = True,
     enable_faces: bool = False,
     force_faces: bool = False,
+    force_clip: bool = False,
 ):
     """Index all photos in a directory.
 
@@ -84,6 +85,8 @@ def index_directory(
         enable_colors: If True, extract dominant colors.
         enable_faces: If True, detect and encode faces.
         force_faces: If True, clear existing face data and re-run detection on all photos.
+        force_clip: If True, clear existing CLIP embeddings and regenerate for all photos.
+                    Use this when switching CLIP models to avoid stale embeddings.
     """
     photo_dir = str(Path(photo_dir).resolve())
     photos = find_photos(photo_dir)
@@ -118,11 +121,23 @@ def index_directory(
             photo_id = db.add_photo(**meta)
             new_photos.append((photo_id, photo_path))
 
-        if not new_photos:
+        # force_clip: wipe all existing CLIP embeddings and re-embed every photo.
+        # Required when switching CLIP models — old embeddings live in a different
+        # vector space and will give nonsensical search results if mixed with new ones.
+        if force_clip and enable_clip:
+            print("\nClearing existing CLIP embeddings for full regeneration (--force-clip)...")
+            db.conn.execute("DELETE FROM clip_embeddings")
+            db.conn.commit()
+            # Re-embed all photos, not just new ones
+            all_rows = db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+            new_photos = [(row["id"], row["filepath"]) for row in all_rows]
+            print(f"  Will re-embed {len(new_photos)} photo(s).")
+        elif not new_photos:
             print("All photos already indexed. Nothing to do.")
             return
 
-        print(f"\nIndexed {len(new_photos)} new photos into database.")
+        if new_photos:
+            print(f"\nIndexed {len(new_photos)} new photos into database.")
 
         # Step 2: CLIP embeddings (batched)
         if enable_clip:

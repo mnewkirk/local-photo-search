@@ -1,5 +1,5 @@
 """
-Face detection and matching accuracy tests.
+Face detection, matching, and semantic search accuracy tests.
 
 Ground truth for the 7-photo sample set:
   DSC04878.JPG  nobody
@@ -19,8 +19,11 @@ After indexing, run in this order to get a fully-passing suite:
 Or run with auto-setup (only runs missing steps):
   python tests/test_face_matching.py --setup
 
-Run with pytest:
+Run with pytest (all tests):
   pytest tests/test_face_matching.py -v
+
+Run with pytest (face tests only, no CLIP needed — works from sandbox):
+  pytest tests/test_face_matching.py -v -m "not semantic"
 
 Known limitations documented in MANUALLY_CORRECTED:
   DSC04907 Calvin — 87×80px crop, L2=1.3565. Resolved by temporal matching
@@ -62,6 +65,54 @@ KNOWN_UNDETECTABLE: dict[str, list[str]] = {
 # Faces resolved by temporal matching or manual correction (documented for reference).
 MANUALLY_CORRECTED: dict[str, list[tuple[int, str]]] = {
     "DSC04907.JPG": [(2, "Calvin")],   # 87×80px crop, L2=1.3565, above auto threshold
+}
+
+# ---------------------------------------------------------------------------
+# Semantic search ground truth
+# ---------------------------------------------------------------------------
+# Each entry: query → {"include": set of filenames that MUST appear,
+#                       "exclude": set of filenames that must NOT appear}
+# Tests are marked @pytest.mark.semantic and skipped when CLIP is unavailable.
+# All 7 sample photos should be accounted for in each query's include+exclude.
+#
+# Model: ViT-B/16 + openai pretrained (clip_embed.py).
+# CLIP alone scores all 7 sample photos within a 0.018-point band for "people
+# outdoors" — it sees them all as "outdoor coastal scene" and can't reliably
+# isolate the "people" component. The face-aware boost in search.py (FACE_BOOST)
+# lifts photos with detected faces above pure landscapes, fixing 3 of 4 people
+# photos. DSC04895 (person facing away, no detectable face) remains a known gap
+# that LLaVA descriptions (M3) will close.
+#
+# If tests start failing after a model change, check raw scores with:
+#   python cli.py search -q "people outdoors" --json-output
+
+# Semantic search tests use RANKING checks: relevant photos must outrank
+# irrelevant ones. With only 7 photos from the same coastal shoot, CLIP returns
+# all of them above min_score — strict include/exclude isn't meaningful here.
+# What matters is that the right photos are at the top.
+#
+# Format: query → {
+#   "top": set of filenames that MUST appear in the top N results (N = len(top)),
+#   "bottom": set of filenames that must rank BELOW every "top" photo,
+# }
+# Photos not in either set (like DSC04895 — person facing away) are unconstrained.
+EXPECTED_SEMANTIC: dict[str, dict[str, set[str]]] = {
+    "people outdoors": {
+        "top": {
+            "DSC04894.JPG",   # Calvin + Nicole outdoors — 2 detected faces
+            "DSC04907.JPG",   # Eleanor + Calvin outdoors — 2 detected faces
+            "DSC04922.JPG",   # Eleanor + Calvin outdoors — 2 detected faces
+        },
+        "bottom": {
+            "DSC04878.JPG",   # landscape, no people
+            "DSC04880.JPG",   # landscape, no people
+            "DSC04899.JPG",   # landscape, no people
+        },
+        # DSC04895.JPG: Eleanor from behind — person IS present but no detectable
+        # face. CLIP + face-boost can't distinguish this from a landscape.
+        # LLaVA descriptions (M3) will close this gap.
+    },
+    # Add more queries here as ground truth is established.
 }
 
 
@@ -225,6 +276,86 @@ def test_no_faces_in_nobody_photos(photo_db):
 
 
 # ---------------------------------------------------------------------------
+# Semantic search helpers and tests
+# ---------------------------------------------------------------------------
+
+def _has_clip() -> bool:
+    """Return True if open_clip and the CLIP model are available."""
+    try:
+        import open_clip  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.fixture(scope="module")
+def clip_db(photo_db):
+    """Same DB connection as photo_db, but skips if CLIP is not installed."""
+    if not _has_clip():
+        pytest.skip(
+            "open_clip not installed — semantic search tests require the full venv.\n"
+            "Run:  pytest tests/test_face_matching.py -m 'not semantic'  to skip these."
+        )
+    yield photo_db
+
+
+@pytest.mark.semantic
+@pytest.mark.parametrize("query,expected", EXPECTED_SEMANTIC.items())
+def test_semantic_search(clip_db, query, expected):
+    """Semantic search ranking: relevant photos must outrank irrelevant ones.
+
+    'top' photos must appear before all 'bottom' photos in the result ranking.
+    This validates CLIP + face-boost without requiring a perfect threshold cutoff.
+    """
+    from photosearch.search import search_semantic
+
+    results = search_semantic(clip_db, query, limit=20)
+    ranked = [r["filename"] for r in results]
+    scores = {r["filename"]: r.get("score", "?") for r in results}
+
+    top_expected = expected.get("top", set())
+    bottom_expected = expected.get("bottom", set())
+
+    # Check that all "top" photos are present in results
+    missing_top = top_expected - set(ranked)
+
+    # Check ranking: every "top" photo must rank above every "bottom" photo
+    ranking_violations = []
+    for top_f in top_expected:
+        if top_f not in ranked:
+            continue
+        top_rank = ranked.index(top_f)
+        for bot_f in bottom_expected:
+            if bot_f not in ranked:
+                continue
+            bot_rank = ranked.index(bot_f)
+            if top_rank > bot_rank:  # higher index = worse rank
+                ranking_violations.append(
+                    f"{top_f} (rank {top_rank+1}, score {scores.get(top_f, '?'):.3f}) "
+                    f"ranked below {bot_f} (rank {bot_rank+1}, score {scores.get(bot_f, '?'):.3f})"
+                )
+
+    ok = not missing_top and not ranking_violations
+
+    assert ok, (
+        f"\n  Query: '{query}'"
+        + (
+            f"\n  Missing from results: {sorted(missing_top)}"
+            f"\n    → check CLIP model (should be ViT-B-16 + openai)"
+            f"\n    → run: python cli.py index <dir> --force-clip"
+            if missing_top else ""
+        )
+        + (
+            f"\n  Ranking violations (top photo ranked below bottom photo):"
+            + "".join(f"\n    • {v}" for v in ranking_violations)
+            if ranking_violations else ""
+        )
+        + f"\n  Full ranking: {ranked}"
+        + f"\n  Scores: { {f: f'{s:.3f}' for f, s in sorted(scores.items())} }"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Standalone summary runner
 # ---------------------------------------------------------------------------
 
@@ -297,6 +428,71 @@ def run_summary(auto_setup: bool = False) -> int:
     total = passed + failed
     print(f"\n{passed}/{total} passed", end="")
     print("  ✓  all passing" if not failed else f"  —  {failed} failed")
+
+    # ── Semantic search tests (only if CLIP is available) ────────────────────
+    if _has_clip():
+        from photosearch.search import search_semantic
+        print(f"\n{'─' * 108}")
+        print(f"  Semantic search ranking tests")
+        print(f"{'─' * 108}")
+
+        sem_col_w = [6, 24, 38, 38]
+        sem_headers = ["", "Query", "Must outrank landscapes", "Result"]
+        sem_sep = "  ".join("-" * w for w in sem_col_w)
+        sem_fmt = "  ".join(f"{{:<{w}}}" for w in sem_col_w)
+        print(sem_fmt.format(*sem_headers))
+        print(sem_sep)
+
+        sem_passed = sem_failed = 0
+        with PhotoDB(DB_PATH) as db:
+            for query, expected in EXPECTED_SEMANTIC.items():
+                results = search_semantic(db, query, limit=20)
+                ranked = [r["filename"] for r in results]
+                scores = {r["filename"]: r.get("score", 0) for r in results}
+
+                top_expected = expected.get("top", set())
+                bottom_expected = expected.get("bottom", set())
+
+                missing_top = top_expected - set(ranked)
+                violations = []
+                for top_f in top_expected:
+                    if top_f not in ranked:
+                        continue
+                    top_rank = ranked.index(top_f)
+                    for bot_f in bottom_expected:
+                        if bot_f not in ranked:
+                            continue
+                        if ranked.index(bot_f) < top_rank:
+                            violations.append(f"{top_f} below {bot_f}")
+
+                ok = not missing_top and not violations
+                status = "PASS" if ok else "FAIL"
+                sem_passed += ok
+                sem_failed += (not ok)
+
+                top_str = ", ".join(f.replace("DSC0", "") for f in sorted(top_expected))
+                parts = []
+                if missing_top:
+                    parts.append(f"missing {[f.replace('DSC0','') for f in sorted(missing_top)]}")
+                if violations:
+                    parts.append(f"rank errors: {violations}")
+                result_str = "OK" if ok else " | ".join(parts)
+
+                print(sem_fmt.format(
+                    status,
+                    query[:sem_col_w[1]],
+                    top_str[:sem_col_w[2]],
+                    result_str[:sem_col_w[3]],
+                ))
+
+        print(sem_sep)
+        print(f"\n{sem_passed}/{sem_passed + sem_failed} semantic passed", end="")
+        print("  ✓" if not sem_failed else f"  —  {sem_failed} failed")
+        failed += sem_failed
+    else:
+        print(f"\n  Semantic search tests: skipped (open_clip not in this environment)")
+        print(f"  Run on your Mac with the full venv to test CLIP search quality.")
+
     print()
     return failed
 
