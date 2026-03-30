@@ -7,6 +7,10 @@ Colors are stored as a JSON list of hex strings in the database.
 import json
 from typing import Optional
 
+from PIL import ImageFile
+# Allow loading of slightly truncated JPEGs
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 from colorthief import ColorThief
 
 

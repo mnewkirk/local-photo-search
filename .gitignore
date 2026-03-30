@@ -43,3 +43,7 @@ thumbnails/
 
 # Environment / secrets
 .env
+.env.example
+
+# FUSE artifacts (Cowork sandbox)
+.fuse_hidden*

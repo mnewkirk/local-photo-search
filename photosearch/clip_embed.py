@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
+
+# Allow loading of slightly truncated JPEGs — common with camera files
+# where the last few bytes are missing but the image is otherwise fine.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Lazy-loaded model state
 _model = None

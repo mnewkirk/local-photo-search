@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# Development
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+tests/
+scripts/
+
+# Data (lives in Docker volumes, not the image)
+*.db
+*.db-journal
+results/
+thumbnails/
+references/
+
+# Photos (never bake into the image)
+*.JPG
+*.jpg
+*.jpeg
+*.ARW
+*.arw
+*.png
+*.tif
+
+# OS
+.DS_Store
+.fuse_hidden*
+
+# Docs (not needed in runtime image)
+README.md
+
+# Env
+.env
+.env.*

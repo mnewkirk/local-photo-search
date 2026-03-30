@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -84,6 +84,7 @@ class PhotoDB:
                 image_height INTEGER,
                 description TEXT,
                 dominant_colors TEXT,
+                aesthetic_score REAL,
                 indexed_at TEXT DEFAULT (datetime('now')),
                 raw_filepath TEXT
             )
@@ -124,9 +125,16 @@ class PhotoDB:
             )
         """)
 
+        # Migration: add aesthetic_score column if upgrading from schema v2
+        try:
+            cur.execute("SELECT aesthetic_score FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN aesthetic_score REAL")
+
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aesthetic ON photos(aesthetic_score)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")

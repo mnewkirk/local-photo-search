@@ -1,9 +1,10 @@
 # Core
 click>=8.0
+numpy>=1.20
 
 # Image handling
 Pillow>=10.0
-rawpy>=0.20           # ARW/RAW file support
+opencv-python>=4.5    # Used by InsightFace for image processing
 exifread>=3.0         # EXIF extraction
 
 # Embeddings & search
@@ -12,16 +13,13 @@ sqlite-vec>=0.1
 
 # Face recognition (InsightFace + ArcFace)
 insightface>=0.7
-onnxruntime>=1.16
+onnxruntime>=1.16     # Runtime for InsightFace models
 
 # Scene descriptions (via Ollama)
 ollama>=0.3
 
 # Color extraction
 colorthief>=0.2.1
-
-# Geocoding (offline)
-reverse_geocoder>=1.5
 
 # Web UI
 fastapi>=0.110

@@ -1,0 +1,69 @@
+# ============================================================================
+# local-photo-search — Docker Compose
+#
+# Services:
+#   photosearch — the main app: web UI + CLI for indexing/searching
+#   ollama      — LLaVA model server for generating scene descriptions
+#
+# Quick start:
+#   1. Copy .env.example to .env and set PHOTO_DIR to your library path
+#   2. docker compose up -d
+#   3. Open http://localhost:8000
+#
+# To index photos (first time or after adding new photos):
+#   docker compose run --rm photosearch index /photos --faces --describe
+#
+# To index without Ollama (CLIP + faces only, no descriptions):
+#   docker compose run --rm photosearch index /photos --faces --no-colors
+#
+# On a UGREEN NAS, PHOTO_DIR might be /volume1/photos or similar.
+# ============================================================================
+
+services:
+  photosearch:
+    build: .
+    container_name: photosearch
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    volumes:
+      # Your photo library — mounted read-only for safety
+      - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photos:ro
+      # Persistent data: database, thumbnails, model cache
+      - photosearch-data:/data
+    environment:
+      - PHOTOSEARCH_DB=/data/photo_index.db
+      - OLLAMA_HOST=http://ollama:11434
+      - INSIGHTFACE_HOME=/data/.insightface
+    depends_on:
+      ollama:
+        condition: service_started
+    # Default: run the web UI
+    # Override with: docker compose run --rm photosearch index /photos
+    command: ["serve"]
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: photosearch-ollama
+    restart: unless-stopped
+    volumes:
+      # Persist downloaded models (LLaVA is ~4.7 GB)
+      - ollama-models:/root/.ollama
+    # No ports exposed by default — only the photosearch container needs access.
+    # Uncomment to access Ollama directly from the host:
+    # ports:
+    #   - "11434:11434"
+
+    # Resource limits — tune for your NAS hardware.
+    # LLaVA 13B needs ~10 GB RAM; 7B needs ~5 GB.
+    # On a UGREEN with 16 GB RAM, these defaults work well.
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 12G
+
+volumes:
+  photosearch-data:
+    driver: local
+  ollama-models:
+    driver: local

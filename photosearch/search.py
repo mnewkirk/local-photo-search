@@ -4,6 +4,7 @@ Combines CLIP semantic search, text search, color search, and face/person search
 """
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -11,6 +12,9 @@ from typing import Optional
 
 from .clip_embed import embed_text
 from .db import PhotoDB
+
+# Debug logger for step-by-step search tracing
+_log = logging.getLogger("photosearch.search")
 
 
 # Minimum CLIP similarity score (1 - L2_distance) required to return a result.
@@ -188,14 +192,175 @@ def _description_contains_excluded(description: str, excluded: list[str]) -> boo
     )
 
     for term in excluded:
+        # Check the term itself (with basic stem) using word boundaries
         stem = term.rstrip("s") if len(term) > 4 else term
-        if stem in desc_lower:
+        if re.search(r'\b' + re.escape(stem) + r'\b', desc_lower):
             # If this is a people term and the description negates people,
             # don't count it as a match (the description says "no people")
             if term in _PEOPLE_KEYWORDS and desc_negates_people:
                 continue
             return True
+        # Check expanded terms (e.g. excluding "animal" also excludes "bird")
+        expansions = _expand_query_word(term)
+        if len(expansions) > 1:
+            for exp_term in expansions:
+                if re.search(r'\b' + re.escape(exp_term) + r'\b', desc_lower):
+                    if term in _PEOPLE_KEYWORDS and desc_negates_people:
+                        continue
+                    return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Semantic term expansion
+# ---------------------------------------------------------------------------
+# When a user searches for a category word like "animal", the description might
+# say "bird", "elk", or "shark" — correct matches that literal word matching
+# would miss. This dictionary maps category terms to their common members so
+# the description scorer can recognize them. CLIP already handles this for
+# visual similarity; this makes the description boost/penalty logic match.
+#
+# Each key is a search term; its value is a set of words that should count as
+# a match for that term when found in a description.
+
+_TERM_EXPANSIONS: dict[str, set[str]] = {
+    # Animals — broad category
+    "animal": {
+        "bird", "birds", "dog", "dogs", "cat", "cats", "fish", "deer", "elk",
+        "moose", "bear", "shark", "whale", "dolphin", "horse", "cow", "sheep",
+        "goat", "pig", "rabbit", "squirrel", "fox", "wolf", "eagle", "hawk",
+        "owl", "heron", "pelican", "seagull", "gull", "duck", "goose", "swan",
+        "turtle", "frog", "snake", "lizard", "insect", "butterfly", "bee",
+        "spider", "crab", "lobster", "octopus", "seal", "otter", "raccoon",
+        "chipmunk", "mouse", "rat", "bat", "penguin", "flamingo", "parrot",
+        "chicken", "rooster", "turkey", "pigeon", "crow", "raven", "jay",
+        "cardinal", "sparrow", "finch", "woodpecker", "hummingbird",
+        "animal", "animals", "wildlife", "creature", "pet",
+    },
+    "animals": {  # plural form maps to the same set
+        "bird", "birds", "dog", "dogs", "cat", "cats", "fish", "deer", "elk",
+        "moose", "bear", "shark", "whale", "dolphin", "horse", "cow", "sheep",
+        "goat", "pig", "rabbit", "squirrel", "fox", "wolf", "eagle", "hawk",
+        "owl", "heron", "pelican", "seagull", "gull", "duck", "goose", "swan",
+        "turtle", "frog", "snake", "lizard", "insect", "butterfly", "bee",
+        "spider", "crab", "lobster", "octopus", "seal", "otter", "raccoon",
+        "chipmunk", "mouse", "rat", "bat", "penguin", "flamingo", "parrot",
+        "chicken", "rooster", "turkey", "pigeon", "crow", "raven", "jay",
+        "cardinal", "sparrow", "finch", "woodpecker", "hummingbird",
+        "animal", "animals", "wildlife", "creature", "pet",
+    },
+    "wildlife": {
+        "bird", "birds", "deer", "elk", "moose", "bear", "fox", "wolf",
+        "eagle", "hawk", "owl", "heron", "seal", "otter", "raccoon",
+        "squirrel", "chipmunk", "whale", "dolphin", "shark",
+        "wildlife", "animal", "animals", "creature",
+    },
+    # Birds
+    "bird": {
+        "eagle", "hawk", "owl", "heron", "pelican", "seagull", "gull",
+        "duck", "goose", "swan", "penguin", "flamingo", "parrot", "pigeon",
+        "crow", "raven", "jay", "cardinal", "sparrow", "finch", "woodpecker",
+        "hummingbird", "chicken", "rooster", "turkey",
+        "bird", "birds", "avian", "waterfowl", "songbird",
+    },
+    "birds": {
+        "eagle", "hawk", "owl", "heron", "pelican", "seagull", "gull",
+        "duck", "goose", "swan", "penguin", "flamingo", "parrot", "pigeon",
+        "crow", "raven", "jay", "cardinal", "sparrow", "finch", "woodpecker",
+        "hummingbird", "chicken", "rooster", "turkey",
+        "bird", "birds", "avian", "waterfowl", "songbird",
+    },
+    # Pets
+    "pet": {"dog", "dogs", "cat", "cats", "puppy", "kitten", "fish",
+            "rabbit", "hamster", "pet", "pets"},
+    "pets": {"dog", "dogs", "cat", "cats", "puppy", "kitten", "fish",
+             "rabbit", "hamster", "pet", "pets"},
+    # Vehicles
+    "vehicle": {"car", "truck", "bus", "van", "motorcycle", "bike", "bicycle",
+                "boat", "ship", "train", "plane", "airplane", "helicopter",
+                "vehicle", "vehicles"},
+    "vehicles": {"car", "truck", "bus", "van", "motorcycle", "bike", "bicycle",
+                 "boat", "ship", "train", "plane", "airplane", "helicopter",
+                 "vehicle", "vehicles"},
+    # Water / bodies of water
+    "water": {"ocean", "sea", "lake", "river", "stream", "creek", "pond",
+              "waterfall", "waves", "water", "beach", "shore", "coast"},
+    # Flowers / plants
+    "flower": {"rose", "daisy", "sunflower", "tulip", "lily", "orchid",
+               "wildflower", "blossom", "bloom", "petal", "flower", "flowers",
+               "floral", "bouquet"},
+    "flowers": {"rose", "daisy", "sunflower", "tulip", "lily", "orchid",
+                "wildflower", "blossom", "bloom", "petal", "flower", "flowers",
+                "floral", "bouquet"},
+    "plant": {"tree", "bush", "shrub", "fern", "moss", "vine", "grass",
+              "cactus", "succulent", "flower", "plant", "plants", "vegetation",
+              "foliage", "leaf", "leaves"},
+    "plants": {"tree", "bush", "shrub", "fern", "moss", "vine", "grass",
+               "cactus", "succulent", "flower", "plant", "plants", "vegetation",
+               "foliage", "leaf", "leaves"},
+    # Food
+    "food": {"meal", "dish", "plate", "fruit", "vegetable", "bread", "cake",
+             "pizza", "sandwich", "salad", "soup", "rice", "pasta", "meat",
+             "fish", "dessert", "snack", "food", "eating", "cooking"},
+}
+
+
+def _expand_query_word(word: str) -> set[str]:
+    """Return the set of terms that should count as a match for a query word.
+
+    If the word has expansions, returns those. Otherwise returns just
+    the word itself (with basic stem).
+    """
+    lower = word.lower()
+    if lower in _TERM_EXPANSIONS:
+        return _TERM_EXPANSIONS[lower]
+    return {lower}
+
+
+def _term_in_desc_positive(term: str, desc_lower: str) -> bool:
+    """Check if a term appears in a description in a non-negated context.
+
+    Returns True if the term is present as a whole word and NOT preceded
+    by a negation phrase like "no", "without", "absence of", etc.
+
+    Uses word-boundary matching to avoid false positives like "cat" matching
+    inside "scattered" or "location".
+
+    For example:
+      "a bird perched on a branch" + "bird"  → True
+      "no animals or objects"      + "animal" → False
+      "no other people visible"    + "people" → True (exception)
+      "driftwood scattered around" + "cat"    → False (substring, not word)
+    """
+    # Use word-boundary regex to find whole-word matches only
+    term_re = re.compile(r'\b' + re.escape(term) + r'\b')
+    matches = list(term_re.finditer(desc_lower))
+    if not matches:
+        return False
+
+    # Check if any occurrence of the term is NOT negated
+    for m in matches:
+        pos = m.start()
+
+        # Look at the ~40 chars before this occurrence for negation cues
+        context_start = max(0, pos - 40)
+        context = desc_lower[context_start:pos]
+
+        # Check for negation in the immediate context using regex to
+        # allow small gaps (e.g. "without any animals", "no visible animals",
+        # "no people, animals, or objects")
+        negated = False
+        if re.search(r'\b(?:no|without|absence of)\b.{0,30}$', context):
+            negated = True
+
+        # "no other" is an exception — implies presence
+        if negated and "no other" in context:
+            negated = False
+
+        if not negated:
+            return True  # Found a non-negated occurrence
+
+    return False  # All occurrences were negated
 
 
 def _description_relevance(description: str, query: str,
@@ -237,10 +402,25 @@ def _description_relevance(description: str, query: str,
     # --- Normal (non-negated) query logic ---
 
     # Check for explicit negation: "no people", "no visible people", etc.
+    # Also checks expanded terms: "no animals" negates an "animal" query.
     for word in query_words:
-        for prefix in _NEGATION_PREFIXES:
-            if prefix + word in desc_lower:
-                return -DESCRIPTION_PENALTY
+        # Check the query word itself and its stem
+        terms_to_check = {word}
+        stem = word.rstrip("s") if len(word) > 4 else word
+        terms_to_check.add(stem)
+        # Also check expanded terms (e.g. "animal" → "bird", "fish", etc.)
+        terms_to_check |= _expand_query_word(word)
+
+        for term in terms_to_check:
+            for prefix in _NEGATION_PREFIXES:
+                if prefix + term in desc_lower:
+                    # Make sure it's not "no other <term>" (which implies presence)
+                    neg_snippet = prefix + term
+                    idx = desc_lower.find(neg_snippet)
+                    if idx >= 0:
+                        context = desc_lower[max(0, idx - 10):idx + len(neg_snippet)]
+                        if "no other" not in context:
+                            return -DESCRIPTION_PENALTY
 
     # Check for people-specific negation using regex: catches "no visible
     # presence of people", "no ... humans", "nobody", etc.
@@ -251,13 +431,20 @@ def _description_relevance(description: str, query: str,
             return -DESCRIPTION_PENALTY
 
     # Count how many query words appear in the description.
-    # Use stems (strip trailing 's') for basic plural handling:
-    # "outdoors" matches "outdoor", "kids" matches "kid"
+    # For each query word, check the word itself (with basic stem for plurals)
+    # AND any expanded terms (e.g. "animal" also matches "bird", "elk", etc.).
+    # A match only counts if the term is NOT negated in context.
     matched = 0
     for word in query_words:
         stem = word.rstrip("s") if len(word) > 4 else word
-        if stem in desc_lower:
+        if _term_in_desc_positive(stem, desc_lower):
             matched += 1
+        else:
+            # Check expanded terms for category words
+            expansions = _expand_query_word(word)
+            if len(expansions) > 1:  # has real expansions, not just itself
+                if any(_term_in_desc_positive(term, desc_lower) for term in expansions):
+                    matched += 1
 
     # For people queries: if the description doesn't mention ANY people-related
     # word, that's a strong negative signal regardless of other word matches.
@@ -311,6 +498,7 @@ def search_semantic(
     query: str,
     limit: int = 10,
     min_score: float = CLIP_MIN_SCORE,
+    debug: bool = False,
 ) -> list[dict]:
     """Semantic search — combines CLIP similarity, face boost, and description matching.
 
@@ -325,9 +513,16 @@ def search_semantic(
 
     Supports exclusion syntax: "beach -people" or "beach without people" will
     find beach photos and hard-filter any whose description mentions people.
+
+    When debug=True, logs step-by-step scoring for every candidate to stderr.
     """
+    def _dbg(msg):
+        if debug:
+            _log.info(msg)
+
     # Parse exclusions from the query
     positive_query, excluded_terms = _parse_query(query)
+    _dbg(f"QUERY PARSE: positive={positive_query!r}  excluded={excluded_terms}")
 
     # Use the positive query for CLIP embedding (CLIP can't handle negation)
     clip_query = positive_query if positive_query else query
@@ -340,11 +535,13 @@ def search_semantic(
     # face-having photos that would otherwise be cut off at the limit.
     fetch_limit = max(limit * 3, 30)
     matches = db.search_clip(query_embedding, limit=fetch_limit)
+    _dbg(f"CLIP CANDIDATES: {len(matches)} fetched (fetch_limit={fetch_limit})")
 
     # Use the positive query (without exclusions) for people detection
     boost_people = _query_mentions_people(positive_query) if positive_query else False
     negate_people = bool(excluded_terms and any(t in _PEOPLE_KEYWORDS for t in excluded_terms))
     has_exclusions = bool(excluded_terms)
+    _dbg(f"MODIFIERS: boost_people={boost_people}  negate_people={negate_people}  has_exclusions={has_exclusions}")
 
     # Pre-load face counts if we need them
     face_counts: dict[int, int] = {}
@@ -361,38 +558,67 @@ def search_semantic(
     ).fetchall()
     desc_cache = {row["id"]: row["description"] for row in rows}
 
+    # Pre-load filenames for debug logging
+    name_cache: dict[int, str] = {}
+    if debug:
+        rows = db.conn.execute("SELECT id, filename FROM photos").fetchall()
+        name_cache = {row["id"]: row["filename"] for row in rows}
+
     results_by_id: dict[int, dict] = {}
+    excluded_log: list[str] = []
 
     # Score CLIP results
     for match in matches:
         raw_score = 1.0 - match["distance"]
         score = raw_score
         photo_id = match["photo_id"]
+        fname = name_cache.get(photo_id, f"id={photo_id}")
+        steps = [f"clip={raw_score:.5f}"]
 
         # Hard-filter: if the query has excluded terms (e.g. "beach -people"),
         # skip any photo whose description contains the excluded content.
         if has_exclusions and photo_id in desc_cache:
             if _description_contains_excluded(desc_cache[photo_id], excluded_terms):
+                reason = f"EXCLUDED {fname}: description contains excluded term"
+                excluded_log.append(reason)
+                _dbg(reason)
                 continue
 
         # Hard-filter: if people are excluded, skip photos with detected faces
         if negate_people and photo_id in face_counts:
+            reason = f"EXCLUDED {fname}: has faces but people excluded"
+            excluded_log.append(reason)
+            _dbg(reason)
             continue
 
         # Normal people boost: each detected face adds FACE_BOOST
         if boost_people and photo_id in face_counts:
-            score += face_counts[photo_id] * FACE_BOOST
+            face_adj = face_counts[photo_id] * FACE_BOOST
+            score += face_adj
+            steps.append(f"face_boost=+{face_adj:.3f} ({face_counts[photo_id]} faces)")
 
         # Description relevance against the positive query
         if photo_id in desc_cache and positive_query:
             desc_rel = _description_relevance(desc_cache[photo_id], positive_query)
             if desc_rel > 0 and raw_score < CLIP_MIN_FOR_DESC_BOOST:
-                pass  # CLIP score too low — don't trust description boost
+                steps.append(f"desc_boost_blocked (desc_rel=+{desc_rel:.3f} but clip too low)")
             else:
                 score += desc_rel
+                if desc_rel != 0:
+                    label = "desc_boost" if desc_rel > 0 else "desc_penalty"
+                    steps.append(f"{label}={desc_rel:+.3f}")
+        elif photo_id not in desc_cache:
+            steps.append("no_description")
+
+        steps.append(f"final={score:.5f}")
 
         if score < min_score:
-            continue  # Too dissimilar even after adjustments — skip
+            reason = f"EXCLUDED {fname}: {' → '.join(steps)} < min_score={min_score}"
+            excluded_log.append(reason)
+            _dbg(reason)
+            continue
+
+        _dbg(f"INCLUDED {fname}: {' → '.join(steps)}")
 
         photo = db.get_photo(photo_id)
         if photo:
@@ -403,29 +629,40 @@ def search_semantic(
     # Also surface photos that match on description but weren't in CLIP results.
     # These have no CLIP support, so we require face confirmation for people
     # queries to avoid hallucinated descriptions surfacing irrelevant photos.
-    # Also surface photos that match on description but weren't in CLIP results.
     if positive_query:
         desc_matches = search_descriptions(db, positive_query, limit=fetch_limit)
+        _dbg(f"DESC-ONLY CANDIDATES: {len(desc_matches)} text matches")
         for desc_photo in desc_matches:
             pid = desc_photo["id"]
             if pid not in results_by_id:
+                fname = name_cache.get(pid, f"id={pid}")
                 # Apply exclusion filter
                 desc_text = desc_photo.get("description", "")
                 if has_exclusions and _description_contains_excluded(desc_text, excluded_terms):
+                    _dbg(f"EXCLUDED {fname} (desc-only): description contains excluded term")
                     continue
                 if negate_people and pid in face_counts:
+                    _dbg(f"EXCLUDED {fname} (desc-only): has faces but people excluded")
                     continue
                 rel = _description_relevance(desc_text, positive_query)
                 if rel > 0:
                     if boost_people and pid not in face_counts:
+                        _dbg(f"EXCLUDED {fname} (desc-only): people query but no faces")
                         continue
                     desc_photo["score"] = rel
                     desc_photo["clip_score"] = None
                     results_by_id[pid] = desc_photo
+                    _dbg(f"INCLUDED {fname} (desc-only): score={rel:.3f}")
 
     # Re-sort by combined score, descending
     results = sorted(results_by_id.values(), key=lambda r: r["score"], reverse=True)
-    return _dedupe_by_hash(results)[:limit]
+    final = _dedupe_by_hash(results)[:limit]
+
+    if debug:
+        _dbg(f"FINAL: {len(final)} results from {len(results_by_id)} candidates "
+             f"({len(excluded_log)} excluded)")
+
+    return final
 
 
 def search_by_color(db: PhotoDB, color: str, tolerance: int = 60, limit: int = 10) -> list[dict]:
@@ -511,11 +748,19 @@ def search_combined(
     face_image: Optional[str] = None,
     limit: int = 10,
     min_score: float = CLIP_MIN_SCORE,
+    min_quality: Optional[float] = None,
+    sort_quality: bool = False,
+    debug: bool = False,
 ) -> list[dict]:
     """Run multiple search types and merge results.
 
     When multiple criteria are given, returns the intersection
     ranked by the primary search type (person > semantic > color > place).
+
+    Args:
+        min_quality: If set, filter out photos with aesthetic_score below this value.
+        sort_quality: If True, sort final results by aesthetic_score (highest first)
+                     instead of the default relevance ordering.
     """
     result_sets = []
 
@@ -528,7 +773,7 @@ def search_combined(
         result_sets.append({r["id"]: r for r in results})
 
     if query:
-        results = search_semantic(db, query, limit=limit * 3, min_score=min_score)
+        results = search_semantic(db, query, limit=limit * 3, min_score=min_score, debug=debug)
         result_sets.append({r["id"]: r for r in results})
 
     if color:
@@ -539,20 +784,48 @@ def search_combined(
         results = search_by_place(db, place, limit=limit * 3)
         result_sets.append({r["id"]: r for r in results})
 
+    # Quality-only search: if no other criteria given but min_quality is set,
+    # return the highest-quality photos in the collection.
+    if not result_sets and min_quality is not None:
+        rows = db.conn.execute(
+            """SELECT * FROM photos
+               WHERE aesthetic_score IS NOT NULL AND aesthetic_score >= ?
+               ORDER BY aesthetic_score DESC
+               LIMIT ?""",
+            (min_quality, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     if not result_sets:
         return []
 
     if len(result_sets) == 1:
-        return _dedupe_by_hash(list(result_sets[0].values()))[:limit]
+        merged = _dedupe_by_hash(list(result_sets[0].values()))
+    else:
+        # Intersect: only keep photos present in all result sets
+        common_ids = set(result_sets[0].keys())
+        for rs in result_sets[1:]:
+            common_ids &= set(rs.keys())
+        # Use first result set for ranking/data
+        merged = _dedupe_by_hash(
+            [result_sets[0][pid] for pid in common_ids if pid in result_sets[0]]
+        )
 
-    # Intersect: only keep photos present in all result sets
-    common_ids = set(result_sets[0].keys())
-    for rs in result_sets[1:]:
-        common_ids &= set(rs.keys())
+    # Apply quality filter
+    if min_quality is not None:
+        merged = [
+            r for r in merged
+            if r.get("aesthetic_score") is not None and r["aesthetic_score"] >= min_quality
+        ]
 
-    # Use first result set for ranking/data
-    merged = [result_sets[0][pid] for pid in common_ids if pid in result_sets[0]]
-    return _dedupe_by_hash(merged)[:limit]
+    # Optionally re-sort by aesthetic quality instead of relevance
+    if sort_quality:
+        merged.sort(
+            key=lambda r: r.get("aesthetic_score") or 0,
+            reverse=True,
+        )
+
+    return merged[:limit]
 
 
 def make_results_subdir(base_dir: str, query_parts: dict) -> str:

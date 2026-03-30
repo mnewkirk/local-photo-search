@@ -48,10 +48,26 @@ python cli.py search --color "#ff8800"
 python cli.py search --face /path/to/reference.jpg
 ```
 
+**Quality filtering** — find your best photos using aesthetic scoring:
+
+```bash
+# Show only high-quality photos from any search
+python cli.py search -q "beach sunset" --min-quality 6.0
+
+# Find the best photos in your entire collection
+python cli.py search --min-quality 7.0 --limit 20
+
+# Sort any search by quality instead of relevance
+python cli.py search --person "Calvin" --sort-quality
+
+# Score range: 1-10 (3-5 average, 5-7 good, 7+ excellent)
+```
+
 **Combined search** — intersect multiple criteria:
 
 ```bash
 python cli.py search -q "beach" --person "Calvin" --color blue
+python cli.py search -q "kids playing" --min-quality 5.5
 ```
 
 Search results are written to a timestamped `results/` subfolder as symlinks (preserving the originals) alongside JPEG thumbnails for quick browsing in Finder.
@@ -69,6 +85,7 @@ local-photo-search/
 │   ├── faces.py           # InsightFace detection, ArcFace encoding, clustering
 │   ├── describe.py        # LLaVA scene descriptions via Ollama
 │   ├── colors.py          # Dominant color extraction (colorthief)
+│   ├── quality.py         # Aesthetic quality scoring (LAION predictor + ViT-L/14)
 │   └── exif.py            # EXIF/GPS metadata extraction
 ├── cli.py                 # Click-based CLI with all commands
 ├── tests/
@@ -94,12 +111,13 @@ Photo files on disk
    │  3. Dominant colors (colorthief)    │
    │  4. Face detection (InsightFace)    │  ← opt-in: --faces
    │  5. Scene description (LLaVA)       │  ← opt-in: --describe
+   │  6. Aesthetic scoring (ViT-L/14)    │  ← opt-in: --quality
    └──────────────┬──────────────────────┘
                   │
                   ▼
            photo_index.db
        ┌──────────────────────┐
-       │  photos              │  EXIF metadata, description, colors
+       │  photos              │  EXIF metadata, description, colors, aesthetic_score
        │  clip_embeddings     │  512-dim vectors (sqlite-vec)
        │  faces               │  bounding boxes, cluster IDs
        │  face_encodings      │  512-dim ArcFace vectors (sqlite-vec)
@@ -215,6 +233,34 @@ python cli.py show-descriptions DSC04907.JPG
 ```
 
 
+## Aesthetic quality scoring
+
+Photos can be scored on a 1–10 scale for general aesthetic quality using the LAION improved aesthetic predictor. This model was trained on millions of images with human aesthetic ratings and evaluates composition, lighting, visual appeal, and overall photographic quality.
+
+The scoring uses a separate CLIP model (ViT-L/14) from the one used for semantic search (ViT-B/16). ViT-L/14 produces 768-dimensional embeddings that are passed through a pretrained linear head to produce a single quality score. This is a one-time computation per photo — the score is stored in the database and used instantly at search time.
+
+Score ranges are roughly:
+
+- **1–3:** Poor quality — blurry, bad exposure, random snapshots
+- **3–5:** Average — typical phone photos, unremarkable
+- **5–7:** Good — well-composed, pleasant lighting
+- **7–9:** Excellent — professional quality, striking composition
+- **9–10:** Exceptional — gallery-worthy, extraordinary
+
+The ViT-L/14 model is loaded only during scoring, then released to free memory. On a Mac with Apple Silicon, scoring takes roughly 1–2 seconds per photo in batches. On the N100 NAS (CPU-only), expect 3–5 seconds per photo.
+
+```bash
+# Score all photos during indexing
+python cli.py index /path/to/photos --quality
+
+# Filter searches to only high-quality results
+python cli.py search -q "sunset" --min-quality 6.0
+
+# Find the absolute best photos across your entire collection
+python cli.py search --min-quality 7.0 --limit 50 --sort-quality
+```
+
+
 ## Quick start
 
 ```bash
@@ -230,12 +276,13 @@ pip install -r requirements.txt
 ollama pull llava:13b
 
 # Index a folder of photos (full pipeline)
-python cli.py index /path/to/photos --faces --describe --describe-model llava:13b
+python cli.py index /path/to/photos --faces --describe --describe-model llava:13b --quality
 
 # Search
 python cli.py search -q "people outdoors" --limit 50
 python cli.py search --person "Calvin"
 python cli.py search --color blue
+python cli.py search -q "sunset" --min-quality 6.0
 python cli.py stats
 ```
 
@@ -263,9 +310,11 @@ Key flags for `index`:
 | `--faces` | Enable face detection and encoding |
 | `--describe` | Generate LLaVA scene descriptions |
 | `--describe-model llava:13b` | Use a specific Ollama model |
+| `--quality` | Compute aesthetic quality scores (1–10) |
 | `--force-clip` | Regenerate all CLIP embeddings (required after model change) |
 | `--force-describe` | Regenerate all descriptions |
 | `--force-faces` | Re-run face detection on all photos |
+| `--force-quality` | Rescore quality for all photos |
 | `--no-clip` | Skip CLIP embedding |
 | `--no-colors` | Skip color extraction |
 
@@ -340,8 +389,10 @@ The development process was iterative in a way that's hard to capture in commits
 | **M3** | Done | LLaVA descriptions via Ollama with hybrid search scoring. |
 | **M4** | Done | Full CLI with all search modes (semantic, person, place, color, face). |
 | **M5** | Done | Scale test — 196 photos indexed with descriptions and search validated. |
-| **M6** | Next | Web UI (planned: FastAPI + simple frontend). |
-| **M7** | Future | Docker packaging for UGREEN NAS deployment. |
+| **M6** | Done | Web UI (FastAPI + simple frontend). |
+| **M7** | Done | Docker packaging for UGREEN NAS deployment. |
+| **M8** | Done | Aesthetic quality scoring — pretrained model scores photos 1–10 for composition, lighting, and visual appeal. Filter/sort by quality in search. |
+| **M9** | Next | LLM-generated semantic tags at index time. During description generation, Ollama also produces category tags (animal, vehicle, landscape, portrait, action, etc.) stored in a tags table. Search-time matching uses pre-computed tags instead of a hand-curated dictionary — zero runtime inference cost with full LLM-quality semantic understanding. Both tag-based and dictionary-based matching available for comparison. |
 
 
 ## Known limitations

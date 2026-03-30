@@ -13,10 +13,15 @@ Launch with:
 """
 
 import json
+import logging
 import os
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
+
+# Request logging — helps debug discrepancies between CLI and web results
+logger = logging.getLogger("photosearch.web")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,10 +101,19 @@ def api_search(
     color: Optional[str] = Query(None, description="Color name or hex"),
     place: Optional[str] = Query(None, description="Place name"),
     limit: int = Query(50, ge=1, le=500),
-    min_score: float = Query(-0.20, description="Minimum CLIP score"),
+    min_score: float = Query(-0.25, description="Minimum CLIP score"),
+    min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
+    sort_quality: bool = Query(False, description="Sort by quality instead of relevance"),
 ):
     """Search photos using any combination of criteria."""
-    if not any([q, person, color, place]):
+    logger.info(
+        "SEARCH REQUEST  q=%r  person=%r  color=%r  place=%r  limit=%d  "
+        "min_score=%.3f  min_quality=%s  sort_quality=%s",
+        q, person, color, place, limit, min_score, min_quality, sort_quality,
+    )
+
+    if not any([q, person, color, place, min_quality is not None]):
+        logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
 
     from .search import search_combined
@@ -113,6 +127,14 @@ def api_search(
             place=place,
             limit=limit,
             min_score=min_score,
+            min_quality=min_quality,
+            sort_quality=sort_quality,
+        )
+
+        logger.info(
+            "SEARCH RESULTS  count=%d  top_scores=%s",
+            len(results),
+            [(r.get("filename"), round(r.get("score", 0), 4)) for r in results[:5]],
         )
 
         # Serialize results
@@ -124,6 +146,7 @@ def api_search(
                 "date_taken": r.get("date_taken"),
                 "score": r.get("score"),
                 "clip_score": r.get("clip_score"),
+                "aesthetic_score": r.get("aesthetic_score"),
                 "description": r.get("description"),
                 "camera_model": r.get("camera_model"),
                 "focal_length": r.get("focal_length"),
@@ -223,6 +246,7 @@ def api_photo_detail(photo_id: int):
             "filepath": photo["filepath"],
             "date_taken": photo["date_taken"],
             "description": photo["description"],
+            "aesthetic_score": photo.get("aesthetic_score"),
             "camera_make": photo.get("camera_make"),
             "camera_model": photo.get("camera_model"),
             "focal_length": photo.get("focal_length"),
@@ -262,12 +286,30 @@ def api_stats():
         described = db.conn.execute(
             "SELECT COUNT(*) as c FROM photos WHERE description IS NOT NULL"
         ).fetchone()["c"]
+        scored = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_score IS NOT NULL"
+        ).fetchone()["c"]
+
+        quality_stats = None
+        if scored > 0:
+            row = db.conn.execute(
+                """SELECT MIN(aesthetic_score) as min_s, MAX(aesthetic_score) as max_s,
+                          AVG(aesthetic_score) as avg_s
+                   FROM photos WHERE aesthetic_score IS NOT NULL"""
+            ).fetchone()
+            quality_stats = {
+                "min": round(row["min_s"], 2),
+                "max": round(row["max_s"], 2),
+                "mean": round(row["avg_s"], 2),
+            }
 
     return {
         "photos": photo_count,
         "faces": face_count,
         "persons": person_count,
         "described": described,
+        "quality_scored": scored,
+        "quality_stats": quality_stats,
     }
 
 

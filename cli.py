@@ -7,6 +7,8 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
 
 import json
+import logging
+import logging.handlers
 import os
 
 import click
@@ -43,8 +45,10 @@ def cli():
 @click.option("--describe", is_flag=True, help="Generate scene descriptions via LLaVA (requires Ollama).")
 @click.option("--force-describe", is_flag=True, help="Regenerate descriptions for all photos, even those that already have one.")
 @click.option("--describe-model", default="llava", show_default=True, help="Ollama model for descriptions.")
+@click.option("--quality", is_flag=True, help="Compute aesthetic quality scores (1–10 scale).")
+@click.option("--force-quality", is_flag=True, help="Rescore quality for all photos, even those already scored.")
 def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip,
-          describe, force_describe, describe_model):
+          describe, force_describe, describe_model, quality, force_quality):
     """Index a directory of photos."""
     index_directory(
         photo_dir=photo_dir,
@@ -58,6 +62,8 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
         enable_describe=describe or force_describe,
         force_describe=force_describe,
         describe_model=describe_model,
+        enable_quality=quality or force_quality,
+        force_quality=force_quality,
     )
 
 
@@ -79,9 +85,24 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
 @click.option("--min-score", default=-0.25, show_default=True,
               help="Minimum CLIP similarity score to return a result (-1 to 1). "
                    "Raise toward 0 for stricter matching; lower to be more permissive.")
-def search(query, person, place, color, face, db, limit, results_dir, no_results, json_output, min_score):
+@click.option("--min-quality", type=float, default=None,
+              help="Minimum aesthetic quality score (1–10). "
+                   "Try 5.0 for good photos, 6.0 for excellent, 7.0 for outstanding.")
+@click.option("--sort-quality", is_flag=True, help="Sort results by aesthetic quality (highest first) instead of relevance.")
+@click.option("--debug", is_flag=True, help="Write step-by-step search log to debug.log in the results folder.")
+def search(query, person, place, color, face, db, limit, results_dir, no_results, json_output, min_score,
+           min_quality, sort_quality, debug):
     """Search indexed photos."""
-    if not any([query, person, place, color, face]):
+    # When --debug is used, capture log lines in a buffer (written to file later).
+    debug_handler = None
+    if debug:
+        debug_handler = logging.handlers.MemoryHandler(capacity=100000, flushLevel=logging.CRITICAL)
+        debug_handler.setFormatter(logging.Formatter("%(message)s"))
+        search_logger = logging.getLogger("photosearch.search")
+        search_logger.setLevel(logging.INFO)
+        search_logger.addHandler(debug_handler)
+
+    if not any([query, person, place, color, face, min_quality is not None]):
         click.echo("Please provide at least one search criterion. See --help for options.")
         return
 
@@ -95,34 +116,45 @@ def search(query, person, place, color, face, db, limit, results_dir, no_results
             face_image=face,
             limit=limit,
             min_score=min_score,
+            min_quality=min_quality,
+            sort_quality=sort_quality,
+            debug=debug,
         )
 
         if not results:
             click.echo("No matching photos found.")
             return
 
-        if json_output:
-            for r in results:
-                for k in list(r.keys()):
-                    if r[k] is None:
-                        del r[k]
-            click.echo(json.dumps(results, indent=2))
+        # Always show the summary table in the CLI
+        click.echo(f"\nFound {len(results)} matching photos:\n")
+        has_quality = any(r.get("aesthetic_score") is not None for r in results)
+        if has_quality:
+            click.echo(f"{'#':<4} {'Filename':<20} {'Date':<22} {'Score':<8} {'Quality':<8} {'Colors'}")
+            click.echo("-" * 90)
         else:
-            click.echo(f"\nFound {len(results)} matching photos:\n")
             click.echo(f"{'#':<4} {'Filename':<20} {'Date':<22} {'Score':<8} {'Colors'}")
             click.echo("-" * 80)
-            for i, r in enumerate(results, 1):
-                filename = r.get("filename", "?")
-                date = r.get("date_taken", "")[:19] if r.get("date_taken") else ""
-                score = f"{r.get('score', 0):.3f}" if "score" in r else ""
-                colors = ""
-                if r.get("dominant_colors"):
-                    try:
-                        color_list = json.loads(r["dominant_colors"])
-                        colors = " ".join(color_list[:3])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+        for i, r in enumerate(results, 1):
+            filename = r.get("filename", "?")
+            date = r.get("date_taken", "")[:19] if r.get("date_taken") else ""
+            score = f"{r.get('score', 0):.3f}" if "score" in r else ""
+            quality = f"{r['aesthetic_score']:.1f}" if r.get("aesthetic_score") is not None else ""
+            colors = ""
+            if r.get("dominant_colors"):
+                try:
+                    color_list = json.loads(r["dominant_colors"])
+                    colors = " ".join(color_list[:3])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if has_quality:
+                click.echo(f"{i:<4} {filename:<20} {date:<22} {score:<8} {quality:<8} {colors}")
+            else:
                 click.echo(f"{i:<4} {filename:<20} {date:<22} {score:<8} {colors}")
+
+        # If --json-output, also print JSON to stdout (for piping)
+        if json_output:
+            clean = [{k: v for k, v in r.items() if v is not None} for r in results]
+            click.echo(json.dumps(clean, indent=2))
 
         if not no_results and results:
             subfolder = make_results_subdir(
@@ -131,6 +163,30 @@ def search(query, person, place, color, face, db, limit, results_dir, no_results
             )
             result_path = symlink_results(results, output_dir=subfolder)
             click.echo(f"\nResults folder: {result_path}")
+
+            # Always write results.json to the results folder
+            json_path = os.path.join(result_path, "results.json")
+            clean_results = [{k: v for k, v in r.items() if v is not None} for r in results]
+            with open(json_path, "w") as f:
+                json.dump(clean_results, f, indent=2)
+            click.echo(f"JSON results:   {json_path}")
+
+            # Write debug log to file if --debug was used
+            if debug and debug_handler:
+                debug_log_path = os.path.join(result_path, "debug.log")
+                with open(debug_log_path, "w") as f:
+                    for record in debug_handler.buffer:
+                        f.write(debug_handler.formatter.format(record) + "\n")
+                click.echo(f"Debug log:      {debug_log_path}")
+
+        elif debug and debug_handler:
+            # --no-results but --debug: dump debug log to a temp location
+            debug_log_path = os.path.join(results_dir, "debug.log")
+            os.makedirs(results_dir, exist_ok=True)
+            with open(debug_log_path, "w") as f:
+                for record in debug_handler.buffer:
+                    f.write(debug_handler.formatter.format(record) + "\n")
+            click.echo(f"Debug log:      {debug_log_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -586,12 +642,25 @@ def stats(db):
         described = photo_db.conn.execute(
             "SELECT COUNT(*) as c FROM photos WHERE description IS NOT NULL"
         ).fetchone()["c"]
+        scored = photo_db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_score IS NOT NULL"
+        ).fetchone()["c"]
 
         click.echo(f"Database:        {db}")
         click.echo(f"Photos indexed:  {photo_count}")
         click.echo(f"Faces detected:  {face_count} ({unmatched} unmatched)")
         click.echo(f"Persons named:   {person_count}")
         click.echo(f"Descriptions:    {described}/{photo_count}")
+        click.echo(f"Quality scored:  {scored}/{photo_count}")
+
+        if scored > 0:
+            score_stats = photo_db.conn.execute(
+                """SELECT MIN(aesthetic_score) as min_s, MAX(aesthetic_score) as max_s,
+                          AVG(aesthetic_score) as avg_s
+                   FROM photos WHERE aesthetic_score IS NOT NULL"""
+            ).fetchone()
+            click.echo(f"  Score range:   {score_stats['min_s']:.2f} – {score_stats['max_s']:.2f} "
+                       f"(mean: {score_stats['avg_s']:.2f})")
 
         if photo_count > 0:
             rows = photo_db.conn.execute(
@@ -641,6 +710,65 @@ def show_descriptions(db, filename):
 
 
 # ---------------------------------------------------------------------------
+# show-quality
+# ---------------------------------------------------------------------------
+
+@cli.command("show-quality")
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--sort", "sort_order", type=click.Choice(["score", "name"]), default="score",
+              help="Sort by aesthetic score (descending) or filename.")
+@click.option("--min", "min_score", type=float, default=None, help="Only show photos above this score.")
+def show_quality(db, sort_order, min_score):
+    """Show aesthetic quality scores for all photos.
+
+    \b
+    Examples:
+      python cli.py show-quality
+      python cli.py show-quality --sort name
+      python cli.py show-quality --min 5.0
+    """
+    with PhotoDB(db) as photo_db:
+        if sort_order == "score":
+            order = "aesthetic_score DESC"
+        else:
+            order = "filename"
+
+        if min_score is not None:
+            rows = photo_db.conn.execute(
+                f"SELECT filename, aesthetic_score FROM photos WHERE aesthetic_score IS NOT NULL "
+                f"AND aesthetic_score >= ? ORDER BY {order}",
+                (min_score,),
+            ).fetchall()
+        else:
+            rows = photo_db.conn.execute(
+                f"SELECT filename, aesthetic_score FROM photos ORDER BY {order}"
+            ).fetchall()
+
+        if not rows:
+            click.echo("No photos with quality scores found. Run 'index --quality' first.")
+            return
+
+        scored = [r for r in rows if r["aesthetic_score"] is not None]
+        unscored = [r for r in rows if r["aesthetic_score"] is None]
+
+        click.echo(f"\n{'Filename':<55} {'Score'}")
+        click.echo("-" * 65)
+        for row in scored:
+            score = row["aesthetic_score"]
+            bar = "█" * int(score) + "░" * (10 - int(score))
+            click.echo(f"{row['filename']:<55} {score:>5.2f}  {bar}")
+
+        if unscored:
+            click.echo(f"\n({len(unscored)} photo(s) not yet scored)")
+
+        if scored:
+            scores = [r["aesthetic_score"] for r in scored]
+            click.echo(f"\n{len(scored)} photos scored: "
+                       f"{min(scores):.2f} – {max(scores):.2f} "
+                       f"(mean: {sum(scores)/len(scores):.2f})")
+
+
+# ---------------------------------------------------------------------------
 # serve (web UI)
 # ---------------------------------------------------------------------------
 
@@ -670,6 +798,108 @@ def serve(db, host, port, reload):
         reload=reload,
         log_level="info",
     )
+
+
+# ---------------------------------------------------------------------------
+# remap-paths
+# ---------------------------------------------------------------------------
+
+@cli.command("remap-paths")
+@click.argument("old_prefix")
+@click.argument("new_prefix")
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, help="Show what would change without modifying the database.")
+def remap_paths(old_prefix, new_prefix, db, dry_run):
+    """Rewrite stored filepaths when photos move to a new location.
+
+    Replaces OLD_PREFIX with NEW_PREFIX in all photo filepaths.
+    Essential when moving a Mac-built database to a NAS where photos
+    are mounted at a different path.
+
+    \b
+    Examples:
+      # Moving from Mac to Docker container:
+      python cli.py remap-paths /Users/matt/Pictures /photos
+
+      # Preview changes without modifying:
+      python cli.py remap-paths /Users/matt/Pictures /photos --dry-run
+
+      # Moving to a UGREEN NAS volume:
+      python cli.py remap-paths /Users/matt/Pictures /volume1/photos
+    """
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute(
+            "SELECT id, filepath FROM photos WHERE filepath LIKE ?",
+            (f"{old_prefix}%",),
+        ).fetchall()
+
+        if not rows:
+            click.echo(f"No photos found with prefix '{old_prefix}'.")
+            return
+
+        click.echo(f"Found {len(rows)} photo(s) matching '{old_prefix}'.")
+
+        if dry_run:
+            for row in rows[:5]:
+                old = row["filepath"]
+                new = new_prefix + old[len(old_prefix):]
+                click.echo(f"  {old}")
+                click.echo(f"  → {new}")
+            if len(rows) > 5:
+                click.echo(f"  ... and {len(rows) - 5} more")
+            click.echo("\nNo changes made (dry run).")
+            return
+
+        updated = 0
+        for row in rows:
+            old = row["filepath"]
+            new = new_prefix + old[len(old_prefix):]
+            photo_db.conn.execute(
+                "UPDATE photos SET filepath = ? WHERE id = ?",
+                (new, row["id"]),
+            )
+            updated += 1
+
+        photo_db.conn.commit()
+        click.echo(f"Updated {updated} filepath(s): '{old_prefix}' → '{new_prefix}'.")
+
+
+# ---------------------------------------------------------------------------
+# import-db
+# ---------------------------------------------------------------------------
+
+@cli.command("import-db")
+@click.argument("source_db", type=click.Path(exists=True))
+@click.option("--db", default="photo_index.db", help="Destination database path.")
+@click.option("--remap", nargs=2, help="Remap paths: OLD_PREFIX NEW_PREFIX")
+def import_db(source_db, db, remap):
+    """Import a database built on another machine.
+
+    Copies the source database to the destination path. If --remap is given,
+    also rewrites filepaths. This is the recommended way to deploy a
+    Mac-built database to a NAS.
+
+    \b
+    Examples:
+      # Copy and remap in one step:
+      python cli.py import-db /mnt/usb/photo_index.db \\
+          --db /data/photo_index.db \\
+          --remap /Users/matt/Pictures /photos
+    """
+    import shutil
+
+    click.echo(f"Copying {source_db} → {db}")
+    shutil.copy2(source_db, db)
+
+    if remap:
+        old_prefix, new_prefix = remap
+        # Invoke the remap logic directly
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(remap_paths, [old_prefix, new_prefix, "--db", db])
+        click.echo(result.output)
+    else:
+        click.echo("Done. Run 'remap-paths' if photo paths differ on this machine.")
 
 
 if __name__ == "__main__":

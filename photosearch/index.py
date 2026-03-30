@@ -3,6 +3,7 @@
 M1: EXIF extraction, CLIP embeddings, dominant colors.
 M2: Face detection and encoding.
 M3: LLaVA scene descriptions via Ollama.
+M8: Aesthetic quality scoring.
 """
 
 import hashlib
@@ -67,6 +68,8 @@ def index_directory(
     enable_describe: bool = False,
     force_describe: bool = False,
     describe_model: str = "llava",
+    enable_quality: bool = False,
+    force_quality: bool = False,
 ):
     """Index all photos in a directory.
 
@@ -79,6 +82,7 @@ def index_directory(
       6. Extract dominant colors (if enable_colors)
       7. Detect and encode faces (if enable_faces)
       8. Generate LLaVA description (if enable_describe)
+      9. Aesthetic quality scoring (if enable_quality)
 
     Args:
         photo_dir: Directory to scan for photos.
@@ -95,6 +99,8 @@ def index_directory(
         force_describe: If True, regenerate descriptions for all photos (even those
                         that already have one).
         describe_model: Ollama model name for descriptions (default: "llava").
+        enable_quality: If True, compute aesthetic quality scores.
+        force_quality: If True, rescore all photos (even those already scored).
     """
     photo_dir = str(Path(photo_dir).resolve())
     photos = find_photos(photo_dir)
@@ -143,7 +149,7 @@ def index_directory(
             ]
             new_photos = list(all_photos)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
-        elif not new_photos and not enable_describe and not enable_faces:
+        elif not new_photos and not enable_describe and not enable_faces and not enable_quality:
             print("All photos already indexed. Nothing to do.")
             return
 
@@ -303,5 +309,52 @@ def index_directory(
 
                     elapsed = time.time() - t0
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
+
+        # Step 6: Aesthetic quality scoring
+        if enable_quality:
+            from .quality import score_photos_batch, unload_models as unload_quality
+
+            if force_quality:
+                # Rescore all photos
+                if all_photos is None:
+                    all_photos = [
+                        (row["id"], row["filepath"])
+                        for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+                    ]
+                quality_candidates = list(all_photos)
+                print(f"\nScoring aesthetic quality for all {len(quality_candidates)} photo(s) (--force-quality)...")
+            else:
+                # Only score photos that don't have a score yet
+                unscored = db.conn.execute(
+                    "SELECT id, filepath FROM photos WHERE aesthetic_score IS NULL"
+                ).fetchall()
+                quality_candidates = [(row["id"], row["filepath"]) for row in unscored]
+                if quality_candidates:
+                    print(f"\nScoring aesthetic quality for {len(quality_candidates)} unscored photo(s)...")
+                else:
+                    print("\nAll photos already have aesthetic scores.")
+
+            if quality_candidates:
+                t0 = time.time()
+                paths = [p for _, p in quality_candidates]
+                scores = score_photos_batch(paths, batch_size=batch_size)
+
+                scored_count = 0
+                for (photo_id, path), score in zip(quality_candidates, scores):
+                    if score is not None:
+                        db.update_photo(photo_id, aesthetic_score=score)
+                        scored_count += 1
+
+                elapsed = time.time() - t0
+                print(f"  Scored {scored_count}/{len(quality_candidates)} photos in {elapsed:.1f}s")
+
+                # Show score distribution
+                if scored_count > 0:
+                    valid_scores = [s for s in scores if s is not None]
+                    print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
+                          f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
+
+            # Free the aesthetic model memory before other steps
+            unload_quality()
 
         print(f"\nDone! Database: {db_path} ({db.photo_count()} total photos)")
