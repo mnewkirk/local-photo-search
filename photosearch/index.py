@@ -135,9 +135,27 @@ def index_directory(
             photo_id = db.add_photo(**meta)
             new_photos.append((photo_id, photo_path))
 
+        # Build a list of all photos in the TARGET DIRECTORY that are in the DB.
+        # Used by --force-* flags to scope reprocessing to this directory, not the
+        # entire database (which may contain photos from other directories).
+        dir_photos = None  # lazy-loaded
+
+        def _get_dir_photos():
+            nonlocal dir_photos
+            if dir_photos is None:
+                resolved = [str(Path(p).resolve()) for p in photos]
+                dir_photos = [
+                    (row["id"], row["filepath"])
+                    for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+                    if row["filepath"] in resolved
+                ]
+            return dir_photos
+
         # force_clip: wipe all existing CLIP embeddings and re-embed every photo.
         # Required when switching CLIP models — old embeddings live in a different
         # vector space and will give nonsensical search results if mixed with new ones.
+        # NOTE: force_clip is global (deletes ALL embeddings) because mixed vector
+        # spaces break search. Other force flags are scoped to the target directory.
         all_photos = None  # lazy-loaded list of (id, filepath) for all indexed photos
         if force_clip and enable_clip:
             print("\nClearing existing CLIP embeddings for full regeneration (--force-clip)...")
@@ -270,14 +288,9 @@ def index_directory(
                 print(f"\nSkipping descriptions: {e}")
             else:
                 if force_describe:
-                    # Regenerate descriptions for ALL photos
-                    if all_photos is None:
-                        all_photos = [
-                            (row["id"], row["filepath"])
-                            for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
-                        ]
-                    desc_candidates = list(all_photos)
-                    print(f"\nGenerating descriptions for all {len(desc_candidates)} photo(s) (--force-describe)...")
+                    # Regenerate descriptions for photos in the target directory
+                    desc_candidates = list(_get_dir_photos())
+                    print(f"\nGenerating descriptions for {len(desc_candidates)} photo(s) in target directory (--force-describe)...")
                 else:
                     # Only describe photos that don't have a description yet
                     undescribed = db.conn.execute(
@@ -310,19 +323,18 @@ def index_directory(
                     elapsed = time.time() - t0
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
 
-        # Step 6: Aesthetic quality scoring
+        # Step 6: Aesthetic quality scoring + concept analysis
         if enable_quality:
-            from .quality import score_photos_batch, unload_models as unload_quality
+            import json as _json
+            from .quality import (
+                score_photos_batch, analyze_photos_batch,
+                unload_models as unload_quality,
+            )
 
             if force_quality:
-                # Rescore all photos
-                if all_photos is None:
-                    all_photos = [
-                        (row["id"], row["filepath"])
-                        for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
-                    ]
-                quality_candidates = list(all_photos)
-                print(f"\nScoring aesthetic quality for all {len(quality_candidates)} photo(s) (--force-quality)...")
+                # Rescore photos in the target directory
+                quality_candidates = list(_get_dir_photos())
+                print(f"\nScoring aesthetic quality for {len(quality_candidates)} photo(s) in target directory (--force-quality)...")
             else:
                 # Only score photos that don't have a score yet
                 unscored = db.conn.execute(
@@ -354,7 +366,70 @@ def index_directory(
                     print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
                           f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
 
+            # Concept analysis — runs on the same ViT-L/14 model while it's loaded
+            if force_quality:
+                concept_candidates = quality_candidates
+            else:
+                unconcept = db.conn.execute(
+                    "SELECT id, filepath FROM photos WHERE aesthetic_concepts IS NULL AND aesthetic_score IS NOT NULL"
+                ).fetchall()
+                concept_candidates = [(row["id"], row["filepath"]) for row in unconcept]
+
+            if concept_candidates:
+                print(f"\nAnalyzing aesthetic concepts for {len(concept_candidates)} photo(s)...")
+                t0 = time.time()
+                paths = [p for _, p in concept_candidates]
+                concepts = analyze_photos_batch(paths, batch_size=batch_size)
+
+                concept_count = 0
+                for (photo_id, path), concept_data in zip(concept_candidates, concepts):
+                    if concept_data is not None:
+                        db.update_photo(photo_id, aesthetic_concepts=_json.dumps(concept_data))
+                        concept_count += 1
+
+                elapsed = time.time() - t0
+                print(f"  Analyzed concepts for {concept_count}/{len(concept_candidates)} photos in {elapsed:.1f}s")
+
             # Free the aesthetic model memory before other steps
             unload_quality()
+
+        # Step 7: Aesthetic critique via Ollama (optional, runs after quality scoring)
+        if enable_quality and enable_describe:
+            from .describe import critique_photo, check_available as desc_check
+            try:
+                desc_check(model=describe_model)
+            except RuntimeError as e:
+                print(f"\nSkipping aesthetic critiques: {e}")
+            else:
+                if force_quality:
+                    critique_candidates = quality_candidates if quality_candidates else []
+                else:
+                    uncritiqued = db.conn.execute(
+                        "SELECT id, filepath FROM photos WHERE aesthetic_critique IS NULL AND aesthetic_score IS NOT NULL"
+                    ).fetchall()
+                    critique_candidates = [(row["id"], row["filepath"]) for row in uncritiqued]
+
+                if critique_candidates:
+                    print(f"\nGenerating aesthetic critiques for {len(critique_candidates)} photo(s)...")
+                    t0 = time.time()
+                    crit_count = 0
+                    total = len(critique_candidates)
+                    for idx, (photo_id, path) in enumerate(critique_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        t_photo = time.time()
+                        critique = critique_photo(path, model=describe_model)
+                        elapsed_photo = time.time() - t_photo
+                        if critique:
+                            db.update_photo(photo_id, aesthetic_critique=critique)
+                            preview = critique[:80].replace("\n", " ")
+                            print(f" ({elapsed_photo:.1f}s) {preview}...")
+                            crit_count += 1
+                        else:
+                            print(f" ({elapsed_photo:.1f}s) no critique")
+                    elapsed = time.time() - t0
+                    print(f"  Generated {crit_count}/{total} critiques in {elapsed:.1f}s")
+                else:
+                    print("\nAll scored photos already have aesthetic critiques.")
 
         print(f"\nDone! Database: {db_path} ({db.photo_count()} total photos)")

@@ -10,6 +10,7 @@ import json
 import logging
 import logging.handlers
 import os
+from pathlib import Path
 
 import click
 
@@ -718,14 +719,20 @@ def show_descriptions(db, filename):
 @click.option("--sort", "sort_order", type=click.Choice(["score", "name"]), default="score",
               help="Sort by aesthetic score (descending) or filename.")
 @click.option("--min", "min_score", type=float, default=None, help="Only show photos above this score.")
-def show_quality(db, sort_order, min_score):
-    """Show aesthetic quality scores for all photos.
+@click.option("--detail", is_flag=True, help="Show concept breakdown and critique for each photo.")
+@click.argument("directory", required=False, default=None)
+def show_quality(db, sort_order, min_score, detail, directory):
+    """Show aesthetic quality scores for photos.
+
+    Optionally pass a DIRECTORY to show only photos indexed from that path.
 
     \b
     Examples:
       python cli.py show-quality
+      python cli.py show-quality ../sample
       python cli.py show-quality --sort name
       python cli.py show-quality --min 5.0
+      python cli.py show-quality --detail ../sample
     """
     with PhotoDB(db) as photo_db:
         if sort_order == "score":
@@ -733,16 +740,29 @@ def show_quality(db, sort_order, min_score):
         else:
             order = "filename"
 
+        cols = "filename, aesthetic_score"
+        if detail:
+            cols = "filename, aesthetic_score, aesthetic_concepts, aesthetic_critique"
+
+        # Build WHERE clause
+        conditions = []
+        params = []
+
+        if directory:
+            resolved_dir = str(Path(directory).resolve())
+            conditions.append("filepath LIKE ?")
+            params.append(resolved_dir + "/%")
+
         if min_score is not None:
-            rows = photo_db.conn.execute(
-                f"SELECT filename, aesthetic_score FROM photos WHERE aesthetic_score IS NOT NULL "
-                f"AND aesthetic_score >= ? ORDER BY {order}",
-                (min_score,),
-            ).fetchall()
-        else:
-            rows = photo_db.conn.execute(
-                f"SELECT filename, aesthetic_score FROM photos ORDER BY {order}"
-            ).fetchall()
+            conditions.append("aesthetic_score IS NOT NULL AND aesthetic_score >= ?")
+            params.append(min_score)
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        rows = photo_db.conn.execute(
+            f"SELECT {cols} FROM photos {where} ORDER BY {order}",
+            params,
+        ).fetchall()
 
         if not rows:
             click.echo("No photos with quality scores found. Run 'index --quality' first.")
@@ -751,15 +771,47 @@ def show_quality(db, sort_order, min_score):
         scored = [r for r in rows if r["aesthetic_score"] is not None]
         unscored = [r for r in rows if r["aesthetic_score"] is None]
 
-        click.echo(f"\n{'Filename':<55} {'Score'}")
-        click.echo("-" * 65)
-        for row in scored:
-            score = row["aesthetic_score"]
-            bar = "█" * int(score) + "░" * (10 - int(score))
-            click.echo(f"{row['filename']:<55} {score:>5.2f}  {bar}")
+        if detail:
+            for row in scored:
+                score = row["aesthetic_score"]
+                bar = "█" * int(score) + "░" * (10 - int(score))
+                click.echo(f"\n{'─' * 70}")
+                click.echo(f"  {row['filename']}  —  {score:.2f}  {bar}")
+
+                # Concept breakdown
+                if row["aesthetic_concepts"]:
+                    try:
+                        concepts = json.loads(row["aesthetic_concepts"])
+                        strengths = concepts.get("strengths", [])
+                        weaknesses = concepts.get("weaknesses", [])
+                        if strengths:
+                            click.echo(f"  Strengths:  {', '.join(strengths)}")
+                        if weaknesses:
+                            click.echo(f"  Weaknesses: {', '.join(weaknesses)}")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # LLM critique
+                if row["aesthetic_critique"]:
+                    click.echo(f"  Critique:   {row['aesthetic_critique']}")
+
+            click.echo(f"{'─' * 70}")
+        else:
+            click.echo(f"\n{'Filename':<55} {'Score'}")
+            click.echo("-" * 65)
+            for row in scored:
+                score = row["aesthetic_score"]
+                bar = "█" * int(score) + "░" * (10 - int(score))
+                click.echo(f"{row['filename']:<55} {score:>5.2f}  {bar}")
 
         if unscored:
             click.echo(f"\n({len(unscored)} photo(s) not yet scored)")
+
+        # Summary stats
+        if scored:
+            scores = [r["aesthetic_score"] for r in scored]
+            click.echo(f"\n{len(scored)} scored — range: {min(scores):.2f}–{max(scores):.2f}, "
+                        f"mean: {sum(scores)/len(scores):.2f}")
 
         if scored:
             scores = [r["aesthetic_score"] for r in scored]

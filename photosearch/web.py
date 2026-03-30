@@ -23,7 +23,7 @@ from typing import Optional
 logger = logging.getLogger("photosearch.web")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -68,13 +68,16 @@ def _ensure_thumb_dir():
 
 
 def _get_or_create_thumbnail(photo: dict) -> str:
-    """Return path to a cached thumbnail, generating it if needed."""
+    """Return path to a cached thumbnail, generating it if needed.
+
+    Thumbnails are keyed by photo ID (not filename) to avoid collisions
+    when the same filename exists in different directories.
+    """
     from PIL import Image
 
     thumb_dir = _ensure_thumb_dir()
-    filename = photo["filename"]
-    stem = Path(filename).stem
-    thumb_path = os.path.join(thumb_dir, f"{stem}_thumb.jpg")
+    photo_id = photo["id"]
+    thumb_path = os.path.join(thumb_dir, f"{photo_id}_thumb.jpg")
 
     if os.path.exists(thumb_path):
         return thumb_path
@@ -178,7 +181,10 @@ def api_thumbnail(photo_id: int):
 
     try:
         thumb_path = _get_or_create_thumbnail(photo)
-        return FileResponse(thumb_path, media_type="image/jpeg")
+        return FileResponse(
+            thumb_path, media_type="image/jpeg",
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
     except FileNotFoundError:
         raise HTTPException(404, "Original photo file not found")
     except Exception as e:
@@ -197,7 +203,10 @@ def api_full_photo(photo_id: int):
     if not filepath or not os.path.exists(filepath):
         raise HTTPException(404, "Photo file not found on disk")
 
-    return FileResponse(filepath, media_type="image/jpeg")
+    return FileResponse(
+        filepath, media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/api/photos/{photo_id}")
@@ -247,6 +256,8 @@ def api_photo_detail(photo_id: int):
             "date_taken": photo["date_taken"],
             "description": photo["description"],
             "aesthetic_score": photo.get("aesthetic_score"),
+            "aesthetic_concepts": json.loads(photo["aesthetic_concepts"]) if photo.get("aesthetic_concepts") else None,
+            "aesthetic_critique": photo.get("aesthetic_critique"),
             "camera_make": photo.get("camera_make"),
             "camera_model": photo.get("camera_model"),
             "focal_length": photo.get("focal_length"),

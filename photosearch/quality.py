@@ -16,6 +16,7 @@ datasets. Scores roughly correspond to:
 Reference: https://github.com/christophschuhmann/improved-aesthetic-predictor
 """
 
+import json
 import os
 import time
 from pathlib import Path
@@ -227,5 +228,191 @@ def score_photos_batch(
 
         for j, idx in enumerate(valid_indices):
             results[idx] = round(float(scores[j].squeeze().cpu()), 3)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CLIP concept similarity breakdown
+# ---------------------------------------------------------------------------
+# Embeds aesthetic concept phrases with the same ViT-L/14 model used for
+# scoring, then computes cosine similarity between the photo embedding and
+# each concept. This gives a fast, interpretable breakdown of *why* a photo
+# scores high or low — no LLM call needed, just vector math.
+
+# Positive concepts (things that make a photo score well)
+_POSITIVE_CONCEPTS = {
+    "composition": "a well-composed photograph with strong visual balance",
+    "lighting": "beautiful natural lighting in a photograph",
+    "color": "rich vibrant colors in a photograph",
+    "sharpness": "a sharp, high-resolution, detailed photograph",
+    "depth": "a photograph with pleasing depth of field and bokeh",
+    "mood": "an evocative photograph with strong atmosphere and mood",
+    "subject": "a photograph with a clear, compelling subject",
+}
+
+# Negative concepts (things that drag a score down)
+_NEGATIVE_CONCEPTS = {
+    "blur": "a blurry, out-of-focus photograph",
+    "exposure": "an overexposed or underexposed photograph",
+    "clutter": "a cluttered, busy photograph with no clear subject",
+    "noise": "a grainy, noisy, low-quality photograph",
+}
+
+# All concepts merged for embedding
+_ALL_CONCEPTS = {**_POSITIVE_CONCEPTS, **_NEGATIVE_CONCEPTS}
+
+# Cached concept embeddings (computed once per session)
+_concept_embeddings: Optional[dict[str, torch.Tensor]] = None
+
+
+def _get_concept_embeddings() -> dict[str, torch.Tensor]:
+    """Embed all aesthetic concept phrases. Cached after first call."""
+    global _concept_embeddings
+    if _concept_embeddings is not None:
+        return _concept_embeddings
+
+    _load_models()
+    import open_clip
+
+    tokenizer = open_clip.get_tokenizer(AESTHETIC_CLIP_MODEL)
+    _concept_embeddings = {}
+
+    with torch.no_grad():
+        for name, phrase in _ALL_CONCEPTS.items():
+            tokens = tokenizer([phrase]).to(_device)
+            emb = _clip_model.encode_text(tokens)
+            emb = emb / emb.norm(dim=-1, keepdim=True)
+            _concept_embeddings[name] = emb.squeeze(0)
+
+    return _concept_embeddings
+
+
+def _classify_scores(scores: dict) -> tuple[list[str], list[str]]:
+    """Pick strengths and weaknesses from raw concept similarity scores.
+
+    Strengths: positive concepts whose score is above the mean of all
+    positive concept scores (i.e. this photo is notably strong there).
+
+    Weaknesses: negative concepts whose score exceeds a fixed threshold,
+    meaning the photo genuinely resembles the negative concept. If no
+    negative concept clears the threshold, the list is empty — we don't
+    fabricate weaknesses for a good photo.
+
+    Returns (strengths, weaknesses).
+    """
+    pos_scores = {k: scores[k] for k in _POSITIVE_CONCEPTS if k in scores}
+    neg_scores = {k: scores[k] for k in _NEGATIVE_CONCEPTS if k in scores}
+
+    # Strengths: above the mean of positive scores
+    pos_mean = sum(pos_scores.values()) / len(pos_scores) if pos_scores else 0
+    strengths = sorted(
+        [k for k, v in pos_scores.items() if v > pos_mean],
+        key=lambda k: pos_scores[k], reverse=True,
+    )[:3]
+
+    # Weaknesses: only if the negative concept score is higher than
+    # the photo's *best* positive score. This means the photo looks
+    # more like "blurry photograph" than it looks like its own best
+    # quality — a genuine problem. Otherwise the weakness list stays
+    # empty, which is the correct answer for a decent photo.
+    pos_max = max(pos_scores.values()) if pos_scores else 0
+    weaknesses = sorted(
+        [k for k, v in neg_scores.items() if v > pos_max],
+        key=lambda k: neg_scores[k], reverse=True,
+    )[:2]
+
+    return strengths, weaknesses
+
+
+def analyze_photo_concepts(image_path: str) -> Optional[dict]:
+    """Compute CLIP concept similarity breakdown for a single photo.
+
+    Returns a dict like:
+        {
+            "strengths": ["lighting", "composition"],
+            "weaknesses": ["clutter"],
+            "scores": {"composition": 0.28, "lighting": 0.31, ...}
+        }
+    Weaknesses may be empty if no negative concept scores high enough.
+    Returns None if the image can't be processed.
+    """
+    _load_models()
+    concepts = _get_concept_embeddings()
+
+    try:
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = _clip_preprocess(image).unsqueeze(0).to(_device)
+
+        with torch.no_grad():
+            img_emb = _clip_model.encode_image(image_tensor)
+            img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
+            img_emb = img_emb.squeeze(0)
+
+        scores = {}
+        for name, concept_emb in concepts.items():
+            sim = float(torch.dot(img_emb, concept_emb).cpu())
+            scores[name] = round(sim, 4)
+
+        strengths, weaknesses = _classify_scores(scores)
+
+        return {
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "scores": scores,
+        }
+
+    except Exception as e:
+        print(f"  Warning: concept analysis failed for {image_path}: {e}")
+        return None
+
+
+def analyze_photos_batch(
+    image_paths: list[str], batch_size: int = 8,
+) -> list[Optional[dict]]:
+    """Compute CLIP concept breakdown for multiple photos in batches.
+
+    Returns a list parallel to image_paths — each entry is a concept
+    dict or None if that image failed.
+    """
+    _load_models()
+    concepts = _get_concept_embeddings()
+    results: list[Optional[dict]] = [None] * len(image_paths)
+
+    for batch_start in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[batch_start : batch_start + batch_size]
+        batch_images = []
+        valid_indices = []
+
+        for i, path in enumerate(batch_paths):
+            try:
+                img = Image.open(path).convert("RGB")
+                batch_images.append(_clip_preprocess(img))
+                valid_indices.append(batch_start + i)
+            except Exception as e:
+                print(f"  Warning: could not load {path}: {e}")
+
+        if not batch_images:
+            continue
+
+        batch_tensor = torch.stack(batch_images).to(_device)
+        with torch.no_grad():
+            embeddings = _clip_model.encode_image(batch_tensor)
+            embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
+
+        for j, idx in enumerate(valid_indices):
+            img_emb = embeddings[j]
+            scores = {}
+            for name, concept_emb in concepts.items():
+                sim = float(torch.dot(img_emb, concept_emb).cpu())
+                scores[name] = round(sim, 4)
+
+            strengths, weaknesses = _classify_scores(scores)
+
+            results[idx] = {
+                "strengths": strengths,
+                "weaknesses": weaknesses,
+                "scores": scores,
+            }
 
     return results

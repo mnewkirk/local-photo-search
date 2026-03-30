@@ -117,6 +117,32 @@ def describe_photo(
         return None
 
 
+# Prompt for aesthetic critique — complements the numeric aesthetic score
+# with a human-readable explanation of what works and what doesn't.
+AESTHETIC_CRITIQUE_PROMPT = """\
+Rate this photo's quality in exactly 2 short sentences. First sentence: what \
+works (be specific — name the compositional technique, lighting quality, or \
+subject). Second sentence: what doesn't work or could be better (be honest — \
+mention blur, exposure problems, distracting elements, weak composition, or \
+lack of a clear subject). If the photo has real problems, say so directly. \
+Do not start with "This photo" or "The image". Do not be generous. \
+Do not comment on resolution or image quality artifacts — you are seeing a \
+downscaled preview and cannot judge the original resolution.\
+"""
+
+
+def critique_photo(
+    image_path: str,
+    model: str = MODEL,
+) -> Optional[str]:
+    """Generate an aesthetic critique for a single photo via Ollama.
+
+    Returns a short text evaluating composition, lighting, and subject
+    clarity — or None if generation failed.
+    """
+    return describe_photo(image_path, model=model, prompt=AESTHETIC_CRITIQUE_PROMPT)
+
+
 def describe_photos_batch(
     image_paths: list[str],
     model: str = MODEL,
