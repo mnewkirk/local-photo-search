@@ -1,0 +1,1376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Faces — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .page-title {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .page-subtitle {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    .toolbar button {
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .toolbar button:hover { border-color: var(--accent); }
+    .toolbar button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    /* Face grid */
+    .face-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 16px;
+    }
+    .face-card {
+      background: var(--surface);
+      border-radius: var(--radius);
+      overflow: hidden;
+      cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.15s;
+      border: 2px solid transparent;
+    }
+    .face-card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      border-color: var(--accent);
+    }
+    .face-card img {
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      display: block;
+      background: var(--surface2);
+    }
+    .face-card-info {
+      padding: 8px 10px;
+    }
+    .face-card-name {
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .face-card-count {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* Detail panel */
+    .detail-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 200;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 40px 20px;
+      overflow-y: auto;
+    }
+    .detail-panel {
+      background: var(--surface);
+      border-radius: 12px;
+      max-width: 1200px;
+      width: 100%;
+      max-height: calc(100vh - 80px);
+      overflow-y: auto;
+    }
+    .detail-header {
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      background: var(--surface);
+      z-index: 10;
+    }
+    .detail-header img {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      object-fit: cover;
+    }
+    .detail-name {
+      font-size: 20px;
+      font-weight: 600;
+      flex: 1;
+    }
+    .detail-name-input {
+      font-size: 20px;
+      font-weight: 600;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid var(--accent);
+      color: var(--text);
+      outline: none;
+      padding: 2px 4px;
+      width: 200px;
+    }
+    .detail-stats {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .detail-close {
+      background: var(--surface2);
+      border: none;
+      color: var(--text);
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      font-size: 18px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .detail-close:hover { background: var(--border); }
+
+    .detail-photos {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+      padding: 16px 24px 24px;
+    }
+    .detail-photo {
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+      position: relative;
+    }
+    .detail-photo img {
+      width: 100%;
+      aspect-ratio: 4/3;
+      object-fit: cover;
+      display: block;
+    }
+    .detail-photo .match-type {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    .rename-btn {
+      padding: 4px 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--accent);
+      background: transparent;
+      color: var(--accent);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .rename-btn:hover { background: var(--accent); color: #fff; }
+    .save-btn {
+      padding: 4px 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--green);
+      background: var(--green);
+      color: #000;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .loading { text-align: center; padding: 60px; color: var(--text-muted); }
+    .loading-bar-container {
+      max-width: 320px;
+      margin: 16px auto 0;
+      height: 4px;
+      background: var(--surface2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .loading-bar {
+      height: 100%;
+      width: 40%;
+      background: var(--accent);
+      border-radius: 4px;
+      animation: loading-slide 1.2s ease-in-out infinite;
+    }
+    @keyframes loading-slide {
+      0%   { transform: translateX(-100%); }
+      50%  { transform: translateX(250%); }
+      100% { transform: translateX(-100%); }
+    }
+    .empty { text-align: center; padding: 60px; color: var(--text-muted); }
+
+    /* Photo modal (reused from search) */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+      z-index: 300; display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal {
+      background: var(--surface); border-radius: 12px; max-width: 1200px; width: 100%;
+      max-height: 90vh; overflow-y: auto; display: flex; flex-direction: row;
+    }
+    .modal-image {
+      flex: 1; min-width: 0; background: #000; display: flex; align-items: center;
+      justify-content: center; border-radius: 12px 0 0 12px; max-height: 90vh; position: relative;
+    }
+    .modal-image img { max-width: 100%; max-height: 90vh; object-fit: contain; }
+    .modal-sidebar {
+      width: 340px; flex-shrink: 0; padding: 24px; border-left: 1px solid var(--border);
+      overflow-y: auto; max-height: 90vh;
+    }
+    .modal-close {
+      position: absolute; top: 16px; right: 16px; background: rgba(0,0,0,0.6);
+      border: none; color: #fff; width: 36px; height: 36px; border-radius: 50%;
+      font-size: 20px; cursor: pointer; display: flex; align-items: center;
+      justify-content: center; z-index: 310;
+    }
+    .modal-close:hover { background: rgba(0,0,0,0.8); }
+    .modal-nav {
+      position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.6);
+      border: none; color: #fff; width: 40px; height: 60px; font-size: 28px;
+      cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 310;
+    }
+    .modal-nav:hover { background: rgba(0,0,0,0.8); }
+    .modal-nav.prev { left: 16px; }
+    .modal-nav.next { right: 56px; }
+    .detail-section { margin-bottom: 20px; }
+    .detail-section h3 {
+      font-size: 13px; color: var(--text-muted); text-transform: uppercase;
+      letter-spacing: 0.5px; margin-bottom: 8px;
+    }
+    .detail-section p { font-size: 14px; line-height: 1.6; }
+    .face-bbox-overlay {
+      position: absolute; border: 2px solid var(--green); border-radius: 4px;
+      pointer-events: none; box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
+    }
+    .face-bbox-label {
+      position: absolute; bottom: 100%; left: -2px; background: var(--green);
+      color: #000; font-size: 11px; padding: 1px 6px; border-radius: 4px 4px 0 0; white-space: nowrap;
+    }
+    .face-edit-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 4px 0;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 13px;
+    }
+    .face-edit-panel select,
+    .face-edit-panel input {
+      font-size: 13px;
+      padding: 4px 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      outline: none;
+      width: 100%;
+    }
+    .face-edit-panel select:focus,
+    .face-edit-panel input:focus { border-color: var(--accent); }
+    .face-edit-buttons {
+      display: flex;
+      gap: 6px;
+      margin-top: 2px;
+    }
+    .face-edit-buttons button {
+      flex: 1;
+      padding: 4px 0;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .face-edit-buttons button:hover { border-color: var(--accent); }
+    .face-edit-buttons button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .face-edit-buttons button.fe-danger {
+      border-color: #f87171;
+      color: #f87171;
+    }
+    .face-edit-buttons button.fe-danger:hover { background: #f87171; color: #fff; }
+    .name-error {
+      color: #f87171;
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    /* Multi-select mode */
+    .face-card.selectable { cursor: pointer; }
+    .face-card.selectable.selected {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent);
+    }
+    .face-card .select-check {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.6);
+      background: rgba(0,0,0,0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      color: transparent;
+      z-index: 5;
+      transition: all 0.15s;
+    }
+    .face-card.selected .select-check {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .multi-bar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      position: sticky;
+      top: 57px; /* below .header */
+      z-index: 90;
+    }
+    .multi-bar .count {
+      font-size: 14px;
+      font-weight: 600;
+      min-width: 120px;
+    }
+    .multi-bar button {
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .multi-bar button:hover { border-color: var(--accent); }
+    .multi-bar button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .multi-bar button.danger {
+      border-color: #f87171;
+      color: #f87171;
+    }
+    .multi-bar button.danger:hover {
+      background: #f87171;
+      color: #fff;
+    }
+    .multi-bar button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .multi-bar .inline-input {
+      font-size: 14px;
+      padding: 4px 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      outline: none;
+      width: 180px;
+    }
+    .multi-bar .inline-input:focus { border-color: var(--accent); }
+    .multi-bar select {
+      font-size: 14px;
+      padding: 4px 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      width: 200px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script>
+    const { useState, useEffect, useCallback, useRef, useMemo } = React;
+    const e = React.createElement;
+    const API = '';
+
+    // -----------------------------------------------------------------------
+    // URL parameter helpers
+    // -----------------------------------------------------------------------
+    function getUrlParams() {
+      const p = new URLSearchParams(window.location.search);
+      return {
+        name: p.get('name') || '',
+        face_id: p.get('face_id') || '',
+        filter: p.get('filter') || 'all',
+      };
+    }
+
+    function updateUrl(params) {
+      const p = new URLSearchParams();
+      if (params.name) p.set('name', params.name);
+      if (params.face_id) p.set('face_id', params.face_id);
+      if (params.filter && params.filter !== 'all') p.set('filter', params.filter);
+      const newUrl = window.location.pathname + (p.toString() ? '?' + p.toString() : '');
+      window.history.pushState(null, '', newUrl);
+    }
+
+    // -----------------------------------------------------------------------
+    // PhotoModal — full photo viewer with face bboxes (same as search page)
+    // -----------------------------------------------------------------------
+    function PhotoModal({ photo, onClose, onPrev, onNext, index, total, onFaceAssigned, persons }) {
+      const [detail, setDetail] = useState(null);
+      const [hoveredFace, setHoveredFace] = useState(null);
+      const [editingFace, setEditingFace] = useState(null);
+      const [editMode, setEditMode] = useState('pick');
+      const [editName, setEditName] = useState('');
+      const [editPick, setEditPick] = useState('');
+      const [imgRect, setImgRect] = useState(null);
+      const imgRef = useRef(null);
+      const editInputRef = useRef(null);
+
+      // Focus the text input when switching to new-name mode
+      useEffect(() => {
+        if (editingFace && editMode === 'new' && editInputRef.current) editInputRef.current.focus();
+      }, [editingFace, editMode]);
+
+      const cancelEdit = useCallback(() => {
+        setEditingFace(null);
+        setEditMode('pick');
+        setEditName('');
+        setEditPick('');
+      }, []);
+
+      const saveExistingName = useCallback((faceId) => {
+        if (!editPick) return;
+        fetch(API + '/api/faces/' + faceId + '/assign?name=' + encodeURIComponent(editPick), { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok) {
+              if (onFaceAssigned) onFaceAssigned(faceId, data.person_name);
+              // Update local detail
+              setDetail(prev => prev ? { ...prev, faces: prev.faces.map(f => f.id === faceId ? { ...f, person_name: data.person_name } : f) } : prev);
+            }
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [editPick, onFaceAssigned, cancelEdit]);
+
+      const saveNewName = useCallback((faceId) => {
+        const name = editName.trim();
+        if (!name) return;
+        fetch(API + '/api/faces/' + faceId + '/assign?name=' + encodeURIComponent(name), { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok) {
+              if (onFaceAssigned) onFaceAssigned(faceId, data.person_name);
+              setDetail(prev => prev ? { ...prev, faces: prev.faces.map(f => f.id === faceId ? { ...f, person_name: data.person_name } : f) } : prev);
+            }
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [editName, onFaceAssigned, cancelEdit]);
+
+      const clearFaceName = useCallback((faceId) => {
+        fetch(API + '/api/faces/' + faceId + '/clear', { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok) {
+              if (onFaceAssigned) onFaceAssigned(faceId, null);
+              setDetail(prev => prev ? { ...prev, faces: prev.faces.map(f => f.id === faceId ? { ...f, person_name: null } : f) } : prev);
+            }
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [onFaceAssigned, cancelEdit]);
+
+      useEffect(() => {
+        setDetail(null);
+        setImgRect(null);
+        cancelEdit();
+        fetch(API + '/api/photos/' + photo.id)
+          .then(r => r.json()).then(setDetail).catch(() => {});
+      }, [photo.id]);
+
+      const updateImgRect = useCallback(() => {
+        const img = imgRef.current;
+        if (!img || !img.naturalWidth) return;
+        const container = img.parentElement;
+        const contRect = container.getBoundingClientRect();
+        const imgElRect = img.getBoundingClientRect();
+        const elOx = imgElRect.left - contRect.left;
+        const elOy = imgElRect.top - contRect.top;
+        const cw = img.clientWidth, ch = img.clientHeight;
+        const nw = img.naturalWidth, nh = img.naturalHeight;
+        const scale = Math.min(cw / nw, ch / nh);
+        const dw = nw * scale, dh = nh * scale;
+        const fitOx = (cw - dw) / 2, fitOy = (ch - dh) / 2;
+        setImgRect({ ox: elOx + fitOx, oy: elOy + fitOy, dw, dh, nw, nh });
+      }, []);
+
+      useEffect(() => {
+        window.addEventListener('resize', updateImgRect);
+        return () => window.removeEventListener('resize', updateImgRect);
+      }, [updateImgRect]);
+
+      const faceOverlays = useMemo(() => {
+        if (!detail || !detail.faces || !imgRect) return [];
+        return detail.faces.filter(f => f.bbox).map(f => {
+          const { top, right, bottom, left } = f.bbox;
+          const sx = imgRect.dw / imgRect.nw;
+          const sy = imgRect.dh / imgRect.nh;
+          return {
+            id: f.id,
+            label: f.person_name || ('Unknown #' + (f.cluster_id || '?')),
+            style: {
+              left: imgRect.ox + left * sx,
+              top: imgRect.oy + top * sy,
+              width: (right - left) * sx,
+              height: (bottom - top) * sy,
+            },
+          };
+        });
+      }, [detail, imgRect]);
+
+      // Keyboard navigation
+      useEffect(() => {
+        const handler = (ev) => {
+          if (ev.key === 'Escape') onClose();
+          if (ev.key === 'ArrowLeft') onPrev();
+          if (ev.key === 'ArrowRight') onNext();
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [onClose, onPrev, onNext]);
+
+      return e('div', { className: 'modal-overlay', onClick: (ev) => {
+        if (ev.target === ev.currentTarget) onClose();
+      }},
+        e('button', { className: 'modal-close', onClick: onClose }, '\u00D7'),
+        total > 1 && e('button', { className: 'modal-nav prev', onClick: (ev) => { ev.stopPropagation(); onPrev(); } }, '\u2039'),
+        total > 1 && e('button', { className: 'modal-nav next', onClick: (ev) => { ev.stopPropagation(); onNext(); } }, '\u203A'),
+        e('div', { className: 'modal' },
+          e('div', { className: 'modal-image' },
+            e('img', {
+              ref: imgRef,
+              src: API + '/api/photos/' + photo.id + '/full',
+              alt: photo.filename,
+              onLoad: updateImgRect,
+            }),
+            ...faceOverlays.filter(ov => hoveredFace === ov.id).map(ov =>
+              e('div', {
+                key: 'bbox-' + ov.id,
+                className: 'face-bbox-overlay',
+                style: ov.style,
+              },
+                e('span', { className: 'face-bbox-label' }, ov.label),
+              )
+            ),
+          ),
+          e('div', { className: 'modal-sidebar' },
+            e('div', { className: 'detail-section' },
+              e('h3', null, 'Photo'),
+              e('p', { style: { fontWeight: 600, fontSize: 16 } }, photo.filename || ''),
+              photo.date_taken && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, photo.date_taken),
+              total > 1 && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, (index + 1) + ' / ' + total),
+            ),
+            detail && detail.description && e('div', { className: 'detail-section' },
+              e('h3', null, 'Description'),
+              e('p', null, detail.description),
+            ),
+            detail && detail.faces && detail.faces.length > 0 && e('div', { className: 'detail-section' },
+              e('h3', null, 'People'),
+              ...detail.faces.map(f =>
+                editingFace === f.id
+                  ? e('div', { key: f.id, className: 'face-edit-panel' },
+                      e('div', { style: { fontWeight: 600, marginBottom: 2 } },
+                        f.person_name || ('Unknown #' + (f.cluster_id || '?'))),
+
+                      // Pick existing person
+                      editMode === 'pick' && e('select', {
+                        value: editPick,
+                        onChange: (ev) => setEditPick(ev.target.value),
+                        autoFocus: true,
+                      },
+                        e('option', { value: '' }, 'Choose existing person\u2026'),
+                        ...(persons || []).map(p =>
+                          e('option', { key: p.id, value: p.name }, p.name)
+                        ),
+                      ),
+                      editMode === 'pick' && e('div', { className: 'face-edit-buttons' },
+                        e('button', {
+                          className: 'primary',
+                          onClick: () => saveExistingName(f.id),
+                          disabled: !editPick,
+                          style: !editPick ? { opacity: 0.5, cursor: 'default' } : {},
+                        }, 'Apply'),
+                        e('button', { onClick: () => { setEditMode('new'); setEditName(''); } }, 'New Name'),
+                        f.person_name && e('button', {
+                          className: 'fe-danger',
+                          onClick: () => clearFaceName(f.id),
+                        }, 'Unset'),
+                        e('button', { onClick: cancelEdit }, 'Cancel'),
+                      ),
+
+                      // New name text input
+                      editMode === 'new' && e('input', {
+                        ref: editInputRef,
+                        type: 'text',
+                        value: editName,
+                        placeholder: 'Enter new name\u2026',
+                        onChange: (ev) => setEditName(ev.target.value),
+                        onKeyDown: (ev) => {
+                          if (ev.key === 'Enter') saveNewName(f.id);
+                          if (ev.key === 'Escape') cancelEdit();
+                        },
+                      }),
+                      editMode === 'new' && e('div', { className: 'face-edit-buttons' },
+                        e('button', {
+                          className: 'primary',
+                          onClick: () => saveNewName(f.id),
+                          disabled: !editName.trim(),
+                          style: !editName.trim() ? { opacity: 0.5, cursor: 'default' } : {},
+                        }, 'Save'),
+                        e('button', { onClick: () => setEditMode('pick') }, 'Back'),
+                        e('button', { onClick: cancelEdit }, 'Cancel'),
+                      ),
+                    )
+                  : e('span', {
+                      key: f.id,
+                      style: {
+                        display: 'inline-block', padding: '4px 10px', background: hoveredFace === f.id ? 'var(--accent)' : 'var(--surface2)',
+                        borderRadius: 12, fontSize: 13, margin: '2px 4px 2px 0', cursor: 'pointer',
+                        color: hoveredFace === f.id ? '#fff' : 'var(--text)',
+                      },
+                      onMouseEnter: () => setHoveredFace(f.id),
+                      onMouseLeave: () => setHoveredFace(null),
+                      onClick: () => { setEditingFace(f.id); setEditMode('pick'); setEditPick(''); setEditName(''); },
+                      title: 'Click to change',
+                    },
+                      f.person_name || ('Unknown #' + (f.cluster_id || '?')),
+                    )
+              ),
+            ),
+            detail && detail.aesthetic_score != null && e('div', { className: 'detail-section' },
+              e('h3', null, 'Quality'),
+              e('span', {
+                style: {
+                  fontSize: 24, fontWeight: 600,
+                  color: detail.aesthetic_score >= 6 ? '#4ade80' : detail.aesthetic_score >= 4.5 ? '#facc15' : '#f87171',
+                },
+              }, detail.aesthetic_score.toFixed(1)),
+              e('span', { style: { fontSize: 13, color: 'var(--text-muted)', marginLeft: 6 } }, '/ 10'),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // App
+    // -----------------------------------------------------------------------
+    function App() {
+      const initParams = getUrlParams();
+      const [groups, setGroups] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [filter, setFilter] = useState(initParams.filter);
+      const [selectedGroup, setSelectedGroup] = useState(null);
+      const [groupPhotos, setGroupPhotos] = useState([]);
+      const [loadingPhotos, setLoadingPhotos] = useState(false);
+      const [editing, setEditing] = useState(false);
+      const [editName, setEditName] = useState('');
+      const [nameError, setNameError] = useState('');
+      const [merging, setMerging] = useState(false);
+      const [mergeTarget, setMergeTarget] = useState('');
+      const editRef = useRef(null);
+      const autoOpened = useRef(false);
+
+      // Photo modal state
+      const [modalPhoto, setModalPhoto] = useState(null);
+      const [modalIndex, setModalIndex] = useState(-1);
+      const [persons, setPersons] = useState([]);
+
+      // Load persons list for face editing dropdown
+      const loadPersons = useCallback(() => {
+        fetch(API + '/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
+      }, []);
+
+      const loadGroups = useCallback(() => {
+        setLoading(true);
+        return fetch(API + '/api/faces/groups')
+          .then(r => r.json())
+          .then(data => { setGroups(data.groups || []); setLoading(false); return data.groups || []; })
+          .catch(() => { setLoading(false); return []; });
+      }, []);
+
+      useEffect(() => {
+        loadPersons();
+        loadGroups().then(grps => {
+          if (autoOpened.current) return;
+          autoOpened.current = true;
+          const params = getUrlParams();
+          // Auto-open if URL has name or face_id
+          if (params.name) {
+            const g = grps.find(g => g.type === 'person' && g.label.toLowerCase() === params.name.toLowerCase());
+            if (g) openGroupDirect(g);
+          } else if (params.face_id) {
+            const fid = parseInt(params.face_id);
+            const g = grps.find(g => g.rep_face_id === fid);
+            if (g) openGroupDirect(g);
+          }
+        });
+      }, []);
+
+      const filteredGroups = useMemo(() => {
+        if (filter === 'named') return groups.filter(g => g.type === 'person');
+        if (filter === 'unknown') return groups.filter(g => g.type === 'cluster');
+        return groups;
+      }, [groups, filter]);
+
+      const loadGroupPhotos = useCallback((group) => {
+        setLoadingPhotos(true);
+        const type = group.type === 'person' ? 'person' : 'cluster';
+        const id = group.type === 'person' ? group.person_id : group.cluster_id;
+        fetch(API + '/api/faces/group/' + type + '/' + id + '/photos')
+          .then(r => r.json())
+          .then(data => { setGroupPhotos(data.photos || []); setLoadingPhotos(false); })
+          .catch(() => setLoadingPhotos(false));
+      }, []);
+
+      const openGroupDirect = useCallback((group) => {
+        setSelectedGroup(group);
+        setEditing(false);
+        setMerging(false);
+        setNameError('');
+        setLoadingPhotos(true);
+        const type = group.type === 'person' ? 'person' : 'cluster';
+        const id = group.type === 'person' ? group.person_id : group.cluster_id;
+        fetch(API + '/api/faces/group/' + type + '/' + id + '/photos')
+          .then(r => r.json())
+          .then(data => { setGroupPhotos(data.photos || []); setLoadingPhotos(false); })
+          .catch(() => setLoadingPhotos(false));
+      }, []);
+
+      const openGroup = useCallback((group) => {
+        openGroupDirect(group);
+        // Update URL
+        if (group.type === 'person') {
+          updateUrl({ name: group.label, filter });
+        } else {
+          updateUrl({ face_id: String(group.rep_face_id || group.cluster_id), filter });
+        }
+      }, [filter]);
+
+      const closeDetail = useCallback(() => {
+        setSelectedGroup(null);
+        setGroupPhotos([]);
+        setEditing(false);
+        setMerging(false);
+        setNameError('');
+        updateUrl({ filter });
+      }, [filter]);
+
+      const changeFilter = useCallback((f) => {
+        setFilter(f);
+        updateUrl({ filter: f, name: selectedGroup && selectedGroup.type === 'person' ? selectedGroup.label : '', face_id: '' });
+      }, [selectedGroup]);
+
+      // Named persons for the merge dropdown (exclude current group if it's a person)
+      const mergeTargets = useMemo(() => {
+        return groups.filter(g =>
+          g.type === 'person' &&
+          !(selectedGroup && selectedGroup.type === 'person' && selectedGroup.person_id === g.person_id)
+        );
+      }, [groups, selectedGroup]);
+
+      const startRename = useCallback(() => {
+        setEditName(selectedGroup.label.startsWith('Unknown') ? '' : selectedGroup.label);
+        setEditing(true);
+        setMerging(false);
+        setNameError('');
+        setTimeout(() => { if (editRef.current) editRef.current.focus(); }, 50);
+      }, [selectedGroup]);
+
+      const startMerge = useCallback(() => {
+        setMerging(true);
+        setEditing(false);
+        setMergeTarget('');
+        setNameError('');
+      }, []);
+
+      const saveMerge = useCallback(() => {
+        if (!mergeTarget || !selectedGroup) { setMerging(false); return; }
+
+        const faceIds = groupPhotos.map(p => p.face_id).filter(Boolean);
+        if (faceIds.length === 0) { setMerging(false); return; }
+
+        Promise.all(faceIds.map(fid =>
+          fetch(API + '/api/faces/' + fid + '/assign?name=' + encodeURIComponent(mergeTarget), { method: 'POST' })
+        )).then(() => {
+          setMerging(false);
+          setSelectedGroup(null);
+          setGroupPhotos([]);
+          updateUrl({ filter });
+          loadGroups();
+        }).catch(() => setMerging(false));
+      }, [mergeTarget, selectedGroup, groupPhotos, loadGroups, filter]);
+
+      const saveRename = useCallback(() => {
+        const name = editName.trim();
+        if (!name || !selectedGroup) { setEditing(false); return; }
+
+        // Check for duplicate name (different person)
+        const existing = groups.find(g =>
+          g.type === 'person' && g.label.toLowerCase() === name.toLowerCase()
+          && !(selectedGroup.type === 'person' && selectedGroup.person_id === g.person_id)
+        );
+        if (existing) {
+          setNameError('A person named "' + existing.label + '" already exists. Use a more specific name.');
+          return;
+        }
+        setNameError('');
+
+        const faceIds = groupPhotos.map(p => p.face_id).filter(Boolean);
+        if (faceIds.length === 0) { setEditing(false); return; }
+
+        Promise.all(faceIds.map(fid =>
+          fetch(API + '/api/faces/' + fid + '/assign?name=' + encodeURIComponent(name), { method: 'POST' })
+        )).then(() => {
+          setEditing(false);
+          setSelectedGroup(prev => prev ? { ...prev, label: name, type: 'person' } : prev);
+          updateUrl({ name, filter });
+          loadGroups();
+        }).catch(() => setEditing(false));
+      }, [editName, selectedGroup, groupPhotos, groups, loadGroups, filter]);
+
+      const handleExport = useCallback(() => {
+        fetch(API + '/api/faces/manual-assignments')
+          .then(r => r.json())
+          .then(data => {
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'face_assignments.json';
+            a.click();
+            URL.revokeObjectURL(url);
+          });
+      }, []);
+
+      // Photo modal handlers
+      const openPhotoAt = useCallback((i) => {
+        const idx = ((i % groupPhotos.length) + groupPhotos.length) % groupPhotos.length;
+        setModalIndex(idx);
+        setModalPhoto(groupPhotos[idx]);
+      }, [groupPhotos]);
+
+      const closeModal = useCallback(() => { setModalPhoto(null); setModalIndex(-1); }, []);
+
+      // ---- Multi-select state ----
+      const [multiSelect, setMultiSelect] = useState(false);
+      const [selected, setSelected] = useState(new Set()); // set of group keys like "p3" or "c42"
+      const [multiAction, setMultiAction] = useState(null); // 'merge' | 'setname' | 'clear' | null
+      const [multiName, setMultiName] = useState('');
+      const [multiMergeTarget, setMultiMergeTarget] = useState('');
+      const [multiError, setMultiError] = useState('');
+      const [multiWorking, setMultiWorking] = useState(false);
+      const multiInputRef = useRef(null);
+
+      const groupKey = (g) => (g.type === 'person' ? 'p' : 'c') + (g.person_id || g.cluster_id);
+
+      const toggleSelect = useCallback((g) => {
+        const key = groupKey(g);
+        setSelected(prev => {
+          const next = new Set(prev);
+          if (next.has(key)) next.delete(key); else next.add(key);
+          return next;
+        });
+      }, []);
+
+      const exitMultiSelect = useCallback(() => {
+        setMultiSelect(false);
+        setSelected(new Set());
+        setMultiAction(null);
+        setMultiName('');
+        setMultiMergeTarget('');
+        setMultiError('');
+      }, []);
+
+      // Escape key exits multi-select
+      useEffect(() => {
+        if (!multiSelect) return;
+        const handler = (ev) => { if (ev.key === 'Escape') exitMultiSelect(); };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [multiSelect, exitMultiSelect]);
+
+      // Global keyboard shortcuts: Escape closes detail, 'm' enters multi-select
+      useEffect(() => {
+        if (multiSelect || modalPhoto) return; // other handlers take priority
+        const handler = (ev) => {
+          // Don't trigger shortcuts when typing in inputs
+          if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT' || ev.target.tagName === 'TEXTAREA') return;
+          if (ev.key === 'Escape' && selectedGroup) {
+            closeDetail();
+          }
+          if (ev.key === 'm' && !selectedGroup) {
+            setMultiSelect(true);
+            setSelected(new Set());
+            setMultiAction(null);
+            setMultiError('');
+          }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [multiSelect, modalPhoto, selectedGroup, closeDetail]);
+
+      // Focus input when starting set-name action
+      useEffect(() => {
+        if (multiAction === 'setname' && multiInputRef.current) multiInputRef.current.focus();
+      }, [multiAction]);
+
+      // Resolve selected groups to their group objects
+      const selectedGroups = useMemo(() => {
+        return groups.filter(g => selected.has(groupKey(g)));
+      }, [groups, selected]);
+
+      // Named persons for multi-merge (exclude any selected named persons)
+      const multiMergeTargets = useMemo(() => {
+        return groups.filter(g => g.type === 'person' && !selected.has(groupKey(g)));
+      }, [groups, selected]);
+
+      // Collect face IDs from selected groups and run an action on all of them
+      const runMultiAction = useCallback((actionFn) => {
+        if (selectedGroups.length === 0) return;
+        setMultiWorking(true);
+
+        const specs = selectedGroups.map(g => ({
+          type: g.type === 'person' ? 'person' : 'cluster',
+          id: g.type === 'person' ? g.person_id : g.cluster_id,
+        }));
+
+        fetch(API + '/api/faces/bulk-collect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ groups: specs }),
+        })
+          .then(r => r.json())
+          .then(data => actionFn(data.face_ids || []))
+          .catch(() => setMultiWorking(false));
+      }, [selectedGroups]);
+
+      const doMultiMerge = useCallback(() => {
+        if (!multiMergeTarget) return;
+        runMultiAction((faceIds) => {
+          Promise.all(faceIds.map(fid =>
+            fetch(API + '/api/faces/' + fid + '/assign?name=' + encodeURIComponent(multiMergeTarget), { method: 'POST' })
+          )).then(() => {
+            setMultiWorking(false);
+            exitMultiSelect();
+            loadGroups();
+          }).catch(() => setMultiWorking(false));
+        });
+      }, [multiMergeTarget, runMultiAction, exitMultiSelect, loadGroups]);
+
+      const doMultiSetName = useCallback(() => {
+        const name = multiName.trim();
+        if (!name) return;
+
+        // Validate unique
+        const existing = groups.find(g =>
+          g.type === 'person' && g.label.toLowerCase() === name.toLowerCase()
+          && !selected.has(groupKey(g))
+        );
+        if (existing) {
+          setMultiError('A person named "' + existing.label + '" already exists. Use a more specific name.');
+          return;
+        }
+        setMultiError('');
+
+        runMultiAction((faceIds) => {
+          Promise.all(faceIds.map(fid =>
+            fetch(API + '/api/faces/' + fid + '/assign?name=' + encodeURIComponent(name), { method: 'POST' })
+          )).then(() => {
+            setMultiWorking(false);
+            exitMultiSelect();
+            loadGroups();
+          }).catch(() => setMultiWorking(false));
+        });
+      }, [multiName, groups, selected, runMultiAction, exitMultiSelect, loadGroups]);
+
+      const doMultiClear = useCallback(() => {
+        runMultiAction((faceIds) => {
+          Promise.all(faceIds.map(fid =>
+            fetch(API + '/api/faces/' + fid + '/clear', { method: 'POST' })
+          )).then(() => {
+            setMultiWorking(false);
+            exitMultiSelect();
+            loadGroups();
+          }).catch(() => setMultiWorking(false));
+        });
+      }, [runMultiAction, exitMultiSelect, loadGroups]);
+
+      const namedCount = groups.filter(g => g.type === 'person').length;
+      const unknownCount = groups.filter(g => g.type === 'cluster').length;
+
+      return e('div', null,
+        // Header
+        e('div', { className: 'header' },
+          e('div', { className: 'header-inner' },
+            e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
+            e('a', { href: '/', className: 'nav-link' }, 'Search'),
+            e('a', { href: '/review', className: 'nav-link' }, 'Review'),
+            e('a', { href: '/faces', className: 'nav-link active' }, 'Faces'),
+          ),
+        ),
+
+        e('div', { className: 'container' },
+          e('div', { className: 'page-title' }, 'Faces'),
+          e('div', { className: 'page-subtitle' },
+            namedCount + ' named \u00B7 ' + unknownCount + ' unknown'),
+
+          // Toolbar
+          e('div', { className: 'toolbar' },
+            e('button', {
+              className: filter === 'all' ? 'active' : '',
+              onClick: () => changeFilter('all'),
+            }, 'All (' + groups.length + ')'),
+            e('button', {
+              className: filter === 'named' ? 'active' : '',
+              onClick: () => changeFilter('named'),
+            }, 'Named (' + namedCount + ')'),
+            e('button', {
+              className: filter === 'unknown' ? 'active' : '',
+              onClick: () => changeFilter('unknown'),
+            }, 'Unknown (' + unknownCount + ')'),
+            !multiSelect && e('button', {
+              onClick: () => { setMultiSelect(true); setSelected(new Set()); setMultiAction(null); setMultiError(''); },
+              style: { marginLeft: 'auto' },
+            }, 'Select Multiple'),
+            !multiSelect && e('button', { onClick: handleExport },
+              '\u2B07 Export Assignments'),
+          ),
+
+          // Multi-select action bar
+          multiSelect && e('div', { className: 'multi-bar' },
+            e('span', { className: 'count' }, selected.size + ' selected'),
+
+            // No sub-action active — show the action buttons
+            !multiAction && selected.size > 0 && e('button', {
+              className: 'primary',
+              onClick: () => { setMultiAction('merge'); setMultiMergeTarget(''); },
+              disabled: multiMergeTargets.length === 0,
+              title: multiMergeTargets.length === 0 ? 'No named persons to merge into' : '',
+            }, 'Merge Faces'),
+            !multiAction && selected.size > 0 && e('button', {
+              onClick: () => { setMultiAction('setname'); setMultiName(''); setMultiError(''); },
+            }, 'Set Name'),
+            !multiAction && selected.size > 0 && e('button', {
+              className: 'danger',
+              onClick: () => { setMultiAction('clear'); },
+            }, 'Clear Name'),
+
+            // Merge sub-action
+            multiAction === 'merge' && e('select', {
+              value: multiMergeTarget,
+              onChange: (ev) => setMultiMergeTarget(ev.target.value),
+            },
+              e('option', { value: '' }, 'Select a person\u2026'),
+              ...multiMergeTargets.map(g =>
+                e('option', { key: g.person_id, value: g.label },
+                  g.label + ' (' + g.photo_count + ')')
+              ),
+            ),
+            multiAction === 'merge' && e('button', {
+              className: 'primary',
+              onClick: doMultiMerge,
+              disabled: !multiMergeTarget || multiWorking,
+            }, multiWorking ? 'Merging\u2026' : 'Merge'),
+            multiAction === 'merge' && e('button', { onClick: () => setMultiAction(null) }, 'Back'),
+
+            // Set Name sub-action
+            multiAction === 'setname' && e('input', {
+              ref: multiInputRef,
+              className: 'inline-input',
+              value: multiName,
+              onChange: (ev) => { setMultiName(ev.target.value); setMultiError(''); },
+              onKeyDown: (ev) => {
+                if (ev.key === 'Enter') doMultiSetName();
+                if (ev.key === 'Escape') { ev.stopPropagation(); setMultiAction(null); setMultiError(''); }
+              },
+              placeholder: 'Enter full name\u2026',
+            }),
+            multiAction === 'setname' && e('button', {
+              className: 'primary',
+              onClick: doMultiSetName,
+              disabled: !multiName.trim() || multiWorking,
+            }, multiWorking ? 'Saving\u2026' : 'Save'),
+            multiAction === 'setname' && e('button', { onClick: () => { setMultiAction(null); setMultiError(''); } }, 'Back'),
+
+            // Clear Name confirmation
+            multiAction === 'clear' && e('span', { style: { fontSize: 13 } },
+              'Clear names from ' + selected.size + ' group(s)?'),
+            multiAction === 'clear' && e('button', {
+              className: 'danger',
+              onClick: doMultiClear,
+              disabled: multiWorking,
+            }, multiWorking ? 'Clearing\u2026' : 'Confirm Clear'),
+            multiAction === 'clear' && e('button', { onClick: () => setMultiAction(null) }, 'Back'),
+
+            // Cancel always visible
+            e('button', { onClick: exitMultiSelect, style: { marginLeft: 'auto' } }, 'Cancel'),
+          ),
+          multiSelect && multiError && e('div', { className: 'name-error', style: { marginBottom: 12, marginTop: -8 } }, multiError),
+
+          loading && e('div', { className: 'loading' },
+            'Loading faces\u2026 sorting by similarity',
+            e('div', { className: 'loading-bar-container' },
+              e('div', { className: 'loading-bar' }),
+            ),
+          ),
+
+          !loading && filteredGroups.length === 0 &&
+            e('div', { className: 'empty' }, 'No faces found. Run face detection first.'),
+
+          // Face grid
+          !loading && filteredGroups.length > 0 &&
+            e('div', { className: 'face-grid' },
+              ...filteredGroups.map(g => {
+                const key = groupKey(g);
+                const isSelected = selected.has(key);
+                return e('div', {
+                  key: key,
+                  className: 'face-card' + (multiSelect ? ' selectable' : '') + (isSelected ? ' selected' : ''),
+                  style: { position: 'relative' },
+                  onClick: () => multiSelect ? toggleSelect(g) : openGroup(g),
+                },
+                  multiSelect && e('div', { className: 'select-check' }, isSelected ? '\u2713' : ''),
+                  g.rep_face_id
+                    ? e('img', {
+                        src: API + '/api/faces/crop/' + g.rep_face_id + '?size=280',
+                        alt: g.label,
+                        loading: 'lazy',
+                      })
+                    : e('div', {
+                        style: {
+                          width: '100%', aspectRatio: '1', background: 'var(--surface2)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          color: 'var(--text-muted)', fontSize: 28,
+                        },
+                      }, '?'),
+                  e('div', { className: 'face-card-info' },
+                    e('div', { className: 'face-card-name' }, g.label),
+                    e('div', { className: 'face-card-count' },
+                      g.photo_count + ' photo' + (g.photo_count !== 1 ? 's' : '')),
+                  ),
+                );
+              }),
+            ),
+        ),
+
+        // Detail overlay (person/cluster view)
+        selectedGroup && !modalPhoto && e('div', { className: 'detail-overlay', onClick: (ev) => {
+          if (ev.target === ev.currentTarget) closeDetail();
+        }},
+          e('div', { className: 'detail-panel' },
+            e('div', { className: 'detail-header' },
+              selectedGroup.rep_face_id && e('img', {
+                src: API + '/api/faces/crop/' + selectedGroup.rep_face_id + '?size=128',
+                alt: selectedGroup.label,
+              }),
+              e('div', { style: { flex: 1 } },
+                editing
+                  ? e('div', null,
+                      e('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                        e('input', {
+                          ref: editRef,
+                          className: 'detail-name-input',
+                          value: editName,
+                          onChange: (ev) => { setEditName(ev.target.value); setNameError(''); },
+                          onKeyDown: (ev) => {
+                            if (ev.key === 'Enter') saveRename();
+                            if (ev.key === 'Escape') { setEditing(false); setNameError(''); }
+                          },
+                          placeholder: 'Enter full name...',
+                        }),
+                        e('button', { className: 'save-btn', onClick: saveRename }, 'Save'),
+                        e('button', { className: 'rename-btn', onClick: () => { setEditing(false); setNameError(''); } }, 'Cancel'),
+                      ),
+                      nameError && e('div', { className: 'name-error' }, nameError),
+                    )
+                : merging
+                  ? e('div', null,
+                      e('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                        e('select', {
+                          value: mergeTarget,
+                          onChange: (ev) => setMergeTarget(ev.target.value),
+                          style: {
+                            fontSize: 16, padding: '4px 8px', background: 'var(--surface2)',
+                            border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                            color: 'var(--text)', width: 220,
+                          },
+                        },
+                          e('option', { value: '' }, 'Select a person\u2026'),
+                          ...mergeTargets.map(g =>
+                            e('option', { key: g.person_id, value: g.label },
+                              g.label + ' (' + g.photo_count + ' photos)')
+                          ),
+                        ),
+                        e('button', {
+                          className: 'save-btn',
+                          onClick: saveMerge,
+                          disabled: !mergeTarget,
+                          style: !mergeTarget ? { opacity: 0.5, cursor: 'default' } : {},
+                        }, 'Merge'),
+                        e('button', { className: 'rename-btn', onClick: () => setMerging(false) }, 'Cancel'),
+                      ),
+                      e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginTop: 4 } },
+                        'All ' + groupPhotos.length + ' photo(s) will be reassigned to the selected person.'),
+                    )
+                  : e('div', { className: 'detail-name' }, selectedGroup.label),
+                !editing && !merging && e('div', { className: 'detail-stats' },
+                  groupPhotos.length + ' photo' + (groupPhotos.length !== 1 ? 's' : '')),
+              ),
+              !editing && !merging && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                e('button', { className: 'rename-btn', onClick: startRename },
+                  selectedGroup.label.startsWith('Unknown') ? 'Set Name' : 'Rename'),
+                mergeTargets.length > 0 && e('button', { className: 'rename-btn', onClick: startMerge }, 'Merge'),
+              ),
+              e('button', { className: 'detail-close', onClick: closeDetail }, '\u00D7'),
+            ),
+            loadingPhotos && e('div', { className: 'loading' }, 'Loading photos...'),
+            !loadingPhotos && e('div', { className: 'detail-photos' },
+              ...groupPhotos.map((p, i) =>
+                e('div', {
+                  key: p.face_id || p.id,
+                  className: 'detail-photo',
+                  onClick: () => openPhotoAt(i),
+                },
+                  e('img', {
+                    src: API + '/api/photos/' + p.id + '/thumbnail',
+                    alt: p.filename || '',
+                    loading: 'lazy',
+                  }),
+                  p.match_source && e('span', { className: 'match-type' },
+                    p.match_source === 'temporal' ? '\u23F1 temporal'
+                    : p.match_source === 'strict' ? '\u2713 strict'
+                    : p.match_source === 'manual' ? '\u270E manual' : p.match_source),
+                )
+              ),
+            ),
+          ),
+        ),
+
+        // Photo modal
+        modalPhoto && e(PhotoModal, {
+          photo: modalPhoto,
+          onClose: closeModal,
+          onPrev: () => openPhotoAt(modalIndex - 1),
+          onNext: () => openPhotoAt(modalIndex + 1),
+          index: modalIndex,
+          total: groupPhotos.length,
+          persons: persons,
+          onFaceAssigned: (faceId, personName) => {
+            // Refresh groups and persons after a face assignment change
+            loadGroups();
+            loadPersons();
+          },
+        }),
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>

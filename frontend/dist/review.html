@@ -452,23 +452,34 @@
     const e = React.createElement;
     const API = '';
 
+    function getReviewUrlParams() {
+      const p = new URLSearchParams(window.location.search);
+      return {
+        folder: p.get('folder') || '',
+        target_pct: p.get('target_pct') || '10',
+        view: p.get('view') || 'all',
+        grid: p.get('grid') || 'normal',
+      };
+    }
+
     // -----------------------------------------------------------------------
     // App
     // -----------------------------------------------------------------------
     function App() {
+      const initParams = getReviewUrlParams();
       const [folders, setFolders] = useState([]);
-      const [selectedFolder, setSelectedFolder] = useState('');
+      const [selectedFolder, setSelectedFolder] = useState(initParams.folder);
       const [photos, setPhotos] = useState([]);
       const [stats, setStats] = useState(null);
       const [loading, setLoading] = useState(false);
-      const [viewMode, setViewMode] = useState('all');       // all | selected | obscure | clusters
-      const [gridSize, setGridSize] = useState('normal');     // normal | large
+      const [viewMode, setViewMode] = useState(initParams.view);       // all | selected | obscure | clusters
+      const [gridSize, setGridSize] = useState(initParams.grid);     // normal | large
       const [modalPhoto, setModalPhoto] = useState(null);
       const [modalDetail, setModalDetail] = useState(null);
       const [showExport, setShowExport] = useState(false);
       const [exportFiles, setExportFiles] = useState([]);
       const [exportRaw, setExportRaw] = useState(false);
-      const [targetPct, setTargetPct] = useState('10');
+      const [targetPct, setTargetPct] = useState(initParams.target_pct);
       const [threshold, setThreshold] = useState('0');
 
       // Load folders on mount
@@ -479,11 +490,26 @@
           .catch(() => {});
       }, []);
 
+      // Update browser URL with current review state
+      const updateReviewUrl = useCallback((folder, pct, view, grid) => {
+        const p = new URLSearchParams();
+        if (folder) p.set('folder', folder);
+        if (pct && pct !== '10') p.set('target_pct', pct);
+        if (view && view !== 'all') p.set('view', view);
+        if (grid && grid !== 'normal') p.set('grid', grid);
+        const newUrl = window.location.pathname + (p.toString() ? '?' + p.toString() : '');
+        window.history.replaceState(null, '', newUrl);
+      }, []);
+
       const runReview = useCallback(() => {
         if (!selectedFolder) return;
         setLoading(true);
         setPhotos([]);
         setStats(null);
+
+        // Update URL
+        updateReviewUrl(selectedFolder, targetPct, viewMode, gridSize);
+
         const params = new URLSearchParams({
           directory: selectedFolder,
           target_pct: targetPct === '' ? 0.10 : parseFloat(targetPct) / 100,
@@ -497,7 +523,7 @@
             setLoading(false);
           })
           .catch(() => { setLoading(false); });
-      }, [selectedFolder, targetPct, threshold]);
+      }, [selectedFolder, targetPct, threshold, viewMode, gridSize, updateReviewUrl]);
 
       const loadExisting = useCallback(() => {
         if (!selectedFolder) return;
@@ -658,6 +684,7 @@
               e('span', null, 'photo'), 'search',
               e('span', { className: 'mode' }, ' / review'),
             ),
+            e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none' } }, 'Faces'),
             // Folder selector
             e('div', { className: 'control-group' },
               e('select', {
@@ -697,19 +724,19 @@
           e('div', { className: 'view-toggle' },
             e('button', {
               className: viewMode === 'all' ? 'active' : '',
-              onClick: () => setViewMode('all'),
+              onClick: () => { setViewMode('all'); updateReviewUrl(selectedFolder, targetPct, 'all', gridSize); },
             }, 'All'),
             e('button', {
               className: viewMode === 'obscure' ? 'active' : '',
-              onClick: () => setViewMode('obscure'),
+              onClick: () => { setViewMode('obscure'); updateReviewUrl(selectedFolder, targetPct, 'obscure', gridSize); },
             }, 'Obscure Unselected'),
             e('button', {
               className: viewMode === 'selected' ? 'active' : '',
-              onClick: () => setViewMode('selected'),
+              onClick: () => { setViewMode('selected'); updateReviewUrl(selectedFolder, targetPct, 'selected', gridSize); },
             }, 'Selected Only'),
             e('button', {
               className: viewMode === 'clusters' ? 'active' : '',
-              onClick: () => setViewMode('clusters'),
+              onClick: () => { setViewMode('clusters'); updateReviewUrl(selectedFolder, targetPct, 'clusters', gridSize); },
             }, 'Clusters'),
           ),
 
@@ -717,11 +744,11 @@
           e('div', { className: 'view-toggle' },
             e('button', {
               className: gridSize === 'normal' ? 'active' : '',
-              onClick: () => setGridSize('normal'),
+              onClick: () => { setGridSize('normal'); updateReviewUrl(selectedFolder, targetPct, viewMode, 'normal'); },
             }, 'Grid'),
             e('button', {
               className: gridSize === 'large' ? 'active' : '',
-              onClick: () => setGridSize('large'),
+              onClick: () => { setGridSize('large'); updateReviewUrl(selectedFolder, targetPct, viewMode, 'large'); },
             }, 'Large'),
           ),
 

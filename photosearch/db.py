@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -240,6 +240,7 @@ class PhotoDB:
                 bbox_bottom INTEGER,
                 bbox_left INTEGER,
                 cluster_id INTEGER,
+                match_source TEXT,
                 FOREIGN KEY (photo_id) REFERENCES photos(id),
                 FOREIGN KEY (person_id) REFERENCES persons(id)
             )
@@ -276,6 +277,15 @@ class PhotoDB:
             cur.execute("SELECT tags FROM photos LIMIT 1")
         except sqlite3.OperationalError:
             cur.execute("ALTER TABLE photos ADD COLUMN tags TEXT")
+
+        # Migration: add match_source column to faces if upgrading from schema v6
+        try:
+            cur.execute("SELECT match_source FROM faces LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE faces ADD COLUMN match_source TEXT")
+
+        # Migration: unique constraint on persons.name (schema v7)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_persons_name_unique ON persons(LOWER(name))")
 
         # Review selections — persists shoot review picks
         cur.execute("""
@@ -450,12 +460,47 @@ class PhotoDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_face_encoding(self, face_id: int) -> list[float] | None:
+        """Retrieve the raw encoding vector for a face."""
+        if not HAS_SQLITE_VEC:
+            return None
+        row = self.conn.execute(
+            "SELECT encoding FROM face_encodings WHERE face_id = ?", (face_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _deserialize_float_list(row["encoding"], FACE_DIMENSIONS)
+
+    def get_face_encodings_bulk(self, face_ids: list[int]) -> dict[int, list[float]]:
+        """Retrieve encodings for multiple faces at once. Returns {face_id: encoding}.
+
+        Batches queries in chunks of 500 to stay within SQLite parameter limits
+        and work well with sqlite-vec virtual tables.
+        """
+        if not HAS_SQLITE_VEC or not face_ids:
+            return {}
+        result = {}
+        batch_size = 500
+        for i in range(0, len(face_ids), batch_size):
+            batch = face_ids[i : i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            rows = self.conn.execute(
+                f"SELECT face_id, encoding FROM face_encodings WHERE face_id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for r in rows:
+                result[r["face_id"]] = _deserialize_float_list(r["encoding"], FACE_DIMENSIONS)
+        return result
+
     # ------------------------------------------------------------------
     # Persons
     # ------------------------------------------------------------------
 
     def add_person(self, name: str) -> int:
-        """Create a named person. Returns person id."""
+        """Create a named person, or return the existing id if the name exists (case-insensitive)."""
+        existing = self.get_person_by_name(name)
+        if existing:
+            return existing["id"]
         cur = self.conn.execute("INSERT INTO persons (name) VALUES (?)", (name,))
         self._maybe_commit()
         return cur.lastrowid
@@ -467,10 +512,14 @@ class PhotoDB:
         ).fetchone()
         return dict(row) if row else None
 
-    def assign_face_to_person(self, face_id: int, person_id: int):
-        """Link a face to a named person."""
+    def assign_face_to_person(self, face_id: int, person_id: int, match_source: str | None = None):
+        """Link a face to a named person.
+
+        match_source: 'strict', 'temporal', or 'manual'.  Stored for filtering.
+        """
         self.conn.execute(
-            "UPDATE faces SET person_id = ? WHERE id = ?", (person_id, face_id)
+            "UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
+            (person_id, match_source, face_id),
         )
         self._maybe_commit()
 

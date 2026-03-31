@@ -822,26 +822,34 @@ def search_by_place(db: PhotoDB, place: str, limit: int = 10) -> list[dict]:
     return db.search_text(place, limit=limit)
 
 
-def search_by_person(db: PhotoDB, name: str, limit: int = 10) -> list[dict]:
+def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str | None = None) -> list[dict]:
     """Find all photos containing a named person.
 
     Looks up the person by name, then finds all faces linked to that person,
     then returns the distinct photos those faces appear in.
+
+    match_source: if set, only return photos where the face was matched via
+    this method ('strict', 'temporal', or 'manual').
     """
     person = db.get_person_by_name(name)
     if not person:
         print(f"  Person '{name}' not found. Use 'add-person' to register them.")
         return []
 
-    rows = db.conn.execute(
-        """SELECT DISTINCT p.*
+    sql = """SELECT DISTINCT p.*
            FROM photos p
            JOIN faces f ON f.photo_id = p.id
-           WHERE f.person_id = ?
-           ORDER BY p.date_taken
-           LIMIT ?""",
-        (person["id"], limit),
-    ).fetchall()
+           WHERE f.person_id = ?"""
+    params: list = [person["id"]]
+
+    if match_source:
+        sql += " AND f.match_source = ?"
+        params.append(match_source)
+
+    sql += " ORDER BY p.date_taken LIMIT ?"
+    params.append(limit)
+
+    rows = db.conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -938,6 +946,7 @@ def search_combined(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     location: Optional[str] = None,
+    match_source: Optional[str] = None,
 ) -> list[dict]:
     """Run multiple search types and merge results.
 
@@ -976,7 +985,7 @@ def search_combined(
     result_sets = []
 
     if person:
-        results = search_by_person(db, person, limit=limit * 3)
+        results = search_by_person(db, person, limit=limit * 3, match_source=match_source)
         result_sets.append({r["id"]: r for r in results})
 
     if face_image:

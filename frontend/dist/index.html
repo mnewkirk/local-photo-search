@@ -298,6 +298,85 @@
       border-radius: 12px;
       font-size: 13px;
       margin: 2px 4px 2px 0;
+      cursor: pointer;
+      transition: background 0.15s, outline 0.15s;
+    }
+    .face-tag:hover, .face-tag.active {
+      background: var(--accent);
+      color: #fff;
+    }
+    .face-tag .match-badge {
+      font-size: 10px;
+      margin-left: 4px;
+      opacity: 0.7;
+    }
+    .face-edit-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 4px 0;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 13px;
+    }
+    .face-edit-panel select,
+    .face-edit-panel input {
+      font-size: 13px;
+      padding: 4px 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      outline: none;
+      width: 100%;
+    }
+    .face-edit-panel select:focus,
+    .face-edit-panel input:focus { border-color: var(--accent); }
+    .face-edit-buttons {
+      display: flex;
+      gap: 6px;
+      margin-top: 2px;
+    }
+    .face-edit-buttons button {
+      flex: 1;
+      padding: 4px 0;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .face-edit-buttons button:hover { border-color: var(--accent); }
+    .face-edit-buttons button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .face-edit-buttons button.danger {
+      border-color: #f87171;
+      color: #f87171;
+    }
+    .face-edit-buttons button.danger:hover { background: #f87171; color: #fff; }
+    .face-bbox-overlay {
+      position: absolute;
+      border: 2px solid var(--accent);
+      border-radius: 4px;
+      pointer-events: none;
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
+      transition: opacity 0.15s;
+    }
+    .face-bbox-label {
+      position: absolute;
+      bottom: 100%;
+      left: -2px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 4px 4px 0 0;
+      white-space: nowrap;
     }
 
     /* Empty state */
@@ -339,23 +418,41 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 
   <script>
-    const { useState, useEffect, useCallback, useRef } = React;
+    const { useState, useEffect, useCallback, useRef, useMemo } = React;
     const e = React.createElement;
 
     const API = '';  // Same origin
+
+    // Read URL search params
+    function getUrlParams() {
+      const p = new URLSearchParams(window.location.search);
+      return {
+        q: p.get('q') || '',
+        person: p.get('person') || '',
+        color: p.get('color') || '',
+        location: p.get('location') || '',
+        date_from: p.get('date_from') || '',
+        date_to: p.get('date_to') || '',
+        min_quality: p.get('min_quality') || '',
+        sort_quality: p.get('sort_quality') === 'true',
+        match_source: p.get('match_source') || '',
+      };
+    }
 
     // -----------------------------------------------------------------------
     // App
     // -----------------------------------------------------------------------
     function App() {
-      const [query, setQuery] = useState('');
-      const [personFilter, setPersonFilter] = useState('');
-      const [colorFilter, setColorFilter] = useState('');
-      const [minQuality, setMinQuality] = useState('');
-      const [sortQuality, setSortQuality] = useState(false);
-      const [locationFilter, setLocationFilter] = useState('');
-      const [dateFrom, setDateFrom] = useState('');
-      const [dateTo, setDateTo] = useState('');
+      const initParams = getUrlParams();
+      const [query, setQuery] = useState(initParams.q);
+      const [personFilter, setPersonFilter] = useState(initParams.person);
+      const [matchSource, setMatchSource] = useState(initParams.match_source);
+      const [colorFilter, setColorFilter] = useState(initParams.color);
+      const [minQuality, setMinQuality] = useState(initParams.min_quality);
+      const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
+      const [locationFilter, setLocationFilter] = useState(initParams.location);
+      const [dateFrom, setDateFrom] = useState(initParams.date_from);
+      const [dateTo, setDateTo] = useState(initParams.date_to);
       const [results, setResults] = useState(null);
       const [loading, setLoading] = useState(false);
       const [selectedPhoto, setSelectedPhoto] = useState(null);
@@ -363,6 +460,7 @@
       const [stats, setStats] = useState(null);
       const [persons, setPersons] = useState([]);
       const inputRef = useRef(null);
+      const hasAutoSearched = useRef(false);
 
       // Load stats and persons on mount
       useEffect(() => {
@@ -371,10 +469,10 @@
         if (inputRef.current) inputRef.current.focus();
       }, []);
 
-      const doSearch = useCallback((e) => {
-        if (e) e.preventDefault();
+      const doSearch = useCallback((ev) => {
+        if (ev) ev.preventDefault();
         const mqVal = minQuality ? parseFloat(minQuality) : null;
-        if (!query && !personFilter && !colorFilter && !locationFilter && !dateFrom && !dateTo && mqVal == null) return;
+        if (!query && !personFilter && !colorFilter && !locationFilter && !dateFrom && !dateTo && mqVal == null && !matchSource) return;
         setLoading(true);
         setResults(null);
 
@@ -387,6 +485,13 @@
         if (dateTo) params.set('date_to', dateTo);
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
         if (sortQuality) params.set('sort_quality', 'true');
+        if (matchSource) params.set('match_source', matchSource);
+
+        // Update browser URL without reload
+        const urlParams = new URLSearchParams(params);
+        const newUrl = window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '');
+        window.history.pushState(null, '', newUrl);
+
         params.set('limit', '100');
 
         fetch(API + '/api/search?' + params.toString())
@@ -399,7 +504,17 @@
             setResults([]);
             setLoading(false);
           });
-      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo]);
+      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo, matchSource]);
+
+      // Auto-search on mount if URL has params
+      useEffect(() => {
+        if (hasAutoSearched.current) return;
+        const p = getUrlParams();
+        if (p.q || p.person || p.color || p.location || p.date_from || p.date_to || p.min_quality || p.match_source) {
+          hasAutoSearched.current = true;
+          doSearch();
+        }
+      }, [doSearch]);
 
       const [selectedIndex, setSelectedIndex] = useState(-1);
 
@@ -431,6 +546,23 @@
       const goPrev = useCallback(() => { openPhotoAt(selectedIndex - 1); }, [selectedIndex, openPhotoAt]);
       const goNext = useCallback(() => { openPhotoAt(selectedIndex + 1); }, [selectedIndex, openPhotoAt]);
 
+      // When a face is assigned/unset in the modal, update the detail in place
+      const handleFaceAssigned = useCallback((faceId, personName) => {
+        setPhotoDetail(prev => {
+          if (!prev || !prev.faces) return prev;
+          return {
+            ...prev,
+            faces: prev.faces.map(f =>
+              f.id === faceId
+                ? { ...f, person_name: personName, match_source: personName ? 'manual' : null }
+                : f
+            ),
+          };
+        });
+        // Refresh persons list for the sidebar filter
+        fetch(API + '/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
+      }, []);
+
       // Keyboard: Escape closes modal, arrows navigate
       useEffect(() => {
         const handler = (ev) => {
@@ -449,6 +581,7 @@
           e('div', { className: 'header-inner' },
             e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
             e('a', { href: '/review', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Review'),
+            e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Faces'),
             e('form', { className: 'search-form', onSubmit: doSearch },
               e('input', {
                 ref: inputRef,
@@ -482,6 +615,19 @@
                 e('option', { key: p.id, value: p.name },
                   p.name + ' (' + p.photo_count + ')')
               ),
+            ),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Match:'),
+            e('select', {
+              className: 'filter-input',
+              value: matchSource,
+              onChange: (ev) => setMatchSource(ev.target.value),
+              style: { width: 130 },
+            },
+              e('option', { value: '' }, 'Any'),
+              e('option', { value: 'strict' }, 'Strict only'),
+              e('option', { value: 'temporal' }, 'Temporal only'),
             ),
           ),
           e('div', { className: 'filter-group' },
@@ -578,6 +724,8 @@
           onNext: goNext,
           index: selectedIndex,
           total: results ? results.length : 0,
+          onFaceAssigned: handleFaceAssigned,
+          persons: persons,
         }),
       );
     }
@@ -655,7 +803,111 @@
     // -----------------------------------------------------------------------
     // Photo modal
     // -----------------------------------------------------------------------
-    function PhotoModal({ photo, detail, onClose, onPrev, onNext, index, total }) {
+    function PhotoModal({ photo, detail, onClose, onPrev, onNext, index, total, onFaceAssigned, persons }) {
+      const [hoveredFace, setHoveredFace] = useState(null);
+      const [editingFace, setEditingFace] = useState(null);  // face id being edited
+      const [editMode, setEditMode] = useState('pick');       // 'pick' (dropdown) or 'new' (text input)
+      const [editName, setEditName] = useState('');
+      const [editPick, setEditPick] = useState('');
+      const [imgRect, setImgRect] = useState(null);
+      const imgRef = useRef(null);
+      const editInputRef = useRef(null);
+
+      // Focus the text input when switching to new-name mode
+      useEffect(() => {
+        if (editingFace && editMode === 'new' && editInputRef.current) editInputRef.current.focus();
+      }, [editingFace, editMode]);
+
+      const cancelEdit = useCallback(() => {
+        setEditingFace(null);
+        setEditMode('pick');
+        setEditName('');
+        setEditPick('');
+      }, []);
+
+      const saveExistingName = useCallback((faceId) => {
+        if (!editPick) return;
+        fetch(API + '/api/faces/' + faceId + '/assign?name=' + encodeURIComponent(editPick), { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && onFaceAssigned) onFaceAssigned(faceId, data.person_name);
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [editPick, onFaceAssigned, cancelEdit]);
+
+      const saveNewName = useCallback((faceId) => {
+        const name = editName.trim();
+        if (!name) return;
+        fetch(API + '/api/faces/' + faceId + '/assign?name=' + encodeURIComponent(name), { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && onFaceAssigned) onFaceAssigned(faceId, data.person_name);
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [editName, onFaceAssigned, cancelEdit]);
+
+      const clearFaceName = useCallback((faceId) => {
+        fetch(API + '/api/faces/' + faceId + '/clear', { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && onFaceAssigned) onFaceAssigned(faceId, null);
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [onFaceAssigned, cancelEdit]);
+
+      // Compute the displayed image rect relative to the modal-image container.
+      // Two offsets: (a) img element within flex container, (b) object-fit:contain
+      // letterboxing within the img element itself.
+      const updateImgRect = useCallback(() => {
+        const img = imgRef.current;
+        if (!img || !img.naturalWidth) return;
+        const container = img.parentElement;
+        const contRect = container.getBoundingClientRect();
+        const imgElRect = img.getBoundingClientRect();
+
+        // Offset of img element within the container (flex centering)
+        const elOx = imgElRect.left - contRect.left;
+        const elOy = imgElRect.top - contRect.top;
+
+        // object-fit:contain letterboxing within the img element
+        const cw = img.clientWidth, ch = img.clientHeight;
+        const nw = img.naturalWidth, nh = img.naturalHeight;
+        const scale = Math.min(cw / nw, ch / nh);
+        const dw = nw * scale, dh = nh * scale;
+        const fitOx = (cw - dw) / 2, fitOy = (ch - dh) / 2;
+
+        setImgRect({ ox: elOx + fitOx, oy: elOy + fitOy, dw, dh, nw, nh });
+      }, []);
+
+      // Recalc on image load or window resize
+      useEffect(() => {
+        window.addEventListener('resize', updateImgRect);
+        return () => window.removeEventListener('resize', updateImgRect);
+      }, [updateImgRect]);
+
+      // Build face bounding box overlays
+      const faceOverlays = useMemo(() => {
+        if (!detail || !detail.faces || !imgRect) return [];
+        return detail.faces.filter(f => f.bbox).map(f => {
+          const { top, right, bottom, left } = f.bbox;
+          const sx = imgRect.dw / imgRect.nw;
+          const sy = imgRect.dh / imgRect.nh;
+          return {
+            id: f.id,
+            label: f.person_name || ('Unknown #' + (f.cluster_id || '?')),
+            style: {
+              left: imgRect.ox + left * sx,
+              top: imgRect.oy + top * sy,
+              width: (right - left) * sx,
+              height: (bottom - top) * sy,
+            },
+          };
+        });
+      }, [detail, imgRect]);
+
       return e('div', { className: 'modal-overlay', onClick: (ev) => {
         if (ev.target === ev.currentTarget) onClose();
       }},
@@ -663,11 +915,29 @@
         total > 1 && e('button', { className: 'modal-nav prev', onClick: (ev) => { ev.stopPropagation(); onPrev(); }, title: 'Previous (\u2190)' }, '\u2039'),
         total > 1 && e('button', { className: 'modal-nav next', onClick: (ev) => { ev.stopPropagation(); onNext(); }, title: 'Next (\u2192)' }, '\u203A'),
         e('div', { className: 'modal' },
-          e('div', { className: 'modal-image' },
+          e('div', { className: 'modal-image', style: { position: 'relative' } },
             e('img', {
+              ref: imgRef,
               src: API + '/api/photos/' + photo.id + '/full',
               alt: photo.filename,
+              onLoad: updateImgRect,
             }),
+            // Render face bounding box overlays (only when hovering a name)
+            ...faceOverlays.filter(ov => hoveredFace === ov.id).map(ov =>
+              e('div', {
+                key: 'bbox-' + ov.id,
+                className: 'face-bbox-overlay',
+                style: {
+                  ...ov.style,
+                  borderColor: '#4ade80',
+                },
+              },
+                e('span', {
+                  className: 'face-bbox-label',
+                  style: { background: '#4ade80', color: '#000' },
+                }, ov.label),
+              )
+            ),
           ),
           e('div', { className: 'modal-sidebar' },
             // Filename
@@ -692,9 +962,73 @@
             detail && detail.faces && detail.faces.length > 0 && e('div', { className: 'detail-section' },
               e('h3', null, 'People'),
               ...detail.faces.map(f =>
-                e('span', { key: f.id, className: 'face-tag' },
-                  f.person_name || ('Unknown #' + (f.cluster_id || '?'))
-                )
+                editingFace === f.id
+                  ? e('div', { key: f.id, className: 'face-edit-panel' },
+                      e('div', { style: { fontWeight: 600, marginBottom: 2 } },
+                        f.person_name || ('Unknown #' + (f.cluster_id || '?'))),
+
+                      // Pick existing person
+                      editMode === 'pick' && e('select', {
+                        value: editPick,
+                        onChange: (ev) => setEditPick(ev.target.value),
+                        autoFocus: true,
+                      },
+                        e('option', { value: '' }, 'Choose existing person\u2026'),
+                        ...(persons || []).map(p =>
+                          e('option', { key: p.id, value: p.name }, p.name)
+                        ),
+                      ),
+                      editMode === 'pick' && e('div', { className: 'face-edit-buttons' },
+                        e('button', {
+                          className: 'primary',
+                          onClick: () => saveExistingName(f.id),
+                          disabled: !editPick,
+                          style: !editPick ? { opacity: 0.5, cursor: 'default' } : {},
+                        }, 'Apply'),
+                        e('button', { onClick: () => { setEditMode('new'); setEditName(''); } }, 'New Name'),
+                        f.person_name && e('button', {
+                          className: 'danger',
+                          onClick: () => clearFaceName(f.id),
+                        }, 'Unset'),
+                        e('button', { onClick: cancelEdit }, 'Cancel'),
+                      ),
+
+                      // New name text input
+                      editMode === 'new' && e('input', {
+                        ref: editInputRef,
+                        type: 'text',
+                        value: editName,
+                        placeholder: 'Enter new name\u2026',
+                        onChange: (ev) => setEditName(ev.target.value),
+                        onKeyDown: (ev) => {
+                          if (ev.key === 'Enter') saveNewName(f.id);
+                          if (ev.key === 'Escape') cancelEdit();
+                        },
+                      }),
+                      editMode === 'new' && e('div', { className: 'face-edit-buttons' },
+                        e('button', {
+                          className: 'primary',
+                          onClick: () => saveNewName(f.id),
+                          disabled: !editName.trim(),
+                          style: !editName.trim() ? { opacity: 0.5, cursor: 'default' } : {},
+                        }, 'Save'),
+                        e('button', { onClick: () => setEditMode('pick') }, 'Back'),
+                        e('button', { onClick: cancelEdit }, 'Cancel'),
+                      ),
+                    )
+                  : e('span', {
+                      key: f.id,
+                      className: 'face-tag' + (hoveredFace === f.id ? ' active' : ''),
+                      onMouseEnter: () => setHoveredFace(f.id),
+                      onMouseLeave: () => setHoveredFace(null),
+                      onClick: () => { setEditingFace(f.id); setEditMode('pick'); setEditPick(''); setEditName(''); },
+                      title: 'Click to change',
+                    },
+                      f.person_name || ('Unknown #' + (f.cluster_id || '?')),
+                      f.match_source && e('span', { className: 'match-badge' },
+                        f.match_source === 'temporal' ? '\u23F1' : f.match_source === 'strict' ? '\u2713'
+                        : f.match_source === 'manual' ? '\u270E' : ''),
+                    )
               ),
             ),
 

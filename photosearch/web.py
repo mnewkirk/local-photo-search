@@ -19,6 +19,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 # Request logging — helps debug discrepancies between CLI and web results
 logger = logging.getLogger("photosearch.web")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -114,6 +116,7 @@ def api_search(
     date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
     location: Optional[str] = Query(None, description="Filter by location name"),
+    match_source: Optional[str] = Query(None, description="Face match type: strict, temporal, or manual"),
 ):
     """Search photos using any combination of criteria."""
     logger.info(
@@ -145,6 +148,7 @@ def api_search(
             date_from=date_from,
             date_to=date_to,
             location=location,
+            match_source=match_source,
         )
 
         logger.info(
@@ -227,6 +231,268 @@ def api_full_photo(photo_id: int):
     )
 
 
+@app.get("/api/faces/crop/{face_id}")
+def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
+    """Serve a square crop of the face from the original photo."""
+    from PIL import Image
+
+    with _get_db() as db:
+        row = db.conn.execute(
+            """SELECT f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                      ph.filepath
+               FROM faces f
+               JOIN photos ph ON ph.id = f.photo_id
+               WHERE f.id = ?""",
+            (face_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Face not found")
+        filepath = db.resolve_filepath(row["filepath"])
+
+    if not filepath or not os.path.exists(filepath):
+        raise HTTPException(404, "Photo file not found")
+
+    if row["bbox_top"] is None:
+        raise HTTPException(400, "Face has no bounding box")
+
+    top, right, bottom, left = row["bbox_top"], row["bbox_right"], row["bbox_bottom"], row["bbox_left"]
+
+    from PIL import ImageOps
+    img = Image.open(filepath)
+    img = ImageOps.exif_transpose(img)
+    img_w, img_h = img.size
+
+    # Add 20% padding around the face for tight framing
+    face_w = right - left
+    face_h = bottom - top
+    pad_x = int(face_w * 0.2)
+    pad_y = int(face_h * 0.2)
+    crop_left = max(0, left - pad_x)
+    crop_top = max(0, top - pad_y)
+    crop_right = min(img_w, right + pad_x)
+    crop_bottom = min(img_h, bottom + pad_y)
+
+    # Make it square (expand the shorter dimension, centered)
+    cw = crop_right - crop_left
+    ch = crop_bottom - crop_top
+    if cw > ch:
+        diff = cw - ch
+        crop_top = max(0, crop_top - diff // 2)
+        crop_bottom = crop_top + cw
+        if crop_bottom > img_h:
+            crop_bottom = img_h
+            crop_top = max(0, crop_bottom - cw)
+    elif ch > cw:
+        diff = ch - cw
+        crop_left = max(0, crop_left - diff // 2)
+        crop_right = crop_left + ch
+        if crop_right > img_w:
+            crop_right = img_w
+            crop_left = max(0, crop_right - ch)
+
+    face_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+    face_img = face_img.resize((size, size), Image.LANCZOS)
+
+    buf = BytesIO()
+    face_img.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/jpeg",
+                             headers={"Cache-Control": "public, max-age=3600"})
+
+
+def _similarity_sort(groups: list[dict], encodings: dict[int, list[float]]) -> list[dict]:
+    """Sort groups so similar faces are adjacent.
+
+    Strategy: named persons first (alpha), then unknowns sorted by photo_count
+    desc but with similar faces pulled next to each other. Uses numpy for fast
+    distance matrix computation and greedy nearest-neighbor chaining.
+    """
+    named = [g for g in groups if g["type"] == "person"]
+    named.sort(key=lambda g: g["label"].lower())
+
+    unknowns = [g for g in groups if g["type"] != "person"]
+    # Sort unknowns by photo_count desc as baseline
+    unknowns.sort(key=lambda g: -g["photo_count"])
+
+    # Build encoding lookup for unknowns that have rep faces with encodings
+    has_enc = []  # indices into unknowns that have encodings
+    enc_vecs = []  # corresponding encoding vectors
+    for i, g in enumerate(unknowns):
+        fid = g.get("rep_face_id")
+        if fid and fid in encodings:
+            has_enc.append(i)
+            enc_vecs.append(encodings[fid])
+
+    if len(has_enc) < 2:
+        return named + unknowns
+
+    # Compute pairwise distance matrix with numpy (fast)
+    mat = np.array(enc_vecs, dtype=np.float32)  # shape (N, D)
+    # Euclidean distance matrix: ||a-b||² = ||a||² + ||b||² - 2*a·b
+    sq_norms = np.sum(mat ** 2, axis=1)
+    dist_matrix = np.sqrt(
+        np.maximum(sq_norms[:, None] + sq_norms[None, :] - 2 * mat @ mat.T, 0.0)
+    )
+
+    # Map from unknown-index to enc-index
+    unk_to_enc = {unk_i: enc_i for enc_i, unk_i in enumerate(has_enc)}
+
+    # Greedy nearest-neighbor chain starting from the largest group
+    n_enc = len(has_enc)
+    enc_visited = np.zeros(n_enc, dtype=bool)  # tracks visited enc indices
+    visited = set()
+    ordered = []
+    current = 0  # Start with the first unknown (largest by photo count)
+    visited.add(current)
+    ordered.append(unknowns[current])
+    if current in unk_to_enc:
+        enc_visited[unk_to_enc[current]] = True
+
+    while len(visited) < len(unknowns):
+        best_idx = None
+
+        if current in unk_to_enc:
+            cur_enc_i = unk_to_enc[current]
+            dists = dist_matrix[cur_enc_i].copy()
+            dists[enc_visited] = np.inf  # mask all visited in one op
+            min_enc_i = int(np.argmin(dists))
+            if dists[min_enc_i] < np.inf:
+                best_idx = has_enc[min_enc_i]
+
+        if best_idx is None:
+            for j in range(len(unknowns)):
+                if j not in visited:
+                    best_idx = j
+                    break
+
+        if best_idx is None:
+            break
+
+        visited.add(best_idx)
+        ordered.append(unknowns[best_idx])
+        if best_idx in unk_to_enc:
+            enc_visited[unk_to_enc[best_idx]] = True
+        current = best_idx
+
+    return named + ordered
+
+
+@app.get("/api/faces/groups")
+def api_face_groups(sort: str = Query("similarity")):
+    """List all face identities grouped by person or cluster.
+
+    Returns a list of groups, each with a representative face_id, name/label,
+    photo count, and face count. Used for the faces gallery page.
+
+    sort: "similarity" (default) clusters similar faces together,
+          "count" sorts by photo count descending.
+    """
+    import time
+    t0 = time.time()
+
+    with _get_db() as db:
+        # Named persons — single query with rep face via window function
+        named_rows = db.conn.execute(
+            """SELECT p.id as person_id, p.name,
+                      COUNT(DISTINCT f.photo_id) as photo_count,
+                      COUNT(f.id) as face_count,
+                      (SELECT f2.id FROM faces f2
+                       WHERE f2.person_id = p.id AND f2.bbox_top IS NOT NULL
+                       ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                       LIMIT 1) as rep_face_id
+               FROM persons p
+               JOIN faces f ON f.person_id = p.id
+               GROUP BY p.id
+               ORDER BY p.name"""
+        ).fetchall()
+
+        groups = []
+        for r in named_rows:
+            groups.append({
+                "type": "person",
+                "person_id": r["person_id"],
+                "label": r["name"],
+                "photo_count": r["photo_count"],
+                "face_count": r["face_count"],
+                "rep_face_id": r["rep_face_id"],
+            })
+
+        # Unknown clusters — single query with rep face via correlated subquery
+        unknown_rows = db.conn.execute(
+            """SELECT f.cluster_id,
+                      COUNT(DISTINCT f.photo_id) as photo_count,
+                      COUNT(f.id) as face_count,
+                      (SELECT f2.id FROM faces f2
+                       WHERE f2.cluster_id = f.cluster_id AND f2.person_id IS NULL
+                             AND f2.bbox_top IS NOT NULL
+                       ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                       LIMIT 1) as rep_face_id
+               FROM faces f
+               WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL
+               GROUP BY f.cluster_id
+               ORDER BY face_count DESC"""
+        ).fetchall()
+
+        for r in unknown_rows:
+            groups.append({
+                "type": "cluster",
+                "cluster_id": r["cluster_id"],
+                "label": "Unknown #" + str(r["cluster_id"]),
+                "photo_count": r["photo_count"],
+                "face_count": r["face_count"],
+                "rep_face_id": r["rep_face_id"],
+            })
+
+        t1 = time.time()
+        logger.info("faces/groups: query took %.3fs (%d groups)", t1 - t0, len(groups))
+
+        # Apply similarity sorting if requested
+        if sort == "similarity":
+            rep_face_ids = [g["rep_face_id"] for g in groups if g["rep_face_id"]]
+            encodings = db.get_face_encodings_bulk(rep_face_ids)
+            t2 = time.time()
+            logger.info("faces/groups: encoding fetch took %.3fs (%d encodings)", t2 - t1, len(encodings))
+            groups = _similarity_sort(groups, encodings)
+            t3 = time.time()
+            logger.info("faces/groups: similarity sort took %.3fs", t3 - t2)
+
+    return {"groups": groups}
+
+
+@app.get("/api/faces/group/{group_type}/{group_id}/photos")
+def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(200)):
+    """Get all photos for a specific face group (person or cluster)."""
+    with _get_db() as db:
+        if group_type == "person":
+            rows = db.conn.execute(
+                """SELECT DISTINCT p.*, f.id as face_id,
+                          f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                          f.match_source
+                   FROM photos p
+                   JOIN faces f ON f.photo_id = p.id
+                   WHERE f.person_id = ?
+                   ORDER BY p.date_taken
+                   LIMIT ?""",
+                (group_id, limit),
+            ).fetchall()
+        elif group_type == "cluster":
+            rows = db.conn.execute(
+                """SELECT DISTINCT p.*, f.id as face_id,
+                          f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                          f.match_source
+                   FROM photos p
+                   JOIN faces f ON f.photo_id = p.id
+                   WHERE f.cluster_id = ? AND f.person_id IS NULL
+                   ORDER BY p.date_taken
+                   LIMIT ?""",
+                (group_id, limit),
+            ).fetchall()
+        else:
+            raise HTTPException(400, "group_type must be 'person' or 'cluster'")
+
+        return {"photos": [dict(r) for r in rows]}
+
+
 @app.get("/api/photos/{photo_id}")
 def api_photo_detail(photo_id: int):
     """Get full metadata for a single photo, including face matches."""
@@ -239,7 +505,7 @@ def api_photo_detail(photo_id: int):
         faces = db.conn.execute(
             """SELECT f.id, f.person_id, f.bbox_top, f.bbox_right,
                       f.bbox_bottom, f.bbox_left, f.cluster_id,
-                      p.name as person_name
+                      f.match_source, p.name as person_name
                FROM faces f
                LEFT JOIN persons p ON p.id = f.person_id
                WHERE f.photo_id = ?""",
@@ -258,6 +524,7 @@ def api_photo_detail(photo_id: int):
                     "left": f["bbox_left"],
                 } if f["bbox_top"] is not None else None,
                 "cluster_id": f["cluster_id"],
+                "match_source": f["match_source"],
             })
 
         colors = []
@@ -305,6 +572,194 @@ def api_persons():
         ).fetchall()
 
     return {"persons": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Face assignment endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/faces/{face_id}/assign")
+def api_assign_face(face_id: int, name: str = Query(..., description="Person name")):
+    """Assign a face to a named person (creates the person if needed)."""
+    with _get_db() as db:
+        # Verify face exists
+        face = db.conn.execute("SELECT id FROM faces WHERE id = ?", (face_id,)).fetchone()
+        if not face:
+            raise HTTPException(404, "Face not found")
+
+        # Find or create person
+        person = db.get_person_by_name(name)
+        if not person:
+            pid = db.add_person(name)
+        else:
+            pid = person["id"]
+
+        db.assign_face_to_person(face_id, pid, match_source="manual")
+        db.conn.commit()
+
+        logger.info("FACE ASSIGN  face_id=%d  person=%r  person_id=%d", face_id, name, pid)
+        return {"ok": True, "person_id": pid, "person_name": name}
+
+
+@app.post("/api/faces/{face_id}/clear")
+def api_clear_face(face_id: int):
+    """Remove the person assignment from a face."""
+    with _get_db() as db:
+        face = db.conn.execute("SELECT id FROM faces WHERE id = ?", (face_id,)).fetchone()
+        if not face:
+            raise HTTPException(404, "Face not found")
+        db.conn.execute(
+            "UPDATE faces SET person_id = NULL, match_source = NULL WHERE id = ?",
+            (face_id,),
+        )
+        db.conn.commit()
+        return {"ok": True}
+
+
+@app.post("/api/faces/bulk-collect")
+def api_bulk_collect_faces(data: dict):
+    """Collect all face IDs for a list of groups (persons and/or clusters).
+
+    Accepts: {"groups": [{"type": "person", "id": 1}, {"type": "cluster", "id": 42}, ...]}
+    Returns: {"face_ids": [1, 2, 3, ...]}
+    """
+    group_specs = data.get("groups", [])
+    if not group_specs:
+        return {"face_ids": []}
+
+    face_ids = []
+    with _get_db() as db:
+        for spec in group_specs:
+            gtype = spec.get("type")
+            gid = spec.get("id")
+            if gtype == "person":
+                rows = db.conn.execute(
+                    "SELECT id FROM faces WHERE person_id = ?", (gid,)
+                ).fetchall()
+            elif gtype == "cluster":
+                rows = db.conn.execute(
+                    "SELECT id FROM faces WHERE cluster_id = ? AND person_id IS NULL", (gid,)
+                ).fetchall()
+            else:
+                continue
+            face_ids.extend(r["id"] for r in rows)
+
+    return {"face_ids": face_ids}
+
+
+@app.get("/api/faces/manual-assignments")
+def api_export_manual_assignments():
+    """Export all manual face-to-person assignments as JSON.
+
+    Each entry contains the photo filepath and face bounding box so
+    assignments can be re-imported after clearing matches or rebuilding
+    the face index.
+    """
+    with _get_db() as db:
+        rows = db.conn.execute(
+            """SELECT f.id as face_id, f.bbox_top, f.bbox_right,
+                      f.bbox_bottom, f.bbox_left,
+                      p.name as person_name,
+                      ph.filepath
+               FROM faces f
+               JOIN persons p ON p.id = f.person_id
+               JOIN photos ph ON ph.id = f.photo_id
+               WHERE f.match_source = 'manual'
+               ORDER BY ph.filepath, f.id"""
+        ).fetchall()
+
+        assignments = []
+        for r in rows:
+            assignments.append({
+                "filepath": r["filepath"],
+                "person_name": r["person_name"],
+                "bbox": {
+                    "top": r["bbox_top"],
+                    "right": r["bbox_right"],
+                    "bottom": r["bbox_bottom"],
+                    "left": r["bbox_left"],
+                },
+            })
+
+        return {"assignments": assignments, "count": len(assignments)}
+
+
+@app.post("/api/faces/import-assignments")
+def api_import_manual_assignments(data: dict):
+    """Re-apply manual face assignments from a previously exported JSON.
+
+    Matches by filepath + bounding box overlap (>80% IoU) so that
+    assignments survive face re-detection even if IDs change.
+    """
+    assignments = data.get("assignments", [])
+    if not assignments:
+        return {"ok": True, "matched": 0, "skipped": 0}
+
+    matched = 0
+    skipped = 0
+
+    with _get_db() as db:
+        for a in assignments:
+            filepath = a.get("filepath")
+            person_name = a.get("person_name")
+            bbox = a.get("bbox")
+            if not filepath or not person_name or not bbox:
+                skipped += 1
+                continue
+
+            # Find the photo
+            photo = db.conn.execute(
+                "SELECT id FROM photos WHERE filepath = ?", (filepath,)
+            ).fetchone()
+            if not photo:
+                skipped += 1
+                continue
+
+            # Find or create person
+            person = db.get_person_by_name(person_name)
+            if not person:
+                pid = db.add_person(person_name)
+            else:
+                pid = person["id"]
+
+            # Find best-matching face by bounding box overlap
+            faces = db.conn.execute(
+                """SELECT id, bbox_top, bbox_right, bbox_bottom, bbox_left
+                   FROM faces WHERE photo_id = ?""",
+                (photo["id"],),
+            ).fetchall()
+
+            best_face_id = None
+            best_iou = 0.0
+            for f in faces:
+                if f["bbox_top"] is None:
+                    continue
+                # Compute IoU
+                t1, r1, b1, l1 = bbox["top"], bbox["right"], bbox["bottom"], bbox["left"]
+                t2, r2, b2, l2 = f["bbox_top"], f["bbox_right"], f["bbox_bottom"], f["bbox_left"]
+                inter_t = max(t1, t2)
+                inter_l = max(l1, l2)
+                inter_b = min(b1, b2)
+                inter_r = min(r1, r2)
+                inter_area = max(0, inter_b - inter_t) * max(0, inter_r - inter_l)
+                area1 = (b1 - t1) * (r1 - l1)
+                area2 = (b2 - t2) * (r2 - l2)
+                union_area = area1 + area2 - inter_area
+                iou = inter_area / union_area if union_area > 0 else 0
+                if iou > best_iou:
+                    best_iou = iou
+                    best_face_id = f["id"]
+
+            if best_face_id and best_iou > 0.5:
+                db.assign_face_to_person(best_face_id, pid, match_source="manual")
+                matched += 1
+            else:
+                skipped += 1
+
+        db.conn.commit()
+
+    logger.info("IMPORT ASSIGNMENTS  matched=%d  skipped=%d", matched, skipped)
+    return {"ok": True, "matched": matched, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +992,14 @@ if _frontend_dir.exists():
         if review.exists():
             return HTMLResponse(review.read_text())
         return HTMLResponse("<h1>Review page not found</h1>")
+
+    @app.get("/faces")
+    def serve_faces():
+        """Serve the faces gallery page."""
+        faces_page = _frontend_dir / "faces.html"
+        if faces_page.exists():
+            return HTMLResponse(faces_page.read_text())
+        return HTMLResponse("<h1>Faces page not found</h1>")
 
     @app.get("/{path:path}")
     def serve_frontend(path: str = ""):

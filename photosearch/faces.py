@@ -421,7 +421,7 @@ def match_faces_to_persons(
 
         if best_matches:
             best_idx, _ = best_matches[0]
-            db.assign_face_to_person(face_id, person_ids[best_idx])
+            db.assign_face_to_person(face_id, person_ids[best_idx], match_source="strict")
             matched += 1
 
     return matched
@@ -586,7 +586,7 @@ def match_faces_temporal(
             except ValueError:
                 pass  # No parseable timestamp — skip temporal check
 
-        db.assign_face_to_person(face_id, best_pid)
+        db.assign_face_to_person(face_id, best_pid, match_source="temporal")
         matched += 1
 
     return matched

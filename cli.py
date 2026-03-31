@@ -498,6 +498,269 @@ def correct_face(filename, face_number, correct_person, db):
 
 
 # ---------------------------------------------------------------------------
+# clear-matches
+# ---------------------------------------------------------------------------
+
+@cli.command("clear-matches")
+@click.argument("photo_dir", type=click.Path(exists=True))
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--person", default=None, help="Only clear matches for this person (by name).")
+@click.option("--all-faces", is_flag=True, help="Also delete the detected face data itself, not just the person assignments.")
+@click.option("--include-manual", is_flag=True, help="Also clear manual (UI) assignments. By default these are preserved.")
+def clear_matches(photo_dir, db, person, all_faces, include_manual):
+    """Clear face matches for all photos in a directory.
+
+    By default this resets person_id to NULL on every auto-matched face
+    in the directory, preserving manual assignments made through the UI.
+    Use --include-manual to clear those too.
+
+    \b
+    Examples:
+      # Clear auto matches in a folder (keeps manual + face detections)
+      python cli.py clear-matches ../Photos/2026-02-08
+
+      # Clear all matches including manual UI assignments
+      python cli.py clear-matches ../Photos/2026-02-08 --include-manual
+
+      # Clear only Ellie matches (leave others intact)
+      python cli.py clear-matches ../Photos/2026-02-08 --person "Ellie"
+
+      # Nuke everything — clear detections too (will need --faces to re-detect)
+      python cli.py clear-matches ../Photos/2026-02-08 --all-faces
+    """
+    photo_dir = str(Path(photo_dir).resolve())
+
+    with PhotoDB(db) as photo_db:
+        # Find photos in the target directory
+        all_rows = photo_db.conn.execute(
+            "SELECT id, filepath FROM photos"
+        ).fetchall()
+        dir_photo_ids = []
+        for row in all_rows:
+            abs_path = photo_db.resolve_filepath(row["filepath"])
+            if abs_path and abs_path.startswith(photo_dir + "/"):
+                dir_photo_ids.append(row["id"])
+
+        if not dir_photo_ids:
+            click.echo(f"No indexed photos found in {photo_dir}")
+            return
+
+        # Build the face query
+        placeholders = ",".join("?" * len(dir_photo_ids))
+
+        # Manual-assignment filter: by default preserve manual (UI) assignments
+        manual_guard = "" if include_manual else " AND (match_source IS NULL OR match_source != 'manual')"
+
+        if all_faces:
+            # Delete face records entirely (respects --include-manual)
+            if include_manual:
+                count = photo_db.conn.execute(
+                    f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders})",
+                    dir_photo_ids,
+                ).fetchone()["c"]
+                photo_db.conn.execute(
+                    f"DELETE FROM faces WHERE photo_id IN ({placeholders})",
+                    dir_photo_ids,
+                )
+            else:
+                count = photo_db.conn.execute(
+                    f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders}){manual_guard}",
+                    dir_photo_ids,
+                ).fetchone()["c"]
+                photo_db.conn.execute(
+                    f"DELETE FROM faces WHERE photo_id IN ({placeholders}){manual_guard}",
+                    dir_photo_ids,
+                )
+                manual_kept = photo_db.conn.execute(
+                    f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders}) AND match_source = 'manual'",
+                    dir_photo_ids,
+                ).fetchone()["c"]
+                if manual_kept:
+                    click.echo(f"  Preserved {manual_kept} manual assignment(s). Use --include-manual to clear those too.")
+            photo_db.conn.commit()
+            click.echo(f"Deleted {count} face detection(s) across {len(dir_photo_ids)} photos in {photo_dir}")
+            click.echo("Re-run with --faces to re-detect.")
+        elif person:
+            # Clear matches for a specific person
+            person_row = photo_db.conn.execute(
+                "SELECT id FROM persons WHERE name = ?", (person,)
+            ).fetchone()
+            if not person_row:
+                click.echo(f"Person '{person}' not found. Use list-persons to see registered people.")
+                return
+            person_id = person_row["id"]
+            count = photo_db.conn.execute(
+                f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders}) AND person_id = ?{manual_guard}",
+                dir_photo_ids + [person_id],
+            ).fetchone()["c"]
+            photo_db.conn.execute(
+                f"UPDATE faces SET person_id = NULL, match_source = NULL WHERE photo_id IN ({placeholders}) AND person_id = ?{manual_guard}",
+                dir_photo_ids + [person_id],
+            )
+            photo_db.conn.commit()
+            click.echo(f"Cleared {count} '{person}' match(es) across {len(dir_photo_ids)} photos.")
+            if not include_manual:
+                manual_kept = photo_db.conn.execute(
+                    f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders}) AND person_id = ? AND match_source = 'manual'",
+                    dir_photo_ids + [person_id],
+                ).fetchone()["c"]
+                if manual_kept:
+                    click.echo(f"  Preserved {manual_kept} manual assignment(s). Use --include-manual to clear those too.")
+        else:
+            # Clear all person assignments (preserve manual by default)
+            count = photo_db.conn.execute(
+                f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders}) AND person_id IS NOT NULL{manual_guard}",
+                dir_photo_ids,
+            ).fetchone()["c"]
+            photo_db.conn.execute(
+                f"UPDATE faces SET person_id = NULL, match_source = NULL WHERE photo_id IN ({placeholders}) AND person_id IS NOT NULL{manual_guard}",
+                dir_photo_ids,
+            )
+            photo_db.conn.commit()
+            click.echo(f"Cleared {count} face match(es) across {len(dir_photo_ids)} photos in {photo_dir}")
+            if not include_manual:
+                manual_kept = photo_db.conn.execute(
+                    f"SELECT COUNT(*) as c FROM faces WHERE photo_id IN ({placeholders}) AND match_source = 'manual'",
+                    dir_photo_ids,
+                ).fetchone()["c"]
+                if manual_kept:
+                    click.echo(f"  Preserved {manual_kept} manual assignment(s). Use --include-manual to clear those too.")
+
+        click.echo("Re-run match-faces to re-match.")
+
+
+# ---------------------------------------------------------------------------
+# export / import manual face assignments
+# ---------------------------------------------------------------------------
+
+@cli.command("export-face-assignments")
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--output", "-o", default="face_assignments.json", help="Output JSON file path.")
+def export_face_assignments(db, output):
+    """Export manual face-to-person assignments to a JSON file.
+
+    This lets you preserve UI-made assignments across database rebuilds.
+
+    \b
+    Example:
+      python cli.py export-face-assignments -o my_assignments.json
+    """
+    import json as _json
+
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute(
+            """SELECT f.id, f.bbox_top, f.bbox_right,
+                      f.bbox_bottom, f.bbox_left,
+                      p.name as person_name,
+                      ph.filepath
+               FROM faces f
+               JOIN persons p ON p.id = f.person_id
+               JOIN photos ph ON ph.id = f.photo_id
+               WHERE f.match_source = 'manual'
+               ORDER BY ph.filepath, f.id"""
+        ).fetchall()
+
+        assignments = []
+        for r in rows:
+            assignments.append({
+                "filepath": r["filepath"],
+                "person_name": r["person_name"],
+                "bbox": {
+                    "top": r["bbox_top"],
+                    "right": r["bbox_right"],
+                    "bottom": r["bbox_bottom"],
+                    "left": r["bbox_left"],
+                },
+            })
+
+    with open(output, "w") as f:
+        _json.dump({"assignments": assignments, "count": len(assignments)}, f, indent=2)
+
+    click.echo(f"Exported {len(assignments)} manual assignment(s) to {output}")
+
+
+@cli.command("import-face-assignments")
+@click.argument("input_file", type=click.Path(exists=True))
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+def import_face_assignments(input_file, db):
+    """Re-apply manual face assignments from a previously exported JSON file.
+
+    Matches by filepath + bounding box overlap (>50% IoU) so assignments
+    survive face re-detection even if face IDs change.
+
+    \b
+    Example:
+      python cli.py import-face-assignments face_assignments.json
+    """
+    import json as _json
+
+    with open(input_file) as f:
+        data = _json.load(f)
+
+    assignments = data.get("assignments", [])
+    if not assignments:
+        click.echo("No assignments found in file.")
+        return
+
+    matched = 0
+    skipped = 0
+
+    with PhotoDB(db) as photo_db:
+        for a in assignments:
+            filepath = a.get("filepath")
+            person_name = a.get("person_name")
+            bbox = a.get("bbox")
+            if not filepath or not person_name or not bbox:
+                skipped += 1
+                continue
+
+            photo = photo_db.conn.execute(
+                "SELECT id FROM photos WHERE filepath = ?", (filepath,)
+            ).fetchone()
+            if not photo:
+                skipped += 1
+                continue
+
+            person = photo_db.get_person_by_name(person_name)
+            if not person:
+                pid = photo_db.add_person(person_name)
+            else:
+                pid = person["id"]
+
+            faces = photo_db.conn.execute(
+                """SELECT id, bbox_top, bbox_right, bbox_bottom, bbox_left
+                   FROM faces WHERE photo_id = ?""",
+                (photo["id"],),
+            ).fetchall()
+
+            best_face_id = None
+            best_iou = 0.0
+            for face in faces:
+                if face["bbox_top"] is None:
+                    continue
+                t1, r1, b1, l1 = bbox["top"], bbox["right"], bbox["bottom"], bbox["left"]
+                t2, r2, b2, l2 = face["bbox_top"], face["bbox_right"], face["bbox_bottom"], face["bbox_left"]
+                inter_t, inter_l = max(t1, t2), max(l1, l2)
+                inter_b, inter_r = min(b1, b2), min(r1, r2)
+                inter_area = max(0, inter_b - inter_t) * max(0, inter_r - inter_l)
+                union_area = (b1 - t1) * (r1 - l1) + (b2 - t2) * (r2 - l2) - inter_area
+                iou = inter_area / union_area if union_area > 0 else 0
+                if iou > best_iou:
+                    best_iou = iou
+                    best_face_id = face["id"]
+
+            if best_face_id and best_iou > 0.5:
+                photo_db.assign_face_to_person(best_face_id, pid, match_source="manual")
+                matched += 1
+            else:
+                skipped += 1
+
+        photo_db.conn.commit()
+
+    click.echo(f"Imported {matched} assignment(s), skipped {skipped}.")
+
+
+# ---------------------------------------------------------------------------
 # tag-photo
 # ---------------------------------------------------------------------------
 
