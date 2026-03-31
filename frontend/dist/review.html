@@ -680,11 +680,9 @@
         // Header
         e('div', { className: 'header' },
           e('div', { className: 'header-inner' },
-            e('a', { className: 'logo', href: '/' },
-              e('span', null, 'photo'), 'search',
-              e('span', { className: 'mode' }, ' / review'),
-            ),
-            e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none' } }, 'Faces'),
+            e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
+            e('a', { href: '/', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Search'),
+            e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Faces'),
             // Folder selector
             e('div', { className: 'control-group' },
               e('select', {
@@ -860,6 +858,7 @@
               e('div', { className: 'detail-section' },
                 e('h3', null, 'Photo'),
                 e('p', { style: { fontWeight: 600, fontSize: 14 } }, modalPhoto.filename),
+                modalDetail && modalDetail.filepath && e('p', { style: { color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 } }, modalDetail.filepath),
                 modalPhoto.date_taken && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, modalPhoto.date_taken),
               ),
 

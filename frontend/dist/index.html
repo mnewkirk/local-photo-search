@@ -944,6 +944,7 @@
             e('div', { className: 'detail-section' },
               e('h3', null, 'Photo'),
               e('p', { style: { fontWeight: 600, fontSize: 16 } }, photo.filename),
+              detail && detail.filepath && e('p', { style: { color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 } }, detail.filepath),
               e('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
                 photo.date_taken && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } },
                   photo.date_taken),

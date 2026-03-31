@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -179,7 +179,12 @@ class PhotoDB:
         return count
 
     def _init_schema(self):
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist.
+
+        If the schema is already at the current version, this is a no-op
+        (no writes attempted), which allows read-only access even when
+        another process holds a write lock on the database.
+        """
         cur = self.conn.cursor()
 
         # Schema version tracking
@@ -189,6 +194,16 @@ class PhotoDB:
                 value TEXT NOT NULL
             )
         """)
+
+        # Fast path: if schema is already at the current version, skip all DDL/writes.
+        try:
+            row = cur.execute(
+                "SELECT value FROM schema_info WHERE key = 'version'"
+            ).fetchone()
+            if row and int(row[0]) >= SCHEMA_VERSION:
+                return
+        except Exception:
+            pass  # table might be empty or missing — proceed with full init
 
         # Core photos table
         cur.execute("""
@@ -286,6 +301,14 @@ class PhotoDB:
 
         # Migration: unique constraint on persons.name (schema v7)
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_persons_name_unique ON persons(LOWER(name))")
+
+        # Ignored clusters — hide unknown faces the user doesn't care about
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ignored_clusters (
+                cluster_id INTEGER PRIMARY KEY,
+                ignored_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
 
         # Review selections — persists shoot review picks
         cur.execute("""

@@ -316,6 +316,16 @@
       letter-spacing: 0.5px; margin-bottom: 8px;
     }
     .detail-section p { font-size: 14px; line-height: 1.6; }
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-row .label { color: var(--text-muted); }
+    .color-dots { display: flex; gap: 3px; margin-top: 4px; }
+    .color-dot { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); }
     .face-bbox-overlay {
       position: absolute; border: 2px solid var(--green); border-radius: 4px;
       pointer-events: none; box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
@@ -484,6 +494,24 @@
     const { useState, useEffect, useCallback, useRef, useMemo } = React;
     const e = React.createElement;
     const API = '';
+
+    // -----------------------------------------------------------------------
+    // Formatting helpers
+    // -----------------------------------------------------------------------
+    function formatFocalLength(fl) {
+      if (fl.includes('/')) {
+        const parts = fl.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(0) + 'mm';
+      }
+      return fl + 'mm';
+    }
+    function formatFNumber(fn) {
+      if (fn.includes('/')) {
+        const parts = fn.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(1);
+      }
+      return fn;
+    }
 
     // -----------------------------------------------------------------------
     // URL parameter helpers
@@ -662,6 +690,7 @@
             e('div', { className: 'detail-section' },
               e('h3', null, 'Photo'),
               e('p', { style: { fontWeight: 600, fontSize: 16 } }, photo.filename || ''),
+              detail && detail.filepath && e('p', { style: { color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 } }, detail.filepath),
               photo.date_taken && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, photo.date_taken),
               total > 1 && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, (index + 1) + ' / ' + total),
             ),
@@ -742,16 +771,117 @@
                     )
               ),
             ),
-            detail && detail.aesthetic_score != null && e('div', { className: 'detail-section' },
-              e('h3', null, 'Quality'),
-              e('span', {
-                style: {
-                  fontSize: 24, fontWeight: 600,
-                  color: detail.aesthetic_score >= 6 ? '#4ade80' : detail.aesthetic_score >= 4.5 ? '#facc15' : '#f87171',
-                },
-              }, detail.aesthetic_score.toFixed(1)),
-              e('span', { style: { fontSize: 13, color: 'var(--text-muted)', marginLeft: 6 } }, '/ 10'),
+            // Aesthetic quality
+            detail && detail.aesthetic_score != null &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Aesthetic Quality'),
+                (() => {
+                  const s = detail.aesthetic_score;
+                  const color = s >= 6 ? '#4ade80' : s >= 4.5 ? '#facc15' : '#f87171';
+                  const label = s >= 7 ? 'Excellent' : s >= 6 ? 'Good' : s >= 4.5 ? 'Average' : 'Below average';
+                  const concepts = detail.aesthetic_concepts;
+                  const critique = detail.aesthetic_critique;
+                  return e('div', null,
+                    e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 } },
+                      e('span', { style: { fontSize: 24, fontWeight: 600, color } }, s.toFixed(1)),
+                      e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } }, '/ 10 \u00B7 ' + label),
+                    ),
+                    e('div', { style: {
+                      height: 6, background: 'var(--surface2)', borderRadius: 3, overflow: 'hidden',
+                      marginBottom: concepts || critique ? 10 : 0,
+                    }},
+                      e('div', { style: {
+                        width: (s * 10) + '%', height: '100%', background: color, borderRadius: 3,
+                      }}),
+                    ),
+                    concepts && concepts.strengths && concepts.strengths.length > 0 &&
+                      e('div', { style: { fontSize: 13, marginBottom: 4 } },
+                        e('span', { style: { color: '#4ade80' } }, '\u25B2 '),
+                        e('span', { style: { color: 'var(--text-muted)' } }, 'Strengths: '),
+                        concepts.strengths.join(', '),
+                      ),
+                    concepts && concepts.weaknesses && concepts.weaknesses.length > 0 &&
+                      e('div', { style: { fontSize: 13, marginBottom: 4 } },
+                        e('span', { style: { color: '#f87171' } }, '\u25BC '),
+                        e('span', { style: { color: 'var(--text-muted)' } }, 'Weaknesses: '),
+                        concepts.weaknesses.join(', '),
+                      ),
+                    critique &&
+                      e('p', { style: { fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 6,
+                                         fontStyle: 'italic' } },
+                        critique,
+                      ),
+                  );
+                })(),
+              ),
+
+            // Tags
+            detail && detail.tags && detail.tags.length > 0 && e('div', { className: 'detail-section' },
+              e('h3', null, 'Tags'),
+              e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4 } },
+                ...detail.tags.map(function(tag) {
+                  return e('span', { key: tag, style: {
+                    fontSize: 12, padding: '2px 8px', borderRadius: 12,
+                    background: 'var(--surface2)', color: 'var(--text)',
+                    border: '1px solid var(--border)',
+                  } }, tag);
+                }),
+              ),
             ),
+
+            // Location
+            detail && detail.place_name && e('div', { className: 'detail-section' },
+              e('h3', null, 'Location'),
+              e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Place'),
+                e('span', null, detail.place_name),
+              ),
+            ),
+
+            // Camera info
+            detail && (detail.camera_model || detail.focal_length || detail.f_number || detail.iso) &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Camera'),
+                detail.camera_model && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Model'),
+                  e('span', null, detail.camera_model),
+                ),
+                detail.focal_length && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Focal Length'),
+                  e('span', null, formatFocalLength(detail.focal_length)),
+                ),
+                detail.exposure_time && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Exposure'),
+                  e('span', null, detail.exposure_time),
+                ),
+                detail.f_number && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Aperture'),
+                  e('span', null, 'f/' + formatFNumber(detail.f_number)),
+                ),
+                detail.iso && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'ISO'),
+                  e('span', null, detail.iso),
+                ),
+                detail.image_width && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Resolution'),
+                  e('span', null, detail.image_width + ' \u00D7 ' + detail.image_height),
+                ),
+              ),
+
+            // Colors
+            detail && detail.colors && detail.colors.length > 0 &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Dominant Colors'),
+                e('div', { className: 'color-dots', style: { gap: 6 } },
+                  ...detail.colors.map((c, i) =>
+                    e('span', {
+                      key: i, className: 'color-dot',
+                      style: { background: c, width: 20, height: 20 },
+                      title: c,
+                    })
+                  ),
+                ),
+              ),
           ),
         ),
       );
@@ -814,8 +944,10 @@
 
       const filteredGroups = useMemo(() => {
         if (filter === 'named') return groups.filter(g => g.type === 'person');
-        if (filter === 'unknown') return groups.filter(g => g.type === 'cluster');
-        return groups;
+        if (filter === 'unknown') return groups.filter(g => g.type === 'cluster' && !g.ignored);
+        if (filter === 'ignored') return groups.filter(g => g.ignored);
+        // 'all' — exclude ignored
+        return groups.filter(g => !g.ignored);
       }, [groups, filter]);
 
       const loadGroupPhotos = useCallback((group) => {
@@ -968,15 +1100,31 @@
       const multiInputRef = useRef(null);
 
       const groupKey = (g) => (g.type === 'person' ? 'p' : 'c') + (g.person_id || g.cluster_id);
+      const lastSelectedIdx = useRef(null); // index into filteredGroups
 
-      const toggleSelect = useCallback((g) => {
+      const toggleSelect = useCallback((g, ev) => {
         const key = groupKey(g);
         setSelected(prev => {
           const next = new Set(prev);
-          if (next.has(key)) next.delete(key); else next.add(key);
+          // Find index of clicked item in the visible grid
+          const clickedIdx = filteredGroups.findIndex(fg => groupKey(fg) === key);
+
+          if (ev && ev.shiftKey && lastSelectedIdx.current != null && clickedIdx >= 0) {
+            // Shift-click: select entire range between last click and this one
+            const lo = Math.min(lastSelectedIdx.current, clickedIdx);
+            const hi = Math.max(lastSelectedIdx.current, clickedIdx);
+            for (let i = lo; i <= hi; i++) {
+              next.add(groupKey(filteredGroups[i]));
+            }
+          } else {
+            // Normal click: toggle single item
+            if (next.has(key)) next.delete(key); else next.add(key);
+          }
+
+          if (clickedIdx >= 0) lastSelectedIdx.current = clickedIdx;
           return next;
         });
-      }, []);
+      }, [filteredGroups]);
 
       const exitMultiSelect = useCallback(() => {
         setMultiSelect(false);
@@ -985,6 +1133,7 @@
         setMultiName('');
         setMultiMergeTarget('');
         setMultiError('');
+        lastSelectedIdx.current = null;
       }, []);
 
       // Escape key exits multi-select
@@ -1101,8 +1250,51 @@
         });
       }, [runMultiAction, exitMultiSelect, loadGroups]);
 
+      // Ignore/unignore clusters
+      const doIgnore = useCallback((clusterIds) => {
+        fetch(API + '/api/faces/ignore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cluster_ids: clusterIds }),
+        }).then(() => loadGroups()).catch(() => {});
+      }, [loadGroups]);
+
+      const doUnignore = useCallback((clusterIds) => {
+        fetch(API + '/api/faces/unignore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cluster_ids: clusterIds }),
+        }).then(() => loadGroups()).catch(() => {});
+      }, [loadGroups]);
+
+      // Multi-select ignore: collect cluster_ids from selected groups
+      const doMultiIgnore = useCallback(() => {
+        const clusterIds = [];
+        for (const g of groups) {
+          if (selected.has(groupKey(g)) && g.type === 'cluster' && !g.ignored) {
+            clusterIds.push(g.cluster_id);
+          }
+        }
+        if (clusterIds.length === 0) return;
+        doIgnore(clusterIds);
+        exitMultiSelect();
+      }, [groups, selected, doIgnore, exitMultiSelect]);
+
+      const doMultiUnignore = useCallback(() => {
+        const clusterIds = [];
+        for (const g of groups) {
+          if (selected.has(groupKey(g)) && g.type === 'cluster' && g.ignored) {
+            clusterIds.push(g.cluster_id);
+          }
+        }
+        if (clusterIds.length === 0) return;
+        doUnignore(clusterIds);
+        exitMultiSelect();
+      }, [groups, selected, doUnignore, exitMultiSelect]);
+
       const namedCount = groups.filter(g => g.type === 'person').length;
-      const unknownCount = groups.filter(g => g.type === 'cluster').length;
+      const unknownCount = groups.filter(g => g.type === 'cluster' && !g.ignored).length;
+      const ignoredCount = groups.filter(g => g.ignored).length;
 
       return e('div', null,
         // Header
@@ -1118,14 +1310,15 @@
         e('div', { className: 'container' },
           e('div', { className: 'page-title' }, 'Faces'),
           e('div', { className: 'page-subtitle' },
-            namedCount + ' named \u00B7 ' + unknownCount + ' unknown'),
+            namedCount + ' named \u00B7 ' + unknownCount + ' unknown'
+            + (ignoredCount > 0 ? ' \u00B7 ' + ignoredCount + ' ignored' : '')),
 
           // Toolbar
           e('div', { className: 'toolbar' },
             e('button', {
               className: filter === 'all' ? 'active' : '',
               onClick: () => changeFilter('all'),
-            }, 'All (' + groups.length + ')'),
+            }, 'All (' + (namedCount + unknownCount) + ')'),
             e('button', {
               className: filter === 'named' ? 'active' : '',
               onClick: () => changeFilter('named'),
@@ -1134,6 +1327,10 @@
               className: filter === 'unknown' ? 'active' : '',
               onClick: () => changeFilter('unknown'),
             }, 'Unknown (' + unknownCount + ')'),
+            ignoredCount > 0 && e('button', {
+              className: filter === 'ignored' ? 'active' : '',
+              onClick: () => changeFilter('ignored'),
+            }, 'Ignored (' + ignoredCount + ')'),
             !multiSelect && e('button', {
               onClick: () => { setMultiSelect(true); setSelected(new Set()); setMultiAction(null); setMultiError(''); },
               style: { marginLeft: 'auto' },
@@ -1160,6 +1357,13 @@
               className: 'danger',
               onClick: () => { setMultiAction('clear'); },
             }, 'Clear Name'),
+            !multiAction && selected.size > 0 && filter !== 'ignored' && e('button', {
+              onClick: doMultiIgnore,
+              style: { color: 'var(--text-muted)' },
+            }, 'Ignore'),
+            !multiAction && selected.size > 0 && filter === 'ignored' && e('button', {
+              onClick: doMultiUnignore,
+            }, 'Unignore'),
 
             // Merge sub-action
             multiAction === 'merge' && e('select', {
@@ -1233,7 +1437,7 @@
                   key: key,
                   className: 'face-card' + (multiSelect ? ' selectable' : '') + (isSelected ? ' selected' : ''),
                   style: { position: 'relative' },
-                  onClick: () => multiSelect ? toggleSelect(g) : openGroup(g),
+                  onClick: (ev) => multiSelect ? toggleSelect(g, ev) : openGroup(g),
                 },
                   multiSelect && e('div', { className: 'select-check' }, isSelected ? '\u2713' : ''),
                   g.rep_face_id
@@ -1322,10 +1526,19 @@
                 !editing && !merging && e('div', { className: 'detail-stats' },
                   groupPhotos.length + ' photo' + (groupPhotos.length !== 1 ? 's' : '')),
               ),
-              !editing && !merging && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+              !editing && !merging && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
                 e('button', { className: 'rename-btn', onClick: startRename },
                   selectedGroup.label.startsWith('Unknown') ? 'Set Name' : 'Rename'),
                 mergeTargets.length > 0 && e('button', { className: 'rename-btn', onClick: startMerge }, 'Merge'),
+                selectedGroup.type === 'cluster' && !selectedGroup.ignored && e('button', {
+                  className: 'rename-btn',
+                  style: { color: 'var(--text-muted)' },
+                  onClick: () => { doIgnore([selectedGroup.cluster_id]); closeDetail(); },
+                }, 'Ignore'),
+                selectedGroup.type === 'cluster' && selectedGroup.ignored && e('button', {
+                  className: 'rename-btn',
+                  onClick: () => { doUnignore([selectedGroup.cluster_id]); closeDetail(); },
+                }, 'Unignore'),
               ),
               e('button', { className: 'detail-close', onClick: closeDetail }, '\u00D7'),
             ),

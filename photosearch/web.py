@@ -417,6 +417,12 @@ def api_face_groups(sort: str = Query("similarity")):
                 "rep_face_id": r["rep_face_id"],
             })
 
+        # Fetch ignored cluster IDs
+        ignored_set = set(
+            r["cluster_id"]
+            for r in db.conn.execute("SELECT cluster_id FROM ignored_clusters").fetchall()
+        )
+
         # Unknown clusters — single query with rep face via correlated subquery
         unknown_rows = db.conn.execute(
             """SELECT f.cluster_id,
@@ -441,6 +447,7 @@ def api_face_groups(sort: str = Query("similarity")):
                 "photo_count": r["photo_count"],
                 "face_count": r["face_count"],
                 "rep_face_id": r["rep_face_id"],
+                "ignored": r["cluster_id"] in ignored_set,
             })
 
         t1 = time.time()
@@ -645,6 +652,44 @@ def api_bulk_collect_faces(data: dict):
             face_ids.extend(r["id"] for r in rows)
 
     return {"face_ids": face_ids}
+
+
+@app.post("/api/faces/ignore")
+def api_ignore_clusters(data: dict):
+    """Mark clusters as ignored so they're hidden from the faces page.
+
+    Accepts: {"cluster_ids": [42, 82, ...]}
+    """
+    cluster_ids = data.get("cluster_ids", [])
+    if not cluster_ids:
+        return {"ok": True, "ignored": 0}
+    with _get_db() as db:
+        for cid in cluster_ids:
+            db.conn.execute(
+                "INSERT OR IGNORE INTO ignored_clusters (cluster_id) VALUES (?)",
+                (cid,),
+            )
+        db.conn.commit()
+    return {"ok": True, "ignored": len(cluster_ids)}
+
+
+@app.post("/api/faces/unignore")
+def api_unignore_clusters(data: dict):
+    """Remove clusters from the ignored list.
+
+    Accepts: {"cluster_ids": [42, 82, ...]}
+    """
+    cluster_ids = data.get("cluster_ids", [])
+    if not cluster_ids:
+        return {"ok": True, "unignored": 0}
+    with _get_db() as db:
+        placeholders = ",".join("?" * len(cluster_ids))
+        db.conn.execute(
+            f"DELETE FROM ignored_clusters WHERE cluster_id IN ({placeholders})",
+            cluster_ids,
+        )
+        db.conn.commit()
+    return {"ok": True, "unignored": len(cluster_ids)}
 
 
 @app.get("/api/faces/manual-assignments")
