@@ -183,7 +183,7 @@ TAG_VOCABULARY = [
     "person", "child", "group", "crowd", "portrait",
     # Activities
     "action", "sports", "playing", "walking", "swimming", "surfing",
-    "running", "climbing", "dancing", "eating", "cooking", "working",
+    "running", "jumping", "climbing", "dancing", "eating", "cooking", "working",
     # Scenes & settings
     "landscape", "seascape", "cityscape", "mountain", "forest", "desert",
     "beach", "ocean", "lake", "river", "waterfall", "sky", "sunset",
@@ -210,8 +210,8 @@ Tag this photo using ONLY tags from this list: {tags}
 Rules:
 - Return ONLY a comma-separated list of tags that apply. Nothing else.
 - Include every tag that clearly applies. Omit any that don't.
-- If you see a specific animal (e.g. hawk, deer), include "animal" AND "bird" or "wildlife" as appropriate.
-- If people are present, include "person" and relevant activity tags.
+- Look carefully for animals, birds, or insects even if small or partially hidden. If you see ANY animal (e.g. hawk, hummingbird, deer, dog), include "animal" AND the relevant type tag ("bird", "wildlife", "pet", "insect", "fish").
+- If people are present, include "person" and relevant activity tags (playing, jumping, running, etc.).
 - Include setting tags (beach, ocean, forest, etc.) and mood tags (dramatic, peaceful, etc.) when they apply.
 - Do NOT add tags that are not in the list above.
 """.format(tags=", ".join(TAG_VOCABULARY))

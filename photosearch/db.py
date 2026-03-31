@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -277,6 +277,20 @@ class PhotoDB:
         except sqlite3.OperationalError:
             cur.execute("ALTER TABLE photos ADD COLUMN tags TEXT")
 
+        # Review selections — persists shoot review picks
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS review_selections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                directory TEXT NOT NULL,
+                selected INTEGER NOT NULL DEFAULT 0,
+                cluster_id INTEGER,
+                rank_in_cluster INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(photo_id, directory)
+            )
+        """)
+
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
@@ -284,6 +298,8 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_review_dir ON review_selections(directory)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
 
         # sqlite-vec virtual tables for vector search
         if HAS_SQLITE_VEC:

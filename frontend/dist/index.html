@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .logo {
+      font-size: 18px;
+      font-weight: 600;
+      white-space: nowrap;
+      color: var(--text);
+    }
+    .logo span { color: var(--accent); }
+
+    /* Search form */
+    .search-form {
+      display: flex;
+      gap: 8px;
+      flex: 1;
+      max-width: 800px;
+    }
+    .search-input {
+      flex: 1;
+      padding: 10px 16px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 15px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .search-input:focus { border-color: var(--accent); }
+    .search-input::placeholder { color: var(--text-muted); }
+
+    .search-btn {
+      padding: 10px 20px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+    .search-btn:hover { background: var(--accent-hover); }
+    .search-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Filter bar */
+    .filters {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 12px 24px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .filter-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .filter-label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .filter-input {
+      padding: 6px 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+      width: 140px;
+    }
+    .filter-input:focus { border-color: var(--accent); }
+
+    .stats-bar {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-left: auto;
+    }
+
+    /* Photo grid */
+    .content {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 8px 24px 40px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 8px;
+    }
+    .grid-item {
+      position: relative;
+      aspect-ratio: 1;
+      overflow: hidden;
+      border-radius: var(--radius);
+      cursor: pointer;
+      background: var(--surface);
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    .grid-item:hover {
+      transform: scale(1.02);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+    .grid-item img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .grid-item .overlay {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 8px 10px;
+      background: linear-gradient(transparent, rgba(0,0,0,0.8));
+      font-size: 12px;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .grid-item:hover .overlay { opacity: 1; }
+    .overlay .filename { font-weight: 500; }
+    .overlay .score { color: var(--accent); float: right; }
+
+    /* Color dots */
+    .color-dots {
+      display: flex;
+      gap: 3px;
+      margin-top: 4px;
+    }
+    .color-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    /* Nav arrows */
+    .modal-nav {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(0,0,0,0.5);
+      border: none;
+      color: #fff;
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      font-size: 22px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 210;
+      transition: background 0.15s;
+    }
+    .modal-nav:hover { background: rgba(0,0,0,0.8); }
+    .modal-nav.prev { left: 16px; }
+    .modal-nav.next { right: 56px; }
+
+    /* Modal overlay */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal {
+      background: var(--surface);
+      border-radius: 12px;
+      max-width: 1200px;
+      width: 100%;
+      max-height: 90vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: row;
+    }
+    .modal-image {
+      flex: 1;
+      min-width: 0;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px 0 0 12px;
+      max-height: 90vh;
+    }
+    .modal-image img {
+      max-width: 100%;
+      max-height: 90vh;
+      object-fit: contain;
+    }
+    .modal-sidebar {
+      width: 340px;
+      flex-shrink: 0;
+      padding: 24px;
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      max-height: 90vh;
+    }
+    .modal-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      background: rgba(0,0,0,0.6);
+      border: none;
+      color: #fff;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      font-size: 20px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 210;
+    }
+    .modal-close:hover { background: rgba(0,0,0,0.8); }
+
+    .detail-section {
+      margin-bottom: 20px;
+    }
+    .detail-section h3 {
+      font-size: 13px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .detail-section p {
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-row .label { color: var(--text-muted); }
+    .face-tag {
+      display: inline-block;
+      padding: 4px 10px;
+      background: var(--surface2);
+      border-radius: 12px;
+      font-size: 13px;
+      margin: 2px 4px 2px 0;
+    }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--text-muted);
+    }
+    .empty-state h2 {
+      font-size: 24px;
+      color: var(--text);
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+    .empty-state p { font-size: 15px; max-width: 500px; margin: 0 auto 8px; }
+
+    .loading {
+      text-align: center;
+      padding: 60px;
+      color: var(--text-muted);
+      font-size: 15px;
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .header-inner { flex-wrap: wrap; }
+      .search-form { width: 100%; }
+      .modal { flex-direction: column; }
+      .modal-image { border-radius: 12px 12px 0 0; max-height: 50vh; }
+      .modal-sidebar { width: 100%; border-left: none; border-top: 1px solid var(--border); }
+      .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+
+  <script>
+    const { useState, useEffect, useCallback, useRef } = React;
+    const e = React.createElement;
+
+    const API = '';  // Same origin
+
+    // -----------------------------------------------------------------------
+    // App
+    // -----------------------------------------------------------------------
+    function App() {
+      const [query, setQuery] = useState('');
+      const [personFilter, setPersonFilter] = useState('');
+      const [colorFilter, setColorFilter] = useState('');
+      const [minQuality, setMinQuality] = useState('');
+      const [sortQuality, setSortQuality] = useState(false);
+      const [locationFilter, setLocationFilter] = useState('');
+      const [dateFrom, setDateFrom] = useState('');
+      const [dateTo, setDateTo] = useState('');
+      const [results, setResults] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [selectedPhoto, setSelectedPhoto] = useState(null);
+      const [photoDetail, setPhotoDetail] = useState(null);
+      const [stats, setStats] = useState(null);
+      const [persons, setPersons] = useState([]);
+      const inputRef = useRef(null);
+
+      // Load stats and persons on mount
+      useEffect(() => {
+        fetch(API + '/api/stats').then(r => r.json()).then(setStats).catch(() => {});
+        fetch(API + '/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
+        if (inputRef.current) inputRef.current.focus();
+      }, []);
+
+      const doSearch = useCallback((e) => {
+        if (e) e.preventDefault();
+        const mqVal = minQuality ? parseFloat(minQuality) : null;
+        if (!query && !personFilter && !colorFilter && !locationFilter && !dateFrom && !dateTo && mqVal == null) return;
+        setLoading(true);
+        setResults(null);
+
+        const params = new URLSearchParams();
+        if (query) params.set('q', query);
+        if (personFilter) params.set('person', personFilter);
+        if (colorFilter) params.set('color', colorFilter);
+        if (locationFilter) params.set('location', locationFilter);
+        if (dateFrom) params.set('date_from', dateFrom);
+        if (dateTo) params.set('date_to', dateTo);
+        if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
+        if (sortQuality) params.set('sort_quality', 'true');
+        params.set('limit', '100');
+
+        fetch(API + '/api/search?' + params.toString())
+          .then(r => r.json())
+          .then(data => {
+            setResults(data.results || []);
+            setLoading(false);
+          })
+          .catch(() => {
+            setResults([]);
+            setLoading(false);
+          });
+      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo]);
+
+      const [selectedIndex, setSelectedIndex] = useState(-1);
+
+      const openPhotoAt = useCallback((index) => {
+        if (!results || results.length === 0) return;
+        // Wrap around for looping
+        const i = ((index % results.length) + results.length) % results.length;
+        const photo = results[i];
+        setSelectedIndex(i);
+        setSelectedPhoto(photo);
+        setPhotoDetail(null);
+        fetch(API + '/api/photos/' + photo.id)
+          .then(r => r.json())
+          .then(setPhotoDetail)
+          .catch(() => {});
+      }, [results]);
+
+      const openPhoto = useCallback((photo) => {
+        const idx = results ? results.findIndex(r => r.id === photo.id) : -1;
+        openPhotoAt(idx >= 0 ? idx : 0);
+      }, [results, openPhotoAt]);
+
+      const closeModal = useCallback(() => {
+        setSelectedPhoto(null);
+        setSelectedIndex(-1);
+        setPhotoDetail(null);
+      }, []);
+
+      const goPrev = useCallback(() => { openPhotoAt(selectedIndex - 1); }, [selectedIndex, openPhotoAt]);
+      const goNext = useCallback(() => { openPhotoAt(selectedIndex + 1); }, [selectedIndex, openPhotoAt]);
+
+      // Keyboard: Escape closes modal, arrows navigate
+      useEffect(() => {
+        const handler = (ev) => {
+          if (!selectedPhoto) return;
+          if (ev.key === 'Escape') closeModal();
+          else if (ev.key === 'ArrowLeft') { ev.preventDefault(); goPrev(); }
+          else if (ev.key === 'ArrowRight') { ev.preventDefault(); goNext(); }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [selectedPhoto, closeModal, goPrev, goNext]);
+
+      return e('div', null,
+        // Header
+        e('div', { className: 'header' },
+          e('div', { className: 'header-inner' },
+            e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
+            e('a', { href: '/review', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Review'),
+            e('form', { className: 'search-form', onSubmit: doSearch },
+              e('input', {
+                ref: inputRef,
+                className: 'search-input',
+                type: 'text',
+                placeholder: 'Search photos... (e.g. "kids playing on the beach")',
+                value: query,
+                onChange: (ev) => setQuery(ev.target.value),
+              }),
+              e('button', {
+                className: 'search-btn',
+                type: 'submit',
+                disabled: loading,
+              }, loading ? 'Searching...' : 'Search'),
+            ),
+          ),
+        ),
+
+        // Filters bar
+        e('div', { className: 'filters' },
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Person:'),
+            e('select', {
+              className: 'filter-input',
+              value: personFilter,
+              onChange: (ev) => setPersonFilter(ev.target.value),
+              style: { width: 160 },
+            },
+              e('option', { value: '' }, 'Any'),
+              ...persons.map(p =>
+                e('option', { key: p.id, value: p.name },
+                  p.name + ' (' + p.photo_count + ')')
+              ),
+            ),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Color:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'text',
+              placeholder: 'blue, #ff0000',
+              value: colorFilter,
+              onChange: (ev) => setColorFilter(ev.target.value),
+              style: { width: 120 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Location:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'text',
+              placeholder: 'Hawaii, Paris...',
+              value: locationFilter,
+              onChange: (ev) => setLocationFilter(ev.target.value),
+              style: { width: 130 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'From:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'date',
+              value: dateFrom,
+              onChange: (ev) => setDateFrom(ev.target.value),
+              style: { width: 130 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'To:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'date',
+              value: dateTo,
+              onChange: (ev) => setDateTo(ev.target.value),
+              style: { width: 130 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Min quality:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'number',
+              placeholder: '1–10',
+              value: minQuality,
+              onChange: (ev) => setMinQuality(ev.target.value),
+              min: 1, max: 10, step: 0.5,
+              style: { width: 72 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('label', {
+              style: { display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
+                       fontSize: 13, color: 'var(--text-muted)' },
+            },
+              e('input', {
+                type: 'checkbox',
+                checked: sortQuality,
+                onChange: (ev) => setSortQuality(ev.target.checked),
+              }),
+              'Sort by quality',
+            ),
+          ),
+          stats && e('div', { className: 'stats-bar' },
+            stats.photos + ' photos indexed · ' +
+            stats.described + ' described · ' +
+            (stats.quality_scored || 0) + ' scored' +
+            (stats.quality_stats ? ' (' + stats.quality_stats.min + '–' + stats.quality_stats.max + ')' : '')
+          ),
+        ),
+
+        // Content
+        e('div', { className: 'content' },
+          results === null && !loading && e(EmptyState),
+          loading && e('div', { className: 'loading' }, 'Searching...'),
+          results !== null && !loading && results.length === 0 &&
+            e('div', { className: 'loading' }, 'No results found.'),
+          results !== null && results.length > 0 &&
+            e(PhotoGrid, { results, onSelect: openPhoto }),
+        ),
+
+        // Modal
+        selectedPhoto && e(PhotoModal, {
+          photo: selectedPhoto,
+          detail: photoDetail,
+          onClose: closeModal,
+          onPrev: goPrev,
+          onNext: goNext,
+          index: selectedIndex,
+          total: results ? results.length : 0,
+        }),
+      );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Empty state
+    // -----------------------------------------------------------------------
+    function EmptyState() {
+      return e('div', { className: 'empty-state' },
+        e('h2', null, 'Search your photo library'),
+        e('p', null, 'Describe what you\'re looking for in natural language, filter by person or color, or combine them.'),
+        e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } },
+          'Try: "people outdoors" · "kids playing" · "sunset" · "bird on a branch"'
+        ),
+      );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Photo grid
+    // -----------------------------------------------------------------------
+    function PhotoGrid({ results, onSelect }) {
+      return e('div', null,
+        e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)' } },
+          results.length + ' result' + (results.length !== 1 ? 's' : ''),
+        ),
+        e('div', { className: 'grid' },
+          ...results.map(photo =>
+            e(GridItem, { key: photo.id, photo, onClick: () => onSelect(photo) })
+          ),
+        ),
+      );
+    }
+
+    function GridItem({ photo, onClick }) {
+      const [loaded, setLoaded] = useState(false);
+      const [error, setError] = useState(false);
+
+      return e('div', { className: 'grid-item', onClick },
+        !error && e('img', {
+          src: API + '/api/photos/' + photo.id + '/thumbnail?v=' + encodeURIComponent(photo.filename),
+          alt: photo.filename,
+          loading: 'lazy',
+          onLoad: () => setLoaded(true),
+          onError: () => setError(true),
+          style: loaded ? {} : { opacity: 0 },
+        }),
+        error && e('div', {
+          style: {
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            height: '100%', color: 'var(--text-muted)', fontSize: 13,
+          }
+        }, photo.filename),
+        e('div', { className: 'overlay' },
+          e('span', { className: 'filename' }, photo.filename),
+          e('span', { style: { float: 'right', display: 'flex', gap: 8 } },
+            photo.aesthetic_score != null && e('span', {
+              style: { color: photo.aesthetic_score >= 6 ? '#4ade80' : photo.aesthetic_score >= 4.5 ? '#facc15' : '#f87171' },
+              title: 'Aesthetic quality',
+            }, '\u2605' + photo.aesthetic_score.toFixed(1)),
+            photo.score != null && e('span', { className: 'score' }, photo.score.toFixed(3)),
+          ),
+          photo.colors && photo.colors.length > 0 &&
+            e('div', { className: 'color-dots' },
+              ...photo.colors.slice(0, 5).map((c, i) =>
+                e('span', { key: i, className: 'color-dot', style: { background: c } })
+              ),
+            ),
+        ),
+      );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Photo modal
+    // -----------------------------------------------------------------------
+    function PhotoModal({ photo, detail, onClose, onPrev, onNext, index, total }) {
+      return e('div', { className: 'modal-overlay', onClick: (ev) => {
+        if (ev.target === ev.currentTarget) onClose();
+      }},
+        e('button', { className: 'modal-close', onClick: onClose }, '\u00D7'),
+        total > 1 && e('button', { className: 'modal-nav prev', onClick: (ev) => { ev.stopPropagation(); onPrev(); }, title: 'Previous (\u2190)' }, '\u2039'),
+        total > 1 && e('button', { className: 'modal-nav next', onClick: (ev) => { ev.stopPropagation(); onNext(); }, title: 'Next (\u2192)' }, '\u203A'),
+        e('div', { className: 'modal' },
+          e('div', { className: 'modal-image' },
+            e('img', {
+              src: API + '/api/photos/' + photo.id + '/full',
+              alt: photo.filename,
+            }),
+          ),
+          e('div', { className: 'modal-sidebar' },
+            // Filename
+            e('div', { className: 'detail-section' },
+              e('h3', null, 'Photo'),
+              e('p', { style: { fontWeight: 600, fontSize: 16 } }, photo.filename),
+              e('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
+                photo.date_taken && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } },
+                  photo.date_taken),
+                total > 1 && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } },
+                  (index + 1) + ' / ' + total),
+              ),
+            ),
+
+            // Description
+            (detail || photo).description && e('div', { className: 'detail-section' },
+              e('h3', null, 'Description'),
+              e('p', null, (detail || photo).description),
+            ),
+
+            // Faces
+            detail && detail.faces && detail.faces.length > 0 && e('div', { className: 'detail-section' },
+              e('h3', null, 'People'),
+              ...detail.faces.map(f =>
+                e('span', { key: f.id, className: 'face-tag' },
+                  f.person_name || ('Unknown #' + (f.cluster_id || '?'))
+                )
+              ),
+            ),
+
+            // Aesthetic quality
+            (detail && detail.aesthetic_score != null || photo.aesthetic_score != null) &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Aesthetic Quality'),
+                (() => {
+                  const s = (detail && detail.aesthetic_score) || photo.aesthetic_score;
+                  const color = s >= 6 ? '#4ade80' : s >= 4.5 ? '#facc15' : '#f87171';
+                  const label = s >= 7 ? 'Excellent' : s >= 6 ? 'Good' : s >= 4.5 ? 'Average' : 'Below average';
+                  const concepts = detail && detail.aesthetic_concepts;
+                  const critique = detail && detail.aesthetic_critique;
+                  return e('div', null,
+                    e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 } },
+                      e('span', { style: { fontSize: 24, fontWeight: 600, color } }, s.toFixed(1)),
+                      e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } }, '/ 10 · ' + label),
+                    ),
+                    e('div', { style: {
+                      height: 6, background: 'var(--surface2)', borderRadius: 3, overflow: 'hidden',
+                      marginBottom: concepts || critique ? 10 : 0,
+                    }},
+                      e('div', { style: {
+                        width: (s * 10) + '%', height: '100%', background: color, borderRadius: 3,
+                      }}),
+                    ),
+                    // Concept strengths and weaknesses
+                    concepts && concepts.strengths && concepts.strengths.length > 0 &&
+                      e('div', { style: { fontSize: 13, marginBottom: 4 } },
+                        e('span', { style: { color: '#4ade80' } }, '\u25B2 '),
+                        e('span', { style: { color: 'var(--text-muted)' } }, 'Strengths: '),
+                        concepts.strengths.join(', '),
+                      ),
+                    concepts && concepts.weaknesses && concepts.weaknesses.length > 0 &&
+                      e('div', { style: { fontSize: 13, marginBottom: 4 } },
+                        e('span', { style: { color: '#f87171' } }, '\u25BC '),
+                        e('span', { style: { color: 'var(--text-muted)' } }, 'Weaknesses: '),
+                        concepts.weaknesses.join(', '),
+                      ),
+                    // LLM critique
+                    critique &&
+                      e('p', { style: { fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 6,
+                                         fontStyle: 'italic' } },
+                        critique,
+                      ),
+                  );
+                })(),
+              ),
+
+            // Tags
+            detail && detail.tags && detail.tags.length > 0 && e('div', { className: 'detail-section' },
+              e('h3', null, 'Tags'),
+              e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4 } },
+                ...detail.tags.map(function(tag) {
+                  return e('span', { key: tag, style: {
+                    fontSize: 12, padding: '2px 8px', borderRadius: 12,
+                    background: 'var(--hover)', color: 'var(--text)',
+                    border: '1px solid var(--border)',
+                  } }, tag);
+                }),
+              ),
+            ),
+
+            // Score
+            photo.score != null && e('div', { className: 'detail-section' },
+              e('h3', null, 'Search Score'),
+              e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Combined'),
+                e('span', null, photo.score.toFixed(4)),
+              ),
+              photo.clip_score != null && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'CLIP'),
+                e('span', null, photo.clip_score.toFixed(4)),
+              ),
+            ),
+
+            // Location
+            detail && detail.place_name && e('div', { className: 'detail-section' },
+              e('h3', null, 'Location'),
+              e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Place'),
+                e('span', null, detail.place_name),
+              ),
+            ),
+
+            // Camera info
+            detail && e('div', { className: 'detail-section' },
+              e('h3', null, 'Camera'),
+              detail.camera_model && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Model'),
+                e('span', null, detail.camera_model),
+              ),
+              detail.focal_length && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Focal Length'),
+                e('span', null, formatFocalLength(detail.focal_length)),
+              ),
+              detail.exposure_time && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Exposure'),
+                e('span', null, detail.exposure_time),
+              ),
+              detail.f_number && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Aperture'),
+                e('span', null, 'f/' + formatFNumber(detail.f_number)),
+              ),
+              detail.iso && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'ISO'),
+                e('span', null, detail.iso),
+              ),
+              detail.image_width && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Resolution'),
+                e('span', null, detail.image_width + ' \u00D7 ' + detail.image_height),
+              ),
+            ),
+
+            // Colors
+            (detail || photo).colors && (detail || photo).colors.length > 0 &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Dominant Colors'),
+                e('div', { className: 'color-dots', style: { gap: 6 } },
+                  ...(detail || photo).colors.map((c, i) =>
+                    e('span', {
+                      key: i, className: 'color-dot',
+                      style: { background: c, width: 20, height: 20 },
+                      title: c,
+                    })
+                  ),
+                ),
+              ),
+          ),
+        ),
+      );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+    function formatFocalLength(fl) {
+      if (fl.includes('/')) {
+        const parts = fl.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(0) + 'mm';
+      }
+      return fl + 'mm';
+    }
+
+    function formatFNumber(fn) {
+      if (fn.includes('/')) {
+        const parts = fn.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(1);
+      }
+      return fn;
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Mount
+    // -----------------------------------------------------------------------
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>

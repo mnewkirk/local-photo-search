@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shoot Review — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .logo {
+      font-size: 18px;
+      font-weight: 600;
+      white-space: nowrap;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .logo span { color: var(--accent); }
+    .logo .mode { color: var(--green); font-size: 14px; margin-left: 8px; }
+
+    /* Controls bar */
+    .controls {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 12px 24px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .control-label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    select, .ctrl-input {
+      padding: 6px 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+    }
+    select:focus, .ctrl-input:focus { border-color: var(--accent); }
+
+    .btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+      white-space: nowrap;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-green { background: var(--green); color: #000; }
+    .btn-green:hover:not(:disabled) { background: #22c55e; }
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-outline:hover:not(:disabled) { background: var(--surface2); }
+
+    .stats-bar {
+      margin-left: auto;
+      font-size: 13px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+    .stat-highlight { color: var(--green); font-weight: 600; }
+
+    /* View toggle */
+    .view-toggle {
+      display: flex;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .view-toggle button {
+      padding: 6px 12px;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .view-toggle button.active {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    /* Photo grid */
+    .content {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 8px 24px 40px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 6px;
+    }
+    .grid.large { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+
+    .grid-item {
+      position: relative;
+      aspect-ratio: 1;
+      overflow: hidden;
+      border-radius: var(--radius);
+      cursor: pointer;
+      background: var(--surface);
+      transition: transform 0.15s, box-shadow 0.15s, opacity 0.3s, filter 0.3s;
+    }
+    .grid-item:hover {
+      transform: scale(1.02);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+    .grid-item img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    /* Unselected photos: dimmed and blurred when filter is "selected only" or "obscure" mode */
+    .grid-item.dimmed {
+      opacity: 0.25;
+      filter: grayscale(0.8);
+    }
+    .grid-item.dimmed:hover {
+      opacity: 0.6;
+      filter: grayscale(0.3);
+    }
+    .grid-item.hidden-item { display: none; }
+
+    /* Cluster view */
+    .cluster-section {
+      margin-bottom: 16px;
+    }
+    .cluster-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 4px 6px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 6px;
+    }
+    .cluster-header .cluster-label {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent);
+      min-width: 40px;
+    }
+    .cluster-header .cluster-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 12px;
+    }
+    .cluster-header .cluster-meta .has-selection {
+      color: var(--green);
+    }
+
+    /* Selection badge */
+    .select-badge {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.6);
+      background: rgba(0,0,0,0.4);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      z-index: 5;
+      transition: all 0.15s;
+      cursor: pointer;
+    }
+    .select-badge.checked {
+      background: var(--green);
+      border-color: var(--green);
+      color: #000;
+    }
+
+    /* Cluster indicator */
+    .cluster-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.6);
+      font-size: 11px;
+      color: var(--text-muted);
+      z-index: 5;
+    }
+
+    /* Quality score */
+    .quality-badge {
+      position: absolute;
+      bottom: 8px;
+      right: 8px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 12px;
+      font-weight: 600;
+      z-index: 5;
+    }
+
+    /* Overlay with filename */
+    .grid-item .overlay {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 6px 10px;
+      background: linear-gradient(transparent, rgba(0,0,0,0.8));
+      font-size: 11px;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .grid-item:hover .overlay { opacity: 1; }
+
+    /* Raw file indicator */
+    .raw-badge {
+      position: absolute;
+      bottom: 8px;
+      left: 8px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(74, 158, 255, 0.8);
+      font-size: 10px;
+      font-weight: 600;
+      color: #fff;
+      z-index: 5;
+    }
+
+    /* Modal overlay */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal {
+      background: var(--surface);
+      border-radius: 12px;
+      max-width: 1200px;
+      width: 100%;
+      max-height: 90vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: row;
+    }
+    .modal-image {
+      flex: 1;
+      min-width: 0;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px 0 0 12px;
+      max-height: 90vh;
+    }
+    .modal-image img {
+      max-width: 100%;
+      max-height: 90vh;
+      object-fit: contain;
+    }
+    .modal-sidebar {
+      width: 320px;
+      flex-shrink: 0;
+      padding: 24px;
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      max-height: 90vh;
+    }
+    .modal-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      background: rgba(0,0,0,0.6);
+      border: none;
+      color: #fff;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      font-size: 20px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 210;
+    }
+    .modal-nav {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(0,0,0,0.5);
+      border: none;
+      color: #fff;
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      font-size: 22px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 210;
+    }
+    .modal-nav.prev { left: 16px; }
+    .modal-nav.next { right: 356px; }
+
+    .detail-section { margin-bottom: 16px; }
+    .detail-section h3 {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 3px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-row .label { color: var(--text-muted); }
+
+    /* Export modal */
+    .export-modal {
+      background: var(--surface);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 500px;
+      width: 100%;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .export-modal h2 {
+      font-size: 18px;
+      margin-bottom: 16px;
+    }
+    .export-list {
+      max-height: 400px;
+      overflow-y: auto;
+      margin: 12px 0;
+      font-family: monospace;
+      font-size: 12px;
+      background: var(--surface2);
+      padding: 12px;
+      border-radius: var(--radius);
+      line-height: 1.8;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 80px 20px;
+      color: var(--text-muted);
+    }
+    .empty-state h2 {
+      font-size: 24px;
+      color: var(--text);
+      margin-bottom: 12px;
+      font-weight: 500;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 60px;
+      color: var(--text-muted);
+      font-size: 15px;
+    }
+
+    @media (max-width: 768px) {
+      .controls { flex-direction: column; align-items: flex-start; }
+      .stats-bar { margin-left: 0; }
+      .grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+      .modal { flex-direction: column; }
+      .modal-image { border-radius: 12px 12px 0 0; max-height: 50vh; }
+      .modal-sidebar { width: 100%; border-left: none; border-top: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+
+  <script>
+    const { useState, useEffect, useCallback, useRef, useMemo } = React;
+    const e = React.createElement;
+    const API = '';
+
+    // -----------------------------------------------------------------------
+    // App
+    // -----------------------------------------------------------------------
+    function App() {
+      const [folders, setFolders] = useState([]);
+      const [selectedFolder, setSelectedFolder] = useState('');
+      const [photos, setPhotos] = useState([]);
+      const [stats, setStats] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [viewMode, setViewMode] = useState('all');       // all | selected | obscure | clusters
+      const [gridSize, setGridSize] = useState('normal');     // normal | large
+      const [modalPhoto, setModalPhoto] = useState(null);
+      const [modalDetail, setModalDetail] = useState(null);
+      const [showExport, setShowExport] = useState(false);
+      const [exportFiles, setExportFiles] = useState([]);
+      const [exportRaw, setExportRaw] = useState(false);
+      const [targetPct, setTargetPct] = useState('10');
+      const [threshold, setThreshold] = useState('0');
+
+      // Load folders on mount
+      useEffect(() => {
+        fetch(API + '/api/review/folders')
+          .then(r => r.json())
+          .then(d => setFolders(d.folders || []))
+          .catch(() => {});
+      }, []);
+
+      const runReview = useCallback(() => {
+        if (!selectedFolder) return;
+        setLoading(true);
+        setPhotos([]);
+        setStats(null);
+        const params = new URLSearchParams({
+          directory: selectedFolder,
+          target_pct: targetPct === '' ? 0.10 : parseFloat(targetPct) / 100,
+          distance_threshold: threshold === '' ? 0.0 : parseFloat(threshold),
+        });
+        fetch(API + '/api/review/run?' + params)
+          .then(r => r.json())
+          .then(data => {
+            setPhotos(data.photos || []);
+            setStats(data.stats || null);
+            setLoading(false);
+          })
+          .catch(() => { setLoading(false); });
+      }, [selectedFolder, targetPct, threshold]);
+
+      const loadExisting = useCallback(() => {
+        if (!selectedFolder) return;
+        setLoading(true);
+        fetch(API + '/api/review/load?directory=' + encodeURIComponent(selectedFolder))
+          .then(r => r.json())
+          .then(data => {
+            if (data.photos && data.photos.length > 0) {
+              setPhotos(data.photos);
+              setStats(data.stats || null);
+            }
+            setLoading(false);
+          })
+          .catch(() => { setLoading(false); });
+      }, [selectedFolder]);
+
+      // Auto-load existing selections when folder changes
+      useEffect(() => {
+        if (selectedFolder) loadExisting();
+      }, [selectedFolder]);
+
+      const togglePhoto = useCallback((photoId) => {
+        setPhotos(prev => {
+          const updated = prev.map(p => {
+            if (p.id === photoId) return { ...p, selected: !p.selected };
+            return p;
+          });
+          // Update server
+          const photo = updated.find(p => p.id === photoId);
+          if (photo) {
+            fetch(API + '/api/review/toggle/' + photoId + '?selected=' + photo.selected, { method: 'POST' });
+          }
+          return updated;
+        });
+        // Update stats
+        setStats(prev => {
+          if (!prev) return prev;
+          const photo = photos.find(p => p.id === photoId);
+          const delta = photo && photo.selected ? -1 : 1;
+          const newSelected = prev.selected + delta;
+          return {
+            ...prev,
+            selected: newSelected,
+            pct: prev.total > 0 ? Math.round(newSelected / prev.total * 1000) / 10 : 0,
+          };
+        });
+      }, [photos]);
+
+      const visiblePhotos = useMemo(() => {
+        if (viewMode === 'selected') return photos.filter(p => p.selected);
+        return photos;
+      }, [photos, viewMode]);
+
+      // Group photos by cluster for cluster view
+      const clusterGroups = useMemo(() => {
+        if (viewMode !== 'clusters') return null;
+        const groups = {};
+        for (const p of photos) {
+          const cid = p.cluster_id != null ? p.cluster_id : -1;
+          if (!groups[cid]) groups[cid] = [];
+          groups[cid].push(p);
+        }
+        // Sort clusters: by cluster ID ascending
+        const sorted = Object.entries(groups)
+          .map(([cid, members]) => ({
+            cid: parseInt(cid),
+            members: members.sort((a, b) => (b.aesthetic_score || 0) - (a.aesthetic_score || 0)),
+            selectedCount: members.filter(m => m.selected).length,
+          }))
+          .sort((a, b) => a.cid - b.cid);
+        return sorted;
+      }, [photos, viewMode]);
+
+      const openExport = useCallback(() => {
+        if (!selectedFolder) return;
+        const params = new URLSearchParams({
+          directory: selectedFolder,
+          include_raw: exportRaw,
+        });
+        fetch(API + '/api/review/export?' + params)
+          .then(r => r.json())
+          .then(data => {
+            setExportFiles(data.files || []);
+            setShowExport(true);
+          })
+          .catch(() => {});
+      }, [selectedFolder, exportRaw]);
+
+      const copyExportList = useCallback(() => {
+        const text = exportFiles.map(f => f.path).join('\n');
+        navigator.clipboard.writeText(text).catch(() => {});
+      }, [exportFiles]);
+
+      // Modal navigation
+      const [modalIndex, setModalIndex] = useState(-1);
+
+      const openModal = useCallback((photo) => {
+        const idx = visiblePhotos.findIndex(p => p.id === photo.id);
+        setModalPhoto(photo);
+        setModalIndex(idx >= 0 ? idx : 0);
+        setModalDetail(null);
+        fetch(API + '/api/photos/' + photo.id)
+          .then(r => r.json())
+          .then(setModalDetail)
+          .catch(() => {});
+      }, [visiblePhotos]);
+
+      const openModalAt = useCallback((index) => {
+        if (!visiblePhotos.length) return;
+        const i = ((index % visiblePhotos.length) + visiblePhotos.length) % visiblePhotos.length;
+        const photo = visiblePhotos[i];
+        setModalPhoto(photo);
+        setModalIndex(i);
+        setModalDetail(null);
+        fetch(API + '/api/photos/' + photo.id)
+          .then(r => r.json())
+          .then(setModalDetail)
+          .catch(() => {});
+      }, [visiblePhotos]);
+
+      const closeModal = useCallback(() => {
+        setModalPhoto(null);
+        setModalIndex(-1);
+        setModalDetail(null);
+      }, []);
+
+      const goPrev = useCallback(() => openModalAt(modalIndex - 1), [modalIndex, openModalAt]);
+      const goNext = useCallback(() => openModalAt(modalIndex + 1), [modalIndex, openModalAt]);
+
+      // Keyboard shortcuts
+      useEffect(() => {
+        const handler = (ev) => {
+          if (showExport) {
+            if (ev.key === 'Escape') setShowExport(false);
+            return;
+          }
+          if (modalPhoto) {
+            if (ev.key === 'Escape') closeModal();
+            else if (ev.key === 'ArrowLeft') { ev.preventDefault(); goPrev(); }
+            else if (ev.key === 'ArrowRight') { ev.preventDefault(); goNext(); }
+            else if (ev.key === 's' || ev.key === 'x') {
+              ev.preventDefault();
+              togglePhoto(modalPhoto.id);
+              // Update modal photo state
+              setModalPhoto(prev => prev ? { ...prev, selected: !prev.selected } : prev);
+            }
+          }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [modalPhoto, showExport, closeModal, goPrev, goNext, togglePhoto]);
+
+      return e('div', null,
+        // Header
+        e('div', { className: 'header' },
+          e('div', { className: 'header-inner' },
+            e('a', { className: 'logo', href: '/' },
+              e('span', null, 'photo'), 'search',
+              e('span', { className: 'mode' }, ' / review'),
+            ),
+            // Folder selector
+            e('div', { className: 'control-group' },
+              e('select', {
+                value: selectedFolder,
+                onChange: (ev) => setSelectedFolder(ev.target.value),
+                style: { minWidth: 250 },
+              },
+                e('option', { value: '' }, 'Select a folder...'),
+                ...folders.map(f => e('option', { key: f, value: f }, f)),
+              ),
+            ),
+            // Target %
+            e('div', { className: 'control-group' },
+              e('span', { className: 'control-label' }, 'Target:'),
+              e('input', {
+                className: 'ctrl-input',
+                type: 'number',
+                value: targetPct,
+                onChange: (ev) => setTargetPct(ev.target.value),
+                min: 1, max: 50, step: 1,
+                style: { width: 50 },
+              }),
+              e('span', { className: 'control-label' }, '%'),
+            ),
+            // Run button
+            e('button', {
+              className: 'btn btn-primary',
+              onClick: runReview,
+              disabled: !selectedFolder || loading,
+            }, loading ? 'Analyzing...' : 'Run Review'),
+          ),
+        ),
+
+        // Controls bar
+        photos.length > 0 && e('div', { className: 'controls' },
+          // View mode toggle
+          e('div', { className: 'view-toggle' },
+            e('button', {
+              className: viewMode === 'all' ? 'active' : '',
+              onClick: () => setViewMode('all'),
+            }, 'All'),
+            e('button', {
+              className: viewMode === 'obscure' ? 'active' : '',
+              onClick: () => setViewMode('obscure'),
+            }, 'Obscure Unselected'),
+            e('button', {
+              className: viewMode === 'selected' ? 'active' : '',
+              onClick: () => setViewMode('selected'),
+            }, 'Selected Only'),
+            e('button', {
+              className: viewMode === 'clusters' ? 'active' : '',
+              onClick: () => setViewMode('clusters'),
+            }, 'Clusters'),
+          ),
+
+          // Grid size
+          e('div', { className: 'view-toggle' },
+            e('button', {
+              className: gridSize === 'normal' ? 'active' : '',
+              onClick: () => setGridSize('normal'),
+            }, 'Grid'),
+            e('button', {
+              className: gridSize === 'large' ? 'active' : '',
+              onClick: () => setGridSize('large'),
+            }, 'Large'),
+          ),
+
+          // Export controls
+          e('div', { className: 'control-group' },
+            e('label', { style: { display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 13, color: 'var(--text-muted)' } },
+              e('input', {
+                type: 'checkbox',
+                checked: exportRaw,
+                onChange: (ev) => setExportRaw(ev.target.checked),
+              }),
+              'Include ARW',
+            ),
+          ),
+          e('button', {
+            className: 'btn btn-green',
+            onClick: openExport,
+            disabled: !stats || stats.selected === 0,
+          }, 'Export Selected'),
+
+          // Stats
+          stats && e('div', { className: 'stats-bar' },
+            e('span', null, stats.total + ' photos'),
+            e('span', null, stats.clusters + ' clusters'),
+            e('span', null,
+              e('span', { className: 'stat-highlight' }, stats.selected + ' selected'),
+              ' (' + stats.pct + '%)',
+            ),
+            e('span', { style: { fontSize: 11, color: 'var(--text-muted)' } },
+              'S/X to toggle in modal',
+            ),
+          ),
+        ),
+
+        // Content
+        e('div', { className: 'content' },
+          !photos.length && !loading && e('div', { className: 'empty-state' },
+            e('h2', null, 'Shoot Review'),
+            e('p', null, 'Select a folder to analyze. The algorithm will cluster visually similar photos and pick the best from each group.'),
+            e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } },
+              'Aim for ~10% of your shoot \u2014 the best, most diverse selection.'),
+          ),
+          loading && e('div', { className: 'loading' }, 'Analyzing photos and clustering...'),
+          // Cluster view
+          photos.length > 0 && !loading && viewMode === 'clusters' && clusterGroups &&
+            clusterGroups.map(group =>
+              e('div', { key: group.cid, className: 'cluster-section' },
+                e('div', { className: 'cluster-header' },
+                  e('span', { className: 'cluster-label' }, 'C' + group.cid),
+                  e('div', { className: 'cluster-meta' },
+                    e('span', null, group.members.length + ' photo' + (group.members.length !== 1 ? 's' : '')),
+                    e('span', { className: group.selectedCount > 0 ? 'has-selection' : '' },
+                      group.selectedCount + ' selected'),
+                  ),
+                ),
+                e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
+                  ...group.members.map(photo => e(ReviewGridItem, {
+                    key: photo.id,
+                    photo: photo,
+                    dimmed: !photo.selected,
+                    onClick: () => openModal(photo),
+                    onToggle: (ev) => { ev.stopPropagation(); togglePhoto(photo.id); },
+                  })),
+                ),
+              )
+            ),
+          // Normal grid views
+          photos.length > 0 && !loading && viewMode !== 'clusters' && e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
+            ...visiblePhotos.map(photo => e(ReviewGridItem, {
+              key: photo.id,
+              photo: photo,
+              dimmed: viewMode === 'obscure' && !photo.selected,
+              onClick: () => openModal(photo),
+              onToggle: (ev) => { ev.stopPropagation(); togglePhoto(photo.id); },
+            })),
+          ),
+        ),
+
+        // Photo modal
+        modalPhoto && e('div', { className: 'modal-overlay', onClick: (ev) => {
+          if (ev.target === ev.currentTarget) closeModal();
+        }},
+          e('button', { className: 'modal-close', onClick: closeModal }, '\u00D7'),
+          visiblePhotos.length > 1 && e('button', { className: 'modal-nav prev', onClick: (ev) => { ev.stopPropagation(); goPrev(); } }, '\u2039'),
+          visiblePhotos.length > 1 && e('button', { className: 'modal-nav next', onClick: (ev) => { ev.stopPropagation(); goNext(); } }, '\u203A'),
+          e('div', { className: 'modal' },
+            e('div', { className: 'modal-image' },
+              e('img', {
+                src: API + '/api/photos/' + modalPhoto.id + '/full',
+                alt: modalPhoto.filename,
+              }),
+            ),
+            e('div', { className: 'modal-sidebar' },
+              // Selection toggle
+              e('div', { className: 'detail-section' },
+                e('button', {
+                  className: 'btn ' + (modalPhoto.selected ? 'btn-green' : 'btn-outline'),
+                  onClick: () => {
+                    togglePhoto(modalPhoto.id);
+                    setModalPhoto(prev => prev ? { ...prev, selected: !prev.selected } : prev);
+                  },
+                  style: { width: '100%', marginBottom: 8 },
+                }, modalPhoto.selected ? '\u2713 Selected' : 'Select this photo'),
+                e('div', { style: { fontSize: 11, color: 'var(--text-muted)', textAlign: 'center' } },
+                  'Press S or X to toggle'),
+              ),
+
+              // Photo info
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Photo'),
+                e('p', { style: { fontWeight: 600, fontSize: 14 } }, modalPhoto.filename),
+                modalPhoto.date_taken && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, modalPhoto.date_taken),
+              ),
+
+              // Quality
+              modalPhoto.aesthetic_score != null && e('div', { className: 'detail-section' },
+                e('h3', null, 'Quality'),
+                (() => {
+                  const s = modalPhoto.aesthetic_score;
+                  const color = s >= 6 ? 'var(--green)' : s >= 4.5 ? 'var(--yellow)' : 'var(--red)';
+                  return e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8 } },
+                    e('span', { style: { fontSize: 24, fontWeight: 600, color } }, s.toFixed(1)),
+                    e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } }, '/ 10'),
+                  );
+                })(),
+              ),
+
+              // Cluster info
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Cluster'),
+                e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Cluster #'),
+                  e('span', null, modalPhoto.cluster_id),
+                ),
+                e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Rank in cluster'),
+                  e('span', null, '#' + modalPhoto.rank_in_cluster),
+                ),
+              ),
+
+              // Description (from detail endpoint)
+              modalDetail && modalDetail.description && e('div', { className: 'detail-section' },
+                e('h3', null, 'Description'),
+                e('p', { style: { fontSize: 13, lineHeight: 1.6 } }, modalDetail.description),
+              ),
+
+              // Camera info
+              modalDetail && e('div', { className: 'detail-section' },
+                e('h3', null, 'Camera'),
+                modalDetail.camera_model && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Model'),
+                  e('span', null, modalDetail.camera_model),
+                ),
+                modalDetail.focal_length && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Focal'),
+                  e('span', null, formatFocalLength(modalDetail.focal_length)),
+                ),
+                modalDetail.f_number && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'Aperture'),
+                  e('span', null, 'f/' + formatFNumber(modalDetail.f_number)),
+                ),
+                modalDetail.iso && e('div', { className: 'detail-row' },
+                  e('span', { className: 'label' }, 'ISO'),
+                  e('span', null, modalDetail.iso),
+                ),
+              ),
+
+              // Raw file
+              modalPhoto.has_raw && e('div', { className: 'detail-section' },
+                e('h3', null, 'Raw File'),
+                e('p', { style: { fontSize: 13, color: 'var(--accent)' } }, 'ARW available'),
+              ),
+
+              // Navigation
+              e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginTop: 8, textAlign: 'center' } },
+                (modalIndex + 1) + ' / ' + visiblePhotos.length,
+              ),
+            ),
+          ),
+        ),
+
+        // Export modal
+        showExport && e('div', { className: 'modal-overlay', onClick: (ev) => {
+          if (ev.target === ev.currentTarget) setShowExport(false);
+        }},
+          e('div', { className: 'export-modal' },
+            e('h2', null, 'Export Selected Photos'),
+            e('p', { style: { fontSize: 14, color: 'var(--text-muted)', marginBottom: 8 } },
+              exportFiles.length + ' file(s) selected' +
+              (exportRaw ? ' (including ARW)' : ' (JPG only)'),
+            ),
+            e('div', { className: 'export-list' },
+              ...exportFiles.map((f, i) =>
+                e('div', { key: i, style: { color: f.type === 'arw' ? 'var(--accent)' : 'var(--text)' } },
+                  f.path,
+                )
+              ),
+            ),
+            e('div', { style: { display: 'flex', gap: 8, marginTop: 16 } },
+              e('button', {
+                className: 'btn btn-primary',
+                onClick: copyExportList,
+              }, 'Copy paths to clipboard'),
+              e('button', {
+                className: 'btn btn-outline',
+                onClick: () => setShowExport(false),
+              }, 'Close'),
+            ),
+            e('p', { style: { fontSize: 12, color: 'var(--text-muted)', marginTop: 12 } },
+              'Tip: Use the copied paths with cp or rsync to move files to a new location.'),
+          ),
+        ),
+      );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Review grid item
+    // -----------------------------------------------------------------------
+    function ReviewGridItem({ photo, dimmed, onClick, onToggle }) {
+      const [loaded, setLoaded] = useState(false);
+      const [error, setError] = useState(false);
+
+      const qualityColor = photo.aesthetic_score >= 6 ? 'var(--green)' :
+                           photo.aesthetic_score >= 4.5 ? 'var(--yellow)' : 'var(--red)';
+
+      return e('div', {
+        className: 'grid-item' + (dimmed ? ' dimmed' : ''),
+        onClick: onClick,
+      },
+        // Selection badge
+        e('div', {
+          className: 'select-badge' + (photo.selected ? ' checked' : ''),
+          onClick: onToggle,
+        }, photo.selected ? '\u2713' : ''),
+
+        // Cluster badge
+        photo.cluster_id != null &&
+          e('div', { className: 'cluster-badge' }, 'C' + photo.cluster_id),
+
+        // Quality badge
+        photo.aesthetic_score != null &&
+          e('div', {
+            className: 'quality-badge',
+            style: { background: qualityColor + '22', color: qualityColor },
+          }, photo.aesthetic_score.toFixed(1)),
+
+        // Raw indicator
+        photo.has_raw && e('div', { className: 'raw-badge' }, 'RAW'),
+
+        // Image
+        !error && e('img', {
+          src: API + '/api/photos/' + photo.id + '/thumbnail?v=' + encodeURIComponent(photo.filename),
+          alt: photo.filename,
+          loading: 'lazy',
+          onLoad: () => setLoaded(true),
+          onError: () => setError(true),
+          style: loaded ? {} : { opacity: 0 },
+        }),
+        error && e('div', {
+          style: {
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            height: '100%', color: 'var(--text-muted)', fontSize: 12,
+          },
+        }, photo.filename),
+
+        // Filename overlay on hover
+        e('div', { className: 'overlay' },
+          e('span', null, photo.filename),
+        ),
+      );
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+    function formatFocalLength(fl) {
+      if (fl && fl.includes('/')) {
+        const parts = fl.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(0) + 'mm';
+      }
+      return fl + 'mm';
+    }
+
+    function formatFNumber(fn) {
+      if (fn && fn.includes('/')) {
+        const parts = fn.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(1);
+      }
+      return fn;
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Mount
+    // -----------------------------------------------------------------------
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>

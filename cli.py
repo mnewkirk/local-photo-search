@@ -50,9 +50,15 @@ def cli():
 @click.option("--force-quality", is_flag=True, help="Rescore quality for all photos, even those already scored.")
 @click.option("--tags", is_flag=True, help="Generate semantic tags via LLaVA (requires --describe or Ollama).")
 @click.option("--force-tags", is_flag=True, help="Regenerate tags for all photos, even those that already have them.")
+@click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --tags. Equivalent to passing each flag individually.")
 def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip,
-          describe, force_describe, describe_model, quality, force_quality, tags, force_tags):
+          describe, force_describe, describe_model, quality, force_quality, tags, force_tags, full):
     """Index a directory of photos."""
+    if full:
+        faces = True
+        describe = True
+        quality = True
+        tags = True
     index_directory(
         photo_dir=photo_dir,
         db_path=db,
@@ -1009,6 +1015,110 @@ def import_db(source_db, db, remap):
         click.echo(result.output)
     else:
         click.echo("Done. Run 'remap-paths' if photo paths differ on this machine.")
+
+
+# ---------------------------------------------------------------------------
+# review — shoot culling
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("photo_dir", type=click.Path(exists=True))
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--target-pct", default=10.0, help="Target percentage of photos to select (default 10).")
+@click.option("--threshold", default=0.0, help="Clustering distance threshold (0 = adaptive, lower = tighter clusters).")
+@click.option("--export", type=click.Path(), default=None,
+              help="If set, copy selected JPGs to this directory.")
+@click.option("--export-raw", type=click.Path(), default=None,
+              help="If set, copy selected ARW files to this directory.")
+@click.option("--list-only", is_flag=True, help="Just print selected file paths, don't copy.")
+def review(photo_dir, db, target_pct, threshold, export, export_raw, list_only):
+    """Review a shoot folder — select the best, most representative photos.
+
+    Clusters visually similar photos using CLIP embeddings and picks the
+    highest-quality photo from each cluster. Aims for ~10% of the folder.
+
+    \b
+    Examples:
+      # Review and see the picks:
+      python cli.py review ../Photos/2026-03-13
+
+      # Review and copy selected JPGs to a new folder:
+      python cli.py review ../Photos/2026-03-13 --export ~/Desktop/selects
+
+      # Also grab the ARW raw files:
+      python cli.py review ../Photos/2026-03-13 \\
+          --export ~/Desktop/selects \\
+          --export-raw ~/Desktop/selects/raw
+    """
+    from photosearch.cull import select_best_photos, save_selections
+
+    with PhotoDB(db) as photo_db:
+        click.echo(f"Analyzing {photo_dir}...")
+        selections = select_best_photos(
+            photo_db, photo_dir,
+            target_pct=target_pct / 100.0,
+            distance_threshold=threshold,
+        )
+
+        if not selections:
+            click.echo("No indexed photos found in this directory.")
+            click.echo("Run 'index' first: python cli.py index " + photo_dir)
+            return
+
+        # Save selections
+        save_selections(photo_db, str(Path(photo_dir).resolve()), selections)
+
+        total = len(selections)
+        selected = [p for p in selections if p["selected"]]
+        n_clusters = len(set(p.get("cluster_id") for p in selections if p.get("cluster_id") is not None))
+
+        click.echo(f"\n{total} photos, {n_clusters} clusters, {len(selected)} selected ({len(selected)*100//total}%)")
+        click.echo()
+
+        # Print selected photos
+        for p in selected:
+            score = p.get("aesthetic_score")
+            score_str = f" [{score:.1f}]" if score else ""
+            raw_str = " +RAW" if p.get("raw_filepath") else ""
+            click.echo(f"  \u2713 {p['filename']}{score_str} (cluster {p.get('cluster_id', '?')}){raw_str}")
+
+        if list_only:
+            click.echo("\n--- Selected file paths ---")
+            for p in selected:
+                abs_path = photo_db.resolve_filepath(p["filepath"])
+                click.echo(abs_path)
+            return
+
+        # Copy files if requested
+        if export:
+            import shutil
+            export_dir = Path(export)
+            export_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for p in selected:
+                src = photo_db.resolve_filepath(p["filepath"])
+                if src and os.path.exists(src):
+                    shutil.copy2(src, export_dir / Path(src).name)
+                    copied += 1
+            click.echo(f"\nCopied {copied} JPG(s) to {export_dir}")
+
+        if export_raw:
+            import shutil
+            raw_dir = Path(export_raw)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for p in selected:
+                raw_path = p.get("raw_filepath")
+                if raw_path:
+                    abs_raw = photo_db.resolve_filepath(raw_path)
+                    if abs_raw and os.path.exists(abs_raw):
+                        shutil.copy2(abs_raw, raw_dir / Path(abs_raw).name)
+                        copied += 1
+            click.echo(f"Copied {copied} ARW file(s) to {raw_dir}")
+
+        if not export and not export_raw and not list_only:
+            click.echo(f"\nSelections saved. View in the web UI at /review")
+            click.echo(f"Or use --export <dir> to copy selected JPGs.")
 
 
 if __name__ == "__main__":

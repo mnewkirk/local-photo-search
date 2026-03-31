@@ -83,17 +83,19 @@ local-photo-search/
 │   ├── search.py          # Hybrid search: CLIP + face boost + description scoring
 │   ├── index.py           # Indexing pipeline orchestrator
 │   ├── faces.py           # InsightFace detection, ArcFace encoding, clustering
-│   ├── describe.py        # LLaVA scene descriptions via Ollama
+│   ├── describe.py        # LLaVA scene descriptions + semantic tagging via Ollama
 │   ├── colors.py          # Dominant color extraction (colorthief)
 │   ├── quality.py         # Aesthetic quality scoring (LAION predictor + ViT-L/14)
+│   ├── cull.py            # Shoot review: clustering + selection algorithm
 │   └── exif.py            # EXIF/GPS metadata extraction
+├── frontend/dist/         # Web UI (static HTML + React)
+│   ├── index.html         # Main search interface
+│   └── review.html        # Shoot review / culling interface
 ├── cli.py                 # Click-based CLI with all commands
 ├── tests/
 │   └── test_face_matching.py   # Face accuracy + semantic ranking tests
 ├── scripts/
 │   └── setup_sample.py    # Automated sample dataset setup for testing
-├── references/            # Face reference photos for known persons
-├── sample/                # 7-photo subset for development
 └── requirements.txt
 ```
 
@@ -117,13 +119,14 @@ Photo files on disk
                   ▼
            photo_index.db
        ┌──────────────────────┐
-       │  photos              │  EXIF metadata, description, colors, aesthetic_score
+       │  photos              │  EXIF metadata, description, tags, colors, aesthetic_score
        │  clip_embeddings     │  512-dim vectors (sqlite-vec)
        │  faces               │  bounding boxes, cluster IDs
        │  face_encodings      │  512-dim ArcFace vectors (sqlite-vec)
        │  persons             │  named people
        │  face_references     │  reference photos for known people
        │  face_ref_encodings  │  reference ArcFace vectors (sqlite-vec)
+       │  review_selections   │  shoot review picks + cluster assignments
        └──────────────────────┘
                   │
                   ▼
@@ -261,6 +264,64 @@ python cli.py search --min-quality 7.0 --limit 50 --sort-quality
 ```
 
 
+## Shoot review (culling)
+
+After a shoot, you often have hundreds of photos with many near-duplicates. The review system automatically selects the best, most representative photos — typically 10–15% of the folder — so you can quickly identify your keepers.
+
+### How it works
+
+The algorithm uses CLIP embeddings to cluster visually similar photos (via agglomerative hierarchical clustering with an adaptive distance threshold), then selects the best photo from each cluster based on aesthetic quality scores. The key design choices:
+
+**Adaptive clustering.** Rather than using a fixed distance threshold (which breaks on same-day shoots where all photos are visually similar), the algorithm binary-searches for the threshold that produces the right number of clusters for the target selection count. This means it automatically adapts to tight-distribution shoots (beach day) and wide-distribution shoots (travel across multiple locations).
+
+**Represent-all-then-trim.** Every cluster gets a representative. If there are more clusters than the selection budget, low-quality singletons are trimmed first, and clusters with 3+ members (real content themes) are protected. This ensures no significant content type is invisible in the selection.
+
+**Tag-based diversity.** Within large clusters, photos with rare tags (from the ~60-tag semantic vocabulary) get selected as diversity picks. If a cluster of 20 beach photos contains one with a "bird" tag, that photo surfaces even though CLIP considers it visually similar to the others.
+
+**ARW pairing.** Raw files (ARW) are tracked as paired files — same name, different extension. The index uses the JPG for analysis (faster, smaller), but export can include the corresponding ARW files.
+
+### Usage
+
+```bash
+# Review a shoot folder (CLI)
+python cli.py review ../Photos/2026-03-13
+
+# Adjust target percentage
+python cli.py review ../Photos/2026-03-13 --target-pct 15
+
+# Export selected JPGs to a new folder
+python cli.py review ../Photos/2026-03-13 --export ~/Desktop/selects
+
+# Also export ARW raw files
+python cli.py review ../Photos/2026-03-13 \
+    --export ~/Desktop/selects \
+    --export-raw ~/Desktop/selects/raw
+```
+
+### Web UI
+
+The review page (`/review`) provides a visual grid interface with:
+
+- **Folder picker** and adjustable target percentage
+- **Four view modes:** All, Obscure Unselected (dims non-selected), Selected Only, and Clusters (groups by cluster with headers)
+- **Click-to-toggle** selection on any photo, or use S/X keyboard shortcuts in the photo modal
+- **Export** with optional ARW inclusion — copies file paths to clipboard for use with `cp` or `rsync`
+- **Cluster badges, quality scores, and RAW indicators** on every thumbnail
+
+
+## Semantic tagging
+
+Photos are tagged from a fixed ~60-tag vocabulary by LLaVA during indexing. Tags cover living things (animal, bird, wildlife), people (person, child, group), activities (playing, jumping, running), scenes (beach, mountain, forest), mood (dramatic, peaceful), and photography style (close-up, aerial). Tags are stored in the database and used by the shoot review algorithm for within-cluster diversity detection, and by the search engine for tag-based matching.
+
+```bash
+# Generate tags during indexing
+python cli.py index /path/to/photos --tags
+
+# Re-tag all photos (e.g., after improving the tag prompt)
+python cli.py index /path/to/photos --tags --force-tags
+```
+
+
 ## Quick start
 
 ```bash
@@ -302,6 +363,7 @@ python cli.py stats
 | `diagnose-photo` | Show face detection details and match distances |
 | `stats` | Database statistics |
 | `show-descriptions` | View LLaVA-generated descriptions |
+| `review <dir>` | Shoot review — select best representative photos from a folder |
 
 Key flags for `index`:
 
@@ -311,12 +373,24 @@ Key flags for `index`:
 | `--describe` | Generate LLaVA scene descriptions |
 | `--describe-model llava:13b` | Use a specific Ollama model |
 | `--quality` | Compute aesthetic quality scores (1–10) |
+| `--tags` | Generate semantic category tags |
 | `--force-clip` | Regenerate all CLIP embeddings (required after model change) |
 | `--force-describe` | Regenerate all descriptions |
 | `--force-faces` | Re-run face detection on all photos |
 | `--force-quality` | Rescore quality for all photos |
+| `--force-tags` | Regenerate tags for all photos |
 | `--no-clip` | Skip CLIP embedding |
 | `--no-colors` | Skip color extraction |
+
+Key flags for `review`:
+
+| Flag | Effect |
+|------|--------|
+| `--target-pct 10` | Target selection percentage (default 10%) |
+| `--threshold 0.0` | Clustering distance threshold (0 = adaptive) |
+| `--export <dir>` | Copy selected JPGs to a directory |
+| `--export-raw <dir>` | Copy selected ARW files to a directory |
+| `--list-only` | Print selected file paths without copying |
 
 
 ## Testing
@@ -392,7 +466,9 @@ The development process was iterative in a way that's hard to capture in commits
 | **M6** | Done | Web UI (FastAPI + simple frontend). |
 | **M7** | Done | Docker packaging for UGREEN NAS deployment. |
 | **M8** | Done | Aesthetic quality scoring — pretrained model scores photos 1–10 for composition, lighting, and visual appeal. Filter/sort by quality in search. |
-| **M9** | Next | LLM-generated semantic tags at index time. During description generation, Ollama also produces category tags (animal, vehicle, landscape, portrait, action, etc.) stored in a tags table. Search-time matching uses pre-computed tags instead of a hand-curated dictionary — zero runtime inference cost with full LLM-quality semantic understanding. Both tag-based and dictionary-based matching available for comparison. |
+| **M9** | Done | Semantic tagging — LLM-generated tags from a fixed ~60-tag vocabulary at index time. Tags stored in the photos table and used for search matching and shoot review diversity detection. |
+| **M10** | Done | Shoot review — adaptive CLIP clustering + quality-based selection for post-shoot culling. Web UI with grid view, cluster view, toggle selection, and export. CLI with export to directory. |
+| **M11** | Done | Portable photo paths — photo_root system stores relative paths in DB, resolves at runtime. Supports moving the database between machines without re-indexing. |
 
 
 ## Known limitations
@@ -400,8 +476,6 @@ The development process was iterative in a way that's hard to capture in commits
 - **Place search has no data.** The Sony camera that took the test photos didn't have GPS enabled. The place search infrastructure (GPS extraction, schema columns, search query) is wired up and ready for photos that include location EXIF data.
 
 - **LLaVA hallucinations.** The 13B model occasionally describes people, objects, or activities that aren't in the photo. The CLIP gate and face confirmation mitigate this for search, but individual descriptions may be inaccurate.
-
-- **requirements.txt is out of sync.** It lists `face_recognition` and `dlib`, but the code uses `insightface` and `onnxruntime`. The requirements should be updated before Docker packaging.
 
 - **No incremental CLIP updates.** Switching CLIP models requires `--force-clip` to regenerate all embeddings. There's no versioning to detect stale embeddings automatically.
 

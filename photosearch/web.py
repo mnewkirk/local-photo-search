@@ -307,6 +307,172 @@ def api_persons():
     return {"persons": [dict(r) for r in rows]}
 
 
+# ---------------------------------------------------------------------------
+# Shoot Review endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/review/folders")
+def api_review_folders():
+    """List directories that contain indexed photos, for the folder picker."""
+    with _get_db() as db:
+        rows = db.conn.execute(
+            "SELECT DISTINCT filepath FROM photos ORDER BY filepath"
+        ).fetchall()
+
+    # Extract unique parent directories
+    dirs = set()
+    for row in rows:
+        fp = row["filepath"]
+        parent = str(Path(fp).parent)
+        # For relative paths, show them as-is; for absolute, show from photo_root
+        if parent and parent != ".":
+            dirs.add(parent)
+
+    return {"folders": sorted(dirs)}
+
+
+@app.get("/api/review/run")
+def api_review_run(
+    directory: str = Query(..., description="Directory path to review"),
+    target_pct: float = Query(0.10, description="Target selection percentage"),
+    distance_threshold: float = Query(0.0, description="Clustering distance threshold (0 = adaptive)"),
+):
+    """Run the culling algorithm on a directory and return selections."""
+    from .cull import select_best_photos, save_selections
+
+    with _get_db() as db:
+        # Resolve the directory — could be relative to photo_root
+        resolved_dir = directory
+        if db.photo_root and not Path(directory).is_absolute():
+            resolved_dir = str(Path(db.photo_root) / directory)
+
+        selections = select_best_photos(
+            db, resolved_dir,
+            target_pct=target_pct,
+            distance_threshold=distance_threshold,
+        )
+
+        if not selections:
+            return {"photos": [], "stats": {"total": 0, "selected": 0}}
+
+        # Save selections to DB for persistence
+        save_selections(db, resolved_dir, selections)
+
+        # Build response
+        items = []
+        for p in selections:
+            items.append({
+                "id": p["id"],
+                "filename": p.get("filename", ""),
+                "filepath": p.get("filepath", ""),
+                "aesthetic_score": p.get("aesthetic_score"),
+                "date_taken": p.get("date_taken"),
+                "selected": p.get("selected", False),
+                "cluster_id": p.get("cluster_id"),
+                "rank_in_cluster": p.get("rank_in_cluster"),
+                "has_raw": bool(p.get("raw_filepath")),
+            })
+
+        n_selected = sum(1 for i in items if i["selected"])
+        n_clusters = len(set(i["cluster_id"] for i in items if i["cluster_id"] is not None))
+
+    return {
+        "photos": items,
+        "stats": {
+            "total": len(items),
+            "selected": n_selected,
+            "clusters": n_clusters,
+            "pct": round(n_selected / len(items) * 100, 1) if items else 0,
+        },
+    }
+
+
+@app.get("/api/review/load")
+def api_review_load(
+    directory: str = Query(..., description="Directory path"),
+):
+    """Load previously saved selections for a directory."""
+    from .cull import load_selections
+
+    with _get_db() as db:
+        resolved_dir = directory
+        if db.photo_root and not Path(directory).is_absolute():
+            resolved_dir = str(Path(db.photo_root) / directory)
+
+        selections = load_selections(db, resolved_dir)
+        if not selections:
+            return {"photos": [], "stats": {"total": 0, "selected": 0}}
+
+        items = []
+        for p in selections:
+            items.append({
+                "id": p["photo_id"],
+                "filename": p.get("filename", ""),
+                "filepath": p.get("filepath", ""),
+                "aesthetic_score": p.get("aesthetic_score"),
+                "date_taken": p.get("date_taken"),
+                "selected": bool(p["selected"]),
+                "cluster_id": p.get("cluster_id"),
+                "rank_in_cluster": p.get("rank_in_cluster"),
+                "has_raw": bool(p.get("raw_filepath")),
+            })
+
+        n_selected = sum(1 for i in items if i["selected"])
+        n_clusters = len(set(i["cluster_id"] for i in items if i["cluster_id"] is not None))
+
+    return {
+        "photos": items,
+        "stats": {
+            "total": len(items),
+            "selected": n_selected,
+            "clusters": n_clusters,
+            "pct": round(n_selected / len(items) * 100, 1) if items else 0,
+        },
+    }
+
+
+@app.post("/api/review/toggle/{photo_id}")
+def api_review_toggle(photo_id: int, selected: bool = Query(...)):
+    """Toggle a photo's selection state."""
+    from .cull import toggle_selection
+
+    with _get_db() as db:
+        toggle_selection(db, photo_id, selected)
+
+    return {"ok": True, "photo_id": photo_id, "selected": selected}
+
+
+@app.get("/api/review/export")
+def api_review_export(
+    directory: str = Query(..., description="Directory path"),
+    include_raw: bool = Query(False, description="Include ARW raw file paths"),
+):
+    """Get the list of selected photo paths for export/copying."""
+    from .cull import load_selections
+
+    with _get_db() as db:
+        resolved_dir = directory
+        if db.photo_root and not Path(directory).is_absolute():
+            resolved_dir = str(Path(db.photo_root) / directory)
+
+        selections = load_selections(db, resolved_dir)
+        if not selections:
+            return {"files": []}
+
+        files = []
+        for p in selections:
+            if not p["selected"]:
+                continue
+            abs_path = db.resolve_filepath(p["filepath"])
+            files.append({"type": "jpg", "path": abs_path, "filename": p["filename"]})
+            if include_raw and p.get("raw_filepath"):
+                raw_abs = db.resolve_filepath(p["raw_filepath"])
+                raw_name = Path(raw_abs).name if raw_abs else ""
+                files.append({"type": "arw", "path": raw_abs, "filename": raw_name})
+
+    return {"files": files, "count": len(files)}
+
+
 @app.get("/api/stats")
 def api_stats():
     """Database statistics."""
@@ -363,6 +529,14 @@ if _frontend_dir.exists():
         if index.exists():
             return HTMLResponse(index.read_text())
         return HTMLResponse("<h1>Frontend not found</h1>")
+
+    @app.get("/review")
+    def serve_review():
+        """Serve the shoot review page."""
+        review = _frontend_dir / "review.html"
+        if review.exists():
+            return HTMLResponse(review.read_text())
+        return HTMLResponse("<h1>Review page not found</h1>")
 
     @app.get("/{path:path}")
     def serve_frontend(path: str = ""):

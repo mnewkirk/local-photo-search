@@ -10,6 +10,7 @@ exifread>=3.0         # EXIF extraction
 # Embeddings & search
 open-clip-torch>=2.24
 sqlite-vec>=0.1
+scipy>=1.10              # Hierarchical clustering for shoot review
 
 # Face recognition (InsightFace + ArcFace)
 insightface>=0.7
