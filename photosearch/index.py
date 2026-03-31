@@ -305,14 +305,14 @@ def index_directory(
             except RuntimeError as e:
                 print(f"\nSkipping face detection: {e}")
             else:
+                # Scope to target directory only
+                dir_ids = set(pid for pid, _ in _get_dir_photos())
                 if force_faces:
-                    print("\nClearing existing face data for re-detection...")
-                    db.conn.execute("DELETE FROM faces")
+                    print("\nClearing existing face data for target directory...")
+                    for pid in dir_ids:
+                        db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
                     db.conn.commit()
-                    all_rows = db.conn.execute(
-                        "SELECT id, filepath FROM photos"
-                    ).fetchall()
-                    all_face_candidates = [(row["id"], db.resolve_filepath(row["filepath"])) for row in all_rows]
+                    all_face_candidates = list(_get_dir_photos())
                 else:
                     unprocessed_rows = db.conn.execute(
                         """SELECT p.id, p.filepath FROM photos p
@@ -324,7 +324,7 @@ def index_directory(
                     all_face_candidates = list(new_photos) + [
                         (row["id"], db.resolve_filepath(row["filepath"]))
                         for row in unprocessed_rows
-                        if row["id"] not in new_ids
+                        if row["id"] not in new_ids and row["id"] in dir_ids
                     ]
 
                 total = len(all_face_candidates)
@@ -485,14 +485,16 @@ def index_directory(
                 quality_candidates = list(_get_dir_photos())
                 print(f"\nScoring aesthetic quality for {len(quality_candidates)} photo(s) (--force-quality)...")
             else:
+                dir_ids = set(pid for pid, _ in _get_dir_photos())
                 unscored = db.conn.execute(
                     "SELECT id, filepath FROM photos WHERE aesthetic_score IS NULL"
                 ).fetchall()
-                quality_candidates = [(row["id"], db.resolve_filepath(row["filepath"])) for row in unscored]
+                quality_candidates = [(row["id"], db.resolve_filepath(row["filepath"]))
+                                      for row in unscored if row["id"] in dir_ids]
                 if quality_candidates:
                     print(f"\nScoring aesthetic quality for {len(quality_candidates)} unscored photo(s)...")
                 else:
-                    print("\nAll photos already have aesthetic scores.")
+                    print("\nAll photos in target directory already have aesthetic scores.")
 
             if quality_candidates:
                 t0 = time.time()
@@ -515,14 +517,16 @@ def index_directory(
                     print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
                           f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
 
-            # Concept analysis
+            # Concept analysis (scoped to target directory)
             if force_quality:
                 concept_candidates = quality_candidates
             else:
+                dir_ids_c = set(pid for pid, _ in _get_dir_photos())
                 unconcept = db.conn.execute(
                     "SELECT id, filepath FROM photos WHERE aesthetic_concepts IS NULL AND aesthetic_score IS NOT NULL"
                 ).fetchall()
-                concept_candidates = [(row["id"], db.resolve_filepath(row["filepath"])) for row in unconcept]
+                concept_candidates = [(row["id"], db.resolve_filepath(row["filepath"]))
+                                      for row in unconcept if row["id"] in dir_ids_c]
 
             if concept_candidates:
                 print(f"\nAnalyzing aesthetic concepts for {len(concept_candidates)} photo(s)...")
@@ -554,10 +558,12 @@ def index_directory(
                 if force_quality:
                     critique_candidates = quality_candidates if quality_candidates else []
                 else:
+                    dir_ids_cr = set(pid for pid, _ in _get_dir_photos())
                     uncritiqued = db.conn.execute(
                         "SELECT id, filepath FROM photos WHERE aesthetic_critique IS NULL AND aesthetic_score IS NOT NULL"
                     ).fetchall()
-                    critique_candidates = [(row["id"], db.resolve_filepath(row["filepath"])) for row in uncritiqued]
+                    critique_candidates = [(row["id"], db.resolve_filepath(row["filepath"]))
+                                           for row in uncritiqued if row["id"] in dir_ids_cr]
 
                 if critique_candidates:
                     print(f"\nGenerating aesthetic critiques for {len(critique_candidates)} photo(s)...")
