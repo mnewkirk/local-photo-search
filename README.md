@@ -469,6 +469,9 @@ The development process was iterative in a way that's hard to capture in commits
 | **M9** | Done | Semantic tagging — LLM-generated tags from a fixed ~60-tag vocabulary at index time. Tags stored in the photos table and used for search matching and shoot review diversity detection. |
 | **M10** | Done | Shoot review — adaptive CLIP clustering + quality-based selection for post-shoot culling. Web UI with grid view, cluster view, toggle selection, and export. CLI with export to directory. |
 | **M11** | Done | Portable photo paths — photo_root system stores relative paths in DB, resolves at runtime. Supports moving the database between machines without re-indexing. |
+| **M12** | Next | Hallucination detection — second LLM pass to verify descriptions, tags, and aesthetic critiques against the actual photo. Re-run generation when hallucinations are found (e.g. describing a sandcastle that isn't there, tagging "landscape" on a hummingbird close-up). |
+| **M13** | Next | Collections / albums — persistent named collections of photos, especially from the review process. Stored in a separate SQLite database. Easy to download all files from a collection, with clear JPG/ARW selection and availability indicators. |
+| **M14** | Next | Photo stacking — detect near-identical burst/bracket shots (very short time gaps, similar CLIP embeddings) and collapse them into stacks. Best photo on top, others hidden behind it. Complements the review/culling cluster view but operates at a tighter similarity threshold for true duplicates. |
 
 
 ## Known limitations
