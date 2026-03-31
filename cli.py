@@ -780,8 +780,10 @@ def show_quality(db, sort_order, min_score, detail, directory):
 
         if directory:
             resolved_dir = str(Path(directory).resolve())
-            conditions.append("filepath LIKE ?")
-            params.append(resolved_dir + "/%")
+            # Match both absolute and relative paths
+            rel_dir = photo_db.relative_filepath(resolved_dir)
+            conditions.append("(filepath LIKE ? OR filepath LIKE ?)")
+            params.extend([resolved_dir + "/%", rel_dir + "/%"])
 
         if min_score is not None:
             conditions.append("aesthetic_score IS NOT NULL AND aesthetic_score >= ?")
@@ -919,7 +921,7 @@ def remap_paths(old_prefix, new_prefix, db, dry_run):
     """
     with PhotoDB(db) as photo_db:
         rows = photo_db.conn.execute(
-            "SELECT id, filepath FROM photos WHERE filepath LIKE ?",
+            "SELECT id, filepath, raw_filepath FROM photos WHERE filepath LIKE ?",
             (f"{old_prefix}%",),
         ).fetchall()
 
@@ -940,18 +942,35 @@ def remap_paths(old_prefix, new_prefix, db, dry_run):
             click.echo("\nNo changes made (dry run).")
             return
 
-        updated = 0
-        for row in rows:
-            old = row["filepath"]
-            new = new_prefix + old[len(old_prefix):]
-            photo_db.conn.execute(
-                "UPDATE photos SET filepath = ? WHERE id = ?",
-                (new, row["id"]),
-            )
-            updated += 1
-
-        photo_db.conn.commit()
+        updated = photo_db.remap_paths(old_prefix, new_prefix)
         click.echo(f"Updated {updated} filepath(s): '{old_prefix}' → '{new_prefix}'.")
+
+
+@cli.command("set-photo-root")
+@click.argument("root_path")
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+def set_photo_root(root_path, db):
+    """Set or change the photo root directory.
+
+    The photo root is the base directory that stored file paths are relative to.
+    When you move the database to a different machine, just update the photo root
+    to point to where photos live on that machine.
+
+    \b
+    Examples:
+      # On your Mac:
+      python cli.py set-photo-root /Volumes/personal_folder/Photos
+
+      # On the NAS:
+      python cli.py set-photo-root /Photos
+    """
+    with PhotoDB(db) as photo_db:
+        old_root = photo_db.photo_root
+        photo_db.set_photo_root(root_path)
+        if old_root:
+            click.echo(f"Updated photo root: {old_root} → {photo_db.photo_root}")
+        else:
+            click.echo(f"Set photo root: {photo_db.photo_root}")
 
 
 # ---------------------------------------------------------------------------

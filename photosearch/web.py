@@ -46,6 +46,7 @@ app.add_middleware(
 
 # Database path — set by the CLI launcher, defaults to cwd
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
+_photo_root: Optional[str] = os.environ.get("PHOTO_ROOT")
 
 # Thumbnail cache directory
 _thumb_dir: Optional[str] = None
@@ -54,7 +55,7 @@ _THUMB_SIZE = 600  # px, long edge
 
 def _get_db() -> PhotoDB:
     """Open a fresh DB connection per request."""
-    return PhotoDB(_db_path)
+    return PhotoDB(_db_path, photo_root=_photo_root)
 
 
 def _ensure_thumb_dir():
@@ -82,7 +83,7 @@ def _get_or_create_thumbnail(photo: dict) -> str:
     if os.path.exists(thumb_path):
         return thumb_path
 
-    filepath = photo.get("filepath", "")
+    filepath = photo.get("_resolved_filepath") or photo.get("filepath", "")
     if not filepath or not os.path.exists(filepath):
         raise FileNotFoundError(f"Original not found: {filepath}")
 
@@ -190,8 +191,10 @@ def api_thumbnail(photo_id: int):
     """Serve a cached thumbnail for a photo."""
     with _get_db() as db:
         photo = db.get_photo(photo_id)
-    if not photo:
-        raise HTTPException(404, "Photo not found")
+        if not photo:
+            raise HTTPException(404, "Photo not found")
+        photo = dict(photo)
+        photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
 
     try:
         thumb_path = _get_or_create_thumbnail(photo)
@@ -210,10 +213,11 @@ def api_full_photo(photo_id: int):
     """Serve the full-resolution original photo."""
     with _get_db() as db:
         photo = db.get_photo(photo_id)
-    if not photo:
-        raise HTTPException(404, "Photo not found")
+        if not photo:
+            raise HTTPException(404, "Photo not found")
 
-    filepath = photo.get("filepath", "")
+        filepath = db.resolve_filepath(photo.get("filepath", ""))
+
     if not filepath or not os.path.exists(filepath):
         raise HTTPException(404, "Photo file not found on disk")
 

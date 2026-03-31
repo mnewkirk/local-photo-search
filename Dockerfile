@@ -63,6 +63,9 @@ ENV INSIGHTFACE_HOME=/data/.insightface
 ENV OLLAMA_HOST=http://ollama:11434
 # Database location
 ENV PHOTOSEARCH_DB=/data/photo_index.db
+# Photo root — base path for resolving relative file paths in the DB.
+# Set this to where photos are mounted in the container.
+ENV PHOTO_ROOT=/photos
 
 EXPOSE 8000
 

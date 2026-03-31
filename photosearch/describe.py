@@ -77,6 +77,35 @@ def check_available(model: str = MODEL) -> None:
         raise
 
 
+_MAX_RETRIES = 3
+_RETRY_DELAY = 5  # seconds between retries
+
+
+def _ollama_chat_with_retry(model: str, messages: list, retries: int = _MAX_RETRIES) -> Optional[str]:
+    """Call ollama.chat with retry logic for transient failures.
+
+    Retries on timeouts, connection errors, and server errors.
+    Returns the response text or None.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            response = ollama.chat(model=model, messages=messages)
+            text = response.message.content.strip()
+            return text if text else None
+        except Exception as e:
+            err_str = str(e).lower()
+            is_transient = any(kw in err_str for kw in [
+                "timeout", "connection", "refused", "reset", "broken pipe",
+                "503", "502", "500", "unavailable",
+            ])
+            if is_transient and attempt < retries:
+                print(f" [retry {attempt}/{retries} in {_RETRY_DELAY}s: {e}]", end="", flush=True)
+                time.sleep(_RETRY_DELAY)
+            else:
+                raise
+    return None
+
+
 def describe_photo(
     image_path: str,
     model: str = MODEL,
@@ -101,7 +130,7 @@ def describe_photo(
         return None
 
     try:
-        response = ollama.chat(
+        return _ollama_chat_with_retry(
             model=model,
             messages=[{
                 "role": "user",
@@ -109,9 +138,6 @@ def describe_photo(
                 "images": [str(path)],
             }],
         )
-        text = response.message.content.strip()
-        return text if text else None
-
     except Exception as e:
         print(f"  Warning: description failed for {path.name}: {e}")
         return None

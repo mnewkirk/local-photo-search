@@ -35,21 +35,148 @@ def _deserialize_float_list(data: bytes, dim: int) -> list[float]:
 
 
 class PhotoDB:
-    """Manages the SQLite database for photo metadata and embeddings."""
+    """Manages the SQLite database for photo metadata and embeddings.
 
-    def __init__(self, db_path: str = "photo_index.db"):
+    Photo file paths are stored relative to a configurable ``photo_root``.
+    At runtime the root is resolved via (in priority order):
+      1. The ``photo_root`` constructor argument.
+      2. The ``PHOTO_ROOT`` environment variable.
+      3. The ``photo_root`` value stored in the ``schema_info`` table.
+
+    Use :meth:`resolve_filepath` to turn a stored relative path into an
+    absolute path that can be opened, and :meth:`relative_filepath` to
+    convert an absolute path for storage.  The helpers are no-ops when
+    the stored path is already absolute and no root is configured (i.e.
+    backwards-compatible).
+    """
+
+    def __init__(self, db_path: str = "photo_index.db", photo_root: Optional[str] = None):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes with WAL
+        self.conn.execute("PRAGMA cache_size=-64000")    # 64 MB page cache
 
         if HAS_SQLITE_VEC:
             self.conn.enable_load_extension(True)
             sqlite_vec.load(self.conn)
             self.conn.enable_load_extension(False)
 
+        self._batch_mode = False
+        self._batch_count = 0
+        self._batch_size = 50  # Commit every N operations in batch mode
+
         self._init_schema()
+
+        # Resolve photo_root: constructor arg > env var > DB setting > None
+        import os as _os
+        if photo_root:
+            self.photo_root = str(Path(photo_root).resolve())
+        elif _os.environ.get("PHOTO_ROOT"):
+            self.photo_root = str(Path(_os.environ["PHOTO_ROOT"]).resolve())
+        else:
+            row = self.conn.execute(
+                "SELECT value FROM schema_info WHERE key = 'photo_root'"
+            ).fetchone()
+            self.photo_root = row["value"] if row else None
+
+    def begin_batch(self, batch_size: int = 50):
+        """Enter batch mode: defer commits until flush_batch() or every batch_size ops."""
+        self._batch_mode = True
+        self._batch_size = batch_size
+        self._batch_count = 0
+
+    def flush_batch(self):
+        """Force a commit of any pending batch operations."""
+        if self._batch_count > 0:
+            self.conn.commit()
+            self._batch_count = 0
+
+    def end_batch(self):
+        """Exit batch mode and commit any remaining operations."""
+        self.flush_batch()
+        self._batch_mode = False
+
+    def _maybe_commit(self):
+        """Commit immediately, or defer if in batch mode."""
+        if self._batch_mode:
+            self._batch_count += 1
+            if self._batch_count >= self._batch_size:
+                self.conn.commit()
+                self._batch_count = 0
+        else:
+            self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Path helpers
+    # ------------------------------------------------------------------
+
+    def set_photo_root(self, root: str):
+        """Persist the photo root directory in the database."""
+        self.photo_root = str(Path(root).resolve())
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES (?, ?)",
+            ("photo_root", self.photo_root),
+        )
+        self.conn.commit()
+
+    def relative_filepath(self, absolute_path: str) -> str:
+        """Convert an absolute path to a path relative to photo_root.
+
+        If no photo_root is set, returns the absolute path unchanged.
+        """
+        if not self.photo_root:
+            return absolute_path
+        try:
+            return str(Path(absolute_path).relative_to(self.photo_root))
+        except ValueError:
+            # Path is not under photo_root — store as-is
+            return absolute_path
+
+    def resolve_filepath(self, stored_path: str) -> str:
+        """Convert a stored (possibly relative) path to an absolute path.
+
+        If photo_root is set and the path is relative, prepend the root.
+        Otherwise returns the path unchanged.
+        """
+        if not stored_path:
+            return stored_path
+        p = Path(stored_path)
+        if p.is_absolute():
+            return stored_path
+        if self.photo_root:
+            return str(Path(self.photo_root) / p)
+        return stored_path
+
+    def remap_paths(self, old_prefix: str, new_prefix: str) -> int:
+        """Bulk-replace a path prefix in all photo filepaths.
+
+        Useful when moving photos between machines / mount points.
+        Returns the number of rows updated.
+
+        Example:
+            db.remap_paths("/Users/matt/Photos", "/Photos")
+        """
+        rows = self.conn.execute(
+            "SELECT id, filepath, raw_filepath FROM photos WHERE filepath LIKE ?",
+            (old_prefix + "%",),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            new_path = new_prefix + row["filepath"][len(old_prefix):]
+            updates = {"filepath": new_path}
+            if row["raw_filepath"] and row["raw_filepath"].startswith(old_prefix):
+                updates["raw_filepath"] = new_prefix + row["raw_filepath"][len(old_prefix):]
+            set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+            self.conn.execute(
+                f"UPDATE photos SET {set_clause} WHERE id = ?",
+                list(updates.values()) + [row["id"]],
+            )
+            count += 1
+        self.conn.commit()
+        return count
 
     def _init_schema(self):
         """Create tables if they don't exist."""
@@ -190,7 +317,7 @@ class PhotoDB:
             ("version", str(SCHEMA_VERSION)),
         )
 
-        self.conn.commit()
+        self.conn.commit()  # Schema init always commits immediately
 
     # ------------------------------------------------------------------
     # Photo CRUD
@@ -204,7 +331,7 @@ class PhotoDB:
             f"INSERT OR IGNORE INTO photos ({columns}) VALUES ({placeholders})",
             list(kwargs.values()),
         )
-        self.conn.commit()
+        self._maybe_commit()
         if cur.lastrowid == 0:
             # Photo already existed — fetch its id
             row = self.conn.execute(
@@ -232,7 +359,7 @@ class PhotoDB:
             f"UPDATE photos SET {set_clause} WHERE id = ?",
             list(kwargs.values()) + [photo_id],
         )
-        self.conn.commit()
+        self._maybe_commit()
 
     def photo_count(self) -> int:
         """Return total number of indexed photos."""
@@ -251,7 +378,7 @@ class PhotoDB:
             "INSERT OR REPLACE INTO clip_embeddings (photo_id, embedding) VALUES (?, ?)",
             (photo_id, _serialize_float_list(embedding)),
         )
-        self.conn.commit()
+        self._maybe_commit()
 
     def search_clip(self, query_embedding: list[float], limit: int = 10) -> list[dict]:
         """Find photos most similar to a query embedding. Returns list of {photo_id, distance}."""
@@ -288,7 +415,7 @@ class PhotoDB:
                 "INSERT INTO face_encodings (face_id, encoding) VALUES (?, ?)",
                 (face_id, _serialize_float_list(encoding)),
             )
-        self.conn.commit()
+        self._maybe_commit()
         return face_id
 
     def search_faces(self, query_encoding: list[float], limit: int = 10) -> list[dict]:
@@ -314,7 +441,7 @@ class PhotoDB:
     def add_person(self, name: str) -> int:
         """Create a named person. Returns person id."""
         cur = self.conn.execute("INSERT INTO persons (name) VALUES (?)", (name,))
-        self.conn.commit()
+        self._maybe_commit()
         return cur.lastrowid
 
     def get_person_by_name(self, name: str) -> Optional[dict]:
@@ -329,7 +456,7 @@ class PhotoDB:
         self.conn.execute(
             "UPDATE faces SET person_id = ? WHERE id = ?", (person_id, face_id)
         )
-        self.conn.commit()
+        self._maybe_commit()
 
     # ------------------------------------------------------------------
     # Color search
@@ -373,6 +500,9 @@ class PhotoDB:
         return [dict(r) for r in rows]
 
     def close(self):
+        # Flush any pending batch writes before closing
+        if self._batch_mode:
+            self.end_batch()
         self.conn.close()
 
     def __enter__(self):

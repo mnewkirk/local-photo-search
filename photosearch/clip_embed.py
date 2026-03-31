@@ -61,6 +61,21 @@ def _load_model():
     _model.eval()
 
 
+def unload_model():
+    """Free the CLIP model from memory (GPU and CPU).
+
+    Call this after finishing a batch of embeddings to reclaim memory
+    before loading other models (e.g., aesthetic scoring).
+    """
+    global _model, _preprocess, _tokenizer, _device
+    _model = None
+    _preprocess = None
+    _tokenizer = None
+    if _device == "cuda":
+        torch.cuda.empty_cache()
+    _device = None
+
+
 def embed_image(image_path: str) -> Optional[list[float]]:
     """Generate a CLIP embedding for an image file.
 
