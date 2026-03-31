@@ -86,7 +86,9 @@ def _get_or_create_thumbnail(photo: dict) -> str:
     if not filepath or not os.path.exists(filepath):
         raise FileNotFoundError(f"Original not found: {filepath}")
 
+    from PIL import ImageOps
     img = Image.open(filepath)
+    img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
     img.thumbnail((_THUMB_SIZE, _THUMB_SIZE), Image.LANCZOS)
     img.save(thumb_path, "JPEG", quality=85)
@@ -107,15 +109,21 @@ def api_search(
     min_score: float = Query(-0.25, description="Minimum CLIP score"),
     min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
     sort_quality: bool = Query(False, description="Sort by quality instead of relevance"),
+    tag_match: str = Query("both", description="Tag matching mode: dict, tags, or both"),
+    date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
+    location: Optional[str] = Query(None, description="Filter by location name"),
 ):
     """Search photos using any combination of criteria."""
     logger.info(
         "SEARCH REQUEST  q=%r  person=%r  color=%r  place=%r  limit=%d  "
-        "min_score=%.3f  min_quality=%s  sort_quality=%s",
+        "min_score=%.3f  min_quality=%s  sort_quality=%s  date_from=%s  date_to=%s  location=%r",
         q, person, color, place, limit, min_score, min_quality, sort_quality,
+        date_from, date_to, location,
     )
 
-    if not any([q, person, color, place, min_quality is not None]):
+    if not any([q, person, color, place, min_quality is not None,
+                date_from, date_to, location]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
 
@@ -132,6 +140,10 @@ def api_search(
             min_score=min_score,
             min_quality=min_quality,
             sort_quality=sort_quality,
+            tag_match=tag_match,
+            date_from=date_from,
+            date_to=date_to,
+            location=location,
         )
 
         logger.info(
@@ -158,6 +170,8 @@ def api_search(
                 "iso": r.get("iso"),
                 "image_width": r.get("image_width"),
                 "image_height": r.get("image_height"),
+                "tags": json.loads(r["tags"]) if r.get("tags") else [],
+                "place_name": r.get("place_name"),
             }
             if r.get("dominant_colors"):
                 try:
@@ -254,6 +268,7 @@ def api_photo_detail(photo_id: int):
             "filename": photo["filename"],
             "filepath": photo["filepath"],
             "date_taken": photo["date_taken"],
+            "place_name": photo.get("place_name"),
             "description": photo["description"],
             "aesthetic_score": photo.get("aesthetic_score"),
             "aesthetic_concepts": json.loads(photo["aesthetic_concepts"]) if photo.get("aesthetic_concepts") else None,
@@ -266,6 +281,7 @@ def api_photo_detail(photo_id: int):
             "iso": photo.get("iso"),
             "image_width": photo.get("image_width"),
             "image_height": photo.get("image_height"),
+            "tags": json.loads(photo["tags"]) if photo.get("tags") else [],
             "colors": colors,
             "faces": face_list,
         }

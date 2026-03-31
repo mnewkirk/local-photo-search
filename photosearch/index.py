@@ -70,6 +70,8 @@ def index_directory(
     describe_model: str = "llava",
     enable_quality: bool = False,
     force_quality: bool = False,
+    enable_tags: bool = False,
+    force_tags: bool = False,
 ):
     """Index all photos in a directory.
 
@@ -101,6 +103,8 @@ def index_directory(
         describe_model: Ollama model name for descriptions (default: "llava").
         enable_quality: If True, compute aesthetic quality scores.
         force_quality: If True, rescore all photos (even those already scored).
+        enable_tags: If True, generate semantic category tags via Ollama.
+        force_tags: If True, regenerate tags for all photos (even those already tagged).
     """
     photo_dir = str(Path(photo_dir).resolve())
     photos = find_photos(photo_dir)
@@ -167,12 +171,37 @@ def index_directory(
             ]
             new_photos = list(all_photos)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
-        elif not new_photos and not enable_describe and not enable_faces and not enable_quality:
-            print("All photos already indexed. Nothing to do.")
-            return
+        elif not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
+            # Still run geocoding check below before returning
+            pass
 
         if new_photos:
             print(f"\nIndexed {len(new_photos)} new photos into database.")
+
+        # Step 1b: Reverse geocode GPS coordinates → place names (offline, fast)
+        ungeo = db.conn.execute(
+            "SELECT id, gps_lat, gps_lon FROM photos "
+            "WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL AND place_name IS NULL"
+        ).fetchall()
+        dir_photo_ids = set(pid for pid, _ in _get_dir_photos())
+        ungeo = [r for r in ungeo if r["id"] in dir_photo_ids]
+
+        if ungeo:
+            from .geocode import reverse_geocode_batch
+            print(f"\nReverse geocoding {len(ungeo)} photo(s) with GPS data...")
+            coords = [(row["gps_lat"], row["gps_lon"]) for row in ungeo]
+            places = reverse_geocode_batch(coords)
+            geo_count = 0
+            for row, place in zip(ungeo, places):
+                if place:
+                    db.update_photo(row["id"], place_name=place)
+                    geo_count += 1
+            print(f"  Geocoded {geo_count}/{len(ungeo)} photos.")
+
+        if not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
+            if not ungeo:
+                print("All photos already indexed. Nothing to do.")
+            return
 
         # Step 2: CLIP embeddings (batched)
         if enable_clip:
@@ -292,15 +321,17 @@ def index_directory(
                     desc_candidates = list(_get_dir_photos())
                     print(f"\nGenerating descriptions for {len(desc_candidates)} photo(s) in target directory (--force-describe)...")
                 else:
-                    # Only describe photos that don't have a description yet
+                    # Only describe photos in target directory that don't have a description yet
+                    dir_photos = set(pid for pid, _ in _get_dir_photos())
                     undescribed = db.conn.execute(
                         "SELECT id, filepath FROM photos WHERE description IS NULL"
                     ).fetchall()
-                    desc_candidates = [(row["id"], row["filepath"]) for row in undescribed]
+                    desc_candidates = [(row["id"], row["filepath"]) for row in undescribed
+                                       if row["id"] in dir_photos]
                     if desc_candidates:
                         print(f"\nGenerating descriptions for {len(desc_candidates)} undescribed photo(s)...")
                     else:
-                        print("\nAll photos already have descriptions.")
+                        print("\nAll photos in target directory already have descriptions.")
 
                 if desc_candidates:
                     t0 = time.time()
@@ -322,6 +353,49 @@ def index_directory(
 
                     elapsed = time.time() - t0
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
+
+        # Step 5b: Semantic tags via Ollama (M9)
+        if enable_tags:
+            import json as _json
+            from .describe import tag_photo, check_available as tag_check
+            try:
+                tag_check(model=describe_model)
+            except RuntimeError as e:
+                print(f"\nSkipping tags: {e}")
+            else:
+                if force_tags:
+                    tag_candidates = list(_get_dir_photos())
+                    print(f"\nGenerating tags for {len(tag_candidates)} photo(s) in target directory (--force-tags)...")
+                else:
+                    dir_photos = set(pid for pid, _ in _get_dir_photos())
+                    untagged = db.conn.execute(
+                        "SELECT id, filepath FROM photos WHERE tags IS NULL"
+                    ).fetchall()
+                    tag_candidates = [(row["id"], row["filepath"]) for row in untagged
+                                      if row["id"] in dir_photos]
+                    if tag_candidates:
+                        print(f"\nGenerating tags for {len(tag_candidates)} untagged photo(s)...")
+                    else:
+                        print("\nAll photos in target directory already have tags.")
+
+                if tag_candidates:
+                    t0 = time.time()
+                    tag_count = 0
+                    total = len(tag_candidates)
+                    for idx, (photo_id, path) in enumerate(tag_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        t_photo = time.time()
+                        tags = tag_photo(path, model=describe_model)
+                        elapsed_photo = time.time() - t_photo
+                        if tags:
+                            db.update_photo(photo_id, tags=_json.dumps(tags))
+                            print(f" ({elapsed_photo:.1f}s) {', '.join(tags)}")
+                            tag_count += 1
+                        else:
+                            print(f" ({elapsed_photo:.1f}s) no tags")
+                    elapsed = time.time() - t0
+                    print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
 
         # Step 6: Aesthetic quality scoring + concept analysis
         if enable_quality:

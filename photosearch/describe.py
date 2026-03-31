@@ -143,6 +143,77 @@ def critique_photo(
     return describe_photo(image_path, model=model, prompt=AESTHETIC_CRITIQUE_PROMPT)
 
 
+# ---------------------------------------------------------------------------
+# Semantic tagging — M9
+# ---------------------------------------------------------------------------
+# A fixed vocabulary of category tags that the LLM assigns to each photo.
+# These replace the hand-curated _TERM_EXPANSIONS dictionary in search.py
+# with LLM-quality semantic understanding at zero search-time cost.
+
+TAG_VOCABULARY = [
+    # Living things
+    "animal", "bird", "fish", "insect", "pet", "wildlife",
+    # People
+    "person", "child", "group", "crowd", "portrait",
+    # Activities
+    "action", "sports", "playing", "walking", "swimming", "surfing",
+    "running", "climbing", "dancing", "eating", "cooking", "working",
+    # Scenes & settings
+    "landscape", "seascape", "cityscape", "mountain", "forest", "desert",
+    "beach", "ocean", "lake", "river", "waterfall", "sky", "sunset",
+    "sunrise", "night",
+    # Built environment
+    "building", "architecture", "street", "road", "bridge", "vehicle",
+    "car", "boat", "airplane",
+    # Nature
+    "flower", "plant", "tree", "garden", "rock", "snow", "rain",
+    # Indoor
+    "indoor", "home", "kitchen", "room", "office",
+    # Mood / style
+    "dramatic", "peaceful", "colorful", "dark", "bright", "foggy",
+    "silhouette", "reflection",
+    # Objects
+    "food", "drink", "sign", "art", "sculpture", "flag",
+    # Photography qualities
+    "close-up", "wide-angle", "aerial", "underwater",
+]
+
+TAG_PROMPT = """\
+Tag this photo using ONLY tags from this list: {tags}
+
+Rules:
+- Return ONLY a comma-separated list of tags that apply. Nothing else.
+- Include every tag that clearly applies. Omit any that don't.
+- If you see a specific animal (e.g. hawk, deer), include "animal" AND "bird" or "wildlife" as appropriate.
+- If people are present, include "person" and relevant activity tags.
+- Include setting tags (beach, ocean, forest, etc.) and mood tags (dramatic, peaceful, etc.) when they apply.
+- Do NOT add tags that are not in the list above.
+""".format(tags=", ".join(TAG_VOCABULARY))
+
+
+def tag_photo(
+    image_path: str,
+    model: str = MODEL,
+) -> Optional[list[str]]:
+    """Generate semantic tags for a single photo via Ollama.
+
+    Returns a list of tags from TAG_VOCABULARY, or None if generation failed.
+    """
+    raw = describe_photo(image_path, model=model, prompt=TAG_PROMPT)
+    if not raw:
+        return None
+
+    # Parse comma-separated response, validate against vocabulary
+    vocab_set = set(TAG_VOCABULARY)
+    tags = []
+    for token in raw.split(","):
+        tag = token.strip().lower().rstrip(".")
+        if tag in vocab_set:
+            tags.append(tag)
+
+    return tags if tags else None
+
+
 def describe_photos_batch(
     image_paths: list[str],
     model: str = MODEL,

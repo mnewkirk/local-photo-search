@@ -48,8 +48,10 @@ def cli():
 @click.option("--describe-model", default="llava", show_default=True, help="Ollama model for descriptions.")
 @click.option("--quality", is_flag=True, help="Compute aesthetic quality scores (1–10 scale).")
 @click.option("--force-quality", is_flag=True, help="Rescore quality for all photos, even those already scored.")
+@click.option("--tags", is_flag=True, help="Generate semantic tags via LLaVA (requires --describe or Ollama).")
+@click.option("--force-tags", is_flag=True, help="Regenerate tags for all photos, even those that already have them.")
 def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip,
-          describe, force_describe, describe_model, quality, force_quality):
+          describe, force_describe, describe_model, quality, force_quality, tags, force_tags):
     """Index a directory of photos."""
     index_directory(
         photo_dir=photo_dir,
@@ -65,6 +67,8 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
         describe_model=describe_model,
         enable_quality=quality or force_quality,
         force_quality=force_quality,
+        enable_tags=tags or force_tags,
+        force_tags=force_tags,
     )
 
 
@@ -91,8 +95,18 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
                    "Try 5.0 for good photos, 6.0 for excellent, 7.0 for outstanding.")
 @click.option("--sort-quality", is_flag=True, help="Sort results by aesthetic quality (highest first) instead of relevance.")
 @click.option("--debug", is_flag=True, help="Write step-by-step search log to debug.log in the results folder.")
+@click.option("--tag-match", type=click.Choice(["dict", "tags", "both"]), default="both",
+              show_default=True, help="Text matching mode: dict (term expansion), tags (LLM tags), both (take best).")
+@click.option("--date", "date_exact", default=None,
+              help="Filter by date: YYYY, YYYY-MM, or YYYY-MM-DD. Also supports natural language in --query.")
+@click.option("--from", "date_from", default=None,
+              help="Filter photos taken on or after this date (YYYY-MM-DD or YYYY-MM).")
+@click.option("--to", "date_to", default=None,
+              help="Filter photos taken on or before this date (YYYY-MM-DD or YYYY-MM).")
+@click.option("--location", "-l", default=None,
+              help="Filter by location/place name (matched against geocoded place names).")
 def search(query, person, place, color, face, db, limit, results_dir, no_results, json_output, min_score,
-           min_quality, sort_quality, debug):
+           min_quality, sort_quality, debug, tag_match, date_exact, date_from, date_to, location):
     """Search indexed photos."""
     # When --debug is used, capture log lines in a buffer (written to file later).
     debug_handler = None
@@ -103,7 +117,19 @@ def search(query, person, place, color, face, db, limit, results_dir, no_results
         search_logger.setLevel(logging.INFO)
         search_logger.addHandler(debug_handler)
 
-    if not any([query, person, place, color, face, min_quality is not None]):
+    # Resolve --date into --from / --to range
+    if date_exact:
+        from photosearch.date_parse import _parse_single_date
+        parsed = _parse_single_date(date_exact)
+        if parsed:
+            date_from = date_from or parsed[0]
+            date_to = date_to or parsed[1]
+        else:
+            click.echo(f"Could not parse date: {date_exact}")
+            return
+
+    if not any([query, person, place, color, face, min_quality is not None,
+                date_from, date_to, location]):
         click.echo("Please provide at least one search criterion. See --help for options.")
         return
 
@@ -120,6 +146,10 @@ def search(query, person, place, color, face, db, limit, results_dir, no_results
             min_quality=min_quality,
             sort_quality=sort_quality,
             debug=debug,
+            tag_match=tag_match,
+            date_from=date_from,
+            date_to=date_to,
+            location=location,
         )
 
         if not results:
@@ -742,7 +772,7 @@ def show_quality(db, sort_order, min_score, detail, directory):
 
         cols = "filename, aesthetic_score"
         if detail:
-            cols = "filename, aesthetic_score, aesthetic_concepts, aesthetic_critique"
+            cols = "filename, aesthetic_score, aesthetic_concepts, aesthetic_critique, tags"
 
         # Build WHERE clause
         conditions = []
@@ -794,6 +824,14 @@ def show_quality(db, sort_order, min_score, detail, directory):
                 # LLM critique
                 if row["aesthetic_critique"]:
                     click.echo(f"  Critique:   {row['aesthetic_critique']}")
+
+                # Semantic tags
+                if row["tags"]:
+                    try:
+                        tags = json.loads(row["tags"])
+                        click.echo(f"  Tags:       {', '.join(tags)}")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
             click.echo(f"{'─' * 70}")
         else:

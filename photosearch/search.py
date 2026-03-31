@@ -317,6 +317,113 @@ def _expand_query_word(word: str) -> set[str]:
     return {lower}
 
 
+# ---------------------------------------------------------------------------
+# Tag-based matching (M9) — replaces dictionary expansion with LLM tags
+# ---------------------------------------------------------------------------
+# Maps query words to tags from TAG_VOCABULARY. When a user searches "animal",
+# we check the photo's pre-computed tags for "animal", "bird", "fish", "pet",
+# "wildlife", etc. This is the LLM-powered alternative to _TERM_EXPANSIONS.
+
+_QUERY_TO_TAGS: dict[str, set[str]] = {
+    # Animals
+    "animal": {"animal", "bird", "fish", "insect", "pet", "wildlife"},
+    "animals": {"animal", "bird", "fish", "insect", "pet", "wildlife"},
+    "wildlife": {"wildlife", "animal", "bird"},
+    "bird": {"bird", "animal", "wildlife"},
+    "birds": {"bird", "animal", "wildlife"},
+    "fish": {"fish", "animal"},
+    "pet": {"pet", "animal"},
+    "pets": {"pet", "animal"},
+    "insect": {"insect", "animal"},
+    # People
+    "people": {"person", "child", "group", "crowd", "portrait"},
+    "person": {"person", "child", "portrait"},
+    "child": {"child", "person"},
+    "children": {"child", "person", "group"},
+    "kid": {"child", "person"},
+    "kids": {"child", "person", "group"},
+    "family": {"person", "child", "group"},
+    "portrait": {"portrait", "person"},
+    # Activities
+    "action": {"action", "sports", "running", "climbing", "surfing", "swimming"},
+    "sports": {"sports", "action", "surfing", "swimming", "running", "climbing"},
+    "playing": {"playing", "action"},
+    # Scenes
+    "landscape": {"landscape", "mountain", "forest", "desert"},
+    "seascape": {"seascape", "ocean", "beach"},
+    "beach": {"beach", "ocean", "seascape"},
+    "ocean": {"ocean", "beach", "seascape"},
+    "mountain": {"mountain", "landscape"},
+    "forest": {"forest", "landscape", "tree"},
+    "sunset": {"sunset", "sky"},
+    "sunrise": {"sunrise", "sky"},
+    # Nature
+    "flower": {"flower", "plant", "garden"},
+    "flowers": {"flower", "plant", "garden"},
+    "plant": {"plant", "tree", "flower", "garden"},
+    "plants": {"plant", "tree", "flower", "garden"},
+    "tree": {"tree", "plant", "forest"},
+    # Vehicles
+    "vehicle": {"vehicle", "car", "boat", "airplane"},
+    "vehicles": {"vehicle", "car", "boat", "airplane"},
+    "car": {"car", "vehicle"},
+    "boat": {"boat", "vehicle"},
+    # Food
+    "food": {"food", "drink", "eating", "cooking"},
+    # Indoor
+    "indoor": {"indoor", "home", "kitchen", "room", "office"},
+    "home": {"home", "indoor", "room", "kitchen"},
+}
+
+
+def _tags_match_query(tags_json: Optional[str], query: str) -> float:
+    """Score how well a photo's tags match a query.
+
+    Uses the same scoring tiers as _description_relevance:
+      +DESCRIPTION_BOOST           tags match the query
+      -DESCRIPTION_ABSENCE_PENALTY tags exist but none match
+      0.0                          no tags available
+    """
+    if not tags_json:
+        return 0.0
+
+    try:
+        photo_tags = set(json.loads(tags_json))
+    except (json.JSONDecodeError, TypeError):
+        return 0.0
+
+    if not photo_tags:
+        return 0.0
+
+    query_words = query.lower().split()
+    matched = 0
+
+    for word in query_words:
+        # Direct tag match
+        if word in photo_tags:
+            matched += 1
+            continue
+
+        # Stem match (basic plural handling)
+        stem = word.rstrip("s") if len(word) > 4 else word
+        if stem in photo_tags:
+            matched += 1
+            continue
+
+        # Expand query word to related tags and check
+        related_tags = _QUERY_TO_TAGS.get(word, _QUERY_TO_TAGS.get(stem, set()))
+        if related_tags & photo_tags:
+            matched += 1
+
+    if matched == len(query_words):
+        return DESCRIPTION_BOOST
+
+    if matched == 0:
+        return -DESCRIPTION_ABSENCE_PENALTY
+
+    return 0.0  # Partial match — neutral
+
+
 def _term_in_desc_positive(term: str, desc_lower: str) -> bool:
     """Check if a term appears in a description in a non-negated context.
 
@@ -499,8 +606,14 @@ def search_semantic(
     limit: int = 10,
     min_score: float = CLIP_MIN_SCORE,
     debug: bool = False,
+    tag_match: str = "both",
 ) -> list[dict]:
     """Semantic search — combines CLIP similarity, face boost, and description matching.
+
+    tag_match controls how text relevance is computed:
+      "dict"  — use dictionary-based term expansion only (original behavior)
+      "tags"  — use LLM-generated tags only
+      "both"  — use both and take the higher score (default)
 
     Three signals are merged:
       1. CLIP embedding similarity (visual match)
@@ -558,6 +671,15 @@ def search_semantic(
     ).fetchall()
     desc_cache = {row["id"]: row["description"] for row in rows}
 
+    # Pre-load tags for tag-based matching
+    tag_cache: dict[int, str] = {}
+    if tag_match in ("tags", "both"):
+        rows = db.conn.execute(
+            "SELECT id, tags FROM photos WHERE tags IS NOT NULL"
+        ).fetchall()
+        tag_cache = {row["id"]: row["tags"] for row in rows}
+        _dbg(f"TAG CACHE: {len(tag_cache)} photos have tags (tag_match={tag_match})")
+
     # Pre-load filenames for debug logging
     name_cache: dict[int, str] = {}
     if debug:
@@ -597,16 +719,37 @@ def search_semantic(
             score += face_adj
             steps.append(f"face_boost=+{face_adj:.3f} ({face_counts[photo_id]} faces)")
 
-        # Description relevance against the positive query
-        if photo_id in desc_cache and positive_query:
-            desc_rel = _description_relevance(desc_cache[photo_id], positive_query)
-            if desc_rel > 0 and raw_score < CLIP_MIN_FOR_DESC_BOOST:
-                steps.append(f"desc_boost_blocked (desc_rel=+{desc_rel:.3f} but clip too low)")
+        # Description / tag relevance against the positive query
+        if positive_query:
+            # Dict-based description relevance (original behavior)
+            dict_rel = 0.0
+            if tag_match in ("dict", "both") and photo_id in desc_cache:
+                dict_rel = _description_relevance(desc_cache[photo_id], positive_query)
+
+            # Tag-based relevance
+            tag_rel = 0.0
+            if tag_match in ("tags", "both") and photo_id in tag_cache:
+                tag_rel = _tags_match_query(tag_cache.get(photo_id), positive_query)
+
+            # Pick the relevance score based on mode
+            if tag_match == "dict":
+                text_rel = dict_rel
+            elif tag_match == "tags":
+                text_rel = tag_rel
+            else:  # "both" — take the better score
+                text_rel = max(dict_rel, tag_rel)
+
+            if text_rel > 0 and raw_score < CLIP_MIN_FOR_DESC_BOOST:
+                steps.append(f"text_boost_blocked (rel=+{text_rel:.3f} but clip too low)")
+                if tag_match == "both":
+                    steps.append(f"  dict_rel={dict_rel:+.3f} tag_rel={tag_rel:+.3f}")
             else:
-                score += desc_rel
-                if desc_rel != 0:
-                    label = "desc_boost" if desc_rel > 0 else "desc_penalty"
-                    steps.append(f"{label}={desc_rel:+.3f}")
+                score += text_rel
+                if text_rel != 0:
+                    label = "text_boost" if text_rel > 0 else "text_penalty"
+                    steps.append(f"{label}={text_rel:+.3f}")
+                    if tag_match == "both":
+                        steps.append(f"  dict_rel={dict_rel:+.3f} tag_rel={tag_rel:+.3f}")
         elif photo_id not in desc_cache:
             steps.append("no_description")
 
@@ -739,6 +882,46 @@ def search_by_face_reference(db: PhotoDB, image_path: str, limit: int = 10) -> l
     return results
 
 
+def _filter_by_date(results: list[dict], date_from: str, date_to: str) -> list[dict]:
+    """Filter results to those whose date_taken falls within [date_from, date_to]."""
+    filtered = []
+    for r in results:
+        dt = r.get("date_taken")
+        if not dt:
+            continue
+        # date_taken is "YYYY-MM-DD HH:MM:SS"; compare date portion
+        date_str = dt[:10]
+        if date_from <= date_str <= date_to:
+            filtered.append(r)
+    return filtered
+
+
+def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 100) -> list[dict]:
+    """Return photos within a date range, ordered by date."""
+    rows = db.conn.execute(
+        """SELECT * FROM photos
+           WHERE date_taken IS NOT NULL
+             AND date_taken >= ? AND date_taken <= ?
+           ORDER BY date_taken
+           LIMIT ?""",
+        (date_from, date_to + " 23:59:59", limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[dict]:
+    """Search by place_name using case-insensitive LIKE matching."""
+    pattern = f"%{location}%"
+    rows = db.conn.execute(
+        """SELECT * FROM photos
+           WHERE place_name IS NOT NULL AND place_name LIKE ?
+           ORDER BY date_taken
+           LIMIT ?""",
+        (pattern, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def search_combined(
     db: PhotoDB,
     query: Optional[str] = None,
@@ -751,6 +934,10 @@ def search_combined(
     min_quality: Optional[float] = None,
     sort_quality: bool = False,
     debug: bool = False,
+    tag_match: str = "both",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    location: Optional[str] = None,
 ) -> list[dict]:
     """Run multiple search types and merge results.
 
@@ -761,7 +948,31 @@ def search_combined(
         min_quality: If set, filter out photos with aesthetic_score below this value.
         sort_quality: If True, sort final results by aesthetic_score (highest first)
                      instead of the default relevance ordering.
+        date_from: If set, filter to photos taken on or after this date (YYYY-MM-DD).
+        date_to: If set, filter to photos taken on or before this date (YYYY-MM-DD).
+        location: If set, search by place name (matched against reverse-geocoded place_name).
     """
+    from .date_parse import parse_date_from_query
+    from .geocode import extract_location_from_query
+
+    # Parse dates and locations from the query string (if not explicitly provided)
+    effective_query = query
+    if effective_query:
+        # Extract date from query if no explicit date args given
+        if not date_from and not date_to:
+            parsed_from, parsed_to, cleaned = parse_date_from_query(effective_query)
+            if parsed_from:
+                date_from = parsed_from
+                date_to = parsed_to
+                effective_query = cleaned if cleaned else None
+
+        # Extract location from query if no explicit --place or --location given
+        if not place and not location and effective_query:
+            parsed_loc, cleaned = extract_location_from_query(effective_query)
+            if parsed_loc:
+                location = parsed_loc
+                effective_query = cleaned if cleaned else None
+
     result_sets = []
 
     if person:
@@ -772,8 +983,8 @@ def search_combined(
         results = search_by_face_reference(db, face_image, limit=limit * 3)
         result_sets.append({r["id"]: r for r in results})
 
-    if query:
-        results = search_semantic(db, query, limit=limit * 3, min_score=min_score, debug=debug)
+    if effective_query:
+        results = search_semantic(db, effective_query, limit=limit * 3, min_score=min_score, debug=debug, tag_match=tag_match)
         result_sets.append({r["id"]: r for r in results})
 
     if color:
@@ -783,6 +994,15 @@ def search_combined(
     if place:
         results = search_by_place(db, place, limit=limit * 3)
         result_sets.append({r["id"]: r for r in results})
+
+    if location:
+        results = _search_by_location(db, location, limit=limit * 3)
+        result_sets.append({r["id"]: r for r in results})
+
+    # Date as a primary search: if only date is specified (no other criteria)
+    if date_from and not result_sets and min_quality is None:
+        results = _search_by_date(db, date_from, date_to or date_from, limit=limit)
+        return results
 
     # Quality-only search: if no other criteria given but min_quality is set,
     # return the highest-quality photos in the collection.
@@ -794,7 +1014,10 @@ def search_combined(
                LIMIT ?""",
             (min_quality, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        results = [dict(r) for r in rows]
+        if date_from:
+            results = _filter_by_date(results, date_from, date_to or date_from)
+        return results
 
     if not result_sets:
         return []
@@ -810,6 +1033,10 @@ def search_combined(
         merged = _dedupe_by_hash(
             [result_sets[0][pid] for pid in common_ids if pid in result_sets[0]]
         )
+
+    # Apply date filter (when date is combined with other search criteria)
+    if date_from:
+        merged = _filter_by_date(merged, date_from, date_to or date_from)
 
     # Apply quality filter
     if min_quality is not None:
