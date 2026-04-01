@@ -10,6 +10,10 @@
 #   2. docker compose up -d
 #   3. Open http://localhost:8000
 #
+# To pull required Ollama models (first time):
+#   docker compose exec ollama ollama pull llava:13b
+#   docker compose exec ollama ollama pull minicpm-v
+#
 # To index photos (first time or after adding new photos):
 #   docker compose run --rm photosearch index /photos --faces --describe
 #
@@ -47,7 +51,7 @@ services:
     container_name: photosearch-ollama
     restart: unless-stopped
     volumes:
-      # Persist downloaded models (LLaVA is ~4.7 GB)
+      # Persist downloaded models (LLaVA ~4.7 GB + minicpm-v ~5 GB)
       - ollama-models:/root/.ollama
     # No ports exposed by default — only the photosearch container needs access.
     # Uncomment to access Ollama directly from the host:

@@ -86,10 +86,12 @@ local-photo-search/
 │   ├── describe.py        # LLaVA scene descriptions + semantic tagging via Ollama
 │   ├── colors.py          # Dominant color extraction (colorthief)
 │   ├── quality.py         # Aesthetic quality scoring (LAION predictor + ViT-L/14)
+│   ├── verify.py          # Hallucination detection (CLIP + cross-model LLM)
 │   ├── cull.py            # Shoot review: clustering + selection algorithm
 │   └── exif.py            # EXIF/GPS metadata extraction
 ├── frontend/dist/         # Web UI (static HTML + React)
 │   ├── index.html         # Main search interface
+│   ├── faces.html         # Face management (grouping, naming, merging, ignore)
 │   └── review.html        # Shoot review / culling interface
 ├── cli.py                 # Click-based CLI with all commands
 ├── tests/
@@ -322,6 +324,51 @@ python cli.py index /path/to/photos --tags --force-tags
 ```
 
 
+## Hallucination detection (verification)
+
+LLaVA occasionally hallucinates — describing a frisbee that isn't there, or claiming a bird is a hummingbird when it's a sparrow. The verification pipeline catches these errors using a three-pass approach with cross-model checking.
+
+### Three-pass pipeline
+
+**Pass 1 — CLIP scoring.** Extract visual nouns from the description and score each against the photo's CLIP embedding. Uses both an absolute threshold and a relative threshold (1.5 std deviations below the median) to flag suspicious items. In batch mode, only photos with flagged items proceed to Pass 2. In `--photo` or `--llm-all` mode, all photos proceed.
+
+**Pass 2 — Cross-model LLM check.** Send the photo (not the description) to a *different* vision model (minicpm-v by default) and ask it to identify errors in the original description. Using a different model is critical: the same model that hallucinated an object will confirm its own hallucination when asked to verify. Different models have different biases, so cross-checking catches errors that self-verification misses.
+
+**Pass 3 — CLIP cross-check.** For each item the LLM flagged as wrong, embed it with CLIP and check its similarity to the photo. If CLIP gives it an above-median score (suggesting the object really is in the image), the LLM's finding is overridden. This prevents the verification model from over-flagging — both CLIP and the LLM must agree before a hallucination is confirmed.
+
+When hallucinations are confirmed, the description and tags are automatically regenerated with a stricter prompt that explicitly excludes the hallucinated objects.
+
+### Why cross-model verification
+
+We discovered through testing that same-model verification doesn't work for hallucination detection. When LLaVA described a beach photo as "playing with a frisbee" (no frisbee present), asking LLaVA to verify always returned "YES, frisbee is visible." Switching verification to minicpm-v (a completely different architecture: SigLip + Qwen2 vs CLIP + Vicuna) immediately caught the error.
+
+```bash
+# Verify all unverified photos
+python cli.py verify
+
+# Verify a specific photo (verbose output, checks everything)
+python cli.py verify --photo DSC04929.JPG
+
+# Re-verify all photos
+python cli.py verify --force
+
+# Flag only, don't regenerate
+python cli.py verify --no-regenerate --force --limit 50
+```
+
+### Required models
+
+The verification pipeline requires two Ollama vision models:
+
+- **Description model** (default: `llava`) — generates and regenerates descriptions/tags
+- **Verification model** (default: `minicpm-v`) — cross-checks descriptions for errors
+
+```bash
+ollama pull llava:13b    # or llava for the 7B variant
+ollama pull minicpm-v    # ~5 GB, SigLip + Qwen2 architecture
+```
+
+
 ## Quick start
 
 ```bash
@@ -332,9 +379,10 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Install Ollama and pull LLaVA (for scene descriptions)
+# Install Ollama and pull models
 # See https://ollama.com for Ollama installation
-ollama pull llava:13b
+ollama pull llava:13b      # Scene descriptions
+ollama pull minicpm-v      # Hallucination verification (cross-model)
 
 # Index a folder of photos (full pipeline)
 python cli.py index /path/to/photos --faces --describe --describe-model llava:13b --quality
@@ -363,6 +411,7 @@ python cli.py stats
 | `diagnose-photo` | Show face detection details and match distances |
 | `stats` | Database statistics |
 | `show-descriptions` | View LLaVA-generated descriptions |
+| `verify` | Verify descriptions/tags for hallucinations and auto-regenerate |
 | `review <dir>` | Shoot review — select best representative photos from a folder |
 
 Key flags for `index`:
@@ -381,6 +430,20 @@ Key flags for `index`:
 | `--force-tags` | Regenerate tags for all photos |
 | `--no-clip` | Skip CLIP embedding |
 | `--no-colors` | Skip color extraction |
+
+Key flags for `verify`:
+
+| Flag | Effect |
+|------|--------|
+| `--photo <path>` | Verify a single photo (auto-enables verbose + llm-all) |
+| `--verify-model minicpm-v` | Vision model for verification (default: minicpm-v) |
+| `--model llava` | Model for regeneration (default: llava) |
+| `--threshold 0.18` | CLIP similarity threshold for flagging |
+| `--force` | Re-verify even previously verified photos |
+| `--no-regenerate` | Flag hallucinations but don't auto-regenerate |
+| `--llm-all` | Send all nouns to LLM, not just CLIP-flagged |
+| `--limit N` | Max photos to verify (0 = all) |
+| `-v` / `--verbose` | Show detailed CLIP scores for every noun/tag |
 
 Key flags for `review`:
 
@@ -469,7 +532,7 @@ The development process was iterative in a way that's hard to capture in commits
 | **M9** | Done | Semantic tagging — LLM-generated tags from a fixed ~60-tag vocabulary at index time. Tags stored in the photos table and used for search matching and shoot review diversity detection. |
 | **M10** | Done | Shoot review — adaptive CLIP clustering + quality-based selection for post-shoot culling. Web UI with grid view, cluster view, toggle selection, and export. CLI with export to directory. |
 | **M11** | Done | Portable photo paths — photo_root system stores relative paths in DB, resolves at runtime. Supports moving the database between machines without re-indexing. |
-| **M12** | Next | Hallucination detection — second LLM pass to verify descriptions, tags, and aesthetic critiques against the actual photo. Re-run generation when hallucinations are found (e.g. describing a sandcastle that isn't there, tagging "landscape" on a hummingbird close-up). |
+| **M12** | Done | Hallucination detection — three-pass verification (CLIP scoring → cross-model LLM check → CLIP cross-check) catches and auto-regenerates hallucinated descriptions. Uses a separate vision model (minicpm-v) to avoid same-model confirmation bias. |
 | **M13** | Next | Collections / albums — persistent named collections of photos, especially from the review process. Stored in a separate SQLite database. Easy to download all files from a collection, with clear JPG/ARW selection and availability indicators. |
 | **M14** | Next | Photo stacking — detect near-identical burst/bracket shots (very short time gaps, similar CLIP embeddings) and collapse them into stacks. Best photo on top, others hidden behind it. Complements the review/culling cluster view but operates at a tighter similarity threshold for true duplicates. |
 
@@ -478,7 +541,7 @@ The development process was iterative in a way that's hard to capture in commits
 
 - **Place search has no data.** The Sony camera that took the test photos didn't have GPS enabled. The place search infrastructure (GPS extraction, schema columns, search query) is wired up and ready for photos that include location EXIF data.
 
-- **LLaVA hallucinations.** The 13B model occasionally describes people, objects, or activities that aren't in the photo. The CLIP gate and face confirmation mitigate this for search, but individual descriptions may be inaccurate.
+- **LLaVA hallucinations.** The 13B model occasionally describes people, objects, or activities that aren't in the photo. The CLIP gate and face confirmation mitigate this for search. The `verify` command (M12) catches and auto-regenerates most hallucinated descriptions using cross-model verification, but some false positives and false negatives remain.
 
 - **No incremental CLIP updates.** Switching CLIP models requires `--force-clip` to regenerate all embeddings. There's no versioning to detect stale embeddings automatically.
 

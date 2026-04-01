@@ -51,8 +51,10 @@ def cli():
 @click.option("--tags", is_flag=True, help="Generate semantic tags via LLaVA (requires --describe or Ollama).")
 @click.option("--force-tags", is_flag=True, help="Regenerate tags for all photos, even those that already have them.")
 @click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --tags. Equivalent to passing each flag individually.")
+@click.option("--verify", is_flag=True, help="Run hallucination verification after indexing (requires descriptions).")
 def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip,
-          describe, force_describe, describe_model, quality, force_quality, tags, force_tags, full):
+          describe, force_describe, describe_model, quality, force_quality, tags, force_tags, full,
+          verify):
     """Index a directory of photos."""
     if full:
         faces = True
@@ -76,6 +78,15 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
         enable_tags=tags or force_tags,
         force_tags=force_tags,
     )
+
+    if verify and (describe or force_describe or tags or force_tags or full):
+        click.echo("\n--- Verification pass ---")
+        from photosearch.db import PhotoDB
+        from photosearch.verify import verify_photos
+        photo_db = PhotoDB(db, photo_root=photo_dir)
+        stats = verify_photos(photo_db, verify_model="minicpm-v", regen_model=describe_model)
+        click.echo(f"Verification: {stats['passed']} passed, "
+                    f"{stats['regenerated']} regenerated, {stats['failed']} failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +1393,137 @@ def review(photo_dir, db, target_pct, threshold, export, export_raw, list_only):
         if not export and not export_raw and not list_only:
             click.echo(f"\nSelections saved. View in the web UI at /review")
             click.echo(f"Or use --export <dir> to copy selected JPGs.")
+
+
+# ---------------------------------------------------------------------------
+# verify — hallucination detection
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--threshold", default=0.18, show_default=True,
+              help="CLIP similarity threshold. Nouns below this are flagged.")
+@click.option("--model", default="llava", show_default=True, help="Ollama model used to regenerate descriptions.")
+@click.option("--verify-model", default="minicpm-v", show_default=True,
+              help="Ollama vision model for verification (should differ from --model to avoid confirmation bias).")
+@click.option("--force", is_flag=True, help="Re-verify even previously verified photos.")
+@click.option("--no-regenerate", is_flag=True, help="Flag hallucinations but don't auto-regenerate.")
+@click.option("--limit", default=0, help="Max photos to verify (0 = all).")
+@click.option("--photo", default=None, type=click.Path(), help="Verify a specific photo by file path.")
+@click.option("--llm-all", is_flag=True, help="Send ALL nouns to LLM, not just CLIP-flagged ones (slower but thorough).")
+@click.option("-v", "--verbose", is_flag=True, help="Show detailed CLIP scores for every noun/tag.")
+def verify(db, threshold, model, verify_model, force, no_regenerate, limit, photo, llm_all, verbose):
+    """Verify photo descriptions and tags for hallucinations.
+
+    Two-pass approach:
+      1. CLIP check — flags nouns in descriptions that don't match the photo
+      2. LLM verify — sends the photo to a DIFFERENT vision model to cross-check
+
+    Uses a separate model for verification (default: minicpm-v) to avoid the
+    problem where the same model confirms its own hallucinations.
+
+    Confirmed hallucinations are automatically regenerated unless --no-regenerate.
+
+    \b
+    Examples:
+      # Verify all unverified photos:
+      python cli.py verify
+
+      # Re-verify everything:
+      python cli.py verify --force
+
+      # Just flag, don't regenerate:
+      python cli.py verify --no-regenerate
+
+      # Verify with stricter threshold:
+      python cli.py verify --threshold 0.20
+
+      # Verify a single photo:
+      python cli.py verify --photo /path/to/DSC00123.JPG
+    """
+    from photosearch.db import PhotoDB
+    from photosearch.verify import verify_photos
+    from photosearch.describe import check_available
+
+    check_available(verify_model)
+    if not no_regenerate:
+        check_available(model)
+
+    # Enable verbose logging for verify module (auto-enabled for --photo)
+    if verbose or photo:
+        verify_logger = logging.getLogger("photosearch.verify")
+        verify_logger.setLevel(logging.INFO)
+        verify_logger.propagate = False  # prevent duplicate output from root logger
+        if not verify_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            verify_logger.addHandler(handler)
+
+    photo_db = PhotoDB(db)
+
+    # Target a specific photo by filepath
+    photos = None
+    if photo:
+        photo_path = os.path.abspath(photo)
+        # Try absolute path first, then the path as given (may be relative in DB)
+        row = photo_db.conn.execute(
+            "SELECT * FROM photos WHERE filepath = ?", (photo_path,)
+        ).fetchone()
+        if row is None:
+            row = photo_db.conn.execute(
+                "SELECT * FROM photos WHERE filepath = ?", (photo,)
+            ).fetchone()
+        if row is None:
+            # Also try matching just the filename or tail of the path
+            row = photo_db.conn.execute(
+                "SELECT * FROM photos WHERE filepath LIKE ?", (f"%{os.path.basename(photo)}",)
+            ).fetchone()
+        if row is None:
+            click.echo(f"Error: photo not found in database: {photo}", err=True)
+            raise SystemExit(1)
+        row = dict(row)
+        if row.get("description") is None and row.get("tags") is None:
+            click.echo(f"Error: photo has no description or tags to verify: {photo_path}", err=True)
+            raise SystemExit(1)
+        photos = [row]
+        force = True  # always verify when targeting a specific photo
+        click.echo(f"Photo: {row['filepath']}")
+        click.echo(f"Description: {row.get('description', '(none)')}")
+        click.echo(f"Tags: {row.get('tags', '(none)')}")
+        click.echo()
+    elif limit > 0:
+        if force:
+            rows = photo_db.conn.execute(
+                "SELECT * FROM photos WHERE description IS NOT NULL OR tags IS NOT NULL LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = photo_db.conn.execute(
+                """SELECT * FROM photos
+                   WHERE (description IS NOT NULL OR tags IS NOT NULL)
+                   AND verified_at IS NULL LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        photos = [dict(r) for r in rows]
+
+    # When targeting a single photo, use LLM-all mode (verify every noun, not just CLIP-flagged)
+    use_llm_all = llm_all or (photo is not None)
+    click.echo(f"Verifying (verify-model={verify_model}, regen-model={model}, threshold={threshold}{', llm-all=true' if use_llm_all else ''})...")
+    stats = verify_photos(
+        photo_db,
+        photos=photos,
+        clip_threshold=threshold,
+        verify_model=verify_model,
+        regen_model=model,
+        auto_regenerate=not no_regenerate,
+        force=force,
+        llm_all=use_llm_all,
+    )
+
+    click.echo(f"\nDone. {stats['checked']}/{stats['total']} checked:")
+    click.echo(f"  Passed:      {stats['passed']}")
+    click.echo(f"  Failed:      {stats['failed']}")
+    click.echo(f"  Regenerated: {stats['regenerated']}")
 
 
 if __name__ == "__main__":

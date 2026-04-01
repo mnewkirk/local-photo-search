@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -301,6 +301,14 @@ class PhotoDB:
 
         # Migration: unique constraint on persons.name (schema v7)
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_persons_name_unique ON persons(LOWER(name))")
+
+        # Migration: hallucination verification columns (schema v9)
+        try:
+            cur.execute("SELECT verified_at FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN verified_at TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN verification_status TEXT")  # 'pass', 'fail', 'regenerated'
+            cur.execute("ALTER TABLE photos ADD COLUMN hallucination_flags TEXT")  # JSON: what was flagged
 
         # Ignored clusters — hide unknown faces the user doesn't care about
         cur.execute("""
