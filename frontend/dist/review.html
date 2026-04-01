@@ -45,16 +45,18 @@
       display: flex;
       align-items: center;
       gap: 16px;
+      min-height: 42px;
     }
-    .logo {
-      font-size: 18px;
-      font-weight: 600;
-      white-space: nowrap;
-      color: var(--text);
-      text-decoration: none;
-    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
     .logo span { color: var(--accent); }
-    .logo .mode { color: var(--green); font-size: 14px; margin-left: 8px; }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
 
     /* Controls bar */
     .controls {
@@ -385,6 +387,54 @@
       border-bottom: 1px solid var(--border);
     }
     .detail-row .label { color: var(--text-muted); }
+    .detail-section p { font-size: 14px; line-height: 1.6; }
+    .face-tag {
+      display: inline-block;
+      padding: 4px 10px;
+      background: var(--surface2);
+      border-radius: 12px;
+      font-size: 13px;
+      margin: 2px 4px 2px 0;
+      cursor: pointer;
+      transition: background 0.15s, outline 0.15s;
+    }
+    .face-tag:hover, .face-tag.active { background: var(--accent); color: #fff; }
+    .face-tag .match-badge { font-size: 10px; margin-left: 4px; opacity: 0.7; }
+    .face-edit-panel {
+      display: flex; flex-direction: column; gap: 6px;
+      margin: 4px 0; padding: 8px 10px;
+      background: var(--surface2); border-radius: 8px; font-size: 13px;
+    }
+    .face-edit-panel select, .face-edit-panel input {
+      font-size: 13px; padding: 4px 8px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); outline: none; width: 100%;
+    }
+    .face-edit-panel select:focus, .face-edit-panel input:focus { border-color: var(--accent); }
+    .face-edit-buttons { display: flex; gap: 6px; margin-top: 2px; }
+    .face-edit-buttons button {
+      flex: 1; padding: 4px 0; border-radius: 6px;
+      border: 1px solid var(--border); background: var(--surface);
+      color: var(--text); cursor: pointer; font-size: 12px;
+    }
+    .face-edit-buttons button:hover { border-color: var(--accent); }
+    .face-edit-buttons button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .face-edit-buttons button.danger { border-color: #f87171; color: #f87171; }
+    .face-edit-buttons button.danger:hover { background: #f87171; color: #fff; }
+    .face-bbox-overlay {
+      position: absolute; border: 2px solid var(--accent); border-radius: 4px;
+      pointer-events: none; box-shadow: 0 0 0 1px rgba(0,0,0,0.4); transition: opacity 0.15s;
+    }
+    .face-bbox-label {
+      position: absolute; bottom: 100%; left: -2px;
+      background: var(--accent); color: #fff; font-size: 11px;
+      padding: 1px 6px; border-radius: 4px 4px 0 0; white-space: nowrap;
+    }
+    .color-dots { display: flex; gap: 3px; margin-top: 4px; }
+    .color-dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
 
     /* Export modal */
     .export-modal {
@@ -446,6 +496,7 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
 
   <script>
     const { useState, useEffect, useCallback, useRef, useMemo } = React;
@@ -722,43 +773,37 @@
 
       return e('div', null,
         // Header
-        e('div', { className: 'header' },
-          e('div', { className: 'header-inner' },
-            e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
-            e('a', { href: '/', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Search'),
-            e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Faces'),
-            e('a', { href: '/collections', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Collections'),
-            // Folder selector
-            e('div', { className: 'control-group' },
-              e('select', {
-                value: selectedFolder,
-                onChange: (ev) => setSelectedFolder(ev.target.value),
-                style: { minWidth: 250 },
-              },
-                e('option', { value: '' }, 'Select a folder...'),
-                ...folders.map(f => e('option', { key: f, value: f }, f)),
-              ),
+        e(PS.SharedHeader, { activePage: 'review' },
+          // Folder selector
+          e('div', { className: 'control-group' },
+            e('select', {
+              value: selectedFolder,
+              onChange: (ev) => setSelectedFolder(ev.target.value),
+              style: { minWidth: 250 },
+            },
+              e('option', { value: '' }, 'Select a folder...'),
+              ...folders.map(f => e('option', { key: f, value: f }, f)),
             ),
-            // Target %
-            e('div', { className: 'control-group' },
-              e('span', { className: 'control-label' }, 'Target:'),
-              e('input', {
-                className: 'ctrl-input',
-                type: 'number',
-                value: targetPct,
-                onChange: (ev) => setTargetPct(ev.target.value),
-                min: 1, max: 50, step: 1,
-                style: { width: 50 },
-              }),
-              e('span', { className: 'control-label' }, '%'),
-            ),
-            // Run button
-            e('button', {
-              className: 'btn btn-primary',
-              onClick: runReview,
-              disabled: !selectedFolder || loading,
-            }, loading ? 'Analyzing...' : 'Run Review'),
           ),
+          // Target %
+          e('div', { className: 'control-group' },
+            e('span', { className: 'control-label' }, 'Target:'),
+            e('input', {
+              className: 'ctrl-input',
+              type: 'number',
+              value: targetPct,
+              onChange: (ev) => setTargetPct(ev.target.value),
+              min: 1, max: 50, step: 1,
+              style: { width: 50 },
+            }),
+            e('span', { className: 'control-label' }, '%'),
+          ),
+          // Run button
+          e('button', {
+            className: 'btn btn-primary',
+            onClick: runReview,
+            disabled: !selectedFolder || loading,
+          }, loading ? 'Analyzing...' : 'Run Review'),
         ),
 
         // Controls bar
@@ -877,108 +922,50 @@
         ),
 
         // Photo modal
-        modalPhoto && e('div', { className: 'modal-overlay', onClick: (ev) => {
-          if (ev.target === ev.currentTarget) closeModal();
-        }},
-          e('button', { className: 'modal-close', onClick: closeModal }, '\u00D7'),
-          visiblePhotos.length > 1 && e('button', { className: 'modal-nav prev', onClick: (ev) => { ev.stopPropagation(); goPrev(); } }, '\u2039'),
-          visiblePhotos.length > 1 && e('button', { className: 'modal-nav next', onClick: (ev) => { ev.stopPropagation(); goNext(); } }, '\u203A'),
-          e('div', { className: 'modal' },
-            e('div', { className: 'modal-image' },
-              e('img', {
-                src: API + '/api/photos/' + modalPhoto.id + '/full',
-                alt: modalPhoto.filename,
-              }),
+        modalPhoto && e(PS.PhotoModal, {
+          photo: modalPhoto,
+          detail: modalDetail,
+          onClose: closeModal,
+          onPrev: goPrev,
+          onNext: goNext,
+          index: modalIndex,
+          total: visiblePhotos.length,
+          showFaces: true,
+          showCollections: false,
+          showLocation: true,
+          showAesthetics: true,
+          headerChildren: e('div', { className: 'detail-section' },
+            e('button', {
+              className: 'btn ' + (modalPhoto.selected ? 'btn-green' : 'btn-outline'),
+              onClick: () => {
+                togglePhoto(modalPhoto.id);
+                setModalPhoto(prev => prev ? { ...prev, selected: !prev.selected } : prev);
+              },
+              style: { width: '100%', marginBottom: 8 },
+            }, modalPhoto.selected ? '\u2713 Selected' : 'Select this photo'),
+            e('div', { style: { fontSize: 11, color: 'var(--text-muted)', textAlign: 'center' } },
+              'Press S or X to toggle'),
+          ),
+          footerChildren: e('div', null,
+            // Cluster info
+            e('div', { className: 'detail-section' },
+              e('h3', null, 'Cluster'),
+              e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Cluster #'),
+                e('span', null, modalPhoto.cluster_id),
+              ),
+              e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Rank in cluster'),
+                e('span', null, '#' + modalPhoto.rank_in_cluster),
+              ),
             ),
-            e('div', { className: 'modal-sidebar' },
-              // Selection toggle
-              e('div', { className: 'detail-section' },
-                e('button', {
-                  className: 'btn ' + (modalPhoto.selected ? 'btn-green' : 'btn-outline'),
-                  onClick: () => {
-                    togglePhoto(modalPhoto.id);
-                    setModalPhoto(prev => prev ? { ...prev, selected: !prev.selected } : prev);
-                  },
-                  style: { width: '100%', marginBottom: 8 },
-                }, modalPhoto.selected ? '\u2713 Selected' : 'Select this photo'),
-                e('div', { style: { fontSize: 11, color: 'var(--text-muted)', textAlign: 'center' } },
-                  'Press S or X to toggle'),
-              ),
-
-              // Photo info
-              e('div', { className: 'detail-section' },
-                e('h3', null, 'Photo'),
-                e('p', { style: { fontWeight: 600, fontSize: 14 } }, modalPhoto.filename),
-                modalDetail && modalDetail.filepath && e('p', { style: { color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 } }, modalDetail.filepath),
-                modalPhoto.date_taken && e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } }, modalPhoto.date_taken),
-              ),
-
-              // Quality
-              modalPhoto.aesthetic_score != null && e('div', { className: 'detail-section' },
-                e('h3', null, 'Quality'),
-                (() => {
-                  const s = modalPhoto.aesthetic_score;
-                  const color = s >= 6 ? 'var(--green)' : s >= 4.5 ? 'var(--yellow)' : 'var(--red)';
-                  return e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8 } },
-                    e('span', { style: { fontSize: 24, fontWeight: 600, color } }, s.toFixed(1)),
-                    e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } }, '/ 10'),
-                  );
-                })(),
-              ),
-
-              // Cluster info
-              e('div', { className: 'detail-section' },
-                e('h3', null, 'Cluster'),
-                e('div', { className: 'detail-row' },
-                  e('span', { className: 'label' }, 'Cluster #'),
-                  e('span', null, modalPhoto.cluster_id),
-                ),
-                e('div', { className: 'detail-row' },
-                  e('span', { className: 'label' }, 'Rank in cluster'),
-                  e('span', null, '#' + modalPhoto.rank_in_cluster),
-                ),
-              ),
-
-              // Description (from detail endpoint)
-              modalDetail && modalDetail.description && e('div', { className: 'detail-section' },
-                e('h3', null, 'Description'),
-                e('p', { style: { fontSize: 13, lineHeight: 1.6 } }, modalDetail.description),
-              ),
-
-              // Camera info
-              modalDetail && e('div', { className: 'detail-section' },
-                e('h3', null, 'Camera'),
-                modalDetail.camera_model && e('div', { className: 'detail-row' },
-                  e('span', { className: 'label' }, 'Model'),
-                  e('span', null, modalDetail.camera_model),
-                ),
-                modalDetail.focal_length && e('div', { className: 'detail-row' },
-                  e('span', { className: 'label' }, 'Focal'),
-                  e('span', null, formatFocalLength(modalDetail.focal_length)),
-                ),
-                modalDetail.f_number && e('div', { className: 'detail-row' },
-                  e('span', { className: 'label' }, 'Aperture'),
-                  e('span', null, 'f/' + formatFNumber(modalDetail.f_number)),
-                ),
-                modalDetail.iso && e('div', { className: 'detail-row' },
-                  e('span', { className: 'label' }, 'ISO'),
-                  e('span', null, modalDetail.iso),
-                ),
-              ),
-
-              // Raw file
-              modalPhoto.has_raw && e('div', { className: 'detail-section' },
-                e('h3', null, 'Raw File'),
-                e('p', { style: { fontSize: 13, color: 'var(--accent)' } }, 'ARW available'),
-              ),
-
-              // Navigation
-              e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginTop: 8, textAlign: 'center' } },
-                (modalIndex + 1) + ' / ' + visiblePhotos.length,
-              ),
+            // Raw file
+            modalPhoto.has_raw && e('div', { className: 'detail-section' },
+              e('h3', null, 'Raw File'),
+              e('p', { style: { fontSize: 13, color: 'var(--accent)' } }, 'ARW available'),
             ),
           ),
-        ),
+        }),
 
         // Export modal
         showExport && e('div', { className: 'modal-overlay', onClick: (ev) => {
@@ -1111,24 +1098,6 @@
     }
 
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-    function formatFocalLength(fl) {
-      if (fl && fl.includes('/')) {
-        const parts = fl.split('/');
-        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(0) + 'mm';
-      }
-      return fl + 'mm';
-    }
-
-    function formatFNumber(fn) {
-      if (fn && fn.includes('/')) {
-        const parts = fn.split('/');
-        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(1);
-      }
-      return fn;
-    }
 
 
     // -----------------------------------------------------------------------
