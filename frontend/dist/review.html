@@ -479,6 +479,10 @@
       const [showExport, setShowExport] = useState(false);
       const [exportFiles, setExportFiles] = useState([]);
       const [exportRaw, setExportRaw] = useState(false);
+      const [showSaveCollection, setShowSaveCollection] = useState(false);
+      const [saveCollName, setSaveCollName] = useState('');
+      const [saveCollError, setSaveCollError] = useState(null);
+      const [saveCollSuccess, setSaveCollSuccess] = useState(null);
       const [targetPct, setTargetPct] = useState(initParams.target_pct);
       const [threshold, setThreshold] = useState('0');
 
@@ -617,6 +621,46 @@
         navigator.clipboard.writeText(text).catch(() => {});
       }, [exportFiles]);
 
+      const openSaveCollection = useCallback(() => {
+        // Default name from folder
+        const defaultName = selectedFolder || '';
+        setSaveCollName(defaultName);
+        setSaveCollError(null);
+        setSaveCollSuccess(null);
+        setShowSaveCollection(true);
+      }, [selectedFolder]);
+
+      const doSaveCollection = useCallback(async () => {
+        const name = saveCollName.trim();
+        if (!name) return;
+        setSaveCollError(null);
+        setSaveCollSuccess(null);
+
+        // Get selected photo IDs
+        const selectedIds = photos.filter(p => p.selected).map(p => p.id);
+        if (!selectedIds.length) {
+          setSaveCollError('No photos selected');
+          return;
+        }
+
+        try {
+          const res = await fetch('/api/collections', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, photo_ids: selectedIds }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            setSaveCollError(data.error || 'Failed to create collection');
+            return;
+          }
+          setSaveCollSuccess(`Saved ${selectedIds.length} photos to "${name}"`);
+          setTimeout(() => { setShowSaveCollection(false); }, 1500);
+        } catch {
+          setSaveCollError('Network error');
+        }
+      }, [saveCollName, photos]);
+
       // Modal navigation
       const [modalIndex, setModalIndex] = useState(-1);
 
@@ -683,6 +727,7 @@
             e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
             e('a', { href: '/', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Search'),
             e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Faces'),
+            e('a', { href: '/collections', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Collections'),
             // Folder selector
             e('div', { className: 'control-group' },
               e('select', {
@@ -766,6 +811,12 @@
             onClick: openExport,
             disabled: !stats || stats.selected === 0,
           }, 'Export Selected'),
+          e('button', {
+            className: 'btn',
+            onClick: openSaveCollection,
+            disabled: !stats || stats.selected === 0,
+            style: { marginLeft: 4 },
+          }, 'Save to Collection'),
 
           // Stats
           stats && e('div', { className: 'stats-bar' },
@@ -958,6 +1009,44 @@
             ),
             e('p', { style: { fontSize: 12, color: 'var(--text-muted)', marginTop: 12 } },
               'Tip: Use the copied paths with cp or rsync to move files to a new location.'),
+          ),
+        ),
+
+        // Save to Collection modal
+        showSaveCollection && e('div', { className: 'modal-overlay', onClick: (ev) => {
+          if (ev.target === ev.currentTarget) setShowSaveCollection(false);
+        }},
+          e('div', { className: 'export-modal', style: { maxWidth: 420 } },
+            e('h2', null, 'Save to Collection'),
+            e('p', { style: { fontSize: 14, color: 'var(--text-muted)', marginBottom: 12 } },
+              (stats ? stats.selected : 0) + ' selected photo(s) will be added.',
+            ),
+            e('input', {
+              type: 'text',
+              placeholder: 'Collection name',
+              value: saveCollName,
+              onChange: ev => setSaveCollName(ev.target.value),
+              onKeyDown: ev => ev.key === 'Enter' && doSaveCollection(),
+              style: {
+                width: '100%', padding: '10px 14px', background: 'var(--surface2)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                color: 'var(--text)', fontSize: 14, marginBottom: 8, outline: 'none',
+              },
+              autoFocus: true,
+            }),
+            saveCollError && e('p', { style: { color: '#f87171', fontSize: 13, marginBottom: 8 } }, saveCollError),
+            saveCollSuccess && e('p', { style: { color: '#4ade80', fontSize: 13, marginBottom: 8 } }, saveCollSuccess),
+            e('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              e('button', {
+                className: 'btn btn-primary',
+                onClick: doSaveCollection,
+                disabled: !saveCollName.trim() || !!saveCollSuccess,
+              }, 'Save'),
+              e('button', {
+                className: 'btn btn-outline',
+                onClick: () => setShowSaveCollection(false),
+              }, 'Cancel'),
+            ),
           ),
         ),
       );

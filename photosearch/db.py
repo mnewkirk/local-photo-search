@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -332,6 +332,28 @@ class PhotoDB:
             )
         """)
 
+        # Collections — named groups of photos (albums)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS collections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                cover_photo_id INTEGER REFERENCES photos(id) ON DELETE SET NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS collection_photos (
+                collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                added_at TEXT DEFAULT (datetime('now')),
+                sort_order INTEGER DEFAULT 0,
+                PRIMARY KEY (collection_id, photo_id)
+            )
+        """)
+
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
@@ -341,6 +363,8 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_dir ON review_selections(directory)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_coll ON collection_photos(collection_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)")
 
         # sqlite-vec virtual tables for vector search
         if HAS_SQLITE_VEC:
@@ -593,6 +617,144 @@ class PhotoDB:
                LIMIT ?""",
             (pattern, pattern, limit),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Collections
+    # ------------------------------------------------------------------
+
+    def create_collection(self, name: str, description: str = None) -> int:
+        """Create a new collection. Returns the collection id."""
+        cur = self.conn.execute(
+            "INSERT INTO collections (name, description) VALUES (?, ?)",
+            (name, description),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_collection(self, collection_id: int) -> dict | None:
+        """Get a single collection by id."""
+        row = self.conn.execute(
+            "SELECT * FROM collections WHERE id = ?", (collection_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_collection_by_name(self, name: str) -> dict | None:
+        """Get a collection by name."""
+        row = self.conn.execute(
+            "SELECT * FROM collections WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_collections(self) -> list[dict]:
+        """List all collections with photo counts."""
+        rows = self.conn.execute("""
+            SELECT c.*,
+                   COUNT(cp.photo_id) AS photo_count,
+                   COALESCE(c.cover_photo_id, (
+                       SELECT cp2.photo_id FROM collection_photos cp2
+                       WHERE cp2.collection_id = c.id
+                       ORDER BY cp2.sort_order, cp2.added_at
+                       LIMIT 1
+                   )) AS effective_cover_photo_id
+            FROM collections c
+            LEFT JOIN collection_photos cp ON cp.collection_id = c.id
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def rename_collection(self, collection_id: int, name: str) -> None:
+        """Rename a collection."""
+        self.conn.execute(
+            "UPDATE collections SET name = ?, updated_at = datetime('now') WHERE id = ?",
+            (name, collection_id),
+        )
+        self.conn.commit()
+
+    def update_collection_description(self, collection_id: int, description: str) -> None:
+        """Update a collection's description."""
+        self.conn.execute(
+            "UPDATE collections SET description = ?, updated_at = datetime('now') WHERE id = ?",
+            (description, collection_id),
+        )
+        self.conn.commit()
+
+    def set_collection_cover(self, collection_id: int, photo_id: int) -> None:
+        """Set the cover photo for a collection."""
+        self.conn.execute(
+            "UPDATE collections SET cover_photo_id = ?, updated_at = datetime('now') WHERE id = ?",
+            (photo_id, collection_id),
+        )
+        self.conn.commit()
+
+    def delete_collection(self, collection_id: int) -> None:
+        """Delete a collection (cascade removes collection_photos rows)."""
+        self.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        self.conn.commit()
+
+    def add_photos_to_collection(self, collection_id: int, photo_ids: list[int]) -> int:
+        """Add photos to a collection. Returns count of newly added photos."""
+        added = 0
+        # Get current max sort_order
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM collection_photos WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()
+        next_order = row[0] + 1
+
+        for pid in photo_ids:
+            try:
+                self.conn.execute(
+                    "INSERT INTO collection_photos (collection_id, photo_id, sort_order) VALUES (?, ?, ?)",
+                    (collection_id, pid, next_order),
+                )
+                added += 1
+                next_order += 1
+            except Exception:
+                # Already in collection (PRIMARY KEY conflict) — skip
+                pass
+        self.conn.execute(
+            "UPDATE collections SET updated_at = datetime('now') WHERE id = ?",
+            (collection_id,),
+        )
+        self.conn.commit()
+        return added
+
+    def remove_photos_from_collection(self, collection_id: int, photo_ids: list[int]) -> int:
+        """Remove photos from a collection. Returns count removed."""
+        placeholders = ",".join("?" * len(photo_ids))
+        cur = self.conn.execute(
+            f"DELETE FROM collection_photos WHERE collection_id = ? AND photo_id IN ({placeholders})",
+            [collection_id] + photo_ids,
+        )
+        self.conn.execute(
+            "UPDATE collections SET updated_at = datetime('now') WHERE id = ?",
+            (collection_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def get_collection_photos(self, collection_id: int) -> list[dict]:
+        """Get all photos in a collection with full photo metadata."""
+        rows = self.conn.execute("""
+            SELECT p.*, cp.sort_order, cp.added_at AS added_to_collection
+            FROM collection_photos cp
+            JOIN photos p ON p.id = cp.photo_id
+            WHERE cp.collection_id = ?
+            ORDER BY cp.sort_order, cp.added_at
+        """, (collection_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_photo_collections(self, photo_id: int) -> list[dict]:
+        """Get all collections a photo belongs to."""
+        rows = self.conn.execute("""
+            SELECT c.id, c.name
+            FROM collections c
+            JOIN collection_photos cp ON cp.collection_id = c.id
+            WHERE cp.photo_id = ?
+            ORDER BY c.name
+        """, (photo_id,)).fetchall()
         return [dict(r) for r in rows]
 
     def close(self):

@@ -149,6 +149,93 @@
       transform: scale(1.02);
       box-shadow: 0 4px 20px rgba(0,0,0,0.4);
     }
+    /* Multi-select mode */
+    .grid-item.selectable { cursor: pointer; }
+    .grid-item.selectable.selected {
+      outline: 3px solid var(--accent);
+      outline-offset: -3px;
+    }
+    .grid-item .select-check {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.6);
+      background: rgba(0,0,0,0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      color: transparent;
+      z-index: 5;
+      transition: all 0.15s;
+    }
+    .grid-item.selected .select-check {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .multi-bar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      position: sticky;
+      top: 57px;
+      z-index: 90;
+    }
+    .multi-bar .count {
+      font-size: 14px;
+      font-weight: 600;
+      min-width: 120px;
+    }
+    .multi-bar button {
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .multi-bar button:hover { border-color: var(--accent); }
+    .multi-bar button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .multi-bar button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .multi-bar .inline-input {
+      font-size: 14px;
+      padding: 4px 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      outline: none;
+      width: 200px;
+    }
+    .multi-bar .inline-input:focus { border-color: var(--accent); }
+    .multi-bar select {
+      font-size: 14px;
+      padding: 4px 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      outline: none;
+    }
     .grid-item img {
       width: 100%;
       height: 100%;
@@ -462,6 +549,99 @@
       const inputRef = useRef(null);
       const hasAutoSearched = useRef(false);
 
+      // ---- Multi-select state ----
+      const [multiSelect, setMultiSelect] = useState(false);
+      const [selected, setSelected] = useState(new Set()); // set of photo IDs
+      const [multiAction, setMultiAction] = useState(null); // 'add-to-coll' | null
+      const [allColls, setAllColls] = useState([]);
+      const [newCollName, setNewCollName] = useState('');
+      const [collBusy, setCollBusy] = useState(false);
+      const lastSelectedIdx = useRef(null);
+
+      const toggleSelect = useCallback((photoId, ev) => {
+        if (!results) return;
+        setSelected(prev => {
+          const next = new Set(prev);
+          const clickedIdx = results.findIndex(p => p.id === photoId);
+
+          if (ev && ev.shiftKey && lastSelectedIdx.current != null && clickedIdx >= 0) {
+            const lo = Math.min(lastSelectedIdx.current, clickedIdx);
+            const hi = Math.max(lastSelectedIdx.current, clickedIdx);
+            for (let i = lo; i <= hi; i++) {
+              next.add(results[i].id);
+            }
+          } else {
+            if (next.has(photoId)) next.delete(photoId); else next.add(photoId);
+          }
+
+          if (clickedIdx >= 0) lastSelectedIdx.current = clickedIdx;
+          return next;
+        });
+      }, [results]);
+
+      const exitMultiSelect = useCallback(() => {
+        setMultiSelect(false);
+        setSelected(new Set());
+        setMultiAction(null);
+        setNewCollName('');
+        lastSelectedIdx.current = null;
+      }, []);
+
+      const startAddToColl = useCallback(() => {
+        fetch(API + '/api/collections').then(r => r.json()).then(d => setAllColls(d.collections || [])).catch(() => {});
+        setMultiAction('add-to-coll');
+        setNewCollName('');
+      }, []);
+
+      const addSelectedToCollection = useCallback((collId) => {
+        setCollBusy(true);
+        fetch(API + '/api/collections/' + collId + '/photos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: Array.from(selected) }),
+        }).then(r => r.json()).then(() => {
+          setCollBusy(false);
+          exitMultiSelect();
+        }).catch(() => setCollBusy(false));
+      }, [selected, exitMultiSelect]);
+
+      const createCollAndAdd = useCallback(() => {
+        const name = newCollName.trim();
+        if (!name || selected.size === 0) return;
+        setCollBusy(true);
+        fetch(API + '/api/collections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, photo_ids: Array.from(selected) }),
+        }).then(r => r.json()).then(() => {
+          setCollBusy(false);
+          exitMultiSelect();
+        }).catch(() => setCollBusy(false));
+      }, [selected, newCollName, exitMultiSelect]);
+
+      // Escape exits multi-select
+      useEffect(() => {
+        if (!multiSelect) return;
+        const handler = (ev) => { if (ev.key === 'Escape') exitMultiSelect(); };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [multiSelect, exitMultiSelect]);
+
+      // 'm' key enters multi-select (when not in modal or typing)
+      useEffect(() => {
+        if (multiSelect || selectedPhoto) return;
+        const handler = (ev) => {
+          if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT' || ev.target.tagName === 'TEXTAREA') return;
+          if (ev.key === 'm' && results && results.length > 0) {
+            setMultiSelect(true);
+            setSelected(new Set());
+            setMultiAction(null);
+          }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [multiSelect, selectedPhoto, results]);
+
       // Load stats and persons on mount
       useEffect(() => {
         fetch(API + '/api/stats').then(r => r.json()).then(setStats).catch(() => {});
@@ -582,6 +762,7 @@
             e('div', { className: 'logo' }, e('span', null, 'photo'), 'search'),
             e('a', { href: '/review', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Review'),
             e('a', { href: '/faces', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Faces'),
+            e('a', { href: '/collections', style: { fontSize: 13, color: 'var(--accent)', textDecoration: 'none', marginLeft: 4 } }, 'Collections'),
             e('form', { className: 'search-form', onSubmit: doSearch },
               e('input', {
                 ref: inputRef,
@@ -711,8 +892,65 @@
           loading && e('div', { className: 'loading' }, 'Searching...'),
           results !== null && !loading && results.length === 0 &&
             e('div', { className: 'loading' }, 'No results found.'),
+
+          // "Select Multiple" button (only shown when results exist and not in multi-select)
+          results !== null && results.length > 0 && !multiSelect &&
+            e('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 8 } },
+              e('button', {
+                style: { padding: '6px 14px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+                         background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer', fontSize: 13 },
+                onClick: () => { setMultiSelect(true); setSelected(new Set()); setMultiAction(null); },
+                title: 'Or press M',
+              }, 'Select Multiple'),
+            ),
+
+          // Multi-select action bar
+          multiSelect && e('div', { className: 'multi-bar' },
+            e('span', { className: 'count' }, selected.size + ' selected'),
+
+            // Default actions
+            !multiAction && selected.size > 0 && e('button', {
+              className: 'primary',
+              onClick: startAddToColl,
+            }, 'Add to Collection'),
+
+            // Add-to-collection sub-action: pick existing
+            multiAction === 'add-to-coll' && allColls.length > 0 && e('select', {
+              value: '',
+              disabled: collBusy,
+              onChange: (ev) => { if (ev.target.value) addSelectedToCollection(parseInt(ev.target.value)); },
+            },
+              e('option', { value: '' }, 'Choose collection\u2026'),
+              ...allColls.map(c =>
+                e('option', { key: c.id, value: c.id }, c.name + ' (' + (c.photo_count || 0) + ')')
+              ),
+            ),
+
+            // Add-to-collection sub-action: create new
+            multiAction === 'add-to-coll' && e('input', {
+              className: 'inline-input',
+              value: newCollName,
+              disabled: collBusy,
+              onChange: (ev) => setNewCollName(ev.target.value),
+              onKeyDown: (ev) => {
+                if (ev.key === 'Enter') createCollAndAdd();
+                if (ev.key === 'Escape') { ev.stopPropagation(); setMultiAction(null); }
+              },
+              placeholder: 'Or create new\u2026',
+            }),
+            multiAction === 'add-to-coll' && e('button', {
+              className: 'primary',
+              onClick: createCollAndAdd,
+              disabled: !newCollName.trim() || collBusy,
+            }, collBusy ? 'Adding\u2026' : 'Create & Add'),
+            multiAction === 'add-to-coll' && e('button', { onClick: () => setMultiAction(null) }, 'Back'),
+
+            // Cancel always visible at right
+            e('button', { onClick: exitMultiSelect, style: { marginLeft: 'auto' } }, 'Cancel'),
+          ),
+
           results !== null && results.length > 0 &&
-            e(PhotoGrid, { results, onSelect: openPhoto }),
+            e(PhotoGrid, { results, onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect }),
         ),
 
         // Modal
@@ -748,24 +986,38 @@
     // -----------------------------------------------------------------------
     // Photo grid
     // -----------------------------------------------------------------------
-    function PhotoGrid({ results, onSelect }) {
+    function PhotoGrid({ results, onSelect, multiSelect, selected, onToggleSelect }) {
       return e('div', null,
-        e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)' } },
-          results.length + ' result' + (results.length !== 1 ? 's' : ''),
+        e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12 } },
+          e('span', null, results.length + ' result' + (results.length !== 1 ? 's' : '')),
+          multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
+            'Click to select \u00B7 Shift-click for range'),
         ),
         e('div', { className: 'grid' },
           ...results.map(photo =>
-            e(GridItem, { key: photo.id, photo, onClick: () => onSelect(photo) })
+            e(GridItem, {
+              key: photo.id, photo,
+              multiSelect: multiSelect,
+              isSelected: selected && selected.has(photo.id),
+              onClick: (ev) => {
+                if (multiSelect) { onToggleSelect(photo.id, ev); return; }
+                onSelect(photo);
+              },
+            })
           ),
         ),
       );
     }
 
-    function GridItem({ photo, onClick }) {
+    function GridItem({ photo, onClick, multiSelect, isSelected }) {
       const [loaded, setLoaded] = useState(false);
       const [error, setError] = useState(false);
 
-      return e('div', { className: 'grid-item', onClick },
+      return e('div', {
+        className: 'grid-item' + (multiSelect ? ' selectable' : '') + (isSelected ? ' selected' : ''),
+        onClick,
+      },
+        multiSelect && e('div', { className: 'select-check' }, isSelected ? '\u2713' : ''),
         !error && e('img', {
           src: API + '/api/photos/' + photo.id + '/thumbnail?v=' + encodeURIComponent(photo.filename),
           alt: photo.filename,
@@ -812,6 +1064,71 @@
       const [imgRect, setImgRect] = useState(null);
       const imgRef = useRef(null);
       const editInputRef = useRef(null);
+
+      // Collection state
+      const [photoColls, setPhotoColls] = useState([]);       // collections this photo belongs to
+      const [allColls, setAllColls] = useState([]);            // all available collections
+      const [showCollAdd, setShowCollAdd] = useState(false);   // show add-to-collection UI
+      const [newCollName, setNewCollName] = useState('');
+      const [collBusy, setCollBusy] = useState(false);
+
+      // Fetch photo's collections + all collections when photo changes
+      useEffect(() => {
+        if (!photo) return;
+        fetch(API + '/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+        fetch(API + '/api/collections').then(r => r.json()).then(d => setAllColls(d.collections || [])).catch(() => {});
+      }, [photo && photo.id]);
+
+      const addToCollection = useCallback((collId) => {
+        setCollBusy(true);
+        fetch(API + '/api/collections/' + collId + '/photos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: [photo.id] }),
+        })
+          .then(r => r.json())
+          .then(() => {
+            fetch(API + '/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+            setShowCollAdd(false);
+            setCollBusy(false);
+          })
+          .catch(() => setCollBusy(false));
+      }, [photo]);
+
+      const createAndAdd = useCallback(() => {
+        const name = newCollName.trim();
+        if (!name) return;
+        setCollBusy(true);
+        fetch(API + '/api/collections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, photo_ids: [photo.id] }),
+        })
+          .then(r => r.json())
+          .then(() => {
+            fetch(API + '/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+            fetch(API + '/api/collections').then(r => r.json()).then(d => setAllColls(d.collections || [])).catch(() => {});
+            setNewCollName('');
+            setShowCollAdd(false);
+            setCollBusy(false);
+          })
+          .catch(() => setCollBusy(false));
+      }, [photo, newCollName]);
+
+      const removeFromCollection = useCallback((collId) => {
+        setCollBusy(true);
+        fetch(API + '/api/collections/' + collId + '/photos/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: [photo.id] }),
+        })
+          .then(r => r.json())
+          .then(() => {
+            fetch(API + '/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+            setCollBusy(false);
+          })
+          .catch(() => setCollBusy(false));
+      }, [photo]);
 
       // Focus the text input when switching to new-name mode
       useEffect(() => {
@@ -1158,6 +1475,78 @@
                   ),
                 ),
               ),
+
+            // Collections
+            e('div', { className: 'detail-section' },
+              e('h3', null, 'Collections'),
+              photoColls.length > 0
+                ? e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 } },
+                    ...photoColls.map(c =>
+                      e('span', {
+                        key: c.id,
+                        style: {
+                          display: 'inline-flex', alignItems: 'center', gap: 4,
+                          background: 'var(--surface-hover)', borderRadius: 4, padding: '2px 8px',
+                          fontSize: 13, cursor: 'pointer',
+                        },
+                        title: 'Click to remove from collection',
+                        onClick: () => removeFromCollection(c.id),
+                      },
+                        c.name,
+                        e('span', { style: { opacity: 0.5, marginLeft: 2 } }, '\u00D7'),
+                      )
+                    ),
+                  )
+                : e('div', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 8 } }, 'Not in any collection'),
+
+              !showCollAdd
+                ? e('button', {
+                    style: { fontSize: 13, padding: '4px 10px', cursor: 'pointer',
+                             background: 'var(--surface-hover)', border: '1px solid var(--border)',
+                             borderRadius: 4, color: 'var(--text-primary)' },
+                    onClick: () => setShowCollAdd(true),
+                  }, '+ Add to Collection')
+                : e('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+                    // Existing collections not already assigned
+                    allColls.filter(c => !photoColls.find(pc => pc.id === c.id)).length > 0 &&
+                      e('select', {
+                        style: { fontSize: 13, padding: '4px 6px', background: 'var(--surface)',
+                                 color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 4 },
+                        value: '',
+                        disabled: collBusy,
+                        onChange: (ev) => { if (ev.target.value) addToCollection(parseInt(ev.target.value)); },
+                      },
+                        e('option', { value: '' }, 'Add to existing\u2026'),
+                        ...allColls
+                          .filter(c => !photoColls.find(pc => pc.id === c.id))
+                          .map(c => e('option', { key: c.id, value: c.id }, c.name)),
+                      ),
+                    // Create new
+                    e('div', { style: { display: 'flex', gap: 4 } },
+                      e('input', {
+                        type: 'text',
+                        placeholder: 'New collection\u2026',
+                        value: newCollName,
+                        disabled: collBusy,
+                        style: { flex: 1, fontSize: 13, padding: '4px 6px', background: 'var(--surface)',
+                                 color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 4 },
+                        onChange: (ev) => setNewCollName(ev.target.value),
+                        onKeyDown: (ev) => { if (ev.key === 'Enter') createAndAdd(); if (ev.key === 'Escape') setShowCollAdd(false); },
+                      }),
+                      e('button', {
+                        style: { fontSize: 13, padding: '4px 8px', cursor: 'pointer',
+                                 background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#fff' },
+                        disabled: collBusy || !newCollName.trim(),
+                        onClick: createAndAdd,
+                      }, 'Create'),
+                    ),
+                    e('button', {
+                      style: { fontSize: 13, padding: '2px 8px', cursor: 'pointer', alignSelf: 'flex-start',
+                               background: 'transparent', border: 'none', color: 'var(--text-muted)' },
+                      onClick: () => { setShowCollAdd(false); setNewCollName(''); },
+                    }, 'Cancel'),
+                  ),
+            ),
           ),
         ),
       );

@@ -1,0 +1,1291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Collections — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --red: #f87171;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    /* Page title row */
+    .page-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+      gap: 16px;
+    }
+    .page-header h2 {
+      font-size: 22px;
+      font-weight: 600;
+    }
+    .page-header .subtitle {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-left: 12px;
+      font-weight: 400;
+    }
+
+    /* Buttons */
+    .btn {
+      padding: 8px 16px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .btn:hover { background: var(--border); }
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+    .btn-danger { color: var(--red); }
+    .btn-danger:hover { background: rgba(248,113,113,0.15); border-color: var(--red); }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+    /* Collection grid */
+    .collections-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 20px;
+    }
+
+    .collection-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      cursor: pointer;
+      transition: border-color 0.15s, transform 0.1s;
+    }
+    .collection-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .collection-card .cover {
+      width: 100%;
+      aspect-ratio: 3/2;
+      background: var(--surface2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .collection-card .cover img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .collection-card .cover .empty-cover {
+      color: var(--text-muted);
+      font-size: 36px;
+    }
+    .collection-card .info {
+      padding: 12px 16px;
+    }
+    .collection-card .info .name {
+      font-weight: 600;
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+    .collection-card .info .meta {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    /* New collection card */
+    .new-collection-card {
+      background: var(--surface);
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 200px;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .new-collection-card:hover { border-color: var(--accent); }
+    .new-collection-card span {
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* Photo grid (collection detail) */
+    .photo-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+    }
+    .photo-grid .thumb-wrap {
+      position: relative;
+      aspect-ratio: 3/2;
+      overflow: hidden;
+      border-radius: 4px;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: border-color 0.15s;
+    }
+    .photo-grid .thumb-wrap:hover { border-color: var(--accent); }
+    .photo-grid .thumb-wrap.selected { border-color: var(--red); }
+    .photo-grid .thumb-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .photo-grid .thumb-wrap .remove-badge {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      background: rgba(248,113,113,0.9);
+      color: #fff;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .photo-grid .thumb-wrap.selected .remove-badge,
+    .photo-grid .thumb-wrap:hover .remove-badge { opacity: 1; }
+
+    /* Modal overlay */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-content {
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 24px;
+      width: 400px;
+      max-width: 90vw;
+    }
+    .modal-content h3 { margin-bottom: 16px; }
+    .modal-content input[type="text"] {
+      width: 100%;
+      padding: 10px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 14px;
+      margin-bottom: 12px;
+      outline: none;
+    }
+    .modal-content input[type="text"]:focus { border-color: var(--accent); }
+    .modal-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    /* Color dots */
+    .color-dots {
+      display: flex;
+      gap: 3px;
+      margin-top: 4px;
+    }
+    .color-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    /* Photo modal — full-featured (matches search page) */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 300;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal {
+      background: var(--surface);
+      border-radius: 12px;
+      max-width: 1200px;
+      width: 100%;
+      max-height: 90vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: row;
+    }
+    .modal-image {
+      flex: 1;
+      min-width: 0;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px 0 0 12px;
+      max-height: 90vh;
+      position: relative;
+    }
+    .modal-image img {
+      max-width: 100%;
+      max-height: 90vh;
+      object-fit: contain;
+    }
+    .modal-sidebar {
+      width: 340px;
+      flex-shrink: 0;
+      padding: 24px;
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      max-height: 90vh;
+    }
+    .modal-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      background: rgba(0,0,0,0.6);
+      border: none;
+      color: #fff;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      font-size: 20px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 310;
+    }
+    .modal-close:hover { background: rgba(0,0,0,0.8); }
+    .modal-nav {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(0,0,0,0.5);
+      border: none;
+      color: #fff;
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      font-size: 22px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 310;
+      transition: background 0.15s;
+    }
+    .modal-nav:hover { background: rgba(0,0,0,0.8); }
+    .modal-nav.prev { left: 16px; }
+    .modal-nav.next { right: 56px; }
+
+    .detail-section {
+      margin-bottom: 20px;
+    }
+    .detail-section h3 {
+      font-size: 13px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .detail-section p {
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-row .label { color: var(--text-muted); }
+
+    .face-tag {
+      display: inline-block;
+      padding: 4px 10px;
+      background: var(--surface2);
+      border-radius: 12px;
+      font-size: 13px;
+      margin: 2px 4px 2px 0;
+      cursor: pointer;
+      transition: background 0.15s, outline 0.15s;
+    }
+    .face-tag:hover, .face-tag.active {
+      background: var(--accent);
+      color: #fff;
+    }
+    .face-tag .match-badge {
+      font-size: 10px;
+      margin-left: 4px;
+      opacity: 0.7;
+    }
+    .face-edit-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 4px 0;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border-radius: 8px;
+      font-size: 13px;
+    }
+    .face-edit-panel select,
+    .face-edit-panel input {
+      font-size: 13px;
+      padding: 4px 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      outline: none;
+      width: 100%;
+    }
+    .face-edit-panel select:focus,
+    .face-edit-panel input:focus { border-color: var(--accent); }
+    .face-edit-buttons {
+      display: flex;
+      gap: 6px;
+      margin-top: 2px;
+    }
+    .face-edit-buttons button {
+      flex: 1;
+      padding: 4px 0;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .face-edit-buttons button:hover { border-color: var(--accent); }
+    .face-edit-buttons button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .face-edit-buttons button.danger {
+      border-color: #f87171;
+      color: #f87171;
+    }
+    .face-edit-buttons button.danger:hover { background: #f87171; color: #fff; }
+    .face-bbox-overlay {
+      position: absolute;
+      border: 2px solid var(--accent);
+      border-radius: 4px;
+      pointer-events: none;
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
+      transition: opacity 0.15s;
+    }
+    .face-bbox-label {
+      position: absolute;
+      bottom: 100%;
+      left: -2px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 4px 4px 0 0;
+      white-space: nowrap;
+    }
+
+    @media (max-width: 768px) {
+      .modal { flex-direction: column; }
+      .modal-image { border-radius: 12px 12px 0 0; max-height: 50vh; }
+      .modal-sidebar { width: 100%; border-left: none; border-top: 1px solid var(--border); }
+    }
+
+    /* Back link */
+    .back-link {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 13px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin-bottom: 16px;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+    }
+    .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+    .empty-state p { margin-bottom: 16px; }
+
+    /* Edit inline */
+    .editable { cursor: pointer; }
+    .editable:hover { color: var(--accent); }
+
+    /* Confirm dialog */
+    .confirm-bar {
+      background: rgba(248,113,113,0.1);
+      border: 1px solid var(--red);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+
+  <script>
+    const e = React.createElement;
+    const { useState, useEffect, useCallback, useRef, useMemo } = React;
+
+    // -----------------------------------------------------------------------
+    // Create Collection Modal
+    // -----------------------------------------------------------------------
+    function CreateModal({ onClose, onCreate }) {
+      const [name, setName] = useState('');
+      const inputRef = useRef(null);
+      useEffect(() => { inputRef.current && inputRef.current.focus(); }, []);
+
+      const submit = () => {
+        const trimmed = name.trim();
+        if (!trimmed) return;
+        onCreate(trimmed);
+      };
+
+      return e('div', { className: 'modal-overlay', onClick: onClose },
+        e('div', { className: 'modal-content', onClick: ev => ev.stopPropagation() },
+          e('h3', null, 'New Collection'),
+          e('input', {
+            ref: inputRef, type: 'text', placeholder: 'Collection name',
+            value: name, onChange: ev => setName(ev.target.value),
+            onKeyDown: ev => ev.key === 'Enter' && submit(),
+          }),
+          e('div', { className: 'modal-actions' },
+            e('button', { className: 'btn', onClick: onClose }, 'Cancel'),
+            e('button', { className: 'btn btn-primary', onClick: submit, disabled: !name.trim() }, 'Create'),
+          ),
+        ),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rename Modal
+    // -----------------------------------------------------------------------
+    function RenameModal({ currentName, onClose, onRename }) {
+      const [name, setName] = useState(currentName);
+      const inputRef = useRef(null);
+      useEffect(() => { inputRef.current && inputRef.current.focus(); }, []);
+
+      const submit = () => {
+        const trimmed = name.trim();
+        if (!trimmed || trimmed === currentName) return;
+        onRename(trimmed);
+      };
+
+      return e('div', { className: 'modal-overlay', onClick: onClose },
+        e('div', { className: 'modal-content', onClick: ev => ev.stopPropagation() },
+          e('h3', null, 'Rename Collection'),
+          e('input', {
+            ref: inputRef, type: 'text', value: name,
+            onChange: ev => setName(ev.target.value),
+            onKeyDown: ev => ev.key === 'Enter' && submit(),
+          }),
+          e('div', { className: 'modal-actions' },
+            e('button', { className: 'btn', onClick: onClose }, 'Cancel'),
+            e('button', { className: 'btn btn-primary', onClick: submit, disabled: !name.trim() || name.trim() === currentName }, 'Rename'),
+          ),
+        ),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Photo Modal (simplified — shows image + basic info)
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+    function formatFocalLength(fl) {
+      if (fl.includes('/')) {
+        const parts = fl.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(0) + 'mm';
+      }
+      return fl + 'mm';
+    }
+    function formatFNumber(fn) {
+      if (fn.includes('/')) {
+        const parts = fn.split('/');
+        return (parseInt(parts[0]) / parseInt(parts[1])).toFixed(1);
+      }
+      return fn;
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-featured Photo Modal (matches search page)
+    // -----------------------------------------------------------------------
+    function PhotoDetailModal({ photo, onClose, onPrev, onNext, index, total, onFaceAssigned, persons }) {
+      const [detail, setDetail] = useState(null);
+      const [hoveredFace, setHoveredFace] = useState(null);
+      const [editingFace, setEditingFace] = useState(null);
+      const [editMode, setEditMode] = useState('pick');
+      const [editName, setEditName] = useState('');
+      const [editPick, setEditPick] = useState('');
+      const [imgRect, setImgRect] = useState(null);
+      const imgRef = useRef(null);
+      const editInputRef = useRef(null);
+
+      // Collection state
+      const [photoColls, setPhotoColls] = useState([]);
+      const [allColls, setAllColls] = useState([]);
+      const [showCollAdd, setShowCollAdd] = useState(false);
+      const [newCollName, setNewCollName] = useState('');
+      const [collBusy, setCollBusy] = useState(false);
+
+      // Fetch full detail when photo changes
+      useEffect(() => {
+        if (!photo) return;
+        setDetail(null);
+        fetch('/api/photos/' + photo.id).then(r => r.json()).then(setDetail).catch(() => {});
+        fetch('/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+        fetch('/api/collections').then(r => r.json()).then(d => setAllColls(d.collections || [])).catch(() => {});
+      }, [photo && photo.id]);
+
+      // Keyboard nav
+      useEffect(() => {
+        const handler = (ev) => {
+          if (ev.key === 'Escape') onClose();
+          if (ev.key === 'ArrowLeft' && onPrev) { ev.preventDefault(); onPrev(); }
+          if (ev.key === 'ArrowRight' && onNext) { ev.preventDefault(); onNext(); }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [onClose, onPrev, onNext]);
+
+      // Focus text input when switching to new-name mode
+      useEffect(() => {
+        if (editingFace && editMode === 'new' && editInputRef.current) editInputRef.current.focus();
+      }, [editingFace, editMode]);
+
+      const cancelEdit = useCallback(() => {
+        setEditingFace(null); setEditMode('pick'); setEditName(''); setEditPick('');
+      }, []);
+
+      const saveExistingName = useCallback((faceId) => {
+        if (!editPick) return;
+        fetch('/api/faces/' + faceId + '/assign?name=' + encodeURIComponent(editPick), { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && onFaceAssigned) onFaceAssigned(faceId, data.person_name);
+            // Update detail in place
+            setDetail(prev => prev && prev.faces ? { ...prev, faces: prev.faces.map(f => f.id === faceId ? { ...f, person_name: data.person_name, match_source: 'manual' } : f) } : prev);
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [editPick, onFaceAssigned, cancelEdit]);
+
+      const saveNewName = useCallback((faceId) => {
+        const name = editName.trim();
+        if (!name) return;
+        fetch('/api/faces/' + faceId + '/assign?name=' + encodeURIComponent(name), { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && onFaceAssigned) onFaceAssigned(faceId, data.person_name);
+            setDetail(prev => prev && prev.faces ? { ...prev, faces: prev.faces.map(f => f.id === faceId ? { ...f, person_name: data.person_name, match_source: 'manual' } : f) } : prev);
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [editName, onFaceAssigned, cancelEdit]);
+
+      const clearFaceName = useCallback((faceId) => {
+        fetch('/api/faces/' + faceId + '/clear', { method: 'POST' })
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && onFaceAssigned) onFaceAssigned(faceId, null);
+            setDetail(prev => prev && prev.faces ? { ...prev, faces: prev.faces.map(f => f.id === faceId ? { ...f, person_name: null, match_source: null } : f) } : prev);
+            cancelEdit();
+          })
+          .catch(() => cancelEdit());
+      }, [onFaceAssigned, cancelEdit]);
+
+      // Collection actions
+      const addToCollection = useCallback((collId) => {
+        setCollBusy(true);
+        fetch('/api/collections/' + collId + '/photos', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: [photo.id] }),
+        }).then(r => r.json()).then(() => {
+          fetch('/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+          setShowCollAdd(false); setCollBusy(false);
+        }).catch(() => setCollBusy(false));
+      }, [photo]);
+
+      const createAndAdd = useCallback(() => {
+        const name = newCollName.trim();
+        if (!name) return;
+        setCollBusy(true);
+        fetch('/api/collections', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, photo_ids: [photo.id] }),
+        }).then(r => r.json()).then(() => {
+          fetch('/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+          fetch('/api/collections').then(r => r.json()).then(d => setAllColls(d.collections || [])).catch(() => {});
+          setNewCollName(''); setShowCollAdd(false); setCollBusy(false);
+        }).catch(() => setCollBusy(false));
+      }, [photo, newCollName]);
+
+      const removeFromCollection = useCallback((collId) => {
+        setCollBusy(true);
+        fetch('/api/collections/' + collId + '/photos/remove', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: [photo.id] }),
+        }).then(r => r.json()).then(() => {
+          fetch('/api/photos/' + photo.id + '/collections').then(r => r.json()).then(d => setPhotoColls(d.collections || [])).catch(() => {});
+          setCollBusy(false);
+        }).catch(() => setCollBusy(false));
+      }, [photo]);
+
+      // Image rect for face bounding boxes
+      const updateImgRect = useCallback(() => {
+        const img = imgRef.current;
+        if (!img || !img.naturalWidth) return;
+        const container = img.parentElement;
+        const contRect = container.getBoundingClientRect();
+        const imgElRect = img.getBoundingClientRect();
+        const elOx = imgElRect.left - contRect.left;
+        const elOy = imgElRect.top - contRect.top;
+        const cw = img.clientWidth, ch = img.clientHeight;
+        const nw = img.naturalWidth, nh = img.naturalHeight;
+        const scale = Math.min(cw / nw, ch / nh);
+        const dw = nw * scale, dh = nh * scale;
+        const fitOx = (cw - dw) / 2, fitOy = (ch - dh) / 2;
+        setImgRect({ ox: elOx + fitOx, oy: elOy + fitOy, dw, dh, nw, nh });
+      }, []);
+
+      useEffect(() => {
+        window.addEventListener('resize', updateImgRect);
+        return () => window.removeEventListener('resize', updateImgRect);
+      }, [updateImgRect]);
+
+      const faceOverlays = useMemo(() => {
+        if (!detail || !detail.faces || !imgRect) return [];
+        return detail.faces.filter(f => f.bbox).map(f => {
+          const { top, right, bottom, left } = f.bbox;
+          const sx = imgRect.dw / imgRect.nw;
+          const sy = imgRect.dh / imgRect.nh;
+          return {
+            id: f.id,
+            label: f.person_name || ('Unknown #' + (f.cluster_id || '?')),
+            style: {
+              left: imgRect.ox + left * sx,
+              top: imgRect.oy + top * sy,
+              width: (right - left) * sx,
+              height: (bottom - top) * sy,
+            },
+          };
+        });
+      }, [detail, imgRect]);
+
+      if (!photo) return null;
+
+      return e('div', { className: 'modal-overlay', onClick: (ev) => {
+        if (ev.target === ev.currentTarget) onClose();
+      }},
+        e('button', { className: 'modal-close', onClick: onClose }, '\u00D7'),
+        total > 1 && onPrev && e('button', { className: 'modal-nav prev', onClick: (ev) => { ev.stopPropagation(); onPrev(); }, title: 'Previous (\u2190)' }, '\u2039'),
+        total > 1 && onNext && e('button', { className: 'modal-nav next', onClick: (ev) => { ev.stopPropagation(); onNext(); }, title: 'Next (\u2192)' }, '\u203A'),
+        e('div', { className: 'modal' },
+          e('div', { className: 'modal-image', style: { position: 'relative' } },
+            e('img', {
+              ref: imgRef,
+              src: '/api/photos/' + photo.id + '/full',
+              alt: photo.filename,
+              onLoad: updateImgRect,
+            }),
+            // Face bounding box overlays
+            ...faceOverlays.filter(ov => hoveredFace === ov.id).map(ov =>
+              e('div', {
+                key: 'bbox-' + ov.id,
+                className: 'face-bbox-overlay',
+                style: { ...ov.style, borderColor: '#4ade80' },
+              },
+                e('span', {
+                  className: 'face-bbox-label',
+                  style: { background: '#4ade80', color: '#000' },
+                }, ov.label),
+              )
+            ),
+          ),
+          e('div', { className: 'modal-sidebar' },
+            // Filename
+            e('div', { className: 'detail-section' },
+              e('h3', null, 'Photo'),
+              e('p', { style: { fontWeight: 600, fontSize: 16 } }, photo.filename),
+              detail && detail.filepath && e('p', { style: { color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 } }, detail.filepath),
+              e('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
+                photo.date_taken && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, photo.date_taken),
+                total > 1 && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, (index + 1) + ' / ' + total),
+              ),
+            ),
+
+            // Description
+            (detail || photo).description && e('div', { className: 'detail-section' },
+              e('h3', null, 'Description'),
+              e('p', null, (detail || photo).description),
+            ),
+
+            // Faces
+            detail && detail.faces && detail.faces.length > 0 && e('div', { className: 'detail-section' },
+              e('h3', null, 'People'),
+              ...detail.faces.map(f =>
+                editingFace === f.id
+                  ? e('div', { key: f.id, className: 'face-edit-panel' },
+                      e('div', { style: { fontWeight: 600, marginBottom: 2 } },
+                        f.person_name || ('Unknown #' + (f.cluster_id || '?'))),
+                      editMode === 'pick' && e('select', {
+                        value: editPick,
+                        onChange: (ev) => setEditPick(ev.target.value),
+                        autoFocus: true,
+                      },
+                        e('option', { value: '' }, 'Choose existing person\u2026'),
+                        ...(persons || []).map(p => e('option', { key: p.id, value: p.name }, p.name)),
+                      ),
+                      editMode === 'pick' && e('div', { className: 'face-edit-buttons' },
+                        e('button', { className: 'primary', onClick: () => saveExistingName(f.id), disabled: !editPick,
+                          style: !editPick ? { opacity: 0.5, cursor: 'default' } : {} }, 'Apply'),
+                        e('button', { onClick: () => { setEditMode('new'); setEditName(''); } }, 'New Name'),
+                        f.person_name && e('button', { className: 'danger', onClick: () => clearFaceName(f.id) }, 'Unset'),
+                        e('button', { onClick: cancelEdit }, 'Cancel'),
+                      ),
+                      editMode === 'new' && e('input', {
+                        ref: editInputRef, type: 'text', value: editName, placeholder: 'Enter new name\u2026',
+                        onChange: (ev) => setEditName(ev.target.value),
+                        onKeyDown: (ev) => { if (ev.key === 'Enter') saveNewName(f.id); if (ev.key === 'Escape') cancelEdit(); },
+                      }),
+                      editMode === 'new' && e('div', { className: 'face-edit-buttons' },
+                        e('button', { className: 'primary', onClick: () => saveNewName(f.id), disabled: !editName.trim(),
+                          style: !editName.trim() ? { opacity: 0.5, cursor: 'default' } : {} }, 'Save'),
+                        e('button', { onClick: () => setEditMode('pick') }, 'Back'),
+                        e('button', { onClick: cancelEdit }, 'Cancel'),
+                      ),
+                    )
+                  : e('span', {
+                      key: f.id,
+                      className: 'face-tag' + (hoveredFace === f.id ? ' active' : ''),
+                      onMouseEnter: () => setHoveredFace(f.id),
+                      onMouseLeave: () => setHoveredFace(null),
+                      onClick: () => { setEditingFace(f.id); setEditMode('pick'); setEditPick(''); setEditName(''); },
+                      title: 'Click to change',
+                    },
+                      f.person_name || ('Unknown #' + (f.cluster_id || '?')),
+                      f.match_source && e('span', { className: 'match-badge' },
+                        f.match_source === 'temporal' ? '\u23F1' : f.match_source === 'strict' ? '\u2713'
+                        : f.match_source === 'manual' ? '\u270E' : ''),
+                    )
+              ),
+            ),
+
+            // Aesthetic quality
+            (detail && detail.aesthetic_score != null || photo.aesthetic_score != null) &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Aesthetic Quality'),
+                (() => {
+                  const s = (detail && detail.aesthetic_score) || photo.aesthetic_score;
+                  const color = s >= 6 ? '#4ade80' : s >= 4.5 ? '#facc15' : '#f87171';
+                  const label = s >= 7 ? 'Excellent' : s >= 6 ? 'Good' : s >= 4.5 ? 'Average' : 'Below average';
+                  const concepts = detail && detail.aesthetic_concepts;
+                  const critique = detail && detail.aesthetic_critique;
+                  return e('div', null,
+                    e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 } },
+                      e('span', { style: { fontSize: 24, fontWeight: 600, color } }, s.toFixed(1)),
+                      e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } }, '/ 10 \u00B7 ' + label),
+                    ),
+                    e('div', { style: { height: 6, background: 'var(--surface2)', borderRadius: 3, overflow: 'hidden',
+                      marginBottom: concepts || critique ? 10 : 0 } },
+                      e('div', { style: { width: (s * 10) + '%', height: '100%', background: color, borderRadius: 3 } }),
+                    ),
+                    concepts && concepts.strengths && concepts.strengths.length > 0 &&
+                      e('div', { style: { fontSize: 13, marginBottom: 4 } },
+                        e('span', { style: { color: '#4ade80' } }, '\u25B2 '),
+                        e('span', { style: { color: 'var(--text-muted)' } }, 'Strengths: '),
+                        concepts.strengths.join(', '),
+                      ),
+                    concepts && concepts.weaknesses && concepts.weaknesses.length > 0 &&
+                      e('div', { style: { fontSize: 13, marginBottom: 4 } },
+                        e('span', { style: { color: '#f87171' } }, '\u25BC '),
+                        e('span', { style: { color: 'var(--text-muted)' } }, 'Weaknesses: '),
+                        concepts.weaknesses.join(', '),
+                      ),
+                    critique &&
+                      e('p', { style: { fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 6, fontStyle: 'italic' } }, critique),
+                  );
+                })(),
+              ),
+
+            // Tags
+            detail && detail.tags && detail.tags.length > 0 && e('div', { className: 'detail-section' },
+              e('h3', null, 'Tags'),
+              e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4 } },
+                ...detail.tags.map(function(tag) {
+                  return e('span', { key: tag, style: {
+                    fontSize: 12, padding: '2px 8px', borderRadius: 12,
+                    background: 'var(--surface2)', color: 'var(--text)',
+                    border: '1px solid var(--border)',
+                  } }, tag);
+                }),
+              ),
+            ),
+
+            // Location
+            detail && detail.place_name && e('div', { className: 'detail-section' },
+              e('h3', null, 'Location'),
+              e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Place'),
+                e('span', null, detail.place_name),
+              ),
+            ),
+
+            // Camera info
+            detail && e('div', { className: 'detail-section' },
+              e('h3', null, 'Camera'),
+              detail.camera_model && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Model'),
+                e('span', null, detail.camera_model),
+              ),
+              detail.focal_length && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Focal Length'),
+                e('span', null, formatFocalLength(detail.focal_length)),
+              ),
+              detail.exposure_time && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Exposure'),
+                e('span', null, detail.exposure_time),
+              ),
+              detail.f_number && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Aperture'),
+                e('span', null, 'f/' + formatFNumber(detail.f_number)),
+              ),
+              detail.iso && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'ISO'),
+                e('span', null, detail.iso),
+              ),
+              detail.image_width && e('div', { className: 'detail-row' },
+                e('span', { className: 'label' }, 'Resolution'),
+                e('span', null, detail.image_width + ' \u00D7 ' + detail.image_height),
+              ),
+            ),
+
+            // Colors
+            (detail || photo).colors && (detail || photo).colors.length > 0 &&
+              e('div', { className: 'detail-section' },
+                e('h3', null, 'Dominant Colors'),
+                e('div', { className: 'color-dots', style: { gap: 6 } },
+                  ...(detail || photo).colors.map((c, i) =>
+                    e('span', {
+                      key: i, className: 'color-dot',
+                      style: { background: c, width: 20, height: 20 },
+                      title: c,
+                    })
+                  ),
+                ),
+              ),
+
+            // Collections
+            e('div', { className: 'detail-section' },
+              e('h3', null, 'Collections'),
+              photoColls.length > 0
+                ? e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 } },
+                    ...photoColls.map(c =>
+                      e('span', {
+                        key: c.id,
+                        style: {
+                          display: 'inline-flex', alignItems: 'center', gap: 4,
+                          background: 'var(--surface2)', borderRadius: 4, padding: '2px 8px',
+                          fontSize: 13, cursor: 'pointer',
+                        },
+                        title: 'Click to remove from collection',
+                        onClick: () => removeFromCollection(c.id),
+                      },
+                        c.name,
+                        e('span', { style: { opacity: 0.5, marginLeft: 2 } }, '\u00D7'),
+                      )
+                    ),
+                  )
+                : e('div', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 8 } }, 'Not in any collection'),
+
+              !showCollAdd
+                ? e('button', {
+                    style: { fontSize: 13, padding: '4px 10px', cursor: 'pointer',
+                             background: 'var(--surface2)', border: '1px solid var(--border)',
+                             borderRadius: 4, color: 'var(--text)' },
+                    onClick: () => setShowCollAdd(true),
+                  }, '+ Add to Collection')
+                : e('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+                    allColls.filter(c => !photoColls.find(pc => pc.id === c.id)).length > 0 &&
+                      e('select', {
+                        style: { fontSize: 13, padding: '4px 6px', background: 'var(--bg)',
+                                 color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4 },
+                        value: '',
+                        disabled: collBusy,
+                        onChange: (ev) => { if (ev.target.value) addToCollection(parseInt(ev.target.value)); },
+                      },
+                        e('option', { value: '' }, 'Add to existing\u2026'),
+                        ...allColls
+                          .filter(c => !photoColls.find(pc => pc.id === c.id))
+                          .map(c => e('option', { key: c.id, value: c.id }, c.name)),
+                      ),
+                    e('div', { style: { display: 'flex', gap: 4 } },
+                      e('input', {
+                        type: 'text', placeholder: 'New collection\u2026', value: newCollName, disabled: collBusy,
+                        style: { flex: 1, fontSize: 13, padding: '4px 6px', background: 'var(--bg)',
+                                 color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4 },
+                        onChange: (ev) => setNewCollName(ev.target.value),
+                        onKeyDown: (ev) => { if (ev.key === 'Enter') createAndAdd(); if (ev.key === 'Escape') setShowCollAdd(false); },
+                      }),
+                      e('button', {
+                        style: { fontSize: 13, padding: '4px 8px', cursor: 'pointer',
+                                 background: 'var(--accent)', border: 'none', borderRadius: 4, color: '#fff' },
+                        disabled: collBusy || !newCollName.trim(),
+                        onClick: createAndAdd,
+                      }, 'Create'),
+                    ),
+                    e('button', {
+                      style: { fontSize: 13, padding: '2px 8px', cursor: 'pointer', alignSelf: 'flex-start',
+                               background: 'transparent', border: 'none', color: 'var(--text-muted)' },
+                      onClick: () => { setShowCollAdd(false); setNewCollName(''); },
+                    }, 'Cancel'),
+                  ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Collections List View
+    // -----------------------------------------------------------------------
+    function CollectionsList() {
+      const [collections, setCollections] = useState([]);
+      const [showCreate, setShowCreate] = useState(false);
+      const [error, setError] = useState(null);
+
+      const load = useCallback(() => {
+        fetch('/api/collections').then(r => r.json()).then(data => {
+          setCollections(data.collections || []);
+        });
+      }, []);
+
+      useEffect(() => { load(); }, [load]);
+
+      const doCreate = async (name) => {
+        setError(null);
+        const res = await fetch('/api/collections', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        const data = await res.json();
+        if (!res.ok) { setError(data.error); return; }
+        setShowCreate(false);
+        // Navigate to the new collection
+        window.location.href = `/collections/${data.collection.id}`;
+      };
+
+      return e('div', null,
+        e('div', { className: 'page-header' },
+          e('h2', null,
+            'Collections',
+            e('span', { className: 'subtitle' }, `${collections.length} collection${collections.length !== 1 ? 's' : ''}`),
+          ),
+          e('button', { className: 'btn btn-primary', onClick: () => setShowCreate(true) }, '+ New Collection'),
+        ),
+
+        error && e('div', { style: { color: 'var(--red)', marginBottom: 16, fontSize: 13 } }, error),
+
+        collections.length === 0 && !showCreate && e('div', { className: 'empty-state' },
+          e('div', { className: 'icon' }, '\ud83d\udcf7'),
+          e('p', null, 'No collections yet. Create one to start organizing your photos.'),
+          e('button', { className: 'btn btn-primary', onClick: () => setShowCreate(true) }, '+ New Collection'),
+        ),
+
+        collections.length > 0 && e('div', { className: 'collections-grid' },
+          collections.map(c => e('div', {
+            key: c.id,
+            className: 'collection-card',
+            onClick: () => { window.location.href = `/collections/${c.id}`; },
+          },
+            e('div', { className: 'cover' },
+              c.cover_thumbnail
+                ? e('img', { src: c.cover_thumbnail, alt: c.name, loading: 'lazy' })
+                : e('span', { className: 'empty-cover' }, '\ud83d\uddbc'),
+            ),
+            e('div', { className: 'info' },
+              e('div', { className: 'name' }, c.name),
+              e('div', { className: 'meta' },
+                `${c.photo_count} photo${c.photo_count !== 1 ? 's' : ''}`,
+                c.description ? ` \u2022 ${c.description}` : '',
+              ),
+            ),
+          )),
+        ),
+
+        showCreate && e(CreateModal, {
+          onClose: () => { setShowCreate(false); setError(null); },
+          onCreate: doCreate,
+        }),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection Detail View
+    // -----------------------------------------------------------------------
+    function CollectionDetail({ collectionId }) {
+      const [collection, setCollection] = useState(null);
+      const [photos, setPhotos] = useState([]);
+      const [selectedForRemoval, setSelectedForRemoval] = useState(new Set());
+      const [showRename, setShowRename] = useState(false);
+      const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+      const [modalIdx, setModalIdx] = useState(null);
+      const [error, setError] = useState(null);
+      const [persons, setPersons] = useState([]);
+
+      const load = useCallback(() => {
+        fetch(`/api/collections/${collectionId}`).then(r => r.json()).then(data => {
+          if (data.error) { setError(data.error); return; }
+          setCollection(data.collection);
+          setPhotos(data.photos || []);
+        });
+      }, [collectionId]);
+
+      useEffect(() => {
+        load();
+        fetch('/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
+      }, [load]);
+
+      const doRename = async (name) => {
+        const res = await fetch(`/api/collections/${collectionId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        if (res.ok) {
+          setShowRename(false);
+          load();
+        }
+      };
+
+      const doDelete = async () => {
+        await fetch(`/api/collections/${collectionId}`, { method: 'DELETE' });
+        window.location.href = '/collections';
+      };
+
+      const toggleRemoval = (photoId) => {
+        setSelectedForRemoval(prev => {
+          const next = new Set(prev);
+          if (next.has(photoId)) next.delete(photoId);
+          else next.add(photoId);
+          return next;
+        });
+      };
+
+      const doRemoveSelected = async () => {
+        const ids = Array.from(selectedForRemoval);
+        if (!ids.length) return;
+        await fetch(`/api/collections/${collectionId}/photos/remove`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: ids }),
+        });
+        setSelectedForRemoval(new Set());
+        load();
+      };
+
+      if (error) {
+        return e('div', null,
+          e('a', { href: '/collections', className: 'back-link' }, '\u2190 Collections'),
+          e('div', { className: 'empty-state' }, e('p', null, error)),
+        );
+      }
+      if (!collection) return e('div', { style: { padding: 40, textAlign: 'center', color: 'var(--text-muted)' } }, 'Loading...');
+
+      const modalPhoto = modalIdx !== null ? photos[modalIdx] : null;
+
+      return e('div', null,
+        e('a', { href: '/collections', className: 'back-link' }, '\u2190 All Collections'),
+
+        e('div', { className: 'page-header' },
+          e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 12 } },
+            e('h2', {
+              className: 'editable',
+              onClick: () => setShowRename(true),
+              title: 'Click to rename',
+            }, collection.name),
+            e('span', { className: 'subtitle' }, `${photos.length} photo${photos.length !== 1 ? 's' : ''}`),
+          ),
+          e('div', { style: { display: 'flex', gap: 8 } },
+            e('button', { className: 'btn btn-sm', onClick: () => setShowRename(true) }, 'Rename'),
+            e('button', { className: 'btn btn-sm btn-danger', onClick: () => setShowDeleteConfirm(true) }, 'Delete'),
+          ),
+        ),
+
+        showDeleteConfirm && e('div', { className: 'confirm-bar' },
+          e('span', null, `Delete "${collection.name}"? This cannot be undone. Photos are not affected.`),
+          e('div', { style: { display: 'flex', gap: 8 } },
+            e('button', { className: 'btn btn-sm', onClick: () => setShowDeleteConfirm(false) }, 'Cancel'),
+            e('button', { className: 'btn btn-sm btn-danger', onClick: doDelete }, 'Delete'),
+          ),
+        ),
+
+        selectedForRemoval.size > 0 && e('div', { className: 'confirm-bar', style: { borderColor: 'var(--accent)', background: 'rgba(74,158,255,0.1)' } },
+          e('span', null, `${selectedForRemoval.size} photo${selectedForRemoval.size !== 1 ? 's' : ''} selected`),
+          e('div', { style: { display: 'flex', gap: 8 } },
+            e('button', { className: 'btn btn-sm', onClick: () => setSelectedForRemoval(new Set()) }, 'Cancel'),
+            e('button', { className: 'btn btn-sm btn-danger', onClick: doRemoveSelected }, 'Remove from Collection'),
+          ),
+        ),
+
+        photos.length === 0 && e('div', { className: 'empty-state' },
+          e('div', { className: 'icon' }, '\ud83d\uddbc'),
+          e('p', null, 'This collection is empty. Add photos from Search or Review.'),
+        ),
+
+        photos.length > 0 && e('div', { className: 'photo-grid' },
+          photos.map((p, i) => e('div', {
+            key: p.id,
+            className: `thumb-wrap ${selectedForRemoval.has(p.id) ? 'selected' : ''}`,
+            onClick: (ev) => {
+              if (ev.shiftKey) { toggleRemoval(p.id); return; }
+              setModalIdx(i);
+            },
+            onContextMenu: (ev) => { ev.preventDefault(); toggleRemoval(p.id); },
+          },
+            e('img', { src: `/api/photos/${p.id}/thumbnail`, alt: p.filename, loading: 'lazy' }),
+            e('span', { className: 'remove-badge' }, '\u00d7'),
+          )),
+        ),
+
+        // Photo modal
+        modalPhoto && e(PhotoDetailModal, {
+          photo: modalPhoto,
+          index: modalIdx,
+          total: photos.length,
+          onClose: () => setModalIdx(null),
+          onPrev: modalIdx > 0 ? () => setModalIdx(modalIdx - 1) : null,
+          onNext: modalIdx < photos.length - 1 ? () => setModalIdx(modalIdx + 1) : null,
+          persons: persons,
+          onFaceAssigned: (faceId, personName) => {
+            fetch('/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
+          },
+        }),
+
+        showRename && e(RenameModal, {
+          currentName: collection.name,
+          onClose: () => setShowRename(false),
+          onRename: doRename,
+        }),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // App — routes based on URL
+    // -----------------------------------------------------------------------
+    function App() {
+      // Parse URL: /collections or /collections/:id
+      const path = window.location.pathname;
+      const match = path.match(/^\/collections\/(\d+)/);
+      const collectionId = match ? parseInt(match[1]) : null;
+
+      return e('div', null,
+        // Header
+        e('div', { className: 'header' },
+          e('div', { className: 'header-inner' },
+            e('div', { className: 'logo' }, 'Photo', e('span', null, 'Search')),
+            e('a', { href: '/', className: 'nav-link' }, 'Search'),
+            e('a', { href: '/review', className: 'nav-link' }, 'Review'),
+            e('a', { href: '/faces', className: 'nav-link' }, 'Faces'),
+            e('a', { href: '/collections', className: 'nav-link active' }, 'Collections'),
+          ),
+        ),
+        // Content
+        e('div', { className: 'container' },
+          collectionId
+            ? e(CollectionDetail, { collectionId })
+            : e(CollectionsList),
+        ),
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>

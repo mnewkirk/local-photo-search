@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 
 from fastapi import FastAPI, Query, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import PhotoDB
@@ -1011,6 +1011,137 @@ def api_stats():
 
 
 # ---------------------------------------------------------------------------
+# Collections
+# ---------------------------------------------------------------------------
+
+@app.get("/api/collections")
+def api_list_collections():
+    """List all collections with photo counts."""
+    with _get_db() as db:
+        collections = db.list_collections()
+        # Add cover thumbnail path
+        for c in collections:
+            cover_id = c.get("effective_cover_photo_id")
+            if cover_id:
+                c["cover_thumbnail"] = f"/api/photos/{cover_id}/thumbnail"
+            else:
+                c["cover_thumbnail"] = None
+    return {"collections": collections}
+
+
+@app.post("/api/collections")
+def api_create_collection(body: dict):
+    """Create a new collection."""
+    name = body.get("name", "").strip()
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    description = body.get("description")
+    photo_ids = body.get("photo_ids", [])
+
+    with _get_db() as db:
+        existing = db.get_collection_by_name(name)
+        if existing:
+            return JSONResponse({"error": f"Collection '{name}' already exists"}, status_code=409)
+
+        coll_id = db.create_collection(name, description)
+        added = 0
+        if photo_ids:
+            added = db.add_photos_to_collection(coll_id, photo_ids)
+
+        collection = db.get_collection(coll_id)
+
+    return {"collection": collection, "photos_added": added}
+
+
+@app.get("/api/collections/{collection_id}")
+def api_get_collection(collection_id: int):
+    """Get a collection with its photos."""
+    with _get_db() as db:
+        collection = db.get_collection(collection_id)
+        if not collection:
+            return JSONResponse({"error": "Collection not found"}, status_code=404)
+
+        photos = db.get_collection_photos(collection_id)
+        # Add thumbnail paths
+        for p in photos:
+            p["thumbnail"] = f"/api/photos/{p['id']}/thumbnail"
+        collection["photo_count"] = len(photos)
+
+    return {"collection": collection, "photos": photos}
+
+
+@app.put("/api/collections/{collection_id}")
+def api_update_collection(collection_id: int, body: dict):
+    """Update collection name and/or description."""
+    with _get_db() as db:
+        collection = db.get_collection(collection_id)
+        if not collection:
+            return JSONResponse({"error": "Collection not found"}, status_code=404)
+
+        if "name" in body:
+            name = body["name"].strip()
+            if name and name != collection["name"]:
+                existing = db.get_collection_by_name(name)
+                if existing:
+                    return JSONResponse({"error": f"Collection '{name}' already exists"}, status_code=409)
+                db.rename_collection(collection_id, name)
+        if "description" in body:
+            db.update_collection_description(collection_id, body["description"])
+        if "cover_photo_id" in body:
+            db.set_collection_cover(collection_id, body["cover_photo_id"])
+
+        collection = db.get_collection(collection_id)
+    return {"collection": collection}
+
+
+@app.delete("/api/collections/{collection_id}")
+def api_delete_collection(collection_id: int):
+    """Delete a collection."""
+    with _get_db() as db:
+        collection = db.get_collection(collection_id)
+        if not collection:
+            return JSONResponse({"error": "Collection not found"}, status_code=404)
+        db.delete_collection(collection_id)
+    return {"ok": True}
+
+
+@app.post("/api/collections/{collection_id}/photos")
+def api_add_to_collection(collection_id: int, body: dict):
+    """Add photos to a collection."""
+    photo_ids = body.get("photo_ids", [])
+    if not photo_ids:
+        return JSONResponse({"error": "photo_ids is required"}, status_code=400)
+    with _get_db() as db:
+        collection = db.get_collection(collection_id)
+        if not collection:
+            return JSONResponse({"error": "Collection not found"}, status_code=404)
+        added = db.add_photos_to_collection(collection_id, photo_ids)
+    return {"added": added}
+
+
+@app.post("/api/collections/{collection_id}/photos/remove")
+def api_remove_from_collection(collection_id: int, body: dict):
+    """Remove photos from a collection."""
+    photo_ids = body.get("photo_ids", [])
+    if not photo_ids:
+        return JSONResponse({"error": "photo_ids is required"}, status_code=400)
+    with _get_db() as db:
+        collection = db.get_collection(collection_id)
+        if not collection:
+            return JSONResponse({"error": "Collection not found"}, status_code=404)
+        removed = db.remove_photos_from_collection(collection_id, photo_ids)
+    return {"removed": removed}
+
+
+@app.get("/api/photos/{photo_id}/collections")
+def api_photo_collections(photo_id: int):
+    """Get all collections a photo belongs to."""
+    with _get_db() as db:
+        collections = db.get_photo_collections(photo_id)
+    return {"collections": collections}
+
+
+# ---------------------------------------------------------------------------
 # Serve the frontend (production mode — built files)
 # ---------------------------------------------------------------------------
 
@@ -1045,6 +1176,22 @@ if _frontend_dir.exists():
         if faces_page.exists():
             return HTMLResponse(faces_page.read_text())
         return HTMLResponse("<h1>Faces page not found</h1>")
+
+    @app.get("/collections")
+    def serve_collections():
+        """Serve the collections page."""
+        coll_page = _frontend_dir / "collections.html"
+        if coll_page.exists():
+            return HTMLResponse(coll_page.read_text())
+        return HTMLResponse("<h1>Collections page not found</h1>")
+
+    @app.get("/collections/{collection_id}")
+    def serve_collection_detail(collection_id: int):
+        """Serve collection detail page (same HTML, JS reads id from URL)."""
+        coll_page = _frontend_dir / "collections.html"
+        if coll_page.exists():
+            return HTMLResponse(coll_page.read_text())
+        return HTMLResponse("<h1>Collections page not found</h1>")
 
     @app.get("/{path:path}")
     def serve_frontend(path: str = ""):
