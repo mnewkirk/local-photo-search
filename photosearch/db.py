@@ -465,16 +465,30 @@ class PhotoDB:
         """Find photos most similar to a query embedding. Returns list of {photo_id, distance}."""
         if not HAS_SQLITE_VEC:
             return []
-        rows = self.conn.execute(
-            """
-            SELECT photo_id, distance
-            FROM clip_embeddings
-            WHERE embedding MATCH ?
-            ORDER BY distance
-            LIMIT ?
-            """,
-            (_serialize_float_list(query_embedding), limit),
-        ).fetchall()
+        blob = _serialize_float_list(query_embedding)
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT photo_id, distance
+                FROM clip_embeddings
+                WHERE embedding MATCH ?
+                ORDER BY distance
+                LIMIT ?
+                """,
+                (blob, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Older sqlite-vec versions require 'k = ?' instead of LIMIT
+            rows = self.conn.execute(
+                """
+                SELECT photo_id, distance
+                FROM clip_embeddings
+                WHERE embedding MATCH ?
+                AND k = ?
+                ORDER BY distance
+                """,
+                (blob, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
@@ -503,16 +517,30 @@ class PhotoDB:
         """Find faces most similar to a query encoding."""
         if not HAS_SQLITE_VEC:
             return []
-        rows = self.conn.execute(
-            """
-            SELECT face_id, distance
-            FROM face_encodings
-            WHERE encoding MATCH ?
-            ORDER BY distance
-            LIMIT ?
-            """,
-            (_serialize_float_list(query_encoding), limit),
-        ).fetchall()
+        blob = _serialize_float_list(query_encoding)
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT face_id, distance
+                FROM face_encodings
+                WHERE encoding MATCH ?
+                ORDER BY distance
+                LIMIT ?
+                """,
+                (blob, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Older sqlite-vec versions require 'k = ?' instead of LIMIT
+            rows = self.conn.execute(
+                """
+                SELECT face_id, distance
+                FROM face_encodings
+                WHERE encoding MATCH ?
+                AND k = ?
+                ORDER BY distance
+                """,
+                (blob, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_face_encoding(self, face_id: int) -> list[float] | None:

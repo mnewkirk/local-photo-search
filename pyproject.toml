@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that take a long time (descriptions via Ollama, quality scoring)",
+]
+filterwarnings = [
+    # colorthief uses deprecated Pillow API — upstream issue
+    "ignore:Image.Image.getdata is deprecated:DeprecationWarning:colorthief",
+    # open_clip QuickGELU config mismatch — cosmetic, does not affect results
+    "ignore:QuickGELU mismatch:UserWarning:open_clip",
+    # insightface uses deprecated scikit-image API — upstream issue
+    "ignore:`estimate` is deprecated:FutureWarning:insightface",
+]
