@@ -88,14 +88,22 @@ local-photo-search/
 │   ├── quality.py         # Aesthetic quality scoring (LAION predictor + ViT-L/14)
 │   ├── verify.py          # Hallucination detection (CLIP + cross-model LLM)
 │   ├── cull.py            # Shoot review: clustering + selection algorithm
+│   ├── stacking.py        # Photo stacking: burst/bracket detection + grouping
 │   └── exif.py            # EXIF/GPS metadata extraction
 ├── frontend/dist/         # Web UI (static HTML + React)
 │   ├── index.html         # Main search interface
 │   ├── faces.html         # Face management (grouping, naming, merging, ignore)
-│   └── review.html        # Shoot review / culling interface
+│   ├── review.html        # Shoot review / culling interface
+│   ├── collections.html   # Collections / albums interface
+│   └── shared.js          # Shared components (PhotoModal)
 ├── cli.py                 # Click-based CLI with all commands
 ├── tests/
-│   └── test_face_matching.py   # Face accuracy + semantic ranking tests
+│   ├── test_face_matching.py   # Face accuracy + semantic ranking tests
+│   ├── test_stacking.py        # Stacking algorithm + API tests
+│   ├── test_cull.py             # Shoot review algorithm tests
+│   ├── test_db.py               # Database layer tests
+│   ├── test_api.py              # Web API endpoint tests
+│   └── ...
 ├── scripts/
 │   └── setup_sample.py    # Automated sample dataset setup for testing
 └── requirements.txt
@@ -129,6 +137,10 @@ Photo files on disk
        │  face_references     │  reference photos for known people
        │  face_ref_encodings  │  reference ArcFace vectors (sqlite-vec)
        │  review_selections   │  shoot review picks + cluster assignments
+       │  collections         │  named photo collections
+       │  collection_photos   │  photos in each collection
+       │  photo_stacks        │  stack groups (burst/bracket detection)
+       │  stack_members       │  photos in each stack + top-photo designation
        └──────────────────────┘
                   │
                   ▼
@@ -308,7 +320,47 @@ The review page (`/review`) provides a visual grid interface with:
 - **Four view modes:** All, Obscure Unselected (dims non-selected), Selected Only, and Clusters (groups by cluster with headers)
 - **Click-to-toggle** selection on any photo, or use S/X keyboard shortcuts in the photo modal
 - **Export** with optional ARW inclusion — copies file paths to clipboard for use with `cp` or `rsync`
-- **Cluster badges, quality scores, and RAW indicators** on every thumbnail
+- **Cluster badges** (center-top), **stack badges** (top-right), **quality scores**, and **RAW indicators** on every thumbnail
+- **Stack expand/collapse** — view burst/bracket members inline in the grid
+
+
+## Photo stacking
+
+When shooting bursts or brackets, you end up with clusters of near-identical photos taken within seconds of each other. The stacking feature detects these and collapses them — showing only the best photo (the "top") while keeping the others accessible with one click.
+
+### How it works
+
+Stacking uses a union-find algorithm over photos sorted by timestamp. Two adjacent photos are linked if they were taken within a configurable time gap (default 3 seconds) AND have high CLIP similarity (L2 distance < 0.15). After building connected components, a span enforcement step limits each stack to 10 seconds from its earliest member — this prevents transitive chaining where A→B→C→D could span far longer than the intended window.
+
+The top photo in each stack is selected by highest aesthetic quality score. All other members are hidden behind it in the UI, shown as a count badge on the thumbnail.
+
+### Stack management in the UI
+
+Stacking is available on all three main pages (Search, Review, Collections):
+
+- **Stack badge** — clickable count badge (top-right) expands/collapses the stack inline in the grid. Expanded members show a white outline to distinguish them from regular photos.
+- **Expand/Close all stacks** — bulk toggle button appears when stacks are detected.
+- **Photo modal** — shows all stack members as chronologically-sorted thumbnails. "Make this top" promotes any member to top photo. "Unstack" removes a photo from the stack entirely.
+- **Add to Stack** — unstacked photos show an "Add to Stack" button that finds nearby stacks (within 60 seconds) and lets you add the photo to one.
+- **Selection persistence** — selected stack members remain visible in the grid even when their stack is collapsed.
+
+### Usage
+
+```bash
+# Detect stacks in all indexed photos
+python cli.py detect-stacks
+
+# Detect stacks with custom parameters
+python cli.py detect-stacks --max-gap 3.0 --max-dist 0.15
+
+# Stacking API endpoints (used by web UI)
+# GET  /api/stacks                      — list all stacks
+# GET  /api/stacks/{id}                 — stack details with members
+# POST /api/stacks/{id}/top             — set top photo
+# POST /api/stacks/{id}/remove          — remove photo from stack
+# POST /api/stacks/{id}/add             — add photo to stack
+# GET  /api/photos/{id}/nearby-stacks   — find stacks within 60s
+```
 
 
 ## Semantic tagging
@@ -413,6 +465,7 @@ python cli.py stats
 | `show-descriptions` | View LLaVA-generated descriptions |
 | `verify` | Verify descriptions/tags for hallucinations and auto-regenerate |
 | `review <dir>` | Shoot review — select best representative photos from a folder |
+| `detect-stacks` | Detect and group burst/bracket shots into stacks |
 
 Key flags for `index`:
 
@@ -533,8 +586,10 @@ The development process was iterative in a way that's hard to capture in commits
 | **M10** | Done | Shoot review — adaptive CLIP clustering + quality-based selection for post-shoot culling. Web UI with grid view, cluster view, toggle selection, and export. CLI with export to directory. |
 | **M11** | Done | Portable photo paths — photo_root system stores relative paths in DB, resolves at runtime. Supports moving the database between machines without re-indexing. |
 | **M12** | Done | Hallucination detection — three-pass verification (CLIP scoring → cross-model LLM check → CLIP cross-check) catches and auto-regenerates hallucinated descriptions. Uses a separate vision model (minicpm-v) to avoid same-model confirmation bias. |
-| **M13** | Next | Collections / albums — persistent named collections of photos, especially from the review process. Stored in a separate SQLite database. Easy to download all files from a collection, with clear JPG/ARW selection and availability indicators. |
-| **M14** | Next | Photo stacking — detect near-identical burst/bracket shots (very short time gaps, similar CLIP embeddings) and collapse them into stacks. Best photo on top, others hidden behind it. Complements the review/culling cluster view but operates at a tighter similarity threshold for true duplicates. |
+| **M13** | Done | Collections / albums — persistent named collections stored in the same SQLite DB. Full CRUD API. Web UI with dedicated collections page, save-from-review, add-from-search (single + multi-select). |
+| **M14** | Done | Photo stacking — burst/bracket detection via union-find (time gap + CLIP similarity), 10-second span enforcement. Stack management UI on all pages (expand/collapse, set top, unstack, add to stack). Schema v11. |
+| **M15** | Done | Shared header component — extracted `PS.SharedHeader` into `shared.js`. All pages use the same logo, nav links, and layout. Page-specific controls passed as children. |
+| **M16** | Done | Shared photo detail modal — extracted `PS.PhotoModal` into `shared.js`. Unified modal with configurable feature flags, face editing, collection management, stacking UI, and keyboard navigation. Removed ~1500 lines of duplicated code. |
 
 
 ## Known limitations
