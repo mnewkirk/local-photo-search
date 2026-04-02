@@ -451,8 +451,8 @@ def correct_face(filename, face_number, correct_person, db):
 
     \b
     Examples:
-      # Reassign face 1 in DSC04922 from Ellie to Calvin
-      python cli.py correct-face DSC04922.JPG 1 "Calvin"
+      # Reassign face 1 in DSC04922 from Jamie to Alex
+      python cli.py correct-face DSC04922.JPG 1 "Alex"
 
       # Clear a wrong match (mark face as unidentified)
       python cli.py correct-face DSC04922.JPG 2 unknown
@@ -533,8 +533,8 @@ def clear_matches(photo_dir, db, person, all_faces, include_manual):
       # Clear all matches including manual UI assignments
       python cli.py clear-matches ../Photos/2026-02-08 --include-manual
 
-      # Clear only Ellie matches (leave others intact)
-      python cli.py clear-matches ../Photos/2026-02-08 --person "Ellie"
+      # Clear only Jamie matches (leave others intact)
+      python cli.py clear-matches ../Photos/2026-02-08 --person "Jamie"
 
       # Nuke everything — clear detections too (will need --faces to re-detect)
       python cli.py clear-matches ../Photos/2026-02-08 --all-faces
@@ -786,7 +786,7 @@ def tag_photo(filename, person_name, db):
 
     \b
     Example:
-      python cli.py tag-photo DSC04894.JPG "Nicole"
+      python cli.py tag-photo DSC04894.JPG "Sam"
     """
     with PhotoDB(db) as photo_db:
         # Find the photo

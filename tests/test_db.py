@@ -169,14 +169,14 @@ class TestPersons:
 
     def test_add_person_case_insensitive_dedup(self, db):
         """Adding a person with different case returns existing id."""
-        pid1 = db.add_person("Calvin")
-        pid2 = db.add_person("calvin")
+        pid1 = db.add_person("Alex")
+        pid2 = db.add_person("alex")
         assert pid1 == pid2
 
     def test_get_person_by_name_case_insensitive(self, db):
-        person = db.get_person_by_name("ELLIE")
+        person = db.get_person_by_name("JAMIE")
         assert person is not None
-        assert person["name"] == "Ellie"
+        assert person["name"] == "Jamie"
 
     def test_get_person_not_found(self, db):
         assert db.get_person_by_name("NonExistent") is None
@@ -194,20 +194,20 @@ class TestFaces:
 
     def test_assign_face_to_person(self, db):
         fid = db._test_face_ids["unknown_878"]
-        calvin_id = db._test_person_ids["Calvin"]
-        db.assign_face_to_person(fid, calvin_id, "manual")
+        alex_id = db._test_person_ids["Alex"]
+        db.assign_face_to_person(fid, alex_id, "manual")
         row = db.conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?", (fid,)).fetchone()
-        assert row["person_id"] == calvin_id
+        assert row["person_id"] == alex_id
         assert row["match_source"] == "manual"
 
     def test_get_face_encoding(self, db):
-        fid = db._test_face_ids["calvin_894"]
+        fid = db._test_face_ids["alex_894"]
         enc = db.get_face_encoding(fid)
         assert enc is not None
         assert len(enc) == FACE_DIMENSIONS
 
     def test_get_face_encodings_bulk(self, db):
-        fids = [db._test_face_ids["calvin_894"], db._test_face_ids["ellie_907"]]
+        fids = [db._test_face_ids["alex_894"], db._test_face_ids["jamie_907"]]
         encodings = db.get_face_encodings_bulk(fids)
         assert len(encodings) == 2
         for fid in fids:
@@ -226,7 +226,7 @@ class TestFaces:
         """
         import sqlite3
         from photosearch.db import _serialize_float_list
-        fid = db._test_face_ids["calvin_894"]
+        fid = db._test_face_ids["alex_894"]
         enc = db.get_face_encoding(fid)
         try:
             results = db.search_faces(enc, limit=3)

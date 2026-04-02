@@ -150,7 +150,7 @@ class TestCombinedSearch:
 
     def test_search_by_person(self, db):
         from photosearch.search import search_by_person
-        results = search_by_person(db, "Calvin")
+        results = search_by_person(db, "Alex")
         filenames = {r["filename"] for r in results}
         assert "DSC04894.JPG" in filenames
         assert "DSC04907.JPG" in filenames
@@ -158,7 +158,7 @@ class TestCombinedSearch:
 
     def test_search_by_person_case_insensitive(self, db):
         from photosearch.search import search_by_person
-        results = search_by_person(db, "calvin")
+        results = search_by_person(db, "alex")
         assert len(results) >= 3
 
     def test_search_by_person_not_found(self, db):
@@ -212,7 +212,7 @@ class TestCombinedSearch:
     def test_search_combined_match_source(self, db):
         from photosearch.search import search_combined
 
-        results = search_combined(db, person="Calvin", match_source="manual")
+        results = search_combined(db, person="Alex", match_source="manual")
         for r in results:
             # At least one face on this photo should be manual
             faces = db.conn.execute(

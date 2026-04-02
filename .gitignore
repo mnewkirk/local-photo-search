@@ -4,10 +4,12 @@ __pycache__/
 *$py.class
 *.egg-info/
 dist/
-!frontend/dist/
+frontend/dist/
+frontend/node_modules/
 build/
 *.egg
 .eggs/
+.coverage
 
 # Virtual environment
 venv/
@@ -28,8 +30,12 @@ Thumbs.db
 # Project-specific
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 results/
 thumbnails/
+scripts/setup_sample.py
+tests/test_face_matching.py
 
 # Photos — never commit photos to the repo
 *.JPG
@@ -44,7 +50,8 @@ thumbnails/
 
 # Environment / secrets
 .env
-.env.example
 
 # FUSE artifacts (Cowork sandbox)
 .fuse_hidden*
+
+

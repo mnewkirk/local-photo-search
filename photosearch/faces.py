@@ -466,7 +466,7 @@ def match_faces_temporal(
          faces score similarly close to a known person.
       2. Temporal presence — the candidate person must actually appear (confirmed,
          automatically-matched) in another photo from the same session. A face
-         that scores 1.40 for "Calvin" but Calvin isn't in any nearby photo is
+         that scores 1.40 for "Alex" but Alex isn't in any nearby photo is
          left unassigned.
 
     Returns the number of faces newly matched.

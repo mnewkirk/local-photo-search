@@ -40,7 +40,7 @@ class TestSearch:
         assert "error" in data
 
     def test_search_by_person(self, client):
-        resp = client.get("/api/search", params={"person": "Calvin"})
+        resp = client.get("/api/search", params={"person": "Alex"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["count"] >= 1
@@ -122,15 +122,15 @@ class TestPhotoDetail:
         assert data["filename"] == "DSC04894.JPG"
         assert data["description"] is not None
         assert isinstance(data["faces"], list)
-        assert len(data["faces"]) == 2  # Calvin + Nicole
+        assert len(data["faces"]) == 2  # Alex + Sam
 
     def test_photo_detail_face_data(self, client, db):
         pid = db._test_photo_ids["DSC04894.JPG"]
         resp = client.get(f"/api/photos/{pid}")
         data = resp.json()
         face_names = {f["person_name"] for f in data["faces"]}
-        assert "Calvin" in face_names
-        assert "Nicole" in face_names
+        assert "Alex" in face_names
+        assert "Sam" in face_names
         for f in data["faces"]:
             assert f["bbox"] is not None
             assert "top" in f["bbox"]
@@ -188,17 +188,17 @@ class TestPersonsAPI:
         assert resp.status_code == 200
         data = resp.json()
         names = {p["name"] for p in data["persons"]}
-        assert "Calvin" in names
-        assert "Ellie" in names
-        assert "Nicole" in names
+        assert "Alex" in names
+        assert "Jamie" in names
+        assert "Sam" in names
         for p in data["persons"]:
             assert "photo_count" in p
 
     def test_persons_photo_counts(self, client):
         resp = client.get("/api/persons")
         data = resp.json()
-        calvin = next(p for p in data["persons"] if p["name"] == "Calvin")
-        assert calvin["photo_count"] == 3  # 894, 907, 922
+        alex = next(p for p in data["persons"] if p["name"] == "Alex")
+        assert alex["photo_count"] == 3  # 894, 907, 922
 
 
 # =========================================================================
@@ -213,7 +213,7 @@ class TestFacesAPI:
         groups = data["groups"]
         person_groups = [g for g in groups if g["type"] == "person"]
         cluster_groups = [g for g in groups if g["type"] == "cluster"]
-        assert len(person_groups) == 3  # Calvin, Ellie, Nicole
+        assert len(person_groups) == 3  # Alex, Jamie, Sam
         assert len(cluster_groups) >= 1  # at least the unknown cluster
 
     def test_face_groups_sort_count(self, client):
@@ -225,11 +225,11 @@ class TestFacesAPI:
         assert resp.status_code == 200
 
     def test_face_group_photos_person(self, client, db):
-        calvin_id = db._test_person_ids["Calvin"]
-        resp = client.get(f"/api/faces/group/person/{calvin_id}/photos")
+        alex_id = db._test_person_ids["Alex"]
+        resp = client.get(f"/api/faces/group/person/{alex_id}/photos")
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data["photos"]) == 3  # Calvin in 3 photos
+        assert len(data["photos"]) == 3  # Alex in 3 photos
 
     def test_face_group_photos_cluster(self, client):
         resp = client.get("/api/faces/group/cluster/99/photos")
@@ -252,16 +252,16 @@ class TestFacesAPI:
 
     def test_assign_face_to_existing_person(self, client, db):
         fid = db._test_face_ids["unknown_878"]
-        resp = client.post(f"/api/faces/{fid}/assign", params={"name": "Calvin"})
+        resp = client.post(f"/api/faces/{fid}/assign", params={"name": "Alex"})
         assert resp.status_code == 200
-        assert resp.json()["person_id"] == db._test_person_ids["Calvin"]
+        assert resp.json()["person_id"] == db._test_person_ids["Alex"]
 
     def test_assign_face_not_found(self, client):
         resp = client.post("/api/faces/99999/assign", params={"name": "Nobody"})
         assert resp.status_code == 404
 
     def test_clear_face(self, client, db):
-        fid = db._test_face_ids["calvin_894"]
+        fid = db._test_face_ids["alex_894"]
         resp = client.post(f"/api/faces/{fid}/clear")
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
@@ -274,13 +274,13 @@ class TestFacesAPI:
         assert resp.status_code == 404
 
     def test_bulk_collect_faces(self, client, db):
-        calvin_id = db._test_person_ids["Calvin"]
+        alex_id = db._test_person_ids["Alex"]
         resp = client.post("/api/faces/bulk-collect", json={
-            "groups": [{"type": "person", "id": calvin_id}]
+            "groups": [{"type": "person", "id": alex_id}]
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data["face_ids"]) == 3  # Calvin has 3 faces
+        assert len(data["face_ids"]) == 3  # Alex has 3 faces
 
     def test_bulk_collect_empty(self, client):
         resp = client.post("/api/faces/bulk-collect", json={"groups": []})
@@ -314,8 +314,8 @@ class TestFacesAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data["assignments"], list)
-        # calvin_922 was manual
-        manual = [a for a in data["assignments"] if a["person_name"] == "Calvin"]
+        # alex_922 was manual
+        manual = [a for a in data["assignments"] if a["person_name"] == "Alex"]
         assert len(manual) >= 1
 
     def test_import_assignments(self, client, db):

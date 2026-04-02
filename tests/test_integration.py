@@ -59,11 +59,11 @@ EXPECTED_TIMES = {
 EXPECTED_FACE_COUNTS = {
     "DSC04878.JPG": 0,   # landscape
     "DSC04880.JPG": 0,   # landscape
-    "DSC04894.JPG": 2,   # Calvin + Nicole
-    "DSC04895.JPG": 0,   # Eleanor facing away — undetectable
+    "DSC04894.JPG": 2,   # Alex + Sam
+    "DSC04895.JPG": 0,   # Jamie facing away — undetectable
     "DSC04899.JPG": 0,   # landscape
-    "DSC04907.JPG": 2,   # Eleanor + Calvin (small faces)
-    "DSC04922.JPG": 2,   # Eleanor + Calvin
+    "DSC04907.JPG": 2,   # Jamie + Alex (small faces)
+    "DSC04922.JPG": 2,   # Jamie + Alex
 }
 
 # Photos that should have people-related words in their description
@@ -471,13 +471,13 @@ class TestFaceDetection:
         def l2_dist(a, b):
             return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
-        # DSC04894 has Calvin + Nicole, DSC04922 has Eleanor + Calvin
+        # DSC04894 has Alex + Sam, DSC04922 has Jamie + Alex
         faces_894 = detect_faces(str(Path(sample_dir) / "DSC04894.JPG"))
         faces_922 = detect_faces(str(Path(sample_dir) / "DSC04922.JPG"))
 
         assert len(faces_894) == 2 and len(faces_922) == 2
 
-        # Find the closest pair across the two photos (should be Calvin-Calvin)
+        # Find the closest pair across the two photos (should be Alex-Alex)
         all_dists = []
         for i, f1 in enumerate(faces_894):
             for j, f2 in enumerate(faces_922):

@@ -5,12 +5,12 @@ Ground truth for the 7-photo sample set:
   DSC04878.JPG  nobody
   DSC04880.JPG  nobody
   DSC04894.JPG  Calvin, Nicole
-  DSC04895.JPG  Eleanor — present but facing away (face undetectable by design)
+  DSC04895.JPG  Ellie — present but facing away (face undetectable by design)
   DSC04899.JPG  nobody
-  DSC04907.JPG  Eleanor, Calvin
-  DSC04922.JPG  Eleanor, Calvin
+  DSC04907.JPG  Ellie, Calvin
+  DSC04922.JPG  Ellie, Calvin
 
-"Eleanor" is stored in the database as "Ellie".
+"Ellie" is stored in the database as "Ellie".
 
 After indexing, run in this order to get a fully-passing suite:
   python scripts/setup_sample.py
@@ -40,7 +40,7 @@ from photosearch.db import PhotoDB
 
 DB_PATH = str(_root / "photo_index.db")
 
-# Eleanor's name as registered in the database
+# Ellie's name as registered in the database
 ELLIE = "Ellie"
 
 # Ground truth: filename → set of person names expected to be identified.
@@ -48,7 +48,7 @@ EXPECTED_IDENTIFIED: dict[str, set[str]] = {
     "DSC04878.JPG": set(),
     "DSC04880.JPG": set(),
     "DSC04894.JPG": {"Calvin", "Nicole"},
-    "DSC04895.JPG": set(),   # Eleanor is in the photo but facing away — undetectable
+    "DSC04895.JPG": set(),   # Ellie is in the photo but facing away — undetectable
     "DSC04899.JPG": set(),
     "DSC04907.JPG": {ELLIE, "Calvin"},
     "DSC04922.JPG": {ELLIE, "Calvin"},

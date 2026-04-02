@@ -30,9 +30,9 @@ python cli.py search -q "bird on a branch"
 **Person search** — find all photos of a specific person:
 
 ```bash
-python cli.py add-person "Calvin" --photo reference/calvin.jpg
+python cli.py add-person "Alex" --photo reference/alex.jpg
 python cli.py match-faces --temporal
-python cli.py search --person "Calvin"
+python cli.py search --person "Alex"
 ```
 
 **Color search** — find photos dominated by a particular color:
@@ -58,7 +58,7 @@ python cli.py search -q "beach sunset" --min-quality 6.0
 python cli.py search --min-quality 7.0 --limit 20
 
 # Sort any search by quality instead of relevance
-python cli.py search --person "Calvin" --sort-quality
+python cli.py search --person "Alex" --sort-quality
 
 # Score range: 1-10 (3-5 average, 5-7 good, 7+ excellent)
 ```
@@ -66,7 +66,7 @@ python cli.py search --person "Calvin" --sort-quality
 **Combined search** — intersect multiple criteria:
 
 ```bash
-python cli.py search -q "beach" --person "Calvin" --color blue
+python cli.py search -q "beach" --person "Alex" --color blue
 python cli.py search -q "kids playing" --min-quality 5.5
 ```
 
@@ -217,18 +217,18 @@ ArcFace produces L2-normalized 512-dimensional vectors. Matching uses L2 distanc
 python cli.py index /path/to/photos --faces
 
 # 2. Register known people from reference photos
-python cli.py add-person "Calvin" --photo ref/calvin.jpg
-python cli.py add-person "Ellie" --photo ref/ellie1.jpg --photo ref/ellie2.jpg
+python cli.py add-person "Alex" --photo ref/alex.jpg
+python cli.py add-person "Jamie" --photo ref/jamie1.jpg --photo ref/jamie2.jpg
 
 # 3. Match detected faces to known people
 python cli.py match-faces --temporal
 
 # 4. Review and correct mistakes
 python cli.py diagnose-photo DSC04922.JPG
-python cli.py correct-face DSC04907.JPG 2 "Calvin"
+python cli.py correct-face DSC04907.JPG 2 "Alex"
 
 # 5. Search by person
-python cli.py search --person "Calvin"
+python cli.py search --person "Alex"
 ```
 
 
@@ -421,6 +421,22 @@ ollama pull minicpm-v    # ~5 GB, SigLip + Qwen2 architecture
 ```
 
 
+## Prerequisites
+
+**Python 3.10+** is required. The project is tested on Python 3.11.
+
+**Ollama** is required for scene descriptions and hallucination verification. It runs as a local server that serves vision language models. Install it from [ollama.com](https://ollama.com), then start it with `ollama serve` (it runs on port 11434 by default).
+
+You'll need two models — the initial download takes a while but only happens once:
+
+```bash
+ollama pull llava:13b      # ~8 GB — scene descriptions (better quality than 7B)
+ollama pull minicpm-v      # ~5 GB — hallucination verification (cross-model check)
+```
+
+If you're tight on disk or RAM, you can start with just `ollama pull llava` (the 7B variant, ~4 GB) and skip `minicpm-v` — descriptions will work but verification won't.
+
+
 ## Quick start
 
 ```bash
@@ -431,21 +447,24 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Install Ollama and pull models
-# See https://ollama.com for Ollama installation
-ollama pull llava:13b      # Scene descriptions
-ollama pull minicpm-v      # Hallucination verification (cross-model)
-
 # Index a folder of photos (full pipeline)
 python cli.py index /path/to/photos --faces --describe --describe-model llava:13b --quality
 
-# Search
+# Launch the web UI
+python cli.py serve              # opens at http://localhost:8000
+
+# Or search from the CLI
 python cli.py search -q "people outdoors" --limit 50
-python cli.py search --person "Calvin"
+python cli.py search --person "Alex"
 python cli.py search --color blue
 python cli.py search -q "sunset" --min-quality 6.0
 python cli.py stats
+
+# See all available commands
+python cli.py --help
 ```
+
+The database (`photo_index.db`) is created automatically on first run in the current directory. All photo annotations are stored there — the original photos are never modified.
 
 
 ## CLI reference
@@ -466,6 +485,7 @@ python cli.py stats
 | `verify` | Verify descriptions/tags for hallucinations and auto-regenerate |
 | `review <dir>` | Shoot review — select best representative photos from a folder |
 | `detect-stacks` | Detect and group burst/bracket shots into stacks |
+| `serve` | Launch the web UI (default port 8000) |
 
 Key flags for `index`:
 
@@ -616,4 +636,4 @@ The stack is chosen to work within these constraints: SQLite needs no server, CL
 
 ## License
 
-Private project.
+MIT — see [LICENSE](LICENSE).

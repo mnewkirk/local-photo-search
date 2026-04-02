@@ -369,8 +369,8 @@ describe('PS.PhotoModal — faces', () => {
     date_taken: '2026-03-13T11:30:00',
     description: 'Two people on overlook',
     faces: [
-      { id: 1, person_name: 'Calvin', bbox: { top: 100, right: 200, bottom: 250, left: 50 } },
-      { id: 2, person_name: 'Nicole', bbox: { top: 100, right: 400, bottom: 250, left: 300 } },
+      { id: 1, person_name: 'Alex', bbox: { top: 100, right: 200, bottom: 250, left: 50 } },
+      { id: 2, person_name: 'Sam', bbox: { top: 100, right: 400, bottom: 250, left: 300 } },
     ],
     tags: [],
     colors: [],
@@ -383,8 +383,8 @@ describe('PS.PhotoModal — faces', () => {
       onClose: jest.fn(),
       showFaces: true,
     }));
-    expect(screen.getByText('Calvin')).toBeInTheDocument();
-    expect(screen.getByText('Nicole')).toBeInTheDocument();
+    expect(screen.getByText('Alex')).toBeInTheDocument();
+    expect(screen.getByText('Sam')).toBeInTheDocument();
   });
 
   test('hides faces when showFaces is false', () => {

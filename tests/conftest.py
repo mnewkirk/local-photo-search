@@ -190,46 +190,46 @@ def db(tmp_db_path):
         database.add_clip_embedding(pid, emb)
 
     # Create persons
-    calvin_id = database.add_person("Calvin")
-    ellie_id = database.add_person("Ellie")
-    nicole_id = database.add_person("Nicole")
+    alex_id = database.add_person("Alex")
+    jamie_id = database.add_person("Jamie")
+    sam_id = database.add_person("Sam")
 
     # Add faces with bounding boxes
     face1 = database.add_face(
         photo_ids["DSC04894.JPG"], (100, 200, 250, 50),
-        _make_embedding(512, seed=100), person_id=calvin_id,
+        _make_embedding(512, seed=100), person_id=alex_id,
     )
-    database.assign_face_to_person(face1, calvin_id, "strict")
+    database.assign_face_to_person(face1, alex_id, "strict")
 
     face2 = database.add_face(
         photo_ids["DSC04894.JPG"], (100, 400, 250, 300),
-        _make_embedding(512, seed=101), person_id=nicole_id,
+        _make_embedding(512, seed=101), person_id=sam_id,
     )
-    database.assign_face_to_person(face2, nicole_id, "strict")
+    database.assign_face_to_person(face2, sam_id, "strict")
 
     face3 = database.add_face(
         photo_ids["DSC04907.JPG"], (80, 180, 200, 60),
-        _make_embedding(512, seed=102), person_id=ellie_id,
+        _make_embedding(512, seed=102), person_id=jamie_id,
     )
-    database.assign_face_to_person(face3, ellie_id, "strict")
+    database.assign_face_to_person(face3, jamie_id, "strict")
 
     face4 = database.add_face(
         photo_ids["DSC04907.JPG"], (90, 350, 170, 260),
-        _make_embedding(512, seed=103), person_id=calvin_id,
+        _make_embedding(512, seed=103), person_id=alex_id,
     )
-    database.assign_face_to_person(face4, calvin_id, "temporal")
+    database.assign_face_to_person(face4, alex_id, "temporal")
 
     face5 = database.add_face(
         photo_ids["DSC04922.JPG"], (50, 150, 180, 30),
-        _make_embedding(512, seed=104), person_id=ellie_id,
+        _make_embedding(512, seed=104), person_id=jamie_id,
     )
-    database.assign_face_to_person(face5, ellie_id, "strict")
+    database.assign_face_to_person(face5, jamie_id, "strict")
 
     face6 = database.add_face(
         photo_ids["DSC04922.JPG"], (60, 320, 190, 200),
-        _make_embedding(512, seed=105), person_id=calvin_id,
+        _make_embedding(512, seed=105), person_id=alex_id,
     )
-    database.assign_face_to_person(face6, calvin_id, "manual")
+    database.assign_face_to_person(face6, alex_id, "manual")
 
     # An unknown face in a cluster (no person assigned)
     face7 = database.add_face(
@@ -246,11 +246,11 @@ def db(tmp_db_path):
 
     # Store IDs for test access
     database._test_photo_ids = photo_ids
-    database._test_person_ids = {"Calvin": calvin_id, "Ellie": ellie_id, "Nicole": nicole_id}
+    database._test_person_ids = {"Alex": alex_id, "Jamie": jamie_id, "Sam": sam_id}
     database._test_face_ids = {
-        "calvin_894": face1, "nicole_894": face2,
-        "ellie_907": face3, "calvin_907": face4,
-        "ellie_922": face5, "calvin_922": face6,
+        "alex_894": face1, "sam_894": face2,
+        "jamie_907": face3, "alex_907": face4,
+        "jamie_922": face5, "alex_922": face6,
         "unknown_878": face7,
     }
     database._test_collection_id = coll_id
