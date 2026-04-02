@@ -184,6 +184,26 @@
       filter: grayscale(0.3);
     }
     .grid-item.hidden-item { display: none; }
+    .stack-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 4px;
+      z-index: 2;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      transition: background 0.15s;
+    }
+    .stack-badge:hover { background: rgba(74,158,255,0.7); }
+    .grid-item.stack-member {
+      outline: 3px solid #fff;
+      outline-offset: -3px;
+    }
 
     /* Cluster view */
     .cluster-section {
@@ -241,7 +261,8 @@
     .cluster-badge {
       position: absolute;
       top: 8px;
-      right: 8px;
+      left: 50%;
+      transform: translateX(-50%);
       padding: 2px 8px;
       border-radius: 10px;
       background: rgba(0,0,0,0.6);
@@ -537,6 +558,52 @@
       const [targetPct, setTargetPct] = useState(initParams.target_pct);
       const [threshold, setThreshold] = useState('0');
 
+      // ---- Stack expansion state ----
+      const [expandedStacks, setExpandedStacks] = useState(new Set());
+      const [stackMembers, setStackMembers] = useState({});
+
+      const toggleStack = useCallback((stackId) => {
+        setExpandedStacks(prev => {
+          const next = new Set(prev);
+          if (next.has(stackId)) {
+            next.delete(stackId);
+          } else {
+            next.add(stackId);
+            if (!stackMembers[stackId]) {
+              fetch(API + '/api/stacks/' + stackId)
+                .then(r => r.json())
+                .then(data => {
+                  if (data && data.members) {
+                    setStackMembers(prev => ({ ...prev, [stackId]: data.members }));
+                  }
+                });
+            }
+          }
+          return next;
+        });
+      }, [stackMembers]);
+
+      const expandAllStacks = useCallback(() => {
+        const stackIds = new Set();
+        photos.forEach(r => { if (r.stack_id && r.stack_count > 1) stackIds.add(r.stack_id); });
+        stackIds.forEach(sid => {
+          if (!stackMembers[sid]) {
+            fetch(API + '/api/stacks/' + sid)
+              .then(r => r.json())
+              .then(data => {
+                if (data && data.members) {
+                  setStackMembers(prev => ({ ...prev, [sid]: data.members }));
+                }
+              });
+          }
+        });
+        setExpandedStacks(stackIds);
+      }, [photos, stackMembers]);
+
+      const collapseAllStacks = useCallback(() => {
+        setExpandedStacks(new Set());
+      }, []);
+
       // Load folders on mount
       useEffect(() => {
         fetch(API + '/api/review/folders')
@@ -631,6 +698,42 @@
         if (viewMode === 'selected') return photos.filter(p => p.selected);
         return photos;
       }, [photos, viewMode]);
+
+      // Build display list: filter non-top stack members, insert expanded members
+      const displayItems = useMemo(() => {
+        // Build a lookup from photos state so expanded stack members can inherit selection
+        const photoById = {};
+        photos.forEach(p => { photoById[p.id] = p; });
+        const added = new Set();
+        const items = [];
+        visiblePhotos.forEach(photo => {
+          const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
+          const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
+          if (isNonTopMember) {
+            if (stackIsExpanded) return; // will appear in expanded group below top photo
+            if (!photo.selected) return; // collapsed + unselected → hide
+            // collapsed but selected → show individually
+          }
+          if (added.has(photo.id)) return;
+          added.add(photo.id);
+          items.push({ photo, isStackMember: false });
+          // When this is the top photo and the stack is expanded, insert all members
+          if (photo.stack_is_top && stackIsExpanded && stackMembers[photo.stack_id]) {
+            stackMembers[photo.stack_id].forEach(m => {
+              if (m.id !== photo.id && !added.has(m.id)) {
+                added.add(m.id);
+                // Merge selection state from photos array if available
+                const statePhoto = photoById[m.id];
+                const merged = statePhoto ? { ...m, selected: statePhoto.selected } : m;
+                items.push({ photo: merged, isStackMember: true, stackId: photo.stack_id });
+              }
+            });
+          }
+        });
+        return items;
+      }, [visiblePhotos, photos, expandedStacks, stackMembers]);
+
+      const hasStacks = photos.some(p => p.stack_id && p.stack_count > 1);
 
       // Group photos by cluster for cluster view
       const clusterGroups = useMemo(() => {
@@ -909,14 +1012,25 @@
                 ),
               )
             ),
+          // Expand/Close Stacks button (normal grid views only)
+          photos.length > 0 && !loading && viewMode !== 'clusters' && hasStacks &&
+            e('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 8 } },
+              e('button', {
+                className: 'btn btn-outline',
+                onClick: () => { expandedStacks.size > 0 ? collapseAllStacks() : expandAllStacks(); },
+              }, expandedStacks.size > 0 ? 'Close Stacks' : 'Expand Stacks'),
+            ),
           // Normal grid views
           photos.length > 0 && !loading && viewMode !== 'clusters' && e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
-            ...visiblePhotos.map(photo => e(ReviewGridItem, {
-              key: photo.id,
-              photo: photo,
-              dimmed: viewMode === 'obscure' && !photo.selected,
-              onClick: () => openModal(photo),
-              onToggle: (ev) => { ev.stopPropagation(); togglePhoto(photo.id); },
+            ...displayItems.map(item => e(ReviewGridItem, {
+              key: (item.isStackMember ? 'sm-' : '') + item.photo.id,
+              photo: item.photo,
+              isStackMember: item.isStackMember,
+              dimmed: viewMode === 'obscure' && !item.photo.selected,
+              onClick: () => openModal(item.photo),
+              onToggle: (ev) => { ev.stopPropagation(); togglePhoto(item.photo.id); },
+              expandedStacks,
+              toggleStack,
             })),
           ),
         ),
@@ -934,6 +1048,14 @@
           showCollections: false,
           showLocation: true,
           showAesthetics: true,
+          onStackNavigate: (member) => {
+            setModalPhoto(member);
+            setModalDetail(null);
+            fetch(API + '/api/photos/' + member.id)
+              .then(r => r.json())
+              .then(setModalDetail)
+              .catch(() => {});
+          },
           headerChildren: e('div', { className: 'detail-section' },
             e('button', {
               className: 'btn ' + (modalPhoto.selected ? 'btn-green' : 'btn-outline'),
@@ -1043,15 +1165,18 @@
     // -----------------------------------------------------------------------
     // Review grid item
     // -----------------------------------------------------------------------
-    function ReviewGridItem({ photo, dimmed, onClick, onToggle }) {
+    function ReviewGridItem({ photo, dimmed, onClick, onToggle, isStackMember, expandedStacks, toggleStack }) {
       const [loaded, setLoaded] = useState(false);
       const [error, setError] = useState(false);
 
       const qualityColor = photo.aesthetic_score >= 6 ? 'var(--green)' :
                            photo.aesthetic_score >= 4.5 ? 'var(--yellow)' : 'var(--red)';
 
+      const isExpanded = photo.stack_id && expandedStacks && expandedStacks.has(photo.stack_id);
+      const showBadge = photo.stack_count > 1 && photo.stack_is_top;
+
       return e('div', {
-        className: 'grid-item' + (dimmed ? ' dimmed' : ''),
+        className: 'grid-item' + (dimmed ? ' dimmed' : '') + (isStackMember ? ' stack-member' : ''),
         onClick: onClick,
       },
         // Selection badge
@@ -1059,6 +1184,15 @@
           className: 'select-badge' + (photo.selected ? ' checked' : ''),
           onClick: onToggle,
         }, photo.selected ? '\u2713' : ''),
+
+        // Stack badge
+        showBadge && e('div', {
+          className: 'stack-badge',
+          onClick: (ev) => {
+            ev.stopPropagation();
+            if (toggleStack) toggleStack(photo.stack_id);
+          },
+        }, isExpanded ? '\u2715' : '\u00d7' + photo.stack_count),
 
         // Cluster badge
         photo.cluster_id != null &&

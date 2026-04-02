@@ -72,6 +72,7 @@ def index_directory(
     force_quality: bool = False,
     enable_tags: bool = False,
     force_tags: bool = False,
+    enable_stacking: bool = True,
 ):
     """Index all photos in a directory.
 
@@ -593,6 +594,22 @@ def index_directory(
                     print(f"  Generated {crit_count}/{total} critiques in {elapsed:.1f}s")
                 else:
                     print("\nAll scored photos already have aesthetic critiques.")
+
+        # ── Step: Photo stacking (burst/bracket detection) ──────────
+        # Runs whenever CLIP embeddings are available.
+        if enable_stacking and enable_clip:
+            print("\n── Photo stacking ──")
+            try:
+                from .stacking import run_stacking
+                stacks = run_stacking(db, directory=photo_dir)
+                if stacks:
+                    total_stacked = sum(len(s) for s in stacks)
+                    print(f"  Detected {len(stacks)} stacks ({total_stacked} photos)")
+                else:
+                    print("  No stacks detected.")
+            except Exception as e:
+                print(f"  Stacking failed: {e}")
+                errors.append(f"stacking: {e}")
 
         # Summary
         print(f"\nDone! Database: {db_path} ({db.photo_count()} total photos)")

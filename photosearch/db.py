@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -332,6 +332,24 @@ class PhotoDB:
             )
         """)
 
+        # Photo stacks — burst/bracket groups of near-identical shots
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS photo_stacks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stack_members (
+                stack_id INTEGER NOT NULL REFERENCES photo_stacks(id) ON DELETE CASCADE,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                is_top INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (stack_id, photo_id),
+                UNIQUE(photo_id)
+            )
+        """)
+
         # Collections — named groups of photos (albums)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS collections (
@@ -363,6 +381,8 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_dir ON review_selections(directory)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stack_members_stack ON stack_members(stack_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_stack_members_photo ON stack_members(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_coll ON collection_photos(collection_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)")
 
@@ -784,6 +804,190 @@ class PhotoDB:
             ORDER BY c.name
         """, (photo_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Photo stacks (burst/bracket groups)
+    # ------------------------------------------------------------------
+
+    def create_stack(self, photo_ids: list[int], top_photo_id: int | None = None) -> int:
+        """Create a new stack from a list of photo IDs.
+
+        Args:
+            photo_ids: At least 2 photo IDs to group.
+            top_photo_id: Which photo is the stack's "best" pick.
+                If None, the first ID in the list is used.
+
+        Returns:
+            The new stack ID.
+        """
+        if len(photo_ids) < 2:
+            raise ValueError("A stack requires at least 2 photos")
+        if top_photo_id is None:
+            top_photo_id = photo_ids[0]
+
+        # Remove these photos from any existing stacks first
+        placeholders = ",".join("?" * len(photo_ids))
+        self.conn.execute(
+            f"DELETE FROM stack_members WHERE photo_id IN ({placeholders})",
+            photo_ids,
+        )
+        # Clean up orphaned stacks (stacks with no remaining members)
+        self.conn.execute("""
+            DELETE FROM photo_stacks
+            WHERE id NOT IN (SELECT DISTINCT stack_id FROM stack_members)
+        """)
+
+        cur = self.conn.execute("INSERT INTO photo_stacks DEFAULT VALUES")
+        stack_id = cur.lastrowid
+
+        for pid in photo_ids:
+            self.conn.execute(
+                "INSERT INTO stack_members (stack_id, photo_id, is_top) VALUES (?, ?, ?)",
+                (stack_id, pid, 1 if pid == top_photo_id else 0),
+            )
+        self._maybe_commit()
+        return stack_id
+
+    def get_stack(self, stack_id: int) -> dict | None:
+        """Fetch a stack with its member photos."""
+        row = self.conn.execute(
+            "SELECT * FROM photo_stacks WHERE id = ?", (stack_id,)
+        ).fetchone()
+        if not row:
+            return None
+        members = self.conn.execute("""
+            SELECT p.*, sm.is_top
+            FROM stack_members sm
+            JOIN photos p ON p.id = sm.photo_id
+            WHERE sm.stack_id = ?
+            ORDER BY sm.is_top DESC, p.aesthetic_score DESC
+        """, (stack_id,)).fetchall()
+        return {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "members": [dict(m) for m in members],
+        }
+
+    def get_photo_stack(self, photo_id: int) -> dict | None:
+        """Get stack info for a photo, if it belongs to one.
+
+        Returns {stack_id, is_top, member_count} or None.
+        """
+        row = self.conn.execute(
+            "SELECT stack_id, is_top FROM stack_members WHERE photo_id = ?",
+            (photo_id,),
+        ).fetchone()
+        if not row:
+            return None
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM stack_members WHERE stack_id = ?",
+            (row["stack_id"],),
+        ).fetchone()["cnt"]
+        return {
+            "stack_id": row["stack_id"],
+            "is_top": bool(row["is_top"]),
+            "member_count": count,
+        }
+
+    def set_stack_top(self, stack_id: int, photo_id: int):
+        """Promote a photo to be the top of its stack."""
+        self.conn.execute(
+            "UPDATE stack_members SET is_top = 0 WHERE stack_id = ?",
+            (stack_id,),
+        )
+        self.conn.execute(
+            "UPDATE stack_members SET is_top = 1 WHERE stack_id = ? AND photo_id = ?",
+            (stack_id, photo_id),
+        )
+        self.conn.commit()
+
+    def add_to_stack(self, stack_id: int, photo_id: int):
+        """Add a photo to an existing stack.
+
+        If the photo is already in another stack, it is removed from that
+        stack first (and that stack is dissolved if it drops to 1 member).
+        """
+        # Remove from any existing stack first
+        self.unstack_photo(photo_id)
+        # Verify the target stack exists
+        row = self.conn.execute(
+            "SELECT id FROM photo_stacks WHERE id = ?", (stack_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Stack {stack_id} does not exist")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO stack_members (stack_id, photo_id, is_top) VALUES (?, ?, 0)",
+            (stack_id, photo_id),
+        )
+        self.conn.commit()
+
+    def delete_stack(self, stack_id: int):
+        """Dissolve a stack — members become unstacked individual photos."""
+        self.conn.execute("DELETE FROM photo_stacks WHERE id = ?", (stack_id,))
+        self.conn.commit()
+
+    def unstack_photo(self, photo_id: int):
+        """Remove a single photo from its stack.
+
+        If the stack drops to 1 member, the stack is dissolved.
+        If the removed photo was the top, the highest-scored remaining
+        member becomes the new top.
+        """
+        row = self.conn.execute(
+            "SELECT stack_id, is_top FROM stack_members WHERE photo_id = ?",
+            (photo_id,),
+        ).fetchone()
+        if not row:
+            return
+        stack_id = row["stack_id"]
+        was_top = row["is_top"]
+
+        self.conn.execute(
+            "DELETE FROM stack_members WHERE photo_id = ?", (photo_id,)
+        )
+
+        remaining = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM stack_members WHERE stack_id = ?",
+            (stack_id,),
+        ).fetchone()["cnt"]
+
+        if remaining <= 1:
+            # Dissolve — a stack of 1 is not a stack
+            self.conn.execute("DELETE FROM photo_stacks WHERE id = ?", (stack_id,))
+        elif was_top:
+            # Promote the highest-scored remaining member
+            best = self.conn.execute("""
+                SELECT sm.photo_id FROM stack_members sm
+                JOIN photos p ON p.id = sm.photo_id
+                WHERE sm.stack_id = ?
+                ORDER BY p.aesthetic_score DESC
+                LIMIT 1
+            """, (stack_id,)).fetchone()
+            if best:
+                self.conn.execute(
+                    "UPDATE stack_members SET is_top = 1 WHERE stack_id = ? AND photo_id = ?",
+                    (stack_id, best["photo_id"]),
+                )
+        self.conn.commit()
+
+    def get_all_stacks(self) -> list[dict]:
+        """List all stacks with member count and top photo info."""
+        rows = self.conn.execute("""
+            SELECT ps.id AS stack_id,
+                   COUNT(sm.photo_id) AS member_count,
+                   MAX(CASE WHEN sm.is_top = 1 THEN sm.photo_id END) AS top_photo_id
+            FROM photo_stacks ps
+            JOIN stack_members sm ON sm.stack_id = ps.id
+            GROUP BY ps.id
+            ORDER BY ps.id
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_stacks(self):
+        """Remove all stacks (useful before re-running detection)."""
+        self.conn.execute("DELETE FROM stack_members")
+        self.conn.execute("DELETE FROM photo_stacks")
+        self.conn.commit()
 
     def close(self):
         # Flush any pending batch writes before closing

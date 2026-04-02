@@ -159,6 +159,26 @@
       outline: 3px solid var(--accent);
       outline-offset: -3px;
     }
+    .stack-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 4px;
+      z-index: 2;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      transition: background 0.15s;
+    }
+    .stack-badge:hover { background: rgba(74,158,255,0.7); }
+    .grid-item.stack-member {
+      outline: 3px solid #fff;
+      outline-offset: -3px;
+    }
     .grid-item .select-check {
       position: absolute;
       top: 8px;
@@ -563,6 +583,55 @@
       const [collBusy, setCollBusy] = useState(false);
       const lastSelectedIdx = useRef(null);
 
+      // ---- Stack expansion state ----
+      const [expandedStacks, setExpandedStacks] = useState(new Set());
+      const [stackMembers, setStackMembers] = useState({}); // { stack_id: [photo, ...] }
+
+      const toggleStack = useCallback((stackId) => {
+        setExpandedStacks(prev => {
+          const next = new Set(prev);
+          if (next.has(stackId)) {
+            next.delete(stackId);
+          } else {
+            next.add(stackId);
+            // Fetch members if not already loaded
+            if (!stackMembers[stackId]) {
+              fetch(API + '/api/stacks/' + stackId)
+                .then(r => r.json())
+                .then(data => {
+                  if (data && data.members) {
+                    setStackMembers(prev => ({ ...prev, [stackId]: data.members }));
+                  }
+                });
+            }
+          }
+          return next;
+        });
+      }, [stackMembers]);
+
+      const expandAllStacks = useCallback(() => {
+        if (!results) return;
+        const stackIds = new Set();
+        results.forEach(r => { if (r.stack_id && r.stack_count > 1) stackIds.add(r.stack_id); });
+        // Fetch all stack members
+        stackIds.forEach(sid => {
+          if (!stackMembers[sid]) {
+            fetch(API + '/api/stacks/' + sid)
+              .then(r => r.json())
+              .then(data => {
+                if (data && data.members) {
+                  setStackMembers(prev => ({ ...prev, [sid]: data.members }));
+                }
+              });
+          }
+        });
+        setExpandedStacks(stackIds);
+      }, [results, stackMembers]);
+
+      const collapseAllStacks = useCallback(() => {
+        setExpandedStacks(new Set());
+      }, []);
+
       const toggleSelect = useCallback((photoId, ev) => {
         if (!results) return;
         setSelected(prev => {
@@ -660,6 +729,8 @@
         if (!query && !personFilter && !colorFilter && !locationFilter && !dateFrom && !dateTo && mqVal == null && !matchSource) return;
         setLoading(true);
         setResults(null);
+        setExpandedStacks(new Set());
+        setStackMembers({});
 
         const params = new URLSearchParams();
         if (query) params.set('q', query);
@@ -892,9 +963,16 @@
           results !== null && !loading && results.length === 0 &&
             e('div', { className: 'loading' }, 'No results found.'),
 
-          // "Select Multiple" button (only shown when results exist and not in multi-select)
+          // "Select Multiple" + "Expand/Close Stacks" buttons
           results !== null && results.length > 0 && !multiSelect &&
-            e('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 8 } },
+            e('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginBottom: 8 } },
+              // Show Expand/Close Stacks only if there are stacks in results
+              results.some(r => r.stack_id && r.stack_count > 1) &&
+                e('button', {
+                  style: { padding: '6px 14px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+                           background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer', fontSize: 13 },
+                  onClick: () => { expandedStacks.size > 0 ? collapseAllStacks() : expandAllStacks(); },
+                }, expandedStacks.size > 0 ? 'Close Stacks' : 'Expand Stacks'),
               e('button', {
                 style: { padding: '6px 14px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
                          background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer', fontSize: 13 },
@@ -949,7 +1027,8 @@
           ),
 
           results !== null && results.length > 0 &&
-            e(PhotoGrid, { results, onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect }),
+            e(PhotoGrid, { results, onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
+                           expandedStacks, stackMembers, toggleStack }),
         ),
 
         // Modal
@@ -963,6 +1042,15 @@
           total: results ? results.length : 0,
           onFaceAssigned: handleFaceAssigned,
           persons: persons,
+          onStackNavigate: (member) => {
+            // Navigate to a stack member within the modal
+            setSelectedPhoto(member);
+            setPhotoDetail(null);
+            fetch(API + '/api/photos/' + member.id)
+              .then(r => r.json())
+              .then(setPhotoDetail)
+              .catch(() => {});
+          },
         }),
       );
     }
@@ -985,38 +1073,86 @@
     // -----------------------------------------------------------------------
     // Photo grid
     // -----------------------------------------------------------------------
-    function PhotoGrid({ results, onSelect, multiSelect, selected, onToggleSelect }) {
+    function PhotoGrid({ results, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack }) {
+      // Build display list: filter out non-top stack members, insert expanded members after their top photo
+      const displayItems = useMemo(() => {
+        const added = new Set();
+        const items = [];
+        results.forEach(photo => {
+          const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
+          const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
+          if (isNonTopMember) {
+            if (stackIsExpanded) return; // will appear in expanded group below top photo
+            if (!selected.has(photo.id)) return; // collapsed + unselected → hide
+            // collapsed but selected → show individually
+          }
+          if (added.has(photo.id)) return;
+          added.add(photo.id);
+          items.push({ type: 'photo', photo, isStackMember: false });
+          // When this is the top photo and the stack is expanded, insert all members
+          if (photo.stack_is_top && stackIsExpanded && stackMembers[photo.stack_id]) {
+            stackMembers[photo.stack_id].forEach(m => {
+              if (m.id !== photo.id && !added.has(m.id)) {
+                added.add(m.id);
+                items.push({ type: 'photo', photo: m, isStackMember: true, stackId: photo.stack_id });
+              }
+            });
+          }
+        });
+        return items;
+      }, [results, selected, expandedStacks, stackMembers]);
+
+      const visibleCount = displayItems.filter(d => d.type === 'photo').length;
+      const stackCount = results.filter(r => r.stack_id && r.stack_count > 1 && r.stack_is_top).length;
+
       return e('div', null,
         e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12 } },
-          e('span', null, results.length + ' result' + (results.length !== 1 ? 's' : '')),
+          e('span', null, results.length + ' result' + (results.length !== 1 ? 's' : '') +
+            (stackCount > 0 ? ' (' + stackCount + ' stacked)' : '')),
           multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
             'Click to select \u00B7 Shift-click for range'),
         ),
         e('div', { className: 'grid' },
-          ...results.map(photo =>
-            e(GridItem, {
-              key: photo.id, photo,
-              multiSelect: multiSelect,
+          ...displayItems.map(item => {
+            const photo = item.photo;
+            return e(GridItem, {
+              key: (item.isStackMember ? 'sm-' : '') + photo.id,
+              photo,
+              multiSelect,
               isSelected: selected && selected.has(photo.id),
+              isStackMember: item.isStackMember,
+              stackId: item.stackId || photo.stack_id,
+              expandedStacks,
+              toggleStack,
               onClick: (ev) => {
                 if (multiSelect) { onToggleSelect(photo.id, ev); return; }
                 onSelect(photo);
               },
-            })
-          ),
+            });
+          }),
         ),
       );
     }
 
-    function GridItem({ photo, onClick, multiSelect, isSelected }) {
+    function GridItem({ photo, onClick, multiSelect, isSelected, isStackMember, stackId, expandedStacks, toggleStack }) {
       const [loaded, setLoaded] = useState(false);
       const [error, setError] = useState(false);
 
+      const isExpanded = photo.stack_id && expandedStacks && expandedStacks.has(photo.stack_id);
+      const showBadge = photo.stack_count > 1 && photo.stack_is_top;
+
       return e('div', {
-        className: 'grid-item' + (multiSelect ? ' selectable' : '') + (isSelected ? ' selected' : ''),
+        className: 'grid-item' + (multiSelect ? ' selectable' : '') + (isSelected ? ' selected' : '') + (isStackMember ? ' stack-member' : ''),
         onClick,
       },
         multiSelect && e('div', { className: 'select-check' }, isSelected ? '\u2713' : ''),
+        showBadge && e('div', {
+          className: 'stack-badge',
+          onClick: (ev) => {
+            ev.stopPropagation();
+            if (toggleStack) toggleStack(photo.stack_id);
+          },
+        }, isExpanded ? '\u2715' : '\u00d7' + photo.stack_count),
         !error && e('img', {
           src: API + '/api/photos/' + photo.id + '/thumbnail?v=' + encodeURIComponent(photo.filename),
           alt: photo.filename,
@@ -1054,9 +1190,10 @@
     // -----------------------------------------------------------------------
     // Photo modal
     // -----------------------------------------------------------------------
-    function PhotoModal({ photo, detail, onClose, onPrev, onNext, index, total, onFaceAssigned, persons }) {
+    function PhotoModal({ photo, detail, onClose, onPrev, onNext, index, total, onFaceAssigned, persons, onStackNavigate }) {
       return e(PS.PhotoModal, {
         photo, detail, onClose, onPrev, onNext, index, total, persons, onFaceAssigned,
+        onStackNavigate,
         showFaces: true,
         showCollections: true,
         showLocation: true,

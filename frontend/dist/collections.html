@@ -193,6 +193,27 @@
       height: 100%;
       object-fit: cover;
     }
+    .photo-grid .thumb-wrap .stack-badge {
+      position: absolute;
+      top: 4px;
+      right: 28px;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      z-index: 2;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      transition: background 0.15s;
+      opacity: 1;
+    }
+    .photo-grid .thumb-wrap .stack-badge:hover { background: rgba(74,158,255,0.7); }
+    .photo-grid .thumb-wrap.stack-member {
+      outline: 3px solid #fff;
+      outline-offset: -3px;
+    }
     .photo-grid .thumb-wrap .remove-badge {
       position: absolute;
       top: 4px;
@@ -579,9 +600,9 @@
     // -----------------------------------------------------------------------
     // Photo Modal (delegates to shared component)
     // -----------------------------------------------------------------------
-    function PhotoDetailModal({ photo, onClose, onPrev, onNext, index, total, onFaceAssigned, persons }) {
+    function PhotoDetailModal({ photo, onClose, onPrev, onNext, index, total, onFaceAssigned, persons, onStackNavigate }) {
       return e(PS.PhotoModal, {
-        photo, onClose, onPrev, onNext, index, total, persons, onFaceAssigned,
+        photo, onClose, onPrev, onNext, index, total, persons, onFaceAssigned, onStackNavigate,
         fetchDetail: true,
         showFaces: true,
         showCollections: true,
@@ -677,6 +698,78 @@
       const [modalIdx, setModalIdx] = useState(null);
       const [error, setError] = useState(null);
       const [persons, setPersons] = useState([]);
+
+      // ---- Stack expansion state ----
+      const [expandedStacks, setExpandedStacks] = useState(new Set());
+      const [stackMembers, setStackMembers] = useState({});
+
+      const toggleStack = useCallback((stackId) => {
+        setExpandedStacks(prev => {
+          const next = new Set(prev);
+          if (next.has(stackId)) {
+            next.delete(stackId);
+          } else {
+            next.add(stackId);
+            if (!stackMembers[stackId]) {
+              fetch('/api/stacks/' + stackId)
+                .then(r => r.json())
+                .then(data => {
+                  if (data && data.members) {
+                    setStackMembers(prev => ({ ...prev, [stackId]: data.members }));
+                  }
+                });
+            }
+          }
+          return next;
+        });
+      }, [stackMembers]);
+
+      const expandAllStacks = useCallback(() => {
+        const stackIds = new Set();
+        photos.forEach(r => { if (r.stack_id && r.stack_count > 1) stackIds.add(r.stack_id); });
+        stackIds.forEach(sid => {
+          if (!stackMembers[sid]) {
+            fetch('/api/stacks/' + sid)
+              .then(r => r.json())
+              .then(data => {
+                if (data && data.members) {
+                  setStackMembers(prev => ({ ...prev, [sid]: data.members }));
+                }
+              });
+          }
+        });
+        setExpandedStacks(stackIds);
+      }, [photos, stackMembers]);
+
+      const collapseAllStacks = useCallback(() => { setExpandedStacks(new Set()); }, []);
+
+      const displayItems = useMemo(() => {
+        const added = new Set();
+        const items = [];
+        photos.forEach(photo => {
+          const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
+          const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
+          if (isNonTopMember) {
+            if (stackIsExpanded) return; // will appear in expanded group below top photo
+            if (!selectedForRemoval.has(photo.id)) return; // collapsed + unselected → hide
+            // collapsed but selected → show individually
+          }
+          if (added.has(photo.id)) return;
+          added.add(photo.id);
+          items.push({ photo, isStackMember: false });
+          if (photo.stack_is_top && stackIsExpanded && stackMembers[photo.stack_id]) {
+            stackMembers[photo.stack_id].forEach(m => {
+              if (m.id !== photo.id && !added.has(m.id)) {
+                added.add(m.id);
+                items.push({ photo: m, isStackMember: true, stackId: photo.stack_id });
+              }
+            });
+          }
+        });
+        return items;
+      }, [photos, selectedForRemoval, expandedStacks, stackMembers]);
+
+      const hasStacks = photos.some(p => p.stack_id && p.stack_count > 1);
 
       const load = useCallback(() => {
         fetch(`/api/collections/${collectionId}`).then(r => r.json()).then(data => {
@@ -778,19 +871,37 @@
           e('p', null, 'This collection is empty. Add photos from Search or Review.'),
         ),
 
+        photos.length > 0 && hasStacks && e('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 8 } },
+          e('button', {
+            className: 'btn btn-sm',
+            onClick: () => { expandedStacks.size > 0 ? collapseAllStacks() : expandAllStacks(); },
+          }, expandedStacks.size > 0 ? 'Close Stacks' : 'Expand Stacks'),
+        ),
+
         photos.length > 0 && e('div', { className: 'photo-grid' },
-          photos.map((p, i) => e('div', {
-            key: p.id,
-            className: `thumb-wrap ${selectedForRemoval.has(p.id) ? 'selected' : ''}`,
-            onClick: (ev) => {
-              if (ev.shiftKey) { toggleRemoval(p.id); return; }
-              setModalIdx(i);
+          displayItems.map((item, i) => {
+            const p = item.photo;
+            const isExpanded = p.stack_id && expandedStacks.has(p.stack_id);
+            const showBadge = p.stack_count > 1 && p.stack_is_top;
+            return e('div', {
+              key: (item.isStackMember ? 'sm-' : '') + p.id,
+              className: `thumb-wrap ${selectedForRemoval.has(p.id) ? 'selected' : ''} ${item.isStackMember ? 'stack-member' : ''}`,
+              onClick: (ev) => {
+                if (ev.shiftKey) { toggleRemoval(p.id); return; }
+                // Find index in original photos array for modal nav
+                const origIdx = photos.findIndex(pp => pp.id === p.id);
+                setModalIdx(origIdx >= 0 ? origIdx : 0);
+              },
+              onContextMenu: (ev) => { ev.preventDefault(); toggleRemoval(p.id); },
             },
-            onContextMenu: (ev) => { ev.preventDefault(); toggleRemoval(p.id); },
-          },
-            e('img', { src: `/api/photos/${p.id}/thumbnail`, alt: p.filename, loading: 'lazy' }),
-            e('span', { className: 'remove-badge' }, '\u00d7'),
-          )),
+              e('img', { src: `/api/photos/${p.id}/thumbnail`, alt: p.filename, loading: 'lazy' }),
+              showBadge && e('span', {
+                className: 'stack-badge',
+                onClick: (ev) => { ev.stopPropagation(); toggleStack(p.stack_id); },
+              }, isExpanded ? '\u2715' : '\u00d7' + p.stack_count),
+              e('span', { className: 'remove-badge' }, '\u00d7'),
+            );
+          }),
         ),
 
         // Photo modal
@@ -804,6 +915,10 @@
           persons: persons,
           onFaceAssigned: (faceId, personName) => {
             fetch('/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
+          },
+          onStackNavigate: (member) => {
+            const origIdx = photos.findIndex(pp => pp.id === member.id);
+            if (origIdx >= 0) setModalIdx(origIdx);
           },
         }),
 

@@ -185,6 +185,15 @@ def api_search(
                     item["colors"] = []
             else:
                 item["colors"] = []
+
+            # Stack info (if photo belongs to a stack)
+            pid = r.get("id") or r.get("photo_id")
+            stack_info = db.get_photo_stack(pid) if pid else None
+            if stack_info:
+                item["stack_id"] = stack_info["stack_id"]
+                item["stack_is_top"] = stack_info["is_top"]
+                item["stack_count"] = stack_info["member_count"]
+
             items.append(item)
 
     return {"results": items, "count": len(items)}
@@ -562,6 +571,7 @@ def api_photo_detail(photo_id: int):
             "tags": json.loads(photo["tags"]) if photo.get("tags") else [],
             "colors": colors,
             "faces": face_list,
+            "stack": db.get_photo_stack(photo_id),
         }
 
 
@@ -861,7 +871,7 @@ def api_review_run(
         # Build response
         items = []
         for p in selections:
-            items.append({
+            item = {
                 "id": p["id"],
                 "filename": p.get("filename", ""),
                 "filepath": p.get("filepath", ""),
@@ -871,7 +881,13 @@ def api_review_run(
                 "cluster_id": p.get("cluster_id"),
                 "rank_in_cluster": p.get("rank_in_cluster"),
                 "has_raw": bool(p.get("raw_filepath")),
-            })
+            }
+            stack_info = db.get_photo_stack(p["id"])
+            if stack_info:
+                item["stack_id"] = stack_info["stack_id"]
+                item["stack_is_top"] = stack_info["is_top"]
+                item["stack_count"] = stack_info["member_count"]
+            items.append(item)
 
         n_selected = sum(1 for i in items if i["selected"])
         n_clusters = len(set(i["cluster_id"] for i in items if i["cluster_id"] is not None))
@@ -905,7 +921,7 @@ def api_review_load(
 
         items = []
         for p in selections:
-            items.append({
+            item = {
                 "id": p["photo_id"],
                 "filename": p.get("filename", ""),
                 "filepath": p.get("filepath", ""),
@@ -915,7 +931,13 @@ def api_review_load(
                 "cluster_id": p.get("cluster_id"),
                 "rank_in_cluster": p.get("rank_in_cluster"),
                 "has_raw": bool(p.get("raw_filepath")),
-            })
+            }
+            stack_info = db.get_photo_stack(p["photo_id"])
+            if stack_info:
+                item["stack_id"] = stack_info["stack_id"]
+                item["stack_is_top"] = stack_info["is_top"]
+                item["stack_count"] = stack_info["member_count"]
+            items.append(item)
 
         n_selected = sum(1 for i in items if i["selected"])
         n_clusters = len(set(i["cluster_id"] for i in items if i["cluster_id"] is not None))
@@ -1062,9 +1084,14 @@ def api_get_collection(collection_id: int):
             return JSONResponse({"error": "Collection not found"}, status_code=404)
 
         photos = db.get_collection_photos(collection_id)
-        # Add thumbnail paths
+        # Add thumbnail paths and stack info
         for p in photos:
             p["thumbnail"] = f"/api/photos/{p['id']}/thumbnail"
+            stack_info = db.get_photo_stack(p["id"])
+            if stack_info:
+                p["stack_id"] = stack_info["stack_id"]
+                p["stack_is_top"] = stack_info["is_top"]
+                p["stack_count"] = stack_info["member_count"]
         collection["photo_count"] = len(photos)
 
     return {"collection": collection, "photos": photos}
@@ -1139,6 +1166,133 @@ def api_photo_collections(photo_id: int):
     with _get_db() as db:
         collections = db.get_photo_collections(photo_id)
     return {"collections": collections}
+
+
+# ---------------------------------------------------------------------------
+# Photo stacks (burst/bracket groups)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/stacks")
+def api_list_stacks():
+    """List all stacks with member counts."""
+    with _get_db() as db:
+        stacks = db.get_all_stacks()
+    return {"stacks": stacks}
+
+
+@app.get("/api/stacks/{stack_id}")
+def api_get_stack(stack_id: int):
+    """Get a stack with all member photos."""
+    with _get_db() as db:
+        stack = db.get_stack(stack_id)
+    if not stack:
+        raise HTTPException(404, "Stack not found")
+    return stack
+
+
+@app.put("/api/stacks/{stack_id}/top")
+def api_set_stack_top(stack_id: int, body: dict):
+    """Promote a photo to the top of a stack."""
+    photo_id = body.get("photo_id")
+    if not photo_id:
+        raise HTTPException(400, "photo_id required")
+    with _get_db() as db:
+        stack = db.get_stack(stack_id)
+        if not stack:
+            raise HTTPException(404, "Stack not found")
+        member_ids = {m["id"] for m in stack["members"]}
+        if photo_id not in member_ids:
+            raise HTTPException(400, "Photo is not a member of this stack")
+        db.set_stack_top(stack_id, photo_id)
+    return {"ok": True}
+
+
+@app.delete("/api/stacks/{stack_id}")
+def api_delete_stack(stack_id: int):
+    """Dissolve a stack (keep the photos)."""
+    with _get_db() as db:
+        stack = db.get_stack(stack_id)
+        if not stack:
+            raise HTTPException(404, "Stack not found")
+        db.delete_stack(stack_id)
+    return {"ok": True}
+
+
+@app.post("/api/photos/{photo_id}/unstack")
+def api_unstack_photo(photo_id: int):
+    """Remove a photo from its stack."""
+    with _get_db() as db:
+        info = db.get_photo_stack(photo_id)
+        if not info:
+            raise HTTPException(400, "Photo is not in a stack")
+        db.unstack_photo(photo_id)
+    return {"ok": True}
+
+
+@app.post("/api/stacks/{stack_id}/add")
+def api_add_to_stack(stack_id: int, body: dict):
+    """Add a photo to an existing stack."""
+    photo_id = body.get("photo_id")
+    if not photo_id:
+        raise HTTPException(400, "photo_id required")
+    with _get_db() as db:
+        stack = db.get_stack(stack_id)
+        if not stack:
+            raise HTTPException(404, "Stack not found")
+        # Verify photo exists
+        photo = db.conn.execute("SELECT id FROM photos WHERE id = ?", (photo_id,)).fetchone()
+        if not photo:
+            raise HTTPException(404, "Photo not found")
+        db.add_to_stack(stack_id, photo_id)
+    return {"ok": True}
+
+
+@app.get("/api/photos/{photo_id}/nearby-stacks")
+def api_nearby_stacks(photo_id: int):
+    """Find stacks with photos taken near the same time as this photo.
+
+    Returns up to 5 stacks whose members were taken within 60 seconds
+    of this photo's date_taken, ordered by time proximity.
+    """
+    with _get_db() as db:
+        photo = db.conn.execute(
+            "SELECT id, date_taken FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        if not photo:
+            raise HTTPException(404, "Photo not found")
+        if not photo["date_taken"]:
+            return {"stacks": []}
+        # Find stacks whose members have date_taken within 60s of this photo
+        rows = db.conn.execute("""
+            SELECT DISTINCT ps.id AS stack_id,
+                   COUNT(sm2.photo_id) AS member_count,
+                   MIN(ABS(julianday(p2.date_taken) - julianday(?))) * 86400 AS min_distance_sec,
+                   MAX(CASE WHEN sm2.is_top = 1 THEN p2.filename END) AS top_filename,
+                   MAX(CASE WHEN sm2.is_top = 1 THEN sm2.photo_id END) AS top_photo_id
+            FROM stack_members sm
+            JOIN photos p ON p.id = sm.photo_id
+            JOIN photo_stacks ps ON ps.id = sm.stack_id
+            JOIN stack_members sm2 ON sm2.stack_id = ps.id
+            JOIN photos p2 ON p2.id = sm2.photo_id
+            WHERE ABS(julianday(p.date_taken) - julianday(?)) * 86400 < 60
+              AND sm.photo_id != ?
+            GROUP BY ps.id
+            ORDER BY min_distance_sec ASC
+            LIMIT 5
+        """, (photo["date_taken"], photo["date_taken"], photo_id)).fetchall()
+        return {
+            "stacks": [
+                {
+                    "stack_id": r["stack_id"],
+                    "member_count": r["member_count"],
+                    "top_filename": r["top_filename"],
+                    "top_photo_id": r["top_photo_id"],
+                    "distance_sec": round(r["min_distance_sec"], 1),
+                }
+                for r in rows
+            ]
+        }
 
 
 # ---------------------------------------------------------------------------

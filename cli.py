@@ -1526,5 +1526,75 @@ def verify(db, threshold, model, verify_model, force, no_regenerate, limit, phot
     click.echo(f"  Regenerated: {stats['regenerated']}")
 
 
+@cli.command()
+@click.option("--db", default="photo_index.db", help="Database path.")
+@click.option("--time-window", default=5.0, type=float,
+              help="Max seconds between shots to consider stacking (default: 5).")
+@click.option("--clip-threshold", default=0.05, type=float,
+              help="Max CLIP cosine distance for visual similarity (default: 0.05).")
+@click.option("--directory", default=None, type=click.Path(),
+              help="Restrict to photos in this directory.")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be stacked without saving to DB.")
+@click.option("--clear", is_flag=True,
+              help="Clear all existing stacks before detecting.")
+def stack(db, time_window, clip_threshold, directory, dry_run, clear):
+    """Detect and create photo stacks (burst/bracket groups).
+
+    Finds photos taken within --time-window seconds AND with CLIP cosine
+    distance < --clip-threshold, groups them into stacks, and picks the
+    best photo (by aesthetic score) as the "top" of each stack.
+    """
+    from photosearch.db import PhotoDB
+    from photosearch.stacking import run_stacking
+
+    photo_db = PhotoDB(db)
+
+    if clear and not dry_run:
+        photo_db.clear_stacks()
+        click.echo("Cleared all existing stacks.")
+
+    if directory:
+        directory = os.path.abspath(directory)
+
+    click.echo(f"Detecting stacks (window={time_window}s, clip_threshold={clip_threshold}"
+               f"{', directory=' + directory if directory else ''}"
+               f"{', dry-run' if dry_run else ''})...")
+
+    stacks = run_stacking(
+        photo_db,
+        time_window_sec=time_window,
+        clip_threshold=clip_threshold,
+        directory=directory,
+        dry_run=dry_run,
+    )
+
+    if not stacks:
+        click.echo("No stacks detected.")
+        return
+
+    # Print summary
+    total_stacked = sum(len(s) for s in stacks)
+    click.echo(f"\n{'Would create' if dry_run else 'Created'} {len(stacks)} stacks "
+               f"({total_stacked} photos stacked):")
+    for i, s in enumerate(stacks[:20]):
+        # Fetch filenames for display
+        placeholders = ",".join("?" * len(s))
+        rows = photo_db.conn.execute(
+            f"SELECT id, filename, aesthetic_score FROM photos WHERE id IN ({placeholders})",
+            s,
+        ).fetchall()
+        by_id = {r["id"]: dict(r) for r in rows}
+        top = by_id.get(s[0])
+        top_name = top["filename"] if top else f"id={s[0]}"
+        top_score = f" (score: {top['aesthetic_score']:.1f})" if top and top["aesthetic_score"] else ""
+        rest = [by_id.get(pid, {}).get("filename", f"id={pid}") for pid in s[1:]]
+        rest_names = ", ".join(rest[:5])
+        ellipsis = "..." if len(rest) > 5 else ""
+        click.echo(f"  Stack {i+1}: {top_name}{top_score} + {len(rest)} more [{rest_names}{ellipsis}]")
+    if len(stacks) > 20:
+        click.echo(f"  ... and {len(stacks) - 20} more stacks")
+
+
 if __name__ == "__main__":
     cli()

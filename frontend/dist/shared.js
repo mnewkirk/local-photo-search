@@ -193,6 +193,44 @@
     var collBusy = _collBusy[0];
     var setCollBusy = _collBusy[1];
 
+    // ---- Stack state ----
+    var _stackData = useState(null);
+    var stackData = _stackData[0];
+    var setStackData = _stackData[1];
+
+    var _stackExpanded = useState(false);
+    var stackExpanded = _stackExpanded[0];
+    var setStackExpanded = _stackExpanded[1];
+
+    var _nearbyStacks = useState(null);
+    var nearbyStacks = _nearbyStacks[0];
+    var setNearbyStacks = _nearbyStacks[1];
+
+    var _showAddToStack = useState(false);
+    var showAddToStack = _showAddToStack[0];
+    var setShowAddToStack = _showAddToStack[1];
+
+    var _addingToStack = useState(false);
+    var addingToStack = _addingToStack[0];
+    var setAddingToStack = _addingToStack[1];
+
+    // Fetch stack members when photo changes
+    useEffect(function () {
+      setStackData(null);
+      setStackExpanded(false);
+      setNearbyStacks(null);
+      setShowAddToStack(false);
+      if (!photo) return;
+      // Check if detail or photo has stack info
+      var stackInfo = (detail && detail.stack) || null;
+      var stackId = stackInfo ? stackInfo.stack_id : (photo.stack_id || null);
+      if (!stackId) return;
+      fetch(API + '/api/stacks/' + stackId)
+        .then(function (r) { return r.json(); })
+        .then(function (d) { setStackData(d); })
+        .catch(function () {});
+    }, [photo && photo.id, detail && detail.stack]);
+
     // Fetch collections when photo changes (only if showCollections)
     useEffect(function () {
       if (!showCollections || !photo) return;
@@ -694,6 +732,138 @@
             e('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
               photo.date_taken && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, photo.date_taken),
               total > 1 && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, (index + 1) + ' / ' + total),
+            ),
+          ),
+
+          // Stack
+          stackData && stackData.members && stackData.members.length > 1 && e('div', { className: 'detail-section' },
+            e('h3', {
+              style: { cursor: 'pointer', userSelect: 'none' },
+              onClick: function () { setStackExpanded(!stackExpanded); },
+            }, 'Stack (\u00d7' + stackData.members.length + ') ', e('span', { style: { fontSize: 11 } }, stackExpanded ? '\u25B2' : '\u25BC')),
+            stackExpanded && e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 } },
+              stackData.members.slice().sort(function (a, b) {
+                var da = a.date_taken || a.filename;
+                var db = b.date_taken || b.filename;
+                return da < db ? -1 : da > db ? 1 : 0;
+              }).map(function (m) {
+                var isCurrent = m.id === photo.id;
+                var isTop = m.is_top;
+                return e('div', {
+                  key: m.id,
+                  style: {
+                    width: 64, height: 64, borderRadius: 4, overflow: 'hidden',
+                    cursor: isCurrent ? 'default' : 'pointer',
+                    border: isCurrent ? '2px solid var(--accent)' : isTop ? '2px solid #4ade80' : '2px solid transparent',
+                    position: 'relative', opacity: isCurrent ? 1 : 0.8,
+                  },
+                  title: m.filename + (isTop ? ' (top)' : '') + (m.aesthetic_score ? ' \u2605' + m.aesthetic_score.toFixed(1) : ''),
+                  onClick: function () {
+                    if (isCurrent) return;
+                    // Navigate within the modal by calling onStackNavigate if provided,
+                    // otherwise swap the photo in-place by triggering detail fetch
+                    if (props.onStackNavigate) {
+                      props.onStackNavigate(m);
+                    }
+                  },
+                },
+                  e('img', {
+                    src: API + '/api/photos/' + m.id + '/thumbnail?v=' + encodeURIComponent(m.filename),
+                    style: { width: '100%', height: '100%', objectFit: 'cover' },
+                  }),
+                  isTop && e('div', {
+                    style: { position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.6)', color: '#4ade80', fontSize: 9, textAlign: 'center', padding: '1px 0' },
+                  }, 'TOP'),
+                );
+              }),
+            ),
+            stackExpanded && e('div', { style: { marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap' } },
+              // Show "Make this top" only if current photo is NOT already the top
+              !stackData.members.some(function (m) { return m.id === photo.id && m.is_top; }) &&
+              e('button', {
+                style: { fontSize: 11, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer' },
+                onClick: function () {
+                  fetch(API + '/api/stacks/' + stackData.id + '/top', {
+                    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ photo_id: photo.id }),
+                  }).then(function () {
+                    fetch(API + '/api/stacks/' + stackData.id).then(function (r) { return r.json(); }).then(setStackData);
+                  });
+                },
+              }, 'Make this top'),
+              e('button', {
+                style: { fontSize: 11, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer' },
+                onClick: function () {
+                  if (!confirm('Remove this photo from the stack?')) return;
+                  fetch(API + '/api/photos/' + photo.id + '/unstack', { method: 'POST' })
+                    .then(function () { setStackData(null); });
+                },
+              }, 'Unstack this'),
+            ),
+          ),
+
+          // Add to Stack (shown for unstacked photos)
+          !stackData && photo && e('div', { className: 'detail-section' },
+            !showAddToStack && e('button', {
+              style: { fontSize: 12, padding: '4px 10px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer' },
+              onClick: function () {
+                setShowAddToStack(true);
+                setNearbyStacks(null);
+                fetch(API + '/api/photos/' + photo.id + '/nearby-stacks')
+                  .then(function (r) { return r.json(); })
+                  .then(function (d) { setNearbyStacks(d.stacks || []); })
+                  .catch(function () { setNearbyStacks([]); });
+              },
+            }, 'Add to Stack'),
+            showAddToStack && e('div', null,
+              e('h3', null, 'Add to Stack'),
+              nearbyStacks === null && e('div', { style: { fontSize: 12, color: 'var(--text-muted)', padding: '4px 0' } }, 'Finding nearby stacks\u2026'),
+              nearbyStacks && nearbyStacks.length === 0 && e('div', { style: { fontSize: 12, color: 'var(--text-muted)', padding: '4px 0' } }, 'No nearby stacks found.'),
+              nearbyStacks && nearbyStacks.length > 0 && e('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                nearbyStacks.map(function (ns) {
+                  return e('div', {
+                    key: ns.stack_id,
+                    style: {
+                      display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px',
+                      borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)',
+                      cursor: addingToStack ? 'default' : 'pointer', opacity: addingToStack ? 0.5 : 1,
+                    },
+                    onClick: function () {
+                      if (addingToStack) return;
+                      setAddingToStack(true);
+                      fetch(API + '/api/stacks/' + ns.stack_id + '/add', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ photo_id: photo.id }),
+                      })
+                        .then(function (r) { return r.json(); })
+                        .then(function () {
+                          // Refresh — fetch the stack we just joined
+                          return fetch(API + '/api/stacks/' + ns.stack_id).then(function (r) { return r.json(); });
+                        })
+                        .then(function (d) {
+                          setStackData(d);
+                          setShowAddToStack(false);
+                          setAddingToStack(false);
+                        })
+                        .catch(function () { setAddingToStack(false); });
+                    },
+                  },
+                    ns.top_photo_id && e('img', {
+                      src: API + '/api/photos/' + ns.top_photo_id + '/thumbnail?v=t',
+                      style: { width: 40, height: 40, borderRadius: 3, objectFit: 'cover', flexShrink: 0 },
+                    }),
+                    e('div', { style: { fontSize: 12, lineHeight: 1.3 } },
+                      e('div', { style: { fontWeight: 500 } }, ns.top_filename || ('Stack #' + ns.stack_id)),
+                      e('div', { style: { color: 'var(--text-muted)' } }, '\u00d7' + ns.member_count + ' \u00B7 ' + ns.distance_sec + 's away'),
+                    ),
+                  );
+                }),
+              ),
+              e('button', {
+                style: { fontSize: 11, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer', marginTop: 6 },
+                onClick: function () { setShowAddToStack(false); },
+              }, 'Cancel'),
             ),
           ),
 
