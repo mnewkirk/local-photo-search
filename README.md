@@ -633,6 +633,8 @@ Proof of concept runs on macOS (Apple Silicon). Production target is a **UGREEN 
 
 The stack is chosen to work within these constraints: SQLite needs no server, CLIP inference runs on CPU (slower but functional), and Ollama can serve LLaVA in CPU-only mode. Face detection via InsightFace uses ONNX Runtime's CPU provider.
 
+For NAS deployment with remote access via Tailscale, see **[NAS_SETUP.md](NAS_SETUP.md)**.
+
 
 ## License
 

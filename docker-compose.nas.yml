@@ -1,0 +1,98 @@
+# ============================================================================
+# local-photo-search — UGREEN NAS deployment with Tailscale
+#
+# This compose file deploys three containers:
+#   photosearch — web UI + indexing engine (port 8000, internal only)
+#   ollama      — LLaVA model server for scene descriptions
+#   tailscale   — encrypted tunnel for remote access via your tailnet
+#
+# Tailscale shares the photosearch container's network, so port 8000
+# is accessible at http://<tailscale-hostname>:8000 from any device
+# on your Tailscale network.
+#
+# Quick start (see NAS_SETUP.md for full walkthrough):
+#   1. Copy .env.example to .env and set PHOTO_DIR
+#   2. docker compose -f docker-compose.nas.yml up -d
+#   3. docker compose -f docker-compose.nas.yml logs tailscale
+#      → visit the auth URL shown in the logs
+#   4. Access at http://photosearch:8000 from your tailnet
+#
+# First-time model setup:
+#   docker compose -f docker-compose.nas.yml exec ollama ollama pull llava
+#   docker compose -f docker-compose.nas.yml exec ollama ollama pull minicpm-v
+#
+# Index photos:
+#   docker compose -f docker-compose.nas.yml run --rm photosearch \
+#       index /photos --faces --describe --quality
+# ============================================================================
+
+services:
+  photosearch:
+    build: .
+    container_name: photosearch
+    restart: unless-stopped
+    ports:
+      # Expose on LAN for local access — Tailscale handles remote access
+      - "${WEB_PORT:-8000}:8000"
+    volumes:
+      - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photos:ro
+      - photosearch-data:/data
+    environment:
+      - PHOTOSEARCH_DB=/data/photo_index.db
+      - OLLAMA_HOST=http://ollama:11434
+      - INSIGHTFACE_HOME=/data/.insightface
+      - PHOTO_ROOT=/photos
+      # If deploying a DB built on Mac, set this once to remap paths:
+      # - REMAP_FROM=/Users/yourname/Pictures
+    depends_on:
+      ollama:
+        condition: service_started
+    command: ["serve"]
+    # The N100 has 4 cores and 8 GB RAM. Indexing is memory-intensive
+    # (CLIP + InsightFace + LLaVA all load models). Serving is lightweight.
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: photosearch-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    # Use llava (7B) on the N100 — 13B needs more RAM than available.
+    # 7B runs fine on CPU, just slower (~60-90s per photo for descriptions).
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: photosearch-tailscale
+    hostname: ${TS_HOSTNAME:-photosearch}
+    restart: unless-stopped
+    network_mode: "service:photosearch"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # Set TS_AUTHKEY in .env for headless auth (optional).
+      # Without it, check 'docker logs photosearch-tailscale' for the auth URL.
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+    depends_on:
+      - photosearch
+
+volumes:
+  photosearch-data:
+    driver: local
+  ollama-models:
+    driver: local
+  tailscale-state:
+    driver: local
