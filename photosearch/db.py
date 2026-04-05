@@ -52,12 +52,14 @@ class PhotoDB:
 
     def __init__(self, db_path: str = "photo_index.db", photo_root: Optional[str] = None):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, timeout=30.0)
+        self.conn = sqlite3.connect(db_path, timeout=60.0)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=60000")   # 60s retry at SQLite level
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes with WAL
         self.conn.execute("PRAGMA cache_size=-64000")    # 64 MB page cache
+        self.conn.execute("PRAGMA wal_autocheckpoint=1000")  # Checkpoint every 1000 pages
 
         if HAS_SQLITE_VEC:
             self.conn.enable_load_extension(True)
