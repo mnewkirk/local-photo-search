@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Status — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 24px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .stat-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .progress-bar-wrap {
+      margin-top: 10px;
+      background: var(--surface2);
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: var(--accent);
+      transition: width 0.4s ease;
+    }
+    .progress-bar-fill.complete { background: var(--green); }
+
+    .refresh-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    .error { color: #f87171; font-size: 14px; margin-top: 16px; }
+    .loading { color: var(--text-muted); font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+
+    function pct(n, total) {
+      if (!total) return 0;
+      return Math.round((n / total) * 100);
+    }
+
+    function StatCard(props) {
+      var label = props.label;
+      var value = props.value;
+      var sub = props.sub;
+      var total = props.total;
+      var n = props.n;
+
+      var fraction = (total != null && n != null) ? n / total : null;
+      var complete = fraction === 1;
+
+      return e('div', { className: 'stat-card' },
+        e('div', { className: 'stat-label' }, label),
+        e('div', { className: 'stat-value' }, value),
+        sub && e('div', { className: 'stat-sub' }, sub),
+        fraction !== null && e('div', { className: 'progress-bar-wrap' },
+          e('div', {
+            className: 'progress-bar-fill' + (complete ? ' complete' : ''),
+            style: { width: Math.round(fraction * 100) + '%' }
+          })
+        )
+      );
+    }
+
+    function StatusPage() {
+      var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
+      var _e = useState(null); var error = _e[0]; var setError = _e[1];
+      var _l = useState(true); var loading = _l[0]; var setLoading = _l[1];
+      var _t = useState(null); var lastUpdated = _t[0]; var setLastUpdated = _t[1];
+
+      function load() {
+        setLoading(true);
+        fetch('/api/stats')
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            setStats(data);
+            setLastUpdated(new Date().toLocaleTimeString());
+            setLoading(false);
+            setError(null);
+          })
+          .catch(function(err) {
+            setError('Failed to load stats: ' + err.message);
+            setLoading(false);
+          });
+      }
+
+      useEffect(function() { load(); }, []);
+
+      var header = e(PS.SharedHeader, { activePage: 'status' });
+
+      var content;
+      if (error) {
+        content = e('p', { className: 'error' }, error);
+      } else if (!stats) {
+        content = e('p', { className: 'loading' }, 'Loading…');
+      } else {
+        var total = stats.photos;
+        var qs = stats.quality_stats;
+
+        content = e(React.Fragment, null,
+          e('div', { className: 'refresh-row' },
+            lastUpdated && e('span', null, 'Updated ' + lastUpdated),
+            e('button', { className: 'btn', onClick: load }, loading ? 'Refreshing…' : 'Refresh')
+          ),
+          e('div', { className: 'grid' },
+            e(StatCard, {
+              label: 'Photos indexed',
+              value: total.toLocaleString(),
+              sub: 'Total in database'
+            }),
+            e(StatCard, {
+              label: 'CLIP embedded',
+              value: stats.clip_embedded.toLocaleString(),
+              sub: pct(stats.clip_embedded, total) + '% — required for search',
+              n: stats.clip_embedded,
+              total: total
+            }),
+            e(StatCard, {
+              label: 'Faces detected',
+              value: stats.faces.toLocaleString(),
+              sub: stats.faces > 0
+                ? (stats.faces - (stats.faces - stats.persons)) + ' across ' + stats.persons + ' named person(s)'
+                : 'Run index --faces to detect'
+            }),
+            e(StatCard, {
+              label: 'Descriptions',
+              value: stats.described.toLocaleString(),
+              sub: pct(stats.described, total) + '% — run index --describe',
+              n: stats.described,
+              total: total
+            }),
+            e(StatCard, {
+              label: 'Quality scored',
+              value: stats.quality_scored.toLocaleString(),
+              sub: qs
+                ? pct(stats.quality_scored, total) + '% — avg ' + qs.mean + ' / 10'
+                : pct(stats.quality_scored, total) + '% — run index --quality',
+              n: stats.quality_scored,
+              total: total
+            })
+          )
+        );
+      }
+
+      return e('div', null,
+        header,
+        e('div', { className: 'container' },
+          e('h1', null, 'Indexing Status'),
+          content
+        )
+      );
+    }
+
+    var root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(e(StatusPage, null));
+  </script>
+</body>
+</html>
