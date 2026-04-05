@@ -26,16 +26,23 @@ The UGREEN cloud link (`ug.link`) only serves the UGOS dashboard and can't route
 
 ## Step 1: Copy the project to the NAS
 
-From your Mac, copy the project to the NAS. You can use `scp`, `rsync`, or the UGOS file manager:
+SSH into the NAS and clone the repo directly from GitHub. The UGOS restricted shell blocks `rsync` and `scp`, so cloning via Docker is the reliable approach:
 
 ```bash
-# From your Mac, in the project directory:
-rsync -av --exclude='venv' --exclude='*.db' --exclude='__pycache__' \
-    --exclude='node_modules' --exclude='thumbnails' --exclude='results' \
-    ./ yournas:/volume1/docker/photosearch/
+ssh yournas
+mkdir -p /volume1/docker/photosearch
+
+# Clone using a temporary Alpine container (avoids needing git on the NAS)
+docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
+  "apk add -q git && git clone https://github.com/mattnewkirk/local-photo-search /repo"
 ```
 
-Or use the UGOS file manager to create `/volume1/docker/photosearch/` and upload the files.
+To update later:
+
+```bash
+docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
+  "apk add -q git && git config --global --add safe.directory /repo && git -C /repo pull"
+```
 
 
 ## Step 2: Configure environment
@@ -62,6 +69,10 @@ TS_HOSTNAME=photosearch
 # Optional: Tailscale auth key for headless setup
 # Generate at https://login.tailscale.com/admin/settings/keys
 # TS_AUTHKEY=tskey-auth-xxxxx
+
+# Optional: HuggingFace token — avoids rate limits when downloading models
+# Get one at https://huggingface.co/settings/tokens
+# HF_TOKEN=hf_xxxxx
 ```
 
 ### About the Tailscale auth key
@@ -119,30 +130,115 @@ You can skip `minicpm-v` initially and add it later. Without it, the `verify` co
 
 ## Step 5: Index your photos
 
-```bash
-# Full pipeline: CLIP embeddings + face detection + descriptions + quality scoring
-docker compose -f docker-compose.nas.yml run --rm photosearch \
-    index /photos --faces --describe --quality
+Indexing runs in passes — each pass adds a layer. Run them in this order so search works as quickly as possible.
 
-# Or index without descriptions (much faster, no Ollama needed):
-docker compose -f docker-compose.nas.yml run --rm photosearch \
-    index /photos --faces --quality
+### Pass 1: CLIP embeddings (required for search)
+
+CLIP is the foundation. Nothing else works until photos have embeddings.
+
+```bash
+# Index one year at a time — easiest to monitor and restart if needed
+nohup bash -c '
+for year in 2026 2025 2024 2023; do
+  echo "=== $year ==="
+  docker compose -f /volume1/docker/photosearch/docker-compose.nas.yml run --rm \
+    -e PYTHONUNBUFFERED=1 photosearch index /photos/$year --clip --no-colors
+  echo "=== Done $year ==="
+done
+' > /tmp/clip.log 2>&1 &
+echo "PID: $!"
 ```
 
-**Timing expectations on the N100:**
-- CLIP embeddings: ~5-10 seconds per photo (CPU-only, no GPU)
-- Face detection: ~2-3 seconds per photo
-- LLaVA descriptions (7B): ~60-90 seconds per photo
-- Quality scoring: ~3-5 seconds per photo
+Monitor progress:
+```bash
+tail -f /tmp/clip.log
+```
 
-For 1000 photos with full pipeline, expect 24-36 hours. You can run indexing in stages — it's safe to stop and restart. Already-indexed photos are skipped.
+**Timing on N100:** ~2 seconds per photo. Expect roughly 6–8 hours per 10,000 photos.
 
-**Tip:** Index without `--describe` first to get search working quickly (CLIP alone takes ~2-3 hours for 1000 photos), then run a second pass with `--describe` overnight.
+**Note:** Use `--no-colors` during the initial CLIP pass. Color extraction runs concurrently with the web server and causes SQLite lock errors on slower hardware. Run a separate color pass later.
+
+### Pass 2: Face detection + quality scoring
+
+Once CLIP is done for a year (or a folder), run faces and quality together:
+
+```bash
+nohup docker compose -f /volume1/docker/photosearch/docker-compose.nas.yml run --rm \
+  -e PYTHONUNBUFFERED=1 photosearch index /photos/2026 --faces --quality --no-colors \
+  > /tmp/faces2026.log 2>&1 &
+```
+
+**Timing on N100:**
+- Face detection: ~3–5 seconds per photo
+- Quality scoring: ~3–5 seconds per photo (runs in parallel)
+
+### Pass 3: Face matching
+
+After face detection completes, match detected faces to your registered reference persons:
+
+```bash
+docker compose -f docker-compose.nas.yml run --rm photosearch match-faces --temporal
+```
+
+This is fast (seconds to minutes). `--temporal` enables a second pass that uses timestamps to match faces that were too small or angled for direct matching.
+
+### Pass 4: Photo stacking
+
+Stacking detects burst/bracket groups using CLIP embeddings. Run per-folder or across the whole library:
+
+```bash
+# Stack a specific year
+docker compose -f docker-compose.nas.yml run --rm photosearch \
+    stack --directory /photos/2026
+
+# Stack everything
+docker compose -f docker-compose.nas.yml run --rm photosearch stack
+```
+
+This is fast — a few minutes for tens of thousands of photos.
+
+### Pass 5: Descriptions (optional, very slow)
+
+LLaVA descriptions are optional — search works without them, but they improve results for complex queries.
+
+```bash
+nohup docker compose -f /volume1/docker/photosearch/docker-compose.nas.yml run --rm \
+  -e PYTHONUNBUFFERED=1 photosearch index /photos/2026 --describe \
+  > /tmp/describe2026.log 2>&1 &
+```
+
+**Timing on N100:** ~60–90 seconds per photo with the 7B model. 10,000 photos ≈ 7–10 days.
+
+### Monitoring progress
+
+The web UI has a Status page at `http://photosearch:8000/status` showing CLIP coverage, face count, descriptions, and quality scores — with a Refresh button. No need to run CLI stats manually.
+
+```bash
+# Or via CLI
+docker compose -f docker-compose.nas.yml run --rm photosearch stats
+```
 
 
-## Step 6: Access the web UI
+## Step 6: Register reference faces (optional)
 
-From any device on your Tailscale network:
+To enable person search, add reference photos for each person you want to find:
+
+```bash
+# Copy reference photos to the NAS first
+# Then register each person:
+docker compose -f docker-compose.nas.yml run --rm photosearch \
+    add-person "Alex" --photo /photos/references/alex.jpg
+
+docker compose -f docker-compose.nas.yml run --rm photosearch \
+    add-person "Jamie" --photo /photos/references/jamie1.jpg --photo /photos/references/jamie2.jpg
+```
+
+Reference photos should be clear, front-facing shots. Multiple reference photos per person improve matching accuracy. After adding references, run `match-faces` (Step 5, Pass 3) to apply them.
+
+
+## Step 7: Access the web UI
+
+From any device on your Tailscale network (once Tailscale is connected and CLIP indexing has run on at least some photos):
 
 ```
 http://photosearch:8000
@@ -199,13 +295,39 @@ docker compose -f docker-compose.nas.yml down
 # Restart after a config change
 docker compose -f docker-compose.nas.yml up -d
 
-# Update the code (after pulling/copying new files)
+# Update the code and rebuild
+docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
+  "apk add -q git && git config --global --add safe.directory /repo && git -C /repo pull"
 docker compose -f docker-compose.nas.yml build photosearch
 docker compose -f docker-compose.nas.yml up -d photosearch
 
-# Run a one-off CLI command
-docker compose -f docker-compose.nas.yml run --rm photosearch detect-stacks
+# Run one-off CLI commands
 docker compose -f docker-compose.nas.yml run --rm photosearch stats
+docker compose -f docker-compose.nas.yml run --rm photosearch stack
+docker compose -f docker-compose.nas.yml run --rm photosearch match-faces --temporal
+docker compose -f docker-compose.nas.yml run --rm photosearch list-persons
+```
+
+### Running background indexing safely
+
+Always use `nohup` with `PYTHONUNBUFFERED=1` so progress is visible and the job survives a disconnected SSH session:
+
+```bash
+nohup docker compose -f /volume1/docker/photosearch/docker-compose.nas.yml run --rm \
+  -e PYTHONUNBUFFERED=1 photosearch index /photos/2026 --clip \
+  > /tmp/index.log 2>&1 &
+echo "PID: $!"
+
+# Monitor
+tail -f /tmp/index.log
+
+# Check what's running
+docker ps --filter name=photosearch-photosearch-run
+```
+
+To stop a background indexing job:
+```bash
+docker ps --filter name=photosearch-photosearch-run --format "{{.ID}}" | xargs docker stop
 ```
 
 
@@ -213,10 +335,25 @@ docker compose -f docker-compose.nas.yml run --rm photosearch stats
 
 **"Ollama connection refused"** — Ollama may still be starting. Check `docker compose -f docker-compose.nas.yml logs ollama` and wait for "Listening on 0.0.0.0:11434".
 
-**Out of memory during indexing** — LLaVA 7B + CLIP + InsightFace together can spike to 6-7 GB. If the container is killed, try indexing in stages: first `--faces --quality` (no LLaVA), then a separate pass with `--describe`.
+**Out of memory during indexing** — LLaVA 7B + CLIP + InsightFace together can spike to 6–7 GB. If the container is killed, try indexing in stages: first `--clip --faces --quality` (no LLaVA), then a separate pass with `--describe`.
 
-**Tailscale not connecting** — Check that `/dev/net/tun` exists on the NAS. If not, you may need to load the tun kernel module: `modprobe tun`. Also verify the container has NET_ADMIN capability.
+**"database is locked" errors during indexing** — The web server and an indexing job are both writing to SQLite simultaneously. Use `--no-colors` during initial indexing passes (color extraction causes the most lock contention). You can run a dedicated color pass later when no other write jobs are active:
+```bash
+docker compose -f docker-compose.nas.yml run --rm photosearch index /photos/2026
+```
+(Without any flags, it only extracts colors for photos that don't have them yet.)
 
-**Slow search results** — First search after startup may be slow while CLIP loads into memory. Subsequent searches should return in under a second.
+**Tailscale not connecting** — Check container logs: `docker logs photosearch-tailscale`. Common causes:
+- Container was restarted individually by UGOS rather than via `docker compose` — the network config change won't take effect. Fix: `docker compose -f docker-compose.nas.yml down && docker compose -f docker-compose.nas.yml up -d`
+- `/dev/net/tun` doesn't exist — run `modprobe tun`
+- Auth token expired — check logs for an auth URL and re-authenticate
+
+**CLIP indexing shows no progress / log appears frozen** — Normal during model loading (first run only). Once you see "Generating CLIP embeddings...", progress lines appear every ~5%. If it's truly stuck, check `docker ps` for duplicate index containers and stop the older ones.
+
+**"No such command 'python'"** — The container entrypoint intercepts commands. Use `--entrypoint python` to run Python directly: `docker compose run --rm --entrypoint python photosearch cli.py --help`
+
+**Slow search results** — First search after startup may be slow while CLIP loads into memory (~10–15 seconds on N100). Subsequent searches return in under a second.
 
 **Photos not found** — Verify the mount path. From inside the container: `docker compose -f docker-compose.nas.yml exec photosearch ls /photos/` should show your photo folders.
+
+**Can't SSH remotely (Tailscale down)** — If you have remote access to a UniFi or other managed router, add a temporary port forward for port 22 to the NAS IP. After reconnecting Tailscale, remove the port forward.

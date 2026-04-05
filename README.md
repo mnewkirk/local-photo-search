@@ -95,7 +95,8 @@ local-photo-search/
 │   ├── faces.html         # Face management (grouping, naming, merging, ignore)
 │   ├── review.html        # Shoot review / culling interface
 │   ├── collections.html   # Collections / albums interface
-│   └── shared.js          # Shared components (PhotoModal)
+│   ├── status.html        # Indexing status dashboard
+│   └── shared.js          # Shared components (nav, PhotoModal)
 ├── cli.py                 # Click-based CLI with all commands
 ├── tests/
 │   ├── test_face_matching.py   # Face accuracy + semantic ranking tests
@@ -119,7 +120,7 @@ Photo files on disk
    │          Indexing pipeline           │
    │                                     │
    │  1. EXIF extraction (exifread)      │
-   │  2. CLIP embedding (open-clip)      │
+   │  2. CLIP embedding (open-clip)      │  ← opt-in: --clip
    │  3. Dominant colors (colorthief)    │
    │  4. Face detection (InsightFace)    │  ← opt-in: --faces
    │  5. Scene description (LLaVA)       │  ← opt-in: --describe
@@ -448,7 +449,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Index a folder of photos (full pipeline)
-python cli.py index /path/to/photos --faces --describe --describe-model llava:13b --quality
+python cli.py index /path/to/photos --clip --faces --describe --describe-model llava:13b --quality
+
+# Detect burst/bracket stacks (uses CLIP embeddings — run after --clip)
+python cli.py stack
 
 # Launch the web UI
 python cli.py serve              # opens at http://localhost:8000
@@ -471,38 +475,38 @@ The database (`photo_index.db`) is created automatically on first run in the cur
 
 | Command | Purpose |
 |---------|---------|
-| `index <dir>` | Index photos: EXIF, CLIP, colors, faces (opt-in), descriptions (opt-in) |
+| `index <dir>` | Index photos: EXIF, colors, and opt-in pipelines below |
 | `search` | Search by query, person, place, color, or face reference |
 | `add-person <name>` | Register a named person with reference photo(s) |
 | `match-faces` | Match detected faces to registered persons |
+| `stack` | Detect and group burst/bracket shots into stacks |
 | `list-persons` | Show registered persons and photo counts |
 | `face-clusters` | Show unidentified face clusters |
 | `correct-face` | Fix a wrong face match |
 | `tag-photo` | Manually tag a person in a photo (bypasses face detection) |
 | `diagnose-photo` | Show face detection details and match distances |
-| `stats` | Database statistics |
+| `stats` | Database statistics (photos, CLIP coverage, faces, quality) |
 | `show-descriptions` | View LLaVA-generated descriptions |
 | `verify` | Verify descriptions/tags for hallucinations and auto-regenerate |
 | `review <dir>` | Shoot review — select best representative photos from a folder |
-| `detect-stacks` | Detect and group burst/bracket shots into stacks |
 | `serve` | Launch the web UI (default port 8000) |
 
 Key flags for `index`:
 
 | Flag | Effect |
 |------|--------|
+| `--clip` | Generate CLIP embeddings (required for search) |
 | `--faces` | Enable face detection and encoding |
 | `--describe` | Generate LLaVA scene descriptions |
 | `--describe-model llava:13b` | Use a specific Ollama model |
 | `--quality` | Compute aesthetic quality scores (1–10) |
 | `--tags` | Generate semantic category tags |
-| `--force-clip` | Regenerate all CLIP embeddings (required after model change) |
+| `--force-clip` | Clear and regenerate CLIP embeddings for this directory |
 | `--force-describe` | Regenerate all descriptions |
 | `--force-faces` | Re-run face detection on all photos |
 | `--force-quality` | Rescore quality for all photos |
 | `--force-tags` | Regenerate tags for all photos |
-| `--no-clip` | Skip CLIP embedding |
-| `--no-colors` | Skip color extraction |
+| `--no-colors` | Skip dominant color extraction |
 
 Key flags for `verify`:
 
@@ -549,13 +553,23 @@ The semantic search tests validate ranking rather than exact thresholds — phot
 
 ## Scale testing
 
-The system has been tested on 196 Sony A7 IV JPEGs (4608×3072, ~2 GB total) from a single beach outing. At this scale:
+The system has been tested on two scales:
 
-- CLIP embedding takes ~2–3 minutes (batched, on Apple Silicon MPS)
-- LLaVA descriptions take ~30–60 seconds per photo with `llava:13b`
-- Face detection and encoding takes ~1–2 seconds per photo
-- Search queries return in under a second
-- The SQLite database with sqlite-vec handles all vector operations without issue
+**Development (196 photos, Apple Silicon Mac):**
+- CLIP embedding: ~2–3 minutes (batched, MPS acceleration)
+- LLaVA descriptions: ~30–60 seconds per photo with `llava:13b`
+- Face detection: ~1–2 seconds per photo
+- Search queries: under a second
+
+**Production (130,000 photos, UGREEN NAS — Intel N100, 8 GB RAM, CPU-only):**
+- CLIP embedding: ~2 seconds per photo (CPU-only, streaming writes to DB)
+- Face detection: ~3–5 seconds per photo
+- LLaVA descriptions (7B): ~60–90 seconds per photo
+- Search queries: under a second after models warm up
+
+At 130K photos, CLIP indexing takes roughly 3–4 days per year of photos on the N100. Index recent years first to get search working quickly, then backfill older years.
+
+The SQLite database with sqlite-vec handles all vector operations without issue at this scale. The database file stays under 2 GB even with full CLIP embeddings for 130K photos.
 
 
 ## Design decisions and their rationale
@@ -618,18 +632,18 @@ The development process was iterative in a way that's hard to capture in commits
 
 - **LLaVA hallucinations.** The 13B model occasionally describes people, objects, or activities that aren't in the photo. The CLIP gate and face confirmation mitigate this for search. The `verify` command (M12) catches and auto-regenerates most hallucinated descriptions using cross-model verification, but some false positives and false negatives remain.
 
-- **No incremental CLIP updates.** Switching CLIP models requires `--force-clip` to regenerate all embeddings. There's no versioning to detect stale embeddings automatically.
+- **Switching CLIP models requires re-embedding.** `--force-clip` clears and regenerates embeddings for the specified directory. There's no automatic versioning to detect stale embeddings across the whole database.
 
 - **Single-threaded LLaVA descriptions.** Ollama processes one image at a time. For 196 photos at ~45 seconds each, that's about 2.5 hours. This could be parallelized if Ollama supported batching.
 
 
 ## Target deployment
 
-Proof of concept runs on macOS (Apple Silicon). Production target is a **UGREEN NAS** with:
+Runs on macOS (Apple Silicon) for development and on a **UGREEN DXP4800 NAS** in production:
 
 - Intel N100 (4 cores, no GPU)
 - 8 GB RAM
-- Docker container
+- Docker container with Tailscale sidecar for remote access
 
 The stack is chosen to work within these constraints: SQLite needs no server, CLIP inference runs on CPU (slower but functional), and Ollama can serve LLaVA in CPU-only mode. Face detection via InsightFace uses ONNX Runtime's CPU provider.
 
