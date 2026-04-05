@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from .colors import colors_to_json, extract_dominant_colors
-from .clip_embed import embed_image, embed_images_batch, unload_model as unload_clip
+from .clip_embed import embed_image, embed_images_batch, embed_images_stream, unload_model as unload_clip
 from .db import PhotoDB
 from .exif import extract_exif, find_raw_pair
 
@@ -279,23 +279,20 @@ def index_directory(
                 print("All photos already indexed. Nothing to do.")
             return
 
-        # Step 2: CLIP embeddings (batched)
+        # Step 2: CLIP embeddings (streamed — store each batch as it completes)
         if enable_clip:
             print(f"\nGenerating CLIP embeddings (batch_size={batch_size})...")
             t0 = time.time()
             paths = [p for _, p in new_photos]
-            embeddings = embed_images_batch(paths, batch_size=batch_size)
-
-            db.begin_batch(batch_size=100)
             embedded_count = 0
-            for (photo_id, path), emb in zip(new_photos, embeddings):
-                if emb is not None:
-                    try:
-                        db.add_clip_embedding(photo_id, emb)
-                        embedded_count += 1
-                    except Exception as e:
-                        _report_error("clip_store", path, e)
-
+            db.begin_batch(batch_size=100)
+            for idx, emb in embed_images_stream(paths, batch_size=batch_size):
+                photo_id, path = new_photos[idx]
+                try:
+                    db.add_clip_embedding(photo_id, emb)
+                    embedded_count += 1
+                except Exception as e:
+                    _report_error("clip_store", path, e)
             db.end_batch()
             elapsed = time.time() - t0
             print(f"  Embedded {embedded_count}/{len(new_photos)} photos in {elapsed:.1f}s")

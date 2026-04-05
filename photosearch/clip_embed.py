@@ -112,21 +112,21 @@ def embed_text(text: str) -> Optional[list[float]]:
         return None
 
 
-def embed_images_batch(image_paths: list[str], batch_size: int = 8) -> list[Optional[list[float]]]:
-    """Embed multiple images in batches for efficiency.
+def embed_images_stream(image_paths: list[str], batch_size: int = 8):
+    """Embed images in batches, yielding (index, embedding) as each batch completes.
 
-    Returns a list parallel to image_paths — each entry is either
-    a 512-float list or None if that image failed.
+    Yields results incrementally so callers can store to DB and print progress
+    without waiting for the entire dataset to be processed.
     """
+    import sys
     _load_model()
-    results: list[Optional[list[float]]] = [None] * len(image_paths)
     total = len(image_paths)
     report_every = max(batch_size, (total // 20 // batch_size) * batch_size)  # ~20 updates
 
     for batch_start in range(0, total, batch_size):
         if batch_start > 0 and batch_start % report_every == 0:
             print(f"  [{batch_start}/{total}] CLIP embedding in progress...")
-            import sys; sys.stdout.flush()
+            sys.stdout.flush()
         batch_paths = image_paths[batch_start:batch_start + batch_size]
         batch_images = []
         valid_indices = []
@@ -148,6 +148,16 @@ def embed_images_batch(image_paths: list[str], batch_size: int = 8) -> list[Opti
             embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
 
         for j, idx in enumerate(valid_indices):
-            results[idx] = embeddings[j].cpu().tolist()
+            yield idx, embeddings[j].cpu().tolist()
 
+
+def embed_images_batch(image_paths: list[str], batch_size: int = 8) -> list[Optional[list[float]]]:
+    """Embed multiple images in batches for efficiency.
+
+    Returns a list parallel to image_paths — each entry is either
+    a 512-float list or None if that image failed.
+    """
+    results: list[Optional[list[float]]] = [None] * len(image_paths)
+    for idx, emb in embed_images_stream(image_paths, batch_size):
+        results[idx] = emb
     return results
