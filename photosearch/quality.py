@@ -50,7 +50,8 @@ AESTHETIC_MODEL_URL = (
 )
 
 # Local cache path for downloaded model weights
-_CACHE_DIR = Path.home() / ".cache" / "photosearch"
+# Respect PHOTOSEARCH_CACHE env var so Docker can persist to a named volume
+_CACHE_DIR = Path(os.environ.get("PHOTOSEARCH_CACHE", Path.home() / ".cache" / "photosearch"))
 _MODEL_FILENAME = "sac+logos+ava1-l14-linearMSE.pth"
 
 

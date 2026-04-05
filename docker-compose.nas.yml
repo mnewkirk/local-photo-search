@@ -42,6 +42,8 @@ services:
       - OLLAMA_HOST=http://ollama:11434
       - INSIGHTFACE_HOME=/data/.insightface
       - PHOTO_ROOT=/photos
+      - PYTHONUNBUFFERED=1
+      - PHOTOSEARCH_CACHE=/data/.cache/photosearch
       # If deploying a DB built on Mac, set this once to remap paths:
       # - REMAP_FROM=/Users/yourname/Pictures
     depends_on:
@@ -71,7 +73,6 @@ services:
   tailscale:
     image: tailscale/tailscale:latest
     container_name: photosearch-tailscale
-    hostname: ${TS_HOSTNAME:-photosearch}
     restart: unless-stopped
     network_mode: "service:photosearch"
     cap_add:
@@ -84,6 +85,7 @@ services:
       # Set TS_AUTHKEY in .env for headless auth (optional).
       # Without it, check 'docker logs photosearch-tailscale' for the auth URL.
       - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_HOSTNAME=${TS_HOSTNAME:-photosearch}
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
     depends_on:

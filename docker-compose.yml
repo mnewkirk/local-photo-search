@@ -39,6 +39,8 @@ services:
       - PHOTOSEARCH_DB=/data/photo_index.db
       - OLLAMA_HOST=http://ollama:11434
       - INSIGHTFACE_HOME=/data/.insightface
+      - PYTHONUNBUFFERED=1
+      - PHOTOSEARCH_CACHE=/data/.cache/photosearch
     depends_on:
       ollama:
         condition: service_started
