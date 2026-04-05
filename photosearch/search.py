@@ -81,6 +81,58 @@ _NEGATION_PEOPLE_RE = re.compile(
 _FALSE_NEGATION_RE = re.compile(r"\bno other\b", re.IGNORECASE)
 
 
+# Filename detection: single token (no spaces), optionally ending in a photo extension.
+# Matches camera naming conventions: DSC06241, IMG_1234, P1020304, DSC_0001, etc.
+# Deliberately permissive — if no filename match is found we fall through to CLIP anyway.
+_FILENAME_STEM_RE = re.compile(
+    r'^[A-Za-z]{0,5}[\d_]{2,}[A-Za-z\d_]*$'
+)
+_PHOTO_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".arw", ".raw", ".dng",
+    ".nef", ".cr2", ".cr3", ".heic", ".heif", ".tif", ".tiff",
+    ".mov", ".mp4",
+}
+
+
+def _looks_like_filename(query: str) -> bool:
+    """Return True if the query looks like a camera filename or filename stem.
+
+    Examples that match: DSC06241, IMG_1234, DSC06241.JPG, P1020304
+    Examples that don't: beach, sunset at the lake, R2D2 (falls through to CLIP)
+    """
+    q = query.strip()
+    if not q or " " in q:
+        return False
+    # Strip a trailing photo extension
+    stem = q
+    suffix = Path(q).suffix.lower()
+    if suffix in _PHOTO_EXTENSIONS:
+        stem = Path(q).stem
+    return bool(_FILENAME_STEM_RE.match(stem))
+
+
+def search_by_filename(db: PhotoDB, query: str, limit: int = 50) -> list[dict]:
+    """Search for photos by filename substring match (case-insensitive LIKE).
+
+    Strips any trailing photo extension from the query so that both
+    'DSC06241' and 'DSC06241.JPG' find the same photo.
+    Returns results ordered by date_taken descending.
+    """
+    stem = query.strip()
+    suffix = Path(stem).suffix.lower()
+    if suffix in _PHOTO_EXTENSIONS:
+        stem = Path(stem).stem
+    pattern = f"%{stem}%"
+    rows = db.conn.execute(
+        """SELECT * FROM photos
+           WHERE filename LIKE ? OR filepath LIKE ?
+           ORDER BY date_taken DESC
+           LIMIT ?""",
+        (pattern, pattern, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def _dedupe_by_hash(results: list[dict]) -> list[dict]:
     """Remove duplicate photos (same file indexed from multiple paths).
 
@@ -993,8 +1045,20 @@ def search_combined(
         result_sets.append({r["id"]: r for r in results})
 
     if effective_query:
-        results = search_semantic(db, effective_query, limit=limit * 3, min_score=min_score, debug=debug, tag_match=tag_match)
-        result_sets.append({r["id"]: r for r in results})
+        # Filename shortcut: if the query looks like a camera filename (no spaces,
+        # alphanumeric serial pattern), try a direct DB lookup first.
+        # CLIP has no understanding of filenames, so semantic search would return
+        # random visually-similar photos instead of the specific file.
+        # If filename search finds nothing, fall through to CLIP as normal.
+        if _looks_like_filename(effective_query):
+            fname_results = search_by_filename(db, effective_query, limit=limit * 3)
+            if fname_results:
+                result_sets.append({r["id"]: r for r in fname_results})
+                effective_query = None  # Skip CLIP — filename match is authoritative
+
+        if effective_query:
+            results = search_semantic(db, effective_query, limit=limit * 3, min_score=min_score, debug=debug, tag_match=tag_match)
+            result_sets.append({r["id"]: r for r in results})
 
     if color:
         results = search_by_color(db, color, limit=limit * 3)
