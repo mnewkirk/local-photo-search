@@ -1,0 +1,27 @@
+# Reference photos for named persons.
+#
+# Used by: python cli.py add-persons --config references.yml
+#
+# Each key is the person's display name. Each value is a list of reference
+# photo paths. Multiple photos improve matching robustness (different angles,
+# lighting, ages). Paths can be absolute or relative to where you run the CLI.
+#
+# On the NAS with Docker, mount this file's directory and use absolute paths
+# inside the container, e.g.:
+#   docker compose -f docker-compose.nas.yml run --rm \
+#     -v /home/cantimatt/docker/photosearch/references:/references:ro \
+#     photosearch add-persons --config /references/references.yml
+
+Matt:
+  - /references/matt_reference.jpg
+
+Calvin:
+  - /references/calvin_reference.jpg
+  - /references/calvin_reference2.JPG
+
+Ellie:
+  - /references/ellie_reference.jpg
+  - /references/ellie_reference2.JPG
+
+Nicole:
+  - /references/nicole_reference.jpg

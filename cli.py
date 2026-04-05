@@ -36,7 +36,7 @@ def cli():
 
 @cli.command()
 @click.argument("photo_dir", type=click.Path(exists=True))
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--batch-size", default=8, help="Batch size for CLIP embedding.")
 @click.option("--clip", is_flag=True, help="Generate CLIP embeddings (required for semantic search).")
 @click.option("--no-colors", is_flag=True, help="Skip dominant color extraction.")
@@ -100,7 +100,7 @@ def index(photo_dir, db, batch_size, clip, no_colors, faces, force_faces, force_
 @click.option("--place", help="Search by place name.")
 @click.option("--color", "-c", help="Search by dominant color (name or #hex).")
 @click.option("--face", type=click.Path(exists=True), help="Search by reference face image.")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--limit", "-n", default=10, help="Max number of results.")
 @click.option("--results-dir", default="results", help="Base directory for result subfolders.")
 @click.option("--no-results", is_flag=True, help="Don't write a results folder.")
@@ -246,7 +246,7 @@ def search(query, person, place, color, face, db, limit, results_dir, no_results
 @click.argument("name")
 @click.option("--photo", "photos", multiple=True, type=click.Path(exists=True),
               help="Reference photo(s) containing this person's face. Can be repeated.")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def add_person(name, photos, db):
     """Register a named person using one or more reference photos.
 
@@ -310,11 +310,109 @@ def add_person(name, photos, db):
 
 
 # ---------------------------------------------------------------------------
+# add-persons  (batch version — reads a YAML config, one model load)
+# ---------------------------------------------------------------------------
+
+@cli.command("add-persons")
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True),
+              help="Path to a YAML file mapping person names to reference photo paths.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+def add_persons(config_path, db):
+    """Register multiple persons from a YAML config — one model load, all at once.
+
+    \b
+    Config format (references.yml):
+      Matt:
+        - /references/matt_reference.jpg
+      Calvin:
+        - /references/calvin_reference.jpg
+        - /references/calvin_reference2.JPG
+
+    \b
+    Example (Docker on NAS):
+      docker compose -f docker-compose.nas.yml run --rm \\
+        -v /home/user/references:/references:ro \\
+        photosearch add-persons --config /references/references.yml
+    """
+    import struct
+    try:
+        import yaml
+    except ImportError:
+        click.echo("PyYAML is required: pip install pyyaml")
+        return
+
+    from photosearch.faces import encode_reference_photo, check_available, _get_face_app
+    from photosearch.db import FACE_DIMENSIONS
+
+    try:
+        check_available()
+    except RuntimeError as e:
+        click.echo(str(e))
+        return
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    if not config or not isinstance(config, dict):
+        click.echo("Config file is empty or not a valid YAML mapping.")
+        return
+
+    # Load the model once before processing anyone
+    click.echo("Loading InsightFace model (buffalo_l)...")
+    _get_face_app()
+    click.echo("")
+
+    with PhotoDB(db) as photo_db:
+        total_added = 0
+        for name, photos in config.items():
+            if not photos:
+                click.echo(f"[{name}] No photos listed — skipping.")
+                continue
+
+            click.echo(f"[{name}]")
+
+            existing = photo_db.get_person_by_name(name)
+            if existing:
+                person_id = existing["id"]
+                click.echo(f"  Person already exists (id={person_id}). Adding new reference(s).")
+            else:
+                person_id = photo_db.add_person(name)
+                click.echo(f"  Created person (id={person_id}).")
+
+            added = 0
+            for photo_path in photos:
+                click.echo(f"  Encoding: {photo_path}")
+                encoding = encode_reference_photo(str(photo_path))
+                if encoding is None:
+                    click.echo(f"  ✗ No face found — skipping.")
+                    continue
+
+                cur = photo_db.conn.execute(
+                    "INSERT INTO face_references (person_id, source_path) VALUES (?, ?)",
+                    (person_id, str(photo_path)),
+                )
+                ref_id = cur.lastrowid
+                photo_db.conn.execute(
+                    "INSERT INTO face_ref_encodings (ref_id, encoding) VALUES (?, ?)",
+                    (ref_id, struct.pack(f"{FACE_DIMENSIONS}f", *encoding)),
+                )
+                photo_db.conn.commit()
+                added += 1
+                click.echo(f"  ✓ Reference added.")
+
+            click.echo(f"  → {added} reference(s) added for '{name}'.\n")
+            total_added += added
+
+    click.echo(f"Done. {total_added} total reference(s) added.")
+    click.echo("Now run: python cli.py match-faces")
+
+
+# ---------------------------------------------------------------------------
 # match-faces
 # ---------------------------------------------------------------------------
 
 @cli.command("match-faces")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--tolerance", default=1.15, help="Match tolerance — L2 distance on 512-dim ArcFace vectors (lower = stricter). Default: 1.15")
 @click.option("--temporal", is_flag=True, default=False,
               help="After standard matching, propagate identities to nearby unmatched faces "
@@ -374,7 +472,7 @@ def match_faces(db, tolerance, temporal, temporal_tolerance, temporal_window):
 # ---------------------------------------------------------------------------
 
 @cli.command("list-persons")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def list_persons(db):
     """List all registered persons and their photo counts."""
     with PhotoDB(db) as photo_db:
@@ -403,7 +501,7 @@ def list_persons(db):
 # ---------------------------------------------------------------------------
 
 @cli.command("face-clusters")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def face_clusters(db):
     """Show a summary of unidentified face clusters.
 
@@ -443,7 +541,7 @@ def face_clusters(db):
 @click.argument("filename")
 @click.argument("face_number", type=int)
 @click.argument("correct_person")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def correct_face(filename, face_number, correct_person, db):
     """Correct a face match in a photo.
 
@@ -515,7 +613,7 @@ def correct_face(filename, face_number, correct_person, db):
 
 @cli.command("clear-matches")
 @click.argument("photo_dir", type=click.Path(exists=True))
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--person", default=None, help="Only clear matches for this person (by name).")
 @click.option("--all-faces", is_flag=True, help="Also delete the detected face data itself, not just the person assignments.")
 @click.option("--include-manual", is_flag=True, help="Also clear manual (UI) assignments. By default these are preserved.")
@@ -646,7 +744,7 @@ def clear_matches(photo_dir, db, person, all_faces, include_manual):
 # ---------------------------------------------------------------------------
 
 @cli.command("export-face-assignments")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--output", "-o", default="face_assignments.json", help="Output JSON file path.")
 def export_face_assignments(db, output):
     """Export manual face-to-person assignments to a JSON file.
@@ -693,7 +791,7 @@ def export_face_assignments(db, output):
 
 @cli.command("import-face-assignments")
 @click.argument("input_file", type=click.Path(exists=True))
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def import_face_assignments(input_file, db):
     """Re-apply manual face assignments from a previously exported JSON file.
 
@@ -779,7 +877,7 @@ def import_face_assignments(input_file, db):
 @cli.command("tag-photo")
 @click.argument("filename")
 @click.argument("person_name")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def tag_photo(filename, person_name, db):
     """Manually tag a person as appearing in a photo, bypassing face detection.
 
@@ -832,7 +930,7 @@ def tag_photo(filename, person_name, db):
 
 @cli.command("diagnose-photo")
 @click.argument("filename")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def diagnose_photo(filename, db):
     """Show face detection details and match distances for a specific photo.
 
@@ -937,7 +1035,7 @@ def diagnose_photo(filename, db):
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def stats(db):
     """Show database statistics."""
     if not os.path.exists(db):
@@ -990,7 +1088,7 @@ def stats(db):
 # ---------------------------------------------------------------------------
 
 @cli.command("show-descriptions")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.argument("filename", required=False)
 def show_descriptions(db, filename):
     """Show LLaVA-generated descriptions for photos.
@@ -1028,7 +1126,7 @@ def show_descriptions(db, filename):
 # ---------------------------------------------------------------------------
 
 @cli.command("show-quality")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--sort", "sort_order", type=click.Choice(["score", "name"]), default="score",
               help="Sort by aesthetic score (descending) or filename.")
 @click.option("--min", "min_score", type=float, default=None, help="Only show photos above this score.")
@@ -1148,7 +1246,7 @@ def show_quality(db, sort_order, min_score, detail, directory):
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--host", default="0.0.0.0", help="Host to bind to.")
 @click.option("--port", default=8000, help="Port to listen on.")
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development.")
@@ -1182,7 +1280,7 @@ def serve(db, host, port, reload):
 @cli.command("remap-paths")
 @click.argument("old_prefix")
 @click.argument("new_prefix")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--dry-run", is_flag=True, help="Show what would change without modifying the database.")
 def remap_paths(old_prefix, new_prefix, db, dry_run):
     """Rewrite stored filepaths when photos move to a new location.
@@ -1231,7 +1329,7 @@ def remap_paths(old_prefix, new_prefix, db, dry_run):
 
 @cli.command("set-photo-root")
 @click.argument("root_path")
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def set_photo_root(root_path, db):
     """Set or change the photo root directory.
 
@@ -1262,7 +1360,7 @@ def set_photo_root(root_path, db):
 
 @cli.command("import-db")
 @click.argument("source_db", type=click.Path(exists=True))
-@click.option("--db", default="photo_index.db", help="Destination database path.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Destination database path.")
 @click.option("--remap", nargs=2, help="Remap paths: OLD_PREFIX NEW_PREFIX")
 def import_db(source_db, db, remap):
     """Import a database built on another machine.
@@ -1300,7 +1398,7 @@ def import_db(source_db, db, remap):
 
 @cli.command()
 @click.argument("photo_dir", type=click.Path(exists=True))
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--target-pct", default=10.0, help="Target percentage of photos to select (default 10).")
 @click.option("--threshold", default=0.0, help="Clustering distance threshold (0 = adaptive, lower = tighter clusters).")
 @click.option("--export", type=click.Path(), default=None,
@@ -1403,7 +1501,7 @@ def review(photo_dir, db, target_pct, threshold, export, export_raw, list_only):
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--threshold", default=0.18, show_default=True,
               help="CLIP similarity threshold. Nouns below this are flagged.")
 @click.option("--model", default="llava", show_default=True, help="Ollama model used to regenerate descriptions.")
@@ -1530,7 +1628,7 @@ def verify(db, threshold, model, verify_model, force, no_regenerate, limit, phot
 
 
 @cli.command()
-@click.option("--db", default="photo_index.db", help="Database path.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Database path.")
 @click.option("--time-window", default=5.0, type=float,
               help="Max seconds between shots to consider stacking (default: 5).")
 @click.option("--clip-threshold", default=0.05, type=float,

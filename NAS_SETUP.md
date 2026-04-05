@@ -221,19 +221,51 @@ docker compose -f docker-compose.nas.yml run --rm photosearch stats
 
 ## Step 6: Register reference faces (optional)
 
-To enable person search, add reference photos for each person you want to find:
+To enable person search, create a `references.yml` config file and add reference photos for each person.
 
-```bash
-# Copy reference photos to the NAS first
-# Then register each person:
-docker compose -f docker-compose.nas.yml run --rm photosearch \
-    add-person "Alex" --photo /photos/references/alex.jpg
+### 6a. Create references.yml
 
-docker compose -f docker-compose.nas.yml run --rm photosearch \
-    add-person "Jamie" --photo /photos/references/jamie1.jpg --photo /photos/references/jamie2.jpg
+Place it alongside your reference photos (e.g. `/home/cantimatt/docker/photosearch/references/references.yml`):
+
+```yaml
+# references.yml
+Matt:
+  - /references/matt_reference.jpg
+Calvin:
+  - /references/calvin_reference.jpg
+  - /references/calvin_reference2.JPG
+Ellie:
+  - /references/ellie_reference.jpg
+  - /references/ellie_reference2.JPG
+Nicole:
+  - /references/nicole_reference.jpg
 ```
 
-Reference photos should be clear, front-facing shots. Multiple reference photos per person improve matching accuracy. After adding references, run `match-faces` (Step 5, Pass 3) to apply them.
+Paths inside the file should be the **container-side** paths (after the volume mount below).
+
+### 6b. Run add-persons (one model download for everyone)
+
+```bash
+docker compose -f docker-compose.nas.yml run --rm \
+  -v /home/cantimatt/docker/photosearch/references:/references:ro \
+  photosearch add-persons --config /references/references.yml
+```
+
+This loads InsightFace once and encodes all persons in a single container run — no repeated model downloads.
+
+### 6c. Verify and run match-faces
+
+```bash
+# Confirm all persons have references
+docker compose -f docker-compose.nas.yml run --rm photosearch list-persons
+
+# Match faces in the database
+docker compose -f docker-compose.nas.yml run --rm photosearch match-faces --temporal
+```
+
+Reference photos should be clear, front-facing shots. Multiple reference photos per person improve matching accuracy.
+
+> **Note:** If you use `add-person` (singular) directly, always pass `--db /data/photo_index.db` or set `PHOTOSEARCH_DB=/data/photo_index.db` in your `.env` file, otherwise the CLI defaults to a temporary local path that is lost when the container exits.
 
 
 ## Step 7: Access the web UI
