@@ -60,6 +60,7 @@
       { href: '/review',      label: 'Review',      id: 'review' },
       { href: '/faces',       label: 'Faces',       id: 'faces' },
       { href: '/collections', label: 'Collections', id: 'collections' },
+      { href: '/status',      label: 'Status',      id: 'status' },
     ];
 
     return e('div', { className: 'header' },

@@ -946,6 +946,7 @@ def stats(db):
 
     with PhotoDB(db) as photo_db:
         photo_count = photo_db.photo_count()
+        clip_count = photo_db.conn.execute("SELECT COUNT(*) as c FROM clip_embeddings").fetchone()["c"]
         face_count = photo_db.conn.execute("SELECT COUNT(*) as c FROM faces").fetchone()["c"]
         person_count = photo_db.conn.execute("SELECT COUNT(*) as c FROM persons").fetchone()["c"]
         unmatched = photo_db.conn.execute(
@@ -960,6 +961,7 @@ def stats(db):
 
         click.echo(f"Database:        {db}")
         click.echo(f"Photos indexed:  {photo_count}")
+        click.echo(f"CLIP embedded:   {clip_count}/{photo_count}")
         click.echo(f"Faces detected:  {face_count} ({unmatched} unmatched)")
         click.echo(f"Persons named:   {person_count}")
         click.echo(f"Descriptions:    {described}/{photo_count}")

@@ -1000,6 +1000,7 @@ def api_stats():
     """Database statistics."""
     with _get_db() as db:
         photo_count = db.photo_count()
+        clip_count = db.conn.execute("SELECT COUNT(*) as c FROM clip_embeddings").fetchone()["c"]
         face_count = db.conn.execute("SELECT COUNT(*) as c FROM faces").fetchone()["c"]
         person_count = db.conn.execute("SELECT COUNT(*) as c FROM persons").fetchone()["c"]
         described = db.conn.execute(
@@ -1024,6 +1025,7 @@ def api_stats():
 
     return {
         "photos": photo_count,
+        "clip_embedded": clip_count,
         "faces": face_count,
         "persons": person_count,
         "described": described,
@@ -1338,6 +1340,14 @@ if _frontend_dir.exists():
         if coll_page.exists():
             return HTMLResponse(coll_page.read_text())
         return HTMLResponse("<h1>Collections page not found</h1>")
+
+    @app.get("/status")
+    def serve_status():
+        """Serve the indexing status page."""
+        status_page = _frontend_dir / "status.html"
+        if status_page.exists():
+            return HTMLResponse(status_page.read_text())
+        return HTMLResponse("<h1>Status page not found</h1>")
 
     @app.get("/collections/{collection_id}")
     def serve_collection_detail(collection_id: int):
