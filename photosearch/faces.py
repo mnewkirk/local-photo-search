@@ -73,10 +73,14 @@ def _get_face_app() -> "FaceAnalysis":
         t0 = _time.time()
         app = FaceAnalysis(
             name="buffalo_l",
+            # Only load detection + recognition. Skip landmark (1k3d68, 2d106det)
+            # and genderage models — we only use bbox + ArcFace embedding.
+            # This roughly halves per-face inference time on CPU.
+            allowed_modules=["detection", "recognition"],
             providers=["CPUExecutionProvider"],
         )
         # det_size controls the internal resolution of the RetinaFace detector.
-        # 640×640 is the standard setting and handles most face sizes.
+        # 640×640 is the standard setting and handles most face sizes well.
         app.prepare(ctx_id=-1, det_size=(640, 640))
         _face_app = app
         print(f" ready ({_time.time() - t0:.1f}s)")
