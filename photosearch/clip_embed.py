@@ -120,8 +120,13 @@ def embed_images_batch(image_paths: list[str], batch_size: int = 8) -> list[Opti
     """
     _load_model()
     results: list[Optional[list[float]]] = [None] * len(image_paths)
+    total = len(image_paths)
+    report_every = max(batch_size, (total // 20 // batch_size) * batch_size)  # ~20 updates
 
-    for batch_start in range(0, len(image_paths), batch_size):
+    for batch_start in range(0, total, batch_size):
+        if batch_start > 0 and batch_start % report_every == 0:
+            print(f"  [{batch_start}/{total}] CLIP embedding in progress...")
+            import sys; sys.stdout.flush()
         batch_paths = image_paths[batch_start:batch_start + batch_size]
         batch_images = []
         valid_indices = []
