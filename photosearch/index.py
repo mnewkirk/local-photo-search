@@ -224,6 +224,31 @@ def index_directory(
         elif not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
             pass
 
+        # When --clip is requested, also queue dir photos already in the DB but missing embeddings.
+        if enable_clip and not force_clip:
+            dir_photos_list = _get_dir_photos()
+            if dir_photos_list:
+                already_queued = {pid for pid, _ in new_photos}
+                dir_photo_lookup = {pid: path for pid, path in dir_photos_list}
+                # Chunk queries to stay within SQLite binding limits
+                photos_with_clip = set()
+                ids = list(dir_photo_lookup.keys())
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    rows = db.conn.execute(
+                        f"SELECT photo_id FROM clip_embeddings WHERE photo_id IN ({placeholders})",
+                        chunk
+                    ).fetchall()
+                    photos_with_clip.update(row[0] for row in rows)
+                missing = [
+                    (pid, path) for pid, path in dir_photos_list
+                    if pid not in photos_with_clip and pid not in already_queued
+                ]
+                if missing:
+                    print(f"  Found {len(missing)} photos in directory without CLIP embeddings.")
+                    new_photos.extend(missing)
+
         if new_photos:
             print(f"\nIndexed {len(new_photos)} new photos into database.")
 
