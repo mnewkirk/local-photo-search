@@ -207,17 +207,19 @@ def index_directory(
                 ]
             return dir_photos
 
-        # force_clip: wipe all existing CLIP embeddings and re-embed every photo.
-        all_photos = None
+        # force_clip: wipe CLIP embeddings for photos in this directory and re-embed them.
         if force_clip and enable_clip:
-            print("\nClearing existing CLIP embeddings for full regeneration (--force-clip)...")
-            db.conn.execute("DELETE FROM clip_embeddings")
-            db.conn.commit()
-            all_photos = [
-                (row["id"], db.resolve_filepath(row["filepath"]))
-                for row in db.conn.execute("SELECT id, filepath FROM photos").fetchall()
-            ]
-            new_photos = list(all_photos)
+            dir_photos_list = _get_dir_photos()
+            dir_photo_ids_for_clip = [pid for pid, _ in dir_photos_list]
+            print(f"\nClearing CLIP embeddings for {len(dir_photo_ids_for_clip)} photos in directory (--force-clip)...")
+            if dir_photo_ids_for_clip:
+                placeholders = ",".join("?" * len(dir_photo_ids_for_clip))
+                db.conn.execute(
+                    f"DELETE FROM clip_embeddings WHERE photo_id IN ({placeholders})",
+                    dir_photo_ids_for_clip
+                )
+                db.conn.commit()
+            new_photos = list(dir_photos_list)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
         elif not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
             pass

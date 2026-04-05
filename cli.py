@@ -38,11 +38,11 @@ def cli():
 @click.argument("photo_dir", type=click.Path(exists=True))
 @click.option("--db", default="photo_index.db", help="Path to the SQLite database file.")
 @click.option("--batch-size", default=8, help="Batch size for CLIP embedding.")
-@click.option("--no-clip", is_flag=True, help="Skip CLIP embedding generation.")
+@click.option("--clip", is_flag=True, help="Generate CLIP embeddings (required for semantic search).")
 @click.option("--no-colors", is_flag=True, help="Skip dominant color extraction.")
 @click.option("--faces", is_flag=True, help="Detect and encode faces.")
 @click.option("--force-faces", is_flag=True, help="Clear all face data and re-run detection on every photo.")
-@click.option("--force-clip", is_flag=True, help="Clear all CLIP embeddings and regenerate for every photo. Use after switching CLIP models.")
+@click.option("--force-clip", is_flag=True, help="Clear and regenerate CLIP embeddings for photos in this directory. Use to fix stale embeddings.")
 @click.option("--describe", is_flag=True, help="Generate scene descriptions via LLaVA (requires Ollama).")
 @click.option("--force-describe", is_flag=True, help="Regenerate descriptions for all photos, even those that already have one.")
 @click.option("--describe-model", default="llava", show_default=True, help="Ollama model for descriptions.")
@@ -52,11 +52,12 @@ def cli():
 @click.option("--force-tags", is_flag=True, help="Regenerate tags for all photos, even those that already have them.")
 @click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --tags. Equivalent to passing each flag individually.")
 @click.option("--verify", is_flag=True, help="Run hallucination verification after indexing (requires descriptions).")
-def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, force_clip,
+def index(photo_dir, db, batch_size, clip, no_colors, faces, force_faces, force_clip,
           describe, force_describe, describe_model, quality, force_quality, tags, force_tags, full,
           verify):
     """Index a directory of photos."""
     if full:
+        clip = True
         faces = True
         describe = True
         quality = True
@@ -65,7 +66,7 @@ def index(photo_dir, db, batch_size, no_clip, no_colors, faces, force_faces, for
         photo_dir=photo_dir,
         db_path=db,
         batch_size=batch_size,
-        enable_clip=not no_clip,
+        enable_clip=clip or force_clip,
         enable_colors=not no_colors,
         enable_faces=faces or force_faces,
         force_faces=force_faces,
