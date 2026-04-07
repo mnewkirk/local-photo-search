@@ -401,6 +401,11 @@
       return function () { window.removeEventListener('resize', updateImgRect); };
     }, [updateImgRect]);
 
+    // Clear stale imgRect when photo changes so face overlays don't flash
+    useEffect(function () {
+      setImgRect(null);
+    }, [photo && photo.id]);
+
     // Build face bounding box overlay data
     var faceOverlays = useMemo(function () {
       if (!detail || !detail.faces || !imgRect) return [];
@@ -700,6 +705,7 @@
         // Image pane
         e('div', { className: 'modal-image', style: { position: 'relative' } },
           e('img', {
+            key: 'photo-' + photo.id,
             ref: imgRef,
             src: API + '/api/photos/' + photo.id + '/full',
             alt: photo.filename,
