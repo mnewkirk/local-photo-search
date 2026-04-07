@@ -1031,6 +1031,109 @@ def diagnose_photo(filename, db):
 
 
 # ---------------------------------------------------------------------------
+# find-dupes
+# ---------------------------------------------------------------------------
+
+@cli.command("find-dupes")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--output", "-o", default=None, help="Write a list of suggested deletions to this file (one path per line).")
+@click.option("--named", is_flag=True, default=False, help="Also report _1/_2 naming-pattern duplicates even if hashes differ.")
+def find_dupes(db, output, named):
+    """Find duplicate photos in the database.
+
+    \b
+    Two detection methods:
+      Content duplicates  — same file_hash (byte-for-byte identical, any filename).
+      Named duplicates    — files like DSC06241_1.JPG alongside DSC06241.JPG
+                           (--named flag; useful for camera copy artifacts).
+
+    \b
+    The suggested deletion list (--output) always keeps the file with the
+    shorter/simpler name (no _N suffix) and marks the rest for deletion.
+    Photos are never deleted automatically — the list is yours to review first.
+    """
+    import re as _re
+
+    with PhotoDB(db) as photo_db:
+
+        # ── 1. Content duplicates (same file_hash) ──────────────────────────
+        rows = photo_db.conn.execute(
+            """SELECT file_hash, COUNT(*) as cnt,
+                      GROUP_CONCAT(filepath, '|') as paths,
+                      GROUP_CONCAT(filename, '|') as names
+               FROM photos
+               WHERE file_hash IS NOT NULL
+               GROUP BY file_hash
+               HAVING cnt > 1
+               ORDER BY cnt DESC"""
+        ).fetchall()
+
+        content_groups = []
+        for row in rows:
+            paths = row["paths"].split("|")
+            names = row["names"].split("|")
+            content_groups.append(list(zip(names, paths)))
+
+        total_content_dupes = sum(len(g) - 1 for g in content_groups)
+        click.echo(f"\nContent duplicates (same file hash): {len(content_groups)} group(s), "
+                   f"{total_content_dupes} extra file(s)\n")
+
+        to_delete = []
+
+        for i, group in enumerate(content_groups[:50], 1):  # cap display at 50 groups
+            # Keep shortest filename (usually the original), delete the rest
+            group_sorted = sorted(group, key=lambda x: (len(x[0]), x[0]))
+            keep_name, keep_path = group_sorted[0]
+            click.echo(f"  Group {i}: keep {keep_name}")
+            for name, path in group_sorted[1:]:
+                click.echo(f"           del  {path}")
+                to_delete.append(path)
+
+        if len(content_groups) > 50:
+            click.echo(f"  ... and {len(content_groups) - 50} more groups (use --output to see all)")
+
+        # ── 2. Named duplicates (_1, _2 suffix pattern) ─────────────────────
+        named_extras = []
+        if named:
+            _suffix_re = _re.compile(r'^(.+?)_(\d+)(\.[^.]+)$', _re.IGNORECASE)
+            all_photos = photo_db.conn.execute(
+                "SELECT filename, filepath FROM photos ORDER BY filename"
+            ).fetchall()
+
+            # Build a set of all filenames for quick lookup
+            all_names = {row["filename"].lower() for row in all_photos}
+
+            for row in all_photos:
+                m = _suffix_re.match(row["filename"])
+                if not m:
+                    continue
+                stem, _num, ext = m.groups()
+                original_name = f"{stem}{ext}"
+                if original_name.lower() in all_names:
+                    named_extras.append((original_name, row["filename"], row["filepath"]))
+
+            click.echo(f"\nNamed duplicates (_N suffix with matching original): {len(named_extras)} file(s)\n")
+            for orig, dupe_name, dupe_path in named_extras[:100]:
+                click.echo(f"  original: {orig}  →  dupe: {dupe_path}")
+                if dupe_path not in to_delete:
+                    to_delete.append(dupe_path)
+
+            if len(named_extras) > 100:
+                click.echo(f"  ... and {len(named_extras) - 100} more (use --output to see all)")
+
+        # ── Summary and optional output file ────────────────────────────────
+        click.echo(f"\nTotal suggested deletions: {len(to_delete)} file(s)")
+        click.echo("Nothing has been deleted — review the list before acting.")
+
+        if output:
+            with open(output, "w") as f:
+                for path in to_delete:
+                    f.write(path + "\n")
+            click.echo(f"Deletion list written to: {output}")
+            click.echo("To remove after review:  xargs rm < " + output)
+
+
+# ---------------------------------------------------------------------------
 # stats
 # ---------------------------------------------------------------------------
 

@@ -194,18 +194,25 @@ def score_photo(image_path: str) -> Optional[float]:
         return None
 
 
-def score_photos_batch(
-    image_paths: list[str], batch_size: int = 8
-) -> list[Optional[float]]:
-    """Score multiple photos in batches for efficiency.
+def score_photos_stream(image_paths: list[str], batch_size: int = 8):
+    """Score photos in batches, yielding (index, score) as each batch completes.
 
-    Returns a list parallel to image_paths — each entry is a float
-    score or None if that image failed.
+    Yields:
+        (idx, score) — index into image_paths and the float aesthetic score.
+        Skipped/failed images are not yielded.
+
+    Progress is printed every ~5% of total photos so long-running jobs remain visible.
     """
+    import sys
     _load_models()
-    results: list[Optional[float]] = [None] * len(image_paths)
+    total = len(image_paths)
+    report_every = max(batch_size, (total // 20 // batch_size) * batch_size)
 
-    for batch_start in range(0, len(image_paths), batch_size):
+    for batch_start in range(0, total, batch_size):
+        if batch_start > 0 and report_every > 0 and batch_start % report_every == 0:
+            print(f"  [{batch_start}/{total}] Quality scoring in progress...", flush=True)
+            sys.stdout.flush()
+
         batch_paths = image_paths[batch_start : batch_start + batch_size]
         batch_images = []
         valid_indices = []
@@ -228,8 +235,21 @@ def score_photos_batch(
             scores = _aesthetic_model(embeddings)
 
         for j, idx in enumerate(valid_indices):
-            results[idx] = round(float(scores[j].squeeze().cpu()), 3)
+            yield idx, round(float(scores[j].squeeze().cpu()), 3)
 
+
+def score_photos_batch(
+    image_paths: list[str], batch_size: int = 8
+) -> list[Optional[float]]:
+    """Score multiple photos in batches for efficiency.
+
+    Returns a list parallel to image_paths — each entry is a float
+    score or None if that image failed.
+    Internally calls score_photos_stream for progress reporting.
+    """
+    results: list[Optional[float]] = [None] * len(image_paths)
+    for idx, score in score_photos_stream(image_paths, batch_size=batch_size):
+        results[idx] = score
     return results
 
 

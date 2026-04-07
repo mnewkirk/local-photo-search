@@ -524,16 +524,17 @@ def index_directory(
             if quality_candidates:
                 t0 = time.time()
                 paths = [p for _, p in quality_candidates]
-                scores = score_photos_batch(paths, batch_size=batch_size)
-
-                db.begin_batch(batch_size=100)
                 scored_count = 0
-                for (photo_id, path), score in zip(quality_candidates, scores):
-                    if score is not None:
-                        db.update_photo(photo_id, aesthetic_score=score)
-                        scored_count += 1
 
+                # Stream scores and write to DB per-batch so progress survives a crash.
+                from .quality import score_photos_stream as _score_stream
+                db.begin_batch(batch_size=100)
+                for idx, score in _score_stream(paths, batch_size=batch_size):
+                    photo_id = quality_candidates[idx][0]
+                    db.update_photo(photo_id, aesthetic_score=score)
+                    scored_count += 1
                 db.end_batch()
+
                 elapsed = time.time() - t0
                 print(f"  Scored {scored_count}/{len(quality_candidates)} photos in {elapsed:.1f}s")
 
