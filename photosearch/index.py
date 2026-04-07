@@ -557,18 +557,19 @@ def index_directory(
 
                 # Stream scores and write to DB per-batch so progress survives a crash.
                 from .quality import score_photos_stream as _score_stream
+                valid_scores = []
                 db.begin_batch(batch_size=100)
                 for idx, score in _score_stream(paths, batch_size=batch_size):
                     photo_id = quality_candidates[idx][0]
                     db.update_photo(photo_id, aesthetic_score=score)
                     scored_count += 1
+                    valid_scores.append(score)
                 db.end_batch()
 
                 elapsed = time.time() - t0
                 print(f"  Scored {scored_count}/{len(quality_candidates)} photos in {elapsed:.1f}s")
 
-                if scored_count > 0:
-                    valid_scores = [s for s in scores if s is not None]
+                if valid_scores:
                     print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
                           f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
 
