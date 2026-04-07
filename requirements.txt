@@ -1,6 +1,12 @@
+# Force CPU-only PyTorch wheels — avoids pulling 2+ GB of NVIDIA CUDA libs
+# on CPU-only hardware (e.g. Intel N100 NAS). Must come before open-clip-torch.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
 # Core
 click>=8.0
 numpy>=1.20
+pyyaml>=6.0
 
 # Image handling
 Pillow>=10.0
