@@ -1038,7 +1038,10 @@ def diagnose_photo(filename, db):
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--output", "-o", default=None, help="Write a list of suggested deletions to this file (one path per line).")
 @click.option("--named", is_flag=True, default=False, help="Also report _1/_2 naming-pattern duplicates even if hashes differ.")
-def find_dupes(db, output, named):
+@click.option("--remove-from-db", is_flag=True, default=False,
+              help="Remove junk entries (._* sidecars, numbered copies whose original is also indexed) "
+                   "from the database. Does NOT delete files on disk.")
+def find_dupes(db, output, named, remove_from_db):
     """Find duplicate photos in the database.
 
     \b
@@ -1131,6 +1134,44 @@ def find_dupes(db, output, named):
                     f.write(path + "\n")
             click.echo(f"Deletion list written to: {output}")
             click.echo("To remove after review:  xargs rm < " + output)
+
+        # ── Optional: purge junk entries from DB ──────────────────────────────
+        if remove_from_db:
+            click.echo("\n--- Purging junk from database (files not touched) ---")
+            removed = 0
+
+            # 1. Remove macOS AppleDouble sidecars (._*)
+            sidecar_ids = [
+                row["id"] for row in photo_db.conn.execute(
+                    "SELECT id FROM photos WHERE filename LIKE '._%%'"
+                ).fetchall()
+            ]
+            if sidecar_ids:
+                placeholders = ",".join("?" * len(sidecar_ids))
+                photo_db.conn.execute(f"DELETE FROM photos WHERE id IN ({placeholders})", sidecar_ids)
+                click.echo(f"  Removed {len(sidecar_ids)} macOS sidecar entries (._*)")
+                removed += len(sidecar_ids)
+
+            # 2. Remove numbered copies (_1, _2 …) whose original is also in the DB
+            all_rows = photo_db.conn.execute(
+                "SELECT id, filename, filepath FROM photos"
+            ).fetchall()
+            all_filenames_lower = {row["filename"].lower() for row in all_rows}
+            numbered_ids = []
+            for row in all_rows:
+                m = _re.match(r'^(.+?)_\d+(\.[^.]+)$', row["filename"], _re.IGNORECASE)
+                if m:
+                    original = f"{m.group(1)}{m.group(2)}"
+                    if original.lower() in all_filenames_lower:
+                        numbered_ids.append(row["id"])
+            if numbered_ids:
+                placeholders = ",".join("?" * len(numbered_ids))
+                photo_db.conn.execute(f"DELETE FROM photos WHERE id IN ({placeholders})", numbered_ids)
+                click.echo(f"  Removed {len(numbered_ids)} numbered-copy entries (*_1.JPG, *_2.JPG, …)")
+                removed += len(numbered_ids)
+
+            photo_db.conn.commit()
+            click.echo(f"  Total DB entries removed: {removed} (files on disk unchanged)")
 
 
 # ---------------------------------------------------------------------------

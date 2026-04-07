@@ -38,20 +38,49 @@ def file_hash(filepath: str, chunk_size: int = 8192) -> str:
 EXCLUDED_DIRS = {"results", "references", ".references", "thumbnails"}
 
 
+import re as _re
+_NUMBERED_COPY_RE = _re.compile(r'^(.+?)_\d+(\.[^.]+)$', _re.IGNORECASE)
+
+
 def find_photos(directory: str) -> list[str]:
     """Recursively find all supported image files in a directory.
 
     Returns JPEG files. ARW files are associated as raw pairs, not indexed separately.
     Skips folders named 'results', 'references', or 'thumbnails'.
+
+    Two classes of files are always excluded:
+      - macOS AppleDouble sidecars (filenames starting with '._')
+        These are metadata blobs created by macOS on non-HFS volumes; they
+        are not photos and share a hash, which pollutes duplicate detection.
+      - Numbered copies (*_1.JPG, *_2.JPG, …) when the un-suffixed original
+        exists in the same directory. These are byte-for-byte duplicates
+        produced by some backup/copy tools and waste CLIP + face time.
     """
     photos = []
     for root, dirs, files in os.walk(directory):
         # Skip excluded subdirectories in-place so os.walk doesn't descend into them
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+
+        # Build a lowercase set of all filenames in this dir for fast lookup
+        file_set_lower = {f.lower() for f in files}
+
         for fname in sorted(files):
+            # 1. Skip macOS AppleDouble metadata sidecars
+            if fname.startswith("._"):
+                continue
+
             ext = Path(fname).suffix.lower()
-            if ext in JPEG_EXTENSIONS:
-                photos.append(os.path.join(root, fname))
+            if ext not in JPEG_EXTENSIONS:
+                continue
+
+            # 2. Skip numbered copies (_1, _2, …) when the original exists here
+            m = _NUMBERED_COPY_RE.match(fname)
+            if m:
+                original = f"{m.group(1)}{m.group(2)}"
+                if original.lower() in file_set_lower:
+                    continue  # original is present — this is a redundant copy
+
+            photos.append(os.path.join(root, fname))
     return photos
 
 
