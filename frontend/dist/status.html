@@ -257,6 +257,13 @@
               total: total
             }),
             e(StatCard, {
+              label: 'Concepts analyzed',
+              value: stats.concepts_analyzed.toLocaleString(),
+              sub: pct(stats.concepts_analyzed, total) + '% — strengths & weaknesses breakdown',
+              n: stats.concepts_analyzed,
+              total: total
+            }),
+            e(StatCard, {
               label: 'Stacks',
               value: stats.stacks.toLocaleString(),
               sub: stats.stacks > 0

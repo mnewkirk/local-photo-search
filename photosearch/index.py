@@ -588,16 +588,16 @@ def index_directory(
                 print(f"\nAnalyzing aesthetic concepts for {len(concept_candidates)} photo(s)...")
                 t0 = time.time()
                 paths = [p for _, p in concept_candidates]
-                concepts = analyze_photos_batch(paths, batch_size=batch_size)
-
-                db.begin_batch(batch_size=100)
                 concept_count = 0
-                for (photo_id, path), concept_data in zip(concept_candidates, concepts):
-                    if concept_data is not None:
-                        db.update_photo(photo_id, aesthetic_concepts=_json.dumps(concept_data))
-                        concept_count += 1
 
+                from .quality import analyze_photos_stream as _analyze_stream
+                db.begin_batch(batch_size=100)
+                for idx, concept_data in _analyze_stream(paths, batch_size=batch_size):
+                    photo_id = concept_candidates[idx][0]
+                    db.update_photo(photo_id, aesthetic_concepts=_json.dumps(concept_data))
+                    concept_count += 1
                 db.end_batch()
+
                 elapsed = time.time() - t0
                 print(f"  Analyzed concepts for {concept_count}/{len(concept_candidates)} photos in {elapsed:.1f}s")
 

@@ -1031,6 +1031,10 @@ def api_stats():
         stack_count = stack_row["stack_count"]
         stacked_photos = stack_row["stacked_photos"]
 
+        concepts_analyzed = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_concepts IS NOT NULL"
+        ).fetchone()["c"]
+
     return {
         "photos": photo_count,
         "clip_embedded": clip_count,
@@ -1039,6 +1043,7 @@ def api_stats():
         "described": described,
         "quality_scored": scored,
         "quality_stats": quality_stats,
+        "concepts_analyzed": concepts_analyzed,
         "stacks": stack_count,
         "stacked_photos": stacked_photos,
     }

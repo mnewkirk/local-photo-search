@@ -388,19 +388,22 @@ def analyze_photo_concepts(image_path: str) -> Optional[dict]:
         return None
 
 
-def analyze_photos_batch(
-    image_paths: list[str], batch_size: int = 8,
-) -> list[Optional[dict]]:
-    """Compute CLIP concept breakdown for multiple photos in batches.
+def analyze_photos_stream(image_paths: list[str], batch_size: int = 8):
+    """Compute CLIP concept breakdown per batch, yielding (index, concept_dict) as each completes.
 
-    Returns a list parallel to image_paths — each entry is a concept
-    dict or None if that image failed.
+    Progress is printed every ~5% so long-running jobs remain visible.
     """
+    import sys
     _load_models()
     concepts = _get_concept_embeddings()
-    results: list[Optional[dict]] = [None] * len(image_paths)
+    total = len(image_paths)
+    report_every = max(batch_size, (total // 20 // batch_size) * batch_size)
 
-    for batch_start in range(0, len(image_paths), batch_size):
+    for batch_start in range(0, total, batch_size):
+        if batch_start > 0 and report_every > 0 and batch_start % report_every == 0:
+            print(f"  [{batch_start}/{total}] Concept analysis in progress...", flush=True)
+            sys.stdout.flush()
+
         batch_paths = image_paths[batch_start : batch_start + batch_size]
         batch_images = []
         valid_indices = []
@@ -427,13 +430,24 @@ def analyze_photos_batch(
             for name, concept_emb in concepts.items():
                 sim = float(torch.dot(img_emb, concept_emb).cpu())
                 scores[name] = round(sim, 4)
-
             strengths, weaknesses = _classify_scores(scores)
-
-            results[idx] = {
+            yield idx, {
                 "strengths": strengths,
                 "weaknesses": weaknesses,
                 "scores": scores,
             }
 
+
+def analyze_photos_batch(
+    image_paths: list[str], batch_size: int = 8,
+) -> list[Optional[dict]]:
+    """Compute CLIP concept breakdown for multiple photos in batches.
+
+    Returns a list parallel to image_paths — each entry is a concept
+    dict or None if that image failed.
+    Internally calls analyze_photos_stream for progress reporting.
+    """
+    results: list[Optional[dict]] = [None] * len(image_paths)
+    for idx, concept_data in analyze_photos_stream(image_paths, batch_size=batch_size):
+        results[idx] = concept_data
     return results
