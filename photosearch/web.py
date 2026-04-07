@@ -1023,6 +1023,14 @@ def api_stats():
                 "mean": round(row["avg_s"], 2),
             }
 
+        stack_row = db.conn.execute(
+            """SELECT COUNT(DISTINCT stack_id) as stack_count,
+                      COUNT(*) as stacked_photos
+               FROM stack_members"""
+        ).fetchone()
+        stack_count = stack_row["stack_count"]
+        stacked_photos = stack_row["stacked_photos"]
+
     return {
         "photos": photo_count,
         "clip_embedded": clip_count,
@@ -1031,6 +1039,8 @@ def api_stats():
         "described": described,
         "quality_scored": scored,
         "quality_stats": quality_stats,
+        "stacks": stack_count,
+        "stacked_photos": stacked_photos,
     }
 
 

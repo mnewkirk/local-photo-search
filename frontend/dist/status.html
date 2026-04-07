@@ -255,6 +255,13 @@
                 : pct(stats.quality_scored, total) + '% — run index --quality',
               n: stats.quality_scored,
               total: total
+            }),
+            e(StatCard, {
+              label: 'Stacks',
+              value: stats.stacks.toLocaleString(),
+              sub: stats.stacks > 0
+                ? stats.stacked_photos.toLocaleString() + ' photos grouped (' + pct(stats.stacked_photos, total) + '% of library)'
+                : 'Run stack to group bursts/brackets'
             })
           )
         );
