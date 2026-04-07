@@ -139,6 +139,59 @@
 
     .error { color: #f87171; font-size: 14px; margin-top: 16px; }
     .loading { color: var(--text-muted); font-size: 14px; }
+
+    h2 {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 14px;
+      margin-top: 8px;
+    }
+
+    .cmd-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .cmd-table tr {
+      border-bottom: 1px solid var(--border);
+    }
+    .cmd-table tr:last-child { border-bottom: none; }
+    .cmd-table td {
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+    .cmd-table td:first-child {
+      white-space: nowrap;
+      color: var(--text-muted);
+      width: 160px;
+    }
+    .cmd-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    code {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
+      font-size: 12px;
+      color: var(--accent);
+      background: none;
+      display: block;
+      padding: 10px 14px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      border-bottom: 1px solid var(--border);
+    }
+    code:last-child { border-bottom: none; }
+    .cmd-note {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 6px 14px 8px;
+      border-top: 1px solid var(--border);
+    }
   </style>
 </head>
 <body>
@@ -215,6 +268,52 @@
         var total = stats.photos;
         var qs = stats.quality_stats;
 
+        var DC = 'docker compose -f docker-compose.nas.yml run --rm photosearch';
+        var NOHUP = 'nohup docker compose -f docker-compose.nas.yml run --rm \\\n  -e PYTHONUNBUFFERED=1 photosearch';
+
+        var commands = [
+          {
+            label: 'CLIP embed',
+            cmd: NOHUP + ' index /photos/YEAR --clip --no-colors \\\n  > /tmp/clip_YEAR.log 2>&1 &',
+            note: 'Required for search. Replace YEAR with e.g. 2026. Run per year.'
+          },
+          {
+            label: 'Face detection',
+            cmd: NOHUP + ' index /photos/YEAR --faces --no-colors \\\n  > /tmp/faces_YEAR.log 2>&1 &',
+            note: 'Detects and encodes faces. Slow on CPU — run in background.'
+          },
+          {
+            label: 'Register faces',
+            cmd: DC + ' add-persons --config /references/references.yml',
+            note: 'Run with: -v /path/to/references:/references:ro'
+          },
+          {
+            label: 'Match faces',
+            cmd: DC + ' match-faces --temporal',
+            note: 'Assigns names to detected faces. Re-run after adding new photos.'
+          },
+          {
+            label: 'Quality score',
+            cmd: NOHUP + ' index /photos/YEAR --quality --no-colors \\\n  > /tmp/quality_YEAR.log 2>&1 &',
+            note: 'Scores aesthetic quality + concept breakdown. Resume-safe if canceled.'
+          },
+          {
+            label: 'Descriptions',
+            cmd: NOHUP + ' index /photos/YEAR --describe --no-colors \\\n  > /tmp/describe_YEAR.log 2>&1 &',
+            note: 'LLaVA scene descriptions via Ollama. Very slow — run overnight.'
+          },
+          {
+            label: 'Stack bursts',
+            cmd: DC + ' stack /photos/YEAR',
+            note: 'Groups near-identical burst/bracket shots. Run after indexing a year.'
+          },
+          {
+            label: 'Find dupes',
+            cmd: DC + ' find-dupes --named --output /data/dupes.txt',
+            note: 'Finds duplicate files by hash and _N naming pattern.'
+          },
+        ];
+
         content = e(React.Fragment, null,
           e('div', { className: 'refresh-row' },
             lastUpdated && e('span', null, 'Updated ' + lastUpdated),
@@ -269,6 +368,18 @@
               sub: stats.stacks > 0
                 ? stats.stacked_photos.toLocaleString() + ' photos grouped (' + pct(stats.stacked_photos, total) + '% of library)'
                 : 'Run stack to group bursts/brackets'
+            })
+          ),
+          e('h2', null, 'Run commands'),
+          e('div', { className: 'cmd-wrap' },
+            commands.map(function(c) {
+              return e('div', { key: c.label },
+                e('code', null, c.cmd),
+                e('div', { className: 'cmd-note' },
+                  e('strong', null, c.label + ': '),
+                  c.note
+                )
+              );
             })
           )
         );
