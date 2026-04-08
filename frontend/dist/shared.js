@@ -409,10 +409,16 @@
     // Build face bounding box overlay data
     var faceOverlays = useMemo(function () {
       if (!detail || !detail.faces || !imgRect) return [];
+      // Use original image dimensions for bbox scaling.
+      // imgRect.nw/nh is the PREVIEW image size (≤1920px), but bbox coords are
+      // stored in original image space (e.g. 4608px). Using detail.image_width
+      // gives the correct scale factor regardless of which image tier is served.
+      var origW = (detail && detail.image_width) ? detail.image_width : imgRect.nw;
+      var origH = (detail && detail.image_height) ? detail.image_height : imgRect.nh;
       return detail.faces.filter(function (f) { return f.bbox; }).map(function (f) {
         var bbox = f.bbox;
-        var sx = imgRect.dw / imgRect.nw;
-        var sy = imgRect.dh / imgRect.nh;
+        var sx = imgRect.dw / origW;
+        var sy = imgRect.dh / origH;
         return {
           id: f.id,
           label: f.person_name || ('Unknown #' + (f.cluster_id || '?')),

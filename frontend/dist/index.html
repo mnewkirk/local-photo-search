@@ -1091,6 +1091,9 @@
             // Navigate to a stack member within the modal
             setSelectedPhoto(member);
             setPhotoDetail(null);
+            // Update index so arrow-key navigation works from the correct position
+            const idx = results ? results.findIndex(r => r.id === member.id) : -1;
+            if (idx >= 0) setSelectedIndex(idx);
             fetch(API + '/api/photos/' + member.id)
               .then(r => r.json())
               .then(setPhotoDetail)

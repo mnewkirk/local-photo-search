@@ -454,7 +454,10 @@ def index_directory(
 
                 if desc_candidates:
                     t0 = time.time()
-                    db.begin_batch(batch_size=20)
+                    # Do NOT use batch mode here — each Ollama call takes 30-200 seconds,
+                    # and batching would hold SQLite's write lock for (batch_size × 200s).
+                    # Committing immediately after each write keeps the lock free between
+                    # LLM calls so the web UI can write (review toggles, etc.) concurrently.
                     desc_count = 0
                     total = len(desc_candidates)
                     for idx, (photo_id, path) in enumerate(desc_candidates, 1):
@@ -466,6 +469,7 @@ def index_directory(
                             elapsed_photo = time.time() - t_photo
                             if desc:
                                 db.update_photo(photo_id, description=desc)
+                                db.conn.commit()  # release write lock immediately
                                 preview = desc[:80].replace("\n", " ")
                                 print(f" ({elapsed_photo:.1f}s) {preview}...{_eta(t0, idx, total)}")
                                 desc_count += 1
@@ -474,7 +478,6 @@ def index_directory(
                         except Exception as e:
                             _report_error("describe", path, e)
 
-                    db.end_batch()
                     elapsed = time.time() - t0
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
 
@@ -504,7 +507,8 @@ def index_directory(
 
                 if tag_candidates:
                     t0 = time.time()
-                    db.begin_batch(batch_size=20)
+                    # Same as describe — commit immediately after each LLM write
+                    # to avoid holding SQLite's write lock during the Ollama call.
                     tag_count = 0
                     total = len(tag_candidates)
                     for idx, (photo_id, path) in enumerate(tag_candidates, 1):
@@ -516,6 +520,7 @@ def index_directory(
                             elapsed_photo = time.time() - t_photo
                             if tags:
                                 db.update_photo(photo_id, tags=_json.dumps(tags))
+                                db.conn.commit()  # release write lock immediately
                                 print(f" ({elapsed_photo:.1f}s) {', '.join(tags)}{_eta(t0, idx, total)}")
                                 tag_count += 1
                             else:
@@ -523,7 +528,6 @@ def index_directory(
                         except Exception as e:
                             _report_error("tags", path, e)
 
-                    db.end_batch()
                     elapsed = time.time() - t0
                     print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
 

@@ -14,6 +14,7 @@ details — all in a few sentences that will match natural language queries.
 """
 
 import base64
+import io
 import time
 from pathlib import Path
 from typing import Optional
@@ -24,9 +25,30 @@ try:
 except ImportError:
     HAS_OLLAMA = False
 
+try:
+    from PIL import Image, ImageOps
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 # Default model — llava is the most widely available multimodal model on Ollama.
 # Other options: llava:13b (better quality, slower), llava-llama3, moondream.
+# TIP: moondream is ~1.6B params vs llava's 7B — 5-10x faster on CPU with
+# acceptable description quality. Switch with: photosearch index --describe-model moondream
 MODEL = "llava"
+
+# Maximum long-edge size (pixels) when resizing images before sending to Ollama.
+# Vision models resize internally anyway — sending a smaller image cuts I/O and
+# model preprocessing time with no meaningful quality loss for descriptions.
+_MAX_IMAGE_PX = 1024
+
+# Generation options passed to every Ollama chat call.
+# num_predict caps output tokens (2-4 sentences needs ~80-120 tokens; 150 is safe).
+# temperature=0 makes output deterministic and can slightly speed up sampling.
+_OLLAMA_OPTIONS = {
+    "num_predict": 150,
+    "temperature": 0,
+}
 
 # Ollama API host — override with OLLAMA_HOST env var if non-default.
 # The ollama Python client reads OLLAMA_HOST automatically.
@@ -46,6 +68,32 @@ Describe this photo in 2-4 concise sentences for a search index. Include:
 Be factual. Only describe what you can clearly see — do not guess at objects you \
 are unsure about. Do not start with "The image shows" or similar preamble.\
 """
+
+
+def _encode_image_for_ollama(image_path: str) -> Optional[str]:
+    """Resize the image to _MAX_IMAGE_PX long edge and return a base64 JPEG string.
+
+    LLaVA and moondream both resize images internally before inference, so
+    sending a smaller image costs nothing in quality for description purposes
+    but meaningfully reduces disk I/O and model preprocessing time — especially
+    for large Sony RAW-to-JPEG files (10-25 MB).
+
+    Returns a base64 string on success, or None if PIL is unavailable (in which
+    case the caller falls back to passing the file path directly).
+    """
+    if not HAS_PIL:
+        return None
+    try:
+        img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        if max(img.size) > _MAX_IMAGE_PX:
+            img.thumbnail((_MAX_IMAGE_PX, _MAX_IMAGE_PX), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
 
 
 def check_available(model: str = MODEL) -> None:
@@ -81,15 +129,23 @@ _MAX_RETRIES = 3
 _RETRY_DELAY = 5  # seconds between retries
 
 
-def _ollama_chat_with_retry(model: str, messages: list, retries: int = _MAX_RETRIES) -> Optional[str]:
+def _ollama_chat_with_retry(
+    model: str,
+    messages: list,
+    retries: int = _MAX_RETRIES,
+    options: Optional[dict] = None,
+) -> Optional[str]:
     """Call ollama.chat with retry logic for transient failures.
 
     Retries on timeouts, connection errors, and server errors.
     Returns the response text or None.
     """
+    call_kwargs: dict = {"model": model, "messages": messages}
+    if options:
+        call_kwargs["options"] = options
     for attempt in range(1, retries + 1):
         try:
-            response = ollama.chat(model=model, messages=messages)
+            response = ollama.chat(**call_kwargs)
             text = response.message.content.strip()
             return text if text else None
         except Exception as e:
@@ -129,14 +185,20 @@ def describe_photo(
         print(f"  Warning: image not found: {image_path}")
         return None
 
+    # Resize to _MAX_IMAGE_PX before sending — vision models resize internally
+    # anyway, so this is free quality-wise but cuts I/O and preprocessing time.
+    encoded = _encode_image_for_ollama(str(path))
+    image_ref = encoded if encoded is not None else str(path)
+
     try:
         return _ollama_chat_with_retry(
             model=model,
             messages=[{
                 "role": "user",
                 "content": prompt,
-                "images": [str(path)],
+                "images": [image_ref],
             }],
+            options=_OLLAMA_OPTIONS,
         )
     except Exception as e:
         print(f"  Warning: description failed for {path.name}: {e}")

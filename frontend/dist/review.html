@@ -586,6 +586,33 @@
       const [expandedStacks, setExpandedStacks] = useState(new Set());
       const [stackMembers, setStackMembers] = useState({});
 
+      // Merge stack members into photos state so togglePhoto can find them.
+      // review/load only returns photos saved via the cull algorithm; if a stack
+      // was built after the last Run Review the non-top members may be absent.
+      // Merging on expand ensures they're always present with correct stack fields.
+      const mergeStackMembersIntoPhotos = useCallback((stackId, members) => {
+        setPhotos(prev => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const newMembers = members
+            .filter(m => !existingIds.has(m.id))
+            .map(m => ({
+              id: m.id,
+              filename: m.filename || '',
+              filepath: m.filepath || '',
+              aesthetic_score: m.aesthetic_score || null,
+              date_taken: m.date_taken || null,
+              selected: false,
+              has_raw: !!m.raw_filepath,
+              stack_id: stackId,
+              stack_is_top: !!m.is_top,
+              stack_count: members.length,
+              cluster_id: null,
+              rank_in_cluster: null,
+            }));
+          return newMembers.length > 0 ? [...prev, ...newMembers] : prev;
+        });
+      }, []);
+
       const toggleStack = useCallback((stackId) => {
         setExpandedStacks(prev => {
           const next = new Set(prev);
@@ -599,13 +626,17 @@
                 .then(data => {
                   if (data && data.members) {
                     setStackMembers(prev => ({ ...prev, [stackId]: data.members }));
+                    mergeStackMembersIntoPhotos(stackId, data.members);
                   }
                 });
+            } else {
+              // Already fetched — ensure members are in photos state
+              mergeStackMembersIntoPhotos(stackId, stackMembers[stackId]);
             }
           }
           return next;
         });
-      }, [stackMembers]);
+      }, [stackMembers, mergeStackMembersIntoPhotos]);
 
       const expandAllStacks = useCallback(() => {
         const stackIds = new Set();
@@ -617,12 +648,15 @@
               .then(data => {
                 if (data && data.members) {
                   setStackMembers(prev => ({ ...prev, [sid]: data.members }));
+                  mergeStackMembersIntoPhotos(sid, data.members);
                 }
               });
+          } else {
+            mergeStackMembersIntoPhotos(sid, stackMembers[sid]);
           }
         });
         setExpandedStacks(stackIds);
-      }, [photos, stackMembers]);
+      }, [photos, stackMembers, mergeStackMembersIntoPhotos]);
 
       const collapseAllStacks = useCallback(() => {
         setExpandedStacks(new Set());
@@ -1075,6 +1109,9 @@
           onStackNavigate: (member) => {
             setModalPhoto(member);
             setModalDetail(null);
+            // Update index so arrow-key navigation works from the correct position
+            const idx = visiblePhotos.findIndex(p => p.id === member.id);
+            if (idx >= 0) setModalIndex(idx);
             fetch(API + '/api/photos/' + member.id)
               .then(r => r.json())
               .then(setModalDetail)
