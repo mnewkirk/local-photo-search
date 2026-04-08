@@ -54,6 +54,10 @@ _photo_root: Optional[str] = os.environ.get("PHOTO_ROOT")
 _thumb_dir: Optional[str] = None
 _THUMB_SIZE = 600  # px, long edge
 
+# Preview cache directory (mid-quality: larger than thumbnail, smaller than full)
+_preview_dir: Optional[str] = None
+_PREVIEW_SIZE = 1920  # px, long edge
+
 
 def _get_db() -> PhotoDB:
     """Open a fresh DB connection per request."""
@@ -68,6 +72,44 @@ def _ensure_thumb_dir():
         _thumb_dir = str(db_parent / "thumbnails")
     Path(_thumb_dir).mkdir(parents=True, exist_ok=True)
     return _thumb_dir
+
+
+def _ensure_preview_dir():
+    """Create preview cache directory if needed."""
+    global _preview_dir
+    if _preview_dir is None:
+        db_parent = Path(_db_path).resolve().parent
+        _preview_dir = str(db_parent / "previews")
+    Path(_preview_dir).mkdir(parents=True, exist_ok=True)
+    return _preview_dir
+
+
+def _get_or_create_preview(photo: dict) -> str:
+    """Return path to a cached mid-quality preview, generating it if needed.
+
+    Previews sit between thumbnails (600px) and full-res.  They are sized
+    to ~1920px on the long edge — large enough for crisp detail-view display
+    on any current screen, but typically 5–15× smaller than the original.
+    """
+    from PIL import Image, ImageOps
+
+    preview_dir = _ensure_preview_dir()
+    photo_id = photo["id"]
+    preview_path = os.path.join(preview_dir, f"{photo_id}_preview.jpg")
+
+    if os.path.exists(preview_path):
+        return preview_path
+
+    filepath = photo.get("_resolved_filepath") or photo.get("filepath", "")
+    if not filepath or not os.path.exists(filepath):
+        raise FileNotFoundError(f"Original not found: {filepath}")
+
+    img = Image.open(filepath)
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("RGB")
+    img.thumbnail((_PREVIEW_SIZE, _PREVIEW_SIZE), Image.LANCZOS)
+    img.save(preview_path, "JPEG", quality=82, optimize=True)
+    return preview_path
 
 
 def _get_or_create_thumbnail(photo: dict) -> str:
@@ -238,6 +280,40 @@ def api_full_photo(photo_id: int):
         filepath, media_type="image/jpeg",
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
+
+
+@app.get("/api/photos/{photo_id}/preview")
+def api_preview_photo(photo_id: int):
+    """Serve a mid-quality preview (~1920px long edge, JPEG 82).
+
+    Faster than /full for detail-view display — generated once and cached
+    alongside the thumbnail cache.  Falls back to /full behaviour if the
+    photo cannot be resized (e.g. non-JPEG original that Pillow can't open).
+    """
+    with _get_db() as db:
+        photo = db.get_photo(photo_id)
+        if not photo:
+            raise HTTPException(404, "Photo not found")
+        photo = dict(photo)
+        photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
+
+    try:
+        preview_path = _get_or_create_preview(photo)
+        return FileResponse(
+            preview_path, media_type="image/jpeg",
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "Original photo file not found")
+    except Exception:
+        # If preview generation fails (e.g. unsupported format), fall back to full
+        filepath = photo.get("_resolved_filepath", "")
+        if filepath and os.path.exists(filepath):
+            return FileResponse(
+                filepath, media_type="image/jpeg",
+                headers={"Cache-Control": "no-cache, must-revalidate"},
+            )
+        raise HTTPException(500, "Could not serve preview")
 
 
 @app.get("/api/faces/crop/{face_id}")

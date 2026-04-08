@@ -484,6 +484,38 @@
       color: var(--text);
       width: 200px;
     }
+
+    /* ---- Responsive ---- */
+
+    /* Tablet (≤ 768 px) */
+    @media (max-width: 768px) {
+      .face-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
+      .photo-subgrid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+      .modal { flex-direction: column; }
+      .modal-image {
+        border-radius: 12px 12px 0 0;
+        max-height: 50vh;
+      }
+      .modal-sidebar {
+        width: 100%;
+        border-left: none;
+        border-top: 1px solid var(--border);
+        max-height: 44vh;
+        overflow-y: auto;
+      }
+    }
+
+    /* Phone (≤ 480 px) */
+    @media (max-width: 480px) {
+      .face-grid { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 4px; }
+      .modal-overlay { padding: 0; }
+      .modal { border-radius: 0; max-height: 100vh; height: 100vh; }
+      .modal-image { border-radius: 0; max-height: 56vh; }
+      .modal-sidebar { max-height: 44vh; }
+      .modal-nav.prev { left: 8px; }
+      .modal-nav.next { right: 8px; }
+      .modal-close { top: 8px; right: 8px; }
+    }
   </style>
 </head>
 <body>

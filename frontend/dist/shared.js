@@ -707,7 +707,7 @@
           e('img', {
             key: 'photo-' + photo.id,
             ref: imgRef,
-            src: API + '/api/photos/' + photo.id + '/full',
+            src: API + '/api/photos/' + photo.id + '/preview',
             alt: photo.filename,
             onLoad: updateImgRect,
           }),
