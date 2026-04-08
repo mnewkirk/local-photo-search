@@ -69,6 +69,21 @@ Be factual. Only describe what you can clearly see — do not guess at objects y
 are unsure about. Do not start with "The image shows" or similar preamble.\
 """
 
+# Moondream is a VQA model trained on direct questions, not structured prompts.
+# The bullet-point DESCRIBE_PROMPT causes it to silently produce empty responses
+# for ~50% of images. This shorter question-style prompt gets consistent output.
+MOONDREAM_DESCRIBE_PROMPT = (
+    "Describe who or what is in this photo, what they are doing, and the setting. "
+    "Be factual and concise (2-3 sentences). "
+    "Mention approximate ages and clothing if people are present."
+)
+
+def _get_describe_prompt(model: str) -> str:
+    """Return the appropriate describe prompt for the given model."""
+    if model.startswith("moondream"):
+        return MOONDREAM_DESCRIBE_PROMPT
+    return DESCRIBE_PROMPT
+
 
 def _encode_image_for_ollama(image_path: str) -> Optional[str]:
     """Resize the image to _MAX_IMAGE_PX long edge and return a base64 JPEG string.
@@ -165,14 +180,16 @@ def _ollama_chat_with_retry(
 def describe_photo(
     image_path: str,
     model: str = MODEL,
-    prompt: str = DESCRIBE_PROMPT,
+    prompt: Optional[str] = None,
 ) -> Optional[str]:
     """Generate a description for a single photo.
 
     Args:
         image_path: Path to the image file (JPEG, PNG, etc.)
         model: Ollama model name (must be multimodal).
-        prompt: The prompt to send alongside the image.
+        prompt: The prompt to send alongside the image. Defaults to the
+                model-appropriate prompt (moondream gets a simpler question-style
+                prompt; all others get the structured DESCRIBE_PROMPT).
 
     Returns:
         A text description string, or None if generation failed.
@@ -185,21 +202,36 @@ def describe_photo(
         print(f"  Warning: image not found: {image_path}")
         return None
 
+    if prompt is None:
+        prompt = _get_describe_prompt(model)
+
     # Resize to _MAX_IMAGE_PX before sending — vision models resize internally
     # anyway, so this is free quality-wise but cuts I/O and preprocessing time.
     encoded = _encode_image_for_ollama(str(path))
     image_ref = encoded if encoded is not None else str(path)
 
+    messages = [{"role": "user", "content": prompt, "images": [image_ref]}]
+
     try:
-        return _ollama_chat_with_retry(
+        result = _ollama_chat_with_retry(
             model=model,
-            messages=[{
-                "role": "user",
-                "content": prompt,
-                "images": [image_ref],
-            }],
+            messages=messages,
             options=_OLLAMA_OPTIONS,
         )
+        # Moondream sometimes returns an empty response on the first attempt
+        # even though the image loaded fine. One retry with a simpler fallback
+        # prompt recovers the majority of these.
+        if result is None and model.startswith("moondream"):
+            result = _ollama_chat_with_retry(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": "What is in this photo?",
+                    "images": [image_ref],
+                }],
+                options=_OLLAMA_OPTIONS,
+            )
+        return result
     except Exception as e:
         print(f"  Warning: description failed for {path.name}: {e}")
         return None
@@ -305,7 +337,7 @@ def tag_photo(
 def describe_photos_batch(
     image_paths: list[str],
     model: str = MODEL,
-    prompt: str = DESCRIBE_PROMPT,
+    prompt: Optional[str] = None,
 ) -> list[Optional[str]]:
     """Generate descriptions for multiple photos sequentially.
 
