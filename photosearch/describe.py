@@ -70,12 +70,15 @@ are unsure about. Do not start with "The image shows" or similar preamble.\
 """
 
 # Moondream is a VQA model trained on direct questions, not structured prompts.
-# The bullet-point DESCRIBE_PROMPT causes it to silently produce empty responses
-# for ~50% of images. This shorter question-style prompt gets consistent output.
+# Two failure modes to avoid:
+#   1. Empty response — caused by complex bullet-point prompts
+#   2. Bounding-box dump — caused by prompts that resemble detection tasks
+#      (e.g. "describe objects", "list what you see")
+# A conversational question avoids both: moondream answers it with plain text.
 MOONDREAM_DESCRIBE_PROMPT = (
-    "Describe who or what is in this photo, what they are doing, and the setting. "
-    "Be factual and concise (2-3 sentences). "
-    "Mention approximate ages and clothing if people are present."
+    "Write 2-3 sentences describing this photo. "
+    "Include who or what is in the scene, what is happening, and where it was taken. "
+    "Use plain sentences, not lists."
 )
 
 def _get_describe_prompt(model: str) -> str:
@@ -142,6 +145,32 @@ def check_available(model: str = MODEL) -> None:
 
 _MAX_RETRIES = 3
 _RETRY_DELAY = 5  # seconds between retries
+
+import re as _re
+_BBOX_PATTERN = _re.compile(r'\[\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*\]')
+
+def _is_valid_description(text: str) -> bool:
+    """Return False for moondream's garbage outputs (bounding-box arrays, etc.).
+
+    Moondream sometimes fires its object-detection head instead of its text
+    generation head and outputs coordinate arrays like:
+        ids = [0.39, 0.72, 0.46, 0.80]
+        idskfjf [0.12, 0.13, 0.87, 0.35]
+    These are useless as search descriptions and must be filtered out.
+    """
+    if not text:
+        return False
+    # Reject responses that are primarily a bounding-box coordinate dump
+    if _BBOX_PATTERN.search(text):
+        # Allow if there is substantial surrounding text (real description with coords)
+        non_coord = _BBOX_PATTERN.sub('', text).strip()
+        word_count = len(non_coord.split())
+        if word_count < 6:
+            return False
+    # Reject very short responses that are unlikely to be useful descriptions
+    if len(text.split()) < 4:
+        return False
+    return True
 
 
 def _ollama_chat_with_retry(
@@ -218,19 +247,26 @@ def describe_photo(
             messages=messages,
             options=_OLLAMA_OPTIONS,
         )
-        # Moondream sometimes returns an empty response on the first attempt
-        # even though the image loaded fine. One retry with a simpler fallback
-        # prompt recovers the majority of these.
+        # Filter out moondream's bounding-box coordinate dumps and other garbage
+        if result is not None and not _is_valid_description(result):
+            result = None
+
+        # Moondream sometimes returns empty or coordinate garbage on the first
+        # attempt. Retry once with a bare fallback question — different enough
+        # to avoid the same failure mode.
         if result is None and model.startswith("moondream"):
             result = _ollama_chat_with_retry(
                 model=model,
                 messages=[{
                     "role": "user",
-                    "content": "What is in this photo?",
+                    "content": "Describe what you see in this photo in 2 sentences.",
                     "images": [image_ref],
                 }],
                 options=_OLLAMA_OPTIONS,
             )
+            if result is not None and not _is_valid_description(result):
+                result = None
+
         return result
     except Exception as e:
         print(f"  Warning: description failed for {path.name}: {e}")
