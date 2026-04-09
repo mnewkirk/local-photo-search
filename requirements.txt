@@ -35,6 +35,11 @@ reverse_geocoder>=1.5
 fastapi>=0.110
 uvicorn>=0.29
 
+# Google Photos upload (optional — only needed if using the upload feature)
+# requests is already transitively required by many packages; listed explicitly
+# so Docker image builds don't break if transitive dep is removed.
+requests>=2.31
+
 # Testing
 pytest>=8.0
 pytest-cov>=5.0

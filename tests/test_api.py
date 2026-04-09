@@ -517,6 +517,110 @@ class TestReviewAPI:
 # Static file serving
 # =========================================================================
 
+# =========================================================================
+# Google Photos upload SSE stream
+# =========================================================================
+
+class TestGoogleUploadSSE:
+    """Test the SSE streaming upload endpoint end-to-end.
+
+    All Google Photos API calls are mocked — what we're testing is that the
+    async SSE wiring (asyncio queue, background thread, event-loop handoff)
+    actually delivers events to the client.
+    """
+
+    def _parse_sse(self, raw: str) -> list[dict]:
+        """Parse SSE text into a list of JSON event dicts."""
+        events = []
+        for line in raw.splitlines():
+            if line.startswith("data: "):
+                try:
+                    events.append(json.loads(line[6:]))
+                except json.JSONDecodeError:
+                    pass
+        return events
+
+    def test_upload_streams_start_and_done_events(self, client, db):
+        """Verify we get start → progress → done events for a basic upload."""
+        import tempfile, os
+
+        # Create a real temp file so _upload_raw_bytes' open() doesn't fail
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            f.write(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+            tmp_path = f.name
+
+        try:
+            pid = db.add_photo(filepath=tmp_path, filename=os.path.basename(tmp_path))
+            cid = db._test_collection_id
+            db.add_photos_to_collection(cid, [pid])
+
+            # Mock the Google API functions
+            with patch("photosearch.google_photos.refresh_access_token", return_value="fake-token"), \
+                 patch("photosearch.google_photos.create_album", return_value="ALBUM_FAKE_123"), \
+                 patch("photosearch.google_photos.upload_photos") as mock_upload:
+
+                # Make upload_photos call its progress_callback for each photo
+                def fake_upload(db_path, records, album_id=None,
+                                include_description=True, progress_callback=None,
+                                begin_callback=None, bytes_done_callback=None):
+                    results = []
+                    for i, rec in enumerate(records):
+                        fn = rec.get("filename", "")
+                        if begin_callback:
+                            begin_callback(i, len(records), fn)
+                        if bytes_done_callback:
+                            bytes_done_callback(i + 1, len(records), fn)
+                        if progress_callback:
+                            progress_callback(i + 1, len(records), fn,
+                                              "uploaded", None, f"MEDIA_{i}")
+                        results.append({
+                            "filename": fn, "status": "uploaded",
+                            "error": None, "media_item_id": f"MEDIA_{i}",
+                        })
+                    return results
+
+                mock_upload.side_effect = fake_upload
+
+                # Also need to mock batch_add_to_album (imported in the endpoint)
+                with patch("photosearch.google_photos.batch_add_to_album", return_value={"added": 0, "errors": []}):
+                    resp = client.post("/api/google/upload", json={
+                        "photo_ids": [pid],
+                        "album_title": "Test Album",
+                        "collection_id": cid,
+                    })
+
+            assert resp.status_code == 200
+            events = self._parse_sse(resp.text)
+
+            # Must have a "start" event first
+            types = [e["type"] for e in events]
+            assert "start" in types, f"Expected 'start' event, got: {types}"
+            assert "done" in types, f"Expected 'done' event, got: {types}"
+
+            start_evt = next(e for e in events if e["type"] == "start")
+            assert os.path.basename(tmp_path) in start_evt["filenames"]
+
+            done_evt = next(e for e in events if e["type"] == "done")
+            assert done_evt["uploaded"] == 1
+
+        finally:
+            os.unlink(tmp_path)
+
+    def test_upload_no_auth_returns_401(self, client, db):
+        """Without auth, the endpoint should return 401 (not an SSE stream)."""
+        pid = db._test_photo_ids["DSC04878.JPG"]
+        with patch("photosearch.google_photos.refresh_access_token", return_value=None):
+            resp = client.post("/api/google/upload", json={
+                "photo_ids": [pid],
+                "album_title": "No Auth Album",
+            })
+        assert resp.status_code == 401
+
+
+# =========================================================================
+# Static serving
+# =========================================================================
+
 class TestStaticServing:
     def test_root_serves_html(self, client):
         resp = client.get("/")

@@ -49,8 +49,12 @@ tests/test_face_matching.py
 
 # Environment / secrets
 .env
+google_client_secret.json
+google_photos_token.json
+
 
 # FUSE artifacts (Cowork sandbox)
 .fuse_hidden*
 
 
+*.db

@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -312,6 +312,20 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN verification_status TEXT")  # 'pass', 'fail', 'regenerated'
             cur.execute("ALTER TABLE photos ADD COLUMN hallucination_flags TEXT")  # JSON: what was flagged
 
+        # Upload ledger — tracks which photos have already been uploaded to which album.
+        # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS google_photos_uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                album_id TEXT NOT NULL,
+                photo_id INTEGER REFERENCES photos(id) ON DELETE CASCADE,
+                filepath TEXT NOT NULL,
+                media_item_id TEXT,
+                uploaded_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(album_id, filepath)
+            )
+        """)
+
         # Ignored clusters — hide unknown faces the user doesn't care about
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ignored_clusters (
@@ -373,6 +387,13 @@ class PhotoDB:
                 PRIMARY KEY (collection_id, photo_id)
             )
         """)
+
+        # Migration: Google Photos album link on collections (must run after collections table exists)
+        try:
+            cur.execute("SELECT google_photos_album_id FROM collections LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE collections ADD COLUMN google_photos_album_id TEXT")
+            cur.execute("ALTER TABLE collections ADD COLUMN google_photos_album_title TEXT")
 
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
@@ -729,6 +750,39 @@ class PhotoDB:
             (description, collection_id),
         )
         self.conn.commit()
+
+    def set_collection_google_album(self, collection_id: int, album_id: str, album_title: str) -> None:
+        """Store the linked Google Photos album ID and title on a collection."""
+        self.conn.execute(
+            "UPDATE collections SET google_photos_album_id = ?, google_photos_album_title = ?, updated_at = datetime('now') WHERE id = ?",
+            (album_id, album_title, collection_id),
+        )
+        self.conn.commit()
+
+    def get_uploaded_filepaths(self, album_id: str) -> set:
+        """Return the set of filepaths already uploaded to the given album."""
+        rows = self.conn.execute(
+            "SELECT filepath FROM google_photos_uploads WHERE album_id = ?", (album_id,)
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def record_upload(self, album_id: str, photo_id: int, filepath: str, media_item_id: str) -> None:
+        """Record a successful upload in the ledger."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO google_photos_uploads
+               (album_id, photo_id, filepath, media_item_id, uploaded_at)
+               VALUES (?, ?, ?, ?, datetime('now'))""",
+            (album_id, photo_id, filepath, media_item_id),
+        )
+        self.conn.commit()
+
+    def clear_upload_ledger(self, album_id: str) -> int:
+        """Delete all ledger entries for an album (forces full re-upload). Returns count deleted."""
+        cur = self.conn.execute(
+            "DELETE FROM google_photos_uploads WHERE album_id = ?", (album_id,)
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def set_collection_cover(self, collection_id: int, photo_id: int) -> None:
         """Set the cover photo for a collection."""

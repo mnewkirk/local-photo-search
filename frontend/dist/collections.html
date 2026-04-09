@@ -710,6 +710,549 @@
     }
 
     // -----------------------------------------------------------------------
+    // Google Photos Upload Modal
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Inline setup instructions (shown when client_secret.json is missing)
+    // -----------------------------------------------------------------------
+    function GoogleSetupInstructions() {
+      const [open, setOpen] = useState(false);
+      const step = (n, text) => e('div', { style: { display: 'flex', gap: 10, marginBottom: 10 } },
+        e('div', { style: {
+          width: 22, height: 22, borderRadius: '50%', background: 'var(--accent)',
+          color: '#fff', fontSize: 11, fontWeight: 700, display: 'flex',
+          alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 1,
+        } }, n),
+        e('div', { style: { fontSize: 12, lineHeight: 1.5, color: 'var(--text)' } }, text),
+      );
+
+      return e('div', null,
+        e('button', {
+          style: { fontSize: 12, color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', padding: '2px 0', marginTop: 6 },
+          onClick: () => setOpen(!open),
+        }, open ? '\u25B2 Hide setup instructions' : '\u25BC Show setup instructions'),
+
+        open && e('div', { style: {
+          marginTop: 10, padding: '14px 14px', background: 'var(--surface2)',
+          borderRadius: 6, border: '1px solid var(--border)',
+        } },
+          step(1, e('span', null,
+            'Go to ', e('a', { href: 'https://console.cloud.google.com', target: '_blank', style: { color: 'var(--accent)' } }, 'console.cloud.google.com'),
+            ', create a project, then enable the ', e('strong', null, 'Photos Library API'), '.',
+          )),
+          step(2, e('span', null,
+            'Open ', e('strong', null, 'APIs & Services → OAuth consent screen'),
+            '. Choose External. Add your Google email as a Test User.',
+          )),
+          step(3, e('span', null,
+            'Open ', e('strong', null, 'APIs & Services → Credentials → Create OAuth client ID'),
+            '. Type: ', e('strong', null, 'Web application'), '.',
+          )),
+          step(4, e('span', null,
+            'Under ', e('strong', null, 'Authorized redirect URIs'), ' add:',
+            e('br', null),
+            e('code', { style: { fontSize: 11, background: 'var(--surface)', padding: '2px 6px', borderRadius: 3 } },
+              window.location.origin + '/api/google/callback',
+            ),
+          )),
+          step(5, e('span', null,
+            'Download the JSON, rename it to ',
+            e('code', { style: { fontSize: 11, background: 'var(--surface)', padding: '2px 6px', borderRadius: 3 } }, 'google_client_secret.json'),
+            ', and place it in the same folder as ', e('code', { style: { fontSize: 11 } }, 'photo_index.db'), '.',
+          )),
+          step(6, 'Restart the server, then come back here and click Connect.'),
+        ),
+      );
+    }
+
+    function GoogleUploadModal({ collectionName, photos: allPhotos, existingAlbumId, existingAlbumTitle, onClose, onUpload }) {
+      const photoCount = allPhotos.length;
+      const [useExisting, setUseExisting] = useState(!!existingAlbumId);
+      const [forceReupload, setForceReupload] = useState(false);
+      const [albumTitle, setAlbumTitle] = useState(collectionName || '');
+      const [includeDesc, setIncludeDesc] = useState(true);
+      const [uploading, setUploading] = useState(false);
+      const [result, setResult] = useState(null);
+      const [googleStatus, setGoogleStatus] = useState(null);
+      // Per-file progress: { filename: { status: 'pending'|'uploaded'|'readded'|'error', error: str|null } }
+      const [fileStatuses, setFileStatuses] = useState({});
+      const [fileOrder, setFileOrder] = useState([]); // ordered list of filenames seen
+      const [progressCount, setProgressCount] = useState({ done: 0, total: 0 });
+      const abortCtrlRef = useRef(null);
+      const inputRef = useRef(null);
+
+      const [showManualCode, setShowManualCode] = useState(false);
+      const [manualCode, setManualCode] = useState('');
+      const [manualRedirectUri, setManualRedirectUri] = useState('');
+      const [manualError, setManualError] = useState('');
+      const [manualBusy, setManualBusy] = useState(false);
+
+      // Upload status: which photos are already uploaded to this album
+      // uploadedMap: { photoId: filename }, notUploadedMap: { photoId: filename }
+      const [uploadedMap, setUploadedMap] = useState(null);
+      const [notUploadedMap, setNotUploadedMap] = useState(null);
+      // Set of photo IDs the user has selected to force re-upload
+      const [selectedReupload, setSelectedReupload] = useState(new Set());
+
+      useEffect(() => {
+        fetch('/api/google/status').then(r => r.json()).then(setGoogleStatus).catch(() => {});
+        if (inputRef.current) inputRef.current.focus();
+      }, []);
+
+      // Fetch upload status when existing album is selected
+      useEffect(() => {
+        if (!existingAlbumId || !useExisting) {
+          setUploadedMap(null);
+          setNotUploadedMap(null);
+          return;
+        }
+        const photoIds = allPhotos.map(p => p.id);
+        fetch('/api/google/upload-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: photoIds, album_id: existingAlbumId }),
+        })
+          .then(r => r.json())
+          .then(data => {
+            setUploadedMap(data.uploaded || {});
+            setNotUploadedMap(data.not_uploaded || {});
+          })
+          .catch(() => {});
+      }, [existingAlbumId, useExisting]);
+
+      const doConnect = () => {
+        const port = window.location.port || '8000';
+        const redirectUri = `http://localhost:${port}/api/google/callback`;
+        setManualRedirectUri(redirectUri);
+        setShowManualCode(false);
+        setManualCode('');
+        setManualError('');
+        fetch('/api/google/authorize?port=' + encodeURIComponent(port))
+          .then(r => r.json())
+          .then(data => {
+            if (data.auth_url) {
+              const win = window.open(data.auth_url, '_blank', 'width=600,height=700');
+              setShowManualCode(true);  // show fallback immediately
+              // Also listen for postMessage from auto-redirect success
+              const listener = (ev) => {
+                if (ev.data === 'google_photos_connected') {
+                  window.removeEventListener('message', listener);
+                  fetch('/api/google/status').then(r => r.json()).then(setGoogleStatus).catch(() => {});
+                  setShowManualCode(false);
+                }
+              };
+              window.addEventListener('message', listener);
+            }
+          })
+          .catch(() => {});
+      };
+
+      const doManualCode = async () => {
+        const code = manualCode.trim();
+        if (!code) return;
+        setManualBusy(true);
+        setManualError('');
+        try {
+          const res = await fetch('/api/google/exchange-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code, redirect_uri: manualRedirectUri }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Exchange failed');
+          fetch('/api/google/status').then(r => r.json()).then(setGoogleStatus).catch(() => {});
+          setShowManualCode(false);
+          setManualCode('');
+        } catch (err) {
+          setManualError(err.message);
+        }
+        setManualBusy(false);
+      };
+
+      const doCancel = () => {
+        if (abortCtrlRef.current) {
+          abortCtrlRef.current.abort();
+          abortCtrlRef.current = null;
+        }
+        setUploading(false);
+        setResult({ cancelled: true });
+      };
+
+      const doUpload = async () => {
+        const ctrl = new AbortController();
+        abortCtrlRef.current = ctrl;
+        setUploading(true);
+        setFileStatuses({});
+        setFileOrder([]);
+        setProgressCount({ done: 0, total: 0 });
+
+        const onProgress = (evt) => {
+          if (evt.type === 'start') {
+            // Pre-populate every file as 'pending' so the list appears immediately
+            const order = evt.filenames || [];
+            const statuses = {};
+            order.forEach(fn => { statuses[fn] = { status: 'pending' }; });
+            setFileOrder(order);
+            setFileStatuses(statuses);
+            setProgressCount({ done: 0, total: evt.total || order.length });
+          } else if (evt.type === 'begin') {
+            // File is actively uploading bytes
+            const { filename, queued, total } = evt;
+            setFileStatuses(prev => ({ ...prev, [filename]: { status: 'uploading' } }));
+            setProgressCount(prev => ({ ...prev, total }));
+          } else if (evt.type === 'bytes_sent') {
+            // Raw bytes received by Google, awaiting batchCreate confirmation
+            const { filename, queued, total } = evt;
+            setFileStatuses(prev => ({ ...prev, [filename]: { status: 'bytes_sent' } }));
+            setProgressCount({ done: queued, total });
+          } else if (evt.type === 'progress') {
+            const { filename, status, done, total, error } = evt;
+            setFileStatuses(prev => ({ ...prev, [filename]: { status, error: error || null } }));
+            setProgressCount({ done, total });
+          }
+        };
+
+        try {
+          const reuploadIds = selectedReupload.size > 0 ? [...selectedReupload] : undefined;
+          const res = await onUpload(
+            useExisting ? existingAlbumTitle : albumTitle.trim(),
+            includeDesc,
+            useExisting ? existingAlbumId : null,
+            forceReupload,
+            onProgress,
+            ctrl.signal,
+            reuploadIds,
+          );
+          // res may be a done summary OR { cancelled: true } from server-side cancel
+          setResult(res || { cancelled: true });
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            setResult({ cancelled: true });
+          } else {
+            setResult({ error: err.message });
+          }
+        }
+        abortCtrlRef.current = null;
+        setUploading(false);
+      };
+
+      const notConfigured = googleStatus && !googleStatus.configured;
+      const notAuthenticated = googleStatus && googleStatus.configured && !googleStatus.authenticated;
+      const ready = googleStatus && googleStatus.configured && googleStatus.authenticated;
+
+      return e('div', { className: 'modal-overlay', onClick: onClose },
+        e('div', { className: 'modal-content', style: { width: 480, maxHeight: '90vh', overflowY: 'auto' }, onClick: ev => ev.stopPropagation() },
+          e('h3', { style: { marginBottom: 16 } }, '\uD83D\uDDBC Upload to Google Photos'),
+
+          // ---- File list (shown while uploading OR after done) ----
+          (uploading || (result && !result.error && !result.cancelled && fileOrder.length > 0)) && e('div', {
+            style: {
+              margin: '0 0 16px 0',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+              overflow: 'hidden',
+            },
+          },
+            // Header bar
+            e('div', {
+              style: {
+                background: 'var(--surface-2, rgba(255,255,255,0.05))',
+                padding: '6px 12px',
+                fontSize: 12,
+                color: 'var(--text-muted)',
+                borderBottom: '1px solid var(--border)',
+                display: 'flex',
+                justifyContent: 'space-between',
+              },
+            },
+              e('span', null, uploading ? 'Uploading…' : 'Upload complete'),
+              progressCount.total > 0 && e('span', null, progressCount.done + ' / ' + progressCount.total),
+            ),
+            // Scrollable file list
+            e('div', {
+              style: {
+                maxHeight: 220,
+                overflowY: 'auto',
+                fontSize: 12,
+                fontFamily: 'monospace',
+              },
+            },
+              fileOrder.map(filename => {
+                const s = fileStatuses[filename] || { status: 'pending' };
+                const icon = s.status === 'uploaded'   ? '✓'
+                           : s.status === 'readded'    ? '♻'
+                           : s.status === 'error'      ? '✗'
+                           : s.status === 'bytes_sent' ? '☁'
+                           : s.status === 'uploading'  ? '↑'
+                           : '·';
+                const color = s.status === 'uploaded'   ? 'var(--green)'
+                            : s.status === 'readded'    ? '#888'
+                            : s.status === 'error'      ? 'var(--red)'
+                            : s.status === 'bytes_sent' ? '#6bc46d'
+                            : s.status === 'uploading'  ? 'var(--accent, #4a9eff)'
+                            : 'var(--text-muted)';
+                return e('div', {
+                  key: filename,
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    padding: '3px 12px',
+                    borderBottom: '1px solid var(--border)',
+                    opacity: s.status === 'pending' ? 0.5 : 1,
+                  },
+                },
+                  e('span', { style: { color, width: 14, flexShrink: 0, textAlign: 'center' } }, icon),
+                  e('span', { style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, filename),
+                  s.error && e('span', { style: { color: 'var(--red)', fontSize: 11, marginLeft: 4, flexShrink: 0 } }, s.error),
+                );
+              }),
+            ),
+          ),
+
+          result ? (
+            result.cancelled
+              ? e('div', null,
+                  e('p', { style: { color: 'var(--text-muted)', marginBottom: 12 } }, 'Upload cancelled.'),
+                  e('div', { className: 'modal-actions' },
+                    e('button', { className: 'btn btn-primary', onClick: onClose }, 'Close'),
+                  ),
+                )
+              : result.error
+              ? e('div', null,
+                  e('p', { style: { color: 'var(--red)', marginBottom: 12 } }, 'Upload failed: ' + result.error),
+                  e('div', { className: 'modal-actions' },
+                    e('button', { className: 'btn btn-primary', onClick: onClose }, 'Close'),
+                  ),
+                )
+              : e('div', null,
+                  e('p', { style: { color: 'var(--green)', marginBottom: 8 } },
+                    '\u2713 ' + result.uploaded + ' of ' + result.total + ' photos uploaded successfully.',
+                  ),
+                  result.readded > 0 && e('p', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 8 } },
+                    result.readded + ' photo(s) re-synced to album (no re-upload needed).',
+                  ),
+                  result.errors > 0 && e('p', { style: { color: 'var(--red)', marginBottom: 8, fontSize: 13 } },
+                    result.errors + ' photo(s) failed.',
+                  ),
+                  result.album_id && e('p', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 12 } },
+                    result.uploaded > 0 ? 'Album updated in your Google Photos library.' : 'All photos were already in the album.',
+                  ),
+                  e('div', { className: 'modal-actions' },
+                    e('button', { className: 'btn btn-primary', onClick: onClose }, 'Done'),
+                  ),
+                )
+          ) : (
+            e('div', null,
+              // ---- Not configured ----
+              notConfigured && e('div', { style: { background: 'rgba(248,113,113,0.1)', border: '1px solid var(--red)', borderRadius: 6, padding: '12px 14px', marginBottom: 16 } },
+                e('p', { style: { fontWeight: 600, marginBottom: 6, color: 'var(--red)', fontSize: 13 } }, 'Setup required'),
+                e('p', { style: { fontSize: 13 } },
+                  'Place ', e('code', null, 'google_client_secret.json'), ' alongside ', e('code', null, 'photo_index.db'), ', then restart the server.',
+                ),
+                e(GoogleSetupInstructions, null),
+              ),
+
+              // ---- Not authenticated ----
+              notAuthenticated && e('div', { style: { background: 'rgba(74,158,255,0.08)', border: '1px solid var(--accent)', borderRadius: 6, padding: '12px 14px', marginBottom: 16, fontSize: 13 } },
+                e('p', { style: { fontWeight: 600, marginBottom: 6 } }, 'Connect your Google account'),
+                e('p', { style: { color: 'var(--text-muted)', marginBottom: 10 } },
+                  'A sign-in window will open. After authorizing, you\'ll be connected automatically.',
+                ),
+                !showManualCode && e('button', { className: 'btn btn-primary', onClick: doConnect }, 'Connect Google Photos'),
+
+                // Manual code fallback (shown after Connect is clicked)
+                showManualCode && e('div', { style: { marginTop: 10 } },
+                  e('p', { style: { marginBottom: 8 } },
+                    'Sign in window opened. If it connected, close the window and click ',
+                    e('strong', null, 'Check status'),
+                    ' below.',
+                  ),
+                  e('details', { style: { marginTop: 10 } },
+                    e('summary', { style: { cursor: 'pointer', color: 'var(--text-muted)', fontSize: 12, marginBottom: 8 } },
+                      'Accessing from a NAS or got an error page? Click here',
+                    ),
+                    e('div', { style: { marginTop: 8 } },
+                      e('p', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 } },
+                        'Google redirected to ', e('code', null, 'localhost'), ' which may not reach your NAS. ',
+                        'Look at the URL in the error page — it contains ', e('code', null, 'code=XXXX'), '. ',
+                        'Copy that code and paste it here:',
+                      ),
+                      e('input', {
+                        type: 'text',
+                        placeholder: 'Paste authorization code here',
+                        value: manualCode,
+                        onChange: ev => setManualCode(ev.target.value),
+                        onKeyDown: ev => ev.key === 'Enter' && doManualCode(),
+                        style: { marginBottom: 6 },
+                      }),
+                      manualError && e('p', { style: { color: 'var(--red)', fontSize: 12, marginBottom: 6 } }, manualError),
+                      e('button', {
+                        className: 'btn btn-primary',
+                        onClick: doManualCode,
+                        disabled: manualBusy || !manualCode.trim(),
+                        style: { fontSize: 12 },
+                      }, manualBusy ? 'Connecting\u2026' : 'Submit code'),
+                    ),
+                  ),
+                  e('div', { style: { marginTop: 10, display: 'flex', gap: 8 } },
+                    e('button', {
+                      className: 'btn btn-sm',
+                      onClick: () => fetch('/api/google/status').then(r => r.json()).then(d => { setGoogleStatus(d); if (d.authenticated) setShowManualCode(false); }),
+                    }, 'Check status'),
+                    e('button', { className: 'btn btn-sm', onClick: doConnect }, 'Re-open sign-in'),
+                  ),
+                ),
+              ),
+
+              googleStatus === null && e('p', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 12 } }, 'Checking Google Photos status\u2026'),
+
+              // ---- Ready ----
+              ready && e('p', { style: { color: 'var(--green)', fontSize: 13, marginBottom: 14 } },
+                '\u2713 Connected to Google Photos',
+              ),
+
+              e('p', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 14 } },
+                photoCount + ' photo' + (photoCount !== 1 ? 's' : '') + ' in this collection.',
+              ),
+
+              // Existing album toggle
+              existingAlbumId && e('div', { style: { marginBottom: 14 } },
+                e('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer', marginBottom: 6 } },
+                  e('input', { type: 'radio', checked: useExisting, onChange: () => setUseExisting(true), disabled: uploading }),
+                  e('span', null, 'Add to existing album: ', e('strong', null, existingAlbumTitle || existingAlbumId)),
+                ),
+
+                // Upload status breakdown when using existing album
+                useExisting && uploadedMap && notUploadedMap && e('div', { style: { marginLeft: 26, marginBottom: 8, fontSize: 12 } },
+                  e('p', { style: { color: 'var(--text-muted)', marginBottom: 4 } },
+                    Object.keys(notUploadedMap).length + ' new, ' +
+                    Object.keys(uploadedMap).length + ' already uploaded',
+                  ),
+
+                  // Show previously uploaded photos with checkboxes for re-upload
+                  Object.keys(uploadedMap).length > 0 && e('div', { style: { marginTop: 6 } },
+                    e('div', { style: {
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      marginBottom: 4, color: 'var(--text-muted)', fontSize: 11,
+                    } },
+                      'Select any to force re-upload',
+                      e('span', { style: { fontSize: 10, opacity: 0.7 } }, ' (needed if removed from album in Google Photos)'),
+                    ),
+                    e('div', {
+                      style: {
+                        maxHeight: 120,
+                        overflowY: 'auto',
+                        border: '1px solid var(--border)',
+                        borderRadius: 4,
+                        padding: '2px 0',
+                      },
+                    },
+                      // Select all / none toggle
+                      e('label', {
+                        style: {
+                          display: 'flex', alignItems: 'center', gap: 6,
+                          padding: '3px 8px', cursor: 'pointer',
+                          borderBottom: '1px solid var(--border)',
+                          fontWeight: 500, fontSize: 11, color: 'var(--text-muted)',
+                        },
+                      },
+                        e('input', {
+                          type: 'checkbox',
+                          checked: selectedReupload.size === Object.keys(uploadedMap).length && Object.keys(uploadedMap).length > 0,
+                          onChange: ev => {
+                            if (ev.target.checked) {
+                              setSelectedReupload(new Set(Object.keys(uploadedMap).map(Number)));
+                            } else {
+                              setSelectedReupload(new Set());
+                            }
+                          },
+                          disabled: uploading,
+                        }),
+                        'Select all (' + Object.keys(uploadedMap).length + ')',
+                      ),
+                      Object.entries(uploadedMap).map(([pid, fname]) =>
+                        e('label', {
+                          key: pid,
+                          style: {
+                            display: 'flex', alignItems: 'center', gap: 6,
+                            padding: '2px 8px', cursor: 'pointer',
+                            opacity: selectedReupload.has(Number(pid)) ? 1 : 0.6,
+                          },
+                        },
+                          e('input', {
+                            type: 'checkbox',
+                            checked: selectedReupload.has(Number(pid)),
+                            onChange: ev => {
+                              setSelectedReupload(prev => {
+                                const next = new Set(prev);
+                                if (ev.target.checked) next.add(Number(pid));
+                                else next.delete(Number(pid));
+                                return next;
+                              });
+                            },
+                            disabled: uploading,
+                          }),
+                          e('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, fname),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                e('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' } },
+                  e('input', { type: 'radio', checked: !useExisting, onChange: () => setUseExisting(false), disabled: uploading }),
+                  'Create a new album',
+                ),
+              ),
+
+              !useExisting && e('div', null,
+                e('label', { style: { display: 'block', fontSize: 13, color: 'var(--text-muted)', marginBottom: 4 } }, 'Album title'),
+                e('input', {
+                  ref: inputRef,
+                  type: 'text',
+                  placeholder: 'Album name in Google Photos',
+                  value: albumTitle,
+                  onChange: ev => setAlbumTitle(ev.target.value),
+                  disabled: uploading || !ready,
+                  style: { marginBottom: 12 },
+                }),
+              ),
+
+
+              e('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer', marginBottom: 16 } },
+                e('input', {
+                  type: 'checkbox',
+                  checked: includeDesc,
+                  onChange: ev => setIncludeDesc(ev.target.checked),
+                  disabled: uploading || !ready,
+                }),
+                'Include AI descriptions as photo captions',
+              ),
+
+              e('div', { className: 'modal-actions' },
+                e('button', {
+                  className: 'btn',
+                  onClick: uploading ? doCancel : onClose,
+                  style: uploading ? { color: 'var(--red)' } : {},
+                }, uploading ? 'Cancel upload' : 'Cancel'),
+                ready && e('button', {
+                  className: 'btn btn-primary',
+                  onClick: doUpload,
+                  disabled: uploading || (!useExisting && !albumTitle.trim()),
+                }, uploading ? 'Uploading\u2026' : 'Upload'),
+                notAuthenticated && e('button', {
+                  className: 'btn btn-primary',
+                  onClick: doConnect,
+                }, 'Connect first'),
+              ),
+            )
+          ),
+        ),
+      );
+    }
+
+    // -----------------------------------------------------------------------
     // Collection Detail View
     // -----------------------------------------------------------------------
     function CollectionDetail({ collectionId }) {
@@ -718,6 +1261,7 @@
       const [selectedForRemoval, setSelectedForRemoval] = useState(new Set());
       const [showRename, setShowRename] = useState(false);
       const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+      const [showGoogleUpload, setShowGoogleUpload] = useState(false);
       const [modalIdx, setModalIdx] = useState(null);
       const [error, setError] = useState(null);
       const [persons, setPersons] = useState([]);
@@ -845,6 +1389,59 @@
         load();
       };
 
+      const doGoogleUpload = async (albumTitle, includeDesc, existingAlbumId, forceReupload, onProgress, signal, forceReuploadIds) => {
+        const photoIds = photos.map(p => p.id);
+        const payload = {
+            photo_ids: photoIds,
+            album_title: albumTitle,
+            album_id: existingAlbumId || undefined,
+            collection_id: collectionId,
+            include_description: includeDesc,
+            force_reupload: forceReupload || false,
+        };
+        if (forceReuploadIds && forceReuploadIds.length > 0) {
+            payload.force_reupload_ids = forceReuploadIds;
+        }
+        const res = await fetch('/api/google/upload', {
+          method: 'POST',
+          signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `Upload failed (${res.status})`);
+        }
+        // Stream SSE response
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop(); // keep incomplete last line
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            let evt;
+            try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+            if (onProgress) onProgress(evt);
+            if (evt.type === 'done') {
+              load(); // refresh collection so google_photos_album_id is up to date
+              return evt;
+            }
+            if (evt.type === 'cancelled') {
+              return { cancelled: true };
+            }
+            if (evt.type === 'fatal') {
+              throw new Error(evt.message || 'Upload failed');
+            }
+          }
+        }
+        throw new Error('Stream ended without a done event');
+      };
+
       if (error) {
         return e('div', null,
           e('a', { href: '/collections', className: 'back-link' }, '\u2190 Collections'),
@@ -867,7 +1464,13 @@
             }, collection.name),
             e('span', { className: 'subtitle' }, `${photos.length} photo${photos.length !== 1 ? 's' : ''}`),
           ),
-          e('div', { style: { display: 'flex', gap: 8 } },
+          e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            photos.length > 0 && e('button', {
+              className: 'btn btn-sm',
+              onClick: () => setShowGoogleUpload(true),
+              title: 'Upload collection to Google Photos',
+              style: { color: '#4a9eff' },
+            }, '\uD83D\uDDBC\uFE0F Upload to Google Photos'),
             e('button', { className: 'btn btn-sm', onClick: () => setShowRename(true) }, 'Rename'),
             e('button', { className: 'btn btn-sm btn-danger', onClick: () => setShowDeleteConfirm(true) }, 'Delete'),
           ),
@@ -949,6 +1552,15 @@
           currentName: collection.name,
           onClose: () => setShowRename(false),
           onRename: doRename,
+        }),
+
+        showGoogleUpload && e(GoogleUploadModal, {
+          collectionName: collection.name,
+          photos: photos,
+          existingAlbumId: collection.google_photos_album_id || null,
+          existingAlbumTitle: collection.google_photos_album_title || null,
+          onClose: () => setShowGoogleUpload(false),
+          onUpload: doGoogleUpload,
         }),
       );
     }

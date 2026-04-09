@@ -25,7 +25,7 @@ import numpy as np
 logger = logging.getLogger("photosearch.web")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-from fastapi import FastAPI, Query, HTTPException, Response
+from fastapi import FastAPI, Query, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -1389,6 +1389,477 @@ def api_nearby_stacks(photo_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Google Photos integration
+# ---------------------------------------------------------------------------
+
+@app.get("/api/google/status")
+def api_google_status():
+    """Return the current Google Photos connection status.
+
+    Returns:
+      configured: bool — client_secret.json is present
+      authenticated: bool — valid tokens are stored
+    """
+    from .google_photos import is_configured, is_authenticated
+    return {
+        "configured": is_configured(_db_path),
+        "authenticated": is_authenticated(_db_path),
+    }
+
+
+@app.get("/api/google/authorize")
+def api_google_authorize(port: Optional[str] = Query(None, description="Browser port, used to build localhost redirect URI")):
+    """Return the Google OAuth2 authorization URL.
+
+    The redirect_uri is always localhost-based so it works with Desktop app
+    credentials (which allow http://localhost without pre-registration).
+    The port parameter lets the frontend pass its own port so the redirect
+    lands on the right server instance.
+
+    For NAS users where localhost doesn't route back to the NAS, the frontend
+    also shows a manual code-paste field as a fallback.
+    """
+    from .google_photos import get_authorization_url
+
+    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
+    if not redirect_uri:
+        # Use localhost + caller's port so the redirect URI matches what's
+        # allowed for Desktop app credentials (any http://localhost port).
+        p = port or "8000"
+        redirect_uri = f"http://localhost:{p}/api/google/callback"
+
+    try:
+        url = get_authorization_url(_db_path, redirect_uri=redirect_uri)
+        return {"auth_url": url, "redirect_uri": redirect_uri}
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/google/exchange-code")
+def api_google_exchange_code(body: dict):
+    """Manually exchange an authorization code for tokens.
+
+    Used when the automatic OAuth redirect doesn't land on the server
+    (e.g. accessing a NAS from a different machine where localhost:PORT
+    routes to the user's own computer rather than the NAS).
+
+    Body: {"code": "4/0AX...", "redirect_uri": "http://localhost:8000/api/google/callback"}
+    The redirect_uri must exactly match the one used in the authorization URL.
+    """
+    from .google_photos import exchange_code
+
+    code = body.get("code", "").strip()
+    redirect_uri = body.get("redirect_uri", "").strip()
+
+    if not code:
+        raise HTTPException(400, "code is required")
+    if not redirect_uri:
+        raise HTTPException(400, "redirect_uri is required")
+
+    try:
+        exchange_code(_db_path, code, redirect_uri=redirect_uri)
+    except Exception as exc:
+        raise HTTPException(400, f"Code exchange failed: {exc}")
+
+    return {"ok": True}
+
+
+@app.get("/api/google/callback")
+def api_google_callback(
+    code: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+):
+    """OAuth2 callback — Google redirects here after user grants access.
+
+    Exchanges the authorization code for tokens, saves them, then serves
+    a small HTML page telling the user they're connected.
+    """
+    from .google_photos import exchange_code
+
+    if error:
+        return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><title>Google Photos — Error</title></head>
+<body style="font-family:sans-serif;padding:40px;background:#0f0f0f;color:#e8e8e8">
+<h2 style="color:#f87171">Authorization failed</h2>
+<p>Google returned an error: <code>{error}</code></p>
+<p><a href="/collections" style="color:#4a9eff">← Back to Collections</a></p>
+</body></html>""")
+
+    if not code:
+        raise HTTPException(400, "Missing authorization code")
+
+    # Reconstruct redirect_uri from the request's own host so it matches
+    # what was sent in the authorization URL.
+    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI")
+
+    try:
+        exchange_code(_db_path, code, redirect_uri=redirect_uri)
+    except Exception as exc:
+        return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><title>Google Photos — Error</title></head>
+<body style="font-family:sans-serif;padding:40px;background:#0f0f0f;color:#e8e8e8">
+<h2 style="color:#f87171">Authorization failed</h2>
+<p>{exc}</p>
+<p><a href="/collections" style="color:#4a9eff">← Back to Collections</a></p>
+</body></html>""")
+
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><title>Google Photos — Connected</title></head>
+<body style="font-family:sans-serif;padding:40px;background:#0f0f0f;color:#e8e8e8">
+<h2 style="color:#4ade80">✓ Connected to Google Photos</h2>
+<p>Your account is now linked. You can close this tab and return to Photo Search.</p>
+<p><a href="/collections" style="color:#4a9eff">← Back to Collections</a></p>
+<script>
+  // Auto-close after 3 seconds if this was opened as a popup
+  if (window.opener) {
+    window.opener.postMessage('google_photos_connected', '*');
+    setTimeout(function() { window.close(); }, 2000);
+  }
+</script>
+</body></html>""")
+
+
+@app.delete("/api/google/disconnect")
+def api_google_disconnect():
+    """Revoke Google Photos access and delete stored tokens."""
+    from .google_photos import revoke_token
+    revoke_token(_db_path)
+    return {"ok": True}
+
+
+@app.post("/api/google/albums")
+def api_google_create_album(body: dict):
+    """Create a Google Photos album.
+
+    Body: {"title": "My Album"}
+    Returns: {"album_id": "...", "title": "..."}
+    """
+    from .google_photos import create_album
+
+    title = body.get("title", "").strip()
+    if not title:
+        raise HTTPException(400, "title is required")
+
+    try:
+        album_id = create_album(_db_path, title)
+    except RuntimeError as exc:
+        raise HTTPException(401, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Album creation failed: {exc}")
+
+    return {"album_id": album_id, "title": title}
+
+
+@app.post("/api/google/upload-status")
+async def api_google_upload_status(body: dict):
+    """Check which photos have already been uploaded to a given album.
+
+    Body:
+      photo_ids: list[int]
+      album_id: str
+
+    Returns:
+      { uploaded: {photo_id: filename, ...}, not_uploaded: {photo_id: filename, ...} }
+    """
+    photo_ids = body.get("photo_ids", [])
+    album_id = body.get("album_id", "")
+    if not photo_ids or not album_id:
+        raise HTTPException(400, "photo_ids and album_id are required")
+
+    with _get_db() as db:
+        ledger_rows = db.conn.execute(
+            "SELECT filepath, media_item_id FROM google_photos_uploads WHERE album_id = ?",
+            (album_id,),
+        ).fetchall()
+        ledger = {row[0] for row in ledger_rows if row[1]}
+
+        uploaded = {}
+        not_uploaded = {}
+        for pid in photo_ids:
+            photo = db.get_photo(pid)
+            if not photo:
+                continue
+            fp = db.resolve_filepath(photo.get("filepath", ""))
+            fname = os.path.basename(fp)
+            if fp in ledger:
+                uploaded[pid] = fname
+            else:
+                not_uploaded[pid] = fname
+
+    return {"uploaded": uploaded, "not_uploaded": not_uploaded}
+
+
+@app.post("/api/google/upload")
+async def api_google_upload(body: dict, request: Request):
+    """Upload photos to Google Photos, streaming per-file progress as SSE.
+
+    Body:
+      photo_ids: list[int] — IDs of photos to upload
+      album_title: str (optional) — creates a new album with this title
+      album_id: str (optional) — adds to an existing album (skips creation)
+      collection_id: int (optional) — if provided, the album ID is saved back
+                      to the collection for future "add to existing" uploads
+      include_description: bool (default true) — use description as caption
+      force_reupload: bool (default false) — ignore ledger, re-upload all
+      force_reupload_ids: list[int] (optional) — specific photo IDs to force
+                          re-upload even if they exist in the ledger
+
+    Streams SSE events:
+      {"type": "progress", "filename": str, "status": "uploaded"|"readded"|"error",
+       "done": int, "total": int, "error": str|None}
+      {"type": "done", "uploaded": int, "readded": int, "errors": int,
+       "total": int, "album_id": str, "album_title": str}
+      {"type": "fatal", "message": str}   — on unrecoverable error
+    """
+    import asyncio
+    import threading
+    from .google_photos import create_album, upload_photos, batch_add_to_album, refresh_access_token
+
+    photo_ids = body.get("photo_ids", [])
+    if not photo_ids:
+        raise HTTPException(400, "photo_ids is required")
+
+    album_title = body.get("album_title", "").strip()
+    album_id = body.get("album_id", "").strip() or None
+    collection_id = body.get("collection_id")
+    include_description = body.get("include_description", True)
+    force_reupload = body.get("force_reupload", False)
+    force_reupload_ids = set(body.get("force_reupload_ids", []))
+
+    # Verify authenticated before opening the stream
+    try:
+        token = refresh_access_token(_db_path)
+        if not token:
+            raise HTTPException(401, "Not authenticated with Google Photos — please authorize first.")
+    except RuntimeError as exc:
+        raise HTTPException(401, str(exc))
+
+    # Create album if title was provided and no existing album_id
+    if album_title and not album_id:
+        try:
+            album_id = create_album(_db_path, album_title)
+            logger.info("GOOGLE ALBUM CREATED  id=%s  title=%s", album_id, album_title)
+        except Exception as exc:
+            raise HTTPException(500, f"Album creation failed: {exc}")
+
+    # Partition photos into two groups:
+    #   readd_items — already uploaded to this album (have a media_item_id in ledger)
+    #   records     — never uploaded, or force_reupload requested; need full upload
+    with _get_db() as db:
+        if album_id and not force_reupload:
+            ledger_rows = db.conn.execute(
+                "SELECT filepath, media_item_id FROM google_photos_uploads WHERE album_id = ?",
+                (album_id,)
+            ).fetchall()
+            ledger = {row[0]: row[1] for row in ledger_rows}
+        else:
+            ledger = {}
+
+        records = []
+        readd_items = []
+
+        for pid in photo_ids:
+            photo = db.get_photo(pid)
+            if not photo:
+                continue
+            photo = dict(photo)
+            photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
+            fp = photo["_resolved_filepath"]
+            if fp in ledger and ledger[fp] and pid not in force_reupload_ids:
+                readd_items.append((photo, ledger[fp]))
+            else:
+                records.append(photo)
+
+    if not records and not readd_items:
+        raise HTTPException(404, "No valid photos found for the given IDs")
+
+    grand_total = len(readd_items) + len(records)
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        """Thread-safe event push onto the async queue."""
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    # Build an ordered filename list for all files (readd + new) for the "start" event
+    all_filenames = (
+        [p.get("filename", "") for p, _ in readd_items] +
+        [p.get("filename", "") for p in records]
+    )
+    # record_map keyed by filename for quick lookup during per-file ledger writes
+    record_map = {p["filename"]: p for p in records}
+
+    def run_upload():
+        """Runs in a background thread; pushes SSE events via _emit."""
+        results = []
+        done_count = [0]  # mutable so nested callbacks can increment
+
+        try:
+            # Announce all filenames upfront so the UI can show the full pending list
+            _emit({"type": "start", "filenames": all_filenames, "total": grand_total})
+
+            # --- Step A: re-add already-uploaded photos (no bytes) ---
+            if readd_items and album_id:
+                media_ids = [mid for _, mid in readd_items]
+                try:
+                    readd_result = batch_add_to_album(_db_path, album_id, media_ids)
+                    logger.info("GOOGLE READD  attempted=%d  ok=%d", len(media_ids), readd_result["added"])
+                    for photo, mid in readd_items:
+                        if cancel_event.is_set():
+                            break
+                        done_count[0] += 1
+                        fname = photo.get("filename", "")
+                        results.append({"filename": fname, "status": "readded",
+                                        "error": None, "media_item_id": mid})
+                        logger.info("GOOGLE UPLOAD  %d/%d  ♻  %s  (re-synced, no upload needed)",
+                                    done_count[0], grand_total, fname)
+                        _emit({"type": "progress", "filename": fname,
+                               "status": "readded", "done": done_count[0], "total": grand_total, "error": None})
+                except Exception as exc:
+                    logger.warning("GOOGLE READD  failed: %s", exc)
+                    for photo, mid in readd_items:
+                        if cancel_event.is_set():
+                            break
+                        done_count[0] += 1
+                        fname = photo.get("filename", "")
+                        results.append({"filename": fname, "status": "error",
+                                        "error": str(exc), "media_item_id": mid})
+                        _emit({"type": "progress", "filename": fname,
+                               "status": "error", "done": done_count[0], "total": grand_total, "error": str(exc)})
+
+            # --- Step B: full upload for new photos ---
+            if cancel_event.is_set():
+                _emit({"type": "cancelled", "message": "Upload cancelled"})
+                return
+
+            if records:
+                def _on_begin(queued: int, total: int, filename: str):
+                    """Called just before raw bytes are POSTed for a file."""
+                    if cancel_event.is_set():
+                        raise InterruptedError("Upload cancelled by client")
+                    overall_queued = len(readd_items) + queued + 1
+                    logger.info("GOOGLE UPLOAD  %d/%d  ↑  %s  (sending bytes…)",
+                                overall_queued, grand_total, filename)
+                    _emit({"type": "begin", "filename": filename,
+                           "queued": overall_queued, "total": grand_total})
+
+                def _on_bytes_done(queued: int, total: int, filename: str):
+                    """Called right after raw bytes finish uploading for a file."""
+                    if cancel_event.is_set():
+                        raise InterruptedError("Upload cancelled by client")
+                    overall_queued = len(readd_items) + queued
+                    logger.info("GOOGLE UPLOAD  %d/%d  ☁  %s  (bytes received, awaiting confirmation)",
+                                overall_queued, grand_total, filename)
+                    _emit({"type": "bytes_sent", "filename": filename,
+                           "queued": overall_queued, "total": grand_total})
+
+                def _on_progress(done: int, total: int, filename: str,
+                                  status: str = "uploaded", error: str = None,
+                                  media_item_id: str = None):
+                    if cancel_event.is_set():
+                        raise InterruptedError("Upload cancelled by client")
+                    overall = len(readd_items) + done
+                    if status == "uploaded":
+                        logger.info("GOOGLE UPLOAD  %d/%d  ✓  %s", overall, grand_total, filename)
+                        # Write to ledger immediately so a cancel doesn't lose this file
+                        if album_id and media_item_id:
+                            try:
+                                photo = record_map.get(filename)
+                                if photo:
+                                    with _get_db() as db:
+                                        db.record_upload(
+                                            album_id, photo.get("id"),
+                                            photo.get("_resolved_filepath", photo.get("filepath", "")),
+                                            media_item_id,
+                                        )
+                            except Exception as exc:
+                                logger.warning("GOOGLE UPLOAD  ledger write failed for %s: %s", filename, exc)
+                    else:
+                        logger.warning("GOOGLE UPLOAD  %d/%d  ✗  %s  error=%s",
+                                       overall, grand_total, filename, error)
+                    _emit({"type": "progress", "filename": filename, "status": status,
+                           "done": overall, "total": grand_total, "error": error})
+
+                try:
+                    upload_results = upload_photos(
+                        _db_path, records,
+                        album_id=album_id or None,
+                        include_description=include_description,
+                        progress_callback=_on_progress,
+                        begin_callback=_on_begin,
+                        bytes_done_callback=_on_bytes_done,
+                    )
+                    results.extend(upload_results)
+                except InterruptedError:
+                    _emit({"type": "cancelled", "message": "Upload cancelled"})
+                    return
+                except RuntimeError as exc:
+                    _emit({"type": "fatal", "message": f"Auth error: {exc}"})
+                    return
+                except Exception as exc:
+                    _emit({"type": "fatal", "message": f"Upload failed: {exc}"})
+                    return
+
+            n_uploaded = sum(1 for r in results if r["status"] == "uploaded")
+            n_readded  = sum(1 for r in results if r["status"] == "readded")
+            n_errors   = sum(1 for r in results if r["status"] == "error")
+
+            logger.info("GOOGLE UPLOAD SUMMARY  total=%d  uploaded=%d  readded=%d  errors=%d  album=%s",
+                        len(results), n_uploaded, n_readded, n_errors, album_id)
+
+            # Save album link to collection (ledger entries already written per-file above)
+            if album_id:
+                try:
+                    with _get_db() as db:
+                        if collection_id and (n_uploaded > 0 or n_readded > 0):
+                            db.set_collection_google_album(collection_id, album_id, album_title)
+                except Exception as exc:
+                    logger.warning("GOOGLE UPLOAD  failed to update collection album link: %s", exc)
+
+            _emit({"type": "done", "uploaded": n_uploaded, "readded": n_readded,
+                   "errors": n_errors, "total": len(results),
+                   "album_id": album_id, "album_title": album_title})
+
+        except Exception as exc:
+            logger.exception("GOOGLE UPLOAD  unexpected error")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    # Launch upload in background thread
+    thread = threading.Thread(target=run_upload, daemon=True)
+    thread.start()
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("GOOGLE UPLOAD  client disconnected — cancelling")
+                    cancel_event.set()
+                    return
+
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("done", "fatal", "cancelled"):
+                    return
+        finally:
+            cancel_event.set()  # ensure thread stops even if generator is abandoned
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Serve the frontend (production mode — built files)
 # ---------------------------------------------------------------------------
 
@@ -1429,7 +1900,8 @@ if _frontend_dir.exists():
         """Serve the collections page."""
         coll_page = _frontend_dir / "collections.html"
         if coll_page.exists():
-            return HTMLResponse(coll_page.read_text())
+            return HTMLResponse(coll_page.read_text(),
+                                headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Collections page not found</h1>")
 
     @app.get("/status")
@@ -1445,7 +1917,8 @@ if _frontend_dir.exists():
         """Serve collection detail page (same HTML, JS reads id from URL)."""
         coll_page = _frontend_dir / "collections.html"
         if coll_page.exists():
-            return HTMLResponse(coll_page.read_text())
+            return HTMLResponse(coll_page.read_text(),
+                                headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Collections page not found</h1>")
 
     @app.get("/{path:path}")

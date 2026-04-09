@@ -1,7 +1,8 @@
 """Tests for the PhotoDB database layer.
 
 Covers: CRUD, path handling, batch mode, collections, faces, persons,
-color search, text search, edge cases, and concurrent access.
+color search, text search, Google Photos upload ledger, schema migrations,
+and concurrent access.
 """
 
 import json
@@ -472,6 +473,292 @@ class TestReviewSelections:
             (pid, "/photos/2026/march"),
         ).fetchone()["c"]
         assert count == 1
+
+
+# =========================================================================
+# Google Photos upload ledger
+# =========================================================================
+
+class TestGooglePhotosUploadLedger:
+    """Tests for record_upload, get_uploaded_filepaths, clear_upload_ledger."""
+
+    ALBUM_ID = "ALBUM_TEST_ABC123"
+
+    def test_record_and_retrieve_upload(self, db):
+        pid = db._test_photo_ids["DSC04878.JPG"]
+        db.record_upload(self.ALBUM_ID, pid, "photos/DSC04878.JPG", "MEDIA_001")
+
+        fps = db.get_uploaded_filepaths(self.ALBUM_ID)
+        assert "photos/DSC04878.JPG" in fps
+
+    def test_get_uploaded_filepaths_empty_for_unknown_album(self, db):
+        fps = db.get_uploaded_filepaths("ALBUM_NONEXISTENT")
+        assert fps == set()
+
+    def test_get_uploaded_filepaths_multiple_photos(self, db):
+        files = [
+            ("DSC04878.JPG", "photos/DSC04878.JPG", "M001"),
+            ("DSC04880.JPG", "photos/DSC04880.JPG", "M002"),
+            ("DSC04894.JPG", "photos/DSC04894.JPG", "M003"),
+        ]
+        for fname, fp, mid in files:
+            pid = db._test_photo_ids[fname]
+            db.record_upload(self.ALBUM_ID, pid, fp, mid)
+
+        fps = db.get_uploaded_filepaths(self.ALBUM_ID)
+        assert fps == {"photos/DSC04878.JPG", "photos/DSC04880.JPG", "photos/DSC04894.JPG"}
+
+    def test_get_uploaded_filepaths_album_isolation(self, db):
+        """Filepaths recorded for one album must not appear in another album's results."""
+        pid = db._test_photo_ids["DSC04878.JPG"]
+        db.record_upload("ALBUM_A", pid, "photos/DSC04878.JPG", "MA001")
+
+        fps_b = db.get_uploaded_filepaths("ALBUM_B")
+        assert "photos/DSC04878.JPG" not in fps_b
+
+    def test_record_upload_upsert_updates_media_item_id(self, db):
+        """Recording the same (album_id, filepath) twice should update, not duplicate."""
+        pid = db._test_photo_ids["DSC04878.JPG"]
+        db.record_upload(self.ALBUM_ID, pid, "photos/DSC04878.JPG", "MEDIA_OLD")
+        db.record_upload(self.ALBUM_ID, pid, "photos/DSC04878.JPG", "MEDIA_NEW")
+
+        rows = db.conn.execute(
+            "SELECT media_item_id FROM google_photos_uploads WHERE album_id = ? AND filepath = ?",
+            (self.ALBUM_ID, "photos/DSC04878.JPG"),
+        ).fetchall()
+        assert len(rows) == 1, "upsert should produce exactly one row"
+        assert rows[0]["media_item_id"] == "MEDIA_NEW"
+
+    def test_media_item_id_round_trip(self, db):
+        """The media_item_id stored in the ledger must be retrievable verbatim."""
+        pid = db._test_photo_ids["DSC04907.JPG"]
+        goog_id = "AHP8L8tNGTE4sm0zGv5uOH3o4WVvEgxko3dzxZAv1ETXnOimdro2b2ODVFul2NGwDI0r_AZLIszC"
+        db.record_upload(self.ALBUM_ID, pid, "photos/DSC04907.JPG", goog_id)
+
+        row = db.conn.execute(
+            "SELECT media_item_id FROM google_photos_uploads WHERE filepath = ? AND album_id = ?",
+            ("photos/DSC04907.JPG", self.ALBUM_ID),
+        ).fetchone()
+        assert row is not None
+        assert row["media_item_id"] == goog_id
+
+    def test_clear_upload_ledger_removes_all_entries(self, db):
+        filenames = ["DSC04878.JPG", "DSC04880.JPG", "DSC04894.JPG"]
+        for i, fname in enumerate(filenames):
+            pid = db._test_photo_ids[fname]
+            db.record_upload(self.ALBUM_ID, pid, f"photos/{fname}", f"M{i:03d}")
+
+        deleted = db.clear_upload_ledger(self.ALBUM_ID)
+        assert deleted == 3
+        fps = db.get_uploaded_filepaths(self.ALBUM_ID)
+        assert fps == set()
+
+    def test_clear_upload_ledger_returns_zero_when_empty(self, db):
+        deleted = db.clear_upload_ledger("ALBUM_EMPTY")
+        assert deleted == 0
+
+    def test_clear_upload_ledger_album_isolation(self, db):
+        """Clearing one album's ledger must not affect another album's entries."""
+        pid_a = db._test_photo_ids["DSC04878.JPG"]
+        pid_b = db._test_photo_ids["DSC04894.JPG"]
+        db.record_upload("ALBUM_A", pid_a, "photos/DSC04878.JPG", "MA")
+        db.record_upload("ALBUM_B", pid_b, "photos/DSC04894.JPG", "MB")
+
+        db.clear_upload_ledger("ALBUM_A")
+
+        fps_b = db.get_uploaded_filepaths("ALBUM_B")
+        assert "photos/DSC04894.JPG" in fps_b
+
+    def test_record_upload_null_photo_id_allowed(self, db):
+        """record_upload must work with photo_id=None (no FK violation)."""
+        db.record_upload(self.ALBUM_ID, None, "photos/orphan.jpg", "M_ORPHAN")
+        fps = db.get_uploaded_filepaths(self.ALBUM_ID)
+        assert "photos/orphan.jpg" in fps
+
+    def test_google_photos_uploads_table_exists(self, db):
+        tables = {r[0] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "google_photos_uploads" in tables
+
+
+# =========================================================================
+# Google Photos album link on collections
+# =========================================================================
+
+class TestCollectionGoogleAlbumLink:
+    """Tests for set_collection_google_album."""
+
+    def test_set_and_retrieve_album_link(self, db):
+        cid = db._test_collection_id
+        db.set_collection_google_album(cid, "ALBUM_XYZ", "My Trip Album")
+
+        row = db.conn.execute(
+            "SELECT google_photos_album_id, google_photos_album_title FROM collections WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        assert row["google_photos_album_id"] == "ALBUM_XYZ"
+        assert row["google_photos_album_title"] == "My Trip Album"
+
+    def test_overwrite_album_link(self, db):
+        cid = db._test_collection_id
+        db.set_collection_google_album(cid, "OLD_ALBUM", "Old Title")
+        db.set_collection_google_album(cid, "NEW_ALBUM", "New Title")
+
+        row = db.conn.execute(
+            "SELECT google_photos_album_id, google_photos_album_title FROM collections WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        assert row["google_photos_album_id"] == "NEW_ALBUM"
+        assert row["google_photos_album_title"] == "New Title"
+
+    def test_unrelated_collection_unaffected(self, db):
+        """Setting an album link on one collection must not touch others."""
+        cid1 = db._test_collection_id
+        cid2 = db.create_collection("Other Collection")
+        db.set_collection_google_album(cid1, "ALBUM_1", "Album One")
+
+        row = db.conn.execute(
+            "SELECT google_photos_album_id FROM collections WHERE id = ?",
+            (cid2,),
+        ).fetchone()
+        assert row["google_photos_album_id"] is None
+
+    def test_new_collection_has_null_album_link(self, db):
+        cid = db.create_collection("Fresh Collection")
+        row = db.conn.execute(
+            "SELECT google_photos_album_id, google_photos_album_title FROM collections WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        assert row["google_photos_album_id"] is None
+        assert row["google_photos_album_title"] is None
+
+
+# =========================================================================
+# Schema migration: google_photos_uploads created on upgrade
+# =========================================================================
+
+class TestSchemaUpgradeMigration:
+    """Verify that a DB stuck at an old version gets the uploads table on open."""
+
+    def test_migration_from_v11_adds_uploads_table(self, tmp_db_path):
+        """Simulate a database frozen at schema v11 (no google_photos_uploads).
+
+        When PhotoDB opens it the migration should add the table and bump the
+        stored version to SCHEMA_VERSION.
+        """
+        import sqlite3 as _sqlite3
+
+        # Build a minimal schema-v11 database by hand
+        conn = _sqlite3.connect(tmp_db_path)
+        conn.execute("CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO schema_info VALUES ('version', '11')")
+        # Use a fairly complete v11 photos schema (all indexed columns must exist)
+        conn.execute("""
+            CREATE TABLE photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filepath TEXT UNIQUE NOT NULL,
+                filename TEXT NOT NULL,
+                file_hash TEXT,
+                date_taken TEXT,
+                gps_lat REAL, gps_lon REAL,
+                place_name TEXT,
+                camera_make TEXT, camera_model TEXT,
+                focal_length TEXT, exposure_time TEXT,
+                f_number TEXT, iso INTEGER,
+                image_width INTEGER, image_height INTEGER,
+                description TEXT,
+                dominant_colors TEXT,
+                aesthetic_score REAL,
+                aesthetic_concepts TEXT,
+                aesthetic_critique TEXT,
+                tags TEXT,
+                indexed_at TEXT DEFAULT (datetime('now')),
+                raw_filepath TEXT,
+                verified_at TEXT,
+                verification_status TEXT,
+                hallucination_flags TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE collections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                cover_photo_id INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE faces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id INTEGER NOT NULL,
+                person_id INTEGER,
+                bbox_top INTEGER, bbox_right INTEGER,
+                bbox_bottom INTEGER, bbox_left INTEGER,
+                cluster_id INTEGER, match_source TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE persons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE face_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                source_path TEXT
+            )
+        """)
+        conn.execute("CREATE TABLE ignored_clusters (cluster_id INTEGER PRIMARY KEY, ignored_at TEXT DEFAULT (datetime('now')))")
+        conn.execute("""
+            CREATE TABLE review_selections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id INTEGER NOT NULL,
+                directory TEXT NOT NULL,
+                selected INTEGER NOT NULL DEFAULT 0,
+                cluster_id INTEGER, rank_in_cluster INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(photo_id, directory)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE photo_stacks (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT DEFAULT (datetime('now')))
+        """)
+        conn.execute("""
+            CREATE TABLE stack_members (
+                stack_id INTEGER NOT NULL, photo_id INTEGER NOT NULL,
+                is_top INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (stack_id, photo_id), UNIQUE(photo_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE collection_photos (
+                collection_id INTEGER NOT NULL, photo_id INTEGER NOT NULL,
+                added_at TEXT DEFAULT (datetime('now')), sort_order INTEGER DEFAULT 0,
+                PRIMARY KEY (collection_id, photo_id)
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Open with PhotoDB — should migrate automatically
+        db = PhotoDB(tmp_db_path)
+
+        tables = {r[0] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "google_photos_uploads" in tables, \
+            "google_photos_uploads table should be created during migration from v11"
+
+        version_row = db.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()
+        assert int(version_row[0]) == SCHEMA_VERSION
 
 
 # =========================================================================

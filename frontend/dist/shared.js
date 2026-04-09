@@ -940,10 +940,231 @@
           // Collections
           renderCollections(),
 
+          // Google Photos upload (single-photo)
+          e(PS.GooglePhotosButton, { photo: photo }),
+
           // Footer children slot (e.g. review's cluster info, raw file)
           footerChildren,
         ),
       ),
+    );
+  };
+
+  // =========================================================================
+  // GooglePhotosButton — upload a single photo from the modal sidebar
+  // =========================================================================
+  // Props:
+  //   photo  — { id, filename, description, ... }
+
+  PS.GooglePhotosButton = function GooglePhotosButton(props) {
+    var photo = props.photo;
+
+    var _status = useState(null);
+    var status = _status[0];   // null | 'uploading' | 'done' | 'error'
+    var setStatus = _status[1];
+
+    var _msg = useState('');
+    var msg = _msg[0];
+    var setMsg = _msg[1];
+
+    var _googleStatus = useState(null);
+    var googleStatus = _googleStatus[0];
+    var setGoogleStatus = _googleStatus[1];
+
+    var _expanded = useState(false);
+    var expanded = _expanded[0];
+    var setExpanded = _expanded[1];
+
+    var _showManual = useState(false);
+    var showManual = _showManual[0];
+    var setShowManual = _showManual[1];
+
+    var _manualCode = useState('');
+    var manualCode = _manualCode[0];
+    var setManualCode = _manualCode[1];
+
+    var _manualRedirectUri = useState('');
+    var manualRedirectUri = _manualRedirectUri[0];
+    var setManualRedirectUri = _manualRedirectUri[1];
+
+    var _manualError = useState('');
+    var manualError = _manualError[0];
+    var setManualError = _manualError[1];
+
+    var _manualBusy = useState(false);
+    var manualBusy = _manualBusy[0];
+    var setManualBusy = _manualBusy[1];
+
+    // Fetch Google connection status when expanded
+    useEffect(function () {
+      if (!expanded) return;
+      fetch(API + '/api/google/status')
+        .then(function (r) { return r.json(); })
+        .then(setGoogleStatus)
+        .catch(function () {});
+    }, [expanded]);
+
+    var doUpload = function () {
+      setStatus('uploading');
+      setMsg('');
+      fetch(API + '/api/google/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ photo_ids: [photo.id], include_description: true }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.detail) { setStatus('error'); setMsg(data.detail); return; }
+          if (data.uploaded > 0) {
+            setStatus('done');
+            setMsg('\u2713 Uploaded to Google Photos');
+          } else {
+            var firstErr = (data.results || []).find(function (r) { return r.error; });
+            setStatus('error');
+            setMsg((firstErr && firstErr.error) || 'Upload failed');
+          }
+        })
+        .catch(function (err) { setStatus('error'); setMsg(err.message); });
+    };
+
+    var doConnect = function () {
+      var port = window.location.port || '8000';
+      var redirectUri = 'http://localhost:' + port + '/api/google/callback';
+      setManualRedirectUri(redirectUri);
+      setShowManual(false);
+      setManualCode('');
+      setManualError('');
+      fetch(API + '/api/google/authorize?port=' + encodeURIComponent(port))
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.auth_url) {
+            window.open(data.auth_url, '_blank', 'width=600,height=700');
+            setShowManual(true);
+            var listener = function (ev) {
+              if (ev.data === 'google_photos_connected') {
+                window.removeEventListener('message', listener);
+                fetch(API + '/api/google/status').then(function (r) { return r.json(); }).then(setGoogleStatus).catch(function () {});
+                setShowManual(false);
+              }
+            };
+            window.addEventListener('message', listener);
+          }
+        })
+        .catch(function () {});
+    };
+
+    var doManualCode = function () {
+      var code = manualCode.trim();
+      if (!code) return;
+      setManualBusy(true);
+      setManualError('');
+      fetch(API + '/api/google/exchange-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: code, redirect_uri: manualRedirectUri }),
+      })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (!res.ok) throw new Error(res.d.detail || 'Exchange failed');
+          fetch(API + '/api/google/status').then(function (r) { return r.json(); }).then(setGoogleStatus).catch(function () {});
+          setShowManual(false);
+          setManualCode('');
+        })
+        .catch(function (err) { setManualError(err.message); })
+        .finally(function () { setManualBusy(false); });
+    };
+
+    if (!expanded) {
+      return e('div', { className: 'detail-section' },
+        e('button', {
+          style: {
+            fontSize: 12, padding: '4px 10px', borderRadius: 4,
+            border: '1px solid var(--border)', background: 'var(--surface2)',
+            color: 'var(--accent)', cursor: 'pointer', width: '100%', textAlign: 'left',
+          },
+          onClick: function () { setExpanded(true); setStatus(null); setMsg(''); },
+        }, '\uD83D\uDDBC\uFE0F Upload to Google Photos'),
+      );
+    }
+
+    var notConfigured = googleStatus && !googleStatus.configured;
+    var notAuthenticated = googleStatus && googleStatus.configured && !googleStatus.authenticated;
+    var ready = googleStatus && googleStatus.configured && googleStatus.authenticated;
+
+    return e('div', { className: 'detail-section' },
+      e('h3', null, '\uD83D\uDDBC Upload to Google Photos'),
+
+      status === 'done' && e('p', { style: { color: 'var(--green)', fontSize: 13, marginBottom: 8 } }, msg),
+      status === 'error' && e('p', { style: { color: 'var(--red)', fontSize: 13, marginBottom: 8 } }, msg),
+      status === 'uploading' && e('p', { style: { color: 'var(--text-muted)', fontSize: 13, marginBottom: 8 } }, 'Uploading\u2026'),
+
+      notConfigured && e('div', null,
+        e('p', { style: { fontSize: 12, color: 'var(--red)', marginBottom: 4 } },
+          'Setup required: place ', e('code', null, 'google_client_secret.json'), ' alongside the database, then restart.',
+        ),
+        e('p', { style: { fontSize: 12, color: 'var(--text-muted)' } },
+          'Open a collection and click \u201cUpload to Google Photos\u201d for step-by-step instructions.',
+        ),
+      ),
+
+      notAuthenticated && e('div', null,
+        !showManual && e('div', null,
+          e('p', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 } },
+            'Connect your Google account to upload.',
+          ),
+          e('button', {
+            style: { fontSize: 12, padding: '4px 10px', borderRadius: 4, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: 'pointer' },
+            onClick: doConnect,
+          }, 'Connect Google Photos'),
+        ),
+        showManual && e('div', null,
+          e('p', { style: { fontSize: 12, marginBottom: 6 } }, 'Sign-in window opened.'),
+          e('details', null,
+            e('summary', { style: { fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer', marginBottom: 6 } }, 'Got an error page? (NAS users)'),
+            e('p', { style: { fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 } },
+              'Copy the ', e('code', null, 'code=XXXX'), ' value from the error URL and paste it here:',
+            ),
+            e('input', {
+              type: 'text',
+              placeholder: 'Authorization code',
+              value: manualCode,
+              onChange: function (ev) { setManualCode(ev.target.value); },
+              onKeyDown: function (ev) { if (ev.key === 'Enter') doManualCode(); },
+              style: { width: '100%', fontSize: 12, padding: '4px 8px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', marginBottom: 4 },
+            }),
+            manualError && e('p', { style: { fontSize: 11, color: 'var(--red)', marginBottom: 4 } }, manualError),
+            e('button', {
+              style: { fontSize: 11, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: 'pointer', opacity: manualBusy ? 0.6 : 1 },
+              onClick: doManualCode,
+              disabled: manualBusy || !manualCode.trim(),
+            }, manualBusy ? 'Connecting\u2026' : 'Submit code'),
+          ),
+          e('div', { style: { marginTop: 8, display: 'flex', gap: 6 } },
+            e('button', {
+              style: { fontSize: 11, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer' },
+              onClick: function () { fetch(API + '/api/google/status').then(function (r) { return r.json(); }).then(function (d) { setGoogleStatus(d); if (d.authenticated) setShowManual(false); }).catch(function () {}); },
+            }, 'Check status'),
+            e('button', {
+              style: { fontSize: 11, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer' },
+              onClick: doConnect,
+            }, 'Re-open'),
+          ),
+        ),
+      ),
+
+      ready && status !== 'done' && e('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+        e('button', {
+          style: { fontSize: 12, padding: '4px 10px', borderRadius: 4, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: 'pointer', opacity: status === 'uploading' ? 0.6 : 1 },
+          onClick: doUpload,
+          disabled: status === 'uploading',
+        }, status === 'uploading' ? 'Uploading\u2026' : 'Upload this photo'),
+        e('button', {
+          style: { fontSize: 12, padding: '4px 10px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text)', cursor: 'pointer' },
+          onClick: function () { setExpanded(false); setStatus(null); setMsg(''); },
+        }, 'Cancel'),
+      ),
+
+      googleStatus === null && e('p', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'Checking status\u2026'),
     );
   };
 
