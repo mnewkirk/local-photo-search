@@ -443,6 +443,32 @@
       return function () { window.removeEventListener('keydown', handler); };
     }, [onClose, onPrev, onNext]);
 
+    // ---- Touch swipe navigation (mobile) ----
+    var touchRef = useRef(null);
+    useEffect(function () {
+      var onTouchStart = function (ev) {
+        var t = ev.touches[0];
+        touchRef.current = { x: t.clientX, y: t.clientY };
+      };
+      var onTouchEnd = function (ev) {
+        if (!touchRef.current) return;
+        var t = ev.changedTouches[0];
+        var dx = t.clientX - touchRef.current.x;
+        var dy = t.clientY - touchRef.current.y;
+        touchRef.current = null;
+        // Require horizontal swipe > 50px and more horizontal than vertical
+        if (Math.abs(dx) < 50 || Math.abs(dy) > Math.abs(dx)) return;
+        if (dx < 0 && onNext) onNext();   // swipe left → next
+        if (dx > 0 && onPrev) onPrev();   // swipe right → prev
+      };
+      window.addEventListener('touchstart', onTouchStart, { passive: true });
+      window.addEventListener('touchend', onTouchEnd, { passive: true });
+      return function () {
+        window.removeEventListener('touchstart', onTouchStart);
+        window.removeEventListener('touchend', onTouchEnd);
+      };
+    }, [onPrev, onNext]);
+
     if (!photo) return null;
 
     // ---- Render helpers ----
