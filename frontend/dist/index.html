@@ -611,6 +611,7 @@
       const [dateFrom, setDateFrom] = useState(initParams.date_from);
       const [dateTo, setDateTo] = useState(initParams.date_to);
       const [results, setResults] = useState(null);
+      const [sortBy, setSortBy] = useState('relevance');
       const [loading, setLoading] = useState(false);
       const [selectedPhoto, setSelectedPhoto] = useState(null);
       const [photoDetail, setPhotoDetail] = useState(null);
@@ -1072,7 +1073,9 @@
           ),
 
           results !== null && results.length > 0 &&
-            e(PhotoGrid, { results, onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
+            e(PhotoGrid, { results: PS.applySortOrder(results, sortBy), sortBy, setSortBy,
+                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc'],
+                           onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack }),
         ),
 
@@ -1121,7 +1124,7 @@
     // -----------------------------------------------------------------------
     // Photo grid
     // -----------------------------------------------------------------------
-    function PhotoGrid({ results, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack }) {
+    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack }) {
       // Build display list: filter out non-top stack members, insert expanded members after their top photo
       const displayItems = useMemo(() => {
         const added = new Set();
@@ -1154,9 +1157,10 @@
       const stackCount = results.filter(r => r.stack_id && r.stack_count > 1 && r.stack_is_top).length;
 
       return e('div', null,
-        e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12 } },
+        e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
           e('span', null, results.length + ' result' + (results.length !== 1 ? 's' : '') +
             (stackCount > 0 ? ' (' + stackCount + ' stacked)' : '')),
+          sortBy && setSortBy && e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: sortOptions }),
           multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
             'Click to select \u00B7 Shift-click for range'),
         ),

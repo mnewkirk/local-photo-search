@@ -566,6 +566,7 @@
       const [folders, setFolders] = useState([]);
       const [selectedFolder, setSelectedFolder] = useState(initParams.folder);
       const [photos, setPhotos] = useState([]);
+      const [sortBy, setSortBy] = useState('relevance');  // 'relevance' = default order (selected first, then quality)
       const [stats, setStats] = useState(null);
       const [loading, setLoading] = useState(false);
       const [viewMode, setViewMode] = useState(initParams.view);       // all | selected | obscure | clusters
@@ -757,6 +758,8 @@
         return photos;
       }, [photos, viewMode]);
 
+      const sortedVisible = useMemo(() => PS.applySortOrder(visiblePhotos, sortBy), [visiblePhotos, sortBy]);
+
       // Build display list: filter non-top stack members, insert expanded members
       const displayItems = useMemo(() => {
         // Build a lookup from photos state so expanded stack members can inherit selection
@@ -764,7 +767,7 @@
         photos.forEach(p => { photoById[p.id] = p; });
         const added = new Set();
         const items = [];
-        visiblePhotos.forEach(photo => {
+        sortedVisible.forEach(photo => {
           const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
           const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
           if (isNonTopMember) {
@@ -789,7 +792,7 @@
           }
         });
         return items;
-      }, [visiblePhotos, photos, expandedStacks, stackMembers]);
+      }, [sortedVisible, photos, expandedStacks, stackMembers]);
 
       const hasStacks = photos.some(p => p.stack_id && p.stack_count > 1);
 
@@ -1000,6 +1003,9 @@
               onClick: () => { setGridSize('large'); updateReviewUrl(selectedFolder, targetPct, viewMode, 'large'); },
             }, 'Large'),
           ),
+
+          // Sort control
+          e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc'] }),
 
           // Export controls
           e('div', { className: 'control-group' },

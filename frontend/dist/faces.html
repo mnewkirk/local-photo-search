@@ -574,6 +574,7 @@
       const [filter, setFilter] = useState(initParams.filter);
       const [selectedGroup, setSelectedGroup] = useState(null);
       const [groupPhotos, setGroupPhotos] = useState([]);
+      const [sortBy, setSortBy] = useState('date_asc');
       const [loadingPhotos, setLoadingPhotos] = useState(false);
       const [editing, setEditing] = useState(false);
       const [editName, setEditName] = useState('');
@@ -757,12 +758,14 @@
           });
       }, []);
 
+      const sortedGroupPhotos = useMemo(() => PS.applySortOrder(groupPhotos, sortBy), [groupPhotos, sortBy]);
+
       // Photo modal handlers
       const openPhotoAt = useCallback((i) => {
-        const idx = ((i % groupPhotos.length) + groupPhotos.length) % groupPhotos.length;
+        const idx = ((i % sortedGroupPhotos.length) + sortedGroupPhotos.length) % sortedGroupPhotos.length;
         setModalIndex(idx);
-        setModalPhoto(groupPhotos[idx]);
-      }, [groupPhotos]);
+        setModalPhoto(sortedGroupPhotos[idx]);
+      }, [sortedGroupPhotos]);
 
       const closeModal = useCallback(() => { setModalPhoto(null); setModalIndex(-1); }, []);
 
@@ -1213,8 +1216,12 @@
               e('button', { className: 'detail-close', onClick: closeDetail }, '\u00D7'),
             ),
             loadingPhotos && e('div', { className: 'loading' }, 'Loading photos...'),
+            !loadingPhotos && e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 0' } },
+              e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, sortedGroupPhotos.length + ' photos'),
+              e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['date_asc', 'date_desc', 'quality_desc'] }),
+            ),
             !loadingPhotos && e('div', { className: 'detail-photos' },
-              ...groupPhotos.map((p, i) =>
+              ...sortedGroupPhotos.map((p, i) =>
                 e('div', {
                   key: p.face_id || p.id,
                   className: 'detail-photo',
@@ -1242,7 +1249,7 @@
           onPrev: () => openPhotoAt(modalIndex - 1),
           onNext: () => openPhotoAt(modalIndex + 1),
           index: modalIndex,
-          total: groupPhotos.length,
+          total: sortedGroupPhotos.length,
           persons: persons,
           onFaceAssigned: (faceId, personName) => {
             // Refresh groups and persons after a face assignment change

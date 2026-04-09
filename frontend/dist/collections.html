@@ -1258,6 +1258,7 @@
     function CollectionDetail({ collectionId }) {
       const [collection, setCollection] = useState(null);
       const [photos, setPhotos] = useState([]);
+      const [sortBy, setSortBy] = useState('relevance');  // 'relevance' = manual/original order
       const [selectedForRemoval, setSelectedForRemoval] = useState(new Set());
       const [showRename, setShowRename] = useState(false);
       const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -1310,10 +1311,12 @@
 
       const collapseAllStacks = useCallback(() => { setExpandedStacks(new Set()); }, []);
 
+      const sortedPhotos = useMemo(() => PS.applySortOrder(photos, sortBy), [photos, sortBy]);
+
       const displayItems = useMemo(() => {
         const added = new Set();
         const items = [];
-        photos.forEach(photo => {
+        sortedPhotos.forEach(photo => {
           const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
           const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
           if (isNonTopMember) {
@@ -1334,7 +1337,7 @@
           }
         });
         return items;
-      }, [photos, selectedForRemoval, expandedStacks, stackMembers]);
+      }, [sortedPhotos, selectedForRemoval, expandedStacks, stackMembers]);
 
       const hasStacks = photos.some(p => p.stack_id && p.stack_count > 1);
 
@@ -1497,8 +1500,9 @@
           e('p', null, 'This collection is empty. Add photos from Search or Review.'),
         ),
 
-        photos.length > 0 && hasStacks && e('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 8 } },
-          e('button', {
+        photos.length > 0 && e('div', { style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 8 } },
+          e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc'] }),
+          hasStacks && e('button', {
             className: 'btn btn-sm',
             onClick: () => { expandedStacks.size > 0 ? collapseAllStacks() : expandAllStacks(); },
           }, expandedStacks.size > 0 ? 'Close Stacks' : 'Expand Stacks'),

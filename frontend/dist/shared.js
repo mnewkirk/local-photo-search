@@ -1168,4 +1168,111 @@
     );
   };
 
+  // =========================================================================
+  // Sort Control — shared sort-by toggle for all pages
+  // =========================================================================
+
+  /**
+   * Sort options available across all pages.
+   * Each page may use a subset — pass `options` to restrict.
+   */
+  var SORT_OPTIONS = {
+    relevance:    { label: 'Relevance',      icon: '\u2605' },  // ★
+    date_desc:    { label: 'Newest first',   icon: '\u2193' },  // ↓
+    date_asc:     { label: 'Oldest first',   icon: '\u2191' },  // ↑
+    quality_desc: { label: 'Best quality',   icon: '\u2b50' },  // ⭐ (using ★ variant)
+    name_asc:     { label: 'Name A\u2013Z',  icon: 'Az' },
+  };
+
+  /**
+   * PS.SortControl({ value, onChange, options })
+   *
+   * A compact inline sort toggle rendered as a row of clickable pills.
+   *
+   *   value:   current sort key (string)
+   *   onChange: (newKey) => void
+   *   options: array of sort keys to show (defaults to all)
+   */
+  PS.SortControl = function SortControl(props) {
+    var value = props.value;
+    var onChange = props.onChange;
+    var options = props.options || ['date_desc', 'date_asc', 'quality_desc'];
+
+    return e('div', {
+      style: {
+        display: 'inline-flex',
+        gap: 0,
+        borderRadius: 4,
+        overflow: 'hidden',
+        border: '1px solid var(--border, #444)',
+        fontSize: 12,
+        flexShrink: 0,
+      },
+    },
+      options.map(function (key) {
+        var opt = SORT_OPTIONS[key];
+        if (!opt) return null;
+        var active = value === key;
+        return e('button', {
+          key: key,
+          onClick: function () { onChange(key); },
+          title: opt.label,
+          style: {
+            padding: '3px 10px',
+            cursor: 'pointer',
+            border: 'none',
+            background: active ? 'var(--accent, #4a9eff)' : 'transparent',
+            color: active ? '#fff' : 'var(--text-muted, #999)',
+            fontWeight: active ? 600 : 400,
+            fontSize: 12,
+            whiteSpace: 'nowrap',
+            transition: 'background 0.15s, color 0.15s',
+          },
+        }, opt.label);
+      }),
+    );
+  };
+
+  /**
+   * PS.applySortOrder(items, sortKey, options)
+   *
+   * Returns a new sorted array. Does not mutate the input.
+   *
+   *   items:   array of photo objects (with date_taken, aesthetic_score, filename, score)
+   *   sortKey: one of the SORT_OPTIONS keys
+   *   options: { idField: 'id' } — optional overrides
+   */
+  PS.applySortOrder = function applySortOrder(items, sortKey) {
+    if (!items || !items.length) return items;
+    var sorted = items.slice();  // shallow copy
+
+    switch (sortKey) {
+      case 'date_desc':
+        sorted.sort(function (a, b) {
+          return (b.date_taken || '').localeCompare(a.date_taken || '');
+        });
+        break;
+      case 'date_asc':
+        sorted.sort(function (a, b) {
+          return (a.date_taken || '').localeCompare(b.date_taken || '');
+        });
+        break;
+      case 'quality_desc':
+        sorted.sort(function (a, b) {
+          return (b.aesthetic_score || 0) - (a.aesthetic_score || 0);
+        });
+        break;
+      case 'name_asc':
+        sorted.sort(function (a, b) {
+          return (a.filename || '').localeCompare(b.filename || '');
+        });
+        break;
+      case 'relevance':
+      default:
+        // Return original order (relevance from search, or manual order)
+        return items;
+    }
+    return sorted;
+  };
+
 })();
