@@ -1933,7 +1933,11 @@ if _frontend_dir.exists():
         # Try serving as a static file first
         file_path = _frontend_dir / path
         if file_path.is_file():
-            return FileResponse(str(file_path))
+            # Prevent stale JS/HTML on deploy — browsers must revalidate
+            headers = {}
+            if file_path.suffix in (".js", ".html", ".css"):
+                headers["Cache-Control"] = "no-cache"
+            return FileResponse(str(file_path), headers=headers)
         # Fall back to index.html for SPA routing
         index = _frontend_dir / "index.html"
         if index.exists():
