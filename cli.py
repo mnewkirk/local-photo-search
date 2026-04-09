@@ -35,7 +35,11 @@ def cli():
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.argument("photo_dir", type=click.Path(exists=True))
+@click.argument("photo_dir", type=click.Path(exists=True), required=False, default=None)
+@click.option("--collection", "collection_id", type=int, default=None,
+              help="Re-index photos in this collection (by ID). Replaces PHOTO_DIR.")
+@click.option("--expand-stacks", is_flag=True, default=False,
+              help="With --collection, also include other photos from the same stacks.")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--batch-size", default=8, help="Batch size for CLIP embedding.")
 @click.option("--clip", is_flag=True, help="Generate CLIP embeddings (required for semantic search).")
@@ -52,10 +56,23 @@ def cli():
 @click.option("--force-tags", is_flag=True, help="Regenerate tags for all photos, even those that already have them.")
 @click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --tags. Equivalent to passing each flag individually.")
 @click.option("--verify", is_flag=True, help="Run hallucination verification after indexing (requires descriptions).")
-def index(photo_dir, db, batch_size, clip, no_colors, faces, force_faces, force_clip,
-          describe, force_describe, describe_model, quality, force_quality, tags, force_tags, full,
-          verify):
-    """Index a directory of photos."""
+def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colors, faces,
+          force_faces, force_clip, describe, force_describe, describe_model, quality, force_quality,
+          tags, force_tags, full, verify):
+    """Index a directory of photos, or re-index a collection.
+
+    \b
+    Directory mode:  photosearch index /photos/2026/2026-04-06 --clip
+    Collection mode: photosearch index --collection 2 --describe --force-describe
+    Expanded:        photosearch index --collection 2 --expand-stacks --quality
+    """
+    if not photo_dir and not collection_id:
+        raise click.UsageError("Provide PHOTO_DIR or --collection ID.")
+    if photo_dir and collection_id:
+        raise click.UsageError("Cannot use both PHOTO_DIR and --collection.")
+    if expand_stacks and not collection_id:
+        raise click.UsageError("--expand-stacks requires --collection.")
+
     if full:
         clip = True
         faces = True
@@ -64,6 +81,8 @@ def index(photo_dir, db, batch_size, clip, no_colors, faces, force_faces, force_
         tags = True
     index_directory(
         photo_dir=photo_dir,
+        collection_id=collection_id,
+        expand_stacks=expand_stacks,
         db_path=db,
         batch_size=batch_size,
         enable_clip=clip or force_clip,
@@ -84,8 +103,15 @@ def index(photo_dir, db, batch_size, clip, no_colors, faces, force_faces, force_
         click.echo("\n--- Verification pass ---")
         from photosearch.db import PhotoDB
         from photosearch.verify import verify_photos
-        photo_db = PhotoDB(db, photo_root=photo_dir)
-        stats = verify_photos(photo_db, verify_model="minicpm-v", regen_model=describe_model)
+        if collection_id:
+            photo_db = PhotoDB(db)
+        else:
+            photo_db = PhotoDB(db, photo_root=photo_dir)
+        photos_to_verify = None
+        if collection_id:
+            photos_to_verify = photo_db.get_collection_photos(collection_id)
+        stats = verify_photos(photo_db, photos=photos_to_verify,
+                              verify_model="minicpm-v", regen_model=describe_model)
         click.echo(f"Verification: {stats['passed']} passed, "
                     f"{stats['regenerated']} regenerated, {stats['failed']} failed")
 
@@ -413,6 +439,10 @@ def add_persons(config_path, db):
 
 @cli.command("match-faces")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--collection", "collection_id", type=int, default=None,
+              help="Only match faces in photos belonging to this collection (by ID).")
+@click.option("--expand-stacks", is_flag=True, default=False,
+              help="With --collection, also include photos from the same stacks.")
 @click.option("--tolerance", default=1.15, help="Match tolerance — L2 distance on 512-dim ArcFace vectors (lower = stricter). Default: 1.15")
 @click.option("--temporal", is_flag=True, default=False,
               help="After standard matching, propagate identities to nearby unmatched faces "
@@ -422,8 +452,8 @@ def add_persons(config_path, db):
               help="Looser ArcFace L2 tolerance used for temporal propagation. Default: 1.45")
 @click.option("--temporal-window", default=30,
               help="Time window in minutes defining a 'session' for temporal matching. Default: 30")
-def match_faces(db, tolerance, temporal, temporal_tolerance, temporal_window):
-    """Match all unidentified faces against registered persons.
+def match_faces(db, collection_id, expand_stacks, tolerance, temporal, temporal_tolerance, temporal_window):
+    """Match unidentified faces against registered persons.
 
     Run this after 'add-person' to apply name labels to indexed faces.
 
@@ -435,6 +465,10 @@ def match_faces(db, tolerance, temporal, temporal_tolerance, temporal_window):
         ArcFace distance is clearly better than the runner-up. This handles small
         or angled faces that fall just outside the strict threshold when photos
         were taken in the same session (same clothes, same lighting).
+
+    \b
+    Use --collection to limit matching to faces in a specific collection:
+      photosearch match-faces --collection 2 --temporal
     """
     from photosearch.faces import (
         match_faces_to_persons, match_faces_temporal, check_available,
@@ -447,8 +481,24 @@ def match_faces(db, tolerance, temporal, temporal_tolerance, temporal_window):
         return
 
     with PhotoDB(db) as photo_db:
+        photo_ids = None
+        if collection_id:
+            coll = photo_db.get_collection(collection_id)
+            if not coll:
+                click.echo(f"Collection {collection_id} not found.")
+                return
+            photo_ids = photo_db.get_collection_photo_ids(collection_id)
+            base_count = len(photo_ids)
+            if expand_stacks:
+                photo_ids = photo_db.expand_to_stacks(photo_ids)
+            if expand_stacks and len(photo_ids) > base_count:
+                click.echo(f"Scoping to collection '{coll['name']}' ({base_count} photos, "
+                           f"expanded to {len(photo_ids)} with stacks)")
+            else:
+                click.echo(f"Scoping to collection '{coll['name']}' ({len(photo_ids)} photos)")
+
         click.echo(f"Matching faces (tolerance={tolerance})...")
-        matched = match_faces_to_persons(photo_db, tolerance=tolerance)
+        matched = match_faces_to_persons(photo_db, tolerance=tolerance, photo_ids=photo_ids)
         click.echo(f"  Pass 1: matched {matched} face(s) to known persons.")
 
         if temporal:
@@ -460,6 +510,7 @@ def match_faces(db, tolerance, temporal, temporal_tolerance, temporal_window):
                 photo_db,
                 temporal_tolerance=temporal_tolerance,
                 window_minutes=temporal_window,
+                photo_ids=photo_ids,
             )
             click.echo(f"  Pass 2: matched {t_matched} additional face(s) via session context.")
             matched += t_matched
@@ -1773,6 +1824,10 @@ def verify(db, threshold, model, verify_model, force, no_regenerate, limit, phot
 
 @cli.command()
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Database path.")
+@click.option("--collection", "collection_id", type=int, default=None,
+              help="Restrict to photos in this collection (by ID).")
+@click.option("--expand-stacks", is_flag=True, default=False,
+              help="With --collection, also include photos from the same stacks.")
 @click.option("--time-window", default=5.0, type=float,
               help="Max seconds between shots to consider stacking (default: 5).")
 @click.option("--clip-threshold", default=0.05, type=float,
@@ -1783,12 +1838,16 @@ def verify(db, threshold, model, verify_model, force, no_regenerate, limit, phot
               help="Show what would be stacked without saving to DB.")
 @click.option("--clear", is_flag=True,
               help="Clear all existing stacks before detecting.")
-def stack(db, time_window, clip_threshold, directory, dry_run, clear):
+def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directory, dry_run, clear):
     """Detect and create photo stacks (burst/bracket groups).
 
     Finds photos taken within --time-window seconds AND with CLIP cosine
     distance < --clip-threshold, groups them into stacks, and picks the
     best photo (by aesthetic score) as the "top" of each stack.
+
+    \b
+    Use --collection to scope to a specific collection:
+      photosearch stack --collection 2
     """
     from photosearch.db import PhotoDB
     from photosearch.stacking import run_stacking
@@ -1799,11 +1858,33 @@ def stack(db, time_window, clip_threshold, directory, dry_run, clear):
         photo_db.clear_stacks()
         click.echo("Cleared all existing stacks.")
 
+    photo_ids = None
+    if collection_id:
+        coll = photo_db.get_collection(collection_id)
+        if not coll:
+            click.echo(f"Collection {collection_id} not found.")
+            return
+        photo_ids = photo_db.get_collection_photo_ids(collection_id)
+        base_count = len(photo_ids)
+        if expand_stacks:
+            photo_ids = photo_db.expand_to_stacks(photo_ids)
+        if expand_stacks and len(photo_ids) > base_count:
+            click.echo(f"Scoping to collection '{coll['name']}' ({base_count} photos, "
+                       f"expanded to {len(photo_ids)} with stacks)")
+        else:
+            click.echo(f"Scoping to collection '{coll['name']}' ({len(photo_ids)} photos)")
+
     if directory:
         directory = os.path.abspath(directory)
 
+    scope_label = ""
+    if collection_id:
+        scope_label = f", collection={collection_id}"
+    elif directory:
+        scope_label = f", directory={directory}"
+
     click.echo(f"Detecting stacks (window={time_window}s, clip_threshold={clip_threshold}"
-               f"{', directory=' + directory if directory else ''}"
+               f"{scope_label}"
                f"{', dry-run' if dry_run else ''})...")
 
     stacks = run_stacking(
@@ -1812,6 +1893,7 @@ def stack(db, time_window, clip_threshold, directory, dry_run, clear):
         clip_threshold=clip_threshold,
         directory=directory,
         dry_run=dry_run,
+        photo_ids=photo_ids,
     )
 
     if not stacks:

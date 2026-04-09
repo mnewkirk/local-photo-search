@@ -850,6 +850,57 @@ class PhotoDB:
         """, (collection_id,)).fetchall()
         return [dict(r) for r in rows]
 
+    def get_collection_photo_ids(self, collection_id: int) -> list[int]:
+        """Get just the photo IDs in a collection (lightweight)."""
+        rows = self.conn.execute(
+            "SELECT photo_id FROM collection_photos WHERE collection_id = ? ORDER BY sort_order",
+            (collection_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def get_collection_photo_pairs(self, collection_id: int) -> list[tuple[int, str]]:
+        """Get (photo_id, absolute_path) pairs for photos in a collection.
+
+        Used by indexing commands to scope work to a specific collection.
+        Returns resolved absolute paths using photo_root.
+        """
+        rows = self.conn.execute("""
+            SELECT p.id, p.filepath
+            FROM collection_photos cp
+            JOIN photos p ON p.id = cp.photo_id
+            WHERE cp.collection_id = ?
+            ORDER BY cp.sort_order
+        """, (collection_id,)).fetchall()
+        return [(row["id"], self.resolve_filepath(row["filepath"])) for row in rows]
+
+    def expand_to_stacks(self, photo_ids: list[int]) -> list[int]:
+        """Given a list of photo IDs, expand to include all stack members.
+
+        Returns a deduplicated list of photo IDs that includes:
+        - All original photo_ids
+        - Any other photos that share a stack with any of the originals
+        """
+        if not photo_ids:
+            return []
+        result = set(photo_ids)
+        # Find stacks containing any of the given photos
+        for i in range(0, len(photo_ids), 500):
+            chunk = photo_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            stack_rows = self.conn.execute(
+                f"SELECT DISTINCT stack_id FROM stack_members WHERE photo_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            stack_ids = [r[0] for r in stack_rows]
+            if stack_ids:
+                sp = ",".join("?" * len(stack_ids))
+                member_rows = self.conn.execute(
+                    f"SELECT photo_id FROM stack_members WHERE stack_id IN ({sp})",
+                    stack_ids,
+                ).fetchall()
+                result.update(r[0] for r in member_rows)
+        return list(result)
+
     def get_photo_collections(self, photo_id: int) -> list[dict]:
         """Get all collections a photo belongs to."""
         rows = self.conn.execute("""

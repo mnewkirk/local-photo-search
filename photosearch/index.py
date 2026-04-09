@@ -84,8 +84,525 @@ def find_photos(directory: str) -> list[str]:
     return photos
 
 
+def _index_collection(
+    collection_id: int,
+    db_path: str = "photo_index.db",
+    batch_size: int = 8,
+    enable_clip: bool = True,
+    enable_colors: bool = True,
+    enable_faces: bool = False,
+    force_faces: bool = False,
+    force_clip: bool = False,
+    enable_describe: bool = False,
+    force_describe: bool = False,
+    describe_model: str = "llava",
+    enable_quality: bool = False,
+    force_quality: bool = False,
+    enable_tags: bool = False,
+    force_tags: bool = False,
+    enable_stacking: bool = True,
+    expand_stacks: bool = False,
+):
+    """Re-index photos that belong to a specific collection.
+
+    Photos are already in the database; this runs the selected processing
+    passes (CLIP, faces, quality, describe, etc.) over them.
+
+    Args:
+        expand_stacks: If True, also include other photos that share a
+            stack with any collection photo (e.g. 170 collection photos
+            might expand to 306 when burst members are included).
+    """
+    errors: list[str] = []
+
+    def _report_error(step: str, path: str, exc: Exception):
+        msg = f"[{step}] {os.path.basename(path)}: {exc}"
+        errors.append(msg)
+        print(f" ERROR: {exc}")
+
+    def _eta(t0: float, done: int, total: int) -> str:
+        if done == 0:
+            return ""
+        elapsed = time.time() - t0
+        rate = done / elapsed
+        remaining = (total - done) / rate if rate > 0 else 0
+        if remaining < 60:
+            return f" ~{remaining:.0f}s left"
+        elif remaining < 3600:
+            return f" ~{remaining / 60:.0f}m left"
+        else:
+            return f" ~{remaining / 3600:.1f}h left"
+
+    with PhotoDB(db_path) as db:
+        coll = db.get_collection(collection_id)
+        if not coll:
+            print(f"Collection {collection_id} not found.")
+            return
+
+        photo_pairs = db.get_collection_photo_pairs(collection_id)
+        if not photo_pairs:
+            print(f"Collection '{coll['name']}' (id={collection_id}) has no photos.")
+            return
+
+        base_count = len(photo_pairs)
+        if expand_stacks:
+            base_ids = [pid for pid, _ in photo_pairs]
+            expanded_ids = set(db.expand_to_stacks(base_ids))
+            # Add any newly-included photos not already in the pairs list
+            existing_ids = {pid for pid, _ in photo_pairs}
+            extra_ids = expanded_ids - existing_ids
+            if extra_ids:
+                placeholders = ",".join("?" * len(extra_ids))
+                rows = db.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders})",
+                    list(extra_ids),
+                ).fetchall()
+                for row in rows:
+                    photo_pairs.append((row["id"], db.resolve_filepath(row["filepath"])))
+
+        if expand_stacks and len(photo_pairs) > base_count:
+            print(f"Re-indexing collection '{coll['name']}' ({base_count} photos, "
+                  f"expanded to {len(photo_pairs)} with stacks)")
+        else:
+            print(f"Re-indexing collection '{coll['name']}' ({len(photo_pairs)} photos)")
+
+        # ── Reverse geocoding ──────────────────────────────────────
+        photo_id_set = {pid for pid, _ in photo_pairs}
+        if photo_id_set:
+            placeholders = ",".join("?" * len(photo_id_set))
+            ungeo = db.conn.execute(
+                f"SELECT id, gps_lat, gps_lon FROM photos "
+                f"WHERE id IN ({placeholders}) "
+                f"AND gps_lat IS NOT NULL AND gps_lon IS NOT NULL AND place_name IS NULL",
+                list(photo_id_set),
+            ).fetchall()
+            if ungeo:
+                from .geocode import reverse_geocode_batch
+                print(f"\nReverse geocoding {len(ungeo)} photo(s) with GPS data...")
+                db.begin_batch(batch_size=200)
+                coords = [(row["gps_lat"], row["gps_lon"]) for row in ungeo]
+                places = reverse_geocode_batch(coords)
+                geo_count = 0
+                for row, place in zip(ungeo, places):
+                    if place:
+                        db.update_photo(row["id"], place_name=place)
+                        geo_count += 1
+                db.end_batch()
+                print(f"  Geocoded {geo_count}/{len(ungeo)} photos.")
+
+        # ── CLIP embeddings ────────────────────────────────────────
+        if enable_clip:
+            if force_clip:
+                clip_ids = [pid for pid, _ in photo_pairs]
+                print(f"\nClearing CLIP embeddings for {len(clip_ids)} photos (--force-clip)...")
+                if clip_ids:
+                    placeholders = ",".join("?" * len(clip_ids))
+                    db.conn.execute(
+                        f"DELETE FROM clip_embeddings WHERE photo_id IN ({placeholders})",
+                        clip_ids,
+                    )
+                    db.conn.commit()
+                clip_candidates = list(photo_pairs)
+            else:
+                # Only photos missing embeddings
+                ids = [pid for pid, _ in photo_pairs]
+                photos_with_clip = set()
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    rows = db.conn.execute(
+                        f"SELECT photo_id FROM clip_embeddings WHERE photo_id IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                    photos_with_clip.update(row[0] for row in rows)
+                clip_candidates = [(pid, path) for pid, path in photo_pairs if pid not in photos_with_clip]
+
+            if clip_candidates:
+                print(f"\nGenerating CLIP embeddings for {len(clip_candidates)} photo(s) (batch_size={batch_size})...")
+                t0 = time.time()
+                paths = [p for _, p in clip_candidates]
+                embedded_count = 0
+                db.begin_batch(batch_size=100)
+                for idx, emb in embed_images_stream(paths, batch_size=batch_size):
+                    photo_id, path = clip_candidates[idx]
+                    try:
+                        db.add_clip_embedding(photo_id, emb)
+                        embedded_count += 1
+                    except Exception as e:
+                        _report_error("clip_store", path, e)
+                db.end_batch()
+                elapsed = time.time() - t0
+                print(f"  Embedded {embedded_count}/{len(clip_candidates)} photos in {elapsed:.1f}s")
+                unload_clip()
+                print("  CLIP model unloaded to free memory.")
+            else:
+                print("\nAll collection photos already have CLIP embeddings.")
+
+        # ── Dominant colors ────────────────────────────────────────
+        if enable_colors:
+            ids = [pid for pid, _ in photo_pairs]
+            placeholders = ",".join("?" * len(ids))
+            already = set(
+                r[0] for r in db.conn.execute(
+                    f"SELECT id FROM photos WHERE id IN ({placeholders}) AND dominant_colors IS NOT NULL",
+                    ids,
+                ).fetchall()
+            )
+            color_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already]
+            if color_candidates:
+                print(f"\nExtracting dominant colors for {len(color_candidates)} photo(s)...")
+                t0 = time.time()
+                db.begin_batch(batch_size=100)
+                color_count = 0
+                for i, (photo_id, path) in enumerate(color_candidates, 1):
+                    try:
+                        colors = extract_dominant_colors(path)
+                        if colors:
+                            db.update_photo(photo_id, dominant_colors=colors_to_json(colors))
+                            color_count += 1
+                    except Exception as e:
+                        _report_error("colors", path, e)
+                    if i % 500 == 0:
+                        print(f"  [{i}/{len(color_candidates)}] colors extracted...{_eta(t0, i, len(color_candidates))}")
+                db.end_batch()
+                elapsed = time.time() - t0
+                print(f"  Extracted colors for {color_count}/{len(color_candidates)} photos in {elapsed:.1f}s")
+
+        # ── Face detection ─────────────────────────────────────────
+        if enable_faces:
+            from .faces import detect_faces, cluster_encodings, check_available
+            try:
+                check_available()
+            except RuntimeError as e:
+                print(f"\nSkipping face detection: {e}")
+            else:
+                photo_id_set = {pid for pid, _ in photo_pairs}
+                if force_faces:
+                    print("\nClearing existing face data for collection photos...")
+                    for pid in photo_id_set:
+                        db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
+                    db.conn.commit()
+                    face_candidates = list(photo_pairs)
+                else:
+                    # Only photos without face data
+                    ids = list(photo_id_set)
+                    placeholders = ",".join("?" * len(ids))
+                    already_processed = set(
+                        r[0] for r in db.conn.execute(
+                            f"SELECT DISTINCT photo_id FROM faces WHERE photo_id IN ({placeholders})",
+                            ids,
+                        ).fetchall()
+                    )
+                    face_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already_processed]
+
+                total = len(face_candidates)
+                if total:
+                    print(f"\nDetecting faces in {total} photo(s)...")
+                    t0 = time.time()
+                    all_encodings = []
+                    all_face_ids = []
+                    db.begin_batch(batch_size=50)
+                    face_count = 0
+                    for idx, (photo_id, path) in enumerate(face_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            faces = detect_faces(path, use_cnn=False)
+                            elapsed_photo = time.time() - t_photo
+                            if faces:
+                                print(f" {len(faces)} face(s) ({elapsed_photo:.1f}s){_eta(t0, idx, total)}")
+                            else:
+                                print(f" no faces ({elapsed_photo:.1f}s)")
+                            for face in faces:
+                                face_id = db.add_face(
+                                    photo_id=photo_id,
+                                    bbox=face["bbox"],
+                                    encoding=face["encoding"],
+                                )
+                                all_encodings.append(face["encoding"])
+                                all_face_ids.append(face_id)
+                                face_count += 1
+                        except Exception as e:
+                            _report_error("faces", path, e)
+                    db.end_batch()
+                    elapsed = time.time() - t0
+                    print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
+
+                    if all_encodings:
+                        print("  Clustering faces...")
+                        cluster_ids = cluster_encodings(all_encodings)
+                        db.begin_batch(batch_size=200)
+                        for face_id, cluster_id in zip(all_face_ids, cluster_ids):
+                            db.conn.execute(
+                                "UPDATE faces SET cluster_id = ? WHERE id = ?",
+                                (cluster_id, face_id),
+                            )
+                        db.end_batch()
+                        n_clusters = len(set(cluster_ids))
+                        print(f"  Grouped into {n_clusters} cluster(s)")
+                else:
+                    print("\nAll collection photos already have face data.")
+
+        # ── LLaVA scene descriptions ───────────────────────────────
+        if enable_describe:
+            from .describe import describe_photo, check_available as desc_check
+            try:
+                desc_check(model=describe_model)
+            except RuntimeError as e:
+                print(f"\nSkipping descriptions: {e}")
+            else:
+                if force_describe:
+                    desc_candidates = list(photo_pairs)
+                    print(f"\nGenerating descriptions for {len(desc_candidates)} photo(s) (--force-describe)...")
+                else:
+                    ids = [pid for pid, _ in photo_pairs]
+                    placeholders = ",".join("?" * len(ids))
+                    already = set(
+                        r[0] for r in db.conn.execute(
+                            f"SELECT id FROM photos WHERE id IN ({placeholders}) AND description IS NOT NULL",
+                            ids,
+                        ).fetchall()
+                    )
+                    desc_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already]
+                    if desc_candidates:
+                        print(f"\nGenerating descriptions for {len(desc_candidates)} undescribed photo(s)...")
+                    else:
+                        print("\nAll collection photos already have descriptions.")
+
+                if desc_candidates:
+                    t0 = time.time()
+                    desc_count = 0
+                    total = len(desc_candidates)
+                    for idx, (photo_id, path) in enumerate(desc_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            desc = describe_photo(path, model=describe_model)
+                            elapsed_photo = time.time() - t_photo
+                            if desc:
+                                db.update_photo(photo_id, description=desc)
+                                db.conn.commit()
+                                preview = desc[:80].replace("\n", " ")
+                                print(f" ({elapsed_photo:.1f}s) {preview}...{_eta(t0, idx, total)}")
+                                desc_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no description")
+                        except Exception as e:
+                            _report_error("describe", path, e)
+                    elapsed = time.time() - t0
+                    print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
+
+        # ── Semantic tags ──────────────────────────────────────────
+        if enable_tags:
+            import json as _json
+            from .describe import tag_photo, check_available as tag_check
+            try:
+                tag_check(model=describe_model)
+            except RuntimeError as e:
+                print(f"\nSkipping tags: {e}")
+            else:
+                if force_tags:
+                    tag_candidates = list(photo_pairs)
+                    print(f"\nGenerating tags for {len(tag_candidates)} photo(s) (--force-tags)...")
+                else:
+                    ids = [pid for pid, _ in photo_pairs]
+                    placeholders = ",".join("?" * len(ids))
+                    already = set(
+                        r[0] for r in db.conn.execute(
+                            f"SELECT id FROM photos WHERE id IN ({placeholders}) AND tags IS NOT NULL",
+                            ids,
+                        ).fetchall()
+                    )
+                    tag_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already]
+                    if tag_candidates:
+                        print(f"\nGenerating tags for {len(tag_candidates)} untagged photo(s)...")
+                    else:
+                        print("\nAll collection photos already have tags.")
+
+                if tag_candidates:
+                    t0 = time.time()
+                    tag_count = 0
+                    total = len(tag_candidates)
+                    for idx, (photo_id, path) in enumerate(tag_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            tags = tag_photo(path, model=describe_model)
+                            elapsed_photo = time.time() - t_photo
+                            if tags:
+                                db.update_photo(photo_id, tags=_json.dumps(tags))
+                                db.conn.commit()
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(tags)}{_eta(t0, idx, total)}")
+                                tag_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no tags")
+                        except Exception as e:
+                            _report_error("tags", path, e)
+                    elapsed = time.time() - t0
+                    print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
+
+        # ── Aesthetic quality scoring + concept analysis ────────────
+        if enable_quality:
+            import json as _json
+            from .quality import (
+                score_photos_batch, analyze_photos_batch,
+                unload_models as unload_quality,
+            )
+
+            if force_quality:
+                quality_candidates = list(photo_pairs)
+                print(f"\nScoring aesthetic quality for {len(quality_candidates)} photo(s) (--force-quality)...")
+            else:
+                ids = [pid for pid, _ in photo_pairs]
+                placeholders = ",".join("?" * len(ids))
+                already = set(
+                    r[0] for r in db.conn.execute(
+                        f"SELECT id FROM photos WHERE id IN ({placeholders}) AND aesthetic_score IS NOT NULL",
+                        ids,
+                    ).fetchall()
+                )
+                quality_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already]
+                if quality_candidates:
+                    print(f"\nScoring aesthetic quality for {len(quality_candidates)} unscored photo(s)...")
+                else:
+                    print("\nAll collection photos already have aesthetic scores.")
+
+            if quality_candidates:
+                t0 = time.time()
+                paths = [p for _, p in quality_candidates]
+                scored_count = 0
+
+                from .quality import score_photos_stream as _score_stream
+                valid_scores = []
+                db.begin_batch(batch_size=100)
+                for idx, score in _score_stream(paths, batch_size=batch_size):
+                    photo_id = quality_candidates[idx][0]
+                    db.update_photo(photo_id, aesthetic_score=score)
+                    scored_count += 1
+                    valid_scores.append(score)
+                db.end_batch()
+
+                elapsed = time.time() - t0
+                print(f"  Scored {scored_count}/{len(quality_candidates)} photos in {elapsed:.1f}s")
+                if valid_scores:
+                    print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
+                          f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
+
+            # Concept analysis
+            if force_quality:
+                concept_candidates = quality_candidates if quality_candidates else []
+            else:
+                ids = [pid for pid, _ in photo_pairs]
+                placeholders = ",".join("?" * len(ids))
+                unconcept = db.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
+                    f"AND aesthetic_concepts IS NULL AND aesthetic_score IS NOT NULL",
+                    ids,
+                ).fetchall()
+                path_lookup = {pid: path for pid, path in photo_pairs}
+                concept_candidates = [(row["id"], path_lookup[row["id"]]) for row in unconcept
+                                      if row["id"] in path_lookup]
+
+            if concept_candidates:
+                print(f"\nAnalyzing aesthetic concepts for {len(concept_candidates)} photo(s)...")
+                t0 = time.time()
+                paths = [p for _, p in concept_candidates]
+                concept_count = 0
+
+                from .quality import analyze_photos_stream as _analyze_stream
+                db.begin_batch(batch_size=100)
+                for idx, concept_data in _analyze_stream(paths, batch_size=batch_size):
+                    photo_id = concept_candidates[idx][0]
+                    db.update_photo(photo_id, aesthetic_concepts=_json.dumps(concept_data))
+                    concept_count += 1
+                db.end_batch()
+
+                elapsed = time.time() - t0
+                print(f"  Analyzed concepts for {concept_count}/{len(concept_candidates)} photos in {elapsed:.1f}s")
+
+            unload_quality()
+
+        # ── Aesthetic critiques ─────────────────────────────────────
+        if enable_quality and enable_describe:
+            from .describe import critique_photo, check_available as desc_check
+            try:
+                desc_check(model=describe_model)
+            except RuntimeError as e:
+                print(f"\nSkipping aesthetic critiques: {e}")
+            else:
+                if force_quality:
+                    critique_candidates = quality_candidates if quality_candidates else []
+                else:
+                    ids = [pid for pid, _ in photo_pairs]
+                    placeholders = ",".join("?" * len(ids))
+                    uncritiqued = db.conn.execute(
+                        f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
+                        f"AND aesthetic_critique IS NULL AND aesthetic_score IS NOT NULL",
+                        ids,
+                    ).fetchall()
+                    path_lookup = {pid: path for pid, path in photo_pairs}
+                    critique_candidates = [(row["id"], path_lookup[row["id"]]) for row in uncritiqued
+                                           if row["id"] in path_lookup]
+
+                if critique_candidates:
+                    print(f"\nGenerating aesthetic critiques for {len(critique_candidates)} photo(s)...")
+                    t0 = time.time()
+                    db.begin_batch(batch_size=20)
+                    crit_count = 0
+                    total = len(critique_candidates)
+                    for idx, (photo_id, path) in enumerate(critique_candidates, 1):
+                        fname = os.path.basename(path)
+                        print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            critique = critique_photo(path, model=describe_model)
+                            elapsed_photo = time.time() - t_photo
+                            if critique:
+                                db.update_photo(photo_id, aesthetic_critique=critique)
+                                preview = critique[:80].replace("\n", " ")
+                                print(f" ({elapsed_photo:.1f}s) {preview}...{_eta(t0, idx, total)}")
+                                crit_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no critique")
+                        except Exception as e:
+                            _report_error("critique", path, e)
+                    db.end_batch()
+                    elapsed = time.time() - t0
+                    print(f"  Generated {crit_count}/{total} critiques in {elapsed:.1f}s")
+                else:
+                    print("\nAll scored collection photos already have aesthetic critiques.")
+
+        # ── Stacking ───────────────────────────────────────────────
+        if enable_stacking and enable_clip:
+            print("\n── Photo stacking ──")
+            try:
+                from .stacking import run_stacking
+                # For collection mode, pass photo_ids to scope stacking
+                stacks = run_stacking(db, photo_ids=[pid for pid, _ in photo_pairs])
+                if stacks:
+                    total_stacked = sum(len(s) for s in stacks)
+                    print(f"  Detected {len(stacks)} stacks ({total_stacked} photos)")
+                else:
+                    print("  No stacks detected.")
+            except Exception as e:
+                print(f"  Stacking failed: {e}")
+                errors.append(f"stacking: {e}")
+
+        # Summary
+        print(f"\nDone! Database: {db_path} ({db.photo_count()} total photos)")
+        if errors:
+            print(f"\n{len(errors)} error(s) during indexing:")
+            for err in errors[:20]:
+                print(f"  - {err}")
+            if len(errors) > 20:
+                print(f"  ... and {len(errors) - 20} more.")
+
+
 def index_directory(
-    photo_dir: str,
+    photo_dir: str = None,
     db_path: str = "photo_index.db",
     batch_size: int = 8,
     skip_existing: bool = True,
@@ -102,14 +619,20 @@ def index_directory(
     enable_tags: bool = False,
     force_tags: bool = False,
     enable_stacking: bool = True,
+    collection_id: int = None,
+    expand_stacks: bool = False,
 ):
-    """Index all photos in a directory.
+    """Index photos from a directory or a collection.
+
+    When photo_dir is given, scans the directory for new photos and indexes them.
+    When collection_id is given, re-indexes existing photos in that collection
+    (skips EXIF/insert since photos are already in the DB).
 
     Steps per photo:
-      1. Extract EXIF metadata
-      2. Check for ARW raw pair
-      3. Compute file hash
-      4. Insert into database
+      1. Extract EXIF metadata (directory mode only)
+      2. Check for ARW raw pair (directory mode only)
+      3. Compute file hash (directory mode only)
+      4. Insert into database (directory mode only)
       5. Generate CLIP embedding (if enable_clip)
       6. Extract dominant colors (if enable_colors)
       7. Detect and encode faces (if enable_faces)
@@ -117,7 +640,7 @@ def index_directory(
       9. Aesthetic quality scoring (if enable_quality)
 
     Args:
-        photo_dir: Directory to scan for photos.
+        photo_dir: Directory to scan for photos. Required unless collection_id is set.
         db_path: Path to SQLite database file.
         batch_size: Batch size for CLIP embedding.
         skip_existing: If True, skip photos already in the database.
@@ -135,7 +658,37 @@ def index_directory(
         force_quality: If True, rescore all photos (even those already scored).
         enable_tags: If True, generate semantic category tags via Ollama.
         force_tags: If True, regenerate tags for all photos (even those already tagged).
+        collection_id: If set, re-index photos in this collection instead of scanning a directory.
     """
+
+    # ── Collection mode: photos are already in the DB ──────────────
+    if collection_id is not None:
+        if photo_dir is not None:
+            raise ValueError("Cannot specify both photo_dir and collection_id")
+        return _index_collection(
+            collection_id=collection_id,
+            db_path=db_path,
+            batch_size=batch_size,
+            enable_clip=enable_clip,
+            enable_colors=enable_colors,
+            enable_faces=enable_faces,
+            force_faces=force_faces,
+            force_clip=force_clip,
+            enable_describe=enable_describe,
+            force_describe=force_describe,
+            describe_model=describe_model,
+            enable_quality=enable_quality,
+            force_quality=force_quality,
+            enable_tags=enable_tags,
+            force_tags=force_tags,
+            enable_stacking=enable_stacking,
+            expand_stacks=expand_stacks,
+        )
+
+    # ── Directory mode (original behaviour) ────────────────────────
+    if photo_dir is None:
+        raise ValueError("Must specify either photo_dir or collection_id")
+
     photo_dir = str(Path(photo_dir).resolve())
     photos = find_photos(photo_dir)
 

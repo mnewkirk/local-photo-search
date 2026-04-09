@@ -487,7 +487,8 @@ class TestReviewAPI:
         data = resp.json()
         assert isinstance(data["folders"], list)
         assert len(data["folders"]) >= 1
-        assert "2026/march" in data["folders"]
+        folder_paths = [f["path"] for f in data["folders"]]
+        assert "2026/march" in folder_paths
 
     def test_review_load_empty(self, client):
         resp = client.get("/api/review/load", params={"directory": "/nonexistent"})

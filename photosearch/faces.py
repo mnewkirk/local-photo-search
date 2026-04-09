@@ -364,11 +364,19 @@ def cluster_encodings(
 def match_faces_to_persons(
     db,
     tolerance: float = MATCH_TOLERANCE,
+    photo_ids: list[int] | None = None,
 ) -> int:
-    """Match all unassigned faces in the database against all known person references.
+    """Match unassigned faces against all known person references.
 
     Loads reference encodings from the vector table, then for each unassigned
     face finds the closest reference within tolerance and assigns the person_id.
+
+    Args:
+        db: PhotoDB instance.
+        tolerance: L2 distance threshold.
+        photo_ids: If set, only match faces belonging to these photo IDs
+            (e.g. from a collection).
+
     Returns the number of faces matched.
     """
     check_available()
@@ -402,10 +410,22 @@ def match_faces_to_persons(
     person_ids = [r[0] for r in ref_data]
     ref_encodings = [r[2] for r in ref_data]
 
-    # All faces not yet assigned to a person
-    face_rows = db.conn.execute(
-        "SELECT id FROM faces WHERE person_id IS NULL"
-    ).fetchall()
+    # All faces not yet assigned to a person, optionally scoped to collection photos
+    if photo_ids is not None:
+        face_rows = []
+        for i in range(0, len(photo_ids), 500):
+            chunk = photo_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            face_rows.extend(
+                db.conn.execute(
+                    f"SELECT id FROM faces WHERE person_id IS NULL AND photo_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            )
+    else:
+        face_rows = db.conn.execute(
+            "SELECT id FROM faces WHERE person_id IS NULL"
+        ).fetchall()
 
     if not face_rows:
         print("  All faces already matched.")
@@ -455,6 +475,7 @@ def match_faces_temporal(
     temporal_tolerance: float = TEMPORAL_TOLERANCE,
     min_gap: float = TEMPORAL_MIN_GAP,
     window_minutes: int = TEMPORAL_WINDOW_MINUTES,
+    photo_ids: list[int] | None = None,
 ) -> int:
     """Propagate person identities to nearby unmatched faces using EXIF timestamps.
 
@@ -532,12 +553,27 @@ def match_faces_temporal(
                     pass
 
     # ---- Process unmatched faces ----
-    face_rows = db.conn.execute(
-        """SELECT f.id, ph.date_taken
-           FROM faces f
-           JOIN photos ph ON ph.id = f.photo_id
-           WHERE f.person_id IS NULL"""
-    ).fetchall()
+    if photo_ids is not None:
+        face_rows = []
+        for i in range(0, len(photo_ids), 500):
+            chunk = photo_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            face_rows.extend(
+                db.conn.execute(
+                    f"""SELECT f.id, ph.date_taken
+                        FROM faces f
+                        JOIN photos ph ON ph.id = f.photo_id
+                        WHERE f.person_id IS NULL AND f.photo_id IN ({placeholders})""",
+                    chunk,
+                ).fetchall()
+            )
+    else:
+        face_rows = db.conn.execute(
+            """SELECT f.id, ph.date_taken
+               FROM faces f
+               JOIN photos ph ON ph.id = f.photo_id
+               WHERE f.person_id IS NULL"""
+        ).fetchall()
     if not face_rows:
         return 0
 

@@ -57,6 +57,7 @@ def detect_stacks(
     clip_threshold: float = 0.05,
     directory: str | None = None,
     max_stack_span_sec: float = 10.0,
+    photo_ids: list[int] | None = None,
 ) -> list[list[int]]:
     """Detect photo stacks based on temporal proximity + CLIP similarity.
 
@@ -81,6 +82,8 @@ def detect_stacks(
             starts with this directory.
         max_stack_span_sec: Hard cap on total span of a stack — all members
             must be within this many seconds of the earliest member.
+        photo_ids: If set, only consider these specific photo IDs
+            (e.g. from a collection). Mutually exclusive with directory.
 
     Returns:
         List of stacks, where each stack is a list of photo IDs
@@ -93,13 +96,19 @@ def detect_stacks(
         "ORDER BY date_taken"
     ).fetchall()
 
+    photo_id_set = set(photo_ids) if photo_ids else None
+
     photos = []
     for r in rows:
         dt = _parse_date(r["date_taken"])
         if dt is None:
             continue
+        # Optional photo_ids filter (collection mode)
+        if photo_id_set is not None:
+            if r["id"] not in photo_id_set:
+                continue
         # Optional directory filter
-        if directory:
+        elif directory:
             abs_path = db.resolve_filepath(r["filepath"])
             if not abs_path or not abs_path.startswith(directory.rstrip("/") + "/"):
                 continue
@@ -240,6 +249,7 @@ def run_stacking(
     directory: str | None = None,
     dry_run: bool = False,
     max_stack_span_sec: float = 10.0,
+    photo_ids: list[int] | None = None,
 ) -> list[list[int]]:
     """Full stacking pipeline: detect + save.
 
@@ -250,11 +260,13 @@ def run_stacking(
         directory: Restrict to photos in this directory.
         dry_run: If True, detect but don't save to DB.
         max_stack_span_sec: Hard cap on total time span of a stack.
+        photo_ids: Restrict to these specific photo IDs (e.g. from a collection).
 
     Returns:
         List of detected stacks (each a list of photo IDs, best first).
     """
-    stacks = detect_stacks(db, time_window_sec, clip_threshold, directory, max_stack_span_sec)
+    stacks = detect_stacks(db, time_window_sec, clip_threshold, directory,
+                           max_stack_span_sec, photo_ids=photo_ids)
     if not dry_run and stacks:
         save_stacks(db, stacks)
     return stacks
