@@ -444,11 +444,25 @@
     }, [onClose, onPrev, onNext]);
 
     // ---- Touch swipe navigation (mobile) ----
+    // Attach to the modal overlay element (via ref) so swipes are scoped to the
+    // modal and don't compete with Safari's edge-swipe back gesture.
+    var overlayRef = useRef(null);
     var touchRef = useRef(null);
     useEffect(function () {
+      var el = overlayRef.current;
+      if (!el) return;
       var onTouchStart = function (ev) {
         var t = ev.touches[0];
         touchRef.current = { x: t.clientX, y: t.clientY };
+      };
+      var onTouchMove = function (ev) {
+        // Once we detect a horizontal swipe, prevent vertical scroll so the
+        // gesture feels intentional and the page doesn't bounce.
+        if (!touchRef.current) return;
+        var t = ev.touches[0];
+        var dx = Math.abs(t.clientX - touchRef.current.x);
+        var dy = Math.abs(t.clientY - touchRef.current.y);
+        if (dx > 10 && dx > dy) ev.preventDefault();
       };
       var onTouchEnd = function (ev) {
         if (!touchRef.current) return;
@@ -461,11 +475,13 @@
         if (dx < 0 && onNext) onNext();   // swipe left → next
         if (dx > 0 && onPrev) onPrev();   // swipe right → prev
       };
-      window.addEventListener('touchstart', onTouchStart, { passive: true });
-      window.addEventListener('touchend', onTouchEnd, { passive: true });
+      el.addEventListener('touchstart', onTouchStart, { passive: true });
+      el.addEventListener('touchmove', onTouchMove, { passive: false });
+      el.addEventListener('touchend', onTouchEnd, { passive: true });
       return function () {
-        window.removeEventListener('touchstart', onTouchStart);
-        window.removeEventListener('touchend', onTouchEnd);
+        el.removeEventListener('touchstart', onTouchStart);
+        el.removeEventListener('touchmove', onTouchMove);
+        el.removeEventListener('touchend', onTouchEnd);
       };
     }, [onPrev, onNext]);
 
@@ -727,7 +743,7 @@
     }
 
     // ===== Main render =====
-    return e('div', { className: 'modal-overlay', onClick: function (ev) {
+    return e('div', { className: 'modal-overlay', ref: overlayRef, onClick: function (ev) {
       if (ev.target === ev.currentTarget) onClose();
     } },
       e('button', { className: 'modal-close', onClick: onClose }, '\u00D7'),
