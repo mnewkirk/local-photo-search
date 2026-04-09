@@ -1939,7 +1939,12 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--ttl", default=30, show_default=True, help="Claim TTL in minutes.")
 @click.option("--one-shot", is_flag=True, help="Process one batch per pass and exit (don't loop).")
 @click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection).")
-def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one_shot, force):
+@click.option("--describe-model", default="llava", show_default=True,
+              help="Ollama model for descriptions and tags.")
+@click.option("--verify-model", default="minicpm-v", show_default=True,
+              help="Ollama model for hallucination verification.")
+def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one_shot, force,
+           describe_model, verify_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -1955,13 +1960,19 @@ def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one
       # Run CLIP + quality scoring:
       python cli.py worker -s http://nas.local:8000 -p clip,quality
 
+      # Run descriptions with moondream model:
+      python cli.py worker -s http://nas.local:8000 -p describe --describe-model moondream
+
+      # Run full pipeline including verification:
+      python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tags,verify
+
       # Quick test — one batch only:
       python cli.py worker -s http://localhost:8000 -p clip --collection 3 --one-shot
     """
     from photosearch.worker import run_worker
 
     pass_list = [p.strip() for p in passes.split(",")]
-    valid_passes = {"clip", "faces", "quality", "describe", "tags"}
+    valid_passes = {"clip", "faces", "quality", "describe", "tags", "verify"}
     for p in pass_list:
         if p not in valid_passes:
             click.echo(f"Error: unknown pass type '{p}'. Valid: {', '.join(sorted(valid_passes))}", err=True)
@@ -1976,6 +1987,8 @@ def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one
         ttl_minutes=ttl,
         one_shot=one_shot,
         force=force,
+        describe_model=describe_model,
+        verify_model=verify_model,
     )
 
 

@@ -1245,6 +1245,26 @@ class PhotoDB:
                     f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
                     (limit + len(claimed),),
                 ).fetchall()
+        elif pass_type == "verify":
+            # Photos that have a description but haven't been verified yet
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE id IN ({placeholders})
+                        AND description IS NOT NULL
+                        AND verified_at IS NULL
+                        LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """SELECT id, filepath FROM photos
+                       WHERE description IS NOT NULL
+                       AND verified_at IS NULL
+                       LIMIT ?""",
+                    (limit + len(claimed),),
+                ).fetchall()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")
 

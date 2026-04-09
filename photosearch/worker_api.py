@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from .db import PhotoDB, _serialize_float_list
+from .db import PhotoDB, _serialize_float_list, _deserialize_float_list, CLIP_DIMENSIONS
 
 logger = logging.getLogger("photosearch.worker_api")
 
@@ -84,6 +84,15 @@ class TagsResult(BaseModel):
     tags: list[str]
 
 
+class VerifyResult(BaseModel):
+    photo_id: int
+    status: str  # 'pass', 'regenerated'
+    verified_at: str
+    hallucination_flags: Optional[str] = None  # JSON string
+    description: Optional[str] = None  # regenerated description
+    tags: Optional[list[str]] = None  # regenerated tags
+
+
 class SubmitRequest(BaseModel):
     batch_id: str
     pass_type: str
@@ -92,6 +101,7 @@ class SubmitRequest(BaseModel):
     quality_results: Optional[list[QualityResult]] = None
     describe_results: Optional[list[DescribeResult]] = None
     tags_results: Optional[list[TagsResult]] = None
+    verify_results: Optional[list[VerifyResult]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +255,26 @@ def submit_results(req: SubmitRequest):
                 except Exception as e:
                     logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
 
+        elif req.pass_type == "verify" and req.verify_results:
+            for r in req.verify_results:
+                try:
+                    updates = {
+                        "verified_at": r.verified_at,
+                        "verification_status": r.status,
+                        "hallucination_flags": r.hallucination_flags,
+                    }
+                    # If hallucinations were found and descriptions regenerated
+                    if r.description:
+                        updates["description"] = r.description
+                    if r.tags:
+                        updates["tags"] = json.dumps(r.tags)
+                    db.update_photo(r.photo_id, **updates)
+                    db.conn.commit()
+                    written += 1
+                    processed_photo_ids.append(r.photo_id)
+                except Exception as e:
+                    logger.warning(f"Failed to store verify for photo {r.photo_id}: {e}")
+
         # Release the claim
         db.release_claim(req.batch_id)
 
@@ -320,11 +350,51 @@ def clear_pass(req: ClearPassRequest):
                 f"UPDATE photos SET tags = NULL WHERE id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+        elif req.pass_type == "verify":
+            cur = db.conn.execute(
+                f"UPDATE photos SET verified_at = NULL, verification_status = NULL, "
+                f"hallucination_flags = NULL WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
         else:
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
         db.conn.commit()
         return {"status": "ok", "pass_type": req.pass_type, "cleared": cleared, "photo_count": len(photo_ids)}
+
+
+@router.get("/photo-detail/{photo_id}")
+def photo_detail(photo_id: int):
+    """Get photo metadata + CLIP embedding for verify pass.
+
+    Returns description, tags, and CLIP embedding so the worker can
+    run hallucination verification without needing the full DB.
+    """
+    with _get_db() as db:
+        photo = db.get_photo(photo_id)
+        if not photo:
+            raise HTTPException(404, f"Photo {photo_id} not found")
+
+        # Fetch CLIP embedding if available
+        clip_embedding = None
+        try:
+            row = db.conn.execute(
+                "SELECT embedding FROM clip_embeddings WHERE photo_id = ?",
+                (photo_id,),
+            ).fetchone()
+            if row:
+                clip_embedding = list(_deserialize_float_list(row["embedding"], CLIP_DIMENSIONS))
+        except Exception:
+            pass  # sqlite-vec not loaded or no embedding
+
+        return {
+            "id": photo["id"],
+            "description": photo.get("description"),
+            "tags": photo.get("tags"),
+            "clip_embedding": clip_embedding,
+            "verified_at": photo.get("verified_at"),
+            "verification_status": photo.get("verification_status"),
+        }
 
 
 @router.get("/status")
@@ -357,7 +427,7 @@ def worker_status(collection_id: Optional[int] = None):
             scope_ids = db.get_collection_photo_ids(collection_id)
 
         queue = {}
-        for pass_type in ("clip", "faces", "quality", "describe", "tags"):
+        for pass_type in ("clip", "faces", "quality", "describe", "tags", "verify"):
             unprocessed = db.get_unprocessed_photos(pass_type, photo_ids=scope_ids, limit=100000)
             queue[pass_type] = len(unprocessed)
 

@@ -102,6 +102,17 @@ class WorkerClient:
         r.raise_for_status()
         return r.json()
 
+    def get_photo_detail(self, photo_id: int) -> Optional[dict]:
+        """Get photo metadata + CLIP embedding for verify pass."""
+        r = self.session.get(
+            f"{self.server_url}/api/worker/photo-detail/{photo_id}",
+            timeout=30,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
 
 def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> list[tuple[dict, str]]:
     """Download photos to temp_dir. Returns [(photo_info, local_path)] for successful downloads."""
@@ -187,6 +198,207 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
     return results
 
 
+def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llava") -> list[dict]:
+    """Generate scene descriptions via Ollama. Returns list of {photo_id, description}."""
+    from .describe import describe_photo, check_available
+    check_available(model)
+
+    results = []
+    total = len(downloaded)
+    for idx, (photo_info, path) in enumerate(downloaded, 1):
+        fname = photo_info["filename"]
+        print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
+        t0 = time.time()
+        try:
+            desc = describe_photo(path, model=model)
+            elapsed = time.time() - t0
+            if desc:
+                preview = desc[:80].replace("\n", " ")
+                print(f" ({elapsed:.1f}s) {preview}...")
+                results.append({"photo_id": photo_info["id"], "description": desc})
+            else:
+                print(f" ({elapsed:.1f}s) no description")
+        except Exception as e:
+            print(f" ERROR: {e}")
+    return results
+
+
+def _process_tags(downloaded: list[tuple[dict, str]], model: str = "llava") -> list[dict]:
+    """Generate semantic tags via Ollama. Returns list of {photo_id, tags: [...]}."""
+    from .describe import tag_photo, check_available
+    check_available(model)
+
+    results = []
+    total = len(downloaded)
+    for idx, (photo_info, path) in enumerate(downloaded, 1):
+        fname = photo_info["filename"]
+        print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
+        t0 = time.time()
+        try:
+            tags = tag_photo(path, model=model)
+            elapsed = time.time() - t0
+            if tags:
+                print(f" ({elapsed:.1f}s) {', '.join(tags)}")
+                results.append({"photo_id": photo_info["id"], "tags": tags})
+            else:
+                print(f" ({elapsed:.1f}s) no tags")
+        except Exception as e:
+            print(f" ERROR: {e}")
+    return results
+
+
+def _process_verify(
+    downloaded: list[tuple[dict, str]],
+    client: "WorkerClient",
+    verify_model: str = "minicpm-v",
+    regen_model: str = "llava",
+) -> list[dict]:
+    """Run hallucination verification on downloaded photos.
+
+    This is more complex than other passes because it needs:
+    1. The photo's existing CLIP embedding (from NAS DB, via API)
+    2. The photo's existing description and tags (from NAS DB, via API)
+    3. Local Ollama for LLM verification
+    4. Local CLIP for cross-checking
+
+    Returns list of {photo_id, status, description, tags, verified_at, ...}
+    """
+    from .describe import check_available as desc_check
+    desc_check(verify_model)
+
+    results = []
+    total = len(downloaded)
+    for idx, (photo_info, path) in enumerate(downloaded, 1):
+        fname = photo_info["filename"]
+        pid = photo_info["id"]
+        print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
+        t0 = time.time()
+
+        try:
+            # Fetch photo detail from server (includes description, tags, CLIP embedding)
+            detail = client.get_photo_detail(pid)
+            if not detail:
+                print(f" could not fetch detail")
+                continue
+
+            description = detail.get("description") or ""
+            tags_raw = detail.get("tags")
+            tags = json.loads(tags_raw) if tags_raw and isinstance(tags_raw, str) else (tags_raw or [])
+            clip_embedding = detail.get("clip_embedding")
+
+            if not description and not tags:
+                print(f" no description/tags to verify")
+                results.append({
+                    "photo_id": pid,
+                    "status": "pass",
+                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "hallucination_flags": None,
+                })
+                continue
+
+            # Pass 1: CLIP scoring
+            clip_flags = []
+            if clip_embedding:
+                from .verify import clip_score_description, clip_score_tags, _flag_by_clip
+                desc_scores = clip_score_description(clip_embedding, description) if description else []
+                tag_scores = clip_score_tags(clip_embedding, tags) if tags else []
+                desc_flagged, tag_flagged, all_clip_items = _flag_by_clip(
+                    desc_scores, tag_scores, clip_threshold=0.18
+                )
+                clip_flags = [item for item in all_clip_items
+                              if any(f.get("noun") == item.get("noun") for f in desc_flagged)
+                              or any(f.get("tag") == item.get("tag") for f in tag_flagged)]
+
+                if not desc_flagged and not tag_flagged:
+                    elapsed = time.time() - t0
+                    print(f" ({elapsed:.1f}s) pass (CLIP clean)")
+                    results.append({
+                        "photo_id": pid,
+                        "status": "pass",
+                        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
+                    })
+                    continue
+
+            # Pass 2: LLM verification
+            from .verify import llm_verify_description
+            confirmed = llm_verify_description(path, description, tags, model=verify_model)
+
+            if not confirmed:
+                elapsed = time.time() - t0
+                print(f" ({elapsed:.1f}s) pass (LLM cleared)")
+                results.append({
+                    "photo_id": pid,
+                    "status": "pass",
+                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
+                })
+                continue
+
+            # Pass 3: CLIP cross-check on LLM findings
+            import numpy as np
+            verified_confirmed = confirmed
+            if clip_embedding:
+                from .clip_embed import embed_text
+                photo_vec = np.array(clip_embedding, dtype=np.float32)
+                desc_scores_sims = [s["similarity"] for s in desc_scores] + [s["similarity"] for s in tag_scores]
+                median_sim = float(np.median(desc_scores_sims)) if desc_scores_sims else 0.0
+
+                verified_confirmed = []
+                for item in confirmed:
+                    text_emb = embed_text(f"a photo of {item['noun']}")
+                    if text_emb is not None:
+                        text_vec = np.array(text_emb, dtype=np.float32)
+                        sim = float(np.dot(photo_vec, text_vec))
+                        if sim >= median_sim:
+                            continue  # CLIP overrides LLM
+                    verified_confirmed.append(item)
+
+            if not verified_confirmed:
+                elapsed = time.time() - t0
+                print(f" ({elapsed:.1f}s) pass (CLIP override)")
+                results.append({
+                    "photo_id": pid,
+                    "status": "pass",
+                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
+                })
+                continue
+
+            # Hallucinations confirmed — regenerate
+            confirmed_nouns = {c["noun"] for c in verified_confirmed}
+            elapsed = time.time() - t0
+            print(f" ({elapsed:.1f}s) FAIL — {', '.join(confirmed_nouns)}")
+
+            from .describe import describe_photo as _describe, tag_photo as _tag, DESCRIBE_PROMPT
+            strict_prompt = DESCRIBE_PROMPT + (
+                "\n\nIMPORTANT: A previous description was found to contain "
+                "hallucinated objects. Be extra careful to ONLY describe what you "
+                "can clearly see. Do NOT mention: "
+                + ", ".join(sorted(confirmed_nouns)) + "."
+            )
+            new_desc = _describe(path, model=regen_model, prompt=strict_prompt)
+            new_tags = _tag(path, model=regen_model)
+
+            result = {
+                "photo_id": pid,
+                "status": "regenerated",
+                "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "hallucination_flags": json.dumps(
+                    [{"noun": n, "llm_says": "NO"} for n in confirmed_nouns]
+                ),
+            }
+            if new_desc:
+                result["description"] = new_desc
+            if new_tags:
+                result["tags"] = new_tags
+            results.append(result)
+
+        except Exception as e:
+            print(f" ERROR: {e}")
+    return results
+
+
 def run_worker(
     server: str,
     passes: list[str],
@@ -196,18 +408,22 @@ def run_worker(
     ttl_minutes: int = 30,
     one_shot: bool = False,
     force: bool = False,
+    describe_model: str = "llava",
+    verify_model: str = "minicpm-v",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
     Args:
         server: NAS server URL (e.g. http://nas.local:8000)
-        passes: List of pass types to process (clip, faces, quality)
+        passes: List of pass types to process (clip, faces, quality, describe, tags, verify)
         collection_id: Optional collection to scope work to
         batch_size: Number of photos to claim per batch
         model_batch_size: Batch size for model inference
         ttl_minutes: Claim TTL in minutes
         one_shot: If True, process one batch per pass and exit
         force: If True, clear existing data and re-process from scratch
+        describe_model: Ollama model for descriptions/tags (default: llava)
+        verify_model: Ollama model for verification (default: minicpm-v)
     """
     print(f"Connecting to {server}...")
     client = WorkerClient(server)
@@ -291,6 +507,18 @@ def run_worker(
                 elif pass_type == "faces":
                     results = _process_faces(downloaded)
                     kwargs = {"face_results": results}
+                elif pass_type == "describe":
+                    results = _process_describe(downloaded, model=describe_model)
+                    kwargs = {"describe_results": results}
+                elif pass_type == "tags":
+                    results = _process_tags(downloaded, model=describe_model)
+                    kwargs = {"tags_results": results}
+                elif pass_type == "verify":
+                    results = _process_verify(
+                        downloaded, client=client,
+                        verify_model=verify_model, regen_model=describe_model,
+                    )
+                    kwargs = {"verify_results": results}
                 else:
                     print(f"  Pass type '{pass_type}' not yet implemented in worker.")
                     continue
