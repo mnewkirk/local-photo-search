@@ -161,6 +161,7 @@ def submit_results(req: SubmitRequest):
             raise HTTPException(410, f"Claim {req.batch_id} expired or does not exist")
 
         written = 0
+        processed_photo_ids = []
 
         if req.pass_type == "clip" and req.clip_results:
             db.begin_batch(batch_size=100)
@@ -168,16 +169,18 @@ def submit_results(req: SubmitRequest):
                 try:
                     db.add_clip_embedding(r.photo_id, r.embedding)
                     written += 1
+                    processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store CLIP for photo {r.photo_id}: {e}")
             db.end_batch()
 
-        elif req.pass_type == "faces" and req.face_results:
-            from .faces import cluster_encodings
-            db.begin_batch(batch_size=50)
+        elif req.pass_type == "faces":
+            face_results = req.face_results or []
             all_encodings = []
             all_face_ids = []
-            for r in req.face_results:
+            db.begin_batch(batch_size=50)
+            for r in face_results:
+                processed_photo_ids.append(r.photo_id)
                 for face in r.faces:
                     try:
                         face_id = db.add_face(
@@ -194,6 +197,7 @@ def submit_results(req: SubmitRequest):
 
             # Cluster the new faces
             if all_encodings:
+                from .faces import cluster_encodings
                 cluster_ids = cluster_encodings(all_encodings)
                 db.begin_batch(batch_size=200)
                 for face_id, cluster_id in zip(all_face_ids, cluster_ids):
@@ -202,6 +206,10 @@ def submit_results(req: SubmitRequest):
                         (cluster_id, face_id),
                     )
                 db.end_batch()
+
+            # Mark all submitted photos as processed (including those with no faces)
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "faces")
 
         elif req.pass_type == "quality" and req.quality_results:
             db.begin_batch(batch_size=100)
@@ -212,6 +220,7 @@ def submit_results(req: SubmitRequest):
                         updates["aesthetic_concepts"] = r.aesthetic_concepts
                     db.update_photo(r.photo_id, **updates)
                     written += 1
+                    processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store quality for photo {r.photo_id}: {e}")
             db.end_batch()
@@ -222,6 +231,7 @@ def submit_results(req: SubmitRequest):
                     db.update_photo(r.photo_id, description=r.description)
                     db.conn.commit()
                     written += 1
+                    processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
 
@@ -231,13 +241,19 @@ def submit_results(req: SubmitRequest):
                     db.update_photo(r.photo_id, tags=json.dumps(r.tags))
                     db.conn.commit()
                     written += 1
+                    processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
 
         # Release the claim
         db.release_claim(req.batch_id)
 
-        return {"status": "ok", "written": written, "batch_id": req.batch_id}
+        return {
+            "status": "ok",
+            "written": written,
+            "processed": len(processed_photo_ids),
+            "batch_id": req.batch_id,
+        }
 
 
 @router.get("/status")

@@ -279,8 +279,13 @@ def run_worker(
                 # Submit
                 print(f"  Submitting results...")
                 resp = client.submit_results(batch_id, pass_type, **kwargs)
-                print(f"  Server wrote {resp['written']} results.")
-                total_processed += resp["written"]
+                n_written = resp.get("written", 0)
+                n_processed = resp.get("processed", n_written)
+                if pass_type == "faces":
+                    print(f"  Server processed {n_processed} photos ({n_written} faces found).")
+                else:
+                    print(f"  Server wrote {n_written} results.")
+                total_processed += n_processed
 
                 # Cleanup temp files
                 shutil.rmtree(batch_temp, ignore_errors=True)

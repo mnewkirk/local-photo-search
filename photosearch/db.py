@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -404,6 +404,18 @@ class PhotoDB:
                 photo_ids TEXT NOT NULL,
                 claimed_at TEXT DEFAULT (datetime('now')),
                 expires_at TEXT NOT NULL
+            )
+        """)
+
+        # Worker processed — tracks which (photo, pass) combos are done.
+        # Needed because some passes (e.g. faces) produce no rows for photos
+        # with no results, so we can't use "has rows in X" as a processed check.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS worker_processed (
+                photo_id INTEGER NOT NULL,
+                pass_type TEXT NOT NULL,
+                processed_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (photo_id, pass_type)
             )
         """)
 
@@ -1140,6 +1152,19 @@ class PhotoDB:
         self.conn.execute("DELETE FROM worker_claims WHERE batch_id = ?", (batch_id,))
         self.conn.commit()
 
+    def mark_processed(self, photo_ids: list[int], pass_type: str):
+        """Record that these photos have been processed for the given pass type.
+
+        Used for passes like 'faces' where a no-result outcome produces no DB rows,
+        so we need an explicit record to avoid re-processing.
+        """
+        for pid in photo_ids:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO worker_processed (photo_id, pass_type) VALUES (?, ?)",
+                (pid, pass_type),
+            )
+        self.conn.commit()
+
     def get_claimed_photo_ids(self, pass_type: str) -> set[int]:
         """Return the set of photo IDs currently claimed for a pass type."""
         self.expire_worker_claims()
@@ -1162,7 +1187,11 @@ class PhotoDB:
         """
         claimed = self.get_claimed_photo_ids(pass_type)
 
-        # Build the "missing" condition per pass type
+        # Build the "missing" condition per pass type.
+        # For faces, we check worker_processed because photos with no faces
+        # produce no rows in the faces table (can't distinguish unprocessed
+        # from processed-with-no-results). Other passes store NULL → value
+        # in photos columns, so we can check IS NULL directly.
         if pass_type == "clip":
             # Photos with no CLIP embedding
             if photo_ids:
@@ -1182,12 +1211,15 @@ class PhotoDB:
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "faces":
+            # Use worker_processed to track which photos have been attempted
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"""SELECT p.id, p.filepath FROM photos p
                         WHERE p.id IN ({placeholders})
                         AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')
                         LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
@@ -1195,37 +1227,13 @@ class PhotoDB:
                 rows = self.conn.execute(
                     """SELECT p.id, p.filepath FROM photos p
                        WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
+                       AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                       WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
-        elif pass_type == "quality":
-            col = "aesthetic_score"
-            if photo_ids:
-                placeholders = ",".join("?" * len(photo_ids))
-                rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND {col} IS NULL LIMIT ?",
-                    list(photo_ids) + [limit + len(claimed)],
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
-                    (limit + len(claimed),),
-                ).fetchall()
-        elif pass_type == "describe":
-            col = "description"
-            if photo_ids:
-                placeholders = ",".join("?" * len(photo_ids))
-                rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND {col} IS NULL LIMIT ?",
-                    list(photo_ids) + [limit + len(claimed)],
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
-                    (limit + len(claimed),),
-                ).fetchall()
-        elif pass_type == "tags":
-            col = "tags"
+        elif pass_type in ("quality", "describe", "tags"):
+            col = {"quality": "aesthetic_score", "describe": "description", "tags": "tags"}[pass_type]
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
