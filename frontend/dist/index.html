@@ -1076,7 +1076,7 @@
             e(PhotoGrid, { results: PS.applySortOrder(results, sortBy), sortBy, setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc'],
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
-                           expandedStacks, stackMembers, toggleStack }),
+                           expandedStacks, stackMembers, toggleStack, query }),
         ),
 
         // Modal
@@ -1124,15 +1124,28 @@
     // -----------------------------------------------------------------------
     // Photo grid
     // -----------------------------------------------------------------------
-    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack }) {
+    // Matches camera filename patterns: DSC06241, IMG_1234, DSC06241.JPG, etc.
+    const _FILENAME_RE = /^[A-Za-z]{0,5}[\d_]{2,}[A-Za-z\d_]*$/;
+    const _PHOTO_EXTS = new Set(['.jpg','.jpeg','.png','.arw','.raw','.dng','.nef','.cr2','.cr3','.heic','.heif','.tif','.tiff','.mov','.mp4']);
+    function looksLikeFilename(q) {
+      if (!q || q.includes(' ')) return false;
+      var stem = q.trim();
+      var dot = stem.lastIndexOf('.');
+      if (dot > 0 && _PHOTO_EXTS.has(stem.substring(dot).toLowerCase())) stem = stem.substring(0, dot);
+      return _FILENAME_RE.test(stem);
+    }
+
+    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query }) {
       // Build display list: filter out non-top stack members, insert expanded members after their top photo
+      // Exception: filename searches always show the matched photo regardless of stack position
+      const isFilenameSearch = useMemo(() => looksLikeFilename(query), [query]);
       const displayItems = useMemo(() => {
         const added = new Set();
         const items = [];
         results.forEach(photo => {
           const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
           const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
-          if (isNonTopMember) {
+          if (isNonTopMember && !isFilenameSearch) {
             if (stackIsExpanded) return; // will appear in expanded group below top photo
             if (!selected.has(photo.id)) return; // collapsed + unselected → hide
             // collapsed but selected → show individually
@@ -1151,14 +1164,15 @@
           }
         });
         return items;
-      }, [results, selected, expandedStacks, stackMembers]);
+      }, [results, selected, expandedStacks, stackMembers, isFilenameSearch]);
 
       const visibleCount = displayItems.filter(d => d.type === 'photo').length;
       const stackCount = results.filter(r => r.stack_id && r.stack_count > 1 && r.stack_is_top).length;
 
       return e('div', null,
         e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-          e('span', null, results.length + ' result' + (results.length !== 1 ? 's' : '') +
+          e('span', null, visibleCount + ' result' + (visibleCount !== 1 ? 's' : '') +
+            (visibleCount < results.length ? ' (of ' + results.length + ')' : '') +
             (stackCount > 0 ? ' (' + stackCount + ' stacked)' : '')),
           sortBy && setSortBy && e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: sortOptions }),
           multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
