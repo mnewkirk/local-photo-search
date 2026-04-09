@@ -31,12 +31,14 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTM
 from fastapi.staticfiles import StaticFiles
 
 from .db import PhotoDB
+from .worker_api import router as worker_router, configure as configure_worker
 
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="local-photo-search", version="0.1.0")
+app.include_router(worker_router)
 
 # Allow the React dev server (port 5173) during development
 app.add_middleware(
@@ -49,6 +51,9 @@ app.add_middleware(
 # Database path — set by the CLI launcher, defaults to cwd
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
 _photo_root: Optional[str] = os.environ.get("PHOTO_ROOT")
+
+# Configure the worker API with DB settings
+configure_worker(_db_path, _photo_root)
 
 # Thumbnail cache directory
 _thumb_dir: Optional[str] = None

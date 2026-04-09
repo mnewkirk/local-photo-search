@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -395,7 +395,20 @@ class PhotoDB:
             cur.execute("ALTER TABLE collections ADD COLUMN google_photos_album_id TEXT")
             cur.execute("ALTER TABLE collections ADD COLUMN google_photos_album_title TEXT")
 
+        # Worker claims — distributed indexing coordination
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS worker_claims (
+                batch_id TEXT PRIMARY KEY,
+                worker_id TEXT NOT NULL,
+                pass_type TEXT NOT NULL,
+                photo_ids TEXT NOT NULL,
+                claimed_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL
+            )
+        """)
+
         # Indexes for common queries
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claims_expire ON worker_claims(expires_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aesthetic ON photos(aesthetic_score)")
@@ -1095,6 +1108,141 @@ class PhotoDB:
         self.conn.execute("DELETE FROM stack_members")
         self.conn.execute("DELETE FROM photo_stacks")
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Worker claims (distributed indexing)
+    # ------------------------------------------------------------------
+
+    def expire_worker_claims(self) -> int:
+        """Delete expired claims, returning them to the queue. Returns count expired."""
+        cur = self.conn.execute(
+            "DELETE FROM worker_claims WHERE expires_at < datetime('now')"
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def claim_photos(self, worker_id: str, pass_type: str, photo_ids: list[int],
+                     ttl_minutes: int = 30) -> str:
+        """Claim a batch of photos for processing. Returns batch_id."""
+        import uuid
+        batch_id = str(uuid.uuid4())
+        self.conn.execute(
+            """INSERT INTO worker_claims (batch_id, worker_id, pass_type, photo_ids, expires_at)
+               VALUES (?, ?, ?, ?, datetime('now', ?))""",
+            (batch_id, worker_id, pass_type, json.dumps(photo_ids),
+             f"+{ttl_minutes} minutes"),
+        )
+        self.conn.commit()
+        return batch_id
+
+    def release_claim(self, batch_id: str):
+        """Release a claim (after results submitted or on failure)."""
+        self.conn.execute("DELETE FROM worker_claims WHERE batch_id = ?", (batch_id,))
+        self.conn.commit()
+
+    def get_claimed_photo_ids(self, pass_type: str) -> set[int]:
+        """Return the set of photo IDs currently claimed for a pass type."""
+        self.expire_worker_claims()
+        rows = self.conn.execute(
+            "SELECT photo_ids FROM worker_claims WHERE pass_type = ? AND expires_at > datetime('now')",
+            (pass_type,),
+        ).fetchall()
+        result = set()
+        for row in rows:
+            result.update(json.loads(row["photo_ids"]))
+        return result
+
+    def get_unprocessed_photos(self, pass_type: str, photo_ids: list[int] | None = None,
+                               limit: int = 16) -> list[dict]:
+        """Find photos missing data for a given pass type, excluding claimed ones.
+
+        pass_type: 'clip', 'faces', 'quality', 'describe', 'tags'
+        photo_ids: optional scope (e.g. collection photos)
+        Returns list of {id, filepath} dicts.
+        """
+        claimed = self.get_claimed_photo_ids(pass_type)
+
+        # Build the "missing" condition per pass type
+        if pass_type == "clip":
+            # Photos with no CLIP embedding
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT p.id, p.filepath FROM photos p
+                        WHERE p.id IN ({placeholders})
+                        AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                        LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """SELECT p.id, p.filepath FROM photos p
+                       WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                       LIMIT ?""",
+                    (limit + len(claimed),),
+                ).fetchall()
+        elif pass_type == "faces":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT p.id, p.filepath FROM photos p
+                        WHERE p.id IN ({placeholders})
+                        AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
+                        LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """SELECT p.id, p.filepath FROM photos p
+                       WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
+                       LIMIT ?""",
+                    (limit + len(claimed),),
+                ).fetchall()
+        elif pass_type == "quality":
+            col = "aesthetic_score"
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND {col} IS NULL LIMIT ?",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
+                    (limit + len(claimed),),
+                ).fetchall()
+        elif pass_type == "describe":
+            col = "description"
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND {col} IS NULL LIMIT ?",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
+                    (limit + len(claimed),),
+                ).fetchall()
+        elif pass_type == "tags":
+            col = "tags"
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND {col} IS NULL LIMIT ?",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
+                    (limit + len(claimed),),
+                ).fetchall()
+        else:
+            raise ValueError(f"Unknown pass type: {pass_type}")
+
+        # Filter out claimed photos and apply limit
+        result = [dict(r) for r in rows if r["id"] not in claimed]
+        return result[:limit]
 
     def close(self):
         # Flush any pending batch writes before closing

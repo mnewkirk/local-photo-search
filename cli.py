@@ -1923,5 +1923,59 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
         click.echo(f"  ... and {len(stacks) - 20} more stacks")
 
 
+# ---------------------------------------------------------------------------
+# worker — distributed indexing (runs on fast laptop, talks to NAS server)
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--server", "-s", required=True, help="NAS server URL (e.g. http://nas.local:8000).")
+@click.option("--passes", "-p", default="clip", show_default=True,
+              help="Comma-separated pass types: clip, faces, quality, describe, tags.")
+@click.option("--collection", "collection_id", type=int, default=None,
+              help="Scope work to a specific collection (by ID).")
+@click.option("--batch-size", default=16, show_default=True, help="Photos per batch.")
+@click.option("--model-batch-size", default=8, show_default=True,
+              help="Batch size for model inference (CLIP, quality).")
+@click.option("--ttl", default=30, show_default=True, help="Claim TTL in minutes.")
+@click.option("--one-shot", is_flag=True, help="Process one batch per pass and exit (don't loop).")
+def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one_shot):
+    """Run a remote indexing worker that processes photos from a NAS server.
+
+    The worker claims batches of unprocessed photos from the server,
+    downloads them locally for fast processing, and submits results back.
+    This lets you leverage a fast laptop/desktop GPU while keeping the
+    database and photos on the NAS.
+
+    \b
+    Examples:
+      # Run CLIP embeddings for collection 3:
+      python cli.py worker -s http://nas.local:8000 -p clip --collection 3
+
+      # Run CLIP + quality scoring:
+      python cli.py worker -s http://nas.local:8000 -p clip,quality
+
+      # Quick test — one batch only:
+      python cli.py worker -s http://localhost:8000 -p clip --collection 3 --one-shot
+    """
+    from photosearch.worker import run_worker
+
+    pass_list = [p.strip() for p in passes.split(",")]
+    valid_passes = {"clip", "faces", "quality", "describe", "tags"}
+    for p in pass_list:
+        if p not in valid_passes:
+            click.echo(f"Error: unknown pass type '{p}'. Valid: {', '.join(sorted(valid_passes))}", err=True)
+            raise SystemExit(1)
+
+    run_worker(
+        server=server,
+        passes=pass_list,
+        collection_id=collection_id,
+        batch_size=batch_size,
+        model_batch_size=model_batch_size,
+        ttl_minutes=ttl,
+        one_shot=one_shot,
+    )
+
+
 if __name__ == "__main__":
     cli()
