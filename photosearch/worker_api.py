@@ -256,6 +256,77 @@ def submit_results(req: SubmitRequest):
         }
 
 
+class ClearPassRequest(BaseModel):
+    pass_type: str
+    collection_id: Optional[int] = None
+
+
+@router.post("/clear-pass")
+def clear_pass(req: ClearPassRequest):
+    """Clear processing state for a pass type, allowing re-processing.
+
+    For faces: deletes face rows + worker_processed entries.
+    For clip: deletes clip_embeddings rows.
+    For quality/describe/tags: NULLs the relevant column.
+
+    If collection_id is set, only affects photos in that collection.
+    """
+    with _get_db() as db:
+        if req.collection_id is not None:
+            photo_ids = db.get_collection_photo_ids(req.collection_id)
+            if not photo_ids:
+                raise HTTPException(404, f"Collection {req.collection_id} has no photos")
+        else:
+            raise HTTPException(400, "collection_id is required for clear-pass (safety)")
+
+        placeholders = ",".join("?" * len(photo_ids))
+        cleared = 0
+
+        if req.pass_type == "faces":
+            # Delete face encodings first (vec table)
+            face_ids = [r[0] for r in db.conn.execute(
+                f"SELECT id FROM faces WHERE photo_id IN ({placeholders})", photo_ids
+            ).fetchall()]
+            if face_ids:
+                fp = ",".join("?" * len(face_ids))
+                db.conn.execute(f"DELETE FROM face_encodings WHERE face_id IN ({fp})", face_ids)
+            cur = db.conn.execute(
+                f"DELETE FROM faces WHERE photo_id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+            # Also clear worker_processed entries
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'faces' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
+        elif req.pass_type == "clip":
+            cur = db.conn.execute(
+                f"DELETE FROM clip_embeddings WHERE photo_id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+        elif req.pass_type == "quality":
+            cur = db.conn.execute(
+                f"UPDATE photos SET aesthetic_score = NULL, aesthetic_concepts = NULL, aesthetic_critique = NULL "
+                f"WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+        elif req.pass_type == "describe":
+            cur = db.conn.execute(
+                f"UPDATE photos SET description = NULL WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+        elif req.pass_type == "tags":
+            cur = db.conn.execute(
+                f"UPDATE photos SET tags = NULL WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+        else:
+            raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
+
+        db.conn.commit()
+        return {"status": "ok", "pass_type": req.pass_type, "cleared": cleared, "photo_count": len(photo_ids)}
+
+
 @router.get("/status")
 def worker_status(collection_id: Optional[int] = None):
     """Show queue depth and active claims for the worker system."""

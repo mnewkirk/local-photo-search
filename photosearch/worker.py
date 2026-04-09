@@ -92,6 +92,16 @@ class WorkerClient:
         r.raise_for_status()
         return r.json()
 
+    def clear_pass(self, pass_type: str, collection_id: int) -> dict:
+        """Clear processing state for a pass type on a collection."""
+        r = self.session.post(
+            f"{self.server_url}/api/worker/clear-pass",
+            json={"pass_type": pass_type, "collection_id": collection_id},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
 
 def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> list[tuple[dict, str]]:
     """Download photos to temp_dir. Returns [(photo_info, local_path)] for successful downloads."""
@@ -185,6 +195,7 @@ def run_worker(
     model_batch_size: int = 8,
     ttl_minutes: int = 30,
     one_shot: bool = False,
+    force: bool = False,
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
@@ -196,10 +207,21 @@ def run_worker(
         model_batch_size: Batch size for model inference
         ttl_minutes: Claim TTL in minutes
         one_shot: If True, process one batch per pass and exit
+        force: If True, clear existing data and re-process from scratch
     """
     print(f"Connecting to {server}...")
     client = WorkerClient(server)
     print(f"Connected as {client.worker_id}")
+
+    # Force mode: clear existing data for the requested passes
+    if force:
+        if collection_id is None:
+            print("Error: --force requires --collection (safety measure).", file=sys.stderr)
+            return
+        for pass_type in passes:
+            print(f"Clearing {pass_type} data for collection {collection_id}...")
+            resp = client.clear_pass(pass_type, collection_id)
+            print(f"  Cleared {resp['cleared']} entries across {resp['photo_count']} photos.")
 
     # Show initial status
     status = client.get_status(collection_id)

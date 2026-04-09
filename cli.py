@@ -1938,7 +1938,8 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Batch size for model inference (CLIP, quality).")
 @click.option("--ttl", default=30, show_default=True, help="Claim TTL in minutes.")
 @click.option("--one-shot", is_flag=True, help="Process one batch per pass and exit (don't loop).")
-def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one_shot):
+@click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection).")
+def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one_shot, force):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -1974,6 +1975,7 @@ def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one
         model_batch_size=model_batch_size,
         ttl_minutes=ttl,
         one_shot=one_shot,
+        force=force,
     )
 
 
