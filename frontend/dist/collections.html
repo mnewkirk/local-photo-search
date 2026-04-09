@@ -1314,19 +1314,16 @@
       const sortedPhotos = useMemo(() => PS.applySortOrder(photos, sortBy), [photos, sortBy]);
 
       const displayItems = useMemo(() => {
+        // Every photo in the collection was explicitly added — always show it.
+        // Stack expand/collapse only affects extra members fetched from the stack API.
         const added = new Set();
         const items = [];
         sortedPhotos.forEach(photo => {
-          const isNonTopMember = photo.stack_id && photo.stack_count > 1 && !photo.stack_is_top;
-          const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
-          if (isNonTopMember) {
-            if (stackIsExpanded) return; // will appear in expanded group below top photo
-            if (!selectedForRemoval.has(photo.id)) return; // collapsed + unselected → hide
-            // collapsed but selected → show individually
-          }
           if (added.has(photo.id)) return;
           added.add(photo.id);
           items.push({ photo, isStackMember: false });
+          // When this is the top photo and the stack is expanded, insert extra stack members
+          const stackIsExpanded = photo.stack_id && expandedStacks.has(photo.stack_id);
           if (photo.stack_is_top && stackIsExpanded && stackMembers[photo.stack_id]) {
             stackMembers[photo.stack_id].forEach(m => {
               if (m.id !== photo.id && !added.has(m.id)) {
@@ -1337,9 +1334,18 @@
           }
         });
         return items;
-      }, [sortedPhotos, selectedForRemoval, expandedStacks, stackMembers]);
+      }, [sortedPhotos, expandedStacks, stackMembers]);
 
       const hasStacks = photos.some(p => p.stack_id && p.stack_count > 1);
+      const visibleCount = displayItems.length;
+      // Total photos including all stack members (replace each top photo's 1 count with its stack_count)
+      const stackedTotal = useMemo(() => {
+        let total = sortedPhotos.length;
+        sortedPhotos.forEach(p => {
+          if (p.stack_id && p.stack_count > 1 && p.stack_is_top) total += p.stack_count - 1;
+        });
+        return total;
+      }, [sortedPhotos]);
 
       const load = useCallback(() => {
         fetch(`/api/collections/${collectionId}`).then(r => r.json()).then(data => {
@@ -1465,7 +1471,9 @@
               onClick: () => setShowRename(true),
               title: 'Click to rename',
             }, collection.name),
-            e('span', { className: 'subtitle' }, `${photos.length} photo${photos.length !== 1 ? 's' : ''}`),
+            e('span', { className: 'subtitle' },
+              `${visibleCount} photo${visibleCount !== 1 ? 's' : ''}` +
+              (hasStacks ? ` (${stackedTotal} with stacks)` : '')),
           ),
           e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             photos.length > 0 && e('button', {
