@@ -563,8 +563,12 @@
     // -----------------------------------------------------------------------
     function App() {
       const initParams = getReviewUrlParams();
-      const [folders, setFolders] = useState([]);
+      const [folders, setFolders] = useState([]);  // [{path, max_date}, ...]
       const [selectedFolder, setSelectedFolder] = useState(initParams.folder);
+      const [folderSearch, setFolderSearch] = useState(initParams.folder || '');
+      const [folderDropdownOpen, setFolderDropdownOpen] = useState(false);
+      const folderInputRef = useRef(null);
+      const folderDropdownRef = useRef(null);
       const [photos, setPhotos] = useState([]);
       const [sortBy, setSortBy] = useState('relevance');  // 'relevance' = default order (selected first, then quality)
       const [stats, setStats] = useState(null);
@@ -663,12 +667,35 @@
         setExpandedStacks(new Set());
       }, []);
 
-      // Load folders on mount
+      // Load folders on mount (already sorted by most recent photo first from API)
       useEffect(() => {
         fetch(API + '/api/review/folders')
           .then(r => r.json())
           .then(d => setFolders(d.folders || []))
           .catch(() => {});
+      }, []);
+
+      // Filtered folders: match search term against any segment of the path
+      const filteredFolders = useMemo(() => {
+        const q = folderSearch.trim().toLowerCase();
+        if (!q) return folders;
+        return folders.filter(f => {
+          const p = f.path.toLowerCase();
+          // Match against full path OR any individual segment
+          if (p.includes(q)) return true;
+          return p.split('/').some(seg => seg.includes(q));
+        });
+      }, [folders, folderSearch]);
+
+      // Close folder dropdown when clicking outside
+      useEffect(() => {
+        const handler = (ev) => {
+          if (folderDropdownRef.current && !folderDropdownRef.current.contains(ev.target)) {
+            setFolderDropdownOpen(false);
+          }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
       }, []);
 
       // Update browser URL with current review state
@@ -938,15 +965,56 @@
       return e('div', null,
         // Header
         e(PS.SharedHeader, { activePage: 'review' },
-          // Folder selector
-          e('div', { className: 'control-group' },
-            e('select', {
-              value: selectedFolder,
-              onChange: (ev) => setSelectedFolder(ev.target.value),
-              style: { minWidth: 250 },
+          // Folder selector — searchable input with dropdown
+          e('div', { className: 'control-group', style: { position: 'relative' }, ref: folderDropdownRef },
+            e('input', {
+              ref: folderInputRef,
+              type: 'text',
+              value: folderSearch,
+              placeholder: 'Search folders...',
+              style: { minWidth: 300, padding: '6px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+                       background: 'var(--surface)', color: 'var(--text)', fontSize: 13 },
+              onChange: (ev) => { setFolderSearch(ev.target.value); setFolderDropdownOpen(true); },
+              onFocus: () => setFolderDropdownOpen(true),
+              onKeyDown: (ev) => {
+                if (ev.key === 'Escape') { setFolderDropdownOpen(false); folderInputRef.current.blur(); }
+                if (ev.key === 'Enter' && filteredFolders.length === 1) {
+                  setSelectedFolder(filteredFolders[0].path);
+                  setFolderSearch(filteredFolders[0].path);
+                  setFolderDropdownOpen(false);
+                }
+              },
+            }),
+            selectedFolder && e('button', {
+              style: { marginLeft: 4, background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 15, padding: '2px 6px' },
+              onClick: () => { setSelectedFolder(''); setFolderSearch(''); },
+              title: 'Clear',
+            }, '\u2715'),
+            folderDropdownOpen && filteredFolders.length > 0 && e('div', {
+              style: { position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 100,
+                       maxHeight: 350, overflowY: 'auto', background: 'var(--surface2)',
+                       border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+                       boxShadow: '0 4px 12px rgba(0,0,0,0.3)', marginTop: 2 },
             },
-              e('option', { value: '' }, 'Select a folder...'),
-              ...folders.map(f => e('option', { key: f, value: f }, f)),
+              ...filteredFolders.slice(0, 50).map(f =>
+                e('div', {
+                  key: f.path,
+                  style: { padding: '6px 10px', cursor: 'pointer', fontSize: 13,
+                           background: f.path === selectedFolder ? 'var(--accent)' : 'transparent',
+                           color: f.path === selectedFolder ? '#fff' : 'var(--text)',
+                           borderBottom: '1px solid var(--border)' },
+                  onMouseDown: (ev) => {
+                    ev.preventDefault();  // prevent blur before click fires
+                    setSelectedFolder(f.path);
+                    setFolderSearch(f.path);
+                    setFolderDropdownOpen(false);
+                  },
+                },
+                  e('div', null, f.path),
+                  f.max_date && e('div', { style: { fontSize: 11, color: f.path === selectedFolder ? 'rgba(255,255,255,0.7)' : 'var(--text-muted)', marginTop: 1 } },
+                    f.max_date.substring(0, 10)),
+                ),
+              ),
             ),
           ),
           // Target %

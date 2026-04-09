@@ -902,19 +902,25 @@ def api_review_folders():
     """List directories that contain indexed photos, for the folder picker."""
     with _get_db() as db:
         rows = db.conn.execute(
-            "SELECT DISTINCT filepath FROM photos ORDER BY filepath"
+            "SELECT filepath, date_taken FROM photos WHERE filepath IS NOT NULL"
         ).fetchall()
 
-    # Extract unique parent directories
-    dirs = set()
+    # Extract unique parent directories with most recent date_taken per folder
+    dir_dates: dict[str, str] = {}
     for row in rows:
         fp = row["filepath"]
         parent = str(Path(fp).parent)
-        # For relative paths, show them as-is; for absolute, show from photo_root
         if parent and parent != ".":
-            dirs.add(parent)
+            dt = row["date_taken"] or ""
+            if parent not in dir_dates or dt > dir_dates[parent]:
+                dir_dates[parent] = dt
 
-    return {"folders": sorted(dirs)}
+    # Return folders sorted by most recent photo first (default), with date info
+    folders = [
+        {"path": d, "max_date": dir_dates[d]}
+        for d in sorted(dir_dates, key=lambda d: dir_dates[d], reverse=True)
+    ]
+    return {"folders": folders}
 
 
 @app.get("/api/review/run")
