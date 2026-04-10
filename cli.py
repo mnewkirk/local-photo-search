@@ -1933,6 +1933,8 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Comma-separated pass types: clip, faces, quality, describe, tags.")
 @click.option("--collection", "collection_id", type=int, default=None,
               help="Scope work to a specific collection (by ID).")
+@click.option("--directory", "-d", default=None,
+              help="Scope work to a directory on the NAS (e.g. /photos/2026/2026-04-09).")
 @click.option("--batch-size", default=16, show_default=True, help="Photos per batch.")
 @click.option("--model-batch-size", default=8, show_default=True,
               help="Batch size for model inference (CLIP, quality).")
@@ -1943,8 +1945,8 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Ollama model for descriptions and tags.")
 @click.option("--verify-model", default="minicpm-v", show_default=True,
               help="Ollama model for hallucination verification.")
-def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one_shot, force,
-           describe_model, verify_model):
+def worker(server, passes, collection_id, directory, batch_size, model_batch_size, ttl,
+           one_shot, force, describe_model, verify_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -1954,22 +1956,26 @@ def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one
 
     \b
     Examples:
-      # Run CLIP embeddings for collection 3:
-      python cli.py worker -s http://nas.local:8000 -p clip --collection 3
+      # Run CLIP embeddings for a directory:
+      python cli.py worker -s http://nas.local:8000 -p clip -d /photos/2026/2026-04-09
 
-      # Run CLIP + quality scoring:
-      python cli.py worker -s http://nas.local:8000 -p clip,quality
+      # Run full pipeline on a directory:
+      python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
+
+      # Run CLIP + quality for a collection:
+      python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
 
       # Run descriptions with moondream model:
       python cli.py worker -s http://nas.local:8000 -p describe --describe-model moondream
 
-      # Run full pipeline including verification:
-      python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tags,verify
-
       # Quick test — one batch only:
-      python cli.py worker -s http://localhost:8000 -p clip --collection 3 --one-shot
+      python cli.py worker -s http://localhost:8000 -p clip -d /photos/2026/2026-04-09 --one-shot
     """
     from photosearch.worker import run_worker
+
+    if collection_id is not None and directory is not None:
+        click.echo("Error: --collection and --directory are mutually exclusive.", err=True)
+        raise SystemExit(1)
 
     pass_list = [p.strip() for p in passes.split(",")]
     valid_passes = {"clip", "faces", "quality", "describe", "tags", "verify"}
@@ -1982,6 +1988,7 @@ def worker(server, passes, collection_id, batch_size, model_batch_size, ttl, one
         server=server,
         passes=pass_list,
         collection_id=collection_id,
+        directory=directory,
         batch_size=batch_size,
         model_batch_size=model_batch_size,
         ttl_minutes=ttl,

@@ -883,6 +883,16 @@ class PhotoDB:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def get_directory_photo_ids(self, directory: str) -> list[int]:
+        """Get photo IDs whose filepath starts with the given directory prefix."""
+        # Ensure trailing slash so '/photos/2026' doesn't match '/photos/2026-extra'
+        prefix = directory.rstrip("/") + "/"
+        rows = self.conn.execute(
+            "SELECT id FROM photos WHERE filepath LIKE ?",
+            (prefix + "%",),
+        ).fetchall()
+        return [row[0] for row in rows]
+
     def get_collection_photo_pairs(self, collection_id: int) -> list[tuple[int, str]]:
         """Get (photo_id, absolute_path) pairs for photos in a collection.
 

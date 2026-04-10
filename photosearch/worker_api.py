@@ -46,9 +46,10 @@ def _get_db() -> PhotoDB:
 
 class ClaimRequest(BaseModel):
     worker_id: str
-    pass_type: str  # 'clip', 'faces', 'quality', 'describe', 'tags'
+    pass_type: str  # 'clip', 'faces', 'quality', 'describe', 'tags', 'verify'
     limit: int = 16
     collection_id: Optional[int] = None
+    directory: Optional[str] = None  # e.g. "/photos/2026/2026-04-09"
     ttl_minutes: int = 30
 
 
@@ -116,12 +117,16 @@ def claim_batch(req: ClaimRequest):
     Returns photo metadata + download URLs. The claim expires after ttl_minutes.
     """
     with _get_db() as db:
-        # Scope to collection if requested
+        # Scope to collection or directory if requested
         scope_ids = None
         if req.collection_id is not None:
             scope_ids = db.get_collection_photo_ids(req.collection_id)
             if not scope_ids:
                 raise HTTPException(404, f"Collection {req.collection_id} has no photos")
+        elif req.directory is not None:
+            scope_ids = db.get_directory_photo_ids(req.directory)
+            if not scope_ids:
+                raise HTTPException(404, f"No photos found in directory {req.directory}")
 
         photos = db.get_unprocessed_photos(
             pass_type=req.pass_type,
@@ -309,6 +314,7 @@ def submit_results(req: SubmitRequest):
 class ClearPassRequest(BaseModel):
     pass_type: str
     collection_id: Optional[int] = None
+    directory: Optional[str] = None
 
 
 @router.post("/clear-pass")
@@ -326,8 +332,12 @@ def clear_pass(req: ClearPassRequest):
             photo_ids = db.get_collection_photo_ids(req.collection_id)
             if not photo_ids:
                 raise HTTPException(404, f"Collection {req.collection_id} has no photos")
+        elif req.directory is not None:
+            photo_ids = db.get_directory_photo_ids(req.directory)
+            if not photo_ids:
+                raise HTTPException(404, f"No photos found in directory {req.directory}")
         else:
-            raise HTTPException(400, "collection_id is required for clear-pass (safety)")
+            raise HTTPException(400, "collection_id or directory is required for clear-pass (safety)")
 
         placeholders = ",".join("?" * len(photo_ids))
         cleared = 0
@@ -428,7 +438,7 @@ def photo_detail(photo_id: int):
 
 
 @router.get("/status")
-def worker_status(collection_id: Optional[int] = None):
+def worker_status(collection_id: Optional[int] = None, directory: Optional[str] = None):
     """Show queue depth and active claims for the worker system."""
     with _get_db() as db:
         db.expire_worker_claims()
@@ -455,6 +465,8 @@ def worker_status(collection_id: Optional[int] = None):
         scope_ids = None
         if collection_id is not None:
             scope_ids = db.get_collection_photo_ids(collection_id)
+        elif directory is not None:
+            scope_ids = db.get_directory_photo_ids(directory)
 
         queue = {}
         for pass_type in ("clip", "faces", "quality", "describe", "tags", "verify"):
@@ -465,4 +477,5 @@ def worker_status(collection_id: Optional[int] = None):
             "active_claims": active,
             "queue_depth": queue,
             "collection_id": collection_id,
+            "directory": directory,
         }
