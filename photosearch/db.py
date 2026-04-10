@@ -884,9 +884,16 @@ class PhotoDB:
         return [row[0] for row in rows]
 
     def get_directory_photo_ids(self, directory: str) -> list[int]:
-        """Get photo IDs whose filepath starts with the given directory prefix."""
-        # Ensure trailing slash so '/photos/2026' doesn't match '/photos/2026-extra'
-        prefix = directory.rstrip("/") + "/"
+        """Get photo IDs whose filepath starts with the given directory prefix.
+
+        Normalizes the input: strips leading './' and ensures trailing '/'
+        so '2026' doesn't match '2026-extra'.
+        """
+        prefix = directory.strip()
+        # Strip leading ./ since DB paths are relative without it
+        while prefix.startswith("./"):
+            prefix = prefix[2:]
+        prefix = prefix.strip("/") + "/"
         rows = self.conn.execute(
             "SELECT id FROM photos WHERE filepath LIKE ?",
             (prefix + "%",),
