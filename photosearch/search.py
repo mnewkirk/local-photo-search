@@ -956,16 +956,28 @@ def _filter_by_date(results: list[dict], date_from: str, date_to: str) -> list[d
     return filtered
 
 
-def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 100) -> list[dict]:
-    """Return photos within a date range, ordered by date."""
-    rows = db.conn.execute(
-        """SELECT * FROM photos
-           WHERE date_taken IS NOT NULL
-             AND date_taken >= ? AND date_taken <= ?
-           ORDER BY date_taken
-           LIMIT ?""",
-        (date_from, date_to + " 23:59:59", limit),
-    ).fetchall()
+def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -> list[dict]:
+    """Return photos within a date range, ordered by date.
+
+    limit=0 means no limit (return all matching photos).
+    """
+    if limit > 0:
+        rows = db.conn.execute(
+            """SELECT * FROM photos
+               WHERE date_taken IS NOT NULL
+                 AND date_taken >= ? AND date_taken <= ?
+               ORDER BY date_taken
+               LIMIT ?""",
+            (date_from, date_to + " 23:59:59", limit),
+        ).fetchall()
+    else:
+        rows = db.conn.execute(
+            """SELECT * FROM photos
+               WHERE date_taken IS NOT NULL
+                 AND date_taken >= ? AND date_taken <= ?
+               ORDER BY date_taken""",
+            (date_from, date_to + " 23:59:59"),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1073,8 +1085,9 @@ def search_combined(
         result_sets.append({r["id"]: r for r in results})
 
     # Date as a primary search: if only date is specified (no other criteria)
+    # No limit — return all photos in the range so the user sees every shot from that day.
     if date_from and not result_sets and min_quality is None:
-        results = _search_by_date(db, date_from, date_to or date_from, limit=limit)
+        results = _search_by_date(db, date_from, date_to or date_from, limit=0)
         return results
 
     # Quality-only search: if no other criteria given but min_quality is set,

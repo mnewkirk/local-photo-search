@@ -155,7 +155,7 @@ def api_search(
     person: Optional[str] = Query(None, description="Person name"),
     color: Optional[str] = Query(None, description="Color name or hex"),
     place: Optional[str] = Query(None, description="Place name"),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(200, ge=1, le=2000),
     min_score: float = Query(-0.25, description="Minimum CLIP score"),
     min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
     sort_quality: bool = Query(False, description="Sort by quality instead of relevance"),
