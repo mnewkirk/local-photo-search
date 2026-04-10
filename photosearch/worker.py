@@ -22,6 +22,21 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.exceptions import ConnectionError, Timeout
+
+
+def _retry(fn, max_retries=5, base_delay=5, label="request"):
+    """Retry a callable on transient network errors (sleep/wake recovery)."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except (ConnectionError, Timeout, OSError) as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)  # 5, 10, 20, 40, 80
+            print(f"  ⚠ {label} failed ({e.__class__.__name__}), retrying in {delay}s "
+                  f"(attempt {attempt + 1}/{max_retries})...")
+            time.sleep(delay)
 
 
 class WorkerClient:
@@ -199,7 +214,11 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
 
 
 def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llava") -> list[dict]:
-    """Generate scene descriptions via Ollama. Returns list of {photo_id, description}."""
+    """Generate scene descriptions via Ollama. Returns list of {photo_id, description}.
+
+    Always includes every photo in results (description may be None) so the
+    server can mark them as processed and avoid infinite reclaim loops.
+    """
     from .describe import describe_photo, check_available
     check_available(model)
 
@@ -215,16 +234,21 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llava") 
             if desc:
                 preview = desc[:80].replace("\n", " ")
                 print(f" ({elapsed:.1f}s) {preview}...")
-                results.append({"photo_id": photo_info["id"], "description": desc})
             else:
                 print(f" ({elapsed:.1f}s) no description")
+            results.append({"photo_id": photo_info["id"], "description": desc})
         except Exception as e:
             print(f" ERROR: {e}")
+            results.append({"photo_id": photo_info["id"], "description": None})
     return results
 
 
 def _process_tags(downloaded: list[tuple[dict, str]], model: str = "llava") -> list[dict]:
-    """Generate semantic tags via Ollama. Returns list of {photo_id, tags: [...]}."""
+    """Generate semantic tags via Ollama. Returns list of {photo_id, tags: [...]}.
+
+    Always includes every photo in results (tags may be empty list) so the
+    server can mark them as processed and avoid infinite reclaim loops.
+    """
     from .describe import tag_photo, check_available
     check_available(model)
 
@@ -239,11 +263,12 @@ def _process_tags(downloaded: list[tuple[dict, str]], model: str = "llava") -> l
             elapsed = time.time() - t0
             if tags:
                 print(f" ({elapsed:.1f}s) {', '.join(tags)}")
-                results.append({"photo_id": photo_info["id"], "tags": tags})
             else:
                 print(f" ({elapsed:.1f}s) no tags")
+            results.append({"photo_id": photo_info["id"], "tags": tags or []})
         except Exception as e:
             print(f" ERROR: {e}")
+            results.append({"photo_id": photo_info["id"], "tags": []})
     return results
 
 
@@ -461,15 +486,21 @@ def run_worker(
             any_work = False
 
             for pass_type in passes:
-                # Claim a batch
+                # Claim a batch (with retry for sleep/wake)
                 print(f"\n{'='*60}")
                 print(f"Claiming {pass_type} batch (limit={batch_size})...")
-                batch = client.claim_batch(
-                    pass_type=pass_type,
-                    limit=batch_size,
-                    collection_id=collection_id,
-                    ttl_minutes=ttl_minutes,
-                )
+                try:
+                    batch = _retry(
+                        lambda pt=pass_type: client.claim_batch(
+                            pass_type=pt, limit=batch_size,
+                            collection_id=collection_id, ttl_minutes=ttl_minutes,
+                        ),
+                        label=f"claim {pass_type}",
+                    )
+                except (ConnectionError, Timeout, OSError) as e:
+                    print(f"  ✗ Cannot reach server after retries: {e}")
+                    print(f"  Skipping {pass_type}, will retry next loop.")
+                    continue
 
                 if not batch.get("batch_id") or not batch.get("photos"):
                     print(f"  No unprocessed {pass_type} photos in queue.")
@@ -480,7 +511,7 @@ def run_worker(
                 batch_id = batch["batch_id"]
                 print(f"  Claimed {len(photos)} photos (batch {batch_id[:8]}...)")
 
-                # Download
+                # Download (with retry per photo — handled inside _download_batch)
                 batch_temp = os.path.join(temp_base, batch_id[:8])
                 os.makedirs(batch_temp, exist_ok=True)
 
@@ -494,7 +525,7 @@ def run_worker(
                     print(f"  No photos downloaded, skipping batch.")
                     continue
 
-                # Process
+                # Process (local — no network needed except verify)
                 print(f"\n  Processing {pass_type}...")
                 t0 = time.time()
 
@@ -526,13 +557,25 @@ def run_worker(
                 proc_elapsed = time.time() - t0
                 print(f"  Processed {len(results)} results in {proc_elapsed:.1f}s")
 
-                # Submit
+                # Submit (with retry — this is where sleep/wake crashes hit)
                 print(f"  Submitting results...")
-                resp = client.submit_results(batch_id, pass_type, **kwargs)
+                try:
+                    resp = _retry(
+                        lambda: client.submit_results(batch_id, pass_type, **kwargs),
+                        label="submit results",
+                    )
+                except (ConnectionError, Timeout, OSError) as e:
+                    print(f"  ✗ Failed to submit after retries: {e}")
+                    print(f"  Results lost for this batch — photos will be reclaimed after TTL.")
+                    shutil.rmtree(batch_temp, ignore_errors=True)
+                    continue
+
                 n_written = resp.get("written", 0)
                 n_processed = resp.get("processed", n_written)
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
+                elif pass_type in ("describe", "tags"):
+                    print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")
                 total_processed += n_processed

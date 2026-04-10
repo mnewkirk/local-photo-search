@@ -76,7 +76,7 @@ class QualityResult(BaseModel):
 
 class DescribeResult(BaseModel):
     photo_id: int
-    description: str
+    description: Optional[str] = None
 
 
 class TagsResult(BaseModel):
@@ -235,25 +235,35 @@ def submit_results(req: SubmitRequest):
                     logger.warning(f"Failed to store quality for photo {r.photo_id}: {e}")
             db.end_batch()
 
-        elif req.pass_type == "describe" and req.describe_results:
-            for r in req.describe_results:
-                try:
-                    db.update_photo(r.photo_id, description=r.description)
-                    db.conn.commit()
-                    written += 1
-                    processed_photo_ids.append(r.photo_id)
-                except Exception as e:
-                    logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
+        elif req.pass_type == "describe":
+            describe_results = req.describe_results or []
+            for r in describe_results:
+                processed_photo_ids.append(r.photo_id)
+                if r.description:
+                    try:
+                        db.update_photo(r.photo_id, description=r.description)
+                        db.conn.commit()
+                        written += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
+            # Mark all submitted photos as processed (including those with no description)
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "describe")
 
-        elif req.pass_type == "tags" and req.tags_results:
-            for r in req.tags_results:
-                try:
-                    db.update_photo(r.photo_id, tags=json.dumps(r.tags))
-                    db.conn.commit()
-                    written += 1
-                    processed_photo_ids.append(r.photo_id)
-                except Exception as e:
-                    logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
+        elif req.pass_type == "tags":
+            tags_results = req.tags_results or []
+            for r in tags_results:
+                processed_photo_ids.append(r.photo_id)
+                if r.tags:
+                    try:
+                        db.update_photo(r.photo_id, tags=json.dumps(r.tags))
+                        db.conn.commit()
+                        written += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
+            # Mark all submitted photos as processed (including those with no tags)
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "tags")
 
         elif req.pass_type == "verify" and req.verify_results:
             for r in req.verify_results:
@@ -345,11 +355,21 @@ def clear_pass(req: ClearPassRequest):
                 f"UPDATE photos SET description = NULL WHERE id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+            # Also clear worker_processed entries
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'describe' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "tags":
             cur = db.conn.execute(
                 f"UPDATE photos SET tags = NULL WHERE id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+            # Also clear worker_processed entries
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'tags' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "verify":
             cur = db.conn.execute(
                 f"UPDATE photos SET verified_at = NULL, verification_status = NULL, "

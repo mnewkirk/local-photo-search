@@ -1232,18 +1232,41 @@ class PhotoDB:
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
-        elif pass_type in ("quality", "describe", "tags"):
-            col = {"quality": "aesthetic_score", "describe": "description", "tags": "tags"}[pass_type]
+        elif pass_type == "quality":
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND {col} IS NULL LIMIT ?",
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND aesthetic_score IS NULL LIMIT ?",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE {col} IS NULL LIMIT ?",
+                    "SELECT id, filepath FROM photos WHERE aesthetic_score IS NULL LIMIT ?",
                     (limit + len(claimed),),
+                ).fetchall()
+        elif pass_type in ("describe", "tags"):
+            # Like faces, use worker_processed to track attempts — photos that
+            # produce no description/tags would otherwise stay NULL forever.
+            col = {"describe": "description", "tags": "tags"}[pass_type]
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE id IN ({placeholders})
+                        AND {col} IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)
+                        LIMIT ?""",
+                    list(photo_ids) + [pass_type, limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE {col} IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)
+                        LIMIT ?""",
+                    (pass_type, limit + len(claimed)),
                 ).fetchall()
         elif pass_type == "verify":
             # Photos that have a description but haven't been verified yet
