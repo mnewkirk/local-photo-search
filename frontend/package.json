@@ -7,6 +7,9 @@
     "test": "jest --verbose",
     "test:watch": "jest --watch"
   },
+  "overrides": {
+    "@tootallnate/once": ">=3.0.1"
+  },
   "devDependencies": {
     "jest": "^29.7.0",
     "jest-environment-jsdom": "^29.7.0",
