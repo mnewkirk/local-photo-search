@@ -56,6 +56,7 @@ class ClaimResponse(BaseModel):
     batch_id: str
     pass_type: str
     photos: list[dict]  # [{id, filepath, filename}]
+    remaining: int = 0  # unclaimed photos left in queue after this claim
 
 
 class ClipResult(BaseModel):
@@ -139,6 +140,14 @@ def claim_batch(req: ClaimRequest):
             ttl_minutes=req.ttl_minutes,
         )
 
+        # Count how many remain unclaimed after this batch
+        remaining_photos = db.get_unprocessed_photos(
+            pass_type=req.pass_type,
+            photo_ids=scope_ids,
+            limit=999999,
+        )
+        remaining = len(remaining_photos)
+
         result_photos = []
         for p in photos:
             result_photos.append({
@@ -151,6 +160,7 @@ def claim_batch(req: ClaimRequest):
             batch_id=batch_id,
             pass_type=req.pass_type,
             photos=result_photos,
+            remaining=remaining,
         )
 
 

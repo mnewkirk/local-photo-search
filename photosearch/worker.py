@@ -509,7 +509,8 @@ def run_worker(
                 any_work = True
                 photos = batch["photos"]
                 batch_id = batch["batch_id"]
-                print(f"  Claimed {len(photos)} photos (batch {batch_id[:8]}...)")
+                remaining = batch.get("remaining", "?")
+                print(f"  Claimed {len(photos)} photos (batch {batch_id[:8]}...), {remaining} remaining")
 
                 # Download (with retry per photo — handled inside _download_batch)
                 batch_temp = os.path.join(temp_base, batch_id[:8])
