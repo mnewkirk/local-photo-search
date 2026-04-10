@@ -22,15 +22,21 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from requests.exceptions import ConnectionError, Timeout
+from requests.exceptions import ConnectionError as ReqConnectionError, Timeout as ReqTimeout
+
+# Transient errors worth retrying (network drop, sleep/wake)
+_TRANSIENT = (ReqConnectionError, ReqTimeout, ConnectionError, TimeoutError)
 
 
 def _retry(fn, max_retries=5, base_delay=5, label="request"):
-    """Retry a callable on transient network errors (sleep/wake recovery)."""
+    """Retry a callable on transient network errors (sleep/wake recovery).
+
+    Does NOT retry HTTP 4xx/5xx — only connection-level failures.
+    """
     for attempt in range(max_retries):
         try:
             return fn()
-        except (ConnectionError, Timeout, OSError) as e:
+        except _TRANSIENT as e:
             if attempt == max_retries - 1:
                 raise
             delay = base_delay * (2 ** attempt)  # 5, 10, 20, 40, 80
@@ -69,7 +75,9 @@ class WorkerClient:
         if directory is not None:
             payload["directory"] = directory
         r = self.session.post(f"{self.server_url}/api/worker/claim-batch", json=payload, timeout=30)
-        r.raise_for_status()
+        if not r.ok:
+            detail = r.text[:200] if r.text else r.reason
+            raise RuntimeError(f"claim-batch failed ({r.status_code}): {detail}")
         return r.json()
 
     def download_photo(self, photo_id: int, dest_path: str) -> bool:
@@ -98,7 +106,9 @@ class WorkerClient:
             json=payload,
             timeout=120,
         )
-        r.raise_for_status()
+        if not r.ok:
+            detail = r.text[:200] if r.text else r.reason
+            raise RuntimeError(f"submit-results failed ({r.status_code}): {detail}")
         return r.json()
 
     def get_status(self, collection_id: Optional[int] = None,
@@ -518,7 +528,7 @@ def run_worker(
                         ),
                         label=f"claim {pass_type}",
                     )
-                except (ConnectionError, Timeout, OSError) as e:
+                except _TRANSIENT as e:
                     print(f"  ✗ Cannot reach server after retries: {e}")
                     print(f"  Skipping {pass_type}, will retry next loop.")
                     continue
@@ -586,7 +596,7 @@ def run_worker(
                         lambda: client.submit_results(batch_id, pass_type, **kwargs),
                         label="submit results",
                     )
-                except (ConnectionError, Timeout, OSError) as e:
+                except _TRANSIENT as e:
                     print(f"  ✗ Failed to submit after retries: {e}")
                     print(f"  Results lost for this batch — photos will be reclaimed after TTL.")
                     shutil.rmtree(batch_temp, ignore_errors=True)
