@@ -1136,6 +1136,35 @@ def api_stats():
     }
 
 
+@app.get("/api/stats/activity")
+def api_stats_activity():
+    """Hourly index activity for the last 3 days."""
+    with _get_db() as db:
+        rows = db.conn.execute("""
+            SELECT strftime('%Y-%m-%dT%H:00:00', created_at) AS hour,
+                   pass_type, action, SUM(count) AS total
+            FROM index_activity
+            WHERE created_at >= datetime('now', '-3 days')
+            GROUP BY hour, pass_type, action
+            ORDER BY hour
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/stats/errors")
+def api_stats_errors():
+    """Recent indexing errors (last 3 days, max 200)."""
+    with _get_db() as db:
+        rows = db.conn.execute("""
+            SELECT pass_type, filepath, message, created_at
+            FROM index_errors
+            WHERE created_at >= datetime('now', '-3 days')
+            ORDER BY created_at DESC
+            LIMIT 200
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Collections
 # ---------------------------------------------------------------------------

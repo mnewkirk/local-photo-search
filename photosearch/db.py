@@ -21,7 +21,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -418,6 +418,30 @@ class PhotoDB:
                 PRIMARY KEY (photo_id, pass_type)
             )
         """)
+
+        # Index activity audit log — tracks indexing events over time
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS index_activity (
+                id INTEGER PRIMARY KEY,
+                pass_type TEXT NOT NULL,
+                action TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_index_activity_created ON index_activity(created_at)")
+
+        # Index errors audit log — tracks indexing failures
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS index_errors (
+                id INTEGER PRIMARY KEY,
+                pass_type TEXT NOT NULL,
+                filepath TEXT,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_index_errors_created ON index_errors(created_at)")
 
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claims_expire ON worker_claims(expires_at)")
@@ -1176,6 +1200,24 @@ class PhotoDB:
     def release_claim(self, batch_id: str):
         """Release a claim (after results submitted or on failure)."""
         self.conn.execute("DELETE FROM worker_claims WHERE batch_id = ?", (batch_id,))
+        self.conn.commit()
+
+    def log_activity(self, pass_type: str, action: str, count: int):
+        """Log an indexing activity event for the activity chart."""
+        if count <= 0:
+            return
+        self.conn.execute(
+            "INSERT INTO index_activity (pass_type, action, count) VALUES (?, ?, ?)",
+            (pass_type, action, count),
+        )
+        self.conn.commit()
+
+    def log_error(self, pass_type: str, filepath: str, message: str):
+        """Log an indexing error for the status page."""
+        self.conn.execute(
+            "INSERT INTO index_errors (pass_type, filepath, message) VALUES (?, ?, ?)",
+            (pass_type, filepath, str(message)[:500]),
+        )
         self.conn.commit()
 
     def mark_processed(self, photo_ids: list[int], pass_type: str):

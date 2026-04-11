@@ -115,11 +115,6 @@ def _index_collection(
     """
     errors: list[str] = []
 
-    def _report_error(step: str, path: str, exc: Exception):
-        msg = f"[{step}] {os.path.basename(path)}: {exc}"
-        errors.append(msg)
-        print(f" ERROR: {exc}")
-
     def _eta(t0: float, done: int, total: int) -> str:
         if done == 0:
             return ""
@@ -134,6 +129,15 @@ def _index_collection(
             return f" ~{remaining / 3600:.1f}h left"
 
     with PhotoDB(db_path) as db:
+        def _report_error(step: str, path: str, exc: Exception):
+            msg = f"[{step}] {os.path.basename(path)}: {exc}"
+            errors.append(msg)
+            print(f" ERROR: {exc}")
+            try:
+                db.log_error(step, os.path.basename(path), str(exc))
+            except Exception:
+                pass
+
         coll = db.get_collection(collection_id)
         if not coll:
             print(f"Collection {collection_id} not found.")
@@ -202,6 +206,7 @@ def _index_collection(
                         clip_ids,
                     )
                     db.conn.commit()
+                    db.log_activity("clip", "clear", len(clip_ids))
                 clip_candidates = list(photo_pairs)
             else:
                 # Only photos missing embeddings
@@ -233,6 +238,7 @@ def _index_collection(
                 db.end_batch()
                 elapsed = time.time() - t0
                 print(f"  Embedded {embedded_count}/{len(clip_candidates)} photos in {elapsed:.1f}s")
+                db.log_activity("clip", "index", embedded_count)
                 unload_clip()
                 print("  CLIP model unloaded to free memory.")
             else:
@@ -279,9 +285,12 @@ def _index_collection(
                 photo_id_set = {pid for pid, _ in photo_pairs}
                 if force_faces:
                     print("\nClearing existing face data for collection photos...")
+                    cleared_faces = 0
                     for pid in photo_id_set:
-                        db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
+                        cur = db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
+                        cleared_faces += cur.rowcount
                     db.conn.commit()
+                    db.log_activity("faces", "clear", cleared_faces)
                     face_candidates = list(photo_pairs)
                 else:
                     # Only photos without face data
@@ -328,6 +337,7 @@ def _index_collection(
                     db.end_batch()
                     elapsed = time.time() - t0
                     print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
+                    db.log_activity("faces", "index", face_count)
 
                     if all_encodings:
                         print("  Clustering faces...")
@@ -393,6 +403,7 @@ def _index_collection(
                             _report_error("describe", path, e)
                     elapsed = time.time() - t0
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("describe", "index", desc_count)
 
         # ── Semantic tags ──────────────────────────────────────────
         if enable_tags:
@@ -443,6 +454,7 @@ def _index_collection(
                             _report_error("tags", path, e)
                     elapsed = time.time() - t0
                     print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("tags", "index", tag_count)
 
         # ── Aesthetic quality scoring + concept analysis ────────────
         if enable_quality:
@@ -487,6 +499,7 @@ def _index_collection(
 
                 elapsed = time.time() - t0
                 print(f"  Scored {scored_count}/{len(quality_candidates)} photos in {elapsed:.1f}s")
+                db.log_activity("quality", "index", scored_count)
                 if valid_scores:
                     print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
                           f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
@@ -522,6 +535,7 @@ def _index_collection(
 
                 elapsed = time.time() - t0
                 print(f"  Analyzed concepts for {concept_count}/{len(concept_candidates)} photos in {elapsed:.1f}s")
+                db.log_activity("concepts", "index", concept_count)
 
             unload_quality()
 
@@ -585,6 +599,7 @@ def _index_collection(
                 if stacks:
                     total_stacked = sum(len(s) for s in stacks)
                     print(f"  Detected {len(stacks)} stacks ({total_stacked} photos)")
+                    db.log_activity("stacks", "index", len(stacks))
                 else:
                     print("  No stacks detected.")
             except Exception as e:
@@ -701,11 +716,6 @@ def index_directory(
     # Error tracking — continue on individual photo failures
     errors: list[str] = []
 
-    def _report_error(step: str, path: str, exc: Exception):
-        msg = f"[{step}] {os.path.basename(path)}: {exc}"
-        errors.append(msg)
-        print(f" ERROR: {exc}")
-
     def _eta(t0: float, done: int, total: int) -> str:
         """Estimate time remaining."""
         if done == 0:
@@ -721,6 +731,15 @@ def index_directory(
             return f" ~{remaining / 3600:.1f}h left"
 
     with PhotoDB(db_path) as db:
+        def _report_error(step: str, path: str, exc: Exception):
+            msg = f"[{step}] {os.path.basename(path)}: {exc}"
+            errors.append(msg)
+            print(f" ERROR: {exc}")
+            try:
+                db.log_error(step, os.path.basename(path), str(exc))
+            except Exception:
+                pass
+
         # If photo_root is not set yet, store it from the common ancestor of photo_dir.
         # This enables relative paths in the DB for portability across machines.
         if not db.photo_root:
@@ -801,6 +820,7 @@ def index_directory(
                     dir_photo_ids_for_clip
                 )
                 db.conn.commit()
+                db.log_activity("clip", "clear", len(dir_photo_ids_for_clip))
             new_photos = list(dir_photos_list)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
         elif not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
@@ -878,6 +898,7 @@ def index_directory(
             db.end_batch()
             elapsed = time.time() - t0
             print(f"  Embedded {embedded_count}/{len(new_photos)} photos in {elapsed:.1f}s")
+            db.log_activity("clip", "index", embedded_count)
 
             # Free CLIP model memory before loading other models
             unload_clip()
@@ -916,9 +937,12 @@ def index_directory(
                 dir_ids = set(pid for pid, _ in _get_dir_photos())
                 if force_faces:
                     print("\nClearing existing face data for target directory...")
+                    cleared_faces = 0
                     for pid in dir_ids:
-                        db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
+                        cur = db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
+                        cleared_faces += cur.rowcount
                     db.conn.commit()
+                    db.log_activity("faces", "clear", cleared_faces)
                     all_face_candidates = list(_get_dir_photos())
                 else:
                     unprocessed_rows = db.conn.execute(
@@ -968,6 +992,7 @@ def index_directory(
                 db.end_batch()
                 elapsed = time.time() - t0
                 print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
+                db.log_activity("faces", "index", face_count)
 
                 if all_encodings:
                     print("  Clustering faces...")
@@ -1033,6 +1058,7 @@ def index_directory(
 
                     elapsed = time.time() - t0
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("describe", "index", desc_count)
 
         # Step 5b: Semantic tags via Ollama (M9)
         if enable_tags:
@@ -1083,6 +1109,7 @@ def index_directory(
 
                     elapsed = time.time() - t0
                     print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("tags", "index", tag_count)
 
         # Step 6: Aesthetic quality scoring + concept analysis
         if enable_quality:
@@ -1125,6 +1152,7 @@ def index_directory(
 
                 elapsed = time.time() - t0
                 print(f"  Scored {scored_count}/{len(quality_candidates)} photos in {elapsed:.1f}s")
+                db.log_activity("quality", "index", scored_count)
 
                 if valid_scores:
                     print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
@@ -1157,6 +1185,7 @@ def index_directory(
 
                 elapsed = time.time() - t0
                 print(f"  Analyzed concepts for {concept_count}/{len(concept_candidates)} photos in {elapsed:.1f}s")
+                db.log_activity("concepts", "index", concept_count)
 
             unload_quality()
 
@@ -1217,6 +1246,7 @@ def index_directory(
                 if stacks:
                     total_stacked = sum(len(s) for s in stacks)
                     print(f"  Detected {len(stacks)} stacks ({total_stacked} photos)")
+                    db.log_activity("stacks", "index", len(stacks))
                 else:
                     print("  No stacks detected.")
             except Exception as e:

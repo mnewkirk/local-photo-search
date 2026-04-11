@@ -174,24 +174,155 @@
       border-radius: var(--radius);
       overflow: hidden;
     }
+    .cmd-wrap > div + div {
+      border-top: 1px solid var(--border);
+    }
+    .cmd-note {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 6px 14px 4px;
+    }
     code {
       font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
       font-size: 12px;
       color: var(--accent);
       background: none;
       display: block;
-      padding: 10px 14px;
+      padding: 6px 14px 10px;
       white-space: pre-wrap;
       word-break: break-all;
-      border-bottom: 1px solid var(--border);
     }
-    code:last-child { border-bottom: none; }
-    .cmd-note {
+
+    /* Activity chart */
+    .chart-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 32px;
+    }
+    .chart-area {
+      display: flex;
+      align-items: flex-end;
+      gap: 1px;
+      height: 160px;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+    .chart-bar-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: flex-end;
+      height: 100%;
+      position: relative;
+      min-width: 0;
+    }
+    .chart-bar-col:hover { opacity: 0.85; }
+    .chart-seg {
+      min-height: 0;
+      transition: height 0.3s ease;
+    }
+    .chart-clear-row {
+      position: absolute;
+      bottom: -14px;
+      left: 0;
+      right: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .chart-clear-seg {
+      width: 100%;
+      background: #f87171;
+      min-height: 0;
+    }
+    .chart-x-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      padding: 0 2px;
+    }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 12px;
       font-size: 11px;
       color: var(--text-muted);
-      padding: 6px 14px 8px;
-      border-top: 1px solid var(--border);
     }
+    .chart-legend-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .chart-legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+    }
+    .chart-tooltip {
+      position: fixed;
+      background: #222;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text);
+      pointer-events: none;
+      z-index: 200;
+      white-space: nowrap;
+    }
+    .chart-tooltip-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      line-height: 1.6;
+    }
+    .chart-tooltip-swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      display: inline-block;
+    }
+    .chart-empty {
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* Errors log */
+    .errors-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .error-row {
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+    }
+    .error-row:last-child { border-bottom: none; }
+    .error-time { color: var(--text-muted); white-space: nowrap; }
+    .error-pass {
+      color: var(--yellow);
+      white-space: nowrap;
+      min-width: 60px;
+    }
+    .error-msg { color: #f87171; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -204,11 +335,33 @@
     var e = React.createElement;
     var useState = React.useState;
     var useEffect = React.useEffect;
+    var useRef = React.useRef;
 
     function pct(n, total) {
       if (!total) return 0;
       return Math.round((n / total) * 100);
     }
+
+    var PASS_COLORS = {
+      clip: '#4a9eff',
+      faces: '#4ade80',
+      quality: '#facc15',
+      describe: '#c084fc',
+      verify: '#fb923c',
+      stacks: '#22d3ee',
+      concepts: '#f472b6',
+      tags: '#2dd4bf',
+    };
+    var PASS_LABELS = {
+      clip: 'CLIP',
+      faces: 'Faces',
+      quality: 'Quality',
+      describe: 'Descriptions',
+      verify: 'Verify',
+      stacks: 'Stacks',
+      concepts: 'Concepts',
+      tags: 'Tags',
+    };
 
     function StatCard(props) {
       var label = props.label;
@@ -233,18 +386,228 @@
       );
     }
 
+    function ActivityChart(props) {
+      var activity = props.activity;
+      var _tip = useState(null); var tooltip = _tip[0]; var setTooltip = _tip[1];
+
+      if (!activity || activity.length === 0) {
+        return e('div', null,
+          e('h2', null, 'Indexing activity (last 3 days)'),
+          e('div', { className: 'chart-wrap' },
+            e('div', { className: 'chart-empty' }, 'No indexing activity recorded yet.')
+          )
+        );
+      }
+
+      // Build 72 hourly buckets
+      var now = new Date();
+      var buckets = [];
+      for (var i = 71; i >= 0; i--) {
+        var d = new Date(now.getTime() - i * 3600000);
+        d.setMinutes(0, 0, 0);
+        buckets.push({ hour: d, index: {}, clear: {} });
+      }
+
+      // Map activity data into buckets
+      var bucketMap = {};
+      buckets.forEach(function(b, idx) {
+        // Key by ISO hour string in UTC to match server response
+        var key = b.hour.getUTCFullYear() + '-' +
+          String(b.hour.getUTCMonth() + 1).padStart(2, '0') + '-' +
+          String(b.hour.getUTCDate()).padStart(2, '0') + 'T' +
+          String(b.hour.getUTCHours()).padStart(2, '0') + ':00:00';
+        bucketMap[key] = idx;
+      });
+
+      activity.forEach(function(row) {
+        var idx = bucketMap[row.hour];
+        if (idx === undefined) return;
+        var target = row.action === 'clear' ? buckets[idx].clear : buckets[idx].index;
+        target[row.pass_type] = (target[row.pass_type] || 0) + row.total;
+      });
+
+      // Find max height for scaling
+      var maxIndex = 0;
+      var maxClear = 0;
+      buckets.forEach(function(b) {
+        var indexTotal = 0;
+        Object.keys(b.index).forEach(function(k) { indexTotal += b.index[k]; });
+        if (indexTotal > maxIndex) maxIndex = indexTotal;
+        var clearTotal = 0;
+        Object.keys(b.clear).forEach(function(k) { clearTotal += b.clear[k]; });
+        if (clearTotal > maxClear) maxClear = clearTotal;
+      });
+
+      var maxVal = Math.max(maxIndex, 1);
+      var clearScale = maxClear > 0 ? Math.max(maxClear, 1) : 1;
+      var chartHeight = 160;
+      var clearHeight = maxClear > 0 ? 24 : 0;
+
+      // Determine which pass types appear
+      var activePasses = {};
+      activity.forEach(function(row) { activePasses[row.pass_type] = true; });
+      var passOrder = ['clip', 'faces', 'quality', 'concepts', 'describe', 'tags', 'verify', 'stacks'];
+
+      // X-axis labels: show every 12 hours
+      var xLabels = [];
+      buckets.forEach(function(b, idx) {
+        if (idx % 12 === 0 || idx === 71) {
+          var h = b.hour;
+          var label = (h.getMonth() + 1) + '/' + h.getDate() + ' ' +
+            String(h.getHours()).padStart(2, '0') + ':00';
+          xLabels.push({ idx: idx, label: label });
+        }
+      });
+
+      function handleMouseEnter(bucketIdx, ev) {
+        var b = buckets[bucketIdx];
+        var lines = [];
+        var h = b.hour;
+        var timeStr = (h.getMonth() + 1) + '/' + h.getDate() + ' ' +
+          String(h.getHours()).padStart(2, '0') + ':00';
+        passOrder.forEach(function(p) {
+          if (b.index[p]) lines.push({ pass: p, count: b.index[p], action: 'indexed' });
+        });
+        passOrder.forEach(function(p) {
+          if (b.clear[p]) lines.push({ pass: p, count: b.clear[p], action: 'cleared' });
+        });
+        if (lines.length === 0) return;
+        setTooltip({ x: ev.clientX, y: ev.clientY, time: timeStr, lines: lines });
+      }
+
+      function handleMouseMove(ev) {
+        if (tooltip) setTooltip(Object.assign({}, tooltip, { x: ev.clientX, y: ev.clientY }));
+      }
+
+      function handleMouseLeave() { setTooltip(null); }
+
+      var columns = buckets.map(function(b, idx) {
+        var segs = [];
+        var indexTotal = 0;
+        passOrder.forEach(function(p) {
+          if (b.index[p]) {
+            indexTotal += b.index[p];
+            segs.push(e('div', {
+              key: p,
+              className: 'chart-seg',
+              style: {
+                height: Math.max(1, Math.round((b.index[p] / maxVal) * chartHeight)) + 'px',
+                background: PASS_COLORS[p] || '#666',
+              }
+            }));
+          }
+        });
+
+        var clearSegs = [];
+        if (maxClear > 0) {
+          passOrder.forEach(function(p) {
+            if (b.clear[p]) {
+              clearSegs.push(e('div', {
+                key: 'c-' + p,
+                className: 'chart-clear-seg',
+                style: {
+                  height: Math.max(1, Math.round((b.clear[p] / clearScale) * clearHeight)) + 'px',
+                }
+              }));
+            }
+          });
+        }
+
+        return e('div', {
+          key: idx,
+          className: 'chart-bar-col',
+          onMouseEnter: function(ev) { handleMouseEnter(idx, ev); },
+          onMouseMove: handleMouseMove,
+          onMouseLeave: handleMouseLeave,
+        },
+          segs.length > 0 ? segs : null,
+          clearSegs.length > 0 ? e('div', { className: 'chart-clear-row' }, clearSegs) : null
+        );
+      });
+
+      var legend = passOrder.filter(function(p) { return activePasses[p]; }).map(function(p) {
+        return e('div', { key: p, className: 'chart-legend-item' },
+          e('div', { className: 'chart-legend-swatch', style: { background: PASS_COLORS[p] } }),
+          PASS_LABELS[p] || p
+        );
+      });
+      if (maxClear > 0) {
+        legend.push(e('div', { key: 'clear', className: 'chart-legend-item' },
+          e('div', { className: 'chart-legend-swatch', style: { background: '#f87171' } }),
+          'Cleared (--force)'
+        ));
+      }
+
+      var tooltipEl = tooltip ? e('div', {
+        className: 'chart-tooltip',
+        style: { left: (tooltip.x + 12) + 'px', top: (tooltip.y - 10) + 'px' }
+      },
+        e('div', { style: { fontWeight: 600, marginBottom: 2 } }, tooltip.time),
+        tooltip.lines.map(function(line, i) {
+          var color = line.action === 'cleared' ? '#f87171' : (PASS_COLORS[line.pass] || '#666');
+          return e('div', { key: i, className: 'chart-tooltip-row' },
+            e('span', { className: 'chart-tooltip-swatch', style: { background: color } }),
+            (PASS_LABELS[line.pass] || line.pass) + ': ' + line.count.toLocaleString() + ' ' + line.action
+          );
+        })
+      ) : null;
+
+      return e('div', null,
+        e('h2', null, 'Indexing activity (last 3 days)'),
+        e('div', { className: 'chart-wrap' },
+          e('div', { className: 'chart-area', style: { marginBottom: clearHeight + 'px' } }, columns),
+          e('div', { className: 'chart-x-labels' },
+            xLabels.map(function(xl) {
+              return e('span', { key: xl.idx }, xl.label);
+            })
+          ),
+          e('div', { className: 'chart-legend' }, legend)
+        ),
+        tooltipEl
+      );
+    }
+
+    function ErrorsLog(props) {
+      var errors = props.errors;
+      if (!errors || errors.length === 0) return null;
+
+      return e('div', null,
+        e('h2', null, 'Recent errors (' + errors.length + ')'),
+        e('div', { className: 'errors-wrap' },
+          errors.map(function(err, i) {
+            var t = err.created_at ? err.created_at.replace('T', ' ').substring(5, 16) : '';
+            return e('div', { key: i, className: 'error-row' },
+              e('span', { className: 'error-time' }, t),
+              e('span', { className: 'error-pass' }, err.pass_type),
+              e('span', { className: 'error-msg' },
+                err.filepath ? err.filepath + ': ' : '',
+                err.message
+              )
+            );
+          })
+        )
+      );
+    }
+
     function StatusPage() {
       var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
       var _e = useState(null); var error = _e[0]; var setError = _e[1];
       var _l = useState(true); var loading = _l[0]; var setLoading = _l[1];
       var _t = useState(null); var lastUpdated = _t[0]; var setLastUpdated = _t[1];
+      var _a = useState(null); var activity = _a[0]; var setActivity = _a[1];
+      var _er = useState(null); var indexErrors = _er[0]; var setIndexErrors = _er[1];
 
       function load() {
         setLoading(true);
-        fetch('/api/stats')
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            setStats(data);
+        Promise.all([
+          fetch('/api/stats').then(function(r) { return r.json(); }),
+          fetch('/api/stats/activity').then(function(r) { return r.json(); }),
+          fetch('/api/stats/errors').then(function(r) { return r.json(); }),
+        ])
+          .then(function(results) {
+            setStats(results[0]);
+            setActivity(results[1]);
+            setIndexErrors(results[2]);
             setLastUpdated(new Date().toLocaleTimeString());
             setLoading(false);
             setError(null);
@@ -370,15 +733,17 @@
                 : 'Run stack to group bursts/brackets'
             })
           ),
+          e(ActivityChart, { activity: activity }),
+          e(ErrorsLog, { errors: indexErrors }),
           e('h2', null, 'Run commands'),
           e('div', { className: 'cmd-wrap' },
             commands.map(function(c) {
               return e('div', { key: c.label },
-                e('code', null, c.cmd),
                 e('div', { className: 'cmd-note' },
                   e('strong', null, c.label + ': '),
                   c.note
-                )
+                ),
+                e('code', null, c.cmd)
               );
             })
           )

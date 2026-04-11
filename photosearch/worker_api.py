@@ -34,10 +34,39 @@ def configure(db_path: str, photo_root: Optional[str] = None):
     global _db_path, _photo_root
     _db_path = db_path
     _photo_root = photo_root
+    _extend_claims_on_startup()
 
 
 def _get_db() -> PhotoDB:
     return PhotoDB(_db_path, photo_root=_photo_root)
+
+
+_STARTUP_GRACE_MINUTES = 10
+
+
+def _extend_claims_on_startup():
+    """Extend all existing claims on service restart.
+
+    While the server was down, workers couldn't renew their claims via heartbeat.
+    Rather than letting those claims expire (and wasting the worker's in-progress
+    compute), give them a grace period so the next heartbeat can reach us.
+    """
+    if not _db_path:
+        return
+    try:
+        with PhotoDB(_db_path) as db:
+            cur = db.conn.execute(
+                "UPDATE worker_claims SET expires_at = datetime('now', ?)",
+                (f"+{_STARTUP_GRACE_MINUTES} minutes",),
+            )
+            db.conn.commit()
+            if cur.rowcount:
+                logger.info(
+                    f"Service restart: extended {cur.rowcount} active claim(s) "
+                    f"by {_STARTUP_GRACE_MINUTES} minutes"
+                )
+    except Exception as e:
+        logger.warning(f"Could not extend claims on startup: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +235,10 @@ def submit_results(req: SubmitRequest):
                     processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store CLIP for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("clip", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
             db.end_batch()
 
         elif req.pass_type == "faces":
@@ -227,6 +260,10 @@ def submit_results(req: SubmitRequest):
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store face for photo {r.photo_id}: {e}")
+                        try:
+                            db.log_error("faces", str(r.photo_id), str(e))
+                        except Exception:
+                            pass
             db.end_batch()
 
             # Cluster the new faces
@@ -257,6 +294,10 @@ def submit_results(req: SubmitRequest):
                     processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store quality for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("quality", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
             db.end_batch()
 
         elif req.pass_type == "describe":
@@ -270,6 +311,10 @@ def submit_results(req: SubmitRequest):
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
+                        try:
+                            db.log_error("describe", str(r.photo_id), str(e))
+                        except Exception:
+                            pass
             # Mark all submitted photos as processed (including those with no description)
             if processed_photo_ids:
                 db.mark_processed(processed_photo_ids, "describe")
@@ -285,6 +330,10 @@ def submit_results(req: SubmitRequest):
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
+                        try:
+                            db.log_error("tags", str(r.photo_id), str(e))
+                        except Exception:
+                            pass
             # Mark all submitted photos as processed (including those with no tags)
             if processed_photo_ids:
                 db.mark_processed(processed_photo_ids, "tags")
@@ -308,6 +357,14 @@ def submit_results(req: SubmitRequest):
                     processed_photo_ids.append(r.photo_id)
                 except Exception as e:
                     logger.warning(f"Failed to store verify for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("verify", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
+
+        # Log activity for the chart
+        if written > 0:
+            db.log_activity(req.pass_type, "index", written)
 
         # Release the claim
         db.release_claim(req.batch_id)
@@ -423,6 +480,11 @@ def clear_pass(req: ClearPassRequest):
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
         db.conn.commit()
+
+        # Log the clear operation for the activity chart
+        if cleared > 0:
+            db.log_activity(req.pass_type, "clear", cleared)
+
         return {"status": "ok", "pass_type": req.pass_type, "cleared": cleared, "photo_count": len(photo_ids)}
 
 
