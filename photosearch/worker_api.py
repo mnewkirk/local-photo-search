@@ -177,13 +177,22 @@ def submit_results(req: SubmitRequest):
     The claim is released after successful write.
     """
     with _get_db() as db:
-        # Verify the claim exists and hasn't expired
-        row = db.conn.execute(
+        # Check if the claim exists — accept results even if expired, since the
+        # worker already did the work and discarding it wastes compute.
+        active_row = db.conn.execute(
             "SELECT * FROM worker_claims WHERE batch_id = ? AND expires_at > datetime('now')",
             (req.batch_id,),
         ).fetchone()
-        if not row:
-            raise HTTPException(410, f"Claim {req.batch_id} expired or does not exist")
+        if not active_row:
+            # Check if the row exists but expired (vs. already cleaned up)
+            any_row = db.conn.execute(
+                "SELECT * FROM worker_claims WHERE batch_id = ?",
+                (req.batch_id,),
+            ).fetchone()
+            if any_row:
+                logger.warning(f"Claim {req.batch_id} expired but accepting results (work already done)")
+            else:
+                logger.warning(f"Claim {req.batch_id} expired and was cleaned up, but accepting results anyway")
 
         written = 0
         processed_photo_ids = []

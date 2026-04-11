@@ -171,10 +171,11 @@ class _ClaimHeartbeat:
         self._client = client
         self._batch_id = batch_id
         self._ttl_minutes = ttl_minutes
-        # Renew at 40% of TTL to leave comfortable margin
-        self._interval = max(60, ttl_minutes * 60 * 0.4)
+        # Renew at 40% of TTL, capped at 120s so even short jobs get heartbeats
+        self._interval = max(30, min(ttl_minutes * 60 * 0.4, 120))
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self.healthy = True  # False if renewal has failed repeatedly
 
     def start(self):
         self._thread.start()
@@ -184,12 +185,23 @@ class _ClaimHeartbeat:
         self._thread.join(timeout=5)
 
     def _run(self):
+        consecutive_failures = 0
         while not self._stop.wait(self._interval):
             ok = self._client.renew_claim(self._batch_id, self._ttl_minutes)
             if ok:
+                consecutive_failures = 0
                 print(f"  ♻ Renewed claim {self._batch_id[:8]}... (next in {self._interval:.0f}s)")
             else:
-                print(f"  ⚠ Failed to renew claim {self._batch_id[:8]}...")
+                # Retry once after a short delay before giving up
+                if not self._stop.wait(5):
+                    ok = self._client.renew_claim(self._batch_id, self._ttl_minutes)
+                if ok:
+                    consecutive_failures = 0
+                    print(f"  ♻ Renewed claim {self._batch_id[:8]}... (retry succeeded)")
+                else:
+                    consecutive_failures += 1
+                    self.healthy = consecutive_failures < 3
+                    print(f"  ⚠ Failed to renew claim {self._batch_id[:8]}... ({consecutive_failures} consecutive failures)")
 
     def __enter__(self):
         self.start()
