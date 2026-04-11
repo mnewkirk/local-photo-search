@@ -43,6 +43,21 @@ docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
   "apk add -q git && git config --global --add safe.directory /repo && git -C /repo pull"
 ```
 
+## Distributed Indexing (Worker)
+
+Offload heavy indexing to a fast laptop while the NAS keeps the DB + photos.
+Worker claims batches via HTTP, downloads photos, processes locally, POSTs results back.
+
+```bash
+# From a fast machine (laptop with GPU):
+python cli.py worker -s http://nas.local:8000 -p clip,quality -d /photos/2026
+python cli.py worker -s http://nas.local:8000 -p describe,tags --collection 3
+python cli.py worker -s http://nas.local:8000 -p clip --force --collection 3
+```
+
+Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints).
+API routes are under `/api/worker/*`. Claims have TTL (default 30min) for crash recovery.
+
 ## Adding Features
 
 - **New CLI command:** Add to `cli.py`, always include `envvar="PHOTOSEARCH_DB"` on `--db`

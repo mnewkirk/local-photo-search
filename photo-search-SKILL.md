@@ -65,8 +65,6 @@ local-photo-search/
 │   ├── verify.py           # Hallucination detection (CLIP + cross-model LLM)
 │   ├── google_photos.py    # Google Photos OAuth2, upload, album management
 │   ├── web.py              # FastAPI app, 50+ /api/* endpoints
-│   ├── worker.py           # Remote worker client — claims batches from NAS, processes locally
-│   ├── worker_api.py       # Worker API endpoints (/api/worker/*) for distributed indexing
 │   ├── exif.py             # EXIF extraction
 │   ├── colors.py           # Dominant color extraction
 │   ├── geocode.py          # Offline reverse geocoding
@@ -474,83 +472,6 @@ export-face-assignments / import-face-assignments
 - **Review page:** Folder picker is searchable with partial path matching
   ("2026-04" matches "2026/2026-04-06"), sorted by most recent photos first.
 - **Static assets:** Served with `Cache-Control: no-cache` to prevent stale JS after deploys.
-
----
-
-## Distributed Indexing (Worker System)
-
-The worker system lets you offload heavy indexing passes (CLIP, faces, quality,
-describe, tags, verify) to a fast laptop/desktop while the NAS remains the single
-source of truth (DB + photos).
-
-### Architecture
-
-- **NAS** runs the web server with `/api/worker/*` endpoints (`worker_api.py`)
-- **Worker** (laptop) runs `python cli.py worker`, claims batches via HTTP,
-  downloads photo bytes, processes locally, and POSTs results back
-- Claims have a TTL (default 30 min) — if a worker dies, photos are auto-reclaimed
-- Multiple workers can run concurrently on different passes
-
-### Worker API Endpoints
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /api/worker/claim-batch` | Claim N unprocessed photos for a pass type |
-| `POST /api/worker/submit-results` | Submit processing results for a claimed batch |
-| `POST /api/worker/clear-pass` | Clear processing state to allow re-processing |
-| `GET /api/worker/photo-detail/{id}` | Get photo metadata + CLIP embedding (for verify) |
-| `GET /api/worker/status` | Queue depth and active claims |
-
-### Worker CLI
-
-```bash
-# Run CLIP embeddings for a directory:
-python cli.py worker -s http://nas.local:8000 -p clip -d /photos/2026/2026-04-09
-
-# Run full pipeline on a directory:
-python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
-
-# Run CLIP + quality for a collection:
-python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
-
-# Run descriptions with moondream model:
-python cli.py worker -s http://nas.local:8000 -p describe --describe-model moondream
-
-# Quick test — one batch only:
-python cli.py worker -s http://localhost:8000 -p clip -d /photos/2026/2026-04-09 --one-shot
-
-# Force re-process (clears existing data first):
-python cli.py worker -s http://nas.local:8000 -p clip --collection 3 --force
-```
-
-Key options: `--batch-size` (photos per claim, default 16), `--model-batch-size`
-(inference batch, default 8), `--ttl` (claim TTL minutes, default 30), `--one-shot`
-(single batch then exit), `--force` (clear + reprocess, requires --collection or --directory).
-
-### Worker Loop
-
-1. Claims a batch of unprocessed photos from the server
-2. Downloads photo bytes to a temp directory
-3. Runs the specified indexing pass locally (fast GPU/CPU)
-4. POSTs results back to the server
-5. Cleans up temp files, repeats until queue is empty
-
-Network retries are built in (exponential backoff on transient errors like
-sleep/wake disconnections). If submit fails after retries, photos are released
-after TTL expires and will be reclaimed by the next worker.
-
-### Key Files
-
-- `photosearch/worker.py` — Client-side worker loop + per-pass processing functions
-- `photosearch/worker_api.py` — Server-side FastAPI router (`/api/worker/*`)
-- `cli.py` — `worker` command with all CLI options
-
-### DB Tables (Worker)
-
-| Table | Purpose |
-|-------|---------|
-| `worker_claims` | Active batch claims (batch_id, worker_id, photo_ids, expires_at) |
-| `worker_processed` | Per-photo processing ledger (photo_id, pass_type) for faces/describe/tags |
 
 ---
 

@@ -489,6 +489,7 @@ The database (`photo_index.db`) is created automatically on first run in the cur
 | `show-descriptions` | View LLaVA-generated descriptions |
 | `verify` | Verify descriptions/tags for hallucinations and auto-regenerate |
 | `review <dir>` | Shoot review — select best representative photos from a folder |
+| `worker` | Run a remote indexing worker (offload processing to a fast machine) |
 | `serve` | Launch the web UI (default port 8000) |
 
 Key flags for `index`:
@@ -531,6 +532,48 @@ Key flags for `review`:
 | `--export <dir>` | Copy selected JPGs to a directory |
 | `--export-raw <dir>` | Copy selected ARW files to a directory |
 | `--list-only` | Print selected file paths without copying |
+
+
+## Distributed indexing (worker)
+
+Indexing passes like CLIP, face detection, and quality scoring are CPU/GPU-intensive. On the NAS (Intel N100), CLIP takes ~2s per photo. On a laptop with Apple Silicon or a GPU, it takes a fraction of that. The worker system lets you offload processing to a fast machine while the NAS stays the source of truth.
+
+The NAS runs the web server as usual. On the fast machine, you run `cli.py worker` which connects to the NAS over HTTP, claims batches of unprocessed photos, downloads them to a temp directory, processes them locally, and POSTs results back.
+
+```bash
+# On the fast machine — run CLIP embeddings for a directory on the NAS:
+python cli.py worker -s http://nas.local:8000 -p clip -d /photos/2026/2026-04-09
+
+# Full pipeline:
+python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
+
+# Scope to a collection:
+python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
+
+# Force re-process (clears existing data first):
+python cli.py worker -s http://nas.local:8000 -p clip --collection 3 --force
+
+# Quick test — one batch only:
+python cli.py worker -s http://nas.local:8000 -p clip -d /photos/2026/2026-04-09 --one-shot
+```
+
+Key flags for `worker`:
+
+| Flag | Effect |
+|------|--------|
+| `-s` / `--server` | NAS server URL (required) |
+| `-p` / `--passes` | Comma-separated pass types: clip, faces, quality, describe, tags, verify |
+| `-d` / `--directory` | Scope to a directory on the NAS |
+| `--collection ID` | Scope to a collection |
+| `--batch-size 16` | Photos per batch claim |
+| `--model-batch-size 8` | Batch size for model inference |
+| `--ttl 30` | Claim TTL in minutes (auto-releases if worker dies) |
+| `--one-shot` | Process one batch per pass and exit |
+| `--force` | Clear existing data and re-process (requires --collection or --directory) |
+| `--describe-model llava` | Ollama model for descriptions and tags |
+| `--verify-model minicpm-v` | Ollama model for hallucination verification |
+
+Multiple workers can run concurrently on different passes. Claims have a TTL — if a worker crashes, uncompleted photos are automatically released and reclaimed by the next worker.
 
 
 ## Testing
@@ -624,6 +667,7 @@ The development process was iterative in a way that's hard to capture in commits
 | **M14** | Done | Photo stacking — burst/bracket detection via union-find (time gap + CLIP similarity), 10-second span enforcement. Stack management UI on all pages (expand/collapse, set top, unstack, add to stack). Schema v11. |
 | **M15** | Done | Shared header component — extracted `PS.SharedHeader` into `shared.js`. All pages use the same logo, nav links, and layout. Page-specific controls passed as children. |
 | **M16** | Done | Shared photo detail modal — extracted `PS.PhotoModal` into `shared.js`. Unified modal with configurable feature flags, face editing, collection management, stacking UI, and keyboard navigation. Removed ~1500 lines of duplicated code. |
+| **M17** | Done | Distributed indexing — worker system for offloading heavy indexing passes (CLIP, faces, quality, describe, tags, verify) to a fast laptop/desktop. Claim/submit API on the NAS, HTTP-based worker loop with TTL-based crash recovery and network retry. |
 
 
 ## Known limitations
