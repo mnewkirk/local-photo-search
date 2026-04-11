@@ -1164,6 +1164,15 @@ class PhotoDB:
         self.conn.commit()
         return batch_id
 
+    def renew_claim(self, batch_id: str, ttl_minutes: int = 30) -> bool:
+        """Extend a claim's expiry. Returns True if the claim existed."""
+        cur = self.conn.execute(
+            "UPDATE worker_claims SET expires_at = datetime('now', ?) WHERE batch_id = ?",
+            (f"+{ttl_minutes} minutes", batch_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def release_claim(self, batch_id: str):
         """Release a claim (after results submitted or on failure)."""
         self.conn.execute("DELETE FROM worker_claims WHERE batch_id = ?", (batch_id,))

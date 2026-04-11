@@ -311,6 +311,20 @@ def submit_results(req: SubmitRequest):
         }
 
 
+class RenewClaimRequest(BaseModel):
+    batch_id: str
+    ttl_minutes: int = 30
+
+
+@router.post("/renew-claim")
+def renew_claim(req: RenewClaimRequest):
+    """Extend the TTL of an active claim (heartbeat)."""
+    with _get_db() as db:
+        if not db.renew_claim(req.batch_id, req.ttl_minutes):
+            raise HTTPException(410, f"Claim {req.batch_id} expired or does not exist")
+        return {"status": "ok", "batch_id": req.batch_id}
+
+
 class ClearPassRequest(BaseModel):
     pass_type: str
     collection_id: Optional[int] = None

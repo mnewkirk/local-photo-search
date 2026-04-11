@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -139,6 +140,18 @@ class WorkerClient:
         r.raise_for_status()
         return r.json()
 
+    def renew_claim(self, batch_id: str, ttl_minutes: int = 30) -> bool:
+        """Extend a claim's TTL (heartbeat). Returns True on success."""
+        try:
+            r = self.session.post(
+                f"{self.server_url}/api/worker/renew-claim",
+                json={"batch_id": batch_id, "ttl_minutes": ttl_minutes},
+                timeout=30,
+            )
+            return r.ok
+        except Exception:
+            return False
+
     def get_photo_detail(self, photo_id: int) -> Optional[dict]:
         """Get photo metadata + CLIP embedding for verify pass."""
         r = self.session.get(
@@ -149,6 +162,41 @@ class WorkerClient:
             return None
         r.raise_for_status()
         return r.json()
+
+
+class _ClaimHeartbeat:
+    """Background thread that periodically renews a worker claim to prevent expiry."""
+
+    def __init__(self, client: WorkerClient, batch_id: str, ttl_minutes: int):
+        self._client = client
+        self._batch_id = batch_id
+        self._ttl_minutes = ttl_minutes
+        # Renew at 40% of TTL to leave comfortable margin
+        self._interval = max(60, ttl_minutes * 60 * 0.4)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            ok = self._client.renew_claim(self._batch_id, self._ttl_minutes)
+            if ok:
+                print(f"  ♻ Renewed claim {self._batch_id[:8]}... (next in {self._interval:.0f}s)")
+            else:
+                print(f"  ⚠ Failed to renew claim {self._batch_id[:8]}...")
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
 
 
 def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> list[tuple[dict, str]]:
@@ -543,6 +591,10 @@ def run_worker(
                 remaining = batch.get("remaining", "?")
                 print(f"  Claimed {len(photos)} photos (batch {batch_id[:8]}...), {remaining} remaining")
 
+                # Start heartbeat to keep claim alive during long processing
+                heartbeat = _ClaimHeartbeat(client, batch_id, ttl_minutes)
+                heartbeat.start()
+
                 # Download (with retry per photo — handled inside _download_batch)
                 batch_temp = os.path.join(temp_base, batch_id[:8])
                 os.makedirs(batch_temp, exist_ok=True)
@@ -555,6 +607,7 @@ def run_worker(
 
                 if not downloaded:
                     print(f"  No photos downloaded, skipping batch.")
+                    heartbeat.stop()
                     continue
 
                 # Process (local — no network needed except verify)
@@ -584,10 +637,14 @@ def run_worker(
                     kwargs = {"verify_results": results}
                 else:
                     print(f"  Pass type '{pass_type}' not yet implemented in worker.")
+                    heartbeat.stop()
                     continue
 
                 proc_elapsed = time.time() - t0
                 print(f"  Processed {len(results)} results in {proc_elapsed:.1f}s")
+
+                # Stop heartbeat before submit (no longer needed)
+                heartbeat.stop()
 
                 # Submit (with retry — this is where sleep/wake crashes hit)
                 print(f"  Submitting results...")
