@@ -323,6 +323,81 @@
       min-width: 60px;
     }
     .error-msg { color: #f87171; word-break: break-all; }
+
+    /* Verify failures */
+    .fail-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .fail-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .fail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px;
+      max-height: 520px;
+      overflow-y: auto;
+    }
+    .fail-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+    }
+    .fail-card:hover { border-color: var(--accent); }
+    .fail-thumb {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      background: #111;
+      display: block;
+    }
+    .fail-meta {
+      padding: 6px 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+    .fail-filename {
+      color: var(--text);
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      font-size: 10px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 2px;
+    }
+    .fail-flag {
+      color: #f87171;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0a1520;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    .btn-primary:hover { background: var(--accent-hover); color: #0a1520; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toast {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--green);
+    }
+    .toast.err { color: #f87171; }
   </style>
 </head>
 <body>
@@ -589,6 +664,107 @@
       );
     }
 
+    function VerifyFailures(props) {
+      var failures = props.failures;
+      var onReload = props.onReload;
+      var onOpen = props.onOpen;
+      var _t = useState(null); var toast = _t[0]; var setToast = _t[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+
+      if (!failures) return null;
+      if (failures.length === 0) {
+        return e('div', null,
+          e('h2', null, 'Verify failures'),
+          e('div', { className: 'fail-wrap' },
+            e('div', { className: 'stat-sub' }, 'No photos have verification_status = fail.')
+          )
+        );
+      }
+
+      function collect() {
+        var name = window.prompt(
+          'Name for new collection of ' + failures.length + ' failed photos:',
+          'Verify failures ' + new Date().toISOString().slice(0, 10)
+        );
+        if (!name) return;
+        setBusy(true);
+        setToast(null);
+        fetch('/api/verify/failures/collect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name.trim() }),
+        })
+          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+          .then(function(res) {
+            setBusy(false);
+            if (!res.ok) {
+              setToast({ msg: res.data.error || 'Failed to create collection', err: true });
+              return;
+            }
+            var c = res.data.collection;
+            setToast({
+              msg: 'Added ' + res.data.added + ' photos to collection "' + c.name + '"',
+              err: false,
+              link: '/collections/' + c.id,
+            });
+          })
+          .catch(function(err) {
+            setBusy(false);
+            setToast({ msg: 'Error: ' + err.message, err: true });
+          });
+      }
+
+      function flagSummary(flags) {
+        if (!flags || !flags.length) return '';
+        var items = flags.slice(0, 3).map(function(f) {
+          return f.noun || f.tag || '';
+        }).filter(Boolean);
+        var extra = flags.length > 3 ? ' +' + (flags.length - 3) : '';
+        return items.join(', ') + extra;
+      }
+
+      var cards = failures.map(function(p) {
+        return e('div', {
+          key: p.id,
+          className: 'fail-card',
+          onClick: function() { onOpen && onOpen(p); },
+          title: p.filepath,
+        },
+          e('img', { className: 'fail-thumb', src: p.thumbnail, loading: 'lazy' }),
+          e('div', { className: 'fail-meta' },
+            e('div', { className: 'fail-filename' }, p.filename || ('id=' + p.id)),
+            e('div', { className: 'fail-flag' }, flagSummary(p.hallucination_flags) || '(no flags recorded)')
+          )
+        );
+      });
+
+      return e('div', null,
+        e('h2', null, 'Verify failures (' + failures.length + ')'),
+        e('div', { className: 'fail-wrap' },
+          e('div', { className: 'fail-header' },
+            e('div', { className: 'stat-sub' },
+              'Hallucinations confirmed but not regenerated. Collect into a collection to re-describe them.'),
+            e('div', { style: { display: 'flex', gap: '8px' } },
+              e('button', { className: 'btn', onClick: onReload }, 'Reload'),
+              e('button', {
+                className: 'btn btn-primary',
+                onClick: collect,
+                disabled: busy,
+              }, busy ? 'Collecting…' : 'Collect into collection')
+            )
+          ),
+          e('div', { className: 'fail-grid' }, cards),
+          toast && e('div', { className: 'toast' + (toast.err ? ' err' : '') },
+            toast.msg,
+            toast.link && e('a', {
+              href: toast.link,
+              style: { color: 'var(--accent)', marginLeft: '8px', textDecoration: 'underline' }
+            }, 'Open →')
+          )
+        )
+      );
+    }
+
     function StatusPage() {
       var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
       var _e = useState(null); var error = _e[0]; var setError = _e[1];
@@ -596,6 +772,9 @@
       var _t = useState(null); var lastUpdated = _t[0]; var setLastUpdated = _t[1];
       var _a = useState(null); var activity = _a[0]; var setActivity = _a[1];
       var _er = useState(null); var indexErrors = _er[0]; var setIndexErrors = _er[1];
+      var _f = useState(null); var failures = _f[0]; var setFailures = _f[1];
+      var _m = useState(null); var modalPhoto = _m[0]; var setModalPhoto = _m[1];
+      var _p = useState([]); var persons = _p[0]; var setPersons = _p[1];
 
       function load() {
         setLoading(true);
@@ -603,11 +782,13 @@
           fetch('/api/stats').then(function(r) { return r.json(); }),
           fetch('/api/stats/activity').then(function(r) { return r.json(); }),
           fetch('/api/stats/errors').then(function(r) { return r.json(); }),
+          fetch('/api/verify/failures').then(function(r) { return r.json(); }),
         ])
           .then(function(results) {
             setStats(results[0]);
             setActivity(results[1]);
             setIndexErrors(results[2]);
+            setFailures((results[3] && results[3].photos) || []);
             setLastUpdated(new Date().toLocaleTimeString());
             setLoading(false);
             setError(null);
@@ -616,6 +797,26 @@
             setError('Failed to load stats: ' + err.message);
             setLoading(false);
           });
+      }
+
+      useEffect(function() {
+        fetch('/api/persons')
+          .then(function(r) { return r.json(); })
+          .then(function(d) { setPersons(d.persons || d || []); })
+          .catch(function() {});
+      }, []);
+
+      function openModal(photo) {
+        setModalPhoto({ id: photo.id });
+      }
+      function closeModal() { setModalPhoto(null); }
+      function navModal(dir) {
+        if (!modalPhoto || !failures) return;
+        var idx = failures.findIndex(function(p) { return p.id === modalPhoto.id; });
+        if (idx < 0) return;
+        var next = idx + dir;
+        if (next < 0 || next >= failures.length) return;
+        setModalPhoto({ id: failures[next].id });
       }
 
       useEffect(function() { load(); }, []);
@@ -731,9 +932,17 @@
               sub: stats.stacks > 0
                 ? stats.stacked_photos.toLocaleString() + ' photos grouped (' + pct(stats.stacked_photos, total) + '% of library)'
                 : 'Run stack to group bursts/brackets'
+            }),
+            e(StatCard, {
+              label: 'Verify',
+              value: (stats.verify_passed + stats.verify_regenerated + stats.verify_failed).toLocaleString(),
+              sub: stats.verify_failed > 0
+                ? stats.verify_failed + ' FAILED · ' + stats.verify_regenerated + ' regenerated · ' + stats.verify_passed + ' passed'
+                : stats.verify_regenerated + ' regenerated · ' + stats.verify_passed + ' passed'
             })
           ),
           e(ActivityChart, { activity: activity }),
+          e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
           e(ErrorsLog, { errors: indexErrors }),
           e('h2', null, 'Run commands'),
           e('div', { className: 'cmd-wrap' },
@@ -750,12 +959,30 @@
         );
       }
 
+      var modalIndex = modalPhoto && failures
+        ? failures.findIndex(function(p) { return p.id === modalPhoto.id; })
+        : -1;
+
       return e('div', null,
         header,
         e('div', { className: 'container' },
           e('h1', null, 'Indexing Status'),
           content
-        )
+        ),
+        modalPhoto && e(PS.PhotoModal, {
+          photo: modalPhoto,
+          onClose: closeModal,
+          onPrev: function() { navModal(-1); },
+          onNext: function() { navModal(1); },
+          index: modalIndex >= 0 ? modalIndex : 0,
+          total: failures ? failures.length : 0,
+          persons: persons,
+          fetchDetail: true,
+          showFaces: true,
+          showCollections: true,
+          showLocation: true,
+          showAesthetics: true,
+        })
       );
     }
 

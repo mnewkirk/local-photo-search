@@ -1122,6 +1122,18 @@ def api_stats():
             "SELECT COUNT(*) as c FROM photos WHERE aesthetic_concepts IS NOT NULL"
         ).fetchone()["c"]
 
+        verify_rows = db.conn.execute(
+            """SELECT verification_status AS status, COUNT(*) AS c
+               FROM photos
+               WHERE verified_at IS NOT NULL
+               GROUP BY verification_status"""
+        ).fetchall()
+        verify_counts = {"pass": 0, "fail": 0, "regenerated": 0}
+        for r in verify_rows:
+            st = r["status"] or "pass"
+            if st in verify_counts:
+                verify_counts[st] += r["c"]
+
     return {
         "photos": photo_count,
         "clip_embedded": clip_count,
@@ -1133,6 +1145,9 @@ def api_stats():
         "concepts_analyzed": concepts_analyzed,
         "stacks": stack_count,
         "stacked_photos": stacked_photos,
+        "verify_passed": verify_counts["pass"],
+        "verify_failed": verify_counts["fail"],
+        "verify_regenerated": verify_counts["regenerated"],
     }
 
 
@@ -1163,6 +1178,77 @@ def api_stats_errors():
             LIMIT 200
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Verify failures
+
+@app.get("/api/verify/failures")
+def api_verify_failures():
+    """Photos with verification_status = 'fail' (hallucinations confirmed but not regenerated)."""
+    with _get_db() as db:
+        rows = db.conn.execute(
+            """SELECT id, filepath, filename, verified_at, hallucination_flags, description
+               FROM photos
+               WHERE verification_status = 'fail'
+               ORDER BY verified_at DESC"""
+        ).fetchall()
+        photos = []
+        for r in rows:
+            flags = None
+            if r["hallucination_flags"]:
+                try:
+                    flags = json.loads(r["hallucination_flags"])
+                except (ValueError, TypeError):
+                    flags = None
+            photos.append({
+                "id": r["id"],
+                "filepath": r["filepath"],
+                "filename": r["filename"],
+                "verified_at": r["verified_at"],
+                "description": r["description"],
+                "hallucination_flags": flags,
+                "thumbnail": f"/api/photos/{r['id']}/thumbnail",
+            })
+    return {"photos": photos, "count": len(photos)}
+
+
+@app.post("/api/verify/failures/collect")
+def api_verify_failures_collect(body: dict):
+    """Gather all verify-failures into a collection.
+
+    Body: {name: str} creates a new collection, or {collection_id: int} appends to existing.
+    """
+    name = (body.get("name") or "").strip()
+    collection_id = body.get("collection_id")
+    if not name and not collection_id:
+        return JSONResponse({"error": "name or collection_id is required"}, status_code=400)
+
+    with _get_db() as db:
+        rows = db.conn.execute(
+            "SELECT id FROM photos WHERE verification_status = 'fail'"
+        ).fetchall()
+        photo_ids = [r["id"] for r in rows]
+        if not photo_ids:
+            return JSONResponse({"error": "No verify failures to collect"}, status_code=404)
+
+        if collection_id:
+            collection = db.get_collection(collection_id)
+            if not collection:
+                return JSONResponse({"error": "Collection not found"}, status_code=404)
+        else:
+            existing = db.get_collection_by_name(name)
+            if existing:
+                return JSONResponse(
+                    {"error": f"Collection '{name}' already exists"}, status_code=409
+                )
+            collection_id = db.create_collection(
+                name, description="Auto-generated from verify failures"
+            )
+            collection = db.get_collection(collection_id)
+
+        added = db.add_photos_to_collection(collection_id, photo_ids)
+    return {"collection": collection, "added": added, "total_failures": len(photo_ids)}
 
 
 # ---------------------------------------------------------------------------
