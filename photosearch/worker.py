@@ -90,9 +90,17 @@ class WorkerClient:
         )
         if r.status_code != 200:
             return False
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                f.write(chunk)
+        try:
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+        except _TRANSIENT:
+            # Let the caller's retry loop handle it; clean up partial file
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            raise
         return True
 
     def submit_results(self, batch_id: str, pass_type: str, **kwargs) -> dict:
@@ -218,7 +226,15 @@ def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> 
         local_path = os.path.join(temp_dir, f"{photo['id']}_{photo['filename']}")
         print(f"    Downloading {photo['filename']}...", end="", flush=True)
         t0 = time.time()
-        if client.download_photo(photo["id"], local_path):
+        try:
+            ok = _retry(
+                lambda pid=photo["id"], lp=local_path: client.download_photo(pid, lp),
+                label=f"download {photo['filename']}",
+            )
+        except _TRANSIENT as e:
+            print(f" FAILED after retries ({e.__class__.__name__})")
+            continue
+        if ok:
             elapsed = time.time() - t0
             size_mb = os.path.getsize(local_path) / (1024 * 1024)
             print(f" {size_mb:.1f}MB ({elapsed:.1f}s)")
