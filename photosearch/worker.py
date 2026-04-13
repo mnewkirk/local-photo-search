@@ -475,7 +475,6 @@ def _process_verify(
             # Hallucinations confirmed — regenerate
             confirmed_nouns = {c["noun"] for c in verified_confirmed}
             elapsed = time.time() - t0
-            print(f" ({elapsed:.1f}s) FAIL — {', '.join(confirmed_nouns)}")
 
             from .describe import describe_photo as _describe, tag_photo as _tag, DESCRIBE_PROMPT
             strict_prompt = DESCRIBE_PROMPT + (
@@ -485,11 +484,21 @@ def _process_verify(
                 + ", ".join(sorted(confirmed_nouns)) + "."
             )
             new_desc = _describe(path, model=regen_model, prompt=strict_prompt)
-            new_tags = _tag(path, model=regen_model)
+            new_tags = _tag(path, model=regen_model) if new_desc else None
+
+            # Mirror verify.py: 'regenerated' only if we actually produced a new
+            # description. Otherwise the photo's description in the DB is still
+            # the one containing hallucinations — mark it 'fail' so it surfaces.
+            if new_desc:
+                status = "regenerated"
+                print(f" ({elapsed:.1f}s) REGENERATED — {', '.join(confirmed_nouns)}")
+            else:
+                status = "fail"
+                print(f" ({elapsed:.1f}s) FAIL — {', '.join(confirmed_nouns)}")
 
             result = {
                 "photo_id": pid,
-                "status": "regenerated",
+                "status": status,
                 "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "hallucination_flags": json.dumps(
                     [{"noun": n, "llm_says": "NO"} for n in confirmed_nouns]

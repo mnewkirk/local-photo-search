@@ -398,6 +398,34 @@
       color: var(--green);
     }
     .toast.err { color: #f87171; }
+
+    .status-badge {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-right: 4px;
+      letter-spacing: 0.04em;
+    }
+    .status-badge.fail { background: #7f1d1d; color: #fecaca; }
+    .status-badge.regenerated { background: #1e3a5f; color: #bfdbfe; }
+
+    .fail-filter {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .fail-filter label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+    .fail-filter input[type="checkbox"] { cursor: pointer; }
   </style>
 </head>
 <body>
@@ -670,21 +698,44 @@
       var onOpen = props.onOpen;
       var _t = useState(null); var toast = _t[0]; var setToast = _t[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _sf = useState(true); var showFail = _sf[0]; var setShowFail = _sf[1];
+      var _sr = useState(true); var showRegen = _sr[0]; var setShowRegen = _sr[1];
 
       if (!failures) return null;
+
+      var counts = { fail: 0, regenerated: 0 };
+      failures.forEach(function(p) {
+        if (counts[p.status] !== undefined) counts[p.status]++;
+      });
+
+      var visible = failures.filter(function(p) {
+        if (p.status === 'fail') return showFail;
+        if (p.status === 'regenerated') return showRegen;
+        return false;
+      });
+
+      var activeStatuses = [];
+      if (showFail) activeStatuses.push('fail');
+      if (showRegen) activeStatuses.push('regenerated');
+
       if (failures.length === 0) {
         return e('div', null,
-          e('h2', null, 'Verify failures'),
+          e('h2', null, 'Verify flags'),
           e('div', { className: 'fail-wrap' },
-            e('div', { className: 'stat-sub' }, 'No photos have verification_status = fail.')
+            e('div', { className: 'stat-sub' }, 'No photos have hallucination flags recorded.')
           )
         );
       }
 
       function collect() {
+        if (activeStatuses.length === 0) {
+          setToast({ msg: 'Select at least one status to collect', err: true });
+          return;
+        }
+        var label = activeStatuses.join('+');
         var name = window.prompt(
-          'Name for new collection of ' + failures.length + ' failed photos:',
-          'Verify failures ' + new Date().toISOString().slice(0, 10)
+          'Name for collection containing ' + visible.length + ' photo(s) (' + label + '):',
+          'Verify ' + label + ' ' + new Date().toISOString().slice(0, 10)
         );
         if (!name) return;
         setBusy(true);
@@ -692,7 +743,7 @@
         fetch('/api/verify/failures/collect', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name.trim() }),
+          body: JSON.stringify({ name: name.trim(), statuses: activeStatuses }),
         })
           .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
           .then(function(res) {
@@ -723,37 +774,66 @@
         return items.join(', ') + extra;
       }
 
-      var cards = failures.map(function(p) {
+      var cards = visible.map(function(p) {
+        var badgeClass = 'status-badge ' + (p.status || 'fail');
         return e('div', {
           key: p.id,
           className: 'fail-card',
           onClick: function() { onOpen && onOpen(p); },
-          title: p.filepath,
+          title: p.filepath + ' — status=' + p.status,
         },
           e('img', { className: 'fail-thumb', src: p.thumbnail, loading: 'lazy' }),
           e('div', { className: 'fail-meta' },
-            e('div', { className: 'fail-filename' }, p.filename || ('id=' + p.id)),
-            e('div', { className: 'fail-flag' }, flagSummary(p.hallucination_flags) || '(no flags recorded)')
+            e('div', { className: 'fail-filename' },
+              e('span', { className: badgeClass }, p.status === 'regenerated' ? 'regen' : 'fail'),
+              p.filename || ('id=' + p.id)
+            ),
+            e('div', { className: 'fail-flag' }, flagSummary(p.hallucination_flags) || '(no flags)')
           )
         );
       });
 
       return e('div', null,
-        e('h2', null, 'Verify failures (' + failures.length + ')'),
+        e('h2', null, 'Verify flags (' + visible.length + ' shown / ' + failures.length + ' total)'),
         e('div', { className: 'fail-wrap' },
           e('div', { className: 'fail-header' },
-            e('div', { className: 'stat-sub' },
-              'Hallucinations confirmed but not regenerated. Collect into a collection to re-describe them.'),
+            e('div', null,
+              e('div', { className: 'stat-sub', style: { marginBottom: '6px' } },
+                'Photos where the verifier flagged hallucinations. "fail" = description still bad; "regen" = description was rewritten.'),
+              e('div', { className: 'fail-filter' },
+                e('label', null,
+                  e('input', {
+                    type: 'checkbox',
+                    checked: showFail,
+                    onChange: function(ev) { setShowFail(ev.target.checked); },
+                  }),
+                  e('span', { className: 'status-badge fail' }, 'fail'),
+                  counts.fail + ' not regenerated'
+                ),
+                e('label', null,
+                  e('input', {
+                    type: 'checkbox',
+                    checked: showRegen,
+                    onChange: function(ev) { setShowRegen(ev.target.checked); },
+                  }),
+                  e('span', { className: 'status-badge regenerated' }, 'regen'),
+                  counts.regenerated + ' regenerated (review recommended)'
+                )
+              )
+            ),
             e('div', { style: { display: 'flex', gap: '8px' } },
               e('button', { className: 'btn', onClick: onReload }, 'Reload'),
               e('button', {
                 className: 'btn btn-primary',
                 onClick: collect,
-                disabled: busy,
-              }, busy ? 'Collecting…' : 'Collect into collection')
+                disabled: busy || activeStatuses.length === 0,
+              }, busy ? 'Collecting…' : 'Collect selected into collection')
             )
           ),
-          e('div', { className: 'fail-grid' }, cards),
+          visible.length === 0
+            ? e('div', { className: 'stat-sub', style: { padding: '20px 0' } },
+                'Nothing matches the current filter.')
+            : e('div', { className: 'fail-grid' }, cards),
           toast && e('div', { className: 'toast' + (toast.err ? ' err' : '') },
             toast.msg,
             toast.link && e('a', {
@@ -936,9 +1016,9 @@
             e(StatCard, {
               label: 'Verify',
               value: (stats.verify_passed + stats.verify_regenerated + stats.verify_failed).toLocaleString(),
-              sub: stats.verify_failed > 0
-                ? stats.verify_failed + ' FAILED · ' + stats.verify_regenerated + ' regenerated · ' + stats.verify_passed + ' passed'
-                : stats.verify_regenerated + ' regenerated · ' + stats.verify_passed + ' passed'
+              sub: (stats.verify_failed > 0 ? stats.verify_failed + ' failed · ' : '')
+                + stats.verify_regenerated + ' regenerated · '
+                + stats.verify_passed + ' passed'
             })
           ),
           e(ActivityChart, { activity: activity }),

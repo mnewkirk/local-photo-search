@@ -1183,15 +1183,48 @@ def api_stats_errors():
 # ---------------------------------------------------------------------------
 # Verify failures
 
+_VERIFY_STATUSES = ("fail", "regenerated")
+
+
+def _parse_statuses(raw: Optional[str]) -> list[str]:
+    """Parse a comma-separated status list into a filtered, ordered list."""
+    if not raw:
+        return ["fail", "regenerated"]
+    wanted = [s.strip() for s in raw.split(",") if s.strip()]
+    return [s for s in wanted if s in _VERIFY_STATUSES]
+
+
 @app.get("/api/verify/failures")
-def api_verify_failures():
-    """Photos with verification_status = 'fail' (hallucinations confirmed but not regenerated)."""
+def api_verify_failures(
+    statuses: Optional[str] = Query(
+        None,
+        description="Comma-separated statuses to include: fail, regenerated. Default: both.",
+    ),
+):
+    """Photos flagged by verify.
+
+    Returns rows where verification_status is in the requested set AND
+    hallucination_flags is not null (i.e. the verifier actually flagged
+    something). By default returns both 'fail' (not regenerated — DB still
+    has bad description/tags) and 'regenerated' (description was rewritten
+    but you may still want to review).
+    """
+    allowed = _parse_statuses(statuses)
+    if not allowed:
+        return {"photos": [], "count": 0, "statuses": []}
+
+    placeholders = ",".join("?" * len(allowed))
     with _get_db() as db:
         rows = db.conn.execute(
-            """SELECT id, filepath, filename, verified_at, hallucination_flags, description
-               FROM photos
-               WHERE verification_status = 'fail'
-               ORDER BY verified_at DESC"""
+            f"""SELECT id, filepath, filename, verified_at, verification_status,
+                       hallucination_flags, description, tags
+                FROM photos
+                WHERE verification_status IN ({placeholders})
+                  AND hallucination_flags IS NOT NULL
+                ORDER BY
+                  CASE verification_status WHEN 'fail' THEN 0 ELSE 1 END,
+                  verified_at DESC""",
+            allowed,
         ).fetchall()
         photos = []
         for r in rows:
@@ -1206,31 +1239,51 @@ def api_verify_failures():
                 "filepath": r["filepath"],
                 "filename": r["filename"],
                 "verified_at": r["verified_at"],
+                "status": r["verification_status"],
                 "description": r["description"],
                 "hallucination_flags": flags,
                 "thumbnail": f"/api/photos/{r['id']}/thumbnail",
             })
-    return {"photos": photos, "count": len(photos)}
+    return {"photos": photos, "count": len(photos), "statuses": allowed}
 
 
 @app.post("/api/verify/failures/collect")
 def api_verify_failures_collect(body: dict):
-    """Gather all verify-failures into a collection.
+    """Gather verify failures and/or regenerated-with-flags photos into a collection.
 
-    Body: {name: str} creates a new collection, or {collection_id: int} appends to existing.
+    Body:
+      - name (str, optional): create a new collection with this name
+      - collection_id (int, optional): append to an existing collection
+      - statuses (list[str], optional): any of 'fail', 'regenerated'. Defaults to ['fail'].
     """
     name = (body.get("name") or "").strip()
     collection_id = body.get("collection_id")
     if not name and not collection_id:
         return JSONResponse({"error": "name or collection_id is required"}, status_code=400)
 
+    raw_statuses = body.get("statuses") or ["fail"]
+    if isinstance(raw_statuses, str):
+        raw_statuses = [s.strip() for s in raw_statuses.split(",") if s.strip()]
+    allowed = [s for s in raw_statuses if s in _VERIFY_STATUSES]
+    if not allowed:
+        return JSONResponse(
+            {"error": f"statuses must be one or more of {list(_VERIFY_STATUSES)}"},
+            status_code=400,
+        )
+
+    placeholders = ",".join("?" * len(allowed))
     with _get_db() as db:
         rows = db.conn.execute(
-            "SELECT id FROM photos WHERE verification_status = 'fail'"
+            f"""SELECT id FROM photos
+                WHERE verification_status IN ({placeholders})
+                  AND hallucination_flags IS NOT NULL""",
+            allowed,
         ).fetchall()
         photo_ids = [r["id"] for r in rows]
         if not photo_ids:
-            return JSONResponse({"error": "No verify failures to collect"}, status_code=404)
+            return JSONResponse(
+                {"error": f"No photos found for statuses {allowed}"}, status_code=404
+            )
 
         if collection_id:
             collection = db.get_collection(collection_id)
@@ -1243,7 +1296,9 @@ def api_verify_failures_collect(body: dict):
                     {"error": f"Collection '{name}' already exists"}, status_code=409
                 )
             collection_id = db.create_collection(
-                name, description="Auto-generated from verify failures"
+                name,
+                description="Auto-generated from verify ("
+                + ", ".join(allowed) + ")",
             )
             collection = db.get_collection(collection_id)
 
