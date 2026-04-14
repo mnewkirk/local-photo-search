@@ -71,9 +71,14 @@ def unload_model():
     _model = None
     _preprocess = None
     _tokenizer = None
-    if _device == "cuda":
-        torch.cuda.empty_cache()
+    prev_device = _device
     _device = None
+    import gc
+    gc.collect()
+    if prev_device == "cuda":
+        torch.cuda.empty_cache()
+    elif prev_device == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
 
 
 def embed_image(image_path: str) -> Optional[list[float]]:

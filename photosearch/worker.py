@@ -11,6 +11,7 @@ The worker loop:
   5. Cleans up temp files, repeats
 """
 
+import gc
 import json
 import os
 import shutil
@@ -27,6 +28,37 @@ from requests.exceptions import ConnectionError as ReqConnectionError, Timeout a
 
 # Transient errors worth retrying (network drop, sleep/wake)
 _TRANSIENT = (ReqConnectionError, ReqTimeout, ConnectionError, TimeoutError)
+
+
+def _unload_pass_models(pass_type: str) -> None:
+    """Release torch models owned by a pass so MPS/CUDA memory is reclaimed.
+
+    Ollama-backed passes (describe/tags/verify) keep their models in the
+    sidecar, so there's nothing to unload here for those.
+    """
+    if pass_type == "clip":
+        from .clip_embed import unload_model as _unload
+        _unload()
+    elif pass_type == "quality":
+        from .quality import unload_models as _unload
+        _unload()
+    elif pass_type == "verify":
+        # Verify borrows clip_embed for its cross-check embeddings.
+        from .clip_embed import unload_model as _unload
+        _unload()
+
+
+def _flush_caches() -> None:
+    """Drop tensor allocator caches between batches to prevent drift."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except ImportError:
+        pass
 
 
 def _retry(fn, max_retries=5, base_delay=5, label="request"):
@@ -596,11 +628,18 @@ def run_worker(
     print(f"\nTemp directory: {temp_base}")
 
     total_processed = 0
+    # Track which pass's torch model is currently resident so we can drop it
+    # before loading a different pass's model (prevents both ViT-B/16 and
+    # ViT-L/14 being held simultaneously when running -p clip,quality).
+    loaded_pass: Optional[str] = None
     try:
         while True:
             any_work = False
 
             for pass_type in passes:
+                if loaded_pass is not None and loaded_pass != pass_type:
+                    _unload_pass_models(loaded_pass)
+                    loaded_pass = None
                 # Claim a batch (with retry for sleep/wake)
                 print(f"\n{'='*60}")
                 print(f"Claiming {pass_type} batch (limit={batch_size})...")
@@ -677,6 +716,8 @@ def run_worker(
                     heartbeat.stop()
                     continue
 
+                loaded_pass = pass_type
+
                 proc_elapsed = time.time() - t0
                 print(f"  Processed {len(results)} results in {proc_elapsed:.1f}s")
 
@@ -709,6 +750,11 @@ def run_worker(
                 # Cleanup temp files
                 shutil.rmtree(batch_temp, ignore_errors=True)
 
+                # Drop allocator caches (MPS especially) and force a GC so
+                # intermediate tensors/PIL buffers don't drift upward.
+                del downloaded, results
+                _flush_caches()
+
             if not any_work:
                 if one_shot:
                     print(f"\nAll queues empty. Processed {total_processed} photos total.")
@@ -722,6 +768,8 @@ def run_worker(
     except KeyboardInterrupt:
         print(f"\n\nInterrupted. Processed {total_processed} photos total.")
     finally:
-        # Cleanup
+        if loaded_pass is not None:
+            _unload_pass_models(loaded_pass)
+        _flush_caches()
         shutil.rmtree(temp_base, ignore_errors=True)
         print(f"Cleaned up temp directory.")

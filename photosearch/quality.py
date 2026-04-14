@@ -168,8 +168,14 @@ def unload_models():
     _aesthetic_model = None
     _clip_model = None
     _clip_preprocess = None
+    prev_device = _device
     _device = None
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    import gc
+    gc.collect()
+    if prev_device == "cuda":
+        torch.cuda.empty_cache()
+    elif prev_device == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
 
 
 def score_photo(image_path: str) -> Optional[float]:
