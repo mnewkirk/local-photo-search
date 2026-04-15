@@ -1525,7 +1525,10 @@ def remap_paths(old_prefix, new_prefix, db, dry_run):
 @cli.command("relocate-into-year-dirs")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--dry-run", is_flag=True, help="Show what would change without modifying the database.")
-def relocate_into_year_dirs(db, dry_run):
+@click.option("--conflicts-file", default="/data/relocate-conflicts.txt",
+              help="Write the full list of skipped target-path conflicts here. "
+                   "Defaults to /data/ so the file persists in the photosearch-data volume.")
+def relocate_into_year_dirs(db, dry_run, conflicts_file):
     """Prepend a YYYY/ directory to filepaths, derived from the leading folder.
 
     Use when photos have been moved from 'SHOOT_DIR/photo.jpg' into
@@ -1543,9 +1546,12 @@ def relocate_into_year_dirs(db, dry_run):
             "SELECT id, filepath, raw_filepath FROM photos"
         ).fetchall()
 
+        existing_paths = {r["filepath"] for r in rows if r["filepath"]}
+
         planned = []
         skipped_no_year = 0
         skipped_already = 0
+        conflicts = []
 
         for row in rows:
             fp = row["filepath"] or ""
@@ -1559,6 +1565,9 @@ def relocate_into_year_dirs(db, dry_run):
                 skipped_already += 1
                 continue
             new_fp = f"{year}/{fp}"
+            if new_fp in existing_paths:
+                conflicts.append((row["id"], fp, new_fp))
+                continue
             new_raw = None
             raw = row["raw_filepath"]
             if raw:
@@ -1572,6 +1581,13 @@ def relocate_into_year_dirs(db, dry_run):
         click.echo(f"  {len(planned)} will be relocated.")
         click.echo(f"  {skipped_no_year} skipped (first folder has no leading year).")
         click.echo(f"  {skipped_already} skipped (already under a YYYY/ folder).")
+        if conflicts:
+            click.echo(f"  {len(conflicts)} skipped (target path already in DB — likely re-indexed duplicate).")
+            with open(conflicts_file, "w") as f:
+                f.write("# id\told_filepath\tnew_filepath (already in DB)\n")
+                for _id, old, new in conflicts:
+                    f.write(f"{_id}\t{old}\t{new}\n")
+            click.echo(f"  Full conflict list written to: {conflicts_file}")
 
         if not planned:
             return
