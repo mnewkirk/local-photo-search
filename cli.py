@@ -1616,6 +1616,151 @@ def relocate_into_year_dirs(db, dry_run, conflicts_file):
         click.echo(f"Updated {len(planned)} filepath(s).")
 
 
+@cli.command("diagnose-relocate-conflicts")
+@click.argument("conflicts_file", default="/data/relocate-conflicts.txt")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+def diagnose_relocate_conflicts(conflicts_file, db):
+    """Compare each (old, new) row pair from relocate-into-year-dirs conflicts.
+
+    Prints per-pair summary of which row has descriptions, tags, scores,
+    file_hash, faces, collection memberships, and related child rows, so
+    you can decide whether to merge or just drop the orphaned old rows.
+    """
+    pairs = []
+    with open(conflicts_file) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                old_id = int(parts[0])
+            except ValueError:
+                continue
+            pairs.append((old_id, parts[1], parts[2]))
+
+    if not pairs:
+        click.echo("No conflict entries found.")
+        return
+
+    def _row_summary(db_, row) -> dict:
+        if not row:
+            return {"exists": False}
+        pid = row["id"]
+        # CLIP embedding lives in a vec table
+        try:
+            has_clip = db_.conn.execute(
+                "SELECT 1 FROM clip_embeddings WHERE photo_id = ? LIMIT 1", (pid,)
+            ).fetchone() is not None
+        except Exception:
+            has_clip = None
+        face_count = db_.conn.execute(
+            "SELECT COUNT(*) FROM faces WHERE photo_id = ?", (pid,)
+        ).fetchone()[0]
+        coll_count = db_.conn.execute(
+            "SELECT COUNT(*) FROM collection_photos WHERE photo_id = ?", (pid,)
+        ).fetchone()[0]
+        stack_count = db_.conn.execute(
+            "SELECT COUNT(*) FROM stack_members WHERE photo_id = ?", (pid,)
+        ).fetchone()[0]
+        rev_count = db_.conn.execute(
+            "SELECT COUNT(*) FROM review_selections WHERE photo_id = ?", (pid,)
+        ).fetchone()[0]
+        try:
+            gp_count = db_.conn.execute(
+                "SELECT COUNT(*) FROM google_photos_uploads WHERE photo_id = ?", (pid,)
+            ).fetchone()[0]
+        except Exception:
+            gp_count = 0
+        wp_count = db_.conn.execute(
+            "SELECT COUNT(*) FROM worker_processed WHERE photo_id = ?", (pid,)
+        ).fetchone()[0]
+        return {
+            "exists": True,
+            "id": pid,
+            "hash": bool(row["file_hash"]),
+            "desc": bool(row["description"]),
+            "tags": bool(row["tags"]),
+            "aesth": row["aesthetic_score"] is not None,
+            "concepts": bool(row["aesthetic_concepts"]),
+            "critique": bool(row["aesthetic_critique"]),
+            "clip": has_clip,
+            "faces": face_count,
+            "coll": coll_count,
+            "stack": stack_count,
+            "review": rev_count,
+            "gphotos": gp_count,
+            "wproc": wp_count,
+        }
+
+    def _fmt(s):
+        if not s.get("exists"):
+            return "(row missing)"
+        parts = []
+        for k in ("hash", "desc", "tags", "aesth", "concepts", "critique", "clip"):
+            parts.append(f"{k}={'Y' if s[k] else '-'}")
+        parts.append(f"faces={s['faces']}")
+        parts.append(f"coll={s['coll']}")
+        parts.append(f"stack={s['stack']}")
+        parts.append(f"review={s['review']}")
+        parts.append(f"gphotos={s['gphotos']}")
+        parts.append(f"wproc={s['wproc']}")
+        return " ".join(parts)
+
+    totals = {"old_only": 0, "new_only": 0, "both": 0, "neither": 0}
+
+    with PhotoDB(db) as pdb:
+        click.echo(f"Comparing {len(pairs)} conflict pair(s):\n")
+        for old_id, old_path, new_path in pairs:
+            old_row = pdb.conn.execute(
+                "SELECT * FROM photos WHERE id = ?", (old_id,)
+            ).fetchone()
+            new_row = pdb.conn.execute(
+                "SELECT * FROM photos WHERE filepath = ?", (new_path,)
+            ).fetchone()
+
+            old_s = _row_summary(pdb, old_row)
+            new_s = _row_summary(pdb, new_row)
+
+            # Tally: does old have something new lacks?
+            old_has_data = old_s.get("exists") and any([
+                old_s.get("desc"), old_s.get("tags"),
+                old_s.get("aesth"), old_s.get("clip"),
+                old_s.get("faces"), old_s.get("coll"),
+                old_s.get("stack"), old_s.get("review"),
+                old_s.get("gphotos"),
+            ])
+            new_has_data = new_s.get("exists") and any([
+                new_s.get("desc"), new_s.get("tags"),
+                new_s.get("aesth"), new_s.get("clip"),
+                new_s.get("faces"), new_s.get("coll"),
+                new_s.get("stack"), new_s.get("review"),
+                new_s.get("gphotos"),
+            ])
+            if old_has_data and new_has_data:
+                totals["both"] += 1
+            elif old_has_data:
+                totals["old_only"] += 1
+            elif new_has_data:
+                totals["new_only"] += 1
+            else:
+                totals["neither"] += 1
+
+            new_id = new_row["id"] if new_row else "?"
+            click.echo(f"  {old_path}")
+            click.echo(f"    old  (id={old_id}): {_fmt(old_s)}")
+            click.echo(f"    new  (id={new_id}): {_fmt(new_s)}")
+            click.echo("")
+
+    click.echo("Summary:")
+    click.echo(f"  Only old row has data:    {totals['old_only']}  → would lose work if deleted")
+    click.echo(f"  Only new row has data:    {totals['new_only']}  → safe to delete old")
+    click.echo(f"  Both have data:           {totals['both']}  → merge candidates")
+    click.echo(f"  Neither has data:         {totals['neither']}  → safe to delete old")
+
+
 @cli.command("set-photo-root")
 @click.argument("root_path")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
