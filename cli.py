@@ -1522,6 +1522,84 @@ def remap_paths(old_prefix, new_prefix, db, dry_run):
         click.echo(f"Updated {updated} filepath(s): '{old_prefix}' → '{new_prefix}'.")
 
 
+@cli.command("relocate-into-year-dirs")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, help="Show what would change without modifying the database.")
+def relocate_into_year_dirs(db, dry_run):
+    """Prepend a YYYY/ directory to filepaths, derived from the leading folder.
+
+    Use when photos have been moved from 'SHOOT_DIR/photo.jpg' into
+    'YYYY/SHOOT_DIR/photo.jpg', where the shoot directory already starts
+    with the year (e.g. '2013-05-04 Cabalette 40th Anniversary').
+
+    Rows whose first path component doesn't start with a 4-digit year are
+    skipped (already relocated, or not year-organized).
+    """
+    import re
+    year_re = re.compile(r"^(\d{4})")
+
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute(
+            "SELECT id, filepath, raw_filepath FROM photos"
+        ).fetchall()
+
+        planned = []
+        skipped_no_year = 0
+        skipped_already = 0
+
+        for row in rows:
+            fp = row["filepath"] or ""
+            first, _, _ = fp.partition("/")
+            m = year_re.match(first)
+            if not m:
+                skipped_no_year += 1
+                continue
+            year = m.group(1)
+            if first == year:
+                skipped_already += 1
+                continue
+            new_fp = f"{year}/{fp}"
+            new_raw = None
+            raw = row["raw_filepath"]
+            if raw:
+                raw_first, _, _ = raw.partition("/")
+                rm = year_re.match(raw_first)
+                if rm and raw_first != rm.group(1):
+                    new_raw = f"{rm.group(1)}/{raw}"
+            planned.append((row["id"], fp, new_fp, raw, new_raw))
+
+        click.echo(f"Found {len(rows)} photo(s).")
+        click.echo(f"  {len(planned)} will be relocated.")
+        click.echo(f"  {skipped_no_year} skipped (first folder has no leading year).")
+        click.echo(f"  {skipped_already} skipped (already under a YYYY/ folder).")
+
+        if not planned:
+            return
+
+        if dry_run:
+            for _id, old, new, _raw, _new_raw in planned[:5]:
+                click.echo(f"  {old}")
+                click.echo(f"  → {new}")
+            if len(planned) > 5:
+                click.echo(f"  ... and {len(planned) - 5} more")
+            click.echo("\nNo changes made (dry run).")
+            return
+
+        for pid, _old, new_fp, _raw, new_raw in planned:
+            if new_raw is not None:
+                photo_db.conn.execute(
+                    "UPDATE photos SET filepath = ?, raw_filepath = ? WHERE id = ?",
+                    (new_fp, new_raw, pid),
+                )
+            else:
+                photo_db.conn.execute(
+                    "UPDATE photos SET filepath = ? WHERE id = ?",
+                    (new_fp, pid),
+                )
+        photo_db.conn.commit()
+        click.echo(f"Updated {len(planned)} filepath(s).")
+
+
 @cli.command("set-photo-root")
 @click.argument("root_path")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")

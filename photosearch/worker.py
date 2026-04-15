@@ -42,6 +42,9 @@ def _unload_pass_models(pass_type: str) -> None:
     elif pass_type == "quality":
         from .quality import unload_models as _unload
         _unload()
+    elif pass_type == "faces":
+        from .faces import unload_model as _unload
+        _unload()
     elif pass_type == "verify":
         # Verify borrows clip_embed for its cross-check embeddings.
         from .clip_embed import unload_model as _unload
@@ -113,15 +116,16 @@ class WorkerClient:
             raise RuntimeError(f"claim-batch failed ({r.status_code}): {detail}")
         return r.json()
 
-    def download_photo(self, photo_id: int, dest_path: str) -> bool:
-        """Download a photo's full-resolution bytes. Returns True on success."""
+    def download_photo(self, photo_id: int, dest_path: str) -> int:
+        """Download a photo's full-resolution bytes. Returns HTTP status code
+        (200 on success, 404 if the NAS can't find the file, etc.)."""
         r = self.session.get(
             f"{self.server_url}/api/photos/{photo_id}/full",
             timeout=120,
             stream=True,
         )
         if r.status_code != 200:
-            return False
+            return r.status_code
         try:
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
@@ -133,7 +137,7 @@ class WorkerClient:
             except OSError:
                 pass
             raise
-        return True
+        return 200
 
     def submit_results(self, batch_id: str, pass_type: str, **kwargs) -> dict:
         """Submit results for a batch. Returns {status, written, batch_id}."""
@@ -259,20 +263,20 @@ def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> 
         print(f"    Downloading {photo['filename']}...", end="", flush=True)
         t0 = time.time()
         try:
-            ok = _retry(
+            status = _retry(
                 lambda pid=photo["id"], lp=local_path: client.download_photo(pid, lp),
                 label=f"download {photo['filename']}",
             )
         except _TRANSIENT as e:
             print(f" FAILED after retries ({e.__class__.__name__})")
             continue
-        if ok:
+        if status == 200:
             elapsed = time.time() - t0
             size_mb = os.path.getsize(local_path) / (1024 * 1024)
             print(f" {size_mb:.1f}MB ({elapsed:.1f}s)")
             downloaded.append((photo, local_path))
         else:
-            print(" FAILED")
+            print(f" FAILED (HTTP {status})")
     return downloaded
 
 
@@ -759,6 +763,13 @@ def run_worker(
                 if one_shot:
                     print(f"\nAll queues empty. Processed {total_processed} photos total.")
                     break
+                # Queues are empty — drop any resident model so we're not
+                # sitting on ~1 GB of weights while idle. Reload cost
+                # (~2–5s) is trivial compared to the idle duration.
+                if loaded_pass is not None:
+                    _unload_pass_models(loaded_pass)
+                    loaded_pass = None
+                    _flush_caches()
                 print(f"\nAll queues empty. Waiting 10s before retrying...")
                 time.sleep(10)
             elif one_shot:

@@ -120,9 +120,14 @@ def _load_models():
 
     import open_clip
 
-    _device = "cuda" if torch.cuda.is_available() else "cpu"
-    if _device == "cpu" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        _device = "mps"
+    # See clip_embed._load_model for why PHOTOSEARCH_DEVICE exists.
+    forced = os.environ.get("PHOTOSEARCH_DEVICE")
+    if forced:
+        _device = forced
+    else:
+        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        if _device == "cpu" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            _device = "mps"
 
     print(f"  Loading aesthetic model (CLIP {AESTHETIC_CLIP_MODEL} + scorer) on {_device}...")
     t0 = time.time()

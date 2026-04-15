@@ -47,12 +47,19 @@ def _load_model():
     if _model is not None:
         return
 
+    import os
     import open_clip
 
-    _device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use MPS (Apple Silicon GPU) if available
-    if _device == "cpu" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        _device = "mps"
+    # Allow override via env var. MPS on macOS has known allocator-cache growth
+    # that can balloon RSS to tens of GB in long-running workers; setting
+    # PHOTOSEARCH_DEVICE=cpu avoids that at the cost of ~2-3x slower inference.
+    forced = os.environ.get("PHOTOSEARCH_DEVICE")
+    if forced:
+        _device = forced
+    else:
+        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        if _device == "cpu" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            _device = "mps"
 
     _model, _, _preprocess = open_clip.create_model_and_transforms(
         MODEL_NAME, pretrained=PRETRAINED, device=_device, quick_gelu=True,

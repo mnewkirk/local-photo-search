@@ -63,6 +63,19 @@ def check_available():
         )
 
 
+def unload_model() -> None:
+    """Release the InsightFace detection + recognition models.
+
+    The buffalo_l pack is ~300 MB of ONNX models that otherwise stay resident
+    for the process lifetime. Call this between pass switches in long-running
+    workers to reclaim that memory.
+    """
+    global _face_app
+    _face_app = None
+    import gc as _gc
+    _gc.collect()
+
+
 def _get_face_app() -> "FaceAnalysis":
     """Lazy-load and return the InsightFace app (CPU execution)."""
     global _face_app
