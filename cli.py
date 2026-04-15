@@ -1761,6 +1761,136 @@ def diagnose_relocate_conflicts(conflicts_file, db):
     click.echo(f"  Neither has data:         {totals['neither']}  → safe to delete old")
 
 
+@cli.command("merge-relocate-conflicts")
+@click.argument("conflicts_file", default="/data/relocate-conflicts.txt")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, help="Show what would change without modifying the database.")
+def merge_relocate_conflicts(conflicts_file, db, dry_run):
+    """Merge each old → new row pair from the relocate conflicts file.
+
+    For each (old_id, new_path) pair:
+      1. Fill in NULL annotation fields on the new row from the old row.
+      2. Re-point child-table rows (clip_embeddings, faces, collection_photos,
+         stack_members, review_selections, google_photos_uploads, worker_processed)
+         from old_id → new_id, skipping rows that would collide with an existing
+         (photo_id, ...) row on the new side.
+      3. Delete the old row.
+    """
+    pairs = []
+    with open(conflicts_file) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                old_id = int(parts[0])
+            except ValueError:
+                continue
+            pairs.append((old_id, parts[2]))
+
+    if not pairs:
+        click.echo("No conflict entries found.")
+        return
+
+    # Annotation columns to copy from old → new when new is NULL
+    copy_cols = [
+        "file_hash", "date_taken", "gps_lat", "gps_lon", "place_name",
+        "camera_make", "camera_model", "focal_length", "exposure_time",
+        "f_number", "iso", "image_width", "image_height",
+        "description", "dominant_colors", "aesthetic_score",
+        "aesthetic_concepts", "aesthetic_critique", "tags", "raw_filepath",
+    ]
+
+    with PhotoDB(db) as pdb:
+        merged = 0
+        skipped = 0
+        for old_id, new_path in pairs:
+            new_row = pdb.conn.execute(
+                "SELECT id FROM photos WHERE filepath = ?", (new_path,)
+            ).fetchone()
+            if not new_row:
+                click.echo(f"  ⚠ new row not found for {new_path} — skipping")
+                skipped += 1
+                continue
+            new_id = new_row["id"]
+            if new_id == old_id:
+                skipped += 1
+                continue
+
+            old_row = pdb.conn.execute(
+                "SELECT * FROM photos WHERE id = ?", (old_id,)
+            ).fetchone()
+            if not old_row:
+                click.echo(f"  ⚠ old row id={old_id} not found — skipping")
+                skipped += 1
+                continue
+
+            if dry_run:
+                click.echo(f"  would merge id={old_id} → id={new_id} ({new_path})")
+                merged += 1
+                continue
+
+            # 1. Fill NULL columns on new from old
+            set_parts, vals = [], []
+            for col in copy_cols:
+                set_parts.append(f"{col} = COALESCE({col}, ?)")
+                vals.append(old_row[col])
+            vals.append(new_id)
+            pdb.conn.execute(
+                f"UPDATE photos SET {', '.join(set_parts)} WHERE id = ?", vals,
+            )
+
+            # 2. Re-point child-table rows. Order matters for virtual vec tables.
+            # clip_embeddings: UPSERT — if new has none, copy old's
+            has_new_clip = pdb.conn.execute(
+                "SELECT 1 FROM clip_embeddings WHERE photo_id = ? LIMIT 1", (new_id,)
+            ).fetchone()
+            if not has_new_clip:
+                old_emb = pdb.conn.execute(
+                    "SELECT embedding FROM clip_embeddings WHERE photo_id = ?", (old_id,)
+                ).fetchone()
+                if old_emb:
+                    pdb.conn.execute(
+                        "INSERT INTO clip_embeddings (photo_id, embedding) VALUES (?, ?)",
+                        (new_id, old_emb["embedding"]),
+                    )
+            pdb.conn.execute(
+                "DELETE FROM clip_embeddings WHERE photo_id = ?", (old_id,),
+            )
+
+            # Simple re-point (no uniqueness on photo_id)
+            pdb.conn.execute(
+                "UPDATE faces SET photo_id = ? WHERE photo_id = ?", (new_id, old_id),
+            )
+            pdb.conn.execute(
+                "UPDATE google_photos_uploads SET photo_id = ? WHERE photo_id = ?",
+                (new_id, old_id),
+            )
+
+            # Re-point with conflict tolerance (composite PKs / UNIQUE photo_id)
+            for table in ("collection_photos", "stack_members",
+                          "review_selections", "worker_processed"):
+                pdb.conn.execute(
+                    f"UPDATE OR IGNORE {table} SET photo_id = ? WHERE photo_id = ?",
+                    (new_id, old_id),
+                )
+                pdb.conn.execute(
+                    f"DELETE FROM {table} WHERE photo_id = ?", (old_id,),
+                )
+
+            # 3. Delete old row
+            pdb.conn.execute("DELETE FROM photos WHERE id = ?", (old_id,))
+            merged += 1
+
+        if not dry_run:
+            pdb.conn.commit()
+        click.echo(f"\nMerged: {merged}, skipped: {skipped}"
+                   + (" (dry run)" if dry_run else ""))
+
+
 @cli.command("set-photo-root")
 @click.argument("root_path")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
