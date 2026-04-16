@@ -555,8 +555,7 @@ def worker_status(collection_id: Optional[int] = None, directory: Optional[str] 
 
         queue = {}
         for pass_type in ("clip", "faces", "quality", "describe", "tags", "verify"):
-            unprocessed = db.get_unprocessed_photos(pass_type, photo_ids=scope_ids, limit=100000)
-            queue[pass_type] = len(unprocessed)
+            queue[pass_type] = db.count_unprocessed_photos(pass_type, photo_ids=scope_ids)
 
         return {
             "active_claims": active,

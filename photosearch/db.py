@@ -1363,6 +1363,91 @@ class PhotoDB:
         result = [dict(r) for r in rows if r["id"] not in claimed]
         return result[:limit]
 
+    def count_unprocessed_photos(self, pass_type: str,
+                                 photo_ids: list[int] | None = None) -> int:
+        """Count photos missing data for a given pass type (fast, no filepath fetch)."""
+        if pass_type == "clip":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos p
+                        WHERE p.id IN ({placeholders})
+                        AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) FROM photos p WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)"
+                ).fetchone()
+        elif pass_type == "faces":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos p
+                        WHERE p.id IN ({placeholders})
+                        AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """SELECT COUNT(*) FROM photos p
+                       WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
+                       AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                       WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')"""
+                ).fetchone()
+        elif pass_type == "quality":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"SELECT COUNT(*) FROM photos WHERE id IN ({placeholders}) AND aesthetic_score IS NULL",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) FROM photos WHERE aesthetic_score IS NULL"
+                ).fetchone()
+        elif pass_type in ("describe", "tags"):
+            col = {"describe": "description", "tags": "tags"}[pass_type]
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE id IN ({placeholders})
+                        AND {col} IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)""",
+                    list(photo_ids) + [pass_type],
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE {col} IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)""",
+                    (pass_type,),
+                ).fetchone()
+        elif pass_type == "verify":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE id IN ({placeholders})
+                        AND description IS NOT NULL
+                        AND verified_at IS NULL""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """SELECT COUNT(*) FROM photos
+                       WHERE description IS NOT NULL
+                       AND verified_at IS NULL"""
+                ).fetchone()
+        else:
+            raise ValueError(f"Unknown pass type: {pass_type}")
+        return row[0]
+
     def close(self):
         # Flush any pending batch writes before closing
         if self._batch_mode:

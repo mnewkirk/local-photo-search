@@ -164,7 +164,7 @@ class WorkerClient:
             params["collection_id"] = collection_id
         if directory is not None:
             params["directory"] = directory
-        r = self.session.get(f"{self.server_url}/api/worker/status", params=params, timeout=10)
+        r = self.session.get(f"{self.server_url}/api/worker/status", params=params, timeout=60)
         r.raise_for_status()
         return r.json()
 
