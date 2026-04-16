@@ -256,8 +256,10 @@ for i in $(seq 1 "$NUM_WORKERS"); do
         --label "photosearch-worker-fleet=true" \
         --memory "$MEM_LIMIT" \
         --restart on-failure:3 \
+        --add-host=host.docker.internal:host-gateway \
         -e PHOTOSEARCH_DEVICE=cpu \
         -e PYTHONUNBUFFERED=1 \
+        -e OLLAMA_HOST=http://host.docker.internal:11434 \
         "$IMAGE_TAG" \
         $WORKER_CMD \
         > /dev/null

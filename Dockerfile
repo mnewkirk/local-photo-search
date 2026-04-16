@@ -59,8 +59,10 @@ VOLUME ["/photos", "/data"]
 
 # InsightFace model cache — store in persistent volume
 ENV INSIGHTFACE_HOME=/data/.insightface
-# Ollama host — points to the sidecar container by default
-ENV OLLAMA_HOST=http://ollama:11434
+# Ollama host — default to localhost so workers on laptops find the local
+# Ollama.  NAS compose files override this to http://ollama:11434 for the
+# sidecar container.
+ENV OLLAMA_HOST=http://localhost:11434
 # Database location
 ENV PHOTOSEARCH_DB=/data/photo_index.db
 # Photo root — base path for resolving relative file paths in the DB.
