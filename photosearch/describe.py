@@ -146,6 +146,42 @@ def check_available(model: str = MODEL) -> None:
 _MAX_RETRIES = 3
 _RETRY_DELAY = 5  # seconds between retries
 
+# Substrings that signal the llama runner was OOM-killed rather than a genuine
+# transient network error. Surfaces in Ollama errors as:
+#   "llama runner process has terminated: %!w(<nil>) (status code: 500)"
+# On Mac with managed Docker Ollama + worker fleet, this almost always means
+# Docker Desktop's VM ran out of memory loading the vision model — see
+# run-workers.sh header for the full explanation and fixes.
+_RUNNER_OOM_PATTERNS = ("llama runner process has terminated", "runner has terminated")
+_RUNNER_OOM_HINT_SHOWN = False
+
+
+def _maybe_print_runner_oom_hint() -> None:
+    """Print a one-time diagnostic hint when the llama-runner OOM pattern appears.
+
+    Retries will still run, but the user sees the likely root cause immediately
+    instead of watching identical 500 errors scroll by.
+    """
+    global _RUNNER_OOM_HINT_SHOWN
+    if _RUNNER_OOM_HINT_SHOWN:
+        return
+    _RUNNER_OOM_HINT_SHOWN = True
+    import sys
+    sys.stderr.write(
+        "\n"
+        "  ⚠ Ollama llama runner terminated — this is almost always the model\n"
+        "    being OOM-killed by the Docker Desktop VM, not a network blip.\n"
+        "    Likely cause: managed Docker Ollama + worker fleet contending for\n"
+        "    Docker's VM memory. Fixes (easiest first):\n"
+        "      1. Prefer native 'ollama serve' on the host (./run-workers.sh --stop,\n"
+        "         then run 'ollama serve' + 'ollama pull <model>', then relaunch workers)\n"
+        "      2. Raise Docker Desktop memory (Settings → Resources → Memory → 16 GiB+)\n"
+        "         and restart Docker Desktop\n"
+        "      3. Reduce fleet pressure: ./run-workers.sh -n 2 -m 2g ...\n"
+        "\n"
+    )
+    sys.stderr.flush()
+
 import re as _re
 _BBOX_PATTERN = _re.compile(r'\[\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*\]')
 
@@ -194,6 +230,8 @@ def _ollama_chat_with_retry(
             return text if text else None
         except Exception as e:
             err_str = str(e).lower()
+            if any(p in err_str for p in _RUNNER_OOM_PATTERNS):
+                _maybe_print_runner_oom_hint()
             is_transient = any(kw in err_str for kw in [
                 "timeout", "connection", "refused", "reset", "broken pipe",
                 "503", "502", "500", "unavailable",

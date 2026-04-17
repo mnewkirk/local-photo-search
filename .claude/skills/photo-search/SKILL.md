@@ -526,6 +526,35 @@ Key options: `-n` (number of workers, default 4), `-m` (memory limit, default 3g
 CPU-only inference is ~2-3x slower per worker than MPS, but 4 containers running
 concurrently with stable memory is faster than 1-2 MPS workers that eventually crash.
 
+#### Ollama for describe/tags/verify passes
+
+If `--passes` includes `describe`, `tags`, or `verify`, the script checks
+`localhost:11434` and either reuses an existing Ollama or starts a managed
+container. It then pre-pulls the required models into the Ollama volume:
+
+- `describe` / `tags` → pulls `${DESCRIBE_MODEL:-llava}`
+- `verify` → pulls **both** `${VERIFY_MODEL:-minicpm-v}` (verifier) **and**
+  `${DESCRIBE_MODEL:-llava}` (regeneration model used when a description fails
+  verification). Ollama does not auto-pull on request, so both must be present
+  before the pass runs.
+
+**Prefer native Ollama.** Running `ollama serve` directly on the Mac host avoids
+Docker Desktop VM memory oversubscription. When native Ollama is reachable at
+`localhost:11434`, `run-workers.sh` detects and reuses it (and only *warns*
+about missing models rather than pulling them, since pulling multi-GB models
+into someone else's Ollama unannounced is rude).
+
+**If you must use the managed Ollama container:** raise Docker Desktop memory
+(Settings → Resources → Memory) to at least ~24 GiB for the default fleet
+(4 workers × 3 GiB = 12 GiB + Ollama ~4-5 GiB + daemon overhead). ~16 GiB has
+been observed to still OOM-kill the llama runner. Restart Docker Desktop fully
+after changing the limit.
+
+**Diagnostic hint:** `photosearch/describe.py` detects the
+`"llama runner process has terminated"` error pattern and prints a one-time
+hint to stderr explaining the likely cause and fixes (see
+`_maybe_print_runner_oom_hint()`).
+
 ### Bare-Metal Worker CLI (Single Quick Tests Only)
 
 ```bash
@@ -613,6 +642,21 @@ instead: `./run-workers.sh -s http://192.168.x.x:8000 ...` Find it with `ping na
 **Worker memory leak / Mac crash** — PyTorch MPS allocator leaks memory in long-running
 workers. Use the Docker fleet (`./run-workers.sh`) instead of bare `python cli.py worker`
 for sustained multi-worker runs. Docker forces CPU-only with hard memory limits.
+
+**"llama runner process has terminated: %!w(<nil>)" (status 500)** — The llama
+runner subprocess inside Ollama was OOM-killed, almost always because the managed
+Docker Ollama container is sharing Docker Desktop's VM memory with worker containers
+and LLaVA's ~4.3 GiB working set doesn't fit. Fixes (easiest first):
+1. Use native `ollama serve` on the host. Stop the fleet (`./run-workers.sh --stop`),
+   run `ollama serve` (or launch Ollama.app), `ollama pull llava && ollama pull minicpm-v`,
+   then relaunch the fleet — it will detect and reuse the native Ollama.
+2. Raise Docker Desktop memory to ~24 GiB (Settings → Resources → Memory) and
+   restart Docker Desktop fully. ~16 GiB is too tight for the default 4×3g fleet
+   plus Ollama.
+3. Reduce fleet pressure: `./run-workers.sh -n 2 -m 2g ...`.
+
+`photosearch/describe.py` prints a one-time diagnostic hint when this error pattern
+is detected, so you'll see this guidance in the worker logs as well.
 
 **Google Photos upload shows 0 uploaded, N re-synced** — `batchAddMediaItems` silently
 fails for photos removed via Google Photos UI. Use "Re-upload" with specific photos selected.

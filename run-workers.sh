@@ -19,7 +19,10 @@
 # If --passes includes describe, tags, or verify, the script checks
 # localhost:11434. If nothing answers, it starts a managed container
 # ($OLLAMA_CONTAINER) and auto-pulls the required models into its volume
-# ($OLLAMA_VOLUME). The managed container is torn down by --stop.
+# ($OLLAMA_VOLUME). For `verify` this pulls BOTH the verifier (minicpm-v) and
+# the regeneration model (llava) — verify regenerates descriptions via the
+# describe model when a photo fails verification, so both must be present.
+# The managed container is torn down by --stop.
 #
 # PREFER NATIVE OLLAMA (run `ollama serve` on the host) if you can. The
 # managed-in-Docker path shares Docker Desktop's VM memory budget with every
@@ -30,7 +33,10 @@
 # directly and does not compete.
 #
 # If you must use the managed container, raise Docker Desktop memory
-# (Settings → Resources → Memory) to ~16 GiB or reduce -n / -m.
+# (Settings → Resources → Memory) to at least ~24 GiB for the default fleet
+# (4 workers × 3 GiB = 12 GiB) plus Ollama's ~4-5 GiB working set plus daemon
+# overhead. ~16 GiB has been observed to still OOM-kill the llama runner.
+# Alternatively reduce -n / -m.
 # ===========================================================================
 
 set -euo pipefail
@@ -89,7 +95,8 @@ Ollama note:
   script will detect and reuse it. The managed-in-Docker fallback shares
   Docker Desktop's VM memory with every worker — on a default VM, LLaVA's
   runner is OOM-killed ("llama runner process has terminated", 500). If you
-  must use the managed container, raise Docker Desktop memory to ~16 GiB.
+  must use the managed container, raise Docker Desktop memory to ~24 GiB for
+  the default fleet (4 × 3 GiB + Ollama + daemon). ~16 GiB is too tight.
 EOF
     exit 0
 }
@@ -156,11 +163,16 @@ ensure_ollama_running() {
 
 required_ollama_models() {
     # Prints newline-separated list of Ollama models required by $PASSES.
+    # verify needs both the verifier and the regen model (used when a photo
+    # fails verification and its description/tags must be re-generated).
     local IFS=','
     for p in $PASSES; do
         case "$p" in
             describe|tags) echo "${DESCRIBE_MODEL:-llava}" ;;
-            verify)        echo "${VERIFY_MODEL:-minicpm-v}" ;;
+            verify)
+                echo "${VERIFY_MODEL:-minicpm-v}"
+                echo "${DESCRIBE_MODEL:-llava}"
+                ;;
         esac
     done | sort -u
 }
