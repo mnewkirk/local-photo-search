@@ -48,15 +48,24 @@ docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
 Offload heavy indexing to a fast laptop while the NAS keeps the DB + photos.
 Worker claims batches via HTTP, downloads photos, processes locally, POSTs results back.
 
+**Docker worker fleet (recommended)** — avoids PyTorch MPS memory leak on macOS:
 ```bash
-# From a fast machine (laptop with GPU):
+./run-workers.sh -s http://<NAS-IP>:8000 -p clip -d /photos/2026 -n 4
+./run-workers.sh --status    # containers + memory + progress
+./run-workers.sh --logs      # tail all workers live
+./run-workers.sh --stop      # stop all workers
+```
+Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
+(not hostname) — Docker containers can't resolve local DNS names.
+
+**Bare-metal (single quick test only):**
+```bash
 python cli.py worker -s http://nas.local:8000 -p clip,quality -d /photos/2026
-python cli.py worker -s http://nas.local:8000 -p describe,tags --collection 3
-python cli.py worker -s http://nas.local:8000 -p clip --force --collection 3
 ```
 
-Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints).
-API routes are under `/api/worker/*`. Claims have TTL (default 30min) for crash recovery.
+Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints),
+`run-workers.sh` (Docker fleet launcher). API routes under `/api/worker/*`.
+Claims have TTL (default 30min) for crash recovery.
 
 ## Adding Features
 

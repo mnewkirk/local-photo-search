@@ -50,6 +50,7 @@ local-photo-search/
 ├── Dockerfile              # Multi-stage: builder + runtime
 ├── docker-compose.yml      # Local dev
 ├── docker-compose.nas.yml  # NAS production
+├── run-workers.sh          # Docker worker fleet launcher (Mac)
 ├── requirements.txt        # Python deps (CPU torch pinned)
 ├── references.yml          # Face reference config (person → photos)
 ├── GOOGLE_PHOTOS_SETUP.md  # Step-by-step Google Photos OAuth setup
@@ -491,17 +492,41 @@ source of truth (DB + photos).
 - Claims have a TTL (default 30 min) — if a worker dies, photos are auto-reclaimed
 - Multiple workers can run concurrently on different passes
 
-### Worker API Endpoints
+### Docker Worker Fleet (Recommended for Mac)
 
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /api/worker/claim-batch` | Claim N unprocessed photos for a pass type |
-| `POST /api/worker/submit-results` | Submit processing results for a claimed batch |
-| `POST /api/worker/clear-pass` | Clear processing state to allow re-processing |
-| `GET /api/worker/photo-detail/{id}` | Get photo metadata + CLIP embedding (for verify) |
-| `GET /api/worker/status` | Queue depth and active claims |
+Running workers bare-metal on macOS causes PyTorch's MPS (Metal) allocator to leak
+memory over time, eventually crashing the machine. The Docker fleet avoids this by
+using CPU-only PyTorch with hard memory limits per container.
 
-### Worker CLI
+```bash
+# Launch 4 workers for CLIP embeddings:
+./run-workers.sh -s http://<NAS-IP>:8000 -p clip -d /photos/2026 -n 4
+
+# Multiple passes:
+./run-workers.sh -s http://<NAS-IP>:8000 -p clip,quality,faces -d /photos/2026
+
+# Fewer workers for heavier passes:
+./run-workers.sh -s http://<NAS-IP>:8000 -p describe --collection 3 -n 2
+
+# More memory per worker if needed:
+./run-workers.sh -s http://<NAS-IP>:8000 -p quality -d /photos/2026 -m 4g -n 3
+
+# Monitor:
+./run-workers.sh --status    # containers + memory usage + recent progress
+./run-workers.sh --logs      # tail all worker logs live (Ctrl-C to stop)
+./run-workers.sh --stop      # stop all workers
+```
+
+**Important:** Use the NAS IP address (not hostname) — Docker containers run in an
+isolated network and cannot resolve local DNS names like `nas.local` or mDNS hostnames.
+
+Key options: `-n` (number of workers, default 4), `-m` (memory limit, default 3g),
+`--batch-size`, `--model-batch-size`, `--ttl`, `--force`, `--describe-model`, `--verify-model`.
+
+CPU-only inference is ~2-3x slower per worker than MPS, but 4 containers running
+concurrently with stable memory is faster than 1-2 MPS workers that eventually crash.
+
+### Bare-Metal Worker CLI (Single Quick Tests Only)
 
 ```bash
 # Run CLIP embeddings for a directory:
@@ -527,6 +552,16 @@ Key options: `--batch-size` (photos per claim, default 16), `--model-batch-size`
 (inference batch, default 8), `--ttl` (claim TTL minutes, default 30), `--one-shot`
 (single batch then exit), `--force` (clear + reprocess, requires --collection or --directory).
 
+### Worker API Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/worker/claim-batch` | Claim N unprocessed photos for a pass type |
+| `POST /api/worker/submit-results` | Submit processing results for a claimed batch |
+| `POST /api/worker/clear-pass` | Clear processing state to allow re-processing |
+| `GET /api/worker/photo-detail/{id}` | Get photo metadata + CLIP embedding (for verify) |
+| `GET /api/worker/status` | Queue depth and active claims |
+
 ### Worker Loop
 
 1. Claims a batch of unprocessed photos from the server
@@ -541,6 +576,7 @@ after TTL expires and will be reclaimed by the next worker.
 
 ### Key Files
 
+- `run-workers.sh` — Docker fleet launcher script (start/status/logs/stop)
 - `photosearch/worker.py` — Client-side worker loop + per-pass processing functions
 - `photosearch/worker_api.py` — Server-side FastAPI router (`/api/worker/*`)
 - `cli.py` — `worker` command with all CLI options
@@ -569,6 +605,14 @@ volume mount and `ENV INSIGHTFACE_HOME=/data/.insightface`.
 instead of `asyncio.get_running_loop()` in async endpoints, (2) missing terminal event
 type in the generate() stream check, (3) `InterruptedError` swallowed by generic
 `except Exception` instead of being re-raised.
+
+**Worker containers exit immediately with "Connection refused"** — Docker containers
+can't resolve local hostnames (mDNS, `.local`, NAS hostnames). Use the NAS IP address
+instead: `./run-workers.sh -s http://192.168.x.x:8000 ...` Find it with `ping nas-hostname`.
+
+**Worker memory leak / Mac crash** — PyTorch MPS allocator leaks memory in long-running
+workers. Use the Docker fleet (`./run-workers.sh`) instead of bare `python cli.py worker`
+for sustained multi-worker runs. Docker forces CPU-only with hard memory limits.
 
 **Google Photos upload shows 0 uploaded, N re-synced** — `batchAddMediaItems` silently
 fails for photos removed via Google Photos UI. Use "Re-upload" with specific photos selected.

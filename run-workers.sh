@@ -18,6 +18,9 @@
 set -euo pipefail
 
 PROJECT="photosearch-worker"
+OLLAMA_CONTAINER="photosearch-worker-ollama"
+OLLAMA_VOLUME="photosearch-worker-ollama-models"
+OLLAMA_PORT=11434
 
 # Defaults
 NUM_WORKERS=4
@@ -67,6 +70,122 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Ollama helpers (auto-start for describe/tags/verify passes)
+# ---------------------------------------------------------------------------
+
+ollama_needed() {
+    # Returns 0 if any pass in $PASSES requires an Ollama backend.
+    local IFS=','
+    for p in $PASSES; do
+        case "$p" in
+            describe|tags|verify) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+ollama_is_reachable() {
+    curl -sf --max-time 2 "http://localhost:${OLLAMA_PORT}/api/tags" > /dev/null 2>&1
+}
+
+ollama_container_exists() {
+    docker ps -a --filter "name=^${OLLAMA_CONTAINER}$" -q 2>/dev/null | grep -q .
+}
+
+ensure_ollama_running() {
+    if ollama_is_reachable; then
+        if ollama_container_exists; then
+            echo "  Ollama reachable (managed container: $OLLAMA_CONTAINER)"
+        else
+            echo "  Ollama already reachable at localhost:${OLLAMA_PORT} (not managed by this script)"
+        fi
+        return
+    fi
+    echo "  Ollama not reachable — starting managed container ($OLLAMA_CONTAINER)..."
+    docker rm -f "$OLLAMA_CONTAINER" > /dev/null 2>&1 || true
+    docker run -d \
+        --name "$OLLAMA_CONTAINER" \
+        --label "photosearch-worker-ollama=true" \
+        --restart unless-stopped \
+        -p "${OLLAMA_PORT}:11434" \
+        -v "${OLLAMA_VOLUME}:/root/.ollama" \
+        ollama/ollama:latest > /dev/null
+    local waited=0
+    until ollama_is_reachable; do
+        if [ "$waited" -ge 30 ]; then
+            echo "  WARNING: Ollama container started but not reachable after 30s." >&2
+            echo "  Check logs: docker logs $OLLAMA_CONTAINER" >&2
+            return
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "  Ollama container ready (models persisted in volume: $OLLAMA_VOLUME)"
+}
+
+required_ollama_models() {
+    # Prints newline-separated list of Ollama models required by $PASSES.
+    local IFS=','
+    for p in $PASSES; do
+        case "$p" in
+            describe|tags) echo "${DESCRIBE_MODEL:-llava}" ;;
+            verify)        echo "${VERIFY_MODEL:-minicpm-v}" ;;
+        esac
+    done | sort -u
+}
+
+ollama_has_model() {
+    # Uses /api/show which returns 200 iff the model is present locally.
+    local model="$1"
+    curl -sf --max-time 5 -X POST "http://localhost:${OLLAMA_PORT}/api/show" \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$model\"}" > /dev/null 2>&1
+}
+
+ensure_ollama_models() {
+    # Pulls any required models not already present. Only auto-pulls into the
+    # managed container — for an external Ollama, we only warn, since pulling
+    # multi-GB models into someone else's Ollama unannounced is rude.
+    local models
+    models=$(required_ollama_models)
+    [ -z "$models" ] && return
+    local managed=0
+    if ollama_container_exists; then
+        managed=1
+    fi
+    while IFS= read -r model; do
+        [ -z "$model" ] && continue
+        if ollama_has_model "$model"; then
+            echo "  Model '$model' already present"
+            continue
+        fi
+        if [ "$managed" -eq 1 ]; then
+            echo "  Model '$model' missing — pulling into $OLLAMA_CONTAINER (may take several minutes)..."
+            if ! docker exec "$OLLAMA_CONTAINER" ollama pull "$model"; then
+                echo "  WARNING: Pull failed for '$model'. Retry manually:" >&2
+                echo "    docker exec $OLLAMA_CONTAINER ollama pull $model" >&2
+            fi
+        else
+            echo "  WARNING: Model '$model' not found in external Ollama. Pull it with:" >&2
+            echo "    ollama pull $model" >&2
+        fi
+    done <<< "$models"
+}
+
+stop_managed_ollama_if_idle() {
+    # Stops our managed Ollama container iff no worker containers remain.
+    if ! ollama_container_exists; then
+        return
+    fi
+    local remaining
+    remaining=$(docker ps --filter "label=photosearch-worker-fleet" -q 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$remaining" -eq 0 ]; then
+        echo "Stopping managed Ollama container ($OLLAMA_CONTAINER)..."
+        docker rm -f "$OLLAMA_CONTAINER" > /dev/null 2>&1 || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Management commands (no server required)
 # ---------------------------------------------------------------------------
 
@@ -103,6 +222,19 @@ do_status() {
         docker logs --tail 8 "$name" 2>&1 | sed 's/^/  /'
         echo ""
     done
+
+    # Show managed Ollama container status
+    echo "=== Ollama ==="
+    echo ""
+    if ollama_container_exists; then
+        docker ps -a --filter "name=^${OLLAMA_CONTAINER}$" \
+                     --format "  {{.Names}}\t{{.Status}}" 2>/dev/null
+    elif ollama_is_reachable; then
+        echo "  External Ollama reachable at localhost:${OLLAMA_PORT} (not managed by this script)"
+    else
+        echo "  Not running. Will auto-start if a describe/tags/verify pass is launched."
+    fi
+    echo ""
     exit 0
 }
 
@@ -131,13 +263,14 @@ do_stop() {
     local FILTER="label=photosearch-worker-fleet"
     local count
     count=$(docker ps --filter "$FILTER" -q 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$count" -eq 0 ]; then
+    if [ "$count" -gt 0 ]; then
+        echo "Stopping $count worker(s)..."
+        docker ps --filter "$FILTER" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
+        echo "All workers stopped. Unclaimed batches will be reclaimed after TTL expires."
+    else
         echo "No workers running."
-        exit 0
     fi
-    echo "Stopping $count worker(s)..."
-    docker ps --filter "$FILTER" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
-    echo "All workers stopped. Unclaimed batches will be reclaimed after TTL expires."
+    stop_managed_ollama_if_idle
     exit 0
 }
 
@@ -236,6 +369,19 @@ EXISTING=$(docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null
 if [ "$EXISTING" -gt 0 ]; then
     echo "Stopping $EXISTING existing worker(s)..."
     docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# Ensure Ollama is running if any pass needs it
+# ---------------------------------------------------------------------------
+
+if ollama_needed; then
+    echo "Passes include describe/tags/verify — checking Ollama availability..."
+    ensure_ollama_running
+    if ollama_is_reachable; then
+        ensure_ollama_models
+    fi
     echo ""
 fi
 
