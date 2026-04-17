@@ -13,6 +13,24 @@
 #   ./run-workers.sh --status                                               # show running workers
 #   ./run-workers.sh --stop                                                 # stop all workers
 #   ./run-workers.sh --logs                                                 # tail all worker logs
+#
+# Ollama for describe/tags/verify passes
+# --------------------------------------
+# If --passes includes describe, tags, or verify, the script checks
+# localhost:11434. If nothing answers, it starts a managed container
+# ($OLLAMA_CONTAINER) and auto-pulls the required models into its volume
+# ($OLLAMA_VOLUME). The managed container is torn down by --stop.
+#
+# PREFER NATIVE OLLAMA (run `ollama serve` on the host) if you can. The
+# managed-in-Docker path shares Docker Desktop's VM memory budget with every
+# worker container — on a Mac with a default VM (~7-8 GiB) plus 4 workers at
+# -m 3g and LLaVA's ~4.3 GiB working set, the VM is heavily oversubscribed and
+# the llama runner gets OOM-killed mid-load ("llama runner process has
+# terminated: %!w(<nil>)", status 500). Native Ollama uses the Mac's full RAM
+# directly and does not compete.
+#
+# If you must use the managed container, raise Docker Desktop memory
+# (Settings → Resources → Memory) to ~16 GiB or reduce -n / -m.
 # ===========================================================================
 
 set -euo pipefail
@@ -65,6 +83,13 @@ Examples:
   ./run-workers.sh -s http://nas.local:8000 -p describe --collection 3 -n 2
   ./run-workers.sh --status
   ./run-workers.sh --stop
+
+Ollama note:
+  For describe/tags/verify, PREFER a native `ollama serve` on the host. The
+  script will detect and reuse it. The managed-in-Docker fallback shares
+  Docker Desktop's VM memory with every worker — on a default VM, LLaVA's
+  runner is OOM-killed ("llama runner process has terminated", 500). If you
+  must use the managed container, raise Docker Desktop memory to ~16 GiB.
 EOF
     exit 0
 }
@@ -103,12 +128,18 @@ ensure_ollama_running() {
     fi
     echo "  Ollama not reachable — starting managed container ($OLLAMA_CONTAINER)..."
     docker rm -f "$OLLAMA_CONTAINER" > /dev/null 2>&1 || true
+    # OLLAMA_NUM_PARALLEL=1 and MAX_LOADED_MODELS=1 serialize requests to avoid
+    # llama-runner crashes under concurrent load in CPU-only Docker (500 errors
+    # like "llama runner process has terminated"). Multiple workers still help —
+    # Ollama queues their requests server-side.
     docker run -d \
         --name "$OLLAMA_CONTAINER" \
         --label "photosearch-worker-ollama=true" \
         --restart unless-stopped \
         -p "${OLLAMA_PORT}:11434" \
         -v "${OLLAMA_VOLUME}:/root/.ollama" \
+        -e OLLAMA_NUM_PARALLEL=1 \
+        -e OLLAMA_MAX_LOADED_MODELS=1 \
         ollama/ollama:latest > /dev/null
     local waited=0
     until ollama_is_reachable; do
