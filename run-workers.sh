@@ -399,9 +399,25 @@ echo ""
 
 IMAGE_TAG="photosearch-worker:latest"
 
-echo "Building worker image (this is fast if only Python changed)..."
-docker build -q -t "$IMAGE_TAG" . > /dev/null
-echo "  Image ready: $IMAGE_TAG"
+# Give the user a realistic expectation before the build runs, and show the
+# live BuildKit output so they can see which layers hit the cache vs. rebuild.
+#   - First build: base image pull + pip install ~5-10min
+#   - requirements.txt changed: pip layer rebuild ~5min
+#   - Python-only change: COPY layers ~10s
+# Watch BuildKit's "CACHED" markers to see which path you got.
+if ! docker image inspect "$IMAGE_TAG" > /dev/null 2>&1; then
+    echo "Building worker image (first build on this machine — expect ~5-10 min"
+    echo "to pull python:3.11-slim and install PyTorch/CLIP/InsightFace)..."
+else
+    echo "Building worker image (incremental — ~10s for Python-only changes,"
+    echo "~5 min if requirements.txt changed; watch for 'CACHED' lines below)..."
+fi
+echo ""
+BUILD_START=$(date +%s)
+docker build -t "$IMAGE_TAG" .
+BUILD_ELAPSED=$(($(date +%s) - BUILD_START))
+echo ""
+echo "  Image ready: $IMAGE_TAG (built in ${BUILD_ELAPSED}s)"
 echo ""
 
 # ---------------------------------------------------------------------------
