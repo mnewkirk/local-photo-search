@@ -401,11 +401,13 @@ def recluster_unknown_faces(
 
     Returns a summary dict: {face_count, cluster_count, noise_count, histogram}.
     """
+    import time
     from sklearn.cluster import DBSCAN
-    from .db import FACE_DIMENSIONS, _deserialize_float_list
+    from .db import FACE_DIMENSIONS
 
     # Pull all unassigned face encodings in one query, ordered by id for
     # deterministic output. Large but bounded (tens to low hundreds of thousands).
+    t0 = time.time()
     rows = db.conn.execute(
         """SELECT f.id, fe.encoding
            FROM faces f
@@ -413,14 +415,24 @@ def recluster_unknown_faces(
            WHERE f.person_id IS NULL
            ORDER BY f.id"""
     ).fetchall()
+    t_query = time.time()
 
     if not rows:
         return {"face_count": 0, "cluster_count": 0, "noise_count": 0, "histogram": {}}
 
+    # Fast path: concatenate all encoding BLOBs and reshape in one np.frombuffer
+    # call. The previous approach (struct.unpack per row → list → np.array of
+    # lists) allocated ~N*dim Python floats (60M+ for 120k faces) and took tens
+    # of minutes on slow CPUs. Direct frombuffer is I/O-bound instead.
     face_ids = [r["id"] for r in rows]
-    X = np.array(
-        [_deserialize_float_list(r["encoding"], FACE_DIMENSIONS) for r in rows],
-        dtype=np.float32,
+    all_bytes = b"".join(r["encoding"] for r in rows)
+    X = np.frombuffer(all_bytes, dtype=np.float32).reshape(len(rows), FACE_DIMENSIONS).copy()
+    t_load = time.time()
+    print(
+        f"  Loaded {len(rows)} encodings "
+        f"(query {t_query - t0:.1f}s, decode {t_load - t_query:.1f}s). "
+        f"Running DBSCAN...",
+        flush=True,
     )
 
     labels = DBSCAN(
@@ -430,6 +442,8 @@ def recluster_unknown_faces(
         algorithm="ball_tree",
         n_jobs=-1,
     ).fit_predict(X)
+    t_dbscan = time.time()
+    print(f"  DBSCAN done in {t_dbscan - t_load:.1f}s.", flush=True)
 
     noise_count = int((labels == -1).sum())
     unique = [int(lab) for lab in sorted(set(labels.tolist())) if lab != -1]
