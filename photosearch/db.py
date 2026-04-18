@@ -547,8 +547,13 @@ class PhotoDB:
         """Store a CLIP embedding for a photo."""
         if not HAS_SQLITE_VEC:
             return
+        # sqlite-vec vec0 doesn't honor `INSERT OR REPLACE` — the PK conflict
+        # fires first and raises UNIQUE. Explicit DELETE+INSERT keeps the write
+        # idempotent across worker claim-TTL races (late submit after another
+        # worker already inserted).
+        self.conn.execute("DELETE FROM clip_embeddings WHERE photo_id = ?", (photo_id,))
         self.conn.execute(
-            "INSERT OR REPLACE INTO clip_embeddings (photo_id, embedding) VALUES (?, ?)",
+            "INSERT INTO clip_embeddings (photo_id, embedding) VALUES (?, ?)",
             (photo_id, _serialize_float_list(embedding)),
         )
         self._maybe_commit()
@@ -582,6 +587,52 @@ class PhotoDB:
                 (blob, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Vec0 orphan cleanup
+    # ------------------------------------------------------------------
+
+    def cleanup_vec_orphans(self, dry_run: bool = False) -> dict:
+        """Remove rows in vec0 virtual tables whose parent row no longer exists.
+
+        SQLite virtual tables can't participate in foreign-key constraints, so
+        ON DELETE CASCADE on photos/faces doesn't reach clip_embeddings or
+        face_encodings. Over time these accumulate stale rows whenever photos
+        or faces are deleted. AUTOINCREMENT on photos.id / faces.id guarantees
+        the orphan IDs can never be reissued, so deletion is safe.
+
+        Returns {'clip_orphans', 'face_orphans', 'clip_deleted', 'face_deleted'}.
+        """
+        if not HAS_SQLITE_VEC:
+            return {"clip_orphans": 0, "face_orphans": 0, "clip_deleted": 0, "face_deleted": 0}
+
+        clip_orphans = self.conn.execute(
+            "SELECT COUNT(*) FROM clip_embeddings WHERE photo_id NOT IN (SELECT id FROM photos)"
+        ).fetchone()[0]
+        face_orphans = self.conn.execute(
+            "SELECT COUNT(*) FROM face_encodings WHERE face_id NOT IN (SELECT id FROM faces)"
+        ).fetchone()[0]
+
+        clip_deleted = face_deleted = 0
+        if not dry_run and (clip_orphans or face_orphans):
+            if clip_orphans:
+                self.conn.execute(
+                    "DELETE FROM clip_embeddings WHERE photo_id NOT IN (SELECT id FROM photos)"
+                )
+                clip_deleted = clip_orphans
+            if face_orphans:
+                self.conn.execute(
+                    "DELETE FROM face_encodings WHERE face_id NOT IN (SELECT id FROM faces)"
+                )
+                face_deleted = face_orphans
+            self.conn.commit()
+
+        return {
+            "clip_orphans": clip_orphans,
+            "face_orphans": face_orphans,
+            "clip_deleted": clip_deleted,
+            "face_deleted": face_deleted,
+        }
 
     # ------------------------------------------------------------------
     # Face encodings

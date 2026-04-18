@@ -24,10 +24,22 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from requests.exceptions import ConnectionError as ReqConnectionError, Timeout as ReqTimeout
+from requests.exceptions import (
+    ConnectionError as ReqConnectionError,
+    Timeout as ReqTimeout,
+    ChunkedEncodingError,
+    ContentDecodingError,
+)
 
-# Transient errors worth retrying (network drop, sleep/wake)
-_TRANSIENT = (ReqConnectionError, ReqTimeout, ConnectionError, TimeoutError)
+# Transient errors worth retrying (network drop, sleep/wake, mid-stream truncation)
+_TRANSIENT = (
+    ReqConnectionError,
+    ReqTimeout,
+    ChunkedEncodingError,
+    ContentDecodingError,
+    ConnectionError,
+    TimeoutError,
+)
 
 
 def _unload_pass_models(pass_type: str) -> None:

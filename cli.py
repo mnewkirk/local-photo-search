@@ -617,6 +617,36 @@ def recluster_faces(db, eps, min_samples, dry_run):
 
 
 # ---------------------------------------------------------------------------
+# cleanup-orphans
+# ---------------------------------------------------------------------------
+
+@cli.command("cleanup-orphans")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, default=False, help="Report orphan counts without deleting.")
+def cleanup_orphans(db, dry_run):
+    """Delete rows in clip_embeddings / face_encodings whose parent is gone.
+
+    SQLite virtual tables (sqlite-vec vec0) can't carry foreign-key constraints,
+    so ON DELETE CASCADE on photos/faces doesn't reach them. This command
+    removes any leftover vector rows whose photo_id (or face_id) no longer
+    exists. AUTOINCREMENT prevents ID reuse, so deletion is always safe.
+    """
+    with PhotoDB(db) as photo_db:
+        result = photo_db.cleanup_vec_orphans(dry_run=dry_run)
+        click.echo(f"  clip_embeddings orphans: {result['clip_orphans']}")
+        click.echo(f"  face_encodings  orphans: {result['face_orphans']}")
+        if dry_run:
+            click.echo("\nDry run — no changes written. Re-run without --dry-run to delete.")
+        elif result["clip_deleted"] or result["face_deleted"]:
+            click.echo(
+                f"\nDeleted {result['clip_deleted']} clip_embeddings "
+                f"and {result['face_deleted']} face_encodings rows."
+            )
+        else:
+            click.echo("\nNo orphans found — nothing to delete.")
+
+
+# ---------------------------------------------------------------------------
 # face-clusters
 # ---------------------------------------------------------------------------
 

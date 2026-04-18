@@ -295,6 +295,31 @@ docker compose -f docker-compose.nas.yml up -d photosearch
 # Run a CLI command
 docker compose -f docker-compose.nas.yml run --rm photosearch <command>
 
+# Ad-hoc Python or shell inside the container — MUST override the entrypoint.
+# docker-entrypoint.sh has a `case` that routes every non-"serve"/"index" first
+# arg to `python cli.py <arg> …`. So `… photosearch python -c "…"` becomes
+# `python cli.py python -c "…"` and cli.py rejects it ("No such command 'python'").
+#
+# `--entrypoint` is a `docker compose run` flag, so it MUST come *before* the
+# service name (photosearch). It cannot be appended after $DC. Use dedicated
+# aliases so the copy-paste works:
+DCPY="docker compose -f docker-compose.nas.yml run --rm --entrypoint python"
+DCSH="docker compose -f docker-compose.nas.yml run --rm --entrypoint bash"
+$DCPY photosearch -c "<snippet>"
+$DCSH photosearch -c "<shell cmd>"
+
+# IMPORTANT: PhotoDB() with no args defaults to the RELATIVE path "photo_index.db",
+# which resolves to /app/photo_index.db (an empty stub) inside the container. The
+# PHOTOSEARCH_DB env var is wired only into cli.py's --db defaults, NOT into
+# PhotoDB.__init__. Every ad-hoc snippet must pass the env var explicitly, or
+# you'll see all-zero stats and leave a bogus /app/photo_index.db behind:
+$DCPY photosearch -c "
+import os
+from photosearch.db import PhotoDB
+with PhotoDB(os.environ['PHOTOSEARCH_DB']) as db:
+    ...
+"
+
 # Background indexing job
 nohup docker compose -f docker-compose.nas.yml run --rm \
   -e PYTHONUNBUFFERED=1 photosearch index /photos/YEAR --clip --no-colors \
@@ -462,6 +487,26 @@ clear-matches <dir> [--person] [--all-faces]
 export-face-assignments / import-face-assignments
 ```
 
+### Vec0 orphan cleanup
+
+`clip_embeddings` and `face_encodings` are sqlite-vec `vec0` virtual tables. SQLite virtual
+tables cannot participate in foreign-key constraints, so `ON DELETE CASCADE` on the parent
+`photos` / `faces` tables does not reach them — every historical photo or face deletion
+left a dangling vector row behind. Symptoms: status page shows `>100% embedded`, and CLIP
+worker submits occasionally fail with `UNIQUE constraint failed on clip_embeddings primary key`
+(since vec0 does not honor `INSERT OR REPLACE` — the PK conflict is raised first).
+
+`AUTOINCREMENT` on `photos.id` and `faces.id` guarantees the orphan IDs can never be reissued
+to different rows, so deletion is always safe.
+
+```bash
+photosearch cleanup-orphans [--dry-run]
+```
+
+Also: `add_clip_embedding` now uses explicit `DELETE` + `INSERT` instead of `INSERT OR REPLACE`,
+making re-submits idempotent when a worker's claim TTL expires and the photo is re-claimed by
+another worker before the original submit lands.
+
 ### Frontend stack filtering behavior
 
 - **Search page:** Filename searches bypass stack filtering — matched photos always visible
@@ -476,6 +521,40 @@ export-face-assignments / import-face-assignments
 ---
 
 ## Troubleshooting
+
+**"Error: No such command 'python'" / "'sh' / '-c'" when running ad-hoc commands** —
+`docker-entrypoint.sh` routes every non-"serve"/"index" first arg to `python cli.py <arg> …`,
+so `docker compose … run --rm photosearch python -c "…"` becomes `python cli.py python -c "…"`
+and Click rejects it. Override the entrypoint — but note `--entrypoint` is a `docker compose
+run` flag, so it must come *before* the service name (it can't be tacked onto an existing
+`$DC="docker compose … run --rm photosearch"` alias). Either re-expand the full command
+or use dedicated aliases:
+```bash
+docker compose -f docker-compose.nas.yml run --rm --entrypoint python photosearch -c "<snippet>"
+docker compose -f docker-compose.nas.yml run --rm --entrypoint bash   photosearch -c "<shell cmd>"
+
+# Or as aliases:
+DCPY="docker compose -f docker-compose.nas.yml run --rm --entrypoint python"
+DCSH="docker compose -f docker-compose.nas.yml run --rm --entrypoint bash"
+$DCPY photosearch -c "<snippet>"
+```
+Same pattern for sqlite3, pip, etc. — anything that isn't a `cli.py` subcommand needs
+`--entrypoint`. This trips up diagnostics constantly; reach for it first when an in-container
+one-liner fails.
+
+**Empty / all-zero results from `PhotoDB()` ad-hoc snippets** — `PhotoDB()` with no args
+defaults to the relative path `"photo_index.db"`, which inside the container resolves to
+`/app/photo_index.db` (a fresh empty DB), not the real `/data/photo_index.db`. The
+`PHOTOSEARCH_DB` env var is only honored by `cli.py`'s `--db` defaults, not by the `PhotoDB`
+constructor. Always pass it explicitly:
+```python
+import os
+from photosearch.db import PhotoDB
+with PhotoDB(os.environ['PHOTOSEARCH_DB']) as db:
+    ...
+```
+If you hit this, also `rm -f /app/photo_index.db` afterwards — the empty stub gets
+persisted into the container's writable layer on first access.
 
 **"database is locked"** — Another process holds a write lock. Check `docker ps` for
 concurrent jobs. WAL mode + `PRAGMA busy_timeout=60000` resolves short locks automatically.

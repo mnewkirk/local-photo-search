@@ -38,6 +38,30 @@ $DC build photosearch              # Rebuild after code changes
 $DC up -d photosearch              # Restart web server
 $DC run --rm photosearch <cmd>     # Run CLI command
 
+# Ad-hoc Python / shell inside the container — MUST override entrypoint.
+# docker-entrypoint.sh shell-routes every non-"serve"/"index" arg to
+# `python cli.py …`, so `… photosearch python -c "…"` becomes
+# `python cli.py python -c "…"` and fails with "No such command 'python'".
+# --entrypoint is a `docker compose run` flag and MUST appear before the
+# service name (photosearch), so it doesn't fit inside the $DC alias — use
+# dedicated aliases instead:
+DCPY="docker compose -f docker-compose.nas.yml run --rm --entrypoint python"
+DCSH="docker compose -f docker-compose.nas.yml run --rm --entrypoint bash"
+$DCPY photosearch -c "<snippet>"
+$DCSH photosearch -c "<shell command>"
+
+# IMPORTANT: PhotoDB() with no args defaults to the RELATIVE path "photo_index.db",
+# which resolves to /app/photo_index.db inside the container (an empty stub DB).
+# The PHOTOSEARCH_DB env var is only wired into cli.py's --db defaults, NOT into
+# PhotoDB.__init__. Every ad-hoc snippet must pass it explicitly, or you'll get
+# zero-row results and a bogus /app/photo_index.db will be created:
+$DCPY photosearch -c "
+import os
+from photosearch.db import PhotoDB
+with PhotoDB(os.environ['PHOTOSEARCH_DB']) as db:
+    ...
+"
+
 # Git pull (Alpine workaround for UGOS ownership)
 docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
   "apk add -q git && git config --global --add safe.directory /repo && git -C /repo pull"
@@ -66,6 +90,25 @@ python cli.py worker -s http://nas.local:8000 -p clip,quality -d /photos/2026
 Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints),
 `run-workers.sh` (Docker fleet launcher). API routes under `/api/worker/*`.
 Claims have TTL (default 30min) for crash recovery.
+
+## Vec0 orphan cleanup
+
+`clip_embeddings` and `face_encodings` are sqlite-vec `vec0` virtual tables.
+Virtual tables can't participate in foreign-key constraints, so
+`ON DELETE CASCADE` on `photos`/`faces` doesn't reach them — when a photo or
+face row is deleted, its vector row stays behind. The status page will show
+`>100% embedded` when this happens. AUTOINCREMENT on `photos.id` / `faces.id`
+prevents ID reuse, so the dangling rows can never silently re-attach to a
+different photo.
+
+Also: `add_clip_embedding` uses explicit DELETE+INSERT (not `INSERT OR
+REPLACE`) because vec0 doesn't honor `OR REPLACE` — the PK conflict fires
+first and raises UNIQUE, which causes worker submits to fail when a claim
+TTL expired and another worker re-processed the same photo.
+
+```bash
+$DC photosearch cleanup-orphans [--dry-run]
+```
 
 ## Adding Features
 
