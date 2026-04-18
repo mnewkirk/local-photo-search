@@ -89,6 +89,19 @@ def _ensure_preview_dir():
     return _preview_dir
 
 
+_face_crop_dir: Optional[str] = None
+
+
+def _ensure_face_crop_dir():
+    """Create face-crop cache directory if needed."""
+    global _face_crop_dir
+    if _face_crop_dir is None:
+        db_parent = Path(_db_path).resolve().parent
+        _face_crop_dir = str(db_parent / "thumbnails" / "face_crops")
+    Path(_face_crop_dir).mkdir(parents=True, exist_ok=True)
+    return _face_crop_dir
+
+
 def _get_or_create_preview(photo: dict) -> str:
     """Return path to a cached mid-quality preview, generating it if needed.
 
@@ -323,8 +336,22 @@ def api_preview_photo(photo_id: int):
 
 @app.get("/api/faces/crop/{face_id}")
 def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
-    """Serve a square crop of the face from the original photo."""
-    from PIL import Image
+    """Serve a square crop of the face from the original photo.
+
+    Cached to disk at thumbnails/face_crops/{face_id}_{size}.jpg — face bbox
+    and source photo are immutable per face_id, so the cache never needs to
+    be invalidated. Generating from the original photo on every request was
+    the dominant cost of /faces (RAW/JPEG decode + exif_transpose + resize).
+    """
+    cache_dir = _ensure_face_crop_dir()
+    cache_path = os.path.join(cache_dir, f"{face_id}_{size}.jpg")
+    if os.path.exists(cache_path):
+        return FileResponse(
+            cache_path, media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    from PIL import Image, ImageOps
 
     with _get_db() as db:
         row = db.conn.execute(
@@ -347,7 +374,6 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
 
     top, right, bottom, left = row["bbox_top"], row["bbox_right"], row["bbox_bottom"], row["bbox_left"]
 
-    from PIL import ImageOps
     img = Image.open(filepath)
     img = ImageOps.exif_transpose(img)
     img_w, img_h = img.size
@@ -383,11 +409,15 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     face_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
     face_img = face_img.resize((size, size), Image.LANCZOS)
 
-    buf = BytesIO()
-    face_img.save(buf, format="JPEG", quality=85)
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="image/jpeg",
-                             headers={"Cache-Control": "public, max-age=3600"})
+    # Write atomically — save to a temp path in the same dir, then rename.
+    tmp_path = cache_path + f".tmp.{os.getpid()}"
+    face_img.save(tmp_path, format="JPEG", quality=85)
+    os.replace(tmp_path, cache_path)
+
+    return FileResponse(
+        cache_path, media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 def _similarity_sort(groups: list[dict], encodings: dict[int, list[float]]) -> list[dict]:
@@ -467,15 +497,27 @@ def _similarity_sort(groups: list[dict], encodings: dict[int, list[float]]) -> l
     return named + ordered
 
 
+# Above this group count, similarity sort is O(N²) and dominates response time.
+# Count-sort is used instead unless the caller explicitly asks for similarity.
+_SIMILARITY_SORT_GROUP_LIMIT = 500
+
+
 @app.get("/api/faces/groups")
-def api_face_groups(sort: str = Query("similarity")):
+def api_face_groups(
+    sort: str = Query("similarity"),
+    include_singletons: bool = Query(False),
+):
     """List all face identities grouped by person or cluster.
 
     Returns a list of groups, each with a representative face_id, name/label,
     photo count, and face count. Used for the faces gallery page.
 
-    sort: "similarity" (default) clusters similar faces together,
-          "count" sorts by photo count descending.
+    sort: "similarity" (default) clusters visually-similar faces together
+          (O(N²); automatically downgraded to "count" when group count
+          exceeds _SIMILARITY_SORT_GROUP_LIMIT). "count" sorts unknowns by
+          face_count desc.
+    include_singletons: when false (default), unknown clusters with only one
+          face are hidden. Named persons are always returned regardless.
     """
     import time
     t0 = time.time()
@@ -513,7 +555,11 @@ def api_face_groups(sort: str = Query("similarity")):
             for r in db.conn.execute("SELECT cluster_id FROM ignored_clusters").fetchall()
         )
 
-        # Unknown clusters — single query with rep face via correlated subquery
+        # Unknown clusters — single query with rep face via correlated subquery.
+        # Default hides singletons; the per-batch cluster_id=0 collision bug
+        # (see docs/plans/faces-clustering-and-perf.md) produces giant false-
+        # positive clusters, so a 1-face cluster is nearly always noise.
+        min_face_count = 1 if include_singletons else 2
         unknown_rows = db.conn.execute(
             """SELECT f.cluster_id,
                       COUNT(DISTINCT f.photo_id) as photo_count,
@@ -526,7 +572,9 @@ def api_face_groups(sort: str = Query("similarity")):
                FROM faces f
                WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL
                GROUP BY f.cluster_id
-               ORDER BY face_count DESC"""
+               HAVING face_count >= ?
+               ORDER BY face_count DESC""",
+            (min_face_count,),
         ).fetchall()
 
         for r in unknown_rows:
@@ -543,8 +591,16 @@ def api_face_groups(sort: str = Query("similarity")):
         t1 = time.time()
         logger.info("faces/groups: query took %.3fs (%d groups)", t1 - t0, len(groups))
 
-        # Apply similarity sorting if requested
-        if sort == "similarity":
+        effective_sort = sort
+        if sort == "similarity" and len(groups) > _SIMILARITY_SORT_GROUP_LIMIT:
+            logger.info(
+                "faces/groups: downgrading similarity sort to count "
+                "(%d groups > %d limit)",
+                len(groups), _SIMILARITY_SORT_GROUP_LIMIT,
+            )
+            effective_sort = "count"
+
+        if effective_sort == "similarity":
             rep_face_ids = [g["rep_face_id"] for g in groups if g["rep_face_id"]]
             encodings = db.get_face_encodings_bulk(rep_face_ids)
             t2 = time.time()
@@ -553,7 +609,7 @@ def api_face_groups(sort: str = Query("similarity")):
             t3 = time.time()
             logger.info("faces/groups: similarity sort took %.3fs", t3 - t2)
 
-    return {"groups": groups}
+    return {"groups": groups, "sort": effective_sort}
 
 
 @app.get("/api/faces/group/{group_type}/{group_id}/photos")

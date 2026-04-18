@@ -104,6 +104,11 @@
       cursor: pointer;
       transition: transform 0.15s, box-shadow 0.15s;
       border: 2px solid transparent;
+      /* Let the browser skip layout/paint for off-screen cards — huge win
+         when there are hundreds of unknown clusters. intrinsic-size reserves
+         a placeholder so scrollbar length is still roughly correct. */
+      content-visibility: auto;
+      contain-intrinsic-size: 200px 200px;
     }
     .face-card:hover {
       transform: translateY(-2px);

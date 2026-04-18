@@ -76,6 +76,15 @@ Claims have TTL (default 30min) for crash recovery.
 - **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops
 - **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`
 
+## Known Issues / Active Plans
+
+- **Faces clustering & `/faces` perf** — `cluster_encodings()` in `photosearch/faces.py`
+  is a greedy per-batch clusterer that restarts IDs at 0 on every worker-submit
+  (`worker_api.py`) and indexing-run (`index.py`), so "Unknown #0" is the union of
+  the first face of every batch. `/api/faces/groups` also runs an O(N²) similarity
+  sort and `/api/faces/crop/{id}` re-decodes the original RAW/JPEG on every request
+  (no disk cache). Plan: `docs/plans/faces-clustering-and-perf.md`.
+
 ## Detailed Reference
 
 For full API endpoint list, indexing pass details, Google Photos integration, stacking
