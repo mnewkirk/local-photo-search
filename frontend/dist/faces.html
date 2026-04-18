@@ -606,8 +606,12 @@
       // Loads the first page for the current filter. `filterOverride` lets the
       // caller pass a fresh value synchronously (useState batching means the
       // `filter` captured in this callback can lag behind changeFilter).
+      // Also refreshes `persons` so merge/rename dropdowns see newly-created
+      // persons without a full page reload — loadGroups fires after every
+      // mutation, so piggy-backing keeps both in sync.
       const loadGroups = useCallback((filterOverride) => {
         setLoading(true);
+        loadPersons();
         const f = filterOverride || filter;
         const url = API + '/api/faces/groups?filter=' + encodeURIComponent(f) +
           '&limit=' + PAGE_SIZE + '&offset=0';
@@ -621,7 +625,7 @@
             return data.groups || [];
           })
           .catch(() => { setLoading(false); return []; });
-      }, [filter]);
+      }, [filter, loadPersons]);
 
       const loadMore = useCallback(() => {
         if (loadingMore || groups.length >= total) return;
