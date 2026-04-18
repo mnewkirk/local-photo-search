@@ -548,6 +548,75 @@ def list_persons(db):
 
 
 # ---------------------------------------------------------------------------
+# recluster-faces
+# ---------------------------------------------------------------------------
+
+@cli.command("recluster-faces")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--eps", default=None, type=float,
+              help="DBSCAN eps (L2 radius on normalized ArcFace vectors). "
+                   "Lower = stricter / more clusters. Default: 0.55.")
+@click.option("--min-samples", default=None, type=int,
+              help="DBSCAN min_samples. Faces with fewer than this many neighbors "
+                   "become noise (cluster_id=NULL, hidden from /faces). Default: 3.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Compute clusters and print histogram without writing to the DB.")
+def recluster_faces(db, eps, min_samples, dry_run):
+    """Rebuild all unknown face clusters from scratch using global DBSCAN.
+
+    Loads every face with person_id IS NULL, runs DBSCAN over the ArcFace
+    embeddings, and overwrites cluster_id for all unknown faces. Noise points
+    become NULL cluster_id and are hidden from /faces.
+
+    \b
+    Important: cluster IDs are fully renumbered on every run, so the
+    ignored_clusters table is cleared in the same transaction. Any "ignore"
+    decisions on unknown clusters will need to be reapplied after reclustering.
+    Named persons (person_id IS NOT NULL) are not touched.
+    """
+    from photosearch.faces import (
+        recluster_unknown_faces, RECLUSTER_EPS, RECLUSTER_MIN_SAMPLES,
+    )
+
+    effective_eps = eps if eps is not None else RECLUSTER_EPS
+    effective_min = min_samples if min_samples is not None else RECLUSTER_MIN_SAMPLES
+
+    with PhotoDB(db) as photo_db:
+        click.echo(
+            f"Reclustering unknown faces (eps={effective_eps}, "
+            f"min_samples={effective_min}, dry_run={dry_run})..."
+        )
+        summary = recluster_unknown_faces(
+            photo_db, eps=effective_eps, min_samples=effective_min, dry_run=dry_run,
+        )
+        click.echo(f"  Faces processed: {summary['face_count']}")
+        click.echo(f"  Clusters formed: {summary['cluster_count']}")
+        click.echo(f"  Noise (singletons + sparse): {summary['noise_count']}")
+
+        hist = summary["histogram"]
+        if hist:
+            sizes = sorted(hist.values(), reverse=True)
+            top = sizes[:10]
+            click.echo(f"  Largest clusters (top 10 sizes): {top}")
+            size_buckets = {"2-5": 0, "6-20": 0, "21-100": 0, "100+": 0}
+            for s in sizes:
+                if s <= 5:
+                    size_buckets["2-5"] += 1
+                elif s <= 20:
+                    size_buckets["6-20"] += 1
+                elif s <= 100:
+                    size_buckets["21-100"] += 1
+                else:
+                    size_buckets["100+"] += 1
+            click.echo(f"  Size buckets: {size_buckets}")
+
+        if dry_run:
+            click.echo("\nDry run — no changes written. Re-run without --dry-run to apply.")
+        else:
+            click.echo("\nDone. ignored_clusters was cleared; reapply any ignore flags on /faces.")
+
+
+# ---------------------------------------------------------------------------
 # face-clusters
 # ---------------------------------------------------------------------------
 

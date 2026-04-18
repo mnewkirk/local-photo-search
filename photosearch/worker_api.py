@@ -243,20 +243,16 @@ def submit_results(req: SubmitRequest):
 
         elif req.pass_type == "faces":
             face_results = req.face_results or []
-            all_encodings = []
-            all_face_ids = []
             db.begin_batch(batch_size=50)
             for r in face_results:
                 processed_photo_ids.append(r.photo_id)
                 for face in r.faces:
                     try:
-                        face_id = db.add_face(
+                        db.add_face(
                             photo_id=r.photo_id,
                             bbox=tuple(face["bbox"]),
                             encoding=face["encoding"],
                         )
-                        all_encodings.append(face["encoding"])
-                        all_face_ids.append(face_id)
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store face for photo {r.photo_id}: {e}")
@@ -266,17 +262,10 @@ def submit_results(req: SubmitRequest):
                             pass
             db.end_batch()
 
-            # Cluster the new faces
-            if all_encodings:
-                from .faces import cluster_encodings
-                cluster_ids = cluster_encodings(all_encodings)
-                db.begin_batch(batch_size=200)
-                for face_id, cluster_id in zip(all_face_ids, cluster_ids):
-                    db.conn.execute(
-                        "UPDATE faces SET cluster_id = ? WHERE id = ?",
-                        (cluster_id, face_id),
-                    )
-                db.end_batch()
+            # New faces land with cluster_id=NULL. Global clustering is a
+            # separate, on-demand step via `photosearch recluster-faces` —
+            # per-batch clustering would collide IDs across batches and
+            # fragment the same person across many pseudo-clusters.
 
             # Mark all submitted photos as processed (including those with no faces)
             if processed_photo_ids:

@@ -276,7 +276,7 @@ def _index_collection(
 
         # ── Face detection ─────────────────────────────────────────
         if enable_faces:
-            from .faces import detect_faces, cluster_encodings, check_available
+            from .faces import detect_faces, check_available
             try:
                 check_available()
             except RuntimeError as e:
@@ -308,8 +308,6 @@ def _index_collection(
                 if total:
                     print(f"\nDetecting faces in {total} photo(s)...")
                     t0 = time.time()
-                    all_encodings = []
-                    all_face_ids = []
                     db.begin_batch(batch_size=50)
                     face_count = 0
                     for idx, (photo_id, path) in enumerate(face_candidates, 1):
@@ -324,13 +322,11 @@ def _index_collection(
                             else:
                                 print(f" no faces ({elapsed_photo:.1f}s)")
                             for face in faces:
-                                face_id = db.add_face(
+                                db.add_face(
                                     photo_id=photo_id,
                                     bbox=face["bbox"],
                                     encoding=face["encoding"],
                                 )
-                                all_encodings.append(face["encoding"])
-                                all_face_ids.append(face_id)
                                 face_count += 1
                         except Exception as e:
                             _report_error("faces", path, e)
@@ -338,19 +334,8 @@ def _index_collection(
                     elapsed = time.time() - t0
                     print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
                     db.log_activity("faces", "index", face_count)
-
-                    if all_encodings:
-                        print("  Clustering faces...")
-                        cluster_ids = cluster_encodings(all_encodings)
-                        db.begin_batch(batch_size=200)
-                        for face_id, cluster_id in zip(all_face_ids, cluster_ids):
-                            db.conn.execute(
-                                "UPDATE faces SET cluster_id = ? WHERE id = ?",
-                                (cluster_id, face_id),
-                            )
-                        db.end_batch()
-                        n_clusters = len(set(cluster_ids))
-                        print(f"  Grouped into {n_clusters} cluster(s)")
+                    if face_count:
+                        print("  Run `photosearch recluster-faces` to group new faces.")
                 else:
                     print("\nAll collection photos already have face data.")
 
@@ -927,7 +912,7 @@ def index_directory(
 
         # Step 4: Face detection and encoding
         if enable_faces:
-            from .faces import detect_faces, cluster_encodings, check_available
+            from .faces import detect_faces, check_available
             try:
                 check_available()
             except RuntimeError as e:
@@ -961,8 +946,6 @@ def index_directory(
                 total = len(all_face_candidates)
                 print(f"\nDetecting faces in {total} photo(s)...")
                 t0 = time.time()
-                all_encodings = []
-                all_face_ids = []
 
                 db.begin_batch(batch_size=50)
                 face_count = 0
@@ -978,13 +961,11 @@ def index_directory(
                         else:
                             print(f" no faces ({elapsed_photo:.1f}s)")
                         for face in faces:
-                            face_id = db.add_face(
+                            db.add_face(
                                 photo_id=photo_id,
                                 bbox=face["bbox"],
                                 encoding=face["encoding"],
                             )
-                            all_encodings.append(face["encoding"])
-                            all_face_ids.append(face_id)
                             face_count += 1
                     except Exception as e:
                         _report_error("faces", path, e)
@@ -993,19 +974,8 @@ def index_directory(
                 elapsed = time.time() - t0
                 print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
                 db.log_activity("faces", "index", face_count)
-
-                if all_encodings:
-                    print("  Clustering faces...")
-                    cluster_ids = cluster_encodings(all_encodings)
-                    db.begin_batch(batch_size=200)
-                    for face_id, cluster_id in zip(all_face_ids, cluster_ids):
-                        db.conn.execute(
-                            "UPDATE faces SET cluster_id = ? WHERE id = ?",
-                            (cluster_id, face_id),
-                        )
-                    db.end_batch()
-                    n_clusters = len(set(cluster_ids))
-                    print(f"  Grouped into {n_clusters} cluster(s)")
+                if face_count:
+                    print("  Run `photosearch recluster-faces` to group new faces.")
 
         # Step 5: LLaVA scene descriptions via Ollama
         if enable_describe:

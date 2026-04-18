@@ -374,6 +374,105 @@ def cluster_encodings(
     return cluster_ids
 
 
+# Default DBSCAN params for global reclustering of unknown faces.
+# eps=0.55 is the L2 radius on 512-dim normalized ArcFace vectors. Calibrated
+# so two photos of the same person almost always land within radius (same-person
+# L2 on good crops is ~0.4–0.6), while different people stay further apart
+# (typically > 0.9). min_samples=3 requires three faces in the neighborhood to
+# form a core — anything sparser is left as noise (cluster_id=NULL).
+RECLUSTER_EPS = 0.55
+RECLUSTER_MIN_SAMPLES = 3
+
+
+def recluster_unknown_faces(
+    db,
+    eps: float = RECLUSTER_EPS,
+    min_samples: int = RECLUSTER_MIN_SAMPLES,
+    dry_run: bool = False,
+) -> dict:
+    """Globally recluster all person_id IS NULL faces via DBSCAN.
+
+    Loads every unassigned face encoding, runs sklearn DBSCAN with the given
+    params, and (unless dry_run) writes fresh cluster_ids back. Noise points
+    (DBSCAN label -1) are written as cluster_id=NULL so the /faces page hides
+    them. `ignored_clusters` is cleared in the same transaction because cluster
+    IDs are fully renumbered — leaving stale rows would silently mis-apply
+    ignore flags to whatever clusters happen to inherit those IDs.
+
+    Returns a summary dict: {face_count, cluster_count, noise_count, histogram}.
+    """
+    from sklearn.cluster import DBSCAN
+    from .db import FACE_DIMENSIONS, _deserialize_float_list
+
+    # Pull all unassigned face encodings in one query, ordered by id for
+    # deterministic output. Large but bounded (tens to low hundreds of thousands).
+    rows = db.conn.execute(
+        """SELECT f.id, fe.encoding
+           FROM faces f
+           JOIN face_encodings fe ON fe.face_id = f.id
+           WHERE f.person_id IS NULL
+           ORDER BY f.id"""
+    ).fetchall()
+
+    if not rows:
+        return {"face_count": 0, "cluster_count": 0, "noise_count": 0, "histogram": {}}
+
+    face_ids = [r["id"] for r in rows]
+    X = np.array(
+        [_deserialize_float_list(r["encoding"], FACE_DIMENSIONS) for r in rows],
+        dtype=np.float32,
+    )
+
+    labels = DBSCAN(
+        eps=eps,
+        min_samples=min_samples,
+        metric="euclidean",
+        algorithm="ball_tree",
+        n_jobs=-1,
+    ).fit_predict(X)
+
+    noise_count = int((labels == -1).sum())
+    unique = [int(lab) for lab in sorted(set(labels.tolist())) if lab != -1]
+    cluster_count = len(unique)
+
+    histogram: dict[int, int] = {}
+    for lab in labels.tolist():
+        if lab == -1:
+            continue
+        histogram[int(lab)] = histogram.get(int(lab), 0) + 1
+
+    if dry_run:
+        return {
+            "face_count": len(face_ids),
+            "cluster_count": cluster_count,
+            "noise_count": noise_count,
+            "histogram": histogram,
+        }
+
+    # Atomic: clear ignored_clusters + renumber every unknown cluster_id in one tx.
+    # SQLite auto-starts a transaction on the first write; we commit at the end.
+    cur = db.conn.cursor()
+    try:
+        cur.execute("DELETE FROM ignored_clusters")
+        # Batch writes: NULL for noise, int for real clusters.
+        pairs = [
+            (int(lab) if lab != -1 else None, fid)
+            for fid, lab in zip(face_ids, labels.tolist())
+        ]
+        cur.executemany("UPDATE faces SET cluster_id = ? WHERE id = ?", pairs)
+        db.conn.commit()
+    except Exception:
+        db.conn.rollback()
+        raise
+
+    return {
+        "face_count": len(face_ids),
+        "cluster_count": cluster_count,
+        "noise_count": noise_count,
+        "histogram": histogram,
+    }
+
+
 def match_faces_to_persons(
     db,
     tolerance: float = MATCH_TOLERANCE,
