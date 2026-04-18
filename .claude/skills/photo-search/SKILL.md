@@ -334,8 +334,15 @@ $NOHUP photosearch index /photos/YEAR --quality --no-colors > /tmp/quality_YEAR.
 $DC -v /home/cantimatt/docker/photosearch/references:/references:ro \
   photosearch add-persons --config /references/references.yml
 $DC photosearch match-faces --temporal
+$DC photosearch recluster-faces          # group remaining unknowns via DBSCAN
 $DC photosearch stack --directory /photos/YEAR
 ```
+
+New faces land with `cluster_id = NULL` and are invisible on `/faces` until
+`recluster-faces` runs — it's the only thing that forms "Unknown #N" groups.
+Run it after each face-indexing pass (or batch thereof). Warning: every run
+renumbers every unknown cluster_id and clears `ignored_clusters`, so any
+"ignore" decisions on unknown clusters need to be reapplied afterward.
 
 ---
 
@@ -458,6 +465,10 @@ match-faces [--tolerance 1.15] [--temporal] # Match faces to persons
   --expand-stacks                           # Include stack members with --collection
   --temporal-tolerance 1.45                 # Looser threshold for temporal
   --temporal-window 30                      # Session context window (minutes)
+recluster-faces [--eps 0.55] [--min-samples 3] [--dry-run]
+                                            # Global DBSCAN over all person_id IS NULL
+                                            # encodings. Renumbers every unknown cluster
+                                            # and clears ignored_clusters atomically
 list-persons                                # Show persons and counts
 face-clusters                               # Show unidentified clusters
 correct-face <filename> <face_num> <name>   # Manual correction

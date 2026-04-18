@@ -44,29 +44,28 @@ Secondary issues:
 
 ## Ordered action items
 
-### Ship now (1–2 hr, low risk)
+### Shipped
 
-1. **Disk-cache face crops** at `thumbnails/face_crops/{face_id}_{size}.jpg`
-   and serve via `FileResponse` if present. Bbox is immutable per `face_id`,
-   no invalidation needed. Single highest-leverage perf fix.
-2. **Hide singletons** in `/api/faces/groups`: default
-   `HAVING face_count >= 2`; expose `?include_singletons=1`.
-3. **Make similarity sort opt-in**. Default to `?sort=count`; skip the O(N²)
-   sort automatically when group count exceeds a threshold (e.g. 500).
-4. **CSS `content-visibility: auto`** on `.face-card` with
-   `contain-intrinsic-size` so the browser defers off-screen layout/paint.
-
-### Ship this week (design + test)
-
-5. **Stop batch-local ID collisions.** Either write `cluster_id = NULL` at
-   ingest and cluster on demand, or offset new IDs by
-   `(SELECT COALESCE(MAX(cluster_id), -1) + 1 FROM faces)` before writing.
-6. **One-shot `recluster-faces` CLI** — load every `person_id IS NULL`
-   encoding, run `sklearn.cluster.DBSCAN(eps=0.55, min_samples=3,
-   metric='euclidean')`, write IDs back. **Critical:** clear/migrate
-   `ignored_clusters` in the same transaction (it keys on `cluster_id`,
-   would otherwise silently mis-apply).
-7. **Paginate** `/api/faces/groups` with `limit` / `offset` + total count.
+1. ✅ **Disk-cache face crops** at `thumbnails/face_crops/{face_id}_{size}.jpg`,
+   atomic write via `os.replace`, served via `FileResponse` (commit 8639799).
+2. ✅ **Hide singletons** in `/api/faces/groups` by default
+   (`HAVING face_count >= 2`); `?include_singletons=1` restores them (8639799).
+3. ✅ **Similarity sort auto-downgrade** to count-sort when group count
+   exceeds 500; response includes `sort` field showing what was applied (8639799).
+4. ✅ **CSS `content-visibility: auto`** on `.face-card` with
+   `contain-intrinsic-size` (8639799).
+5. ✅ **Batch-local ID collisions removed.** Faces now land with
+   `cluster_id = NULL` at every ingest path — `index_directory()`,
+   `_index_collection()`, `worker_api.submit_results()` (commit fd3c206).
+6. ✅ **`recluster-faces` CLI** — global `sklearn.cluster.DBSCAN(eps=0.55,
+   min_samples=3, metric='euclidean', algorithm='ball_tree')` over every
+   `person_id IS NULL` encoding. `ignored_clusters` cleared in the same
+   transaction. Loader uses `np.frombuffer` over concatenated BLOBs for
+   ~50–100× speedup vs. struct.unpack per row (fd3c206, 4dbf15e).
+7. ✅ **Paginate `/api/faces/groups`** with `limit` / `offset` + `total` +
+   pre-pagination `counts`. Frontend got a "Load more" button and reads
+   merge targets from `/api/persons` so persons on unloaded pages still
+   count (commit b12f539, 4b9532c).
 
 ### Iterate
 

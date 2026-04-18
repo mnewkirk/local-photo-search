@@ -76,14 +76,33 @@ Claims have TTL (default 30min) for crash recovery.
 - **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops
 - **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`
 
-## Known Issues / Active Plans
+## Face clustering
 
-- **Faces clustering & `/faces` perf** — `cluster_encodings()` in `photosearch/faces.py`
-  is a greedy per-batch clusterer that restarts IDs at 0 on every worker-submit
-  (`worker_api.py`) and indexing-run (`index.py`), so "Unknown #0" is the union of
-  the first face of every batch. `/api/faces/groups` also runs an O(N²) similarity
-  sort and `/api/faces/crop/{id}` re-decodes the original RAW/JPEG on every request
-  (no disk cache). Plan: `docs/plans/faces-clustering-and-perf.md`.
+New faces land with `cluster_id = NULL` — per-batch clustering was removed from
+`index_directory()`, `_index_collection()`, and `worker_api.submit_results()`
+because every batch independently restarted IDs at 0 and collided
+("Unknown #0" was the union of the first face of every batch).
+
+Grouping is an on-demand step:
+
+```bash
+$DC run --rm photosearch recluster-faces [--eps 0.55] [--min-samples 3] [--dry-run]
+```
+
+Runs global DBSCAN over every `person_id IS NULL` encoding, renumbers all
+unknown clusters from scratch, and clears `ignored_clusters` in the same
+transaction (IDs change, so ignore flags would otherwise mis-apply). Loader
+uses `np.frombuffer` over concatenated BLOBs — 120k faces decode in seconds
+on an N100; DBSCAN at 512-dim with ball_tree is the dominant cost after that.
+
+`/api/faces/groups` is paginated (`limit`/`offset`/`filter`/`total`/`counts`),
+hides singletons by default (`?include_singletons=1` to restore), and
+auto-downgrades its O(N²) similarity sort to count-sort above 500 groups.
+`/api/faces/crop/{id}` disk-caches at `thumbnails/face_crops/{id}_{size}.jpg`.
+
+Remaining work in `docs/plans/faces-clustering-and-perf.md`: persist
+`det_score` + bbox area and filter low-quality faces before clustering,
+swap to HDBSCAN for varying density, and materialize a `face_groups` table.
 
 ## Detailed Reference
 
