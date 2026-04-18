@@ -207,7 +207,9 @@ class TestPersonsAPI:
 
 class TestFacesAPI:
     def test_face_groups(self, client):
-        resp = client.get("/api/faces/groups")
+        # Test fixture's single unknown cluster is a singleton; use include_singletons
+        # so the endpoint surfaces it (default hides size-1 clusters as noise).
+        resp = client.get("/api/faces/groups", params={"include_singletons": "true"})
         assert resp.status_code == 200
         data = resp.json()
         groups = data["groups"]
@@ -215,6 +217,7 @@ class TestFacesAPI:
         cluster_groups = [g for g in groups if g["type"] == "cluster"]
         assert len(person_groups) == 3  # Alex, Jamie, Sam
         assert len(cluster_groups) >= 1  # at least the unknown cluster
+        assert "total" in data and "counts" in data and "sort" in data
 
     def test_face_groups_sort_count(self, client):
         resp = client.get("/api/faces/groups", params={"sort": "count"})
@@ -291,8 +294,12 @@ class TestFacesAPI:
         resp = client.post("/api/faces/ignore", json={"cluster_ids": [99]})
         assert resp.status_code == 200
         assert resp.json()["ignored"] == 1
-        # Verify in face groups
-        groups_resp = client.get("/api/faces/groups")
+        # Default filter=all hides ignored clusters; use filter=ignored to surface it.
+        # Test fixture's cluster 99 is a singleton, so also pass include_singletons.
+        groups_resp = client.get(
+            "/api/faces/groups",
+            params={"filter": "ignored", "include_singletons": "true"},
+        )
         cluster99 = next(
             (g for g in groups_resp.json()["groups"] if g.get("cluster_id") == 99), None
         )

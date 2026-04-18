@@ -575,8 +575,12 @@
     function App() {
       const initParams = getUrlParams();
       const [groups, setGroups] = useState([]);
+      const [total, setTotal] = useState(0);
+      const [counts, setCounts] = useState({ named: 0, unknown: 0, ignored: 0 });
       const [loading, setLoading] = useState(true);
+      const [loadingMore, setLoadingMore] = useState(false);
       const [filter, setFilter] = useState(initParams.filter);
+      const PAGE_SIZE = 200;
       const [selectedGroup, setSelectedGroup] = useState(null);
       const [groupPhotos, setGroupPhotos] = useState([]);
       const [sortBy, setSortBy] = useState('date_asc');
@@ -599,13 +603,41 @@
         fetch(API + '/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
       }, []);
 
-      const loadGroups = useCallback(() => {
+      // Loads the first page for the current filter. `filterOverride` lets the
+      // caller pass a fresh value synchronously (useState batching means the
+      // `filter` captured in this callback can lag behind changeFilter).
+      const loadGroups = useCallback((filterOverride) => {
         setLoading(true);
-        return fetch(API + '/api/faces/groups')
+        const f = filterOverride || filter;
+        const url = API + '/api/faces/groups?filter=' + encodeURIComponent(f) +
+          '&limit=' + PAGE_SIZE + '&offset=0';
+        return fetch(url)
           .then(r => r.json())
-          .then(data => { setGroups(data.groups || []); setLoading(false); return data.groups || []; })
+          .then(data => {
+            setGroups(data.groups || []);
+            setTotal(data.total || 0);
+            setCounts(data.counts || { named: 0, unknown: 0, ignored: 0 });
+            setLoading(false);
+            return data.groups || [];
+          })
           .catch(() => { setLoading(false); return []; });
-      }, []);
+      }, [filter]);
+
+      const loadMore = useCallback(() => {
+        if (loadingMore || groups.length >= total) return;
+        setLoadingMore(true);
+        const url = API + '/api/faces/groups?filter=' + encodeURIComponent(filter) +
+          '&limit=' + PAGE_SIZE + '&offset=' + groups.length;
+        fetch(url)
+          .then(r => r.json())
+          .then(data => {
+            setGroups(prev => prev.concat(data.groups || []));
+            setTotal(data.total || 0);
+            setCounts(data.counts || counts);
+            setLoadingMore(false);
+          })
+          .catch(() => setLoadingMore(false));
+      }, [filter, groups.length, total, loadingMore, counts]);
 
       useEffect(() => {
         loadPersons();
@@ -625,13 +657,9 @@
         });
       }, []);
 
-      const filteredGroups = useMemo(() => {
-        if (filter === 'named') return groups.filter(g => g.type === 'person');
-        if (filter === 'unknown') return groups.filter(g => g.type === 'cluster' && !g.ignored);
-        if (filter === 'ignored') return groups.filter(g => g.ignored);
-        // 'all' — exclude ignored
-        return groups.filter(g => !g.ignored);
-      }, [groups, filter]);
+      // Server applies `filter` and `include_singletons`, so `groups` is already
+      // the correct paginated slice. Keep the name to minimise downstream churn.
+      const filteredGroups = groups;
 
       const loadGroupPhotos = useCallback((group) => {
         setLoadingPhotos(true);
@@ -679,15 +707,18 @@
       const changeFilter = useCallback((f) => {
         setFilter(f);
         updateUrl({ filter: f, name: selectedGroup && selectedGroup.type === 'person' ? selectedGroup.label : '', face_id: '' });
-      }, [selectedGroup]);
+        loadGroups(f);
+      }, [selectedGroup, loadGroups]);
 
-      // Named persons for the merge dropdown (exclude current group if it's a person)
+      // Named persons for the merge dropdown (exclude current group if it's a person).
+      // Sourced from /api/persons (the full list) rather than `groups` because
+      // pagination/filtering may have hidden some persons from the loaded page.
       const mergeTargets = useMemo(() => {
-        return groups.filter(g =>
-          g.type === 'person' &&
-          !(selectedGroup && selectedGroup.type === 'person' && selectedGroup.person_id === g.person_id)
-        );
-      }, [groups, selectedGroup]);
+        return persons
+          .filter(p =>
+            !(selectedGroup && selectedGroup.type === 'person' && selectedGroup.person_id === p.id))
+          .map(p => ({ person_id: p.id, label: p.name, photo_count: p.photo_count }));
+      }, [persons, selectedGroup]);
 
       const startRename = useCallback(() => {
         setEditName(selectedGroup.label.startsWith('Unknown') ? '' : selectedGroup.label);
@@ -725,13 +756,14 @@
         const name = editName.trim();
         if (!name || !selectedGroup) { setEditing(false); return; }
 
-        // Check for duplicate name (different person)
-        const existing = groups.find(g =>
-          g.type === 'person' && g.label.toLowerCase() === name.toLowerCase()
-          && !(selectedGroup.type === 'person' && selectedGroup.person_id === g.person_id)
+        // Check for duplicate name (different person). Uses the full persons list
+        // rather than the paginated `groups` so names on unloaded pages still collide.
+        const existing = persons.find(p =>
+          p.name.toLowerCase() === name.toLowerCase()
+          && !(selectedGroup.type === 'person' && selectedGroup.person_id === p.id)
         );
         if (existing) {
-          setNameError('A person named "' + existing.label + '" already exists. Use a more specific name.');
+          setNameError('A person named "' + existing.name + '" already exists. Use a more specific name.');
           return;
         }
         setNameError('');
@@ -859,10 +891,14 @@
         return groups.filter(g => selected.has(groupKey(g)));
       }, [groups, selected]);
 
-      // Named persons for multi-merge (exclude any selected named persons)
+      // Named persons for multi-merge (exclude any selected named persons). Full
+      // persons list, not paginated groups — unloaded pages still count.
+      // Keep the exclusion in sync with groupKey() which uses 'p' + person_id.
       const multiMergeTargets = useMemo(() => {
-        return groups.filter(g => g.type === 'person' && !selected.has(groupKey(g)));
-      }, [groups, selected]);
+        return persons
+          .filter(p => !selected.has('p' + p.id))
+          .map(p => ({ person_id: p.id, label: p.name, photo_count: p.photo_count, type: 'person' }));
+      }, [persons, selected]);
 
       // Collect face IDs from selected groups and run an action on all of them
       const runMultiAction = useCallback((actionFn) => {
@@ -901,13 +937,13 @@
         const name = multiName.trim();
         if (!name) return;
 
-        // Validate unique
-        const existing = groups.find(g =>
-          g.type === 'person' && g.label.toLowerCase() === name.toLowerCase()
-          && !selected.has(groupKey(g))
+        // Validate unique across the full persons list (paginated `groups` may hide persons).
+        const existing = persons.find(p =>
+          p.name.toLowerCase() === name.toLowerCase()
+          && !selected.has('p' + p.id)
         );
         if (existing) {
-          setMultiError('A person named "' + existing.label + '" already exists. Use a more specific name.');
+          setMultiError('A person named "' + existing.name + '" already exists. Use a more specific name.');
           return;
         }
         setMultiError('');
@@ -977,9 +1013,11 @@
         exitMultiSelect();
       }, [groups, selected, doUnignore, exitMultiSelect]);
 
-      const namedCount = groups.filter(g => g.type === 'person').length;
-      const unknownCount = groups.filter(g => g.type === 'cluster' && !g.ignored).length;
-      const ignoredCount = groups.filter(g => g.ignored).length;
+      // Counts come from the server (pre-pagination, pre-filter). Using the local
+      // `groups` array would under-report since it only holds the current page.
+      const namedCount = counts.named;
+      const unknownCount = counts.unknown;
+      const ignoredCount = counts.ignored;
 
       return e('div', null,
         // Header
@@ -1138,6 +1176,19 @@
                   ),
                 );
               }),
+            ),
+
+          // Load more — shown when the server has more groups than we've loaded
+          !loading && filteredGroups.length > 0 && filteredGroups.length < total &&
+            e('div', { style: { display: 'flex', justifyContent: 'center', margin: '24px 0' } },
+              e('button', {
+                onClick: loadMore,
+                disabled: loadingMore,
+                style: { padding: '10px 20px', fontSize: 14 },
+              },
+                loadingMore
+                  ? 'Loading\u2026'
+                  : 'Load more (' + (total - filteredGroups.length) + ' remaining)'),
             ),
         ),
 

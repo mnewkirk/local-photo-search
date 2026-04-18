@@ -506,97 +506,133 @@ _SIMILARITY_SORT_GROUP_LIMIT = 500
 def api_face_groups(
     sort: str = Query("similarity"),
     include_singletons: bool = Query(False),
+    filter: str = Query("all"),
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
 ):
-    """List all face identities grouped by person or cluster.
+    """List face identities grouped by person or cluster, with filtering and pagination.
 
-    Returns a list of groups, each with a representative face_id, name/label,
-    photo count, and face count. Used for the faces gallery page.
-
-    sort: "similarity" (default) clusters visually-similar faces together
-          (O(N²); automatically downgraded to "count" when group count
-          exceeds _SIMILARITY_SORT_GROUP_LIMIT). "count" sorts unknowns by
-          face_count desc.
+    sort: "similarity" clusters visually-similar faces together (O(N²);
+          auto-downgraded to "count" when the filtered group count exceeds
+          _SIMILARITY_SORT_GROUP_LIMIT). "count" sorts unknowns by face_count desc.
     include_singletons: when false (default), unknown clusters with only one
-          face are hidden. Named persons are always returned regardless.
+          face are hidden.
+    filter: "all" (named + not-ignored clusters), "named" (persons only),
+          "unknown" (not-ignored clusters only), or "ignored" (ignored clusters only).
+    limit/offset: pagination over the sorted list. Counts and `total` always
+          reflect the pre-pagination filtered set.
     """
     import time
     t0 = time.time()
 
+    if filter not in ("all", "named", "unknown", "ignored"):
+        filter = "all"
+
     with _get_db() as db:
-        # Named persons — single query with rep face via window function
-        named_rows = db.conn.execute(
-            """SELECT p.id as person_id, p.name,
-                      COUNT(DISTINCT f.photo_id) as photo_count,
-                      COUNT(f.id) as face_count,
-                      (SELECT f2.id FROM faces f2
-                       WHERE f2.person_id = p.id AND f2.bbox_top IS NOT NULL
-                       ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
-                       LIMIT 1) as rep_face_id
-               FROM persons p
-               JOIN faces f ON f.person_id = p.id
-               GROUP BY p.id
-               ORDER BY p.name"""
-        ).fetchall()
+        min_face_count = 1 if include_singletons else 2
 
-        groups = []
-        for r in named_rows:
-            groups.append({
-                "type": "person",
-                "person_id": r["person_id"],
-                "label": r["name"],
-                "photo_count": r["photo_count"],
-                "face_count": r["face_count"],
-                "rep_face_id": r["rep_face_id"],
-            })
-
-        # Fetch ignored cluster IDs
+        # Fetch ignored cluster IDs once — used for both filtering and annotation.
         ignored_set = set(
             r["cluster_id"]
             for r in db.conn.execute("SELECT cluster_id FROM ignored_clusters").fetchall()
         )
 
-        # Unknown clusters — single query with rep face via correlated subquery.
-        # Default hides singletons; the per-batch cluster_id=0 collision bug
-        # (see docs/plans/faces-clustering-and-perf.md) produces giant false-
-        # positive clusters, so a 1-face cluster is nearly always noise.
-        min_face_count = 1 if include_singletons else 2
-        unknown_rows = db.conn.execute(
-            """SELECT f.cluster_id,
-                      COUNT(DISTINCT f.photo_id) as photo_count,
-                      COUNT(f.id) as face_count,
-                      (SELECT f2.id FROM faces f2
-                       WHERE f2.cluster_id = f.cluster_id AND f2.person_id IS NULL
-                             AND f2.bbox_top IS NOT NULL
-                       ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
-                       LIMIT 1) as rep_face_id
+        named_groups: list[dict] = []
+        if filter in ("all", "named"):
+            named_rows = db.conn.execute(
+                """SELECT p.id as person_id, p.name,
+                          COUNT(DISTINCT f.photo_id) as photo_count,
+                          COUNT(f.id) as face_count,
+                          (SELECT f2.id FROM faces f2
+                           WHERE f2.person_id = p.id AND f2.bbox_top IS NOT NULL
+                           ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                           LIMIT 1) as rep_face_id
+                   FROM persons p
+                   JOIN faces f ON f.person_id = p.id
+                   GROUP BY p.id
+                   ORDER BY p.name"""
+            ).fetchall()
+            for r in named_rows:
+                named_groups.append({
+                    "type": "person",
+                    "person_id": r["person_id"],
+                    "label": r["name"],
+                    "photo_count": r["photo_count"],
+                    "face_count": r["face_count"],
+                    "rep_face_id": r["rep_face_id"],
+                })
+
+        cluster_groups: list[dict] = []
+        if filter in ("all", "unknown", "ignored"):
+            cluster_rows = db.conn.execute(
+                """SELECT f.cluster_id,
+                          COUNT(DISTINCT f.photo_id) as photo_count,
+                          COUNT(f.id) as face_count,
+                          (SELECT f2.id FROM faces f2
+                           WHERE f2.cluster_id = f.cluster_id AND f2.person_id IS NULL
+                                 AND f2.bbox_top IS NOT NULL
+                           ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                           LIMIT 1) as rep_face_id
+                   FROM faces f
+                   WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL
+                   GROUP BY f.cluster_id
+                   HAVING face_count >= ?
+                   ORDER BY face_count DESC""",
+                (min_face_count,),
+            ).fetchall()
+            for r in cluster_rows:
+                is_ignored = r["cluster_id"] in ignored_set
+                if filter == "unknown" and is_ignored:
+                    continue
+                if filter == "ignored" and not is_ignored:
+                    continue
+                if filter == "all" and is_ignored:
+                    # "all" matches the frontend's pre-pagination default of hiding ignored.
+                    continue
+                cluster_groups.append({
+                    "type": "cluster",
+                    "cluster_id": r["cluster_id"],
+                    "label": "Unknown #" + str(r["cluster_id"]),
+                    "photo_count": r["photo_count"],
+                    "face_count": r["face_count"],
+                    "rep_face_id": r["rep_face_id"],
+                    "ignored": is_ignored,
+                })
+
+        groups = named_groups + cluster_groups
+        total = len(groups)
+        t1 = time.time()
+        logger.info("faces/groups: query took %.3fs (filter=%s, %d groups)",
+                    t1 - t0, filter, total)
+
+        # Counts over the full (pre-pagination) state so filter chips stay accurate.
+        named_count = db.conn.execute(
+            """SELECT COUNT(*) AS n FROM persons p
+               WHERE EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id)"""
+        ).fetchone()["n"]
+
+        cluster_size_rows = db.conn.execute(
+            """SELECT f.cluster_id
                FROM faces f
                WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL
                GROUP BY f.cluster_id
-               HAVING face_count >= ?
-               ORDER BY face_count DESC""",
+               HAVING COUNT(f.id) >= ?""",
             (min_face_count,),
         ).fetchall()
-
-        for r in unknown_rows:
-            groups.append({
-                "type": "cluster",
-                "cluster_id": r["cluster_id"],
-                "label": "Unknown #" + str(r["cluster_id"]),
-                "photo_count": r["photo_count"],
-                "face_count": r["face_count"],
-                "rep_face_id": r["rep_face_id"],
-                "ignored": r["cluster_id"] in ignored_set,
-            })
-
-        t1 = time.time()
-        logger.info("faces/groups: query took %.3fs (%d groups)", t1 - t0, len(groups))
+        qualifying_cluster_ids = {r["cluster_id"] for r in cluster_size_rows}
+        ignored_qualifying = qualifying_cluster_ids & ignored_set
+        counts = {
+            "named": named_count,
+            "unknown": len(qualifying_cluster_ids) - len(ignored_qualifying),
+            "ignored": len(ignored_qualifying),
+        }
 
         effective_sort = sort
-        if sort == "similarity" and len(groups) > _SIMILARITY_SORT_GROUP_LIMIT:
+        if sort == "similarity" and total > _SIMILARITY_SORT_GROUP_LIMIT:
             logger.info(
                 "faces/groups: downgrading similarity sort to count "
                 "(%d groups > %d limit)",
-                len(groups), _SIMILARITY_SORT_GROUP_LIMIT,
+                total, _SIMILARITY_SORT_GROUP_LIMIT,
             )
             effective_sort = "count"
 
@@ -609,7 +645,16 @@ def api_face_groups(
             t3 = time.time()
             logger.info("faces/groups: similarity sort took %.3fs", t3 - t2)
 
-    return {"groups": groups, "sort": effective_sort}
+        page = groups[offset : offset + limit]
+
+    return {
+        "groups": page,
+        "total": total,
+        "counts": counts,
+        "sort": effective_sort,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/api/faces/group/{group_type}/{group_id}/photos")
