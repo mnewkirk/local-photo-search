@@ -303,7 +303,7 @@ If you've already indexed photos on your Mac and want to deploy that database to
 2. Add `REMAP_FROM` to the photosearch environment in `docker-compose.nas.yml`:
    ```yaml
    environment:
-     - REMAP_FROM=/Users/mattnewkirk/Documents/Claude/Projects/Photo organization
+     - REMAP_FROM=/Users/mattnewkirk/Documents/Claude/Projects/photo_organization
    ```
 
 3. Restart the container — paths are remapped automatically on startup:
