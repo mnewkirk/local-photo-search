@@ -413,6 +413,7 @@
     }
     .status-tag.accepted { background: rgba(74, 222, 128, 0.2); color: var(--green); }
     .status-tag.dismissed { background: rgba(136, 136, 136, 0.2); color: var(--text-muted); }
+    .status-tag.stale { background: rgba(250, 204, 21, 0.2); color: var(--yellow); }
 
     @media (max-width: 720px) {
       .card-row { grid-template-columns: 1fr; }
@@ -563,7 +564,7 @@
     // One suggestion card
     // --------------------------------------------------------------------
     const MergeCard = React.forwardRef(function MergeCard(
-      { sug, onAccept, onDismiss, onUndismiss, onPreview, status, busy, focused },
+      { sug, onAccept, onDismiss, onUndismiss, onPreview, status, busy, focused, rewritten },
       cardRef,
     ) {
       const left = sug.left;
@@ -571,6 +572,7 @@
       const isDone = status === 'accepted' || status === 'dismissed';
       const conf = confidenceTier(sug);
       const risks = riskBadges(sug);
+      if (rewritten) risks.push('rewritten after merge');
 
       // Prefer augmented sample_face_ids (up to 4 per side) over the single
       // rep_face_id. Falls back to [rep_face_id] if the server JSON wasn't
@@ -775,6 +777,16 @@
       const [hideBorderline, setHideBorderline] = useState(false);
       const [focusIdx, setFocusIdx] = useState(0);
       const cardRefs = React.useRef([]);
+      // Only auto-scroll the focused card into view when the user has actually
+      // used a keyboard shortcut — otherwise mount and accept-triggered
+      // re-renders would scroll unexpectedly.
+      const hasNavigated = React.useRef(false);
+      // Map from emptied-cluster-id → the full side object of what it became.
+      // Any pending suggestion naming one of these as TARGET is rewritten to
+      // the new identity (faces that made it match are still there, just in
+      // the larger bucket). Suggestions naming an emptied cluster as SOURCE
+      // are stale — the source has no faces left to move.
+      const [acceptedMerges, setAcceptedMerges] = useState(() => new Map());
 
       const reload = useCallback(() => {
         setLoading(true);
@@ -792,16 +804,57 @@
 
       const rawSuggestions = (payload && payload.suggestions) || [];
 
+      // Follow the merge chain for a cluster target (handles nested merges
+      // where A → B was accepted, then B → C was accepted, so "X → A" should
+      // ultimately resolve to "X → C").
+      const resolveTarget = useCallback((side) => {
+        if (!side || side.type !== 'cluster') return { side, chain: [] };
+        const chain = [];
+        let cur = side;
+        const seen = new Set();
+        while (cur.type === 'cluster' && acceptedMerges.has(cur.id) && !seen.has(cur.id)) {
+          seen.add(cur.id);
+          chain.push(cur);
+          cur = acceptedMerges.get(cur.id);
+        }
+        return { side: cur, chain };
+      }, [acceptedMerges]);
+
       const annotated = useMemo(() => rawSuggestions.map(sug => {
-        const key = pairKey(sug);
-        const dismissedStatus = dismissed[key] ? 'dismissed' : null;
-        const actedStatus = actedOn[key] || null;
-        return { sug, key, status: actedStatus || dismissedStatus };
-      }), [rawSuggestions, actedOn, dismissed]);
+        const origKey = pairKey(sug);
+        const dismissedStatus = dismissed[origKey] ? 'dismissed' : null;
+        const actedStatus = actedOn[origKey] || null;
+
+        // Stale-as-source: the cluster we'd be moving has already been emptied.
+        const sourceEmptied = sug.left.type === 'cluster'
+          && acceptedMerges.has(sug.left.id);
+
+        // Rewrite target if it was emptied into another group.
+        const { side: resolvedRight, chain } = resolveTarget(sug.right);
+        const rewritten = chain.length > 0;
+
+        // After rewrite, if source equals target, the merge is redundant.
+        const selfMerge = resolvedRight.type === sug.left.type
+          && resolvedRight.id === sug.left.id;
+
+        const effective = rewritten
+          ? { ...sug, right: resolvedRight, _rewritten_from: chain }
+          : sug;
+
+        let status = actedStatus || dismissedStatus || null;
+        if (!status && (sourceEmptied || selfMerge)) status = 'stale';
+
+        return {
+          sug: effective,
+          key: origKey,            // key stays by original ids so localStorage + actedOn still match
+          status,
+          rewritten,
+        };
+      }), [rawSuggestions, actedOn, dismissed, acceptedMerges, resolveTarget]);
 
       const filtered = useMemo(() => {
         const pass = annotated.filter(({ sug, status }) => {
-          if (status === 'accepted') return false;   // gone
+          if (status === 'accepted' || status === 'stale') return false;
           if (typeFilter === 'to_person' && sug.right.type !== 'person') return false;
           if (typeFilter === 'to_cluster' && sug.right.type !== 'cluster') return false;
           if (hideBorderline && typeof sug.min_pair_dist === 'number'
@@ -820,14 +873,18 @@
       }, [annotated, typeFilter, sort, hideBorderline]);
 
       const counts = useMemo(() => {
-        let toPerson = 0, toCluster = 0, accepted = 0, dism = 0;
+        let toPerson = 0, toCluster = 0, accepted = 0, dism = 0, stale = 0;
         for (const { sug, status } of annotated) {
           if (status === 'accepted') { accepted++; continue; }
           if (status === 'dismissed') { dism++; continue; }
+          if (status === 'stale') { stale++; continue; }
           if (sug.right.type === 'person') toPerson++;
           else toCluster++;
         }
-        return { toPerson, toCluster, accepted, dismissed: dism, total: annotated.length };
+        return {
+          toPerson, toCluster, accepted, dismissed: dism, stale,
+          total: annotated.length,
+        };
       }, [annotated]);
 
       const setBusy = (key, val) => {
@@ -855,6 +912,17 @@
             setBusy(key, false);
             if (!ok) { setApiError(data && data.detail ? data.detail : 'Merge failed'); return; }
             setActedOn(prev => ({ ...prev, [key]: 'accepted' }));
+            // Record the remap so any other suggestion naming this cluster
+            // as target gets rewritten to the new identity. Store the full
+            // right-side object so the card can render the new labels and
+            // face crops without an extra fetch.
+            if (sug.left.type === 'cluster') {
+              setAcceptedMerges(prev => {
+                const next = new Map(prev);
+                next.set(sug.left.id, sug.right);
+                return next;
+              });
+            }
           })
           .catch(err => {
             setBusy(key, false);
@@ -898,22 +966,28 @@
 
           if (ev.key === 'j' || ev.key === 'ArrowDown') {
             ev.preventDefault();
+            hasNavigated.current = true;
             setFocusIdx(i => Math.min(i + 1, Math.max(0, filtered.length - 1)));
           } else if (ev.key === 'k' || ev.key === 'ArrowUp') {
             ev.preventDefault();
+            hasNavigated.current = true;
             setFocusIdx(i => Math.max(0, i - 1));
           } else if (ev.key === 'a' || ev.key === 'Enter') {
             const entry = filtered[focusIdx];
             if (entry && !entry.status) {
               ev.preventDefault();
               handleAccept(entry.sug);
-              setFocusIdx(i => Math.min(i + 1, Math.max(0, filtered.length - 1)));
+              // Don't advance — accepted rows are filtered out, so the card
+              // at focusIdx becomes the next suggestion automatically.
             }
           } else if (ev.key === 'd') {
             const entry = filtered[focusIdx];
             if (entry && !entry.status) {
               ev.preventDefault();
               handleDismiss(entry.sug);
+              // Dismissed rows STAY in the list (tagged + undoable), so we
+              // do need to advance past them.
+              hasNavigated.current = true;
               setFocusIdx(i => Math.min(i + 1, Math.max(0, filtered.length - 1)));
             }
           } else if (ev.key === 'Escape') {
@@ -924,8 +998,11 @@
         return () => document.removeEventListener('keydown', onKey);
       }, [filtered, focusIdx, handleAccept, handleDismiss, previewFaceId]);
 
-      // When focusIdx changes, scroll the card into view.
+      // When the user navigates via keyboard, scroll the focused card into view.
+      // Skipped on mount and on filter-induced focusIdx clamps so the page
+      // doesn't scroll on its own when the user is clicking buttons or loading.
       useEffect(() => {
+        if (!hasNavigated.current) return;
         const ref = cardRefs.current[focusIdx];
         if (ref && ref.scrollIntoView) {
           ref.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -984,6 +1061,10 @@
                 e('span', { className: 'val' }, counts.dismissed),
                 e('span', { className: 'lbl' }, 'dismissed'),
               ),
+              counts.stale > 0 && e('div', { className: 'stat muted' },
+                e('span', { className: 'val' }, counts.stale),
+                e('span', { className: 'lbl' }, 'stale (superseded)'),
+              ),
               e('div', { className: 'stat muted' },
                 e('span', { className: 'val' }, counts.total),
                 e('span', { className: 'lbl' }, 'total'),
@@ -1034,11 +1115,12 @@
                   counts.total === 0
                     ? 'No suggestions in the JSON file.'
                     : 'Nothing pending under the current filter.')
-              : filtered.map(({ sug, key, status }, idx) =>
+              : filtered.map(({ sug, key, status, rewritten }, idx) =>
                   e(MergeCard, {
                     key: key,
                     sug: sug,
                     status: status,
+                    rewritten: rewritten,
                     busy: !!busyKeys[key],
                     focused: idx === focusIdx,
                     ref: (el) => { cardRefs.current[idx] = el; },
