@@ -297,6 +297,69 @@
       font-size: 13px;
     }
 
+    /* Workers */
+    .workers-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .workers-head {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .workers-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .workers-idle {
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+    .queue-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .queue-pill {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .queue-pill .q-pass { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .queue-pill .q-count { font-weight: 600; }
+    .queue-pill.empty .q-count { color: var(--text-muted); font-weight: 400; }
+    .active-row {
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+    }
+    .active-row:last-child { border-bottom: none; }
+    .active-pass {
+      color: var(--accent);
+      white-space: nowrap;
+      min-width: 70px;
+    }
+    .active-worker { color: var(--text-muted); min-width: 180px; }
+    .active-count { color: var(--text); white-space: nowrap; }
+    .active-ttl { color: var(--text-muted); white-space: nowrap; margin-left: auto; }
+    .active-ttl.expiring { color: var(--yellow); }
+    .active-ttl.expired { color: #f87171; }
+
     /* Errors log */
     .errors-wrap {
       background: var(--surface);
@@ -670,6 +733,70 @@
       );
     }
 
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'tags', 'verify'];
+
+    function formatTtl(expiresAtStr) {
+      if (!expiresAtStr) return { text: '—', cls: '' };
+      // expires_at is UTC in SQLite ('YYYY-MM-DD HH:MM:SS'), treat as UTC
+      var isoUtc = expiresAtStr.replace(' ', 'T') + 'Z';
+      var deltaMs = new Date(isoUtc).getTime() - Date.now();
+      if (isNaN(deltaMs)) return { text: '—', cls: '' };
+      if (deltaMs <= 0) return { text: 'expired', cls: 'expired' };
+      var mins = Math.floor(deltaMs / 60000);
+      var secs = Math.floor((deltaMs % 60000) / 1000);
+      var text = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+      return { text: text + ' left', cls: mins < 2 ? 'expiring' : '' };
+    }
+
+    function Workers(props) {
+      var data = props.data;
+      if (!data) return null;
+      var queue = data.queue_depth || {};
+      var active = data.active_claims || [];
+      var totalQueue = PASS_ORDER.reduce(function(s, p) { return s + (queue[p] || 0); }, 0);
+
+      return e('div', null,
+        e('h2', null, 'Workers'),
+        e('div', { className: 'workers-wrap' },
+          e('div', { className: 'workers-head' },
+            e('span', { className: 'workers-title' },
+              active.length === 0
+                ? 'No active workers'
+                : active.length + ' active worker' + (active.length === 1 ? '' : 's')
+            ),
+            e('span', { className: 'workers-idle' },
+              totalQueue === 0
+                ? 'queue empty'
+                : totalQueue.toLocaleString() + ' photos queued across passes'
+            )
+          ),
+          e('div', { className: 'queue-grid' },
+            PASS_ORDER.map(function(pass) {
+              var count = queue[pass] || 0;
+              return e('div', {
+                key: pass,
+                className: 'queue-pill' + (count === 0 ? ' empty' : '')
+              },
+                e('span', { className: 'q-pass' }, pass),
+                e('span', { className: 'q-count' }, count.toLocaleString())
+              );
+            })
+          ),
+          active.length > 0 && e('div', null,
+            active.map(function(c) {
+              var ttl = formatTtl(c.expires_at);
+              return e('div', { key: c.batch_id, className: 'active-row' },
+                e('span', { className: 'active-pass' }, c.pass_type),
+                e('span', { className: 'active-worker', title: c.worker_id }, c.worker_id),
+                e('span', { className: 'active-count' }, c.photo_count + ' photos'),
+                e('span', { className: 'active-ttl ' + ttl.cls }, ttl.text)
+              );
+            })
+          )
+        )
+      );
+    }
+
     function ErrorsLog(props) {
       var errors = props.errors;
       if (!errors || errors.length === 0) return null;
@@ -855,6 +982,15 @@
       var _f = useState(null); var failures = _f[0]; var setFailures = _f[1];
       var _m = useState(null); var modalPhoto = _m[0]; var setModalPhoto = _m[1];
       var _p = useState([]); var persons = _p[0]; var setPersons = _p[1];
+      var _w = useState(null); var workerStatus = _w[0]; var setWorkerStatus = _w[1];
+      var _tick = useState(0); var setTick = _tick[1];
+
+      function loadWorkers() {
+        fetch('/api/worker/status')
+          .then(function(r) { return r.json(); })
+          .then(function(d) { setWorkerStatus(d); })
+          .catch(function() {});
+      }
 
       function load() {
         setLoading(true);
@@ -877,7 +1013,17 @@
             setError('Failed to load stats: ' + err.message);
             setLoading(false);
           });
+        loadWorkers();
       }
+
+      // Poll worker status every 5s so active-worker counts + TTLs stay live
+      // without forcing a full /api/stats refresh (which does expensive COUNTs).
+      // Separate 1s tick re-renders active-row TTLs between fetches.
+      useEffect(function() {
+        var pollId = setInterval(loadWorkers, 5000);
+        var tickId = setInterval(function() { setTick(function(t) { return t + 1; }); }, 1000);
+        return function() { clearInterval(pollId); clearInterval(tickId); };
+      }, []);
 
       useEffect(function() {
         fetch('/api/persons')
@@ -1007,6 +1153,13 @@
               total: total
             }),
             e(StatCard, {
+              label: 'Tags',
+              value: (stats.tagged || 0).toLocaleString(),
+              sub: pct(stats.tagged || 0, total) + '% — run index --tags',
+              n: stats.tagged || 0,
+              total: total
+            }),
+            e(StatCard, {
               label: 'Stacks',
               value: stats.stacks.toLocaleString(),
               sub: stats.stacks > 0
@@ -1021,6 +1174,7 @@
                 + stats.verify_passed + ' passed'
             })
           ),
+          e(Workers, { data: workerStatus }),
           e(ActivityChart, { activity: activity }),
           e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
           e(ErrorsLog, { errors: indexErrors }),

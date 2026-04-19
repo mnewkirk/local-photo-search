@@ -874,6 +874,46 @@ def search_by_place(db: PhotoDB, place: str, limit: int = 10) -> list[dict]:
     return db.search_text(place, limit=limit)
 
 
+def _extract_persons_from_query(db: PhotoDB, query: str) -> tuple[str, list[dict]]:
+    """Find registered person names inside a free-text query.
+
+    Matches are case-insensitive, word-bounded, and longest-first (so
+    "Matt Newkirk" wins over "Matt" when both are registered). Names
+    preceded by `-` are left alone so `-Calvin` keeps working as an
+    exclusion token for the CLIP pass downstream. After matched names
+    are stripped, connector tokens ("and", "with", "&", ",") are also
+    stripped from the residual so the leftover reads cleanly as the
+    semantic query.
+
+    Returns (residual_query, [person_rows]).
+    """
+    persons = db.conn.execute("SELECT id, name FROM persons").fetchall()
+    if not persons:
+        return query, []
+
+    candidates = sorted((dict(p) for p in persons), key=lambda p: -len(p["name"]))
+
+    matched: list[dict] = []
+    seen_ids: set[int] = set()
+    residual = query
+    for p in candidates:
+        pattern = re.compile(
+            r'(?<!-)(?<!\w)' + re.escape(p["name"]) + r'(?!\w)',
+            re.IGNORECASE,
+        )
+        if pattern.search(residual) and p["id"] not in seen_ids:
+            matched.append(p)
+            seen_ids.add(p["id"])
+            residual = pattern.sub(' ', residual)
+
+    if matched:
+        residual = re.sub(r'\s+(?:and|with)\s+', ' ', residual, flags=re.IGNORECASE)
+        residual = re.sub(r'\s*[&,]\s*', ' ', residual)
+        residual = re.sub(r'\s+', ' ', residual).strip()
+
+    return residual, matched
+
+
 def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str | None = None) -> list[dict]:
     """Find all photos containing a named person.
 
@@ -1047,6 +1087,26 @@ def search_combined(
                 effective_query = cleaned if cleaned else None
 
     result_sets = []
+
+    # Extract registered person names from the query so "Calvin and Ellie"
+    # becomes an AND-intersection of Calvin's and Ellie's photos instead of
+    # a CLIP embedding of the literal string. Each matched name is added as
+    # its own result_set — the existing intersection logic below gives AND.
+    name_matched: list[dict] = []
+    if effective_query:
+        residual, name_matched = _extract_persons_from_query(db, effective_query)
+        if name_matched:
+            _log.info(
+                "QUERY NAMES: matched %s  residual=%r",
+                [p["name"] for p in name_matched],
+                residual,
+            )
+            for p in name_matched:
+                results = search_by_person(
+                    db, p["name"], limit=limit * 3, match_source=match_source,
+                )
+                result_sets.append({r["id"]: r for r in results})
+            effective_query = residual if residual else None
 
     if person:
         results = search_by_person(db, person, limit=limit * 3, match_source=match_source)

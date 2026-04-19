@@ -1672,6 +1672,10 @@ def api_stats():
             "SELECT COUNT(*) as c FROM photos WHERE aesthetic_concepts IS NOT NULL"
         ).fetchone()["c"]
 
+        tagged = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE tags IS NOT NULL AND tags != '[]'"
+        ).fetchone()["c"]
+
         verify_rows = db.conn.execute(
             """SELECT verification_status AS status, COUNT(*) AS c
                FROM photos
@@ -1693,6 +1697,7 @@ def api_stats():
         "quality_scored": scored,
         "quality_stats": quality_stats,
         "concepts_analyzed": concepts_analyzed,
+        "tagged": tagged,
         "stacks": stack_count,
         "stacked_photos": stacked_photos,
         "verify_passed": verify_counts["pass"],
