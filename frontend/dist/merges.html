@@ -197,12 +197,63 @@
       margin-bottom: 14px;
       contain-intrinsic-size: 280px;
       content-visibility: auto;
+      position: relative;
+      outline: none;
+    }
+    .card.focused {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.25);
     }
     .card.acting { opacity: 0.5; pointer-events: none; }
     .card.done {
       border-color: var(--green);
       background: rgba(74, 222, 128, 0.05);
     }
+    .confidence {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .confidence.strong { background: rgba(74, 222, 128, 0.2); color: var(--green); }
+    .confidence.probable { background: rgba(250, 204, 21, 0.18); color: var(--yellow); }
+    .confidence.borderline { background: rgba(248, 113, 113, 0.18); color: var(--red); }
+    .risk-badges {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .risk-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: rgba(250, 204, 21, 0.1);
+      color: var(--yellow);
+      border: 1px solid rgba(250, 204, 21, 0.35);
+    }
+    .kbd {
+      display: inline-block;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 11px;
+      padding: 1px 5px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 3px;
+      color: var(--text-muted);
+    }
+    .shortcuts-hint {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-left: auto;
+    }
+    .shortcuts-hint .kbd { margin: 0 2px; }
 
     .card-row {
       display: grid;
@@ -229,6 +280,17 @@
       color: var(--text-muted);
       margin-bottom: 10px;
     }
+    .face-strip {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 4px;
+      flex: none;
+      width: 164px;
+    }
+    .face-strip .face-crop {
+      width: 80px;
+      height: 80px;
+    }
     .face-crop {
       width: 110px;
       height: 110px;
@@ -237,6 +299,13 @@
       flex: none;
       background: var(--surface2);
       border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .face-crop.primary {
+      width: 110px;
+      height: 110px;
+      grid-column: 1 / span 2;
+      grid-row: 1;
     }
     .face-crop.missing {
       display: flex;
@@ -244,6 +313,53 @@
       justify-content: center;
       color: var(--text-muted);
       font-size: 11px;
+      cursor: default;
+    }
+
+    /* Photo preview popover — click a face crop to see the full photo with
+       the bbox highlighted, so tight bboxes don't hide context */
+    .preview-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 24px;
+    }
+    .preview-inner {
+      max-width: 95vw;
+      max-height: 90vh;
+      position: relative;
+    }
+    .preview-inner img {
+      max-width: 95vw;
+      max-height: 90vh;
+      border-radius: var(--radius);
+      display: block;
+    }
+    .preview-close {
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 18px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .preview-caption {
+      color: var(--text-muted);
+      font-size: 12px;
+      margin-top: 8px;
+      text-align: center;
     }
     .side-actions {
       display: flex;
@@ -351,6 +467,43 @@
       if (x < warnBelow) return 'warn';
       return '';
     }
+
+    // Confidence tiers — calibrated from the 2026-04-18 review batch where
+    // 125 suggestions produced 15 FPs, all at min_pair ≥ 0.554. TPs were
+    // all < 0.50 (top 12 named-person matches at 0.05–0.48).
+    function confidenceTier(sug) {
+      const m = sug.min_pair_dist;
+      if (typeof m !== 'number') return { tier: 'probable', label: 'Probable' };
+      if (m < 0.50) return { tier: 'strong', label: 'Strong' };
+      if (m < 0.55) return { tier: 'probable', label: 'Probable' };
+      return { tier: 'borderline', label: 'Borderline' };
+    }
+
+    // Risk signals — hints that a pair may be a false positive even if the
+    // numeric scores pass the cutoff. Each returns a short badge label or ''.
+    function riskBadges(sug) {
+      const badges = [];
+      const left = sug.left, right = sug.right;
+      // Large "attractor" target cluster: many small tidy clusters can score
+      // badly-low against a muddy 100+-face bucket via a single coincidental
+      // pair. Flagged in the observed FP batch on clusters like #15, #423.
+      if (right.type === 'cluster' && right.face_count >= 50 &&
+          left.type === 'cluster' && left.face_count < 15) {
+        badges.push('attractor risk');
+      }
+      // Cluster↔cluster with overlap spanning months across unrelated events
+      // was a repeat offender in the FP batch (overlaps of 371–469 days).
+      if (left.type === 'cluster' && right.type === 'cluster' &&
+          typeof sug.shared_days === 'number' && sug.shared_days > 180) {
+        badges.push('long overlap');
+      }
+      // Edge of DBSCAN's own eps — everything just above 0.55 is knife-edge
+      // and over-represented in the observed FPs.
+      if (typeof sug.min_pair_dist === 'number' && sug.min_pair_dist >= 0.55) {
+        badges.push('edge score');
+      }
+      return badges;
+    }
     function formatWhen(ts) {
       if (!ts) return '';
       try {
@@ -367,16 +520,38 @@
       return years + 'y';
     }
 
-    function faceCrop(faceId, label) {
+    function faceCrop(faceId, label, onClick, extraClass) {
       if (!faceId) {
-        return e('div', { className: 'face-crop missing' }, 'no crop');
+        return e('div', { className: 'face-crop missing' + (extraClass ? ' ' + extraClass : '') }, 'no crop');
       }
       return e('img', {
-        className: 'face-crop',
+        className: 'face-crop' + (extraClass ? ' ' + extraClass : ''),
         src: API + '/api/faces/crop/' + faceId + '?size=220',
         alt: label || 'face',
         loading: 'lazy',
+        onClick: onClick,
+        title: 'Click to see the full photo',
       });
+    }
+
+    // Strip of up to 4 face crops per side. The first is the largest-bbox
+    // face (rep); the rest are secondary so the user has fallback signal when
+    // a single bbox is tight/off-center.
+    function faceStrip(ids, label, onFaceClick) {
+      const list = ids && ids.length ? ids : [];
+      if (!list.length) {
+        return e('div', { className: 'face-crop missing' }, 'no crops');
+      }
+      const children = [];
+      for (let i = 0; i < Math.min(list.length, 4); i++) {
+        children.push(faceCrop(
+          list[i],
+          label + ' #' + (i + 1),
+          () => onFaceClick(list[i]),
+          i === 0 ? 'primary' : '',
+        ));
+      }
+      return e('div', { className: 'face-strip' }, ...children);
     }
 
     function groupUrl(side) {
@@ -387,22 +562,45 @@
     // --------------------------------------------------------------------
     // One suggestion card
     // --------------------------------------------------------------------
-    function MergeCard({ sug, onAccept, onDismiss, onUndismiss, status, busy }) {
+    const MergeCard = React.forwardRef(function MergeCard(
+      { sug, onAccept, onDismiss, onUndismiss, onPreview, status, busy, focused },
+      cardRef,
+    ) {
       const left = sug.left;
       const right = sug.right;
       const isDone = status === 'accepted' || status === 'dismissed';
+      const conf = confidenceTier(sug);
+      const risks = riskBadges(sug);
+
+      // Prefer augmented sample_face_ids (up to 4 per side) over the single
+      // rep_face_id. Falls back to [rep_face_id] if the server JSON wasn't
+      // augmented (pre-upgrade suggestions file).
+      const leftIds = (left.sample_face_ids && left.sample_face_ids.length)
+        ? left.sample_face_ids
+        : (left.rep_face_id ? [left.rep_face_id] : []);
+      const rightIds = (right.sample_face_ids && right.sample_face_ids.length)
+        ? right.sample_face_ids
+        : (right.rep_face_id ? [right.rep_face_id] : []);
 
       return e('div', {
-        className: 'card' + (busy ? ' acting' : '') + (isDone ? ' done' : ''),
+        ref: cardRef,
+        tabIndex: focused ? 0 : -1,
+        className: 'card'
+          + (busy ? ' acting' : '')
+          + (isDone ? ' done' : '')
+          + (focused ? ' focused' : ''),
       },
-        // Optional status tag
+        // Confidence tier is a large, always-visible signal — with 237 to
+        // review, the user triages by color before reading scores.
+        e('span', { className: 'confidence ' + conf.tier },
+          conf.label + ' · ' + formatScore(sug.min_pair_dist)),
         isDone && e('div', { style: { textAlign: 'right', marginBottom: 6 } },
           e('span', { className: 'status-tag ' + status }, status),
         ),
-        e('div', { className: 'card-row' },
+        e('div', { className: 'card-row', style: { marginTop: 20 } },
           // Left side
           e('div', { className: 'side left' },
-            faceCrop(left.rep_face_id, left.label),
+            faceStrip(leftIds, left.label, onPreview),
             e('div', { className: 'meta' },
               e('div', { className: 'label ' + (left.type === 'person' ? 'person' : '') }, left.label),
               e('div', { className: 'sublabel' },
@@ -422,7 +620,7 @@
           }, right.type === 'person' ? '→' : '↔'),
           // Right side
           e('div', { className: 'side right' },
-            faceCrop(right.rep_face_id, right.label),
+            faceStrip(rightIds, right.label, onPreview),
             e('div', { className: 'meta' },
               e('div', { className: 'label ' + (right.type === 'person' ? 'person' : '') }, right.label),
               e('div', { className: 'sublabel' },
@@ -455,6 +653,9 @@
           ),
         ),
         // Buttons
+        risks.length > 0 && e('div', { className: 'risk-badges' },
+          ...risks.map((r, i) => e('span', { key: i, className: 'risk-badge' }, r)),
+        ),
         !isDone && e('div', { className: 'card-actions' },
           e('button', {
             className: 'btn btn-danger small',
@@ -477,11 +678,89 @@
           }, 'Undo dismiss'),
         ),
       );
-    }
+    });
 
     // --------------------------------------------------------------------
     // Main app
     // --------------------------------------------------------------------
+    // --------------------------------------------------------------------
+    // Photo preview modal — shows the full photo for a face_id with the
+    // bbox highlighted, so the user can see context when a tight bbox
+    // hides whether it's really the right person.
+    // --------------------------------------------------------------------
+    function PhotoPreview({ faceId, onClose }) {
+      const [detail, setDetail] = useState(null);
+      const [loadErr, setLoadErr] = useState('');
+
+      useEffect(() => {
+        if (!faceId) return;
+        setDetail(null); setLoadErr('');
+        // Face detail lives on a face → photo join. Easiest route: fetch
+        // face group-info? No — just hit /api/faces/{id}-like via a small
+        // inline endpoint. We'll piggy-back on /api/photos/{id} once we know
+        // the photo id, but we don't know it yet. Use /api/faces/crop to
+        // get a crop (we already have it in the card) AND fetch the full
+        // photo by walking through /api/faces/group/*/photos is overkill.
+        // Simplest: a dedicated face-detail endpoint. For now fall back to
+        // /api/faces/crop at a bigger size as the preview image.
+        fetch(API + '/api/faces/face-detail/' + faceId)
+          .then(r => r.ok ? r.json() : null)
+          .then(data => { if (data) setDetail(data); else setLoadErr('not found'); })
+          .catch(err => setLoadErr(err.message || 'error'));
+      }, [faceId]);
+
+      const onKey = useCallback((ev) => {
+        if (ev.key === 'Escape') onClose();
+      }, [onClose]);
+      useEffect(() => {
+        document.addEventListener('keydown', onKey);
+        return () => document.removeEventListener('keydown', onKey);
+      }, [onKey]);
+
+      if (!faceId) return null;
+
+      // Use the photo_id from detail to show the full thumbnail, with bbox
+      // overlay if we have it. Fall back to an enlarged crop while detail
+      // loads or if the endpoint doesn't exist yet (graceful).
+      const imgSrc = detail && detail.photo_id
+        ? API + '/api/photos/' + detail.photo_id + '/preview'
+        : API + '/api/faces/crop/' + faceId + '?size=600';
+
+      const bbox = detail && detail.bbox;
+      const imgW = detail && detail.image_width;
+      const imgH = detail && detail.image_height;
+
+      return e('div', { className: 'preview-overlay', onClick: onClose },
+        e('div', {
+          className: 'preview-inner',
+          onClick: (ev) => ev.stopPropagation(),
+        },
+          e('button', { className: 'preview-close', onClick: onClose }, '×'),
+          e('div', { style: { position: 'relative' } },
+            e('img', { src: imgSrc, alt: 'preview' }),
+            bbox && imgW && imgH && e('div', {
+              style: {
+                position: 'absolute',
+                left: (100 * bbox.left / imgW) + '%',
+                top: (100 * bbox.top / imgH) + '%',
+                width: (100 * (bbox.right - bbox.left) / imgW) + '%',
+                height: (100 * (bbox.bottom - bbox.top) / imgH) + '%',
+                border: '3px solid #4ade80',
+                borderRadius: 4,
+                boxShadow: '0 0 12px rgba(74,222,128,0.55)',
+                pointerEvents: 'none',
+              },
+            }),
+          ),
+          e('div', { className: 'preview-caption' },
+            detail && detail.filename
+              ? detail.filename + (detail.date_taken ? ' · ' + detail.date_taken.slice(0, 10) : '')
+              : (loadErr ? 'Loading failed — showing face crop only' : 'Loading…'),
+          ),
+        ),
+      );
+    }
+
     function App() {
       const [payload, setPayload] = useState(null);
       const [loading, setLoading] = useState(true);
@@ -492,6 +771,10 @@
       const [busyKeys, setBusyKeys] = useState({});        // key → true
       const [apiError, setApiError] = useState('');
       const [dismissed, setDismissed] = useState(loadDismissed);
+      const [previewFaceId, setPreviewFaceId] = useState(null);
+      const [hideBorderline, setHideBorderline] = useState(false);
+      const [focusIdx, setFocusIdx] = useState(0);
+      const cardRefs = React.useRef([]);
 
       const reload = useCallback(() => {
         setLoading(true);
@@ -521,6 +804,8 @@
           if (status === 'accepted') return false;   // gone
           if (typeFilter === 'to_person' && sug.right.type !== 'person') return false;
           if (typeFilter === 'to_cluster' && sug.right.type !== 'cluster') return false;
+          if (hideBorderline && typeof sug.min_pair_dist === 'number'
+              && sug.min_pair_dist >= 0.55) return false;
           return true;
         });
         const sorted = pass.slice();
@@ -532,7 +817,7 @@
           sorted.sort((a, b) => a.sug.min_pair_dist - b.sug.min_pair_dist);
         }
         return sorted;
-      }, [annotated, typeFilter, sort]);
+      }, [annotated, typeFilter, sort, hideBorderline]);
 
       const counts = useMemo(() => {
         let toPerson = 0, toCluster = 0, accepted = 0, dism = 0;
@@ -602,6 +887,56 @@
         saveDismissed({});
       }, [dismissed]);
 
+      // Keyboard review: J/↓ next, K/↑ prev, A/Enter accept focused card,
+      // D dismiss focused card. Skips when a preview or text input is active.
+      useEffect(() => {
+        function onKey(ev) {
+          if (previewFaceId) return;
+          const tag = ev.target && ev.target.tagName;
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+          if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+
+          if (ev.key === 'j' || ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            setFocusIdx(i => Math.min(i + 1, Math.max(0, filtered.length - 1)));
+          } else if (ev.key === 'k' || ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            setFocusIdx(i => Math.max(0, i - 1));
+          } else if (ev.key === 'a' || ev.key === 'Enter') {
+            const entry = filtered[focusIdx];
+            if (entry && !entry.status) {
+              ev.preventDefault();
+              handleAccept(entry.sug);
+              setFocusIdx(i => Math.min(i + 1, Math.max(0, filtered.length - 1)));
+            }
+          } else if (ev.key === 'd') {
+            const entry = filtered[focusIdx];
+            if (entry && !entry.status) {
+              ev.preventDefault();
+              handleDismiss(entry.sug);
+              setFocusIdx(i => Math.min(i + 1, Math.max(0, filtered.length - 1)));
+            }
+          } else if (ev.key === 'Escape') {
+            setFocusIdx(-1);
+          }
+        }
+        document.addEventListener('keydown', onKey);
+        return () => document.removeEventListener('keydown', onKey);
+      }, [filtered, focusIdx, handleAccept, handleDismiss, previewFaceId]);
+
+      // When focusIdx changes, scroll the card into view.
+      useEffect(() => {
+        const ref = cardRefs.current[focusIdx];
+        if (ref && ref.scrollIntoView) {
+          ref.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+      }, [focusIdx]);
+
+      // Reset focus when filter/sort shrinks the list
+      useEffect(() => {
+        if (focusIdx >= filtered.length) setFocusIdx(Math.max(0, filtered.length - 1));
+      }, [filtered.length, focusIdx]);
+
       // --- Render ---
       return e(React.Fragment, null,
         e(PS.SharedHeader, { activePage: 'merges' }),
@@ -668,6 +1003,11 @@
                 className: 'pill' + (typeFilter === 'to_cluster' ? ' active' : ''),
                 onClick: () => setTypeFilter('to_cluster'),
               }, '↔ Cluster (' + counts.toCluster + ')'),
+              e('button', {
+                className: 'pill' + (hideBorderline ? ' active' : ''),
+                onClick: () => setHideBorderline(v => !v),
+                title: 'Hide borderline (min_pair ≥ 0.55) — the band where FPs concentrated in prior reviews',
+              }, hideBorderline ? 'Strict ✓' : 'Strict'),
               e('div', { className: 'spacer' }),
               e('span', { className: 'label' }, 'Sort'),
               e('select', {
@@ -681,24 +1021,38 @@
                 className: 'btn small', onClick: clearDismissals,
               }, 'Clear dismissals'),
             ),
+            e('div', { className: 'shortcuts-hint', style: { marginBottom: 14 } },
+              e('span', { className: 'kbd' }, 'J'), '/', e('span', { className: 'kbd' }, '↓'), ' next ',
+              e('span', { className: 'kbd' }, 'K'), '/', e('span', { className: 'kbd' }, '↑'), ' prev ',
+              e('span', { className: 'kbd' }, 'A'), ' accept ',
+              e('span', { className: 'kbd' }, 'D'), ' dismiss ',
+              e('span', { className: 'kbd' }, 'Esc'), ' blur',
+            ),
 
             filtered.length === 0
               ? e('div', { className: 'info' },
                   counts.total === 0
                     ? 'No suggestions in the JSON file.'
                     : 'Nothing pending under the current filter.')
-              : filtered.map(({ sug, key, status }) =>
+              : filtered.map(({ sug, key, status }, idx) =>
                   e(MergeCard, {
                     key: key,
                     sug: sug,
                     status: status,
                     busy: !!busyKeys[key],
+                    focused: idx === focusIdx,
+                    ref: (el) => { cardRefs.current[idx] = el; },
                     onAccept: handleAccept,
                     onDismiss: handleDismiss,
                     onUndismiss: handleUndismiss,
+                    onPreview: setPreviewFaceId,
                   })),
           ),
         ),
+        previewFaceId && e(PhotoPreview, {
+          faceId: previewFaceId,
+          onClose: () => setPreviewFaceId(null),
+        }),
       );
     }
 

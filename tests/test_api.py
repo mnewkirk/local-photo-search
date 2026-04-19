@@ -441,8 +441,30 @@ class TestMergeReviewAPI:
             assert data["live_count"] == 1
             assert data["source_path"].endswith("suggestions.json")
             assert "generated_at" in data
+
+            # Augmentation: sample_face_ids populated on each side so the UI
+            # can render a multi-face strip instead of relying on rep_face_id.
+            left_side = data["suggestions"][0]["left"]
+            right_side = data["suggestions"][0]["right"]
+            assert left_side["sample_face_ids"] == [unknown_face]
+            assert len(right_side["sample_face_ids"]) >= 1
+            assert db._test_face_ids["alex_894"] in right_side["sample_face_ids"]
         finally:
             web._suggestions_path = orig
+
+    def test_face_detail_returns_bbox_and_photo(self, client, db):
+        unknown_face = db._test_face_ids["unknown_878"]
+        resp = client.get(f"/api/faces/face-detail/{unknown_face}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["face_id"] == unknown_face
+        assert data["photo_id"] == db._test_photo_ids["DSC04878.JPG"]
+        assert data["filename"] == "DSC04878.JPG"
+        assert data["bbox"] == {"top": 300, "right": 400, "bottom": 380, "left": 320}
+        assert data["image_width"] == 7008
+
+    def test_face_detail_missing_face(self, client):
+        assert client.get("/api/faces/face-detail/99999").status_code == 404
 
     def test_merges_cluster_to_person(self, client, db):
         unknown_face = db._test_face_ids["unknown_878"]

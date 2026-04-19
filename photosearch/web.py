@@ -657,6 +657,40 @@ def api_face_groups(
     }
 
 
+@app.get("/api/faces/face-detail/{face_id}")
+def api_face_detail(face_id: int):
+    """Return the photo id, filename, dimensions, date, and bbox for one face.
+
+    Used by the /merges preview: when you click a face crop, we overlay the
+    stored bbox onto the full photo so you can see context — useful when the
+    bbox is tight or off-center.
+    """
+    with _get_db() as db:
+        row = db.conn.execute(
+            """SELECT f.id AS face_id, f.photo_id,
+                      f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                      ph.filename, ph.date_taken, ph.image_width, ph.image_height
+               FROM faces f
+               JOIN photos ph ON ph.id = f.photo_id
+               WHERE f.id = ?""",
+            (face_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Face not found")
+        return {
+            "face_id": row["face_id"],
+            "photo_id": row["photo_id"],
+            "filename": row["filename"],
+            "date_taken": row["date_taken"],
+            "image_width": row["image_width"],
+            "image_height": row["image_height"],
+            "bbox": None if row["bbox_top"] is None else {
+                "top": row["bbox_top"], "right": row["bbox_right"],
+                "bottom": row["bbox_bottom"], "left": row["bbox_left"],
+            },
+        }
+
+
 @app.get("/api/faces/group-info")
 def api_face_group_info(
     cluster_id: int | None = Query(None),
@@ -997,7 +1031,9 @@ def api_face_suggestions():
 
     # Trim live counts — if accepted merges have collapsed a source cluster
     # since the JSON was written, skip those rows so the user doesn't act on
-    # a ghost. Zero-cost for fresh JSON; helpful after partial reviews.
+    # a ghost. Also augment each surviving suggestion with up to 4 sample
+    # face_ids per side (biggest-bbox first), so the review page can show a
+    # face strip instead of relying on one possibly-poorly-bboxed rep face.
     suggestions = payload.get("suggestions", [])
     if suggestions:
         with _get_db() as db:
@@ -1010,15 +1046,84 @@ def api_face_suggestions():
                 ).fetchall()
             }
 
-        def _still_live(side: dict) -> bool:
-            if side.get("type") == "cluster":
-                return cluster_counts.get(side.get("id"), 0) > 0
-            return True  # persons are tracked via /api/persons elsewhere
+            def _still_live(side: dict) -> bool:
+                if side.get("type") == "cluster":
+                    return cluster_counts.get(side.get("id"), 0) > 0
+                return True
 
-        suggestions = [
-            s for s in suggestions
-            if _still_live(s.get("left", {})) and _still_live(s.get("right", {}))
-        ]
+            suggestions = [
+                s for s in suggestions
+                if _still_live(s.get("left", {})) and _still_live(s.get("right", {}))
+            ]
+
+            # Collect every unique (type, id) so we can fetch sample face_ids
+            # in one pass instead of 2×N SQL queries.
+            wanted: set[tuple[str, int]] = set()
+            for s in suggestions:
+                for side in (s.get("left"), s.get("right")):
+                    if side and side.get("type") and side.get("id") is not None:
+                        wanted.add((side["type"], int(side["id"])))
+
+            sample_faces: dict[tuple[str, int], list[int]] = {}
+            cluster_ids = [gid for (t, gid) in wanted if t == "cluster"]
+            person_ids = [gid for (t, gid) in wanted if t == "person"]
+
+            # Window function: top 4 biggest-bbox faces per unknown cluster.
+            if cluster_ids:
+                placeholders = ",".join("?" * len(cluster_ids))
+                rows = db.conn.execute(
+                    f"""WITH ranked AS (
+                          SELECT f.id AS face_id, f.cluster_id,
+                                 ROW_NUMBER() OVER (
+                                   PARTITION BY f.cluster_id
+                                   ORDER BY
+                                     CASE WHEN f.bbox_top IS NOT NULL
+                                          THEN (f.bbox_bottom - f.bbox_top)
+                                               * (f.bbox_right - f.bbox_left)
+                                          ELSE 0 END DESC,
+                                     f.id
+                                 ) AS rn
+                          FROM faces f
+                          WHERE f.person_id IS NULL
+                                AND f.cluster_id IN ({placeholders})
+                        )
+                        SELECT face_id, cluster_id FROM ranked WHERE rn <= 4""",
+                    cluster_ids,
+                ).fetchall()
+                for r in rows:
+                    sample_faces.setdefault(("cluster", int(r["cluster_id"])), []).append(int(r["face_id"]))
+
+            if person_ids:
+                placeholders = ",".join("?" * len(person_ids))
+                rows = db.conn.execute(
+                    f"""WITH ranked AS (
+                          SELECT f.id AS face_id, f.person_id,
+                                 ROW_NUMBER() OVER (
+                                   PARTITION BY f.person_id
+                                   ORDER BY
+                                     CASE WHEN f.bbox_top IS NOT NULL
+                                          THEN (f.bbox_bottom - f.bbox_top)
+                                               * (f.bbox_right - f.bbox_left)
+                                          ELSE 0 END DESC,
+                                     f.id
+                                 ) AS rn
+                          FROM faces f
+                          WHERE f.person_id IN ({placeholders})
+                        )
+                        SELECT face_id, person_id FROM ranked WHERE rn <= 4""",
+                    person_ids,
+                ).fetchall()
+                for r in rows:
+                    sample_faces.setdefault(("person", int(r["person_id"])), []).append(int(r["face_id"]))
+
+            for s in suggestions:
+                for side in ("left", "right"):
+                    g = s.get(side)
+                    if not g:
+                        continue
+                    key = (g.get("type"), int(g["id"])) if g.get("id") is not None else None
+                    g["sample_face_ids"] = sample_faces.get(key, [])
+
         payload["live_count"] = len(suggestions)
         payload["suggestions"] = suggestions
 
