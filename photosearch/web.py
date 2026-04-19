@@ -657,6 +657,81 @@ def api_face_groups(
     }
 
 
+@app.get("/api/faces/group-info")
+def api_face_group_info(
+    cluster_id: int | None = Query(None),
+    person_id: int | None = Query(None),
+):
+    """Look up a single group's metadata by cluster_id or person_id.
+
+    Used by /faces to auto-open a group from a URL like
+    ``/faces?cluster_id=1407`` even when the cluster isn't on the first
+    paginated page (or is a hidden singleton). Returns the same shape the
+    ``groups`` list emits, so the frontend can pass the result straight
+    into its detail view.
+    """
+    if (cluster_id is None) == (person_id is None):
+        raise HTTPException(400, "Pass exactly one of cluster_id or person_id")
+
+    with _get_db() as db:
+        if person_id is not None:
+            row = db.conn.execute(
+                """SELECT p.id as person_id, p.name,
+                          COUNT(DISTINCT f.photo_id) as photo_count,
+                          COUNT(f.id) as face_count,
+                          (SELECT f2.id FROM faces f2
+                           WHERE f2.person_id = p.id AND f2.bbox_top IS NOT NULL
+                           ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                           LIMIT 1) as rep_face_id
+                   FROM persons p
+                   LEFT JOIN faces f ON f.person_id = p.id
+                   WHERE p.id = ?
+                   GROUP BY p.id""",
+                (person_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "Person not found")
+            return {
+                "type": "person",
+                "person_id": row["person_id"],
+                "label": row["name"],
+                "photo_count": row["photo_count"],
+                "face_count": row["face_count"],
+                "rep_face_id": row["rep_face_id"],
+                "ignored": False,
+            }
+
+        # cluster_id branch
+        row = db.conn.execute(
+            """SELECT f.cluster_id,
+                      COUNT(DISTINCT f.photo_id) as photo_count,
+                      COUNT(f.id) as face_count,
+                      (SELECT f2.id FROM faces f2
+                       WHERE f2.cluster_id = f.cluster_id AND f2.person_id IS NULL
+                             AND f2.bbox_top IS NOT NULL
+                       ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                       LIMIT 1) as rep_face_id
+               FROM faces f
+               WHERE f.cluster_id = ? AND f.person_id IS NULL
+               GROUP BY f.cluster_id""",
+            (cluster_id,),
+        ).fetchone()
+        if not row or not row["face_count"]:
+            raise HTTPException(404, "Cluster not found")
+        is_ignored = bool(db.conn.execute(
+            "SELECT 1 FROM ignored_clusters WHERE cluster_id = ?", (cluster_id,)
+        ).fetchone())
+        return {
+            "type": "cluster",
+            "cluster_id": row["cluster_id"],
+            "label": f"Unknown #{row['cluster_id']}",
+            "photo_count": row["photo_count"],
+            "face_count": row["face_count"],
+            "rep_face_id": row["rep_face_id"],
+            "ignored": is_ignored,
+        }
+
+
 @app.get("/api/faces/group/{group_type}/{group_id}/photos")
 def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(200)):
     """Get all photos for a specific face group (person or cluster)."""

@@ -542,6 +542,8 @@
       return {
         name: p.get('name') || '',
         face_id: p.get('face_id') || '',
+        cluster_id: p.get('cluster_id') || '',
+        person_id: p.get('person_id') || '',
         filter: p.get('filter') || 'all',
       };
     }
@@ -550,6 +552,8 @@
       const p = new URLSearchParams();
       if (params.name) p.set('name', params.name);
       if (params.face_id) p.set('face_id', params.face_id);
+      if (params.cluster_id) p.set('cluster_id', params.cluster_id);
+      if (params.person_id) p.set('person_id', params.person_id);
       if (params.filter && params.filter !== 'all') p.set('filter', params.filter);
       const newUrl = window.location.pathname + (p.toString() ? '?' + p.toString() : '');
       window.history.pushState(null, '', newUrl);
@@ -649,10 +653,30 @@
           if (autoOpened.current) return;
           autoOpened.current = true;
           const params = getUrlParams();
-          // Auto-open if URL has name or face_id
+          // Auto-open if the URL has name, face_id, cluster_id, or person_id.
+          // cluster_id and person_id bypass the loaded-groups cache via
+          // /api/faces/group-info so they work for hidden singletons and
+          // groups not on the first paginated page (useful for linking
+          // straight from suggest-face-merges output).
           if (params.name) {
             const g = grps.find(g => g.type === 'person' && g.label.toLowerCase() === params.name.toLowerCase());
             if (g) openGroupDirect(g);
+          } else if (params.cluster_id) {
+            const cid = parseInt(params.cluster_id);
+            const g = grps.find(g => g.type === 'cluster' && g.cluster_id === cid);
+            if (g) { openGroupDirect(g); return; }
+            fetch(API + '/api/faces/group-info?cluster_id=' + cid)
+              .then(r => r.ok ? r.json() : null)
+              .then(info => { if (info) openGroupDirect(info); })
+              .catch(() => {});
+          } else if (params.person_id) {
+            const pid = parseInt(params.person_id);
+            const g = grps.find(g => g.type === 'person' && g.person_id === pid);
+            if (g) { openGroupDirect(g); return; }
+            fetch(API + '/api/faces/group-info?person_id=' + pid)
+              .then(r => r.ok ? r.json() : null)
+              .then(info => { if (info) openGroupDirect(info); })
+              .catch(() => {});
           } else if (params.face_id) {
             const fid = parseInt(params.face_id);
             const g = grps.find(g => g.rep_face_id === fid);

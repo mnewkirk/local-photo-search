@@ -674,9 +674,13 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
               help="Known-ground-truth pair, e.g. 'cluster:2035=person:Matt Newkirk' "
                    "or 'cluster:798!=cluster:745'. Repeatable. The suggester prints "
                    "whether each pair would be caught at the current cutoffs.")
+@click.option("--base-url", default=None,
+              help="If set, each suggestion line also prints clickable URLs to "
+                   "the /faces page (e.g. http://nas:8000). Uses ?cluster_id= and "
+                   "?person_id= so links resolve even for hidden singletons.")
 def suggest_face_merges(
     db, centroid_cutoff, min_pair_cutoff, max_members, min_group_size,
-    include_ignored, limit, show_all, json_out, verify_pair,
+    include_ignored, limit, show_all, json_out, verify_pair, base_url,
 ):
     """Find likely merges between face groups (named + unknown clusters).
 
@@ -752,6 +756,15 @@ def suggest_face_merges(
         shown = suggestions if show_all else suggestions[:limit]
         if not shown:
             click.echo("  (none)")
+
+        def _group_url(side) -> str:
+            if not base_url:
+                return ""
+            stem = base_url.rstrip("/") + "/faces"
+            if side.type == "cluster":
+                return stem + f"?cluster_id={side.id}"
+            return stem + f"?person_id={side.id}"
+
         for s in shown:
             overlap = "—" if s.shared_days is None else f"{s.shared_days}d"
             click.echo(
@@ -761,6 +774,9 @@ def suggest_face_merges(
                 f"min={s.min_pair_dist:.3f} cent={s.centroid_dist:.3f} "
                 f"overlap={overlap}"
             )
+            if base_url:
+                click.echo(f"      left:  {_group_url(s.left)}")
+                click.echo(f"      right: {_group_url(s.right)}")
         if not show_all and len(suggestions) > limit:
             click.echo(f"  ... {len(suggestions) - limit} more. "
                        f"Use --all or --limit N to see more.")

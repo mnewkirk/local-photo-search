@@ -244,6 +244,38 @@ class TestFacesAPI:
         resp = client.get("/api/faces/group/invalid/1/photos")
         assert resp.status_code == 400
 
+    def test_group_info_by_cluster_id(self, client):
+        """/api/faces/group-info resolves a cluster even when it's a hidden singleton."""
+        resp = client.get("/api/faces/group-info", params={"cluster_id": 99})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["type"] == "cluster"
+        assert data["cluster_id"] == 99
+        assert data["face_count"] == 1
+        assert data["label"] == "Unknown #99"
+        assert data["rep_face_id"] is not None
+
+    def test_group_info_by_person_id(self, client, db):
+        alex_id = db._test_person_ids["Alex"]
+        resp = client.get("/api/faces/group-info", params={"person_id": alex_id})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["type"] == "person"
+        assert data["person_id"] == alex_id
+        assert data["label"] == "Alex"
+        assert data["face_count"] >= 1
+
+    def test_group_info_missing_cluster_is_404(self, client):
+        resp = client.get("/api/faces/group-info", params={"cluster_id": 99999})
+        assert resp.status_code == 404
+
+    def test_group_info_requires_exactly_one_id(self, client):
+        """Both or neither is a 400."""
+        assert client.get("/api/faces/group-info").status_code == 400
+        assert client.get(
+            "/api/faces/group-info", params={"cluster_id": 1, "person_id": 1}
+        ).status_code == 400
+
     def test_assign_face(self, client, db):
         fid = db._test_face_ids["unknown_878"]
         resp = client.post(f"/api/faces/{fid}/assign", params={"name": "TestPerson"})
