@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Merge review — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* Shared header */
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .page-title {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .page-subtitle {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+
+    .stats-row {
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+      padding: 14px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 13px;
+    }
+    .stats-row .stat { display: flex; gap: 6px; align-items: baseline; }
+    .stats-row .stat .val { font-weight: 600; font-size: 16px; }
+    .stats-row .stat .lbl { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
+    .stats-row .stat.accent .val { color: var(--accent); }
+    .stats-row .stat.green .val { color: var(--green); }
+    .stats-row .stat.muted .val { color: var(--text-muted); }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .pill {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .pill:hover { border-color: var(--accent); color: var(--accent); }
+    .pill.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+    }
+    .toolbar .spacer { flex: 1; }
+    .toolbar .label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-left: 6px;
+      margin-right: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .toolbar select {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+
+    .btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+      font-weight: 600;
+    }
+    .btn.btn-primary:hover { background: var(--accent-hover); color: var(--bg); }
+    .btn.btn-danger:hover { border-color: var(--red); color: var(--red); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+    .btn.small { padding: 4px 10px; font-size: 12px; }
+
+    .error {
+      color: var(--red);
+      background: rgba(248, 113, 113, 0.1);
+      border: 1px solid rgba(248, 113, 113, 0.3);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+    .info {
+      color: var(--text-muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      text-align: center;
+      font-size: 14px;
+    }
+    .info code {
+      display: inline-block;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 12px;
+      color: var(--accent);
+    }
+
+    /* Merge cards */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 14px;
+      contain-intrinsic-size: 280px;
+      content-visibility: auto;
+    }
+    .card.acting { opacity: 0.5; pointer-events: none; }
+    .card.done {
+      border-color: var(--green);
+      background: rgba(74, 222, 128, 0.05);
+    }
+
+    .card-row {
+      display: grid;
+      grid-template-columns: 1fr 56px 1fr;
+      gap: 14px;
+      align-items: stretch;
+    }
+    .side {
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+    }
+    .side.right { flex-direction: row-reverse; text-align: right; }
+    .side .meta { flex: 1; min-width: 0; }
+    .side .label {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 2px;
+      word-break: break-word;
+    }
+    .side .label.person { color: var(--green); }
+    .side .sublabel {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+    .face-crop {
+      width: 110px;
+      height: 110px;
+      border-radius: var(--radius);
+      object-fit: cover;
+      flex: none;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+    }
+    .face-crop.missing {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+    .side-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .arrow {
+      align-self: center;
+      color: var(--text-muted);
+      font-size: 22px;
+      text-align: center;
+      user-select: none;
+    }
+    .arrow.cluster-to-person { color: var(--green); }
+
+    .scores {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .scores .score { display: flex; align-items: baseline; gap: 4px; }
+    .scores .score .val {
+      color: var(--text);
+      font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
+      font-weight: 600;
+    }
+    .scores .score .val.good { color: var(--green); }
+    .scores .score .val.warn { color: var(--yellow); }
+
+    .card-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .status-tag {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-left: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .status-tag.accepted { background: rgba(74, 222, 128, 0.2); color: var(--green); }
+    .status-tag.dismissed { background: rgba(136, 136, 136, 0.2); color: var(--text-muted); }
+
+    @media (max-width: 720px) {
+      .card-row { grid-template-columns: 1fr; }
+      .arrow { justify-self: center; }
+      .side.right { flex-direction: row; text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    const { useState, useEffect, useCallback, useMemo } = React;
+    const e = React.createElement;
+    const API = '';
+
+    // Dismissals persist in localStorage keyed by rep_face_id pair. rep_face_id
+    // is stable across recluster-faces runs (AUTOINCREMENT, no reuse), so a
+    // dismissal survives regenerations of the suggestions JSON.
+    const DISMISS_KEY = 'photosearch:dismissed_merges:v1';
+
+    function loadDismissed() {
+      try {
+        const raw = localStorage.getItem(DISMISS_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+      } catch (_) {
+        return {};
+      }
+    }
+    function saveDismissed(map) {
+      try { localStorage.setItem(DISMISS_KEY, JSON.stringify(map)); } catch (_) {}
+    }
+
+    // Canonical key: sort the two rep_face_ids so (a, b) == (b, a).
+    function pairKey(sug) {
+      const lf = sug.left.rep_face_id || 0;
+      const rf = sug.right.rep_face_id || 0;
+      return lf < rf ? lf + ':' + rf : rf + ':' + lf;
+    }
+
+    function formatScore(x) {
+      return (typeof x === 'number') ? x.toFixed(3) : '—';
+    }
+    function scoreClass(x, goodBelow, warnBelow) {
+      if (typeof x !== 'number') return '';
+      if (x < goodBelow) return 'good';
+      if (x < warnBelow) return 'warn';
+      return '';
+    }
+    function formatWhen(ts) {
+      if (!ts) return '';
+      try {
+        const d = new Date(ts * 1000);
+        return d.toLocaleString();
+      } catch (_) { return ''; }
+    }
+    function formatOverlap(days) {
+      if (days === null || days === undefined) return '—';
+      if (days === 0) return 'same day';
+      if (days === 1) return '1 day';
+      if (days < 365) return days + ' days';
+      const years = Math.round(days / 36.5) / 10;
+      return years + 'y';
+    }
+
+    function faceCrop(faceId, label) {
+      if (!faceId) {
+        return e('div', { className: 'face-crop missing' }, 'no crop');
+      }
+      return e('img', {
+        className: 'face-crop',
+        src: API + '/api/faces/crop/' + faceId + '?size=220',
+        alt: label || 'face',
+        loading: 'lazy',
+      });
+    }
+
+    function groupUrl(side) {
+      if (side.type === 'cluster') return '/faces?cluster_id=' + side.id;
+      return '/faces?person_id=' + side.id;
+    }
+
+    // --------------------------------------------------------------------
+    // One suggestion card
+    // --------------------------------------------------------------------
+    function MergeCard({ sug, onAccept, onDismiss, onUndismiss, status, busy }) {
+      const left = sug.left;
+      const right = sug.right;
+      const isDone = status === 'accepted' || status === 'dismissed';
+
+      return e('div', {
+        className: 'card' + (busy ? ' acting' : '') + (isDone ? ' done' : ''),
+      },
+        // Optional status tag
+        isDone && e('div', { style: { textAlign: 'right', marginBottom: 6 } },
+          e('span', { className: 'status-tag ' + status }, status),
+        ),
+        e('div', { className: 'card-row' },
+          // Left side
+          e('div', { className: 'side left' },
+            faceCrop(left.rep_face_id, left.label),
+            e('div', { className: 'meta' },
+              e('div', { className: 'label ' + (left.type === 'person' ? 'person' : '') }, left.label),
+              e('div', { className: 'sublabel' },
+                left.face_count + ' face' + (left.face_count !== 1 ? 's' : '') +
+                (left.date_min ? ' · ' + left.date_min.slice(0, 10) + ' → ' + (left.date_max || '').slice(0, 10) : ''),
+              ),
+              e('div', { className: 'side-actions' },
+                e('a', {
+                  className: 'btn small', href: groupUrl(left), target: '_blank', rel: 'noopener',
+                }, 'Open ↗'),
+              ),
+            ),
+          ),
+          // Arrow
+          e('div', {
+            className: 'arrow' + (right.type === 'person' ? ' cluster-to-person' : ''),
+          }, right.type === 'person' ? '→' : '↔'),
+          // Right side
+          e('div', { className: 'side right' },
+            faceCrop(right.rep_face_id, right.label),
+            e('div', { className: 'meta' },
+              e('div', { className: 'label ' + (right.type === 'person' ? 'person' : '') }, right.label),
+              e('div', { className: 'sublabel' },
+                right.face_count + ' face' + (right.face_count !== 1 ? 's' : '') +
+                (right.date_min ? ' · ' + right.date_min.slice(0, 10) + ' → ' + (right.date_max || '').slice(0, 10) : ''),
+              ),
+              e('div', { className: 'side-actions', style: { justifyContent: 'flex-end' } },
+                e('a', {
+                  className: 'btn small', href: groupUrl(right), target: '_blank', rel: 'noopener',
+                }, 'Open ↗'),
+              ),
+            ),
+          ),
+        ),
+        // Scores
+        e('div', { className: 'scores' },
+          e('div', { className: 'score' },
+            e('span', null, 'min_pair'),
+            e('span', { className: 'val ' + scoreClass(sug.min_pair_dist, 0.45, 0.60) },
+              formatScore(sug.min_pair_dist)),
+          ),
+          e('div', { className: 'score' },
+            e('span', null, 'centroid'),
+            e('span', { className: 'val ' + scoreClass(sug.centroid_dist, 0.55, 0.80) },
+              formatScore(sug.centroid_dist)),
+          ),
+          e('div', { className: 'score' },
+            e('span', null, 'overlap'),
+            e('span', { className: 'val' }, formatOverlap(sug.shared_days)),
+          ),
+        ),
+        // Buttons
+        !isDone && e('div', { className: 'card-actions' },
+          e('button', {
+            className: 'btn btn-danger small',
+            onClick: () => onDismiss(sug),
+            disabled: busy,
+          }, 'Dismiss'),
+          e('button', {
+            className: 'btn btn-primary small',
+            onClick: () => onAccept(sug),
+            disabled: busy,
+          },
+            right.type === 'person'
+              ? 'Merge → ' + right.label
+              : 'Merge clusters'),
+        ),
+        status === 'dismissed' && e('div', { className: 'card-actions' },
+          e('button', {
+            className: 'btn small',
+            onClick: () => onUndismiss(sug),
+          }, 'Undo dismiss'),
+        ),
+      );
+    }
+
+    // --------------------------------------------------------------------
+    // Main app
+    // --------------------------------------------------------------------
+    function App() {
+      const [payload, setPayload] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [loadError, setLoadError] = useState('');
+      const [typeFilter, setTypeFilter] = useState('all'); // all | to_person | to_cluster
+      const [sort, setSort] = useState('min');             // min | faces_desc
+      const [actedOn, setActedOn] = useState({});          // key → 'accepted'|'dismissed'
+      const [busyKeys, setBusyKeys] = useState({});        // key → true
+      const [apiError, setApiError] = useState('');
+      const [dismissed, setDismissed] = useState(loadDismissed);
+
+      const reload = useCallback(() => {
+        setLoading(true);
+        setLoadError('');
+        fetch(API + '/api/faces/suggestions')
+          .then(r => {
+            if (r.ok) return r.json();
+            return r.json().then(data => { throw new Error(data && data.detail ? data.detail : 'HTTP ' + r.status); });
+          })
+          .then(data => { setPayload(data); setLoading(false); })
+          .catch(err => { setLoadError(err.message || String(err)); setLoading(false); });
+      }, []);
+
+      useEffect(() => { reload(); }, [reload]);
+
+      const rawSuggestions = (payload && payload.suggestions) || [];
+
+      const annotated = useMemo(() => rawSuggestions.map(sug => {
+        const key = pairKey(sug);
+        const dismissedStatus = dismissed[key] ? 'dismissed' : null;
+        const actedStatus = actedOn[key] || null;
+        return { sug, key, status: actedStatus || dismissedStatus };
+      }), [rawSuggestions, actedOn, dismissed]);
+
+      const filtered = useMemo(() => {
+        const pass = annotated.filter(({ sug, status }) => {
+          if (status === 'accepted') return false;   // gone
+          if (typeFilter === 'to_person' && sug.right.type !== 'person') return false;
+          if (typeFilter === 'to_cluster' && sug.right.type !== 'cluster') return false;
+          return true;
+        });
+        const sorted = pass.slice();
+        if (sort === 'faces_desc') {
+          sorted.sort((a, b) =>
+            (b.sug.left.face_count + b.sug.right.face_count) -
+            (a.sug.left.face_count + a.sug.right.face_count));
+        } else {
+          sorted.sort((a, b) => a.sug.min_pair_dist - b.sug.min_pair_dist);
+        }
+        return sorted;
+      }, [annotated, typeFilter, sort]);
+
+      const counts = useMemo(() => {
+        let toPerson = 0, toCluster = 0, accepted = 0, dism = 0;
+        for (const { sug, status } of annotated) {
+          if (status === 'accepted') { accepted++; continue; }
+          if (status === 'dismissed') { dism++; continue; }
+          if (sug.right.type === 'person') toPerson++;
+          else toCluster++;
+        }
+        return { toPerson, toCluster, accepted, dismissed: dism, total: annotated.length };
+      }, [annotated]);
+
+      const setBusy = (key, val) => {
+        setBusyKeys(prev => {
+          const next = { ...prev };
+          if (val) next[key] = true; else delete next[key];
+          return next;
+        });
+      };
+
+      const handleAccept = useCallback((sug) => {
+        const key = pairKey(sug);
+        setApiError('');
+        setBusy(key, true);
+        fetch(API + '/api/faces/merges', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: { type: sug.left.type, id: sug.left.id },
+            target: { type: sug.right.type, id: sug.right.id },
+          }),
+        })
+          .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+          .then(({ ok, data }) => {
+            setBusy(key, false);
+            if (!ok) { setApiError(data && data.detail ? data.detail : 'Merge failed'); return; }
+            setActedOn(prev => ({ ...prev, [key]: 'accepted' }));
+          })
+          .catch(err => {
+            setBusy(key, false);
+            setApiError(err.message || String(err));
+          });
+      }, []);
+
+      const handleDismiss = useCallback((sug) => {
+        const key = pairKey(sug);
+        setDismissed(prev => {
+          const next = { ...prev, [key]: Date.now() };
+          saveDismissed(next);
+          return next;
+        });
+      }, []);
+
+      const handleUndismiss = useCallback((sug) => {
+        const key = pairKey(sug);
+        setDismissed(prev => {
+          const next = { ...prev };
+          delete next[key];
+          saveDismissed(next);
+          return next;
+        });
+      }, []);
+
+      const clearDismissals = useCallback(() => {
+        if (!confirm('Clear all ' + Object.keys(dismissed).length + ' local dismissals?')) return;
+        setDismissed({});
+        saveDismissed({});
+      }, [dismissed]);
+
+      // --- Render ---
+      return e(React.Fragment, null,
+        e(PS.SharedHeader, { activePage: 'merges' }),
+        e('div', { className: 'container' },
+          e('div', { className: 'page-title' }, 'Face merge review'),
+          e('div', { className: 'page-subtitle' },
+            'Suggestions from ',
+            e('code', null, 'photosearch suggest-face-merges'),
+            payload && payload.generated_at ? ' · generated ' + formatWhen(payload.generated_at) : '',
+          ),
+
+          apiError && e('div', { className: 'error' }, apiError),
+
+          loading && e('div', { className: 'info' }, 'Loading suggestions…'),
+
+          !loading && loadError && e('div', { className: 'info' },
+            loadError,
+            e('div', { style: { marginTop: 12 } },
+              'Run ',
+              e('code', null, 'docker compose -f docker-compose.nas.yml run --rm photosearch ' +
+                'suggest-face-merges --json-out /data/suggestions.json'),
+              ' on the NAS, then reload this page.',
+            ),
+          ),
+
+          !loading && !loadError && payload && e(React.Fragment, null,
+            e('div', { className: 'stats-row' },
+              e('div', { className: 'stat accent' },
+                e('span', { className: 'val' }, counts.toPerson + counts.toCluster),
+                e('span', { className: 'lbl' }, 'pending'),
+              ),
+              e('div', { className: 'stat' },
+                e('span', { className: 'val' }, counts.toPerson),
+                e('span', { className: 'lbl' }, '→ person'),
+              ),
+              e('div', { className: 'stat' },
+                e('span', { className: 'val' }, counts.toCluster),
+                e('span', { className: 'lbl' }, '↔ cluster'),
+              ),
+              e('div', { className: 'stat green' },
+                e('span', { className: 'val' }, counts.accepted),
+                e('span', { className: 'lbl' }, 'accepted'),
+              ),
+              e('div', { className: 'stat muted' },
+                e('span', { className: 'val' }, counts.dismissed),
+                e('span', { className: 'lbl' }, 'dismissed'),
+              ),
+              e('div', { className: 'stat muted' },
+                e('span', { className: 'val' }, counts.total),
+                e('span', { className: 'lbl' }, 'total'),
+              ),
+            ),
+
+            e('div', { className: 'toolbar' },
+              e('button', {
+                className: 'pill' + (typeFilter === 'all' ? ' active' : ''),
+                onClick: () => setTypeFilter('all'),
+              }, 'All'),
+              e('button', {
+                className: 'pill' + (typeFilter === 'to_person' ? ' active' : ''),
+                onClick: () => setTypeFilter('to_person'),
+              }, '→ Person (' + counts.toPerson + ')'),
+              e('button', {
+                className: 'pill' + (typeFilter === 'to_cluster' ? ' active' : ''),
+                onClick: () => setTypeFilter('to_cluster'),
+              }, '↔ Cluster (' + counts.toCluster + ')'),
+              e('div', { className: 'spacer' }),
+              e('span', { className: 'label' }, 'Sort'),
+              e('select', {
+                value: sort, onChange: (ev) => setSort(ev.target.value),
+              },
+                e('option', { value: 'min' }, 'min_pair (closest first)'),
+                e('option', { value: 'faces_desc' }, 'combined face count'),
+              ),
+              e('button', { className: 'btn small', onClick: reload }, 'Reload'),
+              counts.dismissed > 0 && e('button', {
+                className: 'btn small', onClick: clearDismissals,
+              }, 'Clear dismissals'),
+            ),
+
+            filtered.length === 0
+              ? e('div', { className: 'info' },
+                  counts.total === 0
+                    ? 'No suggestions in the JSON file.'
+                    : 'Nothing pending under the current filter.')
+              : filtered.map(({ sug, key, status }) =>
+                  e(MergeCard, {
+                    key: key,
+                    sug: sug,
+                    status: status,
+                    busy: !!busyKeys[key],
+                    onAccept: handleAccept,
+                    onDismiss: handleDismiss,
+                    onUndismiss: handleUndismiss,
+                  })),
+          ),
+        ),
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>
