@@ -276,6 +276,7 @@ class TestFacesAPI:
             "/api/faces/group-info", params={"cluster_id": 1, "person_id": 1}
         ).status_code == 400
 
+
     def test_assign_face(self, client, db):
         fid = db._test_face_ids["unknown_878"]
         resp = client.post(f"/api/faces/{fid}/assign", params={"name": "TestPerson"})
@@ -378,6 +379,145 @@ class TestFacesAPI:
             "assignments": [{"filepath": None, "person_name": None, "bbox": None}]
         })
         assert resp.json()["skipped"] == 1
+
+
+# =========================================================================
+# M18 Phase B.0 — merge review
+# =========================================================================
+
+class TestMergeReviewAPI:
+    """/api/faces/suggestions + /api/faces/merges."""
+
+    def test_suggestions_404_when_no_file(self, client, tmp_path):
+        from photosearch import web
+        orig = web._suggestions_path
+        web._suggestions_path = str(tmp_path / "missing.json")
+        try:
+            resp = client.get("/api/faces/suggestions")
+            assert resp.status_code == 404
+            assert "suggest-face-merges" in resp.json()["detail"]
+        finally:
+            web._suggestions_path = orig
+
+    def test_suggestions_serves_json_and_filters_dead_clusters(self, client, db, tmp_path):
+        """Suggestions pointing at cleared clusters are dropped from the response."""
+        import json as _json
+        from photosearch import web
+
+        unknown_face = db._test_face_ids["unknown_878"]
+        alex_id = db._test_person_ids["Alex"]
+        live_cluster = 99  # present in fixture, one face
+        dead_cluster = 12345  # nothing in DB with this id
+
+        payload = {
+            "centroid_cutoff": 0.95, "min_pair_cutoff": 0.60,
+            "suggestions": [
+                {
+                    "left": {"type": "cluster", "id": live_cluster, "label": "Unknown #99",
+                             "face_count": 1, "rep_face_id": unknown_face},
+                    "right": {"type": "person", "id": alex_id, "label": "Alex",
+                              "face_count": 2, "rep_face_id": db._test_face_ids["alex_894"]},
+                    "centroid_dist": 0.4, "min_pair_dist": 0.3, "shared_days": 1,
+                },
+                {
+                    "left": {"type": "cluster", "id": dead_cluster, "label": "Unknown #12345",
+                             "face_count": 0, "rep_face_id": None},
+                    "right": {"type": "cluster", "id": live_cluster, "label": "Unknown #99",
+                              "face_count": 1, "rep_face_id": unknown_face},
+                    "centroid_dist": 0.5, "min_pair_dist": 0.45, "shared_days": 0,
+                },
+            ],
+        }
+        json_file = tmp_path / "suggestions.json"
+        json_file.write_text(_json.dumps(payload))
+        orig = web._suggestions_path
+        web._suggestions_path = str(json_file)
+        try:
+            resp = client.get("/api/faces/suggestions")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert len(data["suggestions"]) == 1
+            assert data["suggestions"][0]["left"]["id"] == live_cluster
+            assert data["live_count"] == 1
+            assert data["source_path"].endswith("suggestions.json")
+            assert "generated_at" in data
+        finally:
+            web._suggestions_path = orig
+
+    def test_merges_cluster_to_person(self, client, db):
+        unknown_face = db._test_face_ids["unknown_878"]
+        alex_id = db._test_person_ids["Alex"]
+
+        row = db.conn.execute(
+            "SELECT person_id, cluster_id FROM faces WHERE id = ?", (unknown_face,)
+        ).fetchone()
+        assert row["person_id"] is None and row["cluster_id"] == 99
+
+        resp = client.post("/api/faces/merges", json={
+            "source": {"type": "cluster", "id": 99},
+            "target": {"type": "person", "id": alex_id},
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True and data["moved_face_count"] == 1
+
+        row = db.conn.execute(
+            "SELECT person_id, cluster_id, match_source FROM faces WHERE id = ?",
+            (unknown_face,),
+        ).fetchone()
+        assert row["person_id"] == alex_id
+        assert row["cluster_id"] is None
+        assert row["match_source"] == "merge_review"
+
+    def test_merges_cluster_to_cluster(self, client, db):
+        unknown_face = db._test_face_ids["unknown_878"]
+
+        # Same id → 400
+        resp = client.post("/api/faces/merges", json={
+            "source": {"type": "cluster", "id": 99},
+            "target": {"type": "cluster", "id": 99},
+        })
+        assert resp.status_code == 400
+
+        # Seed a second cluster so the cluster→cluster path has a valid target.
+        photo_id = db._test_photo_ids["DSC04878.JPG"]
+        db.add_face(
+            photo_id, (400, 500, 480, 420),
+            [0.1] * 512, cluster_id=200,
+        )
+
+        resp = client.post("/api/faces/merges", json={
+            "source": {"type": "cluster", "id": 99},
+            "target": {"type": "cluster", "id": 200},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["moved_face_count"] == 1
+
+        row = db.conn.execute(
+            "SELECT cluster_id FROM faces WHERE id = ?", (unknown_face,)
+        ).fetchone()
+        assert row["cluster_id"] == 200
+
+    def test_merges_bad_payloads(self, client):
+        assert client.post("/api/faces/merges", json={
+            "source": {"id": 1},
+            "target": {"type": "cluster", "id": 2},
+        }).status_code == 400
+
+        assert client.post("/api/faces/merges", json={
+            "source": {"type": "cluster", "id": 1},
+            "target": {"type": "bogus", "id": 2},
+        }).status_code == 400
+
+        assert client.post("/api/faces/merges", json={
+            "source": {"type": "cluster", "id": 99},
+            "target": {"type": "person", "id": 99999},
+        }).status_code == 404
+
+        assert client.post("/api/faces/merges", json={
+            "source": {"type": "cluster", "id": 99},
+            "target": {"type": "cluster", "id": 99999},
+        }).status_code == 404
 
 
 # =========================================================================

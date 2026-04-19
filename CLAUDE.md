@@ -146,32 +146,45 @@ cleared in the same transaction (IDs are fully renumbered). Loader uses
 `np.frombuffer` over concatenated BLOBs — 120k faces decode in seconds on
 an N100; DBSCAN at 512-dim with ball_tree is the dominant cost after that.
 
-## Face merge suggestions (M18, dry-run only so far)
+## Face merge suggestions (M18)
 
-`suggest-face-merges` finds likely merges between any two face groups
-(cluster↔cluster and cluster↔named person). It's the review step before the
-accept/reject UI lands:
+Two-step flow for merging unknown-face groups into named persons or into
+other unknown clusters:
+
+**1. Generate suggestions** (CLI, read-only):
 
 ```bash
 $DC run --rm photosearch suggest-face-merges \
-  --verify-pair 'cluster:2035=person:Matt Newkirk' \
-  --verify-pair 'cluster:1776=cluster:1339' \
-  --verify-pair 'cluster:798!=cluster:745' \
+  --json-out /data/suggestions.json \
+  [--base-url http://<nas>:8000] \
   [--centroid-cutoff 0.95] [--min-pair-cutoff 0.60] \
   [--max-members 60] [--min-group-size 1] \
-  [--limit 50 | --all] [--json-out suggestions.json]
+  [--verify-pair 'cluster:X=person:Name' ...]
 ```
 
-For every candidate pair it computes two L2 metrics on the ArcFace 512-dim
-encodings: **centroid_dist** (between the two groups' normalized mean
-vectors) and **min_pair_dist** (minimum over all member-to-member pairs).
-Both must be below their cutoffs for a suggestion. `--verify-pair` takes
-known-ground-truth positives (`=`) and negatives (`!=`) and reports TP
-recall / FP avoidance, so thresholds can be tuned to the library.
+For every candidate pair, `photosearch/face_merge.py` computes two L2
+metrics on the ArcFace 512-dim encodings: **centroid_dist** (between the
+two groups' normalized mean vectors) and **min_pair_dist** (minimum over
+all member-to-member pairs). Both must be below their cutoffs for a
+suggestion. `--verify-pair` reports TP recall / FP avoidance against
+known-ground-truth pairs (`=` for should-merge, `!=` for should-not).
 
-Implementation is in `photosearch/face_merge.py` — read-only, no DB writes.
-Encodings are sampled at the biggest-bbox faces first, capped at
-`--max-members` per group to bound per-pair O(K²) cost.
+**2. Review and act** on the `/merges` page (reads the JSON, applies via
+`POST /api/faces/merges`):
+- Each card shows both rep-face crops, labels, face counts, date ranges,
+  and the three scores (min_pair, centroid, overlap).
+- Accept → `POST /api/faces/merges` performs the merge transactionally.
+  cluster→person sets person_id + clears cluster_id + stamps
+  `match_source='merge_review'`. cluster→cluster updates cluster_id.
+- Dismiss → stored in localStorage (client-side only for now; persistent
+  rejection table deferred).
+- Top nav link is global. Suggestions whose source cluster has been
+  accepted or emptied are filtered out live in the API response.
+
+Cluster IDs are ephemeral (every `recluster-faces` run renumbers them),
+but the merge flow is the intended consumer — review within the same
+recluster cycle. Face IDs (`rep_face_id`) are stable, so localStorage
+dismissals survive JSON regeneration.
 
 `/api/faces/groups` is paginated (`limit`/`offset`/`filter`/`total`/`counts`),
 hides singletons by default (`?include_singletons=1` to restore), and

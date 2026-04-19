@@ -959,6 +959,154 @@ def api_unignore_clusters(data: dict):
     return {"ok": True, "unignored": len(cluster_ids)}
 
 
+# ---------------------------------------------------------------------------
+# Merge-suggestions review (/merges page)
+# ---------------------------------------------------------------------------
+
+# Path to the JSON file produced by `suggest-face-merges --json-out`.
+# Default matches the NAS Docker volume layout; override with
+# PHOTOSEARCH_SUGGESTIONS_JSON for other deployments.
+_suggestions_path: str = os.environ.get(
+    "PHOTOSEARCH_SUGGESTIONS_JSON",
+    str(Path(_db_path).resolve().parent / "suggestions.json"),
+)
+
+
+@app.get("/api/faces/suggestions")
+def api_face_suggestions():
+    """Return merge suggestions previously computed via `suggest-face-merges`.
+
+    The CLI writes the JSON; this endpoint just serves it. This keeps the
+    review page snappy (loading 2000+ groups takes ~20s on an N100) and
+    makes the review-then-regenerate workflow explicit. If no file exists
+    yet, returns 404 with a message pointing at the CLI.
+    """
+    path = _suggestions_path
+    if not os.path.exists(path):
+        raise HTTPException(
+            404,
+            "No suggestions file found. Run "
+            "`photosearch suggest-face-merges --json-out <path>` first "
+            f"(expected at {path}; override with PHOTOSEARCH_SUGGESTIONS_JSON).",
+        )
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(500, f"Could not read suggestions: {e}")
+
+    # Trim live counts — if accepted merges have collapsed a source cluster
+    # since the JSON was written, skip those rows so the user doesn't act on
+    # a ghost. Zero-cost for fresh JSON; helpful after partial reviews.
+    suggestions = payload.get("suggestions", [])
+    if suggestions:
+        with _get_db() as db:
+            cluster_counts = {
+                r["cluster_id"]: r["n"]
+                for r in db.conn.execute(
+                    """SELECT cluster_id, COUNT(*) AS n FROM faces
+                       WHERE cluster_id IS NOT NULL AND person_id IS NULL
+                       GROUP BY cluster_id"""
+                ).fetchall()
+            }
+
+        def _still_live(side: dict) -> bool:
+            if side.get("type") == "cluster":
+                return cluster_counts.get(side.get("id"), 0) > 0
+            return True  # persons are tracked via /api/persons elsewhere
+
+        suggestions = [
+            s for s in suggestions
+            if _still_live(s.get("left", {})) and _still_live(s.get("right", {}))
+        ]
+        payload["live_count"] = len(suggestions)
+        payload["suggestions"] = suggestions
+
+    payload["source_path"] = path
+    try:
+        payload["generated_at"] = os.path.getmtime(path)
+    except OSError:
+        pass
+    return payload
+
+
+@app.post("/api/faces/merges")
+def api_apply_face_merge(data: dict):
+    """Apply a cluster→person or cluster→cluster merge.
+
+    Body shape: ``{"source": {"type": "cluster", "id": <int>},
+                   "target": {"type": "cluster"|"person", "id": <int>}}``
+
+    - cluster → person: every source-cluster face (with person_id IS NULL)
+      has its person_id set to the target and cluster_id cleared. match_source
+      is set to 'merge_review' for audit.
+    - cluster → cluster: every source-cluster face (with person_id IS NULL)
+      has its cluster_id updated to the target. Person-id-assigned faces
+      are left alone (defensive — shouldn't happen, but cheap).
+    """
+    source = data.get("source") or {}
+    target = data.get("target") or {}
+
+    if source.get("type") != "cluster":
+        raise HTTPException(400, "source.type must be 'cluster'")
+    if target.get("type") not in ("cluster", "person"):
+        raise HTTPException(400, "target.type must be 'cluster' or 'person'")
+
+    try:
+        source_id = int(source["id"])
+        target_id = int(target["id"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "source.id and target.id must be integers")
+
+    if source.get("type") == target.get("type") and source_id == target_id:
+        raise HTTPException(400, "source and target must differ")
+
+    with _get_db() as db:
+        # Verify the target exists — prevents accidental orphaning.
+        if target["type"] == "person":
+            exists = db.conn.execute(
+                "SELECT 1 FROM persons WHERE id = ?", (target_id,)
+            ).fetchone()
+            if not exists:
+                raise HTTPException(404, f"Person #{target_id} not found")
+        else:
+            exists = db.conn.execute(
+                "SELECT 1 FROM faces WHERE cluster_id = ? AND person_id IS NULL LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            if not exists:
+                raise HTTPException(404, f"Cluster #{target_id} not found")
+
+        cur = db.conn.cursor()
+        try:
+            if target["type"] == "person":
+                cur.execute(
+                    """UPDATE faces
+                       SET person_id = ?, cluster_id = NULL, match_source = 'merge_review'
+                       WHERE cluster_id = ? AND person_id IS NULL""",
+                    (target_id, source_id),
+                )
+            else:
+                cur.execute(
+                    """UPDATE faces
+                       SET cluster_id = ?
+                       WHERE cluster_id = ? AND person_id IS NULL""",
+                    (target_id, source_id),
+                )
+            moved = cur.rowcount
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
+
+    return {
+        "ok": True,
+        "moved_face_count": moved,
+        "source": {"type": source["type"], "id": source_id},
+        "target": {"type": target["type"], "id": target_id},
+    }
+
+
 @app.get("/api/faces/manual-assignments")
 def api_export_manual_assignments():
     """Export all manual face-to-person assignments as JSON.
@@ -2251,6 +2399,15 @@ if _frontend_dir.exists():
         if faces_page.exists():
             return HTMLResponse(faces_page.read_text())
         return HTMLResponse("<h1>Faces page not found</h1>")
+
+    @app.get("/merges")
+    def serve_merges():
+        """Serve the merge-review page (M18 Phase B.0)."""
+        page = _frontend_dir / "merges.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(),
+                                headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Merges page not found</h1>")
 
     @app.get("/collections")
     def serve_collections():

@@ -49,7 +49,7 @@
   // M15 — SharedHeader
   // =========================================================================
   // Props:
-  //   activePage  — 'search' | 'review' | 'faces' | 'collections'
+  //   activePage  — 'search' | 'review' | 'faces' | 'merges' | 'collections'
   //   children    — optional React nodes (search form, review controls, etc.)
   PS.SharedHeader = function SharedHeader(props) {
     var activePage = props.activePage || 'search';
@@ -59,6 +59,7 @@
       { href: '/',            label: 'Search',      id: 'search' },
       { href: '/review',      label: 'Review',      id: 'review' },
       { href: '/faces',       label: 'Faces',       id: 'faces' },
+      { href: '/merges',      label: 'Merges',      id: 'merges' },
       { href: '/collections', label: 'Collections', id: 'collections' },
       { href: '/status',      label: 'Status',      id: 'status' },
     ];

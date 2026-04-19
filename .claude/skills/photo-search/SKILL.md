@@ -542,9 +542,33 @@ Two cooperating tools improve unknown-face grouping:
 Implementation: `photosearch/face_merge.py` (`load_groups`,
 `compute_suggestions`, `score_pair`). Per-pair cost is O(K²) where K is
 `--max-members` (default 60, biggest-bbox faces sampled first). named↔named
-pairs are never suggested. Accept/reject UI is deferred — current flow is:
-run the CLI, tune cutoffs, then the UI layer will surface the suggestions
-for one-click merge.
+pairs are never suggested.
+
+### Merge review page (`/merges`)
+
+After running `suggest-face-merges --json-out /data/suggestions.json`, the
+`/merges` page (Phase B.0) renders each suggestion side-by-side with face
+crops, labels, face counts, and the three scores. Actions:
+
+- **Accept** → `POST /api/faces/merges` with `{source, target}`. For
+  cluster→person: updates `faces.person_id`, clears `cluster_id`, stamps
+  `match_source='merge_review'`. For cluster→cluster: updates
+  `faces.cluster_id` only.
+- **Dismiss** → localStorage-only (keyed by the two `rep_face_id`s, which
+  are stable across reclusters). Persistent rejection table is future work.
+- Each card links to `/faces?cluster_id=N` / `?person_id=N` for deep
+  verification before accepting.
+
+API:
+- `GET /api/faces/suggestions` — reads `PHOTOSEARCH_SUGGESTIONS_JSON`
+  (default `/data/suggestions.json`). Filters out rows whose source
+  cluster has been collapsed since the JSON was written.
+- `POST /api/faces/merges` — body `{"source": {type, id}, "target":
+  {type, id}}`. Source must be `cluster`; target can be `person` or
+  `cluster`. Returns `{ok, moved_face_count, source, target}`.
+
+Suggestions file is on the Docker volume at `/data/suggestions.json` by
+default — re-run the CLI whenever you want fresh candidates.
 
 ### Vec0 orphan cleanup
 
