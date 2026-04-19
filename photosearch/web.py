@@ -2010,6 +2010,188 @@ def api_list_stacks():
     return {"stacks": stacks}
 
 
+@app.post("/api/stacks/detect")
+def api_detect_stacks(data: dict = None):
+    """Run burst/bracket stacking across the library.
+
+    Body (all optional, defaults match the CLI):
+      time_window_sec     (float, default 5.0)
+      clip_threshold      (float, default 0.05)
+      max_stack_span_sec  (float, default 10.0)
+      clear               (bool,  default false) — wipe existing stacks first
+      dry_run             (bool,  default false) — detect but don't save
+
+    Blocks for the duration of detection (no progress streaming). Returns
+    summary counts so the status page can report what happened.
+    """
+    import time
+    from .stacking import run_stacking
+
+    data = data or {}
+    time_window_sec = float(data.get("time_window_sec", 5.0))
+    clip_threshold = float(data.get("clip_threshold", 0.05))
+    max_stack_span_sec = float(data.get("max_stack_span_sec", 10.0))
+    clear = bool(data.get("clear", False))
+    dry_run = bool(data.get("dry_run", False))
+
+    if time_window_sec <= 0 or time_window_sec > 3600:
+        raise HTTPException(400, "time_window_sec must be in (0, 3600]")
+    if clip_threshold <= 0 or clip_threshold >= 2.0:
+        raise HTTPException(400, "clip_threshold must be in (0, 2.0)")
+    if max_stack_span_sec < time_window_sec:
+        raise HTTPException(400, "max_stack_span_sec must be ≥ time_window_sec")
+
+    started = time.monotonic()
+    with _get_db() as db:
+        if clear and not dry_run:
+            db.clear_stacks()
+        stacks = run_stacking(
+            db,
+            time_window_sec=time_window_sec,
+            clip_threshold=clip_threshold,
+            max_stack_span_sec=max_stack_span_sec,
+            dry_run=dry_run,
+        )
+
+    duration_seconds = round(time.monotonic() - started, 2)
+    return {
+        "ok": True,
+        "stacks_created": len(stacks),
+        "photos_stacked": sum(len(s) for s in stacks),
+        "cleared": clear and not dry_run,
+        "dry_run": dry_run,
+        "duration_seconds": duration_seconds,
+        "params": {
+            "time_window_sec": time_window_sec,
+            "clip_threshold": clip_threshold,
+            "max_stack_span_sec": max_stack_span_sec,
+        },
+    }
+
+
+@app.post("/api/stacks/detect/stream")
+async def api_detect_stacks_stream(request: Request):
+    """SSE variant of /api/stacks/detect — streams phase-by-phase progress.
+
+    Body matches the blocking endpoint. Emits events of the form:
+      {"type": "progress", "phase": "scan"|"load_embeddings"|"pairs"|"group"|"save", ...}
+      {"type": "done",      "stacks_created": N, "photos_stacked": M, ...}
+      {"type": "cancelled", "message": "..."}
+      {"type": "fatal",     "message": "..."}
+
+    Client disconnect (AbortController, tab close) flips a threading.Event
+    that stacking.py checks inside its hot loops — work stops within ~1000
+    photo iterations.
+    """
+    import asyncio
+    import threading
+    import time
+    from .stacking import run_stacking
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    data = data or {}
+
+    time_window_sec = float(data.get("time_window_sec", 5.0))
+    clip_threshold = float(data.get("clip_threshold", 0.05))
+    max_stack_span_sec = float(data.get("max_stack_span_sec", 10.0))
+    clear = bool(data.get("clear", False))
+    dry_run = bool(data.get("dry_run", False))
+
+    if time_window_sec <= 0 or time_window_sec > 3600:
+        raise HTTPException(400, "time_window_sec must be in (0, 3600]")
+    if clip_threshold <= 0 or clip_threshold >= 2.0:
+        raise HTTPException(400, "clip_threshold must be in (0, 2.0)")
+    if max_stack_span_sec < time_window_sec:
+        raise HTTPException(400, "max_stack_span_sec must be ≥ time_window_sec")
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    def _on_progress(event: dict):
+        event = dict(event)
+        event["type"] = "progress"
+        _emit(event)
+
+    def _should_abort() -> bool:
+        return cancel_event.is_set()
+
+    def run():
+        started = time.monotonic()
+        try:
+            _emit({
+                "type": "start",
+                "params": {
+                    "time_window_sec": time_window_sec,
+                    "clip_threshold": clip_threshold,
+                    "max_stack_span_sec": max_stack_span_sec,
+                },
+                "clear": clear,
+                "dry_run": dry_run,
+            })
+            with _get_db() as db:
+                if clear and not dry_run:
+                    db.clear_stacks()
+                    _emit({"type": "progress", "phase": "cleared"})
+                stacks = run_stacking(
+                    db,
+                    time_window_sec=time_window_sec,
+                    clip_threshold=clip_threshold,
+                    max_stack_span_sec=max_stack_span_sec,
+                    dry_run=dry_run,
+                    on_progress=_on_progress,
+                    should_abort=_should_abort,
+                )
+            _emit({
+                "type": "done",
+                "stacks_created": len(stacks),
+                "photos_stacked": sum(len(s) for s in stacks),
+                "cleared": clear and not dry_run,
+                "dry_run": dry_run,
+                "duration_seconds": round(time.monotonic() - started, 2),
+            })
+        except InterruptedError:
+            _emit({"type": "cancelled", "message": "Stacking cancelled"})
+        except Exception as exc:
+            logger.exception("STACKING stream failed")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    threading.Thread(target=run, daemon=True).start()
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("STACKING  client disconnected — cancelling")
+                    cancel_event.set()
+                    return
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("done", "fatal", "cancelled"):
+                    return
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/api/stacks/{stack_id}")
 def api_get_stack(stack_id: int):
     """Get a stack with all member photos."""

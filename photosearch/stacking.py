@@ -16,12 +16,17 @@ distance ~0.20 for "visually similar").  Stacking at 0.05 targets
 
 import logging
 import struct
+import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
 from .db import PhotoDB, CLIP_DIMENSIONS, _deserialize_float_list
+
+# Minimum seconds between throttled progress callbacks. Phase transitions
+# (start/end of a phase) bypass the throttle so the UI always sees them.
+_PROGRESS_INTERVAL = 0.25
 
 logger = logging.getLogger("photosearch.stacking")
 
@@ -58,6 +63,8 @@ def detect_stacks(
     directory: str | None = None,
     max_stack_span_sec: float = 10.0,
     photo_ids: list[int] | None = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> list[list[int]]:
     """Detect photo stacks based on temporal proximity + CLIP similarity.
 
@@ -89,6 +96,17 @@ def detect_stacks(
         List of stacks, where each stack is a list of photo IDs
         ordered by aesthetic score descending (best first).
     """
+    def _emit(event: dict):
+        if on_progress:
+            on_progress(event)
+
+    def _check_abort():
+        if should_abort and should_abort():
+            raise InterruptedError("stacking cancelled")
+
+    _emit({"phase": "scan", "message": "Loading photos"})
+    _check_abort()
+
     # 1. Fetch photos with timestamps
     rows = db.conn.execute(
         "SELECT id, filepath, date_taken, aesthetic_score FROM photos "
@@ -118,6 +136,8 @@ def detect_stacks(
             "aesthetic_score": r["aesthetic_score"] or 0.0,
         })
 
+    _emit({"phase": "scan", "scanned": len(photos)})
+
     if len(photos) < 2:
         return []
 
@@ -126,7 +146,9 @@ def detect_stacks(
 
     # 2. Load CLIP embeddings in bulk
     photo_ids = [p["id"] for p in photos]
-    embeddings = _load_embeddings_bulk(db, photo_ids)
+    embeddings = _load_embeddings_bulk(
+        db, photo_ids, on_progress=on_progress, should_abort=should_abort,
+    )
     logger.info("Loaded %d CLIP embeddings", len(embeddings))
 
     # 3. Sliding window: find candidate pairs
@@ -146,8 +168,24 @@ def detect_stacks(
         if rx != ry:
             parent[rx] = ry
 
+    _emit({"phase": "pairs", "processed": 0, "total": len(photos), "pairs_found": 0})
+    last_emit = time.monotonic()
+
     pair_count = 0
     for i, p in enumerate(photos):
+        # Throttled progress + abort check (every ~1000 iterations keeps the
+        # per-photo overhead negligible even for 500k-photo libraries).
+        if i % 1000 == 0:
+            _check_abort()
+            now = time.monotonic()
+            if now - last_emit >= _PROGRESS_INTERVAL:
+                _emit({
+                    "phase": "pairs",
+                    "processed": i,
+                    "total": len(photos),
+                    "pairs_found": pair_count,
+                })
+                last_emit = now
         if p["id"] not in embeddings:
             continue
         emb_i = embeddings[p["id"]]
@@ -164,7 +202,16 @@ def detect_stacks(
                 union(p["id"], q["id"])
                 pair_count += 1
 
+    _emit({
+        "phase": "pairs",
+        "processed": len(photos),
+        "total": len(photos),
+        "pairs_found": pair_count,
+    })
     logger.info("Found %d near-identical pairs", pair_count)
+
+    _check_abort()
+    _emit({"phase": "group", "message": "Grouping into stacks"})
 
     # 4. Group into connected components
     from collections import defaultdict
@@ -196,17 +243,33 @@ def detect_stacks(
 
     logger.info("Detected %d stacks (%d total stacked photos)",
                 len(stacks), sum(len(s) for s in stacks))
+    _emit({
+        "phase": "group",
+        "stacks_detected": len(stacks),
+        "photos_stacked": sum(len(s) for s in stacks),
+    })
     return stacks
 
 
-def _load_embeddings_bulk(db: PhotoDB, photo_ids: list[int]) -> dict[int, np.ndarray]:
+def _load_embeddings_bulk(
+    db: PhotoDB,
+    photo_ids: list[int],
+    on_progress: Optional[Callable[[dict], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
+) -> dict[int, np.ndarray]:
     """Load CLIP embeddings for a list of photo IDs.
 
     Returns {photo_id: normalized_numpy_array}.
     """
     result = {}
     batch_size = 500
-    for i in range(0, len(photo_ids), batch_size):
+    total = len(photo_ids)
+    last_emit = time.monotonic()
+    if on_progress:
+        on_progress({"phase": "load_embeddings", "loaded": 0, "total": total})
+    for i in range(0, total, batch_size):
+        if should_abort and should_abort():
+            raise InterruptedError("stacking cancelled")
         batch = photo_ids[i : i + batch_size]
         placeholders = ",".join("?" * len(batch))
         rows = db.conn.execute(
@@ -223,6 +286,16 @@ def _load_embeddings_bulk(db: PhotoDB, photo_ids: list[int]) -> dict[int, np.nda
             if norm > 0:
                 vec /= norm
             result[r["photo_id"]] = vec
+        now = time.monotonic()
+        if on_progress and now - last_emit >= _PROGRESS_INTERVAL:
+            on_progress({
+                "phase": "load_embeddings",
+                "loaded": min(i + batch_size, total),
+                "total": total,
+            })
+            last_emit = now
+    if on_progress:
+        on_progress({"phase": "load_embeddings", "loaded": total, "total": total})
     return result
 
 
@@ -230,16 +303,33 @@ def _load_embeddings_bulk(db: PhotoDB, photo_ids: list[int]) -> dict[int, np.nda
 # Persistence helpers
 # ---------------------------------------------------------------------------
 
-def save_stacks(db: PhotoDB, stacks: list[list[int]]):
+def save_stacks(
+    db: PhotoDB,
+    stacks: list[list[int]],
+    on_progress: Optional[Callable[[dict], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
+):
     """Clear existing stacks and save new ones.
 
     Each stack list is ordered by aesthetic score descending —
     the first element becomes the top photo.
     """
     db.clear_stacks()
-    for stack_ids in stacks:
+    total = len(stacks)
+    last_emit = time.monotonic()
+    if on_progress:
+        on_progress({"phase": "save", "saved": 0, "total": total})
+    for idx, stack_ids in enumerate(stacks, 1):
+        if should_abort and should_abort():
+            raise InterruptedError("stacking cancelled")
         db.create_stack(stack_ids, top_photo_id=stack_ids[0])
-    logger.info("Saved %d stacks to database", len(stacks))
+        now = time.monotonic()
+        if on_progress and now - last_emit >= _PROGRESS_INTERVAL:
+            on_progress({"phase": "save", "saved": idx, "total": total})
+            last_emit = now
+    if on_progress:
+        on_progress({"phase": "save", "saved": total, "total": total})
+    logger.info("Saved %d stacks to database", total)
 
 
 def run_stacking(
@@ -250,6 +340,8 @@ def run_stacking(
     dry_run: bool = False,
     max_stack_span_sec: float = 10.0,
     photo_ids: list[int] | None = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> list[list[int]]:
     """Full stacking pipeline: detect + save.
 
@@ -261,12 +353,21 @@ def run_stacking(
         dry_run: If True, detect but don't save to DB.
         max_stack_span_sec: Hard cap on total time span of a stack.
         photo_ids: Restrict to these specific photo IDs (e.g. from a collection).
+        on_progress: Optional callback invoked with progress events (throttled
+            to every ~0.25s inside hot loops; phase transitions always fire).
+            Each event is a dict with a "phase" key and phase-specific fields.
+        should_abort: Optional callable. If it returns True mid-run, the
+            function raises InterruptedError. Checked at phase transitions
+            and throttled inside hot loops.
 
     Returns:
         List of detected stacks (each a list of photo IDs, best first).
     """
-    stacks = detect_stacks(db, time_window_sec, clip_threshold, directory,
-                           max_stack_span_sec, photo_ids=photo_ids)
+    stacks = detect_stacks(
+        db, time_window_sec, clip_threshold, directory,
+        max_stack_span_sec, photo_ids=photo_ids,
+        on_progress=on_progress, should_abort=should_abort,
+    )
     if not dry_run and stacks:
-        save_stacks(db, stacks)
+        save_stacks(db, stacks, on_progress=on_progress, should_abort=should_abort)
     return stacks

@@ -297,6 +297,100 @@
       font-size: 13px;
     }
 
+    /* Stacking form */
+    .stack-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .stack-form-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(140px, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .stack-field label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+    .stack-field input[type="number"] {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .stack-field .field-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+    .stack-toggles {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .stack-toggles label {
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .stack-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .stack-result {
+      font-size: 13px;
+      margin-left: 6px;
+    }
+    .stack-result.ok { color: var(--green); }
+    .stack-result.err { color: #f87171; }
+    .stack-progress {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: var(--surface2);
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+    }
+    .stack-progress-phase {
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .stack-progress-bar {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .stack-progress-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      transition: width 0.2s ease;
+    }
+    .stack-progress-meta {
+      color: var(--text-muted);
+      margin-top: 4px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
     /* Workers */
     .workers-wrap {
       background: var(--surface);
@@ -797,6 +891,270 @@
       );
     }
 
+    var STACK_DEFAULTS = {
+      time_window_sec: 5.0,
+      clip_threshold: 0.05,
+      max_stack_span_sec: 10.0,
+    };
+
+    var PHASE_LABELS = {
+      scan: 'Scanning photos',
+      load_embeddings: 'Loading CLIP embeddings',
+      pairs: 'Comparing pairs',
+      group: 'Grouping into stacks',
+      save: 'Saving stacks',
+      cleared: 'Cleared existing stacks',
+    };
+
+    // Parse an SSE chunk (everything up to \n\n) and return the event dict,
+    // or null if the chunk is a keepalive or unrecognized.
+    function parseSSEChunk(chunk) {
+      var trimmed = chunk.trim();
+      if (!trimmed || trimmed.startsWith(':')) return null;
+      var m = trimmed.match(/^data:\s*(.*)$/s);
+      if (!m) return null;
+      try { return JSON.parse(m[1]); } catch (_) { return null; }
+    }
+
+    function StackingForm(props) {
+      var _p = useState(Object.assign({}, STACK_DEFAULTS));
+      var params = _p[0]; var setParams = _p[1];
+      var _c = useState(false); var clearFirst = _c[0]; var setClearFirst = _c[1];
+      var _d = useState(false); var dryRun = _d[0]; var setDryRun = _d[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _r = useState(null); var result = _r[0]; var setResult = _r[1];
+      var _pr = useState(null); var progress = _pr[0]; var setProgress = _pr[1];
+      var _s = useState(null); var startedAt = _s[0]; var setStartedAt = _s[1];
+      var _t = useState(0); var setElapsedTick = _t[1];
+      var abortRef = useRef(null);
+
+      // Tick once/sec while running so elapsed-time display updates
+      useEffect(function() {
+        if (!busy) return;
+        var id = setInterval(function() {
+          setElapsedTick(function(n) { return n + 1; });
+        }, 1000);
+        return function() { clearInterval(id); };
+      }, [busy]);
+
+      function update(key, val) {
+        setParams(function(prev) {
+          var next = Object.assign({}, prev);
+          next[key] = val;
+          return next;
+        });
+      }
+
+      async function submit() {
+        if (busy) return;
+        if (clearFirst && !dryRun && !confirm(
+          'This will delete every existing stack and re-detect from scratch. Continue?'
+        )) return;
+
+        setBusy(true);
+        setResult(null);
+        setProgress(null);
+        setStartedAt(Date.now());
+
+        var controller = new AbortController();
+        abortRef.current = controller;
+
+        try {
+          var response = await fetch('/api/stacks/detect/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              time_window_sec: Number(params.time_window_sec),
+              clip_threshold: Number(params.clip_threshold),
+              max_stack_span_sec: Number(params.max_stack_span_sec),
+              clear: clearFirst,
+              dry_run: dryRun,
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            var body = await response.json().catch(function() { return {}; });
+            throw new Error(body.detail || ('HTTP ' + response.status));
+          }
+
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder();
+          var buffer = '';
+          var terminal = null;
+
+          while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              var raw = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              var ev = parseSSEChunk(raw);
+              if (!ev) continue;
+              if (ev.type === 'progress') {
+                setProgress(ev);
+              } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'fatal') {
+                terminal = ev;
+              }
+            }
+            if (terminal) break;
+          }
+
+          if (!terminal) {
+            // Stream ended without a terminal event (server crash or proxy cut)
+            throw new Error('stream ended unexpectedly');
+          }
+
+          if (terminal.type === 'done') {
+            setResult({
+              ok: true,
+              msg: (terminal.dry_run ? '[dry run] ' : '')
+                + terminal.stacks_created.toLocaleString() + ' stacks · '
+                + terminal.photos_stacked.toLocaleString() + ' photos · '
+                + terminal.duration_seconds + 's'
+                + (terminal.cleared ? ' · cleared first' : ''),
+            });
+            if (props.onComplete && !terminal.dry_run) props.onComplete();
+          } else if (terminal.type === 'cancelled') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: terminal.message || 'Failed' });
+          }
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: err.message });
+          }
+        } finally {
+          setBusy(false);
+          setProgress(null);
+          setStartedAt(null);
+          abortRef.current = null;
+        }
+      }
+
+      function cancel() {
+        if (abortRef.current) abortRef.current.abort();
+      }
+
+      function reset() {
+        if (busy) return;
+        setParams(Object.assign({}, STACK_DEFAULTS));
+        setClearFirst(false);
+        setDryRun(false);
+        setResult(null);
+      }
+
+      var field = function(key, label, step, hint) {
+        return e('div', { className: 'stack-field', key: key },
+          e('label', null, label),
+          e('input', {
+            type: 'number',
+            step: step,
+            min: 0,
+            value: params[key],
+            disabled: busy,
+            onChange: function(ev) { update(key, ev.target.value); },
+          }),
+          e('div', { className: 'field-hint' }, hint)
+        );
+      };
+
+      var progressNode = null;
+      if (busy) {
+        var phaseText = 'Starting\u2026';
+        var fillPct = null;
+        var metaLeft = '';
+        var metaRight = '';
+        if (progress) {
+          phaseText = PHASE_LABELS[progress.phase] || progress.phase;
+          if (typeof progress.total === 'number' && progress.total > 0) {
+            var done = progress.loaded != null ? progress.loaded :
+                       progress.processed != null ? progress.processed :
+                       progress.saved != null ? progress.saved : 0;
+            fillPct = Math.min(100, (done / progress.total) * 100);
+            metaLeft = done.toLocaleString() + ' / ' + progress.total.toLocaleString();
+          } else if (progress.phase === 'group' && typeof progress.stacks_detected === 'number') {
+            metaLeft = progress.stacks_detected.toLocaleString() + ' stacks · '
+                     + progress.photos_stacked.toLocaleString() + ' photos';
+          } else if (progress.phase === 'scan' && typeof progress.scanned === 'number') {
+            metaLeft = progress.scanned.toLocaleString() + ' photos';
+          }
+          if (progress.phase === 'pairs' && typeof progress.pairs_found === 'number') {
+            metaLeft += ' · ' + progress.pairs_found.toLocaleString() + ' pairs';
+          }
+        }
+        if (startedAt) {
+          var elapsed = Math.floor((Date.now() - startedAt) / 1000);
+          metaRight = elapsed + 's elapsed';
+        }
+        progressNode = e('div', { className: 'stack-progress' },
+          e('div', { className: 'stack-progress-phase' }, phaseText),
+          fillPct != null && e('div', { className: 'stack-progress-bar' },
+            e('div', {
+              className: 'stack-progress-bar-fill',
+              style: { width: fillPct + '%' }
+            })
+          ),
+          e('div', { className: 'stack-progress-meta' },
+            e('span', null, metaLeft),
+            e('span', null, metaRight)
+          )
+        );
+      }
+
+      return e('div', null,
+        e('h2', null, 'Stacking'),
+        e('div', { className: 'stack-wrap' },
+          e('div', { className: 'stack-form-row' },
+            field('time_window_sec', 'Time window (s)', '0.5',
+                  'max gap between consecutive shots'),
+            field('clip_threshold', 'CLIP threshold', '0.01',
+                  'max cosine distance — lower = stricter'),
+            field('max_stack_span_sec', 'Max span (s)', '0.5',
+                  'hard cap on stack duration')
+          ),
+          e('div', { className: 'stack-toggles' },
+            e('label', null,
+              e('input', {
+                type: 'checkbox',
+                checked: clearFirst,
+                disabled: busy,
+                onChange: function(ev) { setClearFirst(ev.target.checked); },
+              }),
+              'Clear existing stacks first'
+            ),
+            e('label', null,
+              e('input', {
+                type: 'checkbox',
+                checked: dryRun,
+                disabled: busy,
+                onChange: function(ev) { setDryRun(ev.target.checked); },
+              }),
+              'Dry run (don\u2019t save)'
+            )
+          ),
+          e('div', { className: 'stack-actions' },
+            busy
+              ? e('button', { className: 'btn', onClick: cancel }, 'Cancel')
+              : e('button', { className: 'btn', onClick: submit },
+                  dryRun ? 'Preview' : 'Run stacking'),
+            e('button', {
+              className: 'btn',
+              onClick: reset,
+              disabled: busy,
+            }, 'Reset'),
+            result && e('span', {
+              className: 'stack-result ' + (result.ok ? 'ok' : 'err')
+            }, result.msg)
+          ),
+          progressNode
+        )
+      );
+    }
+
     function ErrorsLog(props) {
       var errors = props.errors;
       if (!errors || errors.length === 0) return null;
@@ -1175,6 +1533,7 @@
             })
           ),
           e(Workers, { data: workerStatus }),
+          e(StackingForm, { onComplete: load }),
           e(ActivityChart, { activity: activity }),
           e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
           e(ErrorsLog, { errors: indexErrors }),
