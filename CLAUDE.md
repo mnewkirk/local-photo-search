@@ -146,6 +146,25 @@ cleared in the same transaction (IDs are fully renumbered). Loader uses
 `np.frombuffer` over concatenated BLOBs — 120k faces decode in seconds on
 an N100; DBSCAN at 512-dim with ball_tree is the dominant cost after that.
 
+## Splitting attractor clusters (M18)
+
+Large muddled clusters (observed on the NAS: one cluster with 126 faces
+across 469 days) pull in multiple distinct people during the eps=0.55
+global recluster. Splitting them is a per-cluster DBSCAN re-run with
+tighter params:
+
+```bash
+$DC run --rm photosearch split-cluster 15 --dry-run       # preview
+$DC run --rm photosearch split-cluster 15 --eps 0.45      # apply
+```
+
+Also available from the /faces detail sidebar: "Split" button on any
+unknown cluster, preview shows the histogram of resulting sub-cluster
+sizes before you apply. API: `POST /api/faces/clusters/{id}/split` with
+body `{eps, min_samples, dry_run}`. New cluster_ids are minted past the
+current max so they never collide. Faces that fall out as DBSCAN noise
+go to `cluster_id=NULL`. Implementation: `photosearch/faces.py:split_cluster`.
+
 ## Face merge suggestions (M18)
 
 Two-step flow for merging unknown-face groups into named persons or into
@@ -185,6 +204,12 @@ Cluster IDs are ephemeral (every `recluster-faces` run renumbers them),
 but the merge flow is the intended consumer — review within the same
 recluster cycle. Face IDs (`rep_face_id`) are stable, so localStorage
 dismissals survive JSON regeneration.
+
+The /merges toolbar also has a **Regenerate** button (`POST
+/api/faces/suggestions/regenerate`) that re-runs the engine with
+user-selected cutoffs and writes fresh JSON — useful after splitting
+attractor clusters or after a batch of accepts changes the grouping
+landscape. Blocks ~15–30s on an N100.
 
 `/api/faces/groups` is paginated (`limit`/`offset`/`filter`/`total`/`counts`),
 hides singletons by default (`?include_singletons=1` to restore), and

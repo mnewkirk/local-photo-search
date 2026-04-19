@@ -541,6 +541,140 @@ class TestMergeReviewAPI:
             "target": {"type": "cluster", "id": 99999},
         }).status_code == 404
 
+    def test_split_cluster_dry_run(self, client, db):
+        """Dry-run split returns a preview without writing."""
+        # Seed a larger cluster so there's something to split. Add 4 faces to
+        # cluster_id 500 with encodings that fall into 2 natural groups.
+        import numpy as _np
+        photo_id = db._test_photo_ids["DSC04878.JPG"]
+        rng = _np.random.RandomState(0)
+
+        def _unit(v):
+            n = float(_np.linalg.norm(v))
+            return (v / n).tolist() if n > 0 else v.tolist()
+
+        base_a = _np.array([1.0] + [0.0] * 511, dtype=_np.float32)
+        base_b = _np.array([0.0, 1.0] + [0.0] * 510, dtype=_np.float32)
+        for base in (base_a, base_a, base_b, base_b):
+            jitter = rng.randn(512).astype(_np.float32) * 0.01 / _np.sqrt(512)
+            db.add_face(photo_id, (100, 200, 250, 50),
+                        _unit(base + jitter), cluster_id=500)
+
+        resp = client.post("/api/faces/clusters/500/split", json={
+            "eps": 0.30, "min_samples": 2, "dry_run": True,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["dry_run"] is True
+        assert data["face_count"] == 4
+        # With two tight groups of 2, DBSCAN at eps=0.3 min_samples=2 should
+        # form 2 sub-clusters.
+        assert data["sub_cluster_count"] == 2
+        # Dry-run: no DB writes — the original cluster_id should still be 500
+        rows = db.conn.execute(
+            "SELECT cluster_id FROM faces WHERE cluster_id = 500"
+        ).fetchall()
+        assert len(rows) == 4
+
+    def test_split_cluster_apply(self, client, db):
+        import numpy as _np
+        photo_id = db._test_photo_ids["DSC04878.JPG"]
+        rng = _np.random.RandomState(1)
+
+        def _unit(v):
+            n = float(_np.linalg.norm(v))
+            return (v / n).tolist() if n > 0 else v.tolist()
+
+        base_a = _np.array([1.0] + [0.0] * 511, dtype=_np.float32)
+        base_b = _np.array([0.0, 1.0] + [0.0] * 510, dtype=_np.float32)
+        for base in (base_a, base_a, base_b, base_b):
+            jitter = rng.randn(512).astype(_np.float32) * 0.01 / _np.sqrt(512)
+            db.add_face(photo_id, (100, 200, 250, 50),
+                        _unit(base + jitter), cluster_id=600)
+
+        resp = client.post("/api/faces/clusters/600/split", json={
+            "eps": 0.30, "min_samples": 2, "dry_run": False,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sub_cluster_count"] == 2
+
+        # Original cluster_id gone, new ids assigned.
+        rows = db.conn.execute(
+            "SELECT cluster_id FROM faces WHERE cluster_id = 600"
+        ).fetchall()
+        assert len(rows) == 0
+        new_ids = set(data["new_cluster_ids"])
+        placeholders = ",".join("?" * len(new_ids))
+        rows = db.conn.execute(
+            f"SELECT COUNT(*) AS n FROM faces WHERE cluster_id IN ({placeholders})",
+            tuple(new_ids),
+        ).fetchone()
+        assert rows["n"] == 4
+
+    def test_split_cluster_refuses_named(self, client, db):
+        """Named-person clusters can't be split."""
+        alex_id = db._test_person_ids["Alex"]
+        # Tag an unknown face with a cluster_id AND a person_id — contrived,
+        # but the guardrail should still reject.
+        photo_id = db._test_photo_ids["DSC04878.JPG"]
+        face_id = db.add_face(
+            photo_id, (100, 200, 250, 50),
+            [0.1] * 512, person_id=alex_id, cluster_id=700,
+        )
+        resp = client.post("/api/faces/clusters/700/split", json={"dry_run": True})
+        assert resp.status_code == 400
+        assert "person-assigned" in resp.json()["detail"]
+
+    def test_split_cluster_missing(self, client):
+        resp = client.post("/api/faces/clusters/99999/split", json={"dry_run": True})
+        assert resp.status_code == 404
+
+    def test_split_cluster_bad_params(self, client):
+        resp = client.post("/api/faces/clusters/99/split", json={"eps": 0})
+        assert resp.status_code == 400
+        resp = client.post("/api/faces/clusters/99/split", json={"min_samples": 0})
+        assert resp.status_code == 400
+
+    def test_regenerate_suggestions_writes_file(self, client, db, tmp_path):
+        """Regenerate runs the engine and overwrites the JSON at _suggestions_path."""
+        from photosearch import web
+        json_file = tmp_path / "suggestions.json"
+        orig = web._suggestions_path
+        web._suggestions_path = str(json_file)
+        try:
+            resp = client.post("/api/faces/suggestions/regenerate", json={
+                "centroid_cutoff": 2.0,
+                "min_pair_cutoff": 2.0,
+                "max_members": 10,
+                "min_group_size": 1,
+            })
+            assert resp.status_code == 200, resp.json()
+            data = resp.json()
+            assert data["ok"] is True
+            assert data["written_to"] == str(json_file)
+            assert json_file.exists()
+            import json as _json
+            payload = _json.loads(json_file.read_text())
+            assert "suggestions" in payload
+            assert payload["centroid_cutoff"] == 2.0
+        finally:
+            web._suggestions_path = orig
+
+    def test_regenerate_suggestions_bad_params(self, client, tmp_path):
+        from photosearch import web
+        orig = web._suggestions_path
+        web._suggestions_path = str(tmp_path / "s.json")
+        try:
+            assert client.post("/api/faces/suggestions/regenerate",
+                               json={"centroid_cutoff": 0}).status_code == 400
+            assert client.post("/api/faces/suggestions/regenerate",
+                               json={"min_pair_cutoff": 3.0}).status_code == 400
+            assert client.post("/api/faces/suggestions/regenerate",
+                               json={"max_members": 1}).status_code == 400
+        finally:
+            web._suggestions_path = orig
+
 
 # =========================================================================
 # Collections

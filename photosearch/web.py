@@ -1135,6 +1135,127 @@ def api_face_suggestions():
     return payload
 
 
+@app.post("/api/faces/suggestions/regenerate")
+def api_regenerate_suggestions(data: dict = None):
+    """Re-run the merge-suggestion engine and overwrite the cached JSON.
+
+    Body (all optional):
+      {"centroid_cutoff": 0.95, "min_pair_cutoff": 0.60,
+       "max_members": 60, "min_group_size": 1,
+       "include_ignored": false}
+
+    Blocking — the engine loads every group's encodings (~20s on an N100 for
+    ~2000 groups) then computes pairwise scores. Progress streaming would be
+    nicer UX; we'll add it if the wait becomes noticeable in practice.
+    """
+    from .face_merge import (
+        CENTROID_CUTOFF, MIN_PAIR_CUTOFF, MAX_MEMBERS_PER_GROUP,
+        compute_suggestions, load_groups,
+    )
+
+    data = data or {}
+    centroid_cutoff = float(data.get("centroid_cutoff", CENTROID_CUTOFF))
+    min_pair_cutoff = float(data.get("min_pair_cutoff", MIN_PAIR_CUTOFF))
+    max_members = int(data.get("max_members", MAX_MEMBERS_PER_GROUP))
+    min_group_size = int(data.get("min_group_size", 1))
+    include_ignored = bool(data.get("include_ignored", False))
+
+    if not (0 < centroid_cutoff <= 2.0):
+        raise HTTPException(400, "centroid_cutoff must be in (0, 2.0]")
+    if not (0 < min_pair_cutoff <= 2.0):
+        raise HTTPException(400, "min_pair_cutoff must be in (0, 2.0]")
+    if max_members < 2:
+        raise HTTPException(400, "max_members must be ≥ 2")
+    if min_group_size < 1:
+        raise HTTPException(400, "min_group_size must be ≥ 1")
+
+    with _get_db() as db:
+        groups = load_groups(
+            db,
+            include_ignored_clusters=include_ignored,
+            max_members=max_members,
+            min_group_size=min_group_size,
+        )
+        suggestions = compute_suggestions(
+            groups,
+            centroid_cutoff=centroid_cutoff,
+            min_pair_cutoff=min_pair_cutoff,
+        )
+
+    payload = {
+        "centroid_cutoff": centroid_cutoff,
+        "min_pair_cutoff": min_pair_cutoff,
+        "max_members": max_members,
+        "min_group_size": min_group_size,
+        "group_count": len(groups),
+        "suggestions": [s.as_dict() for s in suggestions],
+    }
+
+    os.makedirs(os.path.dirname(_suggestions_path) or ".", exist_ok=True)
+    tmp_path = _suggestions_path + f".tmp.{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, _suggestions_path)
+
+    return {
+        "ok": True,
+        "group_count": len(groups),
+        "suggestion_count": len(suggestions),
+        "written_to": _suggestions_path,
+    }
+
+
+@app.post("/api/faces/clusters/{cluster_id}/split")
+def api_split_cluster(cluster_id: int, data: dict = None):
+    """Split an unknown cluster into tighter sub-clusters via DBSCAN.
+
+    Body (all optional): {"eps": 0.45, "min_samples": 2, "dry_run": false}.
+    Dry-run returns the assignments + histogram without writing.
+
+    Rejects named-person clusters and any cluster containing person-assigned
+    faces — split is for unknown-cluster cleanup only.
+    """
+    from .faces import (
+        split_cluster, SPLIT_DEFAULT_EPS, SPLIT_DEFAULT_MIN_SAMPLES,
+    )
+
+    data = data or {}
+    eps = float(data.get("eps", SPLIT_DEFAULT_EPS))
+    min_samples = int(data.get("min_samples", SPLIT_DEFAULT_MIN_SAMPLES))
+    dry_run = bool(data.get("dry_run", False))
+
+    if eps <= 0 or eps >= 2.0:
+        raise HTTPException(400, "eps must be in (0, 2.0)")
+    if min_samples < 1:
+        raise HTTPException(400, "min_samples must be ≥ 1")
+
+    with _get_db() as db:
+        try:
+            summary = split_cluster(
+                db, cluster_id=cluster_id,
+                eps=eps, min_samples=min_samples, dry_run=dry_run,
+            )
+        except ValueError as err:
+            raise HTTPException(400, str(err))
+
+        if summary["face_count"] == 0:
+            raise HTTPException(404, f"Cluster #{cluster_id} has no unknown faces")
+
+        return {
+            "ok": True,
+            "cluster_id": cluster_id,
+            "eps": eps,
+            "min_samples": min_samples,
+            "dry_run": dry_run,
+            "face_count": summary["face_count"],
+            "sub_cluster_count": summary["sub_cluster_count"],
+            "noise_count": summary["noise_count"],
+            "histogram": summary["histogram"],
+            "new_cluster_ids": summary["new_cluster_ids"],
+            "elapsed_sec": summary.get("elapsed_sec"),
+        }
+
+
 @app.post("/api/faces/merges")
 def api_apply_face_merge(data: dict):
     """Apply a cluster→person or cluster→cluster merge.

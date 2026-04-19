@@ -501,6 +501,13 @@ recluster-faces [--eps 0.55] [--min-samples 3] \
                                             # session_window minutes). Renumbers every
                                             # unknown cluster and clears
                                             # ignored_clusters atomically.
+split-cluster CLUSTER_ID [--eps 0.45] [--min-samples 2] [--dry-run]
+                                            # Re-run DBSCAN on one cluster with
+                                            # tighter params to split "attractor"
+                                            # clusters. New cluster_ids minted
+                                            # past the current max; noise → NULL.
+                                            # Also available from the /faces
+                                            # detail sidebar's Split button.
 suggest-face-merges [--centroid-cutoff 0.95] [--min-pair-cutoff 0.60] \
                     [--max-members 60] [--min-group-size 1] \
                     [--include-ignored] [--limit N | --all] \

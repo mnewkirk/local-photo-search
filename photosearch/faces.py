@@ -632,6 +632,139 @@ def recluster_unknown_faces(
     }
 
 
+# ---------------------------------------------------------------------------
+# Cluster splitting (M18 — splits "attractor" clusters that lumped multiple
+# people together during the global recluster-faces pass)
+# ---------------------------------------------------------------------------
+
+# Tighter DBSCAN defaults than the global recluster. Splitting runs only
+# within one cluster's encodings, so it's OK to be stricter.
+SPLIT_DEFAULT_EPS = 0.45
+SPLIT_DEFAULT_MIN_SAMPLES = 2
+
+
+def split_cluster(
+    db,
+    cluster_id: int,
+    eps: float = SPLIT_DEFAULT_EPS,
+    min_samples: int = SPLIT_DEFAULT_MIN_SAMPLES,
+    dry_run: bool = False,
+) -> dict:
+    """Re-run DBSCAN on one unknown cluster with tighter params.
+
+    Loads every face in the cluster (person_id IS NULL, cluster_id = X), runs
+    DBSCAN over just those encodings, and (unless dry_run) writes the new
+    assignments back. New sub-clusters get ids starting past the current
+    max(cluster_id); noise → cluster_id = NULL.
+
+    Returns {face_count, sub_cluster_count, noise_count, histogram,
+    assignments, new_cluster_ids}. ``assignments`` is a list of
+    {face_id, new_cluster_id|None} pairs so the UI/CLI can preview before
+    applying.
+
+    Refuses to act on clusters that contain any person_id-assigned face
+    (those should not land here under normal operation, but the check
+    makes the write safe).
+    """
+    import time as _time
+    from sklearn.cluster import DBSCAN
+    from .db import FACE_DIMENSIONS
+
+    # Guardrail: refuse if any face in the cluster has been person-assigned.
+    bad = db.conn.execute(
+        "SELECT 1 FROM faces WHERE cluster_id = ? AND person_id IS NOT NULL LIMIT 1",
+        (cluster_id,),
+    ).fetchone()
+    if bad:
+        raise ValueError(
+            f"Cluster #{cluster_id} contains person-assigned faces; "
+            "splitting is only supported on unknown clusters."
+        )
+
+    t0 = _time.time()
+    rows = db.conn.execute(
+        """SELECT f.id, fe.encoding
+           FROM faces f
+           JOIN face_encodings fe ON fe.face_id = f.id
+           WHERE f.person_id IS NULL AND f.cluster_id = ?
+           ORDER BY f.id""",
+        (cluster_id,),
+    ).fetchall()
+    if not rows:
+        return {
+            "face_count": 0, "sub_cluster_count": 0, "noise_count": 0,
+            "histogram": {}, "assignments": [], "new_cluster_ids": [],
+        }
+
+    face_ids = [r["id"] for r in rows]
+    all_bytes = b"".join(r["encoding"] for r in rows)
+    X = np.frombuffer(all_bytes, dtype=np.float32).reshape(len(rows), FACE_DIMENSIONS).copy()
+
+    labels = DBSCAN(
+        eps=eps,
+        min_samples=min_samples,
+        metric="euclidean",
+        algorithm="ball_tree",
+        n_jobs=-1,
+    ).fit_predict(X)
+
+    # Find current max cluster_id so we can mint new ones that don't collide.
+    row = db.conn.execute(
+        "SELECT COALESCE(MAX(cluster_id), -1) AS m FROM faces"
+    ).fetchone()
+    next_cluster_id = int(row["m"]) + 1
+
+    unique_raw = sorted(set(int(lab) for lab in labels.tolist()) - {-1})
+    remap: dict[int, int] = {}
+    new_cluster_ids: list[int] = []
+    for raw in unique_raw:
+        remap[raw] = next_cluster_id
+        new_cluster_ids.append(next_cluster_id)
+        next_cluster_id += 1
+
+    assignments = []
+    histogram: dict[int, int] = {}
+    noise_count = 0
+    for fid, lab in zip(face_ids, labels.tolist()):
+        lab_int = int(lab)
+        if lab_int == -1:
+            assignments.append({"face_id": fid, "new_cluster_id": None})
+            noise_count += 1
+        else:
+            nc = remap[lab_int]
+            assignments.append({"face_id": fid, "new_cluster_id": nc})
+            histogram[nc] = histogram.get(nc, 0) + 1
+
+    summary = {
+        "face_count": len(face_ids),
+        "sub_cluster_count": len(new_cluster_ids),
+        "noise_count": noise_count,
+        "histogram": histogram,
+        "assignments": assignments,
+        "new_cluster_ids": new_cluster_ids,
+        "elapsed_sec": _time.time() - t0,
+    }
+
+    if dry_run:
+        return summary
+
+    cur = db.conn.cursor()
+    try:
+        cur.executemany(
+            "UPDATE faces SET cluster_id = ? WHERE id = ?",
+            [(a["new_cluster_id"], a["face_id"]) for a in assignments],
+        )
+        # If the original cluster_id was in ignored_clusters, drop it —
+        # the ignore flag no longer maps to any face.
+        cur.execute("DELETE FROM ignored_clusters WHERE cluster_id = ?", (cluster_id,))
+        db.conn.commit()
+    except Exception:
+        db.conn.rollback()
+        raise
+
+    return summary
+
+
 def match_faces_to_persons(
     db,
     tolerance: float = MATCH_TOLERANCE,

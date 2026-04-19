@@ -316,6 +316,54 @@
       cursor: default;
     }
 
+    /* Regenerate-suggestions form popover */
+    .regen-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      margin-bottom: 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px 18px;
+      align-items: end;
+    }
+    .regen-card .field { display: flex; flex-direction: column; gap: 4px; }
+    .regen-card label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+    }
+    .regen-card input {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      width: 100%;
+    }
+    .regen-card .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .regen-card .actions {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+    }
+    .regen-card .hint {
+      grid-column: 1 / -1;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
     /* Photo preview popover — click a face crop to see the full photo with
        the bbox highlighted, so tight bboxes don't hide context */
     .preview-overlay {
@@ -787,6 +835,16 @@
       // the larger bucket). Suggestions naming an emptied cluster as SOURCE
       // are stale — the source has no faces left to move.
       const [acceptedMerges, setAcceptedMerges] = useState(() => new Map());
+      // Regenerate form state — opens a param card in the toolbar area when
+      // active; POSTs /api/faces/suggestions/regenerate which writes fresh
+      // JSON to /data/suggestions.json, then triggers a reload().
+      const [regenOpen, setRegenOpen] = useState(false);
+      const [regenWorking, setRegenWorking] = useState(false);
+      const [regenCentroid, setRegenCentroid] = useState('0.95');
+      const [regenMinPair, setRegenMinPair] = useState('0.55');
+      const [regenMaxMembers, setRegenMaxMembers] = useState('60');
+      const [regenMinGroupSize, setRegenMinGroupSize] = useState('1');
+      const [regenIncludeIgnored, setRegenIncludeIgnored] = useState(false);
 
       const reload = useCallback(() => {
         setLoading(true);
@@ -801,6 +859,57 @@
       }, []);
 
       useEffect(() => { reload(); }, [reload]);
+
+      // When we load an existing suggestions file, seed the regen form with
+      // the same parameters it was generated with — so the user can tweak
+      // from their prior baseline instead of re-entering defaults.
+      useEffect(() => {
+        if (!payload) return;
+        if (typeof payload.centroid_cutoff === 'number')
+          setRegenCentroid(String(payload.centroid_cutoff));
+        if (typeof payload.min_pair_cutoff === 'number')
+          setRegenMinPair(String(payload.min_pair_cutoff));
+        if (typeof payload.max_members === 'number')
+          setRegenMaxMembers(String(payload.max_members));
+        if (typeof payload.min_group_size === 'number')
+          setRegenMinGroupSize(String(payload.min_group_size));
+      }, [payload]);
+
+      const regenerate = useCallback(() => {
+        setApiError('');
+        setRegenWorking(true);
+        fetch(API + '/api/faces/suggestions/regenerate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            centroid_cutoff: parseFloat(regenCentroid),
+            min_pair_cutoff: parseFloat(regenMinPair),
+            max_members: parseInt(regenMaxMembers, 10),
+            min_group_size: parseInt(regenMinGroupSize, 10),
+            include_ignored: regenIncludeIgnored,
+          }),
+        })
+          .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+          .then(({ ok, data }) => {
+            setRegenWorking(false);
+            if (!ok) {
+              setApiError(data && data.detail ? data.detail : 'Regenerate failed');
+              return;
+            }
+            setRegenOpen(false);
+            // Merge-dismissal state is keyed by rep_face_ids (stable), so it
+            // survives regeneration. actedOn + acceptedMerges are per-session
+            // and should reset — the JSON contents are different now.
+            setActedOn({});
+            setAcceptedMerges(new Map());
+            reload();
+          })
+          .catch(err => {
+            setRegenWorking(false);
+            setApiError(err.message || String(err));
+          });
+      }, [regenCentroid, regenMinPair, regenMaxMembers, regenMinGroupSize,
+          regenIncludeIgnored, reload]);
 
       const rawSuggestions = (payload && payload.suggestions) || [];
 
@@ -1098,9 +1207,78 @@
                 e('option', { value: 'faces_desc' }, 'combined face count'),
               ),
               e('button', { className: 'btn small', onClick: reload }, 'Reload'),
+              e('button', {
+                className: 'btn small' + (regenOpen ? ' btn-primary' : ''),
+                onClick: () => setRegenOpen(v => !v),
+                title: 'Re-run the suggestion engine against the current DB (uses ~20s on an N100 for ~2000 groups)',
+              }, regenOpen ? 'Cancel regenerate' : 'Regenerate\u2026'),
               counts.dismissed > 0 && e('button', {
                 className: 'btn small', onClick: clearDismissals,
               }, 'Clear dismissals'),
+            ),
+
+            regenOpen && e('div', { className: 'regen-card' },
+              e('div', { className: 'field' },
+                e('label', null, 'centroid cutoff'),
+                e('input', {
+                  type: 'number', step: '0.01', min: 0.1, max: 2.0,
+                  value: regenCentroid,
+                  onChange: (ev) => setRegenCentroid(ev.target.value),
+                  disabled: regenWorking,
+                }),
+              ),
+              e('div', { className: 'field' },
+                e('label', null, 'min-pair cutoff'),
+                e('input', {
+                  type: 'number', step: '0.01', min: 0.1, max: 2.0,
+                  value: regenMinPair,
+                  onChange: (ev) => setRegenMinPair(ev.target.value),
+                  disabled: regenWorking,
+                }),
+              ),
+              e('div', { className: 'field' },
+                e('label', null, 'max members/group'),
+                e('input', {
+                  type: 'number', step: '1', min: 2, max: 500,
+                  value: regenMaxMembers,
+                  onChange: (ev) => setRegenMaxMembers(ev.target.value),
+                  disabled: regenWorking,
+                }),
+              ),
+              e('div', { className: 'field' },
+                e('label', null, 'min group size'),
+                e('input', {
+                  type: 'number', step: '1', min: 1, max: 100,
+                  value: regenMinGroupSize,
+                  onChange: (ev) => setRegenMinGroupSize(ev.target.value),
+                  disabled: regenWorking,
+                }),
+              ),
+              e('div', { className: 'hint' },
+                'Blocks ~15–30s on an N100 while groups load and pairs score. ',
+                'Prior tuning: min-pair < 0.50 was near-perfect TPs; ≥ 0.55 was the FP band.',
+              ),
+              e('div', { className: 'actions' },
+                e('div', { className: 'checkbox' },
+                  e('input', {
+                    type: 'checkbox',
+                    checked: regenIncludeIgnored,
+                    onChange: (ev) => setRegenIncludeIgnored(ev.target.checked),
+                    disabled: regenWorking,
+                  }),
+                  'include ignored clusters',
+                ),
+                e('button', {
+                  className: 'btn small',
+                  onClick: () => setRegenOpen(false),
+                  disabled: regenWorking,
+                }, 'Cancel'),
+                e('button', {
+                  className: 'btn btn-primary small',
+                  onClick: regenerate,
+                  disabled: regenWorking,
+                }, regenWorking ? 'Running\u2026' : 'Regenerate'),
+              ),
             ),
             e('div', { className: 'shortcuts-hint', style: { marginBottom: 14 } },
               e('span', { className: 'kbd' }, 'J'), '/', e('span', { className: 'kbd' }, '↓'), ' next ',

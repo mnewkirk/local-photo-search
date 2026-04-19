@@ -72,11 +72,20 @@
       margin-bottom: 20px;
     }
 
+    .sticky-tools {
+      position: sticky;
+      /* Sits under the header (16+16 padding + 42 min-height ≈ 74px). */
+      top: 74px;
+      z-index: 90;
+      background: var(--bg);
+      padding: 12px 0;
+      margin: 0 -4px 20px -4px;
+      border-bottom: 1px solid var(--border);
+    }
     .toolbar {
       display: flex;
       align-items: center;
       gap: 12px;
-      margin-bottom: 20px;
       flex-wrap: wrap;
     }
     .toolbar button {
@@ -90,6 +99,29 @@
     }
     .toolbar button:hover { border-color: var(--accent); }
     .toolbar button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .kbd {
+      display: inline-block;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 11px;
+      padding: 1px 5px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 3px;
+      color: var(--text-muted);
+    }
+    .shortcuts-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 10px;
+    }
+    .shortcuts-row .kbd { margin: 0 2px; }
+    .shortcuts-row .group { display: flex; align-items: center; gap: 2px; }
 
     /* Face grid */
     .face-grid {
@@ -431,11 +463,10 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      margin-bottom: 16px;
+      margin-top: 10px;
       flex-wrap: wrap;
-      position: sticky;
-      top: 75px; /* below .header (16px pad + 42px min-h + 16px pad + 1px border) */
-      z-index: 90;
+      /* Stickiness comes from the enclosing .sticky-tools so the multi-bar
+         sits below the filter row instead of racing it for top: 74px. */
     }
     .multi-bar .count {
       font-size: 14px;
@@ -594,6 +625,15 @@
       const [nameError, setNameError] = useState('');
       const [merging, setMerging] = useState(false);
       const [mergeTarget, setMergeTarget] = useState('');
+      // Split-cluster state: opened from the detail header on unknown
+      // clusters. Preview runs dry_run=true; Apply runs dry_run=false, then
+      // reloads groups.
+      const [splitting, setSplitting] = useState(false);
+      const [splitEps, setSplitEps] = useState('0.45');
+      const [splitMinSamples, setSplitMinSamples] = useState('2');
+      const [splitPreview, setSplitPreview] = useState(null);
+      const [splitWorking, setSplitWorking] = useState(false);
+      const [splitError, setSplitError] = useState('');
       const editRef = useRef(null);
       const autoOpened = useRef(false);
 
@@ -779,6 +819,73 @@
           loadGroups();
         }).catch(() => setMerging(false));
       }, [mergeTarget, selectedGroup, groupPhotos, loadGroups, filter]);
+
+      const startSplit = useCallback(() => {
+        setSplitting(true);
+        setEditing(false);
+        setMerging(false);
+        setSplitPreview(null);
+        setSplitError('');
+      }, []);
+
+      const cancelSplit = useCallback(() => {
+        setSplitting(false);
+        setSplitPreview(null);
+        setSplitError('');
+      }, []);
+
+      // Shared body for dry-run preview + apply — one call, the caller
+      // chooses dry_run.
+      const postSplit = useCallback((dryRun) => {
+        if (!selectedGroup || selectedGroup.type !== 'cluster') return null;
+        const eps = parseFloat(splitEps);
+        const minSamples = parseInt(splitMinSamples, 10);
+        if (!isFinite(eps) || eps <= 0) {
+          setSplitError('eps must be a positive number (typical 0.35–0.55)');
+          return null;
+        }
+        if (!isFinite(minSamples) || minSamples < 1) {
+          setSplitError('min_samples must be ≥ 1');
+          return null;
+        }
+        setSplitError('');
+        setSplitWorking(true);
+        return fetch(API + '/api/faces/clusters/' + selectedGroup.cluster_id + '/split', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ eps, min_samples: minSamples, dry_run: dryRun }),
+        })
+          .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+          .then(({ ok, data }) => {
+            setSplitWorking(false);
+            if (!ok) {
+              setSplitError(data && data.detail ? data.detail : 'Split failed');
+              return null;
+            }
+            return data;
+          })
+          .catch(err => {
+            setSplitWorking(false);
+            setSplitError(err.message || String(err));
+            return null;
+          });
+      }, [selectedGroup, splitEps, splitMinSamples]);
+
+      const runSplitPreview = useCallback(() => {
+        const p = postSplit(true);
+        if (p) p.then(data => { if (data) setSplitPreview(data); });
+      }, [postSplit]);
+
+      const applySplit = useCallback(() => {
+        const p = postSplit(false);
+        if (p) p.then(data => {
+          if (!data) return;
+          setSplitting(false);
+          setSplitPreview(null);
+          closeDetail();
+          loadGroups();
+        });
+      }, [postSplit, closeDetail, loadGroups]);
 
       const saveRename = useCallback(() => {
         const name = editName.trim();
@@ -1057,34 +1164,52 @@
             namedCount + ' named \u00B7 ' + unknownCount + ' unknown'
             + (ignoredCount > 0 ? ' \u00B7 ' + ignoredCount + ' ignored' : '')),
 
-          // Toolbar
-          e('div', { className: 'toolbar' },
-            e('button', {
-              className: filter === 'all' ? 'active' : '',
-              onClick: () => changeFilter('all'),
-            }, 'All (' + (namedCount + unknownCount) + ')'),
-            e('button', {
-              className: filter === 'named' ? 'active' : '',
-              onClick: () => changeFilter('named'),
-            }, 'Named (' + namedCount + ')'),
-            e('button', {
-              className: filter === 'unknown' ? 'active' : '',
-              onClick: () => changeFilter('unknown'),
-            }, 'Unknown (' + unknownCount + ')'),
-            ignoredCount > 0 && e('button', {
-              className: filter === 'ignored' ? 'active' : '',
-              onClick: () => changeFilter('ignored'),
-            }, 'Ignored (' + ignoredCount + ')'),
-            !multiSelect && e('button', {
-              onClick: () => { setMultiSelect(true); setSelected(new Set()); setMultiAction(null); setMultiError(''); },
-              style: { marginLeft: 'auto' },
-            }, 'Select Multiple'),
-            !multiSelect && e('button', { onClick: handleExport },
-              '\u2B07 Export Assignments'),
-          ),
-
-          // Multi-select action bar
-          multiSelect && e('div', { className: 'multi-bar' },
+          // Sticky toolbar + shortcut cheatsheet — stays visible while scrolling
+          // through the (often thousands) of face cards so the user doesn't
+          // have to jump back up to switch filters or remember hotkeys.
+          e('div', { className: 'sticky-tools' },
+            e('div', { className: 'toolbar' },
+              e('button', {
+                className: filter === 'all' ? 'active' : '',
+                onClick: () => changeFilter('all'),
+              }, 'All (' + (namedCount + unknownCount) + ')'),
+              e('button', {
+                className: filter === 'named' ? 'active' : '',
+                onClick: () => changeFilter('named'),
+              }, 'Named (' + namedCount + ')'),
+              e('button', {
+                className: filter === 'unknown' ? 'active' : '',
+                onClick: () => changeFilter('unknown'),
+              }, 'Unknown (' + unknownCount + ')'),
+              ignoredCount > 0 && e('button', {
+                className: filter === 'ignored' ? 'active' : '',
+                onClick: () => changeFilter('ignored'),
+              }, 'Ignored (' + ignoredCount + ')'),
+              !multiSelect && e('button', {
+                onClick: () => { setMultiSelect(true); setSelected(new Set()); setMultiAction(null); setMultiError(''); },
+                style: { marginLeft: 'auto' },
+              }, 'Select Multiple'),
+              !multiSelect && e('button', { onClick: handleExport },
+                '\u2B07 Export Assignments'),
+            ),
+            e('div', { className: 'shortcuts-row' },
+              !multiSelect && e('span', { className: 'group' },
+                e('span', { className: 'kbd' }, 'M'), ' multi-select'),
+              multiSelect && e('span', { className: 'group' },
+                e('span', { className: 'kbd' }, 'Click'), ' toggle'),
+              multiSelect && e('span', { className: 'group' },
+                e('span', { className: 'kbd' }, 'Shift'), '+', e('span', { className: 'kbd' }, 'Click'), ' range'),
+              e('span', { className: 'group' },
+                e('span', { className: 'kbd' }, 'Esc'), multiSelect ? ' exit multi-select' : ' close detail'),
+              e('span', { className: 'group' },
+                'link to a cluster directly: ',
+                e('code', { style: { fontSize: 11, color: 'var(--accent)' } },
+                  '/faces?cluster_id=N')),
+            ),
+            // Multi-select action bar — stays sticky with the toolbar so the
+            // user doesn't lose the action buttons when scrolling through a
+            // long selection.
+            multiSelect && e('div', { className: 'multi-bar' },
             e('span', { className: 'count' }, selected.size + ' selected'),
 
             // No sub-action active — show the action buttons
@@ -1158,8 +1283,12 @@
 
             // Cancel always visible
             e('button', { onClick: exitMultiSelect, style: { marginLeft: 'auto' } }, 'Cancel'),
+            ),
+            multiSelect && multiError && e('div', {
+              className: 'name-error',
+              style: { marginTop: 8 },
+            }, multiError),
           ),
-          multiSelect && multiError && e('div', { className: 'name-error', style: { marginBottom: 12, marginTop: -8 } }, multiError),
 
           loading && e('div', { className: 'loading' },
             'Loading faces\u2026 sorting by similarity',
@@ -1283,10 +1412,15 @@
                 !editing && !merging && e('div', { className: 'detail-stats' },
                   groupPhotos.length + ' photo' + (groupPhotos.length !== 1 ? 's' : '')),
               ),
-              !editing && !merging && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+              !editing && !merging && !splitting && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
                 e('button', { className: 'rename-btn', onClick: startRename },
                   selectedGroup.label.startsWith('Unknown') ? 'Set Name' : 'Rename'),
                 mergeTargets.length > 0 && e('button', { className: 'rename-btn', onClick: startMerge }, 'Merge'),
+                selectedGroup.type === 'cluster' && e('button', {
+                  className: 'rename-btn',
+                  onClick: startSplit,
+                  title: 'Re-run DBSCAN with tighter eps on just this cluster to split lumped-together people into sub-clusters',
+                }, 'Split'),
                 selectedGroup.type === 'cluster' && !selectedGroup.ignored && e('button', {
                   className: 'rename-btn',
                   style: { color: 'var(--text-muted)' },
@@ -1297,7 +1431,73 @@
                   onClick: () => { doUnignore([selectedGroup.cluster_id]); closeDetail(); },
                 }, 'Unignore'),
               ),
+              // Split form — shown in the header when user clicks "Split".
+              splitting && e('div', {
+                style: {
+                  display: 'flex', gap: 10, alignItems: 'center',
+                  flexWrap: 'wrap', flex: 1,
+                },
+              },
+                e('span', { style: { fontSize: 13, fontWeight: 600 } }, 'Split into sub-clusters:'),
+                e('label', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'eps'),
+                e('input', {
+                  type: 'number', step: '0.01', min: 0.1, max: 1.0,
+                  value: splitEps,
+                  onChange: (ev) => setSplitEps(ev.target.value),
+                  style: { width: 70, padding: '4px 8px', background: 'var(--surface2)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4 },
+                  disabled: splitWorking,
+                }),
+                e('label', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'min_samples'),
+                e('input', {
+                  type: 'number', step: '1', min: 1,
+                  value: splitMinSamples,
+                  onChange: (ev) => setSplitMinSamples(ev.target.value),
+                  style: { width: 50, padding: '4px 8px', background: 'var(--surface2)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4 },
+                  disabled: splitWorking,
+                }),
+                e('button', { className: 'rename-btn', onClick: runSplitPreview, disabled: splitWorking },
+                  splitWorking && !splitPreview ? 'Previewing\u2026' : 'Preview'),
+                splitPreview && e('button', {
+                  className: 'rename-btn',
+                  style: { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' },
+                  onClick: applySplit,
+                  disabled: splitWorking || splitPreview.sub_cluster_count === 0,
+                }, splitWorking ? 'Applying\u2026' : ('Apply → ' + splitPreview.sub_cluster_count + ' new cluster' + (splitPreview.sub_cluster_count !== 1 ? 's' : ''))),
+                e('button', { className: 'rename-btn', onClick: cancelSplit, disabled: splitWorking }, 'Cancel'),
+              ),
               e('button', { className: 'detail-close', onClick: closeDetail }, '\u00D7'),
+            ),
+            splitting && (splitError || splitPreview) && e('div', {
+              style: { padding: '12px 24px', borderBottom: '1px solid var(--border)' },
+            },
+              splitError && e('div', { style: { color: '#f87171', fontSize: 13 } }, splitError),
+              splitPreview && e('div', { style: { fontSize: 13 } },
+                e('div', { style: { marginBottom: 6 } },
+                  e('strong', null, splitPreview.face_count),
+                  ' faces would become ',
+                  e('strong', null, splitPreview.sub_cluster_count),
+                  ' sub-cluster' + (splitPreview.sub_cluster_count !== 1 ? 's' : ''),
+                  ' (',
+                  splitPreview.noise_count,
+                  ' noise / unassigned)',
+                ),
+                splitPreview.histogram && Object.keys(splitPreview.histogram).length > 0 && e('div', {
+                  style: { display: 'flex', flexWrap: 'wrap', gap: 6, color: 'var(--text-muted)' },
+                },
+                  ...Object.entries(splitPreview.histogram)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([cid, n]) => e('span', {
+                      key: cid,
+                      style: {
+                        padding: '2px 8px',
+                        background: 'var(--surface2)',
+                        border: '1px solid var(--border)',
+                        borderRadius: 4,
+                        fontSize: 12,
+                      },
+                    }, '#' + cid + ': ' + n)),
+                ),
+              ),
             ),
             loadingPhotos && e('div', { className: 'loading' }, 'Loading photos...'),
             !loadingPhotos && e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 0' } },

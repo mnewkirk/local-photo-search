@@ -647,6 +647,71 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 
 
 # ---------------------------------------------------------------------------
+# split-cluster
+# ---------------------------------------------------------------------------
+
+@cli.command("split-cluster")
+@click.argument("cluster_id", type=int)
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--eps", default=None, type=float,
+              help="DBSCAN eps (L2 radius). Tighter than the global recluster "
+                   "eps=0.55. Default: 0.45.")
+@click.option("--min-samples", default=None, type=int,
+              help="DBSCAN min_samples. Default: 2 (pairs count, since we're "
+                   "splitting within a single already-linked group).")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Preview the split without writing to the DB.")
+def split_cluster_cmd(cluster_id, db, eps, min_samples, dry_run):
+    """Re-run DBSCAN on one unknown cluster with tighter params.
+
+    Use this on "attractor" clusters that lumped multiple people together
+    during the global recluster-faces pass — e.g. a 100+-face cluster
+    spanning years. New sub-clusters get freshly-minted cluster_ids past
+    the current max; noise faces drop back to cluster_id=NULL.
+
+    \b
+    Example:
+      photosearch split-cluster 15 --dry-run         # preview
+      photosearch split-cluster 15 --eps 0.40        # tighter
+      photosearch split-cluster 15                    # apply at 0.45
+    """
+    from photosearch.faces import (
+        split_cluster, SPLIT_DEFAULT_EPS, SPLIT_DEFAULT_MIN_SAMPLES,
+    )
+
+    eff_eps = eps if eps is not None else SPLIT_DEFAULT_EPS
+    eff_min = min_samples if min_samples is not None else SPLIT_DEFAULT_MIN_SAMPLES
+
+    with PhotoDB(db) as photo_db:
+        click.echo(
+            f"Splitting cluster #{cluster_id} "
+            f"(eps={eff_eps}, min_samples={eff_min}, dry_run={dry_run})..."
+        )
+        try:
+            summary = split_cluster(
+                photo_db, cluster_id=cluster_id,
+                eps=eff_eps, min_samples=eff_min, dry_run=dry_run,
+            )
+        except ValueError as err:
+            raise click.ClickException(str(err))
+
+        click.echo(f"  Faces in cluster:   {summary['face_count']}")
+        click.echo(f"  Sub-clusters formed: {summary['sub_cluster_count']}")
+        click.echo(f"  Noise (→ NULL):      {summary['noise_count']}")
+        if summary["histogram"]:
+            sizes = sorted(summary["histogram"].items())
+            click.echo("  New cluster sizes:")
+            for cid, n in sizes:
+                click.echo(f"    #{cid}: {n} faces")
+
+        if dry_run:
+            click.echo("\nDry run — no changes written. Re-run without --dry-run to apply.")
+        else:
+            click.echo("\nDone. Re-run `suggest-face-merges` to get fresh suggestions.")
+
+
+# ---------------------------------------------------------------------------
 # suggest-face-merges
 # ---------------------------------------------------------------------------
 
