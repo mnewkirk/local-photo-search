@@ -22,7 +22,7 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 12. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 15. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, schema_info.
 

@@ -59,7 +59,10 @@ local-photo-search/
 │   ├── index.py            # index_directory() + _index_collection() — indexing pipeline
 │   ├── search.py           # search_combined() + all search types
 │   ├── clip_embed.py       # CLIP text/image embedding (streaming)
-│   ├── faces.py            # InsightFace detection, encoding, matching
+│   ├── faces.py            # InsightFace detection, encoding, matching,
+│   │                       #   recluster + session-stacking, split_cluster
+│   ├── face_merge.py       # M18 — merge-suggestion engine (load_groups,
+│   │                       #   compute_suggestions, score_pair)
 │   ├── quality.py          # Aesthetic scoring + concept analysis (streaming)
 │   ├── describe.py         # LLaVA scene descriptions via Ollama
 │   ├── stacking.py         # Burst/bracket stack detection (union-find)
@@ -75,17 +78,19 @@ local-photo-search/
 │   └── cull.py             # Shoot review / culling logic
 └── frontend/dist/          # Static HTML/JS served by FastAPI
     ├── index.html          # Main search UI
-    ├── faces.html          # Face browser
+    ├── faces.html          # Face browser + Split cluster inline form
+    ├── merges.html         # M18 — merge-suggestion review page
     ├── collections.html    # Collections UI + Google Photos upload modal
     ├── review.html         # Shoot review / culling UI
     ├── status.html         # Indexing status + run commands
-    └── shared.js           # Shared components: PS.SharedHeader, PS.PhotoModal,
-                            #   PS.GooglePhotosButton, PS.formatFocalLength, etc.
+    └── shared.js           # Shared components: PS.SharedHeader (with /merges
+                            #   link), PS.PhotoModal, PS.GooglePhotosButton,
+                            #   PS.formatFocalLength, etc.
 ```
 
 ---
 
-## Database Schema (v12)
+## Database Schema (v15)
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -164,6 +169,15 @@ Operations that can be cancelled mid-way (like uploads) write per-file results t
 DB immediately rather than batching at the end. This ensures partial progress survives
 cancellation.
 
+### 9. Face IDs are stable, cluster IDs are not
+`faces.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` — never reused, survives every
+`recluster-faces`. `cluster_id` is fully renumbered on each recluster, so anything
+that needs to persist across reclusters (merge dismissals, suggestion-file
+identity) keys on `rep_face_id` pairs, not cluster_ids. `/merges` localStorage
+dismissals and the `resolveTarget()` rewrite logic both exploit this. Same rule
+applies when designing future tables: use `face_id` as the stable anchor if you
+need cross-recluster persistence.
+
 ---
 
 ## API Endpoints (50+)
@@ -178,14 +192,34 @@ cancellation.
 - `GET /api/photos/{id}/preview` — Preview size
 
 ### Faces
-- `GET /api/faces/groups` — All face groupings
+- `GET /api/faces/groups` — All face groupings (paginated, similarity-sorted)
+- `GET /api/faces/group-info?cluster_id=N | person_id=N` — Single group metadata
+  (used by `/faces?cluster_id=N` auto-open; works for hidden singletons + unloaded pages)
 - `GET /api/faces/group/{type}/{id}/photos` — Photos for a person or cluster
-- `GET /api/faces/crop/{face_id}` — Face crop image
+- `GET /api/faces/crop/{face_id}` — Face crop image (disk-cached)
+- `GET /api/faces/face-detail/{face_id}` — Photo id + bbox + dimensions for overlays
 - `POST /api/faces/{face_id}/assign` — Assign face to person
 - `POST /api/faces/{face_id}/clear` — Clear assignment
 - `POST /api/faces/bulk-collect` — Bulk assign unassigned faces
 - `POST /api/faces/ignore` / `POST /api/faces/unignore` — Ignore/restore clusters
-- `GET /api/persons` — List persons
+- `POST /api/faces/clusters/{id}/split` — Re-run DBSCAN with tighter eps on
+  one cluster (body `{eps, min_samples, dry_run}`)
+- `GET /api/faces/manual-assignments` / `POST /api/faces/import-assignments`
+  — Export/import manual face-to-person assignments
+
+### Merge suggestions (M18)
+- `GET /api/faces/suggestions` — Read cached JSON (via `PHOTOSEARCH_SUGGESTIONS_JSON`
+  or `/data/suggestions.json`), augments each side with up to 4 sample_face_ids,
+  filters rows whose source cluster has been collapsed
+- `POST /api/faces/suggestions/regenerate` — Re-run the engine with params
+  `{centroid_cutoff, min_pair_cutoff, max_members, min_group_size,
+  include_ignored}` and overwrite the cached JSON
+- `POST /api/faces/merges` — Apply a merge, body `{source: {type:"cluster",id},
+  target: {type:"cluster"|"person",id}}`. Returns `{moved_face_count}`. Stamps
+  `faces.match_source='merge_review'`.
+
+### Persons
+- `GET /api/persons` — List persons with photo counts
 
 ### Collections
 - `GET /api/collections` — List all
@@ -272,7 +306,8 @@ Adaptive clustering of CLIP embeddings to select representative photos:
 
 ## Shared Frontend Components (shared.js)
 
-- `PS.SharedHeader` — Consistent nav header across all pages (logo, nav links, active state)
+- `PS.SharedHeader` — Consistent nav header across all pages. activePage values:
+  `'search' | 'review' | 'faces' | 'merges' | 'collections' | 'status'`.
 - `PS.PhotoModal` — Unified photo detail modal with configurable features:
   showFaces, showCollections, showLocation, showSearchScore, showAesthetics.
   Includes face editing, collection management, stacking UI, keyboard navigation
@@ -280,6 +315,43 @@ Adaptive clustering of CLIP embeddings to select representative photos:
   Slots: fetchDetail, headerChildren, footerChildren.
 - `PS.GooglePhotosButton` — Upload single photo to Google Photos from modal sidebar
 - `PS.formatFocalLength()` / `PS.formatFNumber()` — EXIF display helpers
+
+### /faces URL params (deep-linkable)
+
+- `?name=<Person>` — open named-person detail
+- `?person_id=N` — open person by id (works for hidden/unloaded pages)
+- `?cluster_id=N` — open unknown cluster by id (works for hidden singletons)
+- `?face_id=N` — open the group containing this rep face
+- `?filter=named|unknown|ignored|all` — pre-filter the grid
+
+`cluster_id` / `person_id` fall back to `/api/faces/group-info` when the group
+isn't already in the loaded page, so the suggest-face-merges CLI emits these
+with `--base-url` and they always resolve.
+
+### /merges page architecture
+
+- Reads cached suggestions from `/api/faces/suggestions` (not computed on page
+  load — the engine takes ~20s)
+- Per-card face strip of up to 4 crops (via `sample_face_ids` that the API
+  augments onto the JSON — no per-card fetch)
+- Click any crop → `/api/faces/face-detail/{face_id}` → photo-preview overlay
+  with the bbox highlighted on the full photo
+- Confidence tier (Strong/Probable/Borderline) calibrated from the observed
+  FP pattern: `min_pair < 0.50` strong, `< 0.55` probable, `≥ 0.55` borderline
+- Risk badges: "attractor risk" (big target cluster), "long overlap"
+  (cluster↔cluster spanning >180 days), "edge score" (min_pair ≥ 0.55),
+  "rewritten after merge" (see below)
+- Keyboard: `J/↓` next, `K/↑` prev, `A/Enter` accept, `D` dismiss, `Esc` blur.
+  Accept does NOT advance focus — the accepted card is filtered out, so the
+  next row slides into the same slot naturally
+- **Merge chain rewriting**: when you accept `A → B`, any pending `C → A`
+  becomes `C → B` (using stored target info from the accepted merge). The
+  original min_pair is still a valid lower bound because the faces that
+  matched C are now in B. `resolveTarget()` handles chains (`A → B`, then
+  `B → Person`) with cycle protection. Source-emptied suggestions
+  (`A → X` where A was merged away) are tagged stale, not rewritten.
+- Dismissals persist in `localStorage` keyed by the sorted rep_face_id pair
+  (stable across reclusters). Accepts persist in the DB.
 
 ---
 
@@ -527,7 +599,7 @@ export-face-assignments / import-face-assignments
 
 ### Unknown-face clustering & merge suggestions (M18)
 
-Two cooperating tools improve unknown-face grouping:
+Four cooperating tools improve unknown-face grouping:
 
 1. **Session stacking** in `recluster-faces` — after global DBSCAN, a second
    pass runs union-find over the noise points: pairs whose L2 distance is
@@ -537,32 +609,51 @@ Two cooperating tools improve unknown-face grouping:
    same-person-same-event groups that `min_samples=3` had thrown away.
    Pass `--no-session-stacking` to restore DBSCAN-only behavior.
 
-2. **`suggest-face-merges`** — read-only command that finds likely merges
+2. **`suggest-face-merges`** — read-only CLI that finds likely merges
    between any two face groups (cluster↔cluster and cluster↔named). For
    each candidate pair it computes `centroid_dist` (between the two groups'
    normalized mean encodings) and `min_pair_dist` (min across all
    member-to-member pairs). Suggests when both are under their cutoffs.
    `--verify-pair` takes known TP (`=`) and FP (`!=`) examples and prints
    whether each would be caught — use it to tune thresholds against the
-   real library.
+   real library. `--base-url` emits clickable links next to each suggestion.
+
+3. **`/merges` review page** (see the "/merges page architecture" section
+   above) — renders the JSON output from suggest-face-merges and lets the
+   user accept/dismiss with keyboard shortcuts. Can regenerate the JSON
+   directly from the UI via `POST /api/faces/suggestions/regenerate`.
+
+4. **`split-cluster`** (CLI + API + /faces button) — re-runs DBSCAN on a
+   single cluster with tighter eps to break apart "attractor" clusters that
+   lumped multiple people together during the eps=0.55 global recluster.
+   New cluster_ids are minted past the current max so they never collide.
+   Dry-run previews show the histogram of resulting sub-cluster sizes.
 
 Implementation: `photosearch/face_merge.py` (`load_groups`,
-`compute_suggestions`, `score_pair`). Per-pair cost is O(K²) where K is
-`--max-members` (default 60, biggest-bbox faces sampled first). named↔named
-pairs are never suggested.
+`compute_suggestions`, `score_pair`) for suggestions;
+`photosearch/faces.py:split_cluster` for splitting. Suggestion per-pair cost
+is O(K²) where K is `--max-members` (default 60, biggest-bbox faces sampled
+first). named↔named pairs are never suggested.
 
-### Merge review page (`/merges`)
+### Merge review page (`/merges`) — summary
 
-After running `suggest-face-merges --json-out /data/suggestions.json`, the
-`/merges` page (Phase B.0) renders each suggestion side-by-side with face
-crops, labels, face counts, and the three scores. Actions:
+After generating suggestions (CLI `--json-out /data/suggestions.json` or the
+in-UI Regenerate button), the `/merges` page renders each suggestion
+side-by-side with face crops, labels, face counts, and scores. Full
+architecture is documented in the "Shared Frontend Components" section
+above. Key actions:
 
 - **Accept** → `POST /api/faces/merges` with `{source, target}`. For
   cluster→person: updates `faces.person_id`, clears `cluster_id`, stamps
   `match_source='merge_review'`. For cluster→cluster: updates
-  `faces.cluster_id` only.
-- **Dismiss** → localStorage-only (keyed by the two `rep_face_id`s, which
-  are stable across reclusters). Persistent rejection table is future work.
+  `faces.cluster_id` only. Chain-rewrites downstream suggestions so
+  `C → A` becomes `C → B` when `A → B` was just accepted.
+- **Dismiss** → localStorage-only (keyed by the sorted `rep_face_id` pair,
+  which is stable across reclusters). Persistent rejection table is
+  future work.
+- **Regenerate** → `POST /api/faces/suggestions/regenerate` with
+  cutoff params; blocks ~15–30s on an N100 while the engine reloads groups
+  and rescores.
 - Each card links to `/faces?cluster_id=N` / `?person_id=N` for deep
   verification before accepting.
 
@@ -867,3 +958,16 @@ def my_command(db):
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies
    the migration runs correctly
+
+### New frontend page
+1. Create `frontend/dist/<page>.html` using the pattern from existing pages
+   (plain React UMD, `React.createElement`, no build step)
+2. Include `<script src="/shared.js"></script>` and use `PS.SharedHeader`
+   with a new `activePage` id
+3. Add a route in `photosearch/web.py` near the other `@app.get("/<page>")`
+   block that serves the HTML with `Cache-Control: no-cache`
+4. Add the page's nav id to `PS.SharedHeader`'s `navLinks` in `shared.js`
+   so the link appears on every page
+5. Styles live inline in each `<page>.html`; if you're reproducing a pattern
+   from merges.html / faces.html (sticky toolbar, kbd hints, face-strip,
+   etc.), copy the CSS rather than inventing
