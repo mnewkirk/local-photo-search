@@ -1289,15 +1289,22 @@
     if (!items || !items.length) return items;
     var sorted = items.slice();  // shallow copy
 
+    // Photos from old imports without EXIF have date_taken === null but
+    // their parent folder is named YYYY-MM-DD, so the backend includes an
+    // `effective_date` that falls back to the folder date. Prefer it when
+    // present; fall back to raw date_taken for endpoints that don't set it
+    // yet (search results, review, collections).
+    var dateKey = function (p) { return p.effective_date || p.date_taken || ''; };
+
     switch (sortKey) {
       case 'date_desc':
         sorted.sort(function (a, b) {
-          return (b.date_taken || '').localeCompare(a.date_taken || '');
+          return dateKey(b).localeCompare(dateKey(a));
         });
         break;
       case 'date_asc':
         sorted.sort(function (a, b) {
-          return (a.date_taken || '').localeCompare(b.date_taken || '');
+          return dateKey(a).localeCompare(dateKey(b));
         });
         break;
       case 'quality_desc':

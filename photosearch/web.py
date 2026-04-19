@@ -767,30 +767,56 @@ def api_face_group_info(
 
 
 @app.get("/api/faces/group/{group_type}/{group_id}/photos")
-def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(200)):
-    """Get all photos for a specific face group (person or cluster)."""
+def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(10000)):
+    """Get all photos for a specific face group (person or cluster).
+
+    Returns up to `limit` photos ordered by date_taken DESC with NULL dates
+    last. The frontend applies the user's chosen sort (date_desc / date_asc /
+    quality_desc) client-side via `PS.applySortOrder`, so this endpoint's job
+    is just to deliver the complete set — not a date-truncated slice that
+    would silently hide old or undated photos from the client sort.
+
+    Default limit is intentionally generous (10k) because a single person
+    with >10k indexed photos is rare; if that ceiling is ever hit, the real
+    fix is offset-based pagination with a matching UI, not just bumping the
+    cap. Callers can still pass `?limit=N` to override.
+
+    Each photo includes an `effective_date` field — `date_taken` when
+    present, otherwise the date parsed from the parent folder name via
+    `folder_date(filepath)`. The frontend's `PS.applySortOrder` uses
+    `effective_date` so "oldest first" / "newest first" behave correctly
+    for older imports whose EXIF never had a capture timestamp.
+    """
+    # Same expression is used for selection + sort so the chronology the
+    # client sees matches the chronology we sorted on.
+    effective_expr = "COALESCE(p.date_taken, folder_date(p.filepath))"
+    order_clause = (
+        f"ORDER BY {effective_expr} IS NULL, {effective_expr} DESC"
+    )
     with _get_db() as db:
         if group_type == "person":
             rows = db.conn.execute(
-                """SELECT DISTINCT p.*, f.id as face_id,
+                f"""SELECT DISTINCT p.*, f.id as face_id,
                           f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                          f.match_source
+                          f.match_source,
+                          {effective_expr} AS effective_date
                    FROM photos p
                    JOIN faces f ON f.photo_id = p.id
                    WHERE f.person_id = ?
-                   ORDER BY p.date_taken
+                   {order_clause}
                    LIMIT ?""",
                 (group_id, limit),
             ).fetchall()
         elif group_type == "cluster":
             rows = db.conn.execute(
-                """SELECT DISTINCT p.*, f.id as face_id,
+                f"""SELECT DISTINCT p.*, f.id as face_id,
                           f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                          f.match_source
+                          f.match_source,
+                          {effective_expr} AS effective_date
                    FROM photos p
                    JOIN faces f ON f.photo_id = p.id
                    WHERE f.cluster_id = ? AND f.person_id IS NULL
-                   ORDER BY p.date_taken
+                   {order_clause}
                    LIMIT ?""",
                 (group_id, limit),
             ).fetchall()

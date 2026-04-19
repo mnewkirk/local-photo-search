@@ -186,6 +186,14 @@ need cross-recluster persistence.
 - `GET /api/search` — Combined search (CLIP semantic, color, face, place, date, filename)
   - Params: q, person, color, place, limit, min_score, min_quality, sort_quality,
     tag_match, date_from, date_to, location, match_source
+  - **Name extraction from `q`** — `search.py:_extract_persons_from_query`
+    pulls registered person names out of the free-text query and turns
+    them into AND-intersected person filters via the same `result_sets`
+    logic that handles `person=`. `?q=Calvin and Ellie` matches photos
+    with both people; connector tokens (`and`, `with`, `&`, `,`) are
+    stripped, the residual goes to CLIP. Matching is case-insensitive,
+    word-bounded, longest-first ("Matt Newkirk" beats "Matt"). Lookbehind
+    `(?<!-)` keeps `-Calvin` as a CLIP exclusion rather than a filter.
 - `GET /api/photos/{id}` — Photo detail
 - `GET /api/photos/{id}/thumbnail` — Cached thumbnail
 - `GET /api/photos/{id}/full` — Full resolution
@@ -238,6 +246,16 @@ need cross-recluster persistence.
 - `POST /api/photos/{id}/unstack` — Remove from stack
 - `POST /api/stacks/{id}/add` — Add to stack
 - `GET /api/photos/{id}/nearby-stacks` — Find nearby stacks
+- `POST /api/stacks/detect` — Run detection synchronously. Body
+  `{time_window_sec?, clip_threshold?, max_stack_span_sec?, clear?, dry_run?}`
+  (all optional, defaults match the CLI: 5.0 / 0.05 / 10.0). Returns
+  `{stacks_created, photos_stacked, cleared, dry_run, duration_seconds, params}`.
+- `POST /api/stacks/detect/stream` — SSE variant used by the status-page
+  Stacking form. Same body; streams `start` / `progress` / `done` /
+  `cancelled` / `fatal` events. Client disconnect flips a `threading.Event`
+  that `stacking.py` checks inside its hot loops (≤1s abort latency on 500k
+  libraries). Progress events carry `phase` ∈ `{scan, load_embeddings,
+  pairs, group, save, cleared}` plus phase-specific counters.
 
 ### Review (Culling)
 - `GET /api/review/folders` — Available folders (returns `{path, max_date}` objects, sorted by most recent photo first)
@@ -256,7 +274,14 @@ need cross-recluster persistence.
 - `POST /api/google/upload` — Upload with SSE streaming progress
 
 ### Utility
-- `GET /api/stats` — Database statistics for status page
+- `GET /api/stats` — Database statistics for status page. Response includes
+  `photos`, `clip_embedded`, `faces`, `persons`, `described`, `quality_scored`
+  (+ `quality_stats`), `concepts_analyzed`, `tagged`, `stacks`, `stacked_photos`,
+  `verify_passed`/`verify_failed`/`verify_regenerated`.
+- `GET /api/stats/activity` — Hourly index activity, 3-day window
+- `GET /api/stats/errors` — Recent indexing errors
+- `GET /api/worker/status` — (see Worker System below) polled by the status
+  page Workers panel every 5s for per-pass queue depth + active claims
 
 ---
 
@@ -287,10 +312,28 @@ Always use the API ID stored in the database.
 ## Stacking System
 
 Burst/bracket detection using union-find over time-sorted photos:
-- Two photos linked if taken within 3 seconds AND CLIP L2 distance < 0.15
-- Span enforcement: max 10 seconds from earliest to latest member
+- Two photos linked if taken within `time_window_sec` (default 5.0) AND
+  CLIP cosine distance < `clip_threshold` (default 0.05)
+- Span enforcement: max `max_stack_span_sec` (default 10.0) from earliest
+  to latest member
 - Top photo selected by highest aesthetic score
 - Full CRUD API for manual stack management
+
+Three invocation paths:
+1. **CLI** — `photosearch stack` (see command table below)
+2. **Blocking API** — `POST /api/stacks/detect`
+3. **SSE API** — `POST /api/stacks/detect/stream` (used by the status-page
+   Stacking form). Streams `progress` events with `phase` labels
+   (`scan`, `load_embeddings`, `pairs`, `group`, `save`) throttled to
+   ~0.25s, terminates with `done` / `cancelled` / `fatal`.
+
+`stacking.py:run_stacking`, `detect_stacks`, `save_stacks`, and
+`_load_embeddings_bulk` all accept `on_progress: Callable[[dict], None]`
+and `should_abort: Callable[[], bool]`. Abort is checked at phase
+transitions and every ~1000 photos inside the pairs loop, so a `cancel_event`
+set by `request.is_disconnected()` stops the run within ~1s even on a
+500k-photo library. The pair of hooks is the reference shape for adding
+SSE progress + cancel to other long-running jobs.
 
 ---
 
@@ -315,6 +358,40 @@ Adaptive clustering of CLIP embeddings to select representative photos:
   Slots: fetchDetail, headerChildren, footerChildren.
 - `PS.GooglePhotosButton` — Upload single photo to Google Photos from modal sidebar
 - `PS.formatFocalLength()` / `PS.formatFNumber()` — EXIF display helpers
+
+### /status page
+
+The status page is both a dashboard and a control panel:
+
+- **Stat grid** — one card per pass (CLIP, faces, descriptions, quality,
+  concepts, **tags**, stacks, verify). Each card reads its count from
+  `/api/stats`; the Tags card uses the `tagged` field
+  (`COUNT(*) WHERE tags IS NOT NULL AND tags != '[]'`).
+- **Workers panel** — fetched from `/api/worker/status` on mount and every
+  5s after. Renders total active workers, total queued photos across all
+  passes, a row of per-pass queue-depth pills, and one row per active claim
+  with pass type, worker_id, photo count, and a live TTL (yellow under
+  2 min, red once expired). A separate 1s tick re-renders TTLs between
+  poll cycles. Main `/api/stats` is only re-fetched on the Refresh
+  button, since its COUNTs are expensive.
+- **Stacking form** — editable `time_window_sec` / `clip_threshold` /
+  `max_stack_span_sec` fields (pre-filled with CLI defaults 5.0 / 0.05 /
+  10.0, with a Reset button), plus "Clear existing stacks first" (with
+  a confirm prompt) and "Dry run" toggles. Submit calls
+  `POST /api/stacks/detect/stream`, reads the SSE via
+  `response.body.getReader()` and `\n\n`-split chunks (EventSource can't
+  POST), renders a phase label + progress bar + pair count + elapsed
+  seconds while running, and swaps in a Cancel button that calls
+  `AbortController.abort()`. On `done`, calls the parent's `load()` so
+  the Stacks stat card refreshes immediately.
+- **Activity chart** — hourly buckets for the last 72h, color-coded by
+  pass type, includes a "cleared (--force)" series.
+- **Verify failures / Errors log** — unchanged from M12 shipping.
+
+The Workers panel + Stacking form establish the pattern for other
+"run this job from the UI" actions: fetch-based SSE, throttled progress
+emission inside `on_progress` callbacks, `should_abort` pair for cancel,
+keepalive every 0.5s on the server side.
 
 ### /faces URL params (deep-linkable)
 
@@ -552,6 +629,21 @@ scoping. `PhotoDB.expand_to_stacks()` expands photo IDs to include stack members
 
 The `stack` CLI command also supports `--collection ID` and `--expand-stacks` to scope
 detection to a specific collection's photos.
+
+**Progress + cancel hooks** — `detect_stacks`, `_load_embeddings_bulk`,
+`save_stacks`, and `run_stacking` all take
+`on_progress: Callable[[dict], None] | None` and
+`should_abort: Callable[[], bool] | None`. Progress events are dicts with
+a `phase` key (`scan` / `load_embeddings` / `pairs` / `group` / `save`)
+plus phase-specific counters (`loaded`/`processed`/`saved` vs `total`,
+`pairs_found`, `stacks_detected`). Emission inside hot loops is throttled
+to `_PROGRESS_INTERVAL = 0.25s`; phase transitions bypass the throttle.
+`should_abort()` is checked every ~1000 iterations and at every phase
+transition; returning `True` causes `InterruptedError` to propagate out.
+The SSE endpoint `/api/stacks/detect/stream` wires these up to an
+`asyncio.Queue` + `threading.Event` — the exact pattern to copy when
+adding cancel + progress to any other long-running job (recluster,
+describe, quality, verify).
 
 ### Face management commands (post-indexing)
 
@@ -920,6 +1012,40 @@ fails for photos removed via Google Photos UI. Use "Re-upload" with specific pho
 
 ---
 
+## Planned milestones (see `docs/plans/`)
+
+Living roadmap entries — each is a design doc the next contributor can
+pick up and implement without re-deriving the shape:
+
+- **`docs/plans/bulk-set-location.md`** — bulk-assign location to photos
+  lacking GPS. Two sources feed the same sink: a manual address-picker
+  modal (forward geocoding via proxied Nominatim) and temporal-neighbor
+  inference (absorbs **M19**). Adds `country` / `admin1` / `admin2` /
+  `locality` columns plus `location_source` / `location_confidence`.
+  Downstream unlocks: map view (Leaflet clusters), radius search
+  (`?location_near=47.6,-122.3&radius_km=5`), region-scoped queries like
+  *"beach near southwest France"* via a hand-curated region→admin1 map.
+- **`docs/plans/google-photos-import.md`** — **M20**. Takeout-based
+  import of ~200K smartphone photos. The Library API read scopes were
+  deprecated for third-party apps on March 31, 2025, so the API path is
+  closed; Takeout is the only route. Incremental per-year export,
+  composite dedup (photoTakenTime + camera model + filename stem + phash),
+  lands in `/photos/YYYY/YYYY-MM-DD_gphotos/` to keep origin visible and
+  rollback trivial. Adds `phash`, `import_source`, `google_photo_id`
+  columns. New CLI `photosearch takeout-import` using a reviewable
+  ndjson plan ledger for resumability. Phone GPS amplifies inferred-
+  geotag recall on camera photos — run after each year's import.
+- **`docs/plans/faces-clustering-and-perf.md`** — remaining face work:
+  persist `det_score` + bbox area (filter low-quality faces pre-cluster),
+  swap DBSCAN for HDBSCAN (varying density), materialize a `face_groups`
+  table, persistent rejection table for `/merges` dismissals.
+
+When picking up any of these, read the plan doc first — it contains the
+shape the schema migrations should take and the UX calls that have
+already been made.
+
+---
+
 ## Adding New Features
 
 ### New CLI command
@@ -949,8 +1075,21 @@ def my_command(db):
 ### New API endpoint
 1. Add route in `web.py` with appropriate method + path
 2. Use `with _get_db() as db:` for database access
-3. For long-running ops, consider SSE pattern (Key Patterns §7)
-4. Add frontend integration in the appropriate HTML file
+3. For long-running ops, consider SSE pattern (Key Patterns §7). Reference
+   implementations:
+   - **Google Photos upload** (`web.py:api_upload_google`) — per-file
+     progress over slow network + per-file ledger writes
+   - **Stacking detect stream** (`web.py:api_detect_stacks_stream`) — pure
+     CPU job with multiple phases. Pass `on_progress` + `should_abort`
+     through to the worker function (see `stacking.py:run_stacking`);
+     throttle emission to ~0.25s; check abort at every phase transition
+     and every ~1000 iterations inside hot loops; raise `InterruptedError`
+     on abort; terminal events `done` / `cancelled` / `fatal`.
+4. Add frontend integration in the appropriate HTML file. For POST+SSE,
+   use `fetch` + `response.body.getReader()` + `\n\n`-split parsing
+   (EventSource can't POST); keep an `AbortController` around so the UI
+   can cancel. See `frontend/dist/status.html:StackingForm` for a
+   minimal template.
 
 ### Schema changes
 1. Bump `SCHEMA_VERSION` in `db.py`

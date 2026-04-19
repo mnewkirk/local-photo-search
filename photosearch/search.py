@@ -945,6 +945,52 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
     return [dict(r) for r in rows]
 
 
+def search_by_all_persons(
+    db: PhotoDB,
+    person_ids: list[int],
+    limit: int = 10,
+    match_source: str | None = None,
+) -> list[dict]:
+    """Find photos containing ALL of the given persons (AND intersection).
+
+    Runs a single SQL intersection with `HAVING COUNT(DISTINCT person_id) = N`
+    instead of calling `search_by_person` per person and intersecting in
+    memory. The per-person path caps each set at `limit` photos ordered by
+    date ASC, so for three-way intersections where one person is recent and
+    the others have thousands of earlier photos the oldest-N windows can
+    have zero overlap and the intersection collapses to empty. SQL-side
+    aggregation avoids that entirely.
+
+    Orders by `date_taken DESC` so the most recent matches surface first —
+    usually what the user wants when searching "everyone together".
+    """
+    if not person_ids:
+        return []
+
+    placeholders = ",".join("?" * len(person_ids))
+    sql = (
+        "SELECT p.* FROM photos p "
+        "JOIN faces f ON f.photo_id = p.id "
+        f"WHERE f.person_id IN ({placeholders})"
+    )
+    params: list = list(person_ids)
+
+    if match_source:
+        sql += " AND f.match_source = ?"
+        params.append(match_source)
+
+    sql += (
+        " GROUP BY p.id"
+        " HAVING COUNT(DISTINCT f.person_id) = ?"
+        " ORDER BY p.date_taken DESC"
+        " LIMIT ?"
+    )
+    params.extend([len(person_ids), limit])
+
+    rows = db.conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def search_by_face_reference(db: PhotoDB, image_path: str, limit: int = 10) -> list[dict]:
     """Find photos containing a face similar to the one in the given reference image.
 
@@ -1090,8 +1136,17 @@ def search_combined(
 
     # Extract registered person names from the query so "Calvin and Ellie"
     # becomes an AND-intersection of Calvin's and Ellie's photos instead of
-    # a CLIP embedding of the literal string. Each matched name is added as
-    # its own result_set — the existing intersection logic below gives AND.
+    # a CLIP embedding of the literal string.
+    #
+    # One match → reuse the existing single-person path.
+    # Two+ matches → run a single SQL intersection via
+    # `search_by_all_persons`. Calling `search_by_person` per name and
+    # intersecting dicts in memory is broken at scale: each per-person call
+    # caps at `limit*3` photos ordered ASC by date, so for a 3+-way search
+    # where one subject is recent and others have years of older photos,
+    # the oldest-N windows may not overlap and the intersection silently
+    # collapses to empty — exactly the symptom where "Calvin and Ellie and
+    # Nicole" returns nothing despite many family photos existing.
     name_matched: list[dict] = []
     if effective_query:
         residual, name_matched = _extract_persons_from_query(db, effective_query)
@@ -1101,11 +1156,17 @@ def search_combined(
                 [p["name"] for p in name_matched],
                 residual,
             )
-            for p in name_matched:
+            if len(name_matched) == 1:
                 results = search_by_person(
-                    db, p["name"], limit=limit * 3, match_source=match_source,
+                    db, name_matched[0]["name"],
+                    limit=limit * 3, match_source=match_source,
                 )
-                result_sets.append({r["id"]: r for r in results})
+            else:
+                results = search_by_all_persons(
+                    db, [p["id"] for p in name_matched],
+                    limit=limit * 3, match_source=match_source,
+                )
+            result_sets.append({r["id"]: r for r in results})
             effective_query = residual if residual else None
 
     if person:

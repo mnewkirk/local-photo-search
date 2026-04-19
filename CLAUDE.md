@@ -119,6 +119,43 @@ $DC photosearch cleanup-orphans [--dry-run]
 - **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops
 - **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`
 
+## Name extraction in search queries
+
+`search.py:_extract_persons_from_query` parses registered person names out of
+the free-text `q=` parameter and turns them into AND-intersected person
+filters. `?q=Calvin and Ellie` matches photos containing both people
+(case-insensitive, word-bounded, longest-first so "Matt Newkirk" wins over
+"Matt"), strips connector tokens ("and", "with", "&", ","), and sends any
+residual to CLIP. `(?<!-)` lookbehind keeps `-Calvin` as a CLIP exclusion.
+Stacks cleanly with dates/locations/explicit `person=` via `search_combined`'s
+existing result-set intersection — no special casing.
+
+## Status page live actions
+
+`/status` now runs jobs and monitors the worker fleet directly, not just as
+copy-paste bash snippets:
+
+- **Workers panel** (above the activity chart) polls `/api/worker/status`
+  every 5s. Shows total active workers + queued photos, per-pass queue pills
+  (clip / faces / quality / describe / tags / verify), and one row per active
+  claim with pass type, worker_id, photo count, live TTL (yellow <2min, red
+  when expired). A 1s tick re-renders TTLs between fetches.
+- **Tags card** — `/api/stats` gained a `tagged` field; the card uses the
+  same progress-bar pattern as CLIP/quality/etc.
+- **Stacking form** — runs `POST /api/stacks/detect/stream` (SSE) with
+  editable `time_window_sec` / `clip_threshold` / `max_stack_span_sec`, plus
+  `clear` + `dry_run` toggles. Live progress card shows phase label
+  ("Loading CLIP embeddings", "Comparing pairs", "Saving stacks"), a progress
+  bar with done/total, pair count, and elapsed seconds. Cancel calls
+  `AbortController.abort()`; server sees `request.is_disconnected()`, flips
+  a `threading.Event`, and stacking.py's hot loop checks `should_abort` every
+  ~1000 iterations before raising `InterruptedError`. Blocking
+  `POST /api/stacks/detect` is kept for scripts/curl.
+
+The `on_progress` + `should_abort` callback pair added to `stacking.py` is
+the reference shape for instrumenting other long-running jobs (reclustering,
+describe, etc.) with SSE progress + cancel.
+
 ## Face clustering
 
 New faces land with `cluster_id = NULL` — per-batch clustering was removed from
@@ -219,6 +256,22 @@ auto-downgrades its O(N²) similarity sort to count-sort above 500 groups.
 Remaining work in `docs/plans/faces-clustering-and-perf.md`: persist
 `det_score` + bbox area and filter low-quality faces before clustering,
 swap to HDBSCAN for varying density, and materialize a `face_groups` table.
+
+## Planned milestones (see `docs/plans/`)
+
+- `docs/plans/bulk-set-location.md` — bulk-assign location to photos lacking
+  GPS via manual address picker (forward geocoding, Nominatim) or inferred
+  from temporal GPS neighbors. Absorbs M19. New `country`/`admin1`/`admin2`/
+  `locality` columns unlock map view, radius search, region-scoped queries
+  like "beach near southwest France".
+- `docs/plans/google-photos-import.md` — M20. Takeout-based import of
+  ~200K smartphone photos. Google Photos API read scopes were deprecated for
+  third-party apps in March 2025, so Takeout is the only path. Incremental
+  per-year export, composite dedup (photoTakenTime + device + filename stem),
+  lands in `/photos/YYYY/YYYY-MM-DD_gphotos/`. Phone GPS amplifies the
+  inferred-geotag recall on camera photos.
+- `docs/plans/faces-clustering-and-perf.md` — remaining face work: persist
+  `det_score` + bbox area, HDBSCAN, materialize a `face_groups` table.
 
 ## Detailed Reference
 

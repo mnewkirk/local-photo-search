@@ -5,10 +5,40 @@ All photo annotations live here — original photos are never modified.
 """
 
 import json
+import re
 import sqlite3
 import struct
 from pathlib import Path
 from typing import Optional
+
+
+# Matches the project's /<year>/YYYY-MM-DD[_suffix]/filename convention,
+# returning the date component from the parent directory. The suffix (e.g.
+# `_gphotos` from a future Takeout import) is allowed. If the parent
+# directory isn't date-named, returns None.
+_FOLDER_DATE_RE = re.compile(r'/(\d{4}-\d{2}-\d{2})[^/]*/[^/]+$')
+
+
+def _folder_date_from_path(filepath: Optional[str]) -> Optional[str]:
+    """Return a YYYY-MM-DD 00:00:00 string derived from the parent folder, or None.
+
+    Registered as a SQLite scalar function so queries can COALESCE it into
+    ORDER BY clauses. The suffix "00:00:00" matches `date_taken`'s format
+    so string comparison sorts correctly when both columns are mixed.
+    """
+    if not filepath:
+        return None
+    m = _FOLDER_DATE_RE.search(filepath)
+    if not m:
+        return None
+    date_str = m.group(1)
+    try:
+        y, mo, d = date_str.split('-')
+        if 1900 <= int(y) <= 2100 and 1 <= int(mo) <= 12 and 1 <= int(d) <= 31:
+            return f"{date_str} 00:00:00"
+    except ValueError:
+        pass
+    return None
 
 # sqlite-vec will be imported at init time so we can fail gracefully
 try:
@@ -65,6 +95,13 @@ class PhotoDB:
             self.conn.enable_load_extension(True)
             sqlite_vec.load(self.conn)
             self.conn.enable_load_extension(False)
+
+        # Scalar fn so SQL can fall back to the folder-name date when EXIF
+        # date_taken is NULL. COALESCE(date_taken, folder_date(filepath))
+        # gives a usable ordering key for old imports that never had EXIF.
+        self.conn.create_function(
+            "folder_date", 1, _folder_date_from_path, deterministic=True,
+        )
 
         self._batch_mode = False
         self._batch_count = 0
