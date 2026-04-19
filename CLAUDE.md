@@ -129,14 +129,49 @@ because every batch independently restarted IDs at 0 and collided
 Grouping is an on-demand step:
 
 ```bash
-$DC run --rm photosearch recluster-faces [--eps 0.55] [--min-samples 3] [--dry-run]
+$DC run --rm photosearch recluster-faces \
+  [--eps 0.55] [--min-samples 3] \
+  [--no-session-stacking] [--session-eps 0.50] [--session-window 60] \
+  [--dry-run]
 ```
 
-Runs global DBSCAN over every `person_id IS NULL` encoding, renumbers all
-unknown clusters from scratch, and clears `ignored_clusters` in the same
-transaction (IDs change, so ignore flags would otherwise mis-apply). Loader
-uses `np.frombuffer` over concatenated BLOBs — 120k faces decode in seconds
-on an N100; DBSCAN at 512-dim with ball_tree is the dominant cost after that.
+Runs global DBSCAN over every `person_id IS NULL` encoding, then (by default)
+a **session-stacking second pass**: union-find over the DBSCAN noise points,
+linking pairs whose L2 distance is within `--session-eps` AND whose
+`date_taken` is within `--session-window` minutes. Components of size ≥ 2
+become new clusters continuing past the DBSCAN id range, recovering
+same-person-same-event groups that min_samples=3 had discarded. Pass
+`--no-session-stacking` for DBSCAN-only behavior. `ignored_clusters` is
+cleared in the same transaction (IDs are fully renumbered). Loader uses
+`np.frombuffer` over concatenated BLOBs — 120k faces decode in seconds on
+an N100; DBSCAN at 512-dim with ball_tree is the dominant cost after that.
+
+## Face merge suggestions (M18, dry-run only so far)
+
+`suggest-face-merges` finds likely merges between any two face groups
+(cluster↔cluster and cluster↔named person). It's the review step before the
+accept/reject UI lands:
+
+```bash
+$DC run --rm photosearch suggest-face-merges \
+  --verify-pair 'cluster:2035=person:Matt Newkirk' \
+  --verify-pair 'cluster:1776=cluster:1339' \
+  --verify-pair 'cluster:798!=cluster:745' \
+  [--centroid-cutoff 0.95] [--min-pair-cutoff 0.60] \
+  [--max-members 60] [--min-group-size 1] \
+  [--limit 50 | --all] [--json-out suggestions.json]
+```
+
+For every candidate pair it computes two L2 metrics on the ArcFace 512-dim
+encodings: **centroid_dist** (between the two groups' normalized mean
+vectors) and **min_pair_dist** (minimum over all member-to-member pairs).
+Both must be below their cutoffs for a suggestion. `--verify-pair` takes
+known-ground-truth positives (`=`) and negatives (`!=`) and reports TP
+recall / FP avoidance, so thresholds can be tuned to the library.
+
+Implementation is in `photosearch/face_merge.py` — read-only, no DB writes.
+Encodings are sampled at the biggest-bbox faces first, capped at
+`--max-members` per group to bound per-pair O(K²) cost.
 
 `/api/faces/groups` is paginated (`limit`/`offset`/`filter`/`total`/`counts`),
 hides singletons by default (`?include_singletons=1` to restore), and

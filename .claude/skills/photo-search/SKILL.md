@@ -490,16 +490,61 @@ match-faces [--tolerance 1.15] [--temporal] # Match faces to persons
   --expand-stacks                           # Include stack members with --collection
   --temporal-tolerance 1.45                 # Looser threshold for temporal
   --temporal-window 30                      # Session context window (minutes)
-recluster-faces [--eps 0.55] [--min-samples 3] [--dry-run]
+recluster-faces [--eps 0.55] [--min-samples 3] \
+                [--no-session-stacking] \
+                [--session-eps 0.50] [--session-window 60] \
+                [--dry-run]
                                             # Global DBSCAN over all person_id IS NULL
-                                            # encodings. Renumbers every unknown cluster
-                                            # and clears ignored_clusters atomically
+                                            # encodings, then (default-on) session-
+                                            # stacking second pass that unions DBSCAN
+                                            # noise pairs within (session_eps L2 +
+                                            # session_window minutes). Renumbers every
+                                            # unknown cluster and clears
+                                            # ignored_clusters atomically.
+suggest-face-merges [--centroid-cutoff 0.95] [--min-pair-cutoff 0.60] \
+                    [--max-members 60] [--min-group-size 1] \
+                    [--include-ignored] [--limit N | --all] \
+                    [--json-out FILE] \
+                    [--verify-pair 'cluster:X=person:Name' ...]
+                                            # Read-only dry-run. Surfaces likely merges
+                                            # between every pair of groups (named +
+                                            # unknown). Uses centroid + min-pair L2
+                                            # distances. --verify-pair reports
+                                            # TP/FP coverage against known examples.
 list-persons                                # Show persons and counts
 face-clusters                               # Show unidentified clusters
 correct-face <filename> <face_num> <name>   # Manual correction
 clear-matches <dir> [--person] [--all-faces]
 export-face-assignments / import-face-assignments
 ```
+
+### Unknown-face clustering & merge suggestions (M18)
+
+Two cooperating tools improve unknown-face grouping:
+
+1. **Session stacking** in `recluster-faces` — after global DBSCAN, a second
+   pass runs union-find over the noise points: pairs whose L2 distance is
+   within `--session-eps` (default 0.50) and whose `date_taken` is within
+   `--session-window` minutes (default 60) get linked. Components of size ≥
+   2 become new clusters continuing past the DBSCAN id range. Recovers
+   same-person-same-event groups that `min_samples=3` had thrown away.
+   Pass `--no-session-stacking` to restore DBSCAN-only behavior.
+
+2. **`suggest-face-merges`** — read-only command that finds likely merges
+   between any two face groups (cluster↔cluster and cluster↔named). For
+   each candidate pair it computes `centroid_dist` (between the two groups'
+   normalized mean encodings) and `min_pair_dist` (min across all
+   member-to-member pairs). Suggests when both are under their cutoffs.
+   `--verify-pair` takes known TP (`=`) and FP (`!=`) examples and prints
+   whether each would be caught — use it to tune thresholds against the
+   real library.
+
+Implementation: `photosearch/face_merge.py` (`load_groups`,
+`compute_suggestions`, `score_pair`). Per-pair cost is O(K²) where K is
+`--max-members` (default 60, biggest-bbox faces sampled first). named↔named
+pairs are never suggested. Accept/reject UI is deferred — current flow is:
+run the CLI, tune cutoffs, then the UI layer will surface the suggestions
+for one-click merge.
 
 ### Vec0 orphan cleanup
 

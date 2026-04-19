@@ -559,14 +559,29 @@ def list_persons(db):
 @click.option("--min-samples", default=None, type=int,
               help="DBSCAN min_samples. Faces with fewer than this many neighbors "
                    "become noise (cluster_id=NULL, hidden from /faces). Default: 3.")
+@click.option("--no-session-stacking", is_flag=True, default=False,
+              help="Disable the second-pass session-stacking step that groups "
+                   "DBSCAN noise points by tight face similarity + time proximity.")
+@click.option("--session-eps", default=None, type=float,
+              help="L2 cutoff for session-stacking pairs. Default: 0.50.")
+@click.option("--session-window", default=None, type=float,
+              help="Max minutes between two noise faces to be considered the "
+                   "same session. Default: 60.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Compute clusters and print histogram without writing to the DB.")
-def recluster_faces(db, eps, min_samples, dry_run):
+def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
+                    session_window, dry_run):
     """Rebuild all unknown face clusters from scratch using global DBSCAN.
 
     Loads every face with person_id IS NULL, runs DBSCAN over the ArcFace
-    embeddings, and overwrites cluster_id for all unknown faces. Noise points
-    become NULL cluster_id and are hidden from /faces.
+    embeddings, then optionally runs a second "session-stacking" pass over the
+    DBSCAN noise points: faces taken within ``--session-window`` minutes of
+    each other whose L2 distance is within ``--session-eps`` get grouped into
+    new clusters. This recovers same-person-same-event groups that DBSCAN's
+    ``min_samples=3`` rule rejected as noise.
+
+    Noise points that remain after session stacking become NULL cluster_id
+    and are hidden from /faces.
 
     \b
     Important: cluster IDs are fully renumbered on every run, so the
@@ -576,21 +591,36 @@ def recluster_faces(db, eps, min_samples, dry_run):
     """
     from photosearch.faces import (
         recluster_unknown_faces, RECLUSTER_EPS, RECLUSTER_MIN_SAMPLES,
+        SESSION_STACK_EPS, SESSION_STACK_WINDOW_MINUTES,
     )
 
     effective_eps = eps if eps is not None else RECLUSTER_EPS
     effective_min = min_samples if min_samples is not None else RECLUSTER_MIN_SAMPLES
+    effective_session_eps = session_eps if session_eps is not None else SESSION_STACK_EPS
+    effective_session_window = (
+        session_window if session_window is not None else SESSION_STACK_WINDOW_MINUTES
+    )
 
     with PhotoDB(db) as photo_db:
         click.echo(
             f"Reclustering unknown faces (eps={effective_eps}, "
-            f"min_samples={effective_min}, dry_run={dry_run})..."
+            f"min_samples={effective_min}, "
+            f"session_stacking={'off' if no_session_stacking else 'on'}, "
+            f"dry_run={dry_run})..."
         )
         summary = recluster_unknown_faces(
             photo_db, eps=effective_eps, min_samples=effective_min, dry_run=dry_run,
+            session_stacking=(not no_session_stacking),
+            session_eps=effective_session_eps,
+            session_window_minutes=effective_session_window,
         )
         click.echo(f"  Faces processed: {summary['face_count']}")
         click.echo(f"  Clusters formed: {summary['cluster_count']}")
+        if not no_session_stacking:
+            click.echo(
+                f"    of which session-stacked: {summary.get('session_cluster_count', 0)} "
+                f"(new clusters from noise)"
+            )
         click.echo(f"  Noise (singletons + sparse): {summary['noise_count']}")
 
         hist = summary["histogram"]
@@ -614,6 +644,182 @@ def recluster_faces(db, eps, min_samples, dry_run):
             click.echo("\nDry run — no changes written. Re-run without --dry-run to apply.")
         else:
             click.echo("\nDone. ignored_clusters was cleared; reapply any ignore flags on /faces.")
+
+
+# ---------------------------------------------------------------------------
+# suggest-face-merges
+# ---------------------------------------------------------------------------
+
+@cli.command("suggest-face-merges")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--centroid-cutoff", default=None, type=float,
+              help="Pairs with centroid L2 > this are skipped before min-pair calc. "
+                   "Default: 0.95.")
+@click.option("--min-pair-cutoff", default=None, type=float,
+              help="Pairs with min-pair L2 > this are not suggested. Default: 0.60.")
+@click.option("--max-members", default=None, type=int,
+              help="Per-group face sample cap (biggest-bbox first). Default: 60.")
+@click.option("--min-group-size", default=1, type=int,
+              help="Skip groups smaller than this. Default: 1 (include singletons).")
+@click.option("--include-ignored", is_flag=True, default=False,
+              help="Include ignored clusters (they are skipped by default).")
+@click.option("--limit", default=50, type=int,
+              help="Max suggestions to print. Default: 50. Use --all for everything.")
+@click.option("--all", "show_all", is_flag=True, default=False,
+              help="Print every suggestion, ignoring --limit.")
+@click.option("--json-out", type=click.Path(), default=None,
+              help="Also write all suggestions (not just the top --limit) as JSON.")
+@click.option("--verify-pair", multiple=True,
+              help="Known-ground-truth pair, e.g. 'cluster:2035=person:Matt Newkirk' "
+                   "or 'cluster:798!=cluster:745'. Repeatable. The suggester prints "
+                   "whether each pair would be caught at the current cutoffs.")
+def suggest_face_merges(
+    db, centroid_cutoff, min_pair_cutoff, max_members, min_group_size,
+    include_ignored, limit, show_all, json_out, verify_pair,
+):
+    """Find likely merges between face groups (named + unknown clusters).
+
+    Loads every face group, computes pairwise centroid + min-pair L2 distances,
+    and prints pairs that pass both cutoffs. Read-only — no merges are applied;
+    this is the review step before the accept/reject UI lands.
+
+    \b
+    Example:
+      photosearch suggest-face-merges \\
+        --verify-pair 'cluster:2035=person:Matt Newkirk' \\
+        --verify-pair 'cluster:1772=person:Jane Canulla' \\
+        --verify-pair 'cluster:1776=cluster:1339' \\
+        --verify-pair 'cluster:798!=cluster:745' \\
+        --verify-pair 'cluster:547!=cluster:539' \\
+        --verify-pair 'cluster:1979!=person:Theresa Cabalette'
+    """
+    import json as _json
+    import time as _time
+
+    from photosearch.face_merge import (
+        CENTROID_CUTOFF, MIN_PAIR_CUTOFF, MAX_MEMBERS_PER_GROUP,
+        compute_suggestions, load_groups, parse_verify_pair,
+        resolve_group_spec, score_pair,
+    )
+
+    eff_cent = centroid_cutoff if centroid_cutoff is not None else CENTROID_CUTOFF
+    eff_min = min_pair_cutoff if min_pair_cutoff is not None else MIN_PAIR_CUTOFF
+    eff_max_members = max_members if max_members is not None else MAX_MEMBERS_PER_GROUP
+
+    # Parse verify pairs up front so we fail fast on bad syntax.
+    parsed_verify: list[tuple[str, str, bool]] = []
+    for vp in verify_pair:
+        try:
+            parsed_verify.append(parse_verify_pair(vp))
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="--verify-pair")
+
+    with PhotoDB(db) as photo_db:
+        click.echo(
+            f"Loading face groups (max_members={eff_max_members}, "
+            f"min_group_size={min_group_size}, include_ignored={include_ignored})..."
+        )
+        t0 = _time.time()
+        groups = load_groups(
+            photo_db,
+            include_ignored_clusters=include_ignored,
+            max_members=eff_max_members,
+            min_group_size=min_group_size,
+        )
+        t_load = _time.time()
+        persons_n = sum(1 for g in groups if g.type == "person")
+        clusters_n = sum(1 for g in groups if g.type == "cluster")
+        click.echo(
+            f"  Loaded {len(groups)} groups "
+            f"({persons_n} persons, {clusters_n} clusters) in {t_load - t0:.1f}s."
+        )
+
+        click.echo(
+            f"Computing suggestions "
+            f"(centroid_cutoff={eff_cent:.2f}, min_pair_cutoff={eff_min:.2f})..."
+        )
+        suggestions = compute_suggestions(
+            groups, centroid_cutoff=eff_cent, min_pair_cutoff=eff_min,
+        )
+        t_sugg = _time.time()
+        click.echo(f"  {len(suggestions)} suggestions in {t_sugg - t_load:.1f}s.")
+
+        # ----- Print suggestions -----
+        click.echo("")
+        click.echo(f"=== Merge suggestions (top {'all' if show_all else limit}) ===")
+        click.echo("")
+        shown = suggestions if show_all else suggestions[:limit]
+        if not shown:
+            click.echo("  (none)")
+        for s in shown:
+            overlap = "—" if s.shared_days is None else f"{s.shared_days}d"
+            click.echo(
+                f"  {s.left.label} ({s.left.face_count} face"
+                f"{'s' if s.left.face_count != 1 else ''}) "
+                f"→ {s.right.label} ({s.right.face_count})   "
+                f"min={s.min_pair_dist:.3f} cent={s.centroid_dist:.3f} "
+                f"overlap={overlap}"
+            )
+        if not show_all and len(suggestions) > limit:
+            click.echo(f"  ... {len(suggestions) - limit} more. "
+                       f"Use --all or --limit N to see more.")
+
+        # ----- Verification against known pairs -----
+        if parsed_verify:
+            click.echo("")
+            click.echo("=== Verification against known pairs ===")
+            click.echo("")
+            tp_caught = tp_total = fp_avoided = fp_total = 0
+            for left_spec, right_spec, should_match in parsed_verify:
+                lg = resolve_group_spec(photo_db, groups, left_spec)
+                rg = resolve_group_spec(photo_db, groups, right_spec)
+                label = "TP" if should_match else "FP"
+                header = f"  {label}: {left_spec} {'==' if should_match else '!='} {right_spec}"
+                if lg is None or rg is None:
+                    missing = []
+                    if lg is None:
+                        missing.append(left_spec)
+                    if rg is None:
+                        missing.append(right_spec)
+                    click.echo(f"{header}   → UNRESOLVED ({', '.join(missing)})")
+                    continue
+                cd, md = score_pair(lg, rg)
+                suggested = (cd <= eff_cent) and (md <= eff_min)
+                tag = "SUGGESTED" if suggested else "not suggested"
+                mark = ("✓" if (should_match == suggested) else "✗")
+                click.echo(
+                    f"{header}   min={md:.3f} cent={cd:.3f}   → {tag} {mark}"
+                )
+                if should_match:
+                    tp_total += 1
+                    if suggested:
+                        tp_caught += 1
+                else:
+                    fp_total += 1
+                    if not suggested:
+                        fp_avoided += 1
+            click.echo("")
+            click.echo(
+                f"  TP recall:  {tp_caught}/{tp_total}   "
+                f"FP avoided: {fp_avoided}/{fp_total}"
+            )
+
+        # ----- Optional JSON dump -----
+        if json_out:
+            with open(json_out, "w") as f:
+                _json.dump(
+                    {
+                        "centroid_cutoff": eff_cent,
+                        "min_pair_cutoff": eff_min,
+                        "max_members": eff_max_members,
+                        "min_group_size": min_group_size,
+                        "group_count": len(groups),
+                        "suggestions": [s.as_dict() for s in suggestions],
+                    },
+                    f, indent=2,
+                )
+            click.echo(f"\nWrote {len(suggestions)} suggestions to {json_out}.")
 
 
 # ---------------------------------------------------------------------------

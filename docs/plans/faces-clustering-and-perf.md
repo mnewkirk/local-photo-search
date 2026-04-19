@@ -69,12 +69,30 @@ Secondary issues:
 
 ### Iterate
 
-8. **Quality filter before clustering.** Persist `det_score` + bbox area on
-   `faces`; filter `det_score >= 0.65` and min bbox edge `>= 60 px` before
-   clustering. Keep raw rows for person-matching (`MATCH_TOLERANCE=1.15` is
-   forgiving).
-9. **HDBSCAN** to handle varying density (some people appear 100×, others 2×).
-10. **Materialized `face_groups` table** refreshed after reclustering, so
+8. ✅ **Session-stacking second pass** in `recluster-faces` (M18). After
+   DBSCAN, a union-find pass over the noise points links pairs within
+   `session_eps` L2 AND `session_window` minutes. Components of size ≥ 2
+   become new clusters continuing past the DBSCAN id range. Recovers
+   same-person-same-event groups that `min_samples=3` had discarded.
+   Defaults: `session_eps=0.50`, `session_window=60` minutes. Pass
+   `--no-session-stacking` to disable. See `photosearch/faces.py` —
+   `_session_stack_noise()` and the extended `recluster_unknown_faces()`.
+9. ✅ **Merge-suggestion engine** (M18, dry-run CLI). `suggest-face-merges`
+   finds likely merges between any two groups (cluster↔cluster,
+   cluster↔named). Centroid + min-pair L2 metrics; `--verify-pair`
+   harness reports TP/FP coverage for threshold tuning. No DB writes yet —
+   accept/reject UI is deferred. See `photosearch/face_merge.py`.
+10. **Accept/reject UI** for merge suggestions. Adds a
+    `face_merge_suggestions` table (schema v13), `/api/faces/suggestions`
+    endpoints, and a suggestions section on `/faces` with per-pair
+    accept/reject. Blocked on tuning the CLI cutoffs against the real NAS
+    library first.
+11. **Quality filter before clustering.** Persist `det_score` + bbox area on
+    `faces`; filter `det_score >= 0.65` and min bbox edge `>= 60 px` before
+    clustering. Keep raw rows for person-matching (`MATCH_TOLERANCE=1.15` is
+    forgiving).
+12. **HDBSCAN** to handle varying density (some people appear 100×, others 2×).
+13. **Materialized `face_groups` table** refreshed after reclustering, so
     `/api/faces/groups` becomes a single indexed SELECT.
 
 ## Tradeoffs / risks

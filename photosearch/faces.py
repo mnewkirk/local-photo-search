@@ -383,48 +383,168 @@ def cluster_encodings(
 RECLUSTER_EPS = 0.55
 RECLUSTER_MIN_SAMPLES = 3
 
+# Session-stacking params for second-pass grouping of DBSCAN noise points.
+# Tighter similarity than the main DBSCAN eps, constrained by a time window so
+# we only pair faces from the same session/event. Pairs below both thresholds
+# are union-find-linked into new clusters (min size 2).
+SESSION_STACK_EPS = 0.50
+SESSION_STACK_WINDOW_MINUTES = 60.0
+
+
+def _session_stack_noise(
+    face_ids: list[int],
+    X: np.ndarray,
+    labels: np.ndarray,
+    dates: list[Optional[str]],
+    session_eps: float = SESSION_STACK_EPS,
+    session_window_minutes: float = SESSION_STACK_WINDOW_MINUTES,
+) -> tuple[np.ndarray, int]:
+    """Group DBSCAN noise points via time-aware similarity (union-find).
+
+    For faces DBSCAN labeled as noise (-1), sort by timestamp and link pairs
+    whose encodings are within ``session_eps`` L2 **and** whose timestamps are
+    within ``session_window_minutes``. Connected components of size ≥ 2 get
+    new cluster labels starting from ``max(existing_labels) + 1``.
+
+    Returns (new_labels, num_session_clusters). ``new_labels`` is a copy of
+    ``labels`` with the additional assignments applied.
+    """
+    from datetime import datetime, timedelta
+
+    new_labels = labels.copy()
+    noise_positions = np.where(labels == -1)[0]
+    if len(noise_positions) < 2:
+        return new_labels, 0
+
+    # Keep only noise faces with a parseable date (we need time proximity to avoid
+    # spurious global pairings).
+    dated: list[tuple[datetime, int]] = []  # (timestamp, position into X)
+    for pos in noise_positions:
+        ts_str = dates[pos]
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str[:19])
+        except ValueError:
+            continue
+        dated.append((ts, int(pos)))
+
+    if len(dated) < 2:
+        return new_labels, 0
+
+    dated.sort(key=lambda p: p[0])
+    n = len(dated)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    window = timedelta(minutes=session_window_minutes)
+    eps_sq = session_eps * session_eps
+
+    # Sliding window over the time-sorted list. For each anchor i, compute
+    # squared L2 against all j in (i, j_end) where j_end stops once the time
+    # gap exceeds window. Vectorized per anchor.
+    for i in range(n):
+        ts_i, pos_i = dated[i]
+        j_end = i + 1
+        while j_end < n and (dated[j_end][0] - ts_i) <= window:
+            j_end += 1
+        if j_end <= i + 1:
+            continue
+        neighbor_pos = np.fromiter(
+            (dated[j][1] for j in range(i + 1, j_end)), dtype=np.int64, count=j_end - i - 1,
+        )
+        vec_i = X[pos_i]
+        diffs = X[neighbor_pos] - vec_i
+        sq = (diffs * diffs).sum(axis=1)
+        close = np.where(sq <= eps_sq)[0]
+        for k in close:
+            union(i, int(i + 1 + k))
+
+    # Collect components of size >= 2 and assign new cluster ids.
+    components: dict[int, list[int]] = {}
+    for p in range(n):
+        components.setdefault(find(p), []).append(p)
+
+    existing_max = int(labels.max()) if (labels != -1).any() else -1
+    next_label = existing_max + 1
+    session_cluster_count = 0
+    for members in components.values():
+        if len(members) < 2:
+            continue
+        new_cluster_id = next_label
+        next_label += 1
+        session_cluster_count += 1
+        for member_idx in members:
+            _, pos = dated[member_idx]
+            new_labels[pos] = new_cluster_id
+
+    return new_labels, session_cluster_count
+
 
 def recluster_unknown_faces(
     db,
     eps: float = RECLUSTER_EPS,
     min_samples: int = RECLUSTER_MIN_SAMPLES,
     dry_run: bool = False,
+    session_stacking: bool = True,
+    session_eps: float = SESSION_STACK_EPS,
+    session_window_minutes: float = SESSION_STACK_WINDOW_MINUTES,
 ) -> dict:
     """Globally recluster all person_id IS NULL faces via DBSCAN.
 
     Loads every unassigned face encoding, runs sklearn DBSCAN with the given
     params, and (unless dry_run) writes fresh cluster_ids back. Noise points
-    (DBSCAN label -1) are written as cluster_id=NULL so the /faces page hides
-    them. `ignored_clusters` is cleared in the same transaction because cluster
+    (DBSCAN label -1) are either:
+      - reassigned by session-stacking (second pass using time + similarity)
+        if ``session_stacking=True``, OR
+      - written as cluster_id=NULL so the /faces page hides them.
+
+    ``ignored_clusters`` is cleared in the same transaction because cluster
     IDs are fully renumbered — leaving stale rows would silently mis-apply
     ignore flags to whatever clusters happen to inherit those IDs.
 
-    Returns a summary dict: {face_count, cluster_count, noise_count, histogram}.
+    Returns a summary dict with face_count, cluster_count, noise_count,
+    histogram, and session_cluster_count (new clusters formed from noise).
     """
     import time
     from sklearn.cluster import DBSCAN
     from .db import FACE_DIMENSIONS
 
-    # Pull all unassigned face encodings in one query, ordered by id for
-    # deterministic output. Large but bounded (tens to low hundreds of thousands).
+    # Pull all unassigned face encodings + their photo's date_taken in one query,
+    # ordered by face id for deterministic output. Large but bounded.
     t0 = time.time()
     rows = db.conn.execute(
-        """SELECT f.id, fe.encoding
+        """SELECT f.id, fe.encoding, ph.date_taken
            FROM faces f
            JOIN face_encodings fe ON fe.face_id = f.id
+           LEFT JOIN photos ph ON ph.id = f.photo_id
            WHERE f.person_id IS NULL
            ORDER BY f.id"""
     ).fetchall()
     t_query = time.time()
 
     if not rows:
-        return {"face_count": 0, "cluster_count": 0, "noise_count": 0, "histogram": {}}
+        return {
+            "face_count": 0, "cluster_count": 0, "noise_count": 0,
+            "histogram": {}, "session_cluster_count": 0,
+        }
 
     # Fast path: concatenate all encoding BLOBs and reshape in one np.frombuffer
     # call. The previous approach (struct.unpack per row → list → np.array of
     # lists) allocated ~N*dim Python floats (60M+ for 120k faces) and took tens
     # of minutes on slow CPUs. Direct frombuffer is I/O-bound instead.
     face_ids = [r["id"] for r in rows]
+    dates: list[Optional[str]] = [r["date_taken"] for r in rows]
     all_bytes = b"".join(r["encoding"] for r in rows)
     X = np.frombuffer(all_bytes, dtype=np.float32).reshape(len(rows), FACE_DIMENSIONS).copy()
     t_load = time.time()
@@ -445,6 +565,27 @@ def recluster_unknown_faces(
     t_dbscan = time.time()
     print(f"  DBSCAN done in {t_dbscan - t_load:.1f}s.", flush=True)
 
+    primary_cluster_count = int(len({int(lab) for lab in labels.tolist() if lab != -1}))
+    dbscan_noise_count = int((labels == -1).sum())
+
+    session_cluster_count = 0
+    if session_stacking:
+        labels, session_cluster_count = _session_stack_noise(
+            face_ids=face_ids,
+            X=X,
+            labels=labels,
+            dates=dates,
+            session_eps=session_eps,
+            session_window_minutes=session_window_minutes,
+        )
+        t_session = time.time()
+        print(
+            f"  Session stacking done in {t_session - t_dbscan:.1f}s "
+            f"(formed {session_cluster_count} session cluster"
+            f"{'s' if session_cluster_count != 1 else ''} from {dbscan_noise_count} noise faces).",
+            flush=True,
+        )
+
     noise_count = int((labels == -1).sum())
     unique = [int(lab) for lab in sorted(set(labels.tolist())) if lab != -1]
     cluster_count = len(unique)
@@ -461,6 +602,8 @@ def recluster_unknown_faces(
             "cluster_count": cluster_count,
             "noise_count": noise_count,
             "histogram": histogram,
+            "session_cluster_count": session_cluster_count,
+            "primary_cluster_count": primary_cluster_count,
         }
 
     # Atomic: clear ignored_clusters + renumber every unknown cluster_id in one tx.
@@ -484,6 +627,8 @@ def recluster_unknown_faces(
         "cluster_count": cluster_count,
         "noise_count": noise_count,
         "histogram": histogram,
+        "session_cluster_count": session_cluster_count,
+        "primary_cluster_count": primary_cluster_count,
     }
 
 
