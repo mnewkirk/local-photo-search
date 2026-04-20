@@ -145,6 +145,31 @@ set, but the anchor pool now includes the previous round's results.
 Hand-implemented using `math.radians` / `math.sin` / `math.cos` — no new
 dependency. Earth radius 6371 km.
 
+### Global / multi-region support
+
+The library covers photos taken in Japan, Europe, Australia, and the US.
+What this means for the design:
+
+- **Reverse geocoding** is already global. The existing offline
+  `reverse_geocode_batch` uses GeoNames data which covers every country;
+  output strings are UTF-8 (`"Kyōto, Kyoto, JP"`, `"Bordeaux,
+  Nouvelle-Aquitaine, FR"`, `"Sydney, New South Wales, AU"`) and flow
+  through `place_name TEXT` unchanged.
+- **Haversine** is spherical — signs of lat/lon don't matter, and the
+  International Date Line is handled automatically because
+  `cos(lon2 − lon1)` is symmetric around 0. A photo at lon=+179.9 near a
+  phone at lon=−179.9 is correctly computed as ~22 km apart, not ~40,000
+  km.
+- **Timezone gotcha (pre-existing, not made worse here).** `date_taken`
+  is a naive local-time string extracted from EXIF `DateTimeOriginal`.
+  If a camera's clock was never adjusted on a trip (e.g., left on US
+  time while shooting in Tokyo), its photos won't temporally align with
+  phone photos that auto-adjusted to JST — inference will miss them. The
+  project's stacking, date filters, and date-based search have the same
+  limitation today. Parsing EXIF `OffsetTimeOriginal` to normalize to
+  UTC is deferred to a future milestone (see Open follow-ups) since it
+  requires a column add on `photos` and a re-index pass.
+
 ## CLI
 
 New command in `cli.py`:
@@ -322,18 +347,32 @@ No changes to `shared.js` (no new nav link — the panel lives on
     window=30, max_drift=25km. t=30/t=90 anchor one-sided. t=60 has
     flanking inferred anchors ~250km apart → movement_guard fires.
 11. `date_taken IS NULL` rows counted separately, not crashed on.
-12. Haversine fixture test: (47.62, -122.35) ↔ (45.52, -122.68) ≈ 234km.
+12. Haversine fixture tests covering multiple regions and sign
+    combinations:
+    - US (neg lon): (47.62, -122.35) ↔ (45.52, -122.68) ≈ 234km.
+    - Japan (pos lat, pos lon): (35.68, 139.69) ↔ (34.69, 135.50) ≈ 395km
+      (Tokyo ↔ Osaka).
+    - Europe (pos lat, mixed lon): (48.85, 2.35) ↔ (52.52, 13.41) ≈ 878km
+      (Paris ↔ Berlin).
+    - Southern hemisphere (neg lat, pos lon): (-33.87, 151.21) ↔
+      (-37.81, 144.96) ≈ 713km (Sydney ↔ Melbourne).
+    - Date-line crossing: (51.50, 179.0) ↔ (51.50, -179.0) ≈ 139km. A
+      naive lon-difference implementation would return ≈ 24,900km —
+      this test pins the fix.
+13. Accented / non-ASCII `place_name`: seed a row where
+    `reverse_geocode_batch` returns `"Kyōto, Kyoto, JP"` and verify the
+    string round-trips through write + read unchanged.
 
 **Integration tests — new file `tests/test_web_geocode.py`:**
 
-13. `POST /api/geocode/infer-preview` with seeded DB returns expected
+14. `POST /api/geocode/infer-preview` with seeded DB returns expected
     counts + at least one sample.
-14. `POST /api/geocode/infer-apply` without `confirm: true` → 400.
-15. Apply with `confirm: true` writes: `gps_lat`/`gps_lon` populated,
+15. `POST /api/geocode/infer-apply` without `confirm: true` → 400.
+16. Apply with `confirm: true` writes: `gps_lat`/`gps_lon` populated,
     `place_name` via reverse_geocode_batch, `location_source='inferred'`,
     `location_confidence` in `(0, 1]`. Rows with pre-existing `gps_lat` are
     untouched.
-16. Schema migration test: open a fixture DB at `SCHEMA_VERSION=16`,
+17. Schema migration test: open a fixture DB at `SCHEMA_VERSION=16`,
     verify v17 migration adds columns and backfills
     `location_source='exif'` on pre-existing GPS rows.
 
@@ -376,3 +415,8 @@ No changes to `shared.js` (no new nav link — the panel lives on
 - **Phone-dedup + inferred geotag pipeline** — after M20 (Takeout import),
   run `infer-locations` once to backfill camera photos bracketed by newly
   imported phone GPS.
+- **Timezone-aware `date_taken`** — parse EXIF `OffsetTimeOriginal` /
+  `OffsetTimeDigitized` into a new `date_taken_utc` column on `photos`,
+  re-index existing rows. Required to correctly infer across
+  timezone-transition trips where the camera clock wasn't adjusted.
+  Benefits stacking and date-search too.
