@@ -51,7 +51,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -359,6 +359,20 @@ class PhotoDB:
         except sqlite3.OperationalError:
             cur.execute("ALTER TABLE photos ADD COLUMN date_created TEXT")
 
+        # Migration: location_source + location_confidence columns (schema v17).
+        # Stamps provenance on gps_lat/gps_lon so inferred writes (M19) can be
+        # filtered, audited, or bulk-reverted. Existing GPS-bearing rows are
+        # backfilled as 'exif' since that was the only prior source.
+        try:
+            cur.execute("SELECT location_source FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN location_source TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN location_confidence REAL")
+            cur.execute(
+                "UPDATE photos SET location_source='exif' "
+                "WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
+            )
+
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
         cur.execute("""
@@ -494,6 +508,7 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claims_expire ON worker_claims(expires_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_location_source ON photos(location_source)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aesthetic ON photos(aesthetic_score)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")

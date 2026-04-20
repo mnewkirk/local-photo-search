@@ -773,3 +773,50 @@ class TestContextManager:
         # After exiting, connection is closed — attempting another query should fail
         with pytest.raises(Exception):
             database.photo_count()
+
+
+def test_migration_v17_adds_location_columns_and_backfills_exif(tmp_path):
+    """v16 → v17 adds location_source + location_confidence, backfills 'exif'
+    on pre-existing GPS rows, and leaves no-GPS rows' location_source NULL."""
+    import sqlite3
+    from photosearch.db import PhotoDB
+
+    db_path = str(tmp_path / "v16.db")
+
+    # Build a minimal v16-shaped DB by hand (no location_source column).
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO schema_info VALUES ('version', '16');
+        CREATE TABLE photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT UNIQUE NOT NULL,
+            filename TEXT NOT NULL,
+            gps_lat REAL, gps_lon REAL, place_name TEXT,
+            date_taken TEXT
+        );
+        INSERT INTO photos (filepath, filename, gps_lat, gps_lon, place_name)
+            VALUES ('/a.jpg', 'a.jpg', 47.6, -122.3, 'Seattle, WA, US');
+        INSERT INTO photos (filepath, filename)
+            VALUES ('/b.jpg', 'b.jpg');
+    """)
+    conn.commit()
+    conn.close()
+
+    # Opening with the current code should migrate.
+    with PhotoDB(db_path) as pdb:
+        row_a = pdb.conn.execute(
+            "SELECT location_source, location_confidence FROM photos WHERE filename='a.jpg'"
+        ).fetchone()
+        row_b = pdb.conn.execute(
+            "SELECT location_source, location_confidence FROM photos WHERE filename='b.jpg'"
+        ).fetchone()
+        version = pdb.conn.execute(
+            "SELECT value FROM schema_info WHERE key='version'"
+        ).fetchone()[0]
+
+    assert row_a["location_source"] == "exif"
+    assert row_a["location_confidence"] is None
+    assert row_b["location_source"] is None
+    assert row_b["location_confidence"] is None
+    assert int(version) >= 17
