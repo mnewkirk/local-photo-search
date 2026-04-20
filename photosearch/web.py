@@ -788,8 +788,11 @@ def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(100
     for older imports whose EXIF never had a capture timestamp.
     """
     # Same expression is used for selection + sort so the chronology the
-    # client sees matches the chronology we sorted on.
-    effective_expr = "COALESCE(p.date_taken, folder_date(p.filepath))"
+    # client sees matches the chronology we sorted on. Fallback chain:
+    # EXIF capture date → file mtime (schema v16) → parent-folder YYYY-MM-DD.
+    effective_expr = (
+        "COALESCE(p.date_taken, p.date_created, folder_date(p.filepath))"
+    )
     order_clause = (
         f"ORDER BY {effective_expr} IS NULL, {effective_expr} DESC"
     )

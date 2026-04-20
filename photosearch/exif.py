@@ -5,10 +5,26 @@ Uses exifread for broad format support including Sony ARW.
 """
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import exifread
+
+
+def _mtime_iso(filepath: str) -> Optional[str]:
+    """Return the file's mtime formatted as 'YYYY-MM-DD HH:MM:SS', or None.
+
+    Used as the `date_created` fallback when EXIF has no capture date. For
+    camera-to-disk files, mtime usually ≈ capture time; for re-encoded
+    photos (e.g. Google Takeout) it's "last written", still far better
+    than nothing.
+    """
+    try:
+        ts = os.path.getmtime(filepath)
+    except OSError:
+        return None
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def extract_exif(filepath: str) -> dict:
@@ -21,6 +37,7 @@ def extract_exif(filepath: str) -> dict:
         "filepath": str(Path(filepath).resolve()),
         "filename": os.path.basename(filepath),
         "date_taken": None,
+        "date_created": _mtime_iso(filepath),
         "gps_lat": None,
         "gps_lon": None,
         "camera_make": None,

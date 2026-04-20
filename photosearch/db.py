@@ -51,7 +51,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -348,6 +348,16 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN verified_at TEXT")
             cur.execute("ALTER TABLE photos ADD COLUMN verification_status TEXT")  # 'pass', 'fail', 'regenerated'
             cur.execute("ALTER TABLE photos ADD COLUMN hallucination_flags TEXT")  # JSON: what was flagged
+
+        # Migration: date_created fallback column (schema v16).
+        # Populated from file mtime at index time so photos whose EXIF has
+        # no capture date still have a usable ordering key. Run
+        # `photosearch backfill-dates` once after upgrading to fill this in
+        # for already-indexed photos.
+        try:
+            cur.execute("SELECT date_created FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN date_created TEXT")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.

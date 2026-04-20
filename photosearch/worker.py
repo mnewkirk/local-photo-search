@@ -169,13 +169,20 @@ class WorkerClient:
         return r.json()
 
     def get_status(self, collection_id: Optional[int] = None,
-                   directory: Optional[str] = None) -> dict:
-        """Get worker queue status."""
-        params = {}
+                   directory: Optional[str] = None,
+                   passes: Optional[list[str]] = None) -> dict:
+        """Get worker queue status.
+
+        If passes is provided, the server only computes queue depth for those
+        pass types — much cheaper than counting all six on a large library.
+        """
+        params: dict = {}
         if collection_id is not None:
             params["collection_id"] = collection_id
         if directory is not None:
             params["directory"] = directory
+        if passes:
+            params["passes"] = ",".join(passes)
         r = self.session.get(f"{self.server_url}/api/worker/status", params=params, timeout=60)
         r.raise_for_status()
         return r.json()
@@ -627,18 +634,25 @@ def run_worker(
                                      directory=directory)
             print(f"  Cleared {resp['cleared']} entries across {resp['photo_count']} photos.")
 
-    # Show initial status
-    status = client.get_status(collection_id=collection_id, directory=directory)
-    print(f"\nQueue depth:")
-    for pass_type, count in status["queue_depth"].items():
-        if pass_type in passes:
-            marker = " <--" if count > 0 else ""
-            print(f"  {pass_type}: {count} photos{marker}")
+    # Show initial status — informational only, non-fatal. Under concurrent
+    # worker startup the status endpoint can be slow (counts scan the library),
+    # so we don't want a timeout here to prevent the worker from proceeding.
+    try:
+        status = client.get_status(
+            collection_id=collection_id, directory=directory, passes=passes,
+        )
+        print(f"\nQueue depth:")
+        for pass_type, count in status["queue_depth"].items():
+            if pass_type in passes:
+                marker = " <--" if count > 0 else ""
+                print(f"  {pass_type}: {count} photos{marker}")
 
-    if status["active_claims"]:
-        print(f"\nActive claims: {len(status['active_claims'])}")
-        for claim in status["active_claims"]:
-            print(f"  {claim['worker_id']}: {claim['pass_type']} ({claim['photo_count']} photos)")
+        if status["active_claims"]:
+            print(f"\nActive claims: {len(status['active_claims'])}")
+            for claim in status["active_claims"]:
+                print(f"  {claim['worker_id']}: {claim['pass_type']} ({claim['photo_count']} photos)")
+    except Exception as e:
+        print(f"\n(Could not fetch initial queue status: {e} — proceeding to claim loop)")
 
     temp_base = tempfile.mkdtemp(prefix="photosearch-worker-")
     print(f"\nTemp directory: {temp_base}")

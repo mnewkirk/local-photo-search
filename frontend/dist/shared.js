@@ -1295,17 +1295,24 @@
     // present; fall back to raw date_taken for endpoints that don't set it
     // yet (search results, review, collections).
     var dateKey = function (p) { return p.effective_date || p.date_taken || ''; };
+    // Push empty date keys to the TAIL in both directions. localeCompare
+    // sorts '' before anything in ASC, which is why "oldest first" used
+    // to surface undated photos at the top instead of the actually-old
+    // ones. Matches the backend's `<expr> IS NULL, <expr> DIR` ordering.
+    var cmp = function (a, b, dir) {
+      var da = dateKey(a), db = dateKey(b);
+      if (!da && !db) return 0;
+      if (!da) return 1;
+      if (!db) return -1;
+      return dir === 'asc' ? da.localeCompare(db) : db.localeCompare(da);
+    };
 
     switch (sortKey) {
       case 'date_desc':
-        sorted.sort(function (a, b) {
-          return dateKey(b).localeCompare(dateKey(a));
-        });
+        sorted.sort(function (a, b) { return cmp(a, b, 'desc'); });
         break;
       case 'date_asc':
-        sorted.sort(function (a, b) {
-          return dateKey(a).localeCompare(dateKey(b));
-        });
+        sorted.sort(function (a, b) { return cmp(a, b, 'asc'); });
         break;
       case 'quality_desc':
         sorted.sort(function (a, b) {

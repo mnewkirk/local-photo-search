@@ -511,13 +511,35 @@ def photo_detail(photo_id: int):
         }
 
 
-@router.get("/status")
-def worker_status(collection_id: Optional[int] = None, directory: Optional[str] = None):
-    """Show queue depth and active claims for the worker system."""
-    with _get_db() as db:
-        db.expire_worker_claims()
+_ALL_PASSES = ("clip", "faces", "quality", "describe", "tags", "verify")
 
-        # Active claims
+
+@router.get("/status")
+def worker_status(
+    collection_id: Optional[int] = None,
+    directory: Optional[str] = None,
+    passes: Optional[str] = None,
+):
+    """Show queue depth and active claims for the worker system.
+
+    `passes` is an optional comma-separated list limiting which pass-type
+    counts to compute — each count is a library-wide scan, so restricting
+    to the passes the caller cares about is a significant speedup when
+    many workers poll this endpoint concurrently.
+
+    Expired claims are NOT swept here; claim-batch calls `get_claimed_photo_ids`
+    which already sweeps. Keeping status read-only avoids a write lock that
+    serializes concurrent status polls.
+    """
+    if passes:
+        requested = tuple(p.strip() for p in passes.split(",") if p.strip() in _ALL_PASSES)
+        if not requested:
+            requested = _ALL_PASSES
+    else:
+        requested = _ALL_PASSES
+
+    with _get_db() as db:
+        # Active claims (read-only; no expire sweep)
         claims = db.conn.execute(
             "SELECT pass_type, worker_id, batch_id, photo_ids, claimed_at, expires_at "
             "FROM worker_claims WHERE expires_at > datetime('now')"
@@ -535,7 +557,7 @@ def worker_status(collection_id: Optional[int] = None, directory: Optional[str] 
                 "expires_at": c["expires_at"],
             })
 
-        # Queue depth per pass type — count of photos missing each pass
+        # Queue depth per requested pass type — count of photos missing each pass
         scope_ids = None
         if collection_id is not None:
             scope_ids = db.get_collection_photo_ids(collection_id)
@@ -543,7 +565,7 @@ def worker_status(collection_id: Optional[int] = None, directory: Optional[str] 
             scope_ids = db.get_directory_photo_ids(directory)
 
         queue = {}
-        for pass_type in ("clip", "faces", "quality", "describe", "tags", "verify"):
+        for pass_type in requested:
             queue[pass_type] = db.count_unprocessed_photos(pass_type, photo_ids=scope_ids)
 
         return {

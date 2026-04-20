@@ -907,6 +907,58 @@ def suggest_face_merges(
 # cleanup-orphans
 # ---------------------------------------------------------------------------
 
+@cli.command("backfill-dates")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--batch-size", default=500, type=int, help="Commit every N rows.")
+@click.option("--dry-run", is_flag=True, default=False, help="Report counts without writing.")
+def backfill_dates(db, batch_size, dry_run):
+    """Populate photos.date_created from file mtime for existing rows.
+
+    Added in schema v16 as a fallback sort key for photos whose EXIF has
+    no capture date. Safe to re-run — only touches rows where
+    date_created IS NULL. Uses resolve_filepath() so portable (relative)
+    paths work against the configured photo_root.
+    """
+    import os
+    from datetime import datetime
+
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute(
+            "SELECT id, filepath FROM photos WHERE date_created IS NULL"
+        ).fetchall()
+        total = len(rows)
+        click.echo(f"  {total:,} photos missing date_created")
+
+        if total == 0 or dry_run:
+            if dry_run and total > 0:
+                click.echo("Dry run — no changes written.")
+            return
+
+        updated = 0
+        missing = 0
+        pending = 0
+        for r in rows:
+            abs_path = photo_db.resolve_filepath(r["filepath"]) or r["filepath"]
+            try:
+                ts = os.path.getmtime(abs_path)
+            except OSError:
+                missing += 1
+                continue
+            iso = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            photo_db.conn.execute(
+                "UPDATE photos SET date_created = ? WHERE id = ?",
+                (iso, r["id"]),
+            )
+            updated += 1
+            pending += 1
+            if pending >= batch_size:
+                photo_db.conn.commit()
+                pending = 0
+                click.echo(f"  {updated:,} / {total:,} …")
+        photo_db.conn.commit()
+        click.echo(f"\nUpdated: {updated:,}  skipped (file not found): {missing:,}")
+
+
 @cli.command("cleanup-orphans")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--dry-run", is_flag=True, default=False, help="Report orphan counts without deleting.")
