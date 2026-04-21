@@ -276,3 +276,20 @@ def test_cascade_gps_count_reports_only_real_anchors(empty_db):
     assert result["summary"]["candidate_count"] >= 2
     # gps_count should ONLY count the real anchor
     assert result["summary"]["gps_count"] == 1
+
+
+def test_utf8_place_name_roundtrip(empty_db):
+    """Non-ASCII place_name (e.g. Japanese, accented European) must
+    round-trip through write + read unchanged."""
+    pid = empty_db.add_photo(
+        filepath="/kyoto.jpg",
+        filename="kyoto.jpg",
+        gps_lat=35.0116,
+        gps_lon=135.7681,
+        place_name="Kyōto, Kyoto, JP",
+    )
+    empty_db.conn.commit()
+    row = empty_db.conn.execute(
+        "SELECT place_name FROM photos WHERE id = ?", (pid,)
+    ).fetchone()
+    assert row["place_name"] == "Kyōto, Kyoto, JP"
