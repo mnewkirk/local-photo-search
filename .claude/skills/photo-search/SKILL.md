@@ -55,7 +55,8 @@ local-photo-search/
 ├── references.yml          # Face reference config (person → photos)
 ├── GOOGLE_PHOTOS_SETUP.md  # Step-by-step Google Photos OAuth setup
 ├── photosearch/
-│   ├── db.py               # PhotoDB class, schema v12, all queries
+│   ├── db.py               # PhotoDB class, schema v17, all queries
+│   ├── infer_location.py   # M19 — temporal GPS inference (haversine, cascade)
 │   ├── index.py            # index_directory() + _index_collection() — indexing pipeline
 │   ├── search.py           # search_combined() + all search types
 │   ├── clip_embed.py       # CLIP text/image embedding (streaming)
@@ -90,7 +91,7 @@ local-photo-search/
 
 ---
 
-## Database Schema (v15)
+## Database Schema (v17)
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -111,7 +112,10 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
 `aesthetic_score` (REAL, 1-10), `description` (TEXT, LLaVA-generated), `tags` (JSON array),
-`place_name` (TEXT, reverse-geocoded), `dominant_colors` (JSON array of hex values).
+`place_name` (TEXT, reverse-geocoded), `dominant_colors` (JSON array of hex values),
+`location_source` (`'exif'|'inferred'|NULL`, v17), `location_confidence`
+(`NULL|(0,1]`, v17, only non-null for inferred rows), `date_created` (v16
+file-mtime fallback sort key).
 
 Schema migrations run automatically on DB open via `_init_schema()` with version checks.
 Bump `SCHEMA_VERSION` when adding tables or columns, and add migration SQL in the
@@ -282,6 +286,79 @@ need cross-recluster persistence.
 - `GET /api/stats/errors` — Recent indexing errors
 - `GET /api/worker/status` — (see Worker System below) polled by the status
   page Workers panel every 5s for per-pass queue depth + active claims
+
+### Inferred geotagging (M19)
+- `POST /api/geocode/infer-preview` — read-only. Body takes
+  `{window_minutes, max_drift_km, min_confidence, cascade, max_cascade_rounds}`
+  (all optional, defaults match the CLI: 30 / 25.0 / 0.0 / true / 10).
+  Returns candidate counts, `confidence_buckets` (fixed 5-entry list),
+  `hop_distribution` (sorted), `skipped` reasons, and up to 10 sample
+  candidates with `thumbnail_url` + pre-reverse-geocoded `place_name`.
+- `POST /api/geocode/infer-apply` — write path. Same body plus
+  `confirm: true` (400 without it). Reverse-geocodes the full candidate
+  set and writes in one transaction with
+  `WHERE id=? AND gps_lat IS NULL` so rows a concurrent indexer just
+  populated are never overwritten. Returns
+  `{updated_count, rounds_used, duration_seconds}`.
+
+---
+
+## Inferred geotagging (M19)
+
+Fills `gps_lat`/`gps_lon` for photos with missing GPS by interpolating
+between temporal GPS neighbors.
+
+**Schema v17 columns** (in `photos`):
+- `location_source` — `'exif' | 'inferred' | NULL`. `add_photo()` auto-
+  stamps `'exif'` whenever a caller passes `gps_lat`/`gps_lon` without an
+  explicit source, so provenance is complete from the first index forward.
+- `location_confidence` — `NULL | (0,1]`. Only non-null for inferred
+  rows. `1.0 × 0.7^hops × time_decay × side_bonus` roughly.
+
+**Algorithm** (`photosearch/infer_location.py`):
+1. `_scan_photos` sorts all photos by `date_taken`. Rows with no
+   parseable date are counted and skipped (reported under
+   `skipped.no_date_taken`).
+2. `_find_flanking_anchors` walks left/right from each no-GPS photo to
+   find the nearest anchor on each side within the window. Works
+   bidirectionally so cascade chains resolve correctly regardless of
+   scan order.
+3. Cascade path is **sequential time-ordered promote-as-you-go**: each
+   successful inference becomes an anchor for subsequent photos. Each
+   new inference picks its NEAREST anchor (typically its just-inferred
+   predecessor), so chains compound confidence multiplicatively rather
+   than anchoring the whole chain to a single distant real-GPS photo.
+4. **Movement guard**: if two flanking anchors disagree by more than
+   `max_drift_km` (default 25), inference is refused. `skipped.movement_guard`
+   surfaces this.
+
+**Surfaces:**
+- **CLI:** `photosearch infer-locations [--window-minutes 30]
+  [--max-drift-km 25] [--min-confidence 0.0] [--no-cascade] [--apply]`.
+  Dry-run default prints summary + histograms + 10 samples.
+- **API:** `/api/geocode/infer-preview` + `/api/geocode/infer-apply`
+  (see above).
+- **UI:** `/status` has an **Infer Locations** panel
+  (`InferLocationForm` in `frontend/dist/status.html`) that wraps the
+  two endpoints. Apply is disabled until the current params have been
+  previewed, and re-disables on any param edit until a re-preview.
+
+**Rollback:** every inferred write below a confidence floor can be
+nulled in one query, since `location_source='inferred'` is only ever
+stamped by `infer-apply`:
+
+```sql
+UPDATE photos
+   SET gps_lat=NULL, gps_lon=NULL, place_name=NULL,
+       location_source=NULL, location_confidence=NULL
+ WHERE location_source='inferred' AND location_confidence < 0.5;
+```
+
+Tests:
+`tests/test_infer_location.py` (engine, 20 cases including UTF-8
+`place_name` roundtrip), `tests/test_cli_infer.py` (CLI),
+`tests/test_web_geocode.py` (API), plus 3 cases in `tests/test_db.py`
+for the `add_photo` auto-stamp.
 
 ---
 
@@ -1018,13 +1095,15 @@ Living roadmap entries — each is a design doc the next contributor can
 pick up and implement without re-deriving the shape:
 
 - **`docs/plans/bulk-set-location.md`** — bulk-assign location to photos
-  lacking GPS. Two sources feed the same sink: a manual address-picker
-  modal (forward geocoding via proxied Nominatim) and temporal-neighbor
-  inference (absorbs **M19**). Adds `country` / `admin1` / `admin2` /
-  `locality` columns plus `location_source` / `location_confidence`.
-  Downstream unlocks: map view (Leaflet clusters), radius search
-  (`?location_near=47.6,-122.3&radius_km=5`), region-scoped queries like
-  *"beach near southwest France"* via a hand-curated region→admin1 map.
+  lacking GPS. **M19 (temporal-neighbor inference) shipped** — see
+  "Inferred geotagging (M19)" below. Adds `location_source` and
+  `location_confidence` columns (schema v17). Remaining work from the
+  parent plan: manual address-picker modal (forward geocoding via
+  proxied Nominatim) and the `country` / `admin1` / `admin2` /
+  `locality` columns that unlock map view (Leaflet clusters), radius
+  search (`?location_near=47.6,-122.3&radius_km=5`), and region-scoped
+  queries like *"beach near southwest France"* via a hand-curated
+  region→admin1 map.
 - **`docs/plans/google-photos-import.md`** — **M20**. Takeout-based
   import of ~200K smartphone photos. The Library API read scopes were
   deprecated for third-party apps on March 31, 2025, so the API path is

@@ -22,7 +22,7 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 15. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 17. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, schema_info.
 
@@ -129,6 +129,52 @@ filters. `?q=Calvin and Ellie` matches photos containing both people
 residual to CLIP. `(?<!-)` lookbehind keeps `-Calvin` as a CLIP exclusion.
 Stacks cleanly with dates/locations/explicit `person=` via `search_combined`'s
 existing result-set intersection — no special casing.
+
+## Inferred geotagging (M19)
+
+`photos` now has `location_source` (`'exif' | 'inferred' | NULL`) and
+`location_confidence` (`NULL | (0,1]`) columns stamped on every GPS-bearing
+row. `add_photo` auto-sets `location_source='exif'` whenever a caller
+provides `gps_lat`/`gps_lon` without an explicit source, so provenance is
+complete from the first indexing run forward.
+
+`photosearch infer-locations` scans photos with `gps_lat IS NULL` and copies
+coordinates from temporal GPS neighbors within a window (default 30min).
+The cascade promotes each successful inference into the anchor set for
+subsequent photos (sequential time-ordered promote-as-you-go), so chains
+form naturally and each photo picks its nearest anchor. A movement guard
+refuses to infer when two flanking anchors disagree by more than
+`--max-drift-km` (default 25km).
+
+```bash
+$DC run --rm photosearch infer-locations [--window-minutes 30] [--max-drift-km 25] \
+    [--min-confidence 0.0] [--no-cascade] [--apply]
+```
+
+Dry-run (default) prints a candidate summary + confidence + hop histograms
++ 10 sample inferences. `--apply` reverse-geocodes via the offline
+GeoNames database and writes
+`gps_lat`/`gps_lon`/`place_name`/`location_source='inferred'`/
+`location_confidence` in one transaction. The UPDATE carries a
+`WHERE gps_lat IS NULL` guard so rows with pre-existing GPS are never
+overwritten.
+
+Live tuning UI: `/status` has an **Infer Locations** panel that wraps
+`POST /api/geocode/infer-preview` and `POST /api/geocode/infer-apply`.
+Apply is disabled until the current params have been previewed, and
+re-enables only after a successful preview with matching params.
+
+Rollback (delete every inferred write below a confidence floor):
+
+```sql
+UPDATE photos
+   SET gps_lat=NULL, gps_lon=NULL, place_name=NULL,
+       location_source=NULL, location_confidence=NULL
+ WHERE location_source='inferred' AND location_confidence < 0.5;
+```
+
+Module: `photosearch/infer_location.py` (`infer_locations`,
+`_find_flanking_anchors`, `_infer_one_round`, `haversine_km`).
 
 ## Status page live actions
 
@@ -260,10 +306,12 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
 ## Planned milestones (see `docs/plans/`)
 
 - `docs/plans/bulk-set-location.md` — bulk-assign location to photos lacking
-  GPS via manual address picker (forward geocoding, Nominatim) or inferred
-  from temporal GPS neighbors. Absorbs M19. New `country`/`admin1`/`admin2`/
-  `locality` columns unlock map view, radius search, region-scoped queries
-  like "beach near southwest France".
+  GPS. **M19 (temporal-neighbor inference) shipped** — see the
+  "Inferred geotagging (M19)" section above. Remaining work from that
+  plan: manual address picker (forward geocoding, Nominatim) and the
+  `country`/`admin1`/`admin2`/`locality` columns that unlock map view,
+  radius search, and region-scoped queries like "beach near southwest
+  France".
 - `docs/plans/google-photos-import.md` — M20. Takeout-based import of
   ~200K smartphone photos. Google Photos API read scopes were deprecated for
   third-party apps in March 2025, so Takeout is the only path. Incremental
