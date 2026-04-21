@@ -1104,6 +1104,13 @@ pick up and implement without re-deriving the shape:
   search (`?location_near=47.6,-122.3&radius_km=5`), and region-scoped
   queries like *"beach near southwest France"* via a hand-curated
   region→admin1 map.
+- **`docs/plans/infer-location-refinements.md`** — post-M19 cascade
+  fixes surfaced by the first 127k-library apply. Three ordered
+  changes: (1) cap hop depth at ~6 (observed chain ran 776 deep), (2)
+  downweight inferred anchors on re-scan so decay protects cross-run
+  compounding, (3) delete the dead `--max-cascade-rounds` flag and
+  rename `cascade_rounds_used` → `max_hop_count` to match reality.
+  All localized to `photosearch/infer_location.py`.
 - **`docs/plans/google-photos-import.md`** — **M20**. Takeout-based
   import of ~200K smartphone photos. The Library API read scopes were
   deprecated for third-party apps on March 31, 2025, so the API path is

@@ -312,6 +312,12 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   `country`/`admin1`/`admin2`/`locality` columns that unlock map view,
   radius search, and region-scoped queries like "beach near southwest
   France".
+- `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
+  surfaced on the 127k NAS library. Cap hop depth (cascade ran 776
+  deep, 71% of candidates below 0.25 confidence), downweight inferred
+  anchors on re-scan so decay protects cross-run compounding, drop the
+  dead `--max-cascade-rounds` flag. All localized to
+  `photosearch/infer_location.py`.
 - `docs/plans/google-photos-import.md` — M20. Takeout-based import of
   ~200K smartphone photos. Google Photos API read scopes were deprecated for
   third-party apps in March 2025, so Takeout is the only path. Incremental
