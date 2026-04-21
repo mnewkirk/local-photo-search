@@ -166,8 +166,16 @@ re-enables only after a successful preview with matching params.
 
 Map view: `/map` plots every GPS-bearing photo (exif + inferred) on a
 Leaflet map with marker clustering. Sidebar filters by source
-(exif/inferred) and year; click a marker → opens `PS.PhotoModal`.
-Backed by the `GET /api/photos/geojson` endpoint (compact tuple format
+(exif/inferred) and year. Clicking a marker or cluster opens a preview
+pane (up to 9 thumbnails) with:
+- **Zoom** — fits the map to the cluster's bounds (or zooms to 16 on a
+  single marker).
+- **Search** — deep-links to `/?location=<place_name>`, letting the
+  user jump from a map cluster straight into a filtered search. Button
+  is disabled until the place name resolves (one `/api/photos/{id}`
+  fetch per preview open, from the first photo).
+Clicking a thumbnail still opens `PS.PhotoModal`. Backed by the
+`GET /api/photos/geojson` endpoint (compact tuple format
 `[id, lat, lon, source, year]`, ~500KB gzipped on a 50k-GPS library).
 
 Rollback (delete every inferred write below a confidence floor):

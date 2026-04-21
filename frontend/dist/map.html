@@ -166,6 +166,112 @@
       color: var(--text-muted);
       z-index: 999;
     }
+
+    .preview-pane {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 320px;
+      max-height: calc(100% - 32px);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .preview-header {
+      padding: 12px 14px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .preview-place {
+      flex: 1;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.3;
+      word-break: break-word;
+    }
+    .preview-coords {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+      margin-top: 2px;
+      font-weight: 400;
+    }
+    .preview-close {
+      background: transparent;
+      color: var(--text-muted);
+      border: 0;
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .preview-close:hover { color: var(--text); background: var(--surface2); }
+    .preview-thumbs {
+      padding: 10px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      overflow-y: auto;
+    }
+    .preview-thumb {
+      aspect-ratio: 1 / 1;
+      overflow: hidden;
+      border-radius: 4px;
+      cursor: pointer;
+      background: var(--surface2);
+      position: relative;
+    }
+    .preview-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .preview-thumb:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .preview-footer {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .preview-count {
+      font-size: 12px;
+      color: var(--text-muted);
+      flex: 1;
+    }
+    .preview-btn {
+      background: var(--accent);
+      color: #fff;
+      border: 0;
+      padding: 6px 12px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      text-decoration: none;
+    }
+    .preview-btn:hover { background: var(--accent-hover); }
+    .preview-btn.secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .preview-btn.secondary:hover { border-color: var(--accent); background: var(--surface2); }
+    .preview-btn.disabled,
+    .preview-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -194,11 +300,13 @@
       const [sourceFilter, setSourceFilter] = useState({ exif: true, inferred: true, unknown: true });
       const [yearFilter, setYearFilter] = useState(null);   // Set of allowed years, or null = all
       const [modalPhoto, setModalPhoto] = useState(null);
+      const [preview, setPreview] = useState(null);          // { photos, centerLat, centerLon, placeName?, bounds? }
       const [persons, setPersons] = useState([]);
 
       const mapRef = useRef(null);
       const clusterRef = useRef(null);
       const mapElRef = useRef(null);
+      const previewReqRef = useRef(0);   // race-guard for async place-name fetches
 
       // Initial data load
       useEffect(() => {
@@ -232,6 +340,17 @@
           spiderfyOnMaxZoom: true,
           showCoverageOnHover: false,
           maxClusterRadius: 55,
+          zoomToBoundsOnClick: false,
+        });
+        // Cluster click → open preview with up to 9 child markers.
+        cluster.on('clusterclick', (ev) => {
+          const children = ev.layer.getAllChildMarkers();
+          const photos = children.slice(0, 9)
+            .map(m => m._photoPoint)
+            .filter(Boolean);
+          if (!photos.length) return;
+          const c = ev.layer.getLatLng();
+          openPreview(photos, c.lat, c.lng, ev.layer.getBounds());
         });
         map.addLayer(cluster);
 
@@ -283,11 +402,47 @@
             fillColor: color,
             fillOpacity: 0.85,
           });
-          m.on('click', () => setModalPhoto({ id }));
+          m._photoPoint = p;
+          m.on('click', () => openPreview([p], lat, lon, null));
           return m;
         });
         cluster.addLayers(markers);
       }, [visiblePoints]);
+
+      // Open the preview pane for a set of photos. Fetches place_name from
+      // the first photo; the previewReqRef guards against out-of-order
+      // async resolutions if the user clicks rapidly.
+      const openPreview = useCallback((photos, centerLat, centerLon, bounds) => {
+        const reqId = ++previewReqRef.current;
+        setPreview({ photos, centerLat, centerLon, bounds, placeName: undefined });
+        if (!photos.length) return;
+        fetch('/api/photos/' + photos[0][0])
+          .then(r => r.ok ? r.json() : null)
+          .then(detail => {
+            if (reqId !== previewReqRef.current) return;
+            setPreview(prev => prev && reqId === previewReqRef.current
+              ? { ...prev, placeName: (detail && detail.place_name) || null }
+              : prev);
+          })
+          .catch(() => {
+            if (reqId !== previewReqRef.current) return;
+            setPreview(prev => prev ? { ...prev, placeName: null } : prev);
+          });
+      }, []);
+
+      const closePreview = useCallback(() => {
+        previewReqRef.current++;
+        setPreview(null);
+      }, []);
+
+      const zoomToPreview = useCallback(() => {
+        if (!preview || !mapRef.current) return;
+        if (preview.bounds) {
+          mapRef.current.fitBounds(preview.bounds, { padding: [40, 40], maxZoom: 18 });
+        } else {
+          mapRef.current.setView([preview.centerLat, preview.centerLon], 16);
+        }
+      }, [preview]);
 
       const toggleSource = useCallback((k) => {
         setSourceFilter(s => ({ ...s, [k]: !s[k] }));
@@ -355,11 +510,63 @@
           ' points'),
       );
 
+      const previewPane = preview && (() => {
+        const nPhotos = preview.photos.length;
+        const coordsStr = preview.centerLat.toFixed(4) + ', ' + preview.centerLon.toFixed(4);
+        const placeLoading = preview.placeName === undefined;
+        const placeResolved = typeof preview.placeName === 'string' && preview.placeName.length > 0;
+        const searchHref = placeResolved
+          ? '/?location=' + encodeURIComponent(preview.placeName)
+          : null;
+
+        return e('div', { className: 'preview-pane' },
+          e('div', { className: 'preview-header' },
+            e('div', { className: 'preview-place' },
+              placeLoading ? 'Loading location…'
+                : (placeResolved ? preview.placeName : '(no place name)'),
+              e('div', { className: 'preview-coords' }, coordsStr),
+            ),
+            e('button', { className: 'preview-close', onClick: closePreview, title: 'Close' }, '×'),
+          ),
+          e('div', { className: 'preview-thumbs' },
+            preview.photos.map(p => e('div', {
+              key: p[0],
+              className: 'preview-thumb',
+              onClick: () => setModalPhoto({ id: p[0] }),
+              title: 'Open photo',
+            },
+              e('img', { src: '/api/photos/' + p[0] + '/thumbnail', loading: 'lazy', alt: '' }),
+            )),
+          ),
+          e('div', { className: 'preview-footer' },
+            e('span', { className: 'preview-count' },
+              nPhotos.toLocaleString() + (nPhotos === 1 ? ' photo' : ' photos')),
+            e('button', {
+              className: 'preview-btn secondary',
+              onClick: zoomToPreview,
+              title: 'Zoom map to this location',
+            }, 'Zoom'),
+            searchHref
+              ? e('a', {
+                  className: 'preview-btn',
+                  href: searchHref,
+                  title: 'Open search filtered to ' + preview.placeName,
+                }, 'Search')
+              : e('button', {
+                  className: 'preview-btn disabled',
+                  disabled: true,
+                  title: placeLoading ? 'Resolving place name…' : 'No place name available',
+                }, 'Search'),
+          ),
+        );
+      })();
+
       const mapArea = e('div', { style: { position: 'relative', flex: 1 } },
         e('div', { id: 'map', ref: mapElRef }),
         !points && !loadError && e('div', { className: 'map-loading' }, 'Loading points…'),
         loadError && e('div', { className: 'map-loading', style: { color: 'var(--red, #f87171)' } },
           'Failed to load: ' + loadError),
+        previewPane,
       );
 
       return e('div', null,
