@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Map — Photo Search</title>
+
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="" />
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --exif-color: #4a9eff;
+      --inferred-color: #facc15;
+      --radius: 8px;
+    }
+
+    html, body, #root { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      overflow: hidden;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+    }
+    .header-inner {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .layout {
+      display: flex;
+      height: calc(100vh - 75px);
+    }
+
+    .sidebar {
+      width: 260px;
+      border-right: 1px solid var(--border);
+      background: var(--surface);
+      padding: 16px 20px;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }
+    .sidebar h3 {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+      margin-top: 16px;
+    }
+    .sidebar h3:first-child { margin-top: 0; }
+    .stat {
+      font-size: 13px;
+      margin-bottom: 4px;
+      color: var(--text-muted);
+    }
+    .stat strong { color: var(--text); }
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .legend-row input { margin: 0; }
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(255,255,255,0.4);
+      flex-shrink: 0;
+    }
+    .year-list {
+      max-height: 280px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 8px;
+    }
+    .year-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      padding: 2px 0;
+      cursor: pointer;
+    }
+    .year-row input { margin: 0; }
+    .year-row .count { color: var(--text-muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+    .btn-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .btn {
+      flex: 1;
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn:hover { border-color: var(--accent); }
+
+    #map {
+      flex: 1;
+      height: 100%;
+    }
+    .leaflet-container {
+      background: #1e1e1e;
+    }
+    .map-loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 14px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      color: var(--text-muted);
+      z-index: 999;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="/shared.js"></script>
+
+  <script>
+    const { useState, useEffect, useRef, useMemo, useCallback } = React;
+    const e = React.createElement;
+
+    const SOURCE_LABEL = { exif: 'EXIF GPS', inferred: 'Inferred (M19)', unknown: 'Unknown source' };
+    const SOURCE_COLOR = { exif: '#4a9eff', inferred: '#facc15', unknown: '#888' };
+
+    function sourceKey(s) { return s === 'exif' || s === 'inferred' ? s : 'unknown'; }
+
+    function MapView() {
+      const [points, setPoints] = useState(null);
+      const [loadError, setLoadError] = useState(null);
+      const [sourceFilter, setSourceFilter] = useState({ exif: true, inferred: true, unknown: true });
+      const [yearFilter, setYearFilter] = useState(null);   // Set of allowed years, or null = all
+      const [modalPhoto, setModalPhoto] = useState(null);
+      const [persons, setPersons] = useState([]);
+
+      const mapRef = useRef(null);
+      const clusterRef = useRef(null);
+      const mapElRef = useRef(null);
+
+      // Initial data load
+      useEffect(() => {
+        fetch('/api/photos/geojson')
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(body => setPoints(body.points))
+          .catch(err => setLoadError(String(err)));
+
+        fetch('/api/persons')
+          .then(r => r.ok ? r.json() : [])
+          .then(data => setPersons(Array.isArray(data) ? data : (data.persons || [])))
+          .catch(() => {});
+      }, []);
+
+      // Initialize Leaflet once
+      useEffect(() => {
+        if (!mapElRef.current || mapRef.current) return;
+
+        const map = L.map(mapElRef.current, {
+          center: [30, 0],
+          zoom: 2,
+          worldCopyJump: true,
+        });
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors',
+        }).addTo(map);
+
+        const cluster = L.markerClusterGroup({
+          chunkedLoading: true,
+          spiderfyOnMaxZoom: true,
+          showCoverageOnHover: false,
+          maxClusterRadius: 55,
+        });
+        map.addLayer(cluster);
+
+        mapRef.current = map;
+        clusterRef.current = cluster;
+      }, []);
+
+      // Derived: counts by source and year
+      const stats = useMemo(() => {
+        if (!points) return null;
+        const bySource = { exif: 0, inferred: 0, unknown: 0 };
+        const byYear = new Map();
+        for (const p of points) {
+          bySource[sourceKey(p[3])]++;
+          const y = p[4];
+          byYear.set(y, (byYear.get(y) || 0) + 1);
+        }
+        const years = Array.from(byYear.keys()).sort((a, b) => {
+          if (a === null) return 1;
+          if (b === null) return -1;
+          return b - a;
+        });
+        return { bySource, byYear, years, total: points.length };
+      }, [points]);
+
+      // Visible points = source + year filter applied
+      const visiblePoints = useMemo(() => {
+        if (!points) return [];
+        return points.filter(p => {
+          if (!sourceFilter[sourceKey(p[3])]) return false;
+          if (yearFilter && !yearFilter.has(p[4])) return false;
+          return true;
+        });
+      }, [points, sourceFilter, yearFilter]);
+
+      // Re-render markers whenever filters change
+      useEffect(() => {
+        const cluster = clusterRef.current;
+        if (!cluster) return;
+        cluster.clearLayers();
+
+        const markers = visiblePoints.map(p => {
+          const [id, lat, lon, src] = p;
+          const color = SOURCE_COLOR[sourceKey(src)];
+          const m = L.circleMarker([lat, lon], {
+            radius: 5,
+            color: 'rgba(0,0,0,0.6)',
+            weight: 1,
+            fillColor: color,
+            fillOpacity: 0.85,
+          });
+          m.on('click', () => setModalPhoto({ id }));
+          return m;
+        });
+        cluster.addLayers(markers);
+      }, [visiblePoints]);
+
+      const toggleSource = useCallback((k) => {
+        setSourceFilter(s => ({ ...s, [k]: !s[k] }));
+      }, []);
+
+      const toggleYear = useCallback((y) => {
+        setYearFilter(f => {
+          const next = new Set(f || []);
+          if (next.has(y)) next.delete(y); else next.add(y);
+          if (next.size === 0) return null;
+          return next;
+        });
+      }, []);
+
+      const selectAllYears = useCallback(() => setYearFilter(null), []);
+      const selectNoneYears = useCallback(() => setYearFilter(new Set()), []);
+
+      // Sidebar render
+      const sidebar = e('div', { className: 'sidebar' },
+        e('h3', null, 'Sources'),
+        ['exif', 'inferred', 'unknown'].map(k => {
+          const count = stats ? stats.bySource[k] : 0;
+          if (count === 0 && k === 'unknown') return null;
+          return e('label', { key: k, className: 'legend-row' },
+            e('input', {
+              type: 'checkbox',
+              checked: sourceFilter[k],
+              onChange: () => toggleSource(k),
+            }),
+            e('span', { className: 'legend-dot', style: { background: SOURCE_COLOR[k] } }),
+            e('span', null, SOURCE_LABEL[k]),
+            e('span', { style: { color: 'var(--text-muted)', marginLeft: 'auto' } },
+              count.toLocaleString()),
+          );
+        }),
+
+        e('h3', null, 'Years'),
+        stats && e('div', null,
+          e('div', { className: 'year-list' },
+            stats.years.map(y => {
+              const count = stats.byYear.get(y);
+              const label = y === null ? '(no date)' : String(y);
+              const checked = !yearFilter || yearFilter.has(y);
+              return e('label', { key: String(y), className: 'year-row' },
+                e('input', {
+                  type: 'checkbox',
+                  checked,
+                  onChange: () => toggleYear(y),
+                }),
+                e('span', null, label),
+                e('span', { className: 'count' }, count.toLocaleString()),
+              );
+            })
+          ),
+          e('div', { className: 'btn-row' },
+            e('button', { className: 'btn', onClick: selectAllYears }, 'All'),
+            e('button', { className: 'btn', onClick: selectNoneYears }, 'None'),
+          ),
+        ),
+
+        e('h3', null, 'Visible'),
+        e('div', { className: 'stat' },
+          e('strong', null, visiblePoints.length.toLocaleString()),
+          stats ? ' of ' + stats.total.toLocaleString() : '',
+          ' points'),
+      );
+
+      const mapArea = e('div', { style: { position: 'relative', flex: 1 } },
+        e('div', { id: 'map', ref: mapElRef }),
+        !points && !loadError && e('div', { className: 'map-loading' }, 'Loading points…'),
+        loadError && e('div', { className: 'map-loading', style: { color: 'var(--red, #f87171)' } },
+          'Failed to load: ' + loadError),
+      );
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'map' }),
+        e('div', { className: 'layout' }, sidebar, mapArea),
+        modalPhoto && e(PS.PhotoModal, {
+          photo: modalPhoto,
+          fetchDetail: true,
+          persons: persons,
+          onClose: () => setModalPhoto(null),
+          showLocation: true,
+          showSearchScore: false,
+        }),
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(MapView));
+  </script>
+</body>
+</html>

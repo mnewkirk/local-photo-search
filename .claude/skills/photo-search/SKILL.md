@@ -82,6 +82,7 @@ local-photo-search/
     ├── faces.html          # Face browser + Split cluster inline form
     ├── merges.html         # M18 — merge-suggestion review page
     ├── collections.html    # Collections UI + Google Photos upload modal
+    ├── map.html            # Leaflet map view of GPS-bearing photos
     ├── review.html         # Shoot review / culling UI
     ├── status.html         # Indexing status + run commands
     └── shared.js           # Shared components: PS.SharedHeader (with /merges
@@ -286,6 +287,16 @@ need cross-recluster persistence.
 - `GET /api/stats/errors` — Recent indexing errors
 - `GET /api/worker/status` — (see Worker System below) polled by the status
   page Workers panel every 5s for per-pass queue depth + active claims
+
+### Map view
+- `GET /api/photos/geojson` — compact point dump of every GPS-bearing
+  photo. Returns `{count, points: [[id, lat, lon, source, year], ...]}`
+  — tuple format keeps 50k points under 500KB gzipped. `source` is
+  `'exif' | 'inferred' | None`; `year` is parsed from `date_taken[:4]`
+  or None. Consumed by `/map` (Leaflet + markercluster UMD, no build
+  step). **Must be declared before `/api/photos/{photo_id}` in
+  `web.py`** or FastAPI's path matcher takes `geojson` as a photo id
+  and returns 422.
 
 ### Inferred geotagging (M19)
 - `POST /api/geocode/infer-preview` — read-only. Body takes

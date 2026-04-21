@@ -829,6 +829,38 @@ def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(100
         return {"photos": [dict(r) for r in rows]}
 
 
+@app.get("/api/photos/geojson")
+def api_photos_geojson():
+    """Compact point dump of every GPS-bearing photo for the map view.
+
+    Returns `{count, points: [[id, lat, lon, source, year], ...]}`.
+    `source` is `'exif' | 'inferred' | None`; `year` is int or None
+    (parsed from the first 4 chars of date_taken). Compact tuples keep
+    the response small — on a 50k-GPS library this is under 2MB
+    uncompressed, ~500KB gzipped.
+
+    Must be declared before `/api/photos/{photo_id}` so FastAPI's route
+    matcher doesn't interpret `geojson` as a photo id (→ 422).
+    """
+    with _get_db() as db:
+        rows = db.conn.execute(
+            "SELECT id, gps_lat, gps_lon, location_source, date_taken "
+            "FROM photos WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
+        ).fetchall()
+    points = []
+    for r in rows:
+        dt = r["date_taken"]
+        year = None
+        if dt and len(dt) >= 4:
+            try:
+                year = int(dt[:4])
+            except ValueError:
+                year = None
+        points.append([r["id"], r["gps_lat"], r["gps_lon"],
+                       r["location_source"], year])
+    return {"count": len(points), "points": points}
+
+
 @app.get("/api/photos/{photo_id}")
 def api_photo_detail(photo_id: int):
     """Get full metadata for a single photo, including face matches."""
@@ -3005,6 +3037,15 @@ if _frontend_dir.exists():
         if status_page.exists():
             return HTMLResponse(status_page.read_text())
         return HTMLResponse("<h1>Status page not found</h1>")
+
+    @app.get("/map")
+    def serve_map():
+        """Serve the map view page."""
+        page = _frontend_dir / "map.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(),
+                                headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Map page not found</h1>")
 
     @app.get("/collections/{collection_id}")
     def serve_collection_detail(collection_id: int):

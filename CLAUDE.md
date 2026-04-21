@@ -164,6 +164,12 @@ Live tuning UI: `/status` has an **Infer Locations** panel that wraps
 Apply is disabled until the current params have been previewed, and
 re-enables only after a successful preview with matching params.
 
+Map view: `/map` plots every GPS-bearing photo (exif + inferred) on a
+Leaflet map with marker clustering. Sidebar filters by source
+(exif/inferred) and year; click a marker → opens `PS.PhotoModal`.
+Backed by the `GET /api/photos/geojson` endpoint (compact tuple format
+`[id, lat, lon, source, year]`, ~500KB gzipped on a 50k-GPS library).
+
 Rollback (delete every inferred write below a confidence floor):
 
 ```sql
