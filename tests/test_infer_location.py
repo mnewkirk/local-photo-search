@@ -175,3 +175,86 @@ def test_infer_gap_equals_window_filtered(empty_db):
     result = infer_locations(empty_db, window_minutes=30, cascade=False)
     assert result["candidates"] == []
     assert result["summary"]["skipped"]["below_min_confidence"] == 1
+
+
+def test_cascade_three_hop_chain(empty_db):
+    """Real at t=0, no-GPS at t=20/40/60, window=30. Cascade should
+    anchor all three with decaying confidence and hop_count 1/2/3."""
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/anchor.jpg",
+         date_taken="2020-06-15T10:00:00", lat=47.6, lon=-122.3)
+    t1 = _add(empty_db, filepath="/t1.jpg", date_taken="2020-06-15T10:10:00")
+    t2 = _add(empty_db, filepath="/t2.jpg", date_taken="2020-06-15T10:20:00")
+    t3 = _add(empty_db, filepath="/t3.jpg", date_taken="2020-06-15T10:30:00")
+
+    result = infer_locations(empty_db, window_minutes=30, cascade=True)
+
+    by_id = {c["photo_id"]: c for c in result["candidates"]}
+    assert set(by_id) == {t1, t2, t3}
+    assert by_id[t1]["hop_count"] == 1
+    assert by_id[t2]["hop_count"] == 2
+    assert by_id[t3]["hop_count"] == 3
+    # 10 min past the previous anchor each time -> base_decay=2/3 per hop,
+    # sides_factor=0.7 (one-sided, no right anchor yet).
+    assert by_id[t1]["confidence"] == pytest.approx(2/3 * 0.7, rel=1e-3)
+    assert by_id[t2]["confidence"] == pytest.approx((2/3 * 0.7) ** 2, rel=1e-3)
+    assert result["summary"]["cascade_rounds_used"] >= 3
+
+
+def test_cascade_terminates_on_isolated_cluster(empty_db):
+    """No-GPS cluster with no real anchor in reach stays unanchored;
+    loop exits cleanly without hitting max_cascade_rounds."""
+    from photosearch.infer_location import infer_locations
+    # Connected: real anchor at t=0, target at t=15.
+    _add(empty_db, filepath="/anchor.jpg",
+         date_taken="2020-06-15T10:00:00", lat=47.6, lon=-122.3)
+    _add(empty_db, filepath="/connected.jpg",
+         date_taken="2020-06-15T10:15:00")
+    # Isolated pair: two no-GPS photos with no anchor within reach.
+    _add(empty_db, filepath="/iso1.jpg", date_taken="2021-01-01T00:00:00")
+    _add(empty_db, filepath="/iso2.jpg", date_taken="2021-01-01T00:10:00")
+
+    result = infer_locations(empty_db, window_minutes=30,
+                              cascade=True, max_cascade_rounds=10)
+    assert len(result["candidates"]) == 1
+    assert result["summary"]["skipped"]["no_anchor"] == 2
+    # Must terminate well before max_cascade_rounds.
+    assert result["summary"]["cascade_rounds_used"] < 10
+
+
+def test_cascade_disabled_matches_direct_only(empty_db):
+    """With cascade=False, the 3-hop chain from above only gets t1."""
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/anchor.jpg",
+         date_taken="2020-06-15T10:00:00", lat=47.6, lon=-122.3)
+    t1 = _add(empty_db, filepath="/t1.jpg", date_taken="2020-06-15T10:20:00")
+    _add(empty_db, filepath="/t2.jpg", date_taken="2020-06-15T10:40:00")
+    _add(empty_db, filepath="/t3.jpg", date_taken="2020-06-15T11:00:00")
+
+    result = infer_locations(empty_db, window_minutes=30, cascade=False)
+    assert [c["photo_id"] for c in result["candidates"]] == [t1]
+    assert result["summary"]["skipped"]["no_anchor"] == 2
+
+
+def test_cascade_movement_guard_transitive(empty_db):
+    """Real anchors 250km apart flank a no-GPS region. The middle
+    photo sees flanking *inferred* anchors still 250km apart -> skip."""
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/seattle.jpg",
+         date_taken="2020-06-15T10:00:00", lat=47.60, lon=-122.30)
+    _add(empty_db, filepath="/t30.jpg",  date_taken="2020-06-15T10:25:00")
+    _add(empty_db, filepath="/t60.jpg",  date_taken="2020-06-15T10:50:00")
+    _add(empty_db, filepath="/portland.jpg",
+         date_taken="2020-06-15T11:15:00", lat=45.52, lon=-122.68)
+    _add(empty_db, filepath="/t90.jpg",  date_taken="2020-06-15T11:40:00")
+
+    result = infer_locations(empty_db, window_minutes=30,
+                              max_drift_km=25.0, cascade=True)
+
+    filenames = {c["filepath"] for c in result["candidates"]}
+    # t30 anchors to Seattle, t90 to Portland (one-sided each).
+    # t60 has flanking *inferred* anchors ~250km apart -> movement_guard.
+    assert "/t30.jpg" in filenames
+    assert "/t90.jpg" in filenames
+    assert "/t60.jpg" not in filenames
+    assert result["summary"]["skipped"]["movement_guard"] >= 1

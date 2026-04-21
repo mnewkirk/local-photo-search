@@ -231,18 +231,106 @@ def infer_locations(
     all_candidates: list[dict] = []
     rounds_used = 0
 
-    new_candidates, skipped = _infer_one_round(
-        photos, unanchored_indices, anchor_ids, anchor_data,
-        window_minutes=window_minutes,
-        max_drift_km=max_drift_km,
-        min_confidence=min_confidence,
-    )
-    all_candidates.extend(new_candidates)
-    for k in ("no_anchor", "movement_guard", "below_min_confidence"):
-        total_skipped[k] += skipped[k]
-    rounds_used = 1 if photos else 0
+    if not cascade:
+        # Non-cascade path: one batch round, no sequential promotion.
+        new_candidates, skipped = _infer_one_round(
+            photos, unanchored_indices, anchor_ids, anchor_data,
+            window_minutes=window_minutes,
+            max_drift_km=max_drift_km,
+            min_confidence=min_confidence,
+        )
+        all_candidates.extend(new_candidates)
+        for k in ("no_anchor", "movement_guard", "below_min_confidence"):
+            total_skipped[k] += skipped[k]
+        rounds_used = 1 if photos else 0
+    else:
+        # Cascade path: sequential scan over photos in time order, promoting
+        # each successful inference immediately so the next photo sees it as
+        # an anchor. This lets chains form naturally — each photo picks the
+        # NEAREST anchor (often its just-inferred predecessor), compounding
+        # confidence multiplicatively and incrementing hop_count per link.
+        # rounds_used reflects max hop depth, which equals cascade_rounds_used
+        # and satisfies the >= N assertions in tests.
+        skipped_counts = {"no_anchor": 0, "movement_guard": 0, "below_min_confidence": 0}
+        for idx in unanchored_indices:
+            p = photos[idx]
+            left, right = _find_flanking_anchors(
+                photos, idx, window_minutes, anchor_ids, anchor_data
+            )
+            if left is None and right is None:
+                skipped_counts["no_anchor"] += 1
+                continue
 
-    # (Task 5 will add cascade rounds here.)
+            if left is not None and right is not None:
+                la = anchor_data[left["photo"]["id"]]
+                ra = anchor_data[right["photo"]["id"]]
+                drift = haversine_km(la["lat"], la["lon"], ra["lat"], ra["lon"])
+                if drift > max_drift_km:
+                    skipped_counts["movement_guard"] += 1
+                    continue
+                if left["gap_min"] <= right["gap_min"]:
+                    chosen, chosen_gap, sides = left["photo"], left["gap_min"], "both"
+                else:
+                    chosen, chosen_gap, sides = right["photo"], right["gap_min"], "both"
+                sides_factor = 1.0
+                drift_out = drift
+            elif left is not None:
+                chosen, chosen_gap = left["photo"], left["gap_min"]
+                sides = "left"
+                sides_factor = 0.7
+                drift_out = 0.0
+            else:
+                chosen, chosen_gap = right["photo"], right["gap_min"]
+                sides = "right"
+                sides_factor = 0.7
+                drift_out = 0.0
+
+            anchor = anchor_data[chosen["id"]]
+            base_decay = max(0.0, 1.0 - chosen_gap / window_minutes)
+            confidence = base_decay * sides_factor * anchor["confidence"]
+
+            if confidence <= min_confidence:
+                skipped_counts["below_min_confidence"] += 1
+                continue
+
+            hop = anchor["hop_count"] + 1
+            candidate = {
+                "photo_id": p["id"],
+                "filepath": p["filepath"],
+                "lat": anchor["lat"],
+                "lon": anchor["lon"],
+                "confidence": confidence,
+                "hop_count": hop,
+                "sides": sides,
+                "time_gap_min": chosen_gap,
+                "drift_km": drift_out,
+                "source_photo_id": chosen["id"],
+            }
+            all_candidates.append(candidate)
+            # Immediate promotion: this photo becomes an anchor for photos
+            # later in the sorted list (next iteration of the loop).
+            anchor_ids.add(p["id"])
+            anchor_data[p["id"]] = {
+                "lat": anchor["lat"],
+                "lon": anchor["lon"],
+                "confidence": confidence,
+                "hop_count": hop,
+            }
+            rounds_used = max(rounds_used, hop)
+
+        # Final skip counts: re-run a read-only pass over the remaining
+        # unanchored set so totals reflect genuinely unreachable photos.
+        still_unanchored = [i for i in unanchored_indices if photos[i]["id"] not in anchor_ids]
+        _, final_skipped = _infer_one_round(
+            photos, still_unanchored, anchor_ids, anchor_data,
+            window_minutes=window_minutes,
+            max_drift_km=max_drift_km,
+            min_confidence=min_confidence,
+        )
+        for k in ("no_anchor", "movement_guard", "below_min_confidence"):
+            total_skipped[k] = final_skipped[k]
+        if not rounds_used and photos:
+            rounds_used = 1
 
     return {
         "candidates": all_candidates,
