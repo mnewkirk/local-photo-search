@@ -1155,6 +1155,221 @@
       );
     }
 
+    function InferLocationForm(props) {
+      var _p = useState({
+        window_minutes: 30,
+        max_drift_km: 25.0,
+        min_confidence: 0.0,
+        cascade: true,
+        max_cascade_rounds: 10,
+      });
+      var params = _p[0]; var setParams = _p[1];
+      var _pv = useState(null); var preview = _pv[0]; var setPreview = _pv[1];
+      var _ph = useState(null); var previewParamsHash = _ph[0]; var setPreviewParamsHash = _ph[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _er = useState(null); var error = _er[0]; var setError = _er[1];
+
+      var paramsHash = JSON.stringify(params);
+      var applyReady = preview && previewParamsHash === paramsHash && preview.candidate_count > 0;
+
+      async function runPreview() {
+        setBusy(true);
+        setError(null);
+        try {
+          var r = await fetch('/api/geocode/infer-preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          var body = await r.json();
+          setPreview(body);
+          setPreviewParamsHash(paramsHash);
+        } catch (err) {
+          setError(String(err));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function runApply() {
+        if (!applyReady) return;
+        var msg = 'Apply ' + preview.candidate_count.toLocaleString() + ' inferences?\n\n'
+          + 'window=' + params.window_minutes + 'min, max_drift=' + params.max_drift_km + 'km, '
+          + 'min_conf=' + params.min_confidence + ', cascade=' + params.cascade;
+        if (!window.confirm(msg)) return;
+
+        setBusy(true);
+        setError(null);
+        try {
+          var payload = Object.assign({}, params, { confirm: true });
+          var r = await fetch('/api/geocode/infer-apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          var body = await r.json();
+          alert('Applied ' + body.updated_count.toLocaleString()
+            + ' inferences in ' + body.duration_seconds.toFixed(1) + 's.');
+          setPreview(null);
+          setPreviewParamsHash(null);
+          await runPreview();
+          if (props.onDone) props.onDone();
+        } catch (err) {
+          setError(String(err));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      function setParam(key) {
+        return function(ev) {
+          var raw = ev.target.type === 'checkbox' ? ev.target.checked : ev.target.value;
+          var val = raw;
+          if (ev.target.type === 'number') {
+            val = raw === '' ? '' : Number(raw);
+          }
+          setParams(function(prev) {
+            var next = Object.assign({}, prev);
+            next[key] = val;
+            return next;
+          });
+        };
+      }
+
+      function renderHistogram(rows, labelKey, valueKey) {
+        var max = 1;
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i][valueKey] > max) max = rows[i][valueKey];
+        }
+        return rows.map(function(row, idx) {
+          return e('div', {
+            key: idx,
+            style: { display: 'flex', gap: 8, fontFamily: 'monospace', fontSize: 13 }
+          },
+            e('div', { style: { width: 110 } }, String(row[labelKey])),
+            e('div', {
+              style: {
+                width: Math.round((row[valueKey] / max) * 200),
+                background: '#4a90e2',
+                height: 14,
+              }
+            }),
+            e('div', null, row[valueKey].toLocaleString())
+          );
+        });
+      }
+
+      var inputsRow = e('div', {
+        style: { display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'end', marginBottom: 8 }
+      },
+        e('label', null, 'Window (min)',
+          e('input', {
+            type: 'number', value: params.window_minutes, onChange: setParam('window_minutes'),
+            min: 1, style: { width: 70, display: 'block' }
+          })),
+        e('label', null, 'Max drift (km)',
+          e('input', {
+            type: 'number', value: params.max_drift_km, onChange: setParam('max_drift_km'),
+            min: 0, step: 0.5, style: { width: 90, display: 'block' }
+          })),
+        e('label', null, 'Min conf',
+          e('input', {
+            type: 'number', value: params.min_confidence, onChange: setParam('min_confidence'),
+            min: 0, max: 1, step: 0.05, style: { width: 70, display: 'block' }
+          })),
+        e('label', null,
+          e('input', { type: 'checkbox', checked: params.cascade, onChange: setParam('cascade') }),
+          ' Cascade'),
+        e('label', null, 'Max rounds',
+          e('input', {
+            type: 'number', value: params.max_cascade_rounds, onChange: setParam('max_cascade_rounds'),
+            min: 1, max: 50, style: { width: 70, display: 'block' }
+          }))
+      );
+
+      var buttonsRow = e('div', { style: { display: 'flex', gap: 8, marginBottom: 12 } },
+        e('button', { onClick: runPreview, disabled: busy }, busy ? 'Working…' : 'Preview'),
+        e('button', {
+          onClick: runApply,
+          disabled: busy || !applyReady,
+        },
+          preview && preview.candidate_count > 0
+            ? 'Apply ' + preview.candidate_count.toLocaleString() + ' inferences'
+            : 'Apply'
+        )
+      );
+
+      var errorNode = error
+        ? e('div', { style: { color: '#b00', marginBottom: 8 } }, error)
+        : null;
+
+      var previewNode = null;
+      if (preview) {
+        var skipped = preview.skipped || {};
+        var skippedEntries = Object.keys(skipped).map(function(k) {
+          return k + ' ' + (skipped[k] || 0).toLocaleString();
+        }).join(' · ');
+
+        var samplesNode = null;
+        if (preview.samples && preview.samples.length > 0) {
+          samplesNode = e('div', null,
+            e('div', { style: { fontWeight: 500, margin: '8px 0 4px' } }, 'Samples'),
+            preview.samples.map(function(s) {
+              var loc = s.place_name
+                ? s.place_name
+                : s.inferred_lat.toFixed(3) + ', ' + s.inferred_lon.toFixed(3);
+              var hopLabel = s.hop_count === 1 ? 'hop' : 'hops';
+              var detail = '→ ' + loc + ' · conf ' + s.confidence.toFixed(2)
+                + ' · ' + s.time_gap_min.toFixed(0) + 'min'
+                + ' · drift ' + s.drift_km.toFixed(1) + 'km'
+                + ' · ' + s.hop_count + ' ' + hopLabel;
+              return e('div', {
+                key: s.photo_id,
+                style: { display: 'flex', gap: 8, alignItems: 'center', padding: '4px 0' }
+              },
+                e('img', {
+                  src: s.thumbnail_url,
+                  style: { width: 48, height: 48, objectFit: 'cover' }
+                }),
+                e('div', null,
+                  e('div', { style: { fontFamily: 'monospace', fontSize: 12 } }, s.filepath),
+                  e('div', { style: { fontSize: 12, color: '#555' } }, detail)
+                )
+              );
+            })
+          );
+        }
+
+        previewNode = e('div', null,
+          e('div', { style: { fontWeight: 600, marginBottom: 4 } },
+            preview.candidate_count.toLocaleString() + ' candidates out of '
+              + preview.no_gps_count.toLocaleString() + ' no-GPS photos (cascade '
+              + preview.cascade_rounds_used + ' rounds).'),
+          e('div', { style: { fontSize: 13, color: '#555', marginBottom: 8 } },
+            'Skipped: ' + skippedEntries),
+          e('div', { style: { marginBottom: 8 } },
+            e('div', { style: { fontWeight: 500 } }, 'Confidence'),
+            renderHistogram(preview.confidence_buckets || [], 'bucket', 'count')),
+          e('div', { style: { marginBottom: 8 } },
+            e('div', { style: { fontWeight: 500 } }, 'Hops'),
+            renderHistogram(preview.hop_distribution || [], 'hops', 'count')),
+          samplesNode
+        );
+      }
+
+      return e('div', null,
+        e('h2', null, 'Infer Locations'),
+        e('div', { className: 'stack-wrap' },
+          inputsRow,
+          buttonsRow,
+          errorNode,
+          previewNode
+        )
+      );
+    }
+
     function ErrorsLog(props) {
       var errors = props.errors;
       if (!errors || errors.length === 0) return null;
@@ -1534,6 +1749,7 @@
           ),
           e(Workers, { data: workerStatus }),
           e(StackingForm, { onComplete: load }),
+          e(InferLocationForm, { onDone: load }),
           e(ActivityChart, { activity: activity }),
           e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
           e(ErrorsLog, { errors: indexErrors }),
