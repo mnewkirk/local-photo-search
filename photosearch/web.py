@@ -833,18 +833,21 @@ def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(100
 def api_photos_geojson():
     """Compact point dump of every GPS-bearing photo for the map view.
 
-    Returns `{count, points: [[id, lat, lon, source, year], ...]}`.
+    Returns `{count, points: [[id, lat, lon, source, year, place_name], ...]}`.
     `source` is `'exif' | 'inferred' | None`; `year` is int or None
-    (parsed from the first 4 chars of date_taken). Compact tuples keep
-    the response small — on a 50k-GPS library this is under 2MB
-    uncompressed, ~500KB gzipped.
+    (parsed from the first 4 chars of date_taken); `place_name` is the
+    reverse-geocoded string (`"Locality, Admin1, CC"`) or None.
+
+    `place_name` is included so the map's preview pane can compute a
+    common-suffix search term across a whole cluster without an N+1
+    round-trip (see computeBestSuffix in map.html).
 
     Must be declared before `/api/photos/{photo_id}` so FastAPI's route
     matcher doesn't interpret `geojson` as a photo id (→ 422).
     """
     with _get_db() as db:
         rows = db.conn.execute(
-            "SELECT id, gps_lat, gps_lon, location_source, date_taken "
+            "SELECT id, gps_lat, gps_lon, location_source, date_taken, place_name "
             "FROM photos WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
         ).fetchall()
     points = []
@@ -857,7 +860,7 @@ def api_photos_geojson():
             except ValueError:
                 year = None
         points.append([r["id"], r["gps_lat"], r["gps_lon"],
-                       r["location_source"], year])
+                       r["location_source"], year, r["place_name"]])
     return {"count": len(points), "points": points}
 
 

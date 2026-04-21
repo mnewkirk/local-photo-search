@@ -294,6 +294,48 @@
 
     function sourceKey(s) { return s === 'exif' || s === 'inferred' ? s : 'unknown'; }
 
+    // Given an array of point tuples [id, lat, lon, src, year, place_name],
+    // return the longest trailing "Locality, Admin1, CC" suffix whose photos
+    // cover the majority of the cluster — or the mode at country level if
+    // nothing reaches the threshold. Returns
+    // { suffix, count, total, coverage } or null.
+    //
+    // Example: a cluster of 938 photos mostly in Spain collapses to
+    // suffix='ES', covering ~96%. A tight cluster in one locality keeps the
+    // full "Zarautz, Basque Country, ES".
+    function computeBestSuffix(points, threshold) {
+      const places = points.map(p => p[5]).filter(Boolean);
+      if (!places.length) return null;
+      const parsed = places.map(s => s.split(', '));
+      const maxParts = Math.max.apply(null, parsed.map(p => p.length));
+      const total = parsed.length;
+      const t = typeof threshold === 'number' ? threshold : 0.5;
+      let fallback = null;
+
+      for (let len = maxParts; len >= 1; len--) {
+        const freq = {};
+        for (const parts of parsed) {
+          if (parts.length < len) continue;
+          const key = parts.slice(-len).join(', ');
+          freq[key] = (freq[key] || 0) + 1;
+        }
+        let bestKey = null, bestCount = 0;
+        for (const k in freq) {
+          if (freq[k] > bestCount) { bestKey = k; bestCount = freq[k]; }
+        }
+        if (!bestKey) continue;
+        if (bestCount / total >= t) {
+          return { suffix: bestKey, count: bestCount, total, coverage: bestCount / total };
+        }
+        // Keep the country-level mode as last-resort fallback when even
+        // the country doesn't clear the threshold.
+        if (len === 1 && !fallback) {
+          fallback = { suffix: bestKey, count: bestCount, total, coverage: bestCount / total };
+        }
+      }
+      return fallback;
+    }
+
     function MapView() {
       const [points, setPoints] = useState(null);
       const [loadError, setLoadError] = useState(null);
@@ -306,7 +348,6 @@
       const mapRef = useRef(null);
       const clusterRef = useRef(null);
       const mapElRef = useRef(null);
-      const previewReqRef = useRef(0);   // race-guard for async place-name fetches
 
       // Initial data load
       useEffect(() => {
@@ -342,15 +383,17 @@
           maxClusterRadius: 55,
           zoomToBoundsOnClick: false,
         });
-        // Cluster click → open preview with up to 9 child markers.
+        // Cluster click → open preview. We compute the place-name
+        // suffix over ALL child markers (so a 938-photo Spanish cluster
+        // gets 'ES', not just whatever 9 thumbs happened to be shown),
+        // but display only up to 9 thumbs.
         cluster.on('clusterclick', (ev) => {
           const children = ev.layer.getAllChildMarkers();
-          const photos = children.slice(0, 9)
-            .map(m => m._photoPoint)
-            .filter(Boolean);
-          if (!photos.length) return;
+          const allPoints = children.map(m => m._photoPoint).filter(Boolean);
+          if (!allPoints.length) return;
+          const displayPhotos = allPoints.slice(0, 9);
           const c = ev.layer.getLatLng();
-          openPreview(photos, c.lat, c.lng, ev.layer.getBounds());
+          openPreview(displayPhotos, c.lat, c.lng, ev.layer.getBounds(), allPoints);
         });
         map.addLayer(cluster);
 
@@ -409,29 +452,21 @@
         cluster.addLayers(markers);
       }, [visiblePoints]);
 
-      // Open the preview pane for a set of photos. Fetches place_name from
-      // the first photo; the previewReqRef guards against out-of-order
-      // async resolutions if the user clicks rapidly.
-      const openPreview = useCallback((photos, centerLat, centerLon, bounds) => {
-        const reqId = ++previewReqRef.current;
-        setPreview({ photos, centerLat, centerLon, bounds, placeName: undefined });
-        if (!photos.length) return;
-        fetch('/api/photos/' + photos[0][0])
-          .then(r => r.ok ? r.json() : null)
-          .then(detail => {
-            if (reqId !== previewReqRef.current) return;
-            setPreview(prev => prev && reqId === previewReqRef.current
-              ? { ...prev, placeName: (detail && detail.place_name) || null }
-              : prev);
-          })
-          .catch(() => {
-            if (reqId !== previewReqRef.current) return;
-            setPreview(prev => prev ? { ...prev, placeName: null } : prev);
-          });
+      // Open the preview pane for a set of photos.
+      //   photos: up to 9 points to display as thumbnails
+      //   scope:  optional larger point set (all cluster children) used for
+      //           the place-name suffix computation; defaults to `photos`
+      // place_name is computed synchronously from the cluster's own points
+      // (shipped in the geojson response) — the longest trailing
+      // "Locality, Admin1, CC" suffix that covers the majority of the
+      // scope. This broadens naturally with altitude: tight cluster → full
+      // place_name, country-wide cluster → CC.
+      const openPreview = useCallback((photos, centerLat, centerLon, bounds, scope) => {
+        const place = computeBestSuffix(scope || photos);
+        setPreview({ photos, centerLat, centerLon, bounds, place });
       }, []);
 
       const closePreview = useCallback(() => {
-        previewReqRef.current++;
         setPreview(null);
       }, []);
 
@@ -513,17 +548,31 @@
       const previewPane = preview && (() => {
         const nPhotos = preview.photos.length;
         const coordsStr = preview.centerLat.toFixed(4) + ', ' + preview.centerLon.toFixed(4);
-        const placeLoading = preview.placeName === undefined;
-        const placeResolved = typeof preview.placeName === 'string' && preview.placeName.length > 0;
-        const searchHref = placeResolved
-          ? '/?location=' + encodeURIComponent(preview.placeName)
+        const place = preview.place;   // { suffix, count, total, coverage } or null
+        const partial = place && place.coverage < 0.999;
+        // Country-only suffixes (e.g., "ES") benefit from the ", " prefix so
+        // the LIKE match anchors to the country slot and avoids false
+        // positives on locality names that happen to contain the two-letter
+        // code (e.g., "Esterzili, Sardegna, IT" contains "ES"). Heuristic:
+        // if the suffix has no comma, treat it as a country code.
+        const searchTerm = place
+          ? (place.suffix.indexOf(',') === -1 ? ', ' + place.suffix : place.suffix)
           : null;
+        const searchHref = searchTerm
+          ? '/?location=' + encodeURIComponent(searchTerm)
+          : null;
+        const searchTitle = place
+          ? 'Open search filtered to ' + place.suffix
+            + (partial ? ' (' + Math.round(place.coverage * 100) + '% of visible photos)' : '')
+          : 'No place name available in this cluster';
 
         return e('div', { className: 'preview-pane' },
           e('div', { className: 'preview-header' },
             e('div', { className: 'preview-place' },
-              placeLoading ? 'Loading location…'
-                : (placeResolved ? preview.placeName : '(no place name)'),
+              place ? place.suffix : '(no place name)',
+              partial && e('div', {
+                style: { fontSize: 12, color: 'var(--text-muted)', fontWeight: 400, marginTop: 2 },
+              }, Math.round(place.coverage * 100) + '% of ' + place.total.toLocaleString() + ' photos'),
               e('div', { className: 'preview-coords' }, coordsStr),
             ),
             e('button', { className: 'preview-close', onClick: closePreview, title: 'Close' }, '×'),
@@ -550,12 +599,12 @@
               ? e('a', {
                   className: 'preview-btn',
                   href: searchHref,
-                  title: 'Open search filtered to ' + preview.placeName,
+                  title: searchTitle,
                 }, 'Search')
               : e('button', {
                   className: 'preview-btn disabled',
                   disabled: true,
-                  title: placeLoading ? 'Resolving place name…' : 'No place name available',
+                  title: searchTitle,
                 }, 'Search'),
           ),
         );

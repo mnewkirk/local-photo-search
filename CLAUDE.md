@@ -170,13 +170,19 @@ Leaflet map with marker clustering. Sidebar filters by source
 pane (up to 9 thumbnails) with:
 - **Zoom** — fits the map to the cluster's bounds (or zooms to 16 on a
   single marker).
-- **Search** — deep-links to `/?location=<place_name>`, letting the
-  user jump from a map cluster straight into a filtered search. Button
-  is disabled until the place name resolves (one `/api/photos/{id}`
-  fetch per preview open, from the first photo).
+- **Search** — deep-links to `/?location=<suffix>` using the longest
+  trailing `"Locality, Admin1, CC"` suffix that covers the majority
+  (≥50%) of the cluster's photos. Broadens naturally with altitude:
+  tight cluster keeps the full place_name, country-wide cluster
+  collapses to a 2-letter country code (prefixed with `", "` so the
+  LIKE match anchors to the country slot and doesn't false-positive
+  on locality names like "Esterzili"). The header shows coverage when
+  below 100% (e.g., "ES — 96% of 938 photos").
 Clicking a thumbnail still opens `PS.PhotoModal`. Backed by the
 `GET /api/photos/geojson` endpoint (compact tuple format
-`[id, lat, lon, source, year]`, ~500KB gzipped on a 50k-GPS library).
+`[id, lat, lon, source, year, place_name]`, ~700KB gzipped on a
+50k-GPS library; place_name is included in the dump so cluster clicks
+don't need per-photo fetches).
 
 Rollback (delete every inferred write below a confidence floor):
 
