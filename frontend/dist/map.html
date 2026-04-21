@@ -455,15 +455,20 @@
       // Open the preview pane for a set of photos.
       //   photos: up to 9 points to display as thumbnails
       //   scope:  optional larger point set (all cluster children) used for
-      //           the place-name suffix computation; defaults to `photos`
+      //           the place-name suffix computation AND the total-photos
+      //           count; defaults to `photos`
       // place_name is computed synchronously from the cluster's own points
       // (shipped in the geojson response) — the longest trailing
       // "Locality, Admin1, CC" suffix that covers the majority of the
       // scope. This broadens naturally with altitude: tight cluster → full
       // place_name, country-wide cluster → CC.
       const openPreview = useCallback((photos, centerLat, centerLon, bounds, scope) => {
-        const place = computeBestSuffix(scope || photos);
-        setPreview({ photos, centerLat, centerLon, bounds, place });
+        const pool = scope || photos;
+        const place = computeBestSuffix(pool);
+        setPreview({
+          photos, centerLat, centerLon, bounds, place,
+          totalInScope: pool.length,
+        });
       }, []);
 
       const closePreview = useCallback(() => {
@@ -546,7 +551,9 @@
       );
 
       const previewPane = preview && (() => {
-        const nPhotos = preview.photos.length;
+        const nShown = preview.photos.length;
+        const nTotal = preview.totalInScope || nShown;
+        const sampled = nTotal > nShown;
         const coordsStr = preview.centerLat.toFixed(4) + ', ' + preview.centerLon.toFixed(4);
         const place = preview.place;   // { suffix, count, total, coverage } or null
         const partial = place && place.coverage < 0.999;
@@ -589,7 +596,9 @@
           ),
           e('div', { className: 'preview-footer' },
             e('span', { className: 'preview-count' },
-              nPhotos.toLocaleString() + (nPhotos === 1 ? ' photo' : ' photos')),
+              sampled
+                ? ('showing ' + nShown + ' of ' + nTotal.toLocaleString() + ' photos')
+                : (nTotal.toLocaleString() + (nTotal === 1 ? ' photo' : ' photos'))),
             e('button', {
               className: 'preview-btn secondary',
               onClick: zoomToPreview,
