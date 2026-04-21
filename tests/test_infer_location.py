@@ -258,3 +258,21 @@ def test_cascade_movement_guard_transitive(empty_db):
     assert "/t90.jpg" in filenames
     assert "/t60.jpg" not in filenames
     assert result["summary"]["skipped"]["movement_guard"] >= 1
+
+
+def test_cascade_gps_count_reports_only_real_anchors(empty_db):
+    """gps_count in the summary should only count photos with real EXIF GPS,
+    not inferred ones. Regression guard — before the fix, cascade inflated
+    anchor_ids with inferred photo ids and gps_count reported the sum."""
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/real.jpg", date_taken="2020-06-15T10:00:00",
+         lat=47.6, lon=-122.3)
+    _add(empty_db, filepath="/t1.jpg", date_taken="2020-06-15T10:10:00")
+    _add(empty_db, filepath="/t2.jpg", date_taken="2020-06-15T10:20:00")
+    _add(empty_db, filepath="/t3.jpg", date_taken="2020-06-15T10:30:00")
+
+    result = infer_locations(empty_db, window_minutes=30, cascade=True)
+    # 3 inferred candidates (cascade chain)
+    assert result["summary"]["candidate_count"] >= 2
+    # gps_count should ONLY count the real anchor
+    assert result["summary"]["gps_count"] == 1

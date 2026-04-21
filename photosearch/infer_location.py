@@ -222,6 +222,8 @@ def infer_locations(
         else:
             unanchored_indices.append(i)
 
+    real_gps_count = len(anchor_ids)
+
     total_skipped = {
         "no_anchor": 0,
         "movement_guard": 0,
@@ -251,14 +253,13 @@ def infer_locations(
         # confidence multiplicatively and incrementing hop_count per link.
         # rounds_used reflects max hop depth, which equals cascade_rounds_used
         # and satisfies the >= N assertions in tests.
-        skipped_counts = {"no_anchor": 0, "movement_guard": 0, "below_min_confidence": 0}
+        # Per-round skip counts are discarded; a final _infer_one_round pass below produces the accurate totals.
         for idx in unanchored_indices:
             p = photos[idx]
             left, right = _find_flanking_anchors(
                 photos, idx, window_minutes, anchor_ids, anchor_data
             )
             if left is None and right is None:
-                skipped_counts["no_anchor"] += 1
                 continue
 
             if left is not None and right is not None:
@@ -266,7 +267,6 @@ def infer_locations(
                 ra = anchor_data[right["photo"]["id"]]
                 drift = haversine_km(la["lat"], la["lon"], ra["lat"], ra["lon"])
                 if drift > max_drift_km:
-                    skipped_counts["movement_guard"] += 1
                     continue
                 if left["gap_min"] <= right["gap_min"]:
                     chosen, chosen_gap, sides = left["photo"], left["gap_min"], "both"
@@ -290,7 +290,6 @@ def infer_locations(
             confidence = base_decay * sides_factor * anchor["confidence"]
 
             if confidence <= min_confidence:
-                skipped_counts["below_min_confidence"] += 1
                 continue
 
             hop = anchor["hop_count"] + 1
@@ -337,7 +336,7 @@ def infer_locations(
         "summary": {
             "total_photos": total_photos,
             "no_gps_count": len(unanchored_indices) + no_date_count,
-            "gps_count": len(anchor_ids),
+            "gps_count": real_gps_count,
             "candidate_count": len(all_candidates),
             "cascade_rounds_used": rounds_used,
             "skipped": total_skipped,
