@@ -41,3 +41,50 @@ def test_haversine_date_line_crossing():
 def test_haversine_same_point_is_zero():
     from photosearch.infer_location import haversine_km
     assert haversine_km(0.0, 0.0, 0.0, 0.0) == pytest.approx(0.0)
+
+
+@pytest.fixture
+def empty_db(tmp_db_path):
+    """A PhotoDB with the schema created but no photos inserted."""
+    from photosearch.db import PhotoDB
+    pdb = PhotoDB(tmp_db_path)
+    pdb.set_photo_root("/photos")
+    yield pdb
+    pdb.close()
+
+
+def _add(db, *, filepath, date_taken, lat=None, lon=None):
+    """Shorthand for inserting a test photo."""
+    return db.add_photo(
+        filepath=filepath,
+        filename=filepath.rsplit("/", 1)[-1],
+        date_taken=date_taken,
+        gps_lat=lat,
+        gps_lon=lon,
+    )
+
+
+def test_scan_photos_sorts_by_date_and_counts_no_date(empty_db):
+    from photosearch.infer_location import _scan_photos
+
+    _add(empty_db, filepath="/p1.jpg", date_taken="2020-06-15T10:00:00", lat=47.6, lon=-122.3)
+    _add(empty_db, filepath="/p2.jpg", date_taken="2020-06-15T09:00:00")
+    _add(empty_db, filepath="/p3.jpg", date_taken=None)  # no_date
+
+    photos, no_date_count = _scan_photos(empty_db)
+    assert no_date_count == 1
+    assert [p["filepath"] for p in photos] == ["/p2.jpg", "/p1.jpg"]
+    assert photos[0]["date_taken_dt"].year == 2020
+
+
+def test_scan_photos_accepts_space_and_T_separators(empty_db):
+    """date_taken strings come in two flavors ('YYYY-MM-DD HH:MM:SS' and
+    'YYYY-MM-DDTHH:MM:SS'). Both must parse."""
+    from photosearch.infer_location import _scan_photos
+
+    _add(empty_db, filepath="/a.jpg", date_taken="2020-06-15 10:00:00")
+    _add(empty_db, filepath="/b.jpg", date_taken="2020-06-15T11:00:00")
+
+    photos, _ = _scan_photos(empty_db)
+    assert len(photos) == 2
+    assert all("date_taken_dt" in p for p in photos)
