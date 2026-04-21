@@ -51,7 +51,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -372,6 +372,17 @@ class PhotoDB:
                 "UPDATE photos SET location_source='exif' "
                 "WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
             )
+
+        # Migration: geocode_cache table (schema v18). Small persistent cache
+        # for Nominatim forward-geocoding results keyed by lowercased query.
+        # TTL managed at the proxy layer; the table itself is append-or-replace.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS geocode_cache (
+                query TEXT PRIMARY KEY,
+                results_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.

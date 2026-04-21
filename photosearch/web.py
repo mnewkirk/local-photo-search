@@ -1938,6 +1938,302 @@ def api_infer_apply(data: dict):
 
 
 # ---------------------------------------------------------------------------
+# Manual bulk geotagging (UI-driven) — companion to M19 inferred geotagging
+# ---------------------------------------------------------------------------
+# Feature surface:
+#   GET  /api/geotag/folders         — folder summary for the /geotag picker
+#   GET  /api/geotag/folder-photos   — photos in one folder, optional inferred
+#   GET  /api/geotag/known-places    — distinct place_names from the library
+#   GET  /api/geocode/search         — Nominatim forward-geocode proxy + cache
+#   POST /api/photos/bulk-set-location — the write (location_source='manual')
+
+
+def _folder_of(filepath: str, filename: str) -> str:
+    """Return the folder portion of a photo's filepath.
+
+    Cheaper than Path().parent on a tight loop — photos store forward
+    slashes even on Windows (SQLite stores text, and the indexer
+    normalizes), so rsplit is safe.
+    """
+    if not filepath:
+        return ""
+    if filename and filepath.endswith("/" + filename):
+        return filepath[: -(len(filename) + 1)]
+    idx = filepath.rfind("/")
+    return filepath[:idx] if idx > 0 else filepath
+
+
+@app.get("/api/geotag/folders")
+def api_geotag_folders(include_fully_tagged: bool = False):
+    """Folder summary keyed for the /geotag left panel.
+
+    Returns folders sorted by no_gps count descending. A folder's entry
+    includes photo counts split by provenance (exif / inferred / none)
+    plus date range, so the UI can prioritize which folders to tackle.
+
+    With `include_fully_tagged=true` the response also covers folders
+    where every photo already has GPS; default is to hide them.
+    """
+    from collections import defaultdict
+
+    with _get_db() as db:
+        rows = db.conn.execute(
+            "SELECT filepath, filename, location_source, gps_lat, date_taken FROM photos"
+        ).fetchall()
+
+    folders = defaultdict(lambda: {
+        "total": 0, "with_exif": 0, "with_inferred": 0, "no_gps": 0,
+        "date_from": None, "date_to": None,
+    })
+    for r in rows:
+        folder = _folder_of(r["filepath"], r["filename"])
+        f = folders[folder]
+        f["total"] += 1
+        src = r["location_source"]
+        if src == "exif":
+            f["with_exif"] += 1
+        elif src == "inferred":
+            f["with_inferred"] += 1
+        if r["gps_lat"] is None:
+            f["no_gps"] += 1
+        dt = r["date_taken"]
+        if dt:
+            if f["date_from"] is None or dt < f["date_from"]:
+                f["date_from"] = dt
+            if f["date_to"] is None or dt > f["date_to"]:
+                f["date_to"] = dt
+
+    out = []
+    for path, f in folders.items():
+        if not include_fully_tagged and f["no_gps"] == 0:
+            continue
+        out.append({"path": path, **f})
+    out.sort(key=lambda f: (-f["no_gps"], f["path"]))
+    return {"folders": out, "total_folders": len(out)}
+
+
+@app.get("/api/geotag/folder-photos")
+def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
+                              limit: int = 1000):
+    """Photos in one folder for the /geotag thumbnails panel.
+
+    By default returns only photos where gps_lat IS NULL (the ones that
+    need tagging). With `show_inferred=true`, also includes photos where
+    `location_source='inferred'` so the user can manually correct any M19
+    misfires. `location_source='exif'` photos are always excluded — those
+    came from the camera and are authoritative.
+    """
+    with _get_db() as db:
+        if show_inferred:
+            where = ("WHERE (gps_lat IS NULL "
+                     "   OR location_source='inferred')")
+        else:
+            where = "WHERE gps_lat IS NULL"
+        # Photos in this folder have filepath like "<folder>/<filename>".
+        pattern = folder.rstrip("/") + "/%"
+        # Guard against matching sub-folders: require no additional "/"
+        # between folder and filename. Done by filtering in Python below.
+        rows = db.conn.execute(
+            f"""SELECT id, filepath, filename, date_taken, gps_lat, gps_lon,
+                       place_name, location_source, location_confidence
+                FROM photos
+                {where} AND filepath LIKE ?
+                ORDER BY COALESCE(date_taken, filepath)
+                LIMIT ?""",
+            (pattern, limit),
+        ).fetchall()
+
+    photos = []
+    for r in rows:
+        if _folder_of(r["filepath"], r["filename"]) != folder.rstrip("/"):
+            continue
+        photos.append(dict(r))
+    return {"folder": folder, "photos": photos, "count": len(photos)}
+
+
+@app.get("/api/geotag/known-places")
+def api_geotag_known_places(q: str = "", limit: int = 20):
+    """Distinct place_names in the library matching q (case-insensitive
+    substring). Sorted by photo count descending so frequently-used
+    places float up. Used alongside Nominatim to seed the typeahead.
+    """
+    q_norm = (q or "").strip()
+    with _get_db() as db:
+        if q_norm:
+            rows = db.conn.execute(
+                """SELECT place_name, COUNT(*) AS photo_count
+                   FROM photos
+                   WHERE place_name IS NOT NULL
+                     AND place_name LIKE ?
+                   GROUP BY place_name
+                   ORDER BY photo_count DESC
+                   LIMIT ?""",
+                (f"%{q_norm}%", limit),
+            ).fetchall()
+        else:
+            rows = db.conn.execute(
+                """SELECT place_name, COUNT(*) AS photo_count
+                   FROM photos
+                   WHERE place_name IS NOT NULL
+                   GROUP BY place_name
+                   ORDER BY photo_count DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    return {"places": [{"place_name": r["place_name"],
+                        "photo_count": r["photo_count"]} for r in rows]}
+
+
+_NOMINATIM_UA = "local-photo-search/1.0 (self-hosted photo library; +https://github.com/mnewkirk/local-photo-search)"
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_GEOCODE_CACHE_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+
+
+@app.get("/api/geocode/search")
+def api_geocode_search(q: str, limit: int = 5):
+    """Forward-geocode a free-text query via Nominatim, with a persistent
+    cache in the geocode_cache table. Returns candidates shaped for the
+    /geotag typeahead:
+
+        {results: [{display_name, lat, lon, country, admin1, admin2,
+                    locality, type, importance}, ...], source}
+
+    The cache keys on lowercased query text and expires after 30 days.
+    Cache hits return instantly (`source='cache'`); misses hit Nominatim
+    with a descriptive User-Agent per their usage policy.
+    """
+    import json
+    import time
+    import urllib.parse
+    import urllib.request
+    import datetime
+
+    key = (q or "").strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="q required")
+
+    with _get_db() as db:
+        row = db.conn.execute(
+            "SELECT results_json, fetched_at FROM geocode_cache WHERE query = ?",
+            (key,),
+        ).fetchone()
+        if row:
+            try:
+                fetched = datetime.datetime.fromisoformat(row["fetched_at"])
+                age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - fetched).total_seconds()
+            except (TypeError, ValueError):
+                age = _GEOCODE_CACHE_TTL_SECONDS + 1
+            if age < _GEOCODE_CACHE_TTL_SECONDS:
+                cached = json.loads(row["results_json"])
+                return {"results": cached[:limit], "source": "cache"}
+
+    # Cache miss — hit Nominatim.
+    params = {
+        "q": q,
+        "format": "jsonv2",
+        "limit": str(min(limit, 10)),
+        "addressdetails": "1",
+        "accept-language": "en",
+    }
+    url = _NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": _NOMINATIM_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"Nominatim error: {err}")
+
+    results = []
+    for item in raw:
+        addr = item.get("address", {}) or {}
+        # Pick a locality — Nominatim's address dict uses varying keys.
+        locality = (addr.get("city") or addr.get("town") or addr.get("village")
+                    or addr.get("hamlet") or addr.get("suburb") or None)
+        try:
+            lat = float(item["lat"])
+            lon = float(item["lon"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        results.append({
+            "display_name": item.get("display_name"),
+            "lat": lat,
+            "lon": lon,
+            "country": addr.get("country"),
+            "admin1": addr.get("state") or addr.get("region"),
+            "admin2": addr.get("county"),
+            "locality": locality,
+            "type": item.get("type"),
+            "importance": item.get("importance"),
+        })
+
+    with _get_db() as db:
+        db.conn.execute(
+            "INSERT OR REPLACE INTO geocode_cache (query, results_json, fetched_at) "
+            "VALUES (?, ?, ?)",
+            (key, json.dumps(results),
+             datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")),
+        )
+        db.conn.commit()
+
+    return {"results": results[:limit], "source": "nominatim"}
+
+
+@app.post("/api/photos/bulk-set-location")
+def api_bulk_set_location(data: dict):
+    """Manually assign GPS + place_name to a batch of photos.
+
+    Body: `{photo_ids: [...], lat: float, lon: float, place_name: str,
+            overwrite: bool = false}`.
+
+    Writes `gps_lat`, `gps_lon`, `place_name`, `location_source='manual'`,
+    `location_confidence=NULL`. With `overwrite=false` (default) rows with
+    pre-existing `gps_lat` are skipped; `overwrite=true` replaces any
+    existing value including 'exif' and 'inferred'.
+    """
+    photo_ids = data.get("photo_ids") or []
+    if not isinstance(photo_ids, list) or not photo_ids:
+        raise HTTPException(status_code=400, detail="photo_ids required")
+    try:
+        lat = float(data["lat"])
+        lon = float(data["lon"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="lat/lon required (numeric)")
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        raise HTTPException(status_code=400, detail="lat/lon out of range")
+    place_name = data.get("place_name") or None
+    overwrite = bool(data.get("overwrite", False))
+
+    updated = 0
+    skipped = 0
+    with _get_db() as db:
+        cur = db.conn.cursor()
+        for pid in photo_ids:
+            if overwrite:
+                cur.execute(
+                    "UPDATE photos "
+                    "SET gps_lat=?, gps_lon=?, place_name=?, "
+                    "    location_source='manual', location_confidence=NULL "
+                    "WHERE id=?",
+                    (lat, lon, place_name, pid),
+                )
+            else:
+                cur.execute(
+                    "UPDATE photos "
+                    "SET gps_lat=?, gps_lon=?, place_name=?, "
+                    "    location_source='manual', location_confidence=NULL "
+                    "WHERE id=? AND gps_lat IS NULL",
+                    (lat, lon, place_name, pid),
+                )
+            if cur.rowcount > 0:
+                updated += cur.rowcount
+            else:
+                skipped += 1
+        db.conn.commit()
+
+    return {"updated_count": updated, "skipped_count": skipped}
+
+
+# ---------------------------------------------------------------------------
 # Verify failures
 
 _VERIFY_STATUSES = ("fail", "regenerated")
@@ -3049,6 +3345,15 @@ if _frontend_dir.exists():
             return HTMLResponse(page.read_text(),
                                 headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Map page not found</h1>")
+
+    @app.get("/geotag")
+    def serve_geotag():
+        """Serve the manual bulk-geotag page."""
+        page = _frontend_dir / "geotag.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(),
+                                headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Geotag page not found</h1>")
 
     @app.get("/collections/{collection_id}")
     def serve_collection_detail(collection_id: int):
