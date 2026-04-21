@@ -1765,6 +1765,144 @@ def api_stats_errors():
 
 
 # ---------------------------------------------------------------------------
+# Inferred geotagging (M19)
+# ---------------------------------------------------------------------------
+
+from collections import Counter
+import random
+
+
+_INFER_DEFAULTS = {
+    "window_minutes": 30,
+    "max_drift_km": 25.0,
+    "min_confidence": 0.0,
+    "cascade": True,
+    "max_cascade_rounds": 10,
+}
+
+
+def _parse_infer_params(data: dict) -> dict:
+    """Pull infer params from a POST body, falling back to defaults.
+    Coerces numeric types defensively (JSON-over-HTTP sometimes sends
+    ints where we expect floats and vice versa)."""
+    out = dict(_INFER_DEFAULTS)
+    if "window_minutes" in data: out["window_minutes"] = int(data["window_minutes"])
+    if "max_drift_km" in data:   out["max_drift_km"] = float(data["max_drift_km"])
+    if "min_confidence" in data: out["min_confidence"] = float(data["min_confidence"])
+    if "cascade" in data:        out["cascade"] = bool(data["cascade"])
+    if "max_cascade_rounds" in data:
+        out["max_cascade_rounds"] = int(data["max_cascade_rounds"])
+    return out
+
+
+def _bucket_confidence(c: float) -> str:
+    if c >= 0.90:   return ">=0.90"
+    if c >= 0.75:   return "0.75-0.90"
+    if c >= 0.50:   return "0.50-0.75"
+    if c >= 0.25:   return "0.25-0.50"
+    return "<0.25"
+
+
+@app.post("/api/geocode/infer-preview")
+def api_infer_preview(data: dict):
+    from .infer_location import infer_locations
+
+    params = _parse_infer_params(data)
+    with _get_db() as db:
+        result = infer_locations(db, **params)
+        candidates = result["candidates"]
+        summary = result["summary"]
+
+        buckets = Counter(_bucket_confidence(c["confidence"]) for c in candidates)
+        hops = Counter(c["hop_count"] for c in candidates)
+
+        sample_rows = random.sample(candidates, min(10, len(candidates)))
+        # Pre-geocode just the sampled rows so the UI can show place_name.
+        from .geocode import reverse_geocode_batch
+        sample_places = reverse_geocode_batch(
+            [(c["lat"], c["lon"]) for c in sample_rows]
+        ) if sample_rows else []
+
+        samples = []
+        for c, place in zip(sample_rows, sample_places):
+            samples.append({
+                "photo_id": c["photo_id"],
+                "filepath": c["filepath"],
+                "thumbnail_url": f"/api/photos/{c['photo_id']}/thumbnail",
+                "inferred_lat": c["lat"],
+                "inferred_lon": c["lon"],
+                "place_name": place,
+                "confidence": c["confidence"],
+                "hop_count": c["hop_count"],
+                "time_gap_min": c["time_gap_min"],
+                "drift_km": c["drift_km"],
+                "sides": c["sides"],
+                "source_photo_id": c["source_photo_id"],
+            })
+
+        return {
+            "total_photos": summary["total_photos"],
+            "no_gps_count": summary["no_gps_count"],
+            "gps_count": summary["gps_count"],
+            "candidate_count": summary["candidate_count"],
+            "cascade_rounds_used": summary["cascade_rounds_used"],
+            "skipped": summary["skipped"],
+            "confidence_buckets": [
+                {"bucket": b, "count": buckets.get(b, 0)}
+                for b in (">=0.90", "0.75-0.90", "0.50-0.75",
+                          "0.25-0.50", "<0.25")
+            ],
+            "hop_distribution": [
+                {"hops": h, "count": hops[h]} for h in sorted(hops)
+            ],
+            "samples": samples,
+        }
+
+
+@app.post("/api/geocode/infer-apply")
+def api_infer_apply(data: dict):
+    import time
+    from .infer_location import infer_locations
+    from .geocode import reverse_geocode_batch
+
+    if not data.get("confirm"):
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to apply inferences",
+        )
+
+    params = _parse_infer_params(data)
+    start = time.perf_counter()
+    with _get_db() as db:
+        result = infer_locations(db, **params)
+        candidates = result["candidates"]
+        if not candidates:
+            return {"updated_count": 0, "rounds_used": 0, "duration_seconds": 0.0}
+
+        coords = [(c["lat"], c["lon"]) for c in candidates]
+        places = reverse_geocode_batch(coords)
+
+        cur = db.conn.cursor()
+        updated = 0
+        for c, place in zip(candidates, places):
+            cur.execute(
+                "UPDATE photos "
+                "SET gps_lat=?, gps_lon=?, place_name=COALESCE(place_name, ?), "
+                "    location_source='inferred', location_confidence=? "
+                "WHERE id=? AND gps_lat IS NULL",
+                (c["lat"], c["lon"], place, c["confidence"], c["photo_id"]),
+            )
+            updated += cur.rowcount
+        db.conn.commit()
+
+    return {
+        "updated_count": updated,
+        "rounds_used": result["summary"]["cascade_rounds_used"],
+        "duration_seconds": time.perf_counter() - start,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Verify failures
 
 _VERIFY_STATUSES = ("fail", "regenerated")
