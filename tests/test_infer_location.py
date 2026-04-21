@@ -88,3 +88,90 @@ def test_scan_photos_accepts_space_and_T_separators(empty_db):
     photos, _ = _scan_photos(empty_db)
     assert len(photos) == 2
     assert all("date_taken_dt" in p for p in photos)
+
+
+def test_infer_empty_db(empty_db):
+    from photosearch.infer_location import infer_locations
+    result = infer_locations(empty_db, cascade=False)
+    assert result["candidates"] == []
+    assert result["summary"]["total_photos"] == 0
+    assert result["summary"]["candidate_count"] == 0
+
+
+def test_infer_no_gps_anchors(empty_db):
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/a.jpg", date_taken="2020-06-15T10:00:00")
+    _add(empty_db, filepath="/b.jpg", date_taken="2020-06-15T10:10:00")
+    result = infer_locations(empty_db, cascade=False)
+    assert result["candidates"] == []
+    assert result["summary"]["no_gps_count"] == 2
+    assert result["summary"]["gps_count"] == 0
+
+
+def test_infer_single_anchor_one_sided(empty_db):
+    """One GPS anchor + one no-GPS photo after it (within window)
+    -> one-sided inference with sides_factor=0.7."""
+    from photosearch.infer_location import infer_locations
+    anchor = _add(empty_db, filepath="/anchor.jpg",
+                  date_taken="2020-06-15T10:00:00", lat=47.6, lon=-122.3)
+    target = _add(empty_db, filepath="/target.jpg",
+                  date_taken="2020-06-15T10:10:00")  # 10 min later
+    result = infer_locations(empty_db, window_minutes=30, cascade=False)
+    assert len(result["candidates"]) == 1
+    c = result["candidates"][0]
+    assert c["photo_id"] == target
+    assert c["lat"] == pytest.approx(47.6)
+    assert c["lon"] == pytest.approx(-122.3)
+    assert c["sides"] in ("left", "right")
+    assert c["hop_count"] == 1
+    assert c["source_photo_id"] == anchor
+    # base_decay = 1 - 10/30 = 0.667; sides_factor = 0.7 -> 0.467
+    assert c["confidence"] == pytest.approx(2.0 / 3.0 * 0.7, rel=1e-3)
+
+
+def test_infer_flanking_anchors_agree(empty_db):
+    """Two flanking anchors within max_drift_km -> two-sided,
+    no sides penalty, nearest-time wins."""
+    from photosearch.infer_location import infer_locations
+    a1 = _add(empty_db, filepath="/a1.jpg",
+              date_taken="2020-06-15T10:00:00", lat=47.60, lon=-122.30)
+    target = _add(empty_db, filepath="/target.jpg",
+                  date_taken="2020-06-15T10:10:00")
+    a2 = _add(empty_db, filepath="/a2.jpg",
+              date_taken="2020-06-15T10:25:00", lat=47.61, lon=-122.31)
+    result = infer_locations(empty_db, window_minutes=30,
+                              max_drift_km=5.0, cascade=False)
+    assert len(result["candidates"]) == 1
+    c = result["candidates"][0]
+    assert c["sides"] == "both"
+    assert c["source_photo_id"] == a1  # 10 min vs 15 min -> a1 wins
+    # base_decay = 1 - 10/30 = 0.667; sides_factor = 1.0
+    assert c["confidence"] == pytest.approx(2.0 / 3.0, rel=1e-3)
+
+
+def test_infer_movement_guard_fires(empty_db):
+    """Flanking anchors >max_drift_km apart -> skipped."""
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/seattle.jpg",
+         date_taken="2020-06-15T10:00:00", lat=47.60, lon=-122.30)
+    _add(empty_db, filepath="/mid.jpg",
+         date_taken="2020-06-15T11:00:00")
+    _add(empty_db, filepath="/portland.jpg",
+         date_taken="2020-06-15T12:00:00", lat=45.52, lon=-122.68)
+    result = infer_locations(empty_db, window_minutes=90,
+                              max_drift_km=25.0, cascade=False)
+    assert result["candidates"] == []
+    assert result["summary"]["skipped"]["movement_guard"] == 1
+
+
+def test_infer_gap_equals_window_filtered(empty_db):
+    """When time_gap == window_minutes, base_decay == 0 -> confidence 0
+    -> excluded (min_confidence default 0.0 filters <= 0.0)."""
+    from photosearch.infer_location import infer_locations
+    _add(empty_db, filepath="/anchor.jpg",
+         date_taken="2020-06-15T10:00:00", lat=47.6, lon=-122.3)
+    _add(empty_db, filepath="/target.jpg",
+         date_taken="2020-06-15T10:30:00")  # exactly 30 min
+    result = infer_locations(empty_db, window_minutes=30, cascade=False)
+    assert result["candidates"] == []
+    assert result["summary"]["skipped"]["below_min_confidence"] == 1
