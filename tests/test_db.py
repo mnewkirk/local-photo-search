@@ -66,6 +66,24 @@ class TestPhotoCRUD:
         pid2 = db.add_photo(filepath="dup/photo.jpg", filename="photo.jpg")
         assert pid1 == pid2
 
+    def test_add_photo_with_gps_stamps_exif_provenance(self, db):
+        pid = db.add_photo(filepath="gps/a.jpg", filename="a.jpg",
+                           gps_lat=47.6, gps_lon=-122.3)
+        photo = db.get_photo(pid)
+        assert photo["location_source"] == "exif"
+
+    def test_add_photo_without_gps_leaves_provenance_null(self, db):
+        pid = db.add_photo(filepath="nogps/b.jpg", filename="b.jpg")
+        photo = db.get_photo(pid)
+        assert photo["location_source"] is None
+
+    def test_add_photo_with_explicit_location_source_wins(self, db):
+        pid = db.add_photo(filepath="inferred/c.jpg", filename="c.jpg",
+                           gps_lat=47.6, gps_lon=-122.3,
+                           location_source="inferred")
+        photo = db.get_photo(pid)
+        assert photo["location_source"] == "inferred"
+
     def test_get_photo_by_path(self, db):
         photo = db.get_photo_by_path("2026/march/DSC04878.JPG")
         assert photo is not None

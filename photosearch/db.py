@@ -560,6 +560,17 @@ class PhotoDB:
 
     def add_photo(self, **kwargs) -> int:
         """Insert a photo record. Returns the photo id."""
+        # Stamp provenance on rows whose caller provided GPS but didn't set
+        # location_source. The v16->v17 migration backfills existing rows, but
+        # only runs on the ALTER TABLE path — fresh DBs and every post-migration
+        # insert would otherwise leave this NULL, breaking the precision of M19
+        # rollback SQL (`WHERE location_source='inferred'`) and status filters.
+        if (
+            kwargs.get("gps_lat") is not None
+            and kwargs.get("gps_lon") is not None
+            and "location_source" not in kwargs
+        ):
+            kwargs["location_source"] = "exif"
         columns = ", ".join(kwargs.keys())
         placeholders = ", ".join(["?"] * len(kwargs))
         cur = self.conn.execute(
