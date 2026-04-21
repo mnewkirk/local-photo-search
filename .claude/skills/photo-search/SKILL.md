@@ -83,6 +83,7 @@ local-photo-search/
     ├── merges.html         # M18 — merge-suggestion review page
     ├── collections.html    # Collections UI + Google Photos upload modal
     ├── map.html            # Leaflet map view of GPS-bearing photos
+    ├── geotag.html         # Manual bulk geotag picker (folder-first UI)
     ├── review.html         # Shoot review / culling UI
     ├── status.html         # Indexing status + run commands
     └── shared.js           # Shared components: PS.SharedHeader (with /merges
@@ -297,6 +298,32 @@ need cross-recluster persistence.
   step). **Must be declared before `/api/photos/{photo_id}` in
   `web.py`** or FastAPI's path matcher takes `geojson` as a photo id
   and returns 422.
+
+### Manual bulk geotagging
+- `GET /api/geotag/folders` — folder summary with no-GPS/inferred/exif
+  counts per folder, sorted by no-GPS descending. Hides fully-tagged
+  folders unless `?include_fully_tagged=true`. Folder path is derived
+  from `os.path.dirname`-style rfind of `/` in `filepath`.
+- `GET /api/geotag/folder-photos?folder=...&show_inferred=false` —
+  photos in one folder. By default returns `gps_lat IS NULL` rows only;
+  with `show_inferred=true` also returns `location_source='inferred'`
+  rows so users can correct M19 misfires. Never returns `exif` rows.
+- `GET /api/geotag/known-places?q=...` — distinct `place_name` values
+  from the library matching q (case-insensitive substring), sorted by
+  photo count descending. Feeds the "library" section of the /geotag
+  typeahead.
+- `GET /api/geocode/search?q=...&limit=5` — forward-geocode via
+  Nominatim (public OSM endpoint) with a persistent 30-day cache in
+  `geocode_cache`. User-Agent: `"local-photo-search/1.0 (…)"`.
+  Response shape `{results: [{display_name, lat, lon, country,
+  admin1, admin2, locality, type, importance}], source: 'cache'|
+  'nominatim'}`.
+- `POST /api/photos/bulk-set-location` — body `{photo_ids, lat, lon,
+  place_name, overwrite?}`. Writes `gps_lat/gps_lon/place_name/
+  location_source='manual'/location_confidence=NULL` in one transaction.
+  `overwrite=false` (default) keeps existing GPS; `overwrite=true`
+  replaces any source including exif. Returns
+  `{updated_count, skipped_count}`.
 
 ### Inferred geotagging (M19)
 - `POST /api/geocode/infer-preview` — read-only. Body takes
@@ -1106,15 +1133,16 @@ Living roadmap entries — each is a design doc the next contributor can
 pick up and implement without re-deriving the shape:
 
 - **`docs/plans/bulk-set-location.md`** — bulk-assign location to photos
-  lacking GPS. **M19 (temporal-neighbor inference) shipped** — see
-  "Inferred geotagging (M19)" below. Adds `location_source` and
-  `location_confidence` columns (schema v17). Remaining work from the
-  parent plan: manual address-picker modal (forward geocoding via
-  proxied Nominatim) and the `country` / `admin1` / `admin2` /
-  `locality` columns that unlock map view (Leaflet clusters), radius
-  search (`?location_near=47.6,-122.3&radius_km=5`), and region-scoped
-  queries like *"beach near southwest France"* via a hand-curated
-  region→admin1 map.
+  lacking GPS. **Both halves shipped**: M19 inferred geotagging
+  (temporal neighbors; see "Inferred geotagging (M19)" below) and the
+  manual `/geotag` page (Nominatim typeahead + library-place reuse; see
+  "Manual bulk geotagging" below). Schema v17 added
+  `location_source`/`location_confidence`; schema v18 added the
+  `geocode_cache` table. Remaining from the parent plan: structured
+  `country` / `admin1` / `admin2` / `locality` columns to unlock
+  radius search (`?location_near=47.6,-122.3&radius_km=5`) and
+  region-scoped queries like *"beach near southwest France"* via a
+  hand-curated region→admin1 map.
 - **`docs/plans/infer-location-refinements.md`** — post-M19 cascade
   fixes surfaced by the first 127k-library apply. Three ordered
   changes: (1) cap hop depth at ~6 (observed chain ran 776 deep), (2)

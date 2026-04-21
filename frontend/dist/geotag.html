@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Geotag — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --text-dim: #666;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --radius: 8px;
+    }
+
+    html, body, #root { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      overflow: hidden;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .layout {
+      display: flex;
+      height: calc(100vh - 75px);
+    }
+
+    .col {
+      border-right: 1px solid var(--border);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .col:last-child { border-right: 0; }
+    .col-folders { width: 360px; flex-shrink: 0; background: var(--surface); }
+    .col-photos { flex: 1; background: var(--bg); }
+    .col-picker { width: 380px; flex-shrink: 0; background: var(--surface); }
+
+    .col-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .col-body { flex: 1; overflow-y: auto; }
+    .col-body-padded { padding: 14px 16px; }
+
+    /* Folder list */
+    .folder-row {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .folder-row:hover { background: var(--surface2); }
+    .folder-row.active { background: var(--surface2); border-left: 3px solid var(--accent); padding-left: 13px; }
+    .folder-path {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      word-break: break-all;
+      color: var(--text);
+    }
+    .folder-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 500;
+    }
+    .badge.no-gps { background: rgba(248, 113, 113, 0.18); color: #ffb0b0; }
+    .badge.inferred { background: rgba(250, 204, 21, 0.18); color: #facc15; }
+    .badge.exif { background: rgba(74, 158, 255, 0.18); color: #4a9eff; }
+    .badge.dim { background: var(--surface2); color: var(--text-muted); }
+
+    .folder-toolbar {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+      color: var(--text-muted);
+      background: var(--surface);
+    }
+    .folder-toolbar label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+
+    /* Photo grid */
+    .photo-toolbar {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+    }
+    .photo-toolbar .spacer { flex: 1; }
+    .selected-count { color: var(--text); font-weight: 500; }
+    .btn {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+      padding: 8px 16px;
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn:disabled, .btn-primary:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    .photo-grid {
+      padding: 12px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 8px;
+    }
+    .photo-card {
+      aspect-ratio: 1 / 1;
+      position: relative;
+      overflow: hidden;
+      border-radius: 4px;
+      cursor: pointer;
+      background: var(--surface2);
+      border: 2px solid transparent;
+    }
+    .photo-card img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .photo-card.selected { border-color: var(--accent); }
+    .photo-card.selected::after {
+      content: "✓";
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      background: var(--accent);
+      color: #fff;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .photo-card .src-badge {
+      position: absolute;
+      bottom: 4px;
+      left: 4px;
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: rgba(0,0,0,0.7);
+      color: #facc15;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .empty-state {
+      padding: 48px 24px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* Picker column */
+    .picker-input {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text);
+      font-size: 14px;
+    }
+    .picker-input:focus {
+      outline: 0;
+      border-color: var(--accent);
+    }
+    .picker-section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      margin: 14px 0 6px;
+      padding: 0 16px;
+    }
+    .suggestion {
+      padding: 8px 16px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+    }
+    .suggestion:hover { background: var(--surface2); }
+    .suggestion.chosen { background: rgba(74, 158, 255, 0.14); border-left: 3px solid var(--accent); padding-left: 13px; }
+    .suggestion-name { font-size: 13px; }
+    .suggestion-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .suggestion-source {
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: var(--surface2);
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .suggestion-source.library { background: rgba(74, 158, 255, 0.18); color: var(--accent); }
+
+    .chosen-card {
+      margin: 14px 16px 0;
+      padding: 12px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      background: rgba(74, 158, 255, 0.06);
+    }
+    .chosen-card .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+    .chosen-card .place-name { font-size: 14px; font-weight: 500; word-break: break-word; }
+    .chosen-card .coords {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    .apply-bar {
+      padding: 14px 16px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background: var(--surface);
+    }
+    .apply-bar label {
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      z-index: 10000;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+    .toast.error { border-color: var(--red); color: #ffb0b0; }
+    .toast.success { border-color: var(--green); }
+
+    .loading {
+      padding: 24px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+
+  <script>
+    const { useState, useEffect, useRef, useMemo, useCallback } = React;
+    const e = React.createElement;
+
+    // ---- Debounced value hook ------------------------------------------------
+    function useDebounced(value, ms) {
+      const [v, setV] = useState(value);
+      useEffect(() => {
+        const t = setTimeout(() => setV(value), ms);
+        return () => clearTimeout(t);
+      }, [value, ms]);
+      return v;
+    }
+
+    // ---- Folders panel -------------------------------------------------------
+    function FoldersPanel(props) {
+      const [includeTagged, setIncludeTagged] = useState(false);
+      return e('div', { className: 'col col-folders' },
+        e('div', { className: 'col-header' },
+          e('span', null, 'Folders'),
+          props.folders && e('span', { style: { color: 'var(--text-muted)' } },
+            '(' + props.folders.length.toLocaleString() + ')'),
+          e('span', { className: 'spacer', style: { flex: 1 } }),
+          e('button', {
+            className: 'btn',
+            onClick: () => props.onReload(includeTagged),
+            title: 'Re-scan folders',
+          }, '↻'),
+        ),
+        e('div', { className: 'folder-toolbar' },
+          e('label', null,
+            e('input', {
+              type: 'checkbox',
+              checked: includeTagged,
+              onChange: (ev) => {
+                setIncludeTagged(ev.target.checked);
+                props.onReload(ev.target.checked);
+              },
+            }),
+            ' Show fully-tagged folders'),
+        ),
+        e('div', { className: 'col-body' },
+          !props.folders ? e('div', { className: 'loading' }, 'Scanning…')
+            : props.folders.length === 0 ? e('div', { className: 'empty-state' },
+                '🎉 Every folder is fully tagged.')
+            : props.folders.map(f => {
+                const active = props.activeFolder === f.path;
+                return e('div', {
+                  key: f.path,
+                  className: 'folder-row' + (active ? ' active' : ''),
+                  onClick: () => props.onSelect(f.path),
+                },
+                  e('div', { className: 'folder-path' }, f.path),
+                  e('div', { className: 'folder-meta' },
+                    f.no_gps > 0 && e('span', { className: 'badge no-gps' },
+                      f.no_gps.toLocaleString(), ' missing'),
+                    f.with_inferred > 0 && e('span', { className: 'badge inferred' },
+                      f.with_inferred.toLocaleString(), ' inferred'),
+                    f.with_exif > 0 && e('span', { className: 'badge exif' },
+                      f.with_exif.toLocaleString(), ' exif'),
+                    f.date_from && e('span', { className: 'badge dim' },
+                      f.date_from.slice(0, 10)),
+                  ),
+                );
+              })
+        ),
+      );
+    }
+
+    // ---- Photos panel --------------------------------------------------------
+    function PhotosPanel(props) {
+      if (!props.folder) {
+        return e('div', { className: 'col col-photos' },
+          e('div', { className: 'col-header' }, 'Photos'),
+          e('div', { className: 'empty-state' }, 'Select a folder on the left.'),
+        );
+      }
+
+      const photos = props.photos || [];
+      const selectedCount = props.selected.size;
+      const totalCount = photos.length;
+      const allSelected = totalCount > 0 && selectedCount === totalCount;
+
+      return e('div', { className: 'col col-photos' },
+        e('div', { className: 'col-header' },
+          e('span', null, props.folder),
+        ),
+        e('div', { className: 'photo-toolbar' },
+          e('label', null,
+            e('input', {
+              type: 'checkbox',
+              checked: props.showInferred,
+              onChange: (ev) => props.onToggleInferred(ev.target.checked),
+            }),
+            ' Include inferred (for correction)'),
+          e('span', { className: 'spacer' }),
+          e('span', { className: 'selected-count' },
+            selectedCount.toLocaleString() + ' of ' + totalCount.toLocaleString() + ' selected'),
+          e('button', {
+            className: 'btn',
+            onClick: props.onSelectAll,
+            disabled: allSelected,
+          }, 'All'),
+          e('button', {
+            className: 'btn',
+            onClick: props.onSelectNone,
+            disabled: selectedCount === 0,
+          }, 'None'),
+        ),
+        e('div', { className: 'col-body' },
+          props.loading ? e('div', { className: 'loading' }, 'Loading…')
+            : photos.length === 0 ? e('div', { className: 'empty-state' },
+                'No photos needing tags in this folder.')
+            : e('div', { className: 'photo-grid' },
+                photos.map(p => {
+                  const sel = props.selected.has(p.id);
+                  return e('div', {
+                    key: p.id,
+                    className: 'photo-card' + (sel ? ' selected' : ''),
+                    onClick: () => props.onToggle(p.id),
+                  },
+                    e('img', {
+                      src: '/api/photos/' + p.id + '/thumbnail',
+                      loading: 'lazy',
+                      alt: p.filename,
+                    }),
+                    p.location_source === 'inferred' && e('span', { className: 'src-badge' }, 'inferred'),
+                  );
+                })
+              )
+        ),
+      );
+    }
+
+    // ---- Picker panel --------------------------------------------------------
+    function PickerPanel(props) {
+      const [query, setQuery] = useState('');
+      const [knownPlaces, setKnownPlaces] = useState([]);
+      const [nominatim, setNominatim] = useState([]);
+      const [loadingNom, setLoadingNom] = useState(false);
+      const [nomError, setNomError] = useState(null);
+      const [overwrite, setOverwrite] = useState(false);
+      const debQuery = useDebounced(query, 300);
+
+      // Known-places: run on any query (or empty — returns top-count places).
+      useEffect(() => {
+        const url = '/api/geotag/known-places?limit=10'
+                    + (debQuery.trim() ? '&q=' + encodeURIComponent(debQuery.trim()) : '');
+        let cancelled = false;
+        fetch(url)
+          .then(r => r.ok ? r.json() : null)
+          .then(body => { if (!cancelled && body) setKnownPlaces(body.places || []); })
+          .catch(() => {});
+        return () => { cancelled = true; };
+      }, [debQuery]);
+
+      // Nominatim: only when the user has typed something meaningful.
+      useEffect(() => {
+        const q = debQuery.trim();
+        if (q.length < 2) {
+          setNominatim([]);
+          setNomError(null);
+          return;
+        }
+        let cancelled = false;
+        setLoadingNom(true);
+        setNomError(null);
+        fetch('/api/geocode/search?q=' + encodeURIComponent(q) + '&limit=5')
+          .then(r => r.ok ? r.json() : r.json().then(b => Promise.reject(b)))
+          .then(body => { if (!cancelled) setNominatim(body.results || []); })
+          .catch(err => {
+            if (cancelled) return;
+            setNominatim([]);
+            setNomError((err && err.detail) || 'Geocoder error');
+          })
+          .finally(() => { if (!cancelled) setLoadingNom(false); });
+        return () => { cancelled = true; };
+      }, [debQuery]);
+
+      const applyDisabled = !props.chosen || props.selectedCount === 0 || props.applying;
+
+      return e('div', { className: 'col col-picker' },
+        e('div', { className: 'col-header' }, 'Location'),
+        e('div', { style: { padding: '12px 16px' } },
+          e('input', {
+            type: 'text',
+            className: 'picker-input',
+            placeholder: 'Type a place or address…',
+            value: query,
+            onChange: (ev) => setQuery(ev.target.value),
+            autoFocus: true,
+          }),
+        ),
+
+        e('div', { className: 'col-body' },
+          props.chosen && e('div', { className: 'chosen-card' },
+            e('div', { className: 'label' }, 'Will write to selected photos'),
+            e('div', { className: 'place-name' }, props.chosen.place_name),
+            e('div', { className: 'coords' },
+              props.chosen.lat.toFixed(4) + ', ' + props.chosen.lon.toFixed(4)),
+          ),
+
+          knownPlaces.length > 0 && e('div', null,
+            e('div', { className: 'picker-section-title' }, 'In your library'),
+            knownPlaces.map(p => {
+              const chosen = props.chosen && props.chosen.place_name === p.place_name
+                             && props.chosen.source === 'library';
+              return e('div', {
+                key: 'L:' + p.place_name,
+                className: 'suggestion' + (chosen ? ' chosen' : ''),
+                onClick: () => props.onChoose({
+                  source: 'library',
+                  place_name: p.place_name,
+                  lat: null,   // Resolved below before apply.
+                  lon: null,
+                }),
+              },
+                e('div', { className: 'suggestion-name' }, p.place_name),
+                e('div', { className: 'suggestion-meta' },
+                  e('span', { className: 'suggestion-source library' }, 'library'),
+                  e('span', null, p.photo_count.toLocaleString() + ' photos use this'),
+                ),
+              );
+            })
+          ),
+
+          (loadingNom || nominatim.length > 0 || nomError) && e('div', null,
+            e('div', { className: 'picker-section-title' }, 'Search results'),
+            loadingNom && e('div', { className: 'loading', style: { padding: '8px 16px' } },
+              'Searching Nominatim…'),
+            nomError && e('div', { className: 'loading', style: { padding: '8px 16px', color: 'var(--red)' } },
+              nomError),
+            nominatim.map((r, i) => {
+              const chosen = props.chosen
+                && Math.abs(props.chosen.lat - r.lat) < 1e-6
+                && Math.abs(props.chosen.lon - r.lon) < 1e-6
+                && props.chosen.source === 'nominatim';
+              // Build a canonical "Locality, Admin1, CC" place_name from
+              // structured fields when available, falling back to
+              // display_name.
+              const parts = [r.locality, r.admin1, r.country].filter(Boolean);
+              const canonical = parts.length >= 2
+                ? parts.join(', ')
+                : r.display_name;
+              return e('div', {
+                key: 'N:' + i,
+                className: 'suggestion' + (chosen ? ' chosen' : ''),
+                onClick: () => props.onChoose({
+                  source: 'nominatim',
+                  place_name: canonical,
+                  lat: r.lat,
+                  lon: r.lon,
+                  display_name: r.display_name,
+                }),
+              },
+                e('div', { className: 'suggestion-name' }, canonical),
+                e('div', { className: 'suggestion-meta' },
+                  e('span', { className: 'suggestion-source' }, 'nominatim'),
+                  r.type && e('span', null, r.type),
+                  e('span', null,
+                    r.lat.toFixed(3) + ', ' + r.lon.toFixed(3)),
+                ),
+              );
+            })
+          ),
+        ),
+
+        e('div', { className: 'apply-bar' },
+          e('label', null,
+            e('input', {
+              type: 'checkbox',
+              checked: overwrite,
+              onChange: (ev) => setOverwrite(ev.target.checked),
+            }),
+            ' Overwrite existing GPS (inferred/exif)'),
+          e('button', {
+            className: 'btn-primary',
+            onClick: () => props.onApply(overwrite),
+            disabled: applyDisabled,
+            title: !props.chosen ? 'Pick a location first'
+                  : props.selectedCount === 0 ? 'Select photos to tag'
+                  : 'Apply to ' + props.selectedCount.toLocaleString() + ' photos',
+          },
+            props.applying ? 'Applying…'
+              : 'Apply to ' + (props.selectedCount || 0).toLocaleString() + ' photos'),
+        ),
+      );
+    }
+
+    // ---- Top-level page ------------------------------------------------------
+    function GeotagPage() {
+      const [folders, setFolders] = useState(null);
+      const [activeFolder, setActiveFolder] = useState(null);
+      const [photos, setPhotos] = useState(null);
+      const [loadingPhotos, setLoadingPhotos] = useState(false);
+      const [selected, setSelected] = useState(new Set());
+      const [showInferred, setShowInferred] = useState(false);
+      const [chosen, setChosen] = useState(null);
+      const [applying, setApplying] = useState(false);
+      const [toast, setToast] = useState(null);
+
+      const loadFolders = useCallback((includeTagged) => {
+        setFolders(null);
+        const url = '/api/geotag/folders'
+                    + (includeTagged ? '?include_fully_tagged=true' : '');
+        fetch(url)
+          .then(r => r.json())
+          .then(body => setFolders(body.folders || []))
+          .catch(() => setFolders([]));
+      }, []);
+
+      useEffect(() => { loadFolders(false); }, [loadFolders]);
+
+      const loadPhotos = useCallback((folder, inferred) => {
+        if (!folder) return;
+        setLoadingPhotos(true);
+        const url = '/api/geotag/folder-photos?folder='
+                    + encodeURIComponent(folder)
+                    + (inferred ? '&show_inferred=true' : '');
+        fetch(url)
+          .then(r => r.json())
+          .then(body => {
+            const ps = body.photos || [];
+            setPhotos(ps);
+            // Default: select all of them.
+            setSelected(new Set(ps.map(p => p.id)));
+          })
+          .catch(() => setPhotos([]))
+          .finally(() => setLoadingPhotos(false));
+      }, []);
+
+      function selectFolder(path) {
+        setActiveFolder(path);
+        loadPhotos(path, showInferred);
+      }
+
+      function toggleInferred(val) {
+        setShowInferred(val);
+        if (activeFolder) loadPhotos(activeFolder, val);
+      }
+
+      function togglePhoto(id) {
+        setSelected(prev => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id); else next.add(id);
+          return next;
+        });
+      }
+
+      function selectAll() {
+        setSelected(new Set((photos || []).map(p => p.id)));
+      }
+      function selectNone() { setSelected(new Set()); }
+
+      function flashToast(kind, msg) {
+        setToast({ kind, msg });
+        setTimeout(() => setToast(null), 3500);
+      }
+
+      // If the user picks a library place (no lat/lon), resolve it via
+      // Nominatim before applying. The forward-geocoder hit is cached, so
+      // repeat picks are free.
+      async function resolveChosenCoords(c) {
+        if (c.lat != null && c.lon != null) return c;
+        try {
+          const r = await fetch('/api/geocode/search?q='
+                                + encodeURIComponent(c.place_name) + '&limit=1');
+          if (!r.ok) throw new Error('Geocode failed (' + r.status + ')');
+          const body = await r.json();
+          const first = (body.results || [])[0];
+          if (!first) throw new Error('No match for "' + c.place_name + '"');
+          return { ...c, lat: first.lat, lon: first.lon };
+        } catch (err) {
+          throw err;
+        }
+      }
+
+      async function applyLocation(overwrite) {
+        if (!chosen || selected.size === 0) return;
+        setApplying(true);
+        try {
+          const resolved = await resolveChosenCoords(chosen);
+          const ids = Array.from(selected);
+          const r = await fetch('/api/photos/bulk-set-location', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              photo_ids: ids,
+              lat: resolved.lat,
+              lon: resolved.lon,
+              place_name: resolved.place_name,
+              overwrite: !!overwrite,
+            }),
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || 'HTTP ' + r.status);
+          }
+          const body = await r.json();
+          const skipped = body.skipped_count || 0;
+          flashToast('success',
+            'Tagged ' + body.updated_count.toLocaleString() + ' photos'
+            + (skipped > 0 ? ' (' + skipped + ' skipped)' : ''));
+
+          // Refresh: folder list counts changed; current folder's photos
+          // likely have fewer no-GPS rows now.
+          loadFolders(false);
+          if (activeFolder) loadPhotos(activeFolder, showInferred);
+        } catch (err) {
+          flashToast('error', String(err.message || err));
+        } finally {
+          setApplying(false);
+        }
+      }
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'geotag' }),
+        e('div', { className: 'layout' },
+          e(FoldersPanel, {
+            folders: folders,
+            activeFolder: activeFolder,
+            onReload: loadFolders,
+            onSelect: selectFolder,
+          }),
+          e(PhotosPanel, {
+            folder: activeFolder,
+            photos: photos,
+            loading: loadingPhotos,
+            selected: selected,
+            showInferred: showInferred,
+            onToggleInferred: toggleInferred,
+            onToggle: togglePhoto,
+            onSelectAll: selectAll,
+            onSelectNone: selectNone,
+          }),
+          e(PickerPanel, {
+            chosen: chosen,
+            selectedCount: selected.size,
+            applying: applying,
+            onChoose: setChosen,
+            onApply: applyLocation,
+          }),
+        ),
+        toast && e('div', { className: 'toast ' + toast.kind }, toast.msg),
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(GeotagPage));
+  </script>
+</body>
+</html>

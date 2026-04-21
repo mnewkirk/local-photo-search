@@ -164,6 +164,18 @@ Live tuning UI: `/status` has an **Infer Locations** panel that wraps
 Apply is disabled until the current params have been previewed, and
 re-enables only after a successful preview with matching params.
 
+Manual bulk geotagging: `/geotag` is a 3-panel UI (folder list →
+thumbnails with multi-select → typeahead picker) for filling GPS on
+photos M19 couldn't reach. Typeahead merges **library places** (distinct
+`place_name` values from photos already tagged, via
+`/api/geotag/known-places`, instant, no external call) with **Nominatim
+forward-geocode results** (`/api/geocode/search`, proxied through the
+NAS with a 30-day cache in the `geocode_cache` table). Selecting a
+library place resolves its lat/lon via one cached Nominatim call at
+apply time. Writes `location_source='manual'` in a single transaction
+via `POST /api/photos/bulk-set-location`; overwrite is off by default
+(guards existing exif/inferred GPS unless the user explicitly toggles).
+
 Map view: `/map` plots every GPS-bearing photo (exif + inferred) on a
 Leaflet map with marker clustering. Sidebar filters by source
 (exif/inferred) and year. Clicking a marker or cluster opens a preview
@@ -326,11 +338,11 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
 ## Planned milestones (see `docs/plans/`)
 
 - `docs/plans/bulk-set-location.md` — bulk-assign location to photos lacking
-  GPS. **M19 (temporal-neighbor inference) shipped** — see the
-  "Inferred geotagging (M19)" section above. Remaining work from that
-  plan: manual address picker (forward geocoding, Nominatim) and the
-  `country`/`admin1`/`admin2`/`locality` columns that unlock map view,
-  radius search, and region-scoped queries like "beach near southwest
+  GPS. **Both halves shipped**: M19 inferred geotagging (temporal
+  neighbors) and the manual `/geotag` page (Nominatim typeahead +
+  library places). Remaining from that plan: structured
+  `country`/`admin1`/`admin2`/`locality` columns, which would enable
+  radius search and region-scoped queries like "beach near southwest
   France".
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
   surfaced on the 127k NAS library. Cap hop depth (cascade ran 776
