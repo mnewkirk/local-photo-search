@@ -903,6 +903,131 @@ def suggest_face_merges(
             click.echo(f"\nWrote {len(suggestions)} suggestions to {json_out}.")
 
 
+@cli.command("infer-locations")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--window-minutes", default=30, type=int,
+              help="Max time gap to a GPS anchor.")
+@click.option("--max-drift-km", default=25.0, type=float,
+              help="Reject if flanking anchors disagree by more than this.")
+@click.option("--min-confidence", default=0.0, type=float,
+              help="Filter inferences below this confidence (0..1).")
+@click.option("--cascade/--no-cascade", default=True,
+              help="Let inferred photos serve as anchors for further inference.")
+@click.option("--max-cascade-rounds", default=10, type=int,
+              help="Defensive ceiling on cascade iterations.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write inferences. Without it, prints a dry-run report.")
+def infer_locations_cmd(db, window_minutes, max_drift_km, min_confidence,
+                         cascade, max_cascade_rounds, apply):
+    """Infer gps_lat/gps_lon for photos lacking GPS from temporal neighbors.
+
+    Read-only without --apply. With --apply, reverse-geocodes the inferred
+    coords via the offline GeoNames geocoder and writes
+    gps_lat/gps_lon/place_name/location_source='inferred'/location_confidence
+    in a single transaction.
+    """
+    from collections import Counter
+    from photosearch.db import PhotoDB
+    from photosearch.infer_location import infer_locations
+    from photosearch.geocode import reverse_geocode_batch
+
+    with PhotoDB(db) as pdb:
+        result = infer_locations(
+            pdb,
+            window_minutes=window_minutes,
+            max_drift_km=max_drift_km,
+            min_confidence=min_confidence,
+            cascade=cascade,
+            max_cascade_rounds=max_cascade_rounds,
+        )
+        candidates = result["candidates"]
+        summary = result["summary"]
+
+        click.echo(
+            f"Scanning {summary['total_photos']:,} photos... "
+            f"{summary['no_gps_count']:,} have no GPS, "
+            f"{summary['gps_count']:,} have GPS."
+        )
+        click.echo(
+            f"Inferring with window={window_minutes}min, "
+            f"max_drift={max_drift_km}km, min_conf={min_confidence}, "
+            f"cascade={'on' if cascade else 'off'}..."
+        )
+        click.echo("")
+        click.echo(
+            f"Cascade: {summary['cascade_rounds_used']} rounds to fixpoint."
+        )
+        click.echo(
+            f"Candidates: {summary['candidate_count']:,} of "
+            f"{summary['no_gps_count']:,} no-GPS photos"
+        )
+        click.echo("Skipped:")
+        for k, v in summary["skipped"].items():
+            click.echo(f"  {k:<22} {v:,}")
+
+        if candidates:
+            # Confidence buckets
+            def _bucket(c: float) -> str:
+                if c >= 0.90:   return ">=0.90"
+                if c >= 0.75:   return "0.75-0.90"
+                if c >= 0.50:   return "0.50-0.75"
+                if c >= 0.25:   return "0.25-0.50"
+                return "<0.25"
+            buckets = Counter(_bucket(c["confidence"]) for c in candidates)
+            click.echo("\nConfidence distribution:")
+            for name in (">=0.90", "0.75-0.90", "0.50-0.75", "0.25-0.50", "<0.25"):
+                click.echo(f"  {name:<12} {buckets.get(name, 0):,}")
+
+            # Hop distribution
+            hops = Counter(c["hop_count"] for c in candidates)
+            click.echo("\nHop distribution:")
+            for h in sorted(hops):
+                click.echo(f"  {h:<4} {hops[h]:,}")
+
+            click.echo("\nSample inferences:")
+            import random
+            for c in random.sample(candidates, min(10, len(candidates))):
+                click.echo(
+                    f"  {c['filepath']}\n"
+                    f"    -> {c['lat']:.4f}, {c['lon']:.4f}  "
+                    f"gap={c['time_gap_min']:.0f}min, "
+                    f"drift={c['drift_km']:.1f}km, "
+                    f"confidence={c['confidence']:.2f}, "
+                    f"hops={c['hop_count']}"
+                )
+
+        if not apply:
+            click.echo("\nRe-run with --apply to write these.")
+            return
+
+        # --apply path
+        if not candidates:
+            click.echo("\nNothing to apply.")
+            return
+
+        click.echo(f"\nWriting {len(candidates):,} inferences...")
+        coords = [(c["lat"], c["lon"]) for c in candidates]
+        places = reverse_geocode_batch(coords)
+        geocoded = sum(1 for p in places if p)
+        click.echo(f"  Reverse-geocoded {geocoded:,} place_names.")
+
+        updated = 0
+        cur = pdb.conn.cursor()
+        for c, place in zip(candidates, places):
+            # Guard: only fill rows that still have gps_lat IS NULL.
+            cur.execute(
+                "UPDATE photos "
+                "SET gps_lat=?, gps_lon=?, place_name=COALESCE(place_name, ?), "
+                "    location_source='inferred', location_confidence=? "
+                "WHERE id=? AND gps_lat IS NULL",
+                (c["lat"], c["lon"], place, c["confidence"], c["photo_id"]),
+            )
+            updated += cur.rowcount
+        pdb.conn.commit()
+        click.echo(f"  Transaction committed. Wrote {updated:,} inferences.")
+
+
 # ---------------------------------------------------------------------------
 # cleanup-orphans
 # ---------------------------------------------------------------------------
