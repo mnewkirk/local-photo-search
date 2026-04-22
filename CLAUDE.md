@@ -29,6 +29,37 @@ review_selections, google_photos_uploads, ignored_clusters, schema_info.
 Schema migrations run automatically via `_init_schema()`. Bump `SCHEMA_VERSION` in `db.py`
 when adding tables/columns.
 
+## Richer reverse geocoding (optional)
+
+Default reverse-geocoding uses the `reverse_geocoder` library's
+bundled `cities1000` dataset (~158k populated places). That labels
+Point Reyes photos as "Inverness", Muir Woods photos as "Mill
+Valley", etc. For richer labels (named parks, beaches, monuments,
+smaller towns), download the filtered GeoNames `allCountries`
+dataset:
+
+```bash
+$DC run --rm photosearch download-geonames
+```
+
+One-time ~400 MB download to `/data/geonames/`. After it finishes,
+re-label existing photos:
+
+```bash
+$DC run --rm photosearch normalize-places --force
+```
+
+Runtime cost: ~1 GB RAM at steady state (the KDTree), ~10-30 s
+build on first query each process. Fully falls back to stock
+`reverse_geocoder` if the dataset isn't present — nothing breaks if
+you skip this.
+
+Feature-code filter covers populated places (class P) plus named
+POIs: parks (PRK, PRKN), reserves (RESN, RESW, RESF), monuments
+(MNMT), beaches (BCH), lakes (LK), waterfalls, historic sites,
+mountains, peaks, capes, forests. Tweak `_KEEP_FEATURE_CODES` in
+`photosearch/geonames_rich.py` to add more.
+
 ## Debugging against the prod DB locally
 
 `./debug-db.sh` pulls `/data/photo_index.db` from the NAS via rsync

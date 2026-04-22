@@ -1114,6 +1114,33 @@ def cleanup_orphans(db, dry_run):
 # face-clusters
 # ---------------------------------------------------------------------------
 
+@cli.command("download-geonames")
+@click.option("--cache-dir", default=None,
+              help="Where to store the downloaded files. Default: "
+                   "/data/geonames (container) or ~/.cache/photosearch/"
+                   "geonames (host). Override via PHOTOSEARCH_GEONAMES_DIR.")
+@click.option("--force", is_flag=True, default=False,
+              help="Re-download + re-process even if files already exist.")
+def download_geonames_cmd(cache_dir, force):
+    """Download + build the rich GeoNames dataset for reverse geocoding.
+
+    One-time ~400 MB download. Produces a filtered CSV covering
+    populated places + named POIs (parks, beaches, monuments, etc)
+    that the stock ``reverse_geocoder`` cities1000 dataset doesn't
+    include. After this completes, ``normalize-places --force``
+    re-labels existing photos with the richer data.
+
+    Disk cost: ~1.5 GB peak during processing, ~400 MB steady state.
+    RAM cost at lookup time: ~1 GB for the KDTree. Kept as a
+    module-level singleton so the cost is paid once per process.
+    """
+    from photosearch.geonames_rich import build_rich_dataset
+    path = build_rich_dataset(cache_dir, force=force)
+    click.echo(f"\nRich GeoNames dataset ready at: {path}")
+    click.echo("Re-label existing photos with:")
+    click.echo("  $DC run --rm photosearch normalize-places --force")
+
+
 @cli.command("normalize-places")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")

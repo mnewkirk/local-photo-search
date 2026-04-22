@@ -12,8 +12,29 @@ _rg = None
 
 
 def _get_rg():
+    """Return the reverse-geocoder backend.
+
+    Prefers the rich GeoNames dataset (populated places + parks + POIs)
+    if the user has run `photosearch download-geonames`. Falls back to
+    the stock ``reverse_geocoder`` module (cities1000, ~158k entries)
+    when the rich dataset isn't present.
+
+    Rich dataset holds ~5M entries and takes ~1 GB of RAM at steady
+    state. The first call builds the KDTree (~10-30 s on an N100);
+    subsequent calls are fast because the instance is module-level
+    singleton.
+    """
     global _rg
     if _rg is None:
+        try:
+            from .geonames_rich import get_rich_geocoder
+            rich = get_rich_geocoder()
+            if rich is not None:
+                _rg = rich
+                return _rg
+        except Exception:
+            # Any import error / corrupt dataset → fall through to stock.
+            pass
         import reverse_geocoder as rg
         _rg = rg
     return _rg
