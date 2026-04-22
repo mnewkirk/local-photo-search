@@ -29,6 +29,33 @@ review_selections, google_photos_uploads, ignored_clusters, schema_info.
 Schema migrations run automatically via `_init_schema()`. Bump `SCHEMA_VERSION` in `db.py`
 when adding tables/columns.
 
+## Debugging against the prod DB locally
+
+`./debug-db.sh` pulls `/data/photo_index.db` from the NAS via rsync
+and exposes it for read-only SQL debugging on the Mac. Avoids the
+multi-line-python-paste headache of running diagnostics through
+`$DCPY photosearch -c "…"` and keeps the prod DB untouched.
+
+```bash
+./debug-db.sh pull                       # rsync DB + -wal/-shm locally
+./debug-db.sh shell                      # sqlite3 -readonly shell
+./debug-db.sh query "SELECT ..."         # one-shot SQL
+./debug-db.sh person Calvin "Lucas Valley"   # person-coverage CLI
+./debug-db.sh stats                      # stats CLI
+./debug-db.sh clean                      # delete local copy
+```
+
+Env overrides (`NAS_HOST`, `NAS_DATA_DIR`, `LOCAL_DB`) let you point
+it at a different NAS / path / local filename. The local copy goes
+under `.gitignore` as `photo_index.db.local*`.
+
+Related: `photosearch person-coverage NAME [--place-like PATTERN]`
+(added as a proper CLI command) prints face-match coverage so you
+can diagnose "X has many photos at Y but Person-X search only returns
+N" queries — tells you whether the gap is face detection, face
+matching, or elsewhere. The `debug-db.sh person` subcommand wraps
+this against the local copy.
+
 ## NAS Docker Commands
 
 ```bash

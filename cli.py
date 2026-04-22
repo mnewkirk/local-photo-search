@@ -1114,6 +1114,73 @@ def cleanup_orphans(db, dry_run):
 # face-clusters
 # ---------------------------------------------------------------------------
 
+@cli.command("person-coverage")
+@click.argument("name")
+@click.option("--place-like", "place_pattern", default=None,
+              help="Optional place_name LIKE pattern to scope the coverage report "
+                   "(e.g. 'Lucas Valley' or 'Marin').")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+def person_coverage(name, place_pattern, db):
+    """Report face-match coverage stats for NAME.
+
+    Diagnostic for "X has many photos in Y but only N show up for
+    Person-X" queries — tells you whether the gap is face detection,
+    face matching, or something else.
+    """
+    with PhotoDB(db) as photo_db:
+        conn = photo_db.conn
+        person_row = conn.execute(
+            "SELECT id, name FROM persons WHERE LOWER(name) = LOWER(?)", (name,),
+        ).fetchone()
+        if not person_row:
+            click.echo(f"Person '{name}' not registered.")
+            return
+        pid = person_row["id"]
+
+        n_photos_total = conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+        n_photos_with_face = conn.execute(
+            "SELECT COUNT(DISTINCT photo_id) FROM faces").fetchone()[0]
+        n_person_photos = conn.execute(
+            "SELECT COUNT(DISTINCT photo_id) FROM faces WHERE person_id = ?",
+            (pid,),
+        ).fetchone()[0]
+        n_person_faces = conn.execute(
+            "SELECT COUNT(*) FROM faces WHERE person_id = ?", (pid,),
+        ).fetchone()[0]
+
+        click.echo(f"\nCoverage report for {person_row['name']!r}:")
+        click.echo(f"  Photos total                 {n_photos_total:,}")
+        click.echo(f"  Photos with ANY face         {n_photos_with_face:,}")
+        click.echo(f"  Photos with {person_row['name']!r}-matched face  "
+                   f"{n_person_photos:,}")
+        click.echo(f"  Face rows for {person_row['name']!r}             "
+                   f"{n_person_faces:,}")
+
+        if place_pattern:
+            like = f"%{place_pattern}%"
+            n_place = conn.execute(
+                "SELECT COUNT(*) FROM photos WHERE place_name LIKE ?",
+                (like,),
+            ).fetchone()[0]
+            n_place_with_face = conn.execute(
+                """SELECT COUNT(DISTINCT p.id) FROM photos p
+                   JOIN faces f ON f.photo_id = p.id
+                   WHERE p.place_name LIKE ?""", (like,),
+            ).fetchone()[0]
+            n_place_person = conn.execute(
+                """SELECT COUNT(DISTINCT p.id) FROM photos p
+                   JOIN faces f ON f.photo_id = p.id
+                   WHERE p.place_name LIKE ? AND f.person_id = ?""",
+                (like, pid),
+            ).fetchone()[0]
+            click.echo(f"\n  Scoped to place_name LIKE {place_pattern!r}:")
+            click.echo(f"    Photos in place              {n_place:,}")
+            click.echo(f"    …with ANY face               {n_place_with_face:,}")
+            click.echo(f"    …with {person_row['name']!r}-matched face  "
+                       f"{n_place_person:,}")
+
+
 @cli.command("face-clusters")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 def face_clusters(db):

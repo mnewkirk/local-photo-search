@@ -59,3 +59,6 @@ google_photos_token.json
 
 *.db
 *.skill
+
+# Local copy of prod DB pulled by debug-db.sh
+photo_index.db.local*
