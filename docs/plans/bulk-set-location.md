@@ -1,4 +1,27 @@
-# Bulk set location + inferred geotagging (future milestone — absorbs M19)
+# Bulk set location + inferred geotagging (M19 + /geotag)
+
+**Status: DONE.** Both halves shipped:
+
+- **Inferred (M19)** — `photosearch infer-locations` CLI,
+  `/api/geocode/infer-preview` + `infer-apply` endpoints, and the
+  `/status` Infer Locations panel. Schema v17 added
+  `location_source` + `location_confidence` columns with `add_photo`
+  auto-stamping `'exif'`.
+- **Manual** — `/geotag` page (Nominatim typeahead + library-place
+  reuse + multi-select with shift-click range + day-grouped
+  sections), `GET /api/geotag/folders` / `/folder-photos` /
+  `/known-places`, `GET /api/geocode/search` (Nominatim proxy
+  with 30-day cache in the v18 `geocode_cache` table), and
+  `POST /api/photos/bulk-set-location`.
+
+Remaining future work (not actively scheduled): structured
+`country`/`admin1`/`admin2`/`locality` columns that would unlock
+radius search (`?location_near=47.6,-122.3&radius_km=5`) and region-
+scoped queries like *"beach near southwest France"* via a hand-
+curated region→admin1 map. Post-M19 cascade refinements are tracked
+separately in `docs/plans/infer-location-refinements.md`.
+
+---
 
 Let photos that lack GPS get a location from one of two sources — a user-
 chosen address (manual) or a GPS-bearing photo nearby in time (inferred,

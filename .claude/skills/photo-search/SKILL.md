@@ -1132,17 +1132,6 @@ fails for photos removed via Google Photos UI. Use "Re-upload" with specific pho
 Living roadmap entries — each is a design doc the next contributor can
 pick up and implement without re-deriving the shape:
 
-- **`docs/plans/bulk-set-location.md`** — bulk-assign location to photos
-  lacking GPS. **Both halves shipped**: M19 inferred geotagging
-  (temporal neighbors; see "Inferred geotagging (M19)" below) and the
-  manual `/geotag` page (Nominatim typeahead + library-place reuse; see
-  "Manual bulk geotagging" below). Schema v17 added
-  `location_source`/`location_confidence`; schema v18 added the
-  `geocode_cache` table. Remaining from the parent plan: structured
-  `country` / `admin1` / `admin2` / `locality` columns to unlock
-  radius search (`?location_near=47.6,-122.3&radius_km=5`) and
-  region-scoped queries like *"beach near southwest France"* via a
-  hand-curated region→admin1 map.
 - **`docs/plans/infer-location-refinements.md`** — post-M19 cascade
   fixes surfaced by the first 127k-library apply. Three ordered
   changes: (1) cap hop depth at ~6 (observed chain ran 776 deep), (2)
@@ -1160,12 +1149,19 @@ pick up and implement without re-deriving the shape:
   columns. New CLI `photosearch takeout-import` using a reviewable
   ndjson plan ledger for resumability. Phone GPS amplifies inferred-
   geotag recall on camera photos — run after each year's import.
-- **`docs/plans/faces-clustering-and-perf.md`** — remaining face work:
-  persist `det_score` + bbox area (filter low-quality faces pre-cluster),
-  swap DBSCAN for HDBSCAN (varying density), materialize a `face_groups`
-  table, persistent rejection table for `/merges` dismissals.
+**Shipped, kept for reference:**
+- **`docs/plans/bulk-set-location.md`** — both halves done (M19
+  inferred + `/geotag` manual). Future potential: structured
+  `country`/`admin1`/`admin2`/`locality` columns to unlock radius
+  search and region-scoped queries.
+- **`docs/plans/faces-clustering-and-perf.md`** — M18 clustering
+  overhaul + merge suggestions + accept/reject UI all shipped. Future
+  potential: quality pre-filter (`det_score` + bbox area), HDBSCAN
+  for varying density, materialized `face_groups` table. Pick up only
+  if a concrete pain surfaces — the current clustering has been good
+  enough on 120k+ faces in day-to-day use.
 
-When picking up any of these, read the plan doc first — it contains the
+When picking up any active plan, read the doc first — it contains the
 shape the schema migrations should take and the UX calls that have
 already been made.
 

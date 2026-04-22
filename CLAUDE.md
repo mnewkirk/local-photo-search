@@ -337,13 +337,6 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
 
 ## Planned milestones (see `docs/plans/`)
 
-- `docs/plans/bulk-set-location.md` — bulk-assign location to photos lacking
-  GPS. **Both halves shipped**: M19 inferred geotagging (temporal
-  neighbors) and the manual `/geotag` page (Nominatim typeahead +
-  library places). Remaining from that plan: structured
-  `country`/`admin1`/`admin2`/`locality` columns, which would enable
-  radius search and region-scoped queries like "beach near southwest
-  France".
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
   surfaced on the 127k NAS library. Cap hop depth (cascade ran 776
   deep, 71% of candidates below 0.25 confidence), downweight inferred
@@ -356,8 +349,15 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   per-year export, composite dedup (photoTakenTime + device + filename stem),
   lands in `/photos/YYYY/YYYY-MM-DD_gphotos/`. Phone GPS amplifies the
   inferred-geotag recall on camera photos.
-- `docs/plans/faces-clustering-and-perf.md` — remaining face work: persist
-  `det_score` + bbox area, HDBSCAN, materialize a `face_groups` table.
+
+**Shipped, kept for reference:**
+`docs/plans/bulk-set-location.md` (M19 inferred + `/geotag` manual) and
+`docs/plans/faces-clustering-and-perf.md` (M18 clustering overhaul +
+merge suggestions) are both complete. Each doc has a status header and
+a "Future potential improvements" section for the genuinely-nice-to-
+have items (structured location columns; HDBSCAN, quality pre-filter,
+materialized face_groups). Pick those up only if concrete pain
+surfaces.
 
 ## Detailed Reference
 

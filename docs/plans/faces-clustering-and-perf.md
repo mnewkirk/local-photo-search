@@ -1,5 +1,10 @@
 # Faces clustering & `/faces` page performance
 
+**Status: DONE (M18 shipped).** The clustering overhaul, session
+stacking, merge-suggestion engine, and accept/reject UI all shipped
+and are in day-to-day use on the NAS. Remaining items moved to
+"Future potential improvements" below and are not actively scheduled.
+
 Plan for fixing two linked problems observed on the NAS:
 
 1. **"Unknown #0" contains 1,736 unrelated faces.**
@@ -80,20 +85,34 @@ Secondary issues:
 9. ✅ **Merge-suggestion engine** (M18, dry-run CLI). `suggest-face-merges`
    finds likely merges between any two groups (cluster↔cluster,
    cluster↔named). Centroid + min-pair L2 metrics; `--verify-pair`
-   harness reports TP/FP coverage for threshold tuning. No DB writes yet —
-   accept/reject UI is deferred. See `photosearch/face_merge.py`.
-10. **Accept/reject UI** for merge suggestions. Adds a
-    `face_merge_suggestions` table (schema v13), `/api/faces/suggestions`
-    endpoints, and a suggestions section on `/faces` with per-pair
-    accept/reject. Blocked on tuning the CLI cutoffs against the real NAS
-    library first.
-11. **Quality filter before clustering.** Persist `det_score` + bbox area on
-    `faces`; filter `det_score >= 0.65` and min bbox edge `>= 60 px` before
-    clustering. Keep raw rows for person-matching (`MATCH_TOLERANCE=1.15` is
-    forgiving).
-12. **HDBSCAN** to handle varying density (some people appear 100×, others 2×).
-13. **Materialized `face_groups` table** refreshed after reclustering, so
-    `/api/faces/groups` becomes a single indexed SELECT.
+   harness reports TP/FP coverage for threshold tuning. See
+   `photosearch/face_merge.py`.
+10. ✅ **Accept/reject UI** for merge suggestions (M18). `/merges` page
+    reads suggestions from JSON, applies via `POST /api/faces/merges`,
+    tracks dismissals in localStorage keyed by rep_face_id pairs (stable
+    across reclusters). Chain rewriting handles accepted A→B propagating
+    into pending C→A. See `frontend/dist/merges.html`.
+
+## Future potential improvements
+
+Out of scope for the original milestone — pick up only if a concrete
+pain surfaces. The clustering + merge workflow has been good enough
+on the 120k+ face library that none of these have been necessary in
+practice.
+
+- **Quality filter before clustering.** Persist `det_score` + bbox
+  area on `faces`; filter `det_score >= 0.65` and min bbox edge
+  `>= 60px` before clustering. Keep raw rows for person-matching
+  (`MATCH_TOLERANCE=1.15` is forgiving). Would cut singletons from
+  low-res faces.
+- **HDBSCAN** to handle varying density (some people appear 100×,
+  others 2×). DBSCAN's single `eps` is a compromise; HDBSCAN finds
+  clusters at multiple densities. Would mostly help the long tail
+  of rarely-photographed people.
+- **Materialized `face_groups` table** refreshed after reclustering
+  so `/api/faces/groups` becomes a single indexed SELECT. Current
+  on-the-fly aggregation is fast enough with the paginate + count-
+  sort downgrade already shipped.
 
 ## Tradeoffs / risks
 
