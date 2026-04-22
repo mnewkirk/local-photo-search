@@ -1150,14 +1150,24 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
     if code:
         return results
 
-    if not results:
-        try:
-            candidates, _ = forward_geocode(db, name, limit=1)
-        except Exception:
-            candidates = []
-        if candidates and candidates[0].get("bbox"):
-            south, north, west, east = candidates[0]["bbox"]
-            results = _search_by_bbox(db, south, north, west, east, limit)
+    # Non-country queries: union with Nominatim bbox results so synonyms
+    # and nearby named places collapse to the same answer. "San Rafael",
+    # "Lucas Valley", and "Marinwood" are all the same geography; the
+    # offline geocoder labels photos with whatever populated place is
+    # nearest, so substring matching alone gave wildly different counts
+    # for what's meant to be one location. The bbox catches all of them.
+    try:
+        candidates, _ = forward_geocode(db, name, limit=1)
+    except Exception:
+        candidates = []
+    if candidates and candidates[0].get("bbox"):
+        south, north, west, east = candidates[0]["bbox"]
+        bbox_rows = _search_by_bbox(db, south, north, west, east, limit)
+        seen = {r["id"]: r for r in results}
+        for r in bbox_rows:
+            if r["id"] not in seen:
+                seen[r["id"]] = r
+        results = list(seen.values())[:limit]
 
     return results
 

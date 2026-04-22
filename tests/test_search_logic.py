@@ -458,25 +458,67 @@ class TestSearchByLocationExpandsCountries:
         assert "cus0.jpg" not in filenames
         assert "old0.jpg" not in filenames
 
-    def test_bbox_fallback_not_triggered_when_substring_has_results(
+    def test_bbox_union_catches_nearby_places_with_different_names(
             self, tmp_db_path, monkeypatch):
-        """When the substring match succeeds, Nominatim must not be hit
-        — otherwise every search pays network latency for no reason."""
+        """Non-country queries ALWAYS union the substring hits with
+        Nominatim's bbox hits, even when substring has results. "San
+        Rafael", "Lucas Valley", and "Marinwood" are the same place
+        geographically — the offline geocoder labels photos with the
+        nearest populated place, so substring-only would return wildly
+        different counts. Bbox union collapses them.
+        """
+        import json
         from photosearch.db import PhotoDB
         from photosearch.search import _search_by_location
 
-        called = [0]
-        def fake_urlopen(req, timeout=None):
-            called[0] += 1
-            raise AssertionError("should not hit Nominatim")
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        class _FakeResp:
+            def __init__(self, payload):
+                self._data = json.dumps(payload).encode("utf-8")
+            def read(self):
+                return self._data
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        # Nominatim returns San Rafael's bbox, which contains Lucas
+        # Valley and Marinwood neighborhoods.
+        canned = [{
+            "name": "San Rafael",
+            "display_name": "San Rafael, Marin County, California, United States",
+            "lat": "38.0",
+            "lon": "-122.53",
+            "boundingbox": ["37.94", "38.07", "-122.62", "-122.48"],
+            "address": {
+                "city": "San Rafael", "county": "Marin County",
+                "state": "California", "country": "United States",
+                "country_code": "us",
+            },
+        }]
+        monkeypatch.setattr("urllib.request.urlopen",
+                            lambda req, timeout=None: _FakeResp(canned))
 
         with PhotoDB(tmp_db_path) as pdb:
-            pdb.add_photo(filepath="/a.jpg", filename="a.jpg",
-                          date_taken="2024-10-01T10:00:00",
+            # One photo literally labeled "San Rafael".
+            pdb.add_photo(filepath="/sr.jpg", filename="sr.jpg",
+                          date_taken="2024-01-01T10:00:00",
+                          gps_lat=37.97, gps_lon=-122.53,
+                          place_name="San Rafael, California, US")
+            # Photos geocoded to neighboring names but physically in
+            # the San Rafael bbox.
+            pdb.add_photo(filepath="/lv.jpg", filename="lv.jpg",
+                          date_taken="2024-01-02T10:00:00",
+                          gps_lat=38.02, gps_lon=-122.57,
+                          place_name="Lucas Valley, California, US")
+            pdb.add_photo(filepath="/mw.jpg", filename="mw.jpg",
+                          date_taken="2024-01-03T10:00:00",
+                          gps_lat=38.04, gps_lon=-122.55,
+                          place_name="Marinwood, California, US")
+            # A photo outside the bbox must not leak in.
+            pdb.add_photo(filepath="/sf.jpg", filename="sf.jpg",
+                          date_taken="2024-01-04T10:00:00",
                           gps_lat=37.77, gps_lon=-122.42,
                           place_name="San Francisco, California, US")
             pdb.conn.commit()
-            results = _search_by_location(pdb, "San Francisco")
-        assert len(results) == 1
-        assert called[0] == 0
+
+            results = _search_by_location(pdb, "San Rafael")
+            filenames = sorted(r["filename"] for r in results)
+        assert filenames == ["lv.jpg", "mw.jpg", "sr.jpg"]
