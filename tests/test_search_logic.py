@@ -689,3 +689,73 @@ class TestSortBeforeSlice:
             asc = search_combined(pdb, person="Alice", sort="date_asc")
         assert [r["filename"] for r in desc] == list(reversed(
             [r["filename"] for r in asc]))
+
+
+# =========================================================================
+# Reciprocal Rank Fusion (quick-wins bundle commit 2)
+# =========================================================================
+
+class TestRRFScoring:
+    def test_attach_rrf_single_filter(self):
+        """Single-filter RRF scores are monotonic with rank — higher
+        rank (lower index) = higher score. Preserves the filter's
+        original order when sorted by rrf_score."""
+        from photosearch.search import _attach_rrf_scores, _RRF_K
+
+        primary = {i: {"id": i} for i in (10, 20, 30)}
+        ranks = [{10: 0, 20: 1, 30: 2}]
+        _attach_rrf_scores([primary], ranks)
+        assert primary[10]["rrf_score"] > primary[20]["rrf_score"] > primary[30]["rrf_score"]
+        assert primary[10]["rrf_score"] == pytest.approx(1.0 / _RRF_K)
+
+    def test_attach_rrf_multi_filter_accumulates(self):
+        """A photo that ranks well in both filters scores higher than
+        one that ranks well in just one."""
+        from photosearch.search import _attach_rrf_scores, _RRF_K
+
+        primary = {1: {"id": 1}, 2: {"id": 2}}
+        ranks = [
+            {1: 0, 2: 5},   # Filter A: photo 1 is top, 2 is lower
+            {1: 0, 2: 5},   # Filter B: same
+        ]
+        _attach_rrf_scores([primary, primary], ranks)
+        # Photo 1 gets 1/60 + 1/60 = 2/60
+        # Photo 2 gets 1/65 + 1/65 = 2/65
+        assert primary[1]["rrf_score"] == pytest.approx(2.0 / _RRF_K)
+        assert primary[2]["rrf_score"] == pytest.approx(2.0 / (_RRF_K + 5))
+        assert primary[1]["rrf_score"] > primary[2]["rrf_score"]
+
+    def test_attach_rrf_missing_from_one_filter(self):
+        """Photo not in filter B only gets filter A's contribution."""
+        from photosearch.search import _attach_rrf_scores, _RRF_K
+
+        primary = {1: {"id": 1}, 2: {"id": 2}}
+        ranks = [
+            {1: 0, 2: 1},   # Filter A has both
+            {1: 0},         # Filter B has only photo 1
+        ]
+        _attach_rrf_scores([primary, primary], ranks)
+        assert primary[1]["rrf_score"] == pytest.approx(2.0 / _RRF_K)
+        assert primary[2]["rrf_score"] == pytest.approx(1.0 / (_RRF_K + 1))
+
+    def test_relevance_sort_uses_rrf(self):
+        """sort='relevance' should order by rrf_score desc."""
+        from photosearch.search import _apply_sort
+
+        items = [
+            {"id": 1, "rrf_score": 0.05},
+            {"id": 2, "rrf_score": 0.10},
+            {"id": 3, "rrf_score": 0.02},
+        ]
+        sorted_items = _apply_sort(items, "relevance")
+        assert [r["id"] for r in sorted_items] == [2, 1, 3]
+
+    def test_relevance_sort_without_rrf_preserves_order(self):
+        """Early-return paths don't compute rrf_score. Sort='relevance'
+        must be a no-op there, not reshuffle to 0-keyed arbitrary order.
+        """
+        from photosearch.search import _apply_sort
+
+        items = [{"id": 1}, {"id": 2}, {"id": 3}]
+        sorted_items = _apply_sort(items, "relevance")
+        assert [r["id"] for r in sorted_items] == [1, 2, 3]

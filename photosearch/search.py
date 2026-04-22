@@ -1071,6 +1071,36 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
 # constant so callers (web.py, cli.py) and tests reference one list.
 SORT_MODES = ("date_desc", "date_asc", "quality_desc", "relevance")
 
+# Reciprocal Rank Fusion constant. Textbook default is 60 — smaller k
+# makes the top-ranked item in each filter dominate more; larger k
+# flattens the contribution curve. 60 is a reasonable middle ground
+# that doesn't over-reward any single signal.
+_RRF_K = 60
+
+
+def _attach_rrf_scores(result_sets: list[dict[int, dict]],
+                       ranks_per_set: list[dict[int, int]]) -> None:
+    """Compute Reciprocal Rank Fusion score per photo in result_sets[0]
+    based on its rank in every filter it appears in. Mutates the photo
+    dicts to add an `rrf_score` key.
+
+    Formula: score = Σ 1/(K + rank_i) across filters where the photo
+    appears. K=60. Photos ranking high in multiple filters accumulate,
+    so a "Calvin at the beach" hit where Calvin=rank-5 AND CLIP "beach"
+    =rank-3 scores higher than one where Calvin=rank-200 AND beach=
+    rank-400.
+    """
+    if not result_sets:
+        return
+    primary = result_sets[0]
+    for pid, photo in primary.items():
+        score = 0.0
+        for ranks in ranks_per_set:
+            r = ranks.get(pid)
+            if r is not None:
+                score += 1.0 / (_RRF_K + r)
+        photo["rrf_score"] = score
+
 
 def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
     """Sort `merged` in place-ish (returns a new list) by the requested
@@ -1084,7 +1114,17 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
     pass an explicit date/quality mode.
     """
     if sort == "relevance":
-        return merged
+        # Sort by RRF score (higher = more relevant across all filters).
+        # Photos without an rrf_score key — early-return paths, or
+        # callers that didn't compute it — all score 0 and sorted()'s
+        # stable ordering preserves their original sequence. Matches
+        # the pre-RRF "relevance = preserve order" behavior for those
+        # cases.
+        return sorted(
+            merged,
+            key=lambda r: (r.get("rrf_score") or 0.0),
+            reverse=True,
+        )
     if sort == "quality_desc":
         return sorted(
             merged,
@@ -1278,6 +1318,11 @@ def search_combined(
                 effective_query = cleaned if cleaned else None
 
     result_sets = []
+    # Parallel to result_sets; index i holds {photo_id: rank} for the
+    # i-th filter. Ranks are 0-indexed positions in each filter's
+    # ordered output. Used for Reciprocal Rank Fusion — see
+    # _attach_rrf_scores.
+    ranks_per_set: list[dict[int, int]] = []
 
     # Extract registered person names from the query so "Calvin and Ellie"
     # becomes an AND-intersection of Calvin's and Ellie's photos instead of
@@ -1312,18 +1357,21 @@ def search_combined(
                     limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
                 )
             result_sets.append({r["id"]: r for r in results})
+            ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
             effective_query = residual if residual else None
 
     if person:
         results = search_by_person(
             db, person, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source)
         result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     # Face-image reference stays ranked-by-similarity: limit*3 gives a
     # usable top-N that the intersection step ranks against.
     if face_image:
         results = search_by_face_reference(db, face_image, limit=limit * 3)
         result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     if effective_query:
         # Filename shortcut: if the query looks like a camera filename (no spaces,
@@ -1336,6 +1384,8 @@ def search_combined(
                 db, effective_query, limit=_FILTER_PREFETCH_LIMIT)
             if fname_results:
                 result_sets.append({r["id"]: r for r in fname_results})
+                ranks_per_set.append(
+                    {r["id"]: i for i, r in enumerate(fname_results)})
                 effective_query = None  # Skip CLIP — filename match is authoritative
 
         # CLIP semantic stays ranked (limit*3): scores are real, we
@@ -1344,18 +1394,22 @@ def search_combined(
         if effective_query:
             results = search_semantic(db, effective_query, limit=limit * 3, min_score=min_score, debug=debug, tag_match=tag_match)
             result_sets.append({r["id"]: r for r in results})
+            ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     if color:
         results = search_by_color(db, color, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["photo_id"]: r for r in results})
+        ranks_per_set.append({r["photo_id"]: i for i, r in enumerate(results)})
 
     if place:
         results = search_by_place(db, place, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     if location:
         results = _search_by_location(db, location, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     def _wrap(items: list[dict]):
         """Honor the caller's with_total + sort preferences on early-
@@ -1386,6 +1440,14 @@ def search_combined(
 
     if not result_sets:
         return _wrap([])
+
+    # Attach RRF scores to photos in the primary result set. For multi-
+    # filter queries, a photo's rrf_score accumulates contributions
+    # from every filter it appears in, rewarding photos that rank high
+    # across multiple signals (person + CLIP + location, etc). For
+    # single-filter queries, rrf_score is monotonic with the filter's
+    # own rank, so sort='relevance' preserves that filter's order.
+    _attach_rrf_scores(result_sets, ranks_per_set)
 
     if len(result_sets) == 1:
         merged = _dedupe_by_hash(list(result_sets[0].values()))
