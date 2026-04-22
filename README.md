@@ -72,6 +72,17 @@ python cli.py search -q "kids playing" --min-quality 5.5
 
 Search results are written to a timestamped `results/` subfolder as symlinks (preserving the originals) alongside JPEG thumbnails for quick browsing in Finder.
 
+**Map view** — see every GPS-bearing photo (exif + inferred) plotted on a Leaflet map at `/map`. Filter by source and year in the sidebar; click a marker or cluster for a 9-thumbnail preview with a Search link whose filter broadens with zoom — tight clusters search for the specific locality, country-scale clusters search for the country.
+
+**Location backfill** — photos without GPS get filled in two ways:
+
+```bash
+# Inferred (M19) — copy coords from temporal neighbors that do have GPS
+python cli.py infer-locations --min-confidence 0.75 --apply
+```
+
+Or via the `/geotag` web UI for manual bulk tagging: pick a folder, multi-select photos (shift-click for range, per-day select buttons), then search a place — the typeahead merges your existing library's places with Nominatim forward-geocode results.
+
 
 ## Architecture
 
@@ -692,17 +703,19 @@ The development process was iterative in a way that's hard to capture in commits
 | **M15** | Done | Shared header component — extracted `PS.SharedHeader` into `shared.js`. All pages use the same logo, nav links, and layout. Page-specific controls passed as children. |
 | **M16** | Done | Shared photo detail modal — extracted `PS.PhotoModal` into `shared.js`. Unified modal with configurable feature flags, face editing, collection management, stacking UI, and keyboard navigation. Removed ~1500 lines of duplicated code. |
 | **M17** | Done | Distributed indexing — worker system for offloading heavy indexing passes (CLIP, faces, quality, describe, tags, verify) to a fast laptop/desktop. Claim/submit API on the NAS, HTTP-based worker loop with TTL-based crash recovery and network retry. |
-| **M18** | In progress | Unknown-face similarity stacking + merge suggestions + cluster splitting. Surfaces: (1) `recluster-faces` gained a session-stacking second pass grouping DBSCAN noise by tight ArcFace similarity + time proximity. (2) `suggest-face-merges` CLI finds likely merges between groups via centroid + min-pair L2; `--verify-pair` tunes thresholds. (3) `/merges` review page — side-by-side face-strip cards, confidence tiers, risk badges (attractor/long-overlap/edge-score), keyboard shortcuts, Strict filter, accept/dismiss, rewrite-on-chained-merge, Regenerate button with param inputs. (4) `split-cluster` CLI + Split button on `/faces` re-run DBSCAN on one cluster with tighter eps to break apart attractor clusters. Remaining: persistent rejection table + schema bump (dismissals are currently localStorage-only); HDBSCAN as an optional densty-aware split engine. |
-| **M19** | Planned (merged into location milestone) | Inferred geotagging — for photos missing GPS, infer location from nearby-in-time photos (within seconds/minutes) that do have GPS. Now tracked together with bulk-set-location in `docs/plans/bulk-set-location.md`: both sources write the same columns through the same `/api/photos/bulk-set-location` endpoint, and the bulk-set modal exposes inference as an "Auto-fill from temporal neighbors" option. Smartphone-photo ingest (M20) remains an amplifier, not a prerequisite. |
+| **M18** | Done | Unknown-face similarity stacking + merge suggestions + cluster splitting. (1) `recluster-faces` gained a session-stacking second pass grouping DBSCAN noise by tight ArcFace similarity + time proximity. (2) `suggest-face-merges` CLI finds likely merges between groups via centroid + min-pair L2; `--verify-pair` tunes thresholds. (3) `/merges` review page — side-by-side face-strip cards, confidence tiers, risk badges (attractor/long-overlap/edge-score), keyboard shortcuts, accept/dismiss, rewrite-on-chained-merge, Regenerate button. (4) `split-cluster` CLI + Split button on `/faces` re-run DBSCAN on one cluster with tighter eps to break apart attractor clusters. |
+| **M19** | Done | Inferred geotagging for photos missing GPS. `photosearch infer-locations` walks no-GPS photos and copies coordinates from temporal neighbors within a configurable window, with a cascade that promotes each inference as an anchor for the next photo and a movement guard that refuses when flanking anchors disagree. Schema v17 added `location_source` (`'exif' \| 'inferred' \| 'manual'`) and `location_confidence` columns. Surfaces: CLI `infer-locations`, API `POST /api/geocode/infer-preview` + `infer-apply`, and a live Infer Locations panel on `/status`. |
+| **M19.1** | Done | Manual bulk geotagging UI (`/geotag`) — 3-panel folder-first workflow for tagging photos M19 couldn't reach. Folder list sorted by no-GPS count with per-source counts; middle panel shows multi-select thumbnails grouped by day with per-day Select/None and shift-click range selection; right panel typeahead merges library places (instant DB lookup) with Nominatim forward-geocode results (proxied through the NAS, cached 30 days in schema v18's `geocode_cache` table). Manual writes stamp `location_source='manual'`. |
+| **M19.2** | Done | Map view (`/map`) — Leaflet + marker clustering over every GPS-bearing photo. Sidebar filters by source (exif/inferred) and year; click a marker or cluster opens a preview pane with up to 9 thumbnails, a Zoom button, and a Search link whose filter broadens with altitude via a common-suffix heuristic ("Zarautz, Basque Country, ES" for a tight cluster; "ES" for a cluster spanning Spain). Backed by `GET /api/photos/geojson` returning compact tuples. |
 | **M20** | Planned | Google Photos import — pull photos down from Google Photos into the local library, storing them under `YYYY/YYYY-MM-DD_google_photos/` to sit alongside the existing date-folder layout. Complements the existing upload direction. |
 | **M21** | Planned | Timeline view with LLM executive summaries — chronological UI of photos grouped by time period, each segment annotated with an LLM-generated summary synthesizing where the photos were taken (from GPS/place data) and what was happening (from per-photo descriptions and tags). |
 
 
 ## Known limitations
 
-- **Place search has no data.** The Sony camera that took the test photos didn't have GPS enabled. The place search infrastructure (GPS extraction, schema columns, search query) is wired up and ready for photos that include location EXIF data.
-
 - **LLaVA hallucinations.** The 13B model occasionally describes people, objects, or activities that aren't in the photo. The CLIP gate and face confirmation mitigate this for search. The `verify` command (M12) catches and auto-regenerates most hallucinated descriptions using cross-model verification, but some false positives and false negatives remain.
+
+- **Inferred geotag cascade is unbounded in hop depth.** M19's cascade will infer through long chains (776 hops observed on the real NAS library) whose confidence decays to useless. Safe because `--min-confidence 0.75` filters them out, but wastes compute. See `docs/plans/infer-location-refinements.md` for the fix.
 
 - **Switching CLIP models requires re-embedding.** `--force-clip` clears and regenerates embeddings for the specified directory. There's no automatic versioning to detect stale embeddings across the whole database.
 
