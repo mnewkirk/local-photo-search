@@ -176,11 +176,24 @@
     }
 
     .photo-grid {
-      padding: 12px;
+      padding: 0 12px 12px;
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
       gap: 8px;
     }
+    .day-section { padding-top: 12px; }
+    .day-section + .day-section { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 16px; }
+    .day-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 12px 10px;
+      font-size: 13px;
+    }
+    .day-title { font-weight: 600; color: var(--text); }
+    .day-meta { color: var(--text-muted); font-size: 12px; }
+    .day-header .spacer { flex: 1; }
+    .day-header .btn { font-size: 11px; padding: 3px 8px; }
     .photo-card {
       aspect-ratio: 1 / 1;
       position: relative;
@@ -364,6 +377,32 @@
       return v;
     }
 
+    // ---- Date helpers --------------------------------------------------------
+    function dayKeyOf(photo) {
+      const dt = photo.date_taken;
+      return (dt && dt.length >= 10) ? dt.slice(0, 10) : null;
+    }
+
+    function formatDayHeader(key) {
+      if (!key) return 'Undated';
+      // key is "YYYY-MM-DD" — parse as local midnight to avoid TZ drift.
+      const parts = key.split('-');
+      if (parts.length !== 3) return key;
+      const d = new Date(
+        parseInt(parts[0], 10),
+        parseInt(parts[1], 10) - 1,
+        parseInt(parts[2], 10)
+      );
+      if (isNaN(d.getTime())) return key;
+      try {
+        return d.toLocaleDateString(undefined, {
+          year: 'numeric', month: 'short', day: 'numeric', weekday: 'short',
+        });
+      } catch (_) {
+        return key;
+      }
+    }
+
     // ---- Folders panel -------------------------------------------------------
     function FoldersPanel(props) {
       const [includeTagged, setIncludeTagged] = useState(false);
@@ -433,6 +472,74 @@
       const totalCount = photos.length;
       const allSelected = totalCount > 0 && selectedCount === totalCount;
 
+      // Group into days preserving photos[] order (server sorts by
+      // date_taken). Photos missing date_taken land in a final "Undated"
+      // bucket so the main flow isn't interrupted.
+      const dayGroups = useMemo(() => {
+        const groups = new Map();
+        for (const p of photos) {
+          const k = dayKeyOf(p);
+          if (!groups.has(k)) groups.set(k, []);
+          groups.get(k).push(p);
+        }
+        const entries = Array.from(groups.entries());
+        entries.sort((a, b) => {
+          if (a[0] === null) return 1;
+          if (b[0] === null) return -1;
+          return a[0] < b[0] ? -1 : 1;
+        });
+        return entries.map(([key, items]) => ({ key, items }));
+      }, [photos]);
+
+      function renderDay(group) {
+        const selectedInDay = group.items.reduce(
+          (n, p) => n + (props.selected.has(p.id) ? 1 : 0), 0);
+        const allDay = selectedInDay === group.items.length;
+        const noneDay = selectedInDay === 0;
+        return e('div', { key: group.key || '__undated', className: 'day-section' },
+          e('div', { className: 'day-header' },
+            e('span', { className: 'day-title' }, formatDayHeader(group.key)),
+            e('span', { className: 'day-meta' },
+              group.items.length.toLocaleString()
+                + (group.items.length === 1 ? ' photo · ' : ' photos · ')
+                + (allDay ? 'all selected'
+                   : noneDay ? 'none selected'
+                   : selectedInDay + ' selected')),
+            e('span', { className: 'spacer' }),
+            e('button', {
+              className: 'btn',
+              onClick: () => props.onSelectDay(group.items),
+              disabled: allDay,
+              title: 'Select all photos on this day',
+            }, 'Select'),
+            e('button', {
+              className: 'btn',
+              onClick: () => props.onDeselectDay(group.items),
+              disabled: noneDay,
+              title: 'Deselect all photos on this day',
+            }, 'None'),
+          ),
+          e('div', { className: 'photo-grid' },
+            group.items.map(p => {
+              const sel = props.selected.has(p.id);
+              return e('div', {
+                key: p.id,
+                className: 'photo-card' + (sel ? ' selected' : ''),
+                onClick: (ev) => props.onToggle(p.id, ev.shiftKey),
+                title: 'Click to toggle · Shift-click to select a range',
+              },
+                e('img', {
+                  src: '/api/photos/' + p.id + '/thumbnail',
+                  loading: 'lazy',
+                  alt: p.filename,
+                }),
+                p.location_source === 'inferred' && e('span', { className: 'src-badge' }, 'inferred'),
+              );
+            })
+          ),
+        );
+      }
+
       return e('div', { className: 'col col-photos' },
         e('div', { className: 'col-header' },
           e('span', null, props.folder),
@@ -463,23 +570,7 @@
           props.loading ? e('div', { className: 'loading' }, 'Loading…')
             : photos.length === 0 ? e('div', { className: 'empty-state' },
                 'No photos needing tags in this folder.')
-            : e('div', { className: 'photo-grid' },
-                photos.map(p => {
-                  const sel = props.selected.has(p.id);
-                  return e('div', {
-                    key: p.id,
-                    className: 'photo-card' + (sel ? ' selected' : ''),
-                    onClick: () => props.onToggle(p.id),
-                  },
-                    e('img', {
-                      src: '/api/photos/' + p.id + '/thumbnail',
-                      loading: 'lazy',
-                      alt: p.filename,
-                    }),
-                    p.location_source === 'inferred' && e('span', { className: 'src-badge' }, 'inferred'),
-                  );
-                })
-              )
+            : dayGroups.map(renderDay)
         ),
       );
     }
@@ -693,18 +784,58 @@
         if (activeFolder) loadPhotos(activeFolder, val);
       }
 
-      function togglePhoto(id) {
+      // Track the last-clicked photo id so shift-click can form a range.
+      // Reset whenever the folder changes or the photo list reloads.
+      const [anchorId, setAnchorId] = useState(null);
+      useEffect(() => { setAnchorId(null); }, [activeFolder, showInferred]);
+
+      function togglePhoto(id, shiftKey) {
+        // Shift-click: add every photo from anchor to target (inclusive)
+        // to the current selection. Range is determined by position in
+        // the flat `photos` array (server order, sorted by date_taken),
+        // so it naturally spans day boundaries.
+        if (shiftKey && anchorId != null && anchorId !== id && photos) {
+          const idx1 = photos.findIndex(p => p.id === anchorId);
+          const idx2 = photos.findIndex(p => p.id === id);
+          if (idx1 >= 0 && idx2 >= 0) {
+            const [lo, hi] = idx1 < idx2 ? [idx1, idx2] : [idx2, idx1];
+            setSelected(prev => {
+              const next = new Set(prev);
+              for (let i = lo; i <= hi; i++) next.add(photos[i].id);
+              return next;
+            });
+            setAnchorId(id);
+            return;
+          }
+        }
+        // Regular click: toggle the one photo.
         setSelected(prev => {
           const next = new Set(prev);
           if (next.has(id)) next.delete(id); else next.add(id);
           return next;
         });
+        setAnchorId(id);
       }
 
       function selectAll() {
         setSelected(new Set((photos || []).map(p => p.id)));
       }
       function selectNone() { setSelected(new Set()); }
+
+      function selectDay(items) {
+        setSelected(prev => {
+          const next = new Set(prev);
+          for (const p of items) next.add(p.id);
+          return next;
+        });
+      }
+      function deselectDay(items) {
+        setSelected(prev => {
+          const next = new Set(prev);
+          for (const p of items) next.delete(p.id);
+          return next;
+        });
+      }
 
       function flashToast(kind, msg) {
         setToast({ kind, msg });
@@ -786,6 +917,8 @@
             onToggle: togglePhoto,
             onSelectAll: selectAll,
             onSelectNone: selectNone,
+            onSelectDay: selectDay,
+            onDeselectDay: deselectDay,
           }),
           e(PickerPanel, {
             chosen: chosen,
