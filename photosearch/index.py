@@ -49,8 +49,9 @@ _NUMBERED_COPY_RE = _re.compile(r'^(.+?)_\d+(\.[^.]+)$', _re.IGNORECASE)
 def find_photos(directory: str) -> list[str]:
     """Recursively find all supported image files in a directory.
 
-    Returns JPEG files. ARW files are associated as raw pairs, not indexed separately.
-    Skips folders named 'results', 'references', or 'thumbnails'.
+    Returns JPEG + HEIC files. ARW files are associated as raw pairs,
+    not indexed separately. Skips folders named 'results', 'references',
+    or 'thumbnails'.
 
     Two classes of files are always excluded:
       - macOS AppleDouble sidecars (filenames starting with '._')
@@ -61,6 +62,11 @@ def find_photos(directory: str) -> list[str]:
         produced by some backup/copy tools and waste CLIP + face time.
     """
     photos = []
+    # Directly-indexable formats — JPEG from cameras, HEIC from iPhones.
+    # (ARW / other RAW formats are excluded from direct indexing; they
+    # pair with a JPEG sibling that the indexer picks up instead.)
+    _DIRECT_INDEX_EXTS = JPEG_EXTENSIONS | HEIC_EXTENSIONS
+
     for root, dirs, files in os.walk(directory):
         # Skip excluded subdirectories in-place so os.walk doesn't descend into them
         dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
@@ -74,7 +80,7 @@ def find_photos(directory: str) -> list[str]:
                 continue
 
             ext = Path(fname).suffix.lower()
-            if ext not in JPEG_EXTENSIONS:
+            if ext not in _DIRECT_INDEX_EXTS:
                 continue
 
             # 2. Skip numbered copies (_1, _2, …) when the original exists here
