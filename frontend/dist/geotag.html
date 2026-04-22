@@ -549,7 +549,9 @@
             e('div', { className: 'label' }, 'Will write to selected photos'),
             e('div', { className: 'place-name' }, props.chosen.place_name),
             e('div', { className: 'coords' },
-              props.chosen.lat.toFixed(4) + ', ' + props.chosen.lon.toFixed(4)),
+              (props.chosen.lat != null && props.chosen.lon != null)
+                ? (props.chosen.lat.toFixed(4) + ', ' + props.chosen.lon.toFixed(4))
+                : 'coords resolved on apply'),
           ),
 
           knownPlaces.length > 0 && e('div', null,
