@@ -28,9 +28,19 @@ the primary filter.
 
 From real use on the 144k-photo NAS library:
 
-1. **Recency blind.** `"Calvin in Lucas Valley"` returns oldest photos
-   first. Family photo searches almost always want recent-first, but
-   the default sort (date_taken ASC) has no recency prior.
+1. **"Newest first" is actually "newest of the oldest 1000".** The
+   backend paginates `merged[offset:offset+limit]` from whatever order
+   the first filter set produced. `search_by_person` and
+   `_search_by_location` both do `ORDER BY date_taken LIMIT ?`, and
+   SQLite sorts NULLs **first** in ASC — so the returned page is
+   biased toward NULL-date + oldest photos. The frontend's
+   `PS.applySortOrder(results, 'date_desc')` then sorts those 1000
+   newest-first, but they're already the oldest slice of the real
+   set. Concrete symptom: `?q=Calvin` with "Newest first" doesn't
+   show 2026 photos; NULL-date photos (like id 41435 with no EXIF)
+   surface at the top because NULLs sort first in SQLite ASC.
+   Family searches almost always want recent-first, so this is
+   currently wrong by default, not just unranked.
 2. **Single-filter ranking.** For `"Calvin at the beach"`, a photo
    where Calvin's face matches at 95% and CLIP scores "beach" at 0.85
    ranks the same as one at 50% / 0.40. Both pass the intersection;
@@ -64,11 +74,29 @@ From real use on the 144k-photo NAS library:
    ranking" heuristic. ~50 lines in `search.py`, no new dependencies.
    Immediately fixes pain #2.
 
-2. **Recency decay on final ranking.** Multiply the RRF score (or
-   whatever the final sort key is) by `exp(-years_ago * 0.1)` or a
-   tunable. Family searches get recent-first without a user toggle.
-   Opt-out via a `sort_recency=false` param for users who want strict
-   relevance. One-line change once RRF lands. Fixes pain #1.
+2. **Sort-before-slice + recency decay.** Two coupled fixes for
+   pain #1:
+
+   - **Sort before pagination**, not inside the SQL of the first
+     filter. Today `search_combined` returns `merged[offset:offset
+     + limit]` where `merged` preserves filter-set insertion order —
+     which is whatever the first SQL `ORDER BY` produced. Apply the
+     caller-requested sort (`date_desc`, `date_asc`,
+     `quality_desc`, `relevance`) to `merged` BEFORE slicing, with
+     NULL-date photos always at the tail regardless of direction.
+     One-line change in `api_search` to accept a `sort` param +
+     ~10 lines in `search_combined` for the sort helpers.
+   - **Recency decay** on relevance-mode scores. Once RRF lands,
+     multiply each photo's fused score by `exp(-years_ago * 0.1)`
+     (tunable). Users searching `"beach"` get recent beach photos
+     first; strict-relevance seekers can opt out with
+     `sort=relevance_strict`. Makes family searches feel "native"
+     without forcing the user to pick a sort.
+   - **Plumb the frontend sort dropdown through** to
+     `/api/search?sort=...`. Today the sortBy state is only applied
+     client-side to the 1000-photo page; switching to "Newest
+     first" doesn't re-fetch with the right order. Trivial:
+     `doSearch` / `loadMore` append `&sort=${sortBy}`.
 
 3. **Structured location columns.** Add `country`, `admin1`, `admin2`,
    `locality` to `photos`. Schema v19. Backfill via a new CLI
@@ -174,15 +202,34 @@ From real use on the 144k-photo NAS library:
 
 ## Quick wins bundle
 
-If picking just one ship, do **RRF + recency decay + structured
-location columns** together:
+If picking just one ship, do **sort-before-slice + RRF + recency
+decay + structured location columns** together:
 
-- ~200 lines net across `search.py`, `db.py`, `cli.py`
+- ~250 lines net across `search.py`, `db.py`, `cli.py`,
+  `frontend/dist/index.html`
 - One schema migration (v19) + one backfill CLI
-- Fixes "Calvin in France ranks ancient photos first" (pain #1 + #2)
+- Fixes "Newest first isn't newest first" (pain #1) — the most
+  visible regression today
+- Fixes multi-filter ranking incoherence (pain #2)
 - Fixes "Marin County as a query returns nothing" (pain #5)
 - Reduces Nominatim round-trips to genuinely-new places only
 - No new external dependencies
+
+Order within the bundle (land one commit at a time, each a real
+improvement even if later ones slip):
+
+1. **Sort param + sort-before-slice** — smallest change, most user-
+   visible win. Immediately fixes the "Calvin → NULL dates on top"
+   symptom. No schema or ranking math.
+2. **RRF across filters** — replaces the "use result_sets[0] order"
+   heuristic with a proper fused score. Enables sane multi-filter
+   ranking.
+3. **Recency decay** — one-line multiplier on the RRF score. Makes
+   family searches feel native.
+4. **Structured location columns + backfill** — schema migration,
+   CLI, and `_search_by_location` pre-step that checks structured
+   columns before falling back to substring + Nominatim. Biggest
+   change in isolation but landed independently.
 
 Subsequent work (fuzzy, disambiguation, LLM rewriter, VLM rerank,
 self-hosted Nominatim) is independent and can be picked up one at a
