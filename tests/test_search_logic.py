@@ -235,6 +235,40 @@ class TestCombinedSearch:
 # Country-name-to-code resolution + location search expansion
 # =========================================================================
 
+class TestExtractLocationFromQuery:
+    def test_simple(self):
+        from photosearch.geocode import extract_location_from_query
+        loc, cleaned = extract_location_from_query("Calvin in San Rafael")
+        assert loc == "San Rafael"
+        assert cleaned == "Calvin"
+
+    def test_comma_admin(self):
+        """Places with comma-separated admin suffix must parse —
+        otherwise 'San Rafael, CA' falls through to CLIP and returns 0.
+        """
+        from photosearch.geocode import extract_location_from_query
+        loc, _ = extract_location_from_query("Calvin in San Rafael, CA")
+        assert loc == "San Rafael, CA"
+
+    def test_hyphenated_and_periods(self):
+        from photosearch.geocode import extract_location_from_query
+        assert extract_location_from_query("Calvin in Saint-Tropez")[0] == "Saint-Tropez"
+        assert extract_location_from_query("Calvin in St. Louis")[0] == "St. Louis"
+
+    def test_trailing_keyword_still_terminates_capture(self):
+        """'Calvin in California 2024' must stop at California, not
+        eat the year into the location string."""
+        from photosearch.geocode import extract_location_from_query
+        loc, _ = extract_location_from_query("Calvin in California 2024")
+        assert loc == "California"
+
+    def test_no_preposition(self):
+        from photosearch.geocode import extract_location_from_query
+        loc, cleaned = extract_location_from_query("beach sunset")
+        assert loc is None
+        assert cleaned == "beach sunset"
+
+
 class TestCountryNameToCode:
     def test_known_names(self):
         from photosearch.geocode import country_name_to_code

@@ -191,7 +191,14 @@ def forward_geocode(db, query: str, limit: int = 5) -> tuple[list[dict], str]:
         except (TypeError, ValueError):
             age = _GEOCODE_CACHE_TTL_SECONDS + 1
         if age < _GEOCODE_CACHE_TTL_SECONDS:
-            return json.loads(row["results_json"])[:limit], "cache"
+            cached = json.loads(row["results_json"])
+            # Schema drift: cache entries written before the `bbox` field
+            # was added to the Nominatim normalization still lack it.
+            # Treat those as stale and re-fetch so the bbox-based search
+            # path in _search_by_location gets a usable value. Any result
+            # missing the key triggers the re-fetch.
+            if not cached or all("bbox" in r for r in cached):
+                return cached[:limit], "cache"
 
     params = {
         "q": query,
@@ -245,23 +252,38 @@ def extract_location_from_query(query: str) -> tuple[Optional[str], str]:
       "photos from Hawaii"
       "birds in California"
       "sunset at Yosemite"
+      "Calvin in San Rafael, CA"     (comma-separated admin)
+      "Calvin in Saint-Tropez"       (hyphenated)
+      "St. Louis trip"               (period)
 
     Returns (location_term, cleaned_query).
     """
+    # Character class for place captures: letters, digits, whitespace,
+    # plus the three punctuation marks that show up in real place names
+    # — comma (admin separators), hyphen (Saint-Tropez, Lucas
+    # Valley-Marinwood), apostrophe (D'Iberville, O'Fallon), period
+    # (St. Louis, Washington D.C.). Without these, "Calvin in San
+    # Rafael, CA" falls through to CLIP semantic search and returns
+    # zero useful results.
+    _place = r"[A-Za-z0-9][\w\s,.'\-]+?"
+
     # Patterns: "in <place>", "from <place>", "at <place>", "near <place>"
     m = re.search(
-        r'\b(?:in|from|at|near)\s+([A-Z][a-zA-Z\s]+?)(?:\s+(?:on|in|during|from|to|this|last|today|yesterday|\d{4})|\s*$)',
-        query
+        r'\b(?:in|from|at|near)\s+(' + _place + r')(?:\s+(?:on|in|during|from|to|this|last|today|yesterday|\d{4})|\s*$)',
+        query,
     )
     if m:
-        location = m.group(1).strip()
+        location = m.group(1).strip().rstrip(",.")
         cleaned = query[:m.start()].strip() + " " + query[m.end():].strip()
         return (location, cleaned.strip())
 
-    # Simpler: "from <place>" at end of query
-    m = re.search(r'\b(?:in|from|at|near)\s+([A-Z][a-zA-Z\s]+?)\s*$', query)
+    # Simpler: "<preposition> <place>" at end of query
+    m = re.search(
+        r'\b(?:in|from|at|near)\s+(' + _place + r')\s*$',
+        query,
+    )
     if m:
-        location = m.group(1).strip()
+        location = m.group(1).strip().rstrip(",.")
         cleaned = query[:m.start()].strip()
         return (location, cleaned.strip())
 
