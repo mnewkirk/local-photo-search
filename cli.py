@@ -1114,6 +1114,37 @@ def cleanup_orphans(db, dry_run):
 # face-clusters
 # ---------------------------------------------------------------------------
 
+@cli.command("dump-db")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Source DB path.")
+@click.option("--to", "out_path", required=True,
+              help="Destination file path for the backup.")
+def dump_db(db, out_path):
+    """Write a WAL-consistent binary backup of the DB to --to.
+
+    Uses SQLite's backup() API for an online, consistent snapshot
+    without blocking writers on the source DB. Intended for
+    debug-db.sh's pull step: write into a bind-mounted location
+    (e.g. /data/debug-dump.db) inside the container, then stream the
+    file out via `docker compose run --entrypoint cat`.
+    """
+    import os
+    import sqlite3 as _sqlite3
+    if os.path.exists(out_path):
+        os.unlink(out_path)
+    src = _sqlite3.connect(db)
+    try:
+        dst = _sqlite3.connect(out_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    size = os.path.getsize(out_path)
+    click.echo(f"Wrote {size:,} bytes to {out_path}")
+
+
 @cli.command("person-coverage")
 @click.argument("name")
 @click.option("--place-like", "place_pattern", default=None,

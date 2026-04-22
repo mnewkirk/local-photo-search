@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # debug-db.sh — local debugging against a copy of the NAS DB.
 #
-# Pulls /data/photo_index.db from the NAS to a local file, then exposes
-# subcommands for running queries against the copy. Safer than running
-# ad-hoc SQL on the production DB and faster for iterative debugging.
+# Streams /data/photo_index.db from the NAS through the Docker
+# container to a local file (avoids UGREEN's access layer that blocks
+# direct rsync to /volume1/docker/...), then exposes subcommands for
+# running queries against the copy. Safer than running ad-hoc SQL on
+# the production DB and faster for iterative debugging.
 #
 # Override paths via env:
-#   NAS_HOST         ssh target (e.g. user@192.168.1.237)
-#   NAS_DATA_DIR     bind-mounted /data dir on the NAS
-#                    (default: /volume1/docker/photosearch/data)
-#   LOCAL_DB         local copy path (default: ./photo_index.db.local)
+#   NAS_HOST           ssh target (e.g. user@192.168.1.237)
+#   NAS_COMPOSE_FILE   docker-compose.nas.yml path on the NAS
+#                      (default: /volume1/docker/photosearch/docker-compose.nas.yml)
+#   LOCAL_DB           local copy path (default: ./photo_index.db.local)
 
 set -euo pipefail
 
 NAS_HOST="${NAS_HOST:-cantimatt@192.168.1.237}"
-NAS_DATA_DIR="${NAS_DATA_DIR:-/volume1/docker/photosearch/data}"
+NAS_COMPOSE_FILE="${NAS_COMPOSE_FILE:-/volume1/docker/photosearch/docker-compose.nas.yml}"
 LOCAL_DB="${LOCAL_DB:-./photo_index.db.local}"
 
 have_local() {
@@ -29,21 +31,31 @@ shift || true
 
 case "${cmd}" in
   pull)
-    # rsync the .db plus .db-wal / .db-shm if present (WAL mode writes
-    # land in the -wal file until checkpointed). Copying all three
-    # gives us a consistent snapshot for read-only debugging. Adds a
-    # few seconds per GB but avoids surprise stale data.
-    echo "Pulling DB from ${NAS_HOST}:${NAS_DATA_DIR}/ …"
-    rsync -avz --progress \
-      "${NAS_HOST}:${NAS_DATA_DIR}/photo_index.db" \
-      "${LOCAL_DB}"
-    for ext in wal shm; do
-      rsync -avz --ignore-missing-args \
-        "${NAS_HOST}:${NAS_DATA_DIR}/photo_index.db-${ext}" \
-        "${LOCAL_DB}-${ext}" 2>/dev/null || true
-    done
-    ls -lh "${LOCAL_DB}"* 2>/dev/null | awk '{print "  "$5"\t"$9}'
-    echo "Done."
+    # UGREEN's NAS blocks direct rsync to /volume1/docker/... (the
+    # volume has docker-owned perms that the login user can't see
+    # through their rsync daemon). Workaround: run sqlite3 backup()
+    # inside a transient photosearch container, which has root
+    # access to /data, to produce a consistent snapshot on the
+    # bind-mounted volume, then stream that file out via
+    # `docker compose run --entrypoint cat`. Three SSH calls but
+    # each is clean and no permission tangles.
+    remote="docker compose -f '${NAS_COMPOSE_FILE}'"
+
+    echo "1/3  creating consistent backup on NAS (sqlite3 backup API)…"
+    ssh "${NAS_HOST}" "${remote} run --rm photosearch dump-db --to /data/debug-dump.db"
+
+    echo "2/3  streaming ${LOCAL_DB}…"
+    # -T disables TTY so binary bytes aren't corrupted.
+    ssh "${NAS_HOST}" "${remote} run --rm -T --entrypoint cat photosearch /data/debug-dump.db" \
+      > "${LOCAL_DB}.tmp"
+    mv "${LOCAL_DB}.tmp" "${LOCAL_DB}"
+
+    echo "3/3  cleaning up /data/debug-dump.db on NAS…"
+    ssh "${NAS_HOST}" "${remote} run --rm --entrypoint rm photosearch /data/debug-dump.db" \
+      || echo "  (cleanup failed; next pull will overwrite)"
+
+    size=$(du -h "${LOCAL_DB}" | cut -f1)
+    echo "Done. ${size} at ${LOCAL_DB}"
     ;;
 
   shell)
@@ -100,9 +112,9 @@ Usage:
   $0 help                        this
 
 Env overrides:
-  NAS_HOST      (default: ${NAS_HOST})
-  NAS_DATA_DIR  (default: ${NAS_DATA_DIR})
-  LOCAL_DB      (default: ${LOCAL_DB})
+  NAS_HOST          (default: ${NAS_HOST})
+  NAS_COMPOSE_FILE  (default: ${NAS_COMPOSE_FILE})
+  LOCAL_DB          (default: ${LOCAL_DB})
 
 Typical flow:
   ./debug-db.sh pull
