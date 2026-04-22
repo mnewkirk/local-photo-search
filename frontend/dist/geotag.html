@@ -680,12 +680,23 @@
                 && Math.abs(props.chosen.lat - r.lat) < 1e-6
                 && Math.abs(props.chosen.lon - r.lon) < 1e-6
                 && props.chosen.source === 'nominatim';
-              // Build a canonical "Locality, Admin1, CC" place_name from
-              // structured fields when available, falling back to
-              // display_name.
-              const parts = [r.locality, r.admin1, r.country].filter(Boolean);
-              const canonical = parts.length >= 2
-                ? parts.join(', ')
+              // Build a canonical "<specifier>, Admin1, CC" place_name:
+              //   specifier = name (POI/county/park/lake) ?? locality
+              //               (city/town) ?? admin2 (county)
+              //   cc        = 2-letter country code (matches exif/inferred)
+              // De-dupe adjacent repeats (e.g. name === admin2 for counties),
+              // fall back to display_name if we can't assemble 2 parts.
+              const specifier = r.name || r.locality || r.admin2;
+              const cc = r.country_code || r.country;
+              const raw = [specifier, r.admin1, cc].filter(Boolean);
+              const deduped = [];
+              for (const part of raw) {
+                if (deduped.length === 0 || deduped[deduped.length - 1] !== part) {
+                  deduped.push(part);
+                }
+              }
+              const canonical = deduped.length >= 2
+                ? deduped.join(', ')
                 : r.display_name;
               return e('div', {
                 key: 'N:' + i,

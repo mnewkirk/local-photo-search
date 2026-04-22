@@ -173,6 +173,7 @@ def test_geocode_search_hits_nominatim_then_caches(client, db, monkeypatch):
     calls = []
     canned = [
         {
+            "name": "Rome",
             "display_name": "Rome, Lazio, Italy",
             "lat": "41.9028",
             "lon": "12.4964",
@@ -183,6 +184,7 @@ def test_geocode_search_hits_nominatim_then_caches(client, db, monkeypatch):
                 "state": "Lazio",
                 "county": "Rome",
                 "country": "Italy",
+                "country_code": "it",
             },
         }
     ]
@@ -201,8 +203,10 @@ def test_geocode_search_hits_nominatim_then_caches(client, db, monkeypatch):
     first = body["results"][0]
     assert first["lat"] == pytest.approx(41.9028)
     assert first["country"] == "Italy"
+    assert first["country_code"] == "IT"
     assert first["admin1"] == "Lazio"
     assert first["locality"] == "Rome"
+    assert first["name"] == "Rome"
     assert len(calls) == 1
 
     # Second identical call → cache hit, no second Nominatim call.
@@ -210,6 +214,61 @@ def test_geocode_search_hits_nominatim_then_caches(client, db, monkeypatch):
     assert r2.status_code == 200
     assert r2.json()["source"] == "cache"
     assert len(calls) == 1
+
+
+def test_geocode_search_surfaces_poi_and_county_names(client, db, monkeypatch):
+    """Counties, parks, lakes, and other non-populated-place features land
+    on the top-level `name` field rather than `address.city`. The response
+    must surface them so the UI can render e.g. 'Maui County, Hawaii, US'
+    instead of just 'Hawaii, US'."""
+    canned = [
+        {
+            "name": "Maui County",
+            "display_name": "Maui County, Hawaii, United States",
+            "lat": "20.8",
+            "lon": "-156.3",
+            "type": "administrative",
+            "importance": 0.6,
+            "address": {
+                "county": "Maui County",
+                "state": "Hawaii",
+                "country": "United States",
+                "country_code": "us",
+            },
+        },
+        {
+            "name": "Folsom Lake",
+            "display_name": "Folsom Lake, Sacramento County, California, United States",
+            "lat": "38.71",
+            "lon": "-121.15",
+            "type": "water",
+            "importance": 0.5,
+            "address": {
+                "county": "Sacramento County",
+                "state": "California",
+                "country": "United States",
+                "country_code": "us",
+            },
+        },
+    ]
+
+    def fake_urlopen(req, timeout=None):
+        return _fake_nominatim_response(canned)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    r = client.get("/api/geocode/search?q=maui&limit=5")
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert results[0]["name"] == "Maui County"
+    assert results[0]["locality"] is None      # no city/town for a county
+    assert results[0]["admin1"] == "Hawaii"
+    assert results[0]["country_code"] == "US"
+
+    assert results[1]["name"] == "Folsom Lake"
+    assert results[1]["locality"] is None
+    assert results[1]["admin1"] == "California"
+    assert results[1]["country_code"] == "US"
 
 
 def test_geocode_search_requires_query(client, db):

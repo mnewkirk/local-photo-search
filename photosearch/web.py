@@ -2147,6 +2147,9 @@ def api_geocode_search(q: str, limit: int = 5):
     for item in raw:
         addr = item.get("address", {}) or {}
         # Pick a locality — Nominatim's address dict uses varying keys.
+        # city/town/village/hamlet/suburb cover populated places; counties,
+        # parks, lakes, and landmarks come through on the top-level `name`
+        # field instead, handled below.
         locality = (addr.get("city") or addr.get("town") or addr.get("village")
                     or addr.get("hamlet") or addr.get("suburb") or None)
         try:
@@ -2154,11 +2157,17 @@ def api_geocode_search(q: str, limit: int = 5):
             lon = float(item["lon"])
         except (KeyError, ValueError, TypeError):
             continue
+        # country_code ("us", "it") uppercased ("US", "IT") so manual
+        # geotags use the same 2-letter convention as reverse_geocoder's
+        # output on exif/inferred photos (keeps place_name consistent).
+        cc = (addr.get("country_code") or "").upper() or None
         results.append({
             "display_name": item.get("display_name"),
+            "name": item.get("name"),
             "lat": lat,
             "lon": lon,
             "country": addr.get("country"),
+            "country_code": cc,
             "admin1": addr.get("state") or addr.get("region"),
             "admin2": addr.get("county"),
             "locality": locality,
