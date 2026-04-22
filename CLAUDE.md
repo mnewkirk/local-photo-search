@@ -370,6 +370,15 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   anchors on re-scan so decay protects cross-run compounding, drop the
   dead `--max-cascade-rounds` flag. All localized to
   `photosearch/infer_location.py`.
+- `docs/plans/search-accuracy-improvements.md` — next-milestone
+  search work. Quick-wins bundle: Reciprocal Rank Fusion across
+  filters + recency decay on final ranking + structured
+  `country`/`admin1`/`admin2`/`locality` columns (fixes "Calvin in
+  France ranks ancient photos first" and "Marin County as a query
+  returns nothing" simultaneously, ~200 lines + schema v19 + one
+  backfill CLI). Later work: fuzzy name/place matching, ambiguity
+  disambiguation via photo GPS priors, LLM query rewriter, VLM
+  re-ranking, self-hosted Nominatim.
 - `docs/plans/google-photos-import.md` — M20. Takeout-based import of
   ~200K smartphone photos. Google Photos API read scopes were deprecated for
   third-party apps in March 2025, so Takeout is the only path. Incremental

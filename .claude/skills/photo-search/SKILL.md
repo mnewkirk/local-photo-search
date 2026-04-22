@@ -1139,6 +1139,15 @@ pick up and implement without re-deriving the shape:
   compounding, (3) delete the dead `--max-cascade-rounds` flag and
   rename `cascade_rounds_used` → `max_hop_count` to match reality.
   All localized to `photosearch/infer_location.py`.
+- **`docs/plans/search-accuracy-improvements.md`** — ranking +
+  structural fixes for the search pipeline. Quick-wins bundle
+  (~200 lines + schema v19 + one backfill CLI): RRF across filters,
+  recency decay on the final sort, and structured
+  `country`/`admin1`/`admin2`/`locality` columns so "Marin County"
+  becomes a real filter and Nominatim round-trips are only needed
+  for truly-new places. Iterate items: fuzzy name/place match,
+  multi-candidate ambiguity resolution (GPS-prior tiebreaker), LLM
+  query rewriter. Future: VLM re-ranking, self-hosted Nominatim.
 - **`docs/plans/google-photos-import.md`** — **M20**. Takeout-based
   import of ~200K smartphone photos. The Library API read scopes were
   deprecated for third-party apps on March 31, 2025, so the API path is
