@@ -1114,6 +1114,66 @@ def cleanup_orphans(db, dry_run):
 # face-clusters
 # ---------------------------------------------------------------------------
 
+@cli.command("normalize-places")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--batch-size", default=2000, type=int,
+              help="Photos per reverse_geocoder batch + SQL commit.")
+@click.option("--limit", default=0, type=int,
+              help="Max rows to process (0 = all).")
+@click.option("--force", is_flag=True, default=False,
+              help="Re-normalize even rows that already have structured columns.")
+def normalize_places(db, batch_size, limit, force):
+    """Backfill country / admin1 / admin2 / locality columns (schema v19).
+
+    Runs reverse_geocoder over every photo with GPS and fills the
+    structured columns. Safe to re-run — skips rows that already have
+    values unless --force. Called after the v19 migration or any time
+    new photos are added; the indexer could do this inline but the
+    one-shot backfill covers existing libraries without re-indexing.
+    """
+    with PhotoDB(db) as photo_db:
+        where = ("WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL"
+                 + ("" if force else
+                    " AND (country IS NULL OR admin1 IS NULL)"))
+        limit_sql = f" LIMIT {limit}" if limit else ""
+        rows = photo_db.conn.execute(
+            f"SELECT id, gps_lat, gps_lon FROM photos {where}{limit_sql}"
+        ).fetchall()
+        if not rows:
+            click.echo("No photos to normalize.")
+            return
+
+        click.echo(f"Normalizing {len(rows):,} photos…")
+        import reverse_geocoder as rg
+
+        processed = 0
+        updated = 0
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start:start + batch_size]
+            coords = [(r["gps_lat"], r["gps_lon"]) for r in batch]
+            try:
+                rg_results = rg.search(coords)
+            except Exception as err:
+                click.echo(f"  reverse_geocoder error on batch "
+                           f"{start}-{start + len(batch)}: {err}")
+                continue
+            for photo_row, rg_row in zip(batch, rg_results):
+                photo_db.conn.execute(
+                    "UPDATE photos SET country=?, admin1=?, admin2=?, locality=? "
+                    "WHERE id=?",
+                    (rg_row.get("cc"), rg_row.get("admin1"),
+                     rg_row.get("admin2"), rg_row.get("name"),
+                     photo_row["id"]),
+                )
+                updated += 1
+            photo_db.conn.commit()
+            processed += len(batch)
+            click.echo(f"  {processed:,}/{len(rows):,} photos processed…")
+
+        click.echo(f"\nDone. Updated {updated:,} photos.")
+
+
 @cli.command("dump-db")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Source DB path.")

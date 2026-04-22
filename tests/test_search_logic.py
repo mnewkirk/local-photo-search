@@ -819,3 +819,81 @@ class TestRecencyDecay:
         # 2-year decay is ~exp(-0.10) ≈ 0.905; 0.10 * 0.905 = 0.0905
         # Today: 0.02 * 1.0 = 0.02. High-RRF older photo still wins.
         assert photos[0]["rrf_score"] > photos[1]["rrf_score"]
+
+
+# =========================================================================
+# Structured location columns (quick-wins bundle commit 4)
+# =========================================================================
+
+class TestStructuredLocationMatch:
+    def test_admin2_exact_match_catches_county_query(self, tmp_db_path):
+        """'Marin County' query must find photos — reverse_geocoder's
+        assembled place_name skips admin2, so only structured column
+        match catches them."""
+        from photosearch.db import PhotoDB
+        from photosearch.search import _search_by_location
+
+        with PhotoDB(tmp_db_path) as pdb:
+            # Seed photos with structured columns directly (bypassing
+            # the backfill). place_name is the flat string without
+            # 'Marin County' — simulates the real reverse_geocoder
+            # output format.
+            pdb.add_photo(filepath="/mw.jpg", filename="mw.jpg",
+                          date_taken="2024-06-01T10:00:00",
+                          gps_lat=38.04, gps_lon=-122.56,
+                          place_name="Lucas Valley-Marinwood, California, US")
+            pdb.conn.execute(
+                "UPDATE photos SET country='US', admin1='California', "
+                "admin2='Marin County', locality='Lucas Valley-Marinwood' "
+                "WHERE filename='mw.jpg'")
+            pdb.add_photo(filepath="/sf.jpg", filename="sf.jpg",
+                          date_taken="2024-06-02T10:00:00",
+                          gps_lat=37.77, gps_lon=-122.42,
+                          place_name="San Francisco, California, US")
+            pdb.conn.execute(
+                "UPDATE photos SET country='US', admin1='California', "
+                "admin2='San Francisco County', locality='San Francisco' "
+                "WHERE filename='sf.jpg'")
+            pdb.conn.commit()
+
+            # Query "Marin County" — no substring match in place_name,
+            # no Nominatim needed, structured admin2 match.
+            results = _search_by_location(pdb, "Marin County")
+            filenames = sorted(r["filename"] for r in results)
+        assert filenames == ["mw.jpg"]
+
+    def test_admin1_match_case_insensitive(self, tmp_db_path):
+        from photosearch.db import PhotoDB
+        from photosearch.search import _search_by_location
+
+        with PhotoDB(tmp_db_path) as pdb:
+            pdb.add_photo(filepath="/ca.jpg", filename="ca.jpg",
+                          date_taken="2024-06-01T10:00:00",
+                          gps_lat=37.77, gps_lon=-122.42,
+                          place_name="San Francisco, California, US")
+            pdb.conn.execute(
+                "UPDATE photos SET admin1='California' WHERE filename='ca.jpg'")
+            pdb.conn.commit()
+
+            results = _search_by_location(pdb, "california")
+            assert len(results) == 1
+            assert results[0]["filename"] == "ca.jpg"
+
+
+class TestSchemaV19Migration:
+    def test_columns_added(self, tmp_db_path):
+        """Fresh DB at v19 must have the four structured columns and
+        their indexes."""
+        from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+        assert SCHEMA_VERSION >= 19
+        with PhotoDB(tmp_db_path) as pdb:
+            cols = {r["name"] for r in pdb.conn.execute(
+                "PRAGMA table_info(photos)").fetchall()}
+            for expected in ("country", "admin1", "admin2", "locality"):
+                assert expected in cols, f"missing column {expected}"
+            indexes = {r["name"] for r in pdb.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+            for expected in ("idx_photos_country", "idx_photos_admin1",
+                             "idx_photos_admin2", "idx_photos_locality"):
+                assert expected in indexes, f"missing index {expected}"

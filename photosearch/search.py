@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -1268,6 +1269,32 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
         (*patterns, limit),
     ).fetchall()
     results = [dict(r) for r in rows]
+
+    # Union with structured location columns (schema v19). Enables
+    # admin2 queries like "Marin County" that the flat place_name
+    # substring never caught — reverse_geocoder's assembled place_name
+    # skips admin2, so "Marin County" as substring matched nothing.
+    # This UNIONs exact-match hits on country/admin1/admin2/locality.
+    # Graceful if columns don't exist yet (pre-backfill or old DB).
+    try:
+        struct_rows = db.conn.execute(
+            """SELECT * FROM photos
+               WHERE LOWER(country) = LOWER(?)
+                  OR LOWER(admin1) = LOWER(?)
+                  OR LOWER(admin2) = LOWER(?)
+                  OR LOWER(locality) = LOWER(?)
+               ORDER BY date_taken
+               LIMIT ?""",
+            (name, name, name, name, limit),
+        ).fetchall()
+        if struct_rows:
+            seen = {r["id"]: r for r in results}
+            for r in struct_rows:
+                if r["id"] not in seen:
+                    seen[r["id"]] = dict(r)
+            results = list(seen.values())[:limit]
+    except sqlite3.OperationalError:
+        pass  # Columns not yet migrated — skip silently.
 
     # Country-level queries: the code expansion already covers the
     # entire country, and a Nominatim bbox for a whole country is huge

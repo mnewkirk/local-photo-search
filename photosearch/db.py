@@ -51,7 +51,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -383,6 +383,24 @@ class PhotoDB:
                 fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+
+        # Migration: structured location columns (schema v19). Flattens
+        # the place_name string ("Locality, Admin1, CC") into indexed
+        # columns so queries like "Marin County" (admin2) or "California"
+        # (admin1) become direct filters instead of substring fishing.
+        # reverse_geocoder already returns all four values; we just
+        # weren't storing them. Backfill via `photosearch normalize-places`.
+        try:
+            cur.execute("SELECT country FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN country TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN admin1 TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN admin2 TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN locality TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_country ON photos(country)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin1 ON photos(admin1)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin2 ON photos(admin2)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_locality ON photos(locality)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
