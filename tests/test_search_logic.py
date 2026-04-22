@@ -759,3 +759,63 @@ class TestRRFScoring:
         items = [{"id": 1}, {"id": 2}, {"id": 3}]
         sorted_items = _apply_sort(items, "relevance")
         assert [r["id"] for r in sorted_items] == [1, 2, 3]
+
+
+# =========================================================================
+# Recency decay (quick-wins bundle commit 3)
+# =========================================================================
+
+class TestRecencyDecay:
+    def test_recent_photo_scores_higher(self):
+        """A photo from today should end up with a higher post-decay
+        rrf_score than one from years ago, given equal pre-decay scores."""
+        from photosearch.search import _apply_recency_decay
+        import datetime
+        today = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        ten_years_ago = (datetime.datetime.now()
+                         - datetime.timedelta(days=365 * 10)).strftime("%Y-%m-%dT%H:%M:%S")
+        photos = [
+            {"id": 1, "date_taken": today, "rrf_score": 0.1},
+            {"id": 2, "date_taken": ten_years_ago, "rrf_score": 0.1},
+        ]
+        _apply_recency_decay(photos)
+        assert photos[0]["rrf_score"] > photos[1]["rrf_score"]
+
+    def test_undated_photos_get_neutral_penalty(self):
+        """No date_taken → factor between "today" and "very old" — not
+        winning relevance over recent photos but not zeroed out."""
+        from photosearch.search import _apply_recency_decay, _UNDATED_RECENCY_FACTOR
+        import datetime
+        today = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        photos = [
+            {"id": 1, "date_taken": today, "rrf_score": 1.0},
+            {"id": 2, "date_taken": None, "rrf_score": 1.0},
+        ]
+        _apply_recency_decay(photos)
+        # Today's factor is exp(0) = 1.0
+        assert photos[0]["rrf_score"] == pytest.approx(1.0, rel=0.01)
+        # Undated is fixed at _UNDATED_RECENCY_FACTOR
+        assert photos[1]["rrf_score"] == pytest.approx(_UNDATED_RECENCY_FACTOR)
+
+    def test_bad_date_format_falls_back_to_undated(self):
+        from photosearch.search import _apply_recency_decay, _UNDATED_RECENCY_FACTOR
+        photos = [{"id": 1, "date_taken": "garbage-date", "rrf_score": 1.0}]
+        _apply_recency_decay(photos)
+        assert photos[0]["rrf_score"] == pytest.approx(_UNDATED_RECENCY_FACTOR)
+
+    def test_rrf_score_respected_alongside_decay(self):
+        """Higher RRF should still win over lower RRF after decay, as
+        long as the recency gap isn't enormous."""
+        from photosearch.search import _apply_recency_decay
+        import datetime
+        today = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        two_years = (datetime.datetime.now()
+                     - datetime.timedelta(days=730)).strftime("%Y-%m-%dT%H:%M:%S")
+        photos = [
+            {"id": 1, "date_taken": two_years, "rrf_score": 0.10},  # strong RRF
+            {"id": 2, "date_taken": today, "rrf_score": 0.02},       # weak RRF
+        ]
+        _apply_recency_decay(photos)
+        # 2-year decay is ~exp(-0.10) ≈ 0.905; 0.10 * 0.905 = 0.0905
+        # Today: 0.02 * 1.0 = 0.02. High-RRF older photo still wins.
+        assert photos[0]["rrf_score"] > photos[1]["rrf_score"]

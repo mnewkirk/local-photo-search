@@ -1078,6 +1078,41 @@ SORT_MODES = ("date_desc", "date_asc", "quality_desc", "relevance")
 _RRF_K = 60
 
 
+# Recency decay rate. 0.05 is gentle: photos from 1 year ago score at
+# 95% of today's, 5 years at 78%, 10 years at 61%. Tuned so family
+# photos from a decade ago aren't pushed far below today's — just a
+# nudge so genuinely recent photos surface over equally-relevant old
+# ones in relevance-mode sorts.
+_RECENCY_DECAY_RATE = 0.05
+# Factor for photos with no date_taken. 0.5 is halfway between fresh
+# and "~14 years old" — neutral-ish, slight penalty so undated photos
+# don't beat real recent ones in relevance mode.
+_UNDATED_RECENCY_FACTOR = 0.5
+
+
+def _apply_recency_decay(photos: list[dict]) -> None:
+    """Multiply each photo's rrf_score by exp(-years_ago * 0.05).
+    Mutates the dicts in place. Called only in sort='relevance' mode;
+    date / quality sorts ignore rrf_score so the extra compute would
+    be wasted there.
+    """
+    import math
+    import datetime
+    now = datetime.datetime.now()
+    for photo in photos:
+        dt_str = photo.get("date_taken")
+        factor = _UNDATED_RECENCY_FACTOR
+        if dt_str:
+            try:
+                # SQLite stores "YYYY-MM-DD HH:MM:SS"; accept "T" too.
+                dt = datetime.datetime.fromisoformat(dt_str.replace(" ", "T"))
+                years_ago = max(0.0, (now - dt).total_seconds() / (365.25 * 86400))
+                factor = math.exp(-_RECENCY_DECAY_RATE * years_ago)
+            except (ValueError, TypeError):
+                pass  # keep undated factor
+        photo["rrf_score"] = (photo.get("rrf_score") or 0.0) * factor
+
+
 def _attach_rrf_scores(result_sets: list[dict[int, dict]],
                        ranks_per_set: list[dict[int, int]]) -> None:
     """Compute Reciprocal Rank Fusion score per photo in result_sets[0]
@@ -1448,6 +1483,12 @@ def search_combined(
     # single-filter queries, rrf_score is monotonic with the filter's
     # own rank, so sort='relevance' preserves that filter's order.
     _attach_rrf_scores(result_sets, ranks_per_set)
+
+    # In relevance mode, apply recency decay so today's "Calvin at
+    # the beach" photo ranks above an equally-relevant 2015 one. No
+    # effect on date / quality sorts, which ignore rrf_score.
+    if (not sort_quality) and sort == "relevance" and result_sets:
+        _apply_recency_decay(list(result_sets[0].values()))
 
     if len(result_sets) == 1:
         merged = _dedupe_by_hash(list(result_sets[0].values()))
