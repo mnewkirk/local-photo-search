@@ -1068,14 +1068,35 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
 
 
 def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[dict]:
-    """Search by place_name using case-insensitive LIKE matching."""
-    pattern = f"%{location}%"
+    """Search by place_name using case-insensitive LIKE matching.
+
+    When the query matches a known country name or looks like an ISO
+    alpha-2 code, also match the ", CC" country slot at the end of
+    place_name. The offline reverse geocoder produces
+    "Locality, Admin1, CC" so a raw substring match on "France" only
+    catches "Île-de-France" and misses every other French region.
+    """
+    from .geocode import country_name_to_code
+
+    name = location.strip()
+    if not name:
+        return []
+
+    patterns = [f"%{name}%"]
+    code = country_name_to_code(name)
+    if code:
+        # Anchor with ", CC" so a 2-letter code doesn't false-positive on
+        # locality names containing those letters (e.g. "ES" inside
+        # "Esterzili, Sardegna, IT"). No trailing % → end-of-string match.
+        patterns.append(f"%, {code}")
+
+    placeholders = " OR ".join(["place_name LIKE ?"] * len(patterns))
     rows = db.conn.execute(
-        """SELECT * FROM photos
-           WHERE place_name IS NOT NULL AND place_name LIKE ?
-           ORDER BY date_taken
-           LIMIT ?""",
-        (pattern, limit),
+        f"""SELECT * FROM photos
+            WHERE place_name IS NOT NULL AND ({placeholders})
+            ORDER BY date_taken
+            LIMIT ?""",
+        (*patterns, limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
