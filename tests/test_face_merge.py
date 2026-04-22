@@ -284,3 +284,44 @@ def test_session_stack_preserves_existing_dbscan_labels():
     assert new_labels[0] == 0 and new_labels[1] == 0
     assert n_clusters == 1
     assert new_labels[2] == new_labels[3] >= 1  # new id above 0
+
+
+# ---------------------------------------------------------------------------
+# recluster_unknown_faces — invariant: person-assigned faces must not retain
+# stale cluster_ids after a global recluster (otherwise split_cluster + the
+# /faces UI see a phantom mix of named + unknown faces under the same id).
+# ---------------------------------------------------------------------------
+
+def test_recluster_clears_stale_cluster_id_on_person_assigned_faces(db):
+    from photosearch.faces import recluster_unknown_faces
+
+    # Stamp a stale cluster_id on a person-assigned face. This is the shape
+    # a library accumulates over multiple recluster cycles: the face was
+    # once unknown with cluster_id=X, then got assigned to a person, but
+    # nothing ever cleared the orphaned cluster_id.
+    stale_face_id = db._test_face_ids["alex_894"]
+    db.conn.execute(
+        "UPDATE faces SET cluster_id = ? WHERE id = ?", (0, stale_face_id),
+    )
+    db.conn.commit()
+
+    # Seed enough similar unknown faces to form one DBSCAN cluster
+    # (min_samples=3 default). Use near-identical encodings so the cluster
+    # forms deterministically regardless of eps.
+    photo_id = db._test_photo_ids["DSC04878.JPG"]
+    shared = _base(999).tolist()
+    for i in range(4):
+        jittered = (_perturb(_base(999), i + 1, jitter=0.01)).tolist()
+        db.add_face(photo_id, (10 + i, 20, 30, 5), jittered)
+    db.conn.commit()
+
+    recluster_unknown_faces(db, session_stacking=False)
+
+    row = db.conn.execute(
+        "SELECT cluster_id, person_id FROM faces WHERE id = ?", (stale_face_id,),
+    ).fetchone()
+    assert row["person_id"] is not None, "fixture sanity: face stays person-assigned"
+    assert row["cluster_id"] is None, (
+        "recluster must clear cluster_id on person-assigned faces so the new "
+        "unknown numbering can't collide with stale ids"
+    )

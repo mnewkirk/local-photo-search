@@ -633,6 +633,9 @@ def recluster_unknown_faces(
     cur = db.conn.cursor()
     try:
         cur.execute("DELETE FROM ignored_clusters")
+        # Person-assigned faces can carry a stale cluster_id from a prior
+        # life as an unknown — clear it so the new numbering can't collide.
+        cur.execute("UPDATE faces SET cluster_id = NULL WHERE person_id IS NOT NULL")
         # Batch writes: NULL for noise, int for real clusters.
         pairs = [
             (int(lab) if lab != -1 else None, fid)
