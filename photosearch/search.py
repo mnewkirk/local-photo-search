@@ -1067,6 +1067,19 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
     return [dict(r) for r in rows]
 
 
+# Intermediate limit for filter-based searches that will be intersected
+# with another filter. `search_by_person`, `_search_by_location`, and
+# friends all apply their own LIMIT inside the SQL. If we use `limit*3`
+# (default 600) for those, each filter returns just its oldest-N window
+# and the intersection silently collapses to empty when the windows
+# don't overlap (classic symptom: "Calvin in France" returns zero even
+# though Calvin has many French photos, because Calvin's oldest 600 are
+# US kid photos and the oldest 600 French-tagged photos predate him).
+# Filter sets must be unbounded — ranking-based searches (CLIP semantic,
+# face-image) keep `limit*3` because they're true top-N.
+_FILTER_PREFETCH_LIMIT = 100_000
+
+
 def _search_by_bbox(db: PhotoDB, south: float, north: float,
                     west: float, east: float, limit: int = 100) -> list[dict]:
     """Return photos whose GPS falls inside the given bounding box.
@@ -1228,20 +1241,23 @@ def search_combined(
             if len(name_matched) == 1:
                 results = search_by_person(
                     db, name_matched[0]["name"],
-                    limit=limit * 3, match_source=match_source,
+                    limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
                 )
             else:
                 results = search_by_all_persons(
                     db, [p["id"] for p in name_matched],
-                    limit=limit * 3, match_source=match_source,
+                    limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
                 )
             result_sets.append({r["id"]: r for r in results})
             effective_query = residual if residual else None
 
     if person:
-        results = search_by_person(db, person, limit=limit * 3, match_source=match_source)
+        results = search_by_person(
+            db, person, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source)
         result_sets.append({r["id"]: r for r in results})
 
+    # Face-image reference stays ranked-by-similarity: limit*3 gives a
+    # usable top-N that the intersection step ranks against.
     if face_image:
         results = search_by_face_reference(db, face_image, limit=limit * 3)
         result_sets.append({r["id"]: r for r in results})
@@ -1253,25 +1269,29 @@ def search_combined(
         # random visually-similar photos instead of the specific file.
         # If filename search finds nothing, fall through to CLIP as normal.
         if _looks_like_filename(effective_query):
-            fname_results = search_by_filename(db, effective_query, limit=limit * 3)
+            fname_results = search_by_filename(
+                db, effective_query, limit=_FILTER_PREFETCH_LIMIT)
             if fname_results:
                 result_sets.append({r["id"]: r for r in fname_results})
                 effective_query = None  # Skip CLIP — filename match is authoritative
 
+        # CLIP semantic stays ranked (limit*3): scores are real, we
+        # want the top-N to be the best-scoring photos before the
+        # intersection, not every photo over the noise floor.
         if effective_query:
             results = search_semantic(db, effective_query, limit=limit * 3, min_score=min_score, debug=debug, tag_match=tag_match)
             result_sets.append({r["id"]: r for r in results})
 
     if color:
-        results = search_by_color(db, color, limit=limit * 3)
+        results = search_by_color(db, color, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["photo_id"]: r for r in results})
 
     if place:
-        results = search_by_place(db, place, limit=limit * 3)
+        results = search_by_place(db, place, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["id"]: r for r in results})
 
     if location:
-        results = _search_by_location(db, location, limit=limit * 3)
+        results = _search_by_location(db, location, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["id"]: r for r in results})
 
     # Date as a primary search: if only date is specified (no other criteria)

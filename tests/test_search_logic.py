@@ -388,6 +388,76 @@ class TestSearchByLocationExpandsCountries:
             filenames = sorted(r["filename"] for r in results)
         assert filenames == ["pr1.jpg"]
 
+    def test_person_plus_location_intersection_beyond_old_limit(
+            self, tmp_db_path):
+        """Regression: 'Calvin in France' returned zero results on the
+        NAS even though Calvin had many French photos. Root cause was
+        that search_combined used limit=600 for each intermediate
+        filter set, so the oldest-600 Calvin photos (old US photos) and
+        the oldest-600 France photos (pre-Calvin French photos) had no
+        overlap and the intersection silently collapsed.
+
+        This test seeds enough photos (700 French + 1 Calvin-in-France
+        at the newest date) to have hit the old bug and proves the
+        intersection now finds Calvin's French photo.
+        """
+        import numpy as np
+        from photosearch.db import PhotoDB
+        from photosearch.search import search_combined
+
+        with PhotoDB(tmp_db_path) as db:
+            calvin_id = db.add_person("Calvin")
+            db.begin_batch(batch_size=200)
+
+            # 700 older French photos with no Calvin — these would
+            # saturate the old limit*3=600 window for the France filter.
+            for i in range(700):
+                day = 1 + i // 28
+                mo = 1 + (i // 28) % 12
+                date = f"201{(i // 300) % 5}-{mo:02d}-{day:02d}T12:00:00"
+                db.add_photo(
+                    filepath=f"/old_fr/{i}.jpg", filename=f"old{i}.jpg",
+                    date_taken=date, gps_lat=48.85, gps_lon=2.35,
+                    place_name="Paris, Île-de-France, FR",
+                )
+
+            # A single Calvin-in-France photo with the newest date —
+            # definitely past the oldest-600 window on both sides.
+            pid = db.add_photo(
+                filepath="/calvin_fr.jpg", filename="calvin_fr.jpg",
+                date_taken="2024-06-01T10:00:00",
+                gps_lat=44.84, gps_lon=-0.58,
+                place_name="Bordeaux, Nouvelle-Aquitaine, FR",
+            )
+            emb = np.random.rand(512).astype(np.float32).tolist()
+            fid = db.add_face(pid, (10, 10, 50, 50), emb)
+            db.assign_face_to_person(fid, calvin_id, "manual")
+
+            # Also give Calvin 50 non-France photos so search_by_person
+            # returns >1 row and the intersection is non-trivial.
+            for i in range(50):
+                ppid = db.add_photo(
+                    filepath=f"/calvin_us/{i}.jpg",
+                    filename=f"cus{i}.jpg",
+                    date_taken=f"2018-01-{(i%28)+1:02d}T12:00:00",
+                    gps_lat=47.6, gps_lon=-122.3,
+                    place_name="Seattle, Washington, US",
+                )
+                emb2 = np.random.rand(512).astype(np.float32).tolist()
+                fid2 = db.add_face(ppid, (10, 10, 50, 50), emb2)
+                db.assign_face_to_person(fid2, calvin_id, "manual")
+            db.end_batch()
+
+            results = search_combined(db, query="Calvin in France", limit=20)
+
+        filenames = [r["filename"] for r in results]
+        assert "calvin_fr.jpg" in filenames, \
+            "Calvin's French photo must surface from the intersection"
+        # Must not leak Seattle (no France match) or French-only photos
+        # (no Calvin).
+        assert "cus0.jpg" not in filenames
+        assert "old0.jpg" not in filenames
+
     def test_bbox_fallback_not_triggered_when_substring_has_results(
             self, tmp_db_path, monkeypatch):
         """When the substring match succeeds, Nominatim must not be hit
