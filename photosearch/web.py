@@ -2084,107 +2084,23 @@ def api_geotag_known_places(q: str = "", limit: int = 20):
                         "photo_count": r["photo_count"]} for r in rows]}
 
 
-_NOMINATIM_UA = "local-photo-search/1.0 (self-hosted photo library; +https://github.com/mnewkirk/local-photo-search)"
-_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-_GEOCODE_CACHE_TTL_SECONDS = 30 * 24 * 3600  # 30 days
-
-
 @app.get("/api/geocode/search")
 def api_geocode_search(q: str, limit: int = 5):
     """Forward-geocode a free-text query via Nominatim, with a persistent
-    cache in the geocode_cache table. Returns candidates shaped for the
-    /geotag typeahead:
-
-        {results: [{display_name, lat, lon, country, admin1, admin2,
-                    locality, type, importance}, ...], source}
-
-    The cache keys on lowercased query text and expires after 30 days.
-    Cache hits return instantly (`source='cache'`); misses hit Nominatim
-    with a descriptive User-Agent per their usage policy.
+    cache in the geocode_cache table. Thin wrapper around
+    `photosearch.geocode.forward_geocode` so search.py and other
+    callers can share the same cache + normalization logic.
     """
-    import json
-    import time
-    import urllib.parse
-    import urllib.request
-    import datetime
+    from .geocode import forward_geocode
 
-    key = (q or "").strip().lower()
-    if not key:
+    if not (q or "").strip():
         raise HTTPException(status_code=400, detail="q required")
-
     with _get_db() as db:
-        row = db.conn.execute(
-            "SELECT results_json, fetched_at FROM geocode_cache WHERE query = ?",
-            (key,),
-        ).fetchone()
-        if row:
-            try:
-                fetched = datetime.datetime.fromisoformat(row["fetched_at"])
-                age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - fetched).total_seconds()
-            except (TypeError, ValueError):
-                age = _GEOCODE_CACHE_TTL_SECONDS + 1
-            if age < _GEOCODE_CACHE_TTL_SECONDS:
-                cached = json.loads(row["results_json"])
-                return {"results": cached[:limit], "source": "cache"}
-
-    # Cache miss — hit Nominatim.
-    params = {
-        "q": q,
-        "format": "jsonv2",
-        "limit": str(min(limit, 10)),
-        "addressdetails": "1",
-        "accept-language": "en",
-    }
-    url = _NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": _NOMINATIM_UA})
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-    except Exception as err:
-        raise HTTPException(status_code=502, detail=f"Nominatim error: {err}")
-
-    results = []
-    for item in raw:
-        addr = item.get("address", {}) or {}
-        # Pick a locality — Nominatim's address dict uses varying keys.
-        # city/town/village/hamlet/suburb cover populated places; counties,
-        # parks, lakes, and landmarks come through on the top-level `name`
-        # field instead, handled below.
-        locality = (addr.get("city") or addr.get("town") or addr.get("village")
-                    or addr.get("hamlet") or addr.get("suburb") or None)
         try:
-            lat = float(item["lat"])
-            lon = float(item["lon"])
-        except (KeyError, ValueError, TypeError):
-            continue
-        # country_code ("us", "it") uppercased ("US", "IT") so manual
-        # geotags use the same 2-letter convention as reverse_geocoder's
-        # output on exif/inferred photos (keeps place_name consistent).
-        cc = (addr.get("country_code") or "").upper() or None
-        results.append({
-            "display_name": item.get("display_name"),
-            "name": item.get("name"),
-            "lat": lat,
-            "lon": lon,
-            "country": addr.get("country"),
-            "country_code": cc,
-            "admin1": addr.get("state") or addr.get("region"),
-            "admin2": addr.get("county"),
-            "locality": locality,
-            "type": item.get("type"),
-            "importance": item.get("importance"),
-        })
-
-    with _get_db() as db:
-        db.conn.execute(
-            "INSERT OR REPLACE INTO geocode_cache (query, results_json, fetched_at) "
-            "VALUES (?, ?, ?)",
-            (key, json.dumps(results),
-             datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")),
-        )
-        db.conn.commit()
-
-    return {"results": results[:limit], "source": "nominatim"}
+            results, source = forward_geocode(db, q, limit)
+        except Exception as err:
+            raise HTTPException(status_code=502, detail=f"Nominatim error: {err}")
+    return {"results": results, "source": source}
 
 
 @app.post("/api/photos/bulk-set-location")

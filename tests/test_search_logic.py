@@ -333,3 +333,80 @@ class TestSearchByLocationExpandsCountries:
             results = _search_by_location(pdb, "Zarautz")
         assert len(results) == 1
         assert results[0]["filename"] == "a.jpg"
+
+    def test_bbox_fallback_when_substring_misses(self, tmp_db_path, monkeypatch):
+        """Photos at Point Reyes get geocoded to 'Inverness' (nearest
+        cities1000 match) by the offline geocoder, so a substring
+        search for 'Point Reyes' finds nothing. The Nominatim bbox
+        fallback must pull them in by coordinates."""
+        import json
+        from photosearch.db import PhotoDB
+        from photosearch.search import _search_by_location
+
+        class _FakeResp:
+            def __init__(self, payload):
+                self._data = json.dumps(payload).encode("utf-8")
+            def read(self):
+                return self._data
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        canned = [{
+            "name": "Point Reyes",
+            "display_name": "Point Reyes National Seashore, Marin County, California, United States",
+            "lat": "38.07",
+            "lon": "-122.88",
+            "type": "protected_area",
+            "importance": 0.6,
+            "boundingbox": ["37.99", "38.20", "-123.02", "-122.73"],
+            "address": {
+                "county": "Marin County",
+                "state": "California",
+                "country": "United States",
+                "country_code": "us",
+            },
+        }]
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(canned)
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        with PhotoDB(tmp_db_path) as pdb:
+            # Photo inside the returned bbox, geocoded to a different name.
+            pdb.add_photo(filepath="/pr1.jpg", filename="pr1.jpg",
+                          date_taken="2024-09-01T10:00:00",
+                          gps_lat=38.10, gps_lon=-122.90,
+                          place_name="Inverness, California, US")
+            # Photo outside the bbox must not leak in.
+            pdb.add_photo(filepath="/sf.jpg", filename="sf.jpg",
+                          date_taken="2024-09-02T10:00:00",
+                          gps_lat=37.77, gps_lon=-122.42,
+                          place_name="San Francisco, California, US")
+            pdb.conn.commit()
+
+            results = _search_by_location(pdb, "Point Reyes")
+            filenames = sorted(r["filename"] for r in results)
+        assert filenames == ["pr1.jpg"]
+
+    def test_bbox_fallback_not_triggered_when_substring_has_results(
+            self, tmp_db_path, monkeypatch):
+        """When the substring match succeeds, Nominatim must not be hit
+        — otherwise every search pays network latency for no reason."""
+        from photosearch.db import PhotoDB
+        from photosearch.search import _search_by_location
+
+        called = [0]
+        def fake_urlopen(req, timeout=None):
+            called[0] += 1
+            raise AssertionError("should not hit Nominatim")
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+        with PhotoDB(tmp_db_path) as pdb:
+            pdb.add_photo(filepath="/a.jpg", filename="a.jpg",
+                          date_taken="2024-10-01T10:00:00",
+                          gps_lat=37.77, gps_lon=-122.42,
+                          place_name="San Francisco, California, US")
+            pdb.conn.commit()
+            results = _search_by_location(pdb, "San Francisco")
+        assert len(results) == 1
+        assert called[0] == 0

@@ -115,6 +115,109 @@ _COUNTRY_NAME_TO_CODE = {
 }
 
 
+_NOMINATIM_UA = (
+    "local-photo-search/1.0 "
+    "(self-hosted photo library; +https://github.com/mnewkirk/local-photo-search)"
+)
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_GEOCODE_CACHE_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+
+
+def _normalize_nominatim_item(item: dict) -> Optional[dict]:
+    """Turn one raw Nominatim result into the compact shape used by the
+    project: keeps name/locality/admin1/admin2/country + country_code,
+    parses lat/lon and boundingbox to floats. Returns None if the item
+    has no parseable coordinates.
+    """
+    addr = item.get("address", {}) or {}
+    try:
+        lat = float(item["lat"])
+        lon = float(item["lon"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    locality = (addr.get("city") or addr.get("town") or addr.get("village")
+                or addr.get("hamlet") or addr.get("suburb") or None)
+    cc = (addr.get("country_code") or "").upper() or None
+    bbox = None
+    bb = item.get("boundingbox")
+    if isinstance(bb, list) and len(bb) == 4:
+        try:
+            # Nominatim order: [south, north, west, east] as strings.
+            bbox = [float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]
+        except (ValueError, TypeError):
+            bbox = None
+    return {
+        "display_name": item.get("display_name"),
+        "name": item.get("name"),
+        "lat": lat,
+        "lon": lon,
+        "bbox": bbox,
+        "country": addr.get("country"),
+        "country_code": cc,
+        "admin1": addr.get("state") or addr.get("region"),
+        "admin2": addr.get("county"),
+        "locality": locality,
+        "type": item.get("type"),
+        "importance": item.get("importance"),
+    }
+
+
+def forward_geocode(db, query: str, limit: int = 5) -> tuple[list[dict], str]:
+    """Resolve a free-text query to Nominatim candidates with cache.
+
+    Returns `(results, source)` where `source` is `'cache'` or
+    `'nominatim'`. The cache lives in `geocode_cache` (schema v18),
+    keyed on lowercased query text with a 30-day TTL. Raises on
+    Nominatim / network failure — callers decide whether to swallow.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+    import datetime
+
+    key = (query or "").strip().lower()
+    if not key:
+        return [], "cache"
+
+    row = db.conn.execute(
+        "SELECT results_json, fetched_at FROM geocode_cache WHERE query = ?",
+        (key,),
+    ).fetchone()
+    if row:
+        try:
+            fetched = datetime.datetime.fromisoformat(row["fetched_at"])
+            age = (datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+                   - fetched).total_seconds()
+        except (TypeError, ValueError):
+            age = _GEOCODE_CACHE_TTL_SECONDS + 1
+        if age < _GEOCODE_CACHE_TTL_SECONDS:
+            return json.loads(row["results_json"])[:limit], "cache"
+
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": str(min(max(limit, 1), 10)),
+        "addressdetails": "1",
+        "accept-language": "en",
+    }
+    url = _NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": _NOMINATIM_UA})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+
+    results = [r for r in (_normalize_nominatim_item(i) for i in raw) if r]
+
+    db.conn.execute(
+        "INSERT OR REPLACE INTO geocode_cache (query, results_json, fetched_at) "
+        "VALUES (?, ?, ?)",
+        (key, json.dumps(results),
+         datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            .isoformat(timespec="seconds")),
+    )
+    db.conn.commit()
+    return results[:limit], "nominatim"
+
+
 def country_name_to_code(name: str) -> Optional[str]:
     """Resolve a country name (English, common variants) to its ISO 3166-1
     alpha-2 code. Returns None if the name isn't in the mapping.

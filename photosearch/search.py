@@ -1067,16 +1067,47 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
     return [dict(r) for r in rows]
 
 
-def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[dict]:
-    """Search by place_name using case-insensitive LIKE matching.
+def _search_by_bbox(db: PhotoDB, south: float, north: float,
+                    west: float, east: float, limit: int = 100) -> list[dict]:
+    """Return photos whose GPS falls inside the given bounding box.
 
-    When the query matches a known country name or looks like an ISO
-    alpha-2 code, also match the ", CC" country slot at the end of
-    place_name. The offline reverse geocoder produces
-    "Locality, Admin1, CC" so a raw substring match on "France" only
-    catches "Île-de-France" and misses every other French region.
+    Used by `_search_by_location` as a fallback when a query doesn't
+    substring-match any place_name — the offline reverse-geocoder only
+    knows cities with population >1000, so photos at smaller places
+    (Point Reyes, Marinwood) get labeled with the nearest bigger town
+    and the substring match misses them. Nominatim's bbox puts them
+    back.
     """
-    from .geocode import country_name_to_code
+    rows = db.conn.execute(
+        """SELECT * FROM photos
+           WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL
+             AND gps_lat BETWEEN ? AND ?
+             AND gps_lon BETWEEN ? AND ?
+           ORDER BY date_taken
+           LIMIT ?""",
+        (south, north, west, east, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[dict]:
+    """Search by place_name using case-insensitive LIKE matching, with
+    two expansions on top of the raw substring:
+
+    1. **Country-code anchor.** When the query matches a known country
+       name or looks like an ISO alpha-2 code, also match the ", CC"
+       slot at the end of place_name. Otherwise "France" only catches
+       "Île-de-France" and misses every other French region because
+       the offline geocoder emits "Locality, Admin1, CC".
+
+    2. **Nominatim bbox fallback.** If the substring+code pass returns
+       nothing AND the query isn't a country name, resolve it via
+       Nominatim (cached) and search by the returned bounding box. This
+       catches small places that aren't in the GeoNames cities1000 set
+       (Point Reyes, Marinwood, Folsom Lake, Yosemite, etc.) and so
+       never appear in any photo's place_name.
+    """
+    from .geocode import country_name_to_code, forward_geocode
 
     name = location.strip()
     if not name:
@@ -1098,7 +1129,24 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
             LIMIT ?""",
         (*patterns, limit),
     ).fetchall()
-    return [dict(r) for r in rows]
+    results = [dict(r) for r in rows]
+
+    # Country-level queries: the code expansion already covers the
+    # entire country, and a Nominatim bbox for a whole country is huge
+    # and slow. Skip the fallback.
+    if code:
+        return results
+
+    if not results:
+        try:
+            candidates, _ = forward_geocode(db, name, limit=1)
+        except Exception:
+            candidates = []
+        if candidates and candidates[0].get("bbox"):
+            south, north, west, east = candidates[0]["bbox"]
+            results = _search_by_bbox(db, south, north, west, east, limit)
+
+    return results
 
 
 def search_combined(
