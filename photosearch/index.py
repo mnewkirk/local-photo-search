@@ -16,10 +16,14 @@ from .clip_embed import embed_image, embed_images_batch, embed_images_stream, un
 from .db import PhotoDB
 from .exif import extract_exif, find_raw_pair
 
-# File extensions we index
+# File extensions we index. HEIC is iPhone/iPad's default container
+# since iOS 11 — pillow-heif (registered in photosearch/__init__.py)
+# makes PIL open them transparently, so every downstream pass (EXIF,
+# CLIP, faces, thumbs) works without branching on format.
 JPEG_EXTENSIONS = {".jpg", ".jpeg"}
+HEIC_EXTENSIONS = {".heic", ".heif"}
 RAW_EXTENSIONS = {".arw"}
-SUPPORTED_EXTENSIONS = JPEG_EXTENSIONS | RAW_EXTENSIONS
+SUPPORTED_EXTENSIONS = JPEG_EXTENSIONS | HEIC_EXTENSIONS | RAW_EXTENSIONS
 
 
 def file_hash(filepath: str, chunk_size: int = 8192) -> str:

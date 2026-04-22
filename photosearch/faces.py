@@ -147,6 +147,28 @@ def _normed_embedding(face) -> Optional[np.ndarray]:
     return arr
 
 
+def _read_image_bgr(image_path: str):
+    """cv2.imread() wrapper that falls back to PIL for formats OpenCV
+    doesn't decode natively (notably HEIC/HEIF on iPhone photos).
+    Returns a BGR numpy array shaped like cv2's output, or None on
+    unreadable files.
+    """
+    import cv2
+    img = cv2.imread(image_path)
+    if img is not None:
+        return img
+    # Fallback: use PIL (which gained HEIC support via pillow-heif in
+    # photosearch/__init__.py). Convert RGB → BGR to match cv2's
+    # channel order.
+    try:
+        from PIL import Image
+        with Image.open(image_path) as im:
+            rgb = np.array(im.convert("RGB"))
+        return rgb[:, :, ::-1].copy()  # RGB → BGR, contiguous
+    except Exception:
+        return None
+
+
 def _scale_trbl(bbox: tuple, scale: float) -> tuple:
     """Scale a (top, right, bottom, left) bbox back to original image coordinates."""
     if scale == 1.0:
@@ -184,7 +206,7 @@ def detect_faces(image_path: str, use_cnn: bool = False) -> list[dict]:
     import time as _time
 
     try:
-        img_bgr = cv2.imread(image_path)
+        img_bgr = _read_image_bgr(image_path)
         if img_bgr is None:
             print(f"  Warning: could not read image: {image_path}")
             return []
@@ -245,7 +267,7 @@ def encode_reference_photo(image_path: str) -> Optional[list[float]]:
     import time as _time
 
     try:
-        img_bgr = cv2.imread(image_path)
+        img_bgr = _read_image_bgr(image_path)
         if img_bgr is None:
             print(f"  Warning: could not read image: {image_path}")
             return None

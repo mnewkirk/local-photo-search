@@ -10,8 +10,9 @@ pyyaml>=6.0
 
 # Image handling
 Pillow>=10.0
+pillow-heif>=0.18     # HEIC / HEIF support for iPhone/iPad photos
 opencv-python>=4.5    # Used by InsightFace for image processing
-exifread>=3.0         # EXIF extraction
+exifread>=3.0         # EXIF extraction (handles HEIC, JPEG, TIFF, ARW)
 
 # Embeddings & search
 open-clip-torch>=2.24
