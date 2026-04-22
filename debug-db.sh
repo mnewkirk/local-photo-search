@@ -24,6 +24,25 @@ have_local() {
     echo "No local DB at ${LOCAL_DB}. Run '$0 pull' first." >&2
     exit 1
   fi
+  # Detect truncated / zero-byte file from a crashed pull — SQLite's
+  # "unable to open database file" error otherwise leads here without
+  # an explanation.
+  local size
+  size=$(wc -c < "${LOCAL_DB}" 2>/dev/null || echo 0)
+  if [ "${size}" -lt 4096 ]; then
+    echo "Local DB at ${LOCAL_DB} is only ${size} bytes — likely a" >&2
+    echo "failed or partial pull. Re-run '$0 pull' to refresh." >&2
+    exit 1
+  fi
+  # SQLite opens in read-only mode when the WAL / SHM sidecars are
+  # absent. Leftover -wal / -shm from an earlier rsync-style pull can
+  # confuse sqlite3 if they're out of sync with the .db. Clean them
+  # up; the backup-streamed .db is self-contained.
+  for ext in wal shm; do
+    if [ -f "${LOCAL_DB}-${ext}" ]; then
+      rm -f "${LOCAL_DB}-${ext}"
+    fi
+  done
 }
 
 cmd="${1:-help}"
