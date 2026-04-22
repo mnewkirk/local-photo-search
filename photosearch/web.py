@@ -168,7 +168,8 @@ def api_search(
     person: Optional[str] = Query(None, description="Person name"),
     color: Optional[str] = Query(None, description="Color name or hex"),
     place: Optional[str] = Query(None, description="Place name"),
-    limit: int = Query(200, ge=1, le=2000),
+    limit: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
     min_score: float = Query(-0.25, description="Minimum CLIP score"),
     min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
     sort_quality: bool = Query(False, description="Sort by quality instead of relevance"),
@@ -194,13 +195,15 @@ def api_search(
     from .search import search_combined
 
     with _get_db() as db:
-        results = search_combined(
+        results, total = search_combined(
             db=db,
             query=q,
             person=person,
             color=color,
             place=place,
             limit=limit,
+            offset=offset,
+            with_total=True,
             min_score=min_score,
             min_quality=min_quality,
             sort_quality=sort_quality,
@@ -212,8 +215,8 @@ def api_search(
         )
 
         logger.info(
-            "SEARCH RESULTS  count=%d  top_scores=%s",
-            len(results),
+            "SEARCH RESULTS  count=%d  total=%d  offset=%d  top_scores=%s",
+            len(results), total, offset,
             [(r.get("filename"), round(r.get("score", 0), 4)) for r in results[:5]],
         )
 
@@ -256,7 +259,14 @@ def api_search(
 
             items.append(item)
 
-    return {"results": items, "count": len(items)}
+    return {
+        "results": items,
+        "count": len(items),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": (offset + len(items)) < total,
+    }
 
 
 @app.get("/api/photos/{photo_id}/thumbnail")

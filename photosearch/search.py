@@ -1189,7 +1189,9 @@ def search_combined(
     date_to: Optional[str] = None,
     location: Optional[str] = None,
     match_source: Optional[str] = None,
-) -> list[dict]:
+    offset: int = 0,
+    with_total: bool = False,
+):
     """Run multiple search types and merge results.
 
     When multiple criteria are given, returns the intersection
@@ -1304,11 +1306,17 @@ def search_combined(
         results = _search_by_location(db, location, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["id"]: r for r in results})
 
+    def _wrap(items: list[dict]):
+        """Honor the caller's with_total preference on early-return
+        paths. Pagination slicing happens here so these paths match
+        the main path's contract."""
+        page = items[offset:offset + limit] if limit else items[offset:]
+        return (page, len(items)) if with_total else page
+
     # Date as a primary search: if only date is specified (no other criteria)
     # No limit — return all photos in the range so the user sees every shot from that day.
     if date_from and not result_sets and min_quality is None:
-        results = _search_by_date(db, date_from, date_to or date_from, limit=0)
-        return results
+        return _wrap(_search_by_date(db, date_from, date_to or date_from, limit=0))
 
     # Quality-only search: if no other criteria given but min_quality is set,
     # return the highest-quality photos in the collection.
@@ -1316,17 +1324,16 @@ def search_combined(
         rows = db.conn.execute(
             """SELECT * FROM photos
                WHERE aesthetic_score IS NOT NULL AND aesthetic_score >= ?
-               ORDER BY aesthetic_score DESC
-               LIMIT ?""",
-            (min_quality, limit),
+               ORDER BY aesthetic_score DESC""",
+            (min_quality,),
         ).fetchall()
         results = [dict(r) for r in rows]
         if date_from:
             results = _filter_by_date(results, date_from, date_to or date_from)
-        return results
+        return _wrap(results)
 
     if not result_sets:
-        return []
+        return _wrap([])
 
     if len(result_sets) == 1:
         merged = _dedupe_by_hash(list(result_sets[0].values()))
@@ -1358,7 +1365,11 @@ def search_combined(
             reverse=True,
         )
 
-    return merged[:limit]
+    total = len(merged)
+    page = merged[offset:offset + limit]
+    if with_total:
+        return page, total
+    return page
 
 
 def make_results_subdir(base_dir: str, query_parts: dict) -> str:

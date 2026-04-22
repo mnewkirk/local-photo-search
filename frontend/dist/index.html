@@ -611,8 +611,15 @@
       const [dateFrom, setDateFrom] = useState(initParams.date_from);
       const [dateTo, setDateTo] = useState(initParams.date_to);
       const [results, setResults] = useState(null);
+      const [totalResults, setTotalResults] = useState(0);
+      const [hasMore, setHasMore] = useState(false);
+      const [loadingMore, setLoadingMore] = useState(false);
       const [sortBy, setSortBy] = useState('relevance');
       const [loading, setLoading] = useState(false);
+      // Photos per page. Bumped from 200 to 1000 after user reported
+      // that "Calvin in Lucas Valley" (5,946 matches) was capped at the
+      // old limit. "Load more" fetches subsequent pages.
+      const PAGE_SIZE = 1000;
       const [selectedPhoto, setSelectedPhoto] = useState(null);
       const [photoDetail, setPhotoDetail] = useState(null);
       const [stats, setStats] = useState(null);
@@ -769,15 +776,13 @@
         if (inputRef.current) inputRef.current.focus();
       }, []);
 
-      const doSearch = useCallback((ev) => {
-        if (ev) ev.preventDefault();
+      // Build the common search-param set used by both first-page fetch
+      // and "Load more" pagination. Returns URLSearchParams or null when
+      // the user hasn't supplied any criteria.
+      const buildSearchParams = useCallback(() => {
         const mqVal = minQuality ? parseFloat(minQuality) : null;
-        if (!query && !personFilter && !colorFilter && !locationFilter && !dateFrom && !dateTo && mqVal == null && !matchSource) return;
-        setLoading(true);
-        setResults(null);
-        setExpandedStacks(new Set());
-        setStackMembers({});
-
+        if (!query && !personFilter && !colorFilter && !locationFilter
+            && !dateFrom && !dateTo && mqVal == null && !matchSource) return null;
         const params = new URLSearchParams();
         if (query) params.set('q', query);
         if (personFilter) params.set('person', personFilter);
@@ -788,6 +793,20 @@
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
         if (sortQuality) params.set('sort_quality', 'true');
         if (matchSource) params.set('match_source', matchSource);
+        return params;
+      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo, matchSource]);
+
+      const doSearch = useCallback((ev) => {
+        if (ev) ev.preventDefault();
+        const params = buildSearchParams();
+        if (!params) return;
+
+        setLoading(true);
+        setResults(null);
+        setTotalResults(0);
+        setHasMore(false);
+        setExpandedStacks(new Set());
+        setStackMembers({});
 
         // Update browser URL without reload
         const urlParams = new URLSearchParams(params);
@@ -795,21 +814,51 @@
         window.history.pushState(null, '', newUrl);
 
         // Date-only searches return all photos (no limit needed).
-        // For semantic/other searches, use a generous limit.
-        const isDateOnly = dateFrom && !query && !personFilter && !colorFilter && !locationFilter && mqVal == null;
-        if (!isDateOnly) params.set('limit', '200');
+        const isDateOnly = dateFrom && !query && !personFilter && !colorFilter
+                           && !locationFilter && !minQuality;
+        if (!isDateOnly) {
+          params.set('limit', String(PAGE_SIZE));
+          params.set('offset', '0');
+        }
 
         fetch(API + '/api/search?' + params.toString())
           .then(r => r.json())
           .then(data => {
             setResults(data.results || []);
+            setTotalResults(data.total || (data.results || []).length);
+            setHasMore(!!data.has_more);
             setLoading(false);
           })
           .catch(() => {
             setResults([]);
+            setTotalResults(0);
+            setHasMore(false);
             setLoading(false);
           });
-      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo, matchSource]);
+      }, [buildSearchParams, dateFrom, query, personFilter, colorFilter, locationFilter, minQuality]);
+
+      // Fetch the next page and append to existing results. Reuses the
+      // same search params but bumps offset to results.length.
+      const loadMore = useCallback(() => {
+        if (loadingMore || !hasMore || !results) return;
+        const params = buildSearchParams();
+        if (!params) return;
+        params.set('limit', String(PAGE_SIZE));
+        params.set('offset', String(results.length));
+        setLoadingMore(true);
+        fetch(API + '/api/search?' + params.toString())
+          .then(r => r.json())
+          .then(data => {
+            const newItems = data.results || [];
+            setResults(prev => (prev || []).concat(newItems));
+            setTotalResults(data.total || 0);
+            setHasMore(!!data.has_more);
+            setLoadingMore(false);
+          })
+          .catch(() => {
+            setLoadingMore(false);
+          });
+      }, [buildSearchParams, loadingMore, hasMore, results]);
 
       // Auto-search on mount if URL has params
       useEffect(() => {
@@ -1079,7 +1128,8 @@
             e(PhotoGrid, { results: PS.applySortOrder(results, sortBy), sortBy, setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc'],
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
-                           expandedStacks, stackMembers, toggleStack, query }),
+                           expandedStacks, stackMembers, toggleStack, query,
+                           totalResults, hasMore, loadingMore, onLoadMore: loadMore }),
         ),
 
         // Modal
@@ -1138,7 +1188,7 @@
       return _FILENAME_RE.test(stem);
     }
 
-    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query }) {
+    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query, totalResults, hasMore, loadingMore, onLoadMore }) {
       // Build display list: filter out non-top stack members, insert expanded members after their top photo
       // Exception: filename searches always show the matched photo regardless of stack position
       const isFilenameSearch = useMemo(() => looksLikeFilename(query), [query]);
@@ -1171,11 +1221,18 @@
 
       const visibleCount = displayItems.filter(d => d.type === 'photo').length;
       const stackCount = results.filter(r => r.stack_id && r.stack_count > 1 && r.stack_is_top).length;
+      const loadedCount = results.length;
+      // totalResults is the server-side merged count (pre-[offset:limit]
+      // slice); loadedCount is how many rows the client has pulled so
+      // far across pages. When they diverge, show both.
+      const showTotal = totalResults && totalResults > loadedCount;
 
       return e('div', null,
         e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
-          e('span', null, visibleCount + ' result' + (visibleCount !== 1 ? 's' : '') +
-            (visibleCount < results.length ? ' (of ' + results.length + ')' : '') +
+          e('span', null, visibleCount.toLocaleString() + ' result' + (visibleCount !== 1 ? 's' : '') +
+            (visibleCount < loadedCount ? ' (of ' + loadedCount.toLocaleString() + ' loaded)' : '') +
+            (showTotal ? ' · ' + loadedCount.toLocaleString() + ' of '
+                         + totalResults.toLocaleString() + ' total' : '') +
             (stackCount > 0 ? ' (' + stackCount + ' stacked)' : '')),
           sortBy && setSortBy && e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: sortOptions }),
           multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
@@ -1199,6 +1256,24 @@
               },
             });
           }),
+        ),
+        hasMore && e('div', {
+          style: {
+            textAlign: 'center',
+            margin: '24px 0 12px',
+          },
+        },
+          e('button', {
+            type: 'button',
+            className: 'btn',
+            disabled: loadingMore,
+            onClick: onLoadMore,
+            style: { padding: '8px 20px', fontSize: 14 },
+          },
+            loadingMore
+              ? 'Loading…'
+              : ('Load ' + Math.min(1000, totalResults - loadedCount).toLocaleString()
+                 + ' more (' + (totalResults - loadedCount).toLocaleString() + ' remaining)')),
         ),
       );
     }
