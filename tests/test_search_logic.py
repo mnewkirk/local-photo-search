@@ -565,3 +565,127 @@ class TestSearchByLocationExpandsCountries:
             results = _search_by_location(pdb, "San Rafael")
             filenames = sorted(r["filename"] for r in results)
         assert filenames == ["lv.jpg", "mw.jpg", "sr.jpg"]
+
+
+# =========================================================================
+# Sort-before-slice (quick-wins bundle commit 1)
+# =========================================================================
+
+class TestSortBeforeSlice:
+    """User reported: '?q=Calvin with Newest first is definitely not
+    newest first' because search_by_person's SQL ORDER BY date_taken
+    LIMIT put NULLs + oldest dates first. Backend now sorts `merged`
+    AFTER intersection, BEFORE pagination.
+    """
+
+    def test_date_desc_puts_newest_first(self, tmp_db_path):
+        from photosearch.db import PhotoDB
+        from photosearch.search import search_combined
+
+        with PhotoDB(tmp_db_path) as pdb:
+            person_id = pdb.add_person("Calvin")
+            # Seed three photos across years. Add in oldest-first order
+            # to mimic SQL ORDER BY ASC behaviour.
+            for date in ("2015-01-01T10:00:00",
+                         "2020-06-15T12:00:00",
+                         "2026-04-01T09:00:00"):
+                pid = pdb.add_photo(filepath=f"/{date}.jpg",
+                                    filename=f"{date}.jpg",
+                                    date_taken=date)
+                import numpy as np
+                emb = np.random.rand(512).astype(np.float32).tolist()
+                fid = pdb.add_face(pid, (10, 10, 50, 50), emb)
+                pdb.assign_face_to_person(fid, person_id, "manual")
+            pdb.conn.commit()
+
+            results = search_combined(pdb, person="Calvin", sort="date_desc",
+                                      limit=10)
+        assert [r["filename"] for r in results] == [
+            "2026-04-01T09:00:00.jpg",
+            "2020-06-15T12:00:00.jpg",
+            "2015-01-01T10:00:00.jpg",
+        ]
+
+    def test_date_desc_pushes_nulls_to_tail(self, tmp_db_path):
+        """Photo with NULL date_taken must not surface at the TOP of a
+        newest-first result — the original bug was exactly this, because
+        SQLite's ORDER BY date_taken ASC sorts NULLs first."""
+        from photosearch.db import PhotoDB
+        from photosearch.search import search_combined
+
+        with PhotoDB(tmp_db_path) as pdb:
+            person_id = pdb.add_person("Calvin")
+            import numpy as np
+
+            def add(fn, date):
+                pid = pdb.add_photo(filepath=f"/{fn}", filename=fn,
+                                    date_taken=date)
+                emb = np.random.rand(512).astype(np.float32).tolist()
+                fid = pdb.add_face(pid, (10, 10, 50, 50), emb)
+                pdb.assign_face_to_person(fid, person_id, "manual")
+
+            add("nodate.jpg", None)
+            add("old.jpg", "2015-01-01T10:00:00")
+            add("new.jpg", "2026-04-01T09:00:00")
+            pdb.conn.commit()
+
+            results = search_combined(pdb, person="Calvin", sort="date_desc",
+                                      limit=10)
+        assert [r["filename"] for r in results] == [
+            "new.jpg", "old.jpg", "nodate.jpg"
+        ]
+
+    def test_pagination_preserves_sort(self, tmp_db_path):
+        """Page 1 of DESC must be truly newest, not newest-of-oldest-N."""
+        from photosearch.db import PhotoDB
+        from photosearch.search import search_combined
+
+        with PhotoDB(tmp_db_path) as pdb:
+            person_id = pdb.add_person("Calvin")
+            import numpy as np
+            # 30 photos across 2015-2026; one per year x 3 months.
+            for i, (year, month) in enumerate([(2015 + i // 3, 1 + (i % 3) * 4)
+                                                for i in range(30)]):
+                date = f"{year:04d}-{month:02d}-01T10:00:00"
+                pid = pdb.add_photo(filepath=f"/p{i}.jpg", filename=f"p{i}.jpg",
+                                    date_taken=date)
+                emb = np.random.rand(512).astype(np.float32).tolist()
+                fid = pdb.add_face(pid, (10, 10, 50, 50), emb)
+                pdb.assign_face_to_person(fid, person_id, "manual")
+            pdb.conn.commit()
+
+            # First page, newest first.
+            page1 = search_combined(pdb, person="Calvin", sort="date_desc",
+                                    limit=5, offset=0)
+            # Second page.
+            page2 = search_combined(pdb, person="Calvin", sort="date_desc",
+                                    limit=5, offset=5)
+        # page1 dates strictly >= page2 dates
+        assert page1[-1]["date_taken"] >= page2[0]["date_taken"]
+        # First photo overall is the most recent seeded.
+        assert page1[0]["date_taken"].startswith("2024")  # year 2015 + 29//3 = 2024
+
+    def test_sort_asc_mirrors_desc(self, tmp_db_path):
+        """date_asc should produce the exact reverse of date_desc
+        (excluding NULLs which are always at the tail)."""
+        from photosearch.db import PhotoDB
+        from photosearch.search import search_combined
+
+        with PhotoDB(tmp_db_path) as pdb:
+            person_id = pdb.add_person("Alice")
+            import numpy as np
+            for date in ("2019-01-01T10:00:00",
+                         "2022-01-01T10:00:00",
+                         "2025-01-01T10:00:00"):
+                pid = pdb.add_photo(filepath=f"/{date}.jpg",
+                                    filename=f"{date}.jpg",
+                                    date_taken=date)
+                emb = np.random.rand(512).astype(np.float32).tolist()
+                fid = pdb.add_face(pid, (10, 10, 50, 50), emb)
+                pdb.assign_face_to_person(fid, person_id, "manual")
+            pdb.conn.commit()
+
+            desc = search_combined(pdb, person="Alice", sort="date_desc")
+            asc = search_combined(pdb, person="Alice", sort="date_asc")
+        assert [r["filename"] for r in desc] == list(reversed(
+            [r["filename"] for r in asc]))

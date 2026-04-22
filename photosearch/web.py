@@ -172,7 +172,8 @@ def api_search(
     offset: int = Query(0, ge=0),
     min_score: float = Query(-0.25, description="Minimum CLIP score"),
     min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
-    sort_quality: bool = Query(False, description="Sort by quality instead of relevance"),
+    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, relevance"),
+    sort_quality: bool = Query(False, description="Legacy: equivalent to sort=quality_desc"),
     tag_match: str = Query("both", description="Tag matching mode: dict, tags, or both"),
     date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
@@ -194,6 +195,12 @@ def api_search(
 
     from .search import search_combined
 
+    # Validate / default the sort param. Unknown values fall back to
+    # date_desc so broken clients still get sensible pages.
+    from .search import SORT_MODES
+    if sort not in SORT_MODES:
+        sort = "date_desc"
+
     with _get_db() as db:
         results, total = search_combined(
             db=db,
@@ -204,6 +211,7 @@ def api_search(
             limit=limit,
             offset=offset,
             with_total=True,
+            sort=sort,
             min_score=min_score,
             min_quality=min_quality,
             sort_quality=sort_quality,

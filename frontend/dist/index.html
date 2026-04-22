@@ -614,7 +614,12 @@
       const [totalResults, setTotalResults] = useState(0);
       const [hasMore, setHasMore] = useState(false);
       const [loadingMore, setLoadingMore] = useState(false);
-      const [sortBy, setSortBy] = useState('relevance');
+      // Default sort: newest first. Before the sort-before-slice fix,
+      // 'relevance' default combined with backend SQL `ORDER BY
+      // date_taken ASC LIMIT` produced "Newest first = newest of the
+      // oldest 1000" — misleading. Backend now honors `sort=` param;
+      // flipped the default to match what users expect.
+      const [sortBy, setSortBy] = useState('date_desc');
       const [loading, setLoading] = useState(false);
       // Photos per page. Bumped from 200 to 1000 after user reported
       // that "Calvin in Lucas Valley" (5,946 matches) was capped at the
@@ -793,8 +798,9 @@
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
         if (sortQuality) params.set('sort_quality', 'true');
         if (matchSource) params.set('match_source', matchSource);
+        if (sortBy) params.set('sort', sortBy);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo, matchSource]);
+      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo, matchSource, sortBy]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -869,6 +875,17 @@
           doSearch();
         }
       }, [doSearch]);
+
+      // Re-fetch whenever the sort dropdown changes (but not on first
+      // mount — the auto-search above handles the initial load). Sort
+      // MUST re-fetch now that backend paginates sorted results;
+      // client-side re-sort would only reshuffle the first 1000 rows.
+      useEffect(() => {
+        if (!hasAutoSearched.current) return;
+        if (results === null) return;
+        doSearch();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [sortBy]);
 
       const [selectedIndex, setSelectedIndex] = useState(-1);
 

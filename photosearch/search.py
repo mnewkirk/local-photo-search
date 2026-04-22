@@ -1067,6 +1067,37 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
     return [dict(r) for r in rows]
 
 
+# Allowed values for search_combined's `sort` param. Kept as a module
+# constant so callers (web.py, cli.py) and tests reference one list.
+SORT_MODES = ("date_desc", "date_asc", "quality_desc", "relevance")
+
+
+def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
+    """Sort `merged` in place-ish (returns a new list) by the requested
+    mode. NULL date_taken rows land at the TAIL regardless of direction
+    so "Newest first" never surfaces undated photos at the top.
+
+    Relevance mode preserves the caller-supplied order (which is the
+    first result_set's insertion order today, and will be RRF score
+    once that lands). Callers who know they're in CLIP-semantic or
+    RRF-ranked mode should pass sort='relevance'; everyone else should
+    pass an explicit date/quality mode.
+    """
+    if sort == "relevance":
+        return merged
+    if sort == "quality_desc":
+        return sorted(
+            merged,
+            key=lambda r: (r.get("aesthetic_score") or 0),
+            reverse=True,
+        )
+    # Date sorts: split dated / undated so NULLs land at the tail.
+    dated = [r for r in merged if r.get("date_taken")]
+    undated = [r for r in merged if not r.get("date_taken")]
+    dated.sort(key=lambda r: r["date_taken"], reverse=(sort == "date_desc"))
+    return dated + undated
+
+
 # Nominatim's bbox for a named place hugs its official admin boundary
 # (for a city: the city limits). Users typing "San Rafael" usually mean
 # "the San Rafael area" — including the adjacent unincorporated
@@ -1210,6 +1241,7 @@ def search_combined(
     match_source: Optional[str] = None,
     offset: int = 0,
     with_total: bool = False,
+    sort: str = "date_desc",
 ):
     """Run multiple search types and merge results.
 
@@ -1326,9 +1358,10 @@ def search_combined(
         result_sets.append({r["id"]: r for r in results})
 
     def _wrap(items: list[dict]):
-        """Honor the caller's with_total preference on early-return
-        paths. Pagination slicing happens here so these paths match
-        the main path's contract."""
+        """Honor the caller's with_total + sort preferences on early-
+        return paths. Pagination slicing happens here so these paths
+        match the main path's contract."""
+        items = _apply_sort(items, sort)
         page = items[offset:offset + limit] if limit else items[offset:]
         return (page, len(items)) if with_total else page
 
@@ -1377,12 +1410,10 @@ def search_combined(
             if r.get("aesthetic_score") is not None and r["aesthetic_score"] >= min_quality
         ]
 
-    # Optionally re-sort by aesthetic quality instead of relevance
-    if sort_quality:
-        merged.sort(
-            key=lambda r: r.get("aesthetic_score") or 0,
-            reverse=True,
-        )
+    # Back-compat: sort_quality=True overrides sort to quality_desc.
+    # Prefer the explicit `sort` param in new callers.
+    effective_sort = "quality_desc" if sort_quality else sort
+    merged = _apply_sort(merged, effective_sort)
 
     total = len(merged)
     page = merged[offset:offset + limit]
