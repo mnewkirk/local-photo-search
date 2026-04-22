@@ -55,7 +55,7 @@ local-photo-search/
 ├── references.yml          # Face reference config (person → photos)
 ├── GOOGLE_PHOTOS_SETUP.md  # Step-by-step Google Photos OAuth setup
 ├── photosearch/
-│   ├── db.py               # PhotoDB class, schema v17, all queries
+│   ├── db.py               # PhotoDB class, schema v20, all queries
 │   ├── infer_location.py   # M19 — temporal GPS inference (haversine, cascade)
 │   ├── index.py            # index_directory() + _index_collection() — indexing pipeline
 │   ├── search.py           # search_combined() + all search types
@@ -93,7 +93,7 @@ local-photo-search/
 
 ---
 
-## Database Schema (v17)
+## Database Schema (v20)
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 

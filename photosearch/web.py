@@ -1301,11 +1301,14 @@ def api_split_cluster(cluster_id: int, data: dict = None):
     """
     from .faces import (
         split_cluster, SPLIT_DEFAULT_EPS, SPLIT_DEFAULT_MIN_SAMPLES,
+        CLUSTER_MIN_DET_SCORE, CLUSTER_MIN_BBOX_EDGE,
     )
 
     data = data or {}
     eps = float(data.get("eps", SPLIT_DEFAULT_EPS))
     min_samples = int(data.get("min_samples", SPLIT_DEFAULT_MIN_SAMPLES))
+    min_det_score = float(data.get("min_det_score", CLUSTER_MIN_DET_SCORE))
+    min_bbox_edge = int(data.get("min_bbox_edge", CLUSTER_MIN_BBOX_EDGE))
     dry_run = bool(data.get("dry_run", False))
 
     if eps <= 0 or eps >= 2.0:
@@ -1318,6 +1321,7 @@ def api_split_cluster(cluster_id: int, data: dict = None):
             summary = split_cluster(
                 db, cluster_id=cluster_id,
                 eps=eps, min_samples=min_samples, dry_run=dry_run,
+                min_det_score=min_det_score, min_bbox_edge=min_bbox_edge,
             )
         except ValueError as err:
             raise HTTPException(400, str(err))
@@ -1330,10 +1334,13 @@ def api_split_cluster(cluster_id: int, data: dict = None):
             "cluster_id": cluster_id,
             "eps": eps,
             "min_samples": min_samples,
+            "min_det_score": min_det_score,
+            "min_bbox_edge": min_bbox_edge,
             "dry_run": dry_run,
             "face_count": summary["face_count"],
             "sub_cluster_count": summary["sub_cluster_count"],
             "noise_count": summary["noise_count"],
+            "filtered_out_count": summary.get("filtered_out_count", 0),
             "histogram": summary["histogram"],
             "new_cluster_ids": summary["new_cluster_ids"],
             "elapsed_sec": summary.get("elapsed_sec"),

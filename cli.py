@@ -567,10 +567,17 @@ def list_persons(db):
 @click.option("--session-window", default=None, type=float,
               help="Max minutes between two noise faces to be considered the "
                    "same session. Default: 60.")
+@click.option("--min-det-score", default=None, type=float,
+              help="Exclude faces with InsightFace detection confidence below this "
+                   "threshold from clustering. NULL (pre-v20) rows are grandfathered. "
+                   "Default: 0.65.")
+@click.option("--min-bbox-edge", default=None, type=int,
+              help="Exclude faces whose shorter bbox edge (pixels) is below this "
+                   "threshold from clustering. Default: 60.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Compute clusters and print histogram without writing to the DB.")
 def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
-                    session_window, dry_run):
+                    session_window, min_det_score, min_bbox_edge, dry_run):
     """Rebuild all unknown face clusters from scratch using global DBSCAN.
 
     Loads every face with person_id IS NULL, runs DBSCAN over the ArcFace
@@ -592,6 +599,7 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
     from photosearch.faces import (
         recluster_unknown_faces, RECLUSTER_EPS, RECLUSTER_MIN_SAMPLES,
         SESSION_STACK_EPS, SESSION_STACK_WINDOW_MINUTES,
+        CLUSTER_MIN_DET_SCORE, CLUSTER_MIN_BBOX_EDGE,
     )
 
     effective_eps = eps if eps is not None else RECLUSTER_EPS
@@ -600,12 +608,15 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
     effective_session_window = (
         session_window if session_window is not None else SESSION_STACK_WINDOW_MINUTES
     )
+    effective_min_det = min_det_score if min_det_score is not None else CLUSTER_MIN_DET_SCORE
+    effective_min_edge = min_bbox_edge if min_bbox_edge is not None else CLUSTER_MIN_BBOX_EDGE
 
     with PhotoDB(db) as photo_db:
         click.echo(
             f"Reclustering unknown faces (eps={effective_eps}, "
             f"min_samples={effective_min}, "
             f"session_stacking={'off' if no_session_stacking else 'on'}, "
+            f"min_det_score={effective_min_det}, min_bbox_edge={effective_min_edge}, "
             f"dry_run={dry_run})..."
         )
         summary = recluster_unknown_faces(
@@ -613,6 +624,8 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
             session_stacking=(not no_session_stacking),
             session_eps=effective_session_eps,
             session_window_minutes=effective_session_window,
+            min_det_score=effective_min_det,
+            min_bbox_edge=effective_min_edge,
         )
         click.echo(f"  Faces processed: {summary['face_count']}")
         click.echo(f"  Clusters formed: {summary['cluster_count']}")
@@ -660,9 +673,16 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 @click.option("--min-samples", default=None, type=int,
               help="DBSCAN min_samples. Default: 2 (pairs count, since we're "
                    "splitting within a single already-linked group).")
+@click.option("--min-det-score", default=None, type=float,
+              help="Exclude faces with InsightFace detection confidence below "
+                   "this from the split; they drop to cluster_id=NULL. NULL "
+                   "(pre-v20) rows are grandfathered. Default: 0.65.")
+@click.option("--min-bbox-edge", default=None, type=int,
+              help="Exclude faces whose shorter bbox edge (pixels) is below "
+                   "this threshold. Default: 60.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Preview the split without writing to the DB.")
-def split_cluster_cmd(cluster_id, db, eps, min_samples, dry_run):
+def split_cluster_cmd(cluster_id, db, eps, min_samples, min_det_score, min_bbox_edge, dry_run):
     """Re-run DBSCAN on one unknown cluster with tighter params.
 
     Use this on "attractor" clusters that lumped multiple people together
@@ -678,20 +698,26 @@ def split_cluster_cmd(cluster_id, db, eps, min_samples, dry_run):
     """
     from photosearch.faces import (
         split_cluster, SPLIT_DEFAULT_EPS, SPLIT_DEFAULT_MIN_SAMPLES,
+        CLUSTER_MIN_DET_SCORE, CLUSTER_MIN_BBOX_EDGE,
     )
 
     eff_eps = eps if eps is not None else SPLIT_DEFAULT_EPS
     eff_min = min_samples if min_samples is not None else SPLIT_DEFAULT_MIN_SAMPLES
+    eff_min_det = min_det_score if min_det_score is not None else CLUSTER_MIN_DET_SCORE
+    eff_min_edge = min_bbox_edge if min_bbox_edge is not None else CLUSTER_MIN_BBOX_EDGE
 
     with PhotoDB(db) as photo_db:
         click.echo(
             f"Splitting cluster #{cluster_id} "
-            f"(eps={eff_eps}, min_samples={eff_min}, dry_run={dry_run})..."
+            f"(eps={eff_eps}, min_samples={eff_min}, "
+            f"min_det_score={eff_min_det}, min_bbox_edge={eff_min_edge}, "
+            f"dry_run={dry_run})..."
         )
         try:
             summary = split_cluster(
                 photo_db, cluster_id=cluster_id,
                 eps=eff_eps, min_samples=eff_min, dry_run=dry_run,
+                min_det_score=eff_min_det, min_bbox_edge=eff_min_edge,
             )
         except ValueError as err:
             raise click.ClickException(str(err))
@@ -699,6 +725,8 @@ def split_cluster_cmd(cluster_id, db, eps, min_samples, dry_run):
         click.echo(f"  Faces in cluster:   {summary['face_count']}")
         click.echo(f"  Sub-clusters formed: {summary['sub_cluster_count']}")
         click.echo(f"  Noise (→ NULL):      {summary['noise_count']}")
+        if summary.get("filtered_out_count"):
+            click.echo(f"  Filtered out (low quality): {summary['filtered_out_count']}")
         if summary["histogram"]:
             sizes = sorted(summary["histogram"].items())
             click.echo("  New cluster sizes:")

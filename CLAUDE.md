@@ -22,7 +22,7 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 17. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 20. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, schema_info.
 
@@ -305,6 +305,7 @@ Grouping is an on-demand step:
 $DC run --rm photosearch recluster-faces \
   [--eps 0.55] [--min-samples 3] \
   [--no-session-stacking] [--session-eps 0.50] [--session-window 60] \
+  [--min-det-score 0.65] [--min-bbox-edge 60] \
   [--dry-run]
 ```
 
@@ -318,6 +319,44 @@ same-person-same-event groups that min_samples=3 had discarded. Pass
 cleared in the same transaction (IDs are fully renumbered). Loader uses
 `np.frombuffer` over concatenated BLOBs — 120k faces decode in seconds on
 an N100; DBSCAN at 512-dim with ball_tree is the dominant cost after that.
+
+### Quality pre-filter (schema v20)
+
+`faces.det_score` stores InsightFace's detection confidence `[0, 1]`,
+stamped on every new face from `detect_faces()` onward. `recluster-faces`
+and `split-cluster` both filter out low-quality detections via a SQL
+WHERE clause before DBSCAN runs:
+
+```sql
+WHERE (det_score IS NULL OR det_score >= :min_det_score)
+  AND MIN(bbox_bottom - bbox_top, bbox_right - bbox_left) >= :min_bbox_edge
+```
+
+Defaults (tunable via `--min-det-score` / `--min-bbox-edge` or
+`CLUSTER_MIN_DET_SCORE` / `CLUSTER_MIN_BBOX_EDGE` in `faces.py`):
+
+- `min_det_score=0.65` — InsightFace det_score below this is usually a
+  misfire (off-angle head, partial face, false positive).
+- `min_bbox_edge=60` — shorter bbox edge in pixels. Smaller faces
+  produce noisier encodings that cluster together by "junkness"
+  rather than identity.
+
+**NULL is grandfathered** — faces indexed before v20 have
+`det_score IS NULL` and pass the filter unconditionally, so libraries
+upgrading in place keep clustering as before. As users re-index, new
+rows get real det_score values and the filter tightens. No forced
+backfill.
+
+`split-cluster` applies the same filter: faces below threshold drop to
+`cluster_id=NULL` (not left in the source cluster) so a split leaves no
+junk residue. The summary includes `filtered_out_count` alongside
+`noise_count`.
+
+Evidence motivating this filter: a 434-face cluster on the NAS split
+cleanly at `eps=0.50` into one 75-face real-person sub-cluster plus
+182 NULL'd noise faces. Low-quality faces were the primary attractor
+cause; filtering them pre-DBSCAN prevents the attractor from forming
+in the first place.
 
 ## Splitting attractor clusters (M18)
 

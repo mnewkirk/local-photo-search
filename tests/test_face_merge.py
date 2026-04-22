@@ -325,3 +325,168 @@ def test_recluster_clears_stale_cluster_id_on_person_assigned_faces(db):
         "recluster must clear cluster_id on person-assigned faces so the new "
         "unknown numbering can't collide with stale ids"
     )
+
+
+# ---------------------------------------------------------------------------
+# Quality pre-filter — low-confidence detections and small-bbox faces should
+# be excluded from clustering so junk-region attractors don't form. NULL
+# det_score (pre-v20 rows) is grandfathered so existing libraries keep
+# clustering as before until they're re-indexed.
+# ---------------------------------------------------------------------------
+
+def _seed_similar_unknown_faces(db, photo_id, count, *, det_score, bbox_edge, seed_base=7000):
+    """Seed `count` unknown faces with near-identical encodings + given quality."""
+    ids = []
+    for i in range(count):
+        enc = _perturb(_base(seed_base), i + 1, jitter=0.01).tolist()
+        bbox = (100, 100 + bbox_edge, 100 + bbox_edge, 100)  # (top, right, bottom, left)
+        fid = db.add_face(photo_id, bbox, enc, det_score=det_score)
+        ids.append(fid)
+    db.conn.commit()
+    return ids
+
+
+def test_recluster_excludes_faces_below_min_det_score(db):
+    from photosearch.faces import recluster_unknown_faces
+
+    photo_id = db._test_photo_ids["DSC04878.JPG"]
+    low_ids = _seed_similar_unknown_faces(
+        db, photo_id, count=4, det_score=0.30, bbox_edge=120,
+    )
+
+    recluster_unknown_faces(
+        db, session_stacking=False, min_det_score=0.65, min_bbox_edge=60,
+    )
+
+    cluster_ids = [
+        db.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (fid,)).fetchone()["cluster_id"]
+        for fid in low_ids
+    ]
+    assert all(c is None for c in cluster_ids), (
+        "faces below min_det_score must not be clustered"
+    )
+
+
+def test_recluster_excludes_faces_below_min_bbox_edge(db):
+    from photosearch.faces import recluster_unknown_faces
+
+    photo_id = db._test_photo_ids["DSC04878.JPG"]
+    small_ids = _seed_similar_unknown_faces(
+        db, photo_id, count=4, det_score=0.95, bbox_edge=30,
+    )
+
+    recluster_unknown_faces(
+        db, session_stacking=False, min_det_score=0.65, min_bbox_edge=60,
+    )
+
+    cluster_ids = [
+        db.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (fid,)).fetchone()["cluster_id"]
+        for fid in small_ids
+    ]
+    assert all(c is None for c in cluster_ids), (
+        "faces below min_bbox_edge must not be clustered"
+    )
+
+
+def test_recluster_grandfathers_null_det_score(db):
+    """Pre-v20 faces have det_score=NULL. The filter must let them through so
+    existing libraries keep clustering until they're re-indexed."""
+    from photosearch.faces import recluster_unknown_faces
+
+    photo_id = db._test_photo_ids["DSC04878.JPG"]
+    null_ids = _seed_similar_unknown_faces(
+        db, photo_id, count=4, det_score=None, bbox_edge=120,
+    )
+
+    recluster_unknown_faces(
+        db, session_stacking=False, min_det_score=0.65, min_bbox_edge=60,
+    )
+
+    cluster_ids = [
+        db.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (fid,)).fetchone()["cluster_id"]
+        for fid in null_ids
+    ]
+    assert all(c is not None for c in cluster_ids), (
+        "NULL det_score must be grandfathered through the filter"
+    )
+    assert len(set(cluster_ids)) == 1, "grandfathered faces cluster together"
+
+
+# ---------------------------------------------------------------------------
+# Quality pre-filter applied to split_cluster as well — an attractor cluster
+# that's a mix of good + junk faces should split cleanly, leaving junk with
+# cluster_id=NULL rather than lingering in the source cluster.
+# ---------------------------------------------------------------------------
+
+def test_split_cluster_excludes_low_quality_faces(db):
+    from photosearch.faces import split_cluster
+
+    photo_id = db._test_photo_ids["DSC04878.JPG"]
+    # Put 3 good + 3 junk faces all into cluster_id=500 — the setup for an
+    # attractor-shaped cluster the user wants to break apart.
+    good_ids = []
+    junk_ids = []
+    for i in range(3):
+        enc = _perturb(_base(3000), i + 1, jitter=0.01).tolist()
+        good_ids.append(
+            db.add_face(photo_id, (100, 220, 220, 100), enc, det_score=0.95)
+        )
+    for i in range(3):
+        enc = _perturb(_base(3000), i + 10, jitter=0.01).tolist()
+        junk_ids.append(
+            db.add_face(photo_id, (10, 40, 40, 10), enc, det_score=0.30)
+        )
+    db.conn.executemany(
+        "UPDATE faces SET cluster_id=500 WHERE id=?",
+        [(fid,) for fid in good_ids + junk_ids],
+    )
+    db.conn.commit()
+
+    split_cluster(
+        db, cluster_id=500, dry_run=False,
+        min_det_score=0.65, min_bbox_edge=60,
+    )
+
+    good_clusters = {
+        db.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (fid,)).fetchone()["cluster_id"]
+        for fid in good_ids
+    }
+    junk_clusters = {
+        db.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (fid,)).fetchone()["cluster_id"]
+        for fid in junk_ids
+    }
+
+    assert good_clusters != {500}, "good faces should move to a new cluster"
+    assert None not in good_clusters, "good faces should be clustered, not noise"
+    assert junk_clusters == {None}, (
+        "junk faces should drop to cluster_id=NULL, not linger in the source cluster"
+    )
+
+
+def test_split_cluster_grandfathers_null_det_score(db):
+    from photosearch.faces import split_cluster
+
+    photo_id = db._test_photo_ids["DSC04878.JPG"]
+    null_ids = []
+    for i in range(3):
+        enc = _perturb(_base(4000), i + 1, jitter=0.01).tolist()
+        null_ids.append(
+            db.add_face(photo_id, (100, 220, 220, 100), enc, det_score=None)
+        )
+    db.conn.executemany(
+        "UPDATE faces SET cluster_id=501 WHERE id=?",
+        [(fid,) for fid in null_ids],
+    )
+    db.conn.commit()
+
+    split_cluster(
+        db, cluster_id=501, dry_run=False,
+        min_det_score=0.65, min_bbox_edge=60,
+    )
+
+    cluster_ids = {
+        db.conn.execute("SELECT cluster_id FROM faces WHERE id=?", (fid,)).fetchone()["cluster_id"]
+        for fid in null_ids
+    }
+    assert None not in cluster_ids, "NULL det_score must be grandfathered, not dropped"
+    assert cluster_ids != {501}, "grandfathered faces should be renumbered into a new cluster"

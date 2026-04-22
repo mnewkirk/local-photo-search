@@ -336,6 +336,7 @@ def _index_collection(
                                     photo_id=photo_id,
                                     bbox=face["bbox"],
                                     encoding=face["encoding"],
+                                    det_score=face.get("det_score"),
                                 )
                                 face_count += 1
                         except Exception as e:
@@ -975,6 +976,7 @@ def index_directory(
                                 photo_id=photo_id,
                                 bbox=face["bbox"],
                                 encoding=face["encoding"],
+                                det_score=face.get("det_score"),
                             )
                             face_count += 1
                     except Exception as e:

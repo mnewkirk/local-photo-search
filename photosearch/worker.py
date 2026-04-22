@@ -355,6 +355,7 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
                 face_data.append({
                     "bbox": list(face["bbox"]),
                     "encoding": face["encoding"],
+                    "det_score": face.get("det_score"),
                 })
             results.append({
                 "photo_id": photo_info["id"],

@@ -100,11 +100,18 @@ pain surfaces. The clustering + merge workflow has been good enough
 on the 120k+ face library that none of these have been necessary in
 practice.
 
-- **Quality filter before clustering.** Persist `det_score` + bbox
-  area on `faces`; filter `det_score >= 0.65` and min bbox edge
-  `>= 60px` before clustering. Keep raw rows for person-matching
-  (`MATCH_TOLERANCE=1.15` is forgiving). Would cut singletons from
-  low-res faces.
+- ✅ **Quality filter before clustering.** Shipped 2026-04-22 (schema
+  v20). `faces.det_score` persisted from InsightFace output; bbox edge
+  computed at query time from existing columns. `recluster-faces` and
+  `split-cluster` filter `det_score IS NULL OR det_score >= 0.65` and
+  shorter bbox edge `>= 60px`. NULL grandfathered so existing libraries
+  keep clustering without forced re-index. CLI flags `--min-det-score`
+  and `--min-bbox-edge` on both commands; API endpoint accepts the
+  same. Motivating evidence: cluster #5 on the NAS (434 faces) split
+  at eps=0.50 revealed one 75-face real-person sub-cluster and 182
+  junk faces; pre-filtering prevents such attractors from forming.
+  `split-cluster` summary gains `filtered_out_count` alongside
+  `noise_count`.
 - **HDBSCAN** to handle varying density (some people appear 100×,
   others 2×). DBSCAN's single `eps` is a compromise; HDBSCAN finds
   clusters at multiple densities. Would mostly help the long tail

@@ -838,3 +838,66 @@ def test_migration_v17_adds_location_columns_and_backfills_exif(tmp_path):
     assert row_b["location_source"] is None
     assert row_b["location_confidence"] is None
     assert int(version) >= 17
+
+
+def test_migration_v20_adds_det_score_column_to_faces(tmp_path):
+    """v19 → v20 adds det_score to faces; existing rows are NULL (grandfathered);
+    add_face accepts a det_score kwarg and persists it."""
+    import sqlite3
+    from photosearch.db import PhotoDB
+    from conftest import _make_embedding
+
+    db_path = str(tmp_path / "v19.db")
+
+    # Build a v19-shaped DB with one pre-existing face (no det_score). Includes
+    # the columns v17–v19 migrations already added, so their idempotent checks
+    # pass and only the v20 migration fires.
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO schema_info VALUES ('version', '19');
+        CREATE TABLE photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT UNIQUE NOT NULL,
+            filename TEXT NOT NULL,
+            gps_lat REAL, gps_lon REAL, place_name TEXT,
+            date_taken TEXT,
+            location_source TEXT, location_confidence REAL,
+            country TEXT, admin1 TEXT, admin2 TEXT, locality TEXT
+        );
+        INSERT INTO photos (filepath, filename) VALUES ('/a.jpg', 'a.jpg');
+        CREATE TABLE faces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER NOT NULL,
+            person_id INTEGER,
+            bbox_top INTEGER, bbox_right INTEGER,
+            bbox_bottom INTEGER, bbox_left INTEGER,
+            cluster_id INTEGER,
+            match_source TEXT
+        );
+        INSERT INTO faces (photo_id, bbox_top, bbox_right, bbox_bottom, bbox_left)
+            VALUES (1, 10, 110, 110, 10);
+    """)
+    conn.commit()
+    conn.close()
+
+    # Opening with the current code should migrate and add det_score.
+    with PhotoDB(db_path) as pdb:
+        old_row = pdb.conn.execute(
+            "SELECT det_score FROM faces WHERE id = 1"
+        ).fetchone()
+        new_face_id = pdb.add_face(
+            photo_id=1, bbox=(20, 120, 120, 20),
+            encoding=_make_embedding(512, seed=7),
+            det_score=0.87,
+        )
+        new_row = pdb.conn.execute(
+            "SELECT det_score FROM faces WHERE id = ?", (new_face_id,),
+        ).fetchone()
+        version = pdb.conn.execute(
+            "SELECT value FROM schema_info WHERE key='version'"
+        ).fetchone()[0]
+
+    assert old_row["det_score"] is None, "existing face grandfathered with NULL det_score"
+    assert new_row["det_score"] == pytest.approx(0.87)
+    assert int(version) >= 20

@@ -51,7 +51,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -295,6 +295,7 @@ class PhotoDB:
                 bbox_left INTEGER,
                 cluster_id INTEGER,
                 match_source TEXT,
+                det_score REAL,
                 FOREIGN KEY (photo_id) REFERENCES photos(id),
                 FOREIGN KEY (person_id) REFERENCES persons(id)
             )
@@ -401,6 +402,18 @@ class PhotoDB:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin1 ON photos(admin1)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin2 ON photos(admin2)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_locality ON photos(locality)")
+
+        # Migration: faces.det_score column (schema v20). InsightFace already
+        # returns a detection confidence [0, 1] per face; we just weren't
+        # storing it. Read by recluster-faces / split-cluster to filter out
+        # low-confidence detections that otherwise form junk-region attractor
+        # clusters. Existing rows stay NULL (grandfathered — the filter
+        # treats NULL as pass so old data keeps clustering as before until
+        # re-indexed).
+        try:
+            cur.execute("SELECT det_score FROM faces LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE faces ADD COLUMN det_score REAL")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
@@ -741,12 +754,13 @@ class PhotoDB:
     # ------------------------------------------------------------------
 
     def add_face(self, photo_id: int, bbox: tuple, encoding: list[float],
-                 person_id: Optional[int] = None, cluster_id: Optional[int] = None) -> int:
+                 person_id: Optional[int] = None, cluster_id: Optional[int] = None,
+                 det_score: Optional[float] = None) -> int:
         """Store a detected face with its encoding."""
         cur = self.conn.execute(
-            """INSERT INTO faces (photo_id, person_id, bbox_top, bbox_right, bbox_bottom, bbox_left, cluster_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (photo_id, person_id, bbox[0], bbox[1], bbox[2], bbox[3], cluster_id),
+            """INSERT INTO faces (photo_id, person_id, bbox_top, bbox_right, bbox_bottom, bbox_left, cluster_id, det_score)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (photo_id, person_id, bbox[0], bbox[1], bbox[2], bbox[3], cluster_id, det_score),
         )
         face_id = cur.lastrowid
 

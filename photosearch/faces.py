@@ -396,6 +396,16 @@ def cluster_encodings(
     return cluster_ids
 
 
+# Default quality pre-filter thresholds for clustering.
+# det_score is InsightFace's detection confidence ([0, 1]).
+# bbox_edge is the shorter edge of the face bounding box in pixels.
+# Faces below either threshold are excluded from clustering but kept in
+# the DB (person-matching with MATCH_TOLERANCE=1.15 is forgiving enough
+# to find them anyway). NULL det_score is grandfathered — pre-v20 rows
+# pass the filter until re-indexed.
+CLUSTER_MIN_DET_SCORE = 0.65
+CLUSTER_MIN_BBOX_EDGE = 60
+
 # Default DBSCAN params for global reclustering of unknown faces.
 # eps=0.55 is the L2 radius on 512-dim normalized ArcFace vectors. Calibrated
 # so two photos of the same person almost always land within radius (same-person
@@ -521,6 +531,8 @@ def recluster_unknown_faces(
     session_stacking: bool = True,
     session_eps: float = SESSION_STACK_EPS,
     session_window_minutes: float = SESSION_STACK_WINDOW_MINUTES,
+    min_det_score: float = CLUSTER_MIN_DET_SCORE,
+    min_bbox_edge: int = CLUSTER_MIN_BBOX_EDGE,
 ) -> dict:
     """Globally recluster all person_id IS NULL faces via DBSCAN.
 
@@ -544,6 +556,9 @@ def recluster_unknown_faces(
 
     # Pull all unassigned face encodings + their photo's date_taken in one query,
     # ordered by face id for deterministic output. Large but bounded.
+    # Quality filter: exclude low-confidence detections and small bboxes from
+    # clustering (they form junk-region attractors). NULL det_score is
+    # grandfathered for backwards compat with pre-v20 rows.
     t0 = time.time()
     rows = db.conn.execute(
         """SELECT f.id, fe.encoding, ph.date_taken
@@ -551,7 +566,10 @@ def recluster_unknown_faces(
            JOIN face_encodings fe ON fe.face_id = f.id
            LEFT JOIN photos ph ON ph.id = f.photo_id
            WHERE f.person_id IS NULL
-           ORDER BY f.id"""
+             AND (f.det_score IS NULL OR f.det_score >= ?)
+             AND MIN(f.bbox_bottom - f.bbox_top, f.bbox_right - f.bbox_left) >= ?
+           ORDER BY f.id""",
+        (min_det_score, min_bbox_edge),
     ).fetchall()
     t_query = time.time()
 
@@ -674,6 +692,8 @@ def split_cluster(
     eps: float = SPLIT_DEFAULT_EPS,
     min_samples: int = SPLIT_DEFAULT_MIN_SAMPLES,
     dry_run: bool = False,
+    min_det_score: float = CLUSTER_MIN_DET_SCORE,
+    min_bbox_edge: int = CLUSTER_MIN_BBOX_EDGE,
 ) -> dict:
     """Re-run DBSCAN on one unknown cluster with tighter params.
 
@@ -707,8 +727,14 @@ def split_cluster(
         )
 
     t0 = _time.time()
+    # Load all members + enough metadata to apply the quality filter without
+    # a second query. Quality filter: faces below det_score or bbox-edge
+    # threshold are excluded from DBSCAN and dropped to cluster_id=NULL so
+    # the split leaves no junk residue in the source cluster. NULL det_score
+    # is grandfathered for pre-v20 rows.
     rows = db.conn.execute(
-        """SELECT f.id, fe.encoding
+        """SELECT f.id, fe.encoding, f.det_score,
+                  MIN(f.bbox_bottom - f.bbox_top, f.bbox_right - f.bbox_left) AS bbox_edge
            FROM faces f
            JOIN face_encodings fe ON fe.face_id = f.id
            WHERE f.person_id IS NULL AND f.cluster_id = ?
@@ -719,19 +745,35 @@ def split_cluster(
         return {
             "face_count": 0, "sub_cluster_count": 0, "noise_count": 0,
             "histogram": {}, "assignments": [], "new_cluster_ids": [],
+            "filtered_out_count": 0,
         }
 
-    face_ids = [r["id"] for r in rows]
-    all_bytes = b"".join(r["encoding"] for r in rows)
-    X = np.frombuffer(all_bytes, dtype=np.float32).reshape(len(rows), FACE_DIMENSIONS).copy()
+    eligible_rows = []
+    filtered_face_ids: list[int] = []
+    for r in rows:
+        det_ok = r["det_score"] is None or r["det_score"] >= min_det_score
+        edge_ok = (r["bbox_edge"] or 0) >= min_bbox_edge
+        if det_ok and edge_ok:
+            eligible_rows.append(r)
+        else:
+            filtered_face_ids.append(r["id"])
 
-    labels = DBSCAN(
-        eps=eps,
-        min_samples=min_samples,
-        metric="euclidean",
-        algorithm="ball_tree",
-        n_jobs=-1,
-    ).fit_predict(X)
+    if not eligible_rows:
+        # Everything was filtered out — nothing to cluster, everyone drops to NULL.
+        face_ids: list[int] = []
+        labels = np.array([], dtype=np.int64)
+    else:
+        face_ids = [r["id"] for r in eligible_rows]
+        all_bytes = b"".join(r["encoding"] for r in eligible_rows)
+        X = np.frombuffer(all_bytes, dtype=np.float32).reshape(len(eligible_rows), FACE_DIMENSIONS).copy()
+
+        labels = DBSCAN(
+            eps=eps,
+            min_samples=min_samples,
+            metric="euclidean",
+            algorithm="ball_tree",
+            n_jobs=-1,
+        ).fit_predict(X)
 
     # Find current max cluster_id so we can mint new ones that don't collide.
     row = db.conn.execute(
@@ -760,10 +802,15 @@ def split_cluster(
             assignments.append({"face_id": fid, "new_cluster_id": nc})
             histogram[nc] = histogram.get(nc, 0) + 1
 
+    # Filter-excluded faces are dropped to cluster_id=NULL alongside DBSCAN noise.
+    for fid in filtered_face_ids:
+        assignments.append({"face_id": fid, "new_cluster_id": None})
+
     summary = {
-        "face_count": len(face_ids),
+        "face_count": len(rows),
         "sub_cluster_count": len(new_cluster_ids),
         "noise_count": noise_count,
+        "filtered_out_count": len(filtered_face_ids),
         "histogram": histogram,
         "assignments": assignments,
         "new_cluster_ids": new_cluster_ids,

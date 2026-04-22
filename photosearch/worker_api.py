@@ -252,6 +252,7 @@ def submit_results(req: SubmitRequest):
                             photo_id=r.photo_id,
                             bbox=tuple(face["bbox"]),
                             encoding=face["encoding"],
+                            det_score=face.get("det_score"),
                         )
                         written += 1
                     except Exception as e:
