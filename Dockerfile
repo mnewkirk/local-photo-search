@@ -27,7 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# --timeout / --retries guard against transient PyPI hiccups during the
+# ~190MB pytorch + fonttools + onnx downloads. Defaults (15s / 5) have
+# bitten the NAS build mid-stream; 120s / 10 makes the build idempotent
+# enough that a flaky network just adds a few seconds, not a full
+# rebuild.
+RUN pip install --no-cache-dir --prefix=/install \
+        --timeout 120 --retries 10 \
+        -r requirements.txt
 
 # ---------- Stage 2: runtime ----------
 FROM python:3.11-slim
