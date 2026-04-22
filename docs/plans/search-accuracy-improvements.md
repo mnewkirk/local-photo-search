@@ -111,21 +111,43 @@ From real use on the 144k-photo NAS library:
 
 ### Iterate
 
-4. **Fuzzy name + place matching.** Enable SQLite's `fts5` virtual
+4. **Zip-code / postal-code aware location lookup.** User reported
+   that `"Calvin in 94903"` returns tighter, more accurate results
+   than `"Calvin in Lucas Valley"` or `"Calvin in San Rafael"` because
+   Nominatim's postal-code bbox is precisely the area they expect,
+   while city bboxes miss adjacent CDPs even with the 4km padding.
+   Two ways to exploit this:
+
+   - **Resolve city → associated postal codes** by asking Nominatim
+     for multiple candidate types. Union the city bbox with the
+     postal-code bboxes covering its metro area. One extra call per
+     new location, cached.
+   - **Store postal_code** as another structured column so
+     `_search_by_location` can do exact-match on digits-only inputs
+     without any Nominatim call. Cheap, but only covers places the
+     library has been reverse-geocoded against a postal dataset
+     (reverse_geocoder's cities1000 set doesn't include postal
+     codes — would need an additional offline dataset).
+
+   Fastest win: just document that numeric queries work best today
+   and let users type zip codes explicitly, then come back for
+   structured support.
+
+5. **Fuzzy name + place matching.** Enable SQLite's `fts5` virtual
    table over `persons.name` and `photos.place_name`, or ship a
    trigram similarity Python helper (library size: zero extra deps,
    can use `difflib` for short lists). On an extracted-person or
    location term, fall back to nearest-neighbour if exact match is
    empty. Catches `"Calvvin"`, `"San Raphael"`. Fixes pain #3.
 
-5. **Ambiguity disambiguation via photo priors.** When `forward_geocode`
+6. **Ambiguity disambiguation via photo priors.** When `forward_geocode`
    returns multiple high-importance candidates (e.g. Paris, FR and
    Paris, TX, both at importance > 0.4), score each by how many
    library photos fall in its bbox. Pick the one with more photos; if
    they're close, surface a "Did you mean…?" chip in the UI. Fixes
    pain #4. Requires the map data already present.
 
-6. **LLM query rewriter (optional).** A 3-7B local model
+7. **LLM query rewriter (optional).** A 3-7B local model
    (Qwen2.5-3B, Llama-3.2-3B) parses free text into structured intent:
    `{person, location, date_range, semantic, sort_by, exclude}`.
    Handles "Calvin around Tahoe during the 2022 summer but not the
@@ -135,14 +157,14 @@ From real use on the 144k-photo NAS library:
 
 ### Future
 
-7. **VLM re-ranking.** Top-100 from fast search get rescored by
+8. **VLM re-ranking.** Top-100 from fast search get rescored by
    LLaVA/Qwen2-VL against the raw query string. Slow (2-5s on N100)
    but dramatically improves precision on nuanced queries
    ("people looking sad in snow"). Cacheable per (query, photo_id)
    pair. Fixes pain #6 for queries where the user is willing to
    wait.
 
-8. **Self-hosted Nominatim.** Removes external dependency entirely,
+9. **Self-hosted Nominatim.** Removes external dependency entirely,
    lets us return admin2 and POI matches without a round-trip, enables
    offline operation. ~20GB for a North America extract; less for
    regional. Fixes pain #7. Biggest cost is the initial bulk import

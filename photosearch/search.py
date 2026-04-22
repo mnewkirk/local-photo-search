@@ -1450,11 +1450,21 @@ def search_combined(
                     {r["id"]: i for i, r in enumerate(fname_results)})
                 effective_query = None  # Skip CLIP — filename match is authoritative
 
-        # CLIP semantic stays ranked (limit*3): scores are real, we
-        # want the top-N to be the best-scoring photos before the
-        # intersection, not every photo over the noise floor.
+        # CLIP semantic limit: when combined with other filters, widen
+        # the net to _FILTER_PREFETCH_LIMIT so the intersection doesn't
+        # collapse. "Calvin at the beach" returned 0 because Calvin's
+        # beach photos ranked outside CLIP's top-3000 for "at the
+        # beach" — non-Calvin beach landscapes dominated the top-N,
+        # and strict intersection with Calvin's photos then dropped
+        # everything. With the wider limit, CLIP's long tail of above-
+        # threshold matches gives the intersection enough candidates.
+        # For pure CLIP queries we keep limit*3 since top-N is meaningful
+        # when it's the only ranking signal.
         if effective_query:
-            results = search_semantic(db, effective_query, limit=limit * 3, min_score=min_score, debug=debug, tag_match=tag_match)
+            clip_limit = _FILTER_PREFETCH_LIMIT if result_sets else limit * 3
+            results = search_semantic(db, effective_query, limit=clip_limit,
+                                      min_score=min_score, debug=debug,
+                                      tag_match=tag_match)
             result_sets.append({r["id"]: r for r in results})
             ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 

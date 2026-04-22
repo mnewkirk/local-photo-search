@@ -223,9 +223,11 @@ def api_search(
         )
 
         logger.info(
-            "SEARCH RESULTS  count=%d  total=%d  offset=%d  top_scores=%s",
-            len(results), total, offset,
-            [(r.get("filename"), round(r.get("score", 0), 4)) for r in results[:5]],
+            "SEARCH RESULTS  count=%d  total=%d  offset=%d  sort=%s  "
+            "top_scores=%s",
+            len(results), total, offset, sort,
+            [(r.get("filename"), round(r.get("rrf_score") or r.get("score", 0), 4))
+             for r in results[:5]],
         )
 
         # Serialize results
