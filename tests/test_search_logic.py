@@ -479,14 +479,16 @@ class TestSearchByLocationExpandsCountries:
             def __enter__(self): return self
             def __exit__(self, *a): return False
 
-        # Nominatim returns San Rafael's bbox, which contains Lucas
-        # Valley and Marinwood neighborhoods.
+        # Real Nominatim bbox for "San Rafael, California" — 10×13 km,
+        # TIGHT on the city limits. Lucas Valley-Marinwood sits north
+        # of north=38.0291 (strictly outside); only the _pad_bbox()
+        # expansion (~4km) captures it.
         canned = [{
             "name": "San Rafael",
             "display_name": "San Rafael, Marin County, California, United States",
-            "lat": "38.0",
-            "lon": "-122.53",
-            "boundingbox": ["37.94", "38.07", "-122.62", "-122.48"],
+            "lat": "37.9735",
+            "lon": "-122.5311",
+            "boundingbox": ["37.9388", "38.0291", "-122.5897", "-122.4354"],
             "address": {
                 "city": "San Rafael", "county": "Marin County",
                 "state": "California", "country": "United States",
@@ -497,22 +499,29 @@ class TestSearchByLocationExpandsCountries:
                             lambda req, timeout=None: _FakeResp(canned))
 
         with PhotoDB(tmp_db_path) as pdb:
-            # One photo literally labeled "San Rafael".
+            # Inside strict bbox.
             pdb.add_photo(filepath="/sr.jpg", filename="sr.jpg",
                           date_taken="2024-01-01T10:00:00",
                           gps_lat=37.97, gps_lon=-122.53,
                           place_name="San Rafael, California, US")
-            # Photos geocoded to neighboring names but physically in
-            # the San Rafael bbox.
-            pdb.add_photo(filepath="/lv.jpg", filename="lv.jpg",
-                          date_taken="2024-01-02T10:00:00",
-                          gps_lat=38.02, gps_lon=-122.57,
-                          place_name="Lucas Valley, California, US")
+            # 2 km north of strict north edge — only padded bbox
+            # catches it.
             pdb.add_photo(filepath="/mw.jpg", filename="mw.jpg",
                           date_taken="2024-01-03T10:00:00",
-                          gps_lat=38.04, gps_lon=-122.55,
+                          gps_lat=38.047, gps_lon=-122.569,
                           place_name="Marinwood, California, US")
-            # A photo outside the bbox must not leak in.
+            # ~2.5 km north of strict — also inside padded.
+            pdb.add_photo(filepath="/lv.jpg", filename="lv.jpg",
+                          date_taken="2024-01-02T10:00:00",
+                          gps_lat=38.051, gps_lon=-122.576,
+                          place_name="Lucas Valley-Marinwood, California, US")
+            # ~6 km north of strict (38.09) — OUTSIDE the padded bbox
+            # north edge (38.069). Must not leak in.
+            pdb.add_photo(filepath="/novato.jpg", filename="novato.jpg",
+                          date_taken="2024-01-05T10:00:00",
+                          gps_lat=38.107, gps_lon=-122.569,
+                          place_name="Novato, California, US")
+            # Far away — outside bbox in every dimension.
             pdb.add_photo(filepath="/sf.jpg", filename="sf.jpg",
                           date_taken="2024-01-04T10:00:00",
                           gps_lat=37.77, gps_lon=-122.42,

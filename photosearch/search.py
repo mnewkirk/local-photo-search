@@ -1067,6 +1067,25 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
     return [dict(r) for r in rows]
 
 
+# Nominatim's bbox for a named place hugs its official admin boundary
+# (for a city: the city limits). Users typing "San Rafael" usually mean
+# "the San Rafael area" — including the adjacent unincorporated
+# neighborhoods that the offline reverse-geocoder labels with their
+# own CDP names (Lucas Valley-Marinwood, Marinwood, etc.) and that a
+# tight bbox therefore excludes. Pad the bbox by ~4km per side to
+# capture those immediate-neighbor places. Country-level queries skip
+# bbox entirely (country-code anchor is authoritative), so this pad
+# never applies to huge admin regions.
+_BBOX_PAD_DEG = 0.04  # ~4-5 km depending on latitude
+
+
+def _pad_bbox(bbox: list[float]) -> tuple[float, float, float, float]:
+    """Expand a [south, north, west, east] bbox by _BBOX_PAD_DEG per side."""
+    s, n, w, e = bbox
+    return (s - _BBOX_PAD_DEG, n + _BBOX_PAD_DEG,
+            w - _BBOX_PAD_DEG, e + _BBOX_PAD_DEG)
+
+
 # Intermediate limit for filter-based searches that will be intersected
 # with another filter. `search_by_person`, `_search_by_location`, and
 # friends all apply their own LIMIT inside the SQL. If we use `limit*3`
@@ -1161,7 +1180,7 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
     except Exception:
         candidates = []
     if candidates and candidates[0].get("bbox"):
-        south, north, west, east = candidates[0]["bbox"]
+        south, north, west, east = _pad_bbox(candidates[0]["bbox"])
         bbox_rows = _search_by_bbox(db, south, north, west, east, limit)
         seen = {r["id"]: r for r in results}
         for r in bbox_rows:
