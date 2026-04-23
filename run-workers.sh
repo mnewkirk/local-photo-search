@@ -353,6 +353,10 @@ if [ -z "$SERVER" ]; then
     usage
 fi
 
+if [[ "$SERVER" != http://* && "$SERVER" != https://* ]]; then
+    SERVER="http://$SERVER"
+fi
+
 if [ -n "$DIRECTORY" ] && [ -n "$COLLECTION" ]; then
     echo "Error: --directory and --collection are mutually exclusive." >&2
     exit 1

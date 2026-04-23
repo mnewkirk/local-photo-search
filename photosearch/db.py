@@ -1077,13 +1077,19 @@ class PhotoDB:
     def get_directory_photo_ids(self, directory: str) -> list[int]:
         """Get photo IDs whose filepath starts with the given directory prefix.
 
-        Normalizes the input: strips leading './' and ensures trailing '/'
-        so '2026' doesn't match '2026-extra'.
+        Accepts either an absolute path under photo_root (e.g. '/photos/2026')
+        or a path already relative to photo_root ('2026'). Paths in the DB are
+        stored relative to photo_root, so absolute inputs get re-rooted first.
+        Ensures a trailing '/' so '2026' doesn't match '2026-extra'.
         """
         prefix = directory.strip()
-        # Strip leading ./ since DB paths are relative without it
         while prefix.startswith("./"):
             prefix = prefix[2:]
+        if self.photo_root and prefix.startswith("/"):
+            try:
+                prefix = str(Path(prefix).resolve().relative_to(self.photo_root))
+            except ValueError:
+                pass
         prefix = prefix.strip("/") + "/"
         rows = self.conn.execute(
             "SELECT id FROM photos WHERE filepath LIKE ?",
