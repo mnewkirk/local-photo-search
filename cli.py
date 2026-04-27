@@ -1975,19 +1975,42 @@ def find_dupes(db, output, named, remove_from_db):
         click.echo(f"\nContent duplicates (same file hash): {len(content_groups)} group(s), "
                    f"{total_content_dupes} extra file(s)\n")
 
+        # Canonical-path scoring: lower tuple wins (kept), rest deleted.
+        # 1. Not under canonical YYYY/YYYY-MM-DD[_suffix]/ structure → demote.
+        #    Requires the date folder's year to match the parent year folder,
+        #    so `duplicate filenames/2016-05-14/...` is correctly excluded.
+        # 2. Filename has (N) or -NNN copy marker → demote (browser /
+        #    Photos export numbering). _N is intentionally NOT detected
+        #    — it overlaps with Canon's 100_0046.JPG naming.
+        # 3. Shorter filename, then shorter path as final tiebreakers.
+        _CANON_PATH = _re.compile(r'(?:^|/)(\d{4})/\1-\d{2}-\d{2}[^/]*/[^/]+$')
+        _COPY_MARK = _re.compile(r'(?:\(\d+\)|-\d{3,})\.[^.]+$', _re.IGNORECASE)
+
+        def _canonical_key(name_path):
+            name, path = name_path
+            return (
+                0 if _CANON_PATH.search("/" + path) else 1,
+                1 if _COPY_MARK.search(name) else 0,
+                len(name),
+                name,
+                len(path),
+                path,
+            )
+
         to_delete = []
 
-        for i, group in enumerate(content_groups[:50], 1):  # cap display at 50 groups
-            # Keep shortest filename (usually the original), delete the rest
-            group_sorted = sorted(group, key=lambda x: (len(x[0]), x[0]))
+        for i, group in enumerate(content_groups, 1):
+            group_sorted = sorted(group, key=_canonical_key)
             keep_name, keep_path = group_sorted[0]
-            click.echo(f"  Group {i}: keep {keep_name}")
+            if i <= 50:
+                click.echo(f"  Group {i}: keep {keep_path}")
             for name, path in group_sorted[1:]:
-                click.echo(f"           del  {path}")
+                if i <= 50:
+                    click.echo(f"           del  {path}")
                 to_delete.append(path)
 
         if len(content_groups) > 50:
-            click.echo(f"  ... and {len(content_groups) - 50} more groups (use --output to see all)")
+            click.echo(f"  ... and {len(content_groups) - 50} more groups (full list in --output)")
 
         # ── 2. Named duplicates (_1, _2 suffix pattern) ─────────────────────
         named_extras = []
