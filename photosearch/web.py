@@ -1253,7 +1253,35 @@ def api_regenerate_suggestions(data: dict = None):
     if min_group_size < 1:
         raise HTTPException(400, "min_group_size must be ≥ 1")
 
+    # Sanity cap on N². With min_group_size=1 on a freshly reclustered library
+    # there can be 30k+ unknown clusters; pair scoring is O(N²) and uvicorn
+    # gets killed before it returns. Estimate group count cheaply via SQL
+    # before paying the encoding-load cost, and refuse if it'd blow up.
+    _MAX_GROUP_COUNT = 5000  # ~12.5M pairs; runs in a few minutes on N100.
     with _get_db() as db:
+        ignored_filter = "" if include_ignored else """
+            AND (f.cluster_id IS NULL OR f.cluster_id NOT IN (SELECT cluster_id FROM ignored_clusters))
+        """
+        cluster_count = db.conn.execute(f"""
+            SELECT COUNT(*) FROM (
+                SELECT f.cluster_id
+                FROM faces f
+                WHERE f.cluster_id IS NOT NULL AND f.person_id IS NULL
+                {ignored_filter}
+                GROUP BY f.cluster_id HAVING COUNT(*) >= ?
+            )
+        """, (min_group_size,)).fetchone()[0]
+        person_count = db.conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+        est_groups = cluster_count + person_count
+        if est_groups > _MAX_GROUP_COUNT:
+            raise HTTPException(
+                413,
+                f"Too many groups: {est_groups} (cap {_MAX_GROUP_COUNT}). "
+                f"Raise min_group_size — singletons rarely produce useful "
+                f"suggestions and dominate pair count. Try min_group_size=3 "
+                f"or 5.",
+            )
+
         groups = load_groups(
             db,
             include_ignored_clusters=include_ignored,

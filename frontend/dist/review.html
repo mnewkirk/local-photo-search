@@ -577,6 +577,7 @@
       const [gridSize, setGridSize] = useState(initParams.grid);     // normal | large
       const [modalPhoto, setModalPhoto] = useState(null);
       const [modalDetail, setModalDetail] = useState(null);
+      const [persons, setPersons] = useState([]);
       const [showExport, setShowExport] = useState(false);
       const [exportFiles, setExportFiles] = useState([]);
       const [exportRaw, setExportRaw] = useState(false);
@@ -672,6 +673,35 @@
         fetch(API + '/api/review/folders')
           .then(r => r.json())
           .then(d => setFolders(d.folders || []))
+          .catch(() => {});
+      }, []);
+
+      // Load persons once for the modal's face-edit dropdown.
+      useEffect(() => {
+        fetch(API + '/api/persons')
+          .then(r => r.json())
+          .then(d => setPersons(d.persons || []))
+          .catch(() => {});
+      }, []);
+
+      // Patch the open modal's face list when an assignment is made, so the UI
+      // reflects the new tag without a full refetch. Mirrors index.html.
+      const handleFaceAssigned = useCallback((faceId, personName) => {
+        setModalDetail(prev => {
+          if (!prev || !prev.faces) return prev;
+          return {
+            ...prev,
+            faces: prev.faces.map(f =>
+              f.id === faceId
+                ? { ...f, person_name: personName, match_source: personName ? 'manual' : null }
+                : f
+            ),
+          };
+        });
+        // Refresh persons in case a new name was created.
+        fetch(API + '/api/persons')
+          .then(r => r.json())
+          .then(d => setPersons(d.persons || []))
           .catch(() => {});
       }, []);
 
@@ -1180,6 +1210,8 @@
           showCollections: false,
           showLocation: true,
           showAesthetics: true,
+          persons: persons,
+          onFaceAssigned: handleFaceAssigned,
           onStackNavigate: (member) => {
             setModalPhoto(member);
             setModalDetail(null);

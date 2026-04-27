@@ -843,7 +843,11 @@
       const [regenCentroid, setRegenCentroid] = useState('0.95');
       const [regenMinPair, setRegenMinPair] = useState('0.55');
       const [regenMaxMembers, setRegenMaxMembers] = useState('60');
-      const [regenMinGroupSize, setRegenMinGroupSize] = useState('1');
+      // Default 3, not 1: at min_group_size=1 the engine scores every singleton
+      // unknown against every other group. With ~31k unknown clusters that's
+      // ~500M pairs and the request times out / OOMs uvicorn. Singletons rarely
+      // produce useful suggestions anyway (one face is too noisy a centroid).
+      const [regenMinGroupSize, setRegenMinGroupSize] = useState('3');
       const [regenIncludeIgnored, setRegenIncludeIgnored] = useState(false);
 
       const reload = useCallback(() => {
