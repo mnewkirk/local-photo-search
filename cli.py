@@ -1112,6 +1112,73 @@ def backfill_dates(db, batch_size, dry_run):
         click.echo(f"\nUpdated: {updated:,}  skipped (file not found): {missing:,}")
 
 
+@cli.command("prune-missing")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False, help="Actually delete missing rows. Default is dry-run.")
+@click.option("--sample", default=10, show_default=True, help="Number of missing-file samples to print.")
+def prune_missing(db, apply, sample):
+    """Delete photos rows whose files no longer exist on disk.
+
+    Cascades via FK to faces, stack_members, collection_photos, review_selections,
+    and sets cover_photo_id NULL. Empty photo_stacks are cleaned up after.
+    Run cleanup-orphans afterward to drop dangling vec0 rows.
+    """
+    with PhotoDB(db) as photo_db:
+        if photo_db.photo_root and not os.path.isdir(photo_db.photo_root):
+            click.echo(f"Photo root not accessible: {photo_db.photo_root}")
+            click.echo("Refusing to scan — every photo would look 'missing'. Mount the volume and retry.")
+            return
+
+        rows = photo_db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+        total = len(rows)
+        click.echo(f"Scanning {total:,} photos…")
+
+        missing_ids = []
+        missing_paths = []
+        for r in rows:
+            abs_path = photo_db.resolve_filepath(r["filepath"])
+            if not abs_path or not os.path.exists(abs_path):
+                missing_ids.append(r["id"])
+                missing_paths.append(abs_path or r["filepath"])
+
+        click.echo(f"\nMissing: {len(missing_ids):,} of {total:,}")
+        if missing_paths:
+            click.echo("\nSample:")
+            for p in missing_paths[:sample]:
+                click.echo(f"  {p}")
+            if len(missing_paths) > sample:
+                click.echo(f"  … and {len(missing_paths) - sample:,} more")
+
+        if not missing_ids:
+            click.echo("\nNothing to prune.")
+            return
+
+        if not apply:
+            click.echo("\nDry run — no changes written. Re-run with --apply to delete.")
+            return
+
+        click.echo("\nDeleting…")
+        chunk = 500
+        deleted = 0
+        for i in range(0, len(missing_ids), chunk):
+            batch = missing_ids[i : i + chunk]
+            placeholders = ",".join("?" * len(batch))
+            photo_db.conn.execute(
+                f"DELETE FROM photos WHERE id IN ({placeholders})", batch
+            )
+            deleted += len(batch)
+
+        orphan_stacks = photo_db.conn.execute("""
+            DELETE FROM photo_stacks
+             WHERE id NOT IN (SELECT DISTINCT stack_id FROM stack_members)
+        """).rowcount
+
+        photo_db.conn.commit()
+        click.echo(f"  Deleted {deleted:,} photos rows (+ cascaded faces/stack_members/collection_photos/review_selections).")
+        click.echo(f"  Removed {orphan_stacks:,} now-empty photo_stacks.")
+        click.echo("\nNext: run `cleanup-orphans` to drop dangling clip_embeddings / face_encodings rows.")
+
+
 @cli.command("cleanup-orphans")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--dry-run", is_flag=True, default=False, help="Report orphan counts without deleting.")
