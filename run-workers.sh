@@ -45,6 +45,12 @@ PROJECT="photosearch-worker"
 OLLAMA_CONTAINER="photosearch-worker-ollama"
 OLLAMA_VOLUME="photosearch-worker-ollama-models"
 OLLAMA_PORT=11434
+# Shared model-cache volume — without this every worker re-downloads ~1.7 GB
+# CLIP ViT-L/14 + ~300 MB InsightFace on startup, and concurrent unauthenticated
+# parallel pulls from huggingface.co get rate-limited to "Connection refused".
+# HF's hub cache uses .lock files so simultaneous workers are safe: first to
+# arrive downloads, the rest block on the lock and read the cached weights.
+MODEL_CACHE_VOLUME="photosearch-worker-model-cache"
 
 # Defaults
 NUM_WORKERS=4
@@ -466,9 +472,12 @@ for i in $(seq 1 "$NUM_WORKERS"); do
         --memory "$MEM_LIMIT" \
         --restart on-failure:3 \
         --add-host=host.docker.internal:host-gateway \
+        -v "${MODEL_CACHE_VOLUME}:/model-cache" \
         -e PHOTOSEARCH_DEVICE=cpu \
         -e PYTHONUNBUFFERED=1 \
         -e OLLAMA_HOST=http://host.docker.internal:11434 \
+        -e HF_HOME=/model-cache/huggingface \
+        -e INSIGHTFACE_HOME=/model-cache/insightface \
         "$IMAGE_TAG" \
         $WORKER_CMD \
         > /dev/null
