@@ -500,23 +500,25 @@ def _index_collection(
                     print(f"  Score range: {min(valid_scores):.2f} – {max(valid_scores):.2f} "
                           f"(mean: {sum(valid_scores)/len(valid_scores):.2f})")
 
-            # Concept analysis
+            # Concept analysis. Non-force path is global on purpose — heals
+            # photos left score-only by interrupted prior runs, even when this
+            # invocation is targeting a different directory.
+            backfill = 0
             if force_quality:
                 concept_candidates = quality_candidates if quality_candidates else []
             else:
-                ids = [pid for pid, _ in photo_pairs]
-                placeholders = ",".join("?" * len(ids))
                 unconcept = db.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
-                    f"AND aesthetic_concepts IS NULL AND aesthetic_score IS NOT NULL",
-                    ids,
+                    "SELECT id, filepath FROM photos "
+                    "WHERE aesthetic_concepts IS NULL AND aesthetic_score IS NOT NULL"
                 ).fetchall()
-                path_lookup = {pid: path for pid, path in photo_pairs}
-                concept_candidates = [(row["id"], path_lookup[row["id"]]) for row in unconcept
-                                      if row["id"] in path_lookup]
+                concept_candidates = [(row["id"], row["filepath"]) for row in unconcept]
+                in_run_ids = {p for p, _ in photo_pairs}
+                backfill = sum(1 for pid, _ in concept_candidates if pid not in in_run_ids)
 
             if concept_candidates:
-                print(f"\nAnalyzing aesthetic concepts for {len(concept_candidates)} photo(s)...")
+                suffix = f" ({backfill} backfill from prior runs)" if backfill else ""
+                print(f"\nAnalyzing aesthetic concepts for "
+                      f"{len(concept_candidates)} photo(s){suffix}...")
                 t0 = time.time()
                 paths = [p for _, p in concept_candidates]
                 concept_count = 0

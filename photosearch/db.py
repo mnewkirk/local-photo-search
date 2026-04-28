@@ -1474,15 +1474,20 @@ class PhotoDB:
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "quality":
+            # Either column missing is enough to claim — worker re-runs both
+            # phases and submit-results writes both. Heals interrupted runs
+            # where scoring committed but concept analysis didn't.
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
-                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) AND aesthetic_score IS NULL LIMIT ?",
+                    f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
+                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) LIMIT ?",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    "SELECT id, filepath FROM photos WHERE aesthetic_score IS NULL LIMIT ?",
+                    "SELECT id, filepath FROM photos "
+                    "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL LIMIT ?",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type in ("describe", "tags"):
@@ -1574,12 +1579,14 @@ class PhotoDB:
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
-                    f"SELECT COUNT(*) FROM photos WHERE id IN ({placeholders}) AND aesthetic_score IS NULL",
+                    f"SELECT COUNT(*) FROM photos WHERE id IN ({placeholders}) "
+                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL)",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    "SELECT COUNT(*) FROM photos WHERE aesthetic_score IS NULL"
+                    "SELECT COUNT(*) FROM photos "
+                    "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL"
                 ).fetchone()
         elif pass_type in ("describe", "tags"):
             col = {"describe": "description", "tags": "tags"}[pass_type]
