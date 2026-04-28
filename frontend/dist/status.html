@@ -844,10 +844,31 @@
 
     function Workers(props) {
       var data = props.data;
+      var _cb = useState(false); var clearing = _cb[0]; var setClearing = _cb[1];
       if (!data) return null;
       var queue = data.queue_depth || {};
       var active = data.active_claims || [];
       var totalQueue = PASS_ORDER.reduce(function(s, p) { return s + (queue[p] || 0); }, 0);
+
+      function clearClaims() {
+        var msg = active.length === 0
+          ? 'No active claims to clear. Continue anyway?'
+          : 'Release all ' + active.length + ' active claim'
+            + (active.length === 1 ? '' : 's') + '? '
+            + 'Their photos become reclaimable immediately. '
+            + 'Live workers will still have their results accepted.';
+        if (!window.confirm(msg)) return;
+        setClearing(true);
+        fetch('/api/worker/clear-claims', { method: 'POST' })
+          .then(function(r) { return r.json(); })
+          .then(function() {
+            if (props.onRefresh) props.onRefresh();
+          })
+          .catch(function(err) {
+            window.alert('Failed to clear claims: ' + (err && err.message ? err.message : err));
+          })
+          .then(function() { setClearing(false); });
+      }
 
       return e('div', null,
         e('h2', null, 'Workers'),
@@ -862,7 +883,14 @@
               totalQueue === 0
                 ? 'queue empty'
                 : totalQueue.toLocaleString() + ' photos queued across passes'
-            )
+            ),
+            e('button', {
+              className: 'btn',
+              style: { marginLeft: 'auto' },
+              onClick: clearClaims,
+              disabled: clearing,
+              title: 'Release all active worker claims so their photos can be reclaimed immediately',
+            }, clearing ? 'Clearing…' : 'Clear claims')
           ),
           e('div', { className: 'queue-grid' },
             PASS_ORDER.map(function(pass) {
@@ -1747,7 +1775,7 @@
                 + stats.verify_passed + ' passed'
             })
           ),
-          e(Workers, { data: workerStatus }),
+          e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
           e(StackingForm, { onComplete: load }),
           e(InferLocationForm, { onDone: load }),
           e(ActivityChart, { activity: activity }),

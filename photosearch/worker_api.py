@@ -381,6 +381,22 @@ def renew_claim(req: RenewClaimRequest):
         return {"status": "ok", "batch_id": req.batch_id}
 
 
+@router.post("/clear-claims")
+def clear_claims():
+    """Release every active worker claim immediately.
+
+    Used when a worker fleet has crashed or hung and the photos it claimed
+    should be reclaimable now rather than after the TTL expires. Live
+    workers that submit afterward still have their results accepted —
+    submit-results already tolerates expired/missing claims.
+    """
+    with _get_db() as db:
+        cur = db.conn.execute("DELETE FROM worker_claims")
+        cleared = cur.rowcount
+        db.conn.commit()
+        return {"status": "ok", "cleared": cleared}
+
+
 class ClearPassRequest(BaseModel):
     pass_type: str
     collection_id: Optional[int] = None
