@@ -38,8 +38,16 @@ def file_hash(filepath: str, chunk_size: int = 8192) -> str:
     return h.hexdigest()
 
 
-# Subfolder names that are excluded from indexing
-EXCLUDED_DIRS = {"results", "references", ".references", "thumbnails"}
+# Subfolder names that are excluded from indexing.
+# Built-in set covers project-internal folders. Deployment-specific
+# folders (e.g. organizational duplicate trees) come from the
+# PHOTOSEARCH_EXCLUDED_DIRS env var, colon-separated to allow names
+# with spaces — set it in docker-compose.<env>.yml, not here.
+_BUILTIN_EXCLUDED_DIRS = {"results", "references", ".references", "thumbnails"}
+_user_excluded = os.environ.get("PHOTOSEARCH_EXCLUDED_DIRS", "")
+EXCLUDED_DIRS = _BUILTIN_EXCLUDED_DIRS | {
+    d.strip() for d in _user_excluded.split(":") if d.strip()
+}
 
 
 import re as _re

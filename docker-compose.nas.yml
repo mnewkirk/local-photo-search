@@ -44,6 +44,12 @@ services:
       - PHOTO_ROOT=/photos
       - PYTHONUNBUFFERED=1
       - PHOTOSEARCH_CACHE=/data/.cache/photosearch
+      - HF_TOKEN=${HF_TOKEN}
+      # Deployment-specific subfolders to skip during indexing
+      # (colon-separated; folder basenames, not full paths). These are
+      # NAS-local trees that hold organizational duplicates of photos
+      # already indexed elsewhere — see CLAUDE.md / the de-index pattern.
+      - PHOTOSEARCH_EXCLUDED_DIRS=01 - Organizational folders:02 - Gopro
       # If deploying a DB built on Mac, set this once to remap paths:
       # - REMAP_FROM=/Users/yourname/Pictures
     depends_on:
