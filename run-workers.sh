@@ -395,11 +395,17 @@ do_scale() {
 
     # Cmd is a JSON array — decode into a NUL-separated bash array so args
     # with whitespace survive intact (relies on python3 on the dev host).
+    # Python emits a trailing NUL after every arg (not just between) so that
+    # `read -d ''` exits on the delimiter rather than on EOF — otherwise the
+    # final arg gets dropped and the launched worker crashes with errors
+    # like "Option '--ttl' requires an argument."
     local CMD_ARRAY=()
     while IFS= read -r -d '' arg; do
         CMD_ARRAY+=("$arg")
     done < <(printf '%s' "$TEMPLATE_CMD" | python3 -c \
-        "import json,sys; sys.stdout.buffer.write(b'\0'.join(a.encode() for a in json.load(sys.stdin)))" \
+        "import json,sys
+for a in json.load(sys.stdin):
+    sys.stdout.buffer.write(a.encode() + b'\0')" \
         2>/dev/null) || true
     if [ "${#CMD_ARRAY[@]}" -eq 0 ]; then
         echo "Error: failed to decode Cmd JSON from $TEMPLATE. python3 missing?" >&2
