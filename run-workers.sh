@@ -88,12 +88,19 @@ Manage workers:
       --status            Show running workers and their progress
       --logs              Tail logs from all workers
       --stop              Stop all workers
+      --scale N           Adjust fleet to N workers (inherits image + cmd + env
+                          + memory limit from an existing worker). Scale-up
+                          appends new containers above the highest existing
+                          index; scale-down kills the highest-numbered ones,
+                          and their in-flight batches are reclaimed after the
+                          claim TTL expires.
 
 Examples:
   ./run-workers.sh -s http://nas.local:8000 -p clip -d /photos/2026 -n 4
   ./run-workers.sh -s http://nas.local:8000 -p clip,quality,faces -d /photos/2026
   ./run-workers.sh -s http://nas.local:8000 -p describe --collection 3 -n 2
   ./run-workers.sh --status
+  ./run-workers.sh --scale 10           # resize running fleet without restart
   ./run-workers.sh --stop
 
 Ollama note:
@@ -323,6 +330,118 @@ do_stop() {
     exit 0
 }
 
+do_scale() {
+    local TARGET="$1"
+    if ! [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+        echo "Error: --scale requires a non-negative integer (got: '$TARGET')." >&2
+        exit 1
+    fi
+
+    local FILTER="label=photosearch-worker-fleet"
+    # Sorted by numeric suffix so we know which are highest-indexed.
+    local RUNNING_NAMES
+    RUNNING_NAMES=$(docker ps --filter "$FILTER" --format "{{.Names}}" 2>/dev/null \
+                    | sort -t- -k3 -n)
+    local CURRENT=0
+    if [ -n "$RUNNING_NAMES" ]; then
+        CURRENT=$(echo "$RUNNING_NAMES" | wc -l | tr -d ' ')
+    fi
+
+    echo "Current fleet: $CURRENT worker(s). Target: $TARGET."
+
+    if [ "$TARGET" -eq "$CURRENT" ]; then
+        echo "Already at target — nothing to do."
+        exit 0
+    fi
+
+    if [ "$TARGET" -lt "$CURRENT" ]; then
+        local TO_REMOVE=$((CURRENT - TARGET))
+        echo "Scaling down by $TO_REMOVE (stopping highest-numbered workers)..."
+        local VICTIMS
+        VICTIMS=$(echo "$RUNNING_NAMES" | tail -n "$TO_REMOVE")
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            echo "  Removing $name (in-flight batch will be reclaimed after TTL)..."
+            docker rm -f "$name" > /dev/null 2>&1 || true
+        done <<< "$VICTIMS"
+        if [ "$TARGET" -eq 0 ]; then
+            stop_managed_ollama_if_idle
+        fi
+        echo ""
+        echo "Done. Use --status to verify."
+        exit 0
+    fi
+
+    # Scale up — inherit settings from an existing worker.
+    if [ "$CURRENT" -eq 0 ]; then
+        echo "Error: no workers running to inherit settings from." >&2
+        echo "Launch a fresh fleet with: ./run-workers.sh -s <server> -p <passes> -n $TARGET" >&2
+        exit 1
+    fi
+
+    local TEMPLATE
+    TEMPLATE=$(echo "$RUNNING_NAMES" | head -1)
+    echo "Inheriting settings from $TEMPLATE..."
+
+    local TEMPLATE_IMAGE TEMPLATE_MEM TEMPLATE_CMD
+    TEMPLATE_IMAGE=$(docker inspect "$TEMPLATE" --format '{{.Config.Image}}' 2>/dev/null)
+    TEMPLATE_MEM=$(docker inspect "$TEMPLATE" --format '{{.HostConfig.Memory}}' 2>/dev/null)
+    TEMPLATE_CMD=$(docker inspect "$TEMPLATE" --format '{{json .Config.Cmd}}' 2>/dev/null)
+
+    if [ -z "$TEMPLATE_IMAGE" ] || [ -z "$TEMPLATE_CMD" ] || [ "$TEMPLATE_CMD" = "null" ]; then
+        echo "Error: could not read image/cmd from $TEMPLATE via docker inspect." >&2
+        exit 1
+    fi
+
+    # Cmd is a JSON array — decode into a NUL-separated bash array so args
+    # with whitespace survive intact (relies on python3 on the dev host).
+    local CMD_ARRAY=()
+    while IFS= read -r -d '' arg; do
+        CMD_ARRAY+=("$arg")
+    done < <(printf '%s' "$TEMPLATE_CMD" | python3 -c \
+        "import json,sys; sys.stdout.buffer.write(b'\0'.join(a.encode() for a in json.load(sys.stdin)))" \
+        2>/dev/null) || true
+    if [ "${#CMD_ARRAY[@]}" -eq 0 ]; then
+        echo "Error: failed to decode Cmd JSON from $TEMPLATE. python3 missing?" >&2
+        exit 1
+    fi
+
+    # Pick the next index strictly above the highest currently running one, so we
+    # never collide with a worker we're keeping. Stopped containers are removed
+    # by --stop / scale-down, so we only have to look at running.
+    local MAX_IDX
+    MAX_IDX=$(echo "$RUNNING_NAMES" | sed "s/^${PROJECT}-//" | sort -n | tail -1)
+    [ -z "$MAX_IDX" ] && MAX_IDX=0
+
+    local TO_ADD=$((TARGET - CURRENT))
+    echo "Scaling up by $TO_ADD (next index: $((MAX_IDX + 1)))..."
+    for ((i = 1; i <= TO_ADD; i++)); do
+        local IDX=$((MAX_IDX + i))
+        local CONTAINER_NAME="${PROJECT}-${IDX}"
+        docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1 || true
+        echo "  Starting $CONTAINER_NAME..."
+        docker run -d \
+            --name "$CONTAINER_NAME" \
+            --label "photosearch-worker-fleet=true" \
+            --memory "$TEMPLATE_MEM" \
+            --restart on-failure:3 \
+            --add-host=host.docker.internal:host-gateway \
+            -v "${MODEL_CACHE_VOLUME}:/model-cache" \
+            -e PHOTOSEARCH_DEVICE=cpu \
+            -e PYTHONUNBUFFERED=1 \
+            -e OLLAMA_HOST=http://host.docker.internal:11434 \
+            -e HF_HOME=/model-cache/huggingface \
+            -e INSIGHTFACE_HOME=/model-cache/insightface \
+            "$TEMPLATE_IMAGE" \
+            "${CMD_ARRAY[@]}" \
+            > /dev/null
+    done
+
+    echo ""
+    echo "Done. Use --status to verify."
+    exit 0
+}
+
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
@@ -344,6 +463,7 @@ while [[ $# -gt 0 ]]; do
         --status)           do_status ;;
         --logs)             do_logs ;;
         --stop)             do_stop ;;
+        --scale)            do_scale "${2:-}" ;;
         -h|--help)          usage ;;
         *)  echo "Unknown option: $1" >&2; usage ;;
     esac
