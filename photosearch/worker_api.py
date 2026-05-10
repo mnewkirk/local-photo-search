@@ -174,13 +174,16 @@ def claim_batch(req: ClaimRequest):
             ttl_minutes=req.ttl_minutes,
         )
 
-        # Count how many remain unclaimed after this batch
-        remaining_photos = db.get_unprocessed_photos(
+        # Count how many remain unclaimed after this batch. Uses a COUNT(*)
+        # rather than materializing every unprocessed row — with N concurrent
+        # workers a full-queue scan per claim turned into ReadTimeout cascades
+        # on large libraries. The count doesn't subtract active claims, so the
+        # value is slightly inflated, but it's purely informational (worker
+        # logs it; no decision is made on it).
+        remaining = db.count_unprocessed_photos(
             pass_type=req.pass_type,
             photo_ids=scope_ids,
-            limit=999999,
         )
-        remaining = len(remaining_photos)
 
         result_photos = []
         for p in photos:
