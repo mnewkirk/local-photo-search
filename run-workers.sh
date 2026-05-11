@@ -438,6 +438,7 @@ for a in json.load(sys.stdin):
             -e OLLAMA_HOST=http://host.docker.internal:11434 \
             -e HF_HOME=/model-cache/huggingface \
             -e INSIGHTFACE_HOME=/model-cache/insightface \
+            -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
             "$TEMPLATE_IMAGE" \
             "${CMD_ARRAY[@]}" \
             > /dev/null
@@ -604,6 +605,7 @@ for i in $(seq 1 "$NUM_WORKERS"); do
         -e OLLAMA_HOST=http://host.docker.internal:11434 \
         -e HF_HOME=/model-cache/huggingface \
         -e INSIGHTFACE_HOME=/model-cache/insightface \
+        -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
         "$IMAGE_TAG" \
         $WORKER_CMD \
         > /dev/null
