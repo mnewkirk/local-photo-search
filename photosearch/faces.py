@@ -22,6 +22,7 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
+import os
 from typing import Optional
 import numpy as np
 
@@ -84,8 +85,15 @@ def _get_face_app() -> "FaceAnalysis":
         import time as _time
         print("  Loading InsightFace model (buffalo_l)...", end="", flush=True)
         t0 = _time.time()
+        # InsightFace does NOT honor an INSIGHTFACE_HOME env var — its default
+        # root is hardcoded to ~/.insightface, which inside a container resolves
+        # to /root/.insightface (the writable image layer). We have to forward
+        # the env var explicitly via root=, otherwise every fresh container
+        # re-downloads buffalo_l from scratch even with a persistent volume
+        # mounted at /data/.insightface or /model-cache/insightface.
         app = FaceAnalysis(
             name="buffalo_l",
+            root=os.environ.get("INSIGHTFACE_HOME", "~/.insightface"),
             # Only load detection + recognition. Skip landmark (1k3d68, 2d106det)
             # and genderage models — we only use bbox + ArcFace embedding.
             # This roughly halves per-face inference time on CPU.
