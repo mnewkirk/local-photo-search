@@ -295,12 +295,12 @@ def submit_results(req: SubmitRequest):
 
         elif req.pass_type == "describe":
             describe_results = req.describe_results or []
+            db.begin_batch(batch_size=100)
             for r in describe_results:
                 processed_photo_ids.append(r.photo_id)
                 if r.description:
                     try:
                         db.update_photo(r.photo_id, description=r.description)
-                        db.conn.commit()
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
@@ -308,18 +308,19 @@ def submit_results(req: SubmitRequest):
                             db.log_error("describe", str(r.photo_id), str(e))
                         except Exception:
                             pass
+            db.end_batch()
             # Mark all submitted photos as processed (including those with no description)
             if processed_photo_ids:
                 db.mark_processed(processed_photo_ids, "describe")
 
         elif req.pass_type == "tags":
             tags_results = req.tags_results or []
+            db.begin_batch(batch_size=100)
             for r in tags_results:
                 processed_photo_ids.append(r.photo_id)
                 if r.tags:
                     try:
                         db.update_photo(r.photo_id, tags=json.dumps(r.tags))
-                        db.conn.commit()
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
@@ -327,11 +328,13 @@ def submit_results(req: SubmitRequest):
                             db.log_error("tags", str(r.photo_id), str(e))
                         except Exception:
                             pass
+            db.end_batch()
             # Mark all submitted photos as processed (including those with no tags)
             if processed_photo_ids:
                 db.mark_processed(processed_photo_ids, "tags")
 
         elif req.pass_type == "verify" and req.verify_results:
+            db.begin_batch(batch_size=100)
             for r in req.verify_results:
                 try:
                     updates = {
@@ -345,7 +348,6 @@ def submit_results(req: SubmitRequest):
                     if r.tags:
                         updates["tags"] = json.dumps(r.tags)
                     db.update_photo(r.photo_id, **updates)
-                    db.conn.commit()
                     written += 1
                     processed_photo_ids.append(r.photo_id)
                 except Exception as e:
@@ -354,6 +356,7 @@ def submit_results(req: SubmitRequest):
                         db.log_error("verify", str(r.photo_id), str(e))
                     except Exception:
                         pass
+            db.end_batch()
 
         # Log activity for the chart
         if written > 0:

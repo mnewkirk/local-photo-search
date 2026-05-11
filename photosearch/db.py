@@ -8,8 +8,17 @@ import json
 import re
 import sqlite3
 import struct
+import time
 from pathlib import Path
 from typing import Optional
+
+
+# Throttle state for expire_worker_claims — see method docstring for the
+# rationale. Process-wide is correct here: every FastAPI request opens its
+# own PhotoDB connection, so a per-instance attribute would never see a
+# cache hit.
+_LAST_EXPIRE_SWEEP_MONO = 0.0
+_EXPIRE_SWEEP_INTERVAL_SEC = 5.0
 
 
 # Matches the project's /<year>/YYYY-MM-DD[_suffix]/filename convention,
@@ -1339,12 +1348,24 @@ class PhotoDB:
     # Worker claims (distributed indexing)
     # ------------------------------------------------------------------
 
-    def expire_worker_claims(self) -> int:
-        """Delete expired claims, returning them to the queue. Returns count expired."""
+    def expire_worker_claims(self, force: bool = False) -> int:
+        """Delete expired claims, returning them to the queue. Returns count expired.
+
+        Throttled to once per ~5s process-wide. The read path
+        (get_claimed_photo_ids) fires this on every worker claim — at 40
+        workers polling, that's 40 pointless writer-lock-acquiring DELETEs/sec
+        with nothing to expire. force=True bypasses the throttle for callers
+        that genuinely need a fresh sweep.
+        """
+        global _LAST_EXPIRE_SWEEP_MONO
+        now = time.monotonic()
+        if not force and now - _LAST_EXPIRE_SWEEP_MONO < _EXPIRE_SWEEP_INTERVAL_SEC:
+            return 0
         cur = self.conn.execute(
             "DELETE FROM worker_claims WHERE expires_at < datetime('now')"
         )
         self.conn.commit()
+        _LAST_EXPIRE_SWEEP_MONO = now
         return cur.rowcount
 
     def claim_photos(self, worker_id: str, pass_type: str, photo_ids: list[int],
