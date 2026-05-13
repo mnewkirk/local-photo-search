@@ -610,6 +610,37 @@ Key flags for `worker`:
 
 Multiple workers can run concurrently on different passes. Claims have a TTL — if a worker crashes, uncompleted photos are automatically released and reclaimed by the next worker.
 
+### GPU acceleration for describe/tags/verify
+
+The describe pass runs LLaVA via Ollama, which is by far the slowest pass in the pipeline (~30-60s per photo on CPU). GPU acceleration is the single biggest perf lever — measured 3-6x speedup on this fleet:
+
+| Host | Path | Per-photo describe |
+|---|---|---|
+| Mac M-series | Docker `ollama/ollama` (CPU) | 30-60s |
+| Mac M-series | Native `ollama serve` via brew (Metal/MPS) | ~10s |
+| WSL2 + RX 7900 XTX | Docker `ollama/ollama:rocm` (ROCm) | ~10-20s |
+
+`run-workers.sh` checks `localhost:11434` first and reuses any reachable Ollama, so swapping a machine to a GPU-accelerated path is a one-time setup that needs no script changes.
+
+**Mac (Apple Silicon):**
+```bash
+brew install ollama                       # if needed
+launchctl setenv OLLAMA_NUM_PARALLEL 3    # MUST be before brew services start
+brew services start ollama
+ollama pull llava
+# Now launch workers as usual — script detects native Ollama and skips Docker.
+```
+
+**WSL2 + supported AMD Radeon (RX 7900 XTX/XT/GRE, W-series, MI-series):** install AMD's ROCm-on-WSL driver bundle from `rocm.docs.amd.com`, verify `rocminfo` inside WSL2 shows the GPU, then either run the `ollama/ollama:rocm` Docker image with `--device /dev/kfd --device /dev/dri` (smoke test it manually before scripting), or update `run-workers.sh` to auto-detect via `[ -e /dev/kfd ]`.
+
+**WSL2 + NVIDIA:** install NVIDIA's WSL2 driver, then either `ollama/ollama:latest --gpus all` or native Ollama in WSL2 (auto-detects CUDA).
+
+**No supported GPU:** stay on CPU and route describe traffic to whichever machine does have a GPU — keep this machine on `-p clip,faces,quality`, and one GPU machine on `-p describe,tags`. The race-safe claim-batch path (commit `64eb1ac`, `BEGIN IMMEDIATE` serialization) handles this cleanly across machines.
+
+See `.claude/skills/photo-search/SKILL.md` → "GPU acceleration: per-machine tuning" for the full recipes, smoke-test commands, and `run-workers.sh` patch.
+
+`OLLAMA_NUM_PARALLEL` should equal the per-machine worker count — `run-workers.sh` now sizes it automatically when it creates the managed container. If a pre-existing Ollama container has a different value, the script warns; recreating the container is required to apply changes (`docker rm -f photosearch-worker-ollama`, then re-run).
+
 
 ## Testing
 

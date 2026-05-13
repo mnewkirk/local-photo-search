@@ -968,11 +968,14 @@ container. It then pre-pulls the required models into the Ollama volume:
   verification). Ollama does not auto-pull on request, so both must be present
   before the pass runs.
 
-**Prefer native Ollama.** Running `ollama serve` directly on the Mac host avoids
-Docker Desktop VM memory oversubscription. When native Ollama is reachable at
-`localhost:11434`, `run-workers.sh` detects and reuses it (and only *warns*
-about missing models rather than pulling them, since pulling multi-GB models
-into someone else's Ollama unannounced is rude).
+**Prefer native Ollama, on the GPU.** Ollama performance is dominated by
+whether inference runs on a GPU vs CPU. Switching from CPU-only Docker
+Ollama to GPU-accelerated native Ollama is a 3-6x throughput jump and
+usually the single biggest perf lever for the describe pass. `run-workers.sh`
+checks `localhost:11434` first and reuses any reachable Ollama (managed
+container or external), so the setup is one-time per machine and the
+script needs no change. See **GPU acceleration: per-machine tuning** below
+for the concrete recipes.
 
 **If you must use the managed Ollama container:** raise Docker Desktop memory
 (Settings → Resources → Memory) to at least ~24 GiB for the default fleet
@@ -984,6 +987,141 @@ after changing the limit.
 `"llama runner process has terminated"` error pattern and prints a one-time
 hint to stderr explaining the likely cause and fixes (see
 `_maybe_print_runner_oom_hint()`).
+
+#### GPU acceleration: per-machine tuning
+
+Measured per-photo describe times on this project's fleet (LLaVA 7B Q4_0,
+3 workers, `OLLAMA_NUM_PARALLEL=3`):
+
+| Machine | Path | Per-photo describe |
+|---|---|---|
+| Mac M-series, 14 cores | Docker `ollama/ollama`, CPU-only | 30-60s |
+| Mac M-series, 14 cores | Native `ollama serve` via brew (Metal/MPS) | ~10s |
+| WSL2 + RX 7900 XTX | Docker `ollama/ollama:rocm` w/ ROCm devices | ~10-20s (expected) |
+| WSL2, no supported GPU | Docker `ollama/ollama`, CPU-only | 30-90s |
+
+`OLLAMA_NUM_PARALLEL` should match the per-machine worker count — `run-workers.sh`
+sizes it automatically when it creates the managed container, and warns if a
+pre-existing container's value doesn't match. Env vars on a running container
+are immutable; recreation is required to apply changes (`docker rm -f
+photosearch-worker-ollama` then re-run the script).
+
+##### Mac: native Ollama via brew services
+
+3-6x faster than Docker on Apple Silicon (Metal/MPS vs Linux-VM CPU). Steps:
+
+```bash
+brew install ollama                          # if not already
+
+# Set NUM_PARALLEL in launchd env BEFORE starting — env is captured at spawn,
+# not picked up on the fly.
+launchctl setenv OLLAMA_NUM_PARALLEL 3
+brew services start ollama
+ollama pull llava                            # pull into native Ollama
+curl -s http://localhost:11434/api/tags >/dev/null && echo "Ollama OK"
+```
+
+Logs land at `/opt/homebrew/var/log/ollama.log`. For reboot persistence of
+the env var, edit `~/Library/LaunchAgents/homebrew.mxcl.ollama.plist` to
+add an `EnvironmentVariables` dict; otherwise `launchctl setenv` resets at
+logout and brew services restarts with `NUM_PARALLEL=1`.
+
+Then start workers normally — `run-workers.sh` detects native Ollama and
+skips its Docker fallback:
+
+```bash
+./run-workers.sh -s http://<NAS-IP>:8000 -p describe -n 3 ...
+```
+
+Operating point: 3 workers + NUM_PARALLEL=3 saturates the M-series GPU at
+~97% with describe times steady at ~10s. Adding slots beyond 3 splits the
+GPU and inflates per-photo time without throughput gain. Verify with
+Activity Monitor → Window → GPU History, or:
+
+```bash
+sudo powermetrics --samplers gpu_power -n 3 -i 1000 2>&1 | grep -E "GPU.*active"
+```
+
+##### WSL2 Ubuntu with AMD Radeon (ROCm)
+
+Officially supported WSL2 ROCm cards (per AMD docs, early 2026) are narrow:
+**RX 7900 XTX/XT/GRE**, **W7900/W7800/W6800**, Instinct MI series. Older
+RDNA1/2 cards (RX 6000-series, 5000-series, Vega) have no official WSL2
+ROCm support — they may work on bare-metal Linux but not via the WSL2 GPU
+passthrough.
+
+Setup for a supported card:
+
+1. **Install AMD's ROCm-on-WSL driver bundle on Windows.** Follow AMD's
+   guide at `rocm.docs.amd.com` → "Install ROCm on Radeon GPUs → Windows
+   Subsystem for Linux." Versions move; copy AMD's current recipe rather
+   than stale commands. Generally needs Windows 11 22H2+ and Adrenalin
+   Pro Edition with WSL2 support.
+2. **Verify ROCm sees the GPU from inside WSL2:**
+   ```bash
+   rocminfo | grep -E "Name:|Marketing Name:" | head -10
+   ```
+   You should see the GPU listed as an HSA agent. If only the CPU shows
+   up, the install didn't take — fix this first; nothing downstream will
+   work otherwise.
+3. **Manual smoke test with the ROCm Ollama image, BEFORE touching
+   `run-workers.sh`:**
+   ```bash
+   docker rm -f photosearch-worker-ollama
+   docker run -d \
+     --name photosearch-worker-ollama \
+     --device /dev/kfd --device /dev/dri \
+     --group-add video --group-add render \
+     --security-opt seccomp=unconfined \
+     -v photosearch-worker-ollama-models:/root/.ollama \
+     -p 11434:11434 \
+     -e OLLAMA_NUM_PARALLEL=3 \
+     -e OLLAMA_MAX_LOADED_MODELS=1 \
+     ollama/ollama:rocm
+   docker exec photosearch-worker-ollama ollama pull llava
+   docker logs photosearch-worker-ollama 2>&1 | grep -iE "rocm|gpu" | head
+   ```
+   Look for `using ROCm runtime` or `gpu="0" available=true type=rocm`.
+   If you see `running on CPU`, device passthrough didn't reach Ollama —
+   re-check step 2.
+4. **If the manual test works**, make it permanent by updating
+   `ensure_ollama_running` in `run-workers.sh` to auto-detect AMD and
+   use the ROCm image. Sketch:
+   ```bash
+   if [ -e /dev/kfd ] && [ -e /dev/dri ]; then
+       OLLAMA_IMAGE="ollama/ollama:rocm"
+       DEVICE_FLAGS="--device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined"
+   else
+       OLLAMA_IMAGE="ollama/ollama:latest"
+       DEVICE_FLAGS=""
+   fi
+   ```
+   `/dev/kfd` doesn't exist on Mac, so this auto-detect leaves the Mac
+   path untouched.
+
+The 7900 XTX has 24 GB VRAM, so 4-6 parallel slots fit comfortably. Tune
+by bumping `-n` and watching per-photo times — flat times mean GPU has
+headroom, linearly-growing times mean you've hit the ceiling.
+
+##### WSL2 Ubuntu with NVIDIA (CUDA)
+
+Better-supported path than AMD. Install NVIDIA's WSL2 driver on Windows
+(the same driver that powers CUDA in WSL2 Ubuntu), then either:
+
+- Use the standard `ollama/ollama:latest` image with `--gpus all`. Docker
+  Desktop + WSL2 NVIDIA passthrough is automatic when the Windows driver
+  is present.
+- Or install native Ollama in WSL2 (`curl -fsSL https://ollama.com/install.sh | sh`).
+  Auto-detects CUDA.
+
+##### Fallback: route describe to whichever machine has the GPU
+
+If a machine can't reach GPU acceleration, leave it on CPU-only passes
+(`-p clip,faces,quality`) and push describe traffic to the GPU machine
+alone (`-p describe,tags`). The `BEGIN IMMEDIATE` claim-batch
+serialization (commit `64eb1ac`) keeps this safe under concurrency —
+multiple machines claiming describe batches serialize on the NAS writer
+lock without duplicate work.
 
 ### Bare-Metal Worker CLI (Single Quick Tests Only)
 
