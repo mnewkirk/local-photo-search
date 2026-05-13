@@ -1348,7 +1348,7 @@ class PhotoDB:
     # Worker claims (distributed indexing)
     # ------------------------------------------------------------------
 
-    def expire_worker_claims(self, force: bool = False) -> int:
+    def expire_worker_claims(self, force: bool = False, commit: bool = True) -> int:
         """Delete expired claims, returning them to the queue. Returns count expired.
 
         Throttled to once per ~5s process-wide. The read path
@@ -1356,6 +1356,10 @@ class PhotoDB:
         workers polling, that's 40 pointless writer-lock-acquiring DELETEs/sec
         with nothing to expire. force=True bypasses the throttle for callers
         that genuinely need a fresh sweep.
+
+        commit=False lets a caller that already holds a writer transaction
+        (e.g. claim-batch's BEGIN IMMEDIATE) run the cleanup inside the same
+        transaction without committing prematurely.
         """
         global _LAST_EXPIRE_SWEEP_MONO
         now = time.monotonic()
@@ -1364,13 +1368,18 @@ class PhotoDB:
         cur = self.conn.execute(
             "DELETE FROM worker_claims WHERE expires_at < datetime('now')"
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         _LAST_EXPIRE_SWEEP_MONO = now
         return cur.rowcount
 
     def claim_photos(self, worker_id: str, pass_type: str, photo_ids: list[int],
-                     ttl_minutes: int = 30) -> str:
-        """Claim a batch of photos for processing. Returns batch_id."""
+                     ttl_minutes: int = 30, commit: bool = True) -> str:
+        """Claim a batch of photos for processing. Returns batch_id.
+
+        commit=False lets a caller that already holds a writer transaction
+        (e.g. claim-batch's BEGIN IMMEDIATE) finalize the commit themselves.
+        """
         import uuid
         batch_id = str(uuid.uuid4())
         self.conn.execute(
@@ -1379,7 +1388,8 @@ class PhotoDB:
             (batch_id, worker_id, pass_type, json.dumps(photo_ids),
              f"+{ttl_minutes} minutes"),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return batch_id
 
     def renew_claim(self, batch_id: str, ttl_minutes: int = 30) -> bool:
@@ -1427,9 +1437,13 @@ class PhotoDB:
             )
         self.conn.commit()
 
-    def get_claimed_photo_ids(self, pass_type: str) -> set[int]:
-        """Return the set of photo IDs currently claimed for a pass type."""
-        self.expire_worker_claims()
+    def get_claimed_photo_ids(self, pass_type: str, commit_cleanup: bool = True) -> set[int]:
+        """Return the set of photo IDs currently claimed for a pass type.
+
+        commit_cleanup=False forwards to expire_worker_claims so the internal
+        sweep doesn't commit an outer transaction held by the caller.
+        """
+        self.expire_worker_claims(commit=commit_cleanup)
         rows = self.conn.execute(
             "SELECT photo_ids FROM worker_claims WHERE pass_type = ? AND expires_at > datetime('now')",
             (pass_type,),
@@ -1440,14 +1454,17 @@ class PhotoDB:
         return result
 
     def get_unprocessed_photos(self, pass_type: str, photo_ids: list[int] | None = None,
-                               limit: int = 16) -> list[dict]:
+                               limit: int = 16, commit_cleanup: bool = True) -> list[dict]:
         """Find photos missing data for a given pass type, excluding claimed ones.
 
         pass_type: 'clip', 'faces', 'quality', 'describe', 'tags'
         photo_ids: optional scope (e.g. collection photos)
+        commit_cleanup: when False, the internal expired-claim sweep runs
+            inside the caller's open writer transaction (used by claim-batch
+            under BEGIN IMMEDIATE so the entire read-then-insert is atomic).
         Returns list of {id, filepath} dicts.
         """
-        claimed = self.get_claimed_photo_ids(pass_type)
+        claimed = self.get_claimed_photo_ids(pass_type, commit_cleanup=commit_cleanup)
 
         # Build the "missing" condition per pass type.
         # For faces, we check worker_processed because photos with no faces

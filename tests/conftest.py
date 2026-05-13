@@ -263,17 +263,23 @@ def db(tmp_db_path):
 def client(db, tmp_path):
     """FastAPI TestClient wired to the test database."""
     from fastapi.testclient import TestClient
-    from photosearch import web
+    from photosearch import web, worker_api
 
     # Point the web module at our test DB
     original_db_path = web._db_path
     original_photo_root = web._photo_root
     original_thumb_dir = web._thumb_dir
+    original_worker_db = worker_api._db_path
+    original_worker_root = worker_api._photo_root
 
     web._db_path = db.db_path
     web._photo_root = "/photos"
     web._thumb_dir = str(tmp_path / "thumbs")
     os.makedirs(web._thumb_dir, exist_ok=True)
+    # worker_api captures _db_path at import time via configure_worker; mirror
+    # the override so /api/worker/* endpoints hit the same test DB.
+    worker_api._db_path = db.db_path
+    worker_api._photo_root = "/photos"
 
     with TestClient(web.app) as c:
         yield c
@@ -282,3 +288,5 @@ def client(db, tmp_path):
     web._db_path = original_db_path
     web._photo_root = original_photo_root
     web._thumb_dir = original_thumb_dir
+    worker_api._db_path = original_worker_db
+    worker_api._photo_root = original_worker_root

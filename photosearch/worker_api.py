@@ -157,22 +157,39 @@ def claim_batch(req: ClaimRequest):
             if not scope_ids:
                 raise HTTPException(404, f"No photos found in directory {req.directory}")
 
-        photos = db.get_unprocessed_photos(
-            pass_type=req.pass_type,
-            photo_ids=scope_ids,
-            limit=req.limit,
-        )
+        # BEGIN IMMEDIATE acquires the SQLite writer lock up front so concurrent
+        # claim-batch calls serialize here instead of racing through the
+        # read-then-insert window. Without this, N parallel workers could each
+        # SELECT the same unprocessed photos, then each INSERT a claim row
+        # containing the same photo_ids — every worker would download and
+        # re-describe the same images. Cleanup commits inside the read are
+        # suppressed via commit_cleanup/commit kwargs so they don't end our
+        # outer transaction early.
+        db.conn.execute("BEGIN IMMEDIATE")
+        try:
+            photos = db.get_unprocessed_photos(
+                pass_type=req.pass_type,
+                photo_ids=scope_ids,
+                limit=req.limit,
+                commit_cleanup=False,
+            )
 
-        if not photos:
-            return JSONResponse({"batch_id": None, "pass_type": req.pass_type, "photos": []})
+            if not photos:
+                db.conn.commit()
+                return JSONResponse({"batch_id": None, "pass_type": req.pass_type, "photos": []})
 
-        photo_ids = [p["id"] for p in photos]
-        batch_id = db.claim_photos(
-            worker_id=req.worker_id,
-            pass_type=req.pass_type,
-            photo_ids=photo_ids,
-            ttl_minutes=req.ttl_minutes,
-        )
+            photo_ids = [p["id"] for p in photos]
+            batch_id = db.claim_photos(
+                worker_id=req.worker_id,
+                pass_type=req.pass_type,
+                photo_ids=photo_ids,
+                ttl_minutes=req.ttl_minutes,
+                commit=False,
+            )
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
 
         # Count how many remain unclaimed after this batch. Uses a COUNT(*)
         # rather than materializing every unprocessed row — with N concurrent
