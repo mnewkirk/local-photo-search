@@ -140,25 +140,37 @@ ollama_container_exists() {
 ensure_ollama_running() {
     if ollama_is_reachable; then
         if ollama_container_exists; then
-            echo "  Ollama reachable (managed container: $OLLAMA_CONTAINER)"
+            local current_parallel
+            current_parallel=$(docker inspect "$OLLAMA_CONTAINER" \
+                --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                | sed -n 's/^OLLAMA_NUM_PARALLEL=//p')
+            echo "  Ollama reachable (managed container: $OLLAMA_CONTAINER, NUM_PARALLEL=${current_parallel:-?})"
+            if [ -n "$current_parallel" ] && [ "$current_parallel" != "$NUM_WORKERS" ]; then
+                echo "  NOTE: NUM_PARALLEL=$current_parallel but launching $NUM_WORKERS workers." >&2
+                echo "        Workers past $current_parallel will queue at Ollama. To apply NUM_PARALLEL=$NUM_WORKERS," >&2
+                echo "        recreate the container:  docker rm -f $OLLAMA_CONTAINER  &&  re-run this script." >&2
+            fi
         else
             echo "  Ollama already reachable at localhost:${OLLAMA_PORT} (not managed by this script)"
+            echo "  NOTE: cannot tune OLLAMA_NUM_PARALLEL on an external Ollama. Set it before 'ollama serve'" >&2
+            echo "        if you want >1 slot (e.g. OLLAMA_NUM_PARALLEL=$NUM_WORKERS ollama serve)." >&2
         fi
         return
     fi
-    echo "  Ollama not reachable — starting managed container ($OLLAMA_CONTAINER)..."
+    echo "  Ollama not reachable — starting managed container ($OLLAMA_CONTAINER) with NUM_PARALLEL=$NUM_WORKERS..."
     docker rm -f "$OLLAMA_CONTAINER" > /dev/null 2>&1 || true
-    # OLLAMA_NUM_PARALLEL=1 and MAX_LOADED_MODELS=1 serialize requests to avoid
-    # llama-runner crashes under concurrent load in CPU-only Docker (500 errors
-    # like "llama runner process has terminated"). Multiple workers still help —
-    # Ollama queues their requests server-side.
+    # NUM_PARALLEL is sized to match the worker count so every worker's outstanding
+    # request gets its own slot instead of queueing. MAX_LOADED_MODELS=1 keeps a
+    # single model resident (raise to 2 if you regularly run verify, which needs
+    # both verifier + regen models). Each slot adds ~KV-cache RAM on top of the
+    # model weights — keep an eye on container memory if you push NUM_WORKERS high.
     docker run -d \
         --name "$OLLAMA_CONTAINER" \
         --label "photosearch-worker-ollama=true" \
         --restart unless-stopped \
         -p "${OLLAMA_PORT}:11434" \
         -v "${OLLAMA_VOLUME}:/root/.ollama" \
-        -e OLLAMA_NUM_PARALLEL=1 \
+        -e OLLAMA_NUM_PARALLEL="$NUM_WORKERS" \
         -e OLLAMA_MAX_LOADED_MODELS=1 \
         ollama/ollama:latest > /dev/null
     local waited=0
