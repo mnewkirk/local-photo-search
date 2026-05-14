@@ -94,7 +94,7 @@ local-photo-search/
 │   ├── search.py          # Hybrid search: CLIP + face boost + description scoring
 │   ├── index.py           # Indexing pipeline orchestrator
 │   ├── faces.py           # InsightFace detection, ArcFace encoding, clustering
-│   ├── describe.py        # LLaVA scene descriptions + semantic tagging via Ollama
+│   ├── describe.py        # Scene descriptions + semantic tagging via Ollama
 │   ├── colors.py          # Dominant color extraction (colorthief)
 │   ├── quality.py         # Aesthetic quality scoring (LAION predictor + ViT-L/14)
 │   ├── verify.py          # Hallucination detection (CLIP + cross-model LLM)
@@ -258,17 +258,17 @@ python cli.py search --person "Alex"
 ```
 
 
-## LLaVA scene descriptions
+## Scene descriptions
 
-Each photo gets a 2–4 sentence description from LLaVA running locally through Ollama. The description prompt is tuned for search: it asks the model to describe who/what is present, what they're doing, the setting, and whether people are present or absent.
+Each photo gets a 2–4 sentence description from a vision model running locally through Ollama. The description prompt is tuned for search: it asks the model to describe who/what is present, what they're doing, the setting, and whether people are present or absent.
 
-We use `llava:13b` in production for better accuracy. The 7B model had frequent issues: describing children as adults, misidentifying gender, and hallucinating objects like surfboards. The 13B model is meaningfully better, though occasional hallucinations still occur (describing a person on an empty beach). The descriptions are stored in the database and used by the search engine's text-matching logic.
+The describe pass defaults to `llama3.2-vision`, picked after a 100-image bakeoff where it beat `llava` on free-form description quality (especially text/OCR-heavy photos). It can fall into repetition loops, so `describe.py` applies model-aware generation options plus a degeneration detect-retry-fallback. Earlier iterations used `llava` 7B then 13B; the 7B model frequently described children as adults, misidentified gender, and hallucinated objects — all overridable via `--describe-model`. Descriptions are stored in the database and used by the search engine's text-matching logic.
 
 Ollama runs descriptions entirely locally — the `ollama` Python client communicates with the local Ollama server, and we verified through network monitoring that no photos are sent to external services.
 
 ```bash
-# Generate descriptions for all photos
-python cli.py index /path/to/photos --describe --describe-model llava:13b
+# Generate descriptions for all photos (defaults to llama3.2-vision)
+python cli.py index /path/to/photos --describe
 
 # View descriptions
 python cli.py show-descriptions
@@ -420,7 +420,7 @@ LLaVA occasionally hallucinates — describing a frisbee that isn't there, or cl
 
 **Pass 1 — CLIP scoring.** Extract visual nouns from the description and score each against the photo's CLIP embedding. Uses both an absolute threshold and a relative threshold (1.5 std deviations below the median) to flag suspicious items. In batch mode, only photos with flagged items proceed to Pass 2. In `--photo` or `--llm-all` mode, all photos proceed.
 
-**Pass 2 — Cross-model LLM check.** Send the photo (not the description) to a *different* vision model (minicpm-v by default) and ask it to identify errors in the original description. Using a different model is critical: the same model that hallucinated an object will confirm its own hallucination when asked to verify. Different models have different biases, so cross-checking catches errors that self-verification misses.
+**Pass 2 — Cross-model LLM check.** Send the photo (not the description) to a *different* vision model (default: `llava`, distinct from the `llama3.2-vision` describe model) and ask it to identify errors in the original description. Using a different model is critical: the same model that hallucinated an object will confirm its own hallucination when asked to verify. Different models have different biases, so cross-checking catches errors that self-verification misses.
 
 **Pass 3 — CLIP cross-check.** For each item the LLM flagged as wrong, embed it with CLIP and check its similarity to the photo. If CLIP gives it an above-median score (suggesting the object really is in the image), the LLM's finding is overridden. This prevents the verification model from over-flagging — both CLIP and the LLM must agree before a hallucination is confirmed.
 
@@ -446,14 +446,18 @@ python cli.py verify --no-regenerate --force --limit 50
 
 ### Required models
 
-The verification pipeline requires two Ollama vision models:
+The describe/tags/verify passes use Ollama vision models — decoupled, because no
+single model wins all three tasks:
 
-- **Description model** (default: `llava`) — generates and regenerates descriptions/tags
-- **Verification model** (default: `minicpm-v`) — cross-checks descriptions for errors
+- **Describe model** (default: `llama3.2-vision`) — generates and regenerates descriptions
+- **Tags model** (default: `llava`) — the constrained tag-vocabulary task; `llama3.2-vision`
+  degenerates on it
+- **Verification model** (default: `llava`) — cross-checks descriptions for errors;
+  must differ from the describe model so it isn't confirming its own hallucinations
 
 ```bash
-ollama pull llava:13b    # or llava for the 7B variant
-ollama pull minicpm-v    # ~5 GB, SigLip + Qwen2 architecture
+ollama pull llama3.2-vision   # describe / regen
+ollama pull llava             # tags + verification
 ```
 
 
@@ -466,11 +470,13 @@ ollama pull minicpm-v    # ~5 GB, SigLip + Qwen2 architecture
 You'll need two models — the initial download takes a while but only happens once:
 
 ```bash
-ollama pull llava:13b      # ~8 GB — scene descriptions (better quality than 7B)
-ollama pull minicpm-v      # ~5 GB — hallucination verification (cross-model check)
+ollama pull llama3.2-vision   # ~8 GB — scene descriptions / regeneration
+ollama pull llava             # ~4.7 GB — semantic tags + hallucination verification
 ```
 
-If you're tight on disk or RAM, you can start with just `ollama pull llava` (the 7B variant, ~4 GB) and skip `minicpm-v` — descriptions will work but verification won't.
+If you're tight on disk or RAM, you can run just `ollama pull llava` and pass
+`--describe-model llava` — descriptions will work (lower quality than llama3.2-vision)
+and so will tags/verify.
 
 
 ## Quick start
@@ -533,8 +539,9 @@ Key flags for `index`:
 |------|--------|
 | `--clip` | Generate CLIP embeddings (required for search) |
 | `--faces` | Enable face detection and encoding |
-| `--describe` | Generate LLaVA scene descriptions |
-| `--describe-model llava:13b` | Use a specific Ollama model |
+| `--describe` | Generate scene descriptions (default model: `llama3.2-vision`) |
+| `--describe-model M` | Override the describe model |
+| `--tags-model M` | Override the tags model (default: `llava`, decoupled from describe) |
 | `--quality` | Compute aesthetic quality scores (1–10) |
 | `--tags` | Generate semantic category tags |
 | `--force-clip` | Clear and regenerate CLIP embeddings for this directory |
@@ -549,8 +556,8 @@ Key flags for `verify`:
 | Flag | Effect |
 |------|--------|
 | `--photo <path>` | Verify a single photo (auto-enables verbose + llm-all) |
-| `--verify-model minicpm-v` | Vision model for verification (default: minicpm-v) |
-| `--model llava` | Model for regeneration (default: llava) |
+| `--verify-model M` | Vision model for verification (default: `llava`) |
+| `--model M` | Model for regeneration (default: `llama3.2-vision`) |
 | `--threshold 0.18` | CLIP similarity threshold for flagging |
 | `--force` | Re-verify even previously verified photos |
 | `--no-regenerate` | Flag hallucinations but don't auto-regenerate |
@@ -605,8 +612,9 @@ Key flags for `worker`:
 | `--ttl 30` | Claim TTL in minutes (auto-releases if worker dies) |
 | `--one-shot` | Process one batch per pass and exit |
 | `--force` | Clear existing data and re-process (requires --collection or --directory) |
-| `--describe-model llava` | Ollama model for descriptions and tags |
-| `--verify-model minicpm-v` | Ollama model for hallucination verification |
+| `--describe-model M` | Ollama model for descriptions (default: `llama3.2-vision`) |
+| `--tags-model M` | Ollama model for tags (default: `llava`) |
+| `--verify-model M` | Ollama model for hallucination verification (default: `llava`) |
 
 Multiple workers can run concurrently on different passes. Claims have a TTL — if a worker crashes, uncompleted photos are automatically released and reclaimed by the next worker.
 
@@ -618,26 +626,26 @@ The describe pass runs LLaVA via Ollama, which is by far the slowest pass in the
 |---|---|---|
 | Mac M-series | Docker `ollama/ollama` (CPU) | 30-60s |
 | Mac M-series | Native `ollama serve` via brew (Metal/MPS) | ~10s |
-| WSL2 + RX 7900 XTX | Docker `ollama/ollama:rocm` (ROCm) | ~10-20s |
+| WSL2 + RX 7900 XTX | Windows-native Ollama (GPU), worker `OLLAMA_HOST` → Windows host | ~0.8-4s |
 
-`run-workers.sh` checks `localhost:11434` first and reuses any reachable Ollama, so swapping a machine to a GPU-accelerated path is a one-time setup that needs no script changes.
+For describe/tags/verify, point the worker's `OLLAMA_HOST` at whichever host runs a GPU-capable Ollama. `run-workers.sh` checks `localhost:11434` first and reuses any reachable Ollama.
 
 **Mac (Apple Silicon):**
 ```bash
 brew install ollama                       # if needed
 launchctl setenv OLLAMA_NUM_PARALLEL 3    # MUST be before brew services start
 brew services start ollama
-ollama pull llava
+ollama pull llama3.2-vision llava         # describe + tags/verify models
 # Now launch workers as usual — script detects native Ollama and skips Docker.
 ```
 
-**WSL2 + supported AMD Radeon (RX 7900 XTX/XT/GRE, W-series, MI-series):** install AMD's ROCm-on-WSL driver bundle from `rocm.docs.amd.com`, verify `rocminfo` inside WSL2 shows the GPU, then either run the `ollama/ollama:rocm` Docker image with `--device /dev/kfd --device /dev/dri` (smoke test it manually before scripting), or update `run-workers.sh` to auto-detect via `[ -e /dev/kfd ]`.
+**WSL2 + AMD Radeon (RX 7900 XTX/XT/GRE, W-series, MI-series):** the CLIP/quality/faces passes use the GPU directly — PyTorch-ROCm and onnxruntime-rocm via AMD's `librocdxg` shim (the modern ROCm-on-WSL stack; there is no `/dev/kfd`). But **do not run Ollama inside WSL2** for AMD GPUs — its GPU-verification path is incompatible with `librocdxg` and silently falls back to CPU. Instead run **Windows-native Ollama** (it sees the GPU through the normal Windows driver) and point the WSL2 worker's `OLLAMA_HOST` at the Windows host.
 
 **WSL2 + NVIDIA:** install NVIDIA's WSL2 driver, then either `ollama/ollama:latest --gpus all` or native Ollama in WSL2 (auto-detects CUDA).
 
-**No supported GPU:** stay on CPU and route describe traffic to whichever machine does have a GPU — keep this machine on `-p clip,faces,quality`, and one GPU machine on `-p describe,tags`. The race-safe claim-batch path (commit `64eb1ac`, `BEGIN IMMEDIATE` serialization) handles this cleanly across machines.
+**No supported GPU:** stay on CPU and route describe traffic to whichever machine does have a GPU — keep this machine on `-p clip,faces,quality`, and one GPU machine on `-p describe`. The race-safe claim-batch path (commit `64eb1ac`, `BEGIN IMMEDIATE` serialization) handles this cleanly across machines.
 
-See `.claude/skills/photo-search/SKILL.md` → "GPU acceleration: per-machine tuning" for the full recipes, smoke-test commands, and `run-workers.sh` patch.
+See `.claude/skills/photo-search/SKILL.md` → "GPU acceleration: per-machine tuning" for the full per-machine recipes (Mac Metal, WSL2 + AMD via librocdxg, WSL2 + NVIDIA).
 
 `OLLAMA_NUM_PARALLEL` should equal the per-machine worker count — `run-workers.sh` now sizes it automatically when it creates the managed container. If a pre-existing Ollama container has a different value, the script warns; recreating the container is required to apply changes (`docker rm -f photosearch-worker-ollama`, then re-run).
 

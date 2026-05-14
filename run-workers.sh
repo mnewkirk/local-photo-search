@@ -19,9 +19,9 @@
 # If --passes includes describe, tags, or verify, the script checks
 # localhost:11434. If nothing answers, it starts a managed container
 # ($OLLAMA_CONTAINER) and auto-pulls the required models into its volume
-# ($OLLAMA_VOLUME). For `verify` this pulls BOTH the verifier (minicpm-v) and
-# the regeneration model (llava) — verify regenerates descriptions via the
-# describe model when a photo fails verification, so both must be present.
+# ($OLLAMA_VOLUME). describe and tags use different models (see the per-pass
+# model strategy in CLAUDE.md); `verify` pulls its verifier model plus the
+# describe + tags models it uses to regenerate failed descriptions.
 # The managed container is torn down by --stop.
 #
 # PREFER NATIVE OLLAMA (run `ollama serve` on the host) if you can. The
@@ -64,6 +64,7 @@ TTL=30
 MEM_LIMIT="3g"
 FORCE=""
 DESCRIBE_MODEL=""
+TAGS_MODEL=""
 VERIFY_MODEL=""
 
 usage() {
@@ -81,8 +82,9 @@ Start workers:
       --model-batch-size N  Inference batch size (default: 8)
       --ttl MINUTES       Claim TTL (default: 30)
       --force             Clear existing data and reprocess
-      --describe-model M  Ollama model for describe/tags (default: llava)
-      --verify-model M    Ollama model for verification (default: minicpm-v)
+      --describe-model M  Ollama model for describe (default: llama3.2-vision)
+      --tags-model M      Ollama model for tags (default: llava)
+      --verify-model M    Ollama model for verification (default: llava)
 
 Manage workers:
       --status            Show running workers and their progress
@@ -193,10 +195,12 @@ required_ollama_models() {
     local IFS=','
     for p in $PASSES; do
         case "$p" in
-            describe|tags) echo "${DESCRIBE_MODEL:-llava}" ;;
+            describe) echo "${DESCRIBE_MODEL:-llama3.2-vision}" ;;
+            tags)     echo "${TAGS_MODEL:-llava}" ;;
             verify)
-                echo "${VERIFY_MODEL:-minicpm-v}"
-                echo "${DESCRIBE_MODEL:-llava}"
+                echo "${VERIFY_MODEL:-llava}"
+                echo "${DESCRIBE_MODEL:-llama3.2-vision}"
+                echo "${TAGS_MODEL:-llava}"
                 ;;
         esac
     done | sort -u
@@ -478,6 +482,7 @@ while [[ $# -gt 0 ]]; do
         --ttl)              TTL="$2";              shift 2 ;;
         --force)            FORCE="1";             shift ;;
         --describe-model)   DESCRIBE_MODEL="$2";   shift 2 ;;
+        --tags-model)       TAGS_MODEL="$2";       shift 2 ;;
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
         --status)           do_status ;;
         --logs)             do_logs ;;
@@ -524,6 +529,9 @@ if [ -n "$FORCE" ]; then
 fi
 if [ -n "$DESCRIBE_MODEL" ]; then
     WORKER_CMD="$WORKER_CMD --describe-model $DESCRIBE_MODEL"
+fi
+if [ -n "$TAGS_MODEL" ]; then
+    WORKER_CMD="$WORKER_CMD --tags-model $TAGS_MODEL"
 fi
 if [ -n "$VERIFY_MODEL" ]; then
     WORKER_CMD="$WORKER_CMD --verify-model $VERIFY_MODEL"

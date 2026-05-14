@@ -55,7 +55,7 @@ local-photo-search/
 ├── references.yml          # Face reference config (person → photos)
 ├── GOOGLE_PHOTOS_SETUP.md  # Step-by-step Google Photos OAuth setup
 ├── photosearch/
-│   ├── db.py               # PhotoDB class, schema v20, all queries
+│   ├── db.py               # PhotoDB class, schema v21, all queries
 │   ├── infer_location.py   # M19 — temporal GPS inference (haversine, cascade)
 │   ├── index.py            # index_directory() + _index_collection() — indexing pipeline
 │   ├── search.py           # search_combined() + all search types
@@ -93,7 +93,7 @@ local-photo-search/
 
 ---
 
-## Database Schema (v20)
+## Database Schema (v21)
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -110,14 +110,27 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | review_selections | Culling selections per folder |
 | google_photos_uploads | Upload ledger (album_id, filepath, media_item_id) |
 | ignored_clusters | Face clusters marked to ignore |
+| generations | Provenance log for describe/tags/verify text artifacts (v21) |
 | schema_info | Schema version + photo_root path |
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
-`aesthetic_score` (REAL, 1-10), `description` (TEXT, LLaVA-generated), `tags` (JSON array),
+`aesthetic_score` (REAL, 1-10), `description` (TEXT, vision-model-generated), `tags` (JSON array),
 `place_name` (TEXT, reverse-geocoded), `dominant_colors` (JSON array of hex values),
 `location_source` (`'exif'|'inferred'|NULL`, v17), `location_confidence`
 (`NULL|(0,1]`, v17, only non-null for inferred rows), `date_created` (v16
 file-mtime fallback sort key).
+
+`generations` columns (v21): `photo_id`, `text_type` (`'describe'|'tags'|'verify'`),
+`generated_text` (the description string, or a JSON array for tags), `model_used`,
+`model_version` (Ollama digest, best-effort), `created_at`. The `photos` table
+holds the current "promoted" description/tags; `generations` is the full history
+so artifacts from different models coexist with provenance. Written by
+`db.log_generation()` from `worker_api.submit_results`. Backfill historical data
+with `photosearch backfill-generations` (idempotent — `NOT EXISTS` guard, NULL
+model for pre-v21 rows). Related maintenance command: `photosearch
+clean-garbage-tags` clears regurgitated tag sets (photos with ≥16 of the 78
+vocabulary tags) from both `photos.tags` and `generations`, so they get
+re-tagged — see the regurgitation guard in `describe.py:tag_photo`.
 
 Schema migrations run automatically on DB open via `_init_schema()` with version checks.
 Bump `SCHEMA_VERSION` when adding tables or columns, and add migration SQL in the
@@ -677,20 +690,28 @@ Collection-only options:
 | Face detection | `--faces` | InsightFace buffalo_l (~300 MB) | ~0.5-2s/photo | None |
 | Quality scoring | `--quality` | ViT-L/14 (768-dim) + MLP | ~1000 photos/hr | None |
 | Concept analysis | (auto with quality) | Same ViT-L/14 | Runs after scoring | Quality pass |
-| Descriptions | `--describe` | LLaVA 7B via Ollama | 30-200s/photo | Ollama running |
-| Tags | `--tags` | Same as describe model | 30-200s/photo | Ollama running |
+| Descriptions | `--describe` | `llama3.2-vision` via Ollama (`--describe-model`) | 30-200s/photo CPU, ~4s GPU | Ollama running |
+| Tags | `--tags` | `llava` via Ollama (`--tags-model`) — decoupled from describe | 30-200s/photo CPU, ~1s GPU | Ollama running |
 | Critique | (auto) | Same as describe model | 30-200s/photo | Quality + describe |
 | Stacking | (auto after CLIP) | — | Fast (DB only) | CLIP embeddings |
 | Geocoding | (auto) | GeoNames (offline) | Fast | GPS data in EXIF |
-| Verification | `--verify` | minicpm-v + llava | Slow (2 LLM passes) | Descriptions exist |
+| Verification | `--verify` | `llava` checker + `llama3.2-vision` regen | Slow (2 LLM passes) | Descriptions exist |
+
+The describe/tags/verify models are decoupled because no single vision model
+wins all three — see "Per-pass model strategy" under Distributed Indexing,
+and CLAUDE.md. `describe.py` has model-aware Ollama options + a degeneration
+detect-retry-fallback for `llama3.2-vision`, and a regurgitation guard in
+`tag_photo`.
 
 ### Parallelization
 
 These can run as separate `nohup` processes simultaneously (different models, no conflicts):
 - `--clip`, `--faces`, `--quality`
 
-These must run sequentially (share Ollama's single model slot):
-- `--describe`, `--tags`, critiques
+These share Ollama and now use **different** models (`llama3.2-vision` for
+describe, `llava` for tags). Run them as **separate sequential runs** — bundling
+them forces Ollama to thrash-swap models between every batch. Critiques use the
+describe model, so they batch fine alongside `--describe`.
 
 ### Collection-based re-indexing
 
@@ -951,7 +972,8 @@ using CPU-only PyTorch with hard memory limits per container.
 isolated network and cannot resolve local DNS names like `nas.local` or mDNS hostnames.
 
 Key options: `-n` (number of workers, default 4), `-m` (memory limit, default 3g),
-`--batch-size`, `--model-batch-size`, `--ttl`, `--force`, `--describe-model`, `--verify-model`.
+`--batch-size`, `--model-batch-size`, `--ttl`, `--force`, `--describe-model`,
+`--tags-model`, `--verify-model`.
 
 CPU-only inference is ~2-3x slower per worker than MPS, but 4 containers running
 concurrently with stable memory is faster than 1-2 MPS workers that eventually crash.
@@ -962,11 +984,16 @@ If `--passes` includes `describe`, `tags`, or `verify`, the script checks
 `localhost:11434` and either reuses an existing Ollama or starts a managed
 container. It then pre-pulls the required models into the Ollama volume:
 
-- `describe` / `tags` → pulls `${DESCRIBE_MODEL:-llava}`
-- `verify` → pulls **both** `${VERIFY_MODEL:-minicpm-v}` (verifier) **and**
-  `${DESCRIBE_MODEL:-llava}` (regeneration model used when a description fails
-  verification). Ollama does not auto-pull on request, so both must be present
-  before the pass runs.
+- `describe` → pulls `${DESCRIBE_MODEL:-llama3.2-vision}`
+- `tags` → pulls `${TAGS_MODEL:-llava}` (decoupled from describe — different
+  model wins the constrained tagging task)
+- `verify` → pulls **all of** `${VERIFY_MODEL:-llava}` (verifier),
+  `${DESCRIBE_MODEL:-llama3.2-vision}` (regeneration model), and the tags model.
+  Ollama does not auto-pull on request, so they must be present before the pass.
+
+Because describe and tags now use different models, **don't bundle `describe`
+and `tags` in one `--passes` run** — Ollama would swap models between batches.
+Run them as separate invocations.
 
 **Prefer native Ollama, on the GPU.** Ollama performance is dominated by
 whether inference runs on a GPU vs CPU. Switching from CPU-only Docker
@@ -997,7 +1024,7 @@ Measured per-photo describe times on this project's fleet (LLaVA 7B Q4_0,
 |---|---|---|
 | Mac M-series, 14 cores | Docker `ollama/ollama`, CPU-only | 30-60s |
 | Mac M-series, 14 cores | Native `ollama serve` via brew (Metal/MPS) | ~10s |
-| WSL2 + RX 7900 XTX | Docker `ollama/ollama:rocm` w/ ROCm devices | ~10-20s (expected) |
+| WSL2 + RX 7900 XTX | Windows-native Ollama (GPU), worker `OLLAMA_HOST` → Windows host | ~0.8s llava / ~4s llama3.2-vision (warm) |
 | WSL2, no supported GPU | Docker `ollama/ollama`, CPU-only | 30-90s |
 
 `OLLAMA_NUM_PARALLEL` should match the per-machine worker count — `run-workers.sh`
@@ -1044,64 +1071,63 @@ sudo powermetrics --samplers gpu_power -n 3 -i 1000 2>&1 | grep -E "GPU.*active"
 
 ##### WSL2 Ubuntu with AMD Radeon (ROCm)
 
-Officially supported WSL2 ROCm cards (per AMD docs, early 2026) are narrow:
-**RX 7900 XTX/XT/GRE**, **W7900/W7800/W6800**, Instinct MI series. Older
-RDNA1/2 cards (RX 6000-series, 5000-series, Vega) have no official WSL2
-ROCm support — they may work on bare-metal Linux but not via the WSL2 GPU
-passthrough.
+Officially supported WSL2 ROCm cards (per AMD docs, early 2026): **RX 7900
+XTX/XT/GRE**, **W7900/W7800/W6800**, Instinct MI series. Older RDNA1/2 cards
+have no official WSL2 ROCm support.
 
-Setup for a supported card:
+**The split that works (verified on RX 7900 XTX, 2026-05):**
 
-1. **Install AMD's ROCm-on-WSL driver bundle on Windows.** Follow AMD's
-   guide at `rocm.docs.amd.com` → "Install ROCm on Radeon GPUs → Windows
-   Subsystem for Linux." Versions move; copy AMD's current recipe rather
-   than stale commands. Generally needs Windows 11 22H2+ and Adrenalin
-   Pro Edition with WSL2 support.
-2. **Verify ROCm sees the GPU from inside WSL2:**
-   ```bash
-   rocminfo | grep -E "Name:|Marketing Name:" | head -10
-   ```
-   You should see the GPU listed as an HSA agent. If only the CPU shows
-   up, the install didn't take — fix this first; nothing downstream will
-   work otherwise.
-3. **Manual smoke test with the ROCm Ollama image, BEFORE touching
-   `run-workers.sh`:**
-   ```bash
-   docker rm -f photosearch-worker-ollama
-   docker run -d \
-     --name photosearch-worker-ollama \
-     --device /dev/kfd --device /dev/dri \
-     --group-add video --group-add render \
-     --security-opt seccomp=unconfined \
-     -v photosearch-worker-ollama-models:/root/.ollama \
-     -p 11434:11434 \
-     -e OLLAMA_NUM_PARALLEL=3 \
-     -e OLLAMA_MAX_LOADED_MODELS=1 \
-     ollama/ollama:rocm
-   docker exec photosearch-worker-ollama ollama pull llava
-   docker logs photosearch-worker-ollama 2>&1 | grep -iE "rocm|gpu" | head
-   ```
-   Look for `using ROCm runtime` or `gpu="0" available=true type=rocm`.
-   If you see `running on CPU`, device passthrough didn't reach Ollama —
-   re-check step 2.
-4. **If the manual test works**, make it permanent by updating
-   `ensure_ollama_running` in `run-workers.sh` to auto-detect AMD and
-   use the ROCm image. Sketch:
-   ```bash
-   if [ -e /dev/kfd ] && [ -e /dev/dri ]; then
-       OLLAMA_IMAGE="ollama/ollama:rocm"
-       DEVICE_FLAGS="--device /dev/kfd --device /dev/dri --group-add video --group-add render --security-opt seccomp=unconfined"
-   else
-       OLLAMA_IMAGE="ollama/ollama:latest"
-       DEVICE_FLAGS=""
-   fi
-   ```
-   `/dev/kfd` doesn't exist on Mac, so this auto-detect leaves the Mac
-   path untouched.
+| Pass | How it reaches the GPU |
+|---|---|
+| clip, quality | PyTorch-ROCm in the worker's venv |
+| faces | onnxruntime-rocm in the worker's venv |
+| describe, tags, verify | **Windows-native Ollama** — worker `OLLAMA_HOST` → Windows host |
 
-The 7900 XTX has 24 GB VRAM, so 4-6 parallel slots fit comfortably. Tune
-by bumping `-n` and watching per-photo times — flat times mean GPU has
-headroom, linearly-growing times mean you've hit the ceiling.
+**Do NOT run Ollama inside WSL2 for AMD GPUs.** The modern ROCm-on-WSL stack
+routes HSA through `/dev/dxg` via AMD's `librocdxg` shim (there is no
+`/dev/kfd`). Raw ROCm/HIP/PyTorch work fine through it, but Ollama's
+`--ollama-engine` GPU-verification subprocess is incompatible with librocdxg —
+it times out at a hardcoded 30 s and Ollama silently falls back to CPU. The
+Docker `ollama/ollama:rocm` image doesn't help; the `/dev/kfd` it expects
+isn't there. Windows-*native* Ollama, by contrast, sees the GPU through the
+normal Windows AMD driver and just works.
+
+Setup:
+
+1. **Windows side:** install the standard AMD Adrenalin driver (the consumer
+   one — no Pro Edition needed) and Windows-native Ollama. `ollama pull llava`
+   and `ollama pull llama3.2-vision`. Confirm it sees the GPU:
+   `%LOCALAPPDATA%\Ollama\server.log` should show
+   `inference compute ... library=ROCm ... "AMD Radeon RX 7900 XTX"`.
+2. **WSL2 ROCm runtime (for PyTorch/onnxruntime):**
+   ```bash
+   sudo amdgpu-install -y --usecase=rocm --no-dkms   # the `wsl` usecase was removed in ROCm 7.2
+   # then install librocdxg — the rocdxg-roct .deb from
+   #   github.com/ROCm/librocdxg/releases  (drops librocdxg.so in /opt/rocm/lib)
+   rocminfo | grep -E "Name:|Marketing Name:"        # must list gfx1100 as an HSA agent
+   ```
+   Every ROCm process on this box needs `HSA_ENABLE_DXG_DETECTION=1` in its
+   environment, or HSA init fails.
+3. **Worker venv:** `pip install torch torchvision --index-url
+   https://download.pytorch.org/whl/rocm7.x` (pin the full `+rocm7.x` version
+   or pip won't replace a `+cpu` build). For faces, install AMD's
+   `onnxruntime_rocm` wheel from `repo.radeon.com/rocm/manylinux/rocm-rel-7.x/`
+   (the PyPI build targets ROCm 6.x and won't load on a 7.x box); it also
+   wants `librocm_smi64.so.7` — symlink the system `.so.1` into
+   `onnxruntime_rocm.libs/` if missing.
+4. **Run the worker** bare-metal with both env vars set:
+   ```bash
+   HSA_ENABLE_DXG_DETECTION=1 \
+   OLLAMA_HOST=http://$(ip route show default | awk '{print $3}'):11434 \
+     python cli.py worker -s http://<NAS-IP>:8000 \
+     -p clip,faces,quality,describe,tags,verify -d /photos/<year>
+   ```
+   The WSL2 NAT gateway IP (`ip route show default`) is the Windows host —
+   it can change across WSL restarts, so resolve it dynamically.
+
+The 7900 XTX has 24 GB VRAM. Windows Ollama is a single process (not the
+`-n` worker fleet), so describe throughput is tuned via `OLLAMA_NUM_PARALLEL`
+on the Windows side, not `run-workers.sh`.
 
 ##### WSL2 Ubuntu with NVIDIA (CUDA)
 
@@ -1123,7 +1149,13 @@ serialization (commit `64eb1ac`) keeps this safe under concurrency —
 multiple machines claiming describe batches serialize on the NAS writer
 lock without duplicate work.
 
-### Bare-Metal Worker CLI (Single Quick Tests Only)
+### Bare-Metal Worker CLI
+
+Use the bare-metal worker (not the Docker fleet) when the machine has a **GPU** —
+the Docker fleet is CPU-only PyTorch, so a GPU box must run the worker directly
+to pick up CUDA/ROCm. For describe/tags/verify, set `OLLAMA_HOST` to whichever
+host runs a GPU-capable Ollama. (The Docker fleet is still preferred on Mac for
+its memory-stability under MPS.)
 
 ```bash
 # Run CLIP embeddings for a directory:
@@ -1135,8 +1167,15 @@ python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tag
 # Run CLIP + quality for a collection:
 python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
 
-# Run descriptions with moondream model:
+# Run descriptions with a non-default model:
 python cli.py worker -s http://nas.local:8000 -p describe --describe-model moondream
+
+# Run tags with a specific tags model (decoupled from describe):
+python cli.py worker -s http://nas.local:8000 -p tags --tags-model llava
+
+# GPU worker on WSL2 — CLIP/quality/faces via ROCm, describe via Windows Ollama:
+HSA_ENABLE_DXG_DETECTION=1 OLLAMA_HOST=http://<windows-host>:11434 \
+  python cli.py worker -s http://<NAS-IP>:8000 -p clip,faces,quality -d /photos/2026
 
 # Quick test — one batch only:
 python cli.py worker -s http://localhost:8000 -p clip -d /photos/2026/2026-04-09 --one-shot
@@ -1147,7 +1186,8 @@ python cli.py worker -s http://nas.local:8000 -p clip --collection 3 --force
 
 Key options: `--batch-size` (photos per claim, default 16), `--model-batch-size`
 (inference batch, default 8), `--ttl` (claim TTL minutes, default 30), `--one-shot`
-(single batch then exit), `--force` (clear + reprocess, requires --collection or --directory).
+(single batch then exit), `--force` (clear + reprocess, requires --collection or
+--directory), `--describe-model` / `--tags-model` / `--verify-model`.
 
 ### Worker API Endpoints
 
@@ -1156,6 +1196,10 @@ Key options: `--batch-size` (photos per claim, default 16), `--model-batch-size`
 | `POST /api/worker/claim-batch` | Claim N unprocessed photos for a pass type |
 | `POST /api/worker/submit-results` | Submit processing results for a claimed batch |
 | `POST /api/worker/clear-pass` | Clear processing state to allow re-processing |
+
+`submit-results` accepts optional `model` + `model_version` fields (the worker
+populates them for describe/tags/verify); the describe/tags/verify branches log
+a row to the `generations` provenance table via `db.log_generation()`.
 | `GET /api/worker/photo-detail/{id}` | Get photo metadata + CLIP embedding (for verify) |
 | `GET /api/worker/status` | Queue depth and active claims |
 
@@ -1250,8 +1294,9 @@ runner subprocess inside Ollama was OOM-killed, almost always because the manage
 Docker Ollama container is sharing Docker Desktop's VM memory with worker containers
 and LLaVA's ~4.3 GiB working set doesn't fit. Fixes (easiest first):
 1. Use native `ollama serve` on the host. Stop the fleet (`./run-workers.sh --stop`),
-   run `ollama serve` (or launch Ollama.app), `ollama pull llava && ollama pull minicpm-v`,
-   then relaunch the fleet — it will detect and reuse the native Ollama.
+   run `ollama serve` (or launch Ollama.app), `ollama pull llama3.2-vision && ollama pull llava`
+   (describe + tags/verify models), then relaunch the fleet — it will detect and
+   reuse the native Ollama.
 2. Raise Docker Desktop memory to ~24 GiB (Settings → Resources → Memory) and
    restart Docker Desktop fully. ~16 GiB is too tight for the default 4×3g fleet
    plus Ollama.
@@ -1360,7 +1405,7 @@ def my_command(db):
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py`
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 21)
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies

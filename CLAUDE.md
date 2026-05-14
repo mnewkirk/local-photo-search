@@ -22,12 +22,20 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 20. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 21. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
-review_selections, google_photos_uploads, ignored_clusters, schema_info.
+review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
 
 Schema migrations run automatically via `_init_schema()`. Bump `SCHEMA_VERSION` in `db.py`
 when adding tables/columns.
+
+`generations` (schema v21) is a provenance log — one row per describe/tags/verify
+text artifact, with `photo_id`, `text_type`, `generated_text`, `model_used`,
+`model_version`, `created_at`. The `photos` table still holds the current
+"promoted" description/tags; `generations` is the full history, so outputs from
+different models can coexist with provenance. `worker_api.submit_results` logs a
+row per artifact via `db.log_generation()`. Backfill existing data with
+`photosearch backfill-generations` (idempotent).
 
 ## Richer reverse geocoding (optional)
 
@@ -140,14 +148,46 @@ Worker claims batches via HTTP, downloads photos, processes locally, POSTs resul
 Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
 (not hostname) — Docker containers can't resolve local DNS names.
 
-**Bare-metal (single quick test only):**
+**Bare-metal** — required when the worker has a GPU (the Docker fleet is
+CPU-only). On a GPU box, run the worker directly so it picks up the local
+accelerator:
 ```bash
-python cli.py worker -s http://nas.local:8000 -p clip,quality -d /photos/2026
+python cli.py worker -s http://<NAS-IP>:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
 ```
 
 Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints),
 `run-workers.sh` (Docker fleet launcher). API routes under `/api/worker/*`.
-Claims have TTL (default 30min) for crash recovery.
+Claims have TTL (default 30min) for crash recovery. `submit_results` for the
+describe/tags/verify passes also logs to the `generations` table — the worker
+sends `model` + `model_version` so provenance is captured per artifact.
+
+### Per-pass model strategy
+
+No single vision model wins all three text passes, so each has its own default
+(all overridable: `--describe-model`, `--tags-model`, `--verify-model`):
+
+- **describe / regen → `llama3.2-vision`** — won a 100-image bakeoff over llava
+  on free-form description quality (esp. text/OCR-heavy photos).
+- **tags → `llava`** — the constrained `TAG_PROMPT` task is a different shape;
+  llama3.2-vision degenerates and over-selects on it. `tag_photo` has a
+  regurgitation guard (`_MAX_PLAUSIBLE_TAGS`) that drops responses echoing the
+  vocabulary. `photosearch clean-garbage-tags` clears historical regurgitated
+  tag sets so they get re-tagged.
+- **verify → `llava`** — must differ from the describe/regen model for an
+  independent cross-check.
+
+`describe.py` has model-aware Ollama options (llama3.2-vision gets
+`temperature` + `repeat_penalty` to suppress repetition loops) plus a
+`_is_degenerate` detector → up to 2 retries → llava fallback in `describe_photo`.
+
+### GPU acceleration
+
+CLIP / quality / faces run on the worker's GPU automatically — `clip_embed.py`
+and `faces.py` auto-detect CUDA/ROCm (faces is env-gated via
+`PHOTOSEARCH_DEVICE`, mirroring clip_embed). describe/tags/verify run through
+Ollama; point `OLLAMA_HOST` at whichever host has a GPU-capable Ollama. See the
+photo-search SKILL.md "GPU acceleration" section for per-machine setup
+(Mac Metal, WSL2 + AMD via librocdxg, WSL2 + NVIDIA).
 
 ## Vec0 orphan cleanup
 
