@@ -16,6 +16,7 @@ details — all in a few sentences that will match natural language queries.
 import base64
 import io
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -31,24 +32,47 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# Default model — llava is the most widely available multimodal model on Ollama.
-# Other options: llava:13b (better quality, slower), llava-llama3, moondream.
-# TIP: moondream is ~1.6B params vs llava's 7B — 5-10x faster on CPU with
-# acceptable description quality. Switch with: photosearch index --describe-model moondream
-MODEL = "llava"
+# Default describe model. A 100-image bakeoff (2026-05-14) had llama3.2-vision
+# beat llava 68-26 on free-form description quality, especially on text/OCR-heavy
+# images. It needs the tuned options + detect-retry below to suppress its
+# repetition-loop failure mode. Other options: llava, llava:13b, moondream
+# (moondream is ~1.6B — much faster on CPU, lower quality).
+MODEL = "llama3.2-vision"
+
+# Default tags model — kept separate from MODEL. The tags pass is a constrained
+# vocabulary-selection task, not free-form prose: llama3.2-vision degenerates
+# and hallucinates out-of-vocab tags on it, while llava follows the TAG_PROMPT
+# cleanly. Decoupled so describe and tags each use the model good at their task.
+TAGS_MODEL = "llava"
 
 # Maximum long-edge size (pixels) when resizing images before sending to Ollama.
 # Vision models resize internally anyway — sending a smaller image cuts I/O and
 # model preprocessing time with no meaningful quality loss for descriptions.
 _MAX_IMAGE_PX = 1024
 
-# Generation options passed to every Ollama chat call.
-# num_predict caps output tokens (2-4 sentences needs ~80-120 tokens; 150 is safe).
-# temperature=0 makes output deterministic and can slightly speed up sampling.
-_OLLAMA_OPTIONS = {
+# Generation options passed to Ollama chat calls. Model-aware: llama3.2-vision
+# is prone to repetition-loop degeneration under greedy decoding (temp=0), so it
+# gets repeat_penalty + a small temperature. A 100-image bakeoff showed temp=0
+# alone left 19% of llama3.2-vision outputs degenerate; these params + the
+# detect-and-retry below brought that to ~0%. llava/moondream are not loop-prone
+# under greedy decoding, so they keep deterministic temp=0.
+_DEFAULT_OLLAMA_OPTIONS = {
     "num_predict": 150,
     "temperature": 0,
 }
+_LLAMA_VISION_OPTIONS = {
+    "num_predict": 200,
+    "temperature": 0.4,
+    "repeat_penalty": 1.5,
+    "repeat_last_n": 320,
+}
+
+
+def _options_for_model(model: str) -> dict:
+    """Return Ollama generation options tuned for the given model."""
+    if model.startswith("llama3.2-vision"):
+        return _LLAMA_VISION_OPTIONS
+    return _DEFAULT_OLLAMA_OPTIONS
 
 # Ollama API host — override with OLLAMA_HOST env var if non-default.
 # The ollama Python client reads OLLAMA_HOST automatically.
@@ -209,6 +233,29 @@ def _is_valid_description(text: str) -> bool:
     return True
 
 
+def _is_degenerate(text: str) -> bool:
+    """Detect repetition-loop / runaway degeneration in a model output.
+
+    llama3.2-vision occasionally falls into repetition loops — the same phrase
+    repeated many times, ellipsis spam, or runaway length. A 100-image bakeoff
+    found this in 19% of temp=0 outputs. This heuristic caught all 19/19 with
+    no false positives on clean outputs; describe_photo uses it to retry or
+    fall back. Returns False for short outputs (e.g. tag lists), which are not
+    loop-prone and would be mis-flagged by the length-based checks.
+    """
+    if not text:
+        return False  # emptiness is handled by _is_valid_description
+    words = text.split()
+    n = len(words)
+    if n == 0:
+        return False
+    uniq_ratio = len(set(w.lower() for w in words)) / n
+    sixgrams = [tuple(words[i:i + 6]) for i in range(max(0, n - 5))]
+    max_rep6 = max(Counter(sixgrams).values()) if sixgrams else 0
+    ellipsis = text.count("…") + text.count("...")
+    return (uniq_ratio < 0.45 and n > 60) or max_rep6 >= 3 or ellipsis > 8 or n > 350
+
+
 def _ollama_chat_with_retry(
     model: str,
     messages: list,
@@ -278,12 +325,13 @@ def describe_photo(
     image_ref = encoded if encoded is not None else str(path)
 
     messages = [{"role": "user", "content": prompt, "images": [image_ref]}]
+    options = _options_for_model(model)
 
     try:
         result = _ollama_chat_with_retry(
             model=model,
             messages=messages,
-            options=_OLLAMA_OPTIONS,
+            options=options,
         )
         # Filter out moondream's bounding-box coordinate dumps and other garbage
         if result is not None and not _is_valid_description(result):
@@ -300,10 +348,30 @@ def describe_photo(
                     "content": "Describe what you see in this photo in 2 sentences.",
                     "images": [image_ref],
                 }],
-                options=_OLLAMA_OPTIONS,
+                options=options,
             )
             if result is not None and not _is_valid_description(result):
                 result = None
+
+        # Degeneration recovery: llama3.2-vision occasionally falls into
+        # repetition loops. Its options carry temperature>0 so each retry is
+        # independent — a 100-image bakeoff showed up to 2 retries clears every
+        # loop. If retries still fail, fall back to llava (not loop-prone under
+        # greedy decoding) before giving up.
+        if result is not None and _is_degenerate(result):
+            for _ in range(2):
+                retry = _ollama_chat_with_retry(model=model, messages=messages, options=options)
+                if retry and _is_valid_description(retry) and not _is_degenerate(retry):
+                    result = retry
+                    break
+            else:
+                if not model.startswith("llava"):
+                    fallback = _ollama_chat_with_retry(
+                        model="llava", messages=messages,
+                        options=_options_for_model("llava"),
+                    )
+                    if fallback and _is_valid_description(fallback) and not _is_degenerate(fallback):
+                        result = fallback
 
         return result
     except Exception as e:
@@ -384,10 +452,20 @@ Rules:
 - Do NOT add tags that are not in the list above.
 """.format(tags=", ".join(TAG_VOCABULARY))
 
+# Regurgitation guard: vision models sometimes echo most of the TAG_PROMPT
+# vocabulary back instead of selecting. The vocabulary's categories are
+# largely mutually exclusive (6 animal types, ~13 actions, ~11 landscape
+# types, indoor vs outdoor, etc.), so a real photo realistically draws ~4-14
+# tags — the NAS library's distribution tapers out by ~14. A response with
+# this many or more valid tags is regurgitation, not a description.
+# The real fix is prompt-side (a future tagging-model bakeoff); this guard
+# just keeps the garbage out of the index in the meantime.
+_MAX_PLAUSIBLE_TAGS = 16
+
 
 def tag_photo(
     image_path: str,
-    model: str = MODEL,
+    model: str = TAGS_MODEL,
 ) -> Optional[list[str]]:
     """Generate semantic tags for a single photo via Ollama.
 
@@ -404,6 +482,12 @@ def tag_photo(
         tag = token.strip().lower().rstrip(".")
         if tag in vocab_set:
             tags.append(tag)
+
+    # Drop regurgitated responses (model echoed the vocabulary instead of
+    # selecting). Better to leave the photo untagged than to pollute the
+    # index — a later tags pass can retry it.
+    if len(tags) >= _MAX_PLAUSIBLE_TAGS:
+        return None
 
     return tags if tags else None
 

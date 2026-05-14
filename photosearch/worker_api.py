@@ -133,6 +133,10 @@ class SubmitRequest(BaseModel):
     describe_results: Optional[list[DescribeResult]] = None
     tags_results: Optional[list[TagsResult]] = None
     verify_results: Optional[list[VerifyResult]] = None
+    # Model provenance for describe/tags/verify — logged to the generations
+    # table. Optional so older workers still submit cleanly.
+    model: Optional[str] = None
+    model_version: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +322,8 @@ def submit_results(req: SubmitRequest):
                 if r.description:
                     try:
                         db.update_photo(r.photo_id, description=r.description)
+                        db.log_generation(r.photo_id, "describe", r.description,
+                                          req.model, req.model_version)
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
@@ -337,7 +343,10 @@ def submit_results(req: SubmitRequest):
                 processed_photo_ids.append(r.photo_id)
                 if r.tags:
                     try:
-                        db.update_photo(r.photo_id, tags=json.dumps(r.tags))
+                        tags_json = json.dumps(r.tags)
+                        db.update_photo(r.photo_id, tags=tags_json)
+                        db.log_generation(r.photo_id, "tags", tags_json,
+                                          req.model, req.model_version)
                         written += 1
                     except Exception as e:
                         logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
@@ -365,6 +374,12 @@ def submit_results(req: SubmitRequest):
                     if r.tags:
                         updates["tags"] = json.dumps(r.tags)
                     db.update_photo(r.photo_id, **updates)
+                    # Log the regenerated description as a 'verify' generation —
+                    # marks it as produced by the verify/regen pass, distinct
+                    # from a first-pass describe.
+                    if r.description:
+                        db.log_generation(r.photo_id, "verify", r.description,
+                                          req.model, req.model_version)
                     written += 1
                     processed_photo_ids.append(r.photo_id)
                 except Exception as e:

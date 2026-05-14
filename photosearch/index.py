@@ -113,7 +113,8 @@ def _index_collection(
     force_clip: bool = False,
     enable_describe: bool = False,
     force_describe: bool = False,
-    describe_model: str = "llava",
+    describe_model: str = "llama3.2-vision",
+    tags_model: str = "llava",
     enable_quality: bool = False,
     force_quality: bool = False,
     enable_tags: bool = False,
@@ -414,7 +415,7 @@ def _index_collection(
             import json as _json
             from .describe import tag_photo, check_available as tag_check
             try:
-                tag_check(model=describe_model)
+                tag_check(model=tags_model)
             except RuntimeError as e:
                 print(f"\nSkipping tags: {e}")
             else:
@@ -445,7 +446,7 @@ def _index_collection(
                         print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
                         try:
                             t_photo = time.time()
-                            tags = tag_photo(path, model=describe_model)
+                            tags = tag_photo(path, model=tags_model)
                             elapsed_photo = time.time() - t_photo
                             if tags:
                                 db.update_photo(photo_id, tags=_json.dumps(tags))
@@ -634,7 +635,8 @@ def index_directory(
     force_clip: bool = False,
     enable_describe: bool = False,
     force_describe: bool = False,
-    describe_model: str = "llava",
+    describe_model: str = "llama3.2-vision",
+    tags_model: str = "llava",
     enable_quality: bool = False,
     force_quality: bool = False,
     enable_tags: bool = False,
@@ -674,7 +676,8 @@ def index_directory(
         enable_describe: If True, generate scene descriptions via LLaVA/Ollama.
         force_describe: If True, regenerate descriptions for all photos (even those
                         that already have one).
-        describe_model: Ollama model name for descriptions (default: "llava").
+        describe_model: Ollama model name for descriptions (default: "llama3.2-vision").
+        tags_model: Ollama model name for the tags pass (default: "llava").
         enable_quality: If True, compute aesthetic quality scores.
         force_quality: If True, rescore all photos (even those already scored).
         enable_tags: If True, generate semantic category tags via Ollama.
@@ -698,6 +701,7 @@ def index_directory(
             enable_describe=enable_describe,
             force_describe=force_describe,
             describe_model=describe_model,
+            tags_model=tags_model,
             enable_quality=enable_quality,
             force_quality=force_quality,
             enable_tags=enable_tags,
@@ -1057,7 +1061,7 @@ def index_directory(
             import json as _json
             from .describe import tag_photo, check_available as tag_check
             try:
-                tag_check(model=describe_model)
+                tag_check(model=tags_model)
             except RuntimeError as e:
                 print(f"\nSkipping tags: {e}")
             else:
@@ -1087,7 +1091,7 @@ def index_directory(
                         print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
                         try:
                             t_photo = time.time()
-                            tags = tag_photo(path, model=describe_model)
+                            tags = tag_photo(path, model=tags_model)
                             elapsed_photo = time.time() - t_photo
                             if tags:
                                 db.update_photo(photo_id, tags=_json.dumps(tags))

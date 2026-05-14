@@ -77,13 +77,38 @@ def unload_model() -> None:
     _gc.collect()
 
 
+def _select_face_providers() -> tuple[list[str], int]:
+    """Pick onnxruntime providers + InsightFace ctx_id.
+
+    Mirrors clip_embed.py's PHOTOSEARCH_DEVICE override: the N100 NAS and
+    Docker workers set PHOTOSEARCH_DEVICE=cpu and stay on CPU; a box with
+    onnxruntime-rocm installed auto-uses ROCMExecutionProvider (ctx_id=0).
+    """
+    import onnxruntime as ort
+
+    forced = os.environ.get("PHOTOSEARCH_DEVICE")
+    available = ort.get_available_providers()
+    if forced == "cpu":
+        use_gpu = False
+    elif forced:  # "cuda" / "rocm" / "gpu" — any explicit non-cpu value
+        use_gpu = "ROCMExecutionProvider" in available
+    else:
+        use_gpu = "ROCMExecutionProvider" in available
+
+    if use_gpu:
+        return ["ROCMExecutionProvider", "CPUExecutionProvider"], 0
+    return ["CPUExecutionProvider"], -1
+
+
 def _get_face_app() -> "FaceAnalysis":
-    """Lazy-load and return the InsightFace app (CPU execution)."""
+    """Lazy-load and return the InsightFace app."""
     global _face_app
     if _face_app is None:
         check_available()
         import time as _time
-        print("  Loading InsightFace model (buffalo_l)...", end="", flush=True)
+        providers, ctx_id = _select_face_providers()
+        label = "ROCm GPU" if ctx_id >= 0 else "CPU"
+        print(f"  Loading InsightFace model (buffalo_l, {label})...", end="", flush=True)
         t0 = _time.time()
         # InsightFace does NOT honor an INSIGHTFACE_HOME env var — its default
         # root is hardcoded to ~/.insightface, which inside a container resolves
@@ -98,11 +123,11 @@ def _get_face_app() -> "FaceAnalysis":
             # and genderage models — we only use bbox + ArcFace embedding.
             # This roughly halves per-face inference time on CPU.
             allowed_modules=["detection", "recognition"],
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
         # det_size controls the internal resolution of the RetinaFace detector.
         # 640×640 is the standard setting and handles most face sizes well.
-        app.prepare(ctx_id=-1, det_size=(640, 640))
+        app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         _face_app = app
         print(f" ready ({_time.time() - t0:.1f}s)")
     return _face_app

@@ -49,7 +49,8 @@ def cli():
 @click.option("--force-clip", is_flag=True, help="Clear and regenerate CLIP embeddings for photos in this directory. Use to fix stale embeddings.")
 @click.option("--describe", is_flag=True, help="Generate scene descriptions via LLaVA (requires Ollama).")
 @click.option("--force-describe", is_flag=True, help="Regenerate descriptions for all photos, even those that already have one.")
-@click.option("--describe-model", default="llava", show_default=True, help="Ollama model for descriptions.")
+@click.option("--describe-model", default="llama3.2-vision", show_default=True, help="Ollama model for descriptions.")
+@click.option("--tags-model", default="llava", show_default=True, help="Ollama model for the tags pass.")
 @click.option("--quality", is_flag=True, help="Compute aesthetic quality scores (1–10 scale).")
 @click.option("--force-quality", is_flag=True, help="Rescore quality for all photos, even those already scored.")
 @click.option("--tags", is_flag=True, help="Generate semantic tags via LLaVA (requires --describe or Ollama).")
@@ -57,7 +58,7 @@ def cli():
 @click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --tags. Equivalent to passing each flag individually.")
 @click.option("--verify", is_flag=True, help="Run hallucination verification after indexing (requires descriptions).")
 def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colors, faces,
-          force_faces, force_clip, describe, force_describe, describe_model, quality, force_quality,
+          force_faces, force_clip, describe, force_describe, describe_model, tags_model, quality, force_quality,
           tags, force_tags, full, verify):
     """Index a directory of photos, or re-index a collection.
 
@@ -93,6 +94,7 @@ def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colo
         enable_describe=describe or force_describe,
         force_describe=force_describe,
         describe_model=describe_model,
+        tags_model=tags_model,
         enable_quality=quality or force_quality,
         force_quality=force_quality,
         enable_tags=tags or force_tags,
@@ -111,7 +113,7 @@ def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colo
         if collection_id:
             photos_to_verify = photo_db.get_collection_photos(collection_id)
         stats = verify_photos(photo_db, photos=photos_to_verify,
-                              verify_model="minicpm-v", regen_model=describe_model)
+                              verify_model="llava", regen_model=describe_model)
         click.echo(f"Verification: {stats['passed']} passed, "
                     f"{stats['regenerated']} regenerated, {stats['failed']} failed")
 
@@ -2934,8 +2936,8 @@ def review(photo_dir, db, target_pct, threshold, export, export_raw, list_only):
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--threshold", default=0.18, show_default=True,
               help="CLIP similarity threshold. Nouns below this are flagged.")
-@click.option("--model", default="llava", show_default=True, help="Ollama model used to regenerate descriptions.")
-@click.option("--verify-model", default="minicpm-v", show_default=True,
+@click.option("--model", default="llama3.2-vision", show_default=True, help="Ollama model used to regenerate descriptions.")
+@click.option("--verify-model", default="llava", show_default=True,
               help="Ollama vision model for verification (should differ from --model to avoid confirmation bias).")
 @click.option("--force", is_flag=True, help="Re-verify even previously verified photos.")
 @click.option("--no-regenerate", is_flag=True, help="Flag hallucinations but don't auto-regenerate.")
@@ -2950,8 +2952,9 @@ def verify(db, threshold, model, verify_model, force, no_regenerate, limit, phot
       1. CLIP check — flags nouns in descriptions that don't match the photo
       2. LLM verify — sends the photo to a DIFFERENT vision model to cross-check
 
-    Uses a separate model for verification (default: minicpm-v) to avoid the
-    problem where the same model confirms its own hallucinations.
+    Uses a separate model for verification (default: llava, distinct from the
+    llama3.2-vision describe/regen model) to avoid the problem where the same
+    model confirms its own hallucinations.
 
     Confirmed hallucinations are automatically regenerated unless --no-regenerate.
 
@@ -3176,12 +3179,14 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--ttl", default=30, show_default=True, help="Claim TTL in minutes.")
 @click.option("--one-shot", is_flag=True, help="Process one batch per pass and exit (don't loop).")
 @click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection).")
-@click.option("--describe-model", default="llava", show_default=True,
-              help="Ollama model for descriptions and tags.")
-@click.option("--verify-model", default="minicpm-v", show_default=True,
+@click.option("--describe-model", default="llama3.2-vision", show_default=True,
+              help="Ollama model for descriptions.")
+@click.option("--tags-model", default="llava", show_default=True,
+              help="Ollama model for the tags pass.")
+@click.option("--verify-model", default="llava", show_default=True,
               help="Ollama model for hallucination verification.")
 def worker(server, passes, collection_id, directory, batch_size, model_batch_size, ttl,
-           one_shot, force, describe_model, verify_model):
+           one_shot, force, describe_model, tags_model, verify_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -3230,8 +3235,129 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
         one_shot=one_shot,
         force=force,
         describe_model=describe_model,
+        tags_model=tags_model,
         verify_model=verify_model,
     )
+
+
+@cli.command("backfill-generations")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, help="Show what would be inserted without writing.")
+def backfill_generations(db, dry_run):
+    """Backfill the generations provenance table from existing photo data.
+
+    Inserts one generation row per existing describe/tags artifact, plus a
+    'verify' row for photos whose description was regenerated by the verify
+    pass. Backfilled rows have model_used/model_version = NULL (the producing
+    model is not recorded historically); created_at is the photo's indexed_at
+    (or verified_at for verify rows) as the best available proxy.
+
+    Idempotent: skips any photo that already has a generation row of that
+    text_type, so it is safe to re-run and will not duplicate or clobber rows
+    logged by live workers.
+    """
+    from photosearch.db import PhotoDB
+
+    # Each entry: (text_type, SELECT producing the rows to insert). The
+    # NOT EXISTS guard makes the backfill idempotent and keeps it from
+    # clobbering provenance rows already logged by workers.
+    backfills = [
+        ("describe", """
+            SELECT p.id, 'describe', p.description, NULL, NULL, p.indexed_at
+            FROM photos p
+            WHERE p.description IS NOT NULL AND p.description != ''
+              AND NOT EXISTS (SELECT 1 FROM generations g
+                              WHERE g.photo_id = p.id AND g.text_type = 'describe')
+        """),
+        ("tags", """
+            SELECT p.id, 'tags', p.tags, NULL, NULL, p.indexed_at
+            FROM photos p
+            WHERE p.tags IS NOT NULL AND p.tags != '' AND p.tags != '[]'
+              AND NOT EXISTS (SELECT 1 FROM generations g
+                              WHERE g.photo_id = p.id AND g.text_type = 'tags')
+        """),
+        ("verify", """
+            SELECT p.id, 'verify', p.description, NULL, NULL,
+                   COALESCE(p.verified_at, p.indexed_at)
+            FROM photos p
+            WHERE p.verification_status = 'regenerated'
+              AND p.description IS NOT NULL AND p.description != ''
+              AND NOT EXISTS (SELECT 1 FROM generations g
+                              WHERE g.photo_id = p.id AND g.text_type = 'verify')
+        """),
+    ]
+
+    with PhotoDB(db) as pdb:
+        for text_type, select_sql in backfills:
+            n = pdb.conn.execute(f"SELECT COUNT(*) FROM ({select_sql})").fetchone()[0]
+            if dry_run:
+                click.echo(f"  {text_type}: would insert {n} rows")
+            else:
+                pdb.conn.execute(
+                    "INSERT INTO generations (photo_id, text_type, generated_text, "
+                    f"model_used, model_version, created_at) {select_sql}"
+                )
+                click.echo(f"  {text_type}: inserted {n} rows")
+        if dry_run:
+            click.echo("Dry run — no rows written.")
+        else:
+            pdb.conn.commit()
+            total = pdb.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0]
+            click.echo(f"Done. generations table now has {total} rows.")
+
+
+@cli.command("clean-garbage-tags")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, help="Show what would be cleaned without writing.")
+def clean_garbage_tags(db, dry_run):
+    """Clear regurgitated tag sets so the affected photos get re-tagged.
+
+    Some vision models echo most of the TAG_PROMPT vocabulary back instead of
+    selecting — producing photos tagged with 16+ of the 78 (largely mutually
+    exclusive) vocabulary tags. Real photos draw ~4-14. This command NULLs
+    photos.tags for any photo at/above that threshold (so a later tags pass
+    re-tags them) and drops the matching 'tags' rows from the generations
+    provenance log. The describe.py regurgitation guard prevents new ones.
+    """
+    from photosearch.db import PhotoDB
+    from photosearch.describe import _MAX_PLAUSIBLE_TAGS as THRESH
+
+    with PhotoDB(db) as pdb:
+        photo_n = pdb.conn.execute(
+            "SELECT COUNT(*) FROM photos "
+            "WHERE tags IS NOT NULL AND json_valid(tags) "
+            "AND json_array_length(tags) >= ?", (THRESH,),
+        ).fetchone()[0]
+        # generations table may not exist on a pre-v21 DB opened read-only;
+        # PhotoDB() migrates on open, so it will exist here.
+        gen_n = pdb.conn.execute(
+            "SELECT COUNT(*) FROM generations "
+            "WHERE text_type = 'tags' AND json_valid(generated_text) "
+            "AND json_array_length(generated_text) >= ?", (THRESH,),
+        ).fetchone()[0]
+
+        click.echo(f"Threshold: >= {THRESH} tags = regurgitation")
+        if dry_run:
+            click.echo(f"  would NULL photos.tags on {photo_n} photos")
+            click.echo(f"  would delete {gen_n} 'tags' rows from generations")
+            click.echo("Dry run — no rows written.")
+            return
+
+        pdb.conn.execute(
+            "UPDATE photos SET tags = NULL "
+            "WHERE tags IS NOT NULL AND json_valid(tags) "
+            "AND json_array_length(tags) >= ?", (THRESH,),
+        )
+        pdb.conn.execute(
+            "DELETE FROM generations "
+            "WHERE text_type = 'tags' AND json_valid(generated_text) "
+            "AND json_array_length(generated_text) >= ?", (THRESH,),
+        )
+        pdb.conn.commit()
+        click.echo(f"  cleared tags on {photo_n} photos (now eligible for re-tagging)")
+        click.echo(f"  deleted {gen_n} regurgitated 'tags' rows from generations")
 
 
 if __name__ == "__main__":

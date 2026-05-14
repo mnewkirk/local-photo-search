@@ -60,7 +60,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -554,6 +554,28 @@ class PhotoDB:
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_index_errors_created ON index_errors(created_at)")
+
+        # Generation provenance log (schema v21) — one row per text artifact
+        # produced by a vision model. Lets describe/tags/verify outputs from
+        # different models coexist with full history; the photos table still
+        # holds the current "promoted" description/tags. text_type is
+        # 'describe' | 'tags' | 'verify'; generated_text is the raw string
+        # (a JSON array for tags). model_used / model_version are NULL for
+        # backfilled rows where the producing model is unknown.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS generations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                text_type TEXT NOT NULL,
+                generated_text TEXT NOT NULL,
+                model_used TEXT,
+                model_version TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (photo_id) REFERENCES photos(id)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generations_photo ON generations(photo_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_generations_type ON generations(text_type)")
 
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claims_expire ON worker_claims(expires_at)")
@@ -1423,6 +1445,41 @@ class PhotoDB:
             (pass_type, filepath, str(message)[:500]),
         )
         self.conn.commit()
+
+    def log_generation(
+        self,
+        photo_id: int,
+        text_type: str,
+        generated_text: str,
+        model_used: Optional[str] = None,
+        model_version: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ):
+        """Record a vision-model text artifact in the generations provenance log.
+
+        text_type is 'describe' | 'tags' | 'verify'. generated_text is the raw
+        string (a JSON array for tags). model_used/model_version may be None for
+        backfilled rows. created_at defaults to now; pass an explicit value when
+        backfilling so the row reflects when the artifact was originally made.
+        Honors the active batch (no per-call commit when batching).
+        """
+        if not generated_text:
+            return
+        if created_at is not None:
+            self.conn.execute(
+                """INSERT INTO generations
+                   (photo_id, text_type, generated_text, model_used, model_version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (photo_id, text_type, generated_text, model_used, model_version, created_at),
+            )
+        else:
+            self.conn.execute(
+                """INSERT INTO generations
+                   (photo_id, text_type, generated_text, model_used, model_version)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (photo_id, text_type, generated_text, model_used, model_version),
+            )
+        self._maybe_commit()
 
     def mark_processed(self, photo_ids: list[int], pass_type: str):
         """Record that these photos have been processed for the given pass type.

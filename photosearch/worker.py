@@ -41,6 +41,31 @@ _TRANSIENT = (
     TimeoutError,
 )
 
+# Cache of Ollama model name -> short digest, for generation provenance.
+_MODEL_VERSION_CACHE: dict = {}
+
+
+def _model_version(model: str) -> Optional[str]:
+    """Best-effort short digest for an Ollama model, for the generations log.
+
+    Returns None on any failure — provenance is nice-to-have, never fatal.
+    """
+    if model in _MODEL_VERSION_CACHE:
+        return _MODEL_VERSION_CACHE[model]
+    version = None
+    try:
+        import ollama
+        for m in ollama.list().models:
+            name = m.model or ""
+            if name == model or name.split(":")[0] == model or name.startswith(model):
+                digest = getattr(m, "digest", None)
+                version = digest[:12] if digest else None
+                break
+    except Exception:
+        version = None
+    _MODEL_VERSION_CACHE[model] = version
+    return version
+
 
 def _unload_pass_models(pass_type: str) -> None:
     """Release torch models owned by a pass so MPS/CUDA memory is reclaimed.
@@ -367,7 +392,7 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
     return results
 
 
-def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llava") -> list[dict]:
+def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2-vision") -> list[dict]:
     """Generate scene descriptions via Ollama. Returns list of {photo_id, description}.
 
     Always includes every photo in results (description may be None) so the
@@ -429,8 +454,8 @@ def _process_tags(downloaded: list[tuple[dict, str]], model: str = "llava") -> l
 def _process_verify(
     downloaded: list[tuple[dict, str]],
     client: "WorkerClient",
-    verify_model: str = "minicpm-v",
-    regen_model: str = "llava",
+    verify_model: str = "llava",
+    regen_model: str = "llama3.2-vision",
 ) -> list[dict]:
     """Run hallucination verification on downloaded photos.
 
@@ -597,8 +622,9 @@ def run_worker(
     ttl_minutes: int = 30,
     one_shot: bool = False,
     force: bool = False,
-    describe_model: str = "llava",
-    verify_model: str = "minicpm-v",
+    describe_model: str = "llama3.2-vision",
+    tags_model: str = "llava",
+    verify_model: str = "llava",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
@@ -612,8 +638,9 @@ def run_worker(
         ttl_minutes: Claim TTL in minutes
         one_shot: If True, process one batch per pass and exit
         force: If True, clear existing data and re-process from scratch
-        describe_model: Ollama model for descriptions/tags (default: llava)
-        verify_model: Ollama model for verification (default: minicpm-v)
+        describe_model: Ollama model for descriptions (default: llama3.2-vision)
+        tags_model: Ollama model for the tags pass (default: llava)
+        verify_model: Ollama model for verification (default: llava)
     """
     print(f"Connecting to {server}...")
     client = WorkerClient(server)
@@ -732,16 +759,23 @@ def run_worker(
                     kwargs = {"face_results": results}
                 elif pass_type == "describe":
                     results = _process_describe(downloaded, model=describe_model)
-                    kwargs = {"describe_results": results}
+                    kwargs = {"describe_results": results,
+                              "model": describe_model,
+                              "model_version": _model_version(describe_model)}
                 elif pass_type == "tags":
-                    results = _process_tags(downloaded, model=describe_model)
-                    kwargs = {"tags_results": results}
+                    results = _process_tags(downloaded, model=tags_model)
+                    kwargs = {"tags_results": results,
+                              "model": tags_model,
+                              "model_version": _model_version(tags_model)}
                 elif pass_type == "verify":
                     results = _process_verify(
                         downloaded, client=client,
                         verify_model=verify_model, regen_model=describe_model,
                     )
-                    kwargs = {"verify_results": results}
+                    # regen_model == describe_model produces any regenerated text
+                    kwargs = {"verify_results": results,
+                              "model": describe_model,
+                              "model_version": _model_version(describe_model)}
                 else:
                     print(f"  Pass type '{pass_type}' not yet implemented in worker.")
                     heartbeat.stop()
