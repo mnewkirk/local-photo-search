@@ -97,9 +97,15 @@ def admin_version():
     head = _commit_info("HEAD")
     upstream = _commit_info("@{upstream}")  # tracking branch (usually origin/main)
 
-    # Working-tree cleanliness — empty porcelain output = clean
+    # Working-tree cleanliness — empty porcelain output = clean. Returning
+    # the file list (capped) lets the UI show *what* is dirty when the
+    # operator wonders why the indicator hasn't gone green yet.
     rc, status_out, _ = _run_git(["status", "--porcelain"])
     dirty = (rc == 0 and bool(status_out))
+    dirty_files = []
+    if dirty:
+        for line in status_out.splitlines()[:30]:
+            dirty_files.append(line.rstrip())
 
     # Ahead / behind vs upstream
     ahead = behind = 0
@@ -120,6 +126,7 @@ def admin_version():
         "head": head,
         "upstream": upstream,
         "dirty": dirty,
+        "dirty_files": dirty_files,
         "ahead": ahead,
         "behind": behind,
         "deployed_sha": deployed,
@@ -197,8 +204,10 @@ async def _stream_subprocess(cmd: list[str], cwd: Optional[str] = None, env: Opt
 async def admin_docker_build():
     """`docker compose build photosearch` — SSE stream of build output.
 
-    Passes GIT_SHA so the new image bakes in the current HEAD; /version's
-    deployed_matches_head will flip to true once a restart picks it up.
+    Passes GIT_SHA via an explicit --build-arg (not just env-var expansion in
+    the compose file — that occasionally evaluated to "unknown" even with the
+    env set on the subprocess). The new image bakes /app/BUILD_SHA, and
+    /version's deployed_matches_head flips true once a restart picks it up.
     """
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
@@ -207,11 +216,17 @@ async def admin_docker_build():
     git_sha = sha if rc == 0 else "unknown"
 
     env = os.environ.copy()
-    env["GIT_SHA"] = git_sha
-    cmd = ["docker", "compose", "-f", COMPOSE_FILE, "build", COMPOSE_SERVICE]
+    env["GIT_SHA"] = git_sha   # also exported for compose-file fallback expansion
+    cmd = [
+        "docker", "compose", "-f", COMPOSE_FILE, "build",
+        "--build-arg", f"GIT_SHA={git_sha}",
+        COMPOSE_SERVICE,
+    ]
 
     async def gen():
         try:
+            # Emit the SHA up front so the user can see it land in BUILD_SHA.
+            yield f"event: line\ndata: {json.dumps({'line': '[admin] passing GIT_SHA=' + git_sha[:12]})}\n\n"
             async for chunk in _stream_subprocess(cmd, cwd=REPO_DIR, env=env):
                 yield chunk
         finally:

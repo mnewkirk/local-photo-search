@@ -187,6 +187,19 @@
       word-break: break-all;
     }
     .deploy-log.running { border-color: var(--accent); }
+    /* After a successful build, the Restart button glows so it's clear the
+       next action is to apply the new image. */
+    .deploy-restart-ready {
+      background: rgba(74,222,128,0.15);
+      border-color: var(--green);
+      color: var(--green);
+      animation: pulse-ready 1.8s ease-in-out infinite;
+    }
+    .deploy-restart-ready:hover { border-color: var(--green); color: var(--green); }
+    @keyframes pulse-ready {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); }
+      50%      { box-shadow: 0 0 0 3px rgba(74,222,128,0.2); }
+    }
 
     /* Generations by model */
     .gens-wrap {
@@ -938,6 +951,9 @@
       var _b = useState(false); var busy = _b[0];     var setBusy = _b[1];
       var _l = useState([]);    var log = _l[0];      var setLog = _l[1];
       var _bu = useState(false); var building = _bu[0]; var setBuilding = _bu[1];
+      // null | "ready" | "failed" — sticky banner so it's clear the build
+      // finished and the operator can/should click Restart now.
+      var _br = useState(null); var buildResult = _br[0]; var setBuildResult = _br[1];
 
       function appendLog(line) {
         setLog(function(prev) {
@@ -982,10 +998,22 @@
           .then(function() { setBusy(false); });
       }
 
+      function finishBuild(success) {
+        // Flip building state the moment the `done` event arrives, instead
+        // of waiting for the stream to close — otherwise the user sees
+        // "build OK" in the log but the button still says "Building…" until
+        // the connection finally drops.
+        setBuilding(false);
+        setBusy(false);
+        setBuildResult(success ? 'ready' : 'failed');
+        loadVersion();
+      }
+
       function runBuild() {
         if (busy || building) return;
         setBusy(true);
         setBuilding(true);
+        setBuildResult(null);
         appendLog('▸ docker compose build (this may take several minutes)…');
         // SSE-style stream from the POST handler.
         fetch('/api/admin/docker-build', { method: 'POST' })
@@ -996,6 +1024,7 @@
             var reader = response.body.getReader();
             var decoder = new TextDecoder();
             var buf = '';
+            var resolved = false;
             function pump() {
               return reader.read().then(function(chunk) {
                 if (chunk.done) return;
@@ -1011,18 +1040,30 @@
                     if (payload.line != null) appendLog(payload.line);
                     if (payload.cmd) appendLog('$ ' + payload.cmd);
                     if (payload.returncode != null) {
-                      appendLog(payload.returncode === 0 ? '  ✓ build OK' : '  ✗ build failed (rc=' + payload.returncode + ')');
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ build OK — click Restart to apply' : '  ✗ build failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      finishBuild(ok);
                     }
-                    if (payload.error) appendLog('  ✗ ' + payload.error);
+                    if (payload.error) {
+                      appendLog('  ✗ ' + payload.error);
+                      resolved = true;
+                      finishBuild(false);
+                    }
                   } catch (_) {}
                 });
                 return pump();
               });
             }
-            return pump();
+            return pump().then(function() {
+              // Safety net: stream closed without ever emitting a done event
+              if (!resolved) finishBuild(false);
+            });
           })
-          .catch(function(err) { appendLog('  ✗ build stream error: ' + err.message); })
-          .then(function() { setBusy(false); setBuilding(false); loadVersion(); });
+          .catch(function(err) {
+            appendLog('  ✗ build stream error: ' + err.message);
+            finishBuild(false);
+          });
       }
 
       function runRestart() {
@@ -1031,6 +1072,7 @@
           'The page will lose its connection while the container swaps. ' +
           'Refresh after ~5-15 seconds.'
         )) return;
+        setBuildResult(null);
         postAction('/api/admin/restart', 'docker compose up -d');
       }
 
@@ -1090,7 +1132,17 @@
             version.behind > 0 ? ' · ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's') + ' behind origin' : '',
             version.ahead > 0 ? ' · ' + version.ahead + ' ahead' : ''
           ),
+          version.dirty && version.dirty_files && version.dirty_files.length > 0 && e('div', {
+            className: 'deploy-meta',
+            style: { marginTop: 6, color: '#f87171', whiteSpace: 'pre-wrap' },
+            title: 'git status --porcelain (showing up to 30 entries)',
+          }, 'Dirty:\n  ' + version.dirty_files.join('\n  ')),
           e('div', { className: 'deploy-actions' },
+            e('button', {
+              className: 'btn',
+              onClick: function() { loadVersion(); appendLog('▸ refreshed deployment state'); },
+              title: 'Re-poll /api/admin/version — no git/docker activity',
+            }, 'Check'),
             e('button', {
               className: 'btn',
               disabled: busy,
@@ -1110,11 +1162,13 @@
               title: 'docker compose build photosearch — takes 5-10 min',
             }, building ? 'Building…' : 'Build'),
             e('button', {
-              className: 'btn',
+              className: 'btn' + (buildResult === 'ready' ? ' deploy-restart-ready' : ''),
               disabled: busy,
               onClick: runRestart,
-              title: 'docker compose up -d — swap to the new image',
-            }, 'Restart'),
+              title: buildResult === 'ready'
+                ? 'New image ready — click to apply it'
+                : 'docker compose up -d — swap to the new image',
+            }, buildResult === 'ready' ? 'Restart ← new image ready' : 'Restart'),
             e('button', {
               className: 'btn',
               disabled: busy,
