@@ -31,7 +31,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTM
 from fastapi.staticfiles import StaticFiles
 
 from .db import PhotoDB
-from .worker_api import router as worker_router, configure as configure_worker
+from .worker_api import (
+    router as worker_router,
+    configure as configure_worker,
+    begin_shutdown as worker_begin_shutdown,
+    is_shutting_down as worker_is_shutting_down,
+)
 from .admin_api import router as admin_router
 
 # ---------------------------------------------------------------------------
@@ -49,6 +54,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    """Tell worker_api to start 503'ing worker traffic so the drain finishes."""
+    worker_begin_shutdown()
+
+
+@app.middleware("http")
+async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
+    """Return 503 to worker traffic once shutdown begins, so workers back off
+    and uvicorn can finish its in-flight drain instead of accumulating new
+    requests. Browser UI paths are unaffected (they 'd see a normal connection
+    drop a few seconds later anyway when the container swaps).
+
+    Matched paths:
+      - /api/worker/*           (claim-batch / submit-results / renew-claim / etc.)
+      - /api/photos/<n>/full    (only workers fetch this; UI uses /thumbnail and /preview)
+    """
+    if worker_is_shutting_down():
+        path = request.url.path
+        is_worker_full_fetch = (
+            path.startswith("/api/photos/")
+            and path.endswith("/full")
+        )
+        if path.startswith("/api/worker/") or is_worker_full_fetch:
+            return JSONResponse(
+                {"detail": "server shutting down, retry shortly"},
+                status_code=503,
+                headers={"Retry-After": "30", "Connection": "close"},
+            )
+    return await call_next(request)
 
 # Database path — set by the CLI launcher, defaults to cwd
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")

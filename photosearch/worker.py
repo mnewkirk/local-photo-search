@@ -132,6 +132,33 @@ class WorkerClient:
         except Exception as e:
             raise ConnectionError(f"Cannot reach server at {self.server_url}: {e}")
 
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Send a request, transparently backing off on HTTP 503 (server in
+        graceful-shutdown mode signaling 'retry shortly') by sleeping for
+        Retry-After seconds and looping. Connection-level errors are NOT
+        handled here — caller's _retry() covers those.
+
+        The server returns 503 to /api/worker/* and /api/photos/*/full while
+        uvicorn is draining for a restart. Workers see this, back off (so
+        uvicorn's drain actually completes), then come back when the new
+        container is up and answering 200.
+        """
+        while True:
+            r = self.session.request(method, url, **kwargs)
+            if r.status_code != 503:
+                return r
+            retry_after = 30
+            try:
+                retry_after = max(1, int(r.headers.get("Retry-After", "30")))
+            except (TypeError, ValueError):
+                pass
+            try:
+                r.close()
+            except Exception:
+                pass
+            print(f"  ⏸ server is restarting (503) — backing off {retry_after}s before retry")
+            time.sleep(retry_after)
+
     def claim_batch(self, pass_type: str, limit: int = 16,
                     collection_id: Optional[int] = None,
                     directory: Optional[str] = None,
@@ -147,7 +174,7 @@ class WorkerClient:
             payload["collection_id"] = collection_id
         if directory is not None:
             payload["directory"] = directory
-        r = self.session.post(f"{self.server_url}/api/worker/claim-batch", json=payload, timeout=30)
+        r = self._request("POST", f"{self.server_url}/api/worker/claim-batch", json=payload, timeout=30)
         if not r.ok:
             detail = r.text[:200] if r.text else r.reason
             raise RuntimeError(f"claim-batch failed ({r.status_code}): {detail}")
@@ -156,7 +183,8 @@ class WorkerClient:
     def download_photo(self, photo_id: int, dest_path: str) -> int:
         """Download a photo's full-resolution bytes. Returns HTTP status code
         (200 on success, 404 if the NAS can't find the file, etc.)."""
-        r = self.session.get(
+        r = self._request(
+            "GET",
             f"{self.server_url}/api/photos/{photo_id}/full",
             timeout=120,
             stream=True,
@@ -183,7 +211,8 @@ class WorkerClient:
             "pass_type": pass_type,
             **kwargs,
         }
-        r = self.session.post(
+        r = self._request(
+            "POST",
             f"{self.server_url}/api/worker/submit-results",
             json=payload,
             timeout=120,
@@ -231,7 +260,8 @@ class WorkerClient:
     def renew_claim(self, batch_id: str, ttl_minutes: int = 30) -> bool:
         """Extend a claim's TTL (heartbeat). Returns True on success."""
         try:
-            r = self.session.post(
+            r = self._request(
+                "POST",
                 f"{self.server_url}/api/worker/renew-claim",
                 json={"batch_id": batch_id, "ttl_minutes": ttl_minutes},
                 timeout=30,

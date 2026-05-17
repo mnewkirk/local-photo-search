@@ -28,6 +28,24 @@ router = APIRouter(prefix="/api/worker", tags=["worker"])
 _db_path: str = ""
 _photo_root: Optional[str] = None
 
+# Flipped True by web.py's shutdown handler when uvicorn starts draining.
+# Worker traffic (claim/submit/renew/photo-bytes) returns 503 + Retry-After
+# while this is set so workers back off instead of piling new requests onto
+# the draining process. Without this, the drain window can exceed
+# stop_grace_period and the container gets SIGKILL'd mid-transfer (exit 137).
+_shutting_down: bool = False
+
+
+def begin_shutdown():
+    """Called from web.py's FastAPI shutdown event."""
+    global _shutting_down
+    _shutting_down = True
+    logger.info("worker_api: shutdown signaled — returning 503 to worker traffic")
+
+
+def is_shutting_down() -> bool:
+    return _shutting_down
+
 
 def configure(db_path: str, photo_root: Optional[str] = None):
     """Called by web.py to pass DB config to the worker router."""
