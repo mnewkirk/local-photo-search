@@ -1586,7 +1586,7 @@ class PhotoDB:
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    """SELECT p.id, p.filepath FROM photos p
+                    f"""SELECT p.id, p.filepath FROM photos p
                        WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
@@ -1694,7 +1694,7 @@ class PhotoDB:
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    """SELECT COUNT(*) FROM photos p
+                    f"""SELECT COUNT(*) FROM photos p
                        WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
