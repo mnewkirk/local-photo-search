@@ -1072,8 +1072,53 @@
           'The page will lose its connection while the container swaps. ' +
           'Refresh after ~5-15 seconds.'
         )) return;
+        if (busy) return;
         setBuildResult(null);
-        postAction('/api/admin/restart', 'docker compose up -d');
+        setBusy(true);
+        appendLog('▸ docker compose up -d…');
+        // Inline handler instead of postAction(): a network error here usually
+        // means the container swap dropped our connection mid-response (the
+        // OLD container was killed before it could ACK), which is what we
+        // *want*. Treat it as a soft success and auto-poll for the new one.
+        fetch('/api/admin/restart', { method: 'POST' })
+          .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, status: r.status, body: t }; }); })
+          .then(function(res) {
+            if (!res.ok) {
+              try { var j = JSON.parse(res.body); appendLog('  ✗ ' + (j.detail || res.body)); }
+              catch (_) { appendLog('  ✗ HTTP ' + res.status + ': ' + res.body); }
+            } else {
+              appendLog('  ✓ restart triggered — page may briefly lose connection');
+            }
+          })
+          .catch(function() {
+            appendLog('  ✓ restart in progress — container swap dropped this connection (expected)');
+          })
+          .then(function() {
+            setBusy(false);
+            // Auto-poll /version a few times with backoff so the panel updates
+            // itself once the new container is reachable, without making the
+            // user keep clicking Check.
+            var attempts = 0;
+            function poll() {
+              attempts += 1;
+              fetch('/api/admin/version')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                  setVersion(d);
+                  var sha = d.deployed_sha ? d.deployed_sha.slice(0, 7) : 'unknown';
+                  appendLog('  ✓ new container reachable — deployed: ' + sha);
+                })
+                .catch(function() {
+                  if (attempts < 8) {
+                    appendLog('  … waiting for new container (' + attempts + '/8)');
+                    setTimeout(poll, 3000);
+                  } else {
+                    appendLog('  ⚠ couldn\'t reach the new container after ~24s — try Check manually');
+                  }
+                });
+            }
+            setTimeout(poll, 4000); // give docker a moment to start the swap
+          });
       }
 
       if (!version) {
