@@ -36,6 +36,14 @@ COMPOSE_SERVICE = os.environ.get("PHOTOSEARCH_COMPOSE_SERVICE", "photosearch")
 # file pins `name: photosearch` at the top level so this also matches a
 # NAS-shell `docker compose` run from /volume1/docker/photosearch.
 COMPOSE_PROJECT = os.environ.get("PHOTOSEARCH_COMPOSE_PROJECT", "photosearch")
+# Host-side path to the repo. Restart spawns a *separate* helper container
+# (running docker:cli) to do the actual `compose up`, so it survives the
+# moment compose kills the running photosearch container — otherwise the
+# subprocess running compose dies with its parent container right between
+# "old container died" and "start new container", leaving the new one
+# stranded in Created state. The helper needs its own /repo mount from
+# the host, so we need the host path, not the in-container /repo path.
+HOST_REPO_DIR = os.environ.get("HOST_REPO_DIR", "/volume1/docker/photosearch")
 
 # Written at image-build time by the Dockerfile from the GIT_SHA build arg.
 BUILD_SHA_FILE = Path("/app/BUILD_SHA")
@@ -243,21 +251,29 @@ async def admin_docker_build():
 
 @router.post("/restart")
 def admin_restart():
-    """`docker compose up -d --no-deps photosearch` — recreates only this service.
+    """Trigger `docker compose up -d --no-deps photosearch` via a *separate*
+    helper container so the compose process survives this container's death.
 
-    Before triggering docker, extends active worker claims by 15 minutes so
-    in-flight batches survive the restart window (workers can't reach the
-    NAS during the swap; without this, their `renew-claim` calls fail, claim
-    TTL expires, and another worker steals + redoes the same batch).
+    Why a helper container instead of in-process subprocess: when compose
+    SIGKILLs the running photosearch container after stop_grace_period, every
+    process inside that container's PID namespace dies — including the
+    subprocess that's running compose itself. That happens BETWEEN "old
+    container died" and "start new container", leaving the new container
+    stranded in Created state. setsid/nohup don't help — they're in the same
+    PID namespace. A separate `docker run` container has its own lifecycle.
+
+    Also extends active worker claims by 15 minutes before triggering the
+    helper, so workers' in-flight batches survive the swap gap even if
+    `renew-claim` calls 503/timeout during the brief downtime.
 
     --no-deps is required: without it, compose follows depends_on and tries to
     ensure ollama (and other deps) are also up. If those containers were
     created with different project labels, compose decides it needs to create
-    them and hits a name conflict on `photosearch-ollama` etc. Restart should
-    only touch this service.
+    them and hits a name conflict on `photosearch-ollama` etc.
 
-    Returns immediately. The container then dies as docker swaps it for the
-    fresh one, so the client will see a connection drop — that's normal.
+    Returns immediately after launching the helper. The container then dies
+    as docker swaps it for the fresh one, so the client sees a connection
+    drop — that's expected.
     """
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
@@ -280,21 +296,39 @@ def admin_restart():
         except Exception as e:
             logger.warning("claim TTL extension before restart failed: %s", e)
 
-        cmd = ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
-               "up", "-d", "--no-deps", COMPOSE_SERVICE]
+        # Launch helper: `docker run --rm -d docker:cli compose up -d ...`.
+        # --detach so this `docker run` returns as soon as the helper is
+        #   started (we don't want to wait for the swap to complete, and
+        #   we can't anyway — we'd get killed mid-wait).
+        # --rm so the helper container removes itself when compose finishes.
+        # We mount docker.sock + the host repo, then run compose inside it.
+        helper_cmd = [
+            "docker", "run", "--rm", "--detach",
+            "--name", "photosearch-restart-helper",
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            "-v", f"{HOST_REPO_DIR}:/repo",
+            "-w", "/repo",
+            "docker:cli",
+            "compose", "-p", COMPOSE_PROJECT, "-f", "docker-compose.nas.yml",
+            "up", "-d", "--no-deps", COMPOSE_SERVICE,
+        ]
         try:
-            # 240s = enough headroom for full 60s stop_grace_period drain +
-            # container teardown + new-container create+start, with margin.
-            # Earlier 120s left the new container in Created state when
-            # workers kept the old uvicorn busy through the whole 60s drain.
-            r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=240)
+            r = subprocess.run(helper_cmd, capture_output=True, text=True, timeout=30)
         except FileNotFoundError:
             raise HTTPException(500, "docker CLI not installed in this image")
         if r.returncode != 0:
-            raise HTTPException(500, f"docker compose up failed: {r.stderr.strip() or r.stdout.strip()}")
-        note = "container will be replaced; expect a connection drop"
+            err = r.stderr.strip() or r.stdout.strip()
+            # If a previous helper got wedged (name conflict), surface a
+            # clear hint about it — clean up and retry are both manual.
+            if "is already in use by container" in err:
+                err += " — run `docker rm -f photosearch-restart-helper` and retry"
+            raise HTTPException(500, f"restart helper launch failed: {err}")
+
+        helper_id = r.stdout.strip()[:12]
+        note = (f"restart helper {helper_id} launched in detached container; "
+                "expect a connection drop while the swap completes")
         if extended:
             note += f" — extended TTL on {extended} active claim(s) to ride out the gap"
-        return {"ok": True, "note": note}
+        return {"ok": True, "note": note, "helper_container": helper_id}
     finally:
         _op_lock.release()

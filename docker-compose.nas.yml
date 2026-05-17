@@ -66,6 +66,12 @@ services:
       - PYTHONUNBUFFERED=1
       - PHOTOSEARCH_CACHE=/data/.cache/photosearch
       - HF_TOKEN=${HF_TOKEN}
+      # Host-side path to the repo (matches the volume mount above). The
+      # /api/admin/restart endpoint spawns a separate docker:cli helper
+      # container that does `compose up`; the helper needs the HOST path
+      # for its own /repo mount, not the in-container /repo. Defaulted in
+      # admin_api.py if unset, but pin it here so the panel doesn't guess.
+      - HOST_REPO_DIR=${REPO_DIR:-/volume1/docker/photosearch}
       # Deployment-specific subfolders to skip during indexing
       # (colon-separated; folder basenames, not full paths). These are
       # NAS-local trees that hold organizational duplicates of photos
