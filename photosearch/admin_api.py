@@ -237,7 +237,14 @@ async def admin_docker_build():
 
 @router.post("/restart")
 def admin_restart():
-    """`docker compose up -d photosearch` — recreates the service.
+    """`docker compose up -d --no-deps photosearch` — recreates only this service.
+
+    --no-deps is required: without it, compose follows depends_on and tries to
+    ensure ollama (and other deps) are also up. If those containers were
+    created with different project labels (manual `docker run`, prior compose
+    invocations, etc.), compose decides it needs to create them and hits a
+    name conflict on `photosearch-ollama` etc. Restart should only touch this
+    service.
 
     Returns immediately. The container then dies as docker swaps it for the
     fresh one, so the client will see a connection drop — that's normal.
@@ -245,7 +252,8 @@ def admin_restart():
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
     try:
-        cmd = ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", COMPOSE_SERVICE]
+        cmd = ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d",
+               "--no-deps", COMPOSE_SERVICE]
         try:
             r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=60)
         except FileNotFoundError:
