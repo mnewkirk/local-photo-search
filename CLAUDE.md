@@ -128,9 +128,25 @@ with PhotoDB(os.environ['PHOTOSEARCH_DB']) as db:
     ...
 "
 
-# Git pull (Alpine workaround for UGOS ownership)
+# Git on the NAS — UGOS owns this dir as a different uid, so bare `git`
+# fails with "dubious ownership". Two workarounds; pick whichever fits:
+#
+# 1. Host-side, single command — pass `-c safe.directory=...` per-call.
+#    Works for status / diff / log / add / commit / push / etc.
+git -c safe.directory=/volume1/docker/photosearch status
+git -c safe.directory=/volume1/docker/photosearch diff --cached
+git -c safe.directory=/volume1/docker/photosearch commit -m "..."
+#
+# 2. Alpine container — only needed when you'd otherwise want to set
+#    persistent `git config` (user.email/name) without polluting the host.
 docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
   "apk add -q git && git config --global --add safe.directory /repo && git -C /repo pull"
+
+# Push: the remote is HTTPS (https://github.com/mnewkirk/local-photo-search.git)
+# but the host has no stored HTTPS credential — `gh` CLI holds the token.
+# Wire gh in as the credential helper for the push call:
+git -c safe.directory=/volume1/docker/photosearch \
+    -c credential.helper='!gh auth git-credential' push origin main
 ```
 
 ## Distributed Indexing (Worker)
