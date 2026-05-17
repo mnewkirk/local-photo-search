@@ -3360,5 +3360,74 @@ def clean_garbage_tags(db, dry_run):
         click.echo(f"  deleted {gen_n} regurgitated 'tags' rows from generations")
 
 
+@cli.command("retry-failed-describe")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--ext", multiple=True,
+              help="Only retry photos with this extension (e.g. --ext .heic). "
+                   "Repeatable. Default: all extensions.")
+@click.option("--dry-run", is_flag=True, help="Show what would be cleared without writing.")
+def retry_failed_describe(db, ext, dry_run):
+    """Re-enqueue photos whose describe pass failed (no description was stored).
+
+    Workers mark every claimed photo as processed in `worker_processed` —
+    including ones where the describe model returned nothing — so a bad file
+    doesn't get reclaimed forever. The side effect: photos that failed for
+    *transient* reasons stay stuck (e.g. HEIC files indexed before pillow-heif
+    was installed). This clears those markers so they get re-claimed and
+    re-tried on the next describe pass.
+
+    `--ext .heic` (repeatable) limits to specific extensions when you know the
+    failure mode and don't want to retry genuinely-broken files. Use
+    `--dry-run` to preview.
+    """
+    import os
+    from photosearch.db import PhotoDB
+
+    ext_norm = {("." + e.lower().lstrip(".")) for e in ext}  # normalize -> {".heic", ...}
+
+    with PhotoDB(db) as pdb:
+        rows = pdb.conn.execute("""
+            SELECT p.id, p.filepath FROM photos p
+            JOIN worker_processed wp ON wp.photo_id = p.id AND wp.pass_type = 'describe'
+            WHERE p.description IS NULL OR p.description = ''
+        """).fetchall()
+
+        if ext_norm:
+            rows = [r for r in rows if os.path.splitext(r[1])[1].lower() in ext_norm]
+
+        # Show per-extension breakdown so the user can confirm before applying
+        counts = {}
+        for _, fp in rows:
+            counts[os.path.splitext(fp)[1].lower() or "(no ext)"] = \
+                counts.get(os.path.splitext(fp)[1].lower() or "(no ext)", 0) + 1
+
+        click.echo(f"Photos with NULL description AND a 'describe' processed marker: {len(rows)}")
+        if ext_norm:
+            click.echo(f"  (filtered to: {', '.join(sorted(ext_norm))})")
+        for k, n in sorted(counts.items(), key=lambda x: -x[1])[:10]:
+            click.echo(f"    {n:6d}  {k}")
+
+        if dry_run:
+            click.echo("Dry run — no markers cleared.")
+            return
+        if not rows:
+            click.echo("Nothing to do.")
+            return
+
+        ids = [r[0] for r in rows]
+        # Batch the DELETE — SQLite has a default 999-parameter limit.
+        BATCH = 500
+        for i in range(0, len(ids), BATCH):
+            chunk = ids[i:i + BATCH]
+            placeholders = ",".join(["?"] * len(chunk))
+            pdb.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'describe' AND photo_id IN ({placeholders})",
+                chunk,
+            )
+        pdb.conn.commit()
+        click.echo(f"Cleared describe markers on {len(ids)} photos. The next describe worker will re-claim them.")
+
+
 if __name__ == "__main__":
     cli()
