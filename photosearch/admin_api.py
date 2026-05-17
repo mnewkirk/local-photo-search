@@ -283,7 +283,11 @@ def admin_restart():
         cmd = ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
                "up", "-d", "--no-deps", COMPOSE_SERVICE]
         try:
-            r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=120)
+            # 240s = enough headroom for full 60s stop_grace_period drain +
+            # container teardown + new-container create+start, with margin.
+            # Earlier 120s left the new container in Created state when
+            # workers kept the old uvicorn busy through the whole 60s drain.
+            r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=240)
         except FileNotFoundError:
             raise HTTPException(500, "docker CLI not installed in this image")
         if r.returncode != 0:
