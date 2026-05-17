@@ -78,11 +78,16 @@ services:
         condition: service_started
     command: ["serve"]
     # The N100 has 4 cores and 8 GB RAM. Indexing is memory-intensive
-    # (CLIP + InsightFace + LLaVA all load models). Serving is lightweight.
+    # (CLIP + InsightFace + LLaVA all load models). Serving is lightweight
+    # for browsing, but worker batches that pull /api/photos/<id>/full hold
+    # several MB per concurrent photo in memory — a 16-photo batch + model
+    # state can push past 6G and trigger the OOM killer (exit 137). With
+    # describe routed to Windows-native Ollama, the ollama container's 6G
+    # limit is mostly slack, so giving photosearch more headroom is safe.
     deploy:
       resources:
         limits:
-          memory: 6G
+          memory: 7G
 
   ollama:
     image: ollama/ollama:latest
