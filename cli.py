@@ -3247,15 +3247,25 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
               help="Model to record as having produced historical descriptions "
                    "(e.g. 'llava'). Applied to both new inserts and any existing "
                    "rows with model_used=NULL. Default: leave NULL (unknown).")
+@click.option("--describe-model-version", default=None,
+              help="Ollama digest (e.g. '8dd30f6b0cb1') to record alongside "
+                   "--describe-model. Stamped only on rows where model_version "
+                   "is currently NULL. Default: leave NULL.")
 @click.option("--tags-model", default=None,
               help="Model to record for historical tags. See --describe-model.")
+@click.option("--tags-model-version", default=None,
+              help="Ollama digest for the tags model. See --describe-model-version.")
 @click.option("--verify-model", default=None,
               help="Model to record for verify-regenerated descriptions. "
                    "This is the REGEN model (the one that produced the new text), "
                    "not the verifier — historically those defaulted to the same "
                    "thing as --describe-model.")
+@click.option("--verify-model-version", default=None,
+              help="Ollama digest for the verify-regen model. See --describe-model-version.")
 @click.option("--dry-run", is_flag=True, help="Show what would be inserted without writing.")
-def backfill_generations(db, describe_model, tags_model, verify_model, dry_run):
+def backfill_generations(db, describe_model, describe_model_version,
+                         tags_model, tags_model_version,
+                         verify_model, verify_model_version, dry_run):
     """Backfill the generations provenance table from existing photo data.
 
     Inserts one generation row per existing describe/tags artifact, plus a
@@ -3267,26 +3277,31 @@ def backfill_generations(db, describe_model, tags_model, verify_model, dry_run):
     no recorded producing model. If you KNOW what model was used (e.g. you
     only ever ran the worker with the default --describe-model llava),
     pass --describe-model llava (and/or --tags-model, --verify-model) to
-    stamp that across both new inserts and existing NULL rows. model_version
-    stays NULL — we don't know the historical Ollama digest.
+    stamp that across both new inserts and existing NULL rows. Same for the
+    Ollama digest via --*-model-version (look it up via `ollama list`).
 
     Idempotent for inserts: skips any photo that already has a generation row
-    of that text_type, so it's safe to re-run. The NULL→specified-model
-    update IS rerun-friendly too (only touches NULL rows).
+    of that text_type, so it's safe to re-run. The NULL→specified-model and
+    NULL→specified-version updates ARE rerun-friendly too — each only touches
+    rows still NULL on the column it owns, so you can stamp the version in a
+    second pass after the initial backfill.
     """
     from photosearch.db import PhotoDB
 
-    model_for = {"describe": describe_model, "tags": tags_model, "verify": verify_model}
+    model_for = {
+        "describe": (describe_model, describe_model_version),
+        "tags":     (tags_model,     tags_model_version),
+        "verify":   (verify_model,   verify_model_version),
+    }
 
     # Each entry: (text_type, SELECT producing the rows to insert). The
     # NOT EXISTS guard makes the backfill idempotent and keeps it from
-    # clobbering provenance rows already logged by workers. The model_used
-    # column is a SQL literal so the same SELECT works for both NULL and a
-    # caller-supplied value.
-    def select_for(text_type: str, model_lit: str) -> str:
+    # clobbering provenance rows already logged by workers. model_used /
+    # model_version are SQL literals so the same SELECT covers NULL + values.
+    def select_for(text_type: str, model_lit: str, version_lit: str) -> str:
         if text_type == "describe":
             return f"""
-                SELECT p.id, 'describe', p.description, {model_lit}, NULL, p.indexed_at
+                SELECT p.id, 'describe', p.description, {model_lit}, {version_lit}, p.indexed_at
                 FROM photos p
                 WHERE p.description IS NOT NULL AND p.description != ''
                   AND NOT EXISTS (SELECT 1 FROM generations g
@@ -3294,7 +3309,7 @@ def backfill_generations(db, describe_model, tags_model, verify_model, dry_run):
             """
         if text_type == "tags":
             return f"""
-                SELECT p.id, 'tags', p.tags, {model_lit}, NULL, p.indexed_at
+                SELECT p.id, 'tags', p.tags, {model_lit}, {version_lit}, p.indexed_at
                 FROM photos p
                 WHERE p.tags IS NOT NULL AND p.tags != '' AND p.tags != '[]'
                   AND NOT EXISTS (SELECT 1 FROM generations g
@@ -3302,7 +3317,7 @@ def backfill_generations(db, describe_model, tags_model, verify_model, dry_run):
             """
         if text_type == "verify":
             return f"""
-                SELECT p.id, 'verify', p.description, {model_lit}, NULL,
+                SELECT p.id, 'verify', p.description, {model_lit}, {version_lit},
                        COALESCE(p.verified_at, p.indexed_at)
                 FROM photos p
                 WHERE p.verification_status = 'regenerated'
@@ -3312,29 +3327,41 @@ def backfill_generations(db, describe_model, tags_model, verify_model, dry_run):
             """
         raise click.UsageError(f"unknown text_type {text_type!r}")
 
+    def sql_lit(s):
+        return "NULL" if s is None else "'" + s.replace("'", "''") + "'"
+
     with PhotoDB(db) as pdb:
         for text_type in ("describe", "tags", "verify"):
-            model = model_for[text_type]
-            # SQL literal — model name is a constant; quote it ourselves
-            # (model names are short ASCII like 'llava' / 'llama3.2-vision').
-            model_lit = "NULL" if model is None else "'" + model.replace("'", "''") + "'"
-            select_sql = select_for(text_type, model_lit)
+            model, version = model_for[text_type]
+            model_lit = sql_lit(model)
+            version_lit = sql_lit(version)
+            select_sql = select_for(text_type, model_lit, version_lit)
             n_new = pdb.conn.execute(f"SELECT COUNT(*) FROM ({select_sql})").fetchone()[0]
 
-            # Also update any pre-existing NULL-model rows of this text_type
-            # to the specified model, so historical backfills get retroactively
-            # stamped when the operator remembers what model they used.
-            n_updated = 0
+            # Also update pre-existing NULL rows so a re-run can retroactively
+            # stamp model + version once the operator remembers them. Each
+            # column gates independently — letting you backfill the version
+            # in a second pass after the first one set the model.
+            n_model_updated = 0
+            n_version_updated = 0
             if model is not None:
-                n_updated = pdb.conn.execute(
+                n_model_updated = pdb.conn.execute(
                     "SELECT COUNT(*) FROM generations WHERE text_type = ? AND model_used IS NULL",
+                    (text_type,),
+                ).fetchone()[0]
+            if version is not None:
+                n_version_updated = pdb.conn.execute(
+                    "SELECT COUNT(*) FROM generations "
+                    "WHERE text_type = ? AND model_version IS NULL",
                     (text_type,),
                 ).fetchone()[0]
 
             if dry_run:
                 msg = f"  {text_type}: would insert {n_new} rows"
                 if model is not None:
-                    msg += f"; would set model='{model}' on {n_updated} existing NULL rows"
+                    msg += f"; would set model='{model}' on {n_model_updated} NULL rows"
+                if version is not None:
+                    msg += f"; would set version='{version}' on {n_version_updated} NULL rows"
                 click.echo(msg)
             else:
                 pdb.conn.execute(
@@ -3348,7 +3375,14 @@ def backfill_generations(db, describe_model, tags_model, verify_model, dry_run):
                         "WHERE text_type = ? AND model_used IS NULL",
                         (model, text_type),
                     )
-                    msg += f"; stamped model='{model}' on {n_updated} existing NULL rows"
+                    msg += f"; stamped model='{model}' on {n_model_updated} NULL rows"
+                if version is not None:
+                    pdb.conn.execute(
+                        "UPDATE generations SET model_version = ? "
+                        "WHERE text_type = ? AND model_version IS NULL",
+                        (version, text_type),
+                    )
+                    msg += f"; stamped version='{version}' on {n_version_updated} NULL rows"
                 click.echo(msg)
         if dry_run:
             click.echo("Dry run — no rows written.")
