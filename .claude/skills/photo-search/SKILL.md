@@ -943,7 +943,16 @@ source of truth (DB + photos).
 - Claims have a TTL (default 30 min) — if a worker dies, photos are auto-reclaimed
 - Multiple workers can run concurrently on different passes
 
-### Docker Worker Fleet (Recommended for Mac)
+### Worker fleet — `run-workers.sh` (auto-picks mode)
+
+`./run-workers.sh` auto-detects whether to run the **Docker fleet** (default
+on Mac/Linux) or **native** mode (default on WSL2 — launches `cli.py worker`
+processes directly from the project venv, GPU-capable, with `OLLAMA_HOST`
+auto-resolved to the Windows-host gateway). Same command works on every
+machine. Override with `--native` / `--docker`; point at a non-default Ollama
+with `--ollama-host URL`. `--status` / `--logs` / `--stop` work in both modes.
+
+#### Docker mode (default on Mac/Linux)
 
 Running workers bare-metal on macOS causes PyTorch's MPS (Metal) allocator to leak
 memory over time, eventually crashing the machine. The Docker fleet avoids this by

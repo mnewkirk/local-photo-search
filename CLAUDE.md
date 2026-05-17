@@ -148,12 +148,23 @@ Worker claims batches via HTTP, downloads photos, processes locally, POSTs resul
 Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
 (not hostname) — Docker containers can't resolve local DNS names.
 
-**Bare-metal** — required when the worker has a GPU (the Docker fleet is
-CPU-only). On a GPU box, run the worker directly so it picks up the local
-accelerator:
+**Bare-metal / native** — required when the worker has a GPU (the Docker fleet
+is CPU-only). Two ways to launch:
+
 ```bash
+# Easier: same command on every machine; auto-picks native on WSL2, Docker on Mac/Linux.
+./run-workers.sh -s http://<NAS-IP>:8000 -p clip,faces,quality -d /photos/2026 -n 3
+# Override with --native / --docker. --ollama-host URL for non-default Ollama.
+
+# Or run cli.py directly:
 python cli.py worker -s http://<NAS-IP>:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
 ```
+
+Native mode launches `cli.py worker` processes from the project venv (GPU
+auto-detected via torch+rocm / cuda) with `HSA_ENABLE_DXG_DETECTION=1` and
+`OLLAMA_HOST` resolved to the Windows-host gateway on WSL2. Worker logs land
+in `/tmp/photosearch-worker-fleet/worker-N.log`; `--status` / `--logs` /
+`--stop` work in both modes.
 
 Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints),
 `run-workers.sh` (Docker fleet launcher). API routes under `/api/worker/*`.

@@ -628,7 +628,7 @@ The describe pass runs LLaVA via Ollama, which is by far the slowest pass in the
 | Mac M-series | Native `ollama serve` via brew (Metal/MPS) | ~10s |
 | WSL2 + RX 7900 XTX | Windows-native Ollama (GPU), worker `OLLAMA_HOST` → Windows host | ~0.8-4s |
 
-For describe/tags/verify, point the worker's `OLLAMA_HOST` at whichever host runs a GPU-capable Ollama. `run-workers.sh` checks `localhost:11434` first and reuses any reachable Ollama.
+For describe/tags/verify, point the worker's `OLLAMA_HOST` at whichever host runs a GPU-capable Ollama. `run-workers.sh` checks `localhost:11434` first and reuses any reachable Ollama. On WSL2 the launcher auto-switches to **native mode** (bare-metal venv workers — required for the GPU since the Docker fleet is CPU-only) and resolves `OLLAMA_HOST` to the Windows-host gateway. Same command works on every machine; override with `--native` / `--docker` / `--ollama-host URL`.
 
 **Mac (Apple Silicon):**
 ```bash

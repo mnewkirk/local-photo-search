@@ -67,6 +67,47 @@ DESCRIBE_MODEL=""
 TAGS_MODEL=""
 VERIFY_MODEL=""
 
+# Execution mode. `native` runs `cli.py worker` processes directly from the
+# repo venv (GPU-capable — picks up CUDA/ROCm torch); `docker` runs the
+# CPU-only container fleet. `auto` picks native on WSL2 (where the Docker
+# fleet can't use the GPU and can't easily reach a GPU Ollama on the Windows
+# host) and docker everywhere else. Override with --native / --docker.
+MODE="auto"               # auto | native | docker
+OLLAMA_HOST_OVERRIDE=""   # --ollama-host: base URL where Ollama is reachable
+ACTION="start"            # start | status | logs | stop | scale
+SCALE_TARGET=""
+OLLAMA_URL="http://localhost:${OLLAMA_PORT}"   # resolved per-mode after arg parse
+NATIVE_RUNDIR="/tmp/photosearch-worker-fleet"  # native-mode pid/log files
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+detect_mode() {
+    [ "$MODE" != "auto" ] && return
+    if is_wsl; then MODE="native"; else MODE="docker"; fi
+}
+
+find_venv_python() {
+    local p
+    for p in "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/env/bin/python"; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+resolve_ollama_url() {
+    # Priority: --ollama-host > $OLLAMA_HOST env > WSL2 Windows-host gateway >
+    # localhost. In native WSL2 mode the GPU-capable Ollama runs on Windows,
+    # reachable via the default-route gateway IP.
+    if [ -n "$OLLAMA_HOST_OVERRIDE" ]; then echo "$OLLAMA_HOST_OVERRIDE"; return; fi
+    if [ -n "${OLLAMA_HOST:-}" ]; then echo "$OLLAMA_HOST"; return; fi
+    if [ "$MODE" = "native" ] && is_wsl; then
+        echo "http://$(ip route show default | awk '{print $3}'):11434"
+    else
+        echo "http://localhost:${OLLAMA_PORT}"
+    fi
+}
+
 usage() {
     cat <<'EOF'
 Usage: ./run-workers.sh [OPTIONS]
@@ -76,8 +117,8 @@ Start workers:
   -p, --passes PASSES     Comma-separated passes (default: clip)
   -d, --directory DIR      Scope to directory on NAS (e.g. /photos/2026)
   -c, --collection ID     Scope to collection ID
-  -n, --num-workers N     Number of worker containers (default: 4)
-  -m, --memory LIMIT      Memory limit per container (default: 3g)
+  -n, --num-workers N     Number of workers (default: 4)
+  -m, --memory LIMIT      Memory limit per container, docker mode only (default: 3g)
       --batch-size N      Photos per batch (default: 16)
       --model-batch-size N  Inference batch size (default: 8)
       --ttl MINUTES       Claim TTL (default: 30)
@@ -85,6 +126,10 @@ Start workers:
       --describe-model M  Ollama model for describe (default: llama3.2-vision)
       --tags-model M      Ollama model for tags (default: llava)
       --verify-model M    Ollama model for verification (default: llava)
+      --native            Run bare-metal venv workers (GPU-capable). Auto on WSL2.
+      --docker            Run the CPU-only Docker fleet. Auto on Mac/Linux.
+      --ollama-host URL   Base URL for Ollama (default: localhost, or the
+                          Windows-host gateway in native WSL2 mode)
 
 Manage workers:
       --status            Show running workers and their progress
@@ -132,7 +177,7 @@ ollama_needed() {
 }
 
 ollama_is_reachable() {
-    curl -sf --max-time 2 "http://localhost:${OLLAMA_PORT}/api/tags" > /dev/null 2>&1
+    curl -sf --max-time 2 "${OLLAMA_URL}/api/tags" > /dev/null 2>&1
 }
 
 ollama_container_exists() {
@@ -140,6 +185,19 @@ ollama_container_exists() {
 }
 
 ensure_ollama_running() {
+    # Native mode never manages a Docker Ollama — describe/tags/verify reach
+    # whatever Ollama $OLLAMA_URL points at (a Windows-host Ollama on WSL2, or
+    # a local `ollama serve`). Just check reachability and warn.
+    if [ "$MODE" = "native" ]; then
+        if ollama_is_reachable; then
+            echo "  Ollama reachable at ${OLLAMA_URL}"
+        else
+            echo "  WARNING: Ollama not reachable at ${OLLAMA_URL}" >&2
+            echo "  describe/tags/verify will fail. Start Ollama on that host," >&2
+            echo "  or pass --ollama-host URL." >&2
+        fi
+        return
+    fi
     if ollama_is_reachable; then
         if ollama_container_exists; then
             local current_parallel
@@ -207,9 +265,9 @@ required_ollama_models() {
 }
 
 ollama_has_model() {
-    # Uses /api/show which returns 200 iff the model is present locally.
+    # Uses /api/show which returns 200 iff the model is present.
     local model="$1"
-    curl -sf --max-time 5 -X POST "http://localhost:${OLLAMA_PORT}/api/show" \
+    curl -sf --max-time 5 -X POST "${OLLAMA_URL}/api/show" \
         -H 'Content-Type: application/json' \
         -d "{\"name\":\"$model\"}" > /dev/null 2>&1
 }
@@ -466,6 +524,82 @@ for a in json.load(sys.stdin):
 }
 
 # ---------------------------------------------------------------------------
+# Native-mode management (bare-metal worker processes, tracked via pid/log
+# files under $NATIVE_RUNDIR)
+# ---------------------------------------------------------------------------
+
+do_status_native() {
+    echo "=== Worker Processes (native) ==="
+    echo ""
+    if [ ! -d "$NATIVE_RUNDIR" ] || ! ls "$NATIVE_RUNDIR"/worker-*.pid >/dev/null 2>&1; then
+        echo "No workers running."
+        echo ""
+        echo "Start workers with: ./run-workers.sh -s <server> -p <passes> -d <directory>"
+        exit 0
+    fi
+    local live=0
+    for pidf in "$NATIVE_RUNDIR"/worker-*.pid; do
+        [ -e "$pidf" ] || continue
+        local pid name
+        pid=$(cat "$pidf" 2>/dev/null)
+        name=$(basename "$pidf" .pid)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "  $name (pid $pid) — running"
+            live=$((live + 1))
+        else
+            echo "  $name (pid ${pid:-?}) — exited"
+        fi
+    done
+    [ "$live" -eq 0 ] && echo "  (no live workers — all exited; queue likely drained)"
+    echo ""
+    echo "=== Recent Progress ==="
+    echo ""
+    for logf in "$NATIVE_RUNDIR"/worker-*.log; do
+        [ -e "$logf" ] || continue
+        echo "--- $(basename "$logf" .log) ---"
+        tail -n 8 "$logf" 2>/dev/null | sed 's/^/  /'
+        echo ""
+    done
+    exit 0
+}
+
+do_logs_native() {
+    if [ ! -d "$NATIVE_RUNDIR" ] || ! ls "$NATIVE_RUNDIR"/worker-*.log >/dev/null 2>&1; then
+        echo "No workers running."
+        exit 0
+    fi
+    echo "Tailing native worker logs (Ctrl-C to stop)..."
+    echo ""
+    trap 'kill $(jobs -p) 2>/dev/null; exit 0' INT TERM
+    for logf in "$NATIVE_RUNDIR"/worker-*.log; do
+        [ -e "$logf" ] || continue
+        short=$(basename "$logf" .log | sed 's/worker-//')
+        tail -f -n 10 "$logf" | sed "s/^/[$short] /" &
+    done
+    wait
+    exit 0
+}
+
+do_stop_native() {
+    if [ ! -d "$NATIVE_RUNDIR" ] || ! ls "$NATIVE_RUNDIR"/worker-*.pid >/dev/null 2>&1; then
+        echo "No workers running."
+        exit 0
+    fi
+    local count=0
+    for pidf in "$NATIVE_RUNDIR"/worker-*.pid; do
+        [ -e "$pidf" ] || continue
+        local pid
+        pid=$(cat "$pidf" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null && count=$((count + 1))
+        fi
+        rm -f "$pidf"
+    done
+    echo "Stopped $count native worker(s). Unclaimed batches reclaimed after TTL expires."
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
 
@@ -484,14 +618,35 @@ while [[ $# -gt 0 ]]; do
         --describe-model)   DESCRIBE_MODEL="$2";   shift 2 ;;
         --tags-model)       TAGS_MODEL="$2";       shift 2 ;;
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
-        --status)           do_status ;;
-        --logs)             do_logs ;;
-        --stop)             do_stop ;;
-        --scale)            do_scale "${2:-}" ;;
+        --native)           MODE="native";         shift ;;
+        --docker)           MODE="docker";         shift ;;
+        --ollama-host)      OLLAMA_HOST_OVERRIDE="$2"; shift 2 ;;
+        --status)           ACTION="status";       shift ;;
+        --logs)             ACTION="logs";         shift ;;
+        --stop)             ACTION="stop";         shift ;;
+        --scale)            ACTION="scale"; SCALE_TARGET="${2:-}"; shift 2 ;;
         -h|--help)          usage ;;
         *)  echo "Unknown option: $1" >&2; usage ;;
     esac
 done
+
+# Resolve execution mode + Ollama URL now that flags are parsed.
+detect_mode
+OLLAMA_URL="$(resolve_ollama_url)"
+
+# Management actions need no --server; dispatch them mode-aware and exit.
+case "$ACTION" in
+    status) [ "$MODE" = "native" ] && do_status_native || do_status ;;
+    logs)   [ "$MODE" = "native" ] && do_logs_native   || do_logs   ;;
+    stop)
+        if [ "$MODE" = "native" ]; then do_stop_native; else do_stop; fi ;;
+    scale)
+        if [ "$MODE" = "native" ]; then
+            echo "Error: --scale is Docker-only. In native mode, --stop and re-run with -n N." >&2
+            exit 1
+        fi
+        do_scale "$SCALE_TARGET" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Validate
@@ -542,7 +697,7 @@ if [ -n "$DIRECTORY" ]; then SCOPE=" (directory: $DIRECTORY)"; fi
 if [ -n "$COLLECTION" ]; then SCOPE=" (collection: $COLLECTION)"; fi
 
 # ---------------------------------------------------------------------------
-# Build image if needed
+# Header
 # ---------------------------------------------------------------------------
 
 echo "=== Photo Search Worker Fleet ==="
@@ -550,42 +705,63 @@ echo ""
 echo "  Server:     $SERVER"
 echo "  Passes:     $PASSES"
 echo "  Workers:    $NUM_WORKERS"
-echo "  Memory:     $MEM_LIMIT per worker"
+echo "  Mode:       $MODE$([ "$MODE" = docker ] && echo " (${MEM_LIMIT}/worker)")"
+if ollama_needed; then echo "  Ollama:     $OLLAMA_URL"; fi
 echo "  Scope:      ${SCOPE:- all photos}"
 echo ""
 
-IMAGE_TAG="photosearch-worker:latest"
+# ---------------------------------------------------------------------------
+# Prepare runtime (docker: build image; native: locate venv)
+# ---------------------------------------------------------------------------
 
-# Give the user a realistic expectation before the build runs, and show the
-# live BuildKit output so they can see which layers hit the cache vs. rebuild.
-#   - First build: base image pull + pip install ~5-10min
-#   - requirements.txt changed: pip layer rebuild ~5min
-#   - Python-only change: COPY layers ~10s
-# Watch BuildKit's "CACHED" markers to see which path you got.
-if ! docker image inspect "$IMAGE_TAG" > /dev/null 2>&1; then
-    echo "Building worker image (first build on this machine — expect ~5-10 min"
-    echo "to pull python:3.11-slim and install PyTorch/CLIP/InsightFace)..."
+if [ "$MODE" = "docker" ]; then
+    IMAGE_TAG="photosearch-worker:latest"
+    # First build: base image pull + pip install ~5-10min. requirements.txt
+    # changed: pip layer rebuild ~5min. Python-only change: COPY layers ~10s.
+    if ! docker image inspect "$IMAGE_TAG" > /dev/null 2>&1; then
+        echo "Building worker image (first build — expect ~5-10 min)..."
+    else
+        echo "Building worker image (incremental — ~10s for Python-only changes)..."
+    fi
+    echo ""
+    BUILD_START=$(date +%s)
+    docker build -t "$IMAGE_TAG" .
+    echo ""
+    echo "  Image ready: $IMAGE_TAG (built in $(($(date +%s) - BUILD_START))s)"
+    echo ""
 else
-    echo "Building worker image (incremental — ~10s for Python-only changes,"
-    echo "~5 min if requirements.txt changed; watch for 'CACHED' lines below)..."
+    VENV_PYTHON="$(find_venv_python)" || {
+        echo "Error: native mode needs the project venv (.venv / venv / env)." >&2
+        echo "Create it and install requirements, or pass --docker." >&2
+        exit 1
+    }
+    echo "  Python:     $VENV_PYTHON"
+    echo ""
 fi
-echo ""
-BUILD_START=$(date +%s)
-docker build -t "$IMAGE_TAG" .
-BUILD_ELAPSED=$(($(date +%s) - BUILD_START))
-echo ""
-echo "  Image ready: $IMAGE_TAG (built in ${BUILD_ELAPSED}s)"
-echo ""
 
 # ---------------------------------------------------------------------------
 # Stop any existing workers from a previous run
 # ---------------------------------------------------------------------------
 
-EXISTING=$(docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | wc -l | tr -d ' ')
-if [ "$EXISTING" -gt 0 ]; then
-    echo "Stopping $EXISTING existing worker(s)..."
-    docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
-    echo ""
+if [ "$MODE" = "docker" ]; then
+    EXISTING=$(docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$EXISTING" -gt 0 ]; then
+        echo "Stopping $EXISTING existing worker(s)..."
+        docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
+        echo ""
+    fi
+else
+    mkdir -p "$NATIVE_RUNDIR"
+    if ls "$NATIVE_RUNDIR"/worker-*.pid >/dev/null 2>&1; then
+        echo "Stopping existing native worker(s)..."
+        for pidf in "$NATIVE_RUNDIR"/worker-*.pid; do
+            [ -e "$pidf" ] || continue
+            oldpid=$(cat "$pidf" 2>/dev/null)
+            [ -n "$oldpid" ] && kill "$oldpid" 2>/dev/null || true
+            rm -f "$pidf"
+        done
+        echo ""
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -608,28 +784,41 @@ fi
 echo "Starting $NUM_WORKERS workers..."
 echo ""
 
-for i in $(seq 1 "$NUM_WORKERS"); do
-    CONTAINER_NAME="${PROJECT}-${i}"
-    # Remove leftover stopped container with this name
-    docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1 || true
-    echo "  Starting $CONTAINER_NAME..."
-    docker run -d \
-        --name "$CONTAINER_NAME" \
-        --label "photosearch-worker-fleet=true" \
-        --memory "$MEM_LIMIT" \
-        --restart on-failure:3 \
-        --add-host=host.docker.internal:host-gateway \
-        -v "${MODEL_CACHE_VOLUME}:/model-cache" \
-        -e PHOTOSEARCH_DEVICE=cpu \
-        -e PYTHONUNBUFFERED=1 \
-        -e OLLAMA_HOST=http://host.docker.internal:11434 \
-        -e HF_HOME=/model-cache/huggingface \
-        -e INSIGHTFACE_HOME=/model-cache/insightface \
-        -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
-        "$IMAGE_TAG" \
-        $WORKER_CMD \
-        > /dev/null
-done
+if [ "$MODE" = "docker" ]; then
+    for i in $(seq 1 "$NUM_WORKERS"); do
+        CONTAINER_NAME="${PROJECT}-${i}"
+        docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1 || true
+        echo "  Starting $CONTAINER_NAME..."
+        docker run -d \
+            --name "$CONTAINER_NAME" \
+            --label "photosearch-worker-fleet=true" \
+            --memory "$MEM_LIMIT" \
+            --restart on-failure:3 \
+            --add-host=host.docker.internal:host-gateway \
+            -v "${MODEL_CACHE_VOLUME}:/model-cache" \
+            -e PHOTOSEARCH_DEVICE=cpu \
+            -e PYTHONUNBUFFERED=1 \
+            -e OLLAMA_HOST=http://host.docker.internal:11434 \
+            -e HF_HOME=/model-cache/huggingface \
+            -e INSIGHTFACE_HOME=/model-cache/insightface \
+            -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
+            "$IMAGE_TAG" \
+            $WORKER_CMD \
+            > /dev/null
+    done
+else
+    # Native: bare-metal venv processes. PHOTOSEARCH_DEVICE is left unset so the
+    # worker auto-detects the GPU (CUDA/ROCm). HSA_ENABLE_DXG_DETECTION is
+    # harmless off-WSL and required for ROCm-via-librocdxg on WSL2.
+    cd "$SCRIPT_DIR"
+    for i in $(seq 1 "$NUM_WORKERS"); do
+        LOGF="$NATIVE_RUNDIR/worker-$i.log"
+        echo "  Starting worker-$i → $LOGF"
+        HSA_ENABLE_DXG_DETECTION=1 OLLAMA_HOST="$OLLAMA_URL" PYTHONUNBUFFERED=1 \
+            nohup "$VENV_PYTHON" cli.py $WORKER_CMD > "$LOGF" 2>&1 &
+        echo $! > "$NATIVE_RUNDIR/worker-$i.pid"
+    done
+fi
 
 echo ""
 echo "=== $NUM_WORKERS workers launched ==="
