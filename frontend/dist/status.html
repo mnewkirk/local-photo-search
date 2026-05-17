@@ -136,6 +136,57 @@
       cursor: pointer;
     }
     .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+
+    /* Deployment panel */
+    .deploy-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .deploy-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .deploy-state {
+      font-size: 13px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+    .deploy-state.ok      { background: rgba(74,222,128,0.15); color: #4ade80; }
+    .deploy-state.behind  { background: rgba(250,204,21,0.15); color: #facc15; }
+    .deploy-state.dirty   { background: rgba(248,113,113,0.15); color: #f87171; }
+    .deploy-state.unknown { background: rgba(136,136,136,0.15); color: #aaa; }
+    .deploy-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .deploy-meta .sha { color: var(--text); }
+    .deploy-meta .subj { color: var(--text); }
+    .deploy-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .deploy-log {
+      margin-top: 12px;
+      background: #0b0b0b;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .deploy-log.running { border-color: var(--accent); }
 
     .error { color: #f87171; font-size: 14px; margin-top: 16px; }
     .loading { color: var(--text-muted); font-size: 14px; }
@@ -840,6 +891,207 @@
       var secs = Math.floor((deltaMs % 60000) / 1000);
       var text = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
       return { text: text + ' left', cls: mins < 2 ? 'expiring' : '' };
+    }
+
+    // ── Deployment ─────────────────────────────────────────────────────────
+    // Surface the running container's git SHA + drift vs origin/main, with
+    // buttons to git-fetch / git-pull / docker-build / restart. Replaces the
+    // manual `git pull && docker compose build && docker compose up -d` dance.
+    function Deployment() {
+      var _v = useState(null);  var version = _v[0];  var setVersion = _v[1];
+      var _b = useState(false); var busy = _b[0];     var setBusy = _b[1];
+      var _l = useState([]);    var log = _l[0];      var setLog = _l[1];
+      var _bu = useState(false); var building = _bu[0]; var setBuilding = _bu[1];
+
+      function appendLog(line) {
+        setLog(function(prev) {
+          var next = prev.concat([line]);
+          if (next.length > 500) next = next.slice(-500); // cap
+          return next;
+        });
+      }
+
+      function loadVersion() {
+        fetch('/api/admin/version')
+          .then(function(r) { return r.json(); })
+          .then(setVersion)
+          .catch(function(err) { setVersion({ available: false, reason: 'fetch failed: ' + err.message }); });
+      }
+
+      useEffect(function() { loadVersion(); }, []);
+
+      function postAction(path, label) {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ ' + label + '…');
+        fetch(path, { method: 'POST' })
+          .then(function(r) {
+            return r.text().then(function(t) { return { ok: r.ok, status: r.status, body: t }; });
+          })
+          .then(function(res) {
+            if (!res.ok) {
+              try { var j = JSON.parse(res.body); appendLog('  ✗ ' + (j.detail || res.body)); }
+              catch (_) { appendLog('  ✗ HTTP ' + res.status + ': ' + res.body); }
+            } else {
+              try {
+                var j = JSON.parse(res.body);
+                if (j.output) j.output.split('\n').forEach(function(line) { if (line) appendLog('  ' + line); });
+                if (j.note) appendLog('  ' + j.note);
+                appendLog('  ✓ ' + label + ' OK');
+              } catch (_) { appendLog('  ✓ ' + label + ' OK'); }
+              loadVersion();
+            }
+          })
+          .catch(function(err) { appendLog('  ✗ ' + label + ' failed: ' + err.message); })
+          .then(function() { setBusy(false); });
+      }
+
+      function runBuild() {
+        if (busy || building) return;
+        setBusy(true);
+        setBuilding(true);
+        appendLog('▸ docker compose build (this may take several minutes)…');
+        // SSE-style stream from the POST handler.
+        fetch('/api/admin/docker-build', { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                // SSE events separated by blank line; each event has lines like "event: line\ndata: {...}"
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      appendLog(payload.returncode === 0 ? '  ✓ build OK' : '  ✗ build failed (rc=' + payload.returncode + ')');
+                    }
+                    if (payload.error) appendLog('  ✗ ' + payload.error);
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump();
+          })
+          .catch(function(err) { appendLog('  ✗ build stream error: ' + err.message); })
+          .then(function() { setBusy(false); setBuilding(false); loadVersion(); });
+      }
+
+      function runRestart() {
+        if (!window.confirm(
+          'Restart photosearch service?\n\n' +
+          'The page will lose its connection while the container swaps. ' +
+          'Refresh after ~5-15 seconds.'
+        )) return;
+        postAction('/api/admin/restart', 'docker compose up -d');
+      }
+
+      if (!version) {
+        return e('div', null,
+          e('h2', null, 'Deployment'),
+          e('div', { className: 'deploy-wrap' }, e('span', { className: 'deploy-meta' }, 'Loading…'))
+        );
+      }
+
+      if (!version.available) {
+        return e('div', null,
+          e('h2', null, 'Deployment'),
+          e('div', { className: 'deploy-wrap' },
+            e('span', { className: 'deploy-state unknown' }, 'unavailable'),
+            e('div', { className: 'deploy-meta', style: { marginTop: 8 } },
+              version.reason || 'git repo not mounted',
+              version.deployed_sha ? ' · deployed: ' + version.deployed_sha.slice(0, 7) : ''
+            )
+          )
+        );
+      }
+
+      var head = version.head || {};
+      var upstream = version.upstream || {};
+      var stateClass, stateLabel;
+      if (version.dirty) {
+        stateClass = 'dirty'; stateLabel = 'working tree dirty';
+      } else if (!version.deployed_sha || version.deployed_sha === 'unknown') {
+        stateClass = 'unknown'; stateLabel = 'deployed SHA unknown (rebuild to capture)';
+      } else if (version.deployed_matches_head && version.behind === 0) {
+        stateClass = 'ok'; stateLabel = 'up to date';
+      } else if (!version.deployed_matches_head) {
+        stateClass = 'behind'; stateLabel = 'running container is behind HEAD — rebuild + restart';
+      } else if (version.behind > 0) {
+        stateClass = 'behind'; stateLabel = 'origin is ahead by ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's');
+      } else {
+        stateClass = 'ok'; stateLabel = 'up to date';
+      }
+
+      var deployedShort = version.deployed_sha && version.deployed_sha !== 'unknown'
+        ? version.deployed_sha.slice(0, 7) : 'unknown';
+
+      return e('div', null,
+        e('h2', null, 'Deployment'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-head' },
+            e('span', { className: 'deploy-state ' + stateClass }, stateLabel)
+          ),
+          e('div', { className: 'deploy-meta' },
+            'HEAD ',     e('span', { className: 'sha' }, head.sha_short || '?'),
+            ' · ',       e('span', { className: 'subj' }, head.subject || ''),
+            head.date ? ' · ' + head.date.slice(0, 10) : ''
+          ),
+          e('div', { className: 'deploy-meta', style: { marginTop: 4 } },
+            'Deployed image: ', e('span', { className: 'sha' }, deployedShort),
+            version.behind > 0 ? ' · ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's') + ' behind origin' : '',
+            version.ahead > 0 ? ' · ' + version.ahead + ' ahead' : ''
+          ),
+          e('div', { className: 'deploy-actions' },
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { postAction('/api/admin/git-fetch', 'git fetch'); },
+              title: 'git fetch origin — refresh remote refs',
+            }, 'Fetch'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { postAction('/api/admin/git-pull', 'git pull'); },
+              title: 'git pull --ff-only — fast-forward the working tree',
+            }, 'Pull'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: runBuild,
+              title: 'docker compose build photosearch — takes 5-10 min',
+            }, building ? 'Building…' : 'Build'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: runRestart,
+              title: 'docker compose up -d — swap to the new image',
+            }, 'Restart'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { setLog([]); },
+              title: 'Clear log',
+              style: { marginLeft: 'auto' },
+            }, 'Clear log')
+          ),
+          log.length > 0 && e('div', {
+            className: 'deploy-log' + (building ? ' running' : ''),
+          }, log.join('\n'))
+        )
+      );
     }
 
     function Workers(props) {
@@ -1775,6 +2027,7 @@
                 + stats.verify_passed + ' passed'
             })
           ),
+          e(Deployment, null),
           e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
           e(StackingForm, { onComplete: load }),
           e(InferLocationForm, { onDone: load }),

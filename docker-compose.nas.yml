@@ -28,7 +28,14 @@
 
 services:
   photosearch:
-    build: .
+    build:
+      context: .
+      args:
+        # Set by the /status deploy panel when it triggers a rebuild, so
+        # /api/admin/version can report which commit the running image holds.
+        # Manual builds can pass via:
+        #   GIT_SHA=$(git rev-parse HEAD) docker compose build photosearch
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: photosearch
     restart: unless-stopped
     ports:
@@ -37,6 +44,12 @@ services:
     volumes:
       - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photos:ro
       - photosearch-data:/data
+      # Deploy-control panel (/status): mount the repo so git pull + docker
+      # compose build / up can be triggered from the UI. WARNING:
+      # docker.sock gives the container effective root on the host — only
+      # acceptable because this service is on a private LAN/tailnet.
+      - ${REPO_DIR:-/volume1/docker/photosearch}:/repo
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - PHOTOSEARCH_DB=/data/photo_index.db
       - OLLAMA_HOST=http://ollama:11434

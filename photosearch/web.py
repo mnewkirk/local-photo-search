@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .db import PhotoDB
 from .worker_api import router as worker_router, configure as configure_worker
+from .admin_api import router as admin_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -39,6 +40,7 @@ from .worker_api import router as worker_router, configure as configure_worker
 
 app = FastAPI(title="local-photo-search", version="0.1.0")
 app.include_router(worker_router)
+app.include_router(admin_router)
 
 # Allow the React dev server (port 5173) during development
 app.add_middleware(

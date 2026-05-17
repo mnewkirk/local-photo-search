@@ -39,11 +39,16 @@ RUN pip install --no-cache-dir --prefix=/install \
 # ---------- Stage 2: runtime ----------
 FROM python:3.11-slim
 
-# Runtime libraries needed by OpenCV / Pillow / InsightFace
+# Runtime libraries needed by OpenCV / Pillow / InsightFace, plus git +
+# docker CLI for the /status deploy-control panel (git pull, docker
+# compose build / up -d against the host's docker.sock and /repo mount).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
+        git \
+        docker.io \
+        docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed Python packages from builder
@@ -58,6 +63,13 @@ COPY cli.py .
 COPY requirements.txt .
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
+
+# Bake the git SHA that this image was built from. Surfaced via
+# /api/admin/version so the /status page can show whether the running
+# container matches the latest commit. Defaults to "unknown" so a build
+# without GIT_SHA still succeeds.
+ARG GIT_SHA=unknown
+RUN echo "${GIT_SHA}" > /app/BUILD_SHA
 
 # Volumes:
 #   /photos — your photo library (can be read-only for serving)
