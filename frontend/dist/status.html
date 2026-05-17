@@ -1095,25 +1095,37 @@
           })
           .then(function() {
             setBusy(false);
-            // Auto-poll /version a few times with backoff so the panel updates
-            // itself once the new container is reachable, without making the
-            // user keep clicking Check.
+            // Auto-poll /version with a generous window — uvicorn boot + the
+            // ML-model imports take 30-60s on the N100 NAS, so a 24s window
+            // false-alarms even on healthy restarts. 30 attempts × 3s = 90s.
+            // /api/admin/version is lightweight (no DB hits) so it's the
+            // cleanest readiness signal — if THAT 200s, the app is alive.
             var attempts = 0;
+            var MAX_ATTEMPTS = 30;
             function poll() {
               attempts += 1;
-              fetch('/api/admin/version')
-                .then(function(r) { return r.json(); })
+              fetch('/api/admin/version', { cache: 'no-store' })
+                .then(function(r) {
+                  if (!r.ok) throw new Error('HTTP ' + r.status);
+                  return r.json();
+                })
                 .then(function(d) {
                   setVersion(d);
                   var sha = d.deployed_sha ? d.deployed_sha.slice(0, 7) : 'unknown';
                   appendLog('  ✓ new container reachable — deployed: ' + sha);
                 })
                 .catch(function() {
-                  if (attempts < 8) {
-                    appendLog('  … waiting for new container (' + attempts + '/8)');
+                  if (attempts < MAX_ATTEMPTS) {
+                    // Quieter status — log every 5th attempt instead of every one
+                    if (attempts === 1 || attempts % 5 === 0) {
+                      appendLog('  … waiting for new container (' + attempts + '/' + MAX_ATTEMPTS + ')');
+                    }
                     setTimeout(poll, 3000);
                   } else {
-                    appendLog('  ⚠ couldn\'t reach the new container after ~24s — try Check manually');
+                    appendLog('  ⚠ couldn\'t reach the new container after ~' + (MAX_ATTEMPTS * 3) + 's.');
+                    appendLog('     The container may have crashed on startup — on the NAS:');
+                    appendLog('       docker ps -a --filter name=^photosearch$');
+                    appendLog('       docker logs photosearch --tail 50');
                   }
                 });
             }
