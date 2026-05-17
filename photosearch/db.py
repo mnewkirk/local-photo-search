@@ -60,7 +60,14 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
+
+# Maximum times a worker will attempt a pass on a single photo before giving
+# up. The worker_processed table tracks attempts; the claim path filters
+# `attempts >= MAX_PROCESS_ATTEMPTS`. Old failures (HEIC pre-decoder, runner
+# OOM blips) auto-heal on the next pass instead of needing a manual
+# retry-failed-* CLI.
+MAX_PROCESS_ATTEMPTS = 3
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -527,9 +534,19 @@ class PhotoDB:
                 photo_id INTEGER NOT NULL,
                 pass_type TEXT NOT NULL,
                 processed_at TEXT DEFAULT (datetime('now')),
+                attempts INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (photo_id, pass_type)
             )
         """)
+        # Schema v22: add `attempts` column for the retry-counter pattern.
+        # Existing rows represent at least one prior attempt, so default 1 is
+        # accurate. The claim path filters `attempts >= MAX_PROCESS_ATTEMPTS`
+        # (db.py module constant) so historical single-attempt failures get
+        # one more shot under the new system before being permanently skipped.
+        try:
+            cur.execute("SELECT attempts FROM worker_processed LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE worker_processed ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
 
         # Index activity audit log — tracks indexing events over time
         cur.execute("""
@@ -1482,14 +1499,21 @@ class PhotoDB:
         self._maybe_commit()
 
     def mark_processed(self, photo_ids: list[int], pass_type: str):
-        """Record that these photos have been processed for the given pass type.
+        """Record an attempt at processing these photos for the given pass.
 
-        Used for passes like 'faces' where a no-result outcome produces no DB rows,
-        so we need an explicit record to avoid re-processing.
+        Used for passes (faces, describe, tags) where a no-result outcome produces
+        no rows in the result table, so we need an explicit attempts log. UPSERT-
+        increments `attempts` so the claim path can skip after MAX_PROCESS_ATTEMPTS
+        — transient failures (HEIC pre-decoder, runner-OOM blips) auto-retry on
+        the next pass; truly broken files stop being claimed after N tries.
         """
         for pid in photo_ids:
             self.conn.execute(
-                "INSERT OR IGNORE INTO worker_processed (photo_id, pass_type) VALUES (?, ?)",
+                """INSERT INTO worker_processed (photo_id, pass_type, attempts)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(photo_id, pass_type) DO UPDATE SET
+                     attempts = attempts + 1,
+                     processed_at = datetime('now')""",
                 (pid, pass_type),
             )
         self.conn.commit()
@@ -1555,7 +1579,8 @@ class PhotoDB:
                         WHERE p.id IN ({placeholders})
                         AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')
+                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
                         LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
@@ -1564,7 +1589,8 @@ class PhotoDB:
                     """SELECT p.id, p.filepath FROM photos p
                        WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                       WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')
+                                       WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
+                                         AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
@@ -1596,7 +1622,8 @@ class PhotoDB:
                         WHERE id IN ({placeholders})
                         AND {col} IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
                         LIMIT ?""",
                     list(photo_ids) + [pass_type, limit + len(claimed)],
                 ).fetchall()
@@ -1605,7 +1632,8 @@ class PhotoDB:
                     f"""SELECT id, filepath FROM photos
                         WHERE {col} IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
                         LIMIT ?""",
                     (pass_type, limit + len(claimed)),
                 ).fetchall()
@@ -1660,7 +1688,8 @@ class PhotoDB:
                         WHERE p.id IN ({placeholders})
                         AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')""",
+                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
                     list(photo_ids),
                 ).fetchone()
             else:
@@ -1668,7 +1697,8 @@ class PhotoDB:
                     """SELECT COUNT(*) FROM photos p
                        WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                       WHERE wp.photo_id = p.id AND wp.pass_type = 'faces')"""
+                                       WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
+                                         AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"""
                 ).fetchone()
         elif pass_type == "quality":
             if photo_ids:
@@ -1692,7 +1722,8 @@ class PhotoDB:
                         WHERE id IN ({placeholders})
                         AND {col} IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)""",
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
                     list(photo_ids) + [pass_type],
                 ).fetchone()
             else:
@@ -1700,7 +1731,8 @@ class PhotoDB:
                     f"""SELECT COUNT(*) FROM photos
                         WHERE {col} IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
-                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?)""",
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = ?
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
                     (pass_type,),
                 ).fetchone()
         elif pass_type == "verify":

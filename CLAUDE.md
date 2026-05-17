@@ -22,12 +22,21 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 21. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 22. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
 
 Schema migrations run automatically via `_init_schema()`. Bump `SCHEMA_VERSION` in `db.py`
 when adding tables/columns.
+
+`worker_processed` (schema v22) gained an `attempts INTEGER` column. The claim
+path filters `attempts >= MAX_PROCESS_ATTEMPTS` (default 3) instead of `NOT
+EXISTS`, so transient failures (HEIC files indexed pre-pillow-heif, runner-OOM
+blips) auto-retry on the next pass; truly broken files stop being claimed after
+N tries. `mark_processed` UPSERT-increments. This replaces the manual
+`retry-failed-describe` workflow for newly-stuck photos — that CLI is still
+useful for clearing historical pre-v22 markers (which all migrated to
+attempts=1) when you want to give them a clean re-attempt counter.
 
 `generations` (schema v21) is a provenance log — one row per describe/tags/verify
 text artifact, with `photo_id`, `text_type`, `generated_text`, `model_used`,

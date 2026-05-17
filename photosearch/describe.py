@@ -463,6 +463,17 @@ Rules:
 _MAX_PLAUSIBLE_TAGS = 16
 
 
+def _parse_tag_response(raw: str) -> list[str]:
+    """Parse a comma-separated tag response and validate against TAG_VOCABULARY."""
+    vocab_set = set(TAG_VOCABULARY)
+    tags = []
+    for token in (raw or "").split(","):
+        tag = token.strip().lower().rstrip(".")
+        if tag in vocab_set:
+            tags.append(tag)
+    return tags
+
+
 def tag_photo(
     image_path: str,
     model: str = TAGS_MODEL,
@@ -470,24 +481,45 @@ def tag_photo(
     """Generate semantic tags for a single photo via Ollama.
 
     Returns a list of tags from TAG_VOCABULARY, or None if generation failed.
+    On regurgitation (the model echoes most of the vocabulary instead of
+    selecting), retries once with a small temperature bump to break the
+    deterministic pattern. If both attempts regurgitate, returns None rather
+    than poison the index — the retry counter on worker_processed will give
+    the photo another chance on a future pass.
     """
     raw = describe_photo(image_path, model=model, prompt=TAG_PROMPT)
     if not raw:
         return None
+    tags = _parse_tag_response(raw)
 
-    # Parse comma-separated response, validate against vocabulary
-    vocab_set = set(TAG_VOCABULARY)
-    tags = []
-    for token in raw.split(","):
-        tag = token.strip().lower().rstrip(".")
-        if tag in vocab_set:
-            tags.append(tag)
-
-    # Drop regurgitated responses (model echoed the vocabulary instead of
-    # selecting). Better to leave the photo untagged than to pollute the
-    # index — a later tags pass can retry it.
+    # Regurgitation guard: response had too many valid tags. Retry once with
+    # a non-zero temp so the next inference is not deterministic — under temp
+    # 0 the model would otherwise produce the same vocab-echo every time.
     if len(tags) >= _MAX_PLAUSIBLE_TAGS:
-        return None
+        if not HAS_OLLAMA:
+            return None
+        path = Path(image_path)
+        if not path.exists():
+            return None
+        encoded = _encode_image_for_ollama(str(path))
+        image_ref = encoded if encoded is not None else str(path)
+        retry_opts = dict(_options_for_model(model))
+        retry_opts["temperature"] = 0.4
+        retry_opts.setdefault("repeat_penalty", 1.3)
+        try:
+            raw2 = _ollama_chat_with_retry(
+                model=model,
+                messages=[{"role": "user", "content": TAG_PROMPT, "images": [image_ref]}],
+                options=retry_opts,
+            )
+        except Exception:
+            raw2 = None
+        if not raw2:
+            return None
+        tags2 = _parse_tag_response(raw2)
+        if len(tags2) >= _MAX_PLAUSIBLE_TAGS or not tags2:
+            return None
+        tags = tags2
 
     return tags if tags else None
 
