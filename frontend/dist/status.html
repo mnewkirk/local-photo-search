@@ -188,6 +188,42 @@
     }
     .deploy-log.running { border-color: var(--accent); }
 
+    /* Generations by model */
+    .gens-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .gens-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .gens-col h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .gens-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .gens-row:last-child { border-bottom: 0; }
+    .gens-model { color: var(--text); font-weight: 500; }
+    .gens-model.null  { color: var(--text-muted); font-style: italic; }
+    .gens-version { color: var(--text-muted); font-size: 11px; font-family: ui-monospace, monospace; margin-left: 6px; }
+    .gens-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
     .error { color: #f87171; font-size: 14px; margin-top: 16px; }
     .loading { color: var(--text-muted); font-size: 14px; }
 
@@ -1090,6 +1126,61 @@
           log.length > 0 && e('div', {
             className: 'deploy-log' + (building ? ' running' : ''),
           }, log.join('\n'))
+        )
+      );
+    }
+
+    // ── Generations by model ─────────────────────────────────────────────
+    // Surface the v21 generations provenance log on /status. For each text
+    // type (describe / tags / verify), show which model produced each photo's
+    // currently-promoted artifact. NULL model = backfilled-historical, where
+    // the producing model wasn't recorded.
+    function GenerationsByModel() {
+      var _d = useState(null); var data = _d[0]; var setData = _d[1];
+      useEffect(function() {
+        fetch('/api/stats/generations')
+          .then(function(r) { return r.json(); })
+          .then(setData)
+          .catch(function() { setData({}); });
+      }, []);
+      if (!data) return null;
+      var types = Object.keys(data);
+      if (types.length === 0) {
+        return e('div', null,
+          e('h2', null, 'Generations by model'),
+          e('div', { className: 'gens-wrap' },
+            e('span', { className: 'gens-count' }, 'No generations logged yet — backfill with `photosearch backfill-generations`.')
+          )
+        );
+      }
+      var TYPE_ORDER = ['describe', 'tags', 'verify'];
+      types.sort(function(a, b) {
+        var ai = TYPE_ORDER.indexOf(a); var bi = TYPE_ORDER.indexOf(b);
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+      });
+      return e('div', null,
+        e('h2', null, 'Generations by model'),
+        e('div', { className: 'gens-wrap' },
+          e('div', { className: 'gens-grid' },
+            types.map(function(t) {
+              var rows = data[t] || [];
+              var total = rows.reduce(function(s, r) { return s + r.count; }, 0);
+              return e('div', { key: t, className: 'gens-col' },
+                e('h3', null, t + ' · ' + total.toLocaleString() + ' photos'),
+                rows.map(function(r, i) {
+                  var pct = total > 0 ? Math.round((r.count / total) * 100) : 0;
+                  var modelLabel = r.model
+                    ? e('span', { className: 'gens-model' }, r.model,
+                        r.version ? e('span', { className: 'gens-version' }, r.version.slice(0, 7)) : null)
+                    : e('span', { className: 'gens-model null' }, '(unknown — backfilled)');
+                  return e('div', { key: i, className: 'gens-row' },
+                    modelLabel,
+                    e('span', { className: 'gens-count' }, r.count.toLocaleString() + ' (' + pct + '%)')
+                  );
+                })
+              );
+            })
+          )
         )
       );
     }
@@ -2028,6 +2119,7 @@
             })
           ),
           e(Deployment, null),
+          e(GenerationsByModel, null),
           e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
           e(StackingForm, { onComplete: load }),
           e(InferLocationForm, { onDone: load }),

@@ -927,6 +927,31 @@ def api_photo_detail(photo_id: int):
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        # Latest generation row per text_type — surfaces the model that
+        # produced the currently-promoted description/tags/verify text. The UI
+        # displays this inline so the operator can tell which model generated
+        # what they're looking at. Full history is at the on-demand
+        # /api/photos/<id>/generations endpoint.
+        gen_rows = db.conn.execute("""
+            WITH latest AS (
+                SELECT text_type, model_used, model_version, created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY text_type
+                           ORDER BY created_at DESC, id DESC
+                       ) AS rn
+                FROM generations WHERE photo_id = ?
+            )
+            SELECT text_type, model_used, model_version, created_at
+            FROM latest WHERE rn = 1
+        """, (photo_id,)).fetchall()
+        current_models = {
+            r["text_type"]: {
+                "model": r["model_used"],
+                "version": r["model_version"],
+                "created_at": r["created_at"],
+            } for r in gen_rows
+        }
+
         return {
             "id": photo["id"],
             "filename": photo["filename"],
@@ -949,7 +974,27 @@ def api_photo_detail(photo_id: int):
             "colors": colors,
             "faces": face_list,
             "stack": db.get_photo_stack(photo_id),
+            "current_models": current_models,
         }
+
+
+@app.get("/api/photos/{photo_id}/generations")
+def api_photo_generations(photo_id: int):
+    """Full describe/tags/verify generation history for one photo.
+
+    Lazy-fetched by the photo modal's "Prior generations" expand — not pre-
+    loaded with /api/photos/<id> because most modals never expand it.
+    """
+    with _get_db() as db:
+        if not db.get_photo(photo_id):
+            raise HTTPException(404, "Photo not found")
+        rows = db.conn.execute("""
+            SELECT id, text_type, generated_text, model_used, model_version, created_at
+            FROM generations
+            WHERE photo_id = ?
+            ORDER BY created_at DESC, id DESC
+        """, (photo_id,)).fetchall()
+    return {"photo_id": photo_id, "generations": [dict(r) for r in rows]}
 
 
 @app.get("/api/persons")
@@ -1840,6 +1885,40 @@ def api_stats_activity():
             ORDER BY hour
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/stats/generations")
+def api_stats_generations():
+    """Per-text-type breakdown of which model produced each photo's CURRENT
+    promoted artifact. Uses the latest generations row per (photo_id, text_type)
+    pair — model_used = NULL means a backfilled-historical row where the
+    producing model wasn't recorded.
+    """
+    with _get_db() as db:
+        rows = db.conn.execute("""
+            WITH latest AS (
+                SELECT photo_id, text_type, model_used, model_version,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY photo_id, text_type
+                           ORDER BY created_at DESC, id DESC
+                       ) AS rn
+                FROM generations
+            )
+            SELECT text_type, model_used, model_version, COUNT(*) AS n
+            FROM latest
+            WHERE rn = 1
+            GROUP BY text_type, model_used, model_version
+            ORDER BY text_type, n DESC
+        """).fetchall()
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        d = dict(r)
+        out.setdefault(d["text_type"], []).append({
+            "model": d["model_used"],
+            "version": d["model_version"],
+            "count": d["n"],
+        })
+    return out
 
 
 @app.get("/api/stats/errors")

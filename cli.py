@@ -3429,5 +3429,49 @@ def retry_failed_describe(db, ext, dry_run):
         click.echo(f"Cleared describe markers on {len(ids)} photos. The next describe worker will re-claim them.")
 
 
+@cli.command("generation-history")
+@click.argument("photo_id", type=int)
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+def generation_history(photo_id, db):
+    """Show all describe/tags/verify generations for one photo.
+
+    Lists every entry in the `generations` provenance table for the photo,
+    most-recent first, with model + version + timestamp + the generated text.
+    The `photos` table holds only the currently-promoted artifact; this command
+    shows the full history (including prior models / regenerations / backfilled
+    rows with model=unknown).
+    """
+    from photosearch.db import PhotoDB
+
+    with PhotoDB(db) as pdb:
+        photo = pdb.get_photo(photo_id)
+        if not photo:
+            click.echo(f"Photo {photo_id} not found", err=True)
+            raise SystemExit(1)
+        click.echo(f"Photo {photo_id}: {photo['filename']}")
+        if photo.get("filepath"):
+            click.echo(f"  {photo['filepath']}")
+        click.echo()
+        rows = pdb.conn.execute("""
+            SELECT id, text_type, generated_text, model_used, model_version, created_at
+            FROM generations
+            WHERE photo_id = ?
+            ORDER BY created_at DESC, id DESC
+        """, (photo_id,)).fetchall()
+        if not rows:
+            click.echo("No generations recorded.")
+            click.echo("(Run `photosearch backfill-generations` to seed from existing description/tags.)")
+            return
+        for r in rows:
+            model = r["model_used"] or "(unknown)"
+            version = ("@" + r["model_version"][:12]) if r["model_version"] else ""
+            click.echo(f"── {r['text_type']:<8} {model}{version}  at  {r['created_at']}")
+            text = r["generated_text"] or ""
+            for line in text.splitlines() or [text]:
+                click.echo(f"     {line}")
+            click.echo()
+
+
 if __name__ == "__main__":
     cli()
