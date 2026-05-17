@@ -30,6 +30,12 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 REPO_DIR = os.environ.get("PHOTOSEARCH_REPO_DIR", "/repo")
 COMPOSE_FILE = os.environ.get("PHOTOSEARCH_COMPOSE_FILE", f"{REPO_DIR}/docker-compose.nas.yml")
 COMPOSE_SERVICE = os.environ.get("PHOTOSEARCH_COMPOSE_SERVICE", "photosearch")
+# Compose project name — must match whatever the running containers were
+# labeled with, or compose won't recognize them and will try to create
+# fresh ones (hitting the explicit container_name conflicts). The compose
+# file pins `name: photosearch` at the top level so this also matches a
+# NAS-shell `docker compose` run from /volume1/docker/photosearch.
+COMPOSE_PROJECT = os.environ.get("PHOTOSEARCH_COMPOSE_PROJECT", "photosearch")
 
 # Written at image-build time by the Dockerfile from the GIT_SHA build arg.
 BUILD_SHA_FILE = Path("/app/BUILD_SHA")
@@ -218,7 +224,7 @@ async def admin_docker_build():
     env = os.environ.copy()
     env["GIT_SHA"] = git_sha   # also exported for compose-file fallback expansion
     cmd = [
-        "docker", "compose", "-f", COMPOSE_FILE, "build",
+        "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE, "build",
         "--build-arg", f"GIT_SHA={git_sha}",
         COMPOSE_SERVICE,
     ]
@@ -252,8 +258,8 @@ def admin_restart():
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
     try:
-        cmd = ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d",
-               "--no-deps", COMPOSE_SERVICE]
+        cmd = ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
+               "up", "-d", "--no-deps", COMPOSE_SERVICE]
         try:
             r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=60)
         except FileNotFoundError:

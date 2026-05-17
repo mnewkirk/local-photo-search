@@ -26,6 +26,14 @@
 #       index /photos --faces --describe --quality
 # ============================================================================
 
+# Pinning the project name here makes compose recognize existing containers
+# regardless of where the invocation is run from. Without this, the deploy
+# panel (running inside the container with -f /repo/docker-compose.nas.yml)
+# would derive project=`repo` from the compose-file parent dir, while a NAS-
+# shell run from /volume1/docker/photosearch derives project=`photosearch` —
+# leading to name conflicts on the explicit container_name fields.
+name: photosearch
+
 services:
   photosearch:
     build:
