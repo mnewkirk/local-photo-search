@@ -245,12 +245,16 @@ async def admin_docker_build():
 def admin_restart():
     """`docker compose up -d --no-deps photosearch` — recreates only this service.
 
+    Before triggering docker, extends active worker claims by 15 minutes so
+    in-flight batches survive the restart window (workers can't reach the
+    NAS during the swap; without this, their `renew-claim` calls fail, claim
+    TTL expires, and another worker steals + redoes the same batch).
+
     --no-deps is required: without it, compose follows depends_on and tries to
     ensure ollama (and other deps) are also up. If those containers were
-    created with different project labels (manual `docker run`, prior compose
-    invocations, etc.), compose decides it needs to create them and hits a
-    name conflict on `photosearch-ollama` etc. Restart should only touch this
-    service.
+    created with different project labels, compose decides it needs to create
+    them and hits a name conflict on `photosearch-ollama` etc. Restart should
+    only touch this service.
 
     Returns immediately. The container then dies as docker swaps it for the
     fresh one, so the client will see a connection drop — that's normal.
@@ -258,14 +262,35 @@ def admin_restart():
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
     try:
+        # Extend active claims so workers' in-flight batches survive the
+        # restart gap. Best-effort: if the DB import or write fails we still
+        # proceed with the restart — the worker would just lose some claims.
+        extended = 0
+        try:
+            from .db import PhotoDB
+            db_path = os.environ.get("PHOTOSEARCH_DB", "/data/photo_index.db")
+            with PhotoDB(db_path) as db:
+                cur = db.conn.execute(
+                    "UPDATE worker_claims "
+                    "SET expires_at = datetime('now', '+15 minutes') "
+                    "WHERE expires_at > datetime('now')"
+                )
+                extended = cur.rowcount
+                db.conn.commit()
+        except Exception as e:
+            logger.warning("claim TTL extension before restart failed: %s", e)
+
         cmd = ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
                "up", "-d", "--no-deps", COMPOSE_SERVICE]
         try:
-            r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=120)
         except FileNotFoundError:
             raise HTTPException(500, "docker CLI not installed in this image")
         if r.returncode != 0:
             raise HTTPException(500, f"docker compose up failed: {r.stderr.strip() or r.stdout.strip()}")
-        return {"ok": True, "note": "container will be replaced; expect a connection drop"}
+        note = "container will be replaced; expect a connection drop"
+        if extended:
+            note += f" — extended TTL on {extended} active claim(s) to ride out the gap"
+        return {"ok": True, "note": note}
     finally:
         _op_lock.release()

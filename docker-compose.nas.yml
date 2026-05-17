@@ -77,6 +77,13 @@ services:
       ollama:
         condition: service_started
     command: ["serve"]
+    # Workers pull /api/photos/<id>/full in long-running streamed transfers.
+    # On Restart, uvicorn gets SIGTERM and enters "waiting for connections to
+    # close" — large in-flight downloads need real time to drain. The default
+    # stop_grace_period of 10s gets SIGKILL'd through mid-transfer, leaving
+    # ports/state half-cleaned and sometimes wedging the new container's
+    # startup. 60s is comfortably more than the longest /full transfer.
+    stop_grace_period: 60s
     # The N100 has 4 cores and 8 GB RAM. Indexing is memory-intensive
     # (CLIP + InsightFace + LLaVA all load models). Serving is lightweight
     # for browsing, but worker batches that pull /api/photos/<id>/full hold
