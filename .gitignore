@@ -62,3 +62,12 @@ google_photos_token.json
 
 # Local copy of prod DB pulled by debug-db.sh
 photo_index.db.local*
+
+# Claude Code per-checkout config — never tracked
+.claude/settings.local.json
+.claude/settings.json
+.claude/launch.json
+
+# Local installer/binary downloads kept in the repo root for convenience
+amdgpu-install*.deb
+amdgpu-insecure-instinct-udev-rules*.deb
