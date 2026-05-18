@@ -1,6 +1,8 @@
 # Categories + keywords redesign
 
-Status: **design** — written 2026-05-17. Not yet implemented.
+Status: **design** — written 2026-05-17. Phases 0.1–0.2, 1, 2.1–2.4, 3.1–3.3 implemented; remaining phases pending vocab curation + backfill.
+
+Phase 0 keyword model: **llama3.2:3b** (bakeoff 2026-05-18, N=30 sample, head-to-head vs qwen2.5:3b: 8.5 vs 12 median kw, both ~0.44s/call, llama 8.4% strict-substring "hallucinations" — mostly paraphrases — vs qwen 13.6% real ones including tokenizer-mashed compounds like "grasshillside"; llama wins on multi-word phrase preservation).
 
 Replaces the M9 single-`tags` column (78-word fixed vocab, LLaVA
 vision-pass) with a richer two-axis design: structured `categories`

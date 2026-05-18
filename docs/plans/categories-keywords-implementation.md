@@ -2054,7 +2054,7 @@ Expected: FAIL — function missing.
 In `photosearch/describe.py`, after the `extract_categories_from_description` you just added:
 
 ```python
-KEYWORDS_MODEL = "<TBD — set after Phase 0 bakeoff, e.g. 'llama3.2:3b'>"
+KEYWORDS_MODEL = "llama3.2:3b"  # set 2026-05-18 from Phase 0 bakeoff (see categories-keywords-redesign.md)
 
 
 def extract_keywords_from_description(
