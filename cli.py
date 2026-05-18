@@ -3218,7 +3218,12 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
         raise SystemExit(1)
 
     pass_list = [p.strip() for p in passes.split(",")]
-    valid_passes = {"clip", "faces", "quality", "describe", "tags", "verify"}
+    valid_passes = {
+        "clip", "faces", "quality", "describe", "verify",
+        "category-content", "category-visual", "keywords",
+    }
+    # Note: "tags" is removed. Old clients that still pass --passes tags
+    # will be rejected here with a clear error. They should be upgraded.
     for p in pass_list:
         if p not in valid_passes:
             click.echo(f"Error: unknown pass type '{p}'. Valid: {', '.join(sorted(valid_passes))}", err=True)
