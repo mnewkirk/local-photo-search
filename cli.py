@@ -3528,6 +3528,46 @@ def bakeoff_keywords(db, sample, models, out, seed):
     click.echo(f"\nWrote {out} — review side-by-side and pick a model.")
 
 
+@cli.command("mine-vocab")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
+@click.option("--out", default="/data/vocab_candidates.json", show_default=True)
+@click.option("--min-count", default=50, show_default=True,
+              help="Drop phrases that occur fewer than N times.")
+@click.option("--limit", default=0,
+              help="Optional cap on descriptions processed (0 = all).")
+def mine_vocab(db, out, min_count, limit):
+    """Mine noun-phrase candidates from photo descriptions."""
+    import json
+    import time
+    from photosearch.db import PhotoDB
+    from photosearch.vocab_mining import mine_corpus
+
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute(
+            "SELECT description FROM photos "
+            "WHERE description IS NOT NULL AND length(description) > 20"
+        ).fetchall()
+    descriptions = [r["description"] for r in rows]
+    if limit:
+        descriptions = descriptions[:limit]
+
+    click.echo(f"Mining noun phrases from {len(descriptions)} descriptions...")
+    t0 = time.time()
+    candidates = mine_corpus(descriptions, min_count=min_count)
+    elapsed = time.time() - t0
+
+    payload = {
+        "source_count": len(descriptions),
+        "min_count": min_count,
+        "elapsed_s": round(elapsed, 1),
+        "candidates": candidates,
+    }
+    with open(out, "w") as f:
+        json.dump(payload, f, indent=2)
+    click.echo(f"Wrote {len(candidates)} terms (count >= {min_count}) to {out}")
+    click.echo(f"Top 20: {', '.join(c['term'] for c in candidates[:20])}")
+
+
 @cli.command("retry-failed-describe")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
