@@ -3445,6 +3445,84 @@ def clean_garbage_tags(db, dry_run):
         click.echo(f"  deleted {gen_n} regurgitated 'tags' rows from generations")
 
 
+@cli.command("bakeoff-keywords")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
+@click.option("--sample", default=30, show_default=True,
+              help="Number of descriptions to sample.")
+@click.option("--models", default="llama3.2:3b,llama3.2-vision",
+              show_default=True,
+              help="Comma-separated model list to evaluate.")
+@click.option("--out", default="/data/bakeoff_keywords.json",
+              show_default=True,
+              help="Output JSON path with side-by-side results.")
+@click.option("--seed", default=17, show_default=True,
+              help="Random seed for reproducible sampling.")
+def bakeoff_keywords(db, sample, models, out, seed):
+    """Run two candidate models on N descriptions; emit JSON for review."""
+    import json
+    import random
+    import time
+    from photosearch.db import PhotoDB
+    from photosearch.bakeoff import build_keyword_prompt, parse_keywords_response
+    from photosearch.describe import _ollama_chat_with_retry, HAS_OLLAMA
+
+    if not HAS_OLLAMA:
+        click.echo("Ollama client not available; install `ollama` Python package.", err=True)
+        raise SystemExit(1)
+
+    model_list = [m.strip() for m in models.split(",") if m.strip()]
+    rng = random.Random(seed)
+
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute(
+            "SELECT id, description FROM photos "
+            "WHERE description IS NOT NULL AND length(description) > 40 "
+            "ORDER BY id"
+        ).fetchall()
+    pool = [(r["id"], r["description"]) for r in rows]
+    if len(pool) < sample:
+        click.echo(f"Only {len(pool)} described photos found; using all.")
+        chosen = pool
+    else:
+        chosen = rng.sample(pool, sample)
+
+    results = []
+    for photo_id, description in chosen:
+        prompt = build_keyword_prompt(description)
+        per_model = {}
+        for model in model_list:
+            t0 = time.time()
+            try:
+                raw = _ollama_chat_with_retry(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0},
+                )
+            except Exception as exc:
+                per_model[model] = {"error": str(exc), "elapsed_s": time.time() - t0}
+                continue
+            per_model[model] = {
+                "raw": raw,
+                "parsed": parse_keywords_response(raw),
+                "elapsed_s": round(time.time() - t0, 3),
+            }
+        results.append({
+            "photo_id": photo_id,
+            "description": description,
+            "models": per_model,
+        })
+        click.echo(f"photo {photo_id}: " + " | ".join(
+            f"{m}={len(per_model[m].get('parsed', []))} kw, "
+            f"{per_model[m].get('elapsed_s', '-')}s"
+            for m in model_list
+        ))
+
+    with open(out, "w") as f:
+        json.dump({"sample": sample, "seed": seed, "models": model_list, "rows": results},
+                  f, indent=2)
+    click.echo(f"\nWrote {out} — review side-by-side and pick a model.")
+
+
 @cli.command("retry-failed-describe")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
