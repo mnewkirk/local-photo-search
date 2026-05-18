@@ -27,6 +27,9 @@ onnxruntime>=1.16     # Runtime for InsightFace models
 # Scene descriptions (via Ollama)
 ollama>=0.3
 
+# NLP — noun-chunk extraction for vocab mining
+spacy>=3.7,<4
+
 # Color extraction
 colorthief>=0.2.1
 

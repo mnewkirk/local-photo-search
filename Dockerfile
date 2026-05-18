@@ -88,6 +88,9 @@ ENV PHOTOSEARCH_DB=/data/photo_index.db
 # Set this to where photos are mounted in the container.
 ENV PHOTO_ROOT=/photos
 
+# Pre-download the spaCy model so containers don't need network at runtime
+RUN python -m spacy download en_core_web_sm
+
 EXPOSE 8000
 
 ENTRYPOINT ["./docker-entrypoint.sh"]
