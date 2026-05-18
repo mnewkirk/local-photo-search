@@ -13,7 +13,8 @@ _KEYWORD_PROMPT_TEMPLATE = """\
 Extract 5-15 keywords or short phrases from this photo description.
 
 Rules:
-- Include proper nouns (people, places), breeds, multi-word phrases (e.g. "golden retriever", "pacific ocean").
+- ONLY use words and phrases that appear in the description. Do NOT add likely-but-absent details.
+- Include proper nouns (names of people, places), breed names, and multi-word noun phrases when present in the description.
 - Lowercase everything.
 - Return ONLY a comma-separated list. No bullets, no explanation, no numbering.
 - Skip vague words like "thing", "scene", "image", "photo".

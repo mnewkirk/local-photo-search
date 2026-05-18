@@ -3468,9 +3468,10 @@ def clean_garbage_tags(db, dry_run):
 def bakeoff_keywords(db, sample, models, out, seed, per_call_timeout):
     """Run two candidate models on N descriptions; emit JSON for review."""
     import json
+    import queue
     import random
+    import threading
     import time
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
     from photosearch.db import PhotoDB
     from photosearch.bakeoff import build_keyword_prompt, parse_keywords_response
     from photosearch.describe import _ollama_chat_with_retry, HAS_OLLAMA
@@ -3495,38 +3496,49 @@ def bakeoff_keywords(db, sample, models, out, seed, per_call_timeout):
     else:
         chosen = rng.sample(pool, sample)
 
-    # ThreadPoolExecutor wraps each Ollama call so a wedged request can't stall
-    # the whole run. Future.result(timeout=...) raises; the underlying thread
-    # leaks (no way to interrupt the ollama HTTP client cleanly), but for a
-    # one-shot CLI that's acceptable.
-    executor = ThreadPoolExecutor(max_workers=1)
+    # Each Ollama call runs in a daemon thread so a wedged request can't
+    # stall the whole run or keep the process alive at exit. The thread leaks
+    # on timeout (the ollama HTTP client can't be cleanly interrupted), but
+    # daemon=True ensures it dies with the process.
+    def _call_with_timeout(model: str, prompt: str, timeout: int) -> tuple[str, object]:
+        """Returns ("ok", raw_text) | ("timeout", None) | ("err", Exception)."""
+        result_q: queue.Queue = queue.Queue(maxsize=1)
+        def worker():
+            try:
+                result_q.put(("ok", _ollama_chat_with_retry(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0},
+                )))
+            except Exception as e:
+                result_q.put(("err", e))
+        threading.Thread(target=worker, daemon=True).start()
+        try:
+            return result_q.get(timeout=timeout)
+        except queue.Empty:
+            return ("timeout", None)
+
     results = []
     for photo_id, description in chosen:
         prompt = build_keyword_prompt(description)
         per_model = {}
         for model in model_list:
             t0 = time.time()
-            future = executor.submit(
-                _ollama_chat_with_retry,
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0},
-            )
-            try:
-                raw = future.result(timeout=per_call_timeout)
-            except FutTimeout:
+            kind, val = _call_with_timeout(model, prompt, per_call_timeout)
+            elapsed = round(time.time() - t0, 3)
+            if kind == "timeout":
                 per_model[model] = {
                     "error": f"timeout after {per_call_timeout}s",
-                    "elapsed_s": round(time.time() - t0, 3),
+                    "elapsed_s": elapsed,
                 }
                 continue
-            except Exception as exc:
-                per_model[model] = {"error": str(exc), "elapsed_s": round(time.time() - t0, 3)}
+            if kind == "err":
+                per_model[model] = {"error": str(val), "elapsed_s": elapsed}
                 continue
             per_model[model] = {
-                "raw": raw,
-                "parsed": parse_keywords_response(raw),
-                "elapsed_s": round(time.time() - t0, 3),
+                "raw": val,
+                "parsed": parse_keywords_response(val),
+                "elapsed_s": elapsed,
             }
         results.append({
             "photo_id": photo_id,
