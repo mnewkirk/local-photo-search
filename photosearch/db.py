@@ -1646,16 +1646,27 @@ class PhotoDB:
                     "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL LIMIT ?",
                     (limit + len(claimed),),
                 ).fetchall()
-        elif pass_type in ("describe", "tags"):
+        elif pass_type in ("describe", "tags", "category-content", "keywords"):
             # Like faces, use worker_processed to track attempts — photos that
-            # produce no description/tags would otherwise stay NULL forever.
-            col = {"describe": "description", "tags": "tags"}[pass_type]
+            # produce no description/tags/categories/keywords would otherwise
+            # stay NULL forever. The legacy "tags" case stays for historical
+            # claim cleanup; new code targets the three v23 columns.
+            col = {
+                "describe": "description",
+                "tags": "tags",
+                "category-content": "categories",
+                "keywords": "keywords",
+            }[pass_type]
+            # category-content and keywords require a non-null description.
+            extra = ""
+            if pass_type in ("category-content", "keywords"):
+                extra = " AND description IS NOT NULL"
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"""SELECT id, filepath FROM photos
                         WHERE id IN ({placeholders})
-                        AND {col} IS NULL
+                        AND {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
@@ -1665,12 +1676,36 @@ class PhotoDB:
             else:
                 rows = self.conn.execute(
                     f"""SELECT id, filepath FROM photos
-                        WHERE {col} IS NULL
+                        WHERE {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
                         LIMIT ?""",
                     (pass_type, limit + len(claimed)),
+                ).fetchall()
+        elif pass_type == "category-visual":
+            # Visual pass has no description dependency.
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE id IN ({placeholders})
+                        AND visual_tags IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
+                        LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE visual_tags IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
+                        LIMIT ?""",
+                    (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "verify":
             # Photos that have a description but haven't been verified yet
@@ -1748,14 +1783,27 @@ class PhotoDB:
                     "SELECT COUNT(*) FROM photos "
                     "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL"
                 ).fetchone()
-        elif pass_type in ("describe", "tags"):
-            col = {"describe": "description", "tags": "tags"}[pass_type]
+        elif pass_type in ("describe", "tags", "category-content", "keywords"):
+            # All four passes gate on the same condition: photos.<col> IS NULL
+            # AND no exhausted worker_processed row exists. The legacy "tags"
+            # case stays for historical claim cleanup; new code targets the
+            # three v23 columns.
+            col = {
+                "describe": "description",
+                "tags": "tags",
+                "category-content": "categories",
+                "keywords": "keywords",
+            }[pass_type]
+            # category-content and keywords require a non-null description.
+            extra = ""
+            if pass_type in ("category-content", "keywords"):
+                extra = " AND description IS NOT NULL"
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
                         WHERE id IN ({placeholders})
-                        AND {col} IS NULL
+                        AND {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
@@ -1764,11 +1812,32 @@ class PhotoDB:
             else:
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE {col} IS NULL
+                        WHERE {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
                     (pass_type,),
+                ).fetchone()
+        elif pass_type == "category-visual":
+            # Visual pass has no description dependency.
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE id IN ({placeholders})
+                        AND visual_tags IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE visual_tags IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"""
                 ).fetchone()
         elif pass_type == "verify":
             if photo_ids:

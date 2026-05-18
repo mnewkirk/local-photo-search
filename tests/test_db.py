@@ -1020,3 +1020,48 @@ def test_schema_v23_migration_from_v22(tmp_path):
             "SELECT value FROM schema_info WHERE key='version'"
         ).fetchone()[0]
         assert int(v) == 23
+
+
+# =========================================================================
+# count_unprocessed_photos / get_unprocessed_photos — v23 pass types
+# =========================================================================
+
+def _seed_three_described(db):
+    db.conn.executemany(
+        "INSERT INTO photos (filepath, filename, description) VALUES (?, ?, ?)",
+        [("a.jpg", "a.jpg", "a dog"), ("b.jpg", "b.jpg", "a beach"), ("c.jpg", "c.jpg", None)],
+    )
+    db.conn.commit()
+
+
+def test_count_unprocessed_category_content_gates_on_description(tmp_path):
+    from photosearch.db import PhotoDB
+    with PhotoDB(str(tmp_path / "x.db")) as db:
+        _seed_three_described(db)
+        # Two described, one not — only the described ones are eligible.
+        assert db.count_unprocessed_photos("category-content") == 2
+
+
+def test_count_unprocessed_keywords_gates_on_description(tmp_path):
+    from photosearch.db import PhotoDB
+    with PhotoDB(str(tmp_path / "x.db")) as db:
+        _seed_three_described(db)
+        assert db.count_unprocessed_photos("keywords") == 2
+
+
+def test_count_unprocessed_category_visual_includes_all(tmp_path):
+    from photosearch.db import PhotoDB
+    with PhotoDB(str(tmp_path / "x.db")) as db:
+        _seed_three_described(db)
+        # visual pass doesn't require a description.
+        assert db.count_unprocessed_photos("category-visual") == 3
+
+
+def test_mark_processed_blocks_after_max_attempts_category_content(tmp_path):
+    from photosearch.db import PhotoDB, MAX_PROCESS_ATTEMPTS
+    with PhotoDB(str(tmp_path / "x.db")) as db:
+        _seed_three_described(db)
+        photo_ids = [r[0] for r in db.conn.execute("SELECT id FROM photos WHERE description IS NOT NULL")]
+        for _ in range(MAX_PROCESS_ATTEMPTS):
+            db.mark_processed(photo_ids, "category-content")
+        assert db.count_unprocessed_photos("category-content") == 0
