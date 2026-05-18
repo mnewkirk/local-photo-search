@@ -3568,6 +3568,33 @@ def mine_vocab(db, out, min_count, limit):
     click.echo(f"Top 20: {', '.join(c['term'] for c in candidates[:20])}")
 
 
+@cli.command("group-vocab")
+@click.option("--in", "in_path", default="/data/vocab_candidates.json",
+              show_default=True, help="Output of mine-vocab.")
+@click.option("--out", default="/data/vocab_proposal.json", show_default=True)
+@click.option("--model", default="llama3.2:3b", show_default=True)
+@click.option("--chunk-size", default=200, show_default=True)
+def group_vocab(in_path, out, model, chunk_size):
+    """Group mined candidates into semantic buckets via LLM."""
+    import json
+    from photosearch.vocab_grouping import group_terms
+
+    with open(in_path) as f:
+        payload = json.load(f)
+    terms = [c["term"] for c in payload["candidates"]]
+    click.echo(f"Grouping {len(terms)} terms via {model} (chunk size {chunk_size})...")
+    grouped = group_terms(terms, chunk_size=chunk_size, model=model)
+    with open(out, "w") as f:
+        json.dump({
+            "source_path": in_path,
+            "model": model,
+            "buckets": grouped,
+        }, f, indent=2)
+    click.echo(f"Wrote {len(grouped)} buckets to {out}")
+    for bucket, items in grouped.items():
+        click.echo(f"  {bucket}: {len(items)} terms")
+
+
 @cli.command("retry-failed-describe")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")

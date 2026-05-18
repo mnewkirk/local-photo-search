@@ -37,3 +37,44 @@ def test_mine_corpus_returns_frequency_sorted_filtered_list():
     # Frequency monotone non-increasing.
     counts = [row["count"] for row in out]
     assert counts == sorted(counts, reverse=True)
+
+
+def test_group_terms_uses_stub_chat_and_aggregates():
+    from photosearch.vocab_grouping import group_terms
+
+    def fake_chat(model, messages, options):
+        # Pretend the LLM split the chunk evenly.
+        prompt = messages[0]["content"]
+        terms_block = prompt.split("Terms (one per line):\n", 1)[1].split("\n\n", 1)[0]
+        terms = [t for t in terms_block.splitlines() if t]
+        half = len(terms) // 2 or 1
+        return '{"animals": ' + str(terms[:half]).replace("'", '"') + \
+               ', "landscapes": ' + str(terms[half:]).replace("'", '"') + "}"
+
+    grouped = group_terms(["dog", "cat", "beach", "mountain"], chunk_size=4, chat_fn=fake_chat)
+    assert sorted(grouped["animals"]) == ["cat", "dog"]
+    assert sorted(grouped["landscapes"]) == ["beach", "mountain"]
+
+
+def test_group_terms_chunks_and_passes_existing_summary():
+    from photosearch.vocab_grouping import group_terms
+    calls = []
+
+    def fake_chat(model, messages, options):
+        calls.append(messages[0]["content"])
+        return '{"misc": ["x"]}'
+
+    group_terms(["a", "b", "c", "d"], chunk_size=2, chat_fn=fake_chat)
+    assert len(calls) == 2
+    assert "(none yet)" in calls[0]
+    assert "misc" in calls[1]
+
+
+def test_group_terms_falls_back_to_unsorted_on_bad_json():
+    from photosearch.vocab_grouping import group_terms
+
+    def bad_chat(model, messages, options):
+        return "not json at all"
+
+    grouped = group_terms(["dog", "cat"], chunk_size=10, chat_fn=bad_chat)
+    assert grouped == {"unsorted": ["dog", "cat"]}
