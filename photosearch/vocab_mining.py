@@ -11,6 +11,12 @@ from typing import Iterable
 _VAGUE_WORDS = {
     "thing", "things", "place", "stuff", "scene", "image", "photo",
     "picture", "view", "side", "part", "area", "background",
+    # Added 2026-05-18 after first mining run on the live library surfaced
+    # these as top-frequency bare nouns that mean nothing as content tags.
+    # Filtered only when the WHOLE noun-chunk is vague — "outdoor setting"
+    # still passes because "outdoor" is informative; bare "setting" drops.
+    "setting", "appearance", "look", "presence", "composition",
+    "foreground", "environment",
 }
 
 
