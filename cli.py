@@ -3462,11 +3462,15 @@ def clean_garbage_tags(db, dry_run):
               help="Output JSON path with side-by-side results.")
 @click.option("--seed", default=17, show_default=True,
               help="Random seed for reproducible sampling.")
-def bakeoff_keywords(db, sample, models, out, seed):
+@click.option("--per-call-timeout", default=90, show_default=True,
+              help="Max seconds per Ollama call; on timeout the call is recorded "
+                   "as an error and the run continues.")
+def bakeoff_keywords(db, sample, models, out, seed, per_call_timeout):
     """Run two candidate models on N descriptions; emit JSON for review."""
     import json
     import random
     import time
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
     from photosearch.db import PhotoDB
     from photosearch.bakeoff import build_keyword_prompt, parse_keywords_response
     from photosearch.describe import _ollama_chat_with_retry, HAS_OLLAMA
@@ -3491,20 +3495,33 @@ def bakeoff_keywords(db, sample, models, out, seed):
     else:
         chosen = rng.sample(pool, sample)
 
+    # ThreadPoolExecutor wraps each Ollama call so a wedged request can't stall
+    # the whole run. Future.result(timeout=...) raises; the underlying thread
+    # leaks (no way to interrupt the ollama HTTP client cleanly), but for a
+    # one-shot CLI that's acceptable.
+    executor = ThreadPoolExecutor(max_workers=1)
     results = []
     for photo_id, description in chosen:
         prompt = build_keyword_prompt(description)
         per_model = {}
         for model in model_list:
             t0 = time.time()
+            future = executor.submit(
+                _ollama_chat_with_retry,
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0},
+            )
             try:
-                raw = _ollama_chat_with_retry(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    options={"temperature": 0},
-                )
+                raw = future.result(timeout=per_call_timeout)
+            except FutTimeout:
+                per_model[model] = {
+                    "error": f"timeout after {per_call_timeout}s",
+                    "elapsed_s": round(time.time() - t0, 3),
+                }
+                continue
             except Exception as exc:
-                per_model[model] = {"error": str(exc), "elapsed_s": time.time() - t0}
+                per_model[model] = {"error": str(exc), "elapsed_s": round(time.time() - t0, 3)}
                 continue
             per_model[model] = {
                 "raw": raw,
