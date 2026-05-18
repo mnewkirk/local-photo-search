@@ -3455,6 +3455,15 @@ if _frontend_dir.exists():
                                 headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Geotag page not found</h1>")
 
+    @app.get("/admin/vocab")
+    def serve_admin_vocab():
+        """Serve the vocab curator page."""
+        page = _frontend_dir / "admin_vocab.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(),
+                                headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Admin vocab page not found</h1>")
+
     @app.get("/collections/{collection_id}")
     def serve_collection_detail(collection_id: int):
         """Serve collection detail page (same HTML, JS reads id from URL)."""

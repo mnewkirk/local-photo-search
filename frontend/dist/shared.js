@@ -49,7 +49,7 @@
   // M15 — SharedHeader
   // =========================================================================
   // Props:
-  //   activePage  — 'search' | 'review' | 'faces' | 'merges' | 'collections' | 'map' | 'geotag' | 'status'
+  //   activePage  — 'search' | 'review' | 'faces' | 'merges' | 'collections' | 'map' | 'geotag' | 'status' | 'admin'
   //   children    — optional React nodes (search form, review controls, etc.)
   PS.SharedHeader = function SharedHeader(props) {
     var activePage = props.activePage || 'search';
@@ -64,6 +64,7 @@
       { href: '/map',         label: 'Map',         id: 'map' },
       { href: '/geotag',      label: 'Geotag',      id: 'geotag' },
       { href: '/status',      label: 'Status',      id: 'status' },
+      { href: '/admin/vocab', label: 'Admin',       id: 'admin' },
     ];
 
     return e('div', { className: 'header' },

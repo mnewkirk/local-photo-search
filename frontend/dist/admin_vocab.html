@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>Vocab Curator</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="/shared.js"></script>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #f5f5f7; }
+  .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px; min-height: calc(100vh - 60px); }
+  .pane { background: white; border-radius: 8px; padding: 12px; overflow-y: auto; max-height: calc(100vh - 100px); }
+  .coverage-bar { background: #eee; height: 18px; border-radius: 9px; overflow: hidden; }
+  .coverage-fill { background: #36a36a; height: 100%; transition: width 0.3s; }
+  .bucket { margin-bottom: 12px; }
+  .bucket h4 { margin: 6px 0; font-size: 13px; color: #555; text-transform: uppercase; }
+  .term { display: inline-block; padding: 3px 8px; margin: 2px; border: 1px solid #ccc;
+          border-radius: 12px; cursor: pointer; user-select: none; background: #fff; }
+  .term.included-content { background: #d8e9ff; border-color: #5994f0; }
+  .term.included-visual  { background: #ffe0d8; border-color: #f08259; }
+  .term .count { color: #888; font-size: 11px; margin-left: 4px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 8px; }
+  .tab { padding: 4px 10px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; }
+  .tab.active { background: #333; color: white; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  button { padding: 6px 12px; cursor: pointer; }
+  .filter-input { flex: 1; padding: 4px 8px; }
+  .status-line { padding: 6px 0; color: #666; }
+  .error { color: #c00; font-weight: 600; }
+  .test-photo-input { padding: 4px 8px; }
+</style>
+</head><body>
+<div id="header-root"></div>
+<div id="app-root"></div>
+
+<script>
+const { useState, useEffect, useMemo, createElement: h } = React;
+
+// -- API helpers ----------------------------------------------------
+const api = {
+  candidates: () => fetch('/api/admin/vocab/candidates').then(r => r.ok ? r.json() : null),
+  getDraft:   () => fetch('/api/admin/vocab/draft').then(r => r.json()),
+  putDraft:   d  => fetch('/api/admin/vocab/draft', {method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(d)}).then(r => r.json()),
+  coverage:   (draft, n) => fetch('/api/admin/vocab/coverage-preview', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({draft, sample_size: n})}).then(r => r.json()),
+  compile:    draft => fetch('/api/admin/vocab/compile', {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({draft})}).then(async r => { const b = await r.json(); if (!r.ok) throw new Error(b.detail || 'compile failed'); return b; }),
+  testPhoto:  (id, draft) => fetch('/api/admin/vocab/test-photo/' + id, {method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({draft})}).then(r => r.json()),
+};
+
+// -- Coverage preview -----------------------------------------------
+function CoveragePreview({ draft }) {
+  const [pct, setPct] = useState(null);
+  const [n, setN] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const run = async () => {
+    setLoading(true);
+    const r = await api.coverage(draft, 1000);
+    setPct(r.coverage_pct);
+    setN(r.sample_size);
+    setLoading(false);
+  };
+  return h('div', { style: { padding: '6px 0' } },
+    h('div', { className: 'toolbar' },
+      h('button', { onClick: run, disabled: loading }, loading ? 'Sampling...' : 'Preview coverage (1000 sample)'),
+      pct !== null && h('span', { style: { fontWeight: 600 } }, pct + '% of ' + n + ' covered'),
+    ),
+    pct !== null && h('div', { className: 'coverage-bar' },
+      h('div', { className: 'coverage-fill', style: { width: pct + '%' } })),
+  );
+}
+
+// -- Left pane: candidate list --------------------------------------
+function Candidates({ candidates, draft, onToggle, filter }) {
+  const visible = candidates.filter(c =>
+    !filter || c.term.toLowerCase().includes(filter.toLowerCase())
+  );
+  const contentSet = useMemo(() => new Set(draft.content), [draft.content]);
+  const visualSet  = useMemo(() => new Set(draft.visual),  [draft.visual]);
+  return h('div', null,
+    h('div', { className: 'status-line' }, visible.length + ' / ' + candidates.length + ' candidates'),
+    visible.map(c => {
+      const cls = contentSet.has(c.term) ? 'term included-content'
+                : visualSet.has(c.term)  ? 'term included-visual'
+                : 'term';
+      return h('span', {
+        key: c.term, className: cls,
+        title: 'click: toggle content | shift-click: toggle visual',
+        onClick: e => onToggle(c.term, e.shiftKey ? 'visual' : 'content'),
+      }, c.term, h('span', { className: 'count' }, c.count));
+    })
+  );
+}
+
+// -- Right pane: draft state ----------------------------------------
+function DraftEditor({ draft, setDraft, saveDraft, lastSaved, compileStatus, onCompile }) {
+  const [tab, setTab] = useState('content');
+  const [testId, setTestId] = useState('');
+  const [testResult, setTestResult] = useState(null);
+  const list = draft[tab] || [];
+  const removeTerm = term => {
+    setDraft({ ...draft, [tab]: list.filter(t => t !== term) });
+  };
+  const runTest = async () => {
+    if (!testId) return;
+    const r = await api.testPhoto(testId, draft);
+    setTestResult(r);
+  };
+  return h('div', null,
+    h(CoveragePreview, { draft }),
+    h('div', { className: 'tabs' },
+      ['content', 'visual'].map(t =>
+        h('div', { key: t, className: 'tab' + (tab === t ? ' active' : ''),
+                   onClick: () => setTab(t) }, t + ' (' + (draft[t] || []).length + ')')),
+    ),
+    h('div', null,
+      list.map(term => h('span', {
+        key: term, className: 'term included-' + tab,
+        onClick: () => removeTerm(term),
+        title: 'click to remove'
+      }, term))
+    ),
+    h('div', { className: 'toolbar', style: { marginTop: 16 } },
+      h('button', { onClick: saveDraft }, 'Save draft'),
+      lastSaved && h('span', { className: 'status-line' }, 'saved ' + lastSaved),
+    ),
+    h('div', { className: 'toolbar' },
+      h('button', { onClick: onCompile }, 'Compile vocab modules'),
+      compileStatus && h('span', { className: compileStatus.error ? 'error' : 'status-line' },
+        compileStatus.error || ('compiled ' + (compileStatus.draft_hash || ''))),
+    ),
+    h('div', { className: 'toolbar', style: { marginTop: 16 } },
+      h('input', {
+        className: 'test-photo-input', placeholder: 'Photo ID to test',
+        value: testId, onChange: e => setTestId(e.target.value),
+      }),
+      h('button', { onClick: runTest }, 'Test on photo'),
+    ),
+    testResult && h('div', { className: 'status-line' },
+      h('div', null, h('em', null, (testResult.description || '').slice(0, 240))),
+      h('div', null, 'categories: ', (testResult.matched_categories || []).join(', ') || '(none)'),
+      h('div', null, 'visual: ',     (testResult.matched_visual || []).join(', ') || '(none)'),
+    ),
+  );
+}
+
+// -- Root app -------------------------------------------------------
+function App() {
+  const [candidates, setCandidates] = useState([]);
+  const [draft, setDraft] = useState({ content: [], visual: [], expansions: {} });
+  const [filter, setFilter] = useState('');
+  const [lastSaved, setLastSaved] = useState(null);
+  const [compileStatus, setCompileStatus] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    api.candidates().then(r => {
+      if (!r) { setError('No vocab_candidates.json. Run `photosearch mine-vocab` on the NAS first.'); return; }
+      setCandidates(r.candidates || []);
+    });
+    api.getDraft().then(setDraft);
+  }, []);
+
+  const onToggle = (term, kind) => {
+    setDraft(d => {
+      const list = new Set(d[kind] || []);
+      if (list.has(term)) list.delete(term); else list.add(term);
+      // Toggle removes from the other list to enforce disjointness.
+      const otherKey = kind === 'content' ? 'visual' : 'content';
+      const other = (d[otherKey] || []).filter(t => t !== term);
+      return { ...d, [kind]: Array.from(list), [otherKey]: other };
+    });
+  };
+
+  const saveDraft = async () => {
+    await api.putDraft(draft);
+    setLastSaved(new Date().toLocaleTimeString());
+  };
+
+  const onCompile = async () => {
+    setCompileStatus(null);
+    try {
+      const r = await api.compile(draft);
+      setCompileStatus(r);
+    } catch (e) {
+      setCompileStatus({ error: e.message });
+    }
+  };
+
+  return h(React.Fragment, null,
+    h('div', { className: 'toolbar', style: { padding: '8px 16px', background: 'white' } },
+      h('input', { className: 'filter-input', placeholder: 'Filter candidates...',
+                   value: filter, onChange: e => setFilter(e.target.value) }),
+      error && h('span', { className: 'error' }, error),
+    ),
+    h('div', { className: 'layout' },
+      h('div', { className: 'pane' }, h(Candidates, { candidates, draft, onToggle, filter })),
+      h('div', { className: 'pane' }, h(DraftEditor, {
+        draft, setDraft, saveDraft, lastSaved, compileStatus, onCompile,
+      })),
+    ),
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('header-root')).render(
+  h(PS.SharedHeader, { activePage: 'admin' })
+);
+ReactDOM.createRoot(document.getElementById('app-root')).render(h(App));
+</script>
+</body></html>
