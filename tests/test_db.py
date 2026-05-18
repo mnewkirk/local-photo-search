@@ -901,3 +901,122 @@ def test_migration_v20_adds_det_score_column_to_faces(tmp_path):
     assert old_row["det_score"] is None, "existing face grandfathered with NULL det_score"
     assert new_row["det_score"] == pytest.approx(0.87)
     assert int(version) >= 20
+
+
+def test_schema_v23_migration_from_v22(tmp_path):
+    """Build a minimal v22 DB by hand, open it as v23, verify migration."""
+    import sqlite3, json
+    db_path = tmp_path / "v22.db"
+    conn = sqlite3.connect(db_path)
+    # The photos table must include columns added by v2–v22 migrations so that
+    # migration probes (e.g. the v17 backfill UPDATE referencing gps_lat/gps_lon,
+    # the v19 country/admin1 checks) run cleanly on this fixture.
+    conn.executescript("""
+        CREATE TABLE photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filepath TEXT UNIQUE NOT NULL,
+            filename TEXT NOT NULL,
+            file_hash TEXT,
+            date_taken TEXT,
+            gps_lat REAL,
+            gps_lon REAL,
+            place_name TEXT,
+            camera_make TEXT,
+            camera_model TEXT,
+            focal_length TEXT,
+            exposure_time TEXT,
+            f_number TEXT,
+            iso INTEGER,
+            image_width INTEGER,
+            image_height INTEGER,
+            description TEXT,
+            dominant_colors TEXT,
+            aesthetic_score REAL,
+            aesthetic_concepts TEXT,
+            aesthetic_critique TEXT,
+            tags TEXT,
+            indexed_at TEXT DEFAULT (datetime('now')),
+            raw_filepath TEXT,
+            verified_at TEXT,
+            verification_status TEXT,
+            hallucination_flags TEXT,
+            date_created TEXT,
+            location_source TEXT,
+            location_confidence REAL,
+            country TEXT,
+            admin1 TEXT,
+            admin2 TEXT,
+            locality TEXT
+        );
+        CREATE TABLE faces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER NOT NULL,
+            person_id INTEGER,
+            bbox_top INTEGER, bbox_right INTEGER,
+            bbox_bottom INTEGER, bbox_left INTEGER,
+            cluster_id INTEGER,
+            match_source TEXT,
+            det_score REAL
+        );
+        CREATE TABLE collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            cover_photo_id INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            google_photos_album_id TEXT,
+            google_photos_album_title TEXT
+        );
+        CREATE TABLE worker_processed (
+            photo_id INTEGER NOT NULL,
+            pass_type TEXT NOT NULL,
+            processed_at TEXT DEFAULT (datetime('now')),
+            attempts INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (photo_id, pass_type)
+        );
+        CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE generations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER, text_type TEXT, generated_text TEXT,
+            model_used TEXT, model_version TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        INSERT INTO schema_info (key, value) VALUES ('version', '22');
+        INSERT INTO photos (id, filepath, filename, description, tags)
+            VALUES (1, 'a.jpg', 'a.jpg', 'a dog', '["pet","animal"]'),
+                   (2, 'b.jpg', 'b.jpg', NULL,    NULL);
+        INSERT INTO generations (photo_id, text_type, generated_text, model_used)
+            VALUES (1, 'tags', '["pet","animal"]', 'llava');
+    """)
+    conn.commit()
+    conn.close()
+
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+    assert SCHEMA_VERSION == 23
+
+    with PhotoDB(str(db_path)) as db:
+        # New columns exist and are nullable.
+        cols = {row[1] for row in db.conn.execute("PRAGMA table_info(photos)").fetchall()}
+        assert {"categories", "visual_tags", "keywords", "tags_v22_backup"} <= cols
+
+        # Pre-migration tag values are snapshotted then nulled.
+        row = db.conn.execute(
+            "SELECT tags, tags_v22_backup, categories FROM photos WHERE id=1"
+        ).fetchone()
+        assert row["tags"] is None
+        assert json.loads(row["tags_v22_backup"]) == ["pet", "animal"]
+        assert row["categories"] is None  # awaits the new pass
+
+        # Legacy generations row got re-tagged.
+        text_types = {r[0] for r in db.conn.execute(
+            "SELECT DISTINCT text_type FROM generations"
+        ).fetchall()}
+        assert "category-content-legacy" in text_types
+        assert "tags" not in text_types
+
+        # Schema version stamped.
+        v = db.conn.execute(
+            "SELECT value FROM schema_info WHERE key='version'"
+        ).fetchone()[0]
+        assert int(v) == 23

@@ -60,7 +60,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -548,6 +548,33 @@ class PhotoDB:
         except sqlite3.OperationalError:
             cur.execute("ALTER TABLE worker_processed ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
 
+        # Schema v23: categories / visual_tags / keywords / tags_v22_backup.
+        # The old 78-word `tags` content is incompatible with the new vocab,
+        # so we snapshot it into tags_v22_backup, null `tags`, and re-tag
+        # historical `generations` rows as 'category-content-legacy' so the
+        # provenance log keeps a clean lineage. See
+        # docs/plans/categories-keywords-redesign.md for full rationale.
+        # NOTE: the generations relabel runs after the CREATE TABLE IF NOT EXISTS
+        # generations block below, so the UPDATE is safe on both fresh and
+        # migrating DBs. We use a flag to defer it.
+        _needs_generations_relabel = False
+        try:
+            cur.execute("SELECT categories FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            # All four ADDs + the data moves run inside the connection's
+            # implicit transaction that wraps _init_schema; partial failure
+            # rolls back cleanly.
+            cur.execute("ALTER TABLE photos ADD COLUMN categories TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN visual_tags TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN keywords TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN tags_v22_backup TEXT")
+            cur.execute(
+                "UPDATE photos SET tags_v22_backup = tags "
+                "WHERE tags IS NOT NULL AND tags != ''"
+            )
+            cur.execute("UPDATE photos SET tags = NULL")
+            _needs_generations_relabel = True
+
         # Index activity audit log — tracks indexing events over time
         cur.execute("""
             CREATE TABLE IF NOT EXISTS index_activity (
@@ -593,6 +620,14 @@ class PhotoDB:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_generations_photo ON generations(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_generations_type ON generations(text_type)")
+
+        # Schema v23 deferred step: relabel legacy 'tags' generations rows now
+        # that the table is guaranteed to exist (CREATE TABLE IF NOT EXISTS above).
+        if _needs_generations_relabel:
+            cur.execute(
+                "UPDATE generations SET text_type = 'category-content-legacy' "
+                "WHERE text_type = 'tags'"
+            )
 
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claims_expire ON worker_claims(expires_at)")
