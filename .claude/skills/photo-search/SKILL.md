@@ -521,6 +521,107 @@ The Workers panel + Stacking form establish the pattern for other
 emission inside `on_progress` callbacks, `should_abort` pair for cancel,
 keepalive every 0.5s on the server side.
 
+#### Deploy panel (Version / Fetch / Build / Restart)
+
+The Deployment card on `/status` replaces the manual
+`git pull && docker compose build && docker compose up -d` cycle. It hits
+`/api/admin/*` endpoints under `photosearch/admin_api.py`:
+
+- `GET /version` — reads `/app/BUILD_SHA` (baked by the Dockerfile from a
+  `--build-arg GIT_SHA=...`) and runs `git log/status` in the mounted
+  `/repo` to report dirty files, ahead/behind, and whether the deployed
+  SHA matches HEAD.
+- `POST /git-fetch`, `POST /git-pull` — `git -c safe.directory=*` under
+  `/repo` (UGOS owns it as a different uid; the global flag is required).
+- `POST /docker-build` — SSE stream of `docker compose build
+  --build-arg GIT_SHA=$(git rev-parse HEAD)`. The explicit `--build-arg`
+  is load-bearing — relying on env-var expansion in the compose file
+  occasionally resolved to "unknown" even with `GIT_SHA` exported on the
+  subprocess. The UI flips to the green pulsing "Restart" CTA on the
+  SSE `done` event (NOT on connection close — uvicorn keeps the SSE
+  channel open briefly after `done`).
+- `POST /restart` — **see helper-container section below.**
+
+**Helper-container restart pattern (critical):** the Restart endpoint does
+NOT call `docker compose up` in-process. It launches a detached helper:
+
+```python
+docker run --rm --detach \
+  --name photosearch-restart-helper \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v $HOST_REPO_DIR:/repo \
+  -w /repo docker:cli \
+  compose -p photosearch -f docker-compose.nas.yml up -d --no-deps photosearch
+```
+
+The helper has its own PID namespace, so it survives the photosearch
+container's SIGTERM/SIGKILL and reliably reaches the "start new
+container" step. Doing this in-process would put the compose subprocess
+inside the very container being recreated — when docker kills that
+container's PID namespace, every process inside it dies, INCLUDING the
+compose subprocess that's mid-restart. The result is a new container
+stranded in Created state with a rename-suffix name and no way for the
+panel to recover (since the panel container is now dead too).
+
+`HOST_REPO_DIR` env var (set in docker-compose.nas.yml,
+`${REPO_DIR:-/volume1/docker/photosearch}`) tells the helper the
+**host** path to mount as `/repo` — the in-container `/repo` path is
+useless to a sibling container. `setsid`/`nohup` don't fix this either;
+they detach from process groups, not PID namespaces.
+
+`--no-deps` is also required — without it, compose follows depends_on
+and tries to recreate ollama too, hitting a name conflict on
+`photosearch-ollama` and aborting.
+
+**Graceful shutdown handshake.** When the panel triggers restart:
+1. `/api/admin/restart` first runs
+   `UPDATE worker_claims SET expires_at = datetime('now', '+15 minutes')`
+   so workers' in-flight batches survive the swap gap even if their
+   `renew-claim` calls time out during the brief downtime.
+2. Helper container is launched (detached).
+3. Compose sends SIGTERM to the old photosearch container.
+4. uvicorn enters shutdown; FastAPI fires `@app.on_event("shutdown")`
+   which sets `worker_api._shutting_down = True`.
+5. The middleware in `web.py` starts returning `503 Retry-After: 30`
+   on `/api/worker/*` and `/api/photos/<id>/full`. Workers'
+   `WorkerClient._request()` sees 503, sleeps Retry-After seconds, and
+   loops. Browser UI paths (thumbnails, stats, search) keep serving so
+   the drain only waits on actual in-flight worker downloads.
+6. `stop_grace_period: 60s` in the compose file gives uvicorn time to
+   finish those in-flight transfers.
+7. Old dies, helper finishes its `compose up`, new container binds :8000.
+
+**If the helper gets wedged** (rare, e.g. a previous helper crashed
+without `--rm` succeeding), the panel returns
+`"...is already in use by container..."` with a hint:
+```bash
+docker rm -f photosearch-restart-helper
+```
+Then retry from the panel.
+
+**Manual restart recovery (when panel is unreachable):**
+
+```bash
+# 1. Clean up any stuck rename-suffix containers from a partial recreate.
+docker ps -a | grep photosearch
+docker rm -f <any-container-with-rename-suffix-name>
+
+# 2. CRITICAL: REPO_DIR must not be set to empty string. Bash's ${VAR:-default}
+#    falls back to default only if UNSET, not if set-but-empty — so an empty
+#    REPO_DIR resolves to an empty volume mount source and docker silently
+#    drops the /repo mount, breaking the deploy panel on the next boot.
+unset REPO_DIR
+
+cd /volume1/docker/photosearch
+GIT_SHA=$(docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
+  "apk add -q git && git config --global --add safe.directory /repo && git -C /repo rev-parse HEAD")
+docker compose -f docker-compose.nas.yml build --build-arg GIT_SHA=$GIT_SHA photosearch
+docker compose -f docker-compose.nas.yml up -d --no-deps photosearch
+sleep 5
+docker ps | grep photosearch
+curl -s http://localhost:8000/api/admin/version | python3 -m json.tool | head -15
+```
+
 ### /faces URL params (deep-linkable)
 
 - `?name=<Person>` — open named-person detail
@@ -1316,6 +1417,46 @@ is detected, so you'll see this guidance in the worker logs as well.
 
 **Google Photos upload shows 0 uploaded, N re-synced** — `batchAddMediaItems` silently
 fails for photos removed via Google Photos UI. Use "Re-upload" with specific photos selected.
+
+**Panel-triggered restart leaves a container stuck in "Created" with a
+rename-suffix name** (e.g. `54350640f483_photosearch`) — almost always means
+the compose subprocess was killed mid-restart because it was running inside
+the container being recreated. With the helper-container architecture this
+shouldn't happen anymore; if it does, recovery is:
+```bash
+docker rm -f <stuck-container-id>
+docker rm -f photosearch-restart-helper   # if it didn't self-clean
+docker compose -f docker-compose.nas.yml up -d --no-deps photosearch
+```
+To diagnose what happened during a failed restart, walk the docker event log:
+```bash
+docker events --since 10m --until 30s 2>&1 | grep photosearch | tail -30
+```
+You'll see the full lifecycle: `container create` (new), `container kill
+signal=15` (SIGTERM old), 60s wait, `container kill signal=9` (SIGKILL old),
+`container die exitCode=137`, and then either `container start` (new — happy
+path) or nothing (compose died before reaching that step).
+
+**Old container exits 137 on restart but new one IS up** — uvicorn's
+"waiting for connections to close" couldn't drain in `stop_grace_period: 60s`
+because workers (or other clients) kept opening fresh connections. The 503-
+on-shutdown middleware fixes this for worker traffic; for browser polling
+(e.g. `/api/worker/status` every 5s) the connections are short-lived enough
+not to matter. If you've raised drain time further and still hit 137,
+something is hanging an HTTP request open — check `docker logs photosearch
+2>&1 | tail -50` for the last accepted requests before shutdown.
+
+**Workers crash on `RuntimeError: claim-batch failed (503)`** — old worker
+code (pre-577a3b3) raised on any non-2xx. New `WorkerClient._request()`
+transparently sleeps `Retry-After` and retries. Pull + restart your worker
+fleet after deploying the server-side shutdown middleware.
+
+**Deploy panel shows "git repo not mounted at /repo"** — `REPO_DIR` was set
+to empty string in the shell that ran `docker compose up`. Bash's
+`${REPO_DIR:-default}` resolves to the default ONLY when unset, not when
+empty, so the volume source became `:/repo` and docker silently dropped
+the mount. Fix: `unset REPO_DIR` before the compose call (or set it
+explicitly), then recreate the container.
 
 ---
 

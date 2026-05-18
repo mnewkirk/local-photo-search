@@ -368,6 +368,70 @@ The `on_progress` + `should_abort` callback pair added to `stacking.py` is
 the reference shape for instrumenting other long-running jobs (reclustering,
 describe, etc.) with SSE progress + cancel.
 
+## Deploy panel (Version / Build / Restart)
+
+`/status` has a Deployment card backed by `photosearch/admin_api.py`. It
+replaces the manual git-pull + compose-build + compose-up cycle. Endpoints:
+
+- `GET /api/admin/version` — deployed SHA (from `/app/BUILD_SHA`) vs HEAD
+- `POST /api/admin/git-fetch|git-pull` — git with `-c safe.directory=*`
+- `POST /api/admin/docker-build` — SSE stream with explicit
+  `--build-arg GIT_SHA=$(git rev-parse HEAD)` (env-var expansion in the
+  compose file is unreliable)
+- `POST /api/admin/restart` — **runs compose in a detached helper container**
+
+**Critical invariant — never call `docker compose up` for the photosearch
+service from inside the photosearch container itself.** Every process inside
+a container shares one PID namespace; when compose kills the old container,
+every process inside dies — including the compose subprocess that's
+mid-restart, leaving the new container stranded in Created state with a
+rename-suffix name. `setsid`/`nohup` don't help (different problem).
+
+The restart endpoint does this instead:
+
+```python
+docker run --rm --detach \
+  --name photosearch-restart-helper \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v $HOST_REPO_DIR:/repo \
+  -w /repo docker:cli \
+  compose -p photosearch -f docker-compose.nas.yml up -d --no-deps photosearch
+```
+
+The helper has its own PID namespace and lifecycle. `HOST_REPO_DIR` is set
+in docker-compose.nas.yml as `${REPO_DIR:-/volume1/docker/photosearch}` so
+the helper knows the **host** path (in-container `/repo` is useless to a
+sibling container).
+
+**Shutdown handshake** (no worker-fleet churn during restart):
+
+1. `/api/admin/restart` first runs `UPDATE worker_claims SET expires_at =
+   datetime('now', '+15 minutes')` — workers' in-flight batches survive
+   the swap gap even if `renew-claim` times out during downtime.
+2. Helper launched; compose SIGTERMs the old photosearch.
+3. `@app.on_event("shutdown")` in `web.py` flips
+   `worker_api._shutting_down = True`.
+4. Middleware returns `503 Retry-After: 30` on `/api/worker/*` and
+   `/api/photos/<id>/full`. `WorkerClient._request()` sleeps the
+   Retry-After window then loops — transparent to call sites. Browser
+   UI paths keep serving normally.
+5. `stop_grace_period: 60s` lets in-flight transfers drain cleanly.
+6. Old dies, helper completes `compose up`, new container binds :8000.
+
+**Workers built before `577a3b3` will crash on the 503** (old client
+raised on any non-2xx). Pull + restart the worker fleet after server-side
+deploy.
+
+**Recovery from a wedged restart** (extremely rare with helper-container):
+```bash
+docker rm -f <stuck-container-id>
+docker rm -f photosearch-restart-helper   # if it didn't self-clean
+unset REPO_DIR   # bash ${VAR:-default} falls back only when UNSET, not empty
+docker compose -f docker-compose.nas.yml up -d --no-deps photosearch
+```
+Walk `docker events --since 10m --until 30s 2>&1 | grep photosearch` to see
+exactly which step failed.
+
 ## Face clustering
 
 New faces land with `cluster_id = NULL` — per-batch clustering was removed from
