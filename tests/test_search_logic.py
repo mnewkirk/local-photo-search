@@ -897,3 +897,65 @@ class TestSchemaV19Migration:
             for expected in ("idx_photos_country", "idx_photos_admin1",
                              "idx_photos_admin2", "idx_photos_locality"):
                 assert expected in indexes, f"missing index {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Bundle E: _categories_match_query, _visual_match_query, _keywords_match_query
+# ---------------------------------------------------------------------------
+
+import json
+
+
+def test_categories_match_uses_exact_then_expansion(monkeypatch):
+    from photosearch import search as s
+    monkeypatch.setattr("photosearch.search._QUERY_TO_CATEGORIES",
+                        {"sea": {"beach", "ocean"}})
+    cats_json = json.dumps(["beach", "dog"])
+    # Exact match.
+    assert s._categories_match_query(cats_json, "beach") > 0
+    # Expansion: "sea" → {beach, ocean}; beach is present → match.
+    assert s._categories_match_query(cats_json, "sea") > 0
+    # No expansion + not present.
+    assert s._categories_match_query(cats_json, "moon") == 0
+
+
+def test_categories_match_handles_empty_inputs():
+    from photosearch import search as s
+    assert s._categories_match_query(None, "beach") == 0
+    assert s._categories_match_query("", "beach") == 0
+    assert s._categories_match_query("[]", "beach") == 0
+    assert s._categories_match_query('["beach"]', "") == 0
+
+
+def test_keywords_match_handles_multiword_phrases():
+    from photosearch import search as s
+    kws_json = json.dumps(["golden retriever", "stinson beach"])
+    # Whole-phrase match scores highest.
+    assert s._keywords_match_query(kws_json, "golden retriever") > 0
+    # Token-in-query containing phrase substring.
+    assert s._keywords_match_query(kws_json, "stinson") > 0
+    # Word inside phrase.
+    assert s._keywords_match_query(kws_json, "retriever") > 0
+    # Unrelated.
+    assert s._keywords_match_query(kws_json, "moon") == 0
+
+
+def test_keywords_match_handles_empty_inputs():
+    from photosearch import search as s
+    assert s._keywords_match_query(None, "beach") == 0
+    assert s._keywords_match_query("[]", "beach") == 0
+    assert s._keywords_match_query('["beach"]', "") == 0
+
+
+def test_visual_match_returns_score_on_exact():
+    from photosearch import search as s
+    vis_json = json.dumps(["dramatic", "foggy"])
+    assert s._visual_match_query(vis_json, "dramatic") > 0
+    assert s._visual_match_query(vis_json, "cheerful") == 0
+
+
+def test_visual_match_handles_empty_inputs():
+    from photosearch import search as s
+    assert s._visual_match_query(None, "dramatic") == 0
+    assert s._visual_match_query("[]", "dramatic") == 0
+    assert s._visual_match_query('["dramatic"]', "") == 0

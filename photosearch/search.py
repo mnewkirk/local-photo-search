@@ -373,6 +373,17 @@ def _expand_query_word(word: str) -> set[str]:
 # ---------------------------------------------------------------------------
 # Tag-based matching (M9) — replaces dictionary expansion with LLM tags
 # ---------------------------------------------------------------------------
+# _QUERY_TO_CATEGORIES: maps query words to sets of category labels for the
+# new _categories_match_query scorer (Bundle E / M23).  Loaded from the
+# generated vocab_query_expansion module if present; graceful empty default
+# when the curator hasn't filled in expansions yet (the initial v23 ship has
+# an empty dict).
+try:
+    from .vocab_query_expansion import _QUERY_TO_CATEGORIES
+except ImportError:
+    _QUERY_TO_CATEGORIES: dict[str, set[str]] = {}
+
+# ---------------------------------------------------------------------------
 # Maps query words to tags from TAG_VOCABULARY. When a user searches "animal",
 # we check the photo's pre-computed tags for "animal", "bird", "fish", "pet",
 # "wildlife", etc. This is the LLM-powered alternative to _TERM_EXPANSIONS.
@@ -475,6 +486,92 @@ def _tags_match_query(tags_json: Optional[str], query: str) -> float:
         return -DESCRIPTION_ABSENCE_PENALTY
 
     return 0.0  # Partial match — neutral
+
+
+def _categories_match_query(categories_json: Optional[str], query: str) -> float:
+    """Score a categories array against a free-text query.
+
+    Tiers:
+      +1.0  query (lowercased, full) matches a category exactly
+      +0.5  per query word that matches a category exactly
+      +0.4  per query word whose _QUERY_TO_CATEGORIES expansion intersects categories
+    """
+    if not categories_json or not query:
+        return 0.0
+    try:
+        cats = set(json.loads(categories_json))
+    except (ValueError, TypeError):
+        return 0.0
+    if not cats:
+        return 0.0
+    q_lower = query.lower().strip()
+    if not q_lower:
+        return 0.0
+    score = 0.0
+    if q_lower in cats:
+        score += 1.0
+    for word in q_lower.split():
+        if word in cats:
+            score += 0.5
+        expansion = _QUERY_TO_CATEGORIES.get(word, set())
+        if expansion & cats:
+            score += 0.4
+    return score
+
+
+def _visual_match_query(visual_json: Optional[str], query: str) -> float:
+    """Score a visual_tags array against a query. Tiers: 0.8 whole, 0.4 per word."""
+    if not visual_json or not query:
+        return 0.0
+    try:
+        tags = set(json.loads(visual_json))
+    except (ValueError, TypeError):
+        return 0.0
+    if not tags:
+        return 0.0
+    q_lower = query.lower().strip()
+    if not q_lower:
+        return 0.0
+    score = 0.0
+    if q_lower in tags:
+        score += 0.8
+    for word in q_lower.split():
+        if word in tags:
+            score += 0.4
+    return score
+
+
+def _keywords_match_query(keywords_json: Optional[str], query: str) -> float:
+    """Score a keywords array against a query.
+
+    Tiers per keyword:
+      +1.2  whole-query equals the keyword
+      +0.6  query contains the keyword OR keyword contains the query (substring)
+      +0.3  any token shared between query and the keyword's tokens
+    """
+    if not keywords_json or not query:
+        return 0.0
+    try:
+        keywords = json.loads(keywords_json)
+    except (ValueError, TypeError):
+        return 0.0
+    if not keywords:
+        return 0.0
+    q_lower = query.lower().strip()
+    if not q_lower:
+        return 0.0
+    score = 0.0
+    q_words = set(q_lower.split())
+    for kw in keywords:
+        kw_l = kw.lower()
+        if kw_l == q_lower:
+            score += 1.2
+        elif q_lower in kw_l or kw_l in q_lower:
+            score += 0.6
+        else:
+            if set(kw_l.split()) & q_words:
+                score += 0.3
+    return score
 
 
 def _term_in_desc_positive(term: str, desc_lower: str) -> bool:
