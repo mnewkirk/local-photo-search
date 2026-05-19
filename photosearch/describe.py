@@ -176,6 +176,17 @@ def check_available(model: str = MODEL) -> None:
 _MAX_RETRIES = 3
 _RETRY_DELAY = 5  # seconds between retries
 
+# Per-call wall-clock cap for ollama.chat. Without this, a wedged Ollama
+# runner can hang an `ollama.chat()` call indefinitely — observed in the
+# Phase 0 bakeoff (one call ran 1h 23m before 500-ing) and again in the
+# Phase 5 backfill (all 4 workers simultaneously stuck at photo 16/16
+# with no progress). 120s is generous for vision-on-CPU (~60-90s typical)
+# and 30-60× the normal text-only call. A timeout fires a retry; after
+# _MAX_RETRIES the caller's existing exception-handling catches and
+# either marks the photo failed or returns []. Override per-call by
+# passing `timeout=...` to `_ollama_chat_with_retry`.
+_DEFAULT_OLLAMA_TIMEOUT_S = 120
+
 # Substrings that signal the llama runner was OOM-killed rather than a genuine
 # transient network error. Surfaces in Ollama errors as:
 #   "llama runner process has terminated: %!w(<nil>) (status code: 500)"
@@ -267,33 +278,65 @@ def _ollama_chat_with_retry(
     messages: list,
     retries: int = _MAX_RETRIES,
     options: Optional[dict] = None,
+    timeout: Optional[float] = None,
 ) -> Optional[str]:
     """Call ollama.chat with retry logic for transient failures.
+
+    Each attempt is bounded by `timeout` seconds (default
+    _DEFAULT_OLLAMA_TIMEOUT_S). Wedged Ollama runners that would otherwise
+    block forever are aborted, the call is treated as a transient error,
+    and the retry loop kicks in. The underlying thread is daemon, so it
+    dies with the process if it can't be cleanly interrupted.
 
     Retries on timeouts, connection errors, and server errors.
     Returns the response text or None.
     """
+    import queue as _queue
+    import threading as _threading
+
+    if timeout is None:
+        timeout = _DEFAULT_OLLAMA_TIMEOUT_S
+
     call_kwargs: dict = {"model": model, "messages": messages}
     if options:
         call_kwargs["options"] = options
+
     for attempt in range(1, retries + 1):
+        result_q: _queue.Queue = _queue.Queue(maxsize=1)
+
+        def _worker():
+            try:
+                response = ollama.chat(**call_kwargs)
+                text = response.message.content.strip()
+                result_q.put(("ok", text if text else None))
+            except Exception as ex:
+                result_q.put(("err", ex))
+
+        _threading.Thread(target=_worker, daemon=True).start()
         try:
-            response = ollama.chat(**call_kwargs)
-            text = response.message.content.strip()
-            return text if text else None
-        except Exception as e:
-            err_str = str(e).lower()
-            if any(p in err_str for p in _RUNNER_OOM_PATTERNS):
-                _maybe_print_runner_oom_hint()
-            is_transient = any(kw in err_str for kw in [
-                "timeout", "connection", "refused", "reset", "broken pipe",
-                "503", "502", "500", "unavailable",
-            ])
-            if is_transient and attempt < retries:
-                print(f" [retry {attempt}/{retries} in {_RETRY_DELAY}s: {e}]", end="", flush=True)
-                time.sleep(_RETRY_DELAY)
-            else:
-                raise
+            kind, val = result_q.get(timeout=timeout)
+        except _queue.Empty:
+            kind = "err"
+            val = TimeoutError(
+                f"ollama.chat exceeded {timeout}s timeout on attempt {attempt}/{retries}"
+            )
+
+        if kind == "ok":
+            return val
+
+        e = val
+        err_str = str(e).lower()
+        if any(p in err_str for p in _RUNNER_OOM_PATTERNS):
+            _maybe_print_runner_oom_hint()
+        is_transient = any(kw in err_str for kw in [
+            "timeout", "connection", "refused", "reset", "broken pipe",
+            "503", "502", "500", "unavailable",
+        ])
+        if is_transient and attempt < retries:
+            print(f" [retry {attempt}/{retries} in {_RETRY_DELAY}s: {e}]", end="", flush=True)
+            time.sleep(_RETRY_DELAY)
+        else:
+            raise e
     return None
 
 
