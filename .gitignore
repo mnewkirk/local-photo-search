@@ -51,6 +51,7 @@ tests/test_face_matching.py
 .env
 google_client_secret.json
 google_photos_token.json
+vocab_candidates.json
 
 
 # FUSE artifacts (Cowork sandbox)
