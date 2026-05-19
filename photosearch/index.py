@@ -114,11 +114,17 @@ def _index_collection(
     enable_describe: bool = False,
     force_describe: bool = False,
     describe_model: str = "llama3.2-vision",
-    tags_model: str = "llava",
     enable_quality: bool = False,
     force_quality: bool = False,
-    enable_tags: bool = False,
-    force_tags: bool = False,
+    enable_category_content: bool = False,
+    force_category_content: bool = False,
+    enable_category_visual: bool = False,
+    force_category_visual: bool = False,
+    enable_keywords: bool = False,
+    force_keywords: bool = False,
+    category_content_model: str = "llama3.2:3b",
+    category_visual_model: str = "llava",
+    keywords_model: str = "llama3.2:3b",
     enable_stacking: bool = True,
     expand_stacks: bool = False,
 ):
@@ -410,56 +416,169 @@ def _index_collection(
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
                     db.log_activity("describe", "index", desc_count)
 
-        # ── Semantic tags ──────────────────────────────────────────
-        if enable_tags:
+        # ── Visual-quality tags (vision LLM) ───────────────────────
+        if enable_category_visual:
             import json as _json
-            from .describe import tag_photo, check_available as tag_check
+            from .describe import tag_visual_photo, check_available as tag_check
             try:
-                tag_check(model=tags_model)
+                tag_check(model=category_visual_model)
             except RuntimeError as e:
-                print(f"\nSkipping tags: {e}")
+                print(f"\nSkipping category-visual: {e}")
             else:
-                if force_tags:
-                    tag_candidates = list(photo_pairs)
-                    print(f"\nGenerating tags for {len(tag_candidates)} photo(s) (--force-tags)...")
+                if force_category_visual:
+                    visual_candidates = list(photo_pairs)
+                    print(f"\nGenerating visual tags for {len(visual_candidates)} photo(s) (--force-category-visual)...")
                 else:
                     ids = [pid for pid, _ in photo_pairs]
                     placeholders = ",".join("?" * len(ids))
                     already = set(
                         r[0] for r in db.conn.execute(
-                            f"SELECT id FROM photos WHERE id IN ({placeholders}) AND tags IS NOT NULL",
+                            f"SELECT id FROM photos WHERE id IN ({placeholders}) AND visual_tags IS NOT NULL",
                             ids,
                         ).fetchall()
                     )
-                    tag_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already]
-                    if tag_candidates:
-                        print(f"\nGenerating tags for {len(tag_candidates)} untagged photo(s)...")
+                    visual_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already]
+                    if visual_candidates:
+                        print(f"\nGenerating visual tags for {len(visual_candidates)} untagged photo(s)...")
                     else:
-                        print("\nAll collection photos already have tags.")
+                        print("\nAll collection photos already have visual tags.")
 
-                if tag_candidates:
+                if visual_candidates:
                     t0 = time.time()
-                    tag_count = 0
-                    total = len(tag_candidates)
-                    for idx, (photo_id, path) in enumerate(tag_candidates, 1):
+                    visual_count = 0
+                    total = len(visual_candidates)
+                    for idx, (photo_id, path) in enumerate(visual_candidates, 1):
                         fname = os.path.basename(path)
                         print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
                         try:
                             t_photo = time.time()
-                            tags = tag_photo(path, model=tags_model)
+                            vtags = tag_visual_photo(path, model=category_visual_model)
                             elapsed_photo = time.time() - t_photo
-                            if tags:
-                                db.update_photo(photo_id, tags=_json.dumps(tags))
+                            if vtags:
+                                db.update_photo(photo_id, visual_tags=_json.dumps(vtags))
                                 db.conn.commit()
-                                print(f" ({elapsed_photo:.1f}s) {', '.join(tags)}{_eta(t0, idx, total)}")
-                                tag_count += 1
+                                db.log_generation(photo_id, "visual_tags", _json.dumps(vtags),
+                                                  model_used=category_visual_model)
+                                db.mark_processed([photo_id], "category-visual")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(vtags)}{_eta(t0, idx, total)}")
+                                visual_count += 1
                             else:
-                                print(f" ({elapsed_photo:.1f}s) no tags")
+                                print(f" ({elapsed_photo:.1f}s) no visual tags")
                         except Exception as e:
-                            _report_error("tags", path, e)
+                            _report_error("category-visual", path, e)
                     elapsed = time.time() - t0
-                    print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
-                    db.log_activity("tags", "index", tag_count)
+                    print(f"  Visual-tagged {visual_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("category-visual", "index", visual_count)
+
+        # ── Content categories (text-only LLM) ────────────────────
+        if enable_category_content:
+            import json as _json
+            from .describe import extract_categories_from_description, check_available as cat_check
+            try:
+                cat_check(model=category_content_model)
+            except RuntimeError as e:
+                print(f"\nSkipping category-content: {e}")
+            else:
+                ids = [pid for pid, _ in photo_pairs]
+                placeholders = ",".join("?" * len(ids))
+                if force_category_content:
+                    rows = db.conn.execute(
+                        f"SELECT id, description FROM photos WHERE id IN ({placeholders}) AND description IS NOT NULL",
+                        ids,
+                    ).fetchall()
+                    cat_candidates = [(r[0], r[1]) for r in rows]
+                    print(f"\nGenerating content categories for {len(cat_candidates)} photo(s) (--force-category-content)...")
+                else:
+                    rows = db.conn.execute(
+                        f"SELECT id, description FROM photos WHERE id IN ({placeholders}) AND description IS NOT NULL AND categories IS NULL",
+                        ids,
+                    ).fetchall()
+                    cat_candidates = [(r[0], r[1]) for r in rows]
+                    if cat_candidates:
+                        print(f"\nGenerating content categories for {len(cat_candidates)} uncategorised photo(s)...")
+                    else:
+                        print("\nAll collection photos already have content categories.")
+
+                if cat_candidates:
+                    t0 = time.time()
+                    cat_count = 0
+                    total = len(cat_candidates)
+                    for idx, (photo_id, description) in enumerate(cat_candidates, 1):
+                        print(f"  [{idx}/{total}] photo {photo_id} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            cats = extract_categories_from_description(description, model=category_content_model)
+                            elapsed_photo = time.time() - t_photo
+                            if cats:
+                                db.update_photo(photo_id, categories=_json.dumps(cats))
+                                db.conn.commit()
+                                db.log_generation(photo_id, "categories", _json.dumps(cats),
+                                                  model_used=category_content_model)
+                                db.mark_processed([photo_id], "category-content")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(cats)}{_eta(t0, idx, total)}")
+                                cat_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no categories")
+                        except Exception as e:
+                            _report_error("category-content", str(photo_id), e)
+                    elapsed = time.time() - t0
+                    print(f"  Categorised {cat_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("category-content", "index", cat_count)
+
+        # ── Keywords (text-only LLM) ────────────────────────────────
+        if enable_keywords:
+            import json as _json
+            from .describe import extract_keywords_from_description, check_available as kw_check
+            try:
+                kw_check(model=keywords_model)
+            except RuntimeError as e:
+                print(f"\nSkipping keywords: {e}")
+            else:
+                ids = [pid for pid, _ in photo_pairs]
+                placeholders = ",".join("?" * len(ids))
+                if force_keywords:
+                    rows = db.conn.execute(
+                        f"SELECT id, description FROM photos WHERE id IN ({placeholders}) AND description IS NOT NULL",
+                        ids,
+                    ).fetchall()
+                    kw_candidates = [(r[0], r[1]) for r in rows]
+                    print(f"\nGenerating keywords for {len(kw_candidates)} photo(s) (--force-keywords)...")
+                else:
+                    rows = db.conn.execute(
+                        f"SELECT id, description FROM photos WHERE id IN ({placeholders}) AND description IS NOT NULL AND keywords IS NULL",
+                        ids,
+                    ).fetchall()
+                    kw_candidates = [(r[0], r[1]) for r in rows]
+                    if kw_candidates:
+                        print(f"\nGenerating keywords for {len(kw_candidates)} un-keyworded photo(s)...")
+                    else:
+                        print("\nAll collection photos already have keywords.")
+
+                if kw_candidates:
+                    t0 = time.time()
+                    kw_count = 0
+                    total = len(kw_candidates)
+                    for idx, (photo_id, description) in enumerate(kw_candidates, 1):
+                        print(f"  [{idx}/{total}] photo {photo_id} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            kws = extract_keywords_from_description(description, model=keywords_model)
+                            elapsed_photo = time.time() - t_photo
+                            if kws:
+                                db.update_photo(photo_id, keywords=_json.dumps(kws))
+                                db.conn.commit()
+                                db.log_generation(photo_id, "keywords", _json.dumps(kws),
+                                                  model_used=keywords_model)
+                                db.mark_processed([photo_id], "keywords")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(kws)}{_eta(t0, idx, total)}")
+                                kw_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no keywords")
+                        except Exception as e:
+                            _report_error("keywords", str(photo_id), e)
+                    elapsed = time.time() - t0
+                    print(f"  Keyworded {kw_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("keywords", "index", kw_count)
 
         # ── Aesthetic quality scoring + concept analysis ────────────
         if enable_quality:
@@ -636,11 +755,17 @@ def index_directory(
     enable_describe: bool = False,
     force_describe: bool = False,
     describe_model: str = "llama3.2-vision",
-    tags_model: str = "llava",
     enable_quality: bool = False,
     force_quality: bool = False,
-    enable_tags: bool = False,
-    force_tags: bool = False,
+    enable_category_content: bool = False,
+    force_category_content: bool = False,
+    enable_category_visual: bool = False,
+    force_category_visual: bool = False,
+    enable_keywords: bool = False,
+    force_keywords: bool = False,
+    category_content_model: str = "llama3.2:3b",
+    category_visual_model: str = "llava",
+    keywords_model: str = "llama3.2:3b",
     enable_stacking: bool = True,
     collection_id: int = None,
     expand_stacks: bool = False,
@@ -677,11 +802,14 @@ def index_directory(
         force_describe: If True, regenerate descriptions for all photos (even those
                         that already have one).
         describe_model: Ollama model name for descriptions (default: "llama3.2-vision").
-        tags_model: Ollama model name for the tags pass (default: "llava").
         enable_quality: If True, compute aesthetic quality scores.
         force_quality: If True, rescore all photos (even those already scored).
-        enable_tags: If True, generate semantic category tags via Ollama.
-        force_tags: If True, regenerate tags for all photos (even those already tagged).
+        enable_category_content: If True, extract content categories from descriptions (text-only LLM).
+        force_category_content: If True, regenerate content categories for all photos.
+        enable_category_visual: If True, extract visual-quality tags from images (vision LLM).
+        force_category_visual: If True, regenerate visual tags for all photos.
+        enable_keywords: If True, extract free-form keywords from descriptions (text-only LLM).
+        force_keywords: If True, regenerate keywords for all photos.
         collection_id: If set, re-index photos in this collection instead of scanning a directory.
     """
 
@@ -701,11 +829,17 @@ def index_directory(
             enable_describe=enable_describe,
             force_describe=force_describe,
             describe_model=describe_model,
-            tags_model=tags_model,
             enable_quality=enable_quality,
             force_quality=force_quality,
-            enable_tags=enable_tags,
-            force_tags=force_tags,
+            enable_category_content=enable_category_content,
+            force_category_content=force_category_content,
+            enable_category_visual=enable_category_visual,
+            force_category_visual=force_category_visual,
+            enable_keywords=enable_keywords,
+            force_keywords=force_keywords,
+            category_content_model=category_content_model,
+            category_visual_model=category_visual_model,
+            keywords_model=keywords_model,
             enable_stacking=enable_stacking,
             expand_stacks=expand_stacks,
         )
@@ -833,7 +967,7 @@ def index_directory(
                 db.log_activity("clip", "clear", len(dir_photo_ids_for_clip))
             new_photos = list(dir_photos_list)
             print(f"  Will re-embed {len(new_photos)} photo(s).")
-        elif not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
+        elif not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_category_content and not enable_category_visual and not enable_keywords:
             pass
 
         # When --clip is requested, also queue dir photos already in the DB but missing embeddings.
@@ -886,7 +1020,7 @@ def index_directory(
             db.end_batch()
             print(f"  Geocoded {geo_count}/{len(ungeo)} photos.")
 
-        if not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_tags:
+        if not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_category_content and not enable_category_visual and not enable_keywords:
             if not ungeo:
                 print("All photos already indexed. Nothing to do.")
             return
@@ -1056,56 +1190,165 @@ def index_directory(
                     print(f"  Described {desc_count}/{total} photos in {elapsed:.1f}s")
                     db.log_activity("describe", "index", desc_count)
 
-        # Step 5b: Semantic tags via Ollama (M9)
-        if enable_tags:
+        # Step 5b: Visual-quality tags via Ollama (vision LLM)
+        if enable_category_visual:
             import json as _json
-            from .describe import tag_photo, check_available as tag_check
+            from .describe import tag_visual_photo, check_available as tag_check
             try:
-                tag_check(model=tags_model)
+                tag_check(model=category_visual_model)
             except RuntimeError as e:
-                print(f"\nSkipping tags: {e}")
+                print(f"\nSkipping category-visual: {e}")
             else:
-                if force_tags:
-                    tag_candidates = list(_get_dir_photos())
-                    print(f"\nGenerating tags for {len(tag_candidates)} photo(s) (--force-tags)...")
+                if force_category_visual:
+                    visual_candidates = list(_get_dir_photos())
+                    print(f"\nGenerating visual tags for {len(visual_candidates)} photo(s) (--force-category-visual)...")
                 else:
                     dir_ids = set(pid for pid, _ in _get_dir_photos())
                     untagged = db.conn.execute(
-                        "SELECT id, filepath FROM photos WHERE tags IS NULL"
+                        "SELECT id, filepath FROM photos WHERE visual_tags IS NULL"
                     ).fetchall()
-                    tag_candidates = [(row["id"], db.resolve_filepath(row["filepath"])) for row in untagged
-                                      if row["id"] in dir_ids]
-                    if tag_candidates:
-                        print(f"\nGenerating tags for {len(tag_candidates)} untagged photo(s)...")
+                    visual_candidates = [(row["id"], db.resolve_filepath(row["filepath"])) for row in untagged
+                                         if row["id"] in dir_ids]
+                    if visual_candidates:
+                        print(f"\nGenerating visual tags for {len(visual_candidates)} untagged photo(s)...")
                     else:
-                        print("\nAll photos in target directory already have tags.")
+                        print("\nAll photos in target directory already have visual tags.")
 
-                if tag_candidates:
+                if visual_candidates:
                     t0 = time.time()
-                    # Same as describe — commit immediately after each LLM write
-                    # to avoid holding SQLite's write lock during the Ollama call.
-                    tag_count = 0
-                    total = len(tag_candidates)
-                    for idx, (photo_id, path) in enumerate(tag_candidates, 1):
+                    # Commit immediately after each LLM write to avoid holding
+                    # SQLite's write lock during the Ollama call.
+                    visual_count = 0
+                    total = len(visual_candidates)
+                    for idx, (photo_id, path) in enumerate(visual_candidates, 1):
                         fname = os.path.basename(path)
                         print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
                         try:
                             t_photo = time.time()
-                            tags = tag_photo(path, model=tags_model)
+                            vtags = tag_visual_photo(path, model=category_visual_model)
                             elapsed_photo = time.time() - t_photo
-                            if tags:
-                                db.update_photo(photo_id, tags=_json.dumps(tags))
+                            if vtags:
+                                db.update_photo(photo_id, visual_tags=_json.dumps(vtags))
                                 db.conn.commit()  # release write lock immediately
-                                print(f" ({elapsed_photo:.1f}s) {', '.join(tags)}{_eta(t0, idx, total)}")
-                                tag_count += 1
+                                db.log_generation(photo_id, "visual_tags", _json.dumps(vtags),
+                                                  model_used=category_visual_model)
+                                db.mark_processed([photo_id], "category-visual")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(vtags)}{_eta(t0, idx, total)}")
+                                visual_count += 1
                             else:
-                                print(f" ({elapsed_photo:.1f}s) no tags")
+                                print(f" ({elapsed_photo:.1f}s) no visual tags")
                         except Exception as e:
-                            _report_error("tags", path, e)
+                            _report_error("category-visual", path, e)
 
                     elapsed = time.time() - t0
-                    print(f"  Tagged {tag_count}/{total} photos in {elapsed:.1f}s")
-                    db.log_activity("tags", "index", tag_count)
+                    print(f"  Visual-tagged {visual_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("category-visual", "index", visual_count)
+
+        # Step 5c: Content categories from descriptions (text-only LLM)
+        if enable_category_content:
+            import json as _json
+            from .describe import extract_categories_from_description, check_available as cat_check
+            try:
+                cat_check(model=category_content_model)
+            except RuntimeError as e:
+                print(f"\nSkipping category-content: {e}")
+            else:
+                dir_ids = set(pid for pid, _ in _get_dir_photos())
+                if force_category_content:
+                    rows = db.conn.execute(
+                        "SELECT id, description FROM photos WHERE description IS NOT NULL"
+                    ).fetchall()
+                    cat_candidates = [(r["id"], r["description"]) for r in rows if r["id"] in dir_ids]
+                    print(f"\nGenerating content categories for {len(cat_candidates)} photo(s) (--force-category-content)...")
+                else:
+                    rows = db.conn.execute(
+                        "SELECT id, description FROM photos WHERE description IS NOT NULL AND categories IS NULL"
+                    ).fetchall()
+                    cat_candidates = [(r["id"], r["description"]) for r in rows if r["id"] in dir_ids]
+                    if cat_candidates:
+                        print(f"\nGenerating content categories for {len(cat_candidates)} uncategorised photo(s)...")
+                    else:
+                        print("\nAll photos in target directory already have content categories.")
+
+                if cat_candidates:
+                    t0 = time.time()
+                    cat_count = 0
+                    total = len(cat_candidates)
+                    for idx, (photo_id, description) in enumerate(cat_candidates, 1):
+                        print(f"  [{idx}/{total}] photo {photo_id} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            cats = extract_categories_from_description(description, model=category_content_model)
+                            elapsed_photo = time.time() - t_photo
+                            if cats:
+                                db.update_photo(photo_id, categories=_json.dumps(cats))
+                                db.conn.commit()  # release write lock immediately
+                                db.log_generation(photo_id, "categories", _json.dumps(cats),
+                                                  model_used=category_content_model)
+                                db.mark_processed([photo_id], "category-content")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(cats)}{_eta(t0, idx, total)}")
+                                cat_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no categories")
+                        except Exception as e:
+                            _report_error("category-content", str(photo_id), e)
+
+                    elapsed = time.time() - t0
+                    print(f"  Categorised {cat_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("category-content", "index", cat_count)
+
+        # Step 5d: Keywords from descriptions (text-only LLM)
+        if enable_keywords:
+            import json as _json
+            from .describe import extract_keywords_from_description, check_available as kw_check
+            try:
+                kw_check(model=keywords_model)
+            except RuntimeError as e:
+                print(f"\nSkipping keywords: {e}")
+            else:
+                dir_ids = set(pid for pid, _ in _get_dir_photos())
+                if force_keywords:
+                    rows = db.conn.execute(
+                        "SELECT id, description FROM photos WHERE description IS NOT NULL"
+                    ).fetchall()
+                    kw_candidates = [(r["id"], r["description"]) for r in rows if r["id"] in dir_ids]
+                    print(f"\nGenerating keywords for {len(kw_candidates)} photo(s) (--force-keywords)...")
+                else:
+                    rows = db.conn.execute(
+                        "SELECT id, description FROM photos WHERE description IS NOT NULL AND keywords IS NULL"
+                    ).fetchall()
+                    kw_candidates = [(r["id"], r["description"]) for r in rows if r["id"] in dir_ids]
+                    if kw_candidates:
+                        print(f"\nGenerating keywords for {len(kw_candidates)} un-keyworded photo(s)...")
+                    else:
+                        print("\nAll photos in target directory already have keywords.")
+
+                if kw_candidates:
+                    t0 = time.time()
+                    kw_count = 0
+                    total = len(kw_candidates)
+                    for idx, (photo_id, description) in enumerate(kw_candidates, 1):
+                        print(f"  [{idx}/{total}] photo {photo_id} ...", end="", flush=True)
+                        try:
+                            t_photo = time.time()
+                            kws = extract_keywords_from_description(description, model=keywords_model)
+                            elapsed_photo = time.time() - t_photo
+                            if kws:
+                                db.update_photo(photo_id, keywords=_json.dumps(kws))
+                                db.conn.commit()  # release write lock immediately
+                                db.log_generation(photo_id, "keywords", _json.dumps(kws),
+                                                  model_used=keywords_model)
+                                db.mark_processed([photo_id], "keywords")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(kws)}{_eta(t0, idx, total)}")
+                                kw_count += 1
+                            else:
+                                print(f" ({elapsed_photo:.1f}s) no keywords")
+                        except Exception as e:
+                            _report_error("keywords", str(photo_id), e)
+
+                    elapsed = time.time() - t0
+                    print(f"  Keyworded {kw_count}/{total} photos in {elapsed:.1f}s")
+                    db.log_activity("keywords", "index", kw_count)
 
         # Step 6: Aesthetic quality scoring + concept analysis
         if enable_quality:

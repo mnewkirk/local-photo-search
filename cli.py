@@ -50,16 +50,27 @@ def cli():
 @click.option("--describe", is_flag=True, help="Generate scene descriptions via LLaVA (requires Ollama).")
 @click.option("--force-describe", is_flag=True, help="Regenerate descriptions for all photos, even those that already have one.")
 @click.option("--describe-model", default="llama3.2-vision", show_default=True, help="Ollama model for descriptions.")
-@click.option("--tags-model", default="llava", show_default=True, help="Ollama model for the tags pass.")
 @click.option("--quality", is_flag=True, help="Compute aesthetic quality scores (1–10 scale).")
 @click.option("--force-quality", is_flag=True, help="Rescore quality for all photos, even those already scored.")
-@click.option("--tags", is_flag=True, help="Generate semantic tags via LLaVA (requires --describe or Ollama).")
-@click.option("--force-tags", is_flag=True, help="Regenerate tags for all photos, even those that already have them.")
-@click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --tags. Equivalent to passing each flag individually.")
+@click.option("--category-content", is_flag=True, help="Extract content categories from descriptions (text-only LLM).")
+@click.option("--force-category-content", is_flag=True, help="Regenerate content categories for all photos.")
+@click.option("--category-visual", is_flag=True, help="Extract visual-quality tags from images (vision LLM).")
+@click.option("--force-category-visual", is_flag=True, help="Regenerate visual tags for all photos.")
+@click.option("--keywords", is_flag=True, help="Extract free-form keywords from descriptions (text-only LLM).")
+@click.option("--force-keywords", is_flag=True, help="Regenerate keywords for all photos.")
+@click.option("--category-content-model", default="llama3.2:3b", show_default=True,
+              help="Ollama model for the category-content pass.")
+@click.option("--category-visual-model", default="llava", show_default=True,
+              help="Ollama model for the category-visual pass.")
+@click.option("--keywords-model", default="llama3.2:3b", show_default=True,
+              help="Ollama model for the keywords pass.")
+@click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --category-content --category-visual --keywords.")
 @click.option("--verify", is_flag=True, help="Run hallucination verification after indexing (requires descriptions).")
 def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colors, faces,
-          force_faces, force_clip, describe, force_describe, describe_model, tags_model, quality, force_quality,
-          tags, force_tags, full, verify):
+          force_faces, force_clip, describe, force_describe, describe_model, quality, force_quality,
+          category_content, force_category_content, category_visual, force_category_visual,
+          keywords, force_keywords, category_content_model, category_visual_model, keywords_model,
+          full, verify):
     """Index a directory of photos, or re-index a collection.
 
     \b
@@ -79,7 +90,9 @@ def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colo
         faces = True
         describe = True
         quality = True
-        tags = True
+        category_content = True
+        category_visual = True
+        keywords = True
     index_directory(
         photo_dir=photo_dir,
         collection_id=collection_id,
@@ -94,14 +107,21 @@ def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colo
         enable_describe=describe or force_describe,
         force_describe=force_describe,
         describe_model=describe_model,
-        tags_model=tags_model,
         enable_quality=quality or force_quality,
         force_quality=force_quality,
-        enable_tags=tags or force_tags,
-        force_tags=force_tags,
+        enable_category_content=category_content or force_category_content,
+        force_category_content=force_category_content,
+        enable_category_visual=category_visual or force_category_visual,
+        force_category_visual=force_category_visual,
+        enable_keywords=keywords or force_keywords,
+        force_keywords=force_keywords,
+        category_content_model=category_content_model,
+        category_visual_model=category_visual_model,
+        keywords_model=keywords_model,
     )
 
-    if verify and (describe or force_describe or tags or force_tags or full):
+    if verify and (describe or force_describe or category_content or force_category_content or
+                   keywords or force_keywords or category_visual or force_category_visual or full):
         click.echo("\n--- Verification pass ---")
         from photosearch.db import PhotoDB
         from photosearch.verify import verify_photos
