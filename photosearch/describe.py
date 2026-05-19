@@ -45,6 +45,12 @@ MODEL = "llama3.2-vision"
 # cleanly. Decoupled so describe and tags each use the model good at their task.
 TAGS_MODEL = "llava"
 
+# Text-only model used by the v23 category-content and keywords passes.
+# Decided in Phase 0 bakeoff 2026-05-18 (vs qwen2.5:3b head-to-head): cleaner
+# multi-word phrase output, lower hallucination rate, comparable latency.
+CATEGORY_CONTENT_MODEL = "llama3.2:3b"
+KEYWORDS_MODEL = "llama3.2:3b"
+
 # Maximum long-edge size (pixels) when resizing images before sending to Ollama.
 # Vision models resize internally anyway — sending a smaller image cuts I/O and
 # model preprocessing time with no meaningful quality loss for descriptions.
@@ -411,9 +417,6 @@ def critique_photo(
 # A focused visual-quality vocabulary (36 terms) assigned by Ollama vision.
 # Mood / light / composition only — content is handled by extract_categories.
 
-CATEGORY_CONTENT_MODEL = "llama3.2:3b"  # text-only, default per Phase 0 bakeoff
-KEYWORDS_MODEL = "llama3.2:3b"
-
 _VISUAL_MAX_PLAUSIBLE_TAGS = 12  # tighter than the old 16; smaller vocab.
 
 
@@ -466,11 +469,11 @@ def extract_keywords_from_description(
     model: str = KEYWORDS_MODEL,
 ) -> list[str]:
     """Extract 5-15 free-form lowercased keywords from a description."""
-    from .bakeoff import build_keyword_prompt, parse_keywords_response
     if not description or not description.strip():
         return []
     if not HAS_OLLAMA:
         return []
+    from .bakeoff import build_keyword_prompt, parse_keywords_response
     prompt = build_keyword_prompt(description)
     try:
         raw = _ollama_chat_with_retry(
