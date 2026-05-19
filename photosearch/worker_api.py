@@ -103,7 +103,7 @@ class ClaimRequest(BaseModel):
 class ClaimResponse(BaseModel):
     batch_id: str
     pass_type: str
-    photos: list[dict]  # [{id, filepath, filename}]
+    photos: list[dict]  # [{id, filepath, filename, description}]
     remaining: int = 0  # unclaimed photos left in queue after this claim
 
 
@@ -142,6 +142,27 @@ class VerifyResult(BaseModel):
     tags: Optional[list[str]] = None  # regenerated tags
 
 
+class CategoryContentResult(BaseModel):
+    photo_id: int
+    categories: list[str]
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
+class CategoryVisualResult(BaseModel):
+    photo_id: int
+    visual_tags: list[str]
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
+class KeywordsResult(BaseModel):
+    photo_id: int
+    keywords: list[str]
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
 class SubmitRequest(BaseModel):
     batch_id: str
     pass_type: str
@@ -151,6 +172,9 @@ class SubmitRequest(BaseModel):
     describe_results: Optional[list[DescribeResult]] = None
     tags_results: Optional[list[TagsResult]] = None
     verify_results: Optional[list[VerifyResult]] = None
+    category_content_results: Optional[list[CategoryContentResult]] = None
+    category_visual_results: Optional[list[CategoryVisualResult]] = None
+    keywords_results: Optional[list[KeywordsResult]] = None
     # Model provenance for describe/tags/verify — logged to the generations
     # table. Optional so older workers still submit cleanly.
     model: Optional[str] = None
@@ -224,12 +248,23 @@ def claim_batch(req: ClaimRequest):
             photo_ids=scope_ids,
         )
 
+        # Fetch description for every claimed photo in one query so text-only
+        # passes (category-content, keywords) can run without downloading image bytes.
+        photo_id_list = [p["id"] for p in photos]
+        placeholders = ",".join("?" * len(photo_id_list))
+        desc_rows = db.conn.execute(
+            f"SELECT id, description FROM photos WHERE id IN ({placeholders})",
+            photo_id_list,
+        ).fetchall()
+        desc_by_id = {row["id"]: row["description"] for row in desc_rows}
+
         result_photos = []
         for p in photos:
             result_photos.append({
                 "id": p["id"],
                 "filepath": p["filepath"],
                 "filename": Path(p["filepath"]).name,
+                "description": desc_by_id.get(p["id"]),
             })
 
         return ClaimResponse(
@@ -408,6 +443,75 @@ def submit_results(req: SubmitRequest):
                         pass
             db.end_batch()
 
+        elif req.pass_type == "category-content":
+            category_content_results = req.category_content_results or []
+            db.begin_batch(batch_size=100)
+            for r in category_content_results:
+                processed_photo_ids.append(r.photo_id)
+                if r.categories:
+                    try:
+                        cats_json = json.dumps(r.categories)
+                        db.update_photo(r.photo_id, categories=cats_json)
+                        db.log_generation(r.photo_id, "category-content", cats_json,
+                                          r.model, r.model_version)
+                        written += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to store category-content for photo {r.photo_id}: {e}")
+                        try:
+                            db.log_error("category-content", str(r.photo_id), str(e))
+                        except Exception:
+                            pass
+            db.end_batch()
+            # Mark all submitted photos as processed (including those with no categories)
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "category-content")
+
+        elif req.pass_type == "category-visual":
+            category_visual_results = req.category_visual_results or []
+            db.begin_batch(batch_size=100)
+            for r in category_visual_results:
+                processed_photo_ids.append(r.photo_id)
+                if r.visual_tags:
+                    try:
+                        vtags_json = json.dumps(r.visual_tags)
+                        db.update_photo(r.photo_id, visual_tags=vtags_json)
+                        db.log_generation(r.photo_id, "category-visual", vtags_json,
+                                          r.model, r.model_version)
+                        written += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to store category-visual for photo {r.photo_id}: {e}")
+                        try:
+                            db.log_error("category-visual", str(r.photo_id), str(e))
+                        except Exception:
+                            pass
+            db.end_batch()
+            # Mark all submitted photos as processed (including those with no visual tags)
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "category-visual")
+
+        elif req.pass_type == "keywords":
+            keywords_results = req.keywords_results or []
+            db.begin_batch(batch_size=100)
+            for r in keywords_results:
+                processed_photo_ids.append(r.photo_id)
+                if r.keywords:
+                    try:
+                        kw_json = json.dumps(r.keywords)
+                        db.update_photo(r.photo_id, keywords=kw_json)
+                        db.log_generation(r.photo_id, "keywords", kw_json,
+                                          r.model, r.model_version)
+                        written += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to store keywords for photo {r.photo_id}: {e}")
+                        try:
+                            db.log_error("keywords", str(r.photo_id), str(e))
+                        except Exception:
+                            pass
+            db.end_batch()
+            # Mark all submitted photos as processed (including those with no keywords)
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "keywords")
+
         # Log activity for the chart
         if written > 0:
             db.log_activity(req.pass_type, "index", written)
@@ -457,6 +561,7 @@ class ClearPassRequest(BaseModel):
     pass_type: str
     collection_id: Optional[int] = None
     directory: Optional[str] = None
+    photo_ids: Optional[list[int]] = None
 
 
 @router.post("/clear-pass")
@@ -478,8 +583,12 @@ def clear_pass(req: ClearPassRequest):
             photo_ids = db.get_directory_photo_ids(req.directory)
             if not photo_ids:
                 raise HTTPException(404, f"No photos found in directory {req.directory}")
+        elif req.photo_ids is not None:
+            photo_ids = req.photo_ids
+            if not photo_ids:
+                raise HTTPException(400, "photo_ids list is empty")
         else:
-            raise HTTPException(400, "collection_id or directory is required for clear-pass (safety)")
+            raise HTTPException(400, "collection_id, directory, or photo_ids is required for clear-pass (safety)")
 
         placeholders = ",".join("?" * len(photo_ids))
         cleared = 0
@@ -538,6 +647,33 @@ def clear_pass(req: ClearPassRequest):
                 f"hallucination_flags = NULL WHERE id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+        elif req.pass_type == "category-content":
+            cur = db.conn.execute(
+                f"UPDATE photos SET categories = NULL WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'category-content' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
+        elif req.pass_type == "category-visual":
+            cur = db.conn.execute(
+                f"UPDATE photos SET visual_tags = NULL WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'category-visual' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
+        elif req.pass_type == "keywords":
+            cur = db.conn.execute(
+                f"UPDATE photos SET keywords = NULL WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'keywords' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         else:
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
