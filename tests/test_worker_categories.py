@@ -152,3 +152,45 @@ def test_clear_pass_category_content_nulls_column_and_resets_attempts(client):
             "SELECT 1 FROM worker_processed WHERE pass_type='category-content' AND photo_id=1"
         ).fetchall()
         assert rows == []
+
+
+def test_clear_pass_category_visual_nulls_column_and_resets_attempts(client):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        db.conn.execute("UPDATE photos SET visual_tags = ? WHERE id = 1",
+                        (json.dumps(["dramatic"]),))
+        db.mark_processed([1], "category-visual")
+        db.conn.commit()
+    r = client.post("/api/worker/clear-pass", json={
+        "pass_type": "category-visual",
+        "photo_ids": [1],
+    })
+    assert r.status_code == 200, r.text
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        row = db.conn.execute("SELECT visual_tags FROM photos WHERE id=1").fetchone()
+        assert row[0] is None
+        rows = db.conn.execute(
+            "SELECT 1 FROM worker_processed WHERE pass_type='category-visual' AND photo_id=1"
+        ).fetchall()
+        assert rows == []
+
+
+def test_clear_pass_keywords_nulls_column_and_resets_attempts(client):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        db.conn.execute("UPDATE photos SET keywords = ? WHERE id = 1",
+                        (json.dumps(["beach"]),))
+        db.mark_processed([1], "keywords")
+        db.conn.commit()
+    r = client.post("/api/worker/clear-pass", json={
+        "pass_type": "keywords",
+        "photo_ids": [1],
+    })
+    assert r.status_code == 200, r.text
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        row = db.conn.execute("SELECT keywords FROM photos WHERE id=1").fetchone()
+        assert row[0] is None
+        rows = db.conn.execute(
+            "SELECT 1 FROM worker_processed WHERE pass_type='keywords' AND photo_id=1"
+        ).fetchall()
+        assert rows == []
