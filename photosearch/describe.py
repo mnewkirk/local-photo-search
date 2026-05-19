@@ -406,121 +406,157 @@ def critique_photo(
 
 
 # ---------------------------------------------------------------------------
-# Semantic tagging — M9
+# Visual tagging (replaces old M9 TAG_VOCABULARY / tag_photo)
 # ---------------------------------------------------------------------------
-# A fixed vocabulary of category tags that the LLM assigns to each photo.
-# These replace the hand-curated _TERM_EXPANSIONS dictionary in search.py
-# with LLM-quality semantic understanding at zero search-time cost.
+# A focused visual-quality vocabulary (36 terms) assigned by Ollama vision.
+# Mood / light / composition only — content is handled by extract_categories.
 
-TAG_VOCABULARY = [
-    # Living things
-    "animal", "bird", "fish", "insect", "pet", "wildlife",
-    # People
-    "person", "child", "group", "crowd", "portrait",
-    # Activities
-    "action", "sports", "playing", "walking", "swimming", "surfing",
-    "running", "jumping", "climbing", "dancing", "eating", "cooking", "working",
-    # Scenes & settings
-    "landscape", "seascape", "cityscape", "mountain", "forest", "desert",
-    "beach", "ocean", "lake", "river", "waterfall", "sky", "sunset",
-    "sunrise", "night",
-    # Built environment
-    "building", "architecture", "street", "road", "bridge", "vehicle",
-    "car", "boat", "airplane",
-    # Nature
-    "flower", "plant", "tree", "garden", "rock", "snow", "rain",
-    # Indoor
-    "indoor", "home", "kitchen", "room", "office",
-    # Mood / style
-    "dramatic", "peaceful", "colorful", "dark", "bright", "foggy",
-    "silhouette", "reflection",
-    # Objects
-    "food", "drink", "sign", "art", "sculpture", "flag",
-    # Photography qualities
-    "close-up", "wide-angle", "aerial", "underwater",
-]
+CATEGORY_CONTENT_MODEL = "llama3.2:3b"  # text-only, default per Phase 0 bakeoff
+KEYWORDS_MODEL = "llama3.2:3b"
 
-TAG_PROMPT = """\
-Tag this photo using ONLY tags from this list: {tags}
-
-Rules:
-- Return ONLY a comma-separated list of tags that apply. Nothing else.
-- Include every tag that clearly applies. Omit any that don't.
-- Look carefully for animals, birds, or insects even if small or partially hidden. If you see ANY animal (e.g. hawk, hummingbird, deer, dog), include "animal" AND the relevant type tag ("bird", "wildlife", "pet", "insect", "fish").
-- If people are present, include "person" and relevant activity tags (playing, jumping, running, etc.).
-- Include setting tags (beach, ocean, forest, etc.) and mood tags (dramatic, peaceful, etc.) when they apply.
-- Do NOT add tags that are not in the list above.
-""".format(tags=", ".join(TAG_VOCABULARY))
-
-# Regurgitation guard: vision models sometimes echo most of the TAG_PROMPT
-# vocabulary back instead of selecting. The vocabulary's categories are
-# largely mutually exclusive (6 animal types, ~13 actions, ~11 landscape
-# types, indoor vs outdoor, etc.), so a real photo realistically draws ~4-14
-# tags — the NAS library's distribution tapers out by ~14. A response with
-# this many or more valid tags is regurgitation, not a description.
-# The real fix is prompt-side (a future tagging-model bakeoff); this guard
-# just keeps the garbage out of the index in the meantime.
-_MAX_PLAUSIBLE_TAGS = 16
+_VISUAL_MAX_PLAUSIBLE_TAGS = 12  # tighter than the old 16; smaller vocab.
 
 
-def _parse_tag_response(raw: str) -> list[str]:
-    """Parse a comma-separated tag response and validate against TAG_VOCABULARY."""
-    vocab_set = set(TAG_VOCABULARY)
-    tags = []
+def _build_category_prompt(description: str, vocab: list[str]) -> str:
+    vocab_str = ", ".join(vocab)
+    return (
+        "From the vocabulary below, return ONLY tags that apply to this photo description.\n"
+        "Rules:\n"
+        "- Return a comma-separated list with no commentary.\n"
+        "- Only use tags from the vocabulary; ignore anything else.\n\n"
+        f"Vocabulary: {vocab_str}\n\n"
+        f"Description: {description.strip()}\n"
+    )
+
+
+def extract_categories_from_description(
+    description: Optional[str],
+    model: str = CATEGORY_CONTENT_MODEL,
+) -> list[str]:
+    """Map a description → list of in-vocab categories via a text-only LLM."""
+    if not description or not description.strip():
+        return []
+    from .vocab_content import CONTENT_VOCABULARY
+    if not HAS_OLLAMA:
+        return []
+    vocab_set = set(CONTENT_VOCABULARY)
+    prompt = _build_category_prompt(description, CONTENT_VOCABULARY)
+    try:
+        raw = _ollama_chat_with_retry(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0},
+        )
+    except Exception:
+        return []
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw.split(","):
+        t = token.strip().lower().rstrip(".")
+        if t in vocab_set and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def extract_keywords_from_description(
+    description: Optional[str],
+    model: str = KEYWORDS_MODEL,
+) -> list[str]:
+    """Extract 5-15 free-form lowercased keywords from a description."""
+    from .bakeoff import build_keyword_prompt, parse_keywords_response
+    if not description or not description.strip():
+        return []
+    if not HAS_OLLAMA:
+        return []
+    prompt = build_keyword_prompt(description)
+    try:
+        raw = _ollama_chat_with_retry(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0},
+        )
+    except Exception:
+        return []
+    return parse_keywords_response(raw)
+
+
+def _build_visual_prompt(vocab: list[str]) -> str:
+    return (
+        "Pick visual-quality tags for this photo from this list: "
+        + ", ".join(vocab)
+        + "\n\nRules:\n"
+        "- Return ONLY a comma-separated list of tags from the list above.\n"
+        "- Mood / light / composition only. Don't describe content.\n"
+        "- Include every tag that clearly applies.\n"
+    )
+
+
+def _parse_visual_response(raw: str, vocab_set: set[str]) -> list[str]:
+    out = []
+    seen: set[str] = set()
     for token in (raw or "").split(","):
-        tag = token.strip().lower().rstrip(".")
-        if tag in vocab_set:
-            tags.append(tag)
-    return tags
+        t = token.strip().lower().rstrip(".")
+        if t in vocab_set and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
-def tag_photo(
+def tag_visual_photo(
     image_path: str,
     model: str = TAGS_MODEL,
 ) -> Optional[list[str]]:
-    """Generate semantic tags for a single photo via Ollama.
+    """Generate visual-quality tags for a single photo via Ollama (vision).
 
-    Returns a list of tags from TAG_VOCABULARY, or None if generation failed.
-    On regurgitation (the model echoes most of the vocabulary instead of
-    selecting), retries once with a small temperature bump to break the
-    deterministic pattern. If both attempts regurgitate, returns None rather
-    than poison the index — the retry counter on worker_processed will give
-    the photo another chance on a future pass.
+    Calls `_ollama_chat_with_retry` directly (not via describe_photo) so the
+    test surface is uniform — same mock point as extract_categories/keywords.
+    Mirrors the regurgitation guard from the old `tag_photo` at threshold 12.
     """
-    raw = describe_photo(image_path, model=model, prompt=TAG_PROMPT)
+    from .vocab_visual import VISUAL_VOCABULARY
+    if not HAS_OLLAMA:
+        return None
+    path = Path(image_path)
+    if not path.exists():
+        return None
+    vocab_set = set(VISUAL_VOCABULARY)
+    prompt = _build_visual_prompt(VISUAL_VOCABULARY)
+    encoded = _encode_image_for_ollama(str(path))
+    image_ref = encoded if encoded is not None else str(path)
+    options = _options_for_model(model)
+
+    try:
+        raw = _ollama_chat_with_retry(
+            model=model,
+            messages=[{"role": "user", "content": prompt, "images": [image_ref]}],
+            options=options,
+        )
+    except Exception:
+        return None
     if not raw:
         return None
-    tags = _parse_tag_response(raw)
-
-    # Regurgitation guard: response had too many valid tags. Retry once with
-    # a non-zero temp so the next inference is not deterministic — under temp
-    # 0 the model would otherwise produce the same vocab-echo every time.
-    if len(tags) >= _MAX_PLAUSIBLE_TAGS:
-        if not HAS_OLLAMA:
-            return None
-        path = Path(image_path)
-        if not path.exists():
-            return None
-        encoded = _encode_image_for_ollama(str(path))
-        image_ref = encoded if encoded is not None else str(path)
-        retry_opts = dict(_options_for_model(model))
+    tags = _parse_visual_response(raw, vocab_set)
+    if len(tags) >= _VISUAL_MAX_PLAUSIBLE_TAGS:
+        # Retry with temp bump (regurgitation guard — same shape as old tag_photo).
+        retry_opts = dict(options)
         retry_opts["temperature"] = 0.4
         retry_opts.setdefault("repeat_penalty", 1.3)
         try:
             raw2 = _ollama_chat_with_retry(
                 model=model,
-                messages=[{"role": "user", "content": TAG_PROMPT, "images": [image_ref]}],
+                messages=[{"role": "user", "content": prompt, "images": [image_ref]}],
                 options=retry_opts,
             )
         except Exception:
             raw2 = None
         if not raw2:
             return None
-        tags2 = _parse_tag_response(raw2)
-        if len(tags2) >= _MAX_PLAUSIBLE_TAGS or not tags2:
+        tags2 = _parse_visual_response(raw2, vocab_set)
+        if len(tags2) >= _VISUAL_MAX_PLAUSIBLE_TAGS or not tags2:
             return None
         tags = tags2
-
     return tags if tags else None
 
 
