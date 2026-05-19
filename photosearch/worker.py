@@ -452,32 +452,90 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
     return results
 
 
-def _process_tags(downloaded: list[tuple[dict, str]], model: str = "llava") -> list[dict]:
-    """Generate semantic tags via Ollama. Returns list of {photo_id, tags: [...]}.
+def _process_category_content(
+    photos: list[dict],
+    model: str = "llama3.2:3b",
+) -> list[dict]:
+    """Text-only pass: read description from photo dicts, extract in-vocab categories.
 
-    Always includes every photo in results (tags may be empty list) so the
-    server can mark them as processed and avoid infinite reclaim loops.
+    photos is the raw list from claim_batch's response — each dict has 'id',
+    'filename', 'filepath', and 'description'. No image download required.
+    Always returns one entry per photo (categories may be []) so the server
+    can mark them processed.
     """
-    from .describe import tag_photo, check_available
+    from .describe import extract_categories_from_description, check_available
     check_available(model)
-
     results = []
-    total = len(downloaded)
-    for idx, (photo_info, path) in enumerate(downloaded, 1):
-        fname = photo_info["filename"]
+    total = len(photos)
+    for idx, photo in enumerate(photos, 1):
+        fname = photo["filename"]
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
         try:
-            tags = tag_photo(path, model=model)
+            cats = extract_categories_from_description(photo.get("description"), model=model)
+            elapsed = time.time() - t0
+            if cats:
+                print(f" ({elapsed:.1f}s) {', '.join(cats)}")
+            else:
+                print(f" ({elapsed:.1f}s) no categories")
+            results.append({"photo_id": photo["id"], "categories": cats})
+        except Exception as e:
+            print(f" ERROR: {e}")
+            results.append({"photo_id": photo["id"], "categories": []})
+    return results
+
+
+def _process_keywords(
+    photos: list[dict],
+    model: str = "llama3.2:3b",
+) -> list[dict]:
+    """Text-only pass: read description from photo dicts, extract free-form keywords."""
+    from .describe import extract_keywords_from_description, check_available
+    check_available(model)
+    results = []
+    total = len(photos)
+    for idx, photo in enumerate(photos, 1):
+        fname = photo["filename"]
+        print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
+        t0 = time.time()
+        try:
+            kws = extract_keywords_from_description(photo.get("description"), model=model)
+            elapsed = time.time() - t0
+            if kws:
+                print(f" ({elapsed:.1f}s) {', '.join(kws)}")
+            else:
+                print(f" ({elapsed:.1f}s) no keywords")
+            results.append({"photo_id": photo["id"], "keywords": kws})
+        except Exception as e:
+            print(f" ERROR: {e}")
+            results.append({"photo_id": photo["id"], "keywords": []})
+    return results
+
+
+def _process_category_visual(
+    downloaded: list[tuple[dict, str]],
+    model: str = "llava",
+) -> list[dict]:
+    """Vision pass: tag photos with visual-quality terms from VISUAL_VOCABULARY."""
+    from .describe import tag_visual_photo, check_available
+    check_available(model)
+    results = []
+    total = len(downloaded)
+    for idx, (photo, path) in enumerate(downloaded, 1):
+        fname = photo["filename"]
+        print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
+        t0 = time.time()
+        try:
+            tags = tag_visual_photo(path, model=model)
             elapsed = time.time() - t0
             if tags:
                 print(f" ({elapsed:.1f}s) {', '.join(tags)}")
             else:
-                print(f" ({elapsed:.1f}s) no tags")
-            results.append({"photo_id": photo_info["id"], "tags": tags or []})
+                print(f" ({elapsed:.1f}s) no visual tags")
+            results.append({"photo_id": photo["id"], "visual_tags": tags or []})
         except Exception as e:
             print(f" ERROR: {e}")
-            results.append({"photo_id": photo_info["id"], "tags": []})
+            results.append({"photo_id": photo["id"], "visual_tags": []})
     return results
 
 
@@ -603,7 +661,7 @@ def _process_verify(
             confirmed_nouns = {c["noun"] for c in verified_confirmed}
             elapsed = time.time() - t0
 
-            from .describe import describe_photo as _describe, tag_photo as _tag, DESCRIBE_PROMPT
+            from .describe import describe_photo as _describe, tag_visual_photo as _tag, DESCRIBE_PROMPT
             strict_prompt = DESCRIBE_PROMPT + (
                 "\n\nIMPORTANT: A previous description was found to contain "
                 "hallucinated objects. Be extra careful to ONLY describe what you "
@@ -655,12 +713,15 @@ def run_worker(
     describe_model: str = "llama3.2-vision",
     tags_model: str = "llava",
     verify_model: str = "llava",
+    category_content_model: str = "llama3.2:3b",
+    category_visual_model: str = "llava",
+    keywords_model: str = "llama3.2:3b",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
     Args:
         server: NAS server URL (e.g. http://nas.local:8000)
-        passes: List of pass types to process (clip, faces, quality, describe, tags, verify)
+        passes: List of pass types to process (clip, faces, quality, describe, verify, ...)
         collection_id: Optional collection to scope work to
         directory: Optional directory path on the NAS to scope work to
         batch_size: Number of photos to claim per batch
@@ -669,8 +730,11 @@ def run_worker(
         one_shot: If True, process one batch per pass and exit
         force: If True, clear existing data and re-process from scratch
         describe_model: Ollama model for descriptions (default: llama3.2-vision)
-        tags_model: Ollama model for the tags pass (default: llava)
+        tags_model: Ollama model for the (removed) tags pass
         verify_model: Ollama model for verification (default: llava)
+        category_content_model: Ollama model for category-content text pass (default: llama3.2:3b)
+        category_visual_model: Ollama model for category-visual vision pass (default: llava)
+        keywords_model: Ollama model for keywords text pass (default: llama3.2:3b)
     """
     print(f"Connecting to {server}...")
     client = WorkerClient(server)
@@ -760,19 +824,26 @@ def run_worker(
                 heartbeat.start()
 
                 # Download (with retry per photo — handled inside _download_batch)
+                # Text-only passes work off `description` from the claim response
+                # and skip the download entirely.
                 batch_temp = os.path.join(temp_base, batch_id[:8])
                 os.makedirs(batch_temp, exist_ok=True)
 
-                print(f"\n  Downloading {len(photos)} photos...")
-                t0 = time.time()
-                downloaded = _download_batch(client, photos, batch_temp)
-                dl_elapsed = time.time() - t0
-                print(f"  Downloaded {len(downloaded)}/{len(photos)} in {dl_elapsed:.1f}s")
+                TEXT_ONLY_PASSES = {"category-content", "keywords"}
+                needs_images = pass_type not in TEXT_ONLY_PASSES
 
-                if not downloaded:
-                    print(f"  No photos downloaded, skipping batch.")
-                    heartbeat.stop()
-                    continue
+                if needs_images:
+                    print(f"\n  Downloading {len(photos)} photos...")
+                    t0 = time.time()
+                    downloaded = _download_batch(client, photos, batch_temp)
+                    dl_elapsed = time.time() - t0
+                    print(f"  Downloaded {len(downloaded)}/{len(photos)} in {dl_elapsed:.1f}s")
+                    if not downloaded:
+                        print(f"  No photos downloaded, skipping batch.")
+                        heartbeat.stop()
+                        continue
+                else:
+                    downloaded = None  # not used by text-only passes
 
                 # Process (local — no network needed except verify)
                 print(f"\n  Processing {pass_type}...")
@@ -792,11 +863,6 @@ def run_worker(
                     kwargs = {"describe_results": results,
                               "model": describe_model,
                               "model_version": _model_version(describe_model)}
-                elif pass_type == "tags":
-                    results = _process_tags(downloaded, model=tags_model)
-                    kwargs = {"tags_results": results,
-                              "model": tags_model,
-                              "model_version": _model_version(tags_model)}
                 elif pass_type == "verify":
                     results = _process_verify(
                         downloaded, client=client,
@@ -806,6 +872,27 @@ def run_worker(
                     kwargs = {"verify_results": results,
                               "model": describe_model,
                               "model_version": _model_version(describe_model)}
+                elif pass_type == "category-content":
+                    results = _process_category_content(photos, model=category_content_model)
+                    mv = _model_version(category_content_model)
+                    for r in results:
+                        r["model"] = category_content_model
+                        r["model_version"] = mv
+                    kwargs = {"category_content_results": results}
+                elif pass_type == "category-visual":
+                    results = _process_category_visual(downloaded, model=category_visual_model)
+                    mv = _model_version(category_visual_model)
+                    for r in results:
+                        r["model"] = category_visual_model
+                        r["model_version"] = mv
+                    kwargs = {"category_visual_results": results}
+                elif pass_type == "keywords":
+                    results = _process_keywords(photos, model=keywords_model)
+                    mv = _model_version(keywords_model)
+                    for r in results:
+                        r["model"] = keywords_model
+                        r["model_version"] = mv
+                    kwargs = {"keywords_results": results}
                 else:
                     print(f"  Pass type '{pass_type}' not yet implemented in worker.")
                     heartbeat.stop()
@@ -836,7 +923,7 @@ def run_worker(
                 n_processed = resp.get("processed", n_written)
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
-                elif pass_type in ("describe", "tags"):
+                elif pass_type in ("describe", "category-content", "category-visual", "keywords"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")

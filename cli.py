@@ -3185,8 +3185,15 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Ollama model for the tags pass.")
 @click.option("--verify-model", default="llava", show_default=True,
               help="Ollama model for hallucination verification.")
+@click.option("--category-content-model", default="llama3.2:3b", show_default=True,
+              help="Ollama model for the category-content pass (text-only).")
+@click.option("--category-visual-model", default="llava", show_default=True,
+              help="Ollama model for the category-visual pass (vision).")
+@click.option("--keywords-model", default="llama3.2:3b", show_default=True,
+              help="Ollama model for the keywords pass (text-only).")
 def worker(server, passes, collection_id, directory, batch_size, model_batch_size, ttl,
-           one_shot, force, describe_model, tags_model, verify_model):
+           one_shot, force, describe_model, tags_model, verify_model,
+           category_content_model, category_visual_model, keywords_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -3242,6 +3249,9 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
         describe_model=describe_model,
         tags_model=tags_model,
         verify_model=verify_model,
+        category_content_model=category_content_model,
+        category_visual_model=category_visual_model,
+        keywords_model=keywords_model,
     )
 
 
