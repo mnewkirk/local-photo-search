@@ -959,3 +959,27 @@ def test_visual_match_handles_empty_inputs():
     assert s._visual_match_query(None, "dramatic") == 0
     assert s._visual_match_query("[]", "dramatic") == 0
     assert s._visual_match_query('["dramatic"]', "") == 0
+
+
+# ---------------------------------------------------------------------------
+# Bundle F: text_match param rename (signature checks)
+# ---------------------------------------------------------------------------
+
+def test_search_combined_accepts_text_match_param():
+    """text_match replaces tag_match; tag_match no longer in signature."""
+    from photosearch.search import search_combined
+    import inspect
+    sig = inspect.signature(search_combined)
+    assert "text_match" in sig.parameters
+    assert "tag_match" not in sig.parameters
+    assert "category" in sig.parameters
+    assert "visual_tag" in sig.parameters
+    assert "keyword" in sig.parameters
+
+
+def test_search_semantic_accepts_text_match_param():
+    from photosearch.search import search_semantic
+    import inspect
+    sig = inspect.signature(search_semantic)
+    assert "text_match" in sig.parameters
+    assert "tag_match" not in sig.parameters

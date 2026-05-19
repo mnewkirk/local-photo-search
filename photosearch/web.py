@@ -215,11 +215,16 @@ def api_search(
     min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
     sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, relevance"),
     sort_quality: bool = Query(False, description="Legacy: equivalent to sort=quality_desc"),
-    tag_match: str = Query("both", description="Tag matching mode: dict, tags, or both"),
+    text_match: str = Query("all", description="Text matching mode: all, dict, categories, visual, keywords, off"),
+    tag_match: Optional[str] = Query(None, deprecated=True, description="Deprecated; use text_match"),
     date_from: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     date_to: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
     location: Optional[str] = Query(None, description="Filter by location name"),
     match_source: Optional[str] = Query(None, description="Face match type: strict, temporal, or manual"),
+    category: Optional[str] = Query(None, description="Filter by exact category match"),
+    visual_tag: Optional[str] = Query(None, description="Filter by visual tag"),
+    keyword: Optional[str] = Query(None, description="Filter by keyword (substring match)"),
+    tag: Optional[str] = Query(None, deprecated=True, description="Deprecated; use category"),
 ):
     """Search photos using any combination of criteria."""
     logger.info(
@@ -229,8 +234,14 @@ def api_search(
         date_from, date_to, location,
     )
 
-    if not any([q, person, color, place, min_quality is not None,
-                date_from, date_to, location]):
+    # Legacy aliases: tag_match → text_match, tag → category.
+    if tag_match and (text_match is None or text_match == "all"):
+        text_match = {"both": "all", "tags": "categories"}.get(tag_match, tag_match)
+    if tag and not category:
+        category = tag
+
+    if not any([q, person, color, place, category, visual_tag, keyword,
+                min_quality is not None, date_from, date_to, location]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
 
@@ -256,11 +267,14 @@ def api_search(
             min_score=min_score,
             min_quality=min_quality,
             sort_quality=sort_quality,
-            tag_match=tag_match,
+            text_match=text_match,
             date_from=date_from,
             date_to=date_to,
             location=location,
             match_source=match_source,
+            category=category,
+            visual_tag=visual_tag,
+            keyword=keyword,
         )
 
         logger.info(
@@ -289,7 +303,9 @@ def api_search(
                 "iso": r.get("iso"),
                 "image_width": r.get("image_width"),
                 "image_height": r.get("image_height"),
-                "tags": json.loads(r["tags"]) if r.get("tags") else [],
+                "categories": json.loads(r["categories"]) if r.get("categories") else [],
+                "visual_tags": json.loads(r["visual_tags"]) if r.get("visual_tags") else [],
+                "keywords": json.loads(r["keywords"]) if r.get("keywords") else [],
                 "place_name": r.get("place_name"),
             }
             if r.get("dominant_colors"):
@@ -1009,7 +1025,9 @@ def api_photo_detail(photo_id: int):
             "iso": photo.get("iso"),
             "image_width": photo.get("image_width"),
             "image_height": photo.get("image_height"),
-            "tags": json.loads(photo["tags"]) if photo.get("tags") else [],
+            "categories": json.loads(photo["categories"]) if photo.get("categories") else [],
+            "visual_tags": json.loads(photo["visual_tags"]) if photo.get("visual_tags") else [],
+            "keywords": json.loads(photo["keywords"]) if photo.get("keywords") else [],
             "colors": colors,
             "faces": face_list,
             "stack": db.get_photo_stack(photo_id),
@@ -1877,8 +1895,14 @@ def api_stats():
             "SELECT COUNT(*) as c FROM photos WHERE aesthetic_concepts IS NOT NULL"
         ).fetchone()["c"]
 
-        tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE tags IS NOT NULL AND tags != '[]'"
+        category_tagged = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE categories IS NOT NULL AND categories != '[]'"
+        ).fetchone()["c"]
+        visual_tagged = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE visual_tags IS NOT NULL AND visual_tags != '[]'"
+        ).fetchone()["c"]
+        keyword_tagged = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE keywords IS NOT NULL AND keywords != '[]'"
         ).fetchone()["c"]
 
         verify_rows = db.conn.execute(
@@ -1902,7 +1926,9 @@ def api_stats():
         "quality_scored": scored,
         "quality_stats": quality_stats,
         "concepts_analyzed": concepts_analyzed,
-        "tagged": tagged,
+        "category_tagged": category_tagged,
+        "visual_tagged": visual_tagged,
+        "keyword_tagged": keyword_tagged,
         "stacks": stack_count,
         "stacked_photos": stacked_photos,
         "verify_passed": verify_counts["pass"],

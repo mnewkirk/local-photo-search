@@ -383,110 +383,6 @@ try:
 except ImportError:
     _QUERY_TO_CATEGORIES: dict[str, set[str]] = {}
 
-# ---------------------------------------------------------------------------
-# Maps query words to tags from TAG_VOCABULARY. When a user searches "animal",
-# we check the photo's pre-computed tags for "animal", "bird", "fish", "pet",
-# "wildlife", etc. This is the LLM-powered alternative to _TERM_EXPANSIONS.
-
-_QUERY_TO_TAGS: dict[str, set[str]] = {
-    # Animals
-    "animal": {"animal", "bird", "fish", "insect", "pet", "wildlife"},
-    "animals": {"animal", "bird", "fish", "insect", "pet", "wildlife"},
-    "wildlife": {"wildlife", "animal", "bird"},
-    "bird": {"bird", "animal", "wildlife"},
-    "birds": {"bird", "animal", "wildlife"},
-    "fish": {"fish", "animal"},
-    "pet": {"pet", "animal"},
-    "pets": {"pet", "animal"},
-    "insect": {"insect", "animal"},
-    # People
-    "people": {"person", "child", "group", "crowd", "portrait"},
-    "person": {"person", "child", "portrait"},
-    "child": {"child", "person"},
-    "children": {"child", "person", "group"},
-    "kid": {"child", "person"},
-    "kids": {"child", "person", "group"},
-    "family": {"person", "child", "group"},
-    "portrait": {"portrait", "person"},
-    # Activities
-    "action": {"action", "sports", "running", "climbing", "surfing", "swimming"},
-    "sports": {"sports", "action", "surfing", "swimming", "running", "climbing"},
-    "playing": {"playing", "action"},
-    # Scenes
-    "landscape": {"landscape", "mountain", "forest", "desert"},
-    "seascape": {"seascape", "ocean", "beach"},
-    "beach": {"beach", "ocean", "seascape"},
-    "ocean": {"ocean", "beach", "seascape"},
-    "mountain": {"mountain", "landscape"},
-    "forest": {"forest", "landscape", "tree"},
-    "sunset": {"sunset", "sky"},
-    "sunrise": {"sunrise", "sky"},
-    # Nature
-    "flower": {"flower", "plant", "garden"},
-    "flowers": {"flower", "plant", "garden"},
-    "plant": {"plant", "tree", "flower", "garden"},
-    "plants": {"plant", "tree", "flower", "garden"},
-    "tree": {"tree", "plant", "forest"},
-    # Vehicles
-    "vehicle": {"vehicle", "car", "boat", "airplane"},
-    "vehicles": {"vehicle", "car", "boat", "airplane"},
-    "car": {"car", "vehicle"},
-    "boat": {"boat", "vehicle"},
-    # Food
-    "food": {"food", "drink", "eating", "cooking"},
-    # Indoor
-    "indoor": {"indoor", "home", "kitchen", "room", "office"},
-    "home": {"home", "indoor", "room", "kitchen"},
-}
-
-
-def _tags_match_query(tags_json: Optional[str], query: str) -> float:
-    """Score how well a photo's tags match a query.
-
-    Uses the same scoring tiers as _description_relevance:
-      +DESCRIPTION_BOOST           tags match the query
-      -DESCRIPTION_ABSENCE_PENALTY tags exist but none match
-      0.0                          no tags available
-    """
-    if not tags_json:
-        return 0.0
-
-    try:
-        photo_tags = set(json.loads(tags_json))
-    except (json.JSONDecodeError, TypeError):
-        return 0.0
-
-    if not photo_tags:
-        return 0.0
-
-    query_words = query.lower().split()
-    matched = 0
-
-    for word in query_words:
-        # Direct tag match
-        if word in photo_tags:
-            matched += 1
-            continue
-
-        # Stem match (basic plural handling)
-        stem = word.rstrip("s") if len(word) > 4 else word
-        if stem in photo_tags:
-            matched += 1
-            continue
-
-        # Expand query word to related tags and check
-        related_tags = _QUERY_TO_TAGS.get(word, _QUERY_TO_TAGS.get(stem, set()))
-        if related_tags & photo_tags:
-            matched += 1
-
-    if matched == len(query_words):
-        return DESCRIPTION_BOOST
-
-    if matched == 0:
-        return -DESCRIPTION_ABSENCE_PENALTY
-
-    return 0.0  # Partial match — neutral
-
 
 def _categories_match_query(categories_json: Optional[str], query: str) -> float:
     """Score a categories array against a free-text query.
@@ -756,14 +652,17 @@ def search_semantic(
     limit: int = 10,
     min_score: float = CLIP_MIN_SCORE,
     debug: bool = False,
-    tag_match: str = "both",
+    text_match: str = "all",
 ) -> list[dict]:
     """Semantic search — combines CLIP similarity, face boost, and description matching.
 
-    tag_match controls how text relevance is computed:
-      "dict"  — use dictionary-based term expansion only (original behavior)
-      "tags"  — use LLM-generated tags only
-      "both"  — use both and take the higher score (default)
+    text_match controls how text relevance is computed:
+      "all"        — union of all four signals: dict, categories, visual, keywords (default)
+      "dict"       — dictionary-based term expansion only (original behavior)
+      "categories" — LLM-generated categories only
+      "visual"     — visual tags only
+      "keywords"   — keywords only
+      "off"        — disable text matching entirely
 
     Three signals are merged:
       1. CLIP embedding similarity (visual match)
@@ -821,14 +720,31 @@ def search_semantic(
     ).fetchall()
     desc_cache = {row["id"]: row["description"] for row in rows}
 
-    # Pre-load tags for tag-based matching
-    tag_cache: dict[int, str] = {}
-    if tag_match in ("tags", "both"):
-        rows = db.conn.execute(
-            "SELECT id, tags FROM photos WHERE tags IS NOT NULL"
-        ).fetchall()
-        tag_cache = {row["id"]: row["tags"] for row in rows}
-        _dbg(f"TAG CACHE: {len(tag_cache)} photos have tags (tag_match={tag_match})")
+    # Map text_match modes to which signals to use. Unknown modes fall back to 'all'.
+    VALID_TEXT_MATCH = {"all", "categories", "visual", "keywords", "dict", "off"}
+    if text_match not in VALID_TEXT_MATCH:
+        text_match = "all"
+    use_categories = text_match in ("all", "categories")
+    use_visual     = text_match in ("all", "visual")
+    use_keywords   = text_match in ("all", "keywords")
+    use_dict       = text_match in ("all", "dict")
+
+    cat_cache: dict[int, str] = {}
+    visual_cache: dict[int, str] = {}
+    kw_cache: dict[int, str] = {}
+    if use_categories:
+        cat_cache = {row["id"]: row["categories"]
+                     for row in db.conn.execute(
+                         "SELECT id, categories FROM photos WHERE categories IS NOT NULL")}
+    if use_visual:
+        visual_cache = {row["id"]: row["visual_tags"]
+                        for row in db.conn.execute(
+                            "SELECT id, visual_tags FROM photos WHERE visual_tags IS NOT NULL")}
+    if use_keywords:
+        kw_cache = {row["id"]: row["keywords"]
+                    for row in db.conn.execute(
+                        "SELECT id, keywords FROM photos WHERE keywords IS NOT NULL")}
+    _dbg(f"TEXT CACHES: cat={len(cat_cache)} visual={len(visual_cache)} kw={len(kw_cache)} mode={text_match}")
 
     # Pre-load filenames for debug logging
     name_cache: dict[int, str] = {}
@@ -871,35 +787,38 @@ def search_semantic(
 
         # Description / tag relevance against the positive query
         if positive_query:
-            # Dict-based description relevance (original behavior)
-            dict_rel = 0.0
-            if tag_match in ("dict", "both") and photo_id in desc_cache:
-                dict_rel = _description_relevance(desc_cache[photo_id], positive_query)
-
-            # Tag-based relevance
-            tag_rel = 0.0
-            if tag_match in ("tags", "both") and photo_id in tag_cache:
-                tag_rel = _tags_match_query(tag_cache.get(photo_id), positive_query)
-
-            # Pick the relevance score based on mode
-            if tag_match == "dict":
-                text_rel = dict_rel
-            elif tag_match == "tags":
-                text_rel = tag_rel
-            else:  # "both" — take the better score
-                text_rel = max(dict_rel, tag_rel)
-
+            # Build text relevance from the configured signals.
+            text_rel = 0.0
+            parts = []
+            if use_dict and photo_id in desc_cache:
+                r = _description_relevance(desc_cache[photo_id], positive_query)
+                text_rel += r * 0.6
+                if r != 0:
+                    parts.append(f"dict={r:+.3f}")
+            if use_categories and photo_id in cat_cache:
+                r = _categories_match_query(cat_cache.get(photo_id), positive_query)
+                text_rel += r * 1.0
+                if r != 0:
+                    parts.append(f"cat={r:+.3f}")
+            if use_visual and photo_id in visual_cache:
+                r = _visual_match_query(visual_cache.get(photo_id), positive_query)
+                text_rel += r * 0.7
+                if r != 0:
+                    parts.append(f"vis={r:+.3f}")
+            if use_keywords and photo_id in kw_cache:
+                r = _keywords_match_query(kw_cache.get(photo_id), positive_query)
+                text_rel += r * 1.2
+                if r != 0:
+                    parts.append(f"kw={r:+.3f}")
+            # Re-apply the existing CLIP-minimum gate.
             if text_rel > 0 and raw_score < CLIP_MIN_FOR_DESC_BOOST:
-                steps.append(f"text_boost_blocked (rel=+{text_rel:.3f} but clip too low)")
-                if tag_match == "both":
-                    steps.append(f"  dict_rel={dict_rel:+.3f} tag_rel={tag_rel:+.3f}")
+                steps.append(f"text_boost_blocked (rel=+{text_rel:.3f} but clip too low; "
+                             + " ".join(parts) + ")")
             else:
                 score += text_rel
                 if text_rel != 0:
                     label = "text_boost" if text_rel > 0 else "text_penalty"
-                    steps.append(f"{label}={text_rel:+.3f}")
-                    if tag_match == "both":
-                        steps.append(f"  dict_rel={dict_rel:+.3f} tag_rel={tag_rel:+.3f}")
+                    steps.append(f"{label}={text_rel:+.3f} (" + " ".join(parts) + ")")
         elif photo_id not in desc_cache:
             steps.append("no_description")
 
@@ -1433,7 +1352,7 @@ def search_combined(
     min_quality: Optional[float] = None,
     sort_quality: bool = False,
     debug: bool = False,
-    tag_match: str = "both",
+    text_match: str = "all",
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     location: Optional[str] = None,
@@ -1441,6 +1360,9 @@ def search_combined(
     offset: int = 0,
     with_total: bool = False,
     sort: str = "date_desc",
+    category: Optional[str] = None,
+    visual_tag: Optional[str] = None,
+    keyword: Optional[str] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1561,7 +1483,7 @@ def search_combined(
             clip_limit = _FILTER_PREFETCH_LIMIT if result_sets else limit * 3
             results = search_semantic(db, effective_query, limit=clip_limit,
                                       min_score=min_score, debug=debug,
-                                      tag_match=tag_match)
+                                      text_match=text_match)
             result_sets.append({r["id"]: r for r in results})
             ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
@@ -1579,6 +1501,54 @@ def search_combined(
         results = _search_by_location(db, location, limit=_FILTER_PREFETCH_LIMIT)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
+
+    if category:
+        cat_lower = category.lower()
+        matched_rows = []
+        for row in db.conn.execute(
+            "SELECT id, categories FROM photos WHERE categories IS NOT NULL"
+        ):
+            try:
+                if cat_lower in {c.lower() for c in json.loads(row["categories"])}:
+                    p = db.get_photo(row["id"])
+                    if p:
+                        matched_rows.append(p)
+            except (ValueError, TypeError):
+                pass
+        result_sets.append({r["id"]: r for r in matched_rows})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
+
+    if visual_tag:
+        vis_lower = visual_tag.lower()
+        matched_rows = []
+        for row in db.conn.execute(
+            "SELECT id, visual_tags FROM photos WHERE visual_tags IS NOT NULL"
+        ):
+            try:
+                if vis_lower in {v.lower() for v in json.loads(row["visual_tags"])}:
+                    p = db.get_photo(row["id"])
+                    if p:
+                        matched_rows.append(p)
+            except (ValueError, TypeError):
+                pass
+        result_sets.append({r["id"]: r for r in matched_rows})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
+
+    if keyword:
+        kw_lower = keyword.lower()
+        matched_rows = []
+        for row in db.conn.execute(
+            "SELECT id, keywords FROM photos WHERE keywords IS NOT NULL"
+        ):
+            try:
+                if any(kw_lower in k.lower() for k in json.loads(row["keywords"])):
+                    p = db.get_photo(row["id"])
+                    if p:
+                        matched_rows.append(p)
+            except (ValueError, TypeError):
+                pass
+        result_sets.append({r["id"]: r for r in matched_rows})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
 
     def _wrap(items: list[dict]):
         """Honor the caller's with_total + sort preferences on early-

@@ -83,8 +83,12 @@ class TestSearch:
             r = data["results"][0]
             assert "id" in r
             assert "filename" in r
-            assert "tags" in r
-            assert isinstance(r["tags"], list)
+            assert "categories" in r
+            assert isinstance(r["categories"], list)
+            assert "visual_tags" in r
+            assert isinstance(r["visual_tags"], list)
+            assert "keywords" in r
+            assert isinstance(r["keywords"], list)
             assert "colors" in r
             assert isinstance(r["colors"], list)
 
@@ -143,8 +147,12 @@ class TestPhotoDetail:
         pid = db._test_photo_ids["DSC04922.JPG"]
         resp = client.get(f"/api/photos/{pid}")
         data = resp.json()
-        assert isinstance(data["tags"], list)
-        assert len(data["tags"]) > 0
+        assert isinstance(data["categories"], list)
+        assert len(data["categories"]) > 0
+        assert isinstance(data["visual_tags"], list)
+        assert len(data["visual_tags"]) > 0
+        assert isinstance(data["keywords"], list)
+        assert len(data["keywords"]) > 0
         assert isinstance(data["colors"], list)
         assert len(data["colors"]) > 0
 
