@@ -62,15 +62,23 @@ _MAX_IMAGE_PX = 1024
 # alone left 19% of llama3.2-vision outputs degenerate; these params + the
 # detect-and-retry below brought that to ~0%. llava/moondream are not loop-prone
 # under greedy decoding, so they keep deterministic temp=0.
+# num_ctx caps the KV-cache size per request. Our prompts (text + ~576 llava
+# image tokens + ~200 output) fit well under 8192. Pinning it here keeps the
+# context from auto-sizing huge on a big-VRAM GPU — at NUM_PARALLEL=3 an
+# auto-sized 32k context produced a ~16 GiB KV cache that spilled model layers
+# to CPU. Travels with the code, so it also applies to the NAS Docker Ollama.
+_NUM_CTX = 8192
 _DEFAULT_OLLAMA_OPTIONS = {
     "num_predict": 150,
     "temperature": 0,
+    "num_ctx": _NUM_CTX,
 }
 _LLAMA_VISION_OPTIONS = {
     "num_predict": 200,
     "temperature": 0.4,
     "repeat_penalty": 1.5,
     "repeat_last_n": 320,
+    "num_ctx": _NUM_CTX,
 }
 
 
@@ -491,7 +499,7 @@ def extract_categories_from_description(
         raw = _ollama_chat_with_retry(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0},
+            options={"temperature": 0, "num_ctx": _NUM_CTX},
         )
     except Exception:
         return []
@@ -522,7 +530,7 @@ def extract_keywords_from_description(
         raw = _ollama_chat_with_retry(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0},
+            options={"temperature": 0, "num_ctx": _NUM_CTX},
         )
     except Exception:
         return []

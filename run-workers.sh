@@ -166,11 +166,13 @@ EOF
 # ---------------------------------------------------------------------------
 
 ollama_needed() {
-    # Returns 0 if any pass in $PASSES requires an Ollama backend.
+    # Returns 0 if any pass in $PASSES requires an Ollama backend. category-visual
+    # is a vision pass; category-content/keywords are text-only but still hit
+    # Ollama (small text model on the existing description).
     local IFS=','
     for p in $PASSES; do
         case "$p" in
-            describe|tags|verify) return 0 ;;
+            describe|tags|verify|category-visual|category-content|keywords) return 0 ;;
         esac
     done
     return 1
@@ -246,6 +248,64 @@ ensure_ollama_running() {
     echo "  Ollama container ready (models persisted in volume: $OLLAMA_VOLUME)"
 }
 
+check_ollama_gpu() {
+    # The single biggest perf lever for Ollama passes is whether inference runs
+    # on the GPU (40s/img CPU vs ~0.8s GPU). This is a preflight that catches the
+    # two ways it silently regresses to CPU/slow on this WSL2 + Windows-Ollama
+    # setup, and prints the exact fix. Best-effort — never blocks the launch.
+    ollama_needed || return 0
+
+    # 1) Runtime truth: if a model is currently loaded, is it resident in VRAM?
+    #    size_vram==0 means Ollama fell back to CPU (e.g. the Ollama 0.24 ROCm
+    #    discovery regression on multi-AMD-GPU boxes).
+    local ps_json vram size
+    ps_json=$(curl -sf --max-time 3 "${OLLAMA_URL}/api/ps" 2>/dev/null || true)
+    if printf '%s' "$ps_json" | grep -q '"size_vram"'; then
+        vram=$(printf '%s' "$ps_json" | grep -o '"size_vram":[0-9]*' | head -1 | grep -o '[0-9]*$')
+        size=$(printf '%s' "$ps_json" | grep -o '"size":[0-9]*' | head -1 | grep -o '[0-9]*$')
+        if [ "${vram:-0}" -eq 0 ]; then
+            echo "  WARNING: a model is loaded but size_vram=0 — Ollama is running on CPU." >&2
+            echo "           Expect ~40s/image instead of ~1s. See the HIP_VISIBLE_DEVICES fix below." >&2
+        elif [ -n "$size" ] && [ "$vram" -lt $(( size * 9 / 10 )) ]; then
+            echo "  NOTE: only $((vram/1024/1024)) of $((size/1024/1024)) MiB on GPU — model partially on CPU." >&2
+            echo "        Usually an oversized context; describe.py now pins num_ctx=8192. If this persists," >&2
+            echo "        lower the Windows OLLAMA_CONTEXT_LENGTH or reduce OLLAMA_NUM_PARALLEL." >&2
+        else
+            echo "  Ollama GPU OK ($((vram/1024/1024)) MiB resident in VRAM)"
+        fi
+    fi
+
+    # 2) Windows-side env vars (WSL2 → Windows-native Ollama). These configure the
+    #    *Ollama server* and can't be set from this WSL2 script — so we read the
+    #    persisted User-scope values via powershell.exe and remind how to fix.
+    is_wsl || return 0
+    command -v powershell.exe >/dev/null 2>&1 || return 0
+    local hip parallel
+    hip=$(powershell.exe -NoProfile -Command \
+        "[Environment]::GetEnvironmentVariable('HIP_VISIBLE_DEVICES','User')" 2>/dev/null | tr -d '\r\n')
+    parallel=$(powershell.exe -NoProfile -Command \
+        "[Environment]::GetEnvironmentVariable('OLLAMA_NUM_PARALLEL','User')" 2>/dev/null | tr -d '\r\n')
+
+    # HIP_VISIBLE_DEVICES should pin the discrete RX 7900 XTX (index 0); index 1
+    # is the integrated Radeon (2 GiB, can't hold the model). Unset lets Ollama
+    # 0.24 enumerate both and fall back to CPU.
+    if [ "$hip" != "0" ]; then
+        echo "  WARNING: Windows HIP_VISIBLE_DEVICES='${hip:-<unset>}' — want '0' (discrete RX 7900 XTX; '1' is the iGPU)." >&2
+        echo "           Fix in PowerShell, then restart Ollama from the tray:" >&2
+        echo "             [Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','0','User')" >&2
+    fi
+    # OLLAMA_NUM_PARALLEL should match the worker count or extra workers queue.
+    if [ -z "$parallel" ]; then
+        echo "  NOTE: Windows OLLAMA_NUM_PARALLEL is unset (defaults to 1) — your $NUM_WORKERS workers will serialize." >&2
+        echo "        Fix in PowerShell, then restart Ollama from the tray:" >&2
+        echo "          [Environment]::SetEnvironmentVariable('OLLAMA_NUM_PARALLEL','$NUM_WORKERS','User')" >&2
+    elif [ "$parallel" != "$NUM_WORKERS" ]; then
+        echo "  NOTE: Windows OLLAMA_NUM_PARALLEL=$parallel but launching $NUM_WORKERS workers — mismatch means queueing or idle slots." >&2
+        echo "        Fix in PowerShell, then restart Ollama from the tray:" >&2
+        echo "          [Environment]::SetEnvironmentVariable('OLLAMA_NUM_PARALLEL','$NUM_WORKERS','User')" >&2
+    fi
+}
+
 required_ollama_models() {
     # Prints newline-separated list of Ollama models required by $PASSES.
     # verify needs both the verifier and the regen model (used when a photo
@@ -255,6 +315,9 @@ required_ollama_models() {
         case "$p" in
             describe) echo "${DESCRIBE_MODEL:-llama3.2-vision}" ;;
             tags)     echo "${TAGS_MODEL:-llava}" ;;
+            category-visual)  echo "${CATEGORY_VISUAL_MODEL:-llava}" ;;
+            category-content) echo "${CATEGORY_CONTENT_MODEL:-llama3.2:3b}" ;;
+            keywords)         echo "${KEYWORDS_MODEL:-llama3.2:3b}" ;;
             verify)
                 echo "${VERIFY_MODEL:-llava}"
                 echo "${DESCRIBE_MODEL:-llama3.2-vision}"
@@ -769,10 +832,11 @@ fi
 # ---------------------------------------------------------------------------
 
 if ollama_needed; then
-    echo "Passes include describe/tags/verify — checking Ollama availability..."
+    echo "Passes need Ollama — checking availability + GPU config..."
     ensure_ollama_running
     if ollama_is_reachable; then
         ensure_ollama_models
+        check_ollama_gpu
     fi
     echo ""
 fi
