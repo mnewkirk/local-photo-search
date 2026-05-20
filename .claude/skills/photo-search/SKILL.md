@@ -1125,6 +1125,22 @@ after changing the limit.
 hint to stderr explaining the likely cause and fixes (see
 `_maybe_print_runner_oom_hint()`).
 
+**Text-pass Ollama stall (`category-content` / `keywords`):** these
+`llama3.2:3b` text passes intermittently trigger a multi-minute Ollama
+runner freeze under sustained `NUM_PARALLEL=1` load (serves nothing for
+minutes, then bulk-releases). Investigated 2026-05-20: **not** GPU/ROCm
+(a CPU-only WSL2 Ollama froze identically), **not** poison input (normal
+descriptions), **not** runaway generation (stuck photos replay in ~1s,
+`eval_count` ~20). Root cause still open — an Ollama-internal stall
+common to both 0.23.x-CPU and 0.24-GPU. Mitigation:
+`describe.py:_TEXT_OLLAMA_TIMEOUT_S = 10` bounds these calls to 10s (vs
+the 120s `_DEFAULT_OLLAMA_TIMEOUT_S` the vision passes keep) so a stall
+aborts fast and the photo is retried later instead of blocking the
+single slot. The vision passes (`describe`, `category-visual`) have not
+shown this. A restart-on-stall watchdog was rejected — it crashes
+workers via the un-retry-wrapped `check_available` and only masks the
+symptom.
+
 #### GPU acceleration: per-machine tuning
 
 Measured per-photo describe times on this project's fleet (LLaVA 7B Q4_0,

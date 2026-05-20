@@ -216,6 +216,27 @@ No single vision model wins all three text passes, so each has its own default
 `temperature` + `repeat_penalty` to suppress repetition loops) plus a
 `_is_degenerate` detector → up to 2 retries → llava fallback in `describe_photo`.
 
+### Ollama stall on the text passes — tight per-call timeout
+
+The text-only category passes (`category-content`, `keywords` on
+`llama3.2:3b`) intermittently trigger a multi-minute Ollama stall under
+sustained `NUM_PARALLEL=1` load: the runner serves nothing for minutes,
+then bulk-releases. Investigated 2026-05-20 — it is **not** GPU/ROCm
+(a CPU-only WSL2 Ollama froze identically), **not** poison input (stuck
+photos have normal descriptions), and **not** runaway generation (the
+stuck photos replay in ~1s, `eval_count` ~20). Root cause is still open
+(some Ollama-internal stall common to 0.23.x-CPU and 0.24-GPU). The
+describe/`category-visual` vision passes have not shown it.
+
+Mitigation in `describe.py`: `_TEXT_OLLAMA_TIMEOUT_S = 10` is passed as
+`timeout=` on the `extract_categories_from_description` /
+`extract_keywords_from_description` calls, so a stall aborts in 10s
+(vs the 120s `_DEFAULT_OLLAMA_TIMEOUT_S` the vision passes keep) and the
+photo is retried later instead of blocking the single Ollama slot. This
+caps blast radius, not the root cause. A restart-watchdog was rejected:
+it crashes workers (the un-retry-wrapped `check_available`) and only
+treats the symptom.
+
 ### GPU acceleration
 
 CLIP / quality / faces run on the worker's GPU automatically — `clip_embed.py`

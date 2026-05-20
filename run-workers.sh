@@ -76,8 +76,14 @@ MODE="auto"               # auto | native | docker
 OLLAMA_HOST_OVERRIDE=""   # --ollama-host: base URL where Ollama is reachable
 ACTION="start"            # start | status | logs | stop | scale
 SCALE_TARGET=""
+# Fleet instance name. Empty = the default fleet (back-compat). Set via --name to
+# run multiple independent fleets at once (e.g. a CPU text fleet + a GPU vision
+# fleet) — it suffixes NATIVE_RUNDIR, the docker PROJECT, and the docker label so
+# the two don't share pid/log files or get killed by each other's stop-loop.
+# Pass the SAME --name to --status/--logs/--stop to target that fleet.
+FLEET_NAME=""
 OLLAMA_URL="http://localhost:${OLLAMA_PORT}"   # resolved per-mode after arg parse
-NATIVE_RUNDIR="/tmp/photosearch-worker-fleet"  # native-mode pid/log files
+NATIVE_RUNDIR="/tmp/photosearch-worker-fleet"  # native-mode pid/log files (suffixed by --name)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
@@ -128,6 +134,9 @@ Start workers:
       --verify-model M    Ollama model for verification (default: llava)
       --native            Run bare-metal venv workers (GPU-capable). Auto on WSL2.
       --docker            Run the CPU-only Docker fleet. Auto on Mac/Linux.
+      --name NAME         Fleet instance name. Lets multiple fleets run at once
+                          (e.g. a CPU text fleet + a GPU vision fleet) without
+                          colliding. Pass the same --name to --status/--logs/--stop.
       --ollama-host URL   Base URL for Ollama (default: localhost, or the
                           Windows-host gateway in native WSL2 mode)
 
@@ -149,6 +158,13 @@ Examples:
   ./run-workers.sh --status
   ./run-workers.sh --scale 10           # resize running fleet without restart
   ./run-workers.sh --stop
+  # Two simultaneous fleets — split a slow/unstable Ollama pass onto CPU:
+  ./run-workers.sh -s http://nas:8000 --name cpu -p category-content,keywords \
+      --ollama-host http://localhost:11434 -n 2 -d /photos/2026
+  ./run-workers.sh -s http://nas:8000 --name gpu -p category-visual \
+      --ollama-host http://172.20.176.1:11434 -n 3 -d /photos/2026
+  ./run-workers.sh --name cpu --status   # manage each fleet by name
+  ./run-workers.sh --name gpu --stop
 
 Ollama note:
   For describe/tags/verify, PREFER a native `ollama serve` on the host. The
@@ -254,6 +270,13 @@ check_ollama_gpu() {
     # two ways it silently regresses to CPU/slow on this WSL2 + Windows-Ollama
     # setup, and prints the exact fix. Best-effort — never blocks the launch.
     ollama_needed || return 0
+
+    # On WSL2 the GPU-capable Ollama is the Windows host (gateway IP). A localhost
+    # Ollama here is the intentional CPU instance (e.g. the --name cpu text fleet
+    # for passes whose GPU runner stalls), so the GPU checks below don't apply.
+    case "$OLLAMA_URL" in
+        *localhost*|*127.0.0.1*) is_wsl && return 0 ;;
+    esac
 
     # 1) Runtime truth: if a model is currently loaded, is it resident in VRAM?
     #    size_vram==0 means Ollama fell back to CPU (e.g. the Ollama 0.24 ROCm
@@ -371,7 +394,7 @@ stop_managed_ollama_if_idle() {
         return
     fi
     local remaining
-    remaining=$(docker ps --filter "label=photosearch-worker-fleet" -q 2>/dev/null | wc -l | tr -d ' ')
+    remaining=$(docker ps --filter "label=$FLEET_LABEL" -q 2>/dev/null | wc -l | tr -d ' ')
     if [ "$remaining" -eq 0 ]; then
         echo "Stopping managed Ollama container ($OLLAMA_CONTAINER)..."
         docker rm -f "$OLLAMA_CONTAINER" > /dev/null 2>&1 || true
@@ -383,7 +406,7 @@ stop_managed_ollama_if_idle() {
 # ---------------------------------------------------------------------------
 
 do_status() {
-    local FILTER="label=photosearch-worker-fleet"
+    local FILTER="label=$FLEET_LABEL"
     echo "=== Worker Containers ==="
     echo ""
     # Show running containers
@@ -432,7 +455,7 @@ do_status() {
 }
 
 do_logs() {
-    local FILTER="label=photosearch-worker-fleet"
+    local FILTER="label=$FLEET_LABEL"
     local names
     names=$(docker ps --filter "$FILTER" --format "{{.Names}}" 2>/dev/null | sort)
     if [ -z "$names" ]; then
@@ -453,7 +476,7 @@ do_logs() {
 }
 
 do_stop() {
-    local FILTER="label=photosearch-worker-fleet"
+    local FILTER="label=$FLEET_LABEL"
     local count
     count=$(docker ps --filter "$FILTER" -q 2>/dev/null | wc -l | tr -d ' ')
     if [ "$count" -gt 0 ]; then
@@ -474,7 +497,7 @@ do_scale() {
         exit 1
     fi
 
-    local FILTER="label=photosearch-worker-fleet"
+    local FILTER="label=$FLEET_LABEL"
     # Sorted by numeric suffix so we know which are highest-indexed.
     local RUNNING_NAMES
     RUNNING_NAMES=$(docker ps --filter "$FILTER" --format "{{.Names}}" 2>/dev/null \
@@ -565,7 +588,7 @@ for a in json.load(sys.stdin):
         echo "  Starting $CONTAINER_NAME..."
         docker run -d \
             --name "$CONTAINER_NAME" \
-            --label "photosearch-worker-fleet=true" \
+            --label "$FLEET_LABEL=true" \
             --memory "$TEMPLATE_MEM" \
             --restart on-failure:3 \
             --add-host=host.docker.internal:host-gateway \
@@ -683,6 +706,7 @@ while [[ $# -gt 0 ]]; do
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
         --native)           MODE="native";         shift ;;
         --docker)           MODE="docker";         shift ;;
+        --name)             FLEET_NAME="$2";       shift 2 ;;
         --ollama-host)      OLLAMA_HOST_OVERRIDE="$2"; shift 2 ;;
         --status)           ACTION="status";       shift ;;
         --logs)             ACTION="logs";         shift ;;
@@ -696,6 +720,14 @@ done
 # Resolve execution mode + Ollama URL now that flags are parsed.
 detect_mode
 OLLAMA_URL="$(resolve_ollama_url)"
+
+# Apply the fleet-instance suffix (from --name) to everything that distinguishes
+# one fleet from another: native pid/log dir, docker container-name prefix, and
+# the docker label used by --status/--logs/--stop/--scale. Empty FLEET_NAME keeps
+# the original unsuffixed names, so existing single-fleet usage is unchanged.
+FLEET_LABEL="photosearch-worker-fleet${FLEET_NAME:+-$FLEET_NAME}"
+PROJECT="photosearch-worker${FLEET_NAME:+-$FLEET_NAME}"
+NATIVE_RUNDIR="/tmp/photosearch-worker-fleet${FLEET_NAME:+-$FLEET_NAME}"
 
 # Management actions need no --server; dispatch them mode-aware and exit.
 case "$ACTION" in
@@ -807,10 +839,10 @@ fi
 # ---------------------------------------------------------------------------
 
 if [ "$MODE" = "docker" ]; then
-    EXISTING=$(docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | wc -l | tr -d ' ')
+    EXISTING=$(docker ps -a --filter "label=$FLEET_LABEL" -q 2>/dev/null | wc -l | tr -d ' ')
     if [ "$EXISTING" -gt 0 ]; then
         echo "Stopping $EXISTING existing worker(s)..."
-        docker ps -a --filter "label=photosearch-worker-fleet" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
+        docker ps -a --filter "label=$FLEET_LABEL" -q 2>/dev/null | xargs -r docker rm -f > /dev/null 2>&1
         echo ""
     fi
 else
@@ -855,7 +887,7 @@ if [ "$MODE" = "docker" ]; then
         echo "  Starting $CONTAINER_NAME..."
         docker run -d \
             --name "$CONTAINER_NAME" \
-            --label "photosearch-worker-fleet=true" \
+            --label "$FLEET_LABEL=true" \
             --memory "$MEM_LIMIT" \
             --restart on-failure:3 \
             --add-host=host.docker.internal:host-gateway \
@@ -887,9 +919,10 @@ fi
 echo ""
 echo "=== $NUM_WORKERS workers launched ==="
 echo ""
+NAME_ARG="${FLEET_NAME:+--name $FLEET_NAME }"
 echo "Monitor:"
-echo "  ./run-workers.sh --status    # container status + memory + recent progress"
-echo "  ./run-workers.sh --logs      # tail all worker logs live"
-echo "  ./run-workers.sh --stop      # stop all workers"
+echo "  ./run-workers.sh ${NAME_ARG}--status    # container status + memory + recent progress"
+echo "  ./run-workers.sh ${NAME_ARG}--logs      # tail all worker logs live"
+echo "  ./run-workers.sh ${NAME_ARG}--stop      # stop all workers"
 echo ""
 echo "Workers will exit automatically when the queue is empty."

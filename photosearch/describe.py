@@ -195,6 +195,17 @@ _RETRY_DELAY = 5  # seconds between retries
 # passing `timeout=...` to `_ollama_chat_with_retry`.
 _DEFAULT_OLLAMA_TIMEOUT_S = 120
 
+# Tighter timeout for the text-only category/keyword passes. These calls are
+# normally ~1-3s (small llama3.2:3b, ~20-token output), but Ollama intermittently
+# stalls under sustained NUM_PARALLEL=1 text load — a freeze that reproduces on
+# BOTH the Windows GPU and a CPU-only WSL2 Ollama, and is NOT input-, model-, or
+# num_predict-related (the stuck photos replay in ~1s in isolation). Root cause is
+# still open; this just bounds the blast radius: a stall aborts in 10s and the
+# retry/next-pass picks the photo up later, instead of blocking the single Ollama
+# slot for the full 120s. Vision passes keep the 120s default (they're slower and
+# have not shown this stall).
+_TEXT_OLLAMA_TIMEOUT_S = 10
+
 # Substrings that signal the llama runner was OOM-killed rather than a genuine
 # transient network error. Surfaces in Ollama errors as:
 #   "llama runner process has terminated: %!w(<nil>) (status code: 500)"
@@ -500,6 +511,7 @@ def extract_categories_from_description(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "num_ctx": _NUM_CTX},
+            timeout=_TEXT_OLLAMA_TIMEOUT_S,
         )
     except Exception:
         return []
@@ -531,6 +543,7 @@ def extract_keywords_from_description(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "num_ctx": _NUM_CTX},
+            timeout=_TEXT_OLLAMA_TIMEOUT_S,
         )
     except Exception:
         return []
