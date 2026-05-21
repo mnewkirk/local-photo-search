@@ -460,8 +460,10 @@ def _process_category_content(
 
     photos is the raw list from claim_batch's response — each dict has 'id',
     'filename', 'filepath', and 'description'. No image download required.
-    Always returns one entry per photo (categories may be []) so the server
-    can mark them processed.
+    Returns one entry per SUCCESSFUL photo (categories may be [] = genuinely
+    none). Photos whose extraction timed out / errored are OMITTED so the
+    server does NOT mark them processed — they get re-claimed and retried later
+    instead of being permanently recorded with empty categories on a stall.
     """
     from .describe import extract_categories_from_description, check_available
     check_available(model)
@@ -473,15 +475,17 @@ def _process_category_content(
         t0 = time.time()
         try:
             cats = extract_categories_from_description(photo.get("description"), model=model)
-            elapsed = time.time() - t0
-            if cats:
-                print(f" ({elapsed:.1f}s) {', '.join(cats)}")
-            else:
-                print(f" ({elapsed:.1f}s) no categories")
-            results.append({"photo_id": photo["id"], "categories": cats})
         except Exception as e:
-            print(f" ERROR: {e}")
-            results.append({"photo_id": photo["id"], "categories": []})
+            cats, err = None, str(e)
+        else:
+            err = None
+        elapsed = time.time() - t0
+        if cats is None:
+            # timeout/error → defer (omit from results so it isn't marked done)
+            print(f" ({elapsed:.1f}s) deferring (timeout/error{': ' + err if err else ''})")
+            continue
+        print(f" ({elapsed:.1f}s) {', '.join(cats) if cats else 'no categories'}")
+        results.append({"photo_id": photo["id"], "categories": cats})
     return results
 
 
@@ -500,15 +504,17 @@ def _process_keywords(
         t0 = time.time()
         try:
             kws = extract_keywords_from_description(photo.get("description"), model=model)
-            elapsed = time.time() - t0
-            if kws:
-                print(f" ({elapsed:.1f}s) {', '.join(kws)}")
-            else:
-                print(f" ({elapsed:.1f}s) no keywords")
-            results.append({"photo_id": photo["id"], "keywords": kws})
         except Exception as e:
-            print(f" ERROR: {e}")
-            results.append({"photo_id": photo["id"], "keywords": []})
+            kws, err = None, str(e)
+        else:
+            err = None
+        elapsed = time.time() - t0
+        if kws is None:
+            # timeout/error → defer (omit so the server doesn't mark it done)
+            print(f" ({elapsed:.1f}s) deferring (timeout/error{': ' + err if err else ''})")
+            continue
+        print(f" ({elapsed:.1f}s) {', '.join(kws) if kws else 'no keywords'}")
+        results.append({"photo_id": photo["id"], "keywords": kws})
     return results
 
 

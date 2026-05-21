@@ -497,8 +497,13 @@ def _build_category_prompt(description: str, vocab: list[str]) -> str:
 def extract_categories_from_description(
     description: Optional[str],
     model: str = CATEGORY_CONTENT_MODEL,
-) -> list[str]:
-    """Map a description → list of in-vocab categories via a text-only LLM."""
+) -> Optional[list[str]]:
+    """Map a description → list of in-vocab categories via a text-only LLM.
+
+    Returns a list (possibly empty = genuinely no in-vocab categories) on
+    success, or None if the Ollama call timed out / errored so the caller can
+    defer the photo for retry instead of recording an empty result.
+    """
     if not description or not description.strip():
         return []
     from .vocab_content import CONTENT_VOCABULARY
@@ -514,7 +519,11 @@ def extract_categories_from_description(
             timeout=_TEXT_OLLAMA_TIMEOUT_S,
         )
     except Exception:
-        return []
+        # Timeout / connection error — return None (NOT []) so the caller can
+        # tell "Ollama stalled, retry later" apart from "ran fine, no categories".
+        # Returning [] here would let the worker mark the photo permanently done
+        # with empty categories on a mere stall.
+        return None
     if not raw:
         return []
     out: list[str] = []
@@ -530,8 +539,12 @@ def extract_categories_from_description(
 def extract_keywords_from_description(
     description: Optional[str],
     model: str = KEYWORDS_MODEL,
-) -> list[str]:
-    """Extract 5-15 free-form lowercased keywords from a description."""
+) -> Optional[list[str]]:
+    """Extract 5-15 free-form lowercased keywords from a description.
+
+    Returns a list on success (possibly empty), or None if the Ollama call
+    timed out / errored, so the caller can defer the photo for retry.
+    """
     if not description or not description.strip():
         return []
     if not HAS_OLLAMA:
@@ -546,7 +559,8 @@ def extract_keywords_from_description(
             timeout=_TEXT_OLLAMA_TIMEOUT_S,
         )
     except Exception:
-        return []
+        # None (not []) signals "stalled, retry later" vs "ran fine, no keywords".
+        return None
     return parse_keywords_response(raw)
 
 
