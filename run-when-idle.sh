@@ -59,6 +59,17 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNDIR="/tmp/photosearch-worker-fleet-${FLEET_NAME}"
 
+# Single-instance lock per fleet name. Two controllers managing the same fleet
+# fight — one stops it, the other restarts it on its next poll — so the fleet
+# never actually pauses when you're active. flock -n fails fast if another
+# controller for this name already holds the lock.
+exec 9>"/tmp/photosearch-idle-gate-${FLEET_NAME}.lock"
+if ! flock -n 9; then
+    echo "A run-when-idle controller for fleet '${FLEET_NAME}' is already running." >&2
+    echo "Stop it first (Ctrl-C in its terminal, or: pkill -f 'run-when-idle.sh.*--name ${FLEET_NAME}')." >&2
+    exit 1
+fi
+
 # Windows input-idle seconds via GetLastInputInfo. On any failure we print 0,
 # i.e. "treat as active" — fail safe (never start the fleet when we can't
 # confirm you're away).
