@@ -721,6 +721,9 @@
       stacks: 'Stacks',
       concepts: 'Concepts',
       tags: 'Tags',
+      'category-content': 'Categories',
+      'category-visual': 'Visual tags',
+      keywords: 'Keywords',
     };
 
     function StatCard(props) {
@@ -806,7 +809,7 @@
       // Determine which pass types appear
       var activePasses = {};
       activity.forEach(function(row) { activePasses[row.pass_type] = true; });
-      var passOrder = ['clip', 'faces', 'quality', 'concepts', 'describe', 'tags', 'verify', 'stacks'];
+      var passOrder = ['clip', 'faces', 'quality', 'concepts', 'describe', 'tags', 'category-content', 'category-visual', 'keywords', 'verify', 'stacks'];
 
       // X-axis labels: show every 12 hours
       var xLabels = [];
@@ -927,7 +930,7 @@
       );
     }
 
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'tags', 'verify'];
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'tags', 'category-content', 'category-visual', 'keywords', 'verify'];
 
     function formatTtl(expiresAtStr) {
       if (!expiresAtStr) return { text: '—', cls: '' };
@@ -1264,7 +1267,7 @@
           )
         );
       }
-      var TYPE_ORDER = ['describe', 'tags', 'verify'];
+      var TYPE_ORDER = ['describe', 'tags', 'category-content', 'category-visual', 'keywords', 'verify'];
       types.sort(function(a, b) {
         var ai = TYPE_ORDER.indexOf(a); var bi = TYPE_ORDER.indexOf(b);
         return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
@@ -2208,10 +2211,24 @@
               total: total
             }),
             e(StatCard, {
-              label: 'Tags',
-              value: (stats.tagged || 0).toLocaleString(),
-              sub: pct(stats.tagged || 0, total) + '% — run index --tags',
-              n: stats.tagged || 0,
+              label: 'Categories',
+              value: (stats.category_tagged || 0).toLocaleString(),
+              sub: pct(stats.category_tagged || 0, total) + '% — run index --category-content',
+              n: stats.category_tagged || 0,
+              total: total
+            }),
+            e(StatCard, {
+              label: 'Visual tags',
+              value: (stats.visual_tagged || 0).toLocaleString(),
+              sub: pct(stats.visual_tagged || 0, total) + '% — run index --category-visual',
+              n: stats.visual_tagged || 0,
+              total: total
+            }),
+            e(StatCard, {
+              label: 'Keywords',
+              value: (stats.keyword_tagged || 0).toLocaleString(),
+              sub: pct(stats.keyword_tagged || 0, total) + '% — run index --keywords',
+              n: stats.keyword_tagged || 0,
               total: total
             }),
             e(StatCard, {
