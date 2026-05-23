@@ -68,6 +68,13 @@ _MAX_IMAGE_PX = 1024
 # auto-sized 32k context produced a ~16 GiB KV cache that spilled model layers
 # to CPU. Travels with the code, so it also applies to the NAS Docker Ollama.
 _NUM_CTX = 8192
+# The text-only passes (category-content, keywords) carry NO image tokens —
+# just a short description (~250 tok worst case) + the ~80-term vocab + scaffold
+# (~700 tok total). They inherited the vision _NUM_CTX=8192, which forces a 4x-
+# oversized KV cache; under NUM_PARALLEL>1 that allocation churn is a suspected
+# feeder for the Ollama runner stall (see project-mac-ollama-concurrency-limit).
+# 2048 leaves comfortable headroom for the largest real descriptions.
+_TEXT_NUM_CTX = 2048
 _DEFAULT_OLLAMA_OPTIONS = {
     "num_predict": 150,
     "temperature": 0,
@@ -515,7 +522,7 @@ def extract_categories_from_description(
         raw = _ollama_chat_with_retry(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_ctx": _NUM_CTX},
+            options={"temperature": 0, "num_ctx": _TEXT_NUM_CTX},
             timeout=_TEXT_OLLAMA_TIMEOUT_S,
         )
     except Exception:
@@ -555,7 +562,7 @@ def extract_keywords_from_description(
         raw = _ollama_chat_with_retry(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_ctx": _NUM_CTX},
+            options={"temperature": 0, "num_ctx": _TEXT_NUM_CTX},
             timeout=_TEXT_OLLAMA_TIMEOUT_S,
         )
     except Exception:
