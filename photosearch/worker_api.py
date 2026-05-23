@@ -720,7 +720,8 @@ def photo_detail(photo_id: int):
         }
 
 
-_ALL_PASSES = ("clip", "faces", "quality", "describe", "tags", "verify")
+_ALL_PASSES = ("clip", "faces", "quality", "describe", "tags",
+               "category-content", "category-visual", "keywords", "verify")
 
 
 @router.get("/status")
