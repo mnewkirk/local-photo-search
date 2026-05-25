@@ -250,6 +250,7 @@ def llm_verify_description(
                 "content": prompt,
                 "images": [str(image_path)],
             }],
+            role="verify",
         )
     except Exception as e:
         logger.warning("LLM verify failed for %s: %s", image_path, e)

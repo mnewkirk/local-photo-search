@@ -15,6 +15,8 @@ details — all in a few sentences that will match natural language queries.
 
 import base64
 import io
+import json
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -160,7 +162,21 @@ def _encode_image_for_ollama(image_path: str) -> Optional[str]:
 
 
 def check_available(model: str = MODEL) -> None:
-    """Raise a clear error if Ollama is not reachable or the model isn't pulled."""
+    """Raise a clear error if the LLM backend isn't reachable or the model isn't pulled."""
+    base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
+    if base:
+        # OpenAI-compatible backend (LM Studio / llama-server) for the text
+        # passes — verify it instead of Ollama. Scoped to text-pass workers;
+        # don't set PHOTOSEARCH_TEXT_LLM_URL on a worker running vision passes.
+        import urllib.request
+        try:
+            urllib.request.urlopen(base.rstrip("/") + "/models", timeout=10).read()
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot reach OpenAI-compatible LLM at {base} "
+                f"(PHOTOSEARCH_TEXT_LLM_URL):\n  {e}"
+            ) from e
+        return
     if not HAS_OLLAMA:
         raise RuntimeError(
             "ollama Python package is not installed.\n"
@@ -305,6 +321,7 @@ def _ollama_chat_with_retry(
     retries: int = _MAX_RETRIES,
     options: Optional[dict] = None,
     timeout: Optional[float] = None,
+    role: Optional[str] = None,
 ) -> Optional[str]:
     """Call ollama.chat with retry logic for transient failures.
 
@@ -316,7 +333,15 @@ def _ollama_chat_with_retry(
 
     Retries on timeouts, connection errors, and server errors.
     Returns the response text or None.
+
+    If PHOTOSEARCH_TEXT_LLM_URL is set, ALL calls (text and vision) route to that
+    OpenAI-compatible endpoint instead of Ollama — model names mapped via
+    PHOTOSEARCH_LLM_MODEL_MAP, images converted to the OpenAI vision format.
     """
+    base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
+    if base:
+        return _openai_route(base, model, messages, retries, timeout, options, role)
+
     import queue as _queue
     import threading as _threading
 
@@ -366,6 +391,116 @@ def _ollama_chat_with_retry(
     return None
 
 
+def _openai_chat_with_retry(
+    base_url: str,
+    model: str,
+    messages: list,
+    retries: int = _MAX_RETRIES,
+    timeout: Optional[float] = None,
+    temperature: float = 0.0,
+    max_tokens: int = 768,
+) -> Optional[str]:
+    """Call an OpenAI-compatible /chat/completions endpoint (LM Studio,
+    llama-server, ...). Same return contract as _ollama_chat_with_retry: text on
+    success, None on empty, raises on persistent timeout/connection error so the
+    caller's defer-on-error path still works.
+    """
+    import urllib.request
+    if timeout is None:
+        timeout = _DEFAULT_OLLAMA_TIMEOUT_S
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }).encode("utf-8")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url, data=payload, headers={"Content-Type": "application/json"})
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            data = json.loads(resp.read())
+            text = (data["choices"][0]["message"]["content"] or "").strip()
+            return text if text else None
+        except Exception as e:
+            es = str(e).lower()
+            transient = any(k in es for k in [
+                "timeout", "timed out", "connection", "refused", "reset",
+                "broken pipe", "502", "503", "500", "unavailable",
+            ])
+            if transient and attempt < retries:
+                print(f" [retry {attempt}/{retries} in {_RETRY_DELAY}s: {e}]", end="", flush=True)
+                time.sleep(_RETRY_DELAY)
+            else:
+                raise
+    return None
+
+
+def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
+    """Resolve the OpenAI / LM Studio model id for a call by its descriptive
+    ROLE, not by model name. Roles name the *pass* the call serves:
+
+        text     -> category-content + keywords      PHOTOSEARCH_LLM_TEXT_MODEL
+        describe -> describe pass + verify regen      PHOTOSEARCH_LLM_DESCRIBE_MODEL
+        verify   -> verify's independent verifier     PHOTOSEARCH_LLM_VERIFY_MODEL
+        visual   -> category-visual tags              PHOTOSEARCH_LLM_VISUAL_MODEL
+
+    So you point each role at whatever you actually loaded in LM Studio (Gemma,
+    Qwen-VL, llava, ...) without the config keys pretending to be model names.
+    Falls back to PHOTOSEARCH_TEXT_LLM_MODEL (legacy single-model) then the raw
+    name.
+    """
+    if role:
+        v = os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL")
+        if v:
+            return v
+    return os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL") or model
+
+
+def _image_ref_to_b64(ref):
+    """Normalize an Ollama image ref (file path OR base64) to bare base64."""
+    try:
+        if isinstance(ref, str) and len(ref) < 1024 and os.path.exists(ref):
+            return _encode_image_for_ollama(ref)  # resize + base64
+        return ref  # already base64
+    except Exception:
+        return None
+
+
+def _to_openai_message(m: dict) -> dict:
+    """Convert an Ollama-style message ({content, images:[...]}) to OpenAI shape.
+    Image messages become a content list with image_url data URIs (vision)."""
+    role = m.get("role", "user")
+    imgs = m.get("images")
+    if not imgs:
+        return {"role": role, "content": m.get("content", "")}
+    content = [{"type": "text", "text": m.get("content", "")}]
+    for ref in imgs:
+        b64 = _image_ref_to_b64(ref)
+        if b64:
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    return {"role": role, "content": content}
+
+
+def _openai_route(base, model, messages, retries, timeout, options, role=None):
+    """Route an Ollama-style chat call (text or vision) to an OpenAI endpoint."""
+    conv = [_to_openai_message(m) for m in messages]
+    temp = (options or {}).get("temperature", 0.0)
+    return _openai_chat_with_retry(
+        base, _resolve_openai_model(model, role), conv,
+        retries=retries, timeout=timeout, temperature=temp)
+
+
+def _text_chat_with_retry(model, messages, options=None, timeout=None):
+    # Backend routing (Ollama vs OpenAI endpoint) lives in _ollama_chat_with_retry;
+    # this remains the text-pass entry point (role 'text').
+    return _ollama_chat_with_retry(model=model, messages=messages, options=options,
+                                   timeout=timeout, role="text")
+
+
 def describe_photo(
     image_path: str,
     model: str = MODEL,
@@ -407,6 +542,7 @@ def describe_photo(
             model=model,
             messages=messages,
             options=options,
+            role="describe",
         )
         # Filter out moondream's bounding-box coordinate dumps and other garbage
         if result is not None and not _is_valid_description(result):
@@ -424,6 +560,7 @@ def describe_photo(
                     "images": [image_ref],
                 }],
                 options=options,
+                role="describe",
             )
             if result is not None and not _is_valid_description(result):
                 result = None
@@ -435,7 +572,7 @@ def describe_photo(
         # greedy decoding) before giving up.
         if result is not None and _is_degenerate(result):
             for _ in range(2):
-                retry = _ollama_chat_with_retry(model=model, messages=messages, options=options)
+                retry = _ollama_chat_with_retry(model=model, messages=messages, options=options, role="describe")
                 if retry and _is_valid_description(retry) and not _is_degenerate(retry):
                     result = retry
                     break
@@ -444,6 +581,7 @@ def describe_photo(
                     fallback = _ollama_chat_with_retry(
                         model="llava", messages=messages,
                         options=_options_for_model("llava"),
+                        role="describe",
                     )
                     if fallback and _is_valid_description(fallback) and not _is_degenerate(fallback):
                         result = fallback
@@ -519,7 +657,7 @@ def extract_categories_from_description(
     vocab_set = set(CONTENT_VOCABULARY)
     prompt = _build_category_prompt(description, CONTENT_VOCABULARY)
     try:
-        raw = _ollama_chat_with_retry(
+        raw = _text_chat_with_retry(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "num_ctx": _TEXT_NUM_CTX},
@@ -559,7 +697,7 @@ def extract_keywords_from_description(
     from .bakeoff import build_keyword_prompt, parse_keywords_response
     prompt = build_keyword_prompt(description)
     try:
-        raw = _ollama_chat_with_retry(
+        raw = _text_chat_with_retry(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0, "num_ctx": _TEXT_NUM_CTX},
@@ -620,6 +758,7 @@ def tag_visual_photo(
             model=model,
             messages=[{"role": "user", "content": prompt, "images": [image_ref]}],
             options=options,
+            role="visual",
         )
     except Exception:
         return None
@@ -636,6 +775,7 @@ def tag_visual_photo(
                 model=model,
                 messages=[{"role": "user", "content": prompt, "images": [image_ref]}],
                 options=retry_opts,
+                role="visual",
             )
         except Exception:
             raw2 = None
