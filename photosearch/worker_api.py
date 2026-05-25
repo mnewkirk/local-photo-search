@@ -720,7 +720,12 @@ def photo_detail(photo_id: int):
         }
 
 
-_ALL_PASSES = ("clip", "faces", "quality", "describe", "tags",
+# Note: the legacy "tags" pass (pre-v23 78-word vocab) is intentionally excluded.
+# It was replaced by category-content (categories) / category-visual (visual_tags)
+# / keywords, and no worker processes it anymore — its column was nulled at the
+# v23 migration, so count_unprocessed("tags") is pinned at the full library size
+# forever. Including it in queue_depth just showed a confusing dead counter.
+_ALL_PASSES = ("clip", "faces", "quality", "describe",
                "category-content", "category-visual", "keywords", "verify")
 
 
