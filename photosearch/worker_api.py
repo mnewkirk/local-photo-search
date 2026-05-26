@@ -448,19 +448,23 @@ def submit_results(req: SubmitRequest):
             db.begin_batch(batch_size=100)
             for r in category_content_results:
                 processed_photo_ids.append(r.photo_id)
-                if r.categories:
-                    try:
-                        cats_json = json.dumps(r.categories)
-                        db.update_photo(r.photo_id, categories=cats_json)
+                try:
+                    # Always persist the column. A successful-but-empty result
+                    # writes '[]' so the photo is marked done in ONE pass (column
+                    # is NOT NULL). Only a timeout/error defers, and the worker
+                    # omits those from results. Provenance logged for non-empty only.
+                    cats_json = json.dumps(r.categories or [])
+                    db.update_photo(r.photo_id, categories=cats_json)
+                    if r.categories:
                         db.log_generation(r.photo_id, "category-content", cats_json,
                                           r.model, r.model_version)
-                        written += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to store category-content for photo {r.photo_id}: {e}")
-                        try:
-                            db.log_error("category-content", str(r.photo_id), str(e))
-                        except Exception:
-                            pass
+                    written += 1
+                except Exception as e:
+                    logger.warning(f"Failed to store category-content for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("category-content", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
             db.end_batch()
             # Mark all submitted photos as processed (including those with no categories)
             if processed_photo_ids:
@@ -471,19 +475,21 @@ def submit_results(req: SubmitRequest):
             db.begin_batch(batch_size=100)
             for r in category_visual_results:
                 processed_photo_ids.append(r.photo_id)
-                if r.visual_tags:
-                    try:
-                        vtags_json = json.dumps(r.visual_tags)
-                        db.update_photo(r.photo_id, visual_tags=vtags_json)
+                try:
+                    # Always persist the column ('[]' for empty) so a successful
+                    # empty result marks done in one pass; only timeouts defer.
+                    vtags_json = json.dumps(r.visual_tags or [])
+                    db.update_photo(r.photo_id, visual_tags=vtags_json)
+                    if r.visual_tags:
                         db.log_generation(r.photo_id, "category-visual", vtags_json,
                                           r.model, r.model_version)
-                        written += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to store category-visual for photo {r.photo_id}: {e}")
-                        try:
-                            db.log_error("category-visual", str(r.photo_id), str(e))
-                        except Exception:
-                            pass
+                    written += 1
+                except Exception as e:
+                    logger.warning(f"Failed to store category-visual for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("category-visual", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
             db.end_batch()
             # Mark all submitted photos as processed (including those with no visual tags)
             if processed_photo_ids:
@@ -494,19 +500,21 @@ def submit_results(req: SubmitRequest):
             db.begin_batch(batch_size=100)
             for r in keywords_results:
                 processed_photo_ids.append(r.photo_id)
-                if r.keywords:
-                    try:
-                        kw_json = json.dumps(r.keywords)
-                        db.update_photo(r.photo_id, keywords=kw_json)
+                try:
+                    # Always persist the column ('[]' for empty) so a successful
+                    # empty result marks done in one pass; only timeouts defer.
+                    kw_json = json.dumps(r.keywords or [])
+                    db.update_photo(r.photo_id, keywords=kw_json)
+                    if r.keywords:
                         db.log_generation(r.photo_id, "keywords", kw_json,
                                           r.model, r.model_version)
-                        written += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to store keywords for photo {r.photo_id}: {e}")
-                        try:
-                            db.log_error("keywords", str(r.photo_id), str(e))
-                        except Exception:
-                            pass
+                    written += 1
+                except Exception as e:
+                    logger.warning(f"Failed to store keywords for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("keywords", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
             db.end_batch()
             # Mark all submitted photos as processed (including those with no keywords)
             if processed_photo_ids:
