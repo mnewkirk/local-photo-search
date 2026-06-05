@@ -43,7 +43,7 @@ def file_hash(filepath: str, chunk_size: int = 8192) -> str:
 # folders (e.g. organizational duplicate trees) come from the
 # PHOTOSEARCH_EXCLUDED_DIRS env var, colon-separated to allow names
 # with spaces — set it in docker-compose.<env>.yml, not here.
-_BUILTIN_EXCLUDED_DIRS = {"results", "references", ".references", "thumbnails"}
+_BUILTIN_EXCLUDED_DIRS = {"results", "references", ".references", "thumbnails", "_incoming"}
 _user_excluded = os.environ.get("PHOTOSEARCH_EXCLUDED_DIRS", "")
 EXCLUDED_DIRS = _BUILTIN_EXCLUDED_DIRS | {
     d.strip() for d in _user_excluded.split(":") if d.strip()

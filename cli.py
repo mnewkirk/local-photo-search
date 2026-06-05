@@ -1228,6 +1228,93 @@ def cleanup_orphans(db, dry_run):
 
 
 # ---------------------------------------------------------------------------
+# ingest-incoming
+# ---------------------------------------------------------------------------
+
+@cli.command("ingest-incoming")
+@click.option("--incoming-root", default="/photos/_incoming", show_default=True,
+              help="Root containing per-source subdirs (matt/, wife/, ...).")
+@click.option("--photo-root", default="/photos", show_default=True,
+              help="Library root — files land under photo-root/YYYY/YYYY-MM-DD_phone-<source>/.")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Scan + dedup, report what would happen, write nothing.")
+@click.option("--index/--no-index", default=True, show_default=True,
+              help="After move, run index_directory on each new date folder "
+                   "(CLIP + colors). Heavier passes (faces/quality/describe) "
+                   "get picked up by the worker fleet on its next claim.")
+def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index):
+    """Sweep phone-synced photos out of _incoming/<source>/ into the library.
+
+    Designed to run daily from cron. Each direct subdir of --incoming-root is
+    treated as one source label (e.g. 'matt', 'wife'); photos under it move
+    to photo-root/YYYY/YYYY-MM-DD_phone-<source>/ based on EXIF date.
+
+    Dedup: any file whose SHA-256 matches an existing photos.file_hash is
+    skipped and the source is moved to <source>/.processed/ for audit. Files
+    that imported successfully are physically moved (not copied) — the phone
+    still has the original via Syncthing's own folder.
+    """
+    from photosearch.ingest import ingest_incoming
+
+    result = ingest_incoming(
+        incoming_root=incoming_root,
+        photo_root=photo_root,
+        db_path=db,
+        dry_run=dry_run,
+    )
+
+    totals = result["totals"]
+    click.echo(f"Scanned {totals['scanned']:,} files across {len(result['sources'])} sources.")
+    for source, stats in result["sources"].items():
+        click.echo(
+            f"  [{source}] scanned={stats['scanned']:,} "
+            f"imported={stats['imported']:,} deduped={stats['deduped']:,} "
+            f"errors={stats['errors']:,}"
+        )
+        for new_dir in stats["new_dirs"]:
+            click.echo(f"     -> {new_dir}")
+    click.echo(
+        f"Totals: imported={totals['imported']:,}  "
+        f"deduped={totals['deduped']:,}  errors={totals['errors']:,}"
+    )
+
+    if dry_run:
+        click.echo("\nDry run — no files moved, no DB rows written.")
+        return
+
+    if not index:
+        return
+
+    # Collect every new dated folder across sources and index each one.
+    new_dirs: list[str] = []
+    for stats in result["sources"].values():
+        new_dirs.extend(stats["new_dirs"])
+    if not new_dirs:
+        return
+
+    click.echo(f"\nIndexing {len(new_dirs)} new folder(s) (CLIP + colors)...")
+    for d in new_dirs:
+        click.echo(f"  -> {d}")
+        try:
+            index_directory(
+                photo_dir=d,
+                db_path=db,
+                enable_clip=True,
+                enable_colors=True,
+                enable_faces=False,
+                enable_describe=False,
+                enable_quality=False,
+                enable_category_content=False,
+                enable_category_visual=False,
+                enable_keywords=False,
+            )
+        except Exception as exc:
+            click.echo(f"     ERROR indexing {d}: {exc}", err=True)
+
+
+# ---------------------------------------------------------------------------
 # face-clusters
 # ---------------------------------------------------------------------------
 

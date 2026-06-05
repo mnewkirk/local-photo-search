@@ -265,6 +265,47 @@ TTL expired and another worker re-processed the same photo.
 $DC photosearch cleanup-orphans [--dry-run]
 ```
 
+## Phone-photo daily ingest
+
+`/photos/_incoming/<source>/` is the staging area for camera-roll syncs from
+phones (Syncthing on Android, Möbius Sync on iPhone). Each top-level subdir
+under `_incoming/` is one "source" label that ends up in the destination
+folder name. `_incoming` is in `_BUILTIN_EXCLUDED_DIRS` (see
+`photosearch/index.py`), so a `photosearch index /photos` never walks the
+staging tree even if it's mid-sync.
+
+The daily sweep:
+
+```bash
+$DC run --rm photosearch ingest-incoming [--dry-run] [--no-index]
+```
+
+For each photo under `_incoming/<source>/`:
+1. SHA-256 the file (`photosearch.index.file_hash`).
+2. `SELECT id FROM photos WHERE file_hash = ?` — if found, move source to
+   `_incoming/<source>/.processed/<rel-subpath>` and skip. The `.processed/`
+   archive is dedup-only — successful imports are *moved out* of `_incoming/`,
+   not copied, so there's no doubled disk usage for new photos.
+3. Otherwise extract EXIF (or mtime fallback), move to
+   `/photos/YYYY/YYYY-MM-DD_phone-<source>/<filename>` (the `_phone-<source>`
+   suffix mirrors M20's `_gphotos` convention so origin stays visible at the
+   path level). Photos with no parseable date land in `/photos/_undated/phone-<source>/`.
+4. By default, runs `index_directory(photo_dir=<new dated folder>)` for
+   CLIP + colors at the end. Faces / quality / describe / tags get picked
+   up by the existing worker fleet on its next claim — no special wiring.
+
+`.processed/` is safe to `rm -rf` at any time; it only holds deduped
+sources kept for audit. Module: `photosearch/ingest.py`. Tests:
+`tests/test_ingest.py` (12 cases — routing, dedup, archive layout,
+mtime fallback, undated bucket, filename-collision suffix, HEIC,
+AppleDouble skip, hidden-source-dir skip).
+
+Cron entry on the NAS:
+
+```cron
+0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming >> /var/log/photo-ingest.log 2>&1
+```
+
 ## Adding Features
 
 - **New CLI command:** Add to `cli.py`, always include `envvar="PHOTOSEARCH_DB"` on `--db`
