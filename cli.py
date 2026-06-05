@@ -1244,7 +1244,12 @@ def cleanup_orphans(db, dry_run):
               help="After move, run index_directory on each new date folder "
                    "(CLIP + colors). Heavier passes (faces/quality/describe) "
                    "get picked up by the worker fleet on its next claim.")
-def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index):
+@click.option("--no-colors", is_flag=True, default=False,
+              help="Skip dominant-color extraction in the post-move index "
+                   "pass (CLIP only). Lighter + faster for the daily cron; "
+                   "colors are not a worker pass, so backfill them later with "
+                   "`photosearch index <dir>`.")
+def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors):
     """Sweep phone-synced photos out of _incoming/<source>/ into the library.
 
     Designed to run daily from cron. Each direct subdir of --incoming-root is
@@ -1294,7 +1299,8 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index):
     if not new_dirs:
         return
 
-    click.echo(f"\nIndexing {len(new_dirs)} new folder(s) (CLIP + colors)...")
+    passes = "CLIP only" if no_colors else "CLIP + colors"
+    click.echo(f"\nIndexing {len(new_dirs)} new folder(s) ({passes})...")
     for d in new_dirs:
         click.echo(f"  -> {d}")
         try:
@@ -1302,7 +1308,7 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index):
                 photo_dir=d,
                 db_path=db,
                 enable_clip=True,
-                enable_colors=True,
+                enable_colors=not no_colors,
                 enable_faces=False,
                 enable_describe=False,
                 enable_quality=False,

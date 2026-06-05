@@ -291,7 +291,10 @@ For each photo under `_incoming/<source>/`:
    suffix mirrors M20's `_gphotos` convention so origin stays visible at the
    path level). Photos with no parseable date land in `/photos/_undated/phone-<source>/`.
 4. By default, runs `index_directory(photo_dir=<new dated folder>)` for
-   CLIP + colors at the end. Faces / quality / describe / tags get picked
+   CLIP + colors at the end. `--no-colors` drops the color pass (CLIP only)
+   — lighter/faster for the daily cron and avoids the memory-heavy color
+   extraction; colors are *not* a worker pass, so backfill them later with
+   `photosearch index <dir>`. Faces / quality / describe / tags get picked
    up by the existing worker fleet on its next claim — no special wiring.
 
 `.processed/` is safe to `rm -rf` at any time; it only holds deduped
@@ -303,7 +306,7 @@ AppleDouble skip, hidden-source-dir skip).
 Cron entry on the NAS:
 
 ```cron
-0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming >> /var/log/photo-ingest.log 2>&1
+0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
 ```
 
 ## Adding Features
