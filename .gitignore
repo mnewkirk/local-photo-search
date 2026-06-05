@@ -72,3 +72,8 @@ photo_index.db.local*
 # Local installer/binary downloads kept in the repo root for convenience
 amdgpu-install*.deb
 amdgpu-insecure-instinct-udev-rules*.deb
+
+# Phone-photo Syncthing staging area (real photos, mid-sync) — runtime data
+photos/
+# Syncthing runtime config — holds private keys, TLS certs, and the apikey
+syncthing-config/
