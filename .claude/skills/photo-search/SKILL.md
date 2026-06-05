@@ -719,11 +719,18 @@ docker run --rm -v /volume1/docker/photosearch:/repo alpine sh -c \
   google_photos_token.json  # Google OAuth token
   .insightface/             # InsightFace model cache (~300MB)
   .cache/photosearch/       # CLIP + aesthetic model cache
-/photos/                    # Photo library (read-only mount)
+/photos/                    # Photo library (rw mount — ingest moves files in)
   2026/2026-01-15/DSC*.JPG  # Year/date-named folders
+  YYYY/YYYY-MM-DD_phone-<source>/  # phone imports (ingest-incoming)
+  _incoming/<source>/       # Syncthing staging (excluded from indexing)
+  _undated/phone-<source>/  # phone photos with no parseable date
 /references/                # Face reference photos
   references.yml            # Person → photo mapping
 ```
+
+> The `/photos` mount is **rw** (not the older ro) so `ingest-incoming` can
+> move phone uploads from `_incoming/` into the year/date tree. `_incoming` is
+> in `_BUILTIN_EXCLUDED_DIRS`, so a `photosearch index /photos` never walks it.
 
 ### Full indexing sequence for a new year
 ```bash
@@ -746,6 +753,73 @@ New faces land with `cluster_id = NULL` and are invisible on `/faces` until
 Run it after each face-indexing pass (or batch thereof). Warning: every run
 renumbers every unknown cluster_id and clears `ignored_clusters`, so any
 "ignore" decisions on unknown clusters need to be reapplied afterward.
+
+### Phone-photo ingest (Syncthing + `ingest-incoming`)
+
+Phones sync their camera roll into `/photos/_incoming/<source>/` via a
+`linuxserver/syncthing` service (`photosearch-syncthing`, web GUI :8384) defined
+in `docker-compose.nas.yml`. The folder is **receive-only**; each top-level
+subdir under `_incoming/` is one source label (`matt`, `nicole`, …). The daily
+sweep evacuates them into the library:
+
+```bash
+$DC photosearch ingest-incoming [--dry-run] [--no-index] [--no-colors]
+```
+
+Per file: SHA-256 → if it matches an existing `photos.file_hash`, move the
+source to `_incoming/<source>/.processed/` (dedup audit) and skip; otherwise
+EXIF-date it and **move** (not copy) to `/photos/YYYY/YYYY-MM-DD_phone-<source>/`
+(undated → `/photos/_undated/phone-<source>/`). Then it indexes each new dated
+folder (CLIP + colors). Module `photosearch/ingest.py`; 12 tests in
+`tests/test_ingest.py`.
+
+- **`--no-colors`** runs the post-move index CLIP-only. Color extraction is the
+  slow, memory-heavy part (~4 s/photo) and a first-time backfill once OOM-cut a
+  run mid-index. The **move phase always completes first** (files land on disk),
+  so a killed index pass only leaves photos un-embedded — `photosearch index
+  /photos` (idempotent) backfills CLIP; colors are **not** a worker pass, so a
+  plain `photosearch index <dir>` backfills those. Faces/quality/describe/tags
+  are left to the worker fleet either way.
+- **Stuck-phone gotcha:** because ingest *moves* files out, the receive-only
+  Syncthing folder records them as local deletions and the **phone permanently
+  shows <100%** — expected, not a fault (all photos reach the NAS; the REST
+  `db/completion?device=<phone>` reads 100%). Do **not** click "Revert Local
+  Changes" — it re-downloads every already-ingested photo. REST apikey is in
+  `syncthing-config/config.xml` (gitignored, along with `photos/`).
+
+### Cron / scheduling on the NAS
+
+The ingest job runs from cron:
+
+```cron
+0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
+```
+
+It lives in **root's crontab** (`sudo crontab -l`), not `/etc/cron.d` — a normal
+`crontab -l` as `cantimatt` is empty. The job needs no root (cantimatt is in the
+`docker` group; the container writes as PUID 1000), so it can move to the user
+crontab — but UGOS ships cron **without** the standard Debian setgid setup, so a
+non-root `crontab` fails `/var/spool/cron: mkstemp: Permission denied`. One-time
+fix as root (a firmware update may revert it):
+
+```bash
+sudo chown root:crontab /usr/bin/crontab && sudo chmod 2755 /usr/bin/crontab
+sudo chown root:crontab /var/spool/cron/crontabs && sudo chmod 1730 /var/spool/cron/crontabs
+sudo chown cantimatt:admin /var/log/photo-ingest.log
+```
+
+Load the user crontab via a temp file — the `( crontab -l; echo '...' ) |
+crontab -` one-liner is paste-fragile (mangled `\` continuations →
+`"-":1: bad minute`):
+
+```bash
+crontab -l 2>/dev/null > /tmp/mycron
+echo '0 3 * * * ...full line...' >> /tmp/mycron
+crontab /tmp/mycron && rm /tmp/mycron
+```
+
+Firmware-proof fallback (keep it root-owned, just drop the password prompt):
+`echo 'cantimatt ALL=(ALL) NOPASSWD: /usr/bin/crontab' | sudo tee /etc/sudoers.d/crontab-nopasswd && sudo chmod 440 /etc/sudoers.d/crontab-nopasswd`.
 
 ---
 

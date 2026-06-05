@@ -309,6 +309,56 @@ Cron entry on the NAS:
 0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
 ```
 
+`--no-colors` keeps the daily sweep CLIP-only: color extraction is the slow,
+memory-heavy part (~4 s/photo) and a first-time backfill once OOM-cut a run
+mid-index. The move phase always completes first (files land safely on disk),
+so a killed index pass only leaves photos un-embedded — re-run
+`photosearch index /photos` (idempotent) to backfill CLIP, and a plain
+`photosearch index <dir>` later for colors (colors are **not** a worker pass).
+
+### Scheduling / crontab perms on the NAS
+
+The cron job lives in **root's crontab** (`sudo crontab -l`), not
+`/etc/cron.d` — a normal `crontab -l` as `cantimatt` is empty. The job needs no
+root (cantimatt is in the `docker` group; the container moves files as PUID
+1000), so it can move to the user crontab — but UGOS ships the cron subsystem
+**without** the standard Debian setgid setup, so a non-root `crontab` fails with
+`/var/spool/cron: mkstemp: Permission denied`. Fix once as root (a firmware
+update may revert it):
+
+```bash
+sudo chown root:crontab /usr/bin/crontab && sudo chmod 2755 /usr/bin/crontab
+sudo chown root:crontab /var/spool/cron/crontabs && sudo chmod 1730 /var/spool/cron/crontabs
+sudo chown cantimatt:admin /var/log/photo-ingest.log   # so the non-root job can append
+```
+
+Then load the user crontab via a temp file — the
+`( crontab -l; echo '...' ) | crontab -` one-liner is paste-fragile (mangled
+line-continuations → `"-":1: bad minute`):
+
+```bash
+crontab -l 2>/dev/null > /tmp/mycron
+echo '0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1' >> /tmp/mycron
+crontab /tmp/mycron && rm /tmp/mycron
+```
+
+Firmware-update-proof fallback (keep it as root, just drop the password prompt):
+`echo 'cantimatt ALL=(ALL) NOPASSWD: /usr/bin/crontab' | sudo tee /etc/sudoers.d/crontab-nopasswd && sudo chmod 440 /etc/sudoers.d/crontab-nopasswd`.
+
+### Syncthing receiver
+
+`docker-compose.nas.yml` runs a `linuxserver/syncthing` service
+(`photosearch-syncthing`, web GUI on :8384) as a **receive-only** folder
+landing phone camera-rolls in `./photos/_incoming/<source>/` (shared host path
+with the photosearch container, mounted rw at `/photos/_incoming`). Because
+`ingest-incoming` *moves* synced files out into the library, the receive-only
+folder records those as local deletions and the **phone permanently shows
+<100%** — this is expected, not a fault (all photos reach the NAS; the
+`db/completion` for the phone device reads 100%). Do **not** click "Revert Local
+Changes" in the Syncthing GUI — it re-downloads every already-ingested photo.
+The apikey for the REST API is in `syncthing-config/config.xml` (gitignored
+along with `photos/`).
+
 ## Adding Features
 
 - **New CLI command:** Add to `cli.py`, always include `envvar="PHOTOSEARCH_DB"` on `--db`
