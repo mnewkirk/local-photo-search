@@ -38,8 +38,9 @@ N tries. `mark_processed` UPSERT-increments. This replaces the manual
 useful for clearing historical pre-v22 markers (which all migrated to
 attempts=1) when you want to give them a clean re-attempt counter.
 
-`generations` (schema v21) is a provenance log — one row per describe/tags/verify
-text artifact, with `photo_id`, `text_type`, `generated_text`, `model_used`,
+`generations` (schema v21) is a provenance log — one row per LLM text artifact
+(describe, category-content/visual, keywords, verify), with `photo_id`,
+`text_type`, `generated_text`, `model_used`,
 `model_version`, `created_at`. The `photos` table still holds the current
 "promoted" description/tags; `generations` is the full history, so outputs from
 different models can coexist with provenance. `worker_api.submit_results` logs a
@@ -182,8 +183,14 @@ is CPU-only). Two ways to launch:
 # Override with --native / --docker. --ollama-host URL for non-default Ollama.
 
 # Or run cli.py directly:
-python cli.py worker -s http://<NAS-IP>:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
+python cli.py worker -s http://<NAS-IP>:8000 -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -d /photos/2026
 ```
+
+**`-d` gotcha:** `-d` must be a real subdirectory (e.g. `/photos/2026` or
+`/photos/2026/2026-04-09`). `-d /photos` — the photo *root* — always 404s
+("No photos found in directory /photos"): `get_directory_photo_ids` strips
+the photo_root prefix, leaving an empty prefix that matches no relative DB
+path. To process the whole library, **omit `-d` entirely.**
 
 Native mode launches `cli.py worker` processes from the project venv (GPU
 auto-detected via torch+rocm / cuda) with `HSA_ENABLE_DXG_DETECTION=1` and
@@ -194,19 +201,41 @@ in `/tmp/photosearch-worker-fleet/worker-N.log`; `--status` / `--logs` /
 Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints),
 `run-workers.sh` (Docker fleet launcher). API routes under `/api/worker/*`.
 Claims have TTL (default 30min) for crash recovery. `submit_results` for the
-describe/tags/verify passes also logs to the `generations` table — the worker
-sends `model` + `model_version` so provenance is captured per artifact.
+LLM passes (describe / category-* / keywords / verify) also logs to the
+`generations` table — the worker sends `model` + `model_version` so provenance
+is captured per artifact.
 
-### Per-pass model strategy
+### Worker passes
 
-No single vision model wins all three text passes, so each has its own default
-(all overridable: `--describe-model`, `--tags-model`, `--verify-model`):
+The valid worker passes (`-p`/`--passes`, enforced by `valid_passes` in
+`cli.py`) are: `clip`, `faces`, `quality`, `describe`, `category-content`,
+`category-visual`, `keywords`, `verify`. The full LLM-backed pass list is:
+
+```
+clip,faces,quality,describe,category-content,category-visual,keywords,verify
+```
+
+**The old `tags` pass was removed** and split into three first-class passes —
+passing `--passes tags` now errors with "unknown pass type". The split:
+
+- **`category-visual`** (vision) — visual-quality tags from the image
+  (inherits the old `tags` task; `--category-visual-model`, default `llava`).
+- **`category-content`** (text-only) — content categories from the existing
+  description (`--category-content-model`, default `llama3.2:3b`).
+- **`keywords`** (text-only) — free-form keywords from the description
+  (`--keywords-model`, default `llama3.2:3b`).
+
+### Per-pass model strategy (Ollama defaults)
+
+No single vision model wins every pass, so each has its own default
+(all overridable: `--describe-model`, `--verify-model`,
+`--category-visual-model`, `--category-content-model`, `--keywords-model`):
 
 - **describe / regen → `llama3.2-vision`** — won a 100-image bakeoff over llava
   on free-form description quality (esp. text/OCR-heavy photos).
-- **tags → `llava`** — the constrained `TAG_PROMPT` task is a different shape;
-  llama3.2-vision degenerates and over-selects on it. `tag_photo` has a
-  regurgitation guard (`_MAX_PLAUSIBLE_TAGS`) that drops responses echoing the
+- **category-visual → `llava`** — the constrained tag task is a different shape;
+  llama3.2-vision degenerates and over-selects on it. The
+  regurgitation guard (`_MAX_PLAUSIBLE_TAGS`) drops responses echoing the
   vocabulary. `photosearch clean-garbage-tags` clears historical regurgitated
   tag sets so they get re-tagged.
 - **verify → `llava`** — must differ from the describe/regen model for an
@@ -215,6 +244,44 @@ No single vision model wins all three text passes, so each has its own default
 `describe.py` has model-aware Ollama options (llama3.2-vision gets
 `temperature` + `repeat_penalty` to suppress repetition loops) plus a
 `_is_degenerate` detector → up to 2 retries → llava fallback in `describe_photo`.
+
+These defaults apply when passes run through **Ollama**. When the fleet routes
+to an OpenAI-compatible backend (LM Studio — see below), per-pass models are
+selected by role env var instead.
+
+### Routing LLM passes to LM Studio (OpenAI-compatible)
+
+`describe.py` can route **all** LLM passes (text *and* vision) to an
+OpenAI-compatible `/chat/completions` endpoint instead of Ollama. Set
+`PHOTOSEARCH_TEXT_LLM_URL` (base must end in `/v1`) and the per-pass model is
+chosen by **role** env var (not by model name):
+
+| Pass | role | Env var |
+|---|---|---|
+| describe (+ regen) | `describe` | `PHOTOSEARCH_LLM_DESCRIBE_MODEL` |
+| verify | `verify` | `PHOTOSEARCH_LLM_VERIFY_MODEL` |
+| category-visual | `visual` | `PHOTOSEARCH_LLM_VISUAL_MODEL` |
+| category-content / keywords | `text` | `PHOTOSEARCH_LLM_TEXT_MODEL` |
+
+`run-workers.sh` has no flag for these — `export` them before a `--native`
+launch (the native launcher inherits exported env):
+
+```bash
+export PHOTOSEARCH_TEXT_LLM_URL=http://<host>:1234/v1
+export PHOTOSEARCH_LLM_DESCRIBE_MODEL=qwen/qwen3.5-9b
+export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-e2b
+export PHOTOSEARCH_LLM_VISUAL_MODEL=google/gemma-4-e2b
+export PHOTOSEARCH_LLM_TEXT_MODEL=llama-3.2-3b-instruct
+./run-workers.sh --native -s http://<NAS-IP>:8000 \
+    -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -n 2
+```
+
+This was adopted because Ollama proved unstable on a single 24 GB AMD GPU
+(`model runner has unexpectedly stopped` under VRAM contention). LM Studio
+caveats: enable JIT loading + max-loaded-models ≥3 + TTL off, and **raise each
+model's context length above the 4096 JIT default** (LM Studio splits context
+across parallel slots, so a vision describe request 400s with `Context size has
+been exceeded`; qwen3.5-9b→16384, gemma→8192 worked).
 
 ### Ollama stall on the text passes — tight per-call timeout
 
@@ -241,10 +308,13 @@ treats the symptom.
 
 CLIP / quality / faces run on the worker's GPU automatically — `clip_embed.py`
 and `faces.py` auto-detect CUDA/ROCm (faces is env-gated via
-`PHOTOSEARCH_DEVICE`, mirroring clip_embed). describe/tags/verify run through
-Ollama; point `OLLAMA_HOST` at whichever host has a GPU-capable Ollama. See the
-photo-search SKILL.md "GPU acceleration" section for per-machine setup
-(Mac Metal, WSL2 + AMD via librocdxg, WSL2 + NVIDIA).
+`PHOTOSEARCH_DEVICE`, mirroring clip_embed). The LLM passes (describe /
+category-* / keywords / verify) run through Ollama by default — point
+`OLLAMA_HOST` at whichever host has a GPU-capable Ollama — or through an
+OpenAI-compatible backend (LM Studio) via `PHOTOSEARCH_TEXT_LLM_URL` (see
+"Routing LLM passes to LM Studio" above). See the photo-search SKILL.md "GPU
+acceleration" section for per-machine setup (Mac Metal, WSL2 + AMD via
+librocdxg, WSL2 + NVIDIA).
 
 ## Vec0 orphan cleanup
 

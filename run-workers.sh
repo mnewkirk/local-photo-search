@@ -14,15 +14,20 @@
 #   ./run-workers.sh --stop                                                 # stop all workers
 #   ./run-workers.sh --logs                                                 # tail all worker logs
 #
-# Ollama for describe/tags/verify passes
-# --------------------------------------
-# If --passes includes describe, tags, or verify, the script checks
-# localhost:11434. If nothing answers, it starts a managed container
-# ($OLLAMA_CONTAINER) and auto-pulls the required models into its volume
-# ($OLLAMA_VOLUME). describe and tags use different models (see the per-pass
-# model strategy in CLAUDE.md); `verify` pulls its verifier model plus the
-# describe + tags models it uses to regenerate failed descriptions.
+# Ollama for the LLM passes (describe / category-* / keywords / verify)
+# ----------------------------------------------------------------------
+# If --passes includes any LLM pass (describe, category-content,
+# category-visual, keywords, verify), the script checks localhost:11434.
+# If nothing answers, it starts a managed container ($OLLAMA_CONTAINER)
+# and auto-pulls the required models into its volume ($OLLAMA_VOLUME).
+# The passes use different models (see the per-pass model strategy in
+# CLAUDE.md); `verify` pulls its verifier model plus the describe +
+# visual models it uses to regenerate failed descriptions.
 # The managed container is torn down by --stop.
+# (The old `tags` pass was removed — it split into category-content,
+# category-visual, and keywords. To route the LLM passes to LM Studio
+# instead of Ollama, export PHOTOSEARCH_TEXT_LLM_URL + PHOTOSEARCH_LLM_*
+# role models before a --native launch; see CLAUDE.md.)
 #
 # PREFER NATIVE OLLAMA (run `ollama serve` on the host) if you can. The
 # managed-in-Docker path shares Docker Desktop's VM memory budget with every
@@ -66,6 +71,17 @@ FORCE=""
 DESCRIBE_MODEL=""
 TAGS_MODEL=""
 VERIFY_MODEL=""
+
+# OpenAI-compatible (LM Studio / llama-server) routing for the LLM passes.
+# When --text-llm-url is set, describe.py routes ALL text+vision calls there
+# instead of Ollama, and per-pass models are chosen by the role vars below.
+# These map to the PHOTOSEARCH_TEXT_LLM_URL / PHOTOSEARCH_LLM_*_MODEL env vars
+# that describe.py reads (so passing the flag is equivalent to exporting them).
+TEXT_LLM_URL="${PHOTOSEARCH_TEXT_LLM_URL:-}"
+LLM_DESCRIBE_MODEL="${PHOTOSEARCH_LLM_DESCRIBE_MODEL:-}"
+LLM_VERIFY_MODEL="${PHOTOSEARCH_LLM_VERIFY_MODEL:-}"
+LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-}"
+LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-}"
 
 # Execution mode. `native` runs `cli.py worker` processes directly from the
 # repo venv (GPU-capable — picks up CUDA/ROCm torch); `docker` runs the
@@ -130,8 +146,19 @@ Start workers:
       --ttl MINUTES       Claim TTL (default: 30)
       --force             Clear existing data and reprocess
       --describe-model M  Ollama model for describe (default: llama3.2-vision)
-      --tags-model M      Ollama model for tags (default: llava)
+      --tags-model M      (legacy — the tags pass was removed; ignored by the worker)
       --verify-model M    Ollama model for verification (default: llava)
+
+  Route the LLM passes to an OpenAI-compatible backend (LM Studio / llama-server)
+  instead of Ollama. When --text-llm-url is set, ALL text+vision calls go there;
+  per-pass model is chosen by role. (Sets PHOTOSEARCH_TEXT_LLM_URL / PHOTOSEARCH_LLM_*
+  for the workers, so no manual export needed. Defaults read from those env vars if
+  already exported.) Base URL must end in /v1.
+      --text-llm-url URL       e.g. http://172.20.176.1:1234/v1
+      --llm-describe-model M   describe + regen   (role: describe)
+      --llm-verify-model M     verify             (role: verify)
+      --llm-visual-model M     category-visual    (role: visual)
+      --llm-text-model M       category-content + keywords (role: text)
       --native            Run bare-metal venv workers (GPU-capable). Auto on WSL2.
       --docker            Run the CPU-only Docker fleet. Auto on Mac/Linux.
       --name NAME         Fleet instance name. Lets multiple fleets run at once
@@ -167,7 +194,7 @@ Examples:
   ./run-workers.sh --name gpu --stop
 
 Ollama note:
-  For describe/tags/verify, PREFER a native `ollama serve` on the host. The
+  For describe/category-*/verify, PREFER a native `ollama serve` on the host. The
   script will detect and reuse it. The managed-in-Docker fallback shares
   Docker Desktop's VM memory with every worker — on a default VM, LLaVA's
   runner is OOM-killed ("llama runner process has terminated", 500). If you
@@ -178,13 +205,16 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Ollama helpers (auto-start for describe/tags/verify passes)
+# Ollama helpers (auto-start for describe/category-*/verify passes)
 # ---------------------------------------------------------------------------
 
 ollama_needed() {
     # Returns 0 if any pass in $PASSES requires an Ollama backend. category-visual
     # is a vision pass; category-content/keywords are text-only but still hit
     # Ollama (small text model on the existing description).
+    # When --text-llm-url is set, the LLM passes route to an OpenAI-compatible
+    # backend (LM Studio) instead, so Ollama is never needed.
+    [ -n "$TEXT_LLM_URL" ] && return 1
     local IFS=','
     for p in $PASSES; do
         case "$p" in
@@ -203,7 +233,7 @@ ollama_container_exists() {
 }
 
 ensure_ollama_running() {
-    # Native mode never manages a Docker Ollama — describe/tags/verify reach
+    # Native mode never manages a Docker Ollama — describe/category-*/verify reach
     # whatever Ollama $OLLAMA_URL points at (a Windows-host Ollama on WSL2, or
     # a local `ollama serve`). Just check reachability and warn.
     if [ "$MODE" = "native" ]; then
@@ -211,7 +241,7 @@ ensure_ollama_running() {
             echo "  Ollama reachable at ${OLLAMA_URL}"
         else
             echo "  WARNING: Ollama not reachable at ${OLLAMA_URL}" >&2
-            echo "  describe/tags/verify will fail. Start Ollama on that host," >&2
+            echo "  describe/category-*/verify will fail. Start Ollama on that host," >&2
             echo "  or pass --ollama-host URL." >&2
         fi
         return
@@ -448,7 +478,7 @@ do_status() {
     elif ollama_is_reachable; then
         echo "  External Ollama reachable at localhost:${OLLAMA_PORT} (not managed by this script)"
     else
-        echo "  Not running. Will auto-start if a describe/tags/verify pass is launched."
+        echo "  Not running. Will auto-start if a describe/category-*/verify pass is launched."
     fi
     echo ""
     exit 0
@@ -599,6 +629,7 @@ for a in json.load(sys.stdin):
             -e HF_HOME=/model-cache/huggingface \
             -e INSIGHTFACE_HOME=/model-cache/insightface \
             -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
+            ${LLM_ENV_DOCKER[@]+"${LLM_ENV_DOCKER[@]}"} \
             "$TEMPLATE_IMAGE" \
             "${CMD_ARRAY[@]}" \
             > /dev/null
@@ -704,6 +735,11 @@ while [[ $# -gt 0 ]]; do
         --describe-model)   DESCRIBE_MODEL="$2";   shift 2 ;;
         --tags-model)       TAGS_MODEL="$2";       shift 2 ;;
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
+        --text-llm-url)     TEXT_LLM_URL="$2";        shift 2 ;;
+        --llm-describe-model) LLM_DESCRIBE_MODEL="$2"; shift 2 ;;
+        --llm-verify-model)   LLM_VERIFY_MODEL="$2";   shift 2 ;;
+        --llm-visual-model)   LLM_VISUAL_MODEL="$2";   shift 2 ;;
+        --llm-text-model)     LLM_TEXT_MODEL="$2";     shift 2 ;;
         --native)           MODE="native";         shift ;;
         --docker)           MODE="docker";         shift ;;
         --name)             FLEET_NAME="$2";       shift 2 ;;
@@ -720,6 +756,24 @@ done
 # Resolve execution mode + Ollama URL now that flags are parsed.
 detect_mode
 OLLAMA_URL="$(resolve_ollama_url)"
+
+# Assemble the OpenAI-compatible (LM Studio / llama-server) routing env from the
+# --text-llm-url / --llm-*-model flags. Only vars the user actually set are
+# included, so an unset role falls back to describe.py's own default. Two forms:
+# KEY=VAL pairs for the native `env` prefix, and `-e KEY=VAL` for `docker run`.
+LLM_ENV_PAIRS=()
+[ -n "$TEXT_LLM_URL" ]       && LLM_ENV_PAIRS+=("PHOTOSEARCH_TEXT_LLM_URL=$TEXT_LLM_URL")
+[ -n "$LLM_DESCRIBE_MODEL" ] && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_DESCRIBE_MODEL=$LLM_DESCRIBE_MODEL")
+[ -n "$LLM_VERIFY_MODEL" ]   && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_VERIFY_MODEL=$LLM_VERIFY_MODEL")
+[ -n "$LLM_VISUAL_MODEL" ]   && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_VISUAL_MODEL=$LLM_VISUAL_MODEL")
+[ -n "$LLM_TEXT_MODEL" ]     && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_TEXT_MODEL=$LLM_TEXT_MODEL")
+LLM_ENV_DOCKER=()
+for _kv in ${LLM_ENV_PAIRS[@]+"${LLM_ENV_PAIRS[@]}"}; do
+    LLM_ENV_DOCKER+=("-e" "$_kv")
+done
+if [ -n "$TEXT_LLM_URL" ]; then
+    echo "  LLM passes route to OpenAI-compatible backend: $TEXT_LLM_URL"
+fi
 
 # Apply the fleet-instance suffix (from --name) to everything that distinguishes
 # one fleet from another: native pid/log dir, docker container-name prefix, and
@@ -898,6 +952,7 @@ if [ "$MODE" = "docker" ]; then
             -e HF_HOME=/model-cache/huggingface \
             -e INSIGHTFACE_HOME=/model-cache/insightface \
             -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
+            ${LLM_ENV_DOCKER[@]+"${LLM_ENV_DOCKER[@]}"} \
             "$IMAGE_TAG" \
             $WORKER_CMD \
             > /dev/null
@@ -911,7 +966,8 @@ else
         LOGF="$NATIVE_RUNDIR/worker-$i.log"
         echo "  Starting worker-$i → $LOGF"
         HSA_ENABLE_DXG_DETECTION=1 OLLAMA_HOST="$OLLAMA_URL" PYTHONUNBUFFERED=1 \
-            nohup "$VENV_PYTHON" cli.py $WORKER_CMD > "$LOGF" 2>&1 &
+            nohup env ${LLM_ENV_PAIRS[@]+"${LLM_ENV_PAIRS[@]}"} \
+            "$VENV_PYTHON" cli.py $WORKER_CMD > "$LOGF" 2>&1 &
         echo $! > "$NATIVE_RUNDIR/worker-$i.pid"
     done
 fi

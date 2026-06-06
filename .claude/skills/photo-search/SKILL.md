@@ -110,7 +110,7 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | review_selections | Culling selections per folder |
 | google_photos_uploads | Upload ledger (album_id, filepath, media_item_id) |
 | ignored_clusters | Face clusters marked to ignore |
-| generations | Provenance log for describe/tags/verify text artifacts (v21) |
+| generations | Provenance log for LLM text artifacts — describe / category-* / keywords / verify (v21) |
 | schema_info | Schema version + photo_root path |
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
@@ -842,10 +842,12 @@ Common options:
   --faces / --force-faces      Face detection + ArcFace encoding (InsightFace buffalo_l)
   --quality / --force-quality  Aesthetic scoring (ViT-L/14 + MLP) + concept analysis
   --describe / --force-describe  LLaVA scene descriptions (requires Ollama)
-  --describe-model MODEL       Ollama model name (default: llava; alt: moondream)
-  --tags / --force-tags        Semantic tags from fixed ~60-tag vocabulary (requires Ollama)
+  --describe-model MODEL       Ollama model name (default: llama3.2-vision)
+  --category-content / --force-category-content  Content categories from descriptions (text-only LLM)
+  --category-visual / --force-category-visual    Visual-quality tags from images (vision LLM)
+  --keywords / --force-keywords                  Free-form keywords from descriptions (text-only LLM)
   --no-colors                  Disable dominant color extraction (on by default)
-  --full                       Enable all: --clip --faces --describe --quality --tags
+  --full                       Enable all: --faces --describe --quality --category-content --category-visual --keywords
   --verify                     Run hallucination verification after other passes
   --batch-size N               Batch size for CLIP/quality (default: 8)
   --db PATH                    Database path (default: PHOTOSEARCH_DB env var)
@@ -866,17 +868,21 @@ Collection-only options:
 | Quality scoring | `--quality` | ViT-L/14 (768-dim) + MLP | ~1000 photos/hr | None |
 | Concept analysis | (auto with quality) | Same ViT-L/14 | Runs after scoring | Quality pass |
 | Descriptions | `--describe` | `llama3.2-vision` via Ollama (`--describe-model`) | 30-200s/photo CPU, ~4s GPU | Ollama running |
-| Tags | `--tags` | `llava` via Ollama (`--tags-model`) — decoupled from describe | 30-200s/photo CPU, ~1s GPU | Ollama running |
+| Category (visual) | `--category-visual` | `llava` via Ollama (`--category-visual-model`) — visual-quality tags from the image | 30-200s/photo CPU, ~1s GPU | Ollama running |
+| Category (content) | `--category-content` | `llama3.2:3b` via Ollama (`--category-content-model`) — text-only, from description | ~text-only | Description exists |
+| Keywords | `--keywords` | `llama3.2:3b` via Ollama (`--keywords-model`) — text-only, from description | ~text-only | Description exists |
 | Critique | (auto) | Same as describe model | 30-200s/photo | Quality + describe |
 | Stacking | (auto after CLIP) | — | Fast (DB only) | CLIP embeddings |
 | Geocoding | (auto) | GeoNames (offline) | Fast | GPS data in EXIF |
 | Verification | `--verify` | `llava` checker + `llama3.2-vision` regen | Slow (2 LLM passes) | Descriptions exist |
 
-The describe/tags/verify models are decoupled because no single vision model
-wins all three — see "Per-pass model strategy" under Distributed Indexing,
-and CLAUDE.md. `describe.py` has model-aware Ollama options + a degeneration
-detect-retry-fallback for `llama3.2-vision`, and a regurgitation guard in
-`tag_photo`.
+The old single `tags` pass was removed and split into `category-visual`
+(vision), `category-content` (text), and `keywords` (text). The per-pass
+models are decoupled because no single model wins all — see "Per-pass model
+strategy" under Distributed Indexing, and CLAUDE.md. `describe.py` has
+model-aware Ollama options + a degeneration detect-retry-fallback for
+`llama3.2-vision`, and a regurgitation guard on the visual-tag task.
+(`clean-garbage-tags` still exists to clear historical regurgitated tag sets.)
 
 ### Parallelization
 
@@ -1107,8 +1113,14 @@ another worker before the original submit lands.
 ## Distributed Indexing (Worker System)
 
 The worker system lets you offload heavy indexing passes (CLIP, faces, quality,
-describe, tags, verify) to a fast laptop/desktop while the NAS remains the single
-source of truth (DB + photos).
+describe, category-content, category-visual, keywords, verify) to a fast
+laptop/desktop while the NAS remains the single source of truth (DB + photos).
+
+The valid pass tokens (enforced by `valid_passes` in `cli.py`) are: `clip`,
+`faces`, `quality`, `describe`, `category-content`, `category-visual`,
+`keywords`, `verify`. **The old `tags` pass was removed — `--passes tags` now
+errors.** It was split into `category-visual` (vision tags), `category-content`
+(text categories), and `keywords` (text keywords).
 
 ### Architecture
 
@@ -1157,27 +1169,73 @@ isolated network and cannot resolve local DNS names like `nas.local` or mDNS hos
 
 Key options: `-n` (number of workers, default 4), `-m` (memory limit, default 3g),
 `--batch-size`, `--model-batch-size`, `--ttl`, `--force`, `--describe-model`,
-`--tags-model`, `--verify-model`.
+`--verify-model` (the `cli.py worker` command also has `--category-content-model`,
+`--category-visual-model`, `--keywords-model`, though `run-workers.sh` does not
+forward them yet).
+
+**`-d` gotcha:** `-d` must be a real subdirectory like `/photos/2026`. `-d /photos`
+(the photo root) always 404s — `get_directory_photo_ids` strips the photo_root
+prefix and the empty remainder matches no relative DB path. Omit `-d` entirely to
+process the whole queue.
 
 CPU-only inference is ~2-3x slower per worker than MPS, but 4 containers running
 concurrently with stable memory is faster than 1-2 MPS workers that eventually crash.
 
-#### Ollama for describe/tags/verify passes
+#### Ollama for the LLM passes (describe / category-* / keywords / verify)
 
-If `--passes` includes `describe`, `tags`, or `verify`, the script checks
-`localhost:11434` and either reuses an existing Ollama or starts a managed
-container. It then pre-pulls the required models into the Ollama volume:
+If `--passes` includes any LLM pass (`describe`, `category-content`,
+`category-visual`, `keywords`, `verify`), the script checks `localhost:11434`
+and either reuses an existing Ollama or starts a managed container. It then
+pre-pulls the required models into the Ollama volume:
 
 - `describe` → pulls `${DESCRIBE_MODEL:-llama3.2-vision}`
-- `tags` → pulls `${TAGS_MODEL:-llava}` (decoupled from describe — different
-  model wins the constrained tagging task)
+- `category-visual` → pulls `${CATEGORY_VISUAL_MODEL:-llava}` (the constrained
+  visual-tag task — a different model wins it than free-form describe)
+- `category-content` / `keywords` → pull `llama3.2:3b` (text-only)
 - `verify` → pulls **all of** `${VERIFY_MODEL:-llava}` (verifier),
-  `${DESCRIBE_MODEL:-llama3.2-vision}` (regeneration model), and the tags model.
+  `${DESCRIBE_MODEL:-llama3.2-vision}` (regeneration model), and the visual model.
   Ollama does not auto-pull on request, so they must be present before the pass.
 
-Because describe and tags now use different models, **don't bundle `describe`
-and `tags` in one `--passes` run** — Ollama would swap models between batches.
-Run them as separate invocations.
+Because describe and category-visual use different vision models, **don't bundle
+both vision passes in one `--passes` run on a VRAM-constrained host** — Ollama
+would swap models between batches. Run heavy vision passes as separate
+invocations, or route to LM Studio (below).
+
+#### Routing the LLM passes to LM Studio (OpenAI-compatible)
+
+Instead of Ollama, the LLM passes can route to an OpenAI-compatible
+`/chat/completions` server (LM Studio, llama-server) by setting
+`PHOTOSEARCH_TEXT_LLM_URL` (base must end in `/v1`). When set, **all** text and
+vision calls go there. The per-pass model is chosen by role env var:
+
+| Pass | role | Env var |
+|---|---|---|
+| describe (+ regen) | `describe` | `PHOTOSEARCH_LLM_DESCRIBE_MODEL` |
+| verify | `verify` | `PHOTOSEARCH_LLM_VERIFY_MODEL` |
+| category-visual | `visual` | `PHOTOSEARCH_LLM_VISUAL_MODEL` |
+| category-content / keywords | `text` | `PHOTOSEARCH_LLM_TEXT_MODEL` |
+
+`run-workers.sh` has no flag for these — `export` them before a `--native` launch
+(the native launcher inherits exported env):
+
+```bash
+export PHOTOSEARCH_TEXT_LLM_URL=http://<host>:1234/v1
+export PHOTOSEARCH_LLM_DESCRIBE_MODEL=qwen/qwen3.5-9b
+export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-e2b
+export PHOTOSEARCH_LLM_VISUAL_MODEL=google/gemma-4-e2b
+export PHOTOSEARCH_LLM_TEXT_MODEL=llama-3.2-3b-instruct
+./run-workers.sh --native -s http://<NAS-IP>:8000 \
+    -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -n 2
+```
+
+Adopted because Ollama was unstable on the single 24 GB AMD GPU (`model runner
+has unexpectedly stopped` under VRAM contention). **LM Studio config that
+matters:** JIT loading on, max-loaded-models ≥3, model TTL off — and **raise
+each model's context length above the 4096 JIT default**. LM Studio splits the
+loaded context across parallel slots, so a ~1367-token vision describe request
+400s with `Context size has been exceeded` at 4096/N-slots; set qwen3.5-9b →
+16384, gemma-4-e2b → 8192, llama-3.2-3b → 8192. JIT loads at the 4096 default,
+so save per-model load config (or load manually with TTL off) to make it stick.
 
 **Prefer native Ollama, on the GPU.** Ollama performance is dominated by
 whether inference runs on a GPU vs CPU. Switching from CPU-only Docker
@@ -1281,7 +1339,7 @@ have no official WSL2 ROCm support.
 |---|---|
 | clip, quality | PyTorch-ROCm in the worker's venv |
 | faces | onnxruntime-rocm in the worker's venv |
-| describe, tags, verify | **Windows-native Ollama** — worker `OLLAMA_HOST` → Windows host |
+| describe, category-*, keywords, verify | **Windows-native Ollama** (or LM Studio via `PHOTOSEARCH_TEXT_LLM_URL`) — on the Windows host |
 
 **Do NOT run Ollama inside WSL2 for AMD GPUs.** The modern ROCm-on-WSL stack
 routes HSA through `/dev/dxg` via AMD's `librocdxg` shim (there is no
@@ -1320,7 +1378,7 @@ Setup:
    HSA_ENABLE_DXG_DETECTION=1 \
    OLLAMA_HOST=http://$(ip route show default | awk '{print $3}'):11434 \
      python cli.py worker -s http://<NAS-IP>:8000 \
-     -p clip,faces,quality,describe,tags,verify -d /photos/<year>
+     -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -d /photos/<year>
    ```
    The WSL2 NAT gateway IP (`ip route show default`) is the Windows host —
    it can change across WSL restarts, so resolve it dynamically.
@@ -1343,8 +1401,8 @@ Better-supported path than AMD. Install NVIDIA's WSL2 driver on Windows
 ##### Fallback: route describe to whichever machine has the GPU
 
 If a machine can't reach GPU acceleration, leave it on CPU-only passes
-(`-p clip,faces,quality`) and push describe traffic to the GPU machine
-alone (`-p describe,tags`). The `BEGIN IMMEDIATE` claim-batch
+(`-p clip,faces,quality`) and push the LLM passes to the GPU machine
+alone (`-p describe,category-visual`). The `BEGIN IMMEDIATE` claim-batch
 serialization (commit `64eb1ac`) keeps this safe under concurrency —
 multiple machines claiming describe batches serialize on the NAS writer
 lock without duplicate work.
@@ -1353,16 +1411,17 @@ lock without duplicate work.
 
 Use the bare-metal worker (not the Docker fleet) when the machine has a **GPU** —
 the Docker fleet is CPU-only PyTorch, so a GPU box must run the worker directly
-to pick up CUDA/ROCm. For describe/tags/verify, set `OLLAMA_HOST` to whichever
-host runs a GPU-capable Ollama. (The Docker fleet is still preferred on Mac for
-its memory-stability under MPS.)
+to pick up CUDA/ROCm. For the LLM passes (describe / category-* / keywords /
+verify), set `OLLAMA_HOST` to whichever host runs a GPU-capable Ollama (or
+`PHOTOSEARCH_TEXT_LLM_URL` for an LM Studio backend). (The Docker fleet is still
+preferred on Mac for its memory-stability under MPS.)
 
 ```bash
 # Run CLIP embeddings for a directory:
 python cli.py worker -s http://nas.local:8000 -p clip -d /photos/2026/2026-04-09
 
 # Run full pipeline on a directory:
-python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,tags,verify -d /photos/2026
+python cli.py worker -s http://nas.local:8000 -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -d /photos/2026
 
 # Run CLIP + quality for a collection:
 python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
@@ -1370,8 +1429,8 @@ python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
 # Run descriptions with a non-default model:
 python cli.py worker -s http://nas.local:8000 -p describe --describe-model moondream
 
-# Run tags with a specific tags model (decoupled from describe):
-python cli.py worker -s http://nas.local:8000 -p tags --tags-model llava
+# Run visual tags with a specific model (decoupled from describe):
+python cli.py worker -s http://nas.local:8000 -p category-visual --category-visual-model llava
 
 # GPU worker on WSL2 — CLIP/quality/faces via ROCm, describe via Windows Ollama:
 HSA_ENABLE_DXG_DETECTION=1 OLLAMA_HOST=http://<windows-host>:11434 \
@@ -1387,7 +1446,8 @@ python cli.py worker -s http://nas.local:8000 -p clip --collection 3 --force
 Key options: `--batch-size` (photos per claim, default 16), `--model-batch-size`
 (inference batch, default 8), `--ttl` (claim TTL minutes, default 30), `--one-shot`
 (single batch then exit), `--force` (clear + reprocess, requires --collection or
---directory), `--describe-model` / `--tags-model` / `--verify-model`.
+--directory), `--describe-model` / `--verify-model` / `--category-content-model`
+/ `--category-visual-model` / `--keywords-model`.
 
 ### Worker API Endpoints
 
@@ -1398,8 +1458,9 @@ Key options: `--batch-size` (photos per claim, default 16), `--model-batch-size`
 | `POST /api/worker/clear-pass` | Clear processing state to allow re-processing |
 
 `submit-results` accepts optional `model` + `model_version` fields (the worker
-populates them for describe/tags/verify); the describe/tags/verify branches log
-a row to the `generations` provenance table via `db.log_generation()`.
+populates them for the LLM passes — describe / category-* / keywords / verify);
+those branches log a row to the `generations` provenance table via
+`db.log_generation()`.
 | `GET /api/worker/photo-detail/{id}` | Get photo metadata + CLIP embedding (for verify) |
 | `GET /api/worker/status` | Queue depth and active claims |
 
