@@ -134,6 +134,13 @@ def run_one(db, model, prompt_text):
 
 
 def main():
+    # Rebuild the HTML from the last results.json without re-running the models.
+    if "--html-only" in sys.argv[1:]:
+        data = json.loads((OUT_DIR / "bakeoff_results.json").read_text())
+        build_html(data["models"], data["results"])
+        print(f"Rebuilt {OUT_DIR/'bakeoff_report.html'} from cached results")
+        return
+
     models = sys.argv[1:] or MODELS_DEFAULT
     if not os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
         sys.exit("PHOTOSEARCH_TEXT_LLM_URL must be set (LM Studio /v1 endpoint)")
@@ -185,7 +192,9 @@ def build_html(models, results):
                 continue
             b = _fetch_thumb_b64(pid, thumb_cache)
             if b:
-                imgs.append(f'<img src="data:image/jpeg;base64,{b}" title="id {esc(pid)}"/>')
+                imgs.append(f'<img class="thumb" src="data:image/jpeg;base64,{b}" '
+                            f'title="id {esc(pid)} — click to enlarge" '
+                            f'onclick="showLb(this.src)"/>')
         return ('<div class="thumbs">' + "".join(imgs) + "</div>") if imgs \
                else '<div class="thumbs muted">— no photos —</div>'
 
@@ -250,7 +259,11 @@ def build_html(models, results):
  .b.warn {{ background:#fde9c8; }} .b.err {{ background:#f7c5c5; }}
  .answer {{ margin:6px 0; }} .errmsg {{ color:#a00; font-size:12px; }}
  .thumbs {{ display:flex; flex-wrap:wrap; gap:4px; margin:6px 0; }}
- .thumbs img {{ width:84px; height:84px; object-fit:cover; border-radius:4px; border:1px solid #ccc; }}
+ .thumbs img {{ width:84px; height:84px; object-fit:cover; border-radius:4px; border:1px solid #ccc; cursor:zoom-in; transition:transform .08s; }}
+ .thumbs img:hover {{ transform:scale(1.06); border-color:#37c; }}
+ #lb {{ position:fixed; inset:0; background:rgba(0,0,0,.88); display:none; align-items:center; justify-content:center; z-index:1000; cursor:zoom-out; }}
+ #lb.show {{ display:flex; }}
+ #lb img {{ max-width:94vw; max-height:94vh; border-radius:6px; box-shadow:0 0 50px #000; }}
  details {{ margin-top:6px; }} summary {{ cursor:pointer; font-size:12px; color:#37c; }}
  .trace {{ font:11px/1.5 monospace; background:#f6f6f9; padding:6px; border-radius:4px; margin-top:4px; }}
  .call {{ color:#225; }} .args {{ color:#888; }} .res {{ color:#363; }}
@@ -262,6 +275,11 @@ def build_html(models, results):
 Objective metrics only — read the traces + snapshots for quality. "tool-using" = ran real tool calls (not single-shot fallback).</div>
 <table class="scoreboard"><tr><th>model</th><th>tool-using</th><th>non-empty</th><th>errors</th><th>avg time</th></tr>{''.join(score_rows)}</table>
 <table><tr><th>prompt</th>{head_cols}</tr>{''.join(body_rows)}</table>
+<div id="lb" onclick="this.classList.remove('show')"><img id="lbimg" alt="preview"/></div>
+<script>
+ function showLb(src) {{ var l=document.getElementById('lb'); document.getElementById('lbimg').src=src; l.classList.add('show'); }}
+ document.addEventListener('keydown', function(e) {{ if (e.key==='Escape') document.getElementById('lb').classList.remove('show'); }});
+</script>
 </body></html>"""
     (OUT_DIR / "bakeoff_report.html").write_text(html_doc)
 
