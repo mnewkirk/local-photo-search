@@ -174,10 +174,43 @@ def get_authorization_url(db_path: str, redirect_uri: Optional[str] = None) -> s
     return f"{GOOGLE_AUTH_URL}?{query}"
 
 
+def extract_auth_code(raw: str) -> str:
+    """Pull an OAuth authorization code out of whatever the user pasted.
+
+    Accepts any of:
+      - the bare code ("4/0Ad...")
+      - the full callback URL
+        ("http://localhost:8000/api/google/callback?iss=...&code=4/0Ad...&scope=...")
+      - a bare query string ("iss=...&code=4/0Ad...&scope=...")
+
+    Returns the decoded code. The manual-paste path needs this because the
+    callback redirect can't reach the NAS, so the user copies the code out of
+    the browser error page — and browsers often URL-encode the embedded `/`
+    (e.g. `4%2F0Ad...`), which Google's token endpoint rejects verbatim.
+    """
+    from urllib.parse import parse_qs, unquote
+
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    # A full URL or query string carries the code in a `code=` param. Take the
+    # query portion (after the first '?', if any) so a path can't confuse the
+    # parser, then let parse_qs split on '&' and URL-decode the value.
+    if "code=" in raw:
+        query = raw.split("?", 1)[1] if "?" in raw else raw
+        codes = parse_qs(query).get("code")
+        if codes:
+            return codes[0]
+    # Otherwise it's a bare code; still decode any percent-escapes.
+    return unquote(raw)
+
+
 def exchange_code(db_path: str, code: str, redirect_uri: Optional[str] = None) -> dict:
     """Exchange an authorization code for access + refresh tokens.
 
     Called from the OAuth callback endpoint. Saves the tokens to disk.
+    `code` may be a bare code or a full callback URL — extract_auth_code
+    normalizes it.
 
     Returns the token dict (includes access_token, refresh_token, expires_in).
     Raises requests.HTTPError on failure.
@@ -185,6 +218,8 @@ def exchange_code(db_path: str, code: str, redirect_uri: Optional[str] = None) -
     secret = load_client_secret(db_path)
     if not secret:
         raise RuntimeError("Google client secret not configured")
+
+    code = extract_auth_code(code)
 
     redirect = redirect_uri or os.environ.get("GOOGLE_REDIRECT_URI", DEFAULT_REDIRECT_URI)
 
