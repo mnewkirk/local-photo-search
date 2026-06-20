@@ -244,7 +244,25 @@ def refresh_access_token(db_path: str) -> Optional[str]:
             },
             timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # invalid_grant = refresh token revoked or expired (Google expires
+            # refresh tokens after 7 days while the OAuth app is in "Testing"
+            # publishing status). The stored token is dead — clear it so the
+            # UI drops to "not connected" and raise a clean, actionable error
+            # instead of letting a raw HTTPError become a 500.
+            try:
+                err = resp.json().get("error", "")
+            except Exception:
+                err = ""
+            if err == "invalid_grant":
+                clear_token(db_path)
+                raise RuntimeError(
+                    "Google authorization has expired — please reconnect your "
+                    "Google account. (If this keeps happening weekly, change the "
+                    "OAuth consent screen from 'Testing' to 'In production' in the "
+                    "Google Cloud Console.)"
+                )
+            resp.raise_for_status()
         new_token = resp.json()
         new_token["refresh_token"] = refresh_tok  # Google omits it on refresh
         new_token["obtained_at"] = time.time()

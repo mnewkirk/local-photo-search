@@ -3019,12 +3019,36 @@ def api_google_status():
 
     Returns:
       configured: bool — client_secret.json is present
-      authenticated: bool — valid tokens are stored
+      authenticated: bool — a token is stored AND still refreshable
+      needs_reauth: bool — a token existed but its refresh failed (expired/
+                    revoked); the dead token has been cleared
     """
-    from .google_photos import is_configured, is_authenticated
+    from .google_photos import is_configured, is_authenticated, refresh_access_token
+
+    configured = is_configured(_db_path)
+    had_token = is_authenticated(_db_path)
+    needs_reauth = False
+    authenticated = had_token
+
+    # A bare token-file check reports "connected" even when the refresh token
+    # has expired, so uploads then 500. Validate by attempting a refresh; this
+    # only hits the network when the access token is near expiry, and
+    # refresh_access_token clears the token on invalid_grant.
+    if had_token:
+        try:
+            authenticated = bool(refresh_access_token(_db_path))
+        except RuntimeError:
+            authenticated = False
+            needs_reauth = True
+        except Exception:
+            # Transient network/Google error — don't claim the user must
+            # reconnect; leave them as authenticated and let upload surface it.
+            authenticated = True
+
     return {
-        "configured": is_configured(_db_path),
-        "authenticated": is_authenticated(_db_path),
+        "configured": configured,
+        "authenticated": authenticated,
+        "needs_reauth": needs_reauth,
     }
 
 

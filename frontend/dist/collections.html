@@ -1055,7 +1055,11 @@
 
               // ---- Not authenticated ----
               notAuthenticated && e('div', { style: { background: 'rgba(74,158,255,0.08)', border: '1px solid var(--accent)', borderRadius: 6, padding: '12px 14px', marginBottom: 16, fontSize: 13 } },
-                e('p', { style: { fontWeight: 600, marginBottom: 6 } }, 'Connect your Google account'),
+                e('p', { style: { fontWeight: 600, marginBottom: 6 } },
+                  googleStatus.needs_reauth ? 'Reconnect your Google account' : 'Connect your Google account'),
+                googleStatus.needs_reauth && e('p', { style: { color: 'var(--orange, #e0a030)', marginBottom: 10 } },
+                  'Your Google authorization expired. Sign in again to keep uploading. (To stop this recurring weekly, set the OAuth consent screen to "In production" in the Google Cloud Console.)',
+                ),
                 e('p', { style: { color: 'var(--text-muted)', marginBottom: 10 } },
                   'A sign-in window will open. After authorizing, you\'ll be connected automatically.',
                 ),
