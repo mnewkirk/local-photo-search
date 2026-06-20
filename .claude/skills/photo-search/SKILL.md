@@ -768,10 +768,32 @@ $DC photosearch ingest-incoming [--dry-run] [--no-index] [--no-colors]
 
 Per file: SHA-256 → if it matches an existing `photos.file_hash`, move the
 source to `_incoming/<source>/.processed/` (dedup audit) and skip; otherwise
-EXIF-date it and **move** (not copy) to `/photos/YYYY/YYYY-MM-DD_phone-<source>/`
-(undated → `/photos/_undated/phone-<source>/`). Then it indexes each new dated
-folder (CLIP + colors). Module `photosearch/ingest.py`; 12 tests in
+EXIF-date it and **move** (not copy) to `/photos/YYYY/YYYY-MM-DD_<suffix>/`
+(undated → `/photos/_undated/<suffix>/`). Then it indexes each new dated
+folder (CLIP + colors). Module `photosearch/ingest.py`; 15 tests in
 `tests/test_ingest.py`.
+
+- **Folder suffix** (`_folder_suffix`): `phone-<source>` for human labels
+  (`matt`, `wife`), bare `<source>` for camera-model labels (uppercase alnum
+  with a digit, e.g. `ILCE-7RM6` → `2026-06-19_ILCE-7RM6/`). The SD-card
+  importer (`D:\Photos\import-photos-safe.ps1`) names `_incoming/<model>/` dirs
+  after the EXIF camera model, so camera bodies get clean per-model folders
+  with zero config. Force either behavior with `--bare-source` /
+  `--phone-source` (or `PHOTOSEARCH_INGEST_BARE_SOURCES` /
+  `PHOTOSEARCH_INGEST_PHONE_SOURCES`, comma-separated).
+- **RAW + video companions:** ingest relocates RAW (`RAW_EXTENSIONS`) and video
+  (`VIDEO_EXTENSIONS`) into the dated library folder too (every file reaches
+  the NAS) but **never indexes them** — no DB row, no CLIP, and their folders
+  are kept out of `new_dirs`. They dedup at the destination (same name + hash)
+  instead of via `photos.file_hash`. Video with no EXIF routes by mtime. The
+  importer reads RAW's EXIF model (RAW co-locates with its JPEG); model-less
+  video rides the batch's single camera model or lands under `unknown-camera`
+  (default-bare). `stats` gains `companions_moved` / `companions_deduped`.
+- **On-demand run:** the `/status` **Ingest incoming** card hits
+  `POST /api/admin/ingest-incoming` (SSE; `?dry_run=true` supported), which
+  streams `docker compose run --rm --no-deps photosearch ingest-incoming
+  --no-colors` — the same job as the cron, in a throwaway sibling container so
+  the CLIP import never runs inside the web process.
 
 - **`--no-colors`** runs the post-move index CLIP-only. Color extraction is the
   slow, memory-heavy part (~4 s/photo) and a first-time backfill once OOM-cut a

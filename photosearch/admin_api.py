@@ -50,6 +50,10 @@ BUILD_SHA_FILE = Path("/app/BUILD_SHA")
 
 # Serialize destructive ops: only one git-pull or build at a time.
 _op_lock = threading.Lock()
+# Separate lock for ingest-incoming so a long sweep doesn't block /version
+# polling or deploy actions (they don't conflict), but two ingests can't race
+# on the same _incoming/ files within this process.
+_ingest_lock = threading.Lock()
 
 
 def _run_git(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
@@ -245,6 +249,40 @@ async def admin_docker_build():
                 yield chunk
         finally:
             _op_lock.release()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/ingest-incoming")
+async def admin_ingest_incoming(dry_run: bool = False):
+    """`docker compose run --rm photosearch ingest-incoming --no-colors` — SSE.
+
+    Sweeps /photos/_incoming/<source>/ into the library (date routing, hash
+    dedup, CLIP index) — the same job the daily cron runs. Launched in a
+    throwaway sibling container (not in-process) so the heavy CLIP import
+    doesn't run inside the web server, and `--no-deps` keeps it from touching
+    ollama. Matches the `--no-colors` cadence of the cron (colors are not a
+    worker pass; backfill later with `photosearch index <dir>`).
+
+    Pass `?dry_run=true` to scan + report without moving anything.
+    """
+    if not _ingest_lock.acquire(blocking=False):
+        raise HTTPException(409, "an ingest-incoming sweep is already running")
+
+    cmd = [
+        "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
+        "run", "--rm", "--no-deps", COMPOSE_SERVICE,
+        "ingest-incoming", "--no-colors",
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    async def gen():
+        try:
+            async for chunk in _stream_subprocess(cmd, cwd=REPO_DIR, env=os.environ.copy()):
+                yield chunk
+        finally:
+            _ingest_lock.release()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

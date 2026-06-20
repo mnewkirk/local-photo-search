@@ -1244,6 +1244,103 @@
       );
     }
 
+    // ── Ingest incoming ──────────────────────────────────────────────────
+    // Run the phone/camera _incoming/ sweep on demand (same job as the daily
+    // cron). Streams the container's stdout over SSE, like the build button.
+    function IngestIncoming() {
+      var _b = useState(false); var busy = _b[0];   var setBusy = _b[1];
+      var _d = useState(false); var dryRun = _d[0]; var setDryRun = _d[1];
+      var _l = useState([]);    var log = _l[0];    var setLog = _l[1];
+
+      function appendLog(line) {
+        setLog(function(prev) {
+          var next = prev.concat([line]);
+          if (next.length > 500) next = next.slice(-500);
+          return next;
+        });
+      }
+
+      function run() {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ ingest-incoming' + (dryRun ? ' --dry-run' : '') + ' (this can take a while)…');
+        fetch('/api/admin/ingest-incoming' + (dryRun ? '?dry_run=true' : ''), { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            var resolved = false;
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ ingest complete' : '  ✗ ingest failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      setBusy(false);
+                    }
+                    if (payload.error) { appendLog('  ✗ ' + payload.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() { if (!resolved) setBusy(false); });
+          })
+          .catch(function(err) { appendLog('  ✗ ingest stream error: ' + err.message); setBusy(false); });
+      }
+
+      return e('div', null,
+        e('h2', null, 'Ingest incoming'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Sweep /photos/_incoming/<source>/ into the library — date routing, '
+            + 'hash dedup, CLIP index (same job as the daily cron). Camera-model '
+            + 'sources land in YYYY-MM-DD_<model>/, phone sources in _phone-<source>/.'),
+          e('div', { className: 'deploy-actions' },
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: run,
+              title: 'docker compose run --rm photosearch ingest-incoming --no-colors',
+            }, busy ? 'Ingesting…' : 'Run ingest'),
+            e('label', {
+              className: 'deploy-meta',
+              style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' },
+            },
+              e('input', {
+                type: 'checkbox', checked: dryRun, disabled: busy,
+                onChange: function(ev) { setDryRun(ev.target.checked); },
+              }),
+              'Dry run'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { setLog([]); },
+              title: 'Clear log',
+              style: { marginLeft: 'auto' },
+            }, 'Clear log')
+          ),
+          log.length > 0 && e('div', {
+            className: 'deploy-log' + (busy ? ' running' : ''),
+          }, log.join('\n'))
+        )
+      );
+    }
+
     // ── Generations by model ─────────────────────────────────────────────
     // Surface the v21 generations provenance log on /status. For each text
     // type (describe / tags / verify), show which model produced each photo's
@@ -2247,6 +2344,7 @@
             })
           ),
           e(Deployment, null),
+          e(IngestIncoming, null),
           e(GenerationsByModel, null),
           e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
           e(StackingForm, { onComplete: load }),

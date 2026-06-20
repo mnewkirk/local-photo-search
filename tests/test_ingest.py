@@ -114,6 +114,113 @@ def test_dry_run_writes_nothing(tmp_path, tmp_db_path, monkeypatch):
     assert expected in result["sources"]["matt"]["new_dirs"]
 
 
+def test_camera_model_source_drops_phone_prefix(tmp_path, tmp_db_path, monkeypatch):
+    """A camera-model-looking source (ILCE-7RM6) lands in YYYY-MM-DD_<model>/,
+    with no 'phone-' prefix — driven by the heuristic, no config needed."""
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "ILCE-7RM6" / "DCIM" / "DSC00017.JPG"
+    _touch(src, b"camera-bytes")
+    _patch_exif(monkeypatch, "2026-06-19 14:00:00")
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    target = photos / "2026" / "2026-06-19_ILCE-7RM6" / "DSC00017.JPG"
+    assert target.exists(), f"Expected {target} to exist"
+    assert not (photos / "2026" / "2026-06-19_phone-ILCE-7RM6").exists()
+    assert result["sources"]["ILCE-7RM6"]["new_dirs"] == [str(target.parent)]
+
+
+def test_phone_source_override_forces_prefix(tmp_path, tmp_db_path, monkeypatch):
+    """phone_sources forces 'phone-' even on a camera-model-looking label."""
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "ILCE-7M4" / "DSC06593.JPG"
+    _touch(src, b"forced-phone")
+    _patch_exif(monkeypatch, "2026-06-19 15:00:00")
+
+    ingest_incoming(str(incoming), str(photos), tmp_db_path,
+                    phone_sources={"ILCE-7M4"})
+
+    assert (photos / "2026" / "2026-06-19_phone-ILCE-7M4" / "DSC06593.JPG").exists()
+
+
+def test_bare_source_override_drops_prefix(tmp_path, tmp_db_path, monkeypatch):
+    """bare_sources drops 'phone-' even for a non-model-looking label."""
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "drone" / "DJI_0001.JPG"
+    _touch(src, b"drone-bytes")
+    _patch_exif(monkeypatch, "2026-06-19 16:00:00")
+
+    ingest_incoming(str(incoming), str(photos), tmp_db_path,
+                    bare_sources={"drone"})
+
+    assert (photos / "2026" / "2026-06-19_drone" / "DJI_0001.JPG").exists()
+
+
+def test_companion_raw_moved_but_not_indexed(tmp_path, tmp_db_path, monkeypatch):
+    """A RAW file lands in the dated folder but is NOT queued for indexing."""
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "ILCE-7M4" / "DSC05355.ARW"
+    _touch(src, b"raw-bytes")
+    _patch_exif(monkeypatch, "2026-06-19 14:00:00")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    target = photos / "2026" / "2026-06-19_ILCE-7M4" / "DSC05355.ARW"
+    assert target.exists()
+    assert result["totals"]["companions_moved"] == 1
+    assert result["totals"]["imported"] == 0
+    # RAW folder must NOT be queued for the CLIP index pass.
+    assert result["sources"]["ILCE-7M4"]["new_dirs"] == []
+
+
+def test_companion_video_uses_mtime_when_no_exif(tmp_path, tmp_db_path, monkeypatch):
+    """A video with no EXIF date routes by file mtime, not into _undated."""
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "ILCE-7M4" / "C0176.MP4"
+    _touch(src, b"video-bytes")
+    # No EXIF at all (extract_exif raises) → mtime fallback.
+    def boom(_):
+        raise ValueError("no exif in video")
+    monkeypatch.setattr(ingest_mod, "extract_exif", boom)
+    os.utime(src, (1_750_000_000, 1_750_000_000))  # 2025-06-15 UTC-ish
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["companions_moved"] == 1
+    moved = list(photos.rglob("C0176.MP4"))
+    assert len(moved) == 1
+    # Landed in a real YYYY/YYYY-MM-DD_* folder, not _undated.
+    assert "_undated" not in str(moved[0])
+
+
+def test_companion_dedup_at_destination(tmp_path, tmp_db_path, monkeypatch):
+    """Re-ingesting an identical RAW already in the library archives it."""
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "ILCE-7M4" / "DSC05355.ARW"
+    _touch(src, b"raw-identical")
+    _patch_exif(monkeypatch, "2026-06-19 14:00:00")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    # First ingest moves it in.
+    ingest_incoming(str(incoming), str(photos), tmp_db_path)
+    assert (photos / "2026" / "2026-06-19_ILCE-7M4" / "DSC05355.ARW").exists()
+
+    # Same file shows up again in _incoming.
+    _touch(src, b"raw-identical")
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["companions_deduped"] == 1
+    assert result["totals"]["companions_moved"] == 0
+    # Archived for audit, no duplicate in the library.
+    assert (incoming / "ILCE-7M4" / ".processed" / "DSC05355.ARW").exists()
+    assert not (photos / "2026" / "2026-06-19_ILCE-7M4" / "DSC05355_1.ARW").exists()
+
+
 def test_mtime_fallback_when_exif_date_missing(tmp_path, tmp_db_path, monkeypatch):
     """No EXIF date → use date_created (mtime-derived)."""
     incoming, photos = _setup_dirs(tmp_path)

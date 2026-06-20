@@ -357,9 +357,33 @@ For each photo under `_incoming/<source>/`:
    archive is dedup-only — successful imports are *moved out* of `_incoming/`,
    not copied, so there's no doubled disk usage for new photos.
 3. Otherwise extract EXIF (or mtime fallback), move to
-   `/photos/YYYY/YYYY-MM-DD_phone-<source>/<filename>` (the `_phone-<source>`
-   suffix mirrors M20's `_gphotos` convention so origin stays visible at the
-   path level). Photos with no parseable date land in `/photos/_undated/phone-<source>/`.
+   `/photos/YYYY/YYYY-MM-DD_<suffix>/<filename>` (the suffix mirrors M20's
+   `_gphotos` convention so origin stays visible at the path level). The
+   suffix is `phone-<source>` for human source labels (`matt`, `wife`) and a
+   **bare `<source>`** for camera-model labels (`_folder_suffix` /
+   `_looks_like_camera_model` in `ingest.py` — uppercase-alnum-with-a-digit
+   like `ILCE-7RM6` → `2026-06-19_ILCE-7RM6/`, no `phone-` prefix). Override
+   the heuristic with `--bare-source LABEL` / `--phone-source LABEL` (also
+   `PHOTOSEARCH_INGEST_BARE_SOURCES` / `PHOTOSEARCH_INGEST_PHONE_SOURCES`,
+   comma-separated). Photos with no parseable date land in `/photos/_undated/<suffix>/`.
+
+**RAW + video are "companions":** `ingest` relocates them into the same dated
+folder (so every file reaches the NAS) but never adds a DB row or indexes them
+— `is_photo = ext in INGEST_EXTENSIONS` gates the DB-dedup + CLIP path;
+`COMPANION_EXTENSIONS` (RAW + video) take a move-only path with **destination
+dedup** (same name + same hash already present → archive to `.processed`)
+since they have no `photos.file_hash` row. Companion folders are kept out of
+the returned `new_dirs`, so the follow-up CLIP index pass skips them. Video
+with no EXIF date routes by file mtime (photos still go to `_undated`).
+
+The SD-card import path feeds this: `D:\Photos\import-photos-safe.ps1` (on the
+Windows workstation) reads each photo's/RAW's EXIF camera model and pushes all
+media (JPEG/HEIC + RAW + video) to `\\nas\Photos\_incoming\<CameraModel>\`,
+keeping its local `D:\Photos\Archive` backup, then ssh-triggers
+`ingest-incoming`. Video has no readable model, so it rides along with the
+shoot's body (the batch's single camera model) or lands under `unknown-camera`
+(a default-bare suffix). The `/status` **Ingest incoming** card (`POST
+/api/admin/ingest-incoming`, SSE) runs the same sweep on demand.
 4. By default, runs `index_directory(photo_dir=<new dated folder>)` for
    CLIP + colors at the end. `--no-colors` drops the color pass (CLIP only)
    — lighter/faster for the daily cron and avoids the memory-heavy color

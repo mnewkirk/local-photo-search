@@ -1235,7 +1235,7 @@ def cleanup_orphans(db, dry_run):
 @click.option("--incoming-root", default="/photos/_incoming", show_default=True,
               help="Root containing per-source subdirs (matt/, wife/, ...).")
 @click.option("--photo-root", default="/photos", show_default=True,
-              help="Library root — files land under photo-root/YYYY/YYYY-MM-DD_phone-<source>/.")
+              help="Library root — files land under photo-root/YYYY/YYYY-MM-DD_<suffix>/.")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
 @click.option("--dry-run", is_flag=True, default=False,
@@ -1249,25 +1249,47 @@ def cleanup_orphans(db, dry_run):
                    "pass (CLIP only). Lighter + faster for the daily cron; "
                    "colors are not a worker pass, so backfill them later with "
                    "`photosearch index <dir>`.")
-def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors):
-    """Sweep phone-synced photos out of _incoming/<source>/ into the library.
+@click.option("--bare-source", "bare_sources", multiple=True, metavar="LABEL",
+              help="Source label that should land in YYYY-MM-DD_<label>/ with "
+                   "NO 'phone-' prefix (e.g. a camera model like ILCE-7RM6). "
+                   "Repeatable. Camera-model-looking labels (all-caps + digit) "
+                   "are treated this way automatically. Also via "
+                   "PHOTOSEARCH_INGEST_BARE_SOURCES (comma-separated).")
+@click.option("--phone-source", "phone_sources", multiple=True, metavar="LABEL",
+              help="Force the 'phone-' prefix for a source even if it looks "
+                   "like a camera model. Repeatable. Also via "
+                   "PHOTOSEARCH_INGEST_PHONE_SOURCES (comma-separated).")
+def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors,
+                        bare_sources, phone_sources):
+    """Sweep synced media out of _incoming/<source>/ into the library.
 
     Designed to run daily from cron. Each direct subdir of --incoming-root is
-    treated as one source label (e.g. 'matt', 'wife'); photos under it move
-    to photo-root/YYYY/YYYY-MM-DD_phone-<source>/ based on EXIF date.
+    treated as one source label (a phone name like 'matt'/'wife', or a camera
+    model like 'ILCE-7RM6'); media under it moves to
+    photo-root/YYYY/YYYY-MM-DD_<suffix>/ based on EXIF (or mtime) date. The
+    suffix is 'phone-<source>' for human labels and a bare '<source>' for
+    camera-model labels (see --bare-source / --phone-source).
 
-    Dedup: any file whose SHA-256 matches an existing photos.file_hash is
-    skipped and the source is moved to <source>/.processed/ for audit. Files
-    that imported successfully are physically moved (not copied) — the phone
-    still has the original via Syncthing's own folder.
+    Photos (JPEG/HEIC) dedup against photos.file_hash and get CLIP-indexed.
+    RAW + video are moved into the same folder but NOT indexed (every file
+    reaches the NAS; they dedup against the destination). Files that imported
+    successfully are physically moved, not copied.
     """
     from photosearch.ingest import ingest_incoming
+
+    def _csv_env(name):
+        return [s.strip() for s in os.environ.get(name, "").split(",") if s.strip()]
+
+    bare = set(bare_sources) | set(_csv_env("PHOTOSEARCH_INGEST_BARE_SOURCES"))
+    phone = set(phone_sources) | set(_csv_env("PHOTOSEARCH_INGEST_PHONE_SOURCES"))
 
     result = ingest_incoming(
         incoming_root=incoming_root,
         photo_root=photo_root,
         db_path=db,
         dry_run=dry_run,
+        bare_sources=bare,
+        phone_sources=phone,
     )
 
     totals = result["totals"]
@@ -1276,13 +1298,17 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
         click.echo(
             f"  [{source}] scanned={stats['scanned']:,} "
             f"imported={stats['imported']:,} deduped={stats['deduped']:,} "
+            f"companions={stats['companions_moved']:,} "
+            f"(deduped={stats['companions_deduped']:,}) "
             f"errors={stats['errors']:,}"
         )
         for new_dir in stats["new_dirs"]:
             click.echo(f"     -> {new_dir}")
     click.echo(
         f"Totals: imported={totals['imported']:,}  "
-        f"deduped={totals['deduped']:,}  errors={totals['errors']:,}"
+        f"deduped={totals['deduped']:,}  "
+        f"companions(RAW/video)={totals['companions_moved']:,}  "
+        f"errors={totals['errors']:,}"
     )
 
     if dry_run:
