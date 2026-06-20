@@ -167,6 +167,12 @@ SAMPLE_PHOTOS = [
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _redirect_ask_logs(tmp_path, monkeypatch):
+    """Keep the agent's per-query Ask logs out of the repo during tests."""
+    monkeypatch.setenv("PHOTOSEARCH_ASK_LOG_DIR", str(tmp_path / "ask-logs"))
+
+
 @pytest.fixture
 def tmp_db_path(tmp_path):
     """Return a path for a temporary database file."""

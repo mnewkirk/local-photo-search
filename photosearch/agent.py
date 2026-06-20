@@ -403,37 +403,53 @@ def _run_single_shot(db: PhotoDB, message: str) -> Iterator[dict]:
 # Agent loop
 # ---------------------------------------------------------------------------
 
-def _write_ask_log(session: dict) -> None:
-    """Write a readable per-query log (what was typed, the model's reasoning,
-    which tools/args were generated, the final answer) to PHOTOSEARCH_ASK_LOG_DIR
-    (default ./ask-logs). Best-effort — never breaks the agent."""
+def _ask_log_path() -> str:
+    """Current append target: one file per day (ask-YYYY-MM-DD.md), rolling to
+    ask-YYYY-MM-DD.N.md when the day's file exceeds the size cap. Dir from
+    PHOTOSEARCH_ASK_LOG_DIR (default ./ask-logs); cap from
+    PHOTOSEARCH_ASK_LOG_MAX_MB (default 5)."""
+    d = os.environ.get("PHOTOSEARCH_ASK_LOG_DIR") or "ask-logs"
+    os.makedirs(d, exist_ok=True)
+    day = time.strftime("%Y-%m-%d")
     try:
-        import re as _re
-        d = os.environ.get("PHOTOSEARCH_ASK_LOG_DIR") or "ask-logs"
-        os.makedirs(d, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        slug = _re.sub(r"[^a-z0-9]+", "-",
-                       (session.get("message") or "")[:40].lower()).strip("-") or "query"
-        path = os.path.join(d, f"{ts}_{slug}.md")
-        L = [f"# Ask: {session.get('message','')}", "",
-             f"- model: `{session.get('model')}`",
-             f"- mode: {session.get('mode','agent')}",
-             f"- duration: {session.get('seconds')}s"]
+        cap = int(float(os.environ.get("PHOTOSEARCH_ASK_LOG_MAX_MB", "5")) * 1_000_000)
+    except ValueError:
+        cap = 5_000_000
+    base = os.path.join(d, f"ask-{day}.md")
+    if not os.path.exists(base) or os.path.getsize(base) < cap:
+        return base
+    n = 2
+    while True:
+        p = os.path.join(d, f"ask-{day}.{n}.md")
+        if not os.path.exists(p) or os.path.getsize(p) < cap:
+            return p
+        n += 1
+
+
+def _write_ask_log(session: dict) -> None:
+    """Append one entry per query to the day's continuous log (what was typed,
+    the tools/args generated, the model's reasoning, the answer). `tail -f` it
+    to watch queries live. Best-effort — never breaks the agent."""
+    try:
+        path = _ask_log_path()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        L = ["", "=" * 78,
+             f"## {ts} · `{session.get('model')}` · {session.get('seconds')}s "
+             f"· {session.get('mode', 'agent')}",
+             f"**Ask:** {session.get('message', '')}", ""]
         if session.get("error"):
-            L.append(f"- error: {session['error']}")
-        L.append("")
+            L.append(f"**error:** {session['error']}")
         if session.get("tool_calls"):
-            L.append("## Tools generated")
+            L.append("**Tools:**")
             for tc in session["tool_calls"]:
                 L.append(f"- `{tc['name']}({json.dumps(tc.get('args') or {}, ensure_ascii=False)})`"
                          + (f" → {tc['summary']}" if tc.get("summary") else ""))
-            L.append("")
         for i, st in enumerate([s for s in session.get("steps", []) if s.get("reasoning")], 1):
-            L += [f"## Reasoning {i}", "```", st["reasoning"].strip(), "```", ""]
+            L += [f"**Reasoning {i}:**", "```", st["reasoning"].strip(), "```"]
         if session.get("answer"):
-            L += ["## Answer", session["answer"], ""]
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(L))
+            L.append(f"**Answer:** {session['answer']}")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(L) + "\n")
     except Exception:
         pass
 
