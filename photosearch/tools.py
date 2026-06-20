@@ -525,7 +525,12 @@ _register(ToolSpec(
         "type": "object",
         "properties": {
             "query": {"type": "string",
-                      "description": "Free-text semantic (CLIP) query for visual content."},
+                      "description": "Free-text semantic (CLIP) query for visual "
+                      "content (e.g. 'sunset', 'birthday cake'). Supports "
+                      "exclusion: prefix a term with '-' or say 'no <thing>' to "
+                      "filter it out, e.g. 'landscape -people' or 'beach no "
+                      "crowds'. Do NOT put ranking words like 'best'/'top' here "
+                      "— use the sort/min_quality fields for those."},
             "people": {"type": "array", "items": {"type": "string"},
                        "description": "Registered person names; matches photos with ALL of them."},
             "location": {"type": "string",
