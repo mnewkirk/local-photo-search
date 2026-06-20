@@ -48,8 +48,14 @@ done
 # Auto-resolve the LM Studio endpoint if not given.
 if [ -z "${LM_URL}" ]; then
   if grep -qi microsoft /proc/version 2>/dev/null; then
-    GW="$(ip route show default 2>/dev/null | awk '{print $3}')"
-    LM_URL="http://${GW:-host.docker.internal}:1234/v1"   # WSL2 → Windows host
+    # WSL2: try localhost first — works with mirrored networking (and is
+    # cleaner). Fall back to the default-route gateway (NAT mode → Windows host).
+    if curl -s --max-time 2 -o /dev/null "http://localhost:1234/v1/models" 2>/dev/null; then
+      LM_URL="http://localhost:1234/v1"
+    else
+      GW="$(ip route show default 2>/dev/null | awk '{print $3}')"
+      LM_URL="http://${GW:-host.docker.internal}:1234/v1"
+    fi
   else
     LM_URL="http://localhost:1234/v1"                      # Mac / native Linux
   fi
