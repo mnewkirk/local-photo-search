@@ -17,7 +17,8 @@ from photosearch import tools
 
 EXPECTED_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
-    "search_photos", "summarize", "representatives", "get_photo", "get_photo_image",
+    "search_photos", "summarize", "representatives", "rerank_photos",
+    "get_photo", "get_photo_image",
 }
 
 
@@ -296,6 +297,47 @@ def test_representatives_with_person_filter_by_year(db):
 def test_representatives_bad_bucket(db):
     res = tools.call_tool(db, "representatives", {"bucket": "nonsense"})
     assert "error" in res
+
+
+# ---------------------------------------------------------------------------
+# rerank_photos (VLM re-ranking)
+# ---------------------------------------------------------------------------
+
+def test_rerank_falls_back_without_vision_model(db, monkeypatch):
+    monkeypatch.delenv("PHOTOSEARCH_LLM_VISUAL_MODEL", raising=False)
+    monkeypatch.delenv("PHOTOSEARCH_TEXT_LLM_URL", raising=False)
+    ids = list(db._test_photo_ids.values())
+    res = tools.call_tool(db, "rerank_photos", {"photo_ids": ids, "criteria": "a dog"})
+    assert res["reranked"] is False
+    assert [h["id"] for h in res["results"]] == ids  # input order preserved
+
+
+def test_rerank_sorts_by_vision_score(db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://fake:1234/v1")
+    monkeypatch.setenv("PHOTOSEARCH_LLM_VISUAL_MODEL", "fake-vl")
+    monkeypatch.setattr(tools, "_thumb_b64", lambda db, pid: "ZmFrZQ==")
+    # Score = id mod 10 / 10 → deterministic, higher id → higher score.
+    monkeypatch.setattr(tools, "_vision_score",
+                        lambda base, model, b64, crit: {"score": (b64 and 0.0) or 0.0})
+
+    ids = list(db._test_photo_ids.values())
+    # give each id a distinct score via a dict
+    score_map = {pid: i / 10 for i, pid in enumerate(ids)}
+    monkeypatch.setattr(tools, "_thumb_b64", lambda db, pid: f"id:{pid}")
+    monkeypatch.setattr(tools, "_vision_score",
+                        lambda base, model, b64, crit:
+                        {"score": score_map[int(b64.split(':')[1])], "reason": "ok"})
+
+    res = tools.call_tool(db, "rerank_photos", {"photo_ids": ids, "criteria": "x"})
+    assert res["reranked"] is True
+    got = [h["id"] for h in res["results"]]
+    assert got == sorted(ids, key=lambda p: score_map[p], reverse=True)
+    assert all("rerank_score" in h for h in res["results"])
+
+
+def test_rerank_requires_args(db):
+    assert "error" in tools.call_tool(db, "rerank_photos", {"photo_ids": [], "criteria": "x"})
+    assert "error" in tools.call_tool(db, "rerank_photos", {"photo_ids": [1], "criteria": ""})
 
 
 # ---------------------------------------------------------------------------

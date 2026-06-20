@@ -869,6 +869,171 @@ _register(ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Tool: rerank_photos  (VLM re-ranking — a vision model looks at each candidate)
+# ---------------------------------------------------------------------------
+
+_RERANK_MAX_K = 24
+_RERANK_WORKERS = 4
+
+
+def _thumb_b64(db: PhotoDB, photo_id: int) -> Optional[str]:
+    """Base64 JPEG thumbnail for a photo. On a replica (no local originals)
+    fetch from the NAS web API; otherwise generate locally."""
+    import base64
+    nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if nas:
+        import urllib.request
+        try:
+            req = urllib.request.Request(f"{nas}/api/photos/{photo_id}/thumbnail",
+                                         headers={"User-Agent": "photosearch-rerank"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return base64.b64encode(r.read()).decode("ascii")
+        except Exception:
+            return None
+    photo = db.get_photo(photo_id)
+    if not photo:
+        return None
+    try:
+        with open(_thumb_path(db, photo), "rb") as fh:
+            return base64.b64encode(fh.read()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _vision_score(base_url: str, model: str, image_b64: str, criteria: str) -> Optional[dict]:
+    """Ask the vision model how well one image matches `criteria`. Returns
+    {"score": 0-1, "reason": str} or None on failure."""
+    import urllib.request
+    prompt = (
+        "You are scoring how well a photo matches a request.\n"
+        f'Request: "{criteria}".\n'
+        "Look at the image and rate from 0.0 to 1.0 how well it matches "
+        "(1.0 = excellent match, 0.0 = does not match at all). Judge the actual "
+        "visible content. Reply with ONLY a JSON object: "
+        '{"score": <number 0-1>, "reason": "<one short phrase>"}.'
+    )
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]}],
+        "max_tokens": 150,
+        "temperature": 0,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions",
+                                     data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            content = json.loads(r.read())["choices"][0]["message"]["content"] or ""
+    except Exception:
+        return None
+    # Extract the JSON object from the (possibly fenced) reply.
+    s = content.strip()
+    a, b = s.find("{"), s.rfind("}")
+    if a < 0 or b <= a:
+        return None
+    try:
+        obj = json.loads(s[a:b + 1])
+        score = float(obj.get("score"))
+    except (ValueError, TypeError):
+        return None
+    return {"score": max(0.0, min(1.0, score)), "reason": str(obj.get("reason", ""))[:120]}
+
+
+def _h_rerank_photos(db: PhotoDB, args: dict) -> dict:
+    from concurrent.futures import ThreadPoolExecutor
+
+    ids = args.get("photo_ids") or []
+    if isinstance(ids, str):
+        ids = _coerce_str_list(ids)
+    try:
+        ids = [int(x) for x in ids][:_RERANK_MAX_K]
+    except (TypeError, ValueError):
+        return {"error": "photo_ids must be a list of integers"}
+    criteria = (args.get("criteria") or "").strip()
+    if not ids or not criteria:
+        return {"error": "photo_ids and criteria are required"}
+
+    base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
+    model = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
+    photos = {pid: db.get_photo(pid) for pid in ids}
+
+    def _compact(pid, score=None, reason=None):
+        p = photos.get(pid)
+        hit = _compact_hit(p) if p else {"id": pid}
+        if score is not None:
+            hit["rerank_score"] = round(score, 3)
+            hit["rerank_reason"] = reason
+        return hit
+
+    # No vision backend configured → return the candidates in their input order,
+    # unscored (graceful fallback; the agent still gets results).
+    if not (base and model):
+        return {"reranked": False,
+                "note": "no vision model configured (PHOTOSEARCH_LLM_VISUAL_MODEL); "
+                        "returning candidates unranked",
+                "criteria": criteria,
+                "results": [_compact(pid) for pid in ids]}
+
+    def _score(pid):
+        b64 = _thumb_b64(db, pid)
+        if not b64:
+            return pid, None
+        return pid, _vision_score(base, model, b64, criteria)
+
+    scores: dict = {}
+    with ThreadPoolExecutor(max_workers=_RERANK_WORKERS) as pool:
+        for pid, sc in pool.map(_score, ids):
+            scores[pid] = sc
+
+    # Scored photos first (by score desc), then any that failed (input order).
+    scored_ids = [pid for pid in ids if scores.get(pid)]
+    scored_ids.sort(key=lambda pid: scores[pid]["score"], reverse=True)
+    failed_ids = [pid for pid in ids if not scores.get(pid)]
+
+    results = ([_compact(pid, scores[pid]["score"], scores[pid]["reason"]) for pid in scored_ids]
+               + [_compact(pid) for pid in failed_ids])
+    return {
+        "reranked": True,
+        "criteria": criteria,
+        "model": model,
+        "scored": len(scored_ids),
+        "results": results,
+    }
+
+
+_register(ToolSpec(
+    name="rerank_photos",
+    description=(
+        "Re-rank a set of candidate photos by having a VISION model actually "
+        "LOOK at each one and score how well it matches a visual criterion. Use "
+        "this for precision — when the user wants THE specific shot or a visual "
+        "judgment that metadata can't capture: 'the one where Ellie is blowing "
+        "out candles', 'make sure Matt is the primary subject in the foreground, "
+        "not the background', 'the sharpest / best-composed one'. Workflow: run "
+        "search_photos (or representatives) first to get candidates, then call "
+        "rerank_photos(photo_ids=<the ids you got>, criteria=<the visual thing to "
+        "judge>). Returns the photos re-sorted best-first with a per-photo "
+        "rerank_score + reason. Slower than a normal search (it inspects each "
+        "image), so pass a focused candidate set (<=24)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "photo_ids": {"type": "array", "items": {"type": "integer"},
+                          "description": "Candidate photo ids to re-rank (from a prior search)."},
+            "criteria": {"type": "string",
+                         "description": "The visual thing to judge each photo against."},
+        },
+        "required": ["photo_ids", "criteria"],
+        "additionalProperties": False,
+    },
+    handler=_h_rerank_photos,
+))
+
+
+# ---------------------------------------------------------------------------
 # Tool: get_photo_image  (gated at the adapter layer)
 # ---------------------------------------------------------------------------
 

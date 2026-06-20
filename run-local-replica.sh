@@ -84,6 +84,8 @@ export PHOTOSEARCH_DB="${REPLICA_DB}"
 export PHOTOSEARCH_NAS_URL="${NAS_URL}"
 export PHOTOSEARCH_TEXT_LLM_URL="${LM_URL}"
 [ -n "${AGENT_MODEL}" ] && export PHOTOSEARCH_LLM_AGENT_MODEL="${AGENT_MODEL}"
+# Vision model for rerank_photos (VLM re-ranking). Override with VISUAL_MODEL=.
+export PHOTOSEARCH_LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-${VISUAL_MODEL:-qwen2.5-vl-7b-instruct}}"
 [ -n "${PHOTOSEARCH_AGENT_HINTS:-}" ] && export PHOTOSEARCH_AGENT_HINTS
 # No PHOTO_ROOT: originals aren't local, so image routes proxy from the NAS.
 

@@ -162,6 +162,13 @@ def _system_prompt(db=None) -> str:
         "per-bucket selection. E.g. 'best photo of Matt, one per year, last 10 "
         "years' → representatives(people=['Matt'], bucket='year', n=1, "
         "date_from=<10 years ago>).\n"
+        "- For VISUAL precision a vision model must judge — 'the one where X is "
+        "doing Y', 'make sure X is the primary subject / in the foreground', "
+        "'the sharpest / best-composed' — first get candidates with search_photos "
+        "or representatives, then call rerank_photos(photo_ids=<those ids>, "
+        "criteria=<the visual thing>). It LOOKS at each image and re-sorts. It's "
+        "slow, so only use it when metadata can't decide, and keep the candidate "
+        "set small (<=24).\n"
         "- Then stop and write a 1-3 sentence answer that EXPLAINS how you "
         "interpreted the request — which filters and sort you used and why "
         "(e.g. \"'best' so I sorted by quality; 'the kids' = Calvin and Ellie\") "
@@ -238,7 +245,8 @@ def _chat_openai(base_url: str, messages: list, tools: Optional[list],
                 args = {}
         calls.append({"id": tc.get("id"), "name": fn.get("name"),
                       "arguments": args or {}})
-    return {"content": msg.get("content"), "tool_calls": calls}
+    return {"content": msg.get("content"), "tool_calls": calls,
+            "reasoning": msg.get("reasoning_content") or msg.get("reasoning")}
 
 
 def _chat_ollama(messages: list, tools: Optional[list], temperature: float) -> dict:
@@ -304,12 +312,44 @@ def _assistant_tool_msg(reply: dict) -> dict:
     return {"role": "assistant", "content": reply.get("content") or "", "tool_calls": tcs}
 
 
+_MODEL_RESULT_CAP = 15  # photo hits fed back to the model per tool call
+
+
+def _lean_for_model(result):
+    """Trim a tool result before feeding it BACK to the model. Photo-list tools
+    (search_photos / representatives / rerank_photos) return up to 50 hits with
+    240-char descriptions + thumbnail urls — feeding all of that into a
+    multi-step conversation overflows the model's context (the rerank flow 400'd
+    on it). Cap the list and keep only lean fields. The UI still gets the FULL
+    result set (captured separately as last_photos), not this trimmed copy."""
+    if not (isinstance(result, dict) and isinstance(result.get("results"), list)):
+        return result
+    lean = {k: v for k, v in result.items() if k != "results"}
+    trimmed = []
+    for h in result["results"][:_MODEL_RESULT_CAP]:
+        if not isinstance(h, dict):
+            trimmed.append(h)
+            continue
+        t = {"id": h.get("id"), "filename": h.get("filename"),
+             "date_taken": h.get("date_taken"), "place_name": h.get("place_name")}
+        if h.get("description"):
+            t["description"] = h["description"][:100]
+        for k in ("bucket", "rerank_score", "rerank_reason", "aesthetic_score"):
+            if h.get(k) is not None:
+                t[k] = h[k]
+        trimmed.append(t)
+    lean["results"] = trimmed
+    if len(result["results"]) > len(trimmed):
+        lean["results_note"] = f"showing {len(trimmed)} of {len(result['results'])} (use these ids)"
+    return lean
+
+
 def _tool_result_msg(call: dict, result) -> dict:
     return {
         "role": "tool",
         "tool_call_id": call.get("id") or f"call_{call['name']}",
         "name": call["name"],
-        "content": json.dumps(result, default=str),
+        "content": json.dumps(_lean_for_model(result), default=str),
     }
 
 
@@ -363,6 +403,41 @@ def _run_single_shot(db: PhotoDB, message: str) -> Iterator[dict]:
 # Agent loop
 # ---------------------------------------------------------------------------
 
+def _write_ask_log(session: dict) -> None:
+    """Write a readable per-query log (what was typed, the model's reasoning,
+    which tools/args were generated, the final answer) to PHOTOSEARCH_ASK_LOG_DIR
+    (default ./ask-logs). Best-effort — never breaks the agent."""
+    try:
+        import re as _re
+        d = os.environ.get("PHOTOSEARCH_ASK_LOG_DIR") or "ask-logs"
+        os.makedirs(d, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        slug = _re.sub(r"[^a-z0-9]+", "-",
+                       (session.get("message") or "")[:40].lower()).strip("-") or "query"
+        path = os.path.join(d, f"{ts}_{slug}.md")
+        L = [f"# Ask: {session.get('message','')}", "",
+             f"- model: `{session.get('model')}`",
+             f"- mode: {session.get('mode','agent')}",
+             f"- duration: {session.get('seconds')}s"]
+        if session.get("error"):
+            L.append(f"- error: {session['error']}")
+        L.append("")
+        if session.get("tool_calls"):
+            L.append("## Tools generated")
+            for tc in session["tool_calls"]:
+                L.append(f"- `{tc['name']}({json.dumps(tc.get('args') or {}, ensure_ascii=False)})`"
+                         + (f" → {tc['summary']}" if tc.get("summary") else ""))
+            L.append("")
+        for i, st in enumerate([s for s in session.get("steps", []) if s.get("reasoning")], 1):
+            L += [f"## Reasoning {i}", "```", st["reasoning"].strip(), "```", ""]
+        if session.get("answer"):
+            L += ["## Answer", session["answer"], ""]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(L))
+    except Exception:
+        pass
+
+
 def run_agent(
     db: PhotoDB,
     message: str,
@@ -375,103 +450,139 @@ def run_agent(
         yield {"type": "error", "message": "empty message"}
         return
 
-    if os.environ.get("PHOTOSEARCH_AGENT_SINGLE_SHOT", "").strip().lower() in (
-            "1", "true", "yes", "on"):
-        yield from _run_single_shot(db, message)
-        return
+    session = {"message": message, "model": _agent_model(), "started": time.time(),
+               "mode": "agent", "steps": [], "tool_calls": [], "answer": None,
+               "error": None}
 
-    tools = toolmod.openai_tools(include_images=False)
-    messages: list = [{"role": "system", "content": _system_prompt(db)}]
-    for h in (history or []):
-        if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
-            messages.append({"role": h["role"], "content": str(h["content"])})
-    messages.append({"role": "user", "content": message})
+    def _set_answer(text):
+        session["answer"] = text
+        return text
 
-    last_photos: Optional[list] = None
-    last_total = 0
-    made_tool_call = False
-    nudges = 0
-    summary_nudged = False
-
-    for step in range(max_steps):
-        if should_abort and should_abort():
-            yield {"type": "error", "message": "cancelled"}
+    try:
+        if os.environ.get("PHOTOSEARCH_AGENT_SINGLE_SHOT", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            session["mode"] = "single_shot"
+            for ev in _run_single_shot(db, message):
+                if ev.get("type") == "answer":
+                    session["answer"] = ev.get("text")
+                if ev.get("type") == "tool_call":
+                    session["tool_calls"].append({"name": ev.get("tool"),
+                                                  "args": ev.get("arguments")})
+                yield ev
             return
-        try:
-            reply = _chat(messages, tools)
-        except Exception as exc:
-            # First step with no progress → try the single-shot fallback once;
-            # the model likely can't tool-call against this endpoint.
-            if step == 0:
-                yield {"type": "tool_result", "tool": "_fallback",
-                       "summary": "tool-calling failed; trying single-shot"}
-                yield from _run_single_shot(db, message)
+
+        tools = toolmod.openai_tools(include_images=False)
+        messages: list = [{"role": "system", "content": _system_prompt(db)}]
+        for h in (history or []):
+            if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
+                messages.append({"role": h["role"], "content": str(h["content"])})
+        messages.append({"role": "user", "content": message})
+
+        last_photos: Optional[list] = None
+        last_total = 0
+        made_tool_call = False
+        nudges = 0
+        summary_nudged = False
+
+        for step in range(max_steps):
+            if should_abort and should_abort():
+                session["error"] = "cancelled"
+                yield {"type": "error", "message": "cancelled"}
                 return
-            yield {"type": "error", "message": f"LLM error: {exc}"}
+            try:
+                reply = _chat(messages, tools)
+            except Exception as exc:
+                # First step with no progress → try the single-shot fallback
+                # once; the model likely can't tool-call against this endpoint.
+                if step == 0:
+                    session["mode"] = "single_shot_fallback"
+                    yield {"type": "tool_result", "tool": "_fallback",
+                           "summary": "tool-calling failed; trying single-shot"}
+                    for ev in _run_single_shot(db, message):
+                        if ev.get("type") == "answer":
+                            session["answer"] = ev.get("text")
+                        yield ev
+                    return
+                session["error"] = f"LLM error: {exc}"
+                yield {"type": "error", "message": f"LLM error: {exc}"}
+                return
+
+            if reply.get("reasoning") or reply.get("content"):
+                session["steps"].append({"reasoning": reply.get("reasoning"),
+                                         "content": reply.get("content")})
+
+            calls = reply.get("tool_calls") or []
+            if calls:
+                made_tool_call = True
+                messages.append(_assistant_tool_msg(reply))
+                for call in calls:
+                    name = call.get("name") or ""
+                    yield {"type": "tool_call", "tool": name, "arguments": call.get("arguments", {})}
+                    try:
+                        result = toolmod.call_tool(db, name, call.get("arguments", {}))
+                    except KeyError:
+                        result = {"error": f"unknown tool: {name}"}
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+                    if (name in ("search_photos", "representatives", "rerank_photos")
+                            and isinstance(result, dict) and "results" in result):
+                        last_photos = result.get("results", [])
+                        last_total = result.get("total", len(last_photos))
+                    summ = _summarize(name, result)
+                    session["tool_calls"].append({"name": name,
+                                                  "args": call.get("arguments", {}),
+                                                  "summary": summ})
+                    yield {"type": "tool_result", "tool": name, "summary": summ}
+                    messages.append(_tool_result_msg(call, result))
+                continue
+
+            # No tool calls → the model is answering (or stalled).
+            content = (reply.get("content") or "").strip()
+
+            # Empty turn with no results yet — a thinking-mode model that
+            # grounded then handed back an empty assistant turn instead of
+            # searching. Nudge it to search rather than silently returning
+            # "Found 0". Bounded by _MAX_NUDGES; the empty turn is dropped.
+            if not content and last_photos is None and nudges < _MAX_NUDGES:
+                nudges += 1
+                yield {"type": "tool_result", "tool": "_nudge",
+                       "summary": "empty model turn — nudging it to search"}
+                messages.append({"role": "user", "content":
+                    "You haven't returned any photos yet. Call the search_photos "
+                    "tool now with the appropriate filters, then give a brief "
+                    "answer. Do not stop until you have searched."})
+                continue
+
+            # Results in hand but an empty final turn — instead of a terse
+            # "Found N", nudge once for the interpretation/explanation.
+            if not content and last_photos is not None and not summary_nudged:
+                summary_nudged = True
+                messages.append({"role": "user", "content":
+                    "Now write the 1-3 sentence answer: explain how you "
+                    "interpreted the request (which filters/sort you used and "
+                    "why) and what these photos show. Do not list ids."})
+                continue
+
+            if not made_tool_call and not content:
+                # Nothing useful and never called a tool — fall back.
+                session["mode"] = "single_shot_fallback"
+                for ev in _run_single_shot(db, message):
+                    if ev.get("type") == "answer":
+                        session["answer"] = ev.get("text")
+                    yield ev
+                return
+            if last_photos is not None:
+                yield {"type": "photos", "results": last_photos, "total": last_total}
+            yield {"type": "answer", "text": _set_answer(content or f"Found {last_total} photo(s).")}
             return
 
-        calls = reply.get("tool_calls") or []
-        if calls:
-            made_tool_call = True
-            messages.append(_assistant_tool_msg(reply))
-            for call in calls:
-                name = call.get("name") or ""
-                yield {"type": "tool_call", "tool": name, "arguments": call.get("arguments", {})}
-                try:
-                    result = toolmod.call_tool(db, name, call.get("arguments", {}))
-                except KeyError:
-                    result = {"error": f"unknown tool: {name}"}
-                except Exception as exc:
-                    result = {"error": str(exc)}
-                if (name in ("search_photos", "representatives")
-                        and isinstance(result, dict) and "results" in result):
-                    last_photos = result.get("results", [])
-                    last_total = result.get("total", len(last_photos))
-                yield {"type": "tool_result", "tool": name, "summary": _summarize(name, result)}
-                messages.append(_tool_result_msg(call, result))
-            continue
-
-        # No tool calls → the model is answering (or stalled).
-        content = (reply.get("content") or "").strip()
-
-        # Empty turn with no results yet — a thinking-mode model that grounded
-        # then handed back an empty assistant turn instead of searching. Nudge
-        # it to actually call search_photos rather than silently returning
-        # "Found 0". Bounded by _MAX_NUDGES so we can't loop forever; the empty
-        # turn is dropped (not appended) and a user nudge takes its place.
-        if not content and last_photos is None and nudges < _MAX_NUDGES:
-            nudges += 1
-            yield {"type": "tool_result", "tool": "_nudge",
-                   "summary": "empty model turn — nudging it to search"}
-            messages.append({"role": "user", "content":
-                "You haven't returned any photos yet. Call the search_photos "
-                "tool now with the appropriate filters, then give a brief "
-                "answer. Do not stop until you have searched."})
-            continue
-
-        # Results in hand but an empty final turn — instead of falling back to a
-        # terse "Found N", nudge once for the interpretation/explanation.
-        if not content and last_photos is not None and not summary_nudged:
-            summary_nudged = True
-            messages.append({"role": "user", "content":
-                "Now write the 1-3 sentence answer: explain how you interpreted "
-                "the request (which filters/sort you used and why) and what "
-                "these photos show. Do not list ids."})
-            continue
-
-        if not made_tool_call and not content:
-            # Model produced nothing useful and never called a tool — fall back.
-            yield from _run_single_shot(db, message)
-            return
+        # Hit the step cap — emit whatever we have.
         if last_photos is not None:
             yield {"type": "photos", "results": last_photos, "total": last_total}
-        yield {"type": "answer", "text": content or f"Found {last_total} photo(s)."}
-        return
-
-    # Hit the step cap — emit whatever we have.
-    if last_photos is not None:
-        yield {"type": "photos", "results": last_photos, "total": last_total}
-    yield {"type": "answer",
-           "text": f"Stopped after {max_steps} steps. "
-                   + (f"Best result set: {last_total} photo(s)." if last_photos is not None
-                      else "No results yet — try rephrasing.")}
+        yield {"type": "answer",
+               "text": _set_answer("Stopped after %d steps. " % max_steps
+                       + (f"Best result set: {last_total} photo(s)." if last_photos is not None
+                          else "No results yet — try rephrasing."))}
+    finally:
+        session["seconds"] = round(time.time() - session["started"], 1)
+        _write_ask_log(session)

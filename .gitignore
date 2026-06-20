@@ -84,3 +84,6 @@ evals/bakeoff_report.html
 
 # personal Ask-agent glossary
 .agent-hints
+
+# per-query Ask agent logs
+ask-logs/
