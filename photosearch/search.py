@@ -589,8 +589,14 @@ def _description_relevance(description: str, query: str,
     # A match only counts if the term is NOT negated in context.
     matched = 0
     for word in query_words:
+        # Check the ORIGINAL word first, then a naive singular stem. Checking
+        # only the stem silently failed words ending in -es / doubled-s
+        # ("sunglasses".rstrip("s") = "sunglasse", which \bsunglasse\b never
+        # matches against "sunglasses") — so 2000+ photos described as wearing
+        # sunglasses were unsearchable.
         stem = word.rstrip("s") if len(word) > 4 else word
-        if _term_in_desc_positive(stem, desc_lower):
+        if (_term_in_desc_positive(word, desc_lower)
+                or _term_in_desc_positive(stem, desc_lower)):
             matched += 1
         else:
             # Check expanded terms for category words
