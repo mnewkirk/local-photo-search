@@ -84,6 +84,31 @@ def test_unknown_tool_is_reported_not_fatal(db, monkeypatch):
     assert events[-1]["type"] == "answer"
 
 
+def test_empty_turn_after_grounding_is_nudged(db, monkeypatch):
+    # Reproduce qwen3: ground via a tool, then return an EMPTY turn (no content,
+    # no tool calls). The loop should nudge it to search rather than give up.
+    empty = {"content": "", "tool_calls": []}
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("get_library_overview", {}),     # ground
+        empty,                                # stall — should trigger a nudge
+        _tc("search_photos", {"people": ["Alex"]}),  # nudged → searches
+        _answer("Found Alex's photos."),
+    ))
+    events = _run(db, "show me photos of Alex")
+    types = _types(events)
+    assert any(e.get("tool") == "_nudge" for e in events if e["type"] == "tool_result")
+    assert "photos" in types
+    photos = next(e for e in events if e["type"] == "photos")
+    assert photos["total"] == 3
+
+
+def test_persistent_empty_turns_give_up_gracefully(db, monkeypatch):
+    # If the model keeps returning empty turns past _MAX_NUDGES, end cleanly.
+    monkeypatch.setattr(agent, "_chat", _script({"content": "", "tool_calls": []}))
+    events = _run(db, "x")
+    assert events[-1]["type"] == "answer"  # no crash, terminal answer
+
+
 def test_step_cap_emits_partial(db, monkeypatch):
     # Model loops forever issuing tool calls; cap stops it and emits photos.
     monkeypatch.setattr(agent, "_chat", _script(

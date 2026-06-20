@@ -44,6 +44,11 @@ from . import tools as toolmod
 # Bound the loop so a confused model can't spin forever. Each step is one LLM
 # round-trip (which may issue several tool calls).
 _MAX_STEPS = 6
+# Bounded re-prompts when a model returns an empty turn (no tool call, no text)
+# before producing any results — e.g. a thinking-mode model (qwen3) that grounds
+# via a tool then stalls instead of calling search_photos. Keeps thinking mode
+# usable for hard prompts while preventing a silent "Found 0".
+_MAX_NUDGES = 2
 _HTTP_TIMEOUT_S = 120.0
 
 
@@ -75,9 +80,16 @@ def _system_prompt() -> str:
         "list_people for names, list_places for locations, list_vocab for "
         "categories/visual_tags/keywords. Never pass a name to search_photos "
         "that list_people didn't return.\n"
-        "- Use search_photos to find photos. Fill only the filters you "
-        "inferred; omit the rest. Read the returned `total`: if it's far more "
-        "or fewer than expected, adjust the filters and search again.\n"
+        "- Use search_photos to find photos. Fill ONLY the filters you actually "
+        "inferred from the request; OMIT every other field — never send empty "
+        "strings or empty arrays, and never pass a filter 'just in case'.\n"
+        "- Dates: only set date_from/date_to when the user implies a time range, "
+        "and compute it from today's date. NEVER use today's date as a filter "
+        "for a request that isn't about today — that wrongly excludes all older "
+        "photos. 'last summer' / 'in 2024' / 'recently' imply ranges; 'photos of "
+        "Calvin' does not.\n"
+        "- Read the returned `total`: if it's far more or fewer than expected, "
+        "adjust the filters and search again.\n"
         "- Prefer the free-text `query` for visual content (sunset, cake) and "
         "structured filters (people, location, dates, category) for the rest.\n"
         "- When you have a good result set, stop calling tools and answer "
@@ -288,6 +300,7 @@ def run_agent(
     last_photos: Optional[list] = None
     last_total = 0
     made_tool_call = False
+    nudges = 0
 
     for step in range(max_steps):
         if should_abort and should_abort():
@@ -326,8 +339,24 @@ def run_agent(
                 messages.append(_tool_result_msg(call, result))
             continue
 
-        # No tool calls → the model is answering (or can't tool-call).
+        # No tool calls → the model is answering (or stalled).
         content = (reply.get("content") or "").strip()
+
+        # Empty turn with no results yet — a thinking-mode model that grounded
+        # then handed back an empty assistant turn instead of searching. Nudge
+        # it to actually call search_photos rather than silently returning
+        # "Found 0". Bounded by _MAX_NUDGES so we can't loop forever; the empty
+        # turn is dropped (not appended) and a user nudge takes its place.
+        if not content and last_photos is None and nudges < _MAX_NUDGES:
+            nudges += 1
+            yield {"type": "tool_result", "tool": "_nudge",
+                   "summary": "empty model turn — nudging it to search"}
+            messages.append({"role": "user", "content":
+                "You haven't returned any photos yet. Call the search_photos "
+                "tool now with the appropriate filters, then give a brief "
+                "answer. Do not stop until you have searched."})
+            continue
+
         if not made_tool_call and not content:
             # Model produced nothing useful and never called a tool — fall back.
             yield from _run_single_shot(db, message)
