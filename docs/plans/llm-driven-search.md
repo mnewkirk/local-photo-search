@@ -1,6 +1,10 @@
 # LLM-Driven Search + MCP Server (M24)
 
-**Status:** Planned (design doc). Not yet started.
+**Status:** ✅ **SHIPPED.** M24a (shared tool layer + MCP server) and M24b
+(in-app `/api/ask` agent + "Ask" mode) are both implemented and tested. M24a
+was verified live against the 163k-photo NAS library; M24b ships with a
+mocked-LLM test suite (`tests/test_agent.py`) and needs a smoke test against
+the live LM Studio backend once deployed.
 **Decisions locked (2026-06-20):**
 - **Consumer model:** local-only is the daily driver. The headline UX is an
   in-app "Ask" box backed by a *server-side agent loop on the existing local

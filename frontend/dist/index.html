@@ -645,6 +645,13 @@
       const [expandedStacks, setExpandedStacks] = useState(new Set());
       const [stackMembers, setStackMembers] = useState({}); // { stack_id: [photo, ...] }
 
+      // ---- Ask mode (M24b: natural-language LLM agent) ----
+      const [askMode, setAskMode] = useState(false);
+      const [asking, setAsking] = useState(false);
+      const [askLog, setAskLog] = useState([]);      // narration lines
+      const [askAnswer, setAskAnswer] = useState(''); // final prose answer
+      const askAbortRef = useRef(null);
+
       const toggleStack = useCallback((stackId) => {
         setExpandedStacks(prev => {
           const next = new Set(prev);
@@ -843,6 +850,80 @@
           });
       }, [buildSearchParams, dateFrom, query, personFilter, colorFilter, locationFilter, minQuality]);
 
+      // Ask mode: stream the local-LLM agent (POST /api/ask SSE). Narration
+      // (tool_call/tool_result) renders as a status panel; the final `photos`
+      // event feeds the existing PhotoGrid via setResults.
+      const runAsk = useCallback((ev) => {
+        if (ev) ev.preventDefault();
+        const q = (query || '').trim();
+        if (!q || asking) return;
+
+        // Cancel any in-flight ask.
+        if (askAbortRef.current) askAbortRef.current.abort();
+        const ac = new AbortController();
+        askAbortRef.current = ac;
+
+        setAsking(true);
+        setAskLog(['Thinking…']);
+        setAskAnswer('');
+        setResults(null);
+        setTotalResults(0);
+        setHasMore(false);
+
+        fetch(API + '/api/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: q }),
+          signal: ac.signal,
+        })
+          .then(response => {
+            if (!response.ok) {
+              return response.text().then(t => { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = '';
+            const pump = () => reader.read().then(chunk => {
+              if (chunk.done) return;
+              buf += decoder.decode(chunk.value, { stream: true });
+              const parts = buf.split('\n\n');
+              buf = parts.pop();
+              parts.forEach(evt => {
+                const dataLine = evt.split('\n').filter(l => l.indexOf('data:') === 0)[0];
+                if (!dataLine) return; // keepalive comment
+                let p; try { p = JSON.parse(dataLine.slice(5).trim()); } catch (_) { return; }
+                if (p.type === 'tool_call') {
+                  const a = p.arguments && Object.keys(p.arguments).length
+                    ? ' ' + JSON.stringify(p.arguments) : '';
+                  setAskLog(prev => prev.concat(['→ ' + p.tool + a]));
+                } else if (p.type === 'tool_result') {
+                  setAskLog(prev => {
+                    const next = prev.slice();
+                    next[next.length - 1] = next[next.length - 1] + '  —  ' + p.summary;
+                    return next;
+                  });
+                } else if (p.type === 'photos') {
+                  setResults(p.results || []);
+                  setTotalResults(p.total || (p.results || []).length);
+                  setHasMore(false);
+                } else if (p.type === 'answer') {
+                  setAskAnswer(p.text || '');
+                } else if (p.type === 'error') {
+                  setAskLog(prev => prev.concat(['✗ ' + p.message]));
+                } else if (p.type === 'done') {
+                  setAsking(false);
+                }
+              });
+              return pump();
+            });
+            return pump().then(() => setAsking(false));
+          })
+          .catch(err => {
+            if (err.name !== 'AbortError') setAskLog(prev => prev.concat(['✗ ' + err.message]));
+            setAsking(false);
+          });
+      }, [query, asking]);
+
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
       const loadMore = useCallback(() => {
@@ -949,25 +1030,37 @@
       return e('div', null,
         // Header
         e(PS.SharedHeader, { activePage: 'search' },
-          e('form', { className: 'search-form', onSubmit: doSearch },
+          e('form', { className: 'search-form', onSubmit: askMode ? runAsk : doSearch },
+            e('button', {
+              type: 'button',
+              className: 'search-btn',
+              onClick: () => setAskMode(m => !m),
+              title: askMode
+                ? 'Switch to structured search (filters)'
+                : 'Switch to Ask mode — describe what you want in natural language',
+              style: { background: askMode ? 'var(--accent)' : 'var(--surface2)',
+                       color: askMode ? '#fff' : 'var(--text)' },
+            }, askMode ? '✨ Ask' : 'Search'),
             e('input', {
               ref: inputRef,
               className: 'search-input',
               type: 'text',
-              placeholder: 'Search photos... (e.g. "kids playing on the beach")',
+              placeholder: askMode
+                ? 'Ask in natural language… (e.g. "best beach photos of Calvin and Ellie last summer")'
+                : 'Search photos... (e.g. "kids playing on the beach")',
               value: query,
               onChange: (ev) => setQuery(ev.target.value),
             }),
             e('button', {
               className: 'search-btn',
               type: 'submit',
-              disabled: loading,
-            }, loading ? 'Searching...' : 'Search'),
+              disabled: askMode ? asking : loading,
+            }, askMode ? (asking ? 'Asking…' : 'Ask') : (loading ? 'Searching...' : 'Search')),
           ),
         ),
 
-        // Filters bar
-        e('div', { className: 'filters' },
+        // Filters bar (hidden in Ask mode — the LLM picks the filters)
+        !askMode && e('div', { className: 'filters' },
           e('div', { className: 'filter-group' },
             e('span', { className: 'filter-label' }, 'Person:'),
             e('select', {
@@ -1073,7 +1166,29 @@
 
         // Content
         e('div', { className: 'content' },
-          results === null && !loading && e(EmptyState),
+          // Ask-mode narration + answer panel
+          askMode && (askLog.length > 0 || askAnswer) && e('div', {
+            style: { marginBottom: 16, padding: '12px 16px', borderRadius: 'var(--radius)',
+                     background: 'var(--surface2)', border: '1px solid var(--border)' },
+          },
+            askAnswer && e('div', {
+              style: { fontSize: 15, marginBottom: askLog.length ? 10 : 0, color: 'var(--text)' },
+            }, askAnswer),
+            askLog.length > 0 && e('div', {
+              style: { fontFamily: 'monospace', fontSize: 12, color: 'var(--text-muted)',
+                       whiteSpace: 'pre-wrap', lineHeight: 1.6 },
+            }, askLog.join('\n')),
+          ),
+
+          results === null && !loading && !askMode && e(EmptyState),
+          askMode && results === null && !asking && askLog.length === 0 && e('div', { className: 'empty-state' },
+            e('h2', null, 'Ask about your photos'),
+            e('p', null, 'Describe what you want in plain language — the assistant figures out the filters, '
+              + 'looks things up, and shows the matching photos. Everything runs locally on the NAS.'),
+            e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } },
+              'Try: "Calvin and Ellie at the beach last summer" · "our best sunset shots in France" · '
+              + '"photos from the 2024 Italy trip, highest quality first"'),
+          ),
           loading && e('div', { className: 'loading' }, 'Searching...'),
           results !== null && !loading && results.length === 0 &&
             e('div', { className: 'loading' }, 'No results found.'),

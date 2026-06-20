@@ -2816,6 +2816,85 @@ async def api_detect_stacks_stream(request: Request):
     )
 
 
+@app.post("/api/ask")
+async def api_ask(request: Request):
+    """M24b — natural-language search via the local-LLM agent loop (SSE).
+
+    Body: {"message": str, "history"?: [{"role","content"}, ...]}.
+
+    Runs photosearch.agent.run_agent over the shared tool layer on the LOCAL
+    LLM backend (LM Studio / Ollama). Nothing leaves the NAS. Streams the same
+    event dicts the agent yields, plus a terminal `done`:
+      {"type": "tool_call" | "tool_result" | "photos" | "answer" | "error", ...}
+      {"type": "done"}
+
+    Client disconnect (AbortController) flips a threading.Event the agent loop
+    checks between steps.
+    """
+    import asyncio
+    import threading
+    from .agent import run_agent
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    data = data or {}
+    message = (data.get("message") or "").strip()
+    history = data.get("history") if isinstance(data.get("history"), list) else None
+    if not message:
+        raise HTTPException(400, "message is required")
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    def run():
+        try:
+            with _get_db() as db:
+                for event in run_agent(
+                    db, message, history=history,
+                    should_abort=cancel_event.is_set,
+                ):
+                    _emit(event)
+                    if cancel_event.is_set():
+                        break
+            _emit({"type": "done"})
+        except Exception as exc:
+            logger.exception("ASK agent failed")
+            _emit({"type": "error", "message": str(exc)})
+            _emit({"type": "done"})
+
+    threading.Thread(target=run, daemon=True).start()
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("ASK  client disconnected — cancelling")
+                    cancel_event.set()
+                    return
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") == "done":
+                    return
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/stacks/{stack_id}")
 def api_get_stack(stack_id: int):
     """Get a stack with all member photos."""

@@ -1690,8 +1690,42 @@ dates, scores) — that text leaves if an off-box client consumes it.
 (web + MCP); both read-only for search, WAL handles concurrent readers — no
 schema change.
 
-**Not yet built:** M24b — the in-app `POST /api/ask` SSE agent loop on the
-local LLM + the "Ask" mode on the search page. See the plan doc.
+---
+
+## In-app "Ask" agent (M24b)
+
+Natural-language search on the **local** LLM — an "✨ Ask" toggle on the
+search page (`/`). The user describes what they want; a server-side agent
+loop plans the search with the same tool layer the MCP server exposes.
+Nothing leaves the NAS.
+
+- **`photosearch/agent.py`** — `run_agent(db, message, history, should_abort)`
+  is a synchronous generator yielding event dicts (`tool_call` / `tool_result`
+  / `photos` / `answer` / `error`). It has its **own** tool-calling chat client
+  (`_chat`) because describe.py's client is text-only — routes to
+  `PHOTOSEARCH_TEXT_LLM_URL` (OpenAI-compatible, the LM Studio path) with
+  `tools=`/`tool_choice=auto`, else Ollama. Loop capped at `_MAX_STEPS=6`.
+- **Model:** `PHOTOSEARCH_LLM_AGENT_MODEL` (role-resolved, falls back to
+  `PHOTOSEARCH_LLM_TEXT_MODEL` → `PHOTOSEARCH_TEXT_LLM_MODEL` → `llama3.1`).
+  Needs a **tool-calling-capable** model (qwen2.5-instruct / qwen3 /
+  llama-3.1+ with LM Studio tool use on).
+- **Single-shot fallback:** `PHOTOSEARCH_AGENT_SINGLE_SHOT=1` forces a one-shot
+  NL→`search_photos`-args JSON completion (no loop). Also kicks in
+  automatically if the first tool-calling round-trip throws or the model
+  returns neither tool calls nor prose — so the feature degrades gracefully on
+  a model that can't tool-call.
+- **`POST /api/ask`** (web.py, SSE) bridges the sync generator through the
+  thread→`asyncio.Queue` pattern (same as the stacking stream), with
+  `is_disconnected()` cancellation and a terminal `{"type":"done"}`. Body
+  `{message, history?}`.
+- **Frontend:** the "✨ Ask" toggle in `index.html` swaps the search bar to an
+  NL box, hides the structured filters, streams narration into a status panel,
+  and feeds the final `photos` event into the **existing** `PhotoGrid` via
+  `setResults` (compact hits share the grid's photo shape). Additive — the
+  structured search UI is untouched.
+- **Tests:** `tests/test_agent.py` (10 cases, chat client mocked; tool dispatch
+  runs for real against the fixture DB). **Still TODO:** a live smoke test
+  against the LM Studio backend once deployed.
 
 ---
 
@@ -1726,7 +1760,7 @@ pick up and implement without re-deriving the shape:
   columns. New CLI `photosearch takeout-import` using a reviewable
   ndjson plan ledger for resumability. Phone GPS amplifies inferred-
   geotag recall on camera photos — run after each year's import.
-- **`docs/plans/llm-driven-search.md`** — **M24**. LLM-driven search:
+- **`docs/plans/llm-driven-search.md`** — **M24 (SHIPPED)**. LLM-driven search:
   stop hand-assembling structured filters and let an LLM plan the query.
   Keystone is a **shared tool layer** (`photosearch/tools.py`) — a registry
   of `PhotoDB` wrappers (`search_photos`, `list_people`, `list_places`,

@@ -804,18 +804,21 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   per-year export, composite dedup (photoTakenTime + device + filename stem),
   lands in `/photos/YYYY/YYYY-MM-DD_gphotos/`. Phone GPS amplifies the
   inferred-geotag recall on camera photos.
-- `docs/plans/llm-driven-search.md` — M24. Stop hand-assembling search
-  filters; let an LLM be the query planner. One **shared tool layer**
+- `docs/plans/llm-driven-search.md` — M24 **(SHIPPED)**. Stop hand-assembling
+  search filters; let an LLM be the query planner. One **shared tool layer**
   (`photosearch/tools.py`: `search_photos` / `list_people` / `list_places`
   / `list_vocab` / `get_photo` / `get_photo_image` / `get_library_overview`)
-  consumed by two adapters — **M24a** a `FastMCP` streamable-HTTP MCP server
-  as a new `photosearch-mcp` NAS container (the "first step"), and **M24b**
-  an in-app `/api/ask` SSE agent loop on the **local** LM Studio/Ollama
-  backend (nothing leaves the NAS), surfaced as an "Ask" mode toggle on the
-  search page. Image returns gated by `PHOTOSEARCH_MCP_ALLOW_IMAGES`
-  (default off). Single-shot NL→filters fallback for non-tool-calling
-  models. Only existing-code change: a `person_ids` path in
-  `search_combined`. No schema bump.
+  consumed by two adapters — **M24a** a streamable-HTTP MCP server
+  (`photosearch/mcp_server.py`, low-level `Server`) as the `photosearch-mcp`
+  NAS container (`mcp>=1.2`), and **M24b** an in-app `POST /api/ask` SSE agent
+  loop (`photosearch/agent.py`) on the **local** LM Studio/Ollama backend
+  (nothing leaves the NAS), surfaced as an "✨ Ask" mode toggle on the search
+  page. Agent model via `PHOTOSEARCH_LLM_AGENT_MODEL` (falls back to the text
+  role); tool-calling loop capped at 6 steps with a single-shot NL→filters
+  fallback (`PHOTOSEARCH_AGENT_SINGLE_SHOT=1`) for non-tool-calling models.
+  Image returns gated by `PHOTOSEARCH_MCP_ALLOW_IMAGES` (default off). Only
+  existing-code change: a `person_ids` path in `search_combined`. No schema
+  bump. Tests: `tests/test_tools.py`, `tests/test_agent.py`.
 
 - `docs/plans/backfill-maintenance-sweep.md` — M25. **Queued: do NOT start
   until M24b ships.** Many derived-data passes get lost on new photos —
