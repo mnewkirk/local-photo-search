@@ -17,7 +17,7 @@ from photosearch import tools
 
 EXPECTED_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
-    "search_photos", "summarize", "get_photo", "get_photo_image",
+    "search_photos", "summarize", "representatives", "get_photo", "get_photo_image",
 }
 
 
@@ -261,6 +261,40 @@ def test_summarize_location_filter_by_year(db):
 
 def test_summarize_bad_group_by(db):
     res = tools.call_tool(db, "summarize", {"group_by": "nonsense"})
+    assert "error" in res
+
+
+# ---------------------------------------------------------------------------
+# representatives (top-N per bucket)
+# ---------------------------------------------------------------------------
+
+def test_representatives_by_location_one_each(db):
+    # Best (highest aesthetic_score) per place: Big Sur → DSC04922 (9.1),
+    # Morro Bay → DSC04878 (6.2).
+    res = tools.call_tool(db, "representatives", {"bucket": "location", "n": 1})
+    by_bucket = {h["bucket"]: h["filename"] for h in res["results"]}
+    assert by_bucket["Big Sur, CA"] == "DSC04922.JPG"
+    assert by_bucket["Morro Bay, CA"] == "DSC04878.JPG"
+    assert res["buckets"] == 2
+
+
+def test_representatives_n_per_bucket(db):
+    res = tools.call_tool(db, "representatives", {"bucket": "location", "n": 2})
+    # 2 places × up to 2 each = 4 (Big Sur has 3, Morro Bay has 2).
+    assert res["returned"] == 4
+
+
+def test_representatives_with_person_filter_by_year(db):
+    # Alex's photos are all 2026; best is DSC04922.
+    res = tools.call_tool(db, "representatives",
+                          {"people": ["Alex"], "bucket": "year", "n": 1})
+    assert res["returned"] == 1
+    assert res["results"][0]["filename"] == "DSC04922.JPG"
+    assert res["results"][0]["bucket"] == "2026"
+
+
+def test_representatives_bad_bucket(db):
+    res = tools.call_tool(db, "representatives", {"bucket": "nonsense"})
     assert "error" in res
 
 

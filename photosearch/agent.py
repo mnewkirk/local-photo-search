@@ -156,8 +156,16 @@ def _system_prompt(db=None) -> str:
         "a dimension instead of returning photos. For multi-step questions like "
         "'which year were we in both X and Y', summarize each by year, intersect "
         "the years yourself, then search_photos for that year.\n"
-        "- Then stop and answer briefly — the count and how you narrowed it. "
-        "Never list photo ids; the UI shows the photos.\n\n"
+        "- For 'one/N per year' / 'best of each year' / 'a few from each trip' "
+        "(a representative SPREAD, not a flat list), use representatives(filters, "
+        "bucket=year|month|location|person, n). search_photos CANNOT do "
+        "per-bucket selection. E.g. 'best photo of Matt, one per year, last 10 "
+        "years' → representatives(people=['Matt'], bucket='year', n=1, "
+        "date_from=<10 years ago>).\n"
+        "- Then stop and write a 1-3 sentence answer that EXPLAINS how you "
+        "interpreted the request — which filters and sort you used and why "
+        "(e.g. \"'best' so I sorted by quality; 'the kids' = Calvin and Ellie\") "
+        "— and what the photos show. Never list photo ids; the UI shows them.\n\n"
         "Examples (plan straight to search_photos using the facts):\n"
         "  'photos of Calvin' -> people=['Calvin']\n"
         "  'Nicole and Matt together' -> people=['Nicole','Matt']\n"
@@ -383,6 +391,7 @@ def run_agent(
     last_total = 0
     made_tool_call = False
     nudges = 0
+    summary_nudged = False
 
     for step in range(max_steps):
         if should_abort and should_abort():
@@ -414,7 +423,8 @@ def run_agent(
                     result = {"error": f"unknown tool: {name}"}
                 except Exception as exc:
                     result = {"error": str(exc)}
-                if name == "search_photos" and isinstance(result, dict) and "results" in result:
+                if (name in ("search_photos", "representatives")
+                        and isinstance(result, dict) and "results" in result):
                     last_photos = result.get("results", [])
                     last_total = result.get("total", len(last_photos))
                 yield {"type": "tool_result", "tool": name, "summary": _summarize(name, result)}
@@ -437,6 +447,16 @@ def run_agent(
                 "You haven't returned any photos yet. Call the search_photos "
                 "tool now with the appropriate filters, then give a brief "
                 "answer. Do not stop until you have searched."})
+            continue
+
+        # Results in hand but an empty final turn — instead of falling back to a
+        # terse "Found N", nudge once for the interpretation/explanation.
+        if not content and last_photos is not None and not summary_nudged:
+            summary_nudged = True
+            messages.append({"role": "user", "content":
+                "Now write the 1-3 sentence answer: explain how you interpreted "
+                "the request (which filters/sort you used and why) and what "
+                "these photos show. Do not list ids."})
             continue
 
         if not made_tool_call and not content:

@@ -1284,7 +1284,11 @@
           ),
 
           results !== null && results.length > 0 &&
-            e(PhotoGrid, { results: PS.applySortOrder(results, sortBy), sortBy, setSortBy,
+            // Ask mode: render in the agent's chosen order (it picked the sort);
+            // hide the sort control so the structured dropdown can't override it.
+            e(PhotoGrid, { results: askMode ? results : PS.applySortOrder(results, sortBy),
+                           sortBy: askMode ? null : sortBy,
+                           setSortBy: askMode ? null : setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc'],
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack, query,

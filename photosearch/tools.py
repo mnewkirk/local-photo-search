@@ -722,6 +722,92 @@ _register(ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Tool: representatives  (top-N best per bucket — "one per year")
+# ---------------------------------------------------------------------------
+
+def _h_representatives(db: PhotoDB, args: dict) -> dict:
+    bucket = (args.get("bucket") or "year").strip().lower()
+    n = _clamp(args.get("n"), 1, 1, 10)
+    where, params = _build_filter_sql(db, args)
+    # Best-first within a bucket: scored photos before unscored, highest score
+    # first. (Portable NULLS-LAST.)
+    order_quality = "aesthetic_score IS NULL, aesthetic_score DESC"
+
+    if bucket == "person":
+        inner = (f"SELECT photos.*, pe.name AS _bucket, "
+                 f"ROW_NUMBER() OVER (PARTITION BY pe.id ORDER BY {order_quality}) AS _rn "
+                 f"FROM photos JOIN faces f ON f.photo_id = photos.id "
+                 f"JOIN persons pe ON pe.id = f.person_id WHERE {where}")
+        outer_order = "_bucket"
+    elif bucket in _GROUP_EXPR:
+        expr, extra = _GROUP_EXPR[bucket]
+        inner = (f"SELECT photos.*, {expr} AS _bucket, "
+                 f"ROW_NUMBER() OVER (PARTITION BY {expr} ORDER BY {order_quality}) AS _rn "
+                 f"FROM photos WHERE ({where}) AND {extra}")
+        outer_order = "_bucket DESC" if bucket in ("year", "month") else "_bucket"
+    else:
+        return {"error": f"unsupported bucket: {bucket!r}. "
+                         "Use year | month | location | person | camera_model."}
+
+    sql = (f"SELECT * FROM ({inner}) WHERE _rn <= ? "
+           f"ORDER BY {outer_order}, {order_quality} LIMIT 500")
+    try:
+        rows = db.conn.execute(sql, (*params, n)).fetchall()
+    except Exception as exc:
+        return {"error": f"representatives failed: {exc}"}
+
+    results = []
+    for r in rows:
+        d = dict(r)
+        hit = _compact_hit(d)
+        hit["bucket"] = d.get("_bucket")
+        results.append(hit)
+    return {
+        "bucket": bucket,
+        "n_per_bucket": n,
+        "buckets": len({h["bucket"] for h in results}),
+        "returned": len(results),
+        "results": results,
+    }
+
+
+_register(ToolSpec(
+    name="representatives",
+    description=(
+        "Return the top-N best (by aesthetic quality) photos PER bucket — e.g. "
+        "the single best photo of EACH year ('one per year'), a few from each "
+        "trip, or one of each person. Use this when the user wants a "
+        "representative SPREAD across years/months/locations/people, NOT a flat "
+        "ranked list (search_photos can't do per-bucket selection). Same "
+        "structured filters as search_photos (no free-text `query`). `bucket` is "
+        "year|month|location|person|camera_model; `n` is photos per bucket "
+        "(default 1). Example — 'best photo of Matt, one per year for the last "
+        "10 years' → people=['Matt'], bucket='year', n=1, date_from='2016-01-01'."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "bucket": {"type": "string",
+                       "enum": ["year", "month", "location", "person", "camera_model"],
+                       "description": "Group photos by this; return the best N of each."},
+            "n": {"type": "integer", "description": "Photos per bucket (default 1, max 10)."},
+            "people": {"type": "array", "items": {"type": "string"},
+                       "description": "Registered names; matches photos with ALL of them."},
+            "location": {"type": "string", "description": "Place/region name."},
+            "date_from": {"type": "string", "description": "Earliest date, YYYY-MM-DD."},
+            "date_to": {"type": "string", "description": "Latest date, YYYY-MM-DD."},
+            "category": {"type": "string", "description": "Exact content category."},
+            "visual_tag": {"type": "string", "description": "Visual-quality tag."},
+            "keyword": {"type": "string", "description": "Keyword substring."},
+            "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+        },
+        "additionalProperties": False,
+    },
+    handler=_h_representatives,
+))
+
+
+# ---------------------------------------------------------------------------
 # Tool: get_photo
 # ---------------------------------------------------------------------------
 
