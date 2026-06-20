@@ -30,6 +30,10 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 REPO_DIR = os.environ.get("PHOTOSEARCH_REPO_DIR", "/repo")
 COMPOSE_FILE = os.environ.get("PHOTOSEARCH_COMPOSE_FILE", f"{REPO_DIR}/docker-compose.nas.yml")
 COMPOSE_SERVICE = os.environ.get("PHOTOSEARCH_COMPOSE_SERVICE", "photosearch")
+# The MCP server (M24a) runs as a sibling container that reuses the
+# photosearch image, so it never needs its own build — only a recreate after
+# the shared image is rebuilt.
+MCP_SERVICE = os.environ.get("PHOTOSEARCH_COMPOSE_MCP_SERVICE", "photosearch-mcp")
 # Compose project name — must match whatever the running containers were
 # labeled with, or compose won't recognize them and will try to create
 # fresh ones (hitting the explicit container_name conflicts). The compose
@@ -283,6 +287,42 @@ async def admin_ingest_incoming(dry_run: bool = False):
                 yield chunk
         finally:
             _ingest_lock.release()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/restart-mcp")
+async def admin_restart_mcp():
+    """`docker compose up -d --force-recreate --no-deps photosearch-mcp` — SSE.
+
+    Recreates the MCP sibling container. It reuses the photosearch image, so
+    it needs no build of its own — but after the shared image is rebuilt (the
+    Build button), the MCP container keeps running the *old* image until it's
+    recreated. This is that recreate.
+
+    Unlike /restart, no helper container is needed: we're recreating a
+    DIFFERENT container from the one serving this request, so the compose
+    subprocess isn't in the PID namespace being torn down — a plain streamed
+    subprocess completes normally.
+
+    --force-recreate because the image tag (photosearch-photosearch) is
+    unchanged after a rebuild, so compose otherwise sees no config change and
+    skips the swap. --no-deps so it doesn't drag photosearch/ollama along.
+    """
+    if not _op_lock.acquire(blocking=False):
+        raise HTTPException(409, "another admin operation is in progress")
+
+    cmd = [
+        "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
+        "up", "-d", "--force-recreate", "--no-deps", MCP_SERVICE,
+    ]
+
+    async def gen():
+        try:
+            async for chunk in _stream_subprocess(cmd, cwd=REPO_DIR, env=os.environ.copy()):
+                yield chunk
+        finally:
+            _op_lock.release()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

@@ -1136,6 +1136,53 @@
           });
       }
 
+      function runRestartMcp() {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ docker compose up -d --force-recreate photosearch-mcp…');
+        // SSE stream — unlike the photosearch restart, THIS container stays
+        // alive (we're recreating a sibling), so the connection doesn't drop
+        // and we can read the stream + return code to completion.
+        var resolved = false;
+        fetch('/api/admin/restart-mcp', { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ MCP container recreated on the current image'
+                                   : '  ✗ MCP restart failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      setBusy(false);
+                    }
+                    if (payload.error) { appendLog('  ✗ ' + payload.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() { if (!resolved) setBusy(false); });
+          })
+          .catch(function(err) { appendLog('  ✗ MCP restart stream error: ' + err.message); setBusy(false); });
+      }
+
       if (!version) {
         return e('div', null,
           e('h2', null, 'Deployment'),
@@ -1229,6 +1276,14 @@
                 ? 'New image ready — click to apply it'
                 : 'docker compose up -d — swap to the new image',
             }, buildResult === 'ready' ? 'Restart ← new image ready' : 'Restart'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: runRestartMcp,
+              title: 'docker compose up -d --force-recreate photosearch-mcp — recreate the MCP '
+                   + 'container on the current image. No separate build needed: it reuses the '
+                   + 'photosearch image, so just Build then Restart MCP to pick up new code.',
+            }, 'Restart MCP'),
             e('button', {
               className: 'btn',
               disabled: busy,
