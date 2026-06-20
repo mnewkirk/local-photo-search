@@ -35,6 +35,17 @@ up.
 
 ## Backlog (impact-ordered)
 
+0. **Top-N-per-bucket / diversified results** (quick, high-utility). Requests
+   like "best photo of Matt, one per year for the last 10 years" or "a few from
+   each trip" can't be expressed today — `search_photos` returns a flat
+   quality-ranked list, so the agent returns the global top-50, not one per
+   year. `summarize` counts per bucket but returns no photos. Add either a
+   `representatives(filters, bucket=year|month|location, n=1)` tool returning
+   the top-N (by quality) photos *per bucket*, or a `one_per`/`diversify` option
+   on `search_photos`. SQL window-function (`ROW_NUMBER() OVER (PARTITION BY
+   bucket ORDER BY aesthetic_score DESC)`) makes this cheap. Observed live
+   2026-06-20 ("one per year" returned 50 of 3360).
+
 3. **Events / trips metadata.** Cluster photos by time + GPS + place into
    events; "our France trip" becomes a first-class entity with a date range.
    Also the clean way to answer multi-hop year questions (read two trips'
