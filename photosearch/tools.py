@@ -202,9 +202,12 @@ def _resolve_person_names(db: PhotoDB, names: list[str]) -> tuple[list[int], lis
 def _h_get_library_overview(db: PhotoDB, args: dict) -> dict:
     c = db.conn
     total = c.execute("SELECT COUNT(*) AS n FROM photos").fetchone()["n"]
+    # GLOB-filter to well-formed YYYY-MM-DD values: a handful of production
+    # rows have corrupt date_taken (stray control bytes) that MIN/MAX would
+    # otherwise surface as a garbage date range to the model.
     drange = c.execute(
-        "SELECT MIN(date_taken) AS lo, MAX(date_taken) AS hi "
-        "FROM photos WHERE date_taken IS NOT NULL"
+        "SELECT MIN(date_taken) AS lo, MAX(date_taken) AS hi FROM photos "
+        "WHERE date_taken GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
     ).fetchone()
 
     def _count(where: str) -> int:

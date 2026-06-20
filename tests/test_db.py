@@ -294,6 +294,14 @@ class TestCLIPEmbeddings:
         results = self._search_clip_compat(db, emb, 3)
         assert len(results) == 3
 
+    def test_search_clip_clamps_huge_limit(self, db):
+        # vec0 KNN caps k at 4096; a combined person+CLIP search passes a
+        # prefetch limit far above that. search_clip must clamp instead of
+        # raising "k value in knn query too large" (regression).
+        emb = _make_embedding(512, seed=0)
+        results = db.search_clip(emb, limit=300000)
+        assert len(results) <= 5  # never errors; returns what exists
+
 
 # =========================================================================
 # Color search

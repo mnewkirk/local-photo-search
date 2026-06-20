@@ -760,6 +760,13 @@ class PhotoDB:
         """Find photos most similar to a query embedding. Returns list of {photo_id, distance}."""
         if not HAS_SQLITE_VEC:
             return []
+        # sqlite-vec's vec0 KNN hard-caps k at 4096; a larger LIMIT raises
+        # "k value in knn query too large". Callers that combine CLIP with
+        # another filter pass a very large prefetch limit (so the intersection
+        # doesn't collapse) — clamp it here since one KNN can't return more
+        # than 4096 rows regardless. Without this, any person+free-text search
+        # (web or MCP) 500s.
+        limit = min(limit, 4096)
         blob = _serialize_float_list(query_embedding)
         try:
             rows = self.conn.execute(
