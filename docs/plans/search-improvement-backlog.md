@@ -35,6 +35,21 @@ up.
 
 ## Backlog (impact-ordered)
 
+0a. **Subject-prominence ranking** (representatives/search enhancement). "Best
+   photo of Matt, one per year — make sure Matt is the *primary* subject
+   (foreground, not background), and in group shots fewer than ~4-5 people."
+   Today `representatives` ranks each bucket by `aesthetic_score`, so it can
+   surface shots where Matt is incidental/background (observed bad for 2009,
+   2012, 2013; e.g. DSCN1692, "Christmas Party 037"). We HAVE the data to fix
+   it: `faces` has per-face `bbox_top/bottom/left/right` + `det_score` +
+   `person_id`, and `photos` has `image_width/height`. Add a `rank_by=subject`
+   mode that scores each candidate by the filtered person's **face-area
+   fraction** (their bbox area ÷ image area → foreground vs. background) with a
+   penalty for high total face count (favor ≤4-5 people) and low det_score,
+   optionally blended with aesthetic. Requires a person filter (you rank by
+   *that* person's prominence). Then "best of Matt per year" returns shots
+   where Matt is actually the subject.
+
 0. **Top-N-per-bucket / diversified results** (quick, high-utility). Requests
    like "best photo of Matt, one per year for the last 10 years" or "a few from
    each trip" can't be expressed today — `search_photos` returns a flat
