@@ -77,3 +77,7 @@ amdgpu-insecure-instinct-udev-rules*.deb
 photos/
 # Syncthing runtime config — holds private keys, TLS certs, and the apikey
 syncthing-config/
+
+# eval bake-off outputs (regenerable)
+evals/bakeoff_results.json
+evals/bakeoff_report.html

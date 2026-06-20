@@ -162,6 +162,27 @@ def test_search_people_case_insensitive(db):
     assert res["total"] == 3
 
 
+def test_search_people_stringified_array(db):
+    # Small models often JSON-encode the array as a string; coerce it.
+    res = tools.call_tool(db, "search_photos", {"people": '["Alex"]'})
+    assert res["total"] == 3
+    res2 = tools.call_tool(db, "search_photos", {"people": '["Alex", "Jamie"]'})
+    assert res2["total"] == 2
+
+
+def test_search_people_bare_string(db):
+    res = tools.call_tool(db, "search_photos", {"people": "Alex"})
+    assert res["total"] == 3
+
+
+def test_coerce_str_list():
+    assert tools._coerce_str_list('["a","b"]') == ["a", "b"]
+    assert tools._coerce_str_list("Alex") == ["Alex"]
+    assert tools._coerce_str_list(["a", "b"]) == ["a", "b"]
+    assert tools._coerce_str_list(None) == []
+    assert tools._coerce_str_list("") == []
+
+
 def test_search_unresolved_person_reported(db):
     res = tools.call_tool(db, "search_photos", {"people": ["Nobody"]})
     assert res["total"] == 0

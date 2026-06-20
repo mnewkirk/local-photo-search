@@ -146,6 +146,31 @@ def _truncate(text: Optional[str], n: int = _DESC_TRUNCATE) -> Optional[str]:
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
 
 
+def _coerce_str_list(value) -> list[str]:
+    """Coerce a tool argument into a list of strings.
+
+    Tolerates models that JSON-encode the array as a *string* (small models
+    often emit ``people='["Calvin"]'`` instead of ``["Calvin"]``) or pass a
+    bare scalar. Correct reasoning shouldn't be penalized by a serialization
+    quirk — both the agent and the MCP server route through here.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip()]
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(v) for v in parsed if str(v).strip()]
+            except (ValueError, TypeError):
+                pass
+        return [s] if s else []
+    return [str(value)]
+
+
 def _json_array(raw: Optional[str]) -> list:
     if not raw:
         return []
@@ -429,9 +454,7 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
     limit = _clamp(args.get("limit"), _SEARCH_DEFAULT_LIMIT, 1, _SEARCH_MAX_LIMIT)
     sort = args.get("sort") if args.get("sort") in _VALID_SORTS else None
 
-    people = args.get("people") or []
-    if isinstance(people, str):
-        people = [people]
+    people = _coerce_str_list(args.get("people"))
     person_ids, unresolved = _resolve_person_names(db, people) if people else ([], [])
 
     # If the model asked for people that don't exist, don't silently run an
