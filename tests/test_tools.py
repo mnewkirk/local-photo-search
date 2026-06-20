@@ -17,7 +17,7 @@ from photosearch import tools
 
 EXPECTED_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
-    "search_photos", "get_photo", "get_photo_image",
+    "search_photos", "summarize", "get_photo", "get_photo_image",
 }
 
 
@@ -220,6 +220,48 @@ def test_search_description_truncated(db):
     hit = next(h for h in res["results"] if h["id"] == pid)
     assert len(hit["description"]) <= tools._DESC_TRUNCATE
     assert hit["description"].endswith("…")
+
+
+# ---------------------------------------------------------------------------
+# summarize (faceting)
+# ---------------------------------------------------------------------------
+
+def test_summarize_by_year(db):
+    res = tools.call_tool(db, "summarize", {"group_by": "year"})
+    buckets = {b["value"]: b["count"] for b in res["buckets"]}
+    # All 5 fixture photos are 2026-03-13.
+    assert buckets.get("2026") == 5
+
+
+def test_summarize_by_location(db):
+    res = tools.call_tool(db, "summarize", {"group_by": "location"})
+    buckets = {b["value"]: b["count"] for b in res["buckets"]}
+    assert buckets["Big Sur, CA"] == 3
+    assert buckets["Morro Bay, CA"] == 2
+
+
+def test_summarize_by_person(db):
+    res = tools.call_tool(db, "summarize", {"group_by": "person"})
+    buckets = {b["value"]: b["count"] for b in res["buckets"]}
+    assert buckets == {"Alex": 3, "Jamie": 2, "Sam": 1}
+
+
+def test_summarize_with_filter(db):
+    # Alex's photos are all in Big Sur → group by location yields just that.
+    res = tools.call_tool(db, "summarize", {"people": ["Alex"], "group_by": "location"})
+    buckets = {b["value"]: b["count"] for b in res["buckets"]}
+    assert buckets == {"Big Sur, CA": 3}
+
+
+def test_summarize_location_filter_by_year(db):
+    res = tools.call_tool(db, "summarize", {"location": "Big Sur", "group_by": "year"})
+    buckets = {b["value"]: b["count"] for b in res["buckets"]}
+    assert buckets.get("2026") == 3
+
+
+def test_summarize_bad_group_by(db):
+    res = tools.call_tool(db, "summarize", {"group_by": "nonsense"})
+    assert "error" in res
 
 
 # ---------------------------------------------------------------------------

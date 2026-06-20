@@ -557,6 +557,171 @@ _register(ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Tool: summarize  (faceting / aggregation)
+# ---------------------------------------------------------------------------
+
+_STRUCT_LOC_CACHE: dict = {}
+
+
+def _has_structured_location(db) -> bool:
+    key = getattr(db, "db_path", "?")
+    if key not in _STRUCT_LOC_CACHE:
+        try:
+            db.conn.execute("SELECT country FROM photos LIMIT 1")
+            _STRUCT_LOC_CACHE[key] = True
+        except Exception:
+            _STRUCT_LOC_CACHE[key] = False
+    return _STRUCT_LOC_CACHE[key]
+
+
+def _build_filter_sql(db, args: dict) -> tuple[str, list]:
+    """Build a WHERE clause + params from the structured filters (the same set
+    search_photos accepts, minus the free-text CLIP `query`). Mirrors
+    search_combined's structured semantics closely enough for faceting."""
+    clauses: list[str] = []
+    params: list = []
+
+    people = _coerce_str_list(args.get("people"))
+    if people:
+        ids, _ = _resolve_person_names(db, people)
+        if ids:
+            ph = ",".join("?" * len(ids))
+            clauses.append(
+                f"photos.id IN (SELECT photo_id FROM faces WHERE person_id IN ({ph}) "
+                f"GROUP BY photo_id HAVING COUNT(DISTINCT person_id) = ?)")
+            params.extend(ids)
+            params.append(len(ids))
+        else:
+            clauses.append("0")  # unknown person → match nothing
+
+    loc = (args.get("location") or "").strip()
+    if loc:
+        from .geocode import country_name_to_code
+        sub = ["place_name LIKE ?"]
+        params.append(f"%{loc}%")
+        code = country_name_to_code(loc)
+        if code:
+            sub.append("place_name LIKE ?")
+            params.append(f"%, {code}")
+        if _has_structured_location(db):
+            for col in ("country", "admin1", "admin2", "locality"):
+                sub.append(f"LOWER({col}) = LOWER(?)")
+                params.append(loc)
+        clauses.append("(" + " OR ".join(sub) + ")")
+
+    df = (args.get("date_from") or "").strip()
+    dt = (args.get("date_to") or "").strip()
+    if df:
+        clauses.append("date_taken >= ?")
+        params.append(df)
+    if dt:
+        clauses.append("date_taken <= ?")
+        params.append(dt + " 23:59:59")
+
+    # JSON-array token filters.
+    for key, col in (("category", "categories"), ("visual_tag", "visual_tags")):
+        v = (args.get(key) or "").strip()
+        if v:
+            clauses.append(f"{col} LIKE ?")
+            params.append(f'%"{v}"%')
+    kw = (args.get("keyword") or "").strip()
+    if kw:
+        clauses.append("keywords LIKE ?")
+        params.append(f"%{kw}%")
+
+    mq = args.get("min_quality")
+    if mq is not None:
+        try:
+            clauses.append("aesthetic_score >= ?")
+            params.append(float(mq))
+        except (TypeError, ValueError):
+            pass
+
+    return (" AND ".join(clauses) if clauses else "1"), params
+
+
+# group_by → (SELECT expression, extra WHERE to keep buckets clean)
+_GROUP_EXPR = {
+    "year": ("substr(date_taken,1,4)", "date_taken GLOB '[0-9][0-9][0-9][0-9]-*'"),
+    "month": ("substr(date_taken,1,7)", "date_taken GLOB '[0-9][0-9][0-9][0-9]-*'"),
+    "location": ("place_name", "place_name IS NOT NULL"),
+    "camera_model": ("camera_model", "camera_model IS NOT NULL"),
+}
+
+
+def _h_summarize(db: PhotoDB, args: dict) -> dict:
+    group_by = (args.get("group_by") or "year").strip().lower()
+    limit = _clamp(args.get("limit"), 50, 1, 500)
+    where, params = _build_filter_sql(db, args)
+
+    if group_by == "person":
+        sql = ("SELECT pe.name AS bucket, COUNT(DISTINCT photos.id) AS n "
+               "FROM photos JOIN faces f ON f.photo_id = photos.id "
+               "JOIN persons pe ON pe.id = f.person_id "
+               f"WHERE {where} GROUP BY pe.id ORDER BY n DESC LIMIT ?")
+    elif group_by in _GROUP_EXPR:
+        expr, extra = _GROUP_EXPR[group_by]
+        order = "bucket DESC" if group_by in ("year", "month") else "n DESC"
+        sql = (f"SELECT {expr} AS bucket, COUNT(*) AS n FROM photos "
+               f"WHERE ({where}) AND {extra} GROUP BY bucket ORDER BY {order} LIMIT ?")
+    else:
+        return {"error": f"unsupported group_by: {group_by!r}. "
+                         "Use year | month | location | person | camera_model."}
+
+    try:
+        rows = db.conn.execute(sql, (*params, limit)).fetchall()
+    except Exception as exc:
+        return {"error": f"summarize failed: {exc}"}
+
+    buckets = [{"value": r["bucket"], "count": r["n"]}
+               for r in rows if r["bucket"] is not None]
+    return {
+        "group_by": group_by,
+        # NB: person buckets can overlap (a photo with 2 people counts twice),
+        # so this is the sum of buckets, not necessarily distinct photos.
+        "total_in_buckets": sum(b["count"] for b in buckets),
+        "buckets": buckets,
+    }
+
+
+_register(ToolSpec(
+    name="summarize",
+    description=(
+        "Aggregate/COUNT photos by a dimension instead of returning them — for "
+        "'which years / how many / when / who / how often' questions. Accepts "
+        "the same STRUCTURED filters as search_photos (people, location, "
+        "date_from/to, category, visual_tag, keyword, min_quality) but NOT the "
+        "free-text `query`. `group_by` is one of: year, month, location, person, "
+        "camera_model. Returns counts per bucket. Use it to answer multi-step "
+        "questions: e.g. for 'which year were we in both New York and France', "
+        "call summarize(location='New York', group_by='year') and "
+        "summarize(location='France', group_by='year'), intersect the years, "
+        "then search_photos for that year."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "group_by": {"type": "string",
+                         "enum": ["year", "month", "location", "person", "camera_model"],
+                         "description": "Dimension to count by (default year)."},
+            "people": {"type": "array", "items": {"type": "string"},
+                       "description": "Registered names; matches photos with ALL of them."},
+            "location": {"type": "string", "description": "Place/region name."},
+            "date_from": {"type": "string", "description": "Earliest date, YYYY-MM-DD."},
+            "date_to": {"type": "string", "description": "Latest date, YYYY-MM-DD."},
+            "category": {"type": "string", "description": "Exact content category."},
+            "visual_tag": {"type": "string", "description": "Visual-quality tag."},
+            "keyword": {"type": "string", "description": "Keyword substring."},
+            "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            "limit": {"type": "integer", "description": "Max buckets (default 50)."},
+        },
+        "additionalProperties": False,
+    },
+    handler=_h_summarize,
+))
+
+
+# ---------------------------------------------------------------------------
 # Tool: get_photo
 # ---------------------------------------------------------------------------
 
