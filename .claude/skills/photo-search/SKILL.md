@@ -1729,6 +1729,66 @@ Nothing leaves the NAS.
 
 ---
 
+## Running off a local read-replica (M26a)
+
+Run the whole app (web UI + ✨ Ask agent + optional MCP) on the strong GPU
+machine off a synced read-replica — CLIP search runs on the local GPU; the NAS
+stays the source of truth. Image routes proxy thumbnails from the NAS on demand
+(`PHOTOSEARCH_NAS_URL`), so **no photo files are needed locally**. Design:
+`docs/plans/local-replica-and-writes.md`.
+
+**Prereqs:** the project venv with the real ML stack (the worker machines
+already have torch + open-clip + sqlite-vec); ssh access to the NAS (same as
+`debug-db.sh`); LM Studio running with a **tool-calling-capable** model loaded.
+
+**Turnkey launcher** — `run-local-replica.sh` (cross-platform; auto-resolves the
+LM Studio endpoint):
+
+```bash
+# WSL2 (this dev box) — LM Studio runs on the WINDOWS host; the script finds it
+# via the default-route gateway automatically.
+./run-local-replica.sh --sync --model qwen/qwen2.5-7b-instruct
+#   --sync       pulls a fresh replica (sync-replica.sh) first (~1.6 GB / ~128 s)
+#   then serves http://localhost:8001 off ./photo_index.db.local
+#   (gitignored). Subsequent runs: drop --sync to start instantly on the
+#   existing replica.
+
+# macOS — same command; the script defaults LM Studio to http://localhost:1234.
+./run-local-replica.sh --sync --model qwen/qwen2.5-7b-instruct
+```
+
+Key flags: `-p PORT` (default 8001), `--db PATH`, `--nas URL` (default
+`http://dxp4800-f976:8000`), `--lm URL` (override the auto endpoint), `--model`.
+
+**Manual equivalent** (what the launcher exports):
+
+```bash
+export PHOTOSEARCH_DB=./photo_index.db.local
+export PHOTOSEARCH_NAS_URL=http://dxp4800-f976:8000          # image proxy + drift
+export PHOTOSEARCH_TEXT_LLM_URL=http://<lm-studio-host>:1234/v1   # WSL2: Windows-host gateway IP; Mac: localhost
+export PHOTOSEARCH_LLM_AGENT_MODEL=<tool-capable model loaded in LM Studio>
+./.venv/bin/python cli.py serve --db "$PHOTOSEARCH_DB" --host 0.0.0.0 --port 8001
+```
+
+On WSL2 the Windows-host IP is `ip route show default | awk '{print $3}'` (it can
+change across WSL restarts — the launcher resolves it each run). **Do NOT set
+`PHOTO_ROOT`** — leaving it unset means the originals resolve to non-existent
+paths, which triggers the NAS image proxy (intended). Phones reach the machine
+over Tailscale.
+
+**Nightly sync** — schedule `sync-replica.sh`:
+- WSL2 / Linux cron: `0 4 * * * cd /home/mattn/local-photo-search && PHOTOSEARCH_DB=./photo_index.db.local ./sync-replica.sh >> /tmp/replica-sync.log 2>&1`
+- macOS: a launchd agent (or `cron`) running the same line.
+- On-demand: the **Local replica** card on `/status` ("Sync now" →
+  `POST /api/admin/replica-sync`), or just `./run-local-replica.sh --sync`.
+
+**Notes:** first view of a photo proxies its thumbnail from the NAS (slightly
+slower), then it's cached locally. The atomic DB swap means a running `serve`
+picks up a fresh sync on its next request. If the Ask agent's model can't
+tool-call, it auto-falls-back to single-shot NL→filters.
+
+---
+
 ## Planned milestones (see `docs/plans/`)
 
 Living roadmap entries — each is a design doc the next contributor can
