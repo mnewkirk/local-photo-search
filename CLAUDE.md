@@ -833,6 +833,22 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   corrupt `date_taken` control-byte values found in M24a (re-extract from
   EXIF/folder/mtime, else NULL), bad GPS, malformed JSON columns.
 
+- `docs/plans/local-replica-and-writes.md` — M26. Pivot for the asymmetric
+  hardware (weak N100 NAS, strong GPU desktop): run the whole experience
+  (web UI + `/api/ask` agent + MCP) on the desktop off a **local
+  read-replica** of the SQLite DB, with the local LM Studio — search compute
+  (CLIP embed, KNN, SQL) moves to the fast machine. **M26a** syncs the DB +
+  thumbnail mirror (rsync, nightly + a "sync now" button; thumbs ≈12 GB,
+  append-only so tiny deltas; DB ≈1 GB; previews/full proxied from the NAS).
+  **M26b** adds **write tools** (tags / location / collections) with a
+  read-local / **write-NAS-authoritative / mirror-local** dual-write model
+  (NAS applies + returns canonical values → mirror those to the local DB so
+  search updates instantly without a full sync; nightly sync reconciles) and
+  mandatory guardrails (explicit id-set scoping, dry-run→confirm, affected-
+  count cap, reversible+audited via `location_source='manual'` /
+  `generations`). Needs one new NAS endpoint (`bulk-set-tags`). Independent
+  of M25. Reuses `debug-db.sh`'s rsync approach.
+
 **Shipped, kept for reference:**
 `docs/plans/bulk-set-location.md` (M19 inferred + `/geotag` manual) and
 `docs/plans/faces-clustering-and-perf.md` (M18 clustering overhaul +

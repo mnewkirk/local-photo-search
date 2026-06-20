@@ -1792,6 +1792,23 @@ pick up and implement without re-deriving the shape:
   control bytes found in M24a (repair cascade EXIF→folder→mtime→NULL), bad
   GPS, malformed JSON columns; reports orphaned-vec / garbage-tag rows and
   points at the existing `cleanup-orphans` / `clean-garbage-tags`.
+- **`docs/plans/local-replica-and-writes.md`** — **M26**. Run the whole stack
+  (web UI + `/api/ask` agent + MCP) on the strong GPU desktop off a **local
+  read-replica** of the SQLite DB + a thumbnail mirror, with local LM Studio —
+  because search is read-only, the NAS becomes a sync-only source of truth and
+  all search compute moves to the fast machine. **M26a:** rsync the DB (≈1 GB)
+  + `thumbnails/` (≈12 GB measured, append-only → tiny deltas; previews/full
+  proxied from NAS), nightly + a "sync now" SSE endpoint/button; desktop has no
+  originals so thumbnails are mirrored-or-lazy-proxied, never generated locally.
+  **M26b:** write tools (set_photo_tags/location, add_to_collection) with a
+  **read-local / write-NAS-authoritative / mirror-local** dual-write — the NAS
+  endpoint applies and returns canonical values, the tool mirrors *those* to the
+  local DB so search updates instantly, nightly sync reconciles (NAS write fails
+  → abort, don't touch local; mirror fails → safe on NAS, lands next sync).
+  Guardrails: explicit `photo_ids` scoping (no internal re-search),
+  dry-run→`confirm=true`, affected-count cap, reversible+audited
+  (`location_source='manual'` / `generations`). New NAS endpoint:
+  `POST /api/photos/bulk-set-tags`. Reuses `debug-db.sh`'s rsync approach.
 **Shipped, kept for reference:**
 - **`docs/plans/bulk-set-location.md`** — both halves done (M19
   inferred + `/geotag` manual). Future potential: structured
