@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date
 from typing import Callable, Iterator, Optional
 
@@ -67,44 +68,112 @@ def _agent_model() -> str:
     )
 
 
-def _system_prompt() -> str:
-    return (
-        "You are a photo-library search assistant. The user describes what "
-        "they're looking for in natural language; your job is to find the "
-        "matching photos using the provided tools, then give a one- or "
-        "two-sentence answer.\n\n"
+_CONTEXT_CACHE: dict = {}
+_CONTEXT_TTL_S = 600
+
+
+def _top_json_vocab(db, column: str, n: int) -> list:
+    """Top-N distinct values across a JSON-array column (categories etc.).
+    A full scan — only called from the cached _library_context."""
+    counts: dict = {}
+    for (raw,) in db.conn.execute(
+        f"SELECT {column} FROM photos WHERE {column} IS NOT NULL AND {column} != '[]'"):
+        try:
+            for t in json.loads(raw):
+                if isinstance(t, str):
+                    counts[t] = counts.get(t, 0) + 1
+        except (ValueError, TypeError):
+            pass
+    return [k for k, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:n]]
+
+
+def _library_context(db) -> str:
+    """Compact, cached snapshot of the library — people / places / vocab / date
+    span — injected into the system prompt so the model can plan WITHOUT first
+    spending tool calls (and nudges) to discover them. The weak models that
+    don't ground well get the facts for free. Cached per DB for _CONTEXT_TTL_S
+    (the vocab aggregation is a full scan)."""
+    key = getattr(db, "db_path", "?")
+    cached = _CONTEXT_CACHE.get(key)
+    if cached and (time.time() - cached[0] < _CONTEXT_TTL_S):
+        return cached[1]
+    c = db.conn
+    people = [r[0] for r in c.execute(
+        "SELECT p.name FROM persons p LEFT JOIN faces f ON f.person_id=p.id "
+        "GROUP BY p.id ORDER BY COUNT(f.photo_id) DESC LIMIT 40")]
+    places = [r[0] for r in c.execute(
+        "SELECT place_name FROM photos WHERE place_name IS NOT NULL "
+        "GROUP BY place_name ORDER BY COUNT(*) DESC LIMIT 20")]
+    cats = _top_json_vocab(db, "categories", 30)
+    vtags = _top_json_vocab(db, "visual_tags", 30)
+    dr = c.execute(
+        "SELECT MIN(date_taken), MAX(date_taken) FROM photos "
+        "WHERE date_taken GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'").fetchone()
+    lo, hi = (dr[0] or "")[:4], (dr[1] or "")[:4]
+    parts = []
+    if people:
+        parts.append("People (use these EXACT names in `people`; ONLY these are "
+                     "registered): " + ", ".join(people) + ".")
+    if lo and hi:
+        parts.append(f"Photos span {lo}-{hi}.")
+    if places:
+        parts.append("Common locations (for `location`): " + ", ".join(places) + ".")
+    if cats:
+        parts.append("Content categories (for `category`): " + ", ".join(cats) + ".")
+    if vtags:
+        parts.append("Visual tags (for `visual_tag`): " + ", ".join(vtags) + ".")
+    text = "\n".join(parts)
+    _CONTEXT_CACHE[key] = (time.time(), text)
+    return text
+
+
+def _system_prompt(db=None) -> str:
+    base = (
+        "You are a photo-library search assistant. The user describes what they "
+        "want in natural language; find the matching photos with the tools, then "
+        "give a one- or two-sentence answer.\n\n"
+        "You are given LIBRARY FACTS below (people, places, tags, date span), so "
+        "usually go STRAIGHT to search_photos — you do NOT need get_library_overview "
+        "or the list_* tools. Use list_* only to look up something not in the facts.\n\n"
         "Rules:\n"
-        "- Call get_library_overview first to learn what's available and the "
-        "date range.\n"
-        "- Before filtering by a person, place, or tag, VALIDATE it exists: "
-        "list_people for names, list_places for locations, list_vocab for "
-        "categories/visual_tags/keywords. Never pass a name to search_photos "
-        "that list_people didn't return.\n"
-        "- Use search_photos to find photos. Fill ONLY the filters you actually "
-        "inferred from the request; OMIT every other field — never send empty "
-        "strings or empty arrays, and never pass a filter 'just in case'.\n"
-        "- Dates: only set date_from/date_to when the user implies a time range, "
-        "and compute it from today's date. NEVER use today's date as a filter "
-        "for a request that isn't about today — that wrongly excludes all older "
-        "photos. 'last summer' / 'in 2024' / 'recently' imply ranges; 'photos of "
-        "Calvin' does not.\n"
-        "- 'best' / 'top' / 'favorite' / 'greatest' / 'good' photos means rank "
-        "by quality: set sort='quality_desc' (and optionally min_quality ~6). "
-        "Do NOT put those words in `query` — `query` is only for visual content.\n"
-        "- To EXCLUDE something, put it in `query` with a leading '-' or as "
-        "'no <thing>' — e.g. query='landscape -people' or 'beach no crowds'. "
-        "The search hard-filters those out (it can drop photos with faces for "
-        "'-people'). Don't try to express exclusion with the structured "
-        "filters.\n"
-        "- Read the returned `total`: if it's far more or fewer than expected, "
-        "adjust the filters and search again.\n"
-        "- Prefer the free-text `query` for visual content (sunset, cake) and "
-        "structured filters (people, location, dates, category) for the rest.\n"
-        "- When you have a good result set, stop calling tools and answer "
-        "briefly. Do not list photo ids in your answer — the UI shows the "
-        "photos. Mention the count and how you narrowed it.\n"
-        f"Today's date is {date.today().isoformat()}."
+        "- Fill ONLY the filters you actually inferred; OMIT every other field. "
+        "Never send empty strings/arrays or a filter 'just in case'.\n"
+        "- Dates: set date_from/date_to only when the request implies a time range, "
+        "computed from today's date. NEVER filter by today's date for a request "
+        "that isn't about today.\n"
+        "- 'best'/'top'/'favorite'/'good' = rank by quality: sort='quality_desc' "
+        "(optionally min_quality~6). Do NOT put those words in `query`.\n"
+        "- EXCLUDE with `query`: a leading '-' or 'no <thing>', e.g. "
+        "query='landscape -people'. Don't express exclusion via structured filters.\n"
+        "- Resolve group terms from USER NOTES / the people list: 'the kids', "
+        "'the family', 'everyone' -> the specific registered names as a `people` "
+        "list (AND-intersected).\n"
+        "- Read `total`: if 0, relax your most specific filter and retry (drop "
+        "min_quality, widen dates, or move a term into `query`); if huge, add a "
+        "filter. Iterate once or twice before answering.\n"
+        "- Then stop and answer briefly — the count and how you narrowed it. "
+        "Never list photo ids; the UI shows the photos.\n\n"
+        "Examples (plan straight to search_photos using the facts):\n"
+        "  'photos of Calvin' -> people=['Calvin']\n"
+        "  'Nicole and Matt together' -> people=['Nicole','Matt']\n"
+        "  'best beach photos last summer' -> query='beach', date_from=<jun1 last yr>, "
+        "date_to=<aug31 last yr>, sort='quality_desc'\n"
+        "  'landscapes with no people' -> query='landscape -people'\n"
+        "  'most moody shots' -> visual_tag='moody', sort='quality_desc'\n"
+        "  'the kids playing soccer' -> people=<the kids>, category='soccer'\n"
     )
+    try:
+        ctx = _library_context(db) if db is not None else ""
+    except Exception:
+        ctx = ""
+    hints = os.environ.get("PHOTOSEARCH_AGENT_HINTS", "").strip()
+    out = base
+    if ctx:
+        out += "\nLIBRARY FACTS:\n" + ctx + "\n"
+    if hints:
+        out += "\nUSER NOTES:\n" + hints + "\n"
+    out += f"\nToday's date is {date.today().isoformat()}."
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +368,7 @@ def run_agent(
         return
 
     tools = toolmod.openai_tools(include_images=False)
-    messages: list = [{"role": "system", "content": _system_prompt()}]
+    messages: list = [{"role": "system", "content": _system_prompt(db)}]
     for h in (history or []):
         if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
             messages.append({"role": h["role"], "content": str(h["content"])})

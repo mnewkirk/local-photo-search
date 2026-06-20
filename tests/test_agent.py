@@ -132,6 +132,16 @@ def test_empty_message():
     assert events == [{"type": "error", "message": "empty message"}]
 
 
+def test_system_prompt_injects_library_facts(db, monkeypatch):
+    agent._CONTEXT_CACHE.clear()
+    monkeypatch.setenv("PHOTOSEARCH_AGENT_HINTS", "The kids are Alex and Jamie.")
+    p = agent._system_prompt(db)
+    assert "LIBRARY FACTS" in p
+    assert "Alex" in p and "Jamie" in p          # registered people injected
+    assert "landscape" in p or "people" in p      # categories injected
+    assert "USER NOTES" in p and "The kids are Alex and Jamie." in p
+
+
 # ---------------------------------------------------------------------------
 # Single-shot fallback
 # ---------------------------------------------------------------------------
