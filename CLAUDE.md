@@ -817,6 +817,19 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   models. Only existing-code change: a `person_ids` path in
   `search_combined`. No schema bump.
 
+- `docs/plans/backfill-maintenance-sweep.md` — M25. **Queued: do NOT start
+  until M24b ships.** Many derived-data passes get lost on new photos —
+  structured location columns (`normalize-places`), inferred GPS
+  (`infer-locations`), face clustering/matching (`recluster-faces` /
+  `match-faces`), colors (cron runs `--no-colors`), and cross-folder
+  stacking are all manual CLIs nothing schedules; only `ingest-incoming`
+  runs daily. Proposes one idempotent `maintenance-sweep` (missing-only
+  predicates, dependency-ordered, cron + `/status` button) over the
+  lightweight CPU backfills, leaving heavy GPU passes to the worker fleet.
+  Also a `validate-data`/`repair-data` tool for invalid rows — e.g. the
+  corrupt `date_taken` control-byte values found in M24a (re-extract from
+  EXIF/folder/mtime, else NULL), bad GPS, malformed JSON columns.
+
 **Shipped, kept for reference:**
 `docs/plans/bulk-set-location.md` (M19 inferred + `/geotag` manual) and
 `docs/plans/faces-clustering-and-perf.md` (M18 clustering overhaul +

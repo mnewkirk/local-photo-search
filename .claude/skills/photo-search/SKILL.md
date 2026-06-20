@@ -1741,6 +1741,23 @@ pick up and implement without re-deriving the shape:
   Single-shot NL→filters fallback when the local model can't do multi-turn
   tool calls. Only existing-code change: an optional `person_ids` path in
   `search_combined`; no schema bump. Adds `mcp>=1.2` (~5-min rebuild).
+- **`docs/plans/backfill-maintenance-sweep.md`** — **M25. Queued: do NOT
+  start until M24b ships.** Derived-data passes get lost on new photos.
+  Verified trigger map: `ingest-incoming` runs CLIP + (folder-scoped)
+  stacking + geocode but `--no-colors` on the cron; the worker fleet does
+  faces/quality/describe/tags only. So `normalize-places` (structured
+  location cols), `infer-locations`, `recluster-faces`, `match-faces`,
+  colors, and library-wide stacking are manual CLIs nothing schedules.
+  Proposes one idempotent `maintenance-sweep` (dependency-ordered,
+  missing-only SQL predicates, cron stage + `/status` SSE button,
+  cancellable via the stacking `on_progress`/`should_abort` shape) that
+  orchestrates the existing CLIs over the lightweight CPU backfills —
+  leaving heavy GPU passes to the worker fleet. Note: auto-`recluster-faces`
+  would wipe `ignored_clusters` nightly, so gate it to a slower cadence.
+  Also `validate-data`/`repair-data` for invalid rows: corrupt `date_taken`
+  control bytes found in M24a (repair cascade EXIF→folder→mtime→NULL), bad
+  GPS, malformed JSON columns; reports orphaned-vec / garbage-tag rows and
+  points at the existing `cleanup-orphans` / `clean-garbage-tags`.
 **Shipped, kept for reference:**
 - **`docs/plans/bulk-set-location.md`** — both halves done (M19
   inferred + `/geotag` manual). Future potential: structured
