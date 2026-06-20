@@ -804,6 +804,18 @@ swap to HDBSCAN for varying density, and materialize a `face_groups` table.
   per-year export, composite dedup (photoTakenTime + device + filename stem),
   lands in `/photos/YYYY/YYYY-MM-DD_gphotos/`. Phone GPS amplifies the
   inferred-geotag recall on camera photos.
+- `docs/plans/llm-driven-search.md` — M24. Stop hand-assembling search
+  filters; let an LLM be the query planner. One **shared tool layer**
+  (`photosearch/tools.py`: `search_photos` / `list_people` / `list_places`
+  / `list_vocab` / `get_photo` / `get_photo_image` / `get_library_overview`)
+  consumed by two adapters — **M24a** a `FastMCP` streamable-HTTP MCP server
+  as a new `photosearch-mcp` NAS container (the "first step"), and **M24b**
+  an in-app `/api/ask` SSE agent loop on the **local** LM Studio/Ollama
+  backend (nothing leaves the NAS), surfaced as an "Ask" mode toggle on the
+  search page. Image returns gated by `PHOTOSEARCH_MCP_ALLOW_IMAGES`
+  (default off). Single-shot NL→filters fallback for non-tool-calling
+  models. Only existing-code change: a `person_ids` path in
+  `search_combined`. No schema bump.
 
 **Shipped, kept for reference:**
 `docs/plans/bulk-set-location.md` (M19 inferred + `/geotag` manual) and

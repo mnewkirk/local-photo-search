@@ -1664,6 +1664,21 @@ pick up and implement without re-deriving the shape:
   columns. New CLI `photosearch takeout-import` using a reviewable
   ndjson plan ledger for resumability. Phone GPS amplifies inferred-
   geotag recall on camera photos — run after each year's import.
+- **`docs/plans/llm-driven-search.md`** — **M24**. LLM-driven search:
+  stop hand-assembling structured filters and let an LLM plan the query.
+  Keystone is a **shared tool layer** (`photosearch/tools.py`) — a registry
+  of `PhotoDB` wrappers (`search_photos`, `list_people`, `list_places`,
+  `list_vocab`, `get_photo`, `get_photo_image`, `get_library_overview`)
+  with JSON Schemas, consumed by two adapters: **M24a** a `FastMCP`
+  streamable-HTTP MCP server in a new `photosearch-mcp` NAS container
+  (reuses the photosearch image for CLIP; the "first step"), and **M24b**
+  an in-app `POST /api/ask` SSE agent loop on the **local** LLM
+  (`PHOTOSEARCH_TEXT_LLM_URL` + `PHOTOSEARCH_LLM_AGENT_MODEL`) surfaced as
+  an "Ask" mode on the search page — fully local, nothing leaves the NAS.
+  Image returns gated by `PHOTOSEARCH_MCP_ALLOW_IMAGES` (default off).
+  Single-shot NL→filters fallback when the local model can't do multi-turn
+  tool calls. Only existing-code change: an optional `person_ids` path in
+  `search_combined`; no schema bump. Adds `mcp>=1.2` (~5-min rebuild).
 **Shipped, kept for reference:**
 - **`docs/plans/bulk-set-location.md`** — both halves done (M19
   inferred + `/geotag` manual). Future potential: structured
