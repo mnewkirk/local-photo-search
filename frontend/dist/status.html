@@ -1396,6 +1396,96 @@
       );
     }
 
+    // ── Replica sync (M26a) ──────────────────────────────────────────────
+    // For an instance running off a synced read-replica: show freshness vs the
+    // source NAS and pull a fresh snapshot on demand. Hidden when this instance
+    // is the source of truth (no PHOTOSEARCH_NAS_URL).
+    function ReplicaSync() {
+      var _s = useState(null);  var status = _s[0]; var setStatus = _s[1];
+      var _b = useState(false); var busy = _b[0];   var setBusy = _b[1];
+      var _l = useState([]);    var log = _l[0];    var setLog = _l[1];
+
+      function appendLog(line) {
+        setLog(function(prev) { var n = prev.concat([line]); return n.length > 500 ? n.slice(-500) : n; });
+      }
+      function loadStatus() {
+        fetch('/api/admin/replica-status').then(function(r){return r.json();}).then(setStatus).catch(function(){});
+      }
+      useEffect(function() { loadStatus(); }, []);
+
+      function fmtAge(s) {
+        if (s == null) return '?';
+        if (s < 90) return s + 's ago';
+        if (s < 5400) return Math.round(s/60) + 'm ago';
+        if (s < 172800) return Math.round(s/3600) + 'h ago';
+        return Math.round(s/86400) + 'd ago';
+      }
+
+      function run() {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ sync-replica.sh (pulling a fresh DB snapshot from the NAS)…');
+        fetch('/api/admin/replica-sync', { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) return response.text().then(function(t){ throw new Error('HTTP ' + response.status + ': ' + t); });
+            var reader = response.body.getReader(); var decoder = new TextDecoder(); var buf = ''; var resolved = false;
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n'); buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dl = evt.split('\n').filter(function(l){ return l.indexOf('data:') === 0; })[0];
+                  if (!dl) return;
+                  try {
+                    var p = JSON.parse(dl.slice(5).trim());
+                    if (p.line != null) appendLog(p.line);
+                    if (p.cmd) appendLog('$ ' + p.cmd);
+                    if (p.returncode != null) {
+                      appendLog(p.returncode === 0 ? '  ✓ replica synced' : '  ✗ sync failed (rc=' + p.returncode + ')');
+                      resolved = true; setBusy(false); loadStatus();
+                    }
+                    if (p.error) { appendLog('  ✗ ' + p.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function(){ if (!resolved) { setBusy(false); loadStatus(); } });
+          })
+          .catch(function(err){ appendLog('  ✗ sync stream error: ' + err.message); setBusy(false); });
+      }
+
+      // Hide entirely on the source-of-truth NAS (not in replica mode).
+      if (status && !status.replica_mode) return null;
+
+      var drift = status && status.drift;
+      return e('div', null,
+        e('h2', null, 'Local replica'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'This instance runs off a synced read-replica of the NAS DB. Search '
+            + 'is local; the NAS stays the source of truth. Thumbnails are proxied '
+            + 'from the NAS on demand.'),
+          status && e('div', { className: 'deploy-meta', style: { marginTop: 4 } },
+            'Local: ' + (status.local_photos != null ? status.local_photos.toLocaleString() : '?') + ' photos'
+            + (status.nas_photos != null ? '  ·  NAS: ' + status.nas_photos.toLocaleString() : '')
+            + (drift ? '  ·  ' + (drift > 0 ? drift.toLocaleString() + ' behind' : Math.abs(drift).toLocaleString() + ' ahead') : (drift === 0 ? '  ·  in sync' : ''))
+            + (status.last_sync ? '  ·  synced ' + fmtAge(status.last_sync.age_seconds) : '')),
+          e('div', { className: 'deploy-actions' },
+            e('button', { className: 'btn', disabled: busy, onClick: run,
+              title: 'bash sync-replica.sh — pull a fresh consistent DB snapshot from the NAS',
+            }, busy ? 'Syncing…' : 'Sync now'),
+            e('button', { className: 'btn', disabled: busy, onClick: loadStatus,
+              title: 'Re-check freshness' }, 'Check'),
+            e('button', { className: 'btn', disabled: busy, onClick: function(){ setLog([]); },
+              title: 'Clear log', style: { marginLeft: 'auto' } }, 'Clear log')
+          ),
+          log.length > 0 && e('div', { className: 'deploy-log' + (busy ? ' running' : '') }, log.join('\n'))
+        )
+      );
+    }
+
     // ── Generations by model ─────────────────────────────────────────────
     // Surface the v21 generations provenance log on /status. For each text
     // type (describe / tags / verify), show which model produced each photo's
@@ -2400,6 +2490,7 @@
           ),
           e(Deployment, null),
           e(IngestIncoming, null),
+          e(ReplicaSync, null),
           e(GenerationsByModel, null),
           e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
           e(StackingForm, { onComplete: load }),

@@ -93,6 +93,13 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
 _photo_root: Optional[str] = os.environ.get("PHOTO_ROOT")
 
+# Replica mode (M26a): when this instance runs off a synced read-replica on a
+# machine that has the DB but NOT the original photo files, image routes can't
+# generate thumbnails/previews locally. If PHOTOSEARCH_NAS_URL is set, those
+# routes fall back to the source-of-truth NAS web API (and cache the rendered
+# thumbnail/preview locally so the next view is local). Unset on the NAS itself.
+_nas_url: Optional[str] = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/") or None
+
 # Configure the worker API with DB settings
 configure_worker(_db_path, _photo_root)
 
@@ -197,6 +204,28 @@ def _get_or_create_thumbnail(photo: dict) -> str:
     img.thumbnail((_THUMB_SIZE, _THUMB_SIZE), Image.LANCZOS)
     img.save(thumb_path, "JPEG", quality=85)
     return thumb_path
+
+
+def _fetch_from_nas(photo_id: int, kind: str, timeout: float = 30.0) -> bytes:
+    """Fetch a rendered asset (thumbnail|preview|full) from the source NAS.
+
+    Used in replica mode (PHOTOSEARCH_NAS_URL set) when this machine has the
+    DB but not the original photo file. Raises on any failure so callers can
+    map it to a 404/502.
+    """
+    import urllib.request
+    url = f"{_nas_url}/api/photos/{photo_id}/{kind}"
+    req = urllib.request.Request(url, headers={"User-Agent": "photosearch-replica"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _cache_bytes_atomic(path: str, data: bytes) -> None:
+    """Write bytes to a cache path atomically (tmp + rename)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +382,18 @@ def api_thumbnail(photo_id: int):
             headers={"Cache-Control": "no-cache, must-revalidate"},
         )
     except FileNotFoundError:
+        # Replica mode: no local original — pull the rendered thumbnail from
+        # the NAS and cache it locally so the next view is served from disk.
+        if _nas_url:
+            try:
+                cache_path = os.path.join(_ensure_thumb_dir(), f"{photo_id}_thumb.jpg")
+                _cache_bytes_atomic(cache_path, _fetch_from_nas(photo_id, "thumbnail"))
+                return FileResponse(
+                    cache_path, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-cache, must-revalidate"},
+                )
+            except Exception as e:
+                raise HTTPException(502, f"NAS thumbnail fetch failed: {e}")
         raise HTTPException(404, "Original photo file not found")
     except Exception as e:
         raise HTTPException(500, f"Thumbnail error: {e}")
@@ -369,6 +410,15 @@ def api_full_photo(photo_id: int):
         filepath = db.resolve_filepath(photo.get("filepath", ""))
 
     if not filepath or not os.path.exists(filepath):
+        # Replica mode: stream the original through from the NAS (not cached —
+        # full-res is large and rarely re-viewed).
+        if _nas_url:
+            try:
+                data = _fetch_from_nas(photo_id, "full", timeout=120.0)
+                return Response(content=data, media_type="image/jpeg",
+                                headers={"Cache-Control": "no-cache, must-revalidate"})
+            except Exception as e:
+                raise HTTPException(502, f"NAS full-photo fetch failed: {e}")
         raise HTTPException(404, "Photo file not found on disk")
 
     return FileResponse(
@@ -399,6 +449,17 @@ def api_preview_photo(photo_id: int):
             headers={"Cache-Control": "no-cache, must-revalidate"},
         )
     except FileNotFoundError:
+        # Replica mode: pull + cache the rendered preview from the NAS.
+        if _nas_url:
+            try:
+                cache_path = os.path.join(_ensure_preview_dir(), f"{photo_id}_preview.jpg")
+                _cache_bytes_atomic(cache_path, _fetch_from_nas(photo_id, "preview"))
+                return FileResponse(
+                    cache_path, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-cache, must-revalidate"},
+                )
+            except Exception as e:
+                raise HTTPException(502, f"NAS preview fetch failed: {e}")
         raise HTTPException(404, "Original photo file not found")
     except Exception:
         # If preview generation fails (e.g. unsupported format), fall back to full

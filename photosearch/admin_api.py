@@ -291,6 +291,91 @@ async def admin_ingest_incoming(dry_run: bool = False):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _replica_sync_script() -> str:
+    """Path to sync-replica.sh — env override or repo-root default."""
+    env = os.environ.get("PHOTOSEARCH_REPLICA_SYNC_SCRIPT")
+    if env:
+        return env
+    return str(Path(__file__).resolve().parent.parent / "sync-replica.sh")
+
+
+@router.get("/replica-status")
+def admin_replica_status():
+    """Replica freshness for the /status card (M26a).
+
+    Reports the local replica's photo count + last-sync time (DB file mtime),
+    and — if PHOTOSEARCH_NAS_URL is set — the source NAS's count so the UI can
+    show drift. `replica_mode` is true when this instance proxies images from a
+    NAS (i.e. it's running off a replica, not on the NAS itself).
+    """
+    import time
+    nas_url = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    db_path = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
+
+    local_count = None
+    last_sync = None
+    try:
+        from .db import PhotoDB
+        with PhotoDB(db_path) as db:
+            local_count = db.conn.execute("SELECT COUNT(*) AS n FROM photos").fetchone()["n"]
+        mtime = os.path.getmtime(db_path)
+        last_sync = {
+            "epoch": int(mtime),
+            "age_seconds": int(time.time() - mtime),
+        }
+    except Exception as e:
+        logger.warning("replica-status local read failed: %s", e)
+
+    nas_count = None
+    if nas_url:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"{nas_url}/api/stats", timeout=8) as r:
+                nas_count = json.loads(r.read()).get("photos")
+        except Exception as e:
+            logger.info("replica-status NAS reach failed: %s", e)
+
+    return {
+        "replica_mode": bool(nas_url),
+        "nas_url": nas_url or None,
+        "db_path": db_path,
+        "local_photos": local_count,
+        "nas_photos": nas_count,
+        "drift": (nas_count - local_count)
+                 if (nas_count is not None and local_count is not None) else None,
+        "last_sync": last_sync,
+        "sync_script": _replica_sync_script(),
+    }
+
+
+@router.post("/replica-sync")
+async def admin_replica_sync():
+    """`bash sync-replica.sh` — SSE stream of a fresh replica pull (M26a).
+
+    Pulls a consistent DB snapshot from the NAS (dump-db + cat-stream, atomic
+    swap) so local search reflects the latest ingest. Requires ssh access to
+    the NAS from this machine (replica mode is meant for a native local run).
+    Thumbnails are not mirrored — image routes lazily proxy them from the NAS.
+    """
+    if not _op_lock.acquire(blocking=False):
+        raise HTTPException(409, "another admin operation is in progress")
+
+    script = _replica_sync_script()
+    if not Path(script).exists():
+        _op_lock.release()
+        raise HTTPException(404, f"sync script not found: {script}")
+    cmd = ["bash", script]
+
+    async def gen():
+        try:
+            async for chunk in _stream_subprocess(cmd, env=os.environ.copy()):
+                yield chunk
+        finally:
+            _op_lock.release()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 @router.post("/restart-mcp")
 async def admin_restart_mcp():
     """`docker compose up -d --force-recreate --no-deps photosearch-mcp` — SSE.

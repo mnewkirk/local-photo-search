@@ -36,6 +36,15 @@ SAMPLE_PHOTOS = [
     "DSC04922.JPG",
 ]
 
+# These are real integration tests — they need the sample image files AND the ML
+# stack (CLIP, InsightFace, Ollama). When the sample dir is absent (CI / most
+# dev envs) skip the whole module cleanly instead of erroring at setup, so a
+# bare `pytest` run stays green. See docs/plans/test-isolation-fixes.md.
+pytestmark = pytest.mark.skipif(
+    not Path(SAMPLE_DIR).exists(),
+    reason="integration sample photos not present at ../Photos/sample/",
+)
+
 # ---------------------------------------------------------------------------
 # Ground truth — known facts about the sample photos
 # ---------------------------------------------------------------------------

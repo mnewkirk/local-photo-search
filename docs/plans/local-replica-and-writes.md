@@ -1,9 +1,27 @@
 # Local Read-Replica Deployment + Write Tools (M26)
 
-**Status:** Planned (design doc). Captured 2026-06-20 after M24 shipped.
-Sequencing: independent of M25 (backfill sweep) — order TBD by the user. M26a
-(replica deploy) is immediately useful read-only and should land before M26b
-(writes).
+**Status:** **M26a partially shipped** (image-proxy fallback, sync script,
+sync/status endpoints + `/status` card). **M26b (writes) not started.**
+Captured 2026-06-20 after M24 shipped. Independent of M25.
+
+**M26a shipped so far:**
+- `web.py` image routes fall back to the NAS (`PHOTOSEARCH_NAS_URL`) when the
+  local original is absent, caching thumbnails/previews locally (replica mode).
+  Tests: `tests/test_web_replica.py`.
+- `sync-replica.sh` pulls a consistent DB snapshot (dump-db + cat-stream, atomic
+  swap) — **verified live: 1.6 GB in ~128 s, all 163,330 photos + embeddings**.
+- `POST /api/admin/replica-sync` (SSE) + `GET /api/admin/replica-status`
+  (freshness/drift) + a "Local replica" card on `/status` (hidden on the NAS).
+
+**M26a still TODO:** schedule the nightly pull (cron/Task Scheduler); optional
+thumbnail pre-warm (bulk mirror) — lazy proxy covers it for now; a real
+end-to-end run of `serve` off the replica with local LM Studio.
+
+**Measured reality (correcting §2 estimates):** the DB is **~1.6 GB** (not
+~1 GB). The sync is a **full snapshot each run** (~128 s), not a delta — fine
+nightly; if sub-daily freshness is wanted, Litestream/WAL-shipping is the delta
+path (rsync-into-`/data` is blocked by UGREEN perms, which is why we stream a
+container-made snapshot).
 
 ## 1. Motivation
 
