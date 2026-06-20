@@ -37,6 +37,16 @@ case "${1:-serve}" in
             --db "${PHOTOSEARCH_DB}" \
             "$@"
         ;;
+    mcp)
+        # M24a — MCP server over streamable HTTP. Not a cli.py subcommand, so
+        # it needs its own case; the *) branch would route it to `cli.py mcp`.
+        echo "=== local-photo-search: starting MCP server ==="
+        echo "  Database: ${PHOTOSEARCH_DB}"
+        echo "  Port:     ${PHOTOSEARCH_MCP_PORT:-8848}"
+        echo "  Images:   ${PHOTOSEARCH_MCP_ALLOW_IMAGES:-0}"
+        echo ""
+        exec python -m photosearch.mcp_server
+        ;;
     *)
         # Pass through any other cli.py subcommand
         exec python cli.py "$@"

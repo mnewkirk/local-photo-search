@@ -1633,6 +1633,68 @@ explicitly), then recreate the container.
 
 ---
 
+## MCP server (M24a)
+
+LLM-driven search over the Model Context Protocol. Lets any MCP client on
+the LAN plan a photo search instead of hand-assembling structured filters.
+Full design: `docs/plans/llm-driven-search.md`.
+
+**Shared tool layer** — `photosearch/tools.py` is the single source of truth:
+a registry of `ToolSpec`s (name + LLM-facing description + JSON Schema +
+`fn(db, args)` handler) over `PhotoDB`, dispatched by `call_tool(db, name,
+args)`. Tools: `get_library_overview`, `list_people`, `list_places`,
+`list_vocab`, `search_photos`, `get_photo`, `get_photo_image`. `search`
+(hence CLIP/torch) is imported lazily inside handlers, so the module imports
+cheap and is unit-testable without the CLIP stack. Tests:
+`tests/test_tools.py` (26 cases). The same registry will feed the in-app
+`/api/ask` agent (M24b) via `openai_tools()`.
+
+`search_photos` resolves `people` names → ids and passes them to
+`search_combined`'s `person_ids` param (the only change to existing search
+code — routes to `search_by_all_persons` for AND-intersection). It returns
+compact hits (`description` truncated to 240 chars) + a `total` so the model
+can broaden/narrow.
+
+**Server** — `photosearch/mcp_server.py` uses the SDK's **low-level
+`Server`** (not `FastMCP`) so the `tools.py` JSON Schemas are fed in verbatim
+via `mcp_tools()` rather than re-derived from function signatures. Streamable
+HTTP, mounted at `/mcp`, stateless. `requirements.txt` adds `mcp>=1.2`
+(~5-min image rebuild).
+
+**Container** — `photosearch-mcp` in `docker-compose.nas.yml`. Reuses the
+photosearch service's built image (`image: photosearch-photosearch`, no
+build block of its own → no redundant rebuild) with `command: ["mcp"]`. That
+routes through a new `mcp)` case in `docker-entrypoint.sh` which execs
+`python -m photosearch.mcp_server` (the `*)` branch would mis-route it to
+`cli.py mcp`). Mounts `/photos:ro` + the shared `photosearch-data` volume
+(DB + thumbnail cache). Port `${MCP_PORT:-8848}`.
+
+```bash
+DC="docker compose -f docker-compose.nas.yml"
+$DC build photosearch        # build the shared image (mcp reuses it)
+$DC up -d photosearch-mcp     # start the MCP server
+# client connects to http://<nas-ip>:8848/mcp
+```
+
+**Image gating** — `get_photo_image` returns thumbnail bytes and is the only
+path that emits pixels. **Off by default**: `PHOTOSEARCH_MCP_ALLOW_IMAGES`
+unset/0 means the tool is neither advertised in `list_tools` nor callable
+(enforced at both the projection and the call boundary). Set to `1` only if
+you accept thumbnails leaving the NAS to whatever client is connected. The
+text tools always return derived metadata (descriptions, tags, places,
+dates, scores) — that text leaves if an off-box client consumes it.
+
+**Env:** `PHOTOSEARCH_DB` (required), `PHOTO_ROOT`, `PHOTOSEARCH_MCP_HOST`
+(default 0.0.0.0), `PHOTOSEARCH_MCP_PORT` (default 8848),
+`PHOTOSEARCH_MCP_ALLOW_IMAGES` (default 0). Two processes now open the DB
+(web + MCP); both read-only for search, WAL handles concurrent readers — no
+schema change.
+
+**Not yet built:** M24b — the in-app `POST /api/ask` SSE agent loop on the
+local LLM + the "Ask" mode on the search page. See the plan doc.
+
+---
+
 ## Planned milestones (see `docs/plans/`)
 
 Living roadmap entries — each is a design doc the next contributor can

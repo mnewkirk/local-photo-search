@@ -111,6 +111,42 @@ services:
         limits:
           memory: 7G
 
+  photosearch-mcp:
+    # MCP server (M24a) — exposes the LLM tool layer over streamable HTTP so
+    # any MCP client on the LAN can drive photo search. Reuses the photosearch
+    # service's built image (search_photos needs the CLIP text encoder); no
+    # build block of its own, so it never triggers a redundant rebuild — it
+    # just runs the same image with the `mcp` entrypoint command. Shares the
+    # DB + thumbnail cache (photosearch-data) and the photo library (ro).
+    image: photosearch-photosearch
+    container_name: photosearch-mcp
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-8848}:8848"
+    volumes:
+      # ro — the MCP server only reads photos. Thumbnails it generates land
+      # under /data (rw), shared with the web container's cache.
+      - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photos:ro
+      - photosearch-data:/data
+    environment:
+      - PHOTOSEARCH_DB=/data/photo_index.db
+      - PHOTO_ROOT=/photos
+      - PYTHONUNBUFFERED=1
+      - PHOTOSEARCH_CACHE=/data/.cache/photosearch
+      - PHOTOSEARCH_MCP_HOST=0.0.0.0
+      - PHOTOSEARCH_MCP_PORT=8848
+      # Image returns are OFF by default — text metadata only. Set to 1 to let
+      # connected MCP clients pull thumbnails (pixels then leave the NAS).
+      - PHOTOSEARCH_MCP_ALLOW_IMAGES=${PHOTOSEARCH_MCP_ALLOW_IMAGES:-0}
+    command: ["mcp"]
+    depends_on:
+      photosearch:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+
   ollama:
     image: ollama/ollama:latest
     container_name: photosearch-ollama

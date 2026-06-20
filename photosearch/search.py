@@ -1363,6 +1363,7 @@ def search_combined(
     category: Optional[str] = None,
     visual_tag: Optional[str] = None,
     keyword: Optional[str] = None,
+    person_ids: Optional[list[int]] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1444,6 +1445,18 @@ def search_combined(
     if person:
         results = search_by_person(
             db, person, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source)
+        result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
+
+    # Pre-resolved person ids (AND-intersection). The LLM tool layer resolves
+    # names → ids against `list_people` and passes them here directly, rather
+    # than stuffing names back into `query` for `_extract_persons_from_query`
+    # to re-parse. Routes through the same `search_by_all_persons` SQL
+    # intersection that the name-extraction path uses, so a single id and a
+    # three-way "everyone together" search behave identically.
+    if person_ids:
+        results = search_by_all_persons(
+            db, person_ids, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 

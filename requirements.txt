@@ -40,6 +40,10 @@ reverse_geocoder>=1.5
 fastapi>=0.110
 uvicorn>=0.29
 
+# MCP server (M24 — LLM-driven search). Streamable-HTTP transport via the
+# low-level Server API; runs as the photosearch-mcp container.
+mcp>=1.2
+
 # Google Photos upload (optional — only needed if using the upload feature)
 # requests is already transitively required by many packages; listed explicitly
 # so Docker image builds don't break if transitive dep is removed.
