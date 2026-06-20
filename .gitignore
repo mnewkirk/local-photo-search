@@ -81,3 +81,6 @@ syncthing-config/
 # eval bake-off outputs (regenerable)
 evals/bakeoff_results.json
 evals/bakeoff_report.html
+
+# personal Ask-agent glossary
+.agent-hints

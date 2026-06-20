@@ -68,16 +68,24 @@ if [ ! -f "${REPLICA_DB}" ]; then
   exit 1
 fi
 
+# Persistent household glossary for the Ask agent: if PHOTOSEARCH_AGENT_HINTS
+# isn't already set and ./.agent-hints exists, load it (gitignored, personal).
+if [ -z "${PHOTOSEARCH_AGENT_HINTS:-}" ] && [ -f "./.agent-hints" ]; then
+  PHOTOSEARCH_AGENT_HINTS="$(cat ./.agent-hints)"
+fi
+
 export PHOTOSEARCH_DB="${REPLICA_DB}"
 export PHOTOSEARCH_NAS_URL="${NAS_URL}"
 export PHOTOSEARCH_TEXT_LLM_URL="${LM_URL}"
 [ -n "${AGENT_MODEL}" ] && export PHOTOSEARCH_LLM_AGENT_MODEL="${AGENT_MODEL}"
+[ -n "${PHOTOSEARCH_AGENT_HINTS:-}" ] && export PHOTOSEARCH_AGENT_HINTS
 # No PHOTO_ROOT: originals aren't local, so image routes proxy from the NAS.
 
 echo "photosearch (local replica)"
 echo "  DB:        ${REPLICA_DB}"
 echo "  NAS:       ${NAS_URL}   (image proxy + sync)"
 echo "  LM Studio: ${LM_URL}   (Ask agent${AGENT_MODEL:+, model=$AGENT_MODEL})"
-echo "  Web:       http://localhost:${PORT}"
+echo "  Hints:     ${PHOTOSEARCH_AGENT_HINTS:+loaded (${#PHOTOSEARCH_AGENT_HINTS} chars)}${PHOTOSEARCH_AGENT_HINTS:-none}"
+echo "  Web:       http://localhost:${PORT}    (✨ Ask mode in the search bar)"
 echo
 exec "${PYBIN}" cli.py serve --db "${REPLICA_DB}" --host 0.0.0.0 --port "${PORT}"
