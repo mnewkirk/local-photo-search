@@ -1038,9 +1038,11 @@
               title: askMode
                 ? 'Switch to structured search (filters)'
                 : 'Switch to Ask mode — describe what you want in natural language',
-              style: { background: askMode ? 'var(--accent)' : 'var(--surface2)',
-                       color: askMode ? '#fff' : 'var(--text)' },
-            }, askMode ? '✨ Ask' : 'Search'),
+              // Label advertises the mode you'd switch TO, so the ✨ Ask
+              // affordance is visible by default (in search mode).
+              style: { background: askMode ? 'var(--surface2)' : 'var(--accent)',
+                       color: askMode ? 'var(--text)' : '#fff' },
+            }, askMode ? '🔍 Search' : '✨ Ask'),
             e('input', {
               ref: inputRef,
               className: 'search-input',
