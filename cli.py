@@ -1046,6 +1046,125 @@ def apply_face_state(db, from_file, overwrite_persons, apply):
                    "Now run resolve-duplicate-persons to re-enforce the invariant.")
 
 
+def _write_verify_report(suspects, path, nas_url, top_n):
+    """HTML gallery of suspected mis-tagged faces, grouped by person, farthest
+    (most likely wrong) first within each person. Crops fetched from the NAS."""
+    import base64
+    import html as _html
+    import urllib.request
+    from collections import defaultdict
+
+    by_person = defaultdict(list)
+    for s in suspects:
+        by_person[s["person"]].append(s)
+    cache = {}
+
+    def crop(fid):
+        if fid not in cache:
+            try:
+                with urllib.request.urlopen(f"{nas_url}/api/faces/crop/{fid}", timeout=20) as r:
+                    cache[fid] = base64.b64encode(r.read()).decode("ascii")
+            except Exception:
+                cache[fid] = None
+        b = cache[fid]
+        return (f'<img src="data:image/jpeg;base64,{b}"/>' if b else '<div class="m"></div>')
+
+    sections = []
+    for name in sorted(by_person):
+        rows = sorted(by_person[name], key=lambda s: -s["dist"])[:top_n]
+        cells = "".join(
+            f'<div class="c">{crop(s["face_id"])}'
+            f'<div class="l">photo {s["photo_id"]}<br>{s["ym"]} · d={s["dist"]:.2f}</div></div>'
+            for s in rows)
+        sections.append(f'<h2>{_html.escape(name)} — {len(by_person[name])} suspect(s)</h2>'
+                        f'<div class="grid">{cells}</div>')
+
+    doc = f"""<!doctype html><meta charset="utf-8"><title>Mis-tag review</title><style>
+ body{{font:13px system-ui;margin:20px;background:#fafafa}} h1{{font-size:18px}} h2{{font-size:15px;margin:18px 0 6px}}
+ .grid{{display:flex;flex-wrap:wrap;gap:8px}} .c{{text-align:center;width:120px}}
+ .c img{{width:114px;height:114px;object-fit:cover;border-radius:6px;border:3px solid #d62728}}
+ .l{{font:10px monospace;color:#666;margin-top:3px}} .m{{width:114px;height:114px;background:#eee;border-radius:6px}}
+</style><h1>Suspected mis-tagged faces — farthest from each person's trusted references</h1>
+<p>Each face is tagged the named person but sits far from their strict/manual reference faces
+(likely a temporal over-match onto someone else). Confirm which are wrong, then unmatch.
+Catches non-sibling mis-tags well; sibling confusion stays close (embedder limit).</p>
+{''.join(sections)}"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+
+
+@cli.command("verify-person-matches")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--person", default=None, help="Only this person (default: all).")
+@click.option("--min-refs", default=5, show_default=True,
+              help="Skip persons with fewer than this many trusted (strict/manual) faces.")
+@click.option("--min-dist", default=1.30, show_default=True, type=float,
+              help="Flag faces whose distance to the trusted reference set exceeds this.")
+@click.option("--top-n", default=40, show_default=True,
+              help="Cap suspects surfaced per person (farthest first).")
+@click.option("--max-refs", default=500, show_default=True,
+              help="Sample at most this many trusted faces as references (perf).")
+@click.option("--report", default=None, metavar="PATH",
+              help="Write an HTML review gallery (needs PHOTOSEARCH_NAS_URL).")
+def verify_person_matches(db, person, min_refs, min_dist, top_n, max_refs, report):
+    """Surface likely MIS-TAGGED faces (a person tagged on someone else's face).
+
+    For each person, the trusted (strict/manual) faces form a reference set; every
+    face of that person is scored by min L2 distance to it, and the farthest
+    (beyond --min-dist) are flagged — these are usually temporal over-matches onto
+    a different person. Report-only (review the gallery, then unmatch the confirmed
+    ones). Catches non-sibling mis-tags well; siblings stay close (the ArcFace
+    limit). Run where the encodings are (the replica is fine)."""
+    import numpy as np
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        if person:
+            prows = c.execute("SELECT id, name FROM persons WHERE LOWER(name)=LOWER(?)", (person,)).fetchall()
+        else:
+            prows = c.execute("SELECT id, name FROM persons ORDER BY name").fetchall()
+        suspects, skipped = [], 0
+        for pr in prows:
+            pid, name = pr["id"], pr["name"]
+            refs = c.execute(
+                "SELECT e.encoding FROM faces f JOIN face_encodings e ON e.face_id=f.id "
+                "WHERE f.person_id=? AND f.match_source IN ('strict','manual')", (pid,)).fetchall()
+            if len(refs) < min_refs:
+                skipped += 1
+                continue
+            R = np.stack([np.frombuffer(r["encoding"], dtype=np.float32) for r in refs])
+            R = R / np.linalg.norm(R, axis=1, keepdims=True)
+            if len(R) > max_refs:
+                R = R[np.linspace(0, len(R) - 1, max_refs).astype(int)]
+            faces = c.execute(
+                "SELECT f.id, f.photo_id, e.encoding, substr(p.date_taken,1,7) ym "
+                "FROM faces f JOIN face_encodings e ON e.face_id=f.id JOIN photos p ON p.id=f.photo_id "
+                "WHERE f.person_id=?", (pid,)).fetchall()
+            F = np.stack([np.frombuffer(f["encoding"], dtype=np.float32) for f in faces])
+            F = F / np.linalg.norm(F, axis=1, keepdims=True)
+            # min L2 to any reference via cosine: L2^2 = 2 - 2*cos
+            maxsim = (F @ R.T).max(axis=1)
+            dist = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * maxsim))
+            for i, f in enumerate(faces):
+                if dist[i] > min_dist:
+                    suspects.append({"person": name, "face_id": f["id"], "photo_id": f["photo_id"],
+                                     "ym": f["ym"] or "?", "dist": float(dist[i])})
+        # per-person counts (apply top_n cap for the printed summary too)
+        from collections import Counter
+        per = Counter(s["person"] for s in suspects)
+        click.echo(f"{len(prows)} person(s) checked, {skipped} skipped (<{min_refs} trusted refs). "
+                   f"{len(suspects)} suspect face(s) beyond dist {min_dist}:")
+        for nm, n in sorted(per.items(), key=lambda kv: -kv[1]):
+            click.echo(f"  {nm}: {n}")
+        if report:
+            nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+            if not nas:
+                click.echo("  (set PHOTOSEARCH_NAS_URL to fetch crops for the report)")
+            else:
+                _write_verify_report(suspects, report, nas, top_n)
+                click.echo(f"  wrote review gallery: {report}")
+
+
 @cli.command("split-cluster")
 @click.argument("cluster_id", type=int)
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
