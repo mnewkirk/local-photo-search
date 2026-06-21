@@ -961,6 +961,89 @@ def resolve_duplicate_persons(db, apply):
                    "Reversible via: photosearch restore-unmatched-faces.")
 
 
+@cli.command("export-face-state")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Source DB (the locally-computed replica).")
+@click.option("--out", required=True, metavar="PATH",
+              help="Output assignments SQLite file to ship to the NAS.")
+def export_face_state(db, out):
+    """Export computed face cluster_id/person_id assignments to a small SQLite
+    file. Workflow: sync the replica, run recluster-faces / match-faces locally
+    on this fast desktop, export here, ship the file to the NAS, then
+    apply-face-state there. The file holds only the assignment columns
+    (~a few MB), not the photos or encodings.
+
+    (Distinct from export-face-assignments, which is JSON of MANUAL labels for
+    rebuild preservation; this carries the full computed cluster+match state.)"""
+    import os as _os
+    if _os.path.exists(out):
+        _os.remove(out)
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        c.execute("ATTACH DATABASE ? AS exp", (out,))
+        c.execute("CREATE TABLE exp.face_assignments AS "
+                  "SELECT id AS face_id, cluster_id, person_id, match_source FROM faces")
+        c.execute("CREATE UNIQUE INDEX exp.ix_fa ON face_assignments(face_id)")
+        n = c.execute("SELECT COUNT(*) FROM exp.face_assignments").fetchone()[0]
+        c.execute("DETACH DATABASE exp")
+    click.echo(f"Exported {n} face assignments to {out}.")
+
+
+@cli.command("apply-face-state")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Target (authoritative) DB, e.g. the NAS /data/photo_index.db.")
+@click.option("--from", "from_file", required=True, metavar="PATH",
+              help="Assignments SQLite file from export-face-state.")
+@click.option("--overwrite-persons", is_flag=True, default=False,
+              help="Also overwrite EXISTING person assignments. Default: additive "
+                   "(only fill faces currently unmatched here, preserving curation).")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write changes. Default: dry-run.")
+def apply_face_state(db, from_file, overwrite_persons, apply):
+    """Apply locally-computed cluster/person assignments to this DB (the NAS).
+
+    Person matches are ADDITIVE by default — only faces unmatched HERE get a
+    person, so prior curation/dedup isn't clobbered (use --overwrite-persons to
+    force). Clusters are applied to faces that remain unmatched. Faces absent
+    from the file (e.g. ingested after the replica sync) are left untouched.
+    After applying matches, re-run resolve-duplicate-persons to re-enforce the
+    one-person-per-photo invariant (temporal matching can create duplicates)."""
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        c.execute("ATTACH DATABASE ? AS a", (from_file,))
+        if overwrite_persons:
+            newp = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
+                             "WHERE IFNULL(f.person_id,-1) <> IFNULL(x.person_id,-1)").fetchone()[0]
+        else:
+            newp = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
+                             "WHERE f.person_id IS NULL AND x.person_id IS NOT NULL").fetchone()[0]
+        clus = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
+                         "WHERE f.person_id IS NULL AND IFNULL(f.cluster_id,-1) <> IFNULL(x.cluster_id,-1)").fetchone()[0]
+        click.echo(f"{'Re-assign' if overwrite_persons else 'Add'} person on {newp} face(s); "
+                   f"update cluster on {clus} unmatched face(s).")
+        if not apply:
+            c.execute("DETACH DATABASE a")
+            click.echo("Dry run — no changes written. Re-run with --apply.")
+            return
+        # 1) persons first, so newly-matched faces don't keep a stale cluster_id
+        if overwrite_persons:
+            c.execute("UPDATE faces SET person_id=(SELECT person_id FROM a.face_assignments WHERE face_id=faces.id), "
+                      "match_source=(SELECT match_source FROM a.face_assignments WHERE face_id=faces.id) "
+                      "WHERE id IN (SELECT face_id FROM a.face_assignments)")
+        else:
+            c.execute("UPDATE faces SET person_id=(SELECT person_id FROM a.face_assignments WHERE face_id=faces.id), "
+                      "match_source=(SELECT match_source FROM a.face_assignments WHERE face_id=faces.id) "
+                      "WHERE person_id IS NULL "
+                      "AND (SELECT person_id FROM a.face_assignments WHERE face_id=faces.id) IS NOT NULL")
+        # 2) clusters for faces that are still unmatched here
+        c.execute("UPDATE faces SET cluster_id=(SELECT cluster_id FROM a.face_assignments WHERE face_id=faces.id) "
+                  "WHERE person_id IS NULL AND id IN (SELECT face_id FROM a.face_assignments)")
+        pdb.conn.commit()
+        c.execute("DETACH DATABASE a")
+        click.echo(f"Applied: persons on {newp}, clusters on {clus} face(s). "
+                   "Now run resolve-duplicate-persons to re-enforce the invariant.")
+
+
 @cli.command("split-cluster")
 @click.argument("cluster_id", type=int)
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
