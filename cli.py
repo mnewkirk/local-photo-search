@@ -685,6 +685,81 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 # split-cluster
 # ---------------------------------------------------------------------------
 
+@cli.command("dedupe-person-faces")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--person", required=True, help="Person name to dedupe.")
+@click.option("--references", required=True,
+              help="Comma-separated PHOTO ids of known-good reference photos for this "
+                   "person (one clear face of them each, ideally spanning their years).")
+@click.option("--min-gap", default=0.15, type=float,
+              help="Only resolve a double-match when the distance gap between the best "
+                   "and 2nd-best candidate face exceeds this (confidence gate).")
+@click.option("--apply", is_flag=True, default=False,
+              help="Unmatch the losing faces (person_id=NULL). Default: dry-run.")
+def dedupe_person_faces(db, person, references, min_gap, apply):
+    """Fix photos where 2+ faces are wrongly matched to the SAME person.
+
+    A photo contains a person at most once, so any photo with 2+ faces tagged
+    the same person has >=1 false match (usually temporal over-matching that
+    propagated the label to another kid at the same event). Using a small set
+    of REFERENCE faces (the person's face in the --references photos), keep the
+    candidate closest to those references and unmatch the rest — but only when
+    the call is confident (gap > --min-gap). Dry-run by default.
+    """
+    import numpy as np
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        prow = c.execute("SELECT id FROM persons WHERE LOWER(name)=LOWER(?)", (person,)).fetchone()
+        if not prow:
+            click.echo(f"Person '{person}' not found.")
+            return
+        pid = prow["id"]
+        ref_ids = [int(x) for x in references.split(",") if x.strip()]
+        R = []
+        for rpid in ref_ids:
+            for r in c.execute(
+                "SELECT e.encoding FROM faces f JOIN face_encodings e ON e.face_id = f.id "
+                "WHERE f.photo_id = ? AND f.person_id = ?", (rpid, pid)):
+                R.append(np.frombuffer(r["encoding"], dtype=np.float32))
+        if not R:
+            click.echo("No reference faces for this person in the given photos.")
+            return
+        R = np.stack(R)
+        R = R / np.linalg.norm(R, axis=1, keepdims=True)
+        click.echo(f"Reference set: {len(R)} faces of {person} from {len(ref_ids)} photos.")
+
+        def mindist(blob):
+            v = np.frombuffer(blob, dtype=np.float32)
+            v = v / np.linalg.norm(v)
+            return float(np.min(np.linalg.norm(R - v, axis=1)))
+
+        dbl = c.execute(
+            "SELECT photo_id FROM faces WHERE person_id = ? "
+            "GROUP BY photo_id HAVING COUNT(*) >= 2", (pid,)).fetchall()
+        to_unmatch, ambiguous = [], 0
+        for row in dbl:
+            faces = c.execute(
+                "SELECT f.id, e.encoding FROM faces f JOIN face_encodings e ON e.face_id = f.id "
+                "WHERE f.photo_id = ? AND f.person_id = ?", (row["photo_id"], pid)).fetchall()
+            ranked = sorted((mindist(f["encoding"]), f["id"]) for f in faces)
+            if ranked[1][0] - ranked[0][0] > min_gap:
+                to_unmatch.extend(fid for _, fid in ranked[1:])
+            else:
+                ambiguous += 1
+        click.echo(f"{len(dbl)} photos with 2+ {person} faces:")
+        click.echo(f"  confident (gap > {min_gap}): would unmatch {len(to_unmatch)} face(s)")
+        click.echo(f"  ambiguous (left unchanged): {ambiguous} photo(s)")
+        if not apply:
+            click.echo("Dry run — no changes written. Re-run with --apply.")
+            return
+        for fid in to_unmatch:
+            c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
+                      "WHERE id = ?", (fid,))
+        pdb.conn.commit()
+        click.echo(f"Applied: unmatched {len(to_unmatch)} face(s) from {person}.")
+
+
 @cli.command("split-cluster")
 @click.argument("cluster_id", type=int)
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
