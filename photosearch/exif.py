@@ -95,6 +95,20 @@ def extract_exif(filepath: str) -> dict:
                 pass
             break
 
+    # EXIF width/height are RAW sensor dims; for 90/270 rotations (orientation
+    # 5-8) the displayed image — and the InsightFace bboxes, which are computed
+    # on the EXIF-oriented image — are transposed. Store the ORIENTED dims so
+    # overlays line up. (Orientation 1-4 need no swap.)
+    if result["image_width"] and result["image_height"] and "Image Orientation" in tags:
+        try:
+            orient = int(tags["Image Orientation"].values[0])
+        except (ValueError, TypeError, IndexError, AttributeError):
+            s = str(tags["Image Orientation"])
+            orient = 6 if ("90" in s or "270" in s) else 1
+        if orient in (5, 6, 7, 8):
+            result["image_width"], result["image_height"] = (
+                result["image_height"], result["image_width"])
+
     # GPS
     gps_lat = _extract_gps_coord(tags, "GPS GPSLatitude", "GPS GPSLatitudeRef")
     gps_lon = _extract_gps_coord(tags, "GPS GPSLongitude", "GPS GPSLongitudeRef")

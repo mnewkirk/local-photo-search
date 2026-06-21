@@ -1588,6 +1588,88 @@ def cleanup_orphans(db, dry_run):
             click.echo("\nNo orphans found — nothing to delete.")
 
 
+@cli.command("cleanup-orphan-faces")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Delete the orphan faces. Default: dry-run.")
+def cleanup_orphan_faces(db, apply):
+    """Delete face rows whose photo no longer exists (orphans from deleted photos).
+
+    When photos are removed (culls, re-imports), their face rows can survive — they
+    show broken thumbnails in /faces, pollute clustering, and inflate person counts
+    with phantom faces. This deletes faces whose photo_id is gone, then clears their
+    now-dangling face_encodings (via cleanup_vec_orphans). Safe: the photos these
+    point at don't exist, and AUTOINCREMENT prevents id reuse.
+    """
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        n = c.execute("SELECT COUNT(*) FROM faces WHERE photo_id NOT IN "
+                      "(SELECT id FROM photos)").fetchone()[0]
+        matched = c.execute("SELECT COUNT(*) FROM faces WHERE person_id IS NOT NULL "
+                            "AND photo_id NOT IN (SELECT id FROM photos)").fetchone()[0]
+        click.echo(f"orphan faces (photo deleted): {n}  ({matched} matched to a person)")
+        if not apply:
+            click.echo("Dry run — no changes written. Re-run with --apply.")
+            return
+        c.execute("DELETE FROM faces WHERE photo_id NOT IN (SELECT id FROM photos)")
+        pdb.conn.commit()
+        res = pdb.cleanup_vec_orphans(dry_run=False)
+        click.echo(f"Deleted {n} orphan faces; cleared {res['face_deleted']} dangling "
+                   "encodings. Re-run recluster-faces to regroup the affected clusters.")
+
+
+@cli.command("backfill-image-orientation")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write the corrected dimensions. Default: dry-run.")
+@click.option("--limit", default=None, type=int, help="Process only the first N photos (testing).")
+def backfill_image_orientation(db, apply, limit):
+    """Store EXIF-ORIENTED image_width/height so face-box overlays line up.
+
+    EXIF width/height are raw sensor dims, but InsightFace bboxes are computed on
+    the EXIF-oriented image, and previews are exif_transposed — so for 90/270
+    rotations (orientation 5-8) the raw dims are swapped relative to the bboxes,
+    and overlay boxes land in the wrong place. This reads each file's EXIF
+    orientation (header only — fast) and sets dims to the oriented values.
+    Idempotent. Run where the photo files live (the NAS).
+    """
+    from PIL import Image
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        rows = c.execute("SELECT id, filepath, image_width, image_height FROM photos").fetchall()
+        if limit:
+            rows = rows[:limit]
+        checked = fixed = errs = 0
+        for i, r in enumerate(rows):
+            path = pdb.resolve_filepath(r["filepath"])
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                im = Image.open(path)
+                w, h = im.size                      # raw pixel dims (PIL does not auto-rotate)
+                orient = im.getexif().get(274, 1)
+            except Exception:
+                errs += 1
+                continue
+            checked += 1
+            if orient in (5, 6, 7, 8):
+                w, h = h, w
+            if (w, h) != (r["image_width"], r["image_height"]):
+                fixed += 1
+                if apply:
+                    c.execute("UPDATE photos SET image_width=?, image_height=? WHERE id=?",
+                              (w, h, r["id"]))
+            if apply and i % 10000 == 0 and i:
+                pdb.conn.commit()
+                click.echo(f"  ...{i} scanned, {fixed} fixed")
+        if apply:
+            pdb.conn.commit()
+        click.echo(f"checked {checked}, {'fixed' if apply else 'would fix'} {fixed} photo(s), "
+                   f"{errs} unreadable. (Rotated photos get width/height swapped.)")
+
+
 # ---------------------------------------------------------------------------
 # ingest-incoming
 # ---------------------------------------------------------------------------
