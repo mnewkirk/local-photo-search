@@ -844,9 +844,13 @@ manual-label rebuild-preservation.)
 Pipeline (`/tmp/face_recompute_pipeline.sh` is the reference):
 ```
 sync replica → (on desktop) match-faces --temporal + recluster-faces
-→ export-face-state → scp to NAS → (NAS) git pull
+→ export-face-state → cat-stream to NAS → (NAS) git pull
 → apply-face-state --apply → resolve-duplicate-persons --apply
 ```
+Ship the file with `cat FILE | ssh nas 'cat > /volume1/docker/photosearch/FILE'`
+— **UGREEN blocks scp/SFTP/rsync to the box** (same reason `sync-replica.sh`
+cat-streams). One real run (2026-06-21): ~230k-face DBSCAN took ~61 min on the
+desktop, then apply matched 16k + clustered 122k faces, resolve cleaned 2k dups.
 `recluster-faces` writes by default (has `--dry-run`, no `--apply`);
 `match-faces` writes directly. DBSCAN at 512-dim scales ~O(n²) (curse of
 dimensionality) — ~230k faces takes tens of minutes even on a fast desktop.
