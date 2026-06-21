@@ -590,6 +590,17 @@
       window.history.pushState(null, '', newUrl);
     }
 
+    // Build the content-filter query fragment (date / place / semantic search)
+    // appended to /api/faces/groups so only clusters in matching photos show.
+    function cfParams(c) {
+      let s = '';
+      if (c.date_from) s += '&date_from=' + encodeURIComponent(c.date_from);
+      if (c.date_to) s += '&date_to=' + encodeURIComponent(c.date_to);
+      if (c.location) s += '&location=' + encodeURIComponent(c.location);
+      if (c.q) s += '&q=' + encodeURIComponent(c.q);
+      return s;
+    }
+
     // -----------------------------------------------------------------------
     // PhotoModal — full photo viewer with face bboxes (same as search page)
     // -----------------------------------------------------------------------
@@ -615,6 +626,9 @@
       const [loading, setLoading] = useState(true);
       const [loadingMore, setLoadingMore] = useState(false);
       const [filter, setFilter] = useState(initParams.filter);
+      // Content filters (date / place / semantic q). Applied on submit, not per
+      // keystroke; restrict clusters/persons to those in matching photos.
+      const [cf, setCf] = useState({ date_from: '', date_to: '', location: '', q: '' });
       const PAGE_SIZE = 200;
       const [selectedGroup, setSelectedGroup] = useState(null);
       const [groupPhotos, setGroupPhotos] = useState([]);
@@ -653,12 +667,13 @@
       // Also refreshes `persons` so merge/rename dropdowns see newly-created
       // persons without a full page reload — loadGroups fires after every
       // mutation, so piggy-backing keeps both in sync.
-      const loadGroups = useCallback((filterOverride) => {
+      const loadGroups = useCallback((filterOverride, cfOverride) => {
         setLoading(true);
         loadPersons();
         const f = filterOverride || filter;
+        const c = cfOverride || cf;
         const url = API + '/api/faces/groups?filter=' + encodeURIComponent(f) +
-          '&limit=' + PAGE_SIZE + '&offset=0';
+          '&limit=' + PAGE_SIZE + '&offset=0' + cfParams(c);
         return fetch(url)
           .then(r => r.json())
           .then(data => {
@@ -669,13 +684,13 @@
             return data.groups || [];
           })
           .catch(() => { setLoading(false); return []; });
-      }, [filter, loadPersons]);
+      }, [filter, cf, loadPersons]);
 
       const loadMore = useCallback(() => {
         if (loadingMore || groups.length >= total) return;
         setLoadingMore(true);
         const url = API + '/api/faces/groups?filter=' + encodeURIComponent(filter) +
-          '&limit=' + PAGE_SIZE + '&offset=' + groups.length;
+          '&limit=' + PAGE_SIZE + '&offset=' + groups.length + cfParams(cf);
         fetch(url)
           .then(r => r.json())
           .then(data => {
@@ -685,7 +700,7 @@
             setLoadingMore(false);
           })
           .catch(() => setLoadingMore(false));
-      }, [filter, groups.length, total, loadingMore, counts]);
+      }, [filter, cf, groups.length, total, loadingMore, counts]);
 
       useEffect(() => {
         loadPersons();
@@ -1153,6 +1168,7 @@
       const namedCount = counts.named;
       const unknownCount = counts.unknown;
       const ignoredCount = counts.ignored;
+      const cfActive = !!(cf.date_from || cf.date_to || cf.location || cf.q);
 
       return e('div', null,
         // Header
@@ -1191,6 +1207,28 @@
               }, 'Select Multiple'),
               !multiSelect && e('button', { onClick: handleExport },
                 '\u2B07 Export Assignments'),
+            ),
+            // Content-filter bar: restrict clusters to those appearing in photos
+            // matching a date range / place / semantic search. Applied on submit.
+            e('div', { className: 'toolbar', style: { marginTop: '6px', flexWrap: 'wrap', gap: '6px' } },
+              e('span', { style: { fontSize: '12px', color: 'var(--muted, #888)', alignSelf: 'center' } }, 'Filter clusters:'),
+              e('input', { type: 'date', value: cf.date_from, title: 'photos on/after',
+                onChange: ev => setCf({ ...cf, date_from: ev.target.value }) }),
+              e('span', { style: { alignSelf: 'center', color: 'var(--muted, #888)' } }, '\u2013'),
+              e('input', { type: 'date', value: cf.date_to, title: 'photos on/before',
+                onChange: ev => setCf({ ...cf, date_to: ev.target.value }) }),
+              e('input', { type: 'text', placeholder: 'place', value: cf.location, style: { width: '110px' },
+                onChange: ev => setCf({ ...cf, location: ev.target.value }),
+                onKeyDown: ev => { if (ev.key === 'Enter') loadGroups(null, cf); } }),
+              e('input', { type: 'text', placeholder: 'search\u2026', value: cf.q, style: { width: '150px' },
+                onChange: ev => setCf({ ...cf, q: ev.target.value }),
+                onKeyDown: ev => { if (ev.key === 'Enter') loadGroups(null, cf); } }),
+              e('button', { onClick: () => loadGroups(null, cf) }, 'Apply'),
+              cfActive && e('button', {
+                onClick: () => { const empty = { date_from: '', date_to: '', location: '', q: '' }; setCf(empty); loadGroups(null, empty); },
+              }, 'Clear'),
+              cfActive && e('span', { style: { fontSize: '12px', color: 'var(--accent, #4a9)', alignSelf: 'center' } },
+                total + ' matching group' + (total === 1 ? '' : 's')),
             ),
             e('div', { className: 'shortcuts-row' },
               !multiSelect && e('span', { className: 'group' },
