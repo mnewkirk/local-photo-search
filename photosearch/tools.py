@@ -463,24 +463,28 @@ def _subject_ranked_search(db: PhotoDB, args: dict, person_ids: list, limit: int
         f"WHERE f.person_id IN ({ph}) GROUP BY f.photo_id) pm ON pm.photo_id = photos.id")
     order = (f"(pm._prom BETWEEN {_SUBJECT_PROM_MIN} AND {_SUBJECT_PROM_MAX}) DESC, "
              f"aesthetic_score IS NULL, aesthetic_score DESC, pm._prom DESC")
+    dedupe = args.get("dedupe", True)
+    fetch = min(limit * _DEDUP_OVERFETCH, 600) if dedupe else limit
     try:
         total = db.conn.execute(
             f"SELECT COUNT(*) FROM photos {prom_join} WHERE {where}",
             (*person_ids, *params)).fetchone()[0]
-        rows = db.conn.execute(
+        rows = [dict(r) for r in db.conn.execute(
             f"SELECT photos.*, pm._prom AS _prom FROM photos {prom_join} "
             f"WHERE {where} ORDER BY {order} LIMIT ?",
-            (*person_ids, *params, limit)).fetchall()
+            (*person_ids, *params, fetch)).fetchall()]
     except Exception as exc:
         return {"error": f"subject search failed: {exc}"}
+    if dedupe:
+        rows = _dedupe_ranked(rows, limit)
     results = []
-    for r in rows:
-        d = dict(r)
+    for d in rows:
         hit = _compact_hit(d)
         if d.get("_prom") is not None:
             hit["subject_prominence"] = round(d["_prom"], 4)
         results.append(hit)
-    return {"total": total, "returned": len(results), "sort": "subject", "results": results}
+    return {"total": total, "returned": len(results), "sort": "subject",
+            "deduped": dedupe, "results": results}
 
 
 def _h_search_photos(db: PhotoDB, args: dict) -> dict:
@@ -820,15 +824,21 @@ def _h_representatives(db: PhotoDB, args: dict) -> dict:
         return {"error": f"unsupported bucket: {bucket!r}. "
                          "Use year | month | location | person | camera_model."}
 
-    sql = f"SELECT * FROM ({inner}) WHERE _rn <= ? ORDER BY {outer_order}, _rn LIMIT 500"
+    dedupe = args.get("dedupe", True)
+    # Over-fetch per bucket so dedup can still return n distinct photos.
+    fetch_rn = min(n * _DEDUP_OVERFETCH, 60) if dedupe and n > 1 else n
+    sql = f"SELECT * FROM ({inner}) WHERE _rn <= ? ORDER BY {outer_order}, _rn LIMIT 2000"
     try:
-        rows = db.conn.execute(sql, full_params).fetchall()
+        params_with_fetch = full_params[:-1] + (fetch_rn,)
+        rows = [dict(r) for r in db.conn.execute(sql, params_with_fetch).fetchall()]
     except Exception as exc:
         return {"error": f"representatives failed: {exc}"}
 
+    if dedupe and n > 1:
+        rows = _dedupe_ranked(rows, n)
+
     results = []
-    for r in rows:
-        d = dict(r)
+    for d in rows:
         hit = _compact_hit(d)
         hit["bucket"] = d.get("_bucket")
         if d.get("_prom") is not None:
@@ -838,6 +848,7 @@ def _h_representatives(db: PhotoDB, args: dict) -> dict:
         "bucket": bucket,
         "n_per_bucket": n,
         "ranked_by": "subject" if use_subject else "quality",
+        "deduped": bool(dedupe and n > 1),
         "buckets": len({h["bucket"] for h in results}),
         "returned": len(results),
         "results": results,
@@ -871,6 +882,9 @@ _register(ToolSpec(
             "rank_by": {"type": "string", "enum": ["quality", "subject"],
                         "description": "Rank each bucket by aesthetic quality (default) "
                         "or by how foreground/prominent the filtered person is."},
+            "dedupe": {"type": "boolean",
+                       "description": "Skip near-duplicate/burst shots (default true); "
+                       "ensures the N per bucket are distinct moments."},
             "people": {"type": "array", "items": {"type": "string"},
                        "description": "Registered names; matches photos with ALL of them."},
             "location": {"type": "string", "description": "Place/region name."},
@@ -961,6 +975,45 @@ _RERANK_WORKERS = 4
 # from the face-prominence distribution (~p55–p95) on the 163k library.
 _SUBJECT_PROM_MIN = 0.04
 _SUBJECT_PROM_MAX = 0.22
+
+# Two photos taken within this many seconds are treated as the same moment
+# (burst / near-duplicate) for dedup. Bursts are seconds apart; this also
+# catches "took 3 of the same pose" without dropping genuinely different shots.
+_DEDUP_WINDOW_S = 45
+_DEDUP_OVERFETCH = 6  # fetch this × n per bucket so dedup still yields n
+
+
+def _parse_dt(s):
+    import datetime
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace(" ", "T")[:19])
+    except (ValueError, TypeError):
+        return None
+
+
+def _dedupe_ranked(rows: list, n: int) -> list:
+    """Take up to `n` per bucket from ranked (best-first) photo rows, skipping
+    near-duplicates: identical file_hash, or taken within _DEDUP_WINDOW_S of an
+    already-kept photo in the same bucket. Rows must carry date_taken,
+    file_hash, and _bucket (None for a flat, single-bucket list)."""
+    out: list = []
+    per: dict = {}
+    for d in rows:
+        sel = per.setdefault(d.get("_bucket"), [])
+        if len(sel) >= n:
+            continue
+        h = d.get("file_hash")
+        if h and any(s.get("file_hash") == h for s in sel):
+            continue
+        t = _parse_dt(d.get("date_taken"))
+        if t and any((st := _parse_dt(s.get("date_taken"))) is not None
+                     and abs((t - st).total_seconds()) < _DEDUP_WINDOW_S for s in sel):
+            continue
+        sel.append(d)
+        out.append(d)
+    return out
 
 
 def _thumb_b64(db: PhotoDB, photo_id: int) -> Optional[str]:

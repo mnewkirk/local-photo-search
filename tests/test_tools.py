@@ -328,6 +328,17 @@ def test_representatives_subject_falls_back_without_people(db):
     assert res["ranked_by"] == "quality"
 
 
+def test_dedupe_ranked_skips_burst_and_hash():
+    rows = [
+        {"id": 1, "_bucket": "2026", "date_taken": "2026-01-01 10:00:00", "file_hash": "a"},
+        {"id": 2, "_bucket": "2026", "date_taken": "2026-01-01 10:00:03", "file_hash": "b"},  # burst (3s)
+        {"id": 3, "_bucket": "2026", "date_taken": "2026-01-01 14:00:00", "file_hash": "c"},  # distinct
+        {"id": 4, "_bucket": "2026", "date_taken": "2026-06-01 09:00:00", "file_hash": "a"},  # dup hash of 1
+    ]
+    kept = [d["id"] for d in tools._dedupe_ranked(rows, n=3)]
+    assert kept == [1, 3]  # 2 (burst of 1) and 4 (hash dup of 1) skipped
+
+
 # ---------------------------------------------------------------------------
 # rerank_photos (VLM re-ranking)
 # ---------------------------------------------------------------------------
