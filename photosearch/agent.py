@@ -443,7 +443,24 @@ def _write_ask_log(session: dict) -> None:
             L.append("**Tools:**")
             for tc in session["tool_calls"]:
                 L.append(f"- `{tc['name']}({json.dumps(tc.get('args') or {}, ensure_ascii=False)})`"
-                         + (f" → {tc['summary']}" if tc.get("summary") else ""))
+                         + (f" → {tc['summary']}" if tc.get("summary") else "")
+                         + (f"  ⚠ {tc['error']}" if tc.get("error") else ""))
+                items = tc.get("items") or []
+                if tc["name"] == "rerank_photos":
+                    # The interesting part: what the vision model scored each at.
+                    for it in items:
+                        sc = it.get("rerank_score")
+                        L.append(f"    - {sc if sc is not None else '?'}  "
+                                 f"{it.get('filename')} (id {it.get('id')})"
+                                 + (f" — {it['rerank_reason']}" if it.get("rerank_reason") else ""))
+                elif items:
+                    # Returned set: filename (id), with the bucket for representatives.
+                    parts = []
+                    for it in items[:40]:
+                        tag = f"[{it['bucket']}] " if it.get("bucket") else ""
+                        parts.append(f"{tag}{it.get('filename')} (id {it.get('id')})")
+                    more = f" … +{len(items) - 40} more" if len(items) > 40 else ""
+                    L.append("    " + "; ".join(parts) + more)
         for i, st in enumerate([s for s in session.get("steps", []) if s.get("reasoning")], 1):
             L += [f"**Reasoning {i}:**", "```", st["reasoning"].strip(), "```"]
         if session.get("answer"):
@@ -545,9 +562,17 @@ def run_agent(
                         last_photos = result.get("results", [])
                         last_total = result.get("total", len(last_photos))
                     summ = _summarize(name, result)
-                    session["tool_calls"].append({"name": name,
-                                                  "args": call.get("arguments", {}),
-                                                  "summary": summ})
+                    rec = {"name": name, "args": call.get("arguments", {}), "summary": summ}
+                    if isinstance(result, dict) and isinstance(result.get("results"), list):
+                        hits = [h for h in result["results"] if isinstance(h, dict)]
+                        rec["items"] = [{"id": h.get("id"), "filename": h.get("filename"),
+                                         "bucket": h.get("bucket"),
+                                         "rerank_score": h.get("rerank_score"),
+                                         "rerank_reason": h.get("rerank_reason")}
+                                        for h in hits]
+                    elif isinstance(result, dict) and "error" in result:
+                        rec["error"] = result["error"]
+                    session["tool_calls"].append(rec)
                     yield {"type": "tool_result", "tool": name, "summary": summ}
                     messages.append(_tool_result_msg(call, result))
                 continue
