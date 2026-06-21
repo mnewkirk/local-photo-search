@@ -195,8 +195,9 @@ def _system_prompt(db=None) -> str:
         "  'the kids playing soccer' -> people=<the kids>, category='soccer'\n"
         "  'top 3 photos of Calvin playing soccer' -> search_photos(people=['Calvin'], "
         "category='soccer', sort='quality_desc') THEN rerank_photos(photo_ids="
-        "<the returned ids>, criteria='a child actively playing soccer on a field') "
-        "— rerank because category tags include non-soccer false positives\n"
+        "<the returned ids>, criteria='a child actively playing soccer on a field', "
+        "top_n=3) — rerank (category tags have false positives) and pass top_n to "
+        "honor the requested count and drop low-scoring non-matches\n"
     )
     try:
         ctx = _library_context(db) if db is not None else ""

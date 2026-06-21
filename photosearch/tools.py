@@ -1094,6 +1094,10 @@ def _h_rerank_photos(db: PhotoDB, args: dict) -> dict:
     criteria = (args.get("criteria") or "").strip()
     if not ids or not criteria:
         return {"error": "photo_ids and criteria are required"}
+    try:
+        top_n = int(args["top_n"]) if args.get("top_n") is not None else None
+    except (TypeError, ValueError):
+        top_n = None
 
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
     model = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
@@ -1114,7 +1118,7 @@ def _h_rerank_photos(db: PhotoDB, args: dict) -> dict:
                 "note": "no vision model configured (PHOTOSEARCH_LLM_VISUAL_MODEL); "
                         "returning candidates unranked",
                 "criteria": criteria,
-                "results": [_compact(pid) for pid in ids]}
+                "results": [_compact(pid) for pid in (ids[:top_n] if top_n else ids)]}
 
     def _score(pid):
         b64 = _thumb_b64(db, pid)
@@ -1134,11 +1138,14 @@ def _h_rerank_photos(db: PhotoDB, args: dict) -> dict:
 
     results = ([_compact(pid, scores[pid]["score"], scores[pid]["reason"]) for pid in scored_ids]
                + [_compact(pid) for pid in failed_ids])
+    if top_n:
+        results = results[:top_n]   # top matches only → drops low-scoring false tags
     return {
         "reranked": True,
         "criteria": criteria,
         "model": model,
         "scored": len(scored_ids),
+        "returned": len(results),
         "results": results,
     }
 
@@ -1165,6 +1172,9 @@ _register(ToolSpec(
                           "description": "Candidate photo ids to re-rank (from a prior search)."},
             "criteria": {"type": "string",
                          "description": "The visual thing to judge each photo against."},
+            "top_n": {"type": "integer",
+                      "description": "Return only the top N best matches (e.g. 3 for "
+                      "'top 3') — drops low-scoring false matches."},
         },
         "required": ["photo_ids", "criteria"],
         "additionalProperties": False,

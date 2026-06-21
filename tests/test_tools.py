@@ -375,6 +375,23 @@ def test_rerank_sorts_by_vision_score(db, monkeypatch):
     assert all("rerank_score" in h for h in res["results"])
 
 
+def test_rerank_top_n_caps_and_keeps_best(db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://fake:1234/v1")
+    monkeypatch.setenv("PHOTOSEARCH_LLM_VISUAL_MODEL", "fake-vl")
+    ids = list(db._test_photo_ids.values())
+    score_map = {pid: i / 10 for i, pid in enumerate(ids)}
+    monkeypatch.setattr(tools, "_thumb_b64", lambda db, pid: f"id:{pid}")
+    monkeypatch.setattr(tools, "_vision_score",
+                        lambda base, model, b64, crit:
+                        {"score": score_map[int(b64.split(':')[1])], "reason": "x"})
+    res = tools.call_tool(db, "rerank_photos",
+                          {"photo_ids": ids, "criteria": "x", "top_n": 2})
+    assert res["returned"] == 2
+    # The two highest-scoring ids only.
+    top2 = sorted(ids, key=lambda p: score_map[p], reverse=True)[:2]
+    assert [h["id"] for h in res["results"]] == top2
+
+
 def test_rerank_requires_args(db):
     assert "error" in tools.call_tool(db, "rerank_photos", {"photo_ids": [], "criteria": "x"})
     assert "error" in tools.call_tool(db, "rerank_photos", {"photo_ids": [1], "criteria": ""})
