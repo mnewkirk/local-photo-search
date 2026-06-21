@@ -640,6 +640,32 @@ def _similarity_sort(groups: list[dict], encodings: dict[int, list[float]]) -> l
 _SIMILARITY_SORT_GROUP_LIMIT = 500
 
 
+def _face_filter_photo_ids(db, date_from, date_to, location, q, person):
+    """Photo-id set matching the given content filters, or None when none are set.
+
+    Reuses search_combined for semantic/person queries (CLIP-ranked, capped);
+    falls back to a direct, unbounded date/location SQL scan otherwise. Used to
+    restrict /api/faces/groups to clusters/persons appearing in matching photos.
+    """
+    if not any([date_from, date_to, location, q, person]):
+        return None
+    if q or person:
+        from .search import search_combined
+        res = search_combined(db, query=q or None, location=location, person=person,
+                              date_from=date_from, date_to=date_to, limit=5000,
+                              sort="date_desc")
+        rows = res[0] if isinstance(res, tuple) else res
+        return {r["id"] for r in rows}
+    sql, params = "SELECT id FROM photos WHERE 1=1", []
+    if date_from:
+        sql += " AND substr(date_taken,1,10) >= ?"; params.append(date_from[:10])
+    if date_to:
+        sql += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
+    if location:
+        sql += " AND place_name LIKE ?"; params.append(f"%{location}%")
+    return {r["id"] for r in db.conn.execute(sql, params).fetchall()}
+
+
 @app.get("/api/faces/groups")
 def api_face_groups(
     sort: str = Query("similarity"),
@@ -647,6 +673,11 @@ def api_face_groups(
     filter: str = Query("all"),
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    location: str | None = Query(None),
+    q: str | None = Query(None),
+    person: str | None = Query(None),
 ):
     """List face identities grouped by person or cluster, with filtering and pagination.
 
@@ -657,6 +688,10 @@ def api_face_groups(
           face are hidden.
     filter: "all" (named + not-ignored clusters), "named" (persons only),
           "unknown" (not-ignored clusters only), or "ignored" (ignored clusters only).
+    date_from/date_to/location/q/person: CONTENT filters — restrict results to
+          groups that have a face in photos matching the date range / place /
+          semantic (CLIP) query / person. When any are set, groups are ranked by
+          how many matching photos they contain, and singletons are shown.
     limit/offset: pagination over the sorted list. Counts and `total` always
           reflect the pre-pagination filtered set.
     """
@@ -675,18 +710,34 @@ def api_face_groups(
             for r in db.conn.execute("SELECT cluster_id FROM ignored_clusters").fetchall()
         )
 
+        # Optional content filter: restrict to groups whose faces appear in the
+        # matching photos. Materialize the matching photo-ids into a temp table
+        # and inject an EXISTS-style predicate into the group queries.
+        filter_pids = _face_filter_photo_ids(db, date_from, date_to, location, q, person)
+        filtering = filter_pids is not None
+        if filtering:
+            db.conn.execute("CREATE TEMP TABLE IF NOT EXISTS _facefilter (pid INTEGER PRIMARY KEY)")
+            db.conn.execute("DELETE FROM _facefilter")
+            db.conn.executemany("INSERT OR IGNORE INTO _facefilter(pid) VALUES (?)",
+                                [(p,) for p in filter_pids])
+        ff_f = " AND f.photo_id IN (SELECT pid FROM _facefilter) " if filtering else ""
+        ff_f2 = " AND f2.photo_id IN (SELECT pid FROM _facefilter) " if filtering else ""
+        # When filtering, a single matching face makes a group relevant.
+        having_n = 1 if filtering else min_face_count
+
         named_groups: list[dict] = []
         if filter in ("all", "named"):
             named_rows = db.conn.execute(
-                """SELECT p.id as person_id, p.name,
+                f"""SELECT p.id as person_id, p.name,
                           COUNT(DISTINCT f.photo_id) as photo_count,
                           COUNT(f.id) as face_count,
                           (SELECT f2.id FROM faces f2
-                           WHERE f2.person_id = p.id AND f2.bbox_top IS NOT NULL
+                           WHERE f2.person_id = p.id AND f2.bbox_top IS NOT NULL {ff_f2}
                            ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
                            LIMIT 1) as rep_face_id
                    FROM persons p
                    JOIN faces f ON f.person_id = p.id
+                   WHERE 1=1 {ff_f}
                    GROUP BY p.id
                    ORDER BY p.name"""
             ).fetchall()
@@ -703,20 +754,20 @@ def api_face_groups(
         cluster_groups: list[dict] = []
         if filter in ("all", "unknown", "ignored"):
             cluster_rows = db.conn.execute(
-                """SELECT f.cluster_id,
+                f"""SELECT f.cluster_id,
                           COUNT(DISTINCT f.photo_id) as photo_count,
                           COUNT(f.id) as face_count,
                           (SELECT f2.id FROM faces f2
                            WHERE f2.cluster_id = f.cluster_id AND f2.person_id IS NULL
-                                 AND f2.bbox_top IS NOT NULL
+                                 AND f2.bbox_top IS NOT NULL {ff_f2}
                            ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
                            LIMIT 1) as rep_face_id
                    FROM faces f
-                   WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL
+                   WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL {ff_f}
                    GROUP BY f.cluster_id
                    HAVING face_count >= ?
-                   ORDER BY face_count DESC""",
-                (min_face_count,),
+                   ORDER BY photo_count DESC, face_count DESC""",
+                (having_n,),
             ).fetchall()
             for r in cluster_rows:
                 is_ignored = r["cluster_id"] in ignored_set
@@ -743,19 +794,20 @@ def api_face_groups(
         logger.info("faces/groups: query took %.3fs (filter=%s, %d groups)",
                     t1 - t0, filter, total)
 
-        # Counts over the full (pre-pagination) state so filter chips stay accurate.
+        # Counts over the full (pre-pagination) filtered state so filter chips stay
+        # accurate — they also respect the content filter when one is active.
         named_count = db.conn.execute(
-            """SELECT COUNT(*) AS n FROM persons p
-               WHERE EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id)"""
+            f"""SELECT COUNT(DISTINCT f.person_id) AS n FROM faces f
+               WHERE f.person_id IS NOT NULL {ff_f}"""
         ).fetchone()["n"]
 
         cluster_size_rows = db.conn.execute(
-            """SELECT f.cluster_id
+            f"""SELECT f.cluster_id
                FROM faces f
-               WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL
+               WHERE f.person_id IS NULL AND f.cluster_id IS NOT NULL {ff_f}
                GROUP BY f.cluster_id
                HAVING COUNT(f.id) >= ?""",
-            (min_face_count,),
+            (having_n,),
         ).fetchall()
         qualifying_cluster_ids = {r["cluster_id"] for r in cluster_size_rows}
         ignored_qualifying = qualifying_cluster_ids & ignored_set
@@ -764,6 +816,14 @@ def api_face_groups(
             "unknown": len(qualifying_cluster_ids) - len(ignored_qualifying),
             "ignored": len(ignored_qualifying),
         }
+
+        # When content-filtering, relevance (most matching photos first) beats
+        # visual-similarity ordering — surface the groups the query actually hit.
+        if filtering:
+            groups.sort(key=lambda g: -g.get("photo_count", 0))
+            page = groups[offset : offset + limit]
+            return {"groups": page, "total": total, "counts": counts,
+                    "sort": "relevance", "limit": limit, "offset": offset}
 
         effective_sort = sort
         if sort == "similarity" and total > _SIMILARITY_SORT_GROUP_LIMIT:
