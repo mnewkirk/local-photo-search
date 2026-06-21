@@ -193,6 +193,10 @@ def _system_prompt(db=None) -> str:
         "  'landscapes with no people' -> query='landscape -people'\n"
         "  'most moody shots' -> visual_tag='moody', sort='quality_desc'\n"
         "  'the kids playing soccer' -> people=<the kids>, category='soccer'\n"
+        "  'top 3 photos of Calvin playing soccer' -> search_photos(people=['Calvin'], "
+        "category='soccer', sort='quality_desc') THEN rerank_photos(photo_ids="
+        "<the returned ids>, criteria='a child actively playing soccer on a field') "
+        "— rerank because category tags include non-soccer false positives\n"
     )
     try:
         ctx = _library_context(db) if db is not None else ""
