@@ -1016,7 +1016,8 @@ def apply_face_state(db, from_file, overwrite_persons, apply):
                              "WHERE IFNULL(f.person_id,-1) <> IFNULL(x.person_id,-1)").fetchone()[0]
         else:
             newp = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
-                             "WHERE f.person_id IS NULL AND x.person_id IS NOT NULL").fetchone()[0]
+                             "WHERE f.person_id IS NULL AND IFNULL(f.match_source,'') <> 'dedupe_unmatched' "
+                             "AND x.person_id IS NOT NULL").fetchone()[0]
         clus = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
                          "WHERE f.person_id IS NULL AND IFNULL(f.cluster_id,-1) <> IFNULL(x.cluster_id,-1)").fetchone()[0]
         click.echo(f"{'Re-assign' if overwrite_persons else 'Add'} person on {newp} face(s); "
@@ -1034,6 +1035,7 @@ def apply_face_state(db, from_file, overwrite_persons, apply):
             c.execute("UPDATE faces SET person_id=(SELECT person_id FROM a.face_assignments WHERE face_id=faces.id), "
                       "match_source=(SELECT match_source FROM a.face_assignments WHERE face_id=faces.id) "
                       "WHERE person_id IS NULL "
+                      "AND IFNULL(match_source,'') <> 'dedupe_unmatched' "
                       "AND (SELECT person_id FROM a.face_assignments WHERE face_id=faces.id) IS NOT NULL")
         # 2) clusters for faces that are still unmatched here
         c.execute("UPDATE faces SET cluster_id=(SELECT cluster_id FROM a.face_assignments WHERE face_id=faces.id) "
