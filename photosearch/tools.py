@@ -749,11 +749,15 @@ def _h_representatives(db: PhotoDB, args: dict) -> dict:
             f"((f.bbox_right - f.bbox_left) * (f.bbox_bottom - f.bbox_top) * 1.0) "
             f"/ (NULLIF(po.image_width,0) * NULLIF(po.image_height,0))) AS _prom "
             f"FROM faces f JOIN photos po ON po.id = f.photo_id "
-            f"WHERE f.person_id IN ({ph}) GROUP BY f.photo_id) pm ON pm.photo_id = photos.id "
-            f"LEFT JOIN (SELECT photo_id, COUNT(*) AS _fc FROM faces GROUP BY photo_id) "
-            f"fc ON fc.photo_id = photos.id")
-        prom_select = ", pm._prom AS _prom, fc._fc AS _fc"
-        order_within = "pm._prom DESC, fc._fc ASC, " + order_quality
+            f"WHERE f.person_id IN ({ph}) GROUP BY f.photo_id) pm ON pm.photo_id = photos.id")
+        prom_select = ", pm._prom AS _prom"
+        # Prefer photos where the person is a featured subject in a REAL photo —
+        # a prominence "sweet spot" band — then rank those by aesthetic quality.
+        # Pure face-size ranking over-picks extreme close-ups (haircut selfies);
+        # plain quality picks background shots. Band-then-quality avoids both.
+        order_within = (
+            f"(pm._prom BETWEEN {_SUBJECT_PROM_MIN} AND {_SUBJECT_PROM_MAX}) DESC, "
+            f"{order_quality}, pm._prom DESC")
         prom_params = list(person_ids)
 
     if bucket == "person":
@@ -908,6 +912,13 @@ _register(ToolSpec(
 
 _RERANK_MAX_K = 24
 _RERANK_WORKERS = 4
+
+# Subject-prominence "sweet spot": a person's largest face filling this fraction
+# of the frame reads as a featured subject in a real photo. Below ≈ background;
+# above ≈ a face-filling close-up (e.g. a haircut/mirror selfie). Calibrated
+# from the face-prominence distribution (~p55–p95) on the 163k library.
+_SUBJECT_PROM_MIN = 0.04
+_SUBJECT_PROM_MAX = 0.22
 
 
 def _thumb_b64(db: PhotoDB, photo_id: int) -> Optional[str]:
