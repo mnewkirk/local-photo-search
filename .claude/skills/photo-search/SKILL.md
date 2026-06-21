@@ -93,7 +93,7 @@ local-photo-search/
 
 ---
 
-## Database Schema (v21)
+## Database Schema (v23)
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -135,6 +135,17 @@ re-tagged — see the regurgitation guard in `describe.py:tag_photo`.
 Schema migrations run automatically on DB open via `_init_schema()` with version checks.
 Bump `SCHEMA_VERSION` when adding tables or columns, and add migration SQL in the
 appropriate position (after any table it depends on).
+
+**v23** (current): `photos` gained `categories` / `visual_tags` / `keywords`
+columns (the old single `tags` pass split three ways — see Indexing Types) plus
+a `tags_v22_backup` snapshot of the pre-split `tags`. **v22:** `worker_processed`
+gained `attempts INTEGER`; the claim path filters `attempts >=
+MAX_PROCESS_ATTEMPTS` (default 3) instead of `NOT EXISTS`, so transient failures
+auto-retry and truly-broken files stop being claimed after N tries (replaces the
+manual `retry-failed-describe` flow for new failures). **v20:** `faces.det_score`
+stores InsightFace detection confidence, used by the clustering quality
+pre-filter. Note: `face_dedupe_undo` (created on demand by the dedup commands
+below) is a utility table, NOT part of the migrated schema.
 
 ---
 
@@ -219,12 +230,21 @@ need cross-recluster persistence.
 - `GET /api/photos/{id}/preview` — Preview size
 
 ### Faces
-- `GET /api/faces/groups` — All face groupings (paginated, similarity-sorted)
+- `GET /api/faces/groups` — All face groupings (paginated, similarity-sorted).
+  **Content filters** (any combination): `date_from`, `date_to`, `location`, `q`
+  (semantic/CLIP), `person` — restrict to groups with a face in matching photos,
+  ranked by matching-photo count (`sort=relevance`), singletons shown. Reuses
+  `search_combined` for `q`/`person`/`location`, direct date/location SQL
+  otherwise; matching photo-ids go into a temp table joined into the group
+  queries (`_face_filter_photo_ids` in `web.py`). Backs the `/faces`
+  "Filter clusters:" bar — turns cluster triage into a searchable workflow.
 - `GET /api/faces/group-info?cluster_id=N | person_id=N` — Single group metadata
   (used by `/faces?cluster_id=N` auto-open; works for hidden singletons + unloaded pages)
 - `GET /api/faces/group/{type}/{id}/photos` — Photos for a person or cluster
 - `GET /api/faces/crop/{face_id}` — Face crop image (disk-cached)
-- `GET /api/faces/face-detail/{face_id}` — Photo id + bbox + dimensions for overlays
+- `GET /api/faces/face-detail/{face_id}` — Photo id + bbox + dimensions for
+  overlays. `image_width`/`image_height` are stored EXIF-oriented (swapped for
+  orientation 5-8), matching the bbox + preview space so overlays line up.
 - `POST /api/faces/{face_id}/assign` — Assign face to person
 - `POST /api/faces/{face_id}/clear` — Clear assignment
 - `POST /api/faces/bulk-collect` — Bulk assign unassigned faces
@@ -1025,7 +1045,23 @@ list-persons                                # Show persons and counts
 face-clusters                               # Show unidentified clusters
 correct-face <filename> <face_num> <name>   # Manual correction
 clear-matches <dir> [--person] [--all-faces]
-export-face-assignments / import-face-assignments
+export-face-assignments / import-face-assignments  # JSON of MANUAL labels (rebuild preservation)
+
+# --- over-matching cleanup / data integrity (see "Face over-matching" below) ---
+dedupe-person-faces --person NAME --references <photo-ids> \
+                    [--min-gap 0.15] [--report PATH] [--apply]
+                                            # Reference-based, source-gated dedup of
+                                            # photos with 2+ faces of one person.
+resolve-duplicate-persons [--apply]         # Universal: keep one face per (photo,person)
+                                            # by priority manual>strict>temporal.
+restore-unmatched-faces [--apply]           # Undo the two above (face_dedupe_undo table).
+cleanup-orphan-faces [--apply]              # Delete faces whose photo was deleted.
+backfill-image-orientation [--apply] [--limit N]
+                                            # Store EXIF-oriented image_width/height
+                                            # (run where the photo files live).
+export-face-state --out FILE / apply-face-state --from FILE [--overwrite-persons] [--apply]
+                                            # Desktop-compute → NAS-apply bridge for
+                                            # recluster/match (additive person-fill).
 ```
 
 ### Unknown-face clustering & merge suggestions (M18)
@@ -1118,6 +1154,38 @@ photosearch cleanup-orphans [--dry-run]
 Also: `add_clip_embedding` now uses explicit `DELETE` + `INSERT` instead of `INSERT OR REPLACE`,
 making re-submits idempotent when a worker's claim TTL expires and the photo is re-claimed by
 another worker before the original submit lands.
+
+### Face over-matching cleanup, dedup & desktop recompute
+
+Full narrative + rationale live in **CLAUDE.md** ("Face over-matching cleanup",
+"Desktop-as-client face recompute", detection gotchas). Summary of the tooling:
+
+- **Over-matching** = the same person tagged on 2+ faces in one photo (temporal
+  matching propagating a label to another kid at an event). `dedupe-person-faces`
+  is reference-based + **source-gated**: 1 trusted (strict/manual) face → keep it,
+  drop temporal extras; all-temporal → reference-distance gap (`--min-gap`); 2+
+  trusted → leave. Needs a curated `--references` photo-id set (one clear face
+  each, spanning years). `--report` writes a keep-vs-remove **face-crop** gallery.
+- **`resolve-duplicate-persons`** enforces the one-person-per-photo invariant for
+  everyone (priority manual > strict > temporal, tie-break det_score → bbox area).
+- **`restore-unmatched-faces`** reverses both via the on-demand `face_dedupe_undo`
+  snapshot (unmatch sets `match_source='dedupe_unmatched'`; `apply-face-state`
+  additive-fill skips those so a re-match can't undo the cleanup).
+- **`cleanup-orphan-faces`** deletes face rows whose photo was deleted (broken
+  `/faces` thumbnails + phantom matches; ~12% of faces on the NAS were orphans).
+- **Desktop-as-client recompute**: the N100 can't do the ~230k-face DBSCAN, so
+  run `match-faces --temporal` + `recluster-faces` on the synced replica, then
+  `export-face-state` → cat-stream the ~9MB file to the NAS (UGREEN blocks
+  scp/rsync) → `apply-face-state --apply` → `resolve-duplicate-persons`.
+- **Dead end (don't re-explore):** swapping the embedder or using a VLM to fix
+  the hard ambiguous cases — ArcFace / AdaFace / MagFace / QMagFace / qwen2.5-vl
+  all fail the same controlled test (`evals/adaface_compare.py`,
+  `magface_compare.py`, `vlm_face_compare.py`); it's identity ambiguity between
+  similar-looking kids, not model quality. Keep ArcFace; within-photo relative
+  comparison is the only robust signal.
+- **Babies** are detected + clustered but don't auto-match (ArcFace can't bridge
+  baby→child); recover by reclustering + manually assigning the baby clusters
+  (use the searchable `/faces` filter by date to find them).
 
 ### Frontend stack filtering behavior
 
@@ -1933,7 +2001,7 @@ def my_command(db):
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py` (currently 21)
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 23)
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies

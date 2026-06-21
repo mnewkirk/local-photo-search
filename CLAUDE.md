@@ -22,9 +22,10 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 22. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 23. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
+(v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
 
 Schema migrations run automatically via `_init_schema()`. Bump `SCHEMA_VERSION` in `db.py`
 when adding tables/columns.
@@ -873,6 +874,29 @@ dimensionality) — ~230k faces takes tens of minutes even on a fast desktop.
 - **Duplicate detections exist**: occasional identical-bbox face rows (one face
   detected twice). Harmless while unmatched; once both get a person they become
   a duplicate-person photo that `resolve-duplicate-persons` cleans.
+
+### Searchable face clusters
+
+`GET /api/faces/groups` takes content filters — `date_from`, `date_to`,
+`location`, `q` (semantic/CLIP), `person` — and returns only clusters/persons
+with a face in matching photos, ranked by how many matching photos they contain
+(`sort=relevance`), singletons included. It reuses `search_combined` for
+semantic/person queries and a direct date/location SQL scan otherwise
+(matching photo-ids go into a temp table, joined into the group queries). The
+`/faces` page has a **"Filter clusters:"** bar (date range + place + search,
+applied on submit) backed by it. This is the first-class version of the manual
+distance/date-ranked galleries — e.g. `?date_from=2018-10-01&date_to=2018-12-31`
+narrows ~33k unknowns to the baby-era clusters. The picker that's been used to
+recover baby Ellie / young Calvin: filter Unknown by date/place, eyeball, assign.
+
+### EXIF-oriented image dimensions
+
+`image_width`/`image_height` are stored **EXIF-oriented** (swapped for
+orientation 5-8): InsightFace bboxes are computed on the oriented image and the
+preview is `exif_transpose`d, so raw dims misplaced the overlay boxes on rotated
+photos (~18% of the library). `exif.py` swaps forward; `backfill-image-orientation`
+fixes existing rows (header-only read, run where the files live, idempotent).
+Face *data* was always correct — this was overlay-rendering only.
 
 ## Planned milestones (see `docs/plans/`)
 
