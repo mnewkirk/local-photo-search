@@ -685,6 +685,20 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 # split-cluster
 # ---------------------------------------------------------------------------
 
+def _record_unmatch_undo(conn, face_ids):
+    """Snapshot (face_id, person_id, match_source) for each face about to be
+    unmatched, so the bulk change is reversible via restore-unmatched-faces.
+    On-demand utility table (not part of the migrated schema)."""
+    conn.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
+                 "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
+                 "unmatched_at TEXT DEFAULT (datetime('now')))")
+    for fid in face_ids:
+        row = conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?", (fid,)).fetchone()
+        if row and row["person_id"] is not None:
+            conn.execute("INSERT OR REPLACE INTO face_dedupe_undo(face_id, person_id, match_source) "
+                         "VALUES (?, ?, ?)", (fid, row["person_id"], row["match_source"]))
+
+
 def _write_face_dedupe_report(decisions, path, nas_url, person, limit=120):
     """HTML gallery of keep-vs-remove FACE crops for the dedupe spot-check.
     Least-confident decisions first (smallest gap) so the riskiest calls are at
@@ -851,11 +865,46 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
+        _record_unmatch_undo(c, to_unmatch)
         for fid in to_unmatch:
             c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
                       "WHERE id = ?", (fid,))
         pdb.conn.commit()
-        click.echo(f"Applied: unmatched {len(to_unmatch)} face(s) from {person}.")
+        click.echo(f"Applied: unmatched {len(to_unmatch)} face(s) from {person}. "
+                   "Reversible via: photosearch restore-unmatched-faces.")
+
+
+@cli.command("restore-unmatched-faces")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Restore the original person_id/match_source. Default: dry-run.")
+def restore_unmatched_faces(db, apply):
+    """Undo dedupe-person-faces / resolve-duplicate-persons unmatches.
+
+    Restores person_id + match_source from the face_dedupe_undo snapshot for any
+    face that is still unmatched (person_id IS NULL). Faces re-assigned to a
+    person since the unmatch are left alone. Clears the restored undo rows.
+    """
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        if not c.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                         "AND name='face_dedupe_undo'").fetchone():
+            click.echo("Nothing to restore (no face_dedupe_undo table).")
+            return
+        rows = c.execute(
+            "SELECT u.face_id, u.person_id, u.match_source FROM face_dedupe_undo u "
+            "JOIN faces f ON f.id = u.face_id WHERE f.person_id IS NULL").fetchall()
+        click.echo(f"{len(rows)} unmatched face(s) can be restored to their prior person.")
+        if not apply:
+            click.echo("Dry run — no changes written. Re-run with --apply.")
+            return
+        for r in rows:
+            c.execute("UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
+                      (r["person_id"], r["match_source"], r["face_id"]))
+            c.execute("DELETE FROM face_dedupe_undo WHERE face_id = ?", (r["face_id"],))
+        pdb.conn.commit()
+        click.echo(f"Restored {len(rows)} face(s).")
 
 
 @cli.command("resolve-duplicate-persons")
@@ -902,12 +951,14 @@ def resolve_duplicate_persons(db, apply):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
+        _record_unmatch_undo(c, to_unmatch)
         for fid in to_unmatch:
             c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
                       "WHERE id = ?", (fid,))
         pdb.conn.commit()
         click.echo(f"Applied: unmatched {len(to_unmatch)} duplicate face(s). "
-                   "Every photo now has each person at most once.")
+                   "Every photo now has each person at most once. "
+                   "Reversible via: photosearch restore-unmatched-faces.")
 
 
 @cli.command("split-cluster")
