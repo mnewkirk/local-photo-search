@@ -299,6 +299,20 @@ def test_representatives_bad_bucket(db):
     assert "error" in res
 
 
+def test_representatives_rank_by_subject(db):
+    res = tools.call_tool(db, "representatives",
+                          {"people": ["Alex"], "bucket": "location", "rank_by": "subject"})
+    assert res["ranked_by"] == "subject"
+    # Subject ranking attaches a prominence score to each hit.
+    assert all("subject_prominence" in h for h in res["results"])
+
+
+def test_representatives_subject_falls_back_without_people(db):
+    # rank_by=subject needs a people filter; without one it ranks by quality.
+    res = tools.call_tool(db, "representatives", {"bucket": "year", "rank_by": "subject"})
+    assert res["ranked_by"] == "quality"
+
+
 # ---------------------------------------------------------------------------
 # rerank_photos (VLM re-ranking)
 # ---------------------------------------------------------------------------

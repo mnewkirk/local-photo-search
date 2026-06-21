@@ -728,10 +728,33 @@ _register(ToolSpec(
 def _h_representatives(db: PhotoDB, args: dict) -> dict:
     bucket = (args.get("bucket") or "year").strip().lower()
     n = _clamp(args.get("n"), 1, 1, 10)
+    rank_by = (args.get("rank_by") or "quality").strip().lower()
     where, params = _build_filter_sql(db, args)
-    # Best-first within a bucket: scored photos before unscored, highest score
-    # first. (Portable NULLS-LAST.)
     order_quality = "aesthetic_score IS NULL, aesthetic_score DESC"
+
+    # Subject-prominence ranking: rank each bucket by how FOREGROUND the named
+    # person is (their largest face's area as a fraction of the image), then by
+    # fewer total faces, then quality. Needs a person filter. Excludes the
+    # background/incidental shots that pure-aesthetic ranking surfaces.
+    person_ids: list = []
+    if rank_by == "subject":
+        person_ids, _ = _resolve_person_names(db, _coerce_str_list(args.get("people")))
+    use_subject = rank_by == "subject" and person_ids and bucket in _GROUP_EXPR
+
+    prom_join, prom_select, prom_params, order_within = "", "", [], order_quality
+    if use_subject:
+        ph = ",".join("?" * len(person_ids))
+        prom_join = (
+            f"JOIN (SELECT f.photo_id, MAX("
+            f"((f.bbox_right - f.bbox_left) * (f.bbox_bottom - f.bbox_top) * 1.0) "
+            f"/ (NULLIF(po.image_width,0) * NULLIF(po.image_height,0))) AS _prom "
+            f"FROM faces f JOIN photos po ON po.id = f.photo_id "
+            f"WHERE f.person_id IN ({ph}) GROUP BY f.photo_id) pm ON pm.photo_id = photos.id "
+            f"LEFT JOIN (SELECT photo_id, COUNT(*) AS _fc FROM faces GROUP BY photo_id) "
+            f"fc ON fc.photo_id = photos.id")
+        prom_select = ", pm._prom AS _prom, fc._fc AS _fc"
+        order_within = "pm._prom DESC, fc._fc ASC, " + order_quality
+        prom_params = list(person_ids)
 
     if bucket == "person":
         inner = (f"SELECT photos.*, pe.name AS _bucket, "
@@ -739,20 +762,21 @@ def _h_representatives(db: PhotoDB, args: dict) -> dict:
                  f"FROM photos JOIN faces f ON f.photo_id = photos.id "
                  f"JOIN persons pe ON pe.id = f.person_id WHERE {where}")
         outer_order = "_bucket"
+        full_params = (*params, n)
     elif bucket in _GROUP_EXPR:
         expr, extra = _GROUP_EXPR[bucket]
-        inner = (f"SELECT photos.*, {expr} AS _bucket, "
-                 f"ROW_NUMBER() OVER (PARTITION BY {expr} ORDER BY {order_quality}) AS _rn "
-                 f"FROM photos WHERE ({where}) AND {extra}")
+        inner = (f"SELECT photos.*, {expr} AS _bucket{prom_select}, "
+                 f"ROW_NUMBER() OVER (PARTITION BY {expr} ORDER BY {order_within}) AS _rn "
+                 f"FROM photos {prom_join} WHERE ({where}) AND {extra}")
         outer_order = "_bucket DESC" if bucket in ("year", "month") else "_bucket"
+        full_params = (*prom_params, *params, n)
     else:
         return {"error": f"unsupported bucket: {bucket!r}. "
                          "Use year | month | location | person | camera_model."}
 
-    sql = (f"SELECT * FROM ({inner}) WHERE _rn <= ? "
-           f"ORDER BY {outer_order}, {order_quality} LIMIT 500")
+    sql = f"SELECT * FROM ({inner}) WHERE _rn <= ? ORDER BY {outer_order}, _rn LIMIT 500"
     try:
-        rows = db.conn.execute(sql, (*params, n)).fetchall()
+        rows = db.conn.execute(sql, full_params).fetchall()
     except Exception as exc:
         return {"error": f"representatives failed: {exc}"}
 
@@ -761,10 +785,13 @@ def _h_representatives(db: PhotoDB, args: dict) -> dict:
         d = dict(r)
         hit = _compact_hit(d)
         hit["bucket"] = d.get("_bucket")
+        if d.get("_prom") is not None:
+            hit["subject_prominence"] = round(d["_prom"], 4)
         results.append(hit)
     return {
         "bucket": bucket,
         "n_per_bucket": n,
+        "ranked_by": "subject" if use_subject else "quality",
         "buckets": len({h["bucket"] for h in results}),
         "returned": len(results),
         "results": results,
@@ -781,8 +808,12 @@ _register(ToolSpec(
         "ranked list (search_photos can't do per-bucket selection). Same "
         "structured filters as search_photos (no free-text `query`). `bucket` is "
         "year|month|location|person|camera_model; `n` is photos per bucket "
-        "(default 1). Example — 'best photo of Matt, one per year for the last "
-        "10 years' → people=['Matt'], bucket='year', n=1, date_from='2016-01-01'."
+        "(default 1). `rank_by`: 'quality' (default, aesthetic) or 'subject' — "
+        "with 'subject' (+ a `people` filter) each bucket is ranked by how "
+        "FOREGROUND/prominent that person is (their face size in frame), which "
+        "excludes shots where they're in the background. Examples: 'best photo "
+        "of Matt, one per year' → people=['Matt'], bucket='year', n=1. 'one per "
+        "year where Matt is the foreground subject' → add rank_by='subject'."
     ),
     parameters={
         "type": "object",
@@ -791,6 +822,9 @@ _register(ToolSpec(
                        "enum": ["year", "month", "location", "person", "camera_model"],
                        "description": "Group photos by this; return the best N of each."},
             "n": {"type": "integer", "description": "Photos per bucket (default 1, max 10)."},
+            "rank_by": {"type": "string", "enum": ["quality", "subject"],
+                        "description": "Rank each bucket by aesthetic quality (default) "
+                        "or by how foreground/prominent the filtered person is."},
             "people": {"type": "array", "items": {"type": "string"},
                        "description": "Registered names; matches photos with ALL of them."},
             "location": {"type": "string", "description": "Place/region name."},
