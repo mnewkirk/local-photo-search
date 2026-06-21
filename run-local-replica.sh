@@ -40,6 +40,7 @@ while [ $# -gt 0 ]; do
     --nas) NAS_URL="$2"; shift 2 ;;
     --lm) LM_URL="$2"; shift 2 ;;
     --model) AGENT_MODEL="$2"; shift 2 ;;
+    --reload) RELOAD=1; shift ;;   # uvicorn auto-reload on code edits (dev)
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -96,4 +97,5 @@ echo "  LM Studio: ${LM_URL}   (Ask agent${AGENT_MODEL:+, model=$AGENT_MODEL})"
 echo "  Hints:     ${PHOTOSEARCH_AGENT_HINTS:+loaded (${#PHOTOSEARCH_AGENT_HINTS} chars)}${PHOTOSEARCH_AGENT_HINTS:-none}"
 echo "  Web:       http://localhost:${PORT}    (✨ Ask mode in the search bar)"
 echo
-exec "${PYBIN}" cli.py serve --db "${REPLICA_DB}" --host 0.0.0.0 --port "${PORT}"
+exec "${PYBIN}" cli.py serve --db "${REPLICA_DB}" --host 0.0.0.0 --port "${PORT}" \
+  ${RELOAD:+--reload}
