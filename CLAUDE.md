@@ -781,6 +781,95 @@ Remaining work in `docs/plans/faces-clustering-and-perf.md`: persist
 `det_score` + bbox area and filter low-quality faces before clustering,
 swap to HDBSCAN for varying density, and materialize a `face_groups` table.
 
+## Face over-matching cleanup & the one-person-per-photo invariant
+
+Temporal matching (`match-faces --temporal`, `match_source='temporal'`) boosts
+recall but over-matches: it tags the same person on 2+ faces in one photo
+(rampant on kids at events — ~1600 photos had 2+ "Calvin" faces). A person
+appears in a photo at most once, so any such photo has >=1 false match.
+
+**`dedupe-person-faces --person NAME --references <photo-ids> [--min-gap 0.15]
+[--report PATH] [--apply]`** — reference-based, **source-gated** cleanup for one
+person. The reference set is a small curated list of photo-ids with one clear
+face of them each, ideally spanning years (Calvin used one-per-year 2016-2026;
+handles aging). Per double-person photo: **1 trusted (strict/manual) face →
+keep it, drop the temporal extras** (decided by source, no distance, no
+true-positive risk); **all-temporal → keep the face closest to the references,
+drop the rest if the distance gap > `--min-gap`**; **2+ trusted → leave for
+review**. `--report` writes an HTML keep-vs-remove **face-crop** gallery (crops
+from `PHOTOSEARCH_NAS_URL`), least-confident first.
+
+**`resolve-duplicate-persons [--apply]`** — universal safety net guaranteeing
+the invariant for **every** person: for each (photo, person) with 2+ faces, keep
+one by priority **manual > strict > temporal**, tie-break **det_score then bbox
+area**; unmatch the rest. Run the reference-based dedupe first for precise
+people, then this to sweep everyone.
+
+**`restore-unmatched-faces [--apply]`** — both commands above snapshot
+`(face_id, person_id, match_source)` into an on-demand **`face_dedupe_undo`**
+table before nulling `person_id` (unmatch sets `match_source='dedupe_unmatched'`),
+so the bulk cleanup is **reversible**. Restore re-applies the snapshot to faces
+still unmatched.
+
+Applied to the NAS 2026-06-20: 889 (Calvin reference) + 5382 (global) = **6271
+faces unmatched, 4948 → 0 duplicate-person groups**, all reversible.
+
+**Embedder/VLM swap is a tested dead-end — don't re-explore.** The hard
+"wrong-green" cases (a photo where *neither* face is really the person, both
+within temporal tolerance) are NOT separable by a better recognition head:
+ArcFace (current), AdaFace IR-101, MagFace, QMagFace, and a VLM (qwen2.5-vl)
+all fail on the same controlled set (`evals/adaface_compare.py`,
+`magface_compare.py`, `vlm_face_compare.py`). MagFace quality is *inverted*
+(wrong faces are higher quality than awkward-angle correct ones). Root cause is
+identity ambiguity between similar-looking kids at the same event. The
+within-photo **relative** comparison is the only robust signal. Per-year
+references are worse than all-time.
+
+### Desktop-as-client face recompute (heavy clustering off the NAS)
+
+The N100 can't do the global DBSCAN at scale (~230k unmatched faces after the
+quality filter), but the desktop can. Compute on the desktop off the synced
+read-replica, push only the assignments to the NAS:
+
+**`export-face-state --out FILE`** dumps `(face_id, cluster_id, person_id,
+match_source)` for every face into a small (~9MB) SQLite file.
+**`apply-face-state --db <nas> --from FILE [--overwrite-persons] [--apply]`**
+ATTACHes it and applies set-based: person matches **additive** by default (only
+fill faces unmatched on the target — preserves curation, and **skips
+`dedupe_unmatched` faces** so a re-run of temporal matching can't undo the
+dedup); clusters applied to still-unmatched faces; faces absent from the file
+left untouched. (Distinct from the JSON `export-face-assignments`, which is
+manual-label rebuild-preservation.)
+
+Pipeline (`/tmp/face_recompute_pipeline.sh` is the reference):
+```
+sync replica → (on desktop) match-faces --temporal + recluster-faces
+→ export-face-state → scp to NAS → (NAS) git pull
+→ apply-face-state --apply → resolve-duplicate-persons --apply
+```
+`recluster-faces` writes by default (has `--dry-run`, no `--apply`);
+`match-faces` writes directly. DBSCAN at 512-dim scales ~O(n²) (curse of
+dimensionality) — ~230k faces takes tens of minutes even on a fast desktop.
+
+### Face detection / matching gotchas
+
+- **Big backlog**: clustering + matching are on-demand and fell far behind after
+  the big imports (Google Takeout / phone ingest). At 2026-06-20: of 331k faces,
+  only 51k (15%) matched to a person, 77k unmatched-but-clustered, and **202k
+  never clustered** (`person_id IS NULL AND cluster_id IS NULL`, shown as bare
+  "Unknown #" since the label is `"Unknown #" + cluster_id`).
+- **Babies don't auto-match**: infant faces ARE detected and cluster fine, but
+  ArcFace can't bridge baby→child, so `match-faces` won't attach them to the
+  grown person. Recover by reclustering then **manually assigning the baby
+  clusters** in `/faces`/`/merges`. (A baby face also can't seed a reference set
+  until it's tagged.)
+- **Some photos are genuinely undetectable**: e.g. photo 153553 returns 0 faces
+  even re-detecting at det_size up to 2048px — InsightFace just can't find the
+  (turned-away/occluded) face. Not a resolution problem; nothing recovers it.
+- **Duplicate detections exist**: occasional identical-bbox face rows (one face
+  detected twice). Harmless while unmatched; once both get a person they become
+  a duplicate-person photo that `resolve-duplicate-persons` cleans.
+
 ## Planned milestones (see `docs/plans/`)
 
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
