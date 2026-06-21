@@ -685,6 +685,64 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 # split-cluster
 # ---------------------------------------------------------------------------
 
+def _write_face_dedupe_report(decisions, path, nas_url, person, limit=120):
+    """HTML gallery of keep-vs-remove FACE crops for the dedupe spot-check.
+    Least-confident decisions first (smallest gap) so the riskiest calls are at
+    the top. Crops fetched from the NAS face-crop endpoint, base64-embedded."""
+    import base64
+    import html as _html
+    import urllib.request
+
+    shown = sorted(decisions, key=lambda d: d["gap"])[:limit]
+    cache = {}
+
+    def crop(fid):
+        if fid not in cache:
+            try:
+                with urllib.request.urlopen(f"{nas_url}/api/faces/crop/{fid}", timeout=20) as r:
+                    cache[fid] = base64.b64encode(r.read()).decode("ascii")
+            except Exception:
+                cache[fid] = None
+        b = cache[fid]
+        return (f'<img src="data:image/jpeg;base64,{b}"/>' if b
+                else '<div class="missing">no crop</div>')
+
+    rows = []
+    for d in shown:
+        keep_fid = d["keep"][1]
+        keep_html = (f'<div class="face keep">{crop(keep_fid)}'
+                     f'<div class="lbl">KEEP · d={d["keep"][0]:.2f} · face {keep_fid}</div></div>')
+        rem_html = "".join(
+            f'<div class="face remove">{crop(fid)}'
+            f'<div class="lbl">REMOVE · d={dist:.2f} · face {fid}</div></div>'
+            for dist, fid in d["remove"])
+        rows.append(
+            f'<div class="row"><div class="meta">photo {d["photo_id"]}<br>'
+            f'gap {d["gap"]:.2f}</div>{keep_html}<div class="arrow">vs</div>{rem_html}</div>')
+
+    doc = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>{_html.escape(person)} face dedupe spot-check</title><style>
+ body{{font:14px system-ui,sans-serif;margin:24px;background:#fafafa;}}
+ h1{{font-size:20px;}} .note{{color:#555;margin-bottom:16px;}}
+ .row{{display:flex;align-items:center;gap:12px;padding:8px;border-bottom:1px solid #e3e3e3;}}
+ .meta{{width:130px;font:12px monospace;color:#666;}}
+ .face{{text-align:center;}} .face img{{width:128px;height:128px;object-fit:cover;border-radius:6px;}}
+ .keep img{{border:4px solid #2ca02c;}} .remove img{{border:4px solid #d62728;}}
+ .lbl{{font:11px monospace;margin-top:3px;}}
+ .keep .lbl{{color:#2ca02c;}} .remove .lbl{{color:#d62728;}}
+ .arrow{{color:#999;font-weight:bold;}} .missing{{width:128px;height:128px;background:#eee;border-radius:6px;}}
+</style></head><body>
+<h1>{_html.escape(person)} — face dedupe spot-check</h1>
+<div class="note">Showing {len(shown)} of {len(decisions)} confident decisions, least-confident
+(smallest gap) FIRST. <b style="color:#2ca02c">Green = KEEP</b> as {_html.escape(person)};
+<b style="color:#d62728">Red = UNMATCH</b> (not {_html.escape(person)}). If the green face is
+{_html.escape(person)} and the red one isn't, the call is correct.</div>
+{''.join(rows)}
+</body></html>"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+
+
 @cli.command("dedupe-person-faces")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
@@ -697,7 +755,10 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
                    "and 2nd-best candidate face exceeds this (confidence gate).")
 @click.option("--apply", is_flag=True, default=False,
               help="Unmatch the losing faces (person_id=NULL). Default: dry-run.")
-def dedupe_person_faces(db, person, references, min_gap, apply):
+@click.option("--report", default=None, metavar="PATH",
+              help="Write an HTML spot-check gallery of keep-vs-remove FACE crops "
+                   "(fetched from PHOTOSEARCH_NAS_URL). Least-confident decisions first.")
+def dedupe_person_faces(db, person, references, min_gap, apply, report):
     """Fix photos where 2+ faces are wrongly matched to the SAME person.
 
     A photo contains a person at most once, so any photo with 2+ faces tagged
@@ -737,19 +798,29 @@ def dedupe_person_faces(db, person, references, min_gap, apply):
         dbl = c.execute(
             "SELECT photo_id FROM faces WHERE person_id = ? "
             "GROUP BY photo_id HAVING COUNT(*) >= 2", (pid,)).fetchall()
-        to_unmatch, ambiguous = [], 0
+        to_unmatch, ambiguous, decisions = [], 0, []
         for row in dbl:
             faces = c.execute(
                 "SELECT f.id, e.encoding FROM faces f JOIN face_encodings e ON e.face_id = f.id "
                 "WHERE f.photo_id = ? AND f.person_id = ?", (row["photo_id"], pid)).fetchall()
             ranked = sorted((mindist(f["encoding"]), f["id"]) for f in faces)
-            if ranked[1][0] - ranked[0][0] > min_gap:
+            gap = ranked[1][0] - ranked[0][0]
+            if gap > min_gap:
                 to_unmatch.extend(fid for _, fid in ranked[1:])
+                decisions.append({"photo_id": row["photo_id"], "gap": gap,
+                                  "keep": ranked[0], "remove": ranked[1:]})
             else:
                 ambiguous += 1
         click.echo(f"{len(dbl)} photos with 2+ {person} faces:")
         click.echo(f"  confident (gap > {min_gap}): would unmatch {len(to_unmatch)} face(s)")
         click.echo(f"  ambiguous (left unchanged): {ambiguous} photo(s)")
+        if report:
+            nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+            if not nas:
+                click.echo("  (set PHOTOSEARCH_NAS_URL to fetch face crops for the report)")
+            else:
+                _write_face_dedupe_report(decisions, report, nas, person)
+                click.echo(f"  wrote spot-check gallery: {report}")
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return

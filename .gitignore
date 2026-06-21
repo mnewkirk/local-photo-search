@@ -87,3 +87,6 @@ evals/bakeoff_report.html
 
 # per-query Ask agent logs
 ask-logs/
+
+# face-dedupe spot-check galleries (generated)
+*-spotcheck.html
