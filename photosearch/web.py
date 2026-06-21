@@ -505,6 +505,20 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
         filepath = db.resolve_filepath(row["filepath"])
 
     if not filepath or not os.path.exists(filepath):
+        # Replica mode: no local originals — proxy the rendered crop from the NAS
+        # and cache it locally (same pattern as the preview/full endpoints).
+        if _nas_url:
+            try:
+                import urllib.request
+                url = f"{_nas_url.rstrip('/')}/api/faces/crop/{face_id}?size={size}"
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    _cache_bytes_atomic(cache_path, r.read())
+                return FileResponse(
+                    cache_path, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
+            except Exception as e:
+                raise HTTPException(502, f"NAS face-crop fetch failed: {e}")
         raise HTTPException(404, "Photo file not found")
 
     if row["bbox_top"] is None:
