@@ -693,7 +693,9 @@ def _write_face_dedupe_report(decisions, path, nas_url, person, limit=120):
     import html as _html
     import urllib.request
 
-    shown = sorted(decisions, key=lambda d: d["gap"])[:limit]
+    # Least-confident (smallest distance gap) first; source-gated decisions
+    # (gap=None) are high-confidence, so sort them last.
+    shown = sorted(decisions, key=lambda d: d["gap"] if d["gap"] is not None else 1e9)[:limit]
     cache = {}
 
     def crop(fid):
@@ -716,9 +718,10 @@ def _write_face_dedupe_report(decisions, path, nas_url, person, limit=120):
             f'<div class="face remove">{crop(fid)}'
             f'<div class="lbl">REMOVE · d={dist:.2f} · face {fid}</div></div>'
             for dist, fid in d["remove"])
+        tag = f'gap {d["gap"]:.2f}' if d.get("gap") is not None else (d.get("rule") or "source")
         rows.append(
             f'<div class="row"><div class="meta">photo {d["photo_id"]}<br>'
-            f'gap {d["gap"]:.2f}</div>{keep_html}<div class="arrow">vs</div>{rem_html}</div>')
+            f'{tag}</div>{keep_html}<div class="arrow">vs</div>{rem_html}</div>')
 
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>{_html.escape(person)} face dedupe spot-check</title><style>
@@ -798,22 +801,46 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
         dbl = c.execute(
             "SELECT photo_id FROM faces WHERE person_id = ? "
             "GROUP BY photo_id HAVING COUNT(*) >= 2", (pid,)).fetchall()
-        to_unmatch, ambiguous, decisions = [], 0, []
+        TRUSTED = ("strict", "manual")
+        to_unmatch, decisions = [], []
+        n_source, n_distance, ambiguous, review = 0, 0, 0, 0
         for row in dbl:
             faces = c.execute(
-                "SELECT f.id, e.encoding FROM faces f JOIN face_encodings e ON e.face_id = f.id "
+                "SELECT f.id, f.match_source AS src, e.encoding FROM faces f "
+                "JOIN face_encodings e ON e.face_id = f.id "
                 "WHERE f.photo_id = ? AND f.person_id = ?", (row["photo_id"], pid)).fetchall()
-            ranked = sorted((mindist(f["encoding"]), f["id"]) for f in faces)
-            gap = ranked[1][0] - ranked[0][0]
-            if gap > min_gap:
-                to_unmatch.extend(fid for _, fid in ranked[1:])
-                decisions.append({"photo_id": row["photo_id"], "gap": gap,
-                                  "keep": ranked[0], "remove": ranked[1:]})
+            ranked = sorted((mindist(f["encoding"]), f["id"], (f["src"] or "")) for f in faces)
+            trusted = [r for r in ranked if r[2] in TRUSTED]
+            if len(trusted) == 1:
+                # One human-verified / strict face → it's the person; the rest are
+                # over-matches. Decided by source, no distance needed, no TP risk.
+                keep = trusted[0]
+                rem = [r for r in ranked if r[1] != keep[1]]
+                to_unmatch.extend(r[1] for r in rem)
+                decisions.append({"photo_id": row["photo_id"], "gap": None, "rule": "source",
+                                  "keep": (keep[0], keep[1]),
+                                  "remove": [(r[0], r[1]) for r in rem]})
+                n_source += 1
+            elif len(trusted) == 0:
+                # All temporal → fall back to the reference-distance gap.
+                gap = ranked[1][0] - ranked[0][0]
+                if gap > min_gap:
+                    to_unmatch.extend(r[1] for r in ranked[1:])
+                    decisions.append({"photo_id": row["photo_id"], "gap": gap, "rule": "distance",
+                                      "keep": (ranked[0][0], ranked[0][1]),
+                                      "remove": [(r[0], r[1]) for r in ranked[1:]]})
+                    n_distance += 1
+                else:
+                    ambiguous += 1
             else:
-                ambiguous += 1
-        click.echo(f"{len(dbl)} photos with 2+ {person} faces:")
-        click.echo(f"  confident (gap > {min_gap}): would unmatch {len(to_unmatch)} face(s)")
-        click.echo(f"  ambiguous (left unchanged): {ambiguous} photo(s)")
+                # 2+ trusted faces — never auto-drop a confident match. Left for
+                # resolve-duplicate-persons / manual review.
+                review += 1
+        click.echo(f"{len(dbl)} photos with 2+ {person} faces → unmatch {len(to_unmatch)} face(s):")
+        click.echo(f"  source-gated (1 trusted face, drop temporal extras): {n_source} photo(s)")
+        click.echo(f"  distance-gated (all-temporal, gap > {min_gap}):        {n_distance} photo(s)")
+        click.echo(f"  ambiguous all-temporal (left unchanged):              {ambiguous} photo(s)")
+        click.echo(f"  2+ trusted faces (left for manual review):            {review} photo(s)")
         if report:
             nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
             if not nas:
@@ -829,6 +856,58 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
                       "WHERE id = ?", (fid,))
         pdb.conn.commit()
         click.echo(f"Applied: unmatched {len(to_unmatch)} face(s) from {person}.")
+
+
+@cli.command("resolve-duplicate-persons")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Unmatch the duplicate faces (person_id=NULL). Default: dry-run.")
+def resolve_duplicate_persons(db, apply):
+    """Enforce the invariant: no photo has the SAME person tagged in 2+ faces.
+
+    A person appears in a photo at most once, so every (photo, person) group with
+    2+ faces has >=1 false match. For each such group, keep ONE face and unmatch
+    the rest. The keeper is chosen by confidence priority — manual > strict >
+    temporal/other — then by detection score, then by face size (bbox area).
+    Unmatched faces drop to person_id=NULL (reversible, re-matchable). This is the
+    universal safety net (all persons); run the reference-based
+    dedupe-person-faces first for precise, curated cleanup. Dry-run by default.
+    """
+    from collections import Counter
+    with PhotoDB(db) as pdb:
+        c = pdb.conn
+        dups = c.execute(
+            "SELECT photo_id, person_id FROM faces WHERE person_id IS NOT NULL "
+            "GROUP BY photo_id, person_id HAVING COUNT(*) >= 2").fetchall()
+        PRIORITY = {"manual": 0, "strict": 1}        # temporal/other/NULL → 2
+        to_unmatch, per_person = [], Counter()
+        for d in dups:
+            faces = c.execute(
+                "SELECT id, match_source AS src, det_score, "
+                "(bbox_bottom - bbox_top) * (bbox_right - bbox_left) AS area "
+                "FROM faces WHERE photo_id = ? AND person_id = ?",
+                (d["photo_id"], d["person_id"])).fetchall()
+            ranked = sorted(faces, key=lambda f: (
+                PRIORITY.get(f["src"], 2), -(f["det_score"] or 0.0), -(f["area"] or 0)))
+            for f in ranked[1:]:
+                to_unmatch.append(f["id"])
+                per_person[d["person_id"]] += 1
+        click.echo(f"{len(dups)} (photo, person) groups with 2+ faces → "
+                   f"unmatch {len(to_unmatch)} face(s).")
+        if per_person:
+            names = {r["id"]: r["name"] for r in c.execute("SELECT id, name FROM persons")}
+            for pid_, n in sorted(per_person.items(), key=lambda kv: -kv[1])[:10]:
+                click.echo(f"  {names.get(pid_, pid_)}: {n}")
+        if not apply:
+            click.echo("Dry run — no changes written. Re-run with --apply.")
+            return
+        for fid in to_unmatch:
+            c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
+                      "WHERE id = ?", (fid,))
+        pdb.conn.commit()
+        click.echo(f"Applied: unmatched {len(to_unmatch)} duplicate face(s). "
+                   "Every photo now has each person at most once.")
 
 
 @cli.command("split-cluster")
