@@ -15,7 +15,7 @@ def _script(*replies):
     calls = {"n": 0}
     seq = list(replies)
 
-    def fake_chat(messages, tools, temperature=0.0):
+    def fake_chat(messages, tools, temperature=0.0, timeout=None):
         i = calls["n"]
         calls["n"] += 1
         return seq[min(i, len(seq) - 1)]
@@ -174,7 +174,7 @@ def test_chat_failure_falls_back_to_single_shot(db, monkeypatch):
     # First _chat raises (e.g. endpoint can't tool-call) → single-shot kicks in.
     state = {"n": 0}
 
-    def flaky_chat(messages, tools, temperature=0.0):
+    def flaky_chat(messages, tools, temperature=0.0, timeout=None):
         state["n"] += 1
         if state["n"] == 1:
             raise RuntimeError("400 tools not supported")
@@ -183,3 +183,20 @@ def test_chat_failure_falls_back_to_single_shot(db, monkeypatch):
     events = _run(db, "alex")
     assert any(e["type"] == "photos" and e["total"] == 3 for e in events)
     assert events[-1]["type"] == "answer"
+
+
+def test_deadline_returns_gracefully_without_hanging(db, monkeypatch):
+    # A zero time budget trips the wall-clock guard before any LLM call, so an
+    # over-complex query returns a clear message instead of churning (the 158s
+    # hang). _chat must never be invoked.
+    monkeypatch.setenv("PHOTOSEARCH_AGENT_DEADLINE_S", "0")
+    called = {"n": 0}
+
+    def boom(*a, **k):
+        called["n"] += 1
+        raise AssertionError("_chat should not be called past the deadline")
+    monkeypatch.setattr(agent, "_chat", boom)
+    events = _run(db, "something far too complex for the budget")
+    assert called["n"] == 0
+    assert events[-1]["type"] == "answer"
+    assert "time budget" in events[-1]["text"].lower()

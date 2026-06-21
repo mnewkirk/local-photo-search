@@ -51,6 +51,10 @@ _MAX_STEPS = 6
 # usable for hard prompts while preventing a silent "Found 0".
 _MAX_NUDGES = 2
 _HTTP_TIMEOUT_S = 120.0
+# Anti-hang guards. A thinking model (qwen3.5) can ramble for minutes on an
+# unsupported query; without caps a single Ask blew 158s and returned nothing.
+_MAX_TOKENS = 3000          # runaway-generation backstop per LLM call
+_DEFAULT_DEADLINE_S = 90.0  # overall wall-clock budget per Ask (env override)
 
 
 def _agent_model() -> str:
@@ -217,21 +221,23 @@ def _system_prompt(db=None) -> str:
 # Tool-calling chat client (OpenAI-compatible primary, Ollama fallback)
 # ---------------------------------------------------------------------------
 
-def _chat(messages: list, tools: Optional[list], temperature: float = 0.0) -> dict:
+def _chat(messages: list, tools: Optional[list], temperature: float = 0.0,
+          timeout: float = _HTTP_TIMEOUT_S) -> dict:
     """One chat round-trip. Returns a normalized dict:
         {"content": str|None, "tool_calls": [{"id", "name", "arguments"}]}
 
     Routes to the OpenAI-compatible endpoint when PHOTOSEARCH_TEXT_LLM_URL is
-    set (the project's local LM Studio path), else to Ollama.
+    set (the project's local LM Studio path), else to Ollama. `timeout` bounds
+    the call so a single rambling generation can't hang the whole Ask.
     """
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
     if base:
-        return _chat_openai(base, messages, tools, temperature)
+        return _chat_openai(base, messages, tools, temperature, timeout)
     return _chat_ollama(messages, tools, temperature)
 
 
 def _chat_openai(base_url: str, messages: list, tools: Optional[list],
-                 temperature: float) -> dict:
+                 temperature: float, timeout: float = _HTTP_TIMEOUT_S) -> dict:
     import urllib.request
 
     url = base_url.rstrip("/") + "/chat/completions"
@@ -239,6 +245,7 @@ def _chat_openai(base_url: str, messages: list, tools: Optional[list],
         "model": _agent_model(),
         "messages": messages,
         "temperature": temperature,
+        "max_tokens": _MAX_TOKENS,
         "stream": False,
     }
     if tools:
@@ -247,7 +254,7 @@ def _chat_openai(base_url: str, messages: list, tools: Optional[list],
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"})
-    resp = urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S)
+    resp = urllib.request.urlopen(req, timeout=max(5.0, timeout))
     data = json.loads(resp.read())
     msg = data["choices"][0]["message"]
 
@@ -384,11 +391,12 @@ _SINGLE_SHOT_INSTRUCTION = (
 )
 
 
-def _run_single_shot(db: PhotoDB, message: str) -> Iterator[dict]:
+def _run_single_shot(db: PhotoDB, message: str,
+                     timeout: float = _HTTP_TIMEOUT_S) -> Iterator[dict]:
     reply = _chat(
         [{"role": "system", "content": _SINGLE_SHOT_INSTRUCTION},
          {"role": "user", "content": message}],
-        tools=None,
+        tools=None, timeout=timeout,
     )
     text = (reply.get("content") or "").strip()
     # Strip ```json fences if present.
@@ -509,10 +517,13 @@ def run_agent(
         return text
 
     try:
+        deadline = time.monotonic() + float(
+            os.environ.get("PHOTOSEARCH_AGENT_DEADLINE_S") or _DEFAULT_DEADLINE_S)
+
         if os.environ.get("PHOTOSEARCH_AGENT_SINGLE_SHOT", "").strip().lower() in (
                 "1", "true", "yes", "on"):
             session["mode"] = "single_shot"
-            for ev in _run_single_shot(db, message):
+            for ev in _run_single_shot(db, message, timeout=max(5.0, deadline - time.monotonic())):
                 if ev.get("type") == "answer":
                     session["answer"] = ev.get("text")
                 if ev.get("type") == "tool_call":
@@ -533,14 +544,19 @@ def run_agent(
         made_tool_call = False
         nudges = 0
         summary_nudged = False
+        timed_out = False
 
         for step in range(max_steps):
             if should_abort and should_abort():
                 session["error"] = "cancelled"
                 yield {"type": "error", "message": "cancelled"}
                 return
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.0:
+                timed_out = True
+                break
             try:
-                reply = _chat(messages, tools)
+                reply = _chat(messages, tools, timeout=min(_HTTP_TIMEOUT_S, remaining))
             except Exception as exc:
                 # First step with no progress → try the single-shot fallback
                 # once; the model likely can't tool-call against this endpoint.
@@ -548,7 +564,8 @@ def run_agent(
                     session["mode"] = "single_shot_fallback"
                     yield {"type": "tool_result", "tool": "_fallback",
                            "summary": "tool-calling failed; trying single-shot"}
-                    for ev in _run_single_shot(db, message):
+                    for ev in _run_single_shot(db, message,
+                                               timeout=max(5.0, deadline - time.monotonic())):
                         if ev.get("type") == "answer":
                             session["answer"] = ev.get("text")
                         yield ev
@@ -624,7 +641,8 @@ def run_agent(
             if not made_tool_call and not content:
                 # Nothing useful and never called a tool — fall back.
                 session["mode"] = "single_shot_fallback"
-                for ev in _run_single_shot(db, message):
+                for ev in _run_single_shot(db, message,
+                                           timeout=max(5.0, deadline - time.monotonic())):
                     if ev.get("type") == "answer":
                         session["answer"] = ev.get("text")
                     yield ev
@@ -634,13 +652,19 @@ def run_agent(
             yield {"type": "answer", "text": _set_answer(content or f"Found {last_total} photo(s).")}
             return
 
-        # Hit the step cap — emit whatever we have.
+        # Hit the step cap or the time budget — emit whatever we have.
         if last_photos is not None:
             yield {"type": "photos", "results": last_photos, "total": last_total}
-        yield {"type": "answer",
-               "text": _set_answer("Stopped after %d steps. " % max_steps
-                       + (f"Best result set: {last_total} photo(s)." if last_photos is not None
-                          else "No results yet — try rephrasing."))}
+        lead = ("Stopped — this query hit the time budget. "
+                if timed_out else "Stopped after %d steps. " % max_steps)
+        if timed_out and last_photos is None:
+            tail = ("That request was too complex to answer in time — try a "
+                    "simpler one (e.g. one period or one person at a time).")
+        elif last_photos is not None:
+            tail = f"Best result set: {last_total} photo(s)."
+        else:
+            tail = "No results yet — try rephrasing."
+        yield {"type": "answer", "text": _set_answer(lead + tail)}
     finally:
         session["seconds"] = round(time.time() - session["started"], 1)
         _write_ask_log(session)
