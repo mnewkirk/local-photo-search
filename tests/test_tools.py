@@ -191,6 +191,21 @@ def test_search_unresolved_person_reported(db):
     assert "note" in res
 
 
+def test_search_sort_subject(db):
+    # Flat subject-ranked search: returns Alex's photos with prominence scores.
+    res = tools.call_tool(db, "search_photos", {"people": ["Alex"], "sort": "subject"})
+    assert res["sort"] == "subject"
+    assert res["total"] == 3
+    assert all("subject_prominence" in h for h in res["results"])
+
+
+def test_search_sort_subject_without_people_falls_back(db):
+    # No people → can't subject-rank; falls back to a normal search (no crash).
+    res = tools.call_tool(db, "search_photos", {"location": "Big Sur", "sort": "subject"})
+    assert res.get("sort") != "subject"
+    assert res["total"] >= 3  # the 3 Big Sur photos (bbox fallback may add nearby)
+
+
 def test_search_by_category(db):
     res = tools.call_tool(db, "search_photos", {"category": "landscape"})
     assert res["total"] == 1

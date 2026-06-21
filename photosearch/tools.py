@@ -445,17 +445,57 @@ _register(ToolSpec(
 # Tool: search_photos
 # ---------------------------------------------------------------------------
 
-_VALID_SORTS = ("date_desc", "date_asc", "quality_desc", "relevance")
+_VALID_SORTS = ("date_desc", "date_asc", "quality_desc", "relevance", "subject")
+
+
+def _subject_ranked_search(db: PhotoDB, args: dict, person_ids: list, limit: int) -> dict:
+    """Flat top-N search ranked by how FOREGROUND the person is (prominence
+    sweet-spot band, then quality) — for 'best photos of X where X is the
+    foreground subject' in a single scope (no per-bucket spread). Same logic as
+    representatives(rank_by='subject') but a flat list, not one-per-bucket."""
+    where, params = _build_filter_sql(db, args)
+    ph = ",".join("?" * len(person_ids))
+    prom_join = (
+        f"JOIN (SELECT f.photo_id, MAX("
+        f"((f.bbox_right - f.bbox_left) * (f.bbox_bottom - f.bbox_top) * 1.0) "
+        f"/ (NULLIF(po.image_width,0) * NULLIF(po.image_height,0))) AS _prom "
+        f"FROM faces f JOIN photos po ON po.id = f.photo_id "
+        f"WHERE f.person_id IN ({ph}) GROUP BY f.photo_id) pm ON pm.photo_id = photos.id")
+    order = (f"(pm._prom BETWEEN {_SUBJECT_PROM_MIN} AND {_SUBJECT_PROM_MAX}) DESC, "
+             f"aesthetic_score IS NULL, aesthetic_score DESC, pm._prom DESC")
+    try:
+        total = db.conn.execute(
+            f"SELECT COUNT(*) FROM photos {prom_join} WHERE {where}",
+            (*person_ids, *params)).fetchone()[0]
+        rows = db.conn.execute(
+            f"SELECT photos.*, pm._prom AS _prom FROM photos {prom_join} "
+            f"WHERE {where} ORDER BY {order} LIMIT ?",
+            (*person_ids, *params, limit)).fetchall()
+    except Exception as exc:
+        return {"error": f"subject search failed: {exc}"}
+    results = []
+    for r in rows:
+        d = dict(r)
+        hit = _compact_hit(d)
+        if d.get("_prom") is not None:
+            hit["subject_prominence"] = round(d["_prom"], 4)
+        results.append(hit)
+    return {"total": total, "returned": len(results), "sort": "subject", "results": results}
 
 
 def _h_search_photos(db: PhotoDB, args: dict) -> dict:
     from .search import search_combined  # lazy — pulls in CLIP.
 
     limit = _clamp(args.get("limit"), _SEARCH_DEFAULT_LIMIT, 1, _SEARCH_MAX_LIMIT)
-    sort = args.get("sort") if args.get("sort") in _VALID_SORTS else None
+    raw_sort = args.get("sort")
 
     people = _coerce_str_list(args.get("people"))
     person_ids, unresolved = _resolve_person_names(db, people) if people else ([], [])
+
+    # Subject sort: flat list ranked by the person's foreground prominence.
+    if raw_sort == "subject" and person_ids:
+        return _subject_ranked_search(db, args, person_ids, limit)
+    sort = raw_sort if raw_sort in _VALID_SORTS and raw_sort != "subject" else None
 
     # If the model asked for people that don't exist, don't silently run an
     # unfiltered search — return the miss so it can correct via list_people.
@@ -545,7 +585,9 @@ _register(ToolSpec(
                             "description": "Minimum aesthetic score, 1-10."},
             "sort": {"type": "string", "enum": list(_VALID_SORTS),
                      "description": "Result order; defaults to relevance for a query, "
-                                    "else date_desc."},
+                                    "else date_desc. 'subject' (with a `people` filter) "
+                                    "ranks by how foreground/prominent that person is — "
+                                    "for 'best photos of X where X is the main subject'."},
             "limit": {"type": "integer",
                       "description": f"Max results (default {_SEARCH_DEFAULT_LIMIT}, "
                                      f"max {_SEARCH_MAX_LIMIT})."},
