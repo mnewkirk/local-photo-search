@@ -948,8 +948,14 @@ Face *data* was always correct — this was overlay-rendering only.
   existing-code change: a `person_ids` path in `search_combined`. No schema
   bump. Tests: `tests/test_tools.py`, `tests/test_agent.py`.
 
-- `docs/plans/backfill-maintenance-sweep.md` — M25. **Queued: do NOT start
-  until M24b ships.** Many derived-data passes get lost on new photos —
+- `docs/plans/backfill-maintenance-sweep.md` — M25. **SHIPPED (2026-06-21).**
+  `maintenance-sweep` / `validate-data` / `repair-data` CLIs + `photosearch/
+  maintenance.py` (dependency-ordered, missing-only, dry-run default, on_progress/
+  should_abort), SSE `POST /api/admin/maintenance-sweep` + `GET /api/admin/
+  validate-data`, and a Maintenance-sweep card on `/status`. Tests in
+  `tests/test_maintenance.py`. Heavy GPU passes stay with the worker fleet;
+  recluster is opt-in (it clears `ignored_clusters`). Original plan below:
+  Many derived-data passes get lost on new photos —
   structured location columns (`normalize-places`), inferred GPS
   (`infer-locations`), face clustering/matching (`recluster-faces` /
   `match-faces`), colors (cron runs `--no-colors`), and cross-folder
