@@ -1790,6 +1790,98 @@ def backfill_image_orientation(db, apply, limit):
 
 
 # ---------------------------------------------------------------------------
+# maintenance-sweep / validate-data / repair-data (M25)
+# ---------------------------------------------------------------------------
+
+@cli.command("maintenance-sweep")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Run the stages. Default: dry-run (reports what each WOULD touch).")
+@click.option("--no-colors", is_flag=True, default=False, help="Skip the colors backfill stage.")
+@click.option("--no-stacking", is_flag=True, default=False, help="Skip the stacking stage.")
+@click.option("--recluster", is_flag=True, default=False,
+              help="Include recluster-faces (clears ignored_clusters — off by default).")
+@click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
+@click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
+@click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
+def maintenance_sweep(db, apply, no_colors, no_stacking, recluster,
+                      window_minutes, max_drift_km, min_confidence):
+    """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
+
+    Runs the lightweight CPU backfills nothing else schedules (structured
+    locations, inferred GPS, colors, stacking, face match, duplicate-person
+    resolution; recluster is opt-in). Heavy GPU passes stay with the worker
+    fleet. Dry-run by default. Cancel with Ctrl-C.
+    """
+    from photosearch.maintenance import run_maintenance_sweep
+
+    def on_prog(ev):
+        if ev.get("status") == "scanning":
+            return
+        bits = []
+        if ev.get("would"):
+            bits.append(f"would {ev['would']}")
+        if ev.get("applied"):
+            bits.append(f"applied {ev['applied']}")
+        if ev.get("message"):
+            bits.append(ev["message"])
+        click.echo(f"  [{ev.get('stage')}] {ev.get('status')}"
+                   + (": " + ", ".join(bits) if bits else ""))
+
+    with PhotoDB(db) as pdb:
+        try:
+            res = run_maintenance_sweep(
+                pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
+                do_recluster=recluster, window_minutes=window_minutes,
+                max_drift_km=max_drift_km, min_confidence=min_confidence,
+                on_progress=on_prog)
+        except KeyboardInterrupt:
+            click.echo("Aborted."); return
+    total_would = sum(s.get("would", 0) for s in res["stages"])
+    total_applied = sum(s.get("applied", 0) for s in res["stages"])
+    click.echo(f"Sweep {'applied' if apply else 'dry-run'}: "
+               f"{len(res['stages'])} stages, "
+               + (f"{total_applied} rows changed." if apply
+                  else f"{total_would} rows would change. Re-run with --apply."))
+
+
+@cli.command("validate-data")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--sample", default=5, show_default=True, help="Sample rows to show per category.")
+def validate_data_cmd(db, sample):
+    """Scan for invalid rows (corrupt date_taken, bad GPS, malformed JSON,
+    orphaned-vec / garbage-tag). Read-only — see repair-data to fix."""
+    from photosearch.maintenance import validate_data
+    with PhotoDB(db) as pdb:
+        report = validate_data(pdb, sample=sample)
+    for cat, info in report.items():
+        click.echo(f"{cat}: {info.get('count', '?')}"
+                   + (f"   → {info['hint']}" if info.get("hint") else ""))
+        for s in info.get("sample", [])[:sample]:
+            click.echo(f"    {s}")
+
+
+@cli.command("repair-data")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False, help="Write repairs. Default: dry-run.")
+def repair_data_cmd(db, apply):
+    """Repair auto-fixable invalid rows from validate-data: corrupt date_taken
+    (cascade EXIF→folder→mtime→NULL), out-of-range GPS, malformed JSON columns."""
+    from photosearch.maintenance import repair_data
+    with PhotoDB(db) as pdb:
+        summary = repair_data(pdb, apply=apply)
+    for cat, info in summary.items():
+        if cat == "apply":
+            continue
+        click.echo(f"{cat}: {info}")
+    if not apply:
+        click.echo("Dry run — no changes written. Re-run with --apply.")
+
+
+# ---------------------------------------------------------------------------
 # ingest-incoming
 # ---------------------------------------------------------------------------
 
