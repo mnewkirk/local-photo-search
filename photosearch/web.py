@@ -2951,6 +2951,141 @@ async def api_detect_stacks_stream(request: Request):
     )
 
 
+@app.post("/api/admin/maintenance-sweep")
+async def api_maintenance_sweep(request: Request):
+    """M25 — SSE stream of the dependency-ordered backfill sweep.
+
+    Body (all optional; defaults match the CLI, ``apply`` defaults False):
+      {"apply"?, "do_colors"?, "do_stacking"?, "do_recluster"?,
+       "window_minutes"?, "max_drift_km"?, "min_confidence"?}
+
+    Wraps ``maintenance.run_maintenance_sweep`` in a worker thread and bridges
+    its ``on_progress`` events to the client over the same thread→asyncio.Queue
+    pattern as /api/stacks/detect/stream. Each sweep event already carries
+    {"phase":"sweep","stage","status","would","applied","message"}; we tag it
+    with type:"progress". Client disconnect (AbortController/tab close) flips a
+    threading.Event that the sweep's ``should_abort`` checks between + inside
+    stages. Terminal events: done / cancelled / fatal.
+    """
+    import asyncio
+    import threading
+    import time
+    from .maintenance import run_maintenance_sweep
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    data = data or {}
+
+    apply = bool(data.get("apply", False))
+    do_colors = bool(data.get("do_colors", True))
+    do_stacking = bool(data.get("do_stacking", True))
+    do_recluster = bool(data.get("do_recluster", False))
+    window_minutes = int(data.get("window_minutes", 30))
+    max_drift_km = float(data.get("max_drift_km", 25.0))
+    min_confidence = float(data.get("min_confidence", 0.0))
+
+    if window_minutes <= 0 or window_minutes > 1440:
+        raise HTTPException(400, "window_minutes must be in (0, 1440]")
+    if max_drift_km <= 0 or max_drift_km > 10000:
+        raise HTTPException(400, "max_drift_km must be in (0, 10000]")
+    if min_confidence < 0 or min_confidence > 1:
+        raise HTTPException(400, "min_confidence must be in [0, 1]")
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    def _on_progress(event: dict):
+        event = dict(event)
+        event["type"] = "progress"
+        _emit(event)
+
+    def _should_abort() -> bool:
+        return cancel_event.is_set()
+
+    def run():
+        started = time.monotonic()
+        try:
+            _emit({
+                "type": "start",
+                "apply": apply,
+                "do_colors": do_colors,
+                "do_stacking": do_stacking,
+                "do_recluster": do_recluster,
+            })
+            with _get_db() as db:
+                result = run_maintenance_sweep(
+                    db,
+                    apply=apply,
+                    do_colors=do_colors,
+                    do_stacking=do_stacking,
+                    do_recluster=do_recluster,
+                    window_minutes=window_minutes,
+                    max_drift_km=max_drift_km,
+                    min_confidence=min_confidence,
+                    on_progress=_on_progress,
+                    should_abort=_should_abort,
+                )
+            stages = result.get("stages", [])
+            _emit({
+                "type": "done",
+                "apply": apply,
+                "stages": stages,
+                "total_would": sum(s.get("would", 0) for s in stages),
+                "total_applied": sum(s.get("applied", 0) for s in stages),
+                "duration_seconds": round(time.monotonic() - started, 2),
+            })
+        except InterruptedError:
+            _emit({"type": "cancelled", "message": "Maintenance sweep cancelled"})
+        except Exception as exc:
+            logger.exception("MAINTENANCE sweep stream failed")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    threading.Thread(target=run, daemon=True).start()
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("MAINTENANCE client disconnected — cancelling")
+                    cancel_event.set()
+                    return
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("done", "fatal", "cancelled"):
+                    return
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/admin/validate-data")
+def api_validate_data(sample: int = 5):
+    """M25 — read-only data-integrity report (corrupt date_taken, bad GPS,
+    malformed JSON columns, orphaned-vec / garbage-tag hints). Backs the
+    quick "Validate" button on the Maintenance card."""
+    from .maintenance import validate_data
+    with _get_db() as db:
+        return validate_data(db, sample=sample)
+
+
 @app.post("/api/ask")
 async def api_ask(request: Request):
     """M24b — natural-language search via the local-LLM agent loop (SSE).
