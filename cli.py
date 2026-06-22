@@ -1800,21 +1800,30 @@ def backfill_image_orientation(db, apply, limit):
               help="Run the stages. Default: dry-run (reports what each WOULD touch).")
 @click.option("--no-colors", is_flag=True, default=False, help="Skip the colors backfill stage.")
 @click.option("--no-stacking", is_flag=True, default=False, help="Skip the stacking stage.")
+@click.option("--no-match", is_flag=True, default=False,
+              help="Skip face match-faces (the heaviest CPU stage).")
+@click.option("--light", is_flag=True, default=False,
+              help="Only the fast stages (geocode/normalize/infer/resolve-dups) — skips "
+                   "colors+stacking+match. Safe to run while the web UI is live (those "
+                   "heavy stages peg the N100 and starve the server).")
 @click.option("--recluster", is_flag=True, default=False,
               help="Include recluster-faces (clears ignored_clusters — off by default).")
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
-def maintenance_sweep(db, apply, no_colors, no_stacking, recluster,
+def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, recluster,
                       window_minutes, max_drift_km, min_confidence):
     """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
 
-    Runs the lightweight CPU backfills nothing else schedules (structured
-    locations, inferred GPS, colors, stacking, face match, duplicate-person
-    resolution; recluster is opt-in). Heavy GPU passes stay with the worker
-    fleet. Dry-run by default. Cancel with Ctrl-C.
+    Backfills nothing else schedules: structured locations, inferred GPS, colors,
+    stacking, face match, duplicate-person resolution (recluster is opt-in).
+    The heavy stages (colors/stacking/match) peg the N100 — use `--light` to run
+    only the fast ones live; let a cron run the full sweep off-hours. Dry-run by
+    default. Cancel with Ctrl-C.
     """
     from photosearch.maintenance import run_maintenance_sweep
+    if light:
+        no_colors = no_stacking = no_match = True
 
     def on_prog(ev):
         if ev.get("status") == "scanning":
@@ -1833,7 +1842,7 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, recluster,
         try:
             res = run_maintenance_sweep(
                 pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
-                do_recluster=recluster, window_minutes=window_minutes,
+                do_match=not no_match, do_recluster=recluster, window_minutes=window_minutes,
                 max_drift_km=max_drift_km, min_confidence=min_confidence,
                 on_progress=on_prog)
         except KeyboardInterrupt:

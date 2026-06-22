@@ -90,3 +90,7 @@ ask-logs/
 
 # face-dedupe spot-check galleries (generated)
 *-spotcheck.html
+
+# dedup revert lists + desktop->NAS face-state artifacts (written to /repo at runtime)
+*-assigned.txt
+faces-state.db

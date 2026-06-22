@@ -2979,8 +2979,12 @@ async def api_maintenance_sweep(request: Request):
     data = data or {}
 
     apply = bool(data.get("apply", False))
-    do_colors = bool(data.get("do_colors", True))
-    do_stacking = bool(data.get("do_stacking", True))
+    # Interactive default is LIGHT: the heavy stages (colors/stacking/match) peg
+    # the N100 and starve this server, so they're opt-in here (the CLI/cron keep
+    # them on by default for off-hours runs).
+    do_colors = bool(data.get("do_colors", False))
+    do_stacking = bool(data.get("do_stacking", False))
+    do_match = bool(data.get("do_match", False))
     do_recluster = bool(data.get("do_recluster", False))
     window_minutes = int(data.get("window_minutes", 30))
     max_drift_km = float(data.get("max_drift_km", 25.0))
@@ -3016,6 +3020,7 @@ async def api_maintenance_sweep(request: Request):
                 "apply": apply,
                 "do_colors": do_colors,
                 "do_stacking": do_stacking,
+                "do_match": do_match,
                 "do_recluster": do_recluster,
             })
             with _get_db() as db:
@@ -3024,6 +3029,7 @@ async def api_maintenance_sweep(request: Request):
                     apply=apply,
                     do_colors=do_colors,
                     do_stacking=do_stacking,
+                    do_match=do_match,
                     do_recluster=do_recluster,
                     window_minutes=window_minutes,
                     max_drift_km=max_drift_km,

@@ -1904,8 +1904,11 @@
     // button hits the read-only GET /api/admin/validate-data report.
     function MaintenanceSweep(props) {
       var _a = useState(false); var doApply = _a[0]; var setApply = _a[1];
-      var _c = useState(true);  var doColors = _c[0]; var setColors = _c[1];
-      var _st = useState(true); var doStacking = _st[0]; var setStacking = _st[1];
+      // Heavy stages default OFF — they peg the N100 and starve the server.
+      // Enable them only for an off-hours run (or use the CLI/cron).
+      var _c = useState(false);  var doColors = _c[0]; var setColors = _c[1];
+      var _st = useState(false); var doStacking = _st[0]; var setStacking = _st[1];
+      var _m = useState(false);  var doMatch = _m[0]; var setMatch = _m[1];
       var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
       var _stg = useState({}); var stages = _stg[0]; var setStages = _stg[1];
@@ -1946,6 +1949,7 @@
               apply: doApply,
               do_colors: doColors,
               do_stacking: doStacking,
+              do_match: doMatch,
               do_recluster: doRecluster,
             }),
             signal: controller.signal,
@@ -2072,10 +2076,12 @@
         e('h2', null, 'Maintenance sweep'),
         e('div', { className: 'stack-wrap' },
           e('div', { className: 'deploy-meta' },
-            'Dependency-ordered backfill over only-the-missing rows '
-            + '(place names, structured location cols, inferred GPS, colors, '
-            + 'stacking, face matching, duplicate-person resolution). Dry-run '
-            + 'by default; heavy GPU passes stay on the worker fleet.'),
+            'Dependency-ordered backfill over only-the-missing rows. Runs the '
+            + 'fast stages (place names, structured location cols, inferred GPS, '
+            + 'duplicate-person resolution) by default. The heavy stages '
+            + '(colors/stacking/match) peg the N100 and starve the server — '
+            + 'leave them off here and run the full sweep off-hours via cron. '
+            + 'Dry-run unless Apply is checked.'),
           e('div', { className: 'stack-toggles' },
             e('label', null,
               e('input', { type: 'checkbox', checked: doApply, disabled: busy,
@@ -2084,11 +2090,15 @@
             e('label', null,
               e('input', { type: 'checkbox', checked: doColors, disabled: busy,
                 onChange: function(ev) { setColors(ev.target.checked); } }),
-              'Colors'),
+              'Colors (heavy)'),
             e('label', null,
               e('input', { type: 'checkbox', checked: doStacking, disabled: busy,
                 onChange: function(ev) { setStacking(ev.target.checked); } }),
-              'Stacking'),
+              'Stacking (heavy)'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doMatch, disabled: busy,
+                onChange: function(ev) { setMatch(ev.target.checked); } }),
+              'Match faces (heavy)'),
             e('label', null,
               e('input', { type: 'checkbox', checked: doRecluster, disabled: busy,
                 onChange: function(ev) { setRecluster(ev.target.checked); } }),

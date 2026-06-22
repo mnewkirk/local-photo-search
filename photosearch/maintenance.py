@@ -379,6 +379,7 @@ def run_maintenance_sweep(
     apply: bool = False,
     do_colors: bool = True,
     do_stacking: bool = True,
+    do_match: bool = True,
     do_recluster: bool = False,
     window_minutes: int = 30,
     max_drift_km: float = 25.0,
@@ -420,7 +421,11 @@ def run_maintenance_sweep(
         plan.append(("colors", lambda: _stage_colors(db, apply, emit, check_abort)))
     if do_stacking:
         plan.append(("stacking", lambda: _stage_stacking(db, apply, emit, check_abort)))
-    plan.append(("match_faces", lambda: _stage_match_faces(db, apply, emit, check_abort)))
+    # match_faces is the heaviest CPU stage (ArcFace distance over every
+    # unmatched face); gate it so the interactive/live sweep can skip it and
+    # leave it to an off-hours cron or the worker fleet.
+    if do_match:
+        plan.append(("match_faces", lambda: _stage_match_faces(db, apply, emit, check_abort)))
     plan.append(("resolve_dups", lambda: _stage_resolve_dups(db, apply, emit, check_abort)))
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
