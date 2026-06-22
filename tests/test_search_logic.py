@@ -999,3 +999,29 @@ def test_date_from_only_is_open_ended(db):
     assert len(search_combined(db, person="Alex", date_from="2026-01-01", limit=50)) >= 1
     # Explicit single day with no photos that day → empty (single-day still works).
     assert len(search_combined(db, date_from="2026-01-01", date_to="2026-01-01", limit=50)) == 0
+
+
+def test_resolve_location_bbox_falls_back_to_region(db, monkeypatch):
+    """A point-like place ('Point Reyes' → the cape) should fall through to the
+    containing region ('… National Seashore') so photos 25km away still match.
+    Regression for location='Point Reyes' returning 0."""
+    from photosearch import search as S
+
+    def fake_fg(dbarg, q, limit=5):
+        if q == "Point Reyes":  # bare name → a point (degenerate bbox)
+            return ([{"lat": 37.99, "lon": -123.02, "bbox": [37.99, 37.99, -123.02, -123.02]}], "x")
+        if q == "Point Reyes National Seashore":  # region variant → real bbox
+            return ([{"lat": 38.07, "lon": -122.86, "bbox": [37.90, 38.24, -123.03, -122.70]}], "x")
+        return ([], "x")
+    monkeypatch.setattr("photosearch.geocode.forward_geocode", fake_fg)
+
+    bb = S._resolve_location_bbox(db, "Point Reyes")
+    assert bb is not None
+    # padded region bbox must cover the north-end beaches (~38.2, -122.98)
+    assert bb[0] <= 38.2 <= bb[1] and bb[2] <= -122.98 <= bb[3]
+
+    # A real region as the TOP result is used directly (no suffix probing).
+    monkeypatch.setattr("photosearch.geocode.forward_geocode",
+                        lambda d, q, limit=5: ([{"lat": 37.97, "lon": -122.53,
+                                                 "bbox": [37.9, 38.05, -122.6, -122.45]}], "x"))
+    assert S._resolve_location_bbox(db, "San Rafael") is not None

@@ -1258,6 +1258,53 @@ def _search_by_bbox(db: PhotoDB, south: float, north: float,
     return [dict(r) for r in rows]
 
 
+# A Nominatim bbox below this area (deg²) is a point/address, not a region.
+_MIN_REGION_BBOX_AREA = 0.0005
+# Region-name variants tried when a bare query resolves only to a point (e.g.
+# "Point Reyes" → the cape, but photos sit 25km away across the National
+# Seashore). Generalizes to parks/forests whose name is just the place name.
+_REGION_SUFFIXES = (" National Park", " National Seashore", " State Park",
+                    " National Monument", " National Forest",
+                    " National Recreation Area", " National Wildlife Refuge")
+
+
+def _bbox_area(bb) -> float:
+    return (bb[1] - bb[0]) * (bb[3] - bb[2]) if bb and len(bb) == 4 else 0.0
+
+
+def _resolve_location_bbox(db, name: str):
+    """Resolve a free-text place to a padded [s,n,w,e] bbox, or None.
+
+    Uses the top Nominatim result's bbox when it's a real region/city. When the
+    top result is point-like (a cape, a single address), tries region-name
+    variants ("X National Seashore" …) and uses the first whose bbox is a real
+    region NEAR the original point — so "Point Reyes" finds the National
+    Seashore that actually contains the photos, not just the 11m cape point.
+    """
+    from .geocode import forward_geocode
+    try:
+        cands = [c for c in forward_geocode(db, name, limit=5)[0] if c.get("bbox")]
+    except Exception:
+        return None
+    if not cands:
+        return None
+    top = cands[0]
+    if _bbox_area(top["bbox"]) >= _MIN_REGION_BBOX_AREA:
+        return _pad_bbox(top["bbox"])           # real region/city — unchanged behavior
+    for suf in _REGION_SUFFIXES:                 # point-like → try the containing region
+        try:
+            rc = forward_geocode(db, name + suf, limit=2)[0]
+        except Exception:
+            continue
+        for c in rc:
+            bb = c.get("bbox")
+            if (bb and _bbox_area(bb) >= _MIN_REGION_BBOX_AREA
+                    and abs((bb[0] + bb[1]) / 2 - top["lat"]) < 1.5
+                    and abs((bb[2] + bb[3]) / 2 - top["lon"]) < 1.5):
+                return _pad_bbox(bb)
+    return _pad_bbox(top["bbox"])                # fall back to the padded point
+
+
 def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[dict]:
     """Search by place_name using case-insensitive LIKE matching, with
     two expansions on top of the raw substring:
@@ -1337,13 +1384,9 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
     # offline geocoder labels photos with whatever populated place is
     # nearest, so substring matching alone gave wildly different counts
     # for what's meant to be one location. The bbox catches all of them.
-    try:
-        candidates, _ = forward_geocode(db, name, limit=1)
-    except Exception:
-        candidates = []
-    if candidates and candidates[0].get("bbox"):
-        south, north, west, east = _pad_bbox(candidates[0]["bbox"])
-        bbox_rows = _search_by_bbox(db, south, north, west, east, limit)
+    bbox = _resolve_location_bbox(db, name)
+    if bbox:
+        bbox_rows = _search_by_bbox(db, *bbox, limit)
         seen = {r["id"]: r for r in results}
         for r in bbox_rows:
             if r["id"] not in seen:
