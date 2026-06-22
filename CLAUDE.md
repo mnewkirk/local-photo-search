@@ -806,6 +806,17 @@ one by priority **manual > strict > temporal**, tie-break **det_score then bbox
 area**; unmatch the rest. Run the reference-based dedupe first for precise
 people, then this to sweep everyone.
 
+**`verify-person-matches [--person NAME] [--min-dist 1.30] [--report PATH]`** —
+finds MIS-tagged faces (a person tagged on someone *else's* face, vs. the
+duplicate case above). Per person, the trusted (strict/manual) faces form an
+auto reference set; every face of theirs is scored by min L2 distance to it and
+the farthest (> `--min-dist`) are flagged — usually temporal over-matches onto a
+different person. Report-only + an HTML gallery grouped by person. Run on the
+replica; unmatch confirmed ones on the NAS. **Catches non-sibling mis-tags well;
+sibling confusion (Calvin↔Ellie) stays close** — the ArcFace limit. Real run
+(2026-06-21): 278 suspects (Calvin 148, Ellie 72, Matt 40, Nicole 18), all
+confirmed mis-tags, unmatched.
+
 **`restore-unmatched-faces [--apply]`** — both commands above snapshot
 `(face_id, person_id, match_source)` into an on-demand **`face_dedupe_undo`**
 table before nulling `person_id` (unmatch sets `match_source='dedupe_unmatched'`),

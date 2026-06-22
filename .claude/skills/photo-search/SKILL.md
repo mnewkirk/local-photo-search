@@ -1054,6 +1054,12 @@ dedupe-person-faces --person NAME --references <photo-ids> \
                                             # photos with 2+ faces of one person.
 resolve-duplicate-persons [--apply]         # Universal: keep one face per (photo,person)
                                             # by priority manual>strict>temporal.
+verify-person-matches [--person NAME] [--min-dist 1.30] \
+                      [--min-refs 5] [--top-n 40] [--report PATH]
+                                            # Find MIS-tags: rank each person's faces by
+                                            # distance to their trusted (strict/manual)
+                                            # refs; farthest = likely wrong person.
+                                            # Report-only; catches non-sibling mis-tags.
 restore-unmatched-faces [--apply]           # Undo the two above (face_dedupe_undo table).
 cleanup-orphan-faces [--apply]              # Delete faces whose photo was deleted.
 backfill-image-orientation [--apply] [--limit N]
