@@ -983,3 +983,19 @@ def test_search_semantic_accepts_text_match_param():
     sig = inspect.signature(search_semantic)
     assert "text_match" in sig.parameters
     assert "tag_match" not in sig.parameters
+
+
+def test_date_from_only_is_open_ended(db):
+    """date_from without date_to means 'from that date ONWARD', not a single day.
+
+    Regression for the bug where `date_to or date_from` collapsed an open-ended
+    range to one day, so person+date_from='2026-01-01' ("in 2026 so far")
+    matched only Jan 1 and the intersection silently emptied.
+    """
+    from photosearch.search import search_combined
+    # All sample photos are 2026-03-13; a January date_from must still match them.
+    assert len(search_combined(db, date_from="2026-01-01", limit=50)) == 5
+    # person + date_from onward (Alex appears in 3 sample photos, all 2026-03).
+    assert len(search_combined(db, person="Alex", date_from="2026-01-01", limit=50)) >= 1
+    # Explicit single day with no photos that day → empty (single-day still works).
+    assert len(search_combined(db, date_from="2026-01-01", date_to="2026-01-01", limit=50)) == 0

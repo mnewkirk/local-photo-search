@@ -1051,6 +1051,13 @@ def search_by_face_reference(db: PhotoDB, image_path: str, limit: int = 10) -> l
     return results
 
 
+# Open upper bound when a caller gives only `date_from` (meaning "from this date
+# ONWARD"). Defaulting `date_to` to `date_from` instead collapsed the range to a
+# single day, so e.g. person + date_from='2026-01-01' ("in 2026 so far") matched
+# only Jan 1 and the intersection silently emptied.
+_OPEN_DATE_HI = "9999-12-31"
+
+
 def _filter_by_date(results: list[dict], date_from: str, date_to: str) -> list[dict]:
     """Filter results to those whose date_taken falls within [date_from, date_to]."""
     filtered = []
@@ -1580,7 +1587,7 @@ def search_combined(
     # Date as a primary search: if only date is specified (no other criteria)
     # No limit — return all photos in the range so the user sees every shot from that day.
     if date_from and not result_sets and min_quality is None:
-        return _wrap(_search_by_date(db, date_from, date_to or date_from, limit=0))
+        return _wrap(_search_by_date(db, date_from, date_to or _OPEN_DATE_HI, limit=0))
 
     # Quality-only search: if no other criteria given but min_quality is set,
     # return the highest-quality photos in the collection.
@@ -1593,7 +1600,7 @@ def search_combined(
         ).fetchall()
         results = [dict(r) for r in rows]
         if date_from:
-            results = _filter_by_date(results, date_from, date_to or date_from)
+            results = _filter_by_date(results, date_from, date_to or _OPEN_DATE_HI)
         return _wrap(results)
 
     if not result_sets:
@@ -1627,7 +1634,7 @@ def search_combined(
 
     # Apply date filter (when date is combined with other search criteria)
     if date_from:
-        merged = _filter_by_date(merged, date_from, date_to or date_from)
+        merged = _filter_by_date(merged, date_from, date_to or _OPEN_DATE_HI)
 
     # Apply quality filter
     if min_quality is not None:
