@@ -46,7 +46,10 @@
         }
         return { head: head || '(entry)', body: lines.slice(bodyStart).join('\n').trim() };
       });
-      return out.reverse();
+      // Newest first by the entry's leading "YYYY-MM-DD HH:MM:SS" timestamp,
+      // robust to file concat / rotation order (not just a reverse).
+      out.sort((a, b) => b.head.slice(0, 19).localeCompare(a.head.slice(0, 19)));
+      return out;
     }
 
     function App() {
