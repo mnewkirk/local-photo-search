@@ -961,6 +961,14 @@ Face *data* was always correct — this was overlay-rendering only.
   corrupt `date_taken` control-byte values found in M24a (re-extract from
   EXIF/folder/mtime, else NULL), bad GPS, malformed JSON columns.
 
+- `docs/plans/review-folders-perf.md` — M27. **Queued.** The `/review`
+  folder picker is slow: `/api/review/folders` loads all ~163k photo rows and
+  runs `Path(fp).parent` per row in Python on every load. Quick win: swap
+  `Path` for `fp.rsplit('/',1)[0]`. Durable fix: add an indexed `folder`
+  column (dirname of filepath) populated in `add_photo` + backfill, then
+  `GROUP BY folder` — also speeds `/geotag`'s folder summary. Optional caching
+  invalidated on ingest.
+
 - `docs/plans/local-replica-and-writes.md` — M26. Pivot for the asymmetric
   hardware (weak N100 NAS, strong GPU desktop): run the whole experience
   (web UI + `/api/ask` agent + MCP) on the desktop off a **local
