@@ -914,7 +914,11 @@
                 const dataLine = evt.split('\n').filter(l => l.indexOf('data:') === 0)[0];
                 if (!dataLine) return; // keepalive comment
                 let p; try { p = JSON.parse(dataLine.slice(5).trim()); } catch (_) { return; }
-                if (p.type === 'tool_call') {
+                if (p.type === 'step') {
+                  setAskLog(prev => prev.concat(
+                    ['● Round ' + p.n + (p.max ? ' of ' + p.max : '')
+                     + (p.elapsed != null ? '  (' + p.elapsed + 's)' : '')]));
+                } else if (p.type === 'tool_call') {
                   const a = p.arguments && Object.keys(p.arguments).length
                     ? ' ' + JSON.stringify(p.arguments) : '';
                   setAskLog(prev => prev.concat(['→ ' + p.tool + a]));

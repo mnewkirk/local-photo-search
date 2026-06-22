@@ -64,6 +64,7 @@
       { href: '/map',         label: 'Map',         id: 'map' },
       { href: '/geotag',      label: 'Geotag',      id: 'geotag' },
       { href: '/status',      label: 'Status',      id: 'status' },
+      { href: '/logs',        label: 'Logs',        id: 'logs' },
       { href: '/admin/vocab', label: 'Admin',       id: 'admin' },
     ];
 

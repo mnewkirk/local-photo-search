@@ -3639,6 +3639,34 @@ async def api_google_upload(body: dict, request: Request):
     )
 
 
+@app.get("/api/logs")
+def api_logs():
+    """Return the Ask query logs for today + yesterday (for the /logs page).
+
+    Reads the agent's per-query markdown logs (ask-YYYY-MM-DD.md plus any rotated
+    ask-YYYY-MM-DD.N.md) from PHOTOSEARCH_ASK_LOG_DIR (default ./ask-logs).
+    """
+    import glob
+    import time
+    log_dir = os.environ.get("PHOTOSEARCH_ASK_LOG_DIR") or "ask-logs"
+    today = time.strftime("%Y-%m-%d")
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    days = []
+    for day in (today, yesterday):
+        files = sorted(glob.glob(os.path.join(log_dir, f"ask-{day}.md"))
+                       + glob.glob(os.path.join(log_dir, f"ask-{day}.*.md")))
+        content = ""
+        for fp in files:
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    content += fh.read()
+            except Exception:
+                pass
+        days.append({"date": day, "content": content,
+                     "bytes": len(content), "files": [os.path.basename(f) for f in files]})
+    return {"days": days, "dir": log_dir, "generated": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
 # ---------------------------------------------------------------------------
 # Serve the frontend (production mode — built files)
 # ---------------------------------------------------------------------------
@@ -3700,6 +3728,14 @@ if _frontend_dir.exists():
         if status_page.exists():
             return HTMLResponse(status_page.read_text())
         return HTMLResponse("<h1>Status page not found</h1>")
+
+    @app.get("/logs")
+    def serve_logs():
+        """Serve the Ask query-logs viewer page."""
+        page = _frontend_dir / "logs.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Logs page not found</h1>")
 
     @app.get("/map")
     def serve_map():

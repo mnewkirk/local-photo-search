@@ -458,16 +458,23 @@ def _write_ask_log(session: dict) -> None:
     try:
         path = _ask_log_path()
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        started = session.get("started")
+        recv = time.strftime("%H:%M:%S", time.localtime(started)) if started else "?"
         L = ["", "=" * 78,
              f"## {ts} · `{session.get('model')}` · {session.get('seconds')}s "
              f"· {session.get('mode', 'agent')}",
-             f"**Ask:** {session.get('message', '')}", ""]
+             f"**Ask:** {session.get('message', '')}", "",
+             f"- received {recv} by /api/ask · history {session.get('history_len', 0)} msg · "
+             f"agent model `{session.get('model')}` · {session.get('rounds', 0)} round(s) · "
+             f"{len(session.get('tool_calls') or [])} tool call(s)", ""]
         if session.get("error"):
             L.append(f"**error:** {session['error']}")
         if session.get("tool_calls"):
-            L.append("**Tools:**")
+            L.append("**Calls (time since request → tool):**")
             for tc in session["tool_calls"]:
-                L.append(f"- `{tc['name']}({json.dumps(tc.get('args') or {}, ensure_ascii=False)})`"
+                tpfx = f"[+{tc['t']}s] " if tc.get("t") is not None else ""
+                rnd = f"R{tc['step']} " if tc.get("step") else ""
+                L.append(f"- {tpfx}{rnd}`{tc['name']}({json.dumps(tc.get('args') or {}, ensure_ascii=False)})`"
                          + (f" → {tc['summary']}" if tc.get("summary") else "")
                          + (f"  ⚠ {tc['error']}" if tc.get("error") else ""))
                 items = tc.get("items") or []
@@ -510,7 +517,7 @@ def run_agent(
 
     session = {"message": message, "model": _agent_model(), "started": time.time(),
                "mode": "agent", "steps": [], "tool_calls": [], "answer": None,
-               "error": None}
+               "error": None, "history_len": len(history or []), "rounds": 0}
 
     def _set_answer(text):
         session["answer"] = text
@@ -555,6 +562,9 @@ def run_agent(
             if remaining <= 1.0:
                 timed_out = True
                 break
+            session["rounds"] = step + 1
+            yield {"type": "step", "n": step + 1, "max": max_steps,
+                   "elapsed": round(time.time() - session["started"], 1)}
             try:
                 reply = _chat(messages, tools, timeout=min(_HTTP_TIMEOUT_S, remaining))
             except Exception as exc:
@@ -584,7 +594,8 @@ def run_agent(
                 messages.append(_assistant_tool_msg(reply))
                 for call in calls:
                     name = call.get("name") or ""
-                    yield {"type": "tool_call", "tool": name, "arguments": call.get("arguments", {})}
+                    yield {"type": "tool_call", "tool": name, "arguments": call.get("arguments", {}),
+                           "step": step + 1, "elapsed": round(time.time() - session["started"], 1)}
                     try:
                         result = toolmod.call_tool(db, name, call.get("arguments", {}))
                     except KeyError:
@@ -596,7 +607,8 @@ def run_agent(
                         last_photos = result.get("results", [])
                         last_total = result.get("total", len(last_photos))
                     summ = _summarize(name, result)
-                    rec = {"name": name, "args": call.get("arguments", {}), "summary": summ}
+                    rec = {"name": name, "args": call.get("arguments", {}), "summary": summ,
+                           "step": step + 1, "t": round(time.time() - session["started"], 1)}
                     if isinstance(result, dict) and isinstance(result.get("results"), list):
                         hits = [h for h in result["results"] if isinstance(h, dict)]
                         rec["items"] = [{"id": h.get("id"), "filename": h.get("filename"),
@@ -607,7 +619,8 @@ def run_agent(
                     elif isinstance(result, dict) and "error" in result:
                         rec["error"] = result["error"]
                     session["tool_calls"].append(rec)
-                    yield {"type": "tool_result", "tool": name, "summary": summ}
+                    yield {"type": "tool_result", "tool": name, "summary": summ,
+                           "step": step + 1, "elapsed": round(time.time() - session["started"], 1)}
                     messages.append(_tool_result_msg(call, result))
                 continue
 

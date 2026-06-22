@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ask Logs · Photo Search</title>
+  <link rel="stylesheet" href="/shared.css">
+  <style>
+    :root { --bg:#0f1115; --surface:#1a1d24; --border:#2a2f3a; --muted:#8b93a7; --text:#e6e9ef; --accent:#4a9; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px system-ui,sans-serif; }
+    .container { max-width:1100px; margin:0 auto; padding:16px; }
+    .page-title { font-size:22px; font-weight:600; margin:8px 0 2px; }
+    .bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin:8px 0 14px; }
+    .bar button { background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:7px; padding:6px 12px; cursor:pointer; }
+    .bar button:hover { border-color:var(--accent); }
+    .day-h { font-size:15px; font-weight:600; margin:18px 0 8px; color:var(--accent); }
+    .entry { background:var(--surface); border:1px solid var(--border); border-radius:10px; margin:10px 0; overflow:hidden; }
+    .entry-h { padding:9px 12px; font:12px ui-monospace,monospace; color:var(--text); background:#20242d; border-bottom:1px solid var(--border); }
+    .entry-b { padding:10px 12px; margin:0; white-space:pre-wrap; word-break:break-word;
+               font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:#c9d1e0; }
+    .empty { color:var(--muted); padding:20px 0; }
+    .auto { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    const e = React.createElement;
+    const { useState, useEffect, useCallback, useRef } = React;
+    const API = '';
+    const REFRESH_MS = 30000;
+
+    // Split a day's markdown log into individual query entries (separated by the
+    // 78-char '=' rule), newest first. Each entry's first "## " line is the header.
+    function parseEntries(content) {
+      if (!content) return [];
+      const chunks = content.split(/\n={20,}\n/).map(s => s.trim()).filter(Boolean);
+      const out = chunks.map(ch => {
+        const lines = ch.split('\n');
+        let head = '', bodyStart = 0;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].startsWith('## ')) { head = lines[i].slice(3); bodyStart = i + 1; break; }
+        }
+        return { head: head || '(entry)', body: lines.slice(bodyStart).join('\n').trim() };
+      });
+      return out.reverse();
+    }
+
+    function App() {
+      const [data, setData] = useState(null);
+      const [updated, setUpdated] = useState('');
+      const [loading, setLoading] = useState(true);
+      const [auto, setAuto] = useState(true);
+      const timer = useRef(null);
+
+      const load = useCallback(() => {
+        setLoading(true);
+        fetch(API + '/api/logs').then(r => r.json()).then(d => {
+          setData(d); setLoading(false);
+          setUpdated(new Date().toLocaleTimeString());
+        }).catch(() => setLoading(false));
+      }, []);
+
+      useEffect(() => { load(); }, [load]);
+      useEffect(() => {
+        if (timer.current) clearInterval(timer.current);
+        if (auto) timer.current = setInterval(load, REFRESH_MS);
+        return () => timer.current && clearInterval(timer.current);
+      }, [auto, load]);
+
+      const days = (data && data.days) || [];
+      return e('div', { className: 'container' },
+        PS.SharedHeader ? e(PS.SharedHeader, { activePage: 'logs' }) : null,
+        e('div', { className: 'page-title' }, 'Ask Logs'),
+        e('div', { className: 'bar' },
+          e('button', { onClick: load }, loading ? 'Loading…' : 'Refresh'),
+          e('label', null,
+            e('input', { type: 'checkbox', checked: auto, onChange: ev => setAuto(ev.target.checked) }),
+            ' auto-refresh 30s'),
+          updated && e('span', { className: auto ? 'auto' : '' }, 'updated ' + updated),
+          data && e('span', null, 'logs: ' + (data.dir || 'ask-logs'))),
+        days.map(day => {
+          const entries = parseEntries(day.content);
+          return e('div', { key: day.date },
+            e('div', { className: 'day-h' },
+              (day.date === days[0].date ? 'Today · ' : 'Yesterday · ') + day.date
+              + '  (' + entries.length + ' quer' + (entries.length === 1 ? 'y' : 'ies') + ')'),
+            entries.length === 0
+              ? e('div', { className: 'empty' }, 'No Ask queries logged.')
+              : entries.map((en, i) =>
+                  e('div', { className: 'entry', key: i },
+                    e('div', { className: 'entry-h' }, en.head),
+                    e('pre', { className: 'entry-b' }, en.body))));
+        }));
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>

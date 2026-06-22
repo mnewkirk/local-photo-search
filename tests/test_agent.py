@@ -49,7 +49,8 @@ def test_loop_search_then_answer(db, monkeypatch):
         _answer("Found 3 photos of Alex."),
     ))
     events = _run(db, "show me photos of Alex")
-    assert _types(events) == ["tool_call", "tool_result", "photos", "answer"]
+    assert [t for t in _types(events) if t != "step"] == ["tool_call", "tool_result", "photos", "answer"]
+    assert any(e["type"] == "step" and e["n"] == 1 for e in events)  # round progress emitted
     photos = next(e for e in events if e["type"] == "photos")
     assert photos["total"] == 3
     assert len(photos["results"]) == 3
@@ -64,11 +65,12 @@ def test_loop_grounds_then_searches(db, monkeypatch):
         _answer("Two photos have both Alex and Jamie."),
     ))
     events = _run(db, "photos with Alex and Jamie")
-    assert _types(events) == [
+    assert [t for t in _types(events) if t != "step"] == [
         "tool_call", "tool_result",   # list_people
         "tool_call", "tool_result",   # search_photos
         "photos", "answer",
     ]
+    assert [e["n"] for e in events if e["type"] == "step"] == [1, 2, 3]  # 2 tool rounds + answer round
     photos = next(e for e in events if e["type"] == "photos")
     assert photos["total"] == 2
 
