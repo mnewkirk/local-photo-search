@@ -1633,6 +1633,20 @@
       cleared: 'Cleared existing stacks',
     };
 
+    // Human labels for the maintenance-sweep stages (matches
+    // maintenance.SWEEP_STAGE_ORDER).
+    var SWEEP_STAGE_LABELS = {
+      geocode: 'Reverse-geocode place names',
+      normalize: 'Structured location columns',
+      infer: 'Infer GPS from neighbors',
+      normalize_inferred: 'Structured cols (inferred)',
+      colors: 'Dominant colors',
+      stacking: 'Burst/bracket stacking',
+      match_faces: 'Match faces to persons',
+      resolve_dups: 'Resolve duplicate persons',
+      recluster: 'Recluster unknown faces',
+    };
+
     // Parse an SSE chunk (everything up to \n\n) and return the event dict,
     // or null if the chunk is a keepalive or unrecognized.
     function parseSSEChunk(chunk) {
@@ -1878,6 +1892,221 @@
             }, result.msg)
           ),
           progressNode
+        )
+      );
+    }
+
+    // ── Maintenance sweep (M25) ──────────────────────────────────────────
+    // Dependency-ordered backfill over only-the-missing rows. Dry-run by
+    // default; heavy-stage toggles for colors/stacking/recluster. Streams
+    // per-stage progress over SSE (POST, so fetch + getReader, not
+    // EventSource), cancellable via AbortController. A separate "Validate"
+    // button hits the read-only GET /api/admin/validate-data report.
+    function MaintenanceSweep(props) {
+      var _a = useState(false); var doApply = _a[0]; var setApply = _a[1];
+      var _c = useState(true);  var doColors = _c[0]; var setColors = _c[1];
+      var _st = useState(true); var doStacking = _st[0]; var setStacking = _st[1];
+      var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _stg = useState({}); var stages = _stg[0]; var setStages = _stg[1];
+      var _r = useState(null);  var result = _r[0]; var setResult = _r[1];
+      var _v = useState(null);  var report = _v[0]; var setReport = _v[1];
+      var _vb = useState(false); var vBusy = _vb[0]; var setVBusy = _vb[1];
+      var abortRef = useRef(null);
+
+      function setStage(stage, patch) {
+        setStages(function(prev) {
+          var next = Object.assign({}, prev);
+          next[stage] = Object.assign({}, prev[stage] || {}, patch);
+          return next;
+        });
+      }
+
+      async function submit() {
+        if (busy) return;
+        if (doApply && doRecluster && !confirm(
+          'Recluster renumbers every unknown face cluster and clears '
+          + 'ignored_clusters. Continue?'
+        )) return;
+        if (doApply && !confirm(
+          'Apply mode WRITES to the database (idempotent, missing-only). Continue?'
+        )) return;
+
+        setBusy(true);
+        setStages({});
+        setResult(null);
+        var controller = new AbortController();
+        abortRef.current = controller;
+
+        try {
+          var response = await fetch('/api/admin/maintenance-sweep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apply: doApply,
+              do_colors: doColors,
+              do_stacking: doStacking,
+              do_recluster: doRecluster,
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            var body = await response.json().catch(function() { return {}; });
+            throw new Error(body.detail || ('HTTP ' + response.status));
+          }
+
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder();
+          var buffer = '';
+          var terminal = null;
+
+          while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              var raw = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              var ev = parseSSEChunk(raw);
+              if (!ev) continue;
+              if (ev.type === 'progress' && ev.stage) {
+                setStage(ev.stage, {
+                  status: ev.status,
+                  would: ev.would,
+                  applied: ev.applied,
+                  message: ev.message,
+                  done: ev.done,
+                  total: ev.total,
+                });
+              } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'fatal') {
+                terminal = ev;
+              }
+            }
+            if (terminal) break;
+          }
+
+          if (!terminal) throw new Error('stream ended unexpectedly');
+
+          if (terminal.type === 'done') {
+            setResult({
+              ok: true,
+              msg: (terminal.apply ? '' : '[dry run] ')
+                + (terminal.apply
+                    ? terminal.total_applied.toLocaleString() + ' rows changed'
+                    : terminal.total_would.toLocaleString() + ' rows would change')
+                + ' · ' + (terminal.stages || []).length + ' stages · '
+                + terminal.duration_seconds + 's',
+            });
+            if (props.onComplete && terminal.apply) props.onComplete();
+          } else if (terminal.type === 'cancelled') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: terminal.message || 'Failed' });
+          }
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: err.message });
+          }
+        } finally {
+          setBusy(false);
+          abortRef.current = null;
+        }
+      }
+
+      function cancel() {
+        if (abortRef.current) abortRef.current.abort();
+      }
+
+      function validate() {
+        if (vBusy) return;
+        setVBusy(true);
+        setReport(null);
+        fetch('/api/admin/validate-data')
+          .then(function(r) { return r.json(); })
+          .then(function(data) { setReport(data); })
+          .catch(function(err) { setReport({ error: err.message }); })
+          .finally(function() { setVBusy(false); });
+      }
+
+      var order = ['geocode', 'normalize', 'infer', 'normalize_inferred',
+                   'colors', 'stacking', 'match_faces', 'resolve_dups', 'recluster'];
+      var stageRows = order.filter(function(s) { return stages[s]; }).map(function(s) {
+        var st = stages[s];
+        var bits = [];
+        if (st.would != null && st.would !== 0) bits.push('would ' + st.would.toLocaleString());
+        if (st.applied != null && st.applied !== 0) bits.push('applied ' + st.applied.toLocaleString());
+        if (st.done != null && st.total != null) bits.push(st.done.toLocaleString() + ' / ' + st.total.toLocaleString());
+        if (st.message) bits.push(st.message);
+        return e('div', { className: 'stack-progress-meta', key: s },
+          e('span', null, (SWEEP_STAGE_LABELS[s] || s) + ' — ' + (st.status || '')),
+          e('span', null, bits.join(' · '))
+        );
+      });
+
+      var reportNode = null;
+      if (report) {
+        if (report.error) {
+          reportNode = e('div', { className: 'stack-result err' }, report.error);
+        } else {
+          var lines = [];
+          Object.keys(report).forEach(function(cat) {
+            var info = report[cat] || {};
+            if (cat === 'malformed_json') {
+              var totalBad = Object.keys(info).reduce(function(acc, col) {
+                return acc + ((info[col] && info[col].count) || 0);
+              }, 0);
+              lines.push('malformed_json: ' + totalBad);
+            } else {
+              lines.push(cat + ': ' + (info.count != null ? info.count
+                : JSON.stringify(info)) + (info.hint ? '  → ' + info.hint : ''));
+            }
+          });
+          reportNode = e('div', { className: 'deploy-log' }, lines.join('\n'));
+        }
+      }
+
+      return e('div', null,
+        e('h2', null, 'Maintenance sweep'),
+        e('div', { className: 'stack-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Dependency-ordered backfill over only-the-missing rows '
+            + '(place names, structured location cols, inferred GPS, colors, '
+            + 'stacking, face matching, duplicate-person resolution). Dry-run '
+            + 'by default; heavy GPU passes stay on the worker fleet.'),
+          e('div', { className: 'stack-toggles' },
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doApply, disabled: busy,
+                onChange: function(ev) { setApply(ev.target.checked); } }),
+              'Apply (write changes)'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doColors, disabled: busy,
+                onChange: function(ev) { setColors(ev.target.checked); } }),
+              'Colors'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doStacking, disabled: busy,
+                onChange: function(ev) { setStacking(ev.target.checked); } }),
+              'Stacking'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doRecluster, disabled: busy,
+                onChange: function(ev) { setRecluster(ev.target.checked); } }),
+              'Recluster faces (clears ignored)')
+          ),
+          e('div', { className: 'stack-actions' },
+            busy
+              ? e('button', { className: 'btn', onClick: cancel }, 'Cancel')
+              : e('button', { className: 'btn', onClick: submit },
+                  doApply ? 'Run sweep' : 'Preview'),
+            e('button', { className: 'btn', onClick: validate, disabled: vBusy },
+              vBusy ? 'Validating…' : 'Validate data'),
+            result && e('span', {
+              className: 'stack-result ' + (result.ok ? 'ok' : 'err')
+            }, result.msg)
+          ),
+          stageRows.length > 0 && e('div', { className: 'stack-progress' }, stageRows),
+          reportNode
         )
       );
     }
@@ -2494,6 +2723,7 @@
           e(GenerationsByModel, null),
           e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
           e(StackingForm, { onComplete: load }),
+          e(MaintenanceSweep, { onComplete: load }),
           e(InferLocationForm, { onDone: load }),
           e(ActivityChart, { activity: activity }),
           e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
