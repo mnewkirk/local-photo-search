@@ -615,6 +615,8 @@
         min_quality: p.get('min_quality') || '',
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
+        sort: p.get('sort') || '',
+        ask: p.get('ask') || '',
       };
     }
 
@@ -623,7 +625,8 @@
     // -----------------------------------------------------------------------
     function App() {
       const initParams = getUrlParams();
-      const [query, setQuery] = useState(initParams.q);
+      // ?ask= restores an Ask-mode query; ?q= a structured one.
+      const [query, setQuery] = useState(initParams.q || initParams.ask);
       const [personFilter, setPersonFilter] = useState(initParams.person);
       const [matchSource, setMatchSource] = useState(initParams.match_source);
       const [colorFilter, setColorFilter] = useState(initParams.color);
@@ -641,7 +644,7 @@
       // date_taken ASC LIMIT` produced "Newest first = newest of the
       // oldest 1000" — misleading. Backend now honors `sort=` param;
       // flipped the default to match what users expect.
-      const [sortBy, setSortBy] = useState('date_desc');
+      const [sortBy, setSortBy] = useState(initParams.sort || 'date_desc');
       const [loading, setLoading] = useState(false);
       // Photos per page. Bumped from 200 to 1000 after user reported
       // that "Calvin in Lucas Valley" (5,946 matches) was capped at the
@@ -668,7 +671,7 @@
       const [stackMembers, setStackMembers] = useState({}); // { stack_id: [photo, ...] }
 
       // ---- Ask mode (M24b: natural-language LLM agent) ----
-      const [askMode, setAskMode] = useState(false);
+      const [askMode, setAskMode] = useState(!!initParams.ask);
       const [asking, setAsking] = useState(false);
       const [askLog, setAskLog] = useState([]);      // narration lines
       const [askAnswer, setAskAnswer] = useState(''); // final prose answer
@@ -880,6 +883,10 @@
         const q = (query || '').trim();
         if (!q || asking) return;
 
+        // Make the Ask reproducible/shareable: reflect it in the URL (?ask=).
+        window.history.pushState(null, '',
+          window.location.pathname + '?ask=' + encodeURIComponent(q));
+
         // Cancel any in-flight ask.
         if (askAbortRef.current) askAbortRef.current.abort();
         const ac = new AbortController();
@@ -977,11 +984,14 @@
       useEffect(() => {
         if (hasAutoSearched.current) return;
         const p = getUrlParams();
-        if (p.q || p.person || p.color || p.location || p.date_from || p.date_to || p.min_quality || p.match_source) {
+        if (p.ask) {
+          hasAutoSearched.current = true;
+          runAsk();
+        } else if (p.q || p.person || p.color || p.location || p.date_from || p.date_to || p.min_quality || p.match_source) {
           hasAutoSearched.current = true;
           doSearch();
         }
-      }, [doSearch]);
+      }, [doSearch, runAsk]);
 
       // Re-fetch whenever the sort dropdown changes (but not on first
       // mount — the auto-search above handles the initial load). Sort
