@@ -60,14 +60,52 @@ _op_lock = threading.Lock()
 _ingest_lock = threading.Lock()
 
 
+def _native_repo_dir() -> str:
+    """The project checkout dir — used when NOT running in the NAS container.
+
+    The local replica (M26a) runs `cli.py serve` natively from the cloned
+    repo, so REPO_DIR (=/repo, the docker mount) doesn't exist but the
+    checkout two levels up from this file is a real git repo.
+    """
+    return str(Path(__file__).resolve().parent.parent)
+
+
+def _active_repo_dir() -> Optional[str]:
+    """The git repo to operate on: the docker mount if present, else the
+    native checkout. None if neither is a git repo."""
+    if Path(REPO_DIR, ".git").exists():
+        return REPO_DIR
+    nd = _native_repo_dir()
+    if Path(nd, ".git").exists():
+        return nd
+    return None
+
+
+def _deploy_mode() -> str:
+    """How this instance is deployed, which decides the restart mechanism:
+
+    - 'docker'  — running in the NAS container off the /repo mount; restart
+      swaps the container via a helper container, build = docker compose build.
+    - 'native'  — running `cli.py serve` directly off the checkout (the local
+      replica); restart re-execs the process, no build step.
+    - 'none'    — no git repo reachable at all (deploy controls unavailable).
+    """
+    if Path(REPO_DIR, ".git").exists():
+        return "docker"
+    if Path(_native_repo_dir(), ".git").exists():
+        return "native"
+    return "none"
+
+
 def _run_git(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
-    """Run a git command in REPO_DIR. Returns (rc, stdout, stderr).
+    """Run a git command in the active repo dir. Returns (rc, stdout, stderr).
 
     Uses -c safe.directory=* because the mounted repo is owned by the host
     user (UGOS / UID 1000ish), not the container's user, so git's hardened
-    ownership check otherwise refuses to touch it.
+    ownership check otherwise refuses to touch it. (Harmless for the native
+    checkout, which is owned by the same user.)
     """
-    cmd = ["git", "-c", "safe.directory=*", "-C", REPO_DIR] + args
+    cmd = ["git", "-c", "safe.directory=*", "-C", _active_repo_dir() or REPO_DIR] + args
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
@@ -78,17 +116,39 @@ def _run_git(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
 
 
 def _repo_available() -> bool:
-    return Path(REPO_DIR, ".git").exists()
+    return _active_repo_dir() is not None
 
 
 def _deployed_sha() -> Optional[str]:
-    """The git SHA the running container was built from, or None if unknown."""
+    """The git SHA the *running* code was started from, or None if unknown.
+
+    In docker mode this is baked into /app/BUILD_SHA at image-build time. In
+    native mode there's no image, so we capture HEAD once at process startup
+    (`_NATIVE_STARTUP_SHA`); after a `git pull` it stays pinned to the old
+    commit until a restart re-execs the process, which is exactly the
+    "running code is behind HEAD — restart to apply" signal the UI wants.
+    """
+    if _deploy_mode() == "native":
+        return _NATIVE_STARTUP_SHA
     try:
         return BUILD_SHA_FILE.read_text().strip() or None
     except FileNotFoundError:
         return None
     except OSError:
         return None
+
+
+# Captured once at import (process startup) so native mode can tell whether the
+# running code is behind a subsequently-pulled HEAD. None in docker mode (we use
+# the baked BUILD_SHA there) or if HEAD can't be read.
+def _capture_startup_sha() -> Optional[str]:
+    if _deploy_mode() != "native":
+        return None
+    rc, sha, _ = _run_git(["rev-parse", "HEAD"])
+    return sha if rc == 0 else None
+
+
+_NATIVE_STARTUP_SHA = _capture_startup_sha()
 
 
 def _commit_info(ref: str) -> Optional[dict]:
@@ -112,6 +172,7 @@ def admin_version():
     if not _repo_available():
         return {
             "available": False,
+            "mode": "none",
             "reason": f"git repo not mounted at {REPO_DIR}",
             "deployed_sha": _deployed_sha(),
         }
@@ -145,6 +206,7 @@ def admin_version():
 
     return {
         "available": True,
+        "mode": _deploy_mode(),
         "head": head,
         "upstream": upstream,
         "dirty": dirty,
@@ -231,6 +293,12 @@ async def admin_docker_build():
     env set on the subprocess). The new image bakes /app/BUILD_SHA, and
     /version's deployed_matches_head flips true once a restart picks it up.
     """
+    if _deploy_mode() == "native":
+        raise HTTPException(
+            400,
+            "no build step in native/local-replica mode — Python changes apply "
+            "on Restart (re-exec); the frontend is served straight from disk.",
+        )
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
 
@@ -394,6 +462,10 @@ async def admin_restart_mcp():
     unchanged after a rebuild, so compose otherwise sees no config change and
     skips the swap. --no-deps so it doesn't drag photosearch/ollama along.
     """
+    if _deploy_mode() == "native":
+        raise HTTPException(
+            400, "no MCP sibling container in native/local-replica mode",
+        )
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
 
@@ -412,10 +484,52 @@ async def admin_restart_mcp():
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _restart_native():
+    """Restart the local-replica process by re-execing it.
+
+    The replica runs `cli.py serve` as a single uvicorn process (no docker, no
+    workers), so the clean way to apply pulled Python changes is to replace the
+    process image with the same argv+env. We do it from a daemon thread after a
+    short delay so the HTTP response flushes first — the client then sees the
+    listening socket drop (same UX as the docker swap) and auto-polls /version.
+    """
+    if not _op_lock.acquire(blocking=False):
+        raise HTTPException(409, "another admin operation is in progress")
+    try:
+        import sys
+        import time
+
+        argv = [sys.executable] + sys.argv
+
+        def _reexec():
+            time.sleep(0.8)  # let the JSON response flush to the client
+            logger.info("native restart: re-exec %s", " ".join(argv))
+            try:
+                os.execv(sys.executable, argv)
+            except Exception as e:  # pragma: no cover — exec rarely returns
+                logger.error("native restart re-exec failed: %s", e)
+
+        threading.Thread(target=_reexec, daemon=True).start()
+        return {
+            "ok": True,
+            "note": "restarting local replica (process re-exec) — this "
+                    "connection will drop for a few seconds; the page auto-polls "
+                    "for the new process.",
+        }
+    finally:
+        _op_lock.release()
+
+
 @router.post("/restart")
 def admin_restart():
-    """Trigger `docker compose up -d --no-deps photosearch` via a *separate*
-    helper container so the compose process survives this container's death.
+    """Restart the running app to apply pulled code.
+
+    Native (local-replica) mode re-execs the `cli.py serve` process — see
+    `_restart_native`. Docker (NAS) mode does the helper-container swap below.
+
+    Docker path: trigger `docker compose up -d --no-deps photosearch` via a
+    *separate* helper container so the compose process survives this container's
+    death.
 
     Why a helper container instead of in-process subprocess: when compose
     SIGKILLs the running photosearch container after stop_grace_period, every
@@ -438,6 +552,8 @@ def admin_restart():
     as docker swaps it for the fresh one, so the client sees a connection
     drop — that's expected.
     """
+    if _deploy_mode() == "native":
+        return _restart_native()
     if not _op_lock.acquire(blocking=False):
         raise HTTPException(409, "another admin operation is in progress")
     try:

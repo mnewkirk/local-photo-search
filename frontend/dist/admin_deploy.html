@@ -818,15 +818,20 @@
       }
 
       function runRestart() {
+        var native = version && version.mode === 'native';
         if (!window.confirm(
-          'Restart photosearch service?\n\n' +
-          'The page will lose its connection while the container swaps. ' +
-          'Refresh after ~5-15 seconds.'
+          native
+            ? 'Restart the local replica?\n\n' +
+              'The server process re-execs to apply pulled code. The page will ' +
+              'lose its connection for a few seconds, then auto-reconnect.'
+            : 'Restart photosearch service?\n\n' +
+              'The page will lose its connection while the container swaps. ' +
+              'Refresh after ~5-15 seconds.'
         )) return;
         if (busy) return;
         setBuildResult(null);
         setBusy(true);
-        appendLog('▸ docker compose up -d…');
+        appendLog(native ? '▸ re-exec local replica process…' : '▸ docker compose up -d…');
         // Inline handler instead of postAction(): a network error here usually
         // means the container swap dropped our connection mid-response (the
         // OLD container was killed before it could ACK), which is what we
@@ -953,15 +958,20 @@
 
       var head = version.head || {};
       var upstream = version.upstream || {};
+      var native = version.mode === 'native';
       var stateClass, stateLabel;
       if (version.dirty) {
         stateClass = 'dirty'; stateLabel = 'working tree dirty';
       } else if (!version.deployed_sha || version.deployed_sha === 'unknown') {
-        stateClass = 'unknown'; stateLabel = 'deployed SHA unknown (rebuild to capture)';
+        stateClass = 'unknown';
+        stateLabel = native ? 'running commit unknown' : 'deployed SHA unknown (rebuild to capture)';
       } else if (version.deployed_matches_head && version.behind === 0) {
         stateClass = 'ok'; stateLabel = 'up to date';
       } else if (!version.deployed_matches_head) {
-        stateClass = 'behind'; stateLabel = 'running container is behind HEAD — rebuild + restart';
+        stateClass = 'behind';
+        stateLabel = native
+          ? 'running process is behind HEAD — restart to apply'
+          : 'running container is behind HEAD — rebuild + restart';
       } else if (version.behind > 0) {
         stateClass = 'behind'; stateLabel = 'origin is ahead by ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's');
       } else {
@@ -977,13 +987,17 @@
           e('div', { className: 'deploy-head' },
             e('span', { className: 'deploy-state ' + stateClass }, stateLabel)
           ),
-          e('div', { className: 'deploy-meta' },
+          native && e('div', { className: 'deploy-meta', style: { marginTop: 4, fontStyle: 'italic' } },
+            'Local replica (native run) — no Docker build; Restart re-execs the ' +
+            'server to apply pulled Python changes. Frontend edits are served live from disk.'
+          ),
+          e('div', { className: 'deploy-meta', style: { marginTop: native ? 8 : 0 } },
             'HEAD ',     e('span', { className: 'sha' }, head.sha_short || '?'),
             ' · ',       e('span', { className: 'subj' }, head.subject || ''),
             head.date ? ' · ' + head.date.slice(0, 10) : ''
           ),
           e('div', { className: 'deploy-meta', style: { marginTop: 4 } },
-            'Deployed image: ', e('span', { className: 'sha' }, deployedShort),
+            native ? 'Running commit: ' : 'Deployed image: ', e('span', { className: 'sha' }, deployedShort),
             version.behind > 0 ? ' · ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's') + ' behind origin' : '',
             version.ahead > 0 ? ' · ' + version.ahead + ' ahead' : ''
           ),
@@ -1010,7 +1024,7 @@
               onClick: function() { postAction('/api/admin/git-pull', 'git pull'); },
               title: 'git pull --ff-only — fast-forward the working tree',
             }, 'Pull'),
-            e('button', {
+            !native && e('button', {
               className: 'btn',
               disabled: busy,
               onClick: runBuild,
@@ -1020,11 +1034,13 @@
               className: 'btn' + (buildResult === 'ready' ? ' deploy-restart-ready' : ''),
               disabled: busy,
               onClick: runRestart,
-              title: buildResult === 'ready'
-                ? 'New image ready — click to apply it'
-                : 'docker compose up -d — swap to the new image',
+              title: native
+                ? 're-exec the local replica process to apply pulled code'
+                : (buildResult === 'ready'
+                    ? 'New image ready — click to apply it'
+                    : 'docker compose up -d — swap to the new image'),
             }, buildResult === 'ready' ? 'Restart ← new image ready' : 'Restart'),
-            e('button', {
+            !native && e('button', {
               className: 'btn',
               disabled: busy,
               onClick: runRestartMcp,
