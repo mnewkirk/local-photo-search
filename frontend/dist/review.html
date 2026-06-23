@@ -873,6 +873,17 @@
         return sorted;
       }, [photos, viewMode]);
 
+      const doDownload = useCallback(() => {
+        if (!selectedFolder) return;
+        // Navigating to the endpoint downloads the zip (attachment header) without
+        // leaving the page. The Include-ARW toggle applies here too.
+        const params = new URLSearchParams({
+          directory: selectedFolder,
+          include_raw: exportRaw,
+        });
+        window.location.href = API + '/api/review/download?' + params;
+      }, [selectedFolder, exportRaw]);
+
       const openExport = useCallback(() => {
         if (!selectedFolder) return;
         const params = new URLSearchParams({
@@ -1118,9 +1129,16 @@
           ),
           e('button', {
             className: 'btn btn-green',
+            onClick: doDownload,
+            disabled: !stats || stats.selected === 0,
+            title: 'Download the selected photos as a ZIP',
+          }, 'Download Selected'),
+          e('button', {
+            className: 'btn btn-outline',
             onClick: openExport,
             disabled: !stats || stats.selected === 0,
-          }, 'Export Selected'),
+            title: 'List file paths to copy for rsync/cp instead of downloading',
+          }, 'Paths…'),
           e('button', {
             className: 'btn',
             onClick: openSaveCollection,

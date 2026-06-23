@@ -858,6 +858,20 @@
             e('h3', null, 'Photo'),
             e('p', { style: { fontWeight: 600, fontSize: 16 } }, photo.filename),
             detail && detail.filepath && e('p', { style: { color: 'var(--text-muted)', fontSize: 11, wordBreak: 'break-all', marginTop: 2 } }, detail.filepath),
+            // Download the original file. ?download=1 makes the server send it as
+            // an attachment, so this works even when the `download` attr is
+            // ignored (e.g. a cross-origin replica host).
+            e('a', {
+              href: API + '/api/photos/' + photo.id + '/full?download=1',
+              download: photo.filename || '',
+              title: 'Download the original file',
+              style: {
+                display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 8,
+                padding: '5px 12px', fontSize: 13, borderRadius: 6, width: 'fit-content',
+                background: 'var(--surface2)', color: 'var(--text)',
+                border: '1px solid var(--border)', textDecoration: 'none',
+              },
+            }, '↓ Download original'),
             e('div', { style: { display: 'flex', gap: 12, alignItems: 'center' } },
               photo.date_taken && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, photo.date_taken),
               total > 1 && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, (index + 1) + ' / ' + total),

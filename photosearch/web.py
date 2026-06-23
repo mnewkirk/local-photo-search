@@ -399,15 +399,34 @@ def api_thumbnail(photo_id: int):
         raise HTTPException(500, f"Thumbnail error: {e}")
 
 
+def _attachment_header(filename: str) -> str:
+    """Build a Content-Disposition: attachment header that survives non-ASCII
+    filenames (RFC 5987 ``filename*`` plus an ASCII fallback)."""
+    from urllib.parse import quote
+    ascii_name = (filename or "").encode("ascii", "ignore").decode() or "download"
+    ascii_name = ascii_name.replace('"', "")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename or 'download')}"
+
+
 @app.get("/api/photos/{photo_id}/full")
-def api_full_photo(photo_id: int):
-    """Serve the full-resolution original photo."""
+def api_full_photo(
+    photo_id: int,
+    download: bool = Query(False, description="Force a file download (attachment) "
+                           "with the original filename, instead of inline display."),
+):
+    """Serve the full-resolution original photo. ``?download=1`` attaches it as a
+    downloadable file rather than displaying inline."""
     with _get_db() as db:
         photo = db.get_photo(photo_id)
         if not photo:
             raise HTTPException(404, "Photo not found")
 
+        filename = photo.get("filename") or f"photo_{photo_id}.jpg"
         filepath = db.resolve_filepath(photo.get("filepath", ""))
+
+    headers = {"Cache-Control": "no-cache, must-revalidate"}
+    if download:
+        headers["Content-Disposition"] = _attachment_header(filename)
 
     if not filepath or not os.path.exists(filepath):
         # Replica mode: stream the original through from the NAS (not cached —
@@ -415,16 +434,12 @@ def api_full_photo(photo_id: int):
         if _nas_url:
             try:
                 data = _fetch_from_nas(photo_id, "full", timeout=120.0)
-                return Response(content=data, media_type="image/jpeg",
-                                headers={"Cache-Control": "no-cache, must-revalidate"})
+                return Response(content=data, media_type="image/jpeg", headers=headers)
             except Exception as e:
                 raise HTTPException(502, f"NAS full-photo fetch failed: {e}")
         raise HTTPException(404, "Photo file not found on disk")
 
-    return FileResponse(
-        filepath, media_type="image/jpeg",
-        headers={"Cache-Control": "no-cache, must-revalidate"},
-    )
+    return FileResponse(filepath, media_type="image/jpeg", headers=headers)
 
 
 @app.get("/api/photos/{photo_id}/preview")
@@ -1988,6 +2003,81 @@ def api_review_export(
                 files.append({"type": "arw", "path": raw_abs, "filename": raw_name})
 
     return {"files": files, "count": len(files)}
+
+
+@app.get("/api/review/download")
+def api_review_download(
+    directory: str = Query(..., description="Directory path"),
+    include_raw: bool = Query(False, description="Include ARW raw files in the zip"),
+):
+    """Stream a ZIP of the selected photos in a review folder — a real download,
+    unlike /export which only lists paths to copy. Originals are read from disk
+    (or fetched from the NAS in replica mode). Built to a temp file and deleted
+    after the response so a large selection never buffers in RAM on the N100."""
+    import tempfile
+    import zipfile
+    from starlette.background import BackgroundTask
+    from .cull import load_selections
+
+    with _get_db() as db:
+        resolved_dir = directory
+        if db.photo_root and not Path(directory).is_absolute():
+            resolved_dir = str(Path(db.photo_root) / directory)
+
+        selections = load_selections(db, resolved_dir)
+        chosen = [p for p in (selections or []) if p["selected"]]
+        if not chosen:
+            raise HTTPException(404, "No selected photos in that folder")
+
+        # Resolve every source while the DB is open (needed for NAS fallback).
+        entries = []  # (kind, arcname, abs_path_or_None, photo_id)
+        for p in chosen:
+            entries.append(("jpg", p["filename"], db.resolve_filepath(p["filepath"]), p["photo_id"]))
+            if include_raw and p.get("raw_filepath"):
+                raw_abs = db.resolve_filepath(p["raw_filepath"])
+                entries.append(("arw", Path(raw_abs).name if raw_abs else "",
+                                raw_abs, p["photo_id"]))
+
+    tmp = tempfile.NamedTemporaryFile(prefix="review_dl_", suffix=".zip", delete=False)
+    used: dict = {}   # de-collide duplicate basenames across subfolders
+    added = 0
+    try:
+        # ZIP_STORED: JPEG/ARW are already compressed — deflate burns N100 CPU
+        # for ~no size win.
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+            for kind, name, path, pid in entries:
+                name = name or f"photo_{pid}.{kind}"
+                if name in used:
+                    used[name] += 1
+                    stem, dot, ext = name.rpartition(".")
+                    name = f"{stem}_{used[name]}{dot}{ext}" if dot else f"{name}_{used[name]}"
+                else:
+                    used[name] = 0
+                try:
+                    if path and os.path.exists(path):
+                        zf.write(path, arcname=name)
+                        added += 1
+                    elif kind == "jpg" and _nas_url:
+                        zf.writestr(name, _fetch_from_nas(pid, "full", timeout=120.0))
+                        added += 1
+                except Exception:
+                    pass  # unreadable file → skip it, keep the rest of the zip
+        tmp.close()
+    except Exception as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        raise HTTPException(500, f"Zip build failed: {e}")
+
+    if added == 0:
+        os.unlink(tmp.name)
+        raise HTTPException(404, "None of the selected files could be read")
+
+    zipname = f"{Path(directory).name or 'selected'}_selected.zip"
+    return FileResponse(
+        tmp.name, media_type="application/zip",
+        headers={"Content-Disposition": _attachment_header(zipname)},
+        background=BackgroundTask(os.unlink, tmp.name),
+    )
 
 
 @app.get("/api/stats")
