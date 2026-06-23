@@ -1,0 +1,1493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Maintenance — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 24px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .stat-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .progress-bar-wrap {
+      margin-top: 10px;
+      background: var(--surface2);
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: var(--accent);
+      transition: width 0.4s ease;
+    }
+    .progress-bar-fill.complete { background: var(--green); }
+
+    .refresh-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+
+    /* Deployment panel */
+    .deploy-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .deploy-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .deploy-state {
+      font-size: 13px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+    .deploy-state.ok      { background: rgba(74,222,128,0.15); color: #4ade80; }
+    .deploy-state.behind  { background: rgba(250,204,21,0.15); color: #facc15; }
+    .deploy-state.dirty   { background: rgba(248,113,113,0.15); color: #f87171; }
+    .deploy-state.unknown { background: rgba(136,136,136,0.15); color: #aaa; }
+    .deploy-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .deploy-meta .sha { color: var(--text); }
+    .deploy-meta .subj { color: var(--text); }
+    .deploy-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .deploy-log {
+      margin-top: 12px;
+      background: #0b0b0b;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .deploy-log.running { border-color: var(--accent); }
+    /* After a successful build, the Restart button glows so it's clear the
+       next action is to apply the new image. */
+    .deploy-restart-ready {
+      background: rgba(74,222,128,0.15);
+      border-color: var(--green);
+      color: var(--green);
+      animation: pulse-ready 1.8s ease-in-out infinite;
+    }
+    .deploy-restart-ready:hover { border-color: var(--green); color: var(--green); }
+    @keyframes pulse-ready {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); }
+      50%      { box-shadow: 0 0 0 3px rgba(74,222,128,0.2); }
+    }
+
+    /* Generations by model */
+    .gens-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .gens-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .gens-col h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .gens-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .gens-row:last-child { border-bottom: 0; }
+    .gens-model { color: var(--text); font-weight: 500; }
+    .gens-model.null  { color: var(--text-muted); font-style: italic; }
+    .gens-version { color: var(--text-muted); font-size: 11px; font-family: ui-monospace, monospace; margin-left: 6px; }
+    .gens-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+    .error { color: #f87171; font-size: 14px; margin-top: 16px; }
+    .loading { color: var(--text-muted); font-size: 14px; }
+
+    h2 {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 14px;
+      margin-top: 8px;
+    }
+
+    .cmd-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .cmd-table tr {
+      border-bottom: 1px solid var(--border);
+    }
+    .cmd-table tr:last-child { border-bottom: none; }
+    .cmd-table td {
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+    .cmd-table td:first-child {
+      white-space: nowrap;
+      color: var(--text-muted);
+      width: 160px;
+    }
+    .cmd-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .cmd-wrap > div + div {
+      border-top: 1px solid var(--border);
+    }
+    .cmd-note {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 6px 14px 4px;
+    }
+    code {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
+      font-size: 12px;
+      color: var(--accent);
+      background: none;
+      display: block;
+      padding: 6px 14px 10px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* Activity chart */
+    .chart-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 32px;
+    }
+    .chart-area {
+      display: flex;
+      align-items: flex-end;
+      gap: 1px;
+      height: 160px;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+    .chart-bar-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: flex-end;
+      height: 100%;
+      position: relative;
+      min-width: 0;
+    }
+    .chart-bar-col:hover { opacity: 0.85; }
+    .chart-seg {
+      min-height: 0;
+      transition: height 0.3s ease;
+    }
+    .chart-clear-row {
+      position: absolute;
+      bottom: -14px;
+      left: 0;
+      right: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .chart-clear-seg {
+      width: 100%;
+      background: #f87171;
+      min-height: 0;
+    }
+    .chart-x-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      padding: 0 2px;
+    }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .chart-legend-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .chart-legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+    }
+    .chart-tooltip {
+      position: fixed;
+      background: #222;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text);
+      pointer-events: none;
+      z-index: 200;
+      white-space: nowrap;
+    }
+    .chart-tooltip-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      line-height: 1.6;
+    }
+    .chart-tooltip-swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      display: inline-block;
+    }
+    .chart-empty {
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* Stacking form */
+    .stack-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .stack-form-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(140px, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .stack-field label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+    .stack-field input[type="number"] {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .stack-field .field-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+    .stack-toggles {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .stack-toggles label {
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .stack-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .stack-result {
+      font-size: 13px;
+      margin-left: 6px;
+    }
+    .stack-result.ok { color: var(--green); }
+    .stack-result.err { color: #f87171; }
+    .stack-progress {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: var(--surface2);
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+    }
+    .stack-progress-phase {
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .stack-progress-bar {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .stack-progress-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      transition: width 0.2s ease;
+    }
+    .stack-progress-meta {
+      color: var(--text-muted);
+      margin-top: 4px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    /* Workers */
+    .workers-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .workers-head {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .workers-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .workers-idle {
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+    .queue-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .queue-pill {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .queue-pill .q-pass { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .queue-pill .q-count { font-weight: 600; }
+    .queue-pill.empty .q-count { color: var(--text-muted); font-weight: 400; }
+    .active-row {
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+    }
+    .active-row:last-child { border-bottom: none; }
+    .active-pass {
+      color: var(--accent);
+      white-space: nowrap;
+      min-width: 70px;
+    }
+    .active-worker { color: var(--text-muted); min-width: 180px; }
+    .active-count { color: var(--text); white-space: nowrap; }
+    .active-ttl { color: var(--text-muted); white-space: nowrap; margin-left: auto; }
+    .active-ttl.expiring { color: var(--yellow); }
+    .active-ttl.expired { color: #f87171; }
+
+    /* Errors log */
+    .errors-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .error-row {
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+    }
+    .error-row:last-child { border-bottom: none; }
+    .error-time { color: var(--text-muted); white-space: nowrap; }
+    .error-pass {
+      color: var(--yellow);
+      white-space: nowrap;
+      min-width: 60px;
+    }
+    .error-msg { color: #f87171; word-break: break-all; }
+
+    /* Verify failures */
+    .fail-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .fail-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .fail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px;
+      max-height: 520px;
+      overflow-y: auto;
+    }
+    .fail-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+    }
+    .fail-card:hover { border-color: var(--accent); }
+    .fail-thumb {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      background: #111;
+      display: block;
+    }
+    .fail-meta {
+      padding: 6px 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+    .fail-filename {
+      color: var(--text);
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      font-size: 10px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 2px;
+    }
+    .fail-flag {
+      color: #f87171;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0a1520;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    .btn-primary:hover { background: var(--accent-hover); color: #0a1520; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toast {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--green);
+    }
+    .toast.err { color: #f87171; }
+
+    .status-badge {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-right: 4px;
+      letter-spacing: 0.04em;
+    }
+    .status-badge.fail { background: #7f1d1d; color: #fecaca; }
+    .status-badge.regenerated { background: #1e3a5f; color: #bfdbfe; }
+
+    .fail-filter {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .fail-filter label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+    .fail-filter input[type="checkbox"] { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useRef = React.useRef;
+
+    function parseSSEChunk(chunk) {
+      var trimmed = chunk.trim();
+      if (!trimmed || trimmed.startsWith(':')) return null;
+      var m = trimmed.match(/^data:\s*(.*)$/s);
+      if (!m) return null;
+      try { return JSON.parse(m[1]); } catch (_) { return null; }
+    }
+
+    function IngestIncoming() {
+      var _b = useState(false); var busy = _b[0];   var setBusy = _b[1];
+      var _d = useState(false); var dryRun = _d[0]; var setDryRun = _d[1];
+      var _l = useState([]);    var log = _l[0];    var setLog = _l[1];
+
+      function appendLog(line) {
+        setLog(function(prev) {
+          var next = prev.concat([line]);
+          if (next.length > 500) next = next.slice(-500);
+          return next;
+        });
+      }
+
+      function run() {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ ingest-incoming' + (dryRun ? ' --dry-run' : '') + ' (this can take a while)…');
+        fetch('/api/admin/ingest-incoming' + (dryRun ? '?dry_run=true' : ''), { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            var resolved = false;
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ ingest complete' : '  ✗ ingest failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      setBusy(false);
+                    }
+                    if (payload.error) { appendLog('  ✗ ' + payload.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() { if (!resolved) setBusy(false); });
+          })
+          .catch(function(err) { appendLog('  ✗ ingest stream error: ' + err.message); setBusy(false); });
+      }
+
+      return e('div', null,
+        e('h2', null, 'Ingest incoming'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Sweep /photos/_incoming/<source>/ into the library — date routing, '
+            + 'hash dedup, CLIP index (same job as the daily cron). Camera-model '
+            + 'sources land in YYYY-MM-DD_<model>/, phone sources in _phone-<source>/.'),
+          e('div', { className: 'deploy-actions' },
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: run,
+              title: 'docker compose run --rm photosearch ingest-incoming --no-colors',
+            }, busy ? 'Ingesting…' : 'Run ingest'),
+            e('label', {
+              className: 'deploy-meta',
+              style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' },
+            },
+              e('input', {
+                type: 'checkbox', checked: dryRun, disabled: busy,
+                onChange: function(ev) { setDryRun(ev.target.checked); },
+              }),
+              'Dry run'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { setLog([]); },
+              title: 'Clear log',
+              style: { marginLeft: 'auto' },
+            }, 'Clear log')
+          ),
+          log.length > 0 && e('div', {
+            className: 'deploy-log' + (busy ? ' running' : ''),
+          }, log.join('\n'))
+        )
+      );
+    }
+
+    function StackingForm(props) {
+      var _p = useState(Object.assign({}, STACK_DEFAULTS));
+      var params = _p[0]; var setParams = _p[1];
+      var _c = useState(false); var clearFirst = _c[0]; var setClearFirst = _c[1];
+      var _d = useState(false); var dryRun = _d[0]; var setDryRun = _d[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _r = useState(null); var result = _r[0]; var setResult = _r[1];
+      var _pr = useState(null); var progress = _pr[0]; var setProgress = _pr[1];
+      var _s = useState(null); var startedAt = _s[0]; var setStartedAt = _s[1];
+      var _t = useState(0); var setElapsedTick = _t[1];
+      var abortRef = useRef(null);
+
+      // Tick once/sec while running so elapsed-time display updates
+      useEffect(function() {
+        if (!busy) return;
+        var id = setInterval(function() {
+          setElapsedTick(function(n) { return n + 1; });
+        }, 1000);
+        return function() { clearInterval(id); };
+      }, [busy]);
+
+      function update(key, val) {
+        setParams(function(prev) {
+          var next = Object.assign({}, prev);
+          next[key] = val;
+          return next;
+        });
+      }
+
+      async function submit() {
+        if (busy) return;
+        if (clearFirst && !dryRun && !confirm(
+          'This will delete every existing stack and re-detect from scratch. Continue?'
+        )) return;
+
+        setBusy(true);
+        setResult(null);
+        setProgress(null);
+        setStartedAt(Date.now());
+
+        var controller = new AbortController();
+        abortRef.current = controller;
+
+        try {
+          var response = await fetch('/api/stacks/detect/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              time_window_sec: Number(params.time_window_sec),
+              clip_threshold: Number(params.clip_threshold),
+              max_stack_span_sec: Number(params.max_stack_span_sec),
+              clear: clearFirst,
+              dry_run: dryRun,
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            var body = await response.json().catch(function() { return {}; });
+            throw new Error(body.detail || ('HTTP ' + response.status));
+          }
+
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder();
+          var buffer = '';
+          var terminal = null;
+
+          while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              var raw = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              var ev = parseSSEChunk(raw);
+              if (!ev) continue;
+              if (ev.type === 'progress') {
+                setProgress(ev);
+              } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'fatal') {
+                terminal = ev;
+              }
+            }
+            if (terminal) break;
+          }
+
+          if (!terminal) {
+            // Stream ended without a terminal event (server crash or proxy cut)
+            throw new Error('stream ended unexpectedly');
+          }
+
+          if (terminal.type === 'done') {
+            setResult({
+              ok: true,
+              msg: (terminal.dry_run ? '[dry run] ' : '')
+                + terminal.stacks_created.toLocaleString() + ' stacks · '
+                + terminal.photos_stacked.toLocaleString() + ' photos · '
+                + terminal.duration_seconds + 's'
+                + (terminal.cleared ? ' · cleared first' : ''),
+            });
+            if (props.onComplete && !terminal.dry_run) props.onComplete();
+          } else if (terminal.type === 'cancelled') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: terminal.message || 'Failed' });
+          }
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: err.message });
+          }
+        } finally {
+          setBusy(false);
+          setProgress(null);
+          setStartedAt(null);
+          abortRef.current = null;
+        }
+      }
+
+      function cancel() {
+        if (abortRef.current) abortRef.current.abort();
+      }
+
+      function reset() {
+        if (busy) return;
+        setParams(Object.assign({}, STACK_DEFAULTS));
+        setClearFirst(false);
+        setDryRun(false);
+        setResult(null);
+      }
+
+      var field = function(key, label, step, hint) {
+        return e('div', { className: 'stack-field', key: key },
+          e('label', null, label),
+          e('input', {
+            type: 'number',
+            step: step,
+            min: 0,
+            value: params[key],
+            disabled: busy,
+            onChange: function(ev) { update(key, ev.target.value); },
+          }),
+          e('div', { className: 'field-hint' }, hint)
+        );
+      };
+
+      var progressNode = null;
+      if (busy) {
+        var phaseText = 'Starting\u2026';
+        var fillPct = null;
+        var metaLeft = '';
+        var metaRight = '';
+        if (progress) {
+          phaseText = PHASE_LABELS[progress.phase] || progress.phase;
+          if (typeof progress.total === 'number' && progress.total > 0) {
+            var done = progress.loaded != null ? progress.loaded :
+                       progress.processed != null ? progress.processed :
+                       progress.saved != null ? progress.saved : 0;
+            fillPct = Math.min(100, (done / progress.total) * 100);
+            metaLeft = done.toLocaleString() + ' / ' + progress.total.toLocaleString();
+          } else if (progress.phase === 'group' && typeof progress.stacks_detected === 'number') {
+            metaLeft = progress.stacks_detected.toLocaleString() + ' stacks · '
+                     + progress.photos_stacked.toLocaleString() + ' photos';
+          } else if (progress.phase === 'scan' && typeof progress.scanned === 'number') {
+            metaLeft = progress.scanned.toLocaleString() + ' photos';
+          }
+          if (progress.phase === 'pairs' && typeof progress.pairs_found === 'number') {
+            metaLeft += ' · ' + progress.pairs_found.toLocaleString() + ' pairs';
+          }
+        }
+        if (startedAt) {
+          var elapsed = Math.floor((Date.now() - startedAt) / 1000);
+          metaRight = elapsed + 's elapsed';
+        }
+        progressNode = e('div', { className: 'stack-progress' },
+          e('div', { className: 'stack-progress-phase' }, phaseText),
+          fillPct != null && e('div', { className: 'stack-progress-bar' },
+            e('div', {
+              className: 'stack-progress-bar-fill',
+              style: { width: fillPct + '%' }
+            })
+          ),
+          e('div', { className: 'stack-progress-meta' },
+            e('span', null, metaLeft),
+            e('span', null, metaRight)
+          )
+        );
+      }
+
+      return e('div', null,
+        e('h2', null, 'Stacking'),
+        e('div', { className: 'stack-wrap' },
+          e('div', { className: 'stack-form-row' },
+            field('time_window_sec', 'Time window (s)', '0.5',
+                  'max gap between consecutive shots'),
+            field('clip_threshold', 'CLIP threshold', '0.01',
+                  'max cosine distance — lower = stricter'),
+            field('max_stack_span_sec', 'Max span (s)', '0.5',
+                  'hard cap on stack duration')
+          ),
+          e('div', { className: 'stack-toggles' },
+            e('label', null,
+              e('input', {
+                type: 'checkbox',
+                checked: clearFirst,
+                disabled: busy,
+                onChange: function(ev) { setClearFirst(ev.target.checked); },
+              }),
+              'Clear existing stacks first'
+            ),
+            e('label', null,
+              e('input', {
+                type: 'checkbox',
+                checked: dryRun,
+                disabled: busy,
+                onChange: function(ev) { setDryRun(ev.target.checked); },
+              }),
+              'Dry run (don\u2019t save)'
+            )
+          ),
+          e('div', { className: 'stack-actions' },
+            busy
+              ? e('button', { className: 'btn', onClick: cancel }, 'Cancel')
+              : e('button', { className: 'btn', onClick: submit },
+                  dryRun ? 'Preview' : 'Run stacking'),
+            e('button', {
+              className: 'btn',
+              onClick: reset,
+              disabled: busy,
+            }, 'Reset'),
+            result && e('span', {
+              className: 'stack-result ' + (result.ok ? 'ok' : 'err')
+            }, result.msg)
+          ),
+          progressNode
+        )
+      );
+    }
+
+    function MaintenanceSweep(props) {
+      var _a = useState(false); var doApply = _a[0]; var setApply = _a[1];
+      // Heavy stages default OFF — they peg the N100 and starve the server.
+      // Enable them only for an off-hours run (or use the CLI/cron).
+      var _c = useState(false);  var doColors = _c[0]; var setColors = _c[1];
+      var _st = useState(false); var doStacking = _st[0]; var setStacking = _st[1];
+      var _m = useState(false);  var doMatch = _m[0]; var setMatch = _m[1];
+      var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _stg = useState({}); var stages = _stg[0]; var setStages = _stg[1];
+      var _r = useState(null);  var result = _r[0]; var setResult = _r[1];
+      var _v = useState(null);  var report = _v[0]; var setReport = _v[1];
+      var _vb = useState(false); var vBusy = _vb[0]; var setVBusy = _vb[1];
+      var abortRef = useRef(null);
+
+      function setStage(stage, patch) {
+        setStages(function(prev) {
+          var next = Object.assign({}, prev);
+          next[stage] = Object.assign({}, prev[stage] || {}, patch);
+          return next;
+        });
+      }
+
+      async function submit() {
+        if (busy) return;
+        if (doApply && doRecluster && !confirm(
+          'Recluster renumbers every unknown face cluster and clears '
+          + 'ignored_clusters. Continue?'
+        )) return;
+        if (doApply && !confirm(
+          'Apply mode WRITES to the database (idempotent, missing-only). Continue?'
+        )) return;
+
+        setBusy(true);
+        setStages({});
+        setResult(null);
+        var controller = new AbortController();
+        abortRef.current = controller;
+
+        try {
+          var response = await fetch('/api/admin/maintenance-sweep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apply: doApply,
+              do_colors: doColors,
+              do_stacking: doStacking,
+              do_match: doMatch,
+              do_recluster: doRecluster,
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok) {
+            var body = await response.json().catch(function() { return {}; });
+            throw new Error(body.detail || ('HTTP ' + response.status));
+          }
+
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder();
+          var buffer = '';
+          var terminal = null;
+
+          while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+              var raw = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              var ev = parseSSEChunk(raw);
+              if (!ev) continue;
+              if (ev.type === 'progress' && ev.stage) {
+                setStage(ev.stage, {
+                  status: ev.status,
+                  would: ev.would,
+                  applied: ev.applied,
+                  message: ev.message,
+                  done: ev.done,
+                  total: ev.total,
+                });
+              } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'fatal') {
+                terminal = ev;
+              }
+            }
+            if (terminal) break;
+          }
+
+          if (!terminal) throw new Error('stream ended unexpectedly');
+
+          if (terminal.type === 'done') {
+            setResult({
+              ok: true,
+              msg: (terminal.apply ? '' : '[dry run] ')
+                + (terminal.apply
+                    ? terminal.total_applied.toLocaleString() + ' rows changed'
+                    : terminal.total_would.toLocaleString() + ' rows would change')
+                + ' · ' + (terminal.stages || []).length + ' stages · '
+                + terminal.duration_seconds + 's',
+            });
+            if (props.onComplete && terminal.apply) props.onComplete();
+          } else if (terminal.type === 'cancelled') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: terminal.message || 'Failed' });
+          }
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            setResult({ ok: false, msg: 'Cancelled' });
+          } else {
+            setResult({ ok: false, msg: err.message });
+          }
+        } finally {
+          setBusy(false);
+          abortRef.current = null;
+        }
+      }
+
+      function cancel() {
+        if (abortRef.current) abortRef.current.abort();
+      }
+
+      function validate() {
+        if (vBusy) return;
+        setVBusy(true);
+        setReport(null);
+        fetch('/api/admin/validate-data')
+          .then(function(r) { return r.json(); })
+          .then(function(data) { setReport(data); })
+          .catch(function(err) { setReport({ error: err.message }); })
+          .finally(function() { setVBusy(false); });
+      }
+
+      var order = ['geocode', 'normalize', 'infer', 'normalize_inferred',
+                   'colors', 'stacking', 'match_faces', 'resolve_dups', 'recluster'];
+      var stageRows = order.filter(function(s) { return stages[s]; }).map(function(s) {
+        var st = stages[s];
+        var bits = [];
+        if (st.would != null && st.would !== 0) bits.push('would ' + st.would.toLocaleString());
+        if (st.applied != null && st.applied !== 0) bits.push('applied ' + st.applied.toLocaleString());
+        if (st.done != null && st.total != null) bits.push(st.done.toLocaleString() + ' / ' + st.total.toLocaleString());
+        if (st.message) bits.push(st.message);
+        return e('div', { className: 'stack-progress-meta', key: s },
+          e('span', null, (SWEEP_STAGE_LABELS[s] || s) + ' — ' + (st.status || '')),
+          e('span', null, bits.join(' · '))
+        );
+      });
+
+      var reportNode = null;
+      if (report) {
+        if (report.error) {
+          reportNode = e('div', { className: 'stack-result err' }, report.error);
+        } else {
+          var lines = [];
+          Object.keys(report).forEach(function(cat) {
+            var info = report[cat] || {};
+            if (cat === 'malformed_json') {
+              var totalBad = Object.keys(info).reduce(function(acc, col) {
+                return acc + ((info[col] && info[col].count) || 0);
+              }, 0);
+              lines.push('malformed_json: ' + totalBad);
+            } else {
+              lines.push(cat + ': ' + (info.count != null ? info.count
+                : JSON.stringify(info)) + (info.hint ? '  → ' + info.hint : ''));
+            }
+          });
+          reportNode = e('div', { className: 'deploy-log' }, lines.join('\n'));
+        }
+      }
+
+      return e('div', null,
+        e('h2', null, 'Maintenance sweep'),
+        e('div', { className: 'stack-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Dependency-ordered backfill over only-the-missing rows. Runs the '
+            + 'fast stages (place names, structured location cols, inferred GPS, '
+            + 'duplicate-person resolution) by default. The heavy stages '
+            + '(colors/stacking/match) peg the N100 and starve the server — '
+            + 'leave them off here and run the full sweep off-hours via cron. '
+            + 'Dry-run unless Apply is checked.'),
+          e('div', { className: 'stack-toggles' },
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doApply, disabled: busy,
+                onChange: function(ev) { setApply(ev.target.checked); } }),
+              'Apply (write changes)'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doColors, disabled: busy,
+                onChange: function(ev) { setColors(ev.target.checked); } }),
+              'Colors (heavy)'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doStacking, disabled: busy,
+                onChange: function(ev) { setStacking(ev.target.checked); } }),
+              'Stacking (heavy)'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doMatch, disabled: busy,
+                onChange: function(ev) { setMatch(ev.target.checked); } }),
+              'Match faces (heavy)'),
+            e('label', null,
+              e('input', { type: 'checkbox', checked: doRecluster, disabled: busy,
+                onChange: function(ev) { setRecluster(ev.target.checked); } }),
+              'Recluster faces (clears ignored)')
+          ),
+          e('div', { className: 'stack-actions' },
+            busy
+              ? e('button', { className: 'btn', onClick: cancel }, 'Cancel')
+              : e('button', { className: 'btn', onClick: submit },
+                  doApply ? 'Run sweep' : 'Preview'),
+            e('button', { className: 'btn', onClick: validate, disabled: vBusy },
+              vBusy ? 'Validating…' : 'Validate data'),
+            result && e('span', {
+              className: 'stack-result ' + (result.ok ? 'ok' : 'err')
+            }, result.msg)
+          ),
+          stageRows.length > 0 && e('div', { className: 'stack-progress' }, stageRows),
+          reportNode
+        )
+      );
+    }
+
+    function InferLocationForm(props) {
+      var _p = useState({
+        window_minutes: 30,
+        max_drift_km: 25.0,
+        min_confidence: 0.0,
+        cascade: true,
+        max_cascade_rounds: 10,
+      });
+      var params = _p[0]; var setParams = _p[1];
+      var _pv = useState(null); var preview = _pv[0]; var setPreview = _pv[1];
+      var _ph = useState(null); var previewParamsHash = _ph[0]; var setPreviewParamsHash = _ph[1];
+      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
+      var _er = useState(null); var error = _er[0]; var setError = _er[1];
+
+      var paramsHash = JSON.stringify(params);
+      var applyReady = preview && previewParamsHash === paramsHash && preview.candidate_count > 0;
+
+      async function runPreview() {
+        setBusy(true);
+        setError(null);
+        try {
+          var r = await fetch('/api/geocode/infer-preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          var body = await r.json();
+          setPreview(body);
+          setPreviewParamsHash(paramsHash);
+        } catch (err) {
+          setError(String(err));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function runApply() {
+        if (!applyReady) return;
+        var msg = 'Apply ' + preview.candidate_count.toLocaleString() + ' inferences?\n\n'
+          + 'window=' + params.window_minutes + 'min, max_drift=' + params.max_drift_km + 'km, '
+          + 'min_conf=' + params.min_confidence + ', cascade=' + params.cascade;
+        if (!window.confirm(msg)) return;
+
+        setBusy(true);
+        setError(null);
+        try {
+          var payload = Object.assign({}, params, { confirm: true });
+          var r = await fetch('/api/geocode/infer-apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          var body = await r.json();
+          alert('Applied ' + body.updated_count.toLocaleString()
+            + ' inferences in ' + body.duration_seconds.toFixed(1) + 's.');
+          setPreview(null);
+          setPreviewParamsHash(null);
+          await runPreview();
+          if (props.onDone) props.onDone();
+        } catch (err) {
+          setError(String(err));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      function setParam(key) {
+        return function(ev) {
+          var raw = ev.target.type === 'checkbox' ? ev.target.checked : ev.target.value;
+          var val = raw;
+          if (ev.target.type === 'number') {
+            val = raw === '' ? '' : Number(raw);
+          }
+          setParams(function(prev) {
+            var next = Object.assign({}, prev);
+            next[key] = val;
+            return next;
+          });
+        };
+      }
+
+      function renderHistogram(rows, labelKey, valueKey) {
+        var max = 1;
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i][valueKey] > max) max = rows[i][valueKey];
+        }
+        return rows.map(function(row, idx) {
+          return e('div', {
+            key: idx,
+            style: { display: 'flex', gap: 8, fontFamily: 'monospace', fontSize: 13 }
+          },
+            e('div', { style: { width: 110 } }, String(row[labelKey])),
+            e('div', {
+              style: {
+                width: Math.round((row[valueKey] / max) * 200),
+                background: '#4a90e2',
+                height: 14,
+              }
+            }),
+            e('div', null, row[valueKey].toLocaleString())
+          );
+        });
+      }
+
+      var inputsRow = e('div', {
+        style: { display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'end', marginBottom: 8 }
+      },
+        e('label', null, 'Window (min)',
+          e('input', {
+            type: 'number', value: params.window_minutes, onChange: setParam('window_minutes'),
+            min: 1, style: { width: 70, display: 'block' }
+          })),
+        e('label', null, 'Max drift (km)',
+          e('input', {
+            type: 'number', value: params.max_drift_km, onChange: setParam('max_drift_km'),
+            min: 0, step: 0.5, style: { width: 90, display: 'block' }
+          })),
+        e('label', null, 'Min conf',
+          e('input', {
+            type: 'number', value: params.min_confidence, onChange: setParam('min_confidence'),
+            min: 0, max: 1, step: 0.05, style: { width: 70, display: 'block' }
+          })),
+        e('label', null,
+          e('input', { type: 'checkbox', checked: params.cascade, onChange: setParam('cascade') }),
+          ' Cascade'),
+        e('label', null, 'Max rounds',
+          e('input', {
+            type: 'number', value: params.max_cascade_rounds, onChange: setParam('max_cascade_rounds'),
+            min: 1, max: 50, style: { width: 70, display: 'block' }
+          }))
+      );
+
+      var buttonsRow = e('div', { style: { display: 'flex', gap: 8, marginBottom: 12 } },
+        e('button', { onClick: runPreview, disabled: busy }, busy ? 'Working…' : 'Preview'),
+        e('button', {
+          onClick: runApply,
+          disabled: busy || !applyReady,
+        },
+          preview && preview.candidate_count > 0
+            ? 'Apply ' + preview.candidate_count.toLocaleString() + ' inferences'
+            : 'Apply'
+        )
+      );
+
+      var errorNode = error
+        ? e('div', { style: { color: '#b00', marginBottom: 8 } }, error)
+        : null;
+
+      var previewNode = null;
+      if (preview) {
+        var skipped = preview.skipped || {};
+        var skippedEntries = Object.keys(skipped).map(function(k) {
+          return k + ' ' + (skipped[k] || 0).toLocaleString();
+        }).join(' · ');
+
+        var samplesNode = null;
+        if (preview.samples && preview.samples.length > 0) {
+          samplesNode = e('div', null,
+            e('div', { style: { fontWeight: 500, margin: '8px 0 4px' } }, 'Samples'),
+            preview.samples.map(function(s) {
+              var loc = s.place_name
+                ? s.place_name
+                : s.inferred_lat.toFixed(3) + ', ' + s.inferred_lon.toFixed(3);
+              var hopLabel = s.hop_count === 1 ? 'hop' : 'hops';
+              var detail = '→ ' + loc + ' · conf ' + s.confidence.toFixed(2)
+                + ' · ' + s.time_gap_min.toFixed(0) + 'min'
+                + ' · drift ' + s.drift_km.toFixed(1) + 'km'
+                + ' · ' + s.hop_count + ' ' + hopLabel;
+              return e('div', {
+                key: s.photo_id,
+                style: { display: 'flex', gap: 8, alignItems: 'center', padding: '4px 0' }
+              },
+                e('img', {
+                  src: s.thumbnail_url,
+                  style: { width: 48, height: 48, objectFit: 'cover' }
+                }),
+                e('div', null,
+                  e('div', { style: { fontFamily: 'monospace', fontSize: 12 } }, s.filepath),
+                  e('div', { style: { fontSize: 12, color: '#555' } }, detail)
+                )
+              );
+            })
+          );
+        }
+
+        previewNode = e('div', null,
+          e('div', { style: { fontWeight: 600, marginBottom: 4 } },
+            preview.candidate_count.toLocaleString() + ' candidates out of '
+              + preview.no_gps_count.toLocaleString() + ' no-GPS photos (cascade '
+              + preview.cascade_rounds_used + ' rounds).'),
+          e('div', { style: { fontSize: 13, color: '#555', marginBottom: 8 } },
+            'Skipped: ' + skippedEntries),
+          e('div', { style: { marginBottom: 8 } },
+            e('div', { style: { fontWeight: 500 } }, 'Confidence'),
+            renderHistogram(preview.confidence_buckets || [], 'bucket', 'count')),
+          e('div', { style: { marginBottom: 8 } },
+            e('div', { style: { fontWeight: 500 } }, 'Hops'),
+            renderHistogram(preview.hop_distribution || [], 'hops', 'count')),
+          samplesNode
+        );
+      }
+
+      return e('div', null,
+        e('h2', null, 'Infer Locations'),
+        e('div', { className: 'stack-wrap' },
+          inputsRow,
+          buttonsRow,
+          errorNode,
+          previewNode
+        )
+      );
+    }
+
+    function Page() {
+      var noop = function () {};
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'maint' }),
+        e('div', { className: 'container' },
+          e('h1', null, 'Maintenance'),
+          e('p', { style: { color: 'var(--text-muted)', marginBottom: 18, maxWidth: 760 } },
+            'CPU-light backfills + on-demand jobs. Heavy GPU passes stay with the worker fleet.'),
+          e(IngestIncoming, null),
+          e(StackingForm, { onComplete: noop }),
+          e(MaintenanceSweep, { onComplete: noop }),
+          e(InferLocationForm, { onDone: noop })
+        )
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(e(Page, null));
+  </script>
+</body>
+</html>

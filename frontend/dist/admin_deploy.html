@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deploy — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 24px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .stat-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .progress-bar-wrap {
+      margin-top: 10px;
+      background: var(--surface2);
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: var(--accent);
+      transition: width 0.4s ease;
+    }
+    .progress-bar-fill.complete { background: var(--green); }
+
+    .refresh-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    .btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+
+    /* Deployment panel */
+    .deploy-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .deploy-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .deploy-state {
+      font-size: 13px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+    .deploy-state.ok      { background: rgba(74,222,128,0.15); color: #4ade80; }
+    .deploy-state.behind  { background: rgba(250,204,21,0.15); color: #facc15; }
+    .deploy-state.dirty   { background: rgba(248,113,113,0.15); color: #f87171; }
+    .deploy-state.unknown { background: rgba(136,136,136,0.15); color: #aaa; }
+    .deploy-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .deploy-meta .sha { color: var(--text); }
+    .deploy-meta .subj { color: var(--text); }
+    .deploy-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .deploy-log {
+      margin-top: 12px;
+      background: #0b0b0b;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .deploy-log.running { border-color: var(--accent); }
+    /* After a successful build, the Restart button glows so it's clear the
+       next action is to apply the new image. */
+    .deploy-restart-ready {
+      background: rgba(74,222,128,0.15);
+      border-color: var(--green);
+      color: var(--green);
+      animation: pulse-ready 1.8s ease-in-out infinite;
+    }
+    .deploy-restart-ready:hover { border-color: var(--green); color: var(--green); }
+    @keyframes pulse-ready {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); }
+      50%      { box-shadow: 0 0 0 3px rgba(74,222,128,0.2); }
+    }
+
+    /* Generations by model */
+    .gens-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .gens-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .gens-col h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .gens-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .gens-row:last-child { border-bottom: 0; }
+    .gens-model { color: var(--text); font-weight: 500; }
+    .gens-model.null  { color: var(--text-muted); font-style: italic; }
+    .gens-version { color: var(--text-muted); font-size: 11px; font-family: ui-monospace, monospace; margin-left: 6px; }
+    .gens-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+    .error { color: #f87171; font-size: 14px; margin-top: 16px; }
+    .loading { color: var(--text-muted); font-size: 14px; }
+
+    h2 {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 14px;
+      margin-top: 8px;
+    }
+
+    .cmd-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .cmd-table tr {
+      border-bottom: 1px solid var(--border);
+    }
+    .cmd-table tr:last-child { border-bottom: none; }
+    .cmd-table td {
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+    .cmd-table td:first-child {
+      white-space: nowrap;
+      color: var(--text-muted);
+      width: 160px;
+    }
+    .cmd-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .cmd-wrap > div + div {
+      border-top: 1px solid var(--border);
+    }
+    .cmd-note {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 6px 14px 4px;
+    }
+    code {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
+      font-size: 12px;
+      color: var(--accent);
+      background: none;
+      display: block;
+      padding: 6px 14px 10px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* Activity chart */
+    .chart-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 32px;
+    }
+    .chart-area {
+      display: flex;
+      align-items: flex-end;
+      gap: 1px;
+      height: 160px;
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+    .chart-bar-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: flex-end;
+      height: 100%;
+      position: relative;
+      min-width: 0;
+    }
+    .chart-bar-col:hover { opacity: 0.85; }
+    .chart-seg {
+      min-height: 0;
+      transition: height 0.3s ease;
+    }
+    .chart-clear-row {
+      position: absolute;
+      bottom: -14px;
+      left: 0;
+      right: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .chart-clear-seg {
+      width: 100%;
+      background: #f87171;
+      min-height: 0;
+    }
+    .chart-x-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      padding: 0 2px;
+    }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .chart-legend-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .chart-legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+    }
+    .chart-tooltip {
+      position: fixed;
+      background: #222;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text);
+      pointer-events: none;
+      z-index: 200;
+      white-space: nowrap;
+    }
+    .chart-tooltip-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      line-height: 1.6;
+    }
+    .chart-tooltip-swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      display: inline-block;
+    }
+    .chart-empty {
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* Stacking form */
+    .stack-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .stack-form-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(140px, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .stack-field label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+    .stack-field input[type="number"] {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    .stack-field .field-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+    .stack-toggles {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .stack-toggles label {
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .stack-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .stack-result {
+      font-size: 13px;
+      margin-left: 6px;
+    }
+    .stack-result.ok { color: var(--green); }
+    .stack-result.err { color: #f87171; }
+    .stack-progress {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: var(--surface2);
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+    }
+    .stack-progress-phase {
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .stack-progress-bar {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .stack-progress-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      transition: width 0.2s ease;
+    }
+    .stack-progress-meta {
+      color: var(--text-muted);
+      margin-top: 4px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    /* Workers */
+    .workers-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .workers-head {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .workers-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .workers-idle {
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+    .queue-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .queue-pill {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .queue-pill .q-pass { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .queue-pill .q-count { font-weight: 600; }
+    .queue-pill.empty .q-count { color: var(--text-muted); font-weight: 400; }
+    .active-row {
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+    }
+    .active-row:last-child { border-bottom: none; }
+    .active-pass {
+      color: var(--accent);
+      white-space: nowrap;
+      min-width: 70px;
+    }
+    .active-worker { color: var(--text-muted); min-width: 180px; }
+    .active-count { color: var(--text); white-space: nowrap; }
+    .active-ttl { color: var(--text-muted); white-space: nowrap; margin-left: auto; }
+    .active-ttl.expiring { color: var(--yellow); }
+    .active-ttl.expired { color: #f87171; }
+
+    /* Errors log */
+    .errors-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .error-row {
+      font-size: 12px;
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+    }
+    .error-row:last-child { border-bottom: none; }
+    .error-time { color: var(--text-muted); white-space: nowrap; }
+    .error-pass {
+      color: var(--yellow);
+      white-space: nowrap;
+      min-width: 60px;
+    }
+    .error-msg { color: #f87171; word-break: break-all; }
+
+    /* Verify failures */
+    .fail-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 32px;
+    }
+    .fail-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .fail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px;
+      max-height: 520px;
+      overflow-y: auto;
+    }
+    .fail-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+    }
+    .fail-card:hover { border-color: var(--accent); }
+    .fail-thumb {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      background: #111;
+      display: block;
+    }
+    .fail-meta {
+      padding: 6px 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+    .fail-filename {
+      color: var(--text);
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      font-size: 10px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 2px;
+    }
+    .fail-flag {
+      color: #f87171;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0a1520;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    .btn-primary:hover { background: var(--accent-hover); color: #0a1520; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toast {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--green);
+    }
+    .toast.err { color: #f87171; }
+
+    .status-badge {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-right: 4px;
+      letter-spacing: 0.04em;
+    }
+    .status-badge.fail { background: #7f1d1d; color: #fecaca; }
+    .status-badge.regenerated { background: #1e3a5f; color: #bfdbfe; }
+
+    .fail-filter {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .fail-filter label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+    .fail-filter input[type="checkbox"] { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useRef = React.useRef;
+
+    function Deployment() {
+      var _v = useState(null);  var version = _v[0];  var setVersion = _v[1];
+      var _b = useState(false); var busy = _b[0];     var setBusy = _b[1];
+      var _l = useState([]);    var log = _l[0];      var setLog = _l[1];
+      var _bu = useState(false); var building = _bu[0]; var setBuilding = _bu[1];
+      // null | "ready" | "failed" — sticky banner so it's clear the build
+      // finished and the operator can/should click Restart now.
+      var _br = useState(null); var buildResult = _br[0]; var setBuildResult = _br[1];
+
+      function appendLog(line) {
+        setLog(function(prev) {
+          var next = prev.concat([line]);
+          if (next.length > 500) next = next.slice(-500); // cap
+          return next;
+        });
+      }
+
+      function loadVersion() {
+        fetch('/api/admin/version')
+          .then(function(r) { return r.json(); })
+          .then(setVersion)
+          .catch(function(err) { setVersion({ available: false, reason: 'fetch failed: ' + err.message }); });
+      }
+
+      useEffect(function() { loadVersion(); }, []);
+
+      function postAction(path, label) {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ ' + label + '…');
+        fetch(path, { method: 'POST' })
+          .then(function(r) {
+            return r.text().then(function(t) { return { ok: r.ok, status: r.status, body: t }; });
+          })
+          .then(function(res) {
+            if (!res.ok) {
+              try { var j = JSON.parse(res.body); appendLog('  ✗ ' + (j.detail || res.body)); }
+              catch (_) { appendLog('  ✗ HTTP ' + res.status + ': ' + res.body); }
+            } else {
+              try {
+                var j = JSON.parse(res.body);
+                if (j.output) j.output.split('\n').forEach(function(line) { if (line) appendLog('  ' + line); });
+                if (j.note) appendLog('  ' + j.note);
+                appendLog('  ✓ ' + label + ' OK');
+              } catch (_) { appendLog('  ✓ ' + label + ' OK'); }
+              loadVersion();
+            }
+          })
+          .catch(function(err) { appendLog('  ✗ ' + label + ' failed: ' + err.message); })
+          .then(function() { setBusy(false); });
+      }
+
+      function finishBuild(success) {
+        // Flip building state the moment the `done` event arrives, instead
+        // of waiting for the stream to close — otherwise the user sees
+        // "build OK" in the log but the button still says "Building…" until
+        // the connection finally drops.
+        setBuilding(false);
+        setBusy(false);
+        setBuildResult(success ? 'ready' : 'failed');
+        loadVersion();
+      }
+
+      function runBuild() {
+        if (busy || building) return;
+        setBusy(true);
+        setBuilding(true);
+        setBuildResult(null);
+        appendLog('▸ docker compose build (this may take several minutes)…');
+        // SSE-style stream from the POST handler.
+        fetch('/api/admin/docker-build', { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            var resolved = false;
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                // SSE events separated by blank line; each event has lines like "event: line\ndata: {...}"
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ build OK — click Restart to apply' : '  ✗ build failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      finishBuild(ok);
+                    }
+                    if (payload.error) {
+                      appendLog('  ✗ ' + payload.error);
+                      resolved = true;
+                      finishBuild(false);
+                    }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() {
+              // Safety net: stream closed without ever emitting a done event
+              if (!resolved) finishBuild(false);
+            });
+          })
+          .catch(function(err) {
+            appendLog('  ✗ build stream error: ' + err.message);
+            finishBuild(false);
+          });
+      }
+
+      function runRestart() {
+        if (!window.confirm(
+          'Restart photosearch service?\n\n' +
+          'The page will lose its connection while the container swaps. ' +
+          'Refresh after ~5-15 seconds.'
+        )) return;
+        if (busy) return;
+        setBuildResult(null);
+        setBusy(true);
+        appendLog('▸ docker compose up -d…');
+        // Inline handler instead of postAction(): a network error here usually
+        // means the container swap dropped our connection mid-response (the
+        // OLD container was killed before it could ACK), which is what we
+        // *want*. Treat it as a soft success and auto-poll for the new one.
+        fetch('/api/admin/restart', { method: 'POST' })
+          .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, status: r.status, body: t }; }); })
+          .then(function(res) {
+            if (!res.ok) {
+              try { var j = JSON.parse(res.body); appendLog('  ✗ ' + (j.detail || res.body)); }
+              catch (_) { appendLog('  ✗ HTTP ' + res.status + ': ' + res.body); }
+            } else {
+              appendLog('  ✓ restart triggered — page may briefly lose connection');
+            }
+          })
+          .catch(function() {
+            appendLog('  ✓ restart in progress — container swap dropped this connection (expected)');
+          })
+          .then(function() {
+            setBusy(false);
+            // Auto-poll /version with a generous window — uvicorn boot + the
+            // ML-model imports take 30-60s on the N100 NAS, so a 24s window
+            // false-alarms even on healthy restarts. 30 attempts × 3s = 90s.
+            // /api/admin/version is lightweight (no DB hits) so it's the
+            // cleanest readiness signal — if THAT 200s, the app is alive.
+            var attempts = 0;
+            var MAX_ATTEMPTS = 30;
+            function poll() {
+              attempts += 1;
+              fetch('/api/admin/version', { cache: 'no-store' })
+                .then(function(r) {
+                  if (!r.ok) throw new Error('HTTP ' + r.status);
+                  return r.json();
+                })
+                .then(function(d) {
+                  setVersion(d);
+                  var sha = d.deployed_sha ? d.deployed_sha.slice(0, 7) : 'unknown';
+                  appendLog('  ✓ new container reachable — deployed: ' + sha);
+                })
+                .catch(function() {
+                  if (attempts < MAX_ATTEMPTS) {
+                    // Quieter status — log every 5th attempt instead of every one
+                    if (attempts === 1 || attempts % 5 === 0) {
+                      appendLog('  … waiting for new container (' + attempts + '/' + MAX_ATTEMPTS + ')');
+                    }
+                    setTimeout(poll, 3000);
+                  } else {
+                    appendLog('  ⚠ couldn\'t reach the new container after ~' + (MAX_ATTEMPTS * 3) + 's.');
+                    appendLog('     The container may have crashed on startup — on the NAS:');
+                    appendLog('       docker ps -a --filter name=^photosearch$');
+                    appendLog('       docker logs photosearch --tail 50');
+                  }
+                });
+            }
+            setTimeout(poll, 4000); // give docker a moment to start the swap
+          });
+      }
+
+      function runRestartMcp() {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ docker compose up -d --force-recreate photosearch-mcp…');
+        // SSE stream — unlike the photosearch restart, THIS container stays
+        // alive (we're recreating a sibling), so the connection doesn't drop
+        // and we can read the stream + return code to completion.
+        var resolved = false;
+        fetch('/api/admin/restart-mcp', { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ MCP container recreated on the current image'
+                                   : '  ✗ MCP restart failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      setBusy(false);
+                    }
+                    if (payload.error) { appendLog('  ✗ ' + payload.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() { if (!resolved) setBusy(false); });
+          })
+          .catch(function(err) { appendLog('  ✗ MCP restart stream error: ' + err.message); setBusy(false); });
+      }
+
+      if (!version) {
+        return e('div', null,
+          e('h2', null, 'Deployment'),
+          e('div', { className: 'deploy-wrap' }, e('span', { className: 'deploy-meta' }, 'Loading…'))
+        );
+      }
+
+      if (!version.available) {
+        return e('div', null,
+          e('h2', null, 'Deployment'),
+          e('div', { className: 'deploy-wrap' },
+            e('span', { className: 'deploy-state unknown' }, 'unavailable'),
+            e('div', { className: 'deploy-meta', style: { marginTop: 8 } },
+              version.reason || 'git repo not mounted',
+              version.deployed_sha ? ' · deployed: ' + version.deployed_sha.slice(0, 7) : ''
+            )
+          )
+        );
+      }
+
+      var head = version.head || {};
+      var upstream = version.upstream || {};
+      var stateClass, stateLabel;
+      if (version.dirty) {
+        stateClass = 'dirty'; stateLabel = 'working tree dirty';
+      } else if (!version.deployed_sha || version.deployed_sha === 'unknown') {
+        stateClass = 'unknown'; stateLabel = 'deployed SHA unknown (rebuild to capture)';
+      } else if (version.deployed_matches_head && version.behind === 0) {
+        stateClass = 'ok'; stateLabel = 'up to date';
+      } else if (!version.deployed_matches_head) {
+        stateClass = 'behind'; stateLabel = 'running container is behind HEAD — rebuild + restart';
+      } else if (version.behind > 0) {
+        stateClass = 'behind'; stateLabel = 'origin is ahead by ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's');
+      } else {
+        stateClass = 'ok'; stateLabel = 'up to date';
+      }
+
+      var deployedShort = version.deployed_sha && version.deployed_sha !== 'unknown'
+        ? version.deployed_sha.slice(0, 7) : 'unknown';
+
+      return e('div', null,
+        e('h2', null, 'Deployment'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-head' },
+            e('span', { className: 'deploy-state ' + stateClass }, stateLabel)
+          ),
+          e('div', { className: 'deploy-meta' },
+            'HEAD ',     e('span', { className: 'sha' }, head.sha_short || '?'),
+            ' · ',       e('span', { className: 'subj' }, head.subject || ''),
+            head.date ? ' · ' + head.date.slice(0, 10) : ''
+          ),
+          e('div', { className: 'deploy-meta', style: { marginTop: 4 } },
+            'Deployed image: ', e('span', { className: 'sha' }, deployedShort),
+            version.behind > 0 ? ' · ' + version.behind + ' commit' + (version.behind === 1 ? '' : 's') + ' behind origin' : '',
+            version.ahead > 0 ? ' · ' + version.ahead + ' ahead' : ''
+          ),
+          version.dirty && version.dirty_files && version.dirty_files.length > 0 && e('div', {
+            className: 'deploy-meta',
+            style: { marginTop: 6, color: '#f87171', whiteSpace: 'pre-wrap' },
+            title: 'git status --porcelain (showing up to 30 entries)',
+          }, 'Dirty:\n  ' + version.dirty_files.join('\n  ')),
+          e('div', { className: 'deploy-actions' },
+            e('button', {
+              className: 'btn',
+              onClick: function() { loadVersion(); appendLog('▸ refreshed deployment state'); },
+              title: 'Re-poll /api/admin/version — no git/docker activity',
+            }, 'Check'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { postAction('/api/admin/git-fetch', 'git fetch'); },
+              title: 'git fetch origin — refresh remote refs',
+            }, 'Fetch'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { postAction('/api/admin/git-pull', 'git pull'); },
+              title: 'git pull --ff-only — fast-forward the working tree',
+            }, 'Pull'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: runBuild,
+              title: 'docker compose build photosearch — takes 5-10 min',
+            }, building ? 'Building…' : 'Build'),
+            e('button', {
+              className: 'btn' + (buildResult === 'ready' ? ' deploy-restart-ready' : ''),
+              disabled: busy,
+              onClick: runRestart,
+              title: buildResult === 'ready'
+                ? 'New image ready — click to apply it'
+                : 'docker compose up -d — swap to the new image',
+            }, buildResult === 'ready' ? 'Restart ← new image ready' : 'Restart'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: runRestartMcp,
+              title: 'docker compose up -d --force-recreate photosearch-mcp — recreate the MCP '
+                   + 'container on the current image. No separate build needed: it reuses the '
+                   + 'photosearch image, so just Build then Restart MCP to pick up new code.',
+            }, 'Restart MCP'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { setLog([]); },
+              title: 'Clear log',
+              style: { marginLeft: 'auto' },
+            }, 'Clear log')
+          ),
+          log.length > 0 && e('div', {
+            className: 'deploy-log' + (building ? ' running' : ''),
+          }, log.join('\n'))
+        )
+      );
+    }
+
+    function Page() {
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'deploy' }),
+        e('div', { className: 'container' },
+          e('h1', null, 'Deployment'),
+          e(Deployment, null)
+        )
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(e(Page, null));
+  </script>
+</body>
+</html>

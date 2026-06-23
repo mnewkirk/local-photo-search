@@ -3995,6 +3995,22 @@ if _frontend_dir.exists():
                                 headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Admin vocab page not found</h1>")
 
+    @app.get("/admin/deploy")
+    def serve_admin_deploy():
+        """Serve the deployment admin page (git/docker/restart controls)."""
+        page = _frontend_dir / "admin_deploy.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Admin deploy page not found</h1>")
+
+    @app.get("/admin/maintenance")
+    def serve_admin_maintenance():
+        """Serve the maintenance admin page (sweep / stacking / infer-locations / ingest)."""
+        page = _frontend_dir / "admin_maintenance.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Admin maintenance page not found</h1>")
+
     @app.get("/collections/{collection_id}")
     def serve_collection_detail(collection_id: int):
         """Serve collection detail page (same HTML, JS reads id from URL)."""

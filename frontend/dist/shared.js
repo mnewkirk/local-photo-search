@@ -90,8 +90,10 @@
       { href: '/map',         label: 'Map',         id: 'map' },
       { href: '/geotag',      label: 'Geotag',      id: 'geotag' },
       { href: '/status',      label: 'Status',      id: 'status' },
+      { href: '/admin/deploy',      label: 'Deploy', id: 'deploy' },
+      { href: '/admin/maintenance', label: 'Maint',  id: 'maint' },
+      { href: '/admin/vocab', label: 'Vocab',       id: 'admin' },
       { href: '/logs',        label: 'Logs',        id: 'logs' },
-      { href: '/admin/vocab', label: 'Admin',       id: 'admin' },
     ];
 
     return e('div', { className: 'header' },
