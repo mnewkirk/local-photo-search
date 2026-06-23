@@ -16,6 +16,23 @@ import tempfile
 
 SCRIPT_RE = re.compile(r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>", re.DOTALL | re.IGNORECASE)
 
+# UPPER_SNAKE identifiers (must contain an underscore) — the module-level
+# const style in this codebase (STACK_DEFAULTS, PASS_COLORS, …). `node --check`
+# only validates syntax, so a component referencing one that wasn't moved with
+# it passes the parse but throws ReferenceError at runtime. This catches that.
+CONST_RE = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]*[A-Z0-9]\b")
+DECL_RE = re.compile(r"\b(?:var|let|const|function)\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*[A-Z0-9])\b")
+# strip line/block comments so commented-out names don't count as "declared"
+COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def undeclared_consts(body: str) -> set:
+    code = COMMENT_RE.sub("", body)
+    declared = set(DECL_RE.findall(code))
+    used = set(CONST_RE.findall(code))
+    return used - declared
+
+
 def check(path: str) -> bool:
     html = open(path, encoding="utf-8").read()
     ok = True
@@ -32,6 +49,11 @@ def check(path: str) -> bool:
         if r.returncode != 0:
             ok = False
             print(f"✗ {path} (inline script #{i}):\n{r.stderr.strip()}\n")
+        missing = undeclared_consts(body)
+        if missing:
+            ok = False
+            print(f"✗ {path} (inline script #{i}): referenced but undeclared "
+                  f"UPPER_SNAKE const(s): {', '.join(sorted(missing))}\n")
     if ok:
         print(f"✓ {path}: inline JS valid")
     return ok

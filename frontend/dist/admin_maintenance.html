@@ -697,6 +697,35 @@
     var useEffect = React.useEffect;
     var useRef = React.useRef;
 
+    var STACK_DEFAULTS = {
+      time_window_sec: 5.0,
+      clip_threshold: 0.05,
+      max_stack_span_sec: 10.0,
+    };
+
+    var PHASE_LABELS = {
+      scan: 'Scanning photos',
+      load_embeddings: 'Loading CLIP embeddings',
+      pairs: 'Comparing pairs',
+      group: 'Grouping into stacks',
+      save: 'Saving stacks',
+      cleared: 'Cleared existing stacks',
+    };
+
+    // Human labels for the maintenance-sweep stages (matches
+    // maintenance.SWEEP_STAGE_ORDER).
+    var SWEEP_STAGE_LABELS = {
+      geocode: 'Reverse-geocode place names',
+      normalize: 'Structured location columns',
+      infer: 'Infer GPS from neighbors',
+      normalize_inferred: 'Structured cols (inferred)',
+      colors: 'Dominant colors',
+      stacking: 'Burst/bracket stacking',
+      match_faces: 'Match faces to persons',
+      resolve_dups: 'Resolve duplicate persons',
+      recluster: 'Recluster unknown faces',
+    };
+
     function parseSSEChunk(chunk) {
       var trimmed = chunk.trim();
       if (!trimmed || trimmed.startsWith(':')) return null;
