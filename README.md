@@ -721,33 +721,15 @@ The development process was iterative in a way that's hard to capture in commits
 **The LLaVA prompt** was tightened after DSC04907's description mentioned a surfboard that wasn't in the photo. Adding "Only describe what you can clearly see — do not guess at objects you are unsure about" to the prompt reduced hallucinations. Matt then upgraded from llava:7b to llava:13b which further improved accuracy, though it still occasionally hallucinates (describing a person on DSC05036 when the beach is empty).
 
 
-## Development milestones
+## Development milestones & roadmap
 
-| Milestone | Status | Description |
-|-----------|--------|-------------|
-| **M1** | Done | EXIF + CLIP indexing + color extraction. Semantic search works. |
-| **M2** | Done | Face detection, encoding, clustering, temporal matching. |
-| **M3** | Done | LLaVA descriptions via Ollama with hybrid search scoring. |
-| **M4** | Done | Full CLI with all search modes (semantic, person, place, color, face). |
-| **M5** | Done | Scale test — 196 photos indexed with descriptions and search validated. |
-| **M6** | Done | Web UI (FastAPI + simple frontend). |
-| **M7** | Done | Docker packaging for UGREEN NAS deployment. |
-| **M8** | Done | Aesthetic quality scoring — pretrained model scores photos 1–10 for composition, lighting, and visual appeal. Filter/sort by quality in search. |
-| **M9** | Done | Semantic tagging — LLM-generated tags from a fixed ~60-tag vocabulary at index time. Tags stored in the photos table and used for search matching and shoot review diversity detection. |
-| **M10** | Done | Shoot review — adaptive CLIP clustering + quality-based selection for post-shoot culling. Web UI with grid view, cluster view, toggle selection, and export. CLI with export to directory. |
-| **M11** | Done | Portable photo paths — photo_root system stores relative paths in DB, resolves at runtime. Supports moving the database between machines without re-indexing. |
-| **M12** | Done | Hallucination detection — three-pass verification (CLIP scoring → cross-model LLM check → CLIP cross-check) catches and auto-regenerates hallucinated descriptions. Uses a separate vision model (minicpm-v) to avoid same-model confirmation bias. |
-| **M13** | Done | Collections / albums — persistent named collections stored in the same SQLite DB. Full CRUD API. Web UI with dedicated collections page, save-from-review, add-from-search (single + multi-select). |
-| **M14** | Done | Photo stacking — burst/bracket detection via union-find (time gap + CLIP similarity), 10-second span enforcement. Stack management UI on all pages (expand/collapse, set top, unstack, add to stack). Schema v11. |
-| **M15** | Done | Shared header component — extracted `PS.SharedHeader` into `shared.js`. All pages use the same logo, nav links, and layout. Page-specific controls passed as children. |
-| **M16** | Done | Shared photo detail modal — extracted `PS.PhotoModal` into `shared.js`. Unified modal with configurable feature flags, face editing, collection management, stacking UI, and keyboard navigation. Removed ~1500 lines of duplicated code. |
-| **M17** | Done | Distributed indexing — worker system for offloading heavy indexing passes (CLIP, faces, quality, describe, tags, verify) to a fast laptop/desktop. Claim/submit API on the NAS, HTTP-based worker loop with TTL-based crash recovery and network retry. |
-| **M18** | Done | Unknown-face similarity stacking + merge suggestions + cluster splitting. (1) `recluster-faces` gained a session-stacking second pass grouping DBSCAN noise by tight ArcFace similarity + time proximity. (2) `suggest-face-merges` CLI finds likely merges between groups via centroid + min-pair L2; `--verify-pair` tunes thresholds. (3) `/merges` review page — side-by-side face-strip cards, confidence tiers, risk badges (attractor/long-overlap/edge-score), keyboard shortcuts, accept/dismiss, rewrite-on-chained-merge, Regenerate button. (4) `split-cluster` CLI + Split button on `/faces` re-run DBSCAN on one cluster with tighter eps to break apart attractor clusters. |
-| **M19** | Done | Inferred geotagging for photos missing GPS. `photosearch infer-locations` walks no-GPS photos and copies coordinates from temporal neighbors within a configurable window, with a cascade that promotes each inference as an anchor for the next photo and a movement guard that refuses when flanking anchors disagree. Schema v17 added `location_source` (`'exif' \| 'inferred' \| 'manual'`) and `location_confidence` columns. Surfaces: CLI `infer-locations`, API `POST /api/geocode/infer-preview` + `infer-apply`, and a live Infer Locations panel on `/status`. |
-| **M19.1** | Done | Manual bulk geotagging UI (`/geotag`) — 3-panel folder-first workflow for tagging photos M19 couldn't reach. Folder list sorted by no-GPS count with per-source counts; middle panel shows multi-select thumbnails grouped by day with per-day Select/None and shift-click range selection; right panel typeahead merges library places (instant DB lookup) with Nominatim forward-geocode results (proxied through the NAS, cached 30 days in schema v18's `geocode_cache` table). Manual writes stamp `location_source='manual'`. |
-| **M19.2** | Done | Map view (`/map`) — Leaflet + marker clustering over every GPS-bearing photo. Sidebar filters by source (exif/inferred) and year; click a marker or cluster opens a preview pane with up to 9 thumbnails, a Zoom button, and a Search link whose filter broadens with altitude via a common-suffix heuristic ("Zarautz, Basque Country, ES" for a tight cluster; "ES" for a cluster spanning Spain). Backed by `GET /api/photos/geojson` returning compact tuples. |
-| **M20** | Planned | Google Photos import — pull photos down from Google Photos into the local library, storing them under `YYYY/YYYY-MM-DD_google_photos/` to sit alongside the existing date-folder layout. Complements the existing upload direction. |
-| **M21** | Planned | Timeline view with LLM executive summaries — chronological UI of photos grouped by time period, each segment annotated with an LLM-generated summary synthesizing where the photos were taken (from GPS/place data) and what was happening (from per-photo descriptions and tags). |
+The full milestone history and the current status of every plan — shipped,
+in-progress, and not-yet-started — live in one place:
+
+**→ [docs/plans/README.md](docs/plans/README.md)** (the canonical roadmap index)
+
+Each row links to its detail doc. That index is the single source of truth;
+this README intentionally no longer duplicates the milestone table (it drifted).
 
 
 ## Known limitations

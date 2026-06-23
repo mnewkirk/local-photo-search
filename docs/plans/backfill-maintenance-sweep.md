@@ -1,7 +1,11 @@
 # Backfill / Maintenance Sweep + Data Integrity (M25)
 
-**Status:** Planned — **DO NOT START until M24b ships.** Captured 2026-06-20
-while finishing M24a; queued intentionally behind the LLM-driven-search work.
+**Status:** ✅ **SHIPPED 2026-06-21.** `maintenance-sweep` / `validate-data` /
+`repair-data` CLIs + `photosearch/maintenance.py`, the SSE
+`POST /api/admin/maintenance-sweep` + `GET /api/admin/validate-data` endpoints,
+and the `/status` Maintenance-sweep card all landed. Tests in
+`tests/test_maintenance.py`. (Status authority: see
+[the roadmap index](README.md). Original plan below, kept for reference.)
 
 ## 1. Problem
 

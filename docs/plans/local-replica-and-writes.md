@@ -1,8 +1,16 @@
 # Local Read-Replica Deployment + Write Tools (M26)
 
-**Status:** **M26a partially shipped** (image-proxy fallback, sync script,
-sync/status endpoints + `/status` card). **M26b (writes) not started.**
-Captured 2026-06-20 after M24 shipped. Independent of M25.
+**Status:** 🟡 **M26a partially shipped** (image-proxy fallback, sync script,
+sync/status endpoints + `/status` card). **M26b (writes) foundation started
+2026-06-22** — the NAS-authoritative write endpoints landed:
+`POST /api/photos/bulk-set-tags`, `bulk-set-location` reworked to return the
+canonical `applied`/`updated_ids` for replica mirroring, and the shared
+`PhotoDB.set_photo_location` / `set_photo_tags` helpers (tests in
+`tests/test_web_writes.py`). **Remaining:** the agent-facing write tools, the
+read-local/write-NAS/mirror-local dual-write loop, and the guardrails (id-set
+scoping, dry-run→confirm, affected-count cap, audit). Captured 2026-06-20 after
+M24 shipped. Independent of M25. (Status authority: see
+[the roadmap index](README.md).)
 
 **M26a shipped so far:**
 - `web.py` image routes fall back to the NAS (`PHOTOSEARCH_NAS_URL`) when the
