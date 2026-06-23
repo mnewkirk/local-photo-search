@@ -35,6 +35,16 @@
     .pane { max-height: none; }
     .toolbar { flex-wrap: wrap; }
   }
+  /* Shared nav header (SharedHeader emits these classes). This page is
+     light-themed and defines no theme vars, so use explicit values matching
+     the app's dark nav bar on the other pages. */
+  .header { background:#1a1a1a; border-bottom:1px solid #333; padding:14px 24px; position:sticky; top:0; z-index:100; }
+  .header-inner { max-width:1600px; margin:0 auto; display:flex; align-items:center; gap:16px; min-height:42px; flex-wrap:wrap; }
+  .header .logo { font-size:18px; font-weight:700; letter-spacing:-0.5px; color:#e8e8e8; }
+  .header .logo span { color:#4a9eff; }
+  .header .nav-link { font-size:13px; color:#4a9eff; text-decoration:none; margin-left:4px; }
+  .header .nav-link:hover { text-decoration:underline; }
+  .header .nav-link.active { color:#e8e8e8; font-weight:600; }
 </style>
 </head><body>
 <div id="header-root"></div>
