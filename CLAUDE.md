@@ -22,10 +22,17 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 23. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 25. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
 (v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
+(v25 added `photos.folder` — indexed dirname of `filepath`, populated in
+`add_photo` + backfilled on migration — so the `/review` and `/geotag` folder
+pickers `GROUP BY folder` instead of grouping every row in Python (M27). Note:
+some deployed DBs were stamped `version=24` with no v24 column change, so the
+folder migration is keyed v25 — the `try/except SELECT folder` adds the column
+for both v23 and that stray-v24 state. Manual re-derive: `photosearch
+backfill-folders [--apply] [--force]`.)
 
 Schema migrations run automatically via `_init_schema()`. Bump `SCHEMA_VERSION` in `db.py`
 when adding tables/columns.

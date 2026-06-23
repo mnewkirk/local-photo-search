@@ -1828,28 +1828,20 @@ def api_import_manual_assignments(data: dict):
 @app.get("/api/review/folders")
 def api_review_folders():
     """List directories that contain indexed photos, for the folder picker."""
+    # Aggregate over the indexed `folder` column (schema v25, M27) instead of
+    # loading every photo row and grouping in Python. COALESCE(...,'') matches
+    # the old "date_taken or ''" semantics so all-undated folders still sort
+    # consistently last.
     with _get_db() as db:
         rows = db.conn.execute(
-            "SELECT filepath, filename, date_taken FROM photos WHERE filepath IS NOT NULL"
+            "SELECT folder AS path, COALESCE(MAX(date_taken), '') AS max_date "
+            "FROM photos "
+            "WHERE filepath IS NOT NULL AND folder IS NOT NULL AND folder != '' "
+            "GROUP BY folder "
+            "ORDER BY max_date DESC, path ASC"
         ).fetchall()
 
-    # Extract unique parent directories with most recent date_taken per folder.
-    # `_folder_of` is a plain rsplit — far cheaper than Path().parent across the
-    # ~163k-row scan (M27 quick-win), and shared with /geotag's folder summary.
-    dir_dates: dict[str, str] = {}
-    for row in rows:
-        parent = _folder_of(row["filepath"], row["filename"])
-        if parent:
-            dt = row["date_taken"] or ""
-            if parent not in dir_dates or dt > dir_dates[parent]:
-                dir_dates[parent] = dt
-
-    # Return folders sorted by most recent photo first (default), with date info
-    folders = [
-        {"path": d, "max_date": dir_dates[d]}
-        for d in sorted(dir_dates, key=lambda d: dir_dates[d], reverse=True)
-    ]
-    return {"folders": folders}
+    return {"folders": [{"path": r["path"], "max_date": r["max_date"]} for r in rows]}
 
 
 @app.get("/api/review/run")
@@ -2375,21 +2367,6 @@ def api_infer_apply(data: dict):
 #   POST /api/photos/bulk-set-location — the write (location_source='manual')
 
 
-def _folder_of(filepath: str, filename: str) -> str:
-    """Return the folder portion of a photo's filepath.
-
-    Cheaper than Path().parent on a tight loop — photos store forward
-    slashes even on Windows (SQLite stores text, and the indexer
-    normalizes), so rsplit is safe.
-    """
-    if not filepath:
-        return ""
-    if filename and filepath.endswith("/" + filename):
-        return filepath[: -(len(filename) + 1)]
-    idx = filepath.rfind("/")
-    return filepath[:idx] if idx > 0 else filepath
-
-
 @app.get("/api/geotag/folders")
 def api_geotag_folders(include_fully_tagged: bool = False):
     """Folder summary keyed for the /geotag left panel.
@@ -2401,41 +2378,31 @@ def api_geotag_folders(include_fully_tagged: bool = False):
     With `include_fully_tagged=true` the response also covers folders
     where every photo already has GPS; default is to hide them.
     """
-    from collections import defaultdict
-
+    # Aggregate over the indexed `folder` column (schema v25, M27) in one SQL
+    # pass instead of loading every photo row and grouping in Python.
+    # NULLIF(date_taken,'') mirrors the old `if dt:` guard so blank dates don't
+    # become a folder's date_from. The HAVING clause applies the
+    # hide-fully-tagged filter server-side.
+    having = "" if include_fully_tagged else "HAVING no_gps > 0"
     with _get_db() as db:
         rows = db.conn.execute(
-            "SELECT filepath, filename, location_source, gps_lat, date_taken FROM photos"
+            "SELECT folder AS path, "
+            "       COUNT(*) AS total, "
+            "       SUM(CASE WHEN location_source='exif' THEN 1 ELSE 0 END) AS with_exif, "
+            "       SUM(CASE WHEN location_source='inferred' THEN 1 ELSE 0 END) AS with_inferred, "
+            "       SUM(CASE WHEN gps_lat IS NULL THEN 1 ELSE 0 END) AS no_gps, "
+            "       MIN(NULLIF(date_taken, '')) AS date_from, "
+            "       MAX(NULLIF(date_taken, '')) AS date_to "
+            "FROM photos "
+            "WHERE folder IS NOT NULL "
+            "GROUP BY folder "
+            f"{having} "
+            "ORDER BY no_gps DESC, path ASC"
         ).fetchall()
 
-    folders = defaultdict(lambda: {
-        "total": 0, "with_exif": 0, "with_inferred": 0, "no_gps": 0,
-        "date_from": None, "date_to": None,
-    })
-    for r in rows:
-        folder = _folder_of(r["filepath"], r["filename"])
-        f = folders[folder]
-        f["total"] += 1
-        src = r["location_source"]
-        if src == "exif":
-            f["with_exif"] += 1
-        elif src == "inferred":
-            f["with_inferred"] += 1
-        if r["gps_lat"] is None:
-            f["no_gps"] += 1
-        dt = r["date_taken"]
-        if dt:
-            if f["date_from"] is None or dt < f["date_from"]:
-                f["date_from"] = dt
-            if f["date_to"] is None or dt > f["date_to"]:
-                f["date_to"] = dt
-
-    out = []
-    for path, f in folders.items():
-        if not include_fully_tagged and f["no_gps"] == 0:
-            continue
-        out.append({"path": path, **f})
-    out.sort(key=lambda f: (-f["no_gps"], f["path"]))
+    out = [{"path": r["path"], "total": r["total"], "with_exif": r["with_exif"],
+            "with_inferred": r["with_inferred"], "no_gps": r["no_gps"],
+            "date_from": r["date_from"], "date_to": r["date_to"]} for r in rows]
     return {"folders": out, "total_folders": len(out)}
 
 
@@ -2450,31 +2417,27 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
     misfires. `location_source='exif'` photos are always excluded — those
     came from the camera and are authoritative.
     """
+    # Match the exact folder via the indexed `folder` column (schema v25) — no
+    # LIKE + Python subfolder guard. This also fixes a latent bug in the old
+    # path where LIMIT was applied to a sub-folder-inclusive LIKE before the
+    # Python filter, so a folder with many sub-folder photos could return fewer
+    # than `limit` of its own.
     with _get_db() as db:
         if show_inferred:
-            where = ("WHERE (gps_lat IS NULL "
-                     "   OR location_source='inferred')")
+            gps_where = "(gps_lat IS NULL OR location_source='inferred')"
         else:
-            where = "WHERE gps_lat IS NULL"
-        # Photos in this folder have filepath like "<folder>/<filename>".
-        pattern = folder.rstrip("/") + "/%"
-        # Guard against matching sub-folders: require no additional "/"
-        # between folder and filename. Done by filtering in Python below.
+            gps_where = "gps_lat IS NULL"
         rows = db.conn.execute(
             f"""SELECT id, filepath, filename, date_taken, gps_lat, gps_lon,
                        place_name, location_source, location_confidence
                 FROM photos
-                {where} AND filepath LIKE ?
+                WHERE folder = ? AND {gps_where}
                 ORDER BY COALESCE(date_taken, filepath)
                 LIMIT ?""",
-            (pattern, limit),
+            (folder.rstrip("/"), limit),
         ).fetchall()
 
-    photos = []
-    for r in rows:
-        if _folder_of(r["filepath"], r["filename"]) != folder.rstrip("/"):
-            continue
-        photos.append(dict(r))
+    photos = [dict(r) for r in rows]
     return {"folder": folder, "photos": photos, "count": len(photos)}
 
 

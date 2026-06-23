@@ -1001,7 +1001,10 @@ def test_schema_v23_migration_from_v22(tmp_path):
     conn.close()
 
     from photosearch.db import PhotoDB, SCHEMA_VERSION
-    assert SCHEMA_VERSION == 23
+    # The v22->v23 split must still apply when migrating from v22; a v22 DB now
+    # migrates all the way to the current version (folder column etc.), so this
+    # only asserts the v23 logic is still in the chain.
+    assert SCHEMA_VERSION >= 23
 
     with PhotoDB(str(db_path)) as db:
         # New columns exist and are nullable.
@@ -1023,11 +1026,73 @@ def test_schema_v23_migration_from_v22(tmp_path):
         assert "category-content-legacy" in text_types
         assert "tags" not in text_types
 
-        # Schema version stamped.
+        # Schema version stamped to current (migrated v22 -> latest).
         v = db.conn.execute(
             "SELECT value FROM schema_info WHERE key='version'"
         ).fetchone()[0]
-        assert int(v) == 23
+        assert int(v) == SCHEMA_VERSION
+
+
+def test_folder_column_populated_on_add(tmp_path):
+    """add_photo derives the indexed folder column from filepath (schema v25, M27)."""
+    from photosearch.db import PhotoDB, _folder_of
+    db_path = tmp_path / "folder.db"
+    with PhotoDB(str(db_path)) as db:
+        db.add_photo(filepath="2026/2026-03-01_phone-matt/IMG_1.jpg",
+                     filename="IMG_1.jpg", date_taken="2026-03-01 10:00:00")
+        db.add_photo(filepath="2026/2026-03-01_phone-matt/IMG_2.jpg",
+                     filename="IMG_2.jpg", date_taken="2026-03-02 10:00:00")
+        db.add_photo(filepath="rootfile.jpg", filename="rootfile.jpg")  # no directory
+        # explicit folder= is honored over derivation
+        db.add_photo(filepath="x/y/z.jpg", filename="z.jpg", folder="custom/override")
+
+        rows = {r["filepath"]: r["folder"] for r in
+                db.conn.execute("SELECT filepath, folder FROM photos")}
+        assert rows["2026/2026-03-01_phone-matt/IMG_1.jpg"] == "2026/2026-03-01_phone-matt"
+        assert rows["2026/2026-03-01_phone-matt/IMG_2.jpg"] == "2026/2026-03-01_phone-matt"
+        assert rows["rootfile.jpg"] == ""
+        assert rows["x/y/z.jpg"] == "custom/override"
+
+        # The folder index exists for the GROUP BY aggregate.
+        idx = {r[1] for r in db.conn.execute("PRAGMA index_list('photos')")}
+        assert "idx_photos_folder" in idx
+
+
+def test_folder_column_backfilled_on_migration(tmp_path):
+    """Opening a pre-folder DB adds + backfills the folder column for all rows."""
+    import sqlite3
+    from photosearch.db import PhotoDB, _folder_of
+    db_path = tmp_path / "nofolder.db"
+
+    # Build a real, fully-migrated DB, then simulate the pre-folder state that
+    # exists in the wild: some deployed DBs are stamped version=24 with no
+    # folder column. Drop the column + index and roll the version back to 24.
+    with PhotoDB(str(db_path)) as db:
+        for fp, fn in [("2020/2020-01-01_gphotos/a.jpg", "a.jpg"),
+                       ("2020/2020-01-01_gphotos/b.jpg", "b.jpg"),
+                       ("2021/trip/c.JPG", "c.JPG")]:
+            db.add_photo(filepath=fp, filename=fn)
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP INDEX IF EXISTS idx_photos_folder")
+    conn.execute("ALTER TABLE photos DROP COLUMN folder")
+    conn.execute("UPDATE schema_info SET value='24' WHERE key='version'")
+    conn.commit()
+    conn.close()
+
+    # Reopening must run the v25 folder migration (24 < 25, so the fast-path
+    # early-return doesn't skip it) and backfill every row from filepath.
+    with PhotoDB(str(db_path)) as db:
+        ver = db.conn.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0]
+        assert int(ver) == SCHEMA_VERSION
+        rows = {r["filepath"]: r["folder"] for r in
+                db.conn.execute("SELECT filepath, folder FROM photos")}
+        assert rows["2020/2020-01-01_gphotos/a.jpg"] == "2020/2020-01-01_gphotos"
+        assert rows["2020/2020-01-01_gphotos/b.jpg"] == "2020/2020-01-01_gphotos"
+        assert rows["2021/trip/c.JPG"] == "2021/trip"
+        for fp, folder in rows.items():
+            assert folder == _folder_of(fp, fp.rsplit("/", 1)[-1])
+        idx = {r[1] for r in db.conn.execute("PRAGMA index_list('photos')")}
+        assert "idx_photos_folder" in idx
 
 
 # =========================================================================

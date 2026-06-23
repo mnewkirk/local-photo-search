@@ -1,10 +1,19 @@
 # Review folder-list performance (M27 — queued)
 
-**Status:** quick-win #1 **shipped 2026-06-22** — `api_review_folders` now uses
-the `_folder_of` rsplit helper instead of `Path().parent`. Verified against the
-163k-row replica: identical 4328-folder output, 360ms → 38ms (9.5× faster) on
-the Python grouping loop. The durable fix (#3, a `folder` column) remains queued.
-Surfaced 2026-06-21 — the `/review` folder picker is sometimes slow to load.
+**Status:** **DONE.** Quick-win #1 shipped 2026-06-22 (`api_review_folders`
+swapped `Path().parent` for the `_folder_of` rsplit; identical 4328-folder
+output, 360ms → 38ms on the grouping loop). Durable fix #3 shipped 2026-06-23:
+indexed `photos.folder` column (schema v25), populated in `add_photo` +
+backfilled on migration, and both `api_review_folders` and `api_geotag_folders`
+(plus `api_geotag_folder_photos`) reworked to `GROUP BY folder` /
+`WHERE folder = ?`. Output verified byte-identical to the old Python
+implementations against the 163k-row replica (review 4328, geotag 3258/4328,
+folder-photos counts). `backfill-folders` CLI added as the manual net.
+Surfaced 2026-06-21 — the `/review` folder picker was sometimes slow to load.
+
+Caching (#4) was **not** done — the `GROUP BY folder` aggregate over an indexed
+column is fast enough that memoization isn't worth the invalidation complexity.
+Pick it up only if a much larger library makes the aggregate itself slow.
 
 ## Problem
 

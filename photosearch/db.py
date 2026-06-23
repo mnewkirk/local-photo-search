@@ -49,6 +49,25 @@ def _folder_date_from_path(filepath: Optional[str]) -> Optional[str]:
         pass
     return None
 
+
+def _folder_of(filepath: Optional[str], filename: Optional[str]) -> str:
+    """Return the folder (directory) portion of a photo's filepath.
+
+    Cheaper than ``Path(filepath).parent`` on a tight loop — photos store
+    forward slashes even on Windows (the indexer normalizes), so a plain
+    string strip is safe. ``filename`` is always the basename, so the fast
+    path strips it directly; the rfind fallback handles odd rows. Returns
+    "" for a path with no directory component. This is the canonical
+    definition of the indexed ``photos.folder`` column (schema v25) and the
+    SQL backfill in ``_init_schema`` mirrors it exactly.
+    """
+    if not filepath:
+        return ""
+    if filename and filepath.endswith("/" + filename):
+        return filepath[: -(len(filename) + 1)]
+    idx = filepath.rfind("/")
+    return filepath[:idx] if idx > 0 else ""
+
 # sqlite-vec will be imported at init time so we can fail gracefully
 try:
     import sqlite_vec
@@ -60,7 +79,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -286,7 +305,8 @@ class PhotoDB:
                 aesthetic_critique TEXT,
                 tags TEXT,
                 indexed_at TEXT DEFAULT (datetime('now')),
-                raw_filepath TEXT
+                raw_filepath TEXT,
+                folder TEXT
             )
         """)
 
@@ -430,6 +450,29 @@ class PhotoDB:
             cur.execute("SELECT det_score FROM faces LIMIT 1")
         except sqlite3.OperationalError:
             cur.execute("ALTER TABLE faces ADD COLUMN det_score REAL")
+
+        # Migration: folder column (schema v25). Dirname of filepath, indexed,
+        # so the /review and /geotag folder pickers GROUP BY an indexed column
+        # instead of loading every photo row and computing Path().parent in
+        # Python (M27). Populated in add_photo going forward; existing rows are
+        # backfilled here in one SQL pass. filename is always the basename
+        # (verified across the 163k-row library), so the substr strip exactly
+        # mirrors _folder_of(); the ELSE '' covers the no-directory edge case.
+        # (Note: some deployed DBs were stamped version=24 with no v24 column
+        # change, so the folder migration is v25 — the try/except below adds the
+        # column for both v23 and that v24 state since neither has it.)
+        try:
+            cur.execute("SELECT folder FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN folder TEXT")
+            cur.execute(
+                "UPDATE photos SET folder = CASE "
+                "WHEN filepath LIKE '%/' || filename "
+                "THEN substr(filepath, 1, length(filepath) - length(filename) - 1) "
+                "ELSE '' END "
+                "WHERE filepath IS NOT NULL"
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
@@ -632,6 +675,7 @@ class PhotoDB:
         # Indexes for common queries
         cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claims_expire ON worker_claims(expires_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_location_source ON photos(location_source)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aesthetic ON photos(aesthetic_score)")
@@ -696,6 +740,11 @@ class PhotoDB:
             and "location_source" not in kwargs
         ):
             kwargs["location_source"] = "exif"
+        # Derive the indexed folder column from filepath so the /review and
+        # /geotag folder pickers can GROUP BY it (schema v25, M27). Callers
+        # may override by passing folder= explicitly.
+        if "folder" not in kwargs and kwargs.get("filepath"):
+            kwargs["folder"] = _folder_of(kwargs["filepath"], kwargs.get("filename"))
         columns = ", ".join(kwargs.keys())
         placeholders = ", ".join(["?"] * len(kwargs))
         cur = self.conn.execute(

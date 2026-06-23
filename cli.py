@@ -1789,6 +1789,41 @@ def backfill_image_orientation(db, apply, limit):
                    f"{errs} unreadable. (Rotated photos get width/height swapped.)")
 
 
+@cli.command("backfill-folders")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write the folder column. Default: dry-run.")
+@click.option("--force", is_flag=True, default=False,
+              help="Re-derive every row (default: only rows where folder IS NULL).")
+def backfill_folders(db, apply, force):
+    """Populate the indexed photos.folder column (dirname of filepath).
+
+    The schema v24 migration backfills existing rows automatically on upgrade,
+    so this is the manual safety net: re-run it after a bulk filepath change,
+    or with --force to re-derive every row. Pure SQL (no per-row Python), so it
+    finishes in well under a second even on the full library. Idempotent.
+    """
+    with PhotoDB(db) as pdb:
+        where = "filepath IS NOT NULL" if force else "filepath IS NOT NULL AND folder IS NULL"
+        n = pdb.conn.execute(f"SELECT COUNT(*) FROM photos WHERE {where}").fetchone()[0]
+        if not apply:
+            click.echo(f"Would set folder on {n} photo(s) "
+                       f"({'all rows' if force else 'rows with NULL folder'}). "
+                       f"Re-run with --apply.")
+            return
+        pdb.conn.execute(
+            f"UPDATE photos SET folder = CASE "
+            f"WHEN filepath LIKE '%/' || filename "
+            f"THEN substr(filepath, 1, length(filepath) - length(filename) - 1) "
+            f"ELSE '' END "
+            f"WHERE {where}"
+        )
+        pdb.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
+        pdb.conn.commit()
+        click.echo(f"Set folder on {n} photo(s).")
+
+
 # ---------------------------------------------------------------------------
 # maintenance-sweep / validate-data / repair-data (M25)
 # ---------------------------------------------------------------------------
