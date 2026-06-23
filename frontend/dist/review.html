@@ -1013,7 +1013,7 @@
               type: 'text',
               value: folderSearch,
               placeholder: 'Search folders...',
-              style: { minWidth: 300, padding: '6px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+              style: { minWidth: 0, width: 280, maxWidth: '78vw', padding: '6px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
                        background: 'var(--surface)', color: 'var(--text)', fontSize: 13 },
               onChange: (ev) => { setFolderSearch(ev.target.value); setFolderDropdownOpen(true); },
               onFocus: () => setFolderDropdownOpen(true),

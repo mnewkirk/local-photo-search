@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Vocab Curator</title>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -27,6 +28,13 @@
   .status-line { padding: 6px 0; color: #666; }
   .error { color: #c00; font-weight: 600; }
   .test-photo-input { padding: 4px 8px; }
+  /* Phones/tablets: the two panes can't sit side-by-side — stack them and let
+     the page scroll instead of clipping each pane to the viewport height. */
+  @media (max-width: 768px) {
+    .layout { grid-template-columns: 1fr; min-height: 0; }
+    .pane { max-height: none; }
+    .toolbar { flex-wrap: wrap; }
+  }
 </style>
 </head><body>
 <div id="header-root"></div>

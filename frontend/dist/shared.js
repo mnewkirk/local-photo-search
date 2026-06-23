@@ -27,6 +27,32 @@
   var PS = window.PS = window.PS || {};
 
   // =========================================================================
+  // Shared responsive baseline
+  // =========================================================================
+  // Injected once per page (every page loads shared.js). The page nav header
+  // (.header-inner) is `display:flex` with NO flex-wrap on any page, so on a
+  // phone the nav links + page controls (e.g. review's folder picker) overflow
+  // horizontally off-screen. These rules are ADDITIVE — no page sets flex-wrap
+  // or these mobile caps, so nothing existing is overridden. Appended to <head>
+  // after the page's own <style>, so it wins ties.
+  (function injectResponsiveBaseline() {
+    if (document.getElementById('ps-responsive-baseline')) return;
+    var css = [
+      '.header-inner { flex-wrap: wrap; }',
+      '@media (max-width: 640px) {',
+      '  .header { padding-left: 12px; padding-right: 12px; }',
+      '  .header-inner { gap: 8px 10px; }',
+      '  .header-inner input[type="text"], .header-inner input[type="search"],',
+      '  .header-inner select, .header-inner .ctrl-input { max-width: 78vw; }',
+      '}',
+    ].join('\n');
+    var el = document.createElement('style');
+    el.id = 'ps-responsive-baseline';
+    el.textContent = css;
+    (document.head || document.documentElement).appendChild(el);
+  })();
+
+  // =========================================================================
   // Helpers
   // =========================================================================
   PS.formatFocalLength = function formatFocalLength(fl) {

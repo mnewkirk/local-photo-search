@@ -89,6 +89,18 @@
     .col-body { flex: 1; overflow-y: auto; }
     .col-body-padded { padding: 14px 16px; }
 
+    /* Phones/tablets: the 3 fixed-width columns (360 + flex + 380) overflow a
+       phone. Stack them vertically — folders, then photos, then the picker —
+       each a bounded scroll region so the page flows. */
+    @media (max-width: 768px) {
+      .layout { flex-direction: column; height: auto; min-height: calc(100vh - 75px); }
+      .col { border-right: 0; border-bottom: 1px solid var(--border); }
+      .col:last-child { border-bottom: 0; }
+      .col-folders, .col-picker { width: 100%; flex-shrink: 0; }
+      .col-folders .col-body, .col-picker .col-body { max-height: 40vh; }
+      .col-photos { min-height: 55vh; }
+    }
+
     /* Folder list */
     .folder-row {
       padding: 10px 16px;
