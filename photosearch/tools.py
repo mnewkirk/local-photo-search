@@ -154,6 +154,18 @@ def _clamp(value: Any, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
+def _truthy(value: Any) -> bool:
+    """Coerce a tool-supplied boolean flag. Small models sometimes send the
+    JSON bool as a string ('true'/'1'); accept those too."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 def _truncate(text: Optional[str], n: int = _DESC_TRUNCATE) -> Optional[str]:
     if not text:
         return text
@@ -555,12 +567,26 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         with_total=True,
     )
 
+    # Face-framing filters don't flow through search_combined, so post-filter
+    # the returned set by them here (the subject-sort path already applied them
+    # in SQL via _build_filter_sql). `total` stays the pre-frame-filter match
+    # count; `returned` reflects what survived.
+    only_these = _truthy(args.get("only_these_people"))
+    in_frame = _truthy(args.get("faces_in_frame"))
+    if (only_these or in_frame) and results:
+        keep = _ids_passing_face_constraints(
+            db, [r["id"] for r in results if r.get("id")],
+            person_ids, only_these, in_frame)
+        results = [r for r in results if r.get("id") in keep]
+
     out: dict = {
         "total": total,
         "returned": len(results),
         "sort": sort,
         "results": [_compact_hit(r) for r in results],
     }
+    if only_these or in_frame:
+        out["face_filtered"] = True
     if unresolved:
         out["unresolved_people"] = unresolved
     return out
@@ -602,6 +628,16 @@ _register(ToolSpec(
             "keyword": {"type": "string", "description": "Keyword substring (see list_vocab)."},
             "min_quality": {"type": "number",
                             "description": "Minimum aesthetic score, 1-10."},
+            "only_these_people": {"type": "boolean",
+                "description": "Keep only photos whose ONLY faces are the named "
+                "`people` (total detected faces == number of names) — i.e. no "
+                "other/extra people in the shot. Requires a `people` filter. Use "
+                "for 'only the four of us', 'just Calvin and Ellie, nobody else'."},
+            "faces_in_frame": {"type": "boolean",
+                "description": "Keep only photos where no face is cut off at the "
+                "image edge (every face box is fully inside the frame). With a "
+                "`people` filter it checks just those people. Use for 'everyone "
+                "fully in frame', 'no one cropped', 'each face fully visible'."},
             "sort": {"type": "string", "enum": list(_VALID_SORTS),
                      "description": "Result order; defaults to relevance for a query, "
                                     "else date_desc. 'subject' (with a `people` filter) "
@@ -635,6 +671,73 @@ def _has_structured_location(db) -> bool:
     return _STRUCT_LOC_CACHE[key]
 
 
+# A face whose bbox comes within this fraction of any image edge is treated as
+# cut off by the frame. bbox_* and image_width/height are stored in the SAME
+# EXIF-oriented coordinate space (see CLAUDE.md "EXIF-oriented image dimensions"),
+# so the comparison is valid on rotated photos too.
+_FRAME_EDGE_MARGIN = 0.01
+
+
+def _face_constraint_clauses(
+    person_ids: list, only_these: bool, in_frame: bool
+) -> tuple[list[str], list]:
+    """SQL fragments for the two pure-metadata face-framing filters, against a
+    query whose FROM exposes `photos`. Returns ``(clauses, params)`` to splice
+    into a WHERE built left-to-right (params consumed in clause order).
+
+      - ``only_these`` — total detected faces in the photo equals the number of
+        named people, i.e. nobody beyond the requested people is in frame.
+        Needs ``person_ids`` (no-op without it; "only these" is meaningless
+        with no named set).
+      - ``in_frame`` — no face's bbox touches the image border within
+        ``_FRAME_EDGE_MARGIN``, so nobody is cropped at the edge. Scoped to the
+        named people's faces when ``person_ids`` is given, else all faces.
+    """
+    clauses: list[str] = []
+    params: list = []
+    if only_these and person_ids:
+        clauses.append(
+            "(SELECT COUNT(*) FROM faces WHERE faces.photo_id = photos.id) = ?")
+        params.append(len(person_ids))
+    if in_frame:
+        m = _FRAME_EDGE_MARGIN
+        sub = "SELECT 1 FROM faces ff WHERE ff.photo_id = photos.id"
+        if person_ids:
+            ph = ",".join("?" * len(person_ids))
+            sub += f" AND ff.person_id IN ({ph})"
+            params.extend(person_ids)
+        sub += (" AND (ff.bbox_left <= ? * photos.image_width"
+                " OR ff.bbox_top <= ? * photos.image_height"
+                " OR ff.bbox_right >= (1 - ?) * photos.image_width"
+                " OR ff.bbox_bottom >= (1 - ?) * photos.image_height)")
+        params.extend([m, m, m, m])
+        clauses.append(
+            "photos.image_width IS NOT NULL AND photos.image_height IS NOT NULL "
+            f"AND NOT EXISTS ({sub})")
+    return clauses, params
+
+
+def _ids_passing_face_constraints(
+    db, photo_ids: list, person_ids: list, only_these: bool, in_frame: bool
+) -> set:
+    """Subset of ``photo_ids`` satisfying the face-framing filters — used to
+    post-filter the plain search_photos result set (which doesn't flow through
+    _build_filter_sql) so the flags are never silently ignored there."""
+    if not photo_ids or not (only_these or in_frame):
+        return set(photo_ids)
+    fc, fp = _face_constraint_clauses(person_ids, only_these, in_frame)
+    if not fc:
+        return set(photo_ids)
+    ph = ",".join("?" * len(photo_ids))
+    sql = (f"SELECT id FROM photos WHERE id IN ({ph}) AND "
+           + " AND ".join(f"({c})" for c in fc))
+    try:
+        rows = db.conn.execute(sql, (*photo_ids, *fp)).fetchall()
+    except Exception:
+        return set(photo_ids)  # never drop everything on a query error
+    return {r[0] for r in rows}
+
+
 def _build_filter_sql(db, args: dict) -> tuple[str, list]:
     """Build a WHERE clause + params from the structured filters (the same set
     search_photos accepts, minus the free-text CLIP `query`). Mirrors
@@ -643,15 +746,16 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
     params: list = []
 
     people = _coerce_str_list(args.get("people"))
+    person_ids: list = []
     if people:
-        ids, _ = _resolve_person_names(db, people)
-        if ids:
-            ph = ",".join("?" * len(ids))
+        person_ids, _ = _resolve_person_names(db, people)
+        if person_ids:
+            ph = ",".join("?" * len(person_ids))
             clauses.append(
                 f"photos.id IN (SELECT photo_id FROM faces WHERE person_id IN ({ph}) "
                 f"GROUP BY photo_id HAVING COUNT(DISTINCT person_id) = ?)")
-            params.extend(ids)
-            params.append(len(ids))
+            params.extend(person_ids)
+            params.append(len(person_ids))
         else:
             clauses.append("0")  # unknown person → match nothing
 
@@ -697,6 +801,15 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
             params.append(float(mq))
         except (TypeError, ValueError):
             pass
+
+    # Pure-metadata face-framing filters: "only these people in frame" and
+    # "nobody cropped at the edge". Appended last so their params line up.
+    fc, fp = _face_constraint_clauses(
+        person_ids,
+        _truthy(args.get("only_these_people")),
+        _truthy(args.get("faces_in_frame")))
+    clauses.extend(fc)
+    params.extend(fp)
 
     return (" AND ".join(clauses) if clauses else "1"), params
 
@@ -774,6 +887,12 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag."},
             "keyword": {"type": "string", "description": "Keyword substring."},
             "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            "only_these_people": {"type": "boolean",
+                "description": "Count only photos whose ONLY faces are the named "
+                "`people` (no extra people). Requires `people`."},
+            "faces_in_frame": {"type": "boolean",
+                "description": "Count only photos where no face is cropped at the "
+                "image edge."},
             "limit": {"type": "integer", "description": "Max buckets (default 50)."},
         },
         "additionalProperties": False,
@@ -909,6 +1028,13 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag."},
             "keyword": {"type": "string", "description": "Keyword substring."},
             "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            "only_these_people": {"type": "boolean",
+                "description": "Keep only photos whose ONLY faces are the named "
+                "`people` (no extra/other people in the shot). Requires `people`."},
+            "faces_in_frame": {"type": "boolean",
+                "description": "Keep only photos where no face is cropped at the "
+                "image edge (every face fully inside the frame). With `people` it "
+                "checks just those people."},
         },
         "additionalProperties": False,
     },

@@ -447,3 +447,129 @@ def test_get_photo_image_missing_original(db):
     pid = db._test_photo_ids["DSC04894.JPG"]
     res = tools.call_tool(db, "get_photo_image", {"photo_id": pid})
     assert "error" in res
+
+
+# ---------------------------------------------------------------------------
+# Face-framing filters: only_these_people / faces_in_frame (from the Ask-log
+# review — "only the four of us / nobody cropped" is metadata, not vision).
+# bbox tuple order is (top, right, bottom, left); fixture images are
+# 7008x4672, so the 1% edge margin is ~70px wide / ~47px tall.
+# ---------------------------------------------------------------------------
+
+IN_FRAME_BBOX = (1000, 4000, 2000, 1000)   # (top, right, bottom, left) — fully inside
+EDGE_BBOX = (1000, 4000, 2000, 30)         # left=30px → cut off at the left edge
+
+
+def _add_photo_with_faces(db, filename, faces, score=8.0,
+                          date="2026-03-14T10:00:00"):
+    """faces: list of (person_id|None, bbox). Returns the new photo id."""
+    pid = db.add_photo(filepath=f"2026/march/{filename}", filename=filename,
+                       date_taken=date, aesthetic_score=score,
+                       image_width=7008, image_height=4672)
+    for person_id, bbox in faces:
+        fid = db.add_face(pid, bbox, [0.1] * 512, person_id=person_id)
+        if person_id is not None:
+            db.assign_face_to_person(fid, person_id, "strict")
+    return pid
+
+
+def test_truthy_coercion():
+    # Small models sometimes send the JSON bool as a string.
+    assert tools._truthy(True) and tools._truthy("true") and tools._truthy("1")
+    assert tools._truthy("YES") and tools._truthy(1)
+    assert not tools._truthy(False) and not tools._truthy("false")
+    assert not tools._truthy("0") and not tools._truthy(None) and not tools._truthy(0)
+
+
+def test_search_only_these_people_drops_photos_with_extras(db):
+    alex = db._test_person_ids["Alex"]
+    sam = db._test_person_ids["Sam"]
+    # EXTRA has Alex + Sam + an unknown third face → 3 faces total.
+    extra = _add_photo_with_faces(db, "EXTRA_TRIO.JPG", [
+        (alex, IN_FRAME_BBOX), (sam, IN_FRAME_BBOX), (None, IN_FRAME_BBOX)])
+    # DSC04894 has exactly Alex + Sam (2 faces).
+    just_two = db._test_photo_ids["DSC04894.JPG"]
+
+    base = tools.call_tool(db, "search_photos", {"people": ["Alex", "Sam"]})
+    assert {just_two, extra} <= {r["id"] for r in base["results"]}
+
+    filt = tools.call_tool(db, "search_photos",
+                           {"people": ["Alex", "Sam"], "only_these_people": True})
+    ids = {r["id"] for r in filt["results"]}
+    assert just_two in ids       # exactly the two named → kept
+    assert extra not in ids      # third person present → dropped
+    assert filt["face_filtered"] is True
+    # `total` is the pre-filter match count; `returned` reflects survivors.
+    assert filt["returned"] <= filt["total"]
+
+
+def test_search_faces_in_frame_drops_edge_cropped(db):
+    alex = db._test_person_ids["Alex"]
+    sam = db._test_person_ids["Sam"]
+    inside = _add_photo_with_faces(db, "INSIDE.JPG", [
+        (alex, IN_FRAME_BBOX), (sam, IN_FRAME_BBOX)])
+    cropped = _add_photo_with_faces(db, "CROPPED.JPG", [
+        (alex, IN_FRAME_BBOX), (sam, EDGE_BBOX)])
+
+    res = tools.call_tool(db, "search_photos",
+                          {"people": ["Alex", "Sam"], "faces_in_frame": True})
+    ids = {r["id"] for r in res["results"]}
+    assert inside in ids
+    assert cropped not in ids                                # Sam at left edge
+    assert db._test_photo_ids["DSC04894.JPG"] not in ids     # fixture left-edge faces
+
+
+def test_faces_in_frame_scoped_to_named_people(db):
+    # An UNNAMED bystander cropped at the edge must not disqualify the photo —
+    # faces_in_frame with a people filter checks only the named people's faces.
+    alex = db._test_person_ids["Alex"]
+    sam = db._test_person_ids["Sam"]
+    pid = _add_photo_with_faces(db, "BYSTANDER.JPG", [
+        (alex, IN_FRAME_BBOX), (sam, IN_FRAME_BBOX), (None, EDGE_BBOX)])
+    res = tools.call_tool(db, "search_photos",
+                          {"people": ["Alex", "Sam"], "faces_in_frame": True})
+    assert pid in {r["id"] for r in res["results"]}
+
+
+def test_representatives_only_these_people_sql_path(db):
+    # representatives flows through _build_filter_sql (SQL), not the search
+    # post-filter — exercise that branch separately.
+    alex = db._test_person_ids["Alex"]
+    sam = db._test_person_ids["Sam"]
+    # Higher quality than DSC04894 (7.1) so it wins n=1 when NOT filtered.
+    trio = _add_photo_with_faces(db, "TRIO_HIQ.JPG", [
+        (alex, IN_FRAME_BBOX), (sam, IN_FRAME_BBOX), (None, IN_FRAME_BBOX)],
+        score=9.9)
+    unfiltered = tools.call_tool(db, "representatives",
+        {"people": ["Alex", "Sam"], "bucket": "year", "n": 1})
+    assert unfiltered["results"][0]["id"] == trio            # wins on quality
+
+    filtered = tools.call_tool(db, "representatives",
+        {"people": ["Alex", "Sam"], "bucket": "year", "n": 1,
+         "only_these_people": True})
+    ids = {r["id"] for r in filtered["results"]}
+    assert trio not in ids                                   # extra face → out
+    assert db._test_photo_ids["DSC04894.JPG"] in ids         # exactly two → in
+
+
+def test_summarize_faces_in_frame_sql_path(db):
+    alex = db._test_person_ids["Alex"]
+    sam = db._test_person_ids["Sam"]
+    _add_photo_with_faces(db, "INSIDE2.JPG", [
+        (alex, IN_FRAME_BBOX), (sam, IN_FRAME_BBOX)])
+    # people=[Alex,Sam] matches DSC04894 (edge faces) + INSIDE2 (in-frame).
+    base = tools.call_tool(db, "summarize",
+        {"people": ["Alex", "Sam"], "group_by": "year"})
+    framed = tools.call_tool(db, "summarize",
+        {"people": ["Alex", "Sam"], "group_by": "year", "faces_in_frame": True})
+    base_2026 = {b["value"]: b["count"] for b in base["buckets"]}.get("2026", 0)
+    framed_2026 = {b["value"]: b["count"] for b in framed["buckets"]}.get("2026", 0)
+    assert framed_2026 == base_2026 - 1     # DSC04894 (edge) dropped, INSIDE2 kept
+
+
+def test_face_filter_specs_exposed():
+    by_name = {s.name: s for s in tools.all_tools()}
+    for name in ("search_photos", "summarize", "representatives"):
+        props = by_name[name].parameters["properties"]
+        assert "only_these_people" in props
+        assert "faces_in_frame" in props

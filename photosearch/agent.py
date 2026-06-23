@@ -54,7 +54,11 @@ _HTTP_TIMEOUT_S = 120.0
 # Anti-hang guards. A thinking model (qwen3.5) can ramble for minutes on an
 # unsupported query; without caps a single Ask blew 158s and returned nothing.
 _MAX_TOKENS = 3000          # runaway-generation backstop per LLM call
-_DEFAULT_DEADLINE_S = 90.0  # overall wall-clock budget per Ask (env override)
+_DEFAULT_DEADLINE_S = 120.0  # overall wall-clock budget per Ask (env override)
+# A rerank_photos call runs a VISION model over up to 24 images — minutes in the
+# worst case. When the agent invokes it we extend the wall-clock budget so the
+# follow-up turn that consumes the scores isn't killed mid-flight by the deadline.
+_RERANK_DEADLINE_EXTEND_S = 150.0
 
 
 def _writes_enabled() -> bool:
@@ -204,6 +208,16 @@ def _system_prompt(db=None, allow_writes: bool = False) -> str:
         "representatives(people=['X'], rank_by='subject', bucket='year', n=...). "
         "Both rank by the person's face size in frame — prefer them over "
         "rerank_photos for subject prominence.\n"
+        "- FRAMING / who-else-is-in-it constraints are METADATA, not vision — use "
+        "the flags, do NOT reach for rerank_photos for these: 'only the four of "
+        "us / nobody else / just X and Y' -> only_these_people=true (with the "
+        "`people` set); 'everyone fully in the frame / no one cropped / each face "
+        "fully visible' -> faces_in_frame=true. Both work on search_photos, "
+        "representatives, and summarize. They're exact and fast, so APPLY THEM "
+        "FIRST and only then, if a constraint truly needs eyes ('looking at the "
+        "camera', 'eyes and mouth visible', 'smiling') call rerank_photos on the "
+        "narrowed set. Do NOT call get_photo per-result to check face counts or "
+        "framing — that's what these flags are for.\n"
         "- For VISUAL precision a vision model must judge — 'the one where X is "
         "doing Y', a specific ACTIVITY/sport ('playing soccer', 'on a bike'), or "
         "'the sharpest/best-composed' — get candidates first (search_photos with "
@@ -231,6 +245,12 @@ def _system_prompt(db=None, allow_writes: bool = False) -> str:
         "<the returned ids>, criteria='a child actively playing soccer on a field', "
         "top_n=3) — rerank (category tags have false positives) and pass top_n to "
         "honor the requested count and drop low-scoring non-matches\n"
+        "  'best photo of Matt, Calvin, Nicole, Ellie each year, only the four of "
+        "them, everyone fully in frame' -> representatives(people=['Matt','Calvin',"
+        "'Nicole','Ellie'], bucket='year', n=1, rank_by='subject', "
+        "only_these_people=true, faces_in_frame=true) — the flags enforce 'only "
+        "them' + 'not cropped' in metadata; no rerank needed unless they also ask "
+        "for eyes/smiles\n"
     )
     try:
         ctx = _library_context(db) if db is not None else ""
@@ -627,6 +647,11 @@ def run_agent(
                     name = call.get("name") or ""
                     yield {"type": "tool_call", "tool": name, "arguments": call.get("arguments", {}),
                            "step": step + 1, "elapsed": round(time.time() - session["started"], 1)}
+                    # A vision rerank is slow; grant extra wall-clock so the turn
+                    # that reads its scores isn't killed by the deadline.
+                    if name == "rerank_photos":
+                        deadline = max(deadline,
+                                       time.monotonic() + _RERANK_DEADLINE_EXTEND_S)
                     try:
                         result = toolmod.call_tool(db, name, call.get("arguments", {}))
                     except KeyError:
