@@ -1540,6 +1540,84 @@ class PhotoDB:
             )
         self._maybe_commit()
 
+    # ------------------------------------------------------------------
+    # Manual/agent metadata writes (M26b) — one impl shared by the web
+    # endpoints and the agent write tools' NAS-direct path.
+    # ------------------------------------------------------------------
+
+    def set_photo_location(self, photo_id: int, lat: float, lon: float,
+                           place_name: Optional[str] = None,
+                           *, overwrite: bool = False) -> bool:
+        """Set GPS + place on one photo with location_source='manual'. With
+        overwrite=False (default) a row that already has gps_lat is left
+        untouched. Returns True iff a row was written. Honors the active batch."""
+        if overwrite:
+            cur = self.conn.execute(
+                "UPDATE photos SET gps_lat=?, gps_lon=?, place_name=?, "
+                "location_source='manual', location_confidence=NULL WHERE id=?",
+                (lat, lon, place_name, photo_id))
+        else:
+            cur = self.conn.execute(
+                "UPDATE photos SET gps_lat=?, gps_lon=?, place_name=?, "
+                "location_source='manual', location_confidence=NULL "
+                "WHERE id=? AND gps_lat IS NULL",
+                (lat, lon, place_name, photo_id))
+        self._maybe_commit()
+        return cur.rowcount > 0
+
+    _TAG_COLUMNS = {"categories": "category-content",
+                    "visual_tags": "category-visual",
+                    "keywords": "keywords"}
+
+    def set_photo_tags(self, photo_id: int, *, categories: Optional[list] = None,
+                       visual_tags: Optional[list] = None,
+                       keywords: Optional[list] = None, mode: str = "add",
+                       log_model: Optional[str] = None) -> Optional[dict]:
+        """Merge/replace tag columns on one photo. Only the columns passed (not
+        None) are touched. mode 'add' unions with the existing values (order
+        preserved, de-duped), 'replace' overwrites. When log_model is given, each
+        touched column is recorded in the generations provenance log. Returns the
+        photo's full {categories, visual_tags, keywords} after the write, or None
+        if the photo doesn't exist. Honors the active batch."""
+        row = self.conn.execute(
+            "SELECT categories, visual_tags, keywords FROM photos WHERE id=?",
+            (photo_id,)).fetchone()
+        if row is None:
+            return None
+
+        def _load(raw):
+            if not raw:
+                return []
+            try:
+                v = json.loads(raw)
+                return [str(x) for x in v] if isinstance(v, list) else []
+            except (ValueError, TypeError):
+                return []
+
+        incoming = {"categories": categories, "visual_tags": visual_tags,
+                    "keywords": keywords}
+        final = {}
+        for col in ("categories", "visual_tags", "keywords"):
+            current = _load(row[col])
+            new = incoming[col]
+            if new is None:
+                final[col] = current
+                continue
+            new = [str(x) for x in new]
+            if mode == "replace":
+                merged = list(dict.fromkeys(new))
+            else:  # add — union, existing order first
+                merged = list(dict.fromkeys(current + new))
+            final[col] = merged
+            self.conn.execute(f"UPDATE photos SET {col}=? WHERE id=?",
+                              (json.dumps(merged), photo_id))
+            if log_model is not None:
+                self.log_generation(photo_id, self._TAG_COLUMNS[col],
+                                    json.dumps(merged), model_used=log_model,
+                                    model_version="manual")
+        self._maybe_commit()
+        return final
+
     def mark_processed(self, photo_ids: list[int], pass_type: str):
         """Record an attempt at processing these photos for the given pass.
 

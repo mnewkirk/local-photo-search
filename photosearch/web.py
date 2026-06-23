@@ -2554,34 +2554,73 @@ def api_bulk_set_location(data: dict):
     place_name = data.get("place_name") or None
     overwrite = bool(data.get("overwrite", False))
 
-    updated = 0
+    updated_ids = []
     skipped = 0
     with _get_db() as db:
-        cur = db.conn.cursor()
         for pid in photo_ids:
-            if overwrite:
-                cur.execute(
-                    "UPDATE photos "
-                    "SET gps_lat=?, gps_lon=?, place_name=?, "
-                    "    location_source='manual', location_confidence=NULL "
-                    "WHERE id=?",
-                    (lat, lon, place_name, pid),
-                )
-            else:
-                cur.execute(
-                    "UPDATE photos "
-                    "SET gps_lat=?, gps_lon=?, place_name=?, "
-                    "    location_source='manual', location_confidence=NULL "
-                    "WHERE id=? AND gps_lat IS NULL",
-                    (lat, lon, place_name, pid),
-                )
-            if cur.rowcount > 0:
-                updated += cur.rowcount
+            if db.set_photo_location(pid, lat, lon, place_name, overwrite=overwrite):
+                updated_ids.append(pid)
             else:
                 skipped += 1
         db.conn.commit()
 
-    return {"updated_count": updated, "skipped_count": skipped}
+    # `applied` carries the canonical written values so a replica mirror can
+    # copy them byte-for-byte (the M26b dual-write path) instead of re-deriving.
+    return {
+        "updated_count": len(updated_ids),
+        "skipped_count": skipped,
+        "updated_ids": updated_ids,
+        "applied": {"gps_lat": lat, "gps_lon": lon, "place_name": place_name,
+                    "location_source": "manual"},
+    }
+
+
+@app.post("/api/photos/bulk-set-tags")
+def api_bulk_set_tags(data: dict):
+    """Manually/agent-set tag columns on a batch of photos (M26b).
+
+    Body: `{photo_ids: [...], categories?: [...], visual_tags?: [...],
+            keywords?: [...], mode: 'add'|'replace' = 'add', model?: str}`.
+    Only the tag columns provided are touched. `mode='add'` unions with the
+    existing values; `mode='replace'` overwrites. Each touched column is logged
+    to the `generations` provenance table (model defaults to 'manual') so the
+    edit is auditable. Returns the canonical post-write tag lists per photo so a
+    replica mirror can copy them.
+    """
+    photo_ids = data.get("photo_ids") or []
+    if not isinstance(photo_ids, list) or not photo_ids:
+        raise HTTPException(status_code=400, detail="photo_ids required")
+    mode = data.get("mode") or "add"
+    if mode not in ("add", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'add' or 'replace'")
+
+    def _aslist(v):
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise HTTPException(status_code=400,
+                                detail="categories/visual_tags/keywords must be arrays")
+        return [str(x) for x in v]
+
+    categories = _aslist(data.get("categories"))
+    visual_tags = _aslist(data.get("visual_tags"))
+    keywords = _aslist(data.get("keywords"))
+    if categories is None and visual_tags is None and keywords is None:
+        raise HTTPException(status_code=400,
+                            detail="at least one of categories/visual_tags/keywords required")
+    model = data.get("model") or "manual"
+
+    results = []
+    with _get_db() as db:
+        for pid in photo_ids:
+            final = db.set_photo_tags(pid, categories=categories,
+                                      visual_tags=visual_tags, keywords=keywords,
+                                      mode=mode, log_model=model)
+            if final is not None:
+                results.append({"id": pid, **final})
+        db.conn.commit()
+
+    return {"updated_count": len(results), "mode": mode, "results": results}
 
 
 # ---------------------------------------------------------------------------
