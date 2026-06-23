@@ -1,7 +1,10 @@
 # Review folder-list performance (M27 — queued)
 
-**Status:** queued (not started). Surfaced 2026-06-21 — the `/review` folder
-picker is sometimes slow to load.
+**Status:** quick-win #1 **shipped 2026-06-22** — `api_review_folders` now uses
+the `_folder_of` rsplit helper instead of `Path().parent`. Verified against the
+163k-row replica: identical 4328-folder output, 360ms → 38ms (9.5× faster) on
+the Python grouping loop. The durable fix (#3, a `folder` column) remains queued.
+Surfaced 2026-06-21 — the `/review` folder picker is sometimes slow to load.
 
 ## Problem
 

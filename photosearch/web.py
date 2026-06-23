@@ -1830,15 +1830,16 @@ def api_review_folders():
     """List directories that contain indexed photos, for the folder picker."""
     with _get_db() as db:
         rows = db.conn.execute(
-            "SELECT filepath, date_taken FROM photos WHERE filepath IS NOT NULL"
+            "SELECT filepath, filename, date_taken FROM photos WHERE filepath IS NOT NULL"
         ).fetchall()
 
-    # Extract unique parent directories with most recent date_taken per folder
+    # Extract unique parent directories with most recent date_taken per folder.
+    # `_folder_of` is a plain rsplit — far cheaper than Path().parent across the
+    # ~163k-row scan (M27 quick-win), and shared with /geotag's folder summary.
     dir_dates: dict[str, str] = {}
     for row in rows:
-        fp = row["filepath"]
-        parent = str(Path(fp).parent)
-        if parent and parent != ".":
+        parent = _folder_of(row["filepath"], row["filename"])
+        if parent:
             dt = row["date_taken"] or ""
             if parent not in dir_dates or dt > dir_dates[parent]:
                 dir_dates[parent] = dt
