@@ -971,6 +971,38 @@ def _h_representatives(db: PhotoDB, args: dict) -> dict:
     if dedupe and n > 1:
         rows = _dedupe_ranked(rows, n)
 
+    # `max_buckets`: cap the number of buckets to the best K (ranked by each
+    # bucket's top representative) and present the output best-first. This is
+    # what "top N photos, no more than 1 from each location" needs — n stays 1
+    # (one per location) and max_buckets=N caps to the N best locations.
+    # Without it, the bucket order is the chronological/alphabetical spread.
+    max_buckets = args.get("max_buckets")
+    try:
+        max_buckets = int(max_buckets) if max_buckets is not None else None
+    except (TypeError, ValueError):
+        max_buckets = None
+    if max_buckets is not None:
+        max_buckets = max(1, min(max_buckets, 200))
+
+        def _rep_score(d):
+            # Rank by the same signal the buckets were ranked by internally.
+            if use_subject and d.get("_prom") is not None:
+                return d["_prom"]
+            s = d.get("aesthetic_score")
+            return s if s is not None else -1.0
+
+        best_per_bucket: dict = {}
+        for d in rows:
+            b = d.get("_bucket")
+            sc = _rep_score(d)
+            if b not in best_per_bucket or sc > best_per_bucket[b]:
+                best_per_bucket[b] = sc
+        keep = set(sorted(best_per_bucket,
+                          key=lambda b: best_per_bucket[b],
+                          reverse=True)[:max_buckets])
+        rows = [d for d in rows if d.get("_bucket") in keep]
+        rows.sort(key=_rep_score, reverse=True)  # "top N" → best-first
+
     results = []
     for d in rows:
         hit = _compact_hit(d)
@@ -1004,7 +1036,10 @@ _register(ToolSpec(
         "FOREGROUND/prominent that person is (their face size in frame), which "
         "excludes shots where they're in the background. Examples: 'best photo "
         "of Matt, one per year' → people=['Matt'], bucket='year', n=1. 'one per "
-        "year where Matt is the foreground subject' → add rank_by='subject'."
+        "year where Matt is the foreground subject' → add rank_by='subject'. "
+        "'top 10 photos from France, no more than 1 per location' → "
+        "bucket='location', n=1, max_buckets=10 (n stays 1; the 10 is max_buckets, "
+        "NOT n — putting it in n returns up to 10 PER location)."
     ),
     parameters={
         "type": "object",
@@ -1012,7 +1047,13 @@ _register(ToolSpec(
             "bucket": {"type": "string",
                        "enum": ["year", "month", "location", "person", "camera_model"],
                        "description": "Group photos by this; return the best N of each."},
-            "n": {"type": "integer", "description": "Photos per bucket (default 1, max 10)."},
+            "n": {"type": "integer", "description": "Photos PER bucket (default 1, "
+                  "max 10). NOT the total — to cap how many buckets/results come "
+                  "back ('top 10 … one per location'), keep n=1 and set max_buckets=10."},
+            "max_buckets": {"type": "integer", "description": "Cap the result to the "
+                  "best K buckets (ranked by each bucket's top photo) and order the "
+                  "output best-first. Use for 'top N photos, no more than 1 from each "
+                  "<bucket>' → n=1, max_buckets=N. Omit for a full chronological spread."},
             "rank_by": {"type": "string", "enum": ["quality", "subject"],
                         "description": "Rank each bucket by aesthetic quality (default) "
                         "or by how foreground/prominent the filtered person is."},

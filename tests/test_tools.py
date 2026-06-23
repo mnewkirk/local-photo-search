@@ -573,3 +573,47 @@ def test_face_filter_specs_exposed():
         props = by_name[name].parameters["properties"]
         assert "only_these_people" in props
         assert "faces_in_frame" in props
+
+
+# ---------------------------------------------------------------------------
+# representatives max_buckets — "top N photos, no more than 1 from each X"
+# (from the Ask-log review: the agent stuffed the "10" into n and got ~10 PER
+# location; max_buckets caps the bucket count instead, best-first).
+# ---------------------------------------------------------------------------
+
+def test_representatives_max_buckets_caps_and_ranks(db):
+    # Fixture has 2 locations (Big Sur ×3, Morro Bay ×2). n=1 → 2 buckets;
+    # max_buckets=1 keeps only the higher-quality location's representative.
+    full = tools.call_tool(db, "representatives", {"bucket": "location", "n": 1})
+    assert full["buckets"] == 2
+
+    capped = tools.call_tool(db, "representatives",
+                             {"bucket": "location", "n": 1, "max_buckets": 1})
+    assert capped["returned"] == 1
+    assert capped["buckets"] == 1
+    # Big Sur's best (DSC04922, 9.1) beats Morro Bay's best (DSC04878, 6.2).
+    assert capped["results"][0]["filename"] == "DSC04922.JPG"
+
+
+def test_representatives_max_buckets_is_not_per_bucket_count(db):
+    # The bug being fixed: a large value must NOT multiply results per bucket.
+    res = tools.call_tool(db, "representatives",
+                          {"bucket": "location", "n": 1, "max_buckets": 50})
+    # Only 2 locations exist → at most 2 results regardless of the cap.
+    assert res["returned"] == 2
+    assert res["buckets"] == 2
+
+
+def test_representatives_max_buckets_orders_best_first(db):
+    # With max_buckets set, output is a ranked "top" list (best-first), unlike
+    # the default chronological/alphabetical spread.
+    res = tools.call_tool(db, "representatives",
+                          {"bucket": "location", "n": 1, "max_buckets": 10})
+    scores = [r.get("aesthetic_score") for r in res["results"]]
+    non_null = [s for s in scores if s is not None]
+    assert non_null == sorted(non_null, reverse=True)
+
+
+def test_representatives_max_buckets_spec_exposed():
+    spec = {s.name: s for s in tools.all_tools()}["representatives"]
+    assert "max_buckets" in spec.parameters["properties"]

@@ -251,6 +251,12 @@ def _system_prompt(db=None, allow_writes: bool = False) -> str:
         "only_these_people=true, faces_in_frame=true) — the flags enforce 'only "
         "them' + 'not cropped' in metadata; no rerank needed unless they also ask "
         "for eyes/smiles\n"
+        "  'top 10 photos from France last year, no more than 1 from each location' "
+        "-> representatives(location='France', date_from=<jan1 last yr>, "
+        "date_to=<dec31 last yr>, bucket='location', n=1, max_buckets=10) — 'no "
+        "more than 1 per location' is n=1; the '10' is max_buckets (the cap on how "
+        "many locations come back), NOT n. Putting 10 in n returns up to 10 PER "
+        "location\n"
     )
     try:
         ctx = _library_context(db) if db is not None else ""
