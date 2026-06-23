@@ -62,6 +62,7 @@ class ToolSpec:
     description: str
     parameters: dict          # JSON Schema (object) for the arguments
     handler: Callable[[PhotoDB, dict], Any]
+    writes: bool = False      # mutates the library (M26b) — gated off by default
 
 
 _REGISTRY: dict[str, ToolSpec] = {}
@@ -89,15 +90,28 @@ def call_tool(db: PhotoDB, name: str, args: Optional[dict] = None) -> Any:
     return spec.handler(db, args or {})
 
 
-def openai_tools(include_images: bool = True) -> list[dict]:
+def _visible(spec: ToolSpec, include_images: bool, include_writes: bool) -> bool:
+    """Whether a tool is advertised given the image / write gates. Write tools
+    (M26b) are off by default so a plain ``serve`` never exposes mutation to the
+    LLM; the gate is enforced again at the call boundary in the agent / MCP."""
+    if not include_images and spec.name == "get_photo_image":
+        return False
+    if spec.writes and not include_writes:
+        return False
+    return True
+
+
+def openai_tools(include_images: bool = True,
+                 include_writes: bool = False) -> list[dict]:
     """Project the registry into OpenAI/LM-Studio ``tools=[...]`` format.
 
-    ``include_images=False`` drops ``get_photo_image`` — used when image
-    returns are disabled so the model is never told the tool exists.
+    ``include_images=False`` drops ``get_photo_image``; ``include_writes=False``
+    (default) drops the M26b mutation tools — so the model is never even told
+    they exist unless the operator opts in.
     """
     out = []
     for spec in _REGISTRY.values():
-        if not include_images and spec.name == "get_photo_image":
+        if not _visible(spec, include_images, include_writes):
             continue
         out.append({
             "type": "function",
@@ -110,14 +124,15 @@ def openai_tools(include_images: bool = True) -> list[dict]:
     return out
 
 
-def mcp_tools(include_images: bool = True) -> list[dict]:
+def mcp_tools(include_images: bool = True,
+              include_writes: bool = False) -> list[dict]:
     """Project the registry into the shape an MCP ``list_tools`` needs:
     ``[{name, description, inputSchema}]``. The low-level MCP server wraps
     these in ``types.Tool(...)``.
     """
     out = []
     for spec in _REGISTRY.values():
-        if not include_images and spec.name == "get_photo_image":
+        if not _visible(spec, include_images, include_writes):
             continue
         out.append({
             "name": spec.name,
@@ -1255,4 +1270,392 @@ _register(ToolSpec(
         "additionalProperties": False,
     },
     handler=_h_get_photo_image,
+))
+
+
+# ===========================================================================
+# Write tools (M26b) — read-local / write-NAS-authoritative / mirror-local
+# ===========================================================================
+#
+# Reads run against the fast local replica; writes MUST reach the NAS (the
+# disposable replica can't be the system of record). Each confirmed write:
+#   1. POSTs to the NAS endpoint, which applies it and returns the CANONICAL
+#      values it wrote (so we never re-derive — we mirror byte-for-byte).
+#   2. Mirrors those exact values into the local replica so search reflects the
+#      change instantly, without waiting for the nightly sync.
+# When PHOTOSEARCH_NAS_URL is unset (i.e. running ON the NAS), the local DB IS
+# authoritative and we write to it directly — no mirror step.
+#
+# Guardrails (every write tool):
+#   - Explicit photo_ids — the tool NEVER runs a search internally; it mutates
+#     exactly the set the agent already showed the user.
+#   - confirm=false (default) is a dry-run: returns the affected count + a
+#     before→after sample and writes NOTHING. confirm=true applies.
+#   - Affected-count cap: a confirmed write touching more than
+#     PHOTOSEARCH_WRITE_MAX_ROWS (default 1000) rows needs confirm_large=true.
+#   - Audited/reversible: location writes use location_source='manual' (one-query
+#     rollback); tag writes log to the `generations` provenance table.
+
+_WRITE_CAP_DEFAULT = 1000
+_PREVIEW_SAMPLE = 5         # before→after rows shown in a dry-run
+_NAS_WRITE_TIMEOUT_S = 60.0
+
+
+def _write_cap() -> int:
+    try:
+        return max(1, int(os.environ.get("PHOTOSEARCH_WRITE_MAX_ROWS", "")))
+    except (TypeError, ValueError):
+        return _WRITE_CAP_DEFAULT
+
+
+def _nas_base() -> Optional[str]:
+    """Authoritative-writer base URL, or None when this process IS the writer
+    (running on the NAS). Same env var the thumbnail proxy uses."""
+    return (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/") or None
+
+
+def _nas_post(path: str, body: dict, timeout: float = _NAS_WRITE_TIMEOUT_S) -> dict:
+    """POST JSON to the NAS write endpoint and return the parsed response."""
+    import urllib.request
+
+    base = _nas_base()
+    url = base + path
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"},
+        method="POST")
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read())
+
+
+def _parse_ids(args: dict) -> tuple[list[int], Optional[str]]:
+    """Coerce the required photo_ids list into ints. Returns (ids, error)."""
+    raw = args.get("photo_ids")
+    if not isinstance(raw, list) or not raw:
+        return [], "photo_ids is required (a non-empty list of photo ids)"
+    ids = []
+    for v in raw:
+        try:
+            ids.append(int(v))
+        except (TypeError, ValueError):
+            return [], f"photo_ids must be integers (got {v!r})"
+    # De-dupe, preserve order.
+    return list(dict.fromkeys(ids)), None
+
+
+def _truthy(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _cap_guard(n: int, args: dict) -> Optional[dict]:
+    """Return an error dict if a confirmed write of n rows exceeds the cap and
+    confirm_large wasn't set; else None."""
+    cap = _write_cap()
+    if n > cap and not _truthy(args.get("confirm_large")):
+        return {"error": f"this would change {n} photos, above the {cap}-row "
+                         f"safety cap — re-call with confirm_large=true to proceed",
+                "affected_count": n, "cap": cap, "needs": "confirm_large=true"}
+    return None
+
+
+# --- location ---------------------------------------------------------------
+
+def _resolve_location(db: PhotoDB, args: dict):
+    """Resolve the target coordinates from explicit lat/lon or a free-text
+    `place`. Returns (lat, lon, place_name, error)."""
+    lat, lon = args.get("lat"), args.get("lon")
+    place = (args.get("place") or "").strip()
+    label = args.get("place_name") or (place or None)
+    if lat is not None and lon is not None:
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            return None, None, None, "lat/lon must be numeric"
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return None, None, None, "lat/lon out of range"
+        return lat, lon, label, None
+    if place:
+        # Forward-geocode the place name (cached in geocode_cache). Works on the
+        # replica too — Nominatim is an external service, not the NAS.
+        try:
+            from .geocode import forward_geocode
+            results, _src = forward_geocode(db, place, 1)
+        except Exception as exc:
+            return None, None, None, f"could not geocode {place!r}: {exc}"
+        if not results:
+            return None, None, None, f"no geocode match for {place!r}"
+        top = results[0]
+        return (float(top["lat"]), float(top["lon"]),
+                label or top.get("display_name") or place, None)
+    return None, None, None, "provide lat+lon, or a place name to geocode"
+
+
+def _h_set_photo_location(db: PhotoDB, args: dict) -> dict:
+    ids, err = _parse_ids(args)
+    if err:
+        return {"error": err}
+    lat, lon, place_name, err = _resolve_location(db, args)
+    if err:
+        return {"error": err}
+    overwrite = _truthy(args.get("overwrite"))
+
+    # Which rows would actually change? (those with no GPS, unless overwrite).
+    rows = db.conn.execute(
+        f"SELECT id, place_name, gps_lat, gps_lon FROM photos "
+        f"WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
+    found = {r["id"]: r for r in rows}
+    would_change = [i for i in ids
+                    if i in found and (overwrite or found[i]["gps_lat"] is None)]
+
+    if not _truthy(args.get("confirm")):
+        sample = [{"id": i,
+                   "before": {"place_name": found[i]["place_name"],
+                              "gps": [found[i]["gps_lat"], found[i]["gps_lon"]]},
+                   "after": {"place_name": place_name, "gps": [lat, lon]}}
+                  for i in would_change[:_PREVIEW_SAMPLE]]
+        return {"dry_run": True, "affected_count": len(would_change),
+                "requested": len(ids),
+                "missing": len(ids) - len(found),
+                "skipped_existing_gps": len(found) - len(would_change),
+                "applied_preview": {"gps_lat": lat, "gps_lon": lon,
+                                    "place_name": place_name,
+                                    "location_source": "manual"},
+                "sample": sample,
+                "note": "nothing written — re-call with confirm=true to apply"}
+
+    cap_err = _cap_guard(len(would_change), args)
+    if cap_err:
+        return cap_err
+    return _dual_write_location(db, ids, lat, lon, place_name, overwrite)
+
+
+def _dual_write_location(db, ids, lat, lon, place_name, overwrite) -> dict:
+    base = _nas_base()
+    if base:
+        resp = _nas_post("/api/photos/bulk-set-location",
+                         {"photo_ids": ids, "lat": lat, "lon": lon,
+                          "place_name": place_name, "overwrite": overwrite})
+        updated = resp.get("updated_ids") or []
+        applied = resp.get("applied") or {}
+        # Mirror exactly what the NAS wrote (force, since the NAS already applied
+        # the overwrite guard — these ids are the ones it changed).
+        mirrored, mirror_err = 0, 0
+        for pid in updated:
+            try:
+                db.set_photo_location(pid, applied["gps_lat"], applied["gps_lon"],
+                                      applied.get("place_name"), overwrite=True)
+                mirrored += 1
+            except Exception:
+                mirror_err += 1
+        out = {"updated_count": resp.get("updated_count", len(updated)),
+               "skipped_count": resp.get("skipped_count", 0),
+               "applied": applied, "authority": "nas", "mirrored": mirrored}
+        if mirror_err:
+            out["mirror_errors"] = mirror_err
+        return out
+    # No NAS configured → this process is the authoritative writer.
+    updated, skipped = [], 0
+    for pid in ids:
+        if db.set_photo_location(pid, lat, lon, place_name, overwrite=overwrite):
+            updated.append(pid)
+        else:
+            skipped += 1
+    db.conn.commit()
+    return {"updated_count": len(updated), "skipped_count": skipped,
+            "applied": {"gps_lat": lat, "gps_lon": lon, "place_name": place_name,
+                        "location_source": "manual"},
+            "authority": "local"}
+
+
+_register(ToolSpec(
+    name="set_photo_location",
+    writes=True,
+    description=(
+        "Set the GPS location + place name on a SPECIFIC set of photos (by id). "
+        "Pass either lat+lon, or a `place` name to geocode. The id set must come "
+        "from a search you already ran and the user saw — this tool NEVER searches "
+        "on its own. By DEFAULT it is a dry run (confirm=false): it returns how "
+        "many photos would change plus a before→after sample and writes nothing. "
+        "Only set confirm=true after the user has explicitly approved the change "
+        "in the conversation. Existing GPS is preserved unless overwrite=true. "
+        "Writes are reversible (location_source='manual')."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "photo_ids": {"type": "array", "items": {"type": "integer"},
+                          "description": "Exact photo ids to update."},
+            "place": {"type": "string",
+                      "description": "Place name to geocode (alternative to lat/lon)."},
+            "lat": {"type": "number", "description": "Latitude (with lon)."},
+            "lon": {"type": "number", "description": "Longitude (with lat)."},
+            "place_name": {"type": "string",
+                           "description": "Human label to store (defaults to the geocode result)."},
+            "overwrite": {"type": "boolean",
+                          "description": "Replace existing GPS too (default false)."},
+            "confirm": {"type": "boolean",
+                        "description": "false (default) = dry-run preview; true = apply."},
+            "confirm_large": {"type": "boolean",
+                              "description": "Required to apply when >1000 photos change."},
+        },
+        "required": ["photo_ids"],
+        "additionalProperties": False,
+    },
+    handler=_h_set_photo_location,
+))
+
+
+# --- tags -------------------------------------------------------------------
+
+_TAG_FIELDS = ("categories", "visual_tags", "keywords")
+
+
+def _tag_arg(args: dict, key: str):
+    v = args.get(key)
+    if v is None:
+        return None
+    return _coerce_str_list(v)
+
+
+def _merge_preview(current: list, new: list, mode: str) -> list:
+    """Mirror db.set_photo_tags' merge so the dry-run shows the real result."""
+    if mode == "replace":
+        return list(dict.fromkeys(str(x) for x in new))
+    return list(dict.fromkeys([str(x) for x in current] + [str(x) for x in new]))
+
+
+def _h_set_photo_tags(db: PhotoDB, args: dict) -> dict:
+    ids, err = _parse_ids(args)
+    if err:
+        return {"error": err}
+    mode = args.get("mode") or "add"
+    if mode not in ("add", "replace"):
+        return {"error": "mode must be 'add' or 'replace'"}
+    incoming = {f: _tag_arg(args, f) for f in _TAG_FIELDS}
+    if all(v is None for v in incoming.values()):
+        return {"error": "pass at least one of categories / visual_tags / keywords"}
+
+    rows = db.conn.execute(
+        f"SELECT id, categories, visual_tags, keywords FROM photos "
+        f"WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
+    found = {r["id"]: r for r in rows}
+
+    def _load(raw):
+        if not raw:
+            return []
+        try:
+            v = json.loads(raw)
+            return [str(x) for x in v] if isinstance(v, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    changed, sample = [], []
+    for i in ids:
+        if i not in found:
+            continue
+        before, after, diff = {}, {}, False
+        for f in _TAG_FIELDS:
+            cur = _load(found[i][f])
+            if incoming[f] is None:
+                continue
+            merged = _merge_preview(cur, incoming[f], mode)
+            before[f], after[f] = cur, merged
+            if merged != cur:
+                diff = True
+        if diff:
+            changed.append(i)
+            if len(sample) < _PREVIEW_SAMPLE:
+                sample.append({"id": i, "before": before, "after": after})
+
+    if not _truthy(args.get("confirm")):
+        return {"dry_run": True, "mode": mode, "affected_count": len(changed),
+                "requested": len(ids), "missing": len(ids) - len(found),
+                "unchanged": len(found) - len(changed), "sample": sample,
+                "note": "nothing written — re-call with confirm=true to apply"}
+
+    cap_err = _cap_guard(len(changed), args)
+    if cap_err:
+        return cap_err
+    model = args.get("model") or "manual"
+    return _dual_write_tags(db, ids, incoming, mode, model)
+
+
+def _dual_write_tags(db, ids, incoming, mode, model) -> dict:
+    base = _nas_base()
+    if base:
+        resp = _nas_post("/api/photos/bulk-set-tags",
+                         {"photo_ids": ids, "categories": incoming["categories"],
+                          "visual_tags": incoming["visual_tags"],
+                          "keywords": incoming["keywords"], "mode": mode,
+                          "model": model})
+        results = resp.get("results") or []
+        # Mirror the NAS's canonical post-write lists verbatim (replace mode, no
+        # extra provenance row — the NAS already logged the generation).
+        mirrored, mirror_err = 0, 0
+        for r in results:
+            try:
+                db.set_photo_tags(r["id"], categories=r.get("categories"),
+                                  visual_tags=r.get("visual_tags"),
+                                  keywords=r.get("keywords"), mode="replace",
+                                  log_model=None)
+                mirrored += 1
+            except Exception:
+                mirror_err += 1
+        out = {"updated_count": resp.get("updated_count", len(results)),
+               "mode": mode, "results": results, "authority": "nas",
+               "mirrored": mirrored}
+        if mirror_err:
+            out["mirror_errors"] = mirror_err
+        return out
+    results = []
+    for pid in ids:
+        final = db.set_photo_tags(pid, categories=incoming["categories"],
+                                  visual_tags=incoming["visual_tags"],
+                                  keywords=incoming["keywords"], mode=mode,
+                                  log_model=model)
+        if final is not None:
+            results.append({"id": pid, **final})
+    db.conn.commit()
+    return {"updated_count": len(results), "mode": mode, "results": results,
+            "authority": "local"}
+
+
+_register(ToolSpec(
+    name="set_photo_tags",
+    writes=True,
+    description=(
+        "Add or replace tags on a SPECIFIC set of photos (by id). Three tag "
+        "fields: `categories` (content categories), `visual_tags` (visual/style), "
+        "`keywords` (free-form). Pass only the field(s) you mean to change. "
+        "mode='add' (default) unions with existing tags; mode='replace' overwrites. "
+        "The id set must come from a search you already ran — this tool NEVER "
+        "searches on its own. By DEFAULT it is a dry run (confirm=false): it "
+        "returns how many photos would change plus a before→after sample and "
+        "writes nothing. Only set confirm=true after the user explicitly approved. "
+        "Writes are audited in the provenance log."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "photo_ids": {"type": "array", "items": {"type": "integer"},
+                          "description": "Exact photo ids to update."},
+            "categories": {"type": "array", "items": {"type": "string"},
+                           "description": "Content-category tags."},
+            "visual_tags": {"type": "array", "items": {"type": "string"},
+                            "description": "Visual/style tags."},
+            "keywords": {"type": "array", "items": {"type": "string"},
+                         "description": "Free-form keyword tags."},
+            "mode": {"type": "string", "enum": ["add", "replace"],
+                     "description": "add (default) unions; replace overwrites."},
+            "confirm": {"type": "boolean",
+                        "description": "false (default) = dry-run preview; true = apply."},
+            "confirm_large": {"type": "boolean",
+                              "description": "Required to apply when >1000 photos change."},
+        },
+        "required": ["photo_ids"],
+        "additionalProperties": False,
+    },
+    handler=_h_set_photo_tags,
 ))

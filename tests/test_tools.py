@@ -15,11 +15,15 @@ from photosearch import tools
 # Registry + schema projections
 # ---------------------------------------------------------------------------
 
-EXPECTED_TOOLS = {
+# Read-only tools advertised by default (include_images=True, include_writes=False).
+READ_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
     "search_photos", "summarize", "representatives", "rerank_photos",
     "get_photo", "get_photo_image",
 }
+# M26b mutation tools — gated off by default.
+WRITE_TOOLS = {"set_photo_location", "set_photo_tags"}
+EXPECTED_TOOLS = READ_TOOLS | WRITE_TOOLS
 
 
 def test_registry_has_all_tools():
@@ -34,8 +38,9 @@ def test_every_schema_is_a_valid_object_schema():
 
 
 def test_openai_projection_shape():
+    # Default projection hides the write tools (include_writes=False).
     fns = tools.openai_tools()
-    assert {t["function"]["name"] for t in fns} == EXPECTED_TOOLS
+    assert {t["function"]["name"] for t in fns} == READ_TOOLS
     for t in fns:
         assert t["type"] == "function"
         assert "parameters" in t["function"]
@@ -43,7 +48,7 @@ def test_openai_projection_shape():
 
 def test_mcp_projection_shape():
     specs = tools.mcp_tools()
-    assert {s["name"] for s in specs} == EXPECTED_TOOLS
+    assert {s["name"] for s in specs} == READ_TOOLS
     for s in specs:
         assert "inputSchema" in s and s["inputSchema"]["type"] == "object"
 
@@ -56,6 +61,18 @@ def test_include_images_flag_drops_image_tool():
     # …and is present when enabled.
     assert "get_photo_image" in {
         s["name"] for s in tools.mcp_tools(include_images=True)}
+
+
+def test_include_writes_flag_gates_mutation_tools():
+    # Off by default in both projections…
+    assert not (WRITE_TOOLS & {
+        t["function"]["name"] for t in tools.openai_tools()})
+    assert not (WRITE_TOOLS & {s["name"] for s in tools.mcp_tools()})
+    # …and present when opted in.
+    assert WRITE_TOOLS <= {
+        t["function"]["name"] for t in tools.openai_tools(include_writes=True)}
+    assert WRITE_TOOLS <= {
+        s["name"] for s in tools.mcp_tools(include_writes=True)}
 
 
 def test_call_tool_unknown_raises():

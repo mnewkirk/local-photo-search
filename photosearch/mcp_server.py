@@ -26,6 +26,8 @@ Env:
     PHOTOSEARCH_MCP_HOST           bind host (default 0.0.0.0)
     PHOTOSEARCH_MCP_PORT           bind port (default 8848)
     PHOTOSEARCH_MCP_ALLOW_IMAGES   '1'/'true' to expose get_photo_image
+    PHOTOSEARCH_ALLOW_WRITES       '1'/'true' to expose the M26b write tools
+                                   (set_photo_location / set_photo_tags)
 """
 
 from __future__ import annotations
@@ -46,6 +48,14 @@ SERVER_NAME = "photosearch"
 
 def _images_allowed() -> bool:
     return os.environ.get("PHOTOSEARCH_MCP_ALLOW_IMAGES", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _writes_allowed() -> bool:
+    """Expose the M26b mutation tools over MCP. Off by default — an MCP client
+    only gets write access when the operator opts in (PHOTOSEARCH_ALLOW_WRITES)."""
+    return os.environ.get("PHOTOSEARCH_ALLOW_WRITES", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -72,6 +82,7 @@ def build_server():
     import mcp.types as types
 
     allow_images = _images_allowed()
+    allow_writes = _writes_allowed()
     app = Server(SERVER_NAME)
 
     @app.list_tools()
@@ -82,7 +93,8 @@ def build_server():
                 description=spec["description"],
                 inputSchema=spec["inputSchema"],
             )
-            for spec in mcp_tools(include_images=allow_images)
+            for spec in mcp_tools(include_images=allow_images,
+                                  include_writes=allow_writes)
         ]
 
     @app.call_tool()
@@ -94,6 +106,15 @@ def build_server():
                 type="text",
                 text=json.dumps({"error": "image returns are disabled by the "
                                           "operator (PHOTOSEARCH_MCP_ALLOW_IMAGES)"}),
+            )]
+        # Same enforcement for the write tools — a client could call one it
+        # wasn't advertised.
+        spec = get_tool(name)
+        if spec is not None and spec.writes and not allow_writes:
+            return [types.TextContent(
+                type="text",
+                text=json.dumps({"error": "write tools are disabled by the "
+                                          "operator (PHOTOSEARCH_ALLOW_WRITES)"}),
             )]
         if get_tool(name) is None:
             return [types.TextContent(

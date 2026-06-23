@@ -57,6 +57,13 @@ _MAX_TOKENS = 3000          # runaway-generation backstop per LLM call
 _DEFAULT_DEADLINE_S = 90.0  # overall wall-clock budget per Ask (env override)
 
 
+def _writes_enabled() -> bool:
+    """Whether the agent may call the M26b mutation tools. Off by default — a
+    plain `serve` is read-only; the operator opts in (replica deployment)."""
+    return os.environ.get("PHOTOSEARCH_ALLOW_WRITES", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _agent_model() -> str:
     """Resolve the agent model id by role, mirroring describe.py's role map.
 
@@ -131,7 +138,23 @@ def _library_context(db) -> str:
     return text
 
 
-def _system_prompt(db=None) -> str:
+_WRITE_GUIDANCE = (
+    "\n\nWRITES (you can edit the library): set_photo_location and set_photo_tags "
+    "mutate photos. STRICT protocol:\n"
+    "- They act ONLY on an explicit photo_ids list — pass the exact ids from a "
+    "search you already ran and the user saw. NEVER make up ids or write to a set "
+    "the user hasn't seen.\n"
+    "- ALWAYS preview first: call with confirm=false (the default) to show how "
+    "many photos would change and a before→after sample. Report that to the user "
+    "and ask them to confirm.\n"
+    "- Only call again with confirm=true AFTER the user explicitly says yes in the "
+    "conversation. Never pass confirm=true on your own initiative.\n"
+    "- If the preview says confirm_large is needed (a big batch), tell the user "
+    "the count and get a second explicit go-ahead before adding confirm_large=true.\n"
+)
+
+
+def _system_prompt(db=None, allow_writes: bool = False) -> str:
     base = (
         "You are a photo-library search assistant. The user describes what they "
         "want in natural language; find the matching photos with the tools, then "
@@ -211,7 +234,7 @@ def _system_prompt(db=None) -> str:
     except Exception:
         ctx = ""
     hints = os.environ.get("PHOTOSEARCH_AGENT_HINTS", "").strip()
-    out = base
+    out = base + (_WRITE_GUIDANCE if allow_writes else "")
     if ctx:
         out += "\nLIBRARY FACTS:\n" + ctx + "\n"
     if hints:
@@ -542,8 +565,10 @@ def run_agent(
                 yield ev
             return
 
-        tools = toolmod.openai_tools(include_images=False)
-        messages: list = [{"role": "system", "content": _system_prompt(db)}]
+        allow_writes = _writes_enabled()
+        tools = toolmod.openai_tools(include_images=False, include_writes=allow_writes)
+        messages: list = [{"role": "system",
+                           "content": _system_prompt(db, allow_writes=allow_writes)}]
         for h in (history or []):
             if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
                 messages.append({"role": h["role"], "content": str(h["content"])})
