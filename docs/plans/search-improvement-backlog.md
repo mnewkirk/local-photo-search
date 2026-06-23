@@ -7,6 +7,20 @@ up.
 
 ## In progress / done
 
+- **`summarize` / faceting tool — SHIPPED.** `tools.py:_h_summarize` +
+  `summarize` ToolSpec, agent system-prompt rule, 7 tests
+  (`test_tools.py::test_summarize_*`). Counts by year/month/location/person/
+  camera_model; the multi-hop "which year in both X and Y" path is documented in
+  the prompt. (Was "Next #1".)
+- **VLM re-ranking — SHIPPED (core).** `tools.py:_h_rerank_photos` + `rerank_photos`
+  ToolSpec (per-image vision scoring, parallel, `top_n`, no-model fallback),
+  agent prompt rules, MCP exposure, 4 tests. Open: precision eval +
+  vision-model bakeoff — see `docs/plans/vlm-reranking.md`. (Was "Next #2".)
+- **Subject-prominence + top-N-per-bucket — SHIPPED.** `representatives` tool
+  (`rank_by=quality|subject`, dedupe) + `search_photos(sort='subject')` flat
+  variant. Ranks by the named person's face-area fraction (foreground vs
+  background) with a prominence sweet-spot band. Tests + agent prompt rules in.
+  (Was backlog #0 / #0a.)
 - **Prompt improvements (one pass) — DONE.** `photosearch/agent.py`:
   pre-inject **library facts** (people, places, categories, visual_tags, date
   span — cached) into the system prompt so models plan straight to
@@ -19,19 +33,15 @@ up.
 
 ## Next (committed order)
 
-1. **`summarize` / faceting tool.** The bake-off's p10 ("which year were we in
-   both NY and France?") failed for ALL models because the tools expose
-   retrieval but not **aggregation** — there's no way to get "the set of years
-   for a location." Add a tool like `summarize(filters, group_by="year"|"month"
-   |"location"|"person")` returning counts per bucket. Unlocks "which year /
-   how many / when / how often" questions and makes multi-hop set-intersection
-   solvable. Small, high-leverage.
-2. **VLM re-ranking of top-K.** The biggest lever for "find THE photo." Cheaply
-   retrieve 30-50 candidates (CLIP + filters), then have a local vision model
-   look at each thumbnail and score it against the query; return the best.
-   This is the `get_photo_image` path turned into a rerank stage — makes "the
-   one where Ellie's blowing out candles" work. Gated/optional per request
-   (latency). Pairs with the agent.
+The original top two here (`summarize`, VLM re-ranking) both **SHIPPED** — see
+"In progress / done" above. What's actually next:
+
+1. **VLM re-ranking validation.** The tool/agent/MCP/tests are in; the precision
+   eval (`evals/rerank_eval.py`, top-1/top-3 vs baseline) and the vision-model
+   bakeoff to pick `PHOTOSEARCH_LLM_VISUAL_MODEL` are the open items. Needs a
+   vision model loaded in the local LM Studio. See `docs/plans/vlm-reranking.md`.
+2. **M26b write tools** (`docs/plans/local-replica-and-writes.md`) — genuinely
+   not started; the next big buildable search/agent feature.
 
 ## Backlog (impact-ordered)
 

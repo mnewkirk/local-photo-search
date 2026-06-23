@@ -1,7 +1,20 @@
 # VLM Re-ranking — "find THE photo" (M27)
 
-**Status:** Planned (design doc). Not started. Next milestone after the
-`summarize` faceting tool. Captured 2026-06-20.
+**Status:** ✅ **SHIPPED** (core). Captured 2026-06-20; landed shortly after.
+The `rerank_photos` tool (`photosearch/tools.py`, per-image vision scoring,
+parallel, `top_n`, graceful no-vision-model fallback) + agent system-prompt
+rules (`photosearch/agent.py`) + automatic MCP exposure + unit tests
+(`tests/test_tools.py::test_rerank_*`) are all in and green. The Ask UI surfaces
+rerank progress via the generic tool_call/tool_result narration panel.
+
+**Remaining (validation, not build):**
+- **Precision eval** — the §6 harness (`evals/rerank_eval.py`: top-1/top-3 after
+  rerank vs the CLIP/RRF baseline, HTML side-by-side) was never written.
+- **Vision-model pick** — §8 step 1's bakeoff to choose `PHOTOSEARCH_LLM_VISUAL_MODEL`
+  is environment-dependent (which vision model is loaded in LM Studio) and undone.
+
+The §1–§5 design below is implemented; §6 eval + the model bakeoff are the open
+items. Everything past this header is the original (now-implemented) design.
 
 ## 1. Motivation
 
