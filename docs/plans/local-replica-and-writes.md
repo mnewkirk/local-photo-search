@@ -2,24 +2,26 @@
 
 **Status:** 🟡 **M26a partially shipped** (image-proxy fallback, sync script,
 sync/status endpoints + `/status` card). **M26b (writes) shipped 2026-06-23** —
-the agent-facing write tools `set_photo_location` / `set_photo_tags` now live in
-the shared tool layer (`photosearch/tools.py`) with the full
-read-local / write-NAS-authoritative / mirror-local dual-write loop and all the
-§3.2 guardrails (explicit `photo_ids`, dry-run-by-default `confirm`,
-affected-count cap via `PHOTOSEARCH_WRITE_MAX_ROWS`, reversible+audited). Both
-the in-app agent (`/api/ask`) and the MCP server advertise them **only when
-`PHOTOSEARCH_ALLOW_WRITES` is truthy** (off by default — a plain `serve` stays
-read-only). The agent's system prompt enforces preview→confirm. Tests:
-`tests/test_write_tools.py` (incl. a mocked-NAS dual-write+mirror path),
-`tests/test_tools.py` write-gate cases, `tests/test_agent.py` gate cases. The
-foundation (NAS endpoints `POST /api/photos/bulk-set-tags` +
-`bulk-set-location` returning canonical `applied`/`updated_ids`, and the shared
-`PhotoDB.set_photo_location` / `set_photo_tags` helpers) landed 2026-06-22
-(`tests/test_web_writes.py`). **Deferred:** `add_to_collection` (the
-`/api/collections/{id}/photos` endpoint doesn't return canonical mirror values
-and collection-id sync between NAS↔replica needs design — pick up if the pain
-surfaces); structured confirm-over-SSE button (conversational confirm is enough
-for v1). Independent of M25. (Status authority: see
+all three agent-facing write tools `set_photo_location` / `set_photo_tags` /
+`add_to_collection` now live in the shared tool layer (`photosearch/tools.py`)
+with the full read-local / write-NAS-authoritative / mirror-local dual-write
+loop and all the §3.2 guardrails (explicit `photo_ids`, dry-run-by-default
+`confirm`, affected-count cap via `PHOTOSEARCH_WRITE_MAX_ROWS`,
+reversible+audited; collection-create additionally needs `create=true`). Both
+the in-app agent (`/api/ask`) and the MCP server advertise the write tools and
+the gate is re-checked at each call boundary. **Writes are ON by default** —
+the deployment lives behind Tailscale (same trust boundary as the deploy
+panel); set `PHOTOSEARCH_ALLOW_WRITES=0` to make a deployment read-only. The
+agent's system prompt enforces preview→confirm. NAS endpoints:
+`POST /api/photos/bulk-set-location` + `bulk-set-tags` (return canonical
+`applied`/`results` for the mirror, landed 2026-06-22) and
+`POST /api/collections/add-photos` (resolve-or-create by name, returns the
+canonical collection id so the mirror re-creates it under the same id via
+`PhotoDB.ensure_collection`). Tests: `tests/test_write_tools.py` (guardrails +
+mocked-NAS dual-write+mirror for all three tools), `tests/test_web_writes.py`
+(endpoints), `tests/test_tools.py` + `tests/test_agent.py` (write-gate).
+**Deferred:** structured confirm-over-SSE button (conversational confirm is
+enough for v1). Independent of M25. (Status authority: see
 [the roadmap index](README.md).)
 
 **M26a shipped so far:**
@@ -177,7 +179,7 @@ wrong, so every write tool enforces:
 |---|---|---|
 | `set_photo_location(ids, lat/lon or place)` | `POST /api/photos/bulk-set-location` | ✅ shipped (geocodes `place`, returns + mirrors canonical `applied`) |
 | `set_photo_tags(ids, categories?/visual_tags?/keywords?, mode=add|replace)` | `POST /api/photos/bulk-set-tags` | ✅ shipped (logs to `generations`, mirror via replace w/o double-log) |
-| `add_to_collection(ids, collection)` | `POST /api/collections/{id}/photos` | ⏸ deferred (no canonical mirror payload; coll-id sync TBD) |
+| `add_to_collection(ids, collection, create?)` | **new** `POST /api/collections/add-photos` | ✅ shipped (resolve-or-create by name; mirror re-creates under the NAS's canonical id via `ensure_collection`) |
 
 Each tool: dry-run preview → confirmed NAS write returning canonical values →
 local mirror SQL. The dry-run/confirm + mirror logic lives in the tool layer so

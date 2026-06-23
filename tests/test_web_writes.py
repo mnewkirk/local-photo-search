@@ -91,3 +91,29 @@ def test_bulk_set_tags_requires_a_column(client, db):
     db.conn.commit()
     r = client.post("/api/photos/bulk-set-tags", json={"photo_ids": [a]})
     assert r.status_code == 400
+
+
+def test_collection_add_photos_resolves_existing(client, db):
+    a = db.add_photo(filepath="w/c1.jpg", filename="c1.jpg")
+    db.conn.commit()
+    r = client.post("/api/collections/add-photos",
+                    json={"collection": "Best of March", "photo_ids": [a]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["created"] is False
+    assert body["added"] == 1
+    assert body["collection"]["name"] == "Best of March"
+
+
+def test_collection_add_photos_missing_needs_create(client, db):
+    a = db.add_photo(filepath="w/c2.jpg", filename="c2.jpg")
+    db.conn.commit()
+    r = client.post("/api/collections/add-photos",
+                    json={"collection": "Nope", "photo_ids": [a]})
+    assert r.status_code == 404
+    r = client.post("/api/collections/add-photos",
+                    json={"collection": "Fresh Album", "photo_ids": [a], "create": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["created"] is True
+    assert body["collection"]["id"] and body["collection"]["name"] == "Fresh Album"

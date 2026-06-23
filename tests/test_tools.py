@@ -21,8 +21,8 @@ READ_TOOLS = {
     "search_photos", "summarize", "representatives", "rerank_photos",
     "get_photo", "get_photo_image",
 }
-# M26b mutation tools — gated off by default.
-WRITE_TOOLS = {"set_photo_location", "set_photo_tags"}
+# M26b mutation tools — gated out of the default projections.
+WRITE_TOOLS = {"set_photo_location", "set_photo_tags", "add_to_collection"}
 EXPECTED_TOOLS = READ_TOOLS | WRITE_TOOLS
 
 

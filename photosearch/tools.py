@@ -1659,3 +1659,149 @@ _register(ToolSpec(
     },
     handler=_h_set_photo_tags,
 ))
+
+
+# --- collections ------------------------------------------------------------
+
+def _resolve_collection_local(db: PhotoDB, args: dict):
+    """Find the target collection in the LOCAL replica for the dry-run preview.
+    Returns (collection_dict_or_None, error). Resolution is by collection_id if
+    given, else by `collection` name."""
+    cid = args.get("collection_id")
+    if cid is not None:
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            return None, "collection_id must be an integer"
+        coll = db.get_collection(cid)
+        if coll is None:
+            return None, f"no collection with id {cid}"
+        return coll, None
+    name = (args.get("collection") or "").strip()
+    if not name:
+        return None, "pass a collection name or collection_id"
+    return db.get_collection_by_name(name), None   # None = doesn't exist yet
+
+
+def _h_add_to_collection(db: PhotoDB, args: dict) -> dict:
+    ids, err = _parse_ids(args)
+    if err:
+        return {"error": err}
+    coll, err = _resolve_collection_local(db, args)
+    if err:
+        return {"error": err}
+    create = _truthy(args.get("create"))
+    name = (args.get("collection") or "").strip()
+
+    if coll is None:
+        # Collection doesn't exist locally — would be created (needs create=true).
+        would_add = ids
+        existing_members: set = set()
+    else:
+        existing_members = set(db.get_collection_photo_ids(coll["id"]))
+        would_add = [i for i in ids if i not in existing_members]
+
+    if not _truthy(args.get("confirm")):
+        out = {"dry_run": True, "affected_count": len(would_add),
+               "requested": len(ids),
+               "already_in_collection": len(ids) - len(would_add),
+               "collection": (coll["name"] if coll else name),
+               "collection_exists": coll is not None,
+               "note": "nothing written — re-call with confirm=true to apply"}
+        if coll is None:
+            out["would_create"] = True
+            if not create:
+                out["note"] = (f"collection {name!r} does not exist — re-call with "
+                               f"create=true and confirm=true to create it and add "
+                               f"these photos")
+        return out
+
+    if coll is None and not create:
+        return {"error": f"collection {name!r} does not exist — pass create=true "
+                         f"to create it"}
+    cap_err = _cap_guard(len(would_add), args)
+    if cap_err:
+        return cap_err
+    return _dual_write_collection(db, ids, args, create)
+
+
+def _dual_write_collection(db, ids, args, create) -> dict:
+    cid = args.get("collection_id")
+    name = (args.get("collection") or "").strip()
+    description = args.get("description")
+    base = _nas_base()
+    if base:
+        body = {"photo_ids": ids, "create": create, "description": description}
+        if cid is not None:
+            body["collection_id"] = int(cid)
+        else:
+            body["collection"] = name
+        resp = _nas_post("/api/collections/add-photos", body)
+        coll = resp.get("collection") or {}
+        # Mirror under the SAME id the NAS assigned, then add the same photos.
+        mirror_err = 0
+        try:
+            db.ensure_collection(coll["id"], coll["name"], coll.get("description"))
+            db.add_photos_to_collection(coll["id"], ids)
+        except Exception:
+            mirror_err += 1
+        out = {"added": resp.get("added", 0), "created": resp.get("created", False),
+               "collection": coll, "authority": "nas"}
+        if mirror_err:
+            out["mirror_errors"] = mirror_err
+        return out
+    # No NAS → local DB is authoritative.
+    if cid is not None:
+        coll = db.get_collection(int(cid))
+        if coll is None:
+            return {"error": f"no collection with id {cid}"}
+        created = False
+    else:
+        coll = db.get_collection_by_name(name)
+        created = False
+        if coll is None:
+            coll = {"id": db.create_collection(name, description), "name": name,
+                    "description": description}
+            created = True
+    added = db.add_photos_to_collection(coll["id"], ids)
+    return {"added": added, "created": created,
+            "collection": {"id": coll["id"], "name": coll["name"]},
+            "authority": "local"}
+
+
+_register(ToolSpec(
+    name="add_to_collection",
+    writes=True,
+    description=(
+        "Add a SPECIFIC set of photos (by id) to a collection (album), creating "
+        "the collection if needed. Identify the collection by `collection` name "
+        "(or `collection_id`). The id set must come from a search you already ran "
+        "— this tool NEVER searches on its own. By DEFAULT it is a dry run "
+        "(confirm=false): it reports how many photos would be added (and whether "
+        "the collection would be created) and writes nothing. Only set confirm=true "
+        "after the user explicitly approved. Creating a NEW collection also "
+        "requires create=true, so a mistyped name can't silently spawn an album."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "photo_ids": {"type": "array", "items": {"type": "integer"},
+                          "description": "Exact photo ids to add."},
+            "collection": {"type": "string",
+                           "description": "Collection name (resolved or created)."},
+            "collection_id": {"type": "integer",
+                              "description": "Collection id (alternative to name)."},
+            "create": {"type": "boolean",
+                       "description": "Allow creating the collection if it doesn't exist."},
+            "description": {"type": "string",
+                            "description": "Description when creating a new collection."},
+            "confirm": {"type": "boolean",
+                        "description": "false (default) = dry-run preview; true = apply."},
+            "confirm_large": {"type": "boolean",
+                              "description": "Required to apply when >1000 photos are added."},
+        },
+        "required": ["photo_ids"],
+        "additionalProperties": False,
+    },
+    handler=_h_add_to_collection,
+))

@@ -191,6 +191,80 @@ def test_location_dual_write_mirrors_nas_values(db, monkeypatch):
     assert row["location_source"] == "manual"
 
 
+# ---------------------------------------------------------------------------
+# add_to_collection
+# ---------------------------------------------------------------------------
+
+def test_collection_dry_run_existing(db, local_writer):
+    # Fixture has "Best of March" containing 04907 + 04922.
+    coll = db.get_collection_by_name("Best of March")
+    ids = _ids(db, "DSC04907.JPG", "DSC04878.JPG")  # 04907 already in, 04878 new
+    out = tools.call_tool(db, "add_to_collection",
+                          {"photo_ids": ids, "collection": "Best of March"})
+    assert out["dry_run"] is True
+    assert out["collection_exists"] is True
+    assert out["affected_count"] == 1            # only 04878 is new
+    assert out["already_in_collection"] == 1
+    # nothing written
+    assert set(db.get_collection_photo_ids(coll["id"])) == \
+        {db._test_photo_ids["DSC04907.JPG"], db._test_photo_ids["DSC04922.JPG"]}
+
+
+def test_collection_dry_run_missing_needs_create(db, local_writer):
+    ids = _ids(db, "DSC04878.JPG")
+    out = tools.call_tool(db, "add_to_collection",
+                          {"photo_ids": ids, "collection": "Brand New"})
+    assert out["dry_run"] is True
+    assert out["collection_exists"] is False
+    assert out["would_create"] is True
+    assert "create=true" in out["note"]
+
+
+def test_collection_confirm_without_create_errors(db, local_writer):
+    ids = _ids(db, "DSC04878.JPG")
+    out = tools.call_tool(db, "add_to_collection",
+                          {"photo_ids": ids, "collection": "Brand New", "confirm": True})
+    assert "error" in out and "create=true" in out["error"]
+
+
+def test_collection_create_and_add_local(db, local_writer):
+    ids = _ids(db, "DSC04878.JPG", "DSC04880.JPG")
+    out = tools.call_tool(db, "add_to_collection",
+                          {"photo_ids": ids, "collection": "Trip 2026",
+                           "create": True, "confirm": True})
+    assert out["authority"] == "local"
+    assert out["created"] is True
+    assert out["added"] == 2
+    coll = db.get_collection_by_name("Trip 2026")
+    assert set(db.get_collection_photo_ids(coll["id"])) == set(ids)
+
+
+def test_collection_dual_write_mirrors_same_id(db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas.local:8000")
+    ids = _ids(db, "DSC04878.JPG", "DSC04880.JPG")
+
+    captured = {}
+
+    def fake_post(path, body, timeout=60.0):
+        captured["path"] = path
+        captured["body"] = body
+        # NAS created a collection and assigned id 777.
+        return {"collection": {"id": 777, "name": "Hawaii", "description": None},
+                "added": 2, "created": True}
+
+    monkeypatch.setattr(tools, "_nas_post", fake_post)
+    out = tools.call_tool(db, "add_to_collection",
+                          {"photo_ids": ids, "collection": "Hawaii",
+                           "create": True, "confirm": True})
+    assert captured["path"] == "/api/collections/add-photos"
+    assert captured["body"]["create"] is True
+    assert out["authority"] == "nas"
+    # Mirror re-created the collection under the SAME id 777 with the same photos.
+    local = db.get_collection(777)
+    assert local is not None and local["name"] == "Hawaii"
+    assert set(db.get_collection_photo_ids(777)) == set(ids)
+
+
 def test_tags_dual_write_mirrors_without_double_logging(db, monkeypatch):
     monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas.local:8000")
     pid = _ids(db, "DSC04880.JPG")[0]

@@ -26,8 +26,9 @@ Env:
     PHOTOSEARCH_MCP_HOST           bind host (default 0.0.0.0)
     PHOTOSEARCH_MCP_PORT           bind port (default 8848)
     PHOTOSEARCH_MCP_ALLOW_IMAGES   '1'/'true' to expose get_photo_image
-    PHOTOSEARCH_ALLOW_WRITES       '1'/'true' to expose the M26b write tools
-                                   (set_photo_location / set_photo_tags)
+    PHOTOSEARCH_ALLOW_WRITES       M26b write tools (set_photo_location /
+                                   set_photo_tags / add_to_collection) — ON by
+                                   default; set 0/false to disable
 """
 
 from __future__ import annotations
@@ -53,11 +54,13 @@ def _images_allowed() -> bool:
 
 
 def _writes_allowed() -> bool:
-    """Expose the M26b mutation tools over MCP. Off by default — an MCP client
-    only gets write access when the operator opts in (PHOTOSEARCH_ALLOW_WRITES)."""
-    return os.environ.get("PHOTOSEARCH_ALLOW_WRITES", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    """Expose the M26b mutation tools over MCP. ON by default — the deployment is
+    behind Tailscale (same trust boundary as the existing write surface). Set
+    PHOTOSEARCH_ALLOW_WRITES to a falsy value (0/false/no/off) to disable."""
+    v = os.environ.get("PHOTOSEARCH_ALLOW_WRITES")
+    if v is None or not v.strip():
+        return True
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _db_path() -> str:

@@ -2827,6 +2827,56 @@ def api_add_to_collection(collection_id: int, body: dict):
     return {"added": added}
 
 
+@app.post("/api/collections/add-photos")
+def api_collection_add_photos(data: dict):
+    """Resolve-or-create a collection by name (or id) and add photos in one shot
+    (M26b agent write path).
+
+    Body: `{collection: str-name | collection_id: int, photo_ids: [...],
+            create: bool = false, description?: str}`.
+
+    Resolves the target collection: by `collection_id` if given, else by
+    `collection` name. A missing name is created only when `create=true` (guards
+    against a typo silently spawning a new album). Returns the canonical
+    `{collection: {id, name, description}, added, created}` so a replica mirror
+    can re-create the collection under the SAME id and add the same photos.
+    """
+    photo_ids = data.get("photo_ids") or []
+    if not isinstance(photo_ids, list) or not photo_ids:
+        raise HTTPException(status_code=400, detail="photo_ids required")
+    create = bool(data.get("create", False))
+    description = data.get("description")
+    cid = data.get("collection_id")
+    name = (data.get("collection") or "").strip()
+
+    with _get_db() as db:
+        created = False
+        if cid is not None:
+            coll = db.get_collection(int(cid))
+            if not coll:
+                raise HTTPException(status_code=404,
+                                    detail=f"no collection with id {cid}")
+        elif name:
+            coll = db.get_collection_by_name(name)
+            if not coll:
+                if not create:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"collection '{name}' does not exist "
+                               f"(pass create=true to create it)")
+                coll = {"id": db.create_collection(name, description), "name": name,
+                        "description": description}
+                created = True
+        else:
+            raise HTTPException(status_code=400,
+                                detail="collection name or collection_id required")
+        added = db.add_photos_to_collection(coll["id"], photo_ids)
+
+    return {"collection": {"id": coll["id"], "name": coll["name"],
+                           "description": coll.get("description")},
+            "added": added, "created": created}
+
+
 @app.post("/api/collections/{collection_id}/photos/remove")
 def api_remove_from_collection(collection_id: int, body: dict):
     """Remove photos from a collection."""

@@ -58,10 +58,13 @@ _DEFAULT_DEADLINE_S = 90.0  # overall wall-clock budget per Ask (env override)
 
 
 def _writes_enabled() -> bool:
-    """Whether the agent may call the M26b mutation tools. Off by default — a
-    plain `serve` is read-only; the operator opts in (replica deployment)."""
-    return os.environ.get("PHOTOSEARCH_ALLOW_WRITES", "").strip().lower() in (
-        "1", "true", "yes", "on")
+    """Whether the agent may call the M26b mutation tools. ON by default — the
+    deployment lives behind Tailscale (same trust boundary as the deploy panel).
+    Set PHOTOSEARCH_ALLOW_WRITES to a falsy value (0/false/no/off) to disable."""
+    v = os.environ.get("PHOTOSEARCH_ALLOW_WRITES")
+    if v is None or not v.strip():
+        return True
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _agent_model() -> str:
@@ -139,8 +142,8 @@ def _library_context(db) -> str:
 
 
 _WRITE_GUIDANCE = (
-    "\n\nWRITES (you can edit the library): set_photo_location and set_photo_tags "
-    "mutate photos. STRICT protocol:\n"
+    "\n\nWRITES (you can edit the library): set_photo_location, set_photo_tags, "
+    "and add_to_collection mutate the library. STRICT protocol:\n"
     "- They act ONLY on an explicit photo_ids list — pass the exact ids from a "
     "search you already ran and the user saw. NEVER make up ids or write to a set "
     "the user hasn't seen.\n"

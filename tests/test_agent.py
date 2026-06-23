@@ -144,15 +144,20 @@ def test_system_prompt_injects_library_facts(db, monkeypatch):
     assert "USER NOTES" in p and "The kids are Alex and Jamie." in p
 
 
-def test_write_gate_off_by_default(db, monkeypatch):
+def test_write_gate_on_by_default(db, monkeypatch):
+    # Behind Tailscale → writes are ON unless explicitly disabled.
     monkeypatch.delenv("PHOTOSEARCH_ALLOW_WRITES", raising=False)
-    assert agent._writes_enabled() is False
+    assert agent._writes_enabled() is True
     # The write guidance is only appended when writes are enabled.
     assert "WRITES" not in agent._system_prompt(db, allow_writes=False)
     assert "WRITES" in agent._system_prompt(db, allow_writes=True)
 
 
-def test_write_gate_env_flag(db, monkeypatch):
+def test_write_gate_can_be_disabled(db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_ALLOW_WRITES", "0")
+    assert agent._writes_enabled() is False
+    monkeypatch.setenv("PHOTOSEARCH_ALLOW_WRITES", "off")
+    assert agent._writes_enabled() is False
     monkeypatch.setenv("PHOTOSEARCH_ALLOW_WRITES", "1")
     assert agent._writes_enabled() is True
 

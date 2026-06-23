@@ -30,7 +30,7 @@ PORT="${PORT:-8001}"
 REPLICA_DB="${PHOTOSEARCH_DB:-./photo_index.db.local}"
 NAS_URL="${PHOTOSEARCH_NAS_URL:-http://dxp4800-f976:8000}"
 LM_URL="${PHOTOSEARCH_TEXT_LLM_URL:-}"
-AGENT_MODEL="${PHOTOSEARCH_LLM_AGENT_MODEL:-}"
+AGENT_MODEL="${PHOTOSEARCH_LLM_AGENT_MODEL:-qwen/qwen3.5-9b}"
 
 while [ $# -gt 0 ]; do
   case "$1" in

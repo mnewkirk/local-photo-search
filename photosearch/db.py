@@ -1058,6 +1058,24 @@ class PhotoDB:
         self.conn.commit()
         return cur.lastrowid
 
+    def ensure_collection(self, collection_id: int, name: str,
+                          description: str = None) -> int:
+        """Idempotently ensure a collection with the EXACT given id+name exists.
+
+        Used by the M26b replica mirror so a collection created on the NAS lands
+        locally under the same id the NAS assigned (and therefore survives the
+        nightly sync as a no-op). No-op when a row with that id is already
+        present. Returns the collection id."""
+        existing = self.conn.execute(
+            "SELECT id FROM collections WHERE id = ?", (collection_id,)).fetchone()
+        if existing:
+            return collection_id
+        self.conn.execute(
+            "INSERT INTO collections (id, name, description) VALUES (?, ?, ?)",
+            (collection_id, name, description))
+        self.conn.commit()
+        return collection_id
+
     def get_collection(self, collection_id: int) -> dict | None:
         """Get a single collection by id."""
         row = self.conn.execute(
