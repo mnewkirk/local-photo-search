@@ -363,6 +363,23 @@
       font-size: 12px;
       color: var(--text-muted);
     }
+    /* Modal presentation of the regenerate form (was an inline toolbar popover) */
+    .regen-overlay {
+      position: fixed; inset: 0; z-index: 1000;
+      background: rgba(0,0,0,0.55);
+      display: flex; align-items: flex-start; justify-content: center;
+      padding: 8vh 16px 16px;
+    }
+    .regen-card--modal {
+      margin-bottom: 0;
+      width: 100%; max-width: 560px;
+      max-height: 84vh; overflow-y: auto;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    }
+    .regen-modal-title {
+      grid-column: 1 / -1;
+      font-size: 15px; font-weight: 600; color: var(--text);
+    }
 
     /* Photo preview popover — click a face crop to see the full photo with
        the bbox highlighted, so tight bboxes don't hide context */
@@ -1073,6 +1090,11 @@
       useEffect(() => {
         function onKey(ev) {
           if (previewFaceId) return;
+          // Regenerate modal open: Esc closes it; swallow the review shortcuts.
+          if (regenOpen) {
+            if (ev.key === 'Escape') { ev.preventDefault(); setRegenOpen(false); }
+            return;
+          }
           const tag = ev.target && ev.target.tagName;
           if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
           if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
@@ -1109,7 +1131,7 @@
         }
         document.addEventListener('keydown', onKey);
         return () => document.removeEventListener('keydown', onKey);
-      }, [filtered, focusIdx, handleAccept, handleDismiss, previewFaceId]);
+      }, [filtered, focusIdx, handleAccept, handleDismiss, previewFaceId, regenOpen]);
 
       // When the user navigates via keyboard, scroll the focused card into view.
       // Skipped on mount and on filter-induced focusIdx clamps so the page
@@ -1212,16 +1234,21 @@
               ),
               e('button', { className: 'btn small', onClick: reload }, 'Reload'),
               e('button', {
-                className: 'btn small' + (regenOpen ? ' btn-primary' : ''),
-                onClick: () => setRegenOpen(v => !v),
+                className: 'btn small',
+                onClick: () => setRegenOpen(true),
                 title: 'Re-run the suggestion engine against the current DB (uses ~20s on an N100 for ~2000 groups)',
-              }, regenOpen ? 'Cancel regenerate' : 'Regenerate\u2026'),
+              }, 'Regenerate\u2026'),
               counts.dismissed > 0 && e('button', {
                 className: 'btn small', onClick: clearDismissals,
               }, 'Clear dismissals'),
             ),
 
-            regenOpen && e('div', { className: 'regen-card' },
+            regenOpen && e('div', {
+              className: 'regen-overlay',
+              onClick: (ev) => { if (ev.target === ev.currentTarget && !regenWorking) setRegenOpen(false); },
+            },
+              e('div', { className: 'regen-card regen-card--modal' },
+              e('div', { className: 'regen-modal-title' }, 'Regenerate suggestions'),
               e('div', { className: 'field' },
                 e('label', null, 'centroid cutoff'),
                 e('input', {
@@ -1283,6 +1310,7 @@
                   disabled: regenWorking,
                 }, regenWorking ? 'Running\u2026' : 'Regenerate'),
               ),
+              )
             ),
             e('div', { className: 'shortcuts-hint', style: { marginBottom: 14 } },
               e('span', { className: 'kbd' }, 'J'), '/', e('span', { className: 'kbd' }, '↓'), ' next ',
