@@ -28,6 +28,21 @@ up.
   examples; result-count discipline (relax-on-0 / narrow-on-huge); group-term
   resolution; configurable household glossary via `PHOTOSEARCH_AGENT_HINTS`
   (e.g. "the kids = Calvin, Ellie"). Validated in bake-off round 4.
+- **Face-framing metadata filters — SHIPPED (2026-06-23).**
+  `only_these_people` (total detected faces == named-people count → no extras)
+  and `faces_in_frame` (no face bbox at the image edge; scoped to the named
+  people when given) on `search_photos`/`summarize`/`representatives`, wired
+  through both the post-filter and `_build_filter_sql` paths. Reframes "only
+  the four of us / nobody cropped" as metadata, not vision — agent applies the
+  flags first and reserves `rerank_photos` for true visual criteria
+  (eyes/smiles). 7 tests. From the Ask-log review (the query that previously
+  timed out at 92s on per-result `get_photo` fan-out now runs in ~13s).
+- **`representatives` `max_buckets` — SHIPPED (2026-06-23).** Completes backlog
+  #0: caps the result to the best K buckets (ranked by each bucket's top photo)
+  and orders output best-first, so "top N photos, no more than 1 from each
+  location" = `bucket='location', n=1, max_buckets=N`. Before, that was
+  inexpressible and the agent stuffed N into `n` (per-bucket) → ~10 per
+  location. 4 tests. From the Ask-log review.
 - Earlier agent fixes: stringified-array coercion, empty-turn nudge,
   best→quality, exclusion (`-people`) syntax.
 
@@ -60,16 +75,13 @@ The original top two here (`summarize`, VLM re-ranking) both **SHIPPED** — see
    *that* person's prominence). Then "best of Matt per year" returns shots
    where Matt is actually the subject.
 
-0. **Top-N-per-bucket / diversified results** (quick, high-utility). Requests
-   like "best photo of Matt, one per year for the last 10 years" or "a few from
-   each trip" can't be expressed today — `search_photos` returns a flat
-   quality-ranked list, so the agent returns the global top-50, not one per
-   year. `summarize` counts per bucket but returns no photos. Add either a
-   `representatives(filters, bucket=year|month|location, n=1)` tool returning
-   the top-N (by quality) photos *per bucket*, or a `one_per`/`diversify` option
-   on `search_photos`. SQL window-function (`ROW_NUMBER() OVER (PARTITION BY
-   bucket ORDER BY aesthetic_score DESC)`) makes this cheap. Observed live
-   2026-06-20 ("one per year" returned 50 of 3360).
+0. **Top-N-per-bucket / diversified results** — **SHIPPED.** The
+   `representatives(filters, bucket=year|month|location|person|camera_model, n)`
+   tool returns the top-N (by quality, or `rank_by=subject`) photos *per bucket*
+   via `ROW_NUMBER() OVER (PARTITION BY bucket …)`. The "top-N overall, one per
+   bucket" cap (`max_buckets`) landed 2026-06-23 — see "In progress / done".
+   (Original motivation: "one per year" returned 50 of 3360, observed
+   2026-06-20.)
 
 3. **Events / trips metadata.** Cluster photos by time + GPS + place into
    events; "our France trip" becomes a first-class entity with a date range.
