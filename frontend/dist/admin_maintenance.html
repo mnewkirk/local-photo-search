@@ -829,6 +829,101 @@
       );
     }
 
+    function LightIndex() {
+      var _b = useState(false);        var busy = _b[0]; var setBusy = _b[1];
+      var _dir = useState('/photos');  var dir = _dir[0]; var setDir = _dir[1];
+      var _l = useState([]);           var log = _l[0];  var setLog = _l[1];
+
+      function appendLog(line) {
+        setLog(function(prev) {
+          var next = prev.concat([line]);
+          if (next.length > 500) next = next.slice(-500);
+          return next;
+        });
+      }
+
+      function run() {
+        if (busy) return;
+        setBusy(true);
+        appendLog('▸ light index ' + dir + ' --no-colors (EXIF + hash only; idempotent)…');
+        fetch('/api/admin/light-index?directory=' + encodeURIComponent(dir), { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            var resolved = false;
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      var ok = payload.returncode === 0;
+                      appendLog(ok ? '  ✓ light index complete' : '  ✗ light index failed (rc=' + payload.returncode + ')');
+                      resolved = true;
+                      setBusy(false);
+                    }
+                    if (payload.error) { appendLog('  ✗ ' + payload.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() { if (!resolved) setBusy(false); });
+          })
+          .catch(function(err) { appendLog('  ✗ light index stream error: ' + err.message); setBusy(false); });
+      }
+
+      return e('div', null,
+        e('h2', null, 'Light index'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Scan a library directory and insert EXIF + file-hash rows for any new photos '
+            + '— no CLIP, no colors, no faces/quality/describe. Idempotent (only new files are '
+            + 'added). Creates the DB rows the worker fleet then claims for the heavy passes.'),
+          e('div', { className: 'deploy-actions' },
+            e('label', {
+              className: 'deploy-meta',
+              style: { display: 'flex', alignItems: 'center', gap: 6 },
+            },
+              'Directory',
+              e('input', {
+                type: 'text', value: dir, disabled: busy,
+                onChange: function(ev) { setDir(ev.target.value); },
+                style: { width: 240 },
+              })),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: run,
+              title: 'docker compose run --rm photosearch index <dir> --no-colors',
+            }, busy ? 'Indexing…' : 'Run light index'),
+            e('button', {
+              className: 'btn',
+              disabled: busy,
+              onClick: function() { setLog([]); },
+              title: 'Clear log',
+              style: { marginLeft: 'auto' },
+            }, 'Clear log')
+          ),
+          log.length > 0 && e('div', {
+            className: 'deploy-log' + (busy ? ' running' : ''),
+          }, log.join('\n'))
+        )
+      );
+    }
+
     function StackingForm(props) {
       var _p = useState(Object.assign({}, STACK_DEFAULTS));
       var params = _p[0]; var setParams = _p[1];
@@ -1521,6 +1616,7 @@
           e('h1', null, 'Maintenance'),
           e('p', { style: { color: 'var(--text-muted)', marginBottom: 18, maxWidth: 760 } },
             'CPU-light backfills + on-demand jobs. Heavy GPU passes stay with the worker fleet.'),
+          e(LightIndex, null),
           e(IngestIncoming, null),
           e(StackingForm, { onComplete: noop }),
           e(MaintenanceSweep, { onComplete: noop }),

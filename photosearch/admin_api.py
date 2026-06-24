@@ -58,6 +58,9 @@ _op_lock = threading.Lock()
 # polling or deploy actions (they don't conflict), but two ingests can't race
 # on the same _incoming/ files within this process.
 _ingest_lock = threading.Lock()
+# Light-index pass (EXIF + file-hash insert, no heavy passes). Its own guard so
+# two library scans can't run at once, but it never blocks deploy/ingest.
+_light_index_lock = threading.Lock()
 
 
 def _native_repo_dir() -> str:
@@ -355,6 +358,46 @@ async def admin_ingest_incoming(dry_run: bool = False):
                 yield chunk
         finally:
             _ingest_lock.release()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/light-index")
+async def admin_light_index(directory: str = "/photos"):
+    """`docker compose run --rm photosearch index <dir> --no-colors` — SSE.
+
+    Light index pass: walk <dir> and insert EXIF + file-hash rows for any new
+    photos. No CLIP, no colors, no faces/quality/describe — just the rows. This
+    is the prerequisite that creates DB records so the worker fleet can then
+    claim them for the heavy passes. Idempotent: only files not already in the
+    DB are added, so it's safe to re-run on the whole library.
+
+    Runs in a throwaway sibling container (not in-process, so the scan doesn't
+    run inside the web server); `--no-deps` keeps it off ollama. The `index`
+    entrypoint case maps `index <dir> --no-colors` to
+    `cli.py index <dir> --db <DB> --no-colors`.
+
+    `directory` must resolve under /photos (the library mount). Defaults to the
+    whole library.
+    """
+    norm = os.path.normpath(directory)
+    if norm != "/photos" and not norm.startswith("/photos/"):
+        raise HTTPException(400, "directory must be under /photos")
+    if not _light_index_lock.acquire(blocking=False):
+        raise HTTPException(409, "a light index pass is already running")
+
+    cmd = [
+        "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
+        "run", "--rm", "--no-deps", COMPOSE_SERVICE,
+        "index", norm, "--no-colors",
+    ]
+
+    async def gen():
+        try:
+            async for chunk in _stream_subprocess(cmd, cwd=REPO_DIR, env=os.environ.copy()):
+                yield chunk
+        finally:
+            _light_index_lock.release()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
