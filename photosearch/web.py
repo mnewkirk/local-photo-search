@@ -1331,6 +1331,173 @@ def api_unignore_clusters(data: dict):
     return {"ok": True, "unignored": len(cluster_ids)}
 
 
+@app.post("/api/faces/bulk-assign")
+def api_bulk_assign_faces(data: dict):
+    """Bulk reassign or unassign a list of faces.
+
+    Body: {"face_ids": [...], "person_name": "Calvin" | null}
+    A null/empty person_name CLEARS the assignment (person_id=NULL). Otherwise
+    the faces are assigned to that person (created if needed) with
+    match_source='manual'. Used by the per-person inspector to re-map / unset
+    the wrong faces a person picked up via over-matching or duplicate imports.
+    """
+    face_ids = [int(x) for x in (data.get("face_ids") or [])]
+    name = (data.get("person_name") or "").strip()
+    if not face_ids:
+        return {"ok": True, "updated": 0}
+    with _get_db() as db:
+        if name:
+            person = db.get_person_by_name(name)
+            pid = person["id"] if person else db.add_person(name)
+            for fid in face_ids:
+                db.assign_face_to_person(fid, pid, match_source="manual")
+            db.conn.commit()
+            logger.info("FACE BULK-ASSIGN  %d faces -> %r (id=%d)", len(face_ids), name, pid)
+            return {"ok": True, "updated": len(face_ids), "person_id": pid, "person_name": name}
+        # Clear
+        for i in range(0, len(face_ids), 500):
+            batch = face_ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            db.conn.execute(
+                f"UPDATE faces SET person_id = NULL, match_source = NULL "
+                f"WHERE id IN ({ph})", batch)
+        db.conn.commit()
+        logger.info("FACE BULK-CLEAR  %d faces", len(face_ids))
+        return {"ok": True, "updated": len(face_ids), "person_id": None}
+
+
+@app.get("/api/faces/person/{person_id}/inspect")
+def api_person_inspect(
+    person_id: int,
+    eps: float = Query(0.50, ge=0.2, le=1.2),
+    min_samples: int = Query(3, ge=1, le=20),
+):
+    """Sub-structure of one person's faces, for spotting/re-mapping wrong faces.
+
+    Runs DBSCAN over the person's ArcFace encodings to surface visual sub-groups,
+    and scores every face by L2 distance to the person's "core" reference set
+    (their strict/manual faces if enough exist, else the largest sub-cluster).
+    Faces far from the core — and DBSCAN-noise faces — are the likely-wrong ones
+    (over-matches, duplicate-import contamination, a different kid).
+
+    Returns one flat ``faces`` list (all of them — only ids/scores, no crops, so
+    even a 20k-face person is ~1MB) plus a ``sub_clusters`` summary. The frontend
+    derives both views from the flat list (group by sub_id, or sort by distance)
+    and paginates the crop rendering so the browser never draws 20k crops at once.
+    """
+    import hashlib
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+
+    with _get_db() as db:
+        prow = db.conn.execute(
+            "SELECT id, name FROM persons WHERE id = ?", (person_id,)).fetchone()
+        if not prow:
+            raise HTTPException(404, "Person not found")
+
+        rows = db.conn.execute(
+            """SELECT f.id AS face_id, f.photo_id, f.match_source, f.det_score,
+                      fe.encoding, ph.date_taken,
+                      CASE WHEN f.bbox_top IS NOT NULL
+                           THEN (f.bbox_bottom - f.bbox_top) * (f.bbox_right - f.bbox_left)
+                           ELSE 0 END AS area
+               FROM faces f
+               JOIN face_encodings fe ON fe.face_id = f.id
+               LEFT JOIN photos ph ON ph.id = f.photo_id
+               WHERE f.person_id = ?
+               ORDER BY f.id""",
+            (person_id,),
+        ).fetchall()
+
+        if not rows:
+            return {"person": {"id": person_id, "name": prow["name"], "face_count": 0},
+                    "faces": [], "sub_clusters": [], "params": {"eps": eps, "min_samples": min_samples}}
+
+        face_ids = [int(r["face_id"]) for r in rows]
+        X = np.stack([np.frombuffer(r["encoding"], dtype=np.float32) for r in rows]).astype(np.float32)
+        # Normalize defensively (stored encodings are unit-norm, but be safe).
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        X = X / norms
+
+        # DBSCAN sub-clusters within this person.
+        labels = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean",
+                        algorithm="ball_tree", n_jobs=-1).fit_predict(X)
+
+        # Reference set for "distance to core": trusted faces if we have enough,
+        # else the largest sub-cluster. min-dist-to-refs tolerates aging / angles.
+        trusted_idx = [i for i, r in enumerate(rows)
+                       if r["match_source"] in ("strict", "manual")]
+        ref_idx = trusted_idx if len(trusted_idx) >= 3 else None
+        if ref_idx is None:
+            from collections import Counter
+            cnt = Counter(int(l) for l in labels if l != -1)
+            if cnt:
+                core_label = cnt.most_common(1)[0][0]
+                ref_idx = [i for i, l in enumerate(labels) if int(l) == core_label]
+            else:
+                ref_idx = list(range(len(rows)))  # no structure — everything is "core"
+        R = X[ref_idx]
+        if len(R) > 500:
+            R = R[np.linspace(0, len(R) - 1, 500).astype(int)]
+        maxsim = (X @ R.T).max(axis=1)
+        dists = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * maxsim))
+
+        # Mark duplicate faces (byte-identical encoding) within this person.
+        dup_group: dict[int, int] = {}
+        h2idx: dict[bytes, list] = {}
+        for i, r in enumerate(rows):
+            h2idx.setdefault(hashlib.md5(bytes(r["encoding"])).digest(), []).append(i)
+        gid = 0
+        for idxs in h2idx.values():
+            if len(idxs) > 1:
+                for i in idxs:
+                    dup_group[i] = gid
+                gid += 1
+
+        # One flat record per face — ids/scores only (no crops). The frontend
+        # groups by sub_id or sorts by dist, and paginates crop rendering.
+        from collections import defaultdict
+        faces = [
+            {
+                "face_id": face_ids[i], "photo_id": int(rows[i]["photo_id"]),
+                "sub_id": int(labels[i]), "dist": round(float(dists[i]), 4),
+                "date_taken": rows[i]["date_taken"], "match_source": rows[i]["match_source"],
+                "dup_group": dup_group.get(i),
+            }
+            for i in range(len(rows))
+        ]
+
+        # Sub-cluster summaries: size, rep (biggest-area), and median/max distance
+        # to the core. Suspect sub-clusters (high median_dist) are whole groups
+        # that are probably a different person — re-map them in one action.
+        by_sub: dict = defaultdict(list)
+        for i in range(len(rows)):
+            by_sub[int(labels[i])].append(i)
+        sub_clusters = []
+        for sub_id, idxs in by_sub.items():
+            rep_i = max(idxs, key=lambda i: int(rows[i]["area"] or 0))
+            dvals = [float(dists[i]) for i in idxs]
+            sub_clusters.append({
+                "sub_id": sub_id, "size": len(idxs),
+                "rep_face_id": face_ids[rep_i],
+                "median_dist": round(float(np.median(dvals)), 4),
+                "max_dist": round(float(np.max(dvals)), 4),
+            })
+        # Real clusters first (biggest first), outliers (-1) always last.
+        sub_clusters.sort(key=lambda s: (s["sub_id"] == -1, -s["size"]))
+
+        return {
+            "person": {"id": person_id, "name": prow["name"], "face_count": len(rows)},
+            "faces": faces,
+            "sub_clusters": sub_clusters,
+            "n_outliers": sum(1 for l in labels if int(l) == -1),
+            "n_dup_faces": len(dup_group),
+            "params": {"eps": eps, "min_samples": min_samples,
+                       "ref_source": "trusted" if len(trusted_idx) >= 3 else "largest_subcluster"},
+        }
+
+
 # ---------------------------------------------------------------------------
 # Merge-suggestions review (/merges page)
 # ---------------------------------------------------------------------------

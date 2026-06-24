@@ -534,14 +534,32 @@
       return '';
     }
 
+    // The score the tier is built on. Prefer robust_min_pair_dist — the closest
+    // crop pair AFTER discarding duplicate-image pairs (< 0.05 L2). The library
+    // is full of duplicate photos (same image imported twice via Takeout/phone),
+    // which produce byte-identical encodings → a raw min_pair of 0.000 on
+    // otherwise-unrelated clusters ("STRONG · 0.000" on a kid → an adult). The
+    // robust score ignores those so the tier reflects a genuine match. Falls
+    // back to raw min_pair for suggestions generated before this field existed.
+    function tierScore(sug) {
+      const r = sug.robust_min_pair_dist;
+      if (typeof r === 'number') return r;
+      return sug.min_pair_dist;
+    }
+
     // Confidence tiers — calibrated from the 2026-04-18 review batch where
     // 125 suggestions produced 15 FPs, all at min_pair ≥ 0.554. TPs were
-    // all < 0.50 (top 12 named-person matches at 0.05–0.48).
+    // all < 0.50 (top 12 named-person matches at 0.05–0.48). Now keyed on the
+    // robust (dup-discounted) score so duplicate-driven 0.000 noise can't fake
+    // a Strong, and downgraded when the centroids are far apart (a contaminated
+    // cluster whose bulk is a different person).
     function confidenceTier(sug) {
-      const m = sug.min_pair_dist;
+      const m = tierScore(sug);
       if (typeof m !== 'number') return { tier: 'probable', label: 'Probable' };
-      if (m < 0.50) return { tier: 'strong', label: 'Strong' };
-      if (m < 0.55) return { tier: 'probable', label: 'Probable' };
+      const cent = sug.centroid_dist;
+      const farCentroid = typeof cent === 'number' && cent >= 0.75;
+      if (m < 0.50 && !farCentroid) return { tier: 'strong', label: 'Strong' };
+      if (m < 0.55 && !farCentroid) return { tier: 'probable', label: 'Probable' };
       return { tier: 'borderline', label: 'Borderline' };
     }
 
@@ -564,9 +582,19 @@
         badges.push('long overlap');
       }
       // Edge of DBSCAN's own eps — everything just above 0.55 is knife-edge
-      // and over-represented in the observed FPs.
-      if (typeof sug.min_pair_dist === 'number' && sug.min_pair_dist >= 0.55) {
+      // and over-represented in the observed FPs. Use the robust score so a
+      // duplicate 0.000 doesn't mask an otherwise-edge pair.
+      if (typeof tierScore(sug) === 'number' && tierScore(sug) >= 0.55) {
         badges.push('edge score');
+      }
+      // Duplicate-driven: the headline min_pair is ~0 only because the two
+      // groups share a duplicate photo, but the next-closest genuine crop is
+      // far. Means the cluster is probably a DIFFERENT person contaminated by
+      // one duplicate face — verify the whole cluster before accepting.
+      if (sug.dup_pair_count > 0 &&
+          typeof sug.robust_min_pair_dist === 'number' &&
+          sug.robust_min_pair_dist >= 0.55) {
+        badges.push('⚠ duplicate-driven');
       }
       return badges;
     }
@@ -660,7 +688,7 @@
         // Confidence tier is a large, always-visible signal — with 237 to
         // review, the user triages by color before reading scores.
         e('span', { className: 'confidence ' + conf.tier },
-          conf.label + ' · ' + formatScore(sug.min_pair_dist)),
+          conf.label + ' · ' + formatScore(tierScore(sug))),
         isDone && e('div', { style: { textAlign: 'right', marginBottom: 6 } },
           e('span', { className: 'status-tag ' + status }, status),
         ),
@@ -708,6 +736,13 @@
             e('span', null, 'min_pair'),
             e('span', { className: 'val ' + scoreClass(sug.min_pair_dist, 0.45, 0.60) },
               formatScore(sug.min_pair_dist)),
+          ),
+          // Robust min_pair (duplicate pairs discarded) — only shown when it
+          // differs, i.e. duplicates were present. This is the tier's basis.
+          sug.dup_pair_count > 0 && e('div', { className: 'score', title: sug.dup_pair_count + ' duplicate-image crop pair(s) ignored' },
+            e('span', null, 'robust'),
+            e('span', { className: 'val ' + scoreClass(sug.robust_min_pair_dist, 0.45, 0.60) },
+              typeof sug.robust_min_pair_dist === 'number' ? formatScore(sug.robust_min_pair_dist) : '—'),
           ),
           e('div', { className: 'score' },
             e('span', null, 'centroid'),
@@ -987,8 +1022,8 @@
           if (status === 'accepted' || status === 'stale') return false;
           if (typeFilter === 'to_person' && sug.right.type !== 'person') return false;
           if (typeFilter === 'to_cluster' && sug.right.type !== 'cluster') return false;
-          if (hideBorderline && typeof sug.min_pair_dist === 'number'
-              && sug.min_pair_dist >= 0.55) return false;
+          if (hideBorderline && typeof tierScore(sug) === 'number'
+              && tierScore(sug) >= 0.55) return false;
           return true;
         });
         const sorted = pass.slice();
@@ -997,7 +1032,7 @@
             (b.sug.left.face_count + b.sug.right.face_count) -
             (a.sug.left.face_count + a.sug.right.face_count));
         } else {
-          sorted.sort((a, b) => a.sug.min_pair_dist - b.sug.min_pair_dist);
+          sorted.sort((a, b) => tierScore(a.sug) - tierScore(b.sug));
         }
         return sorted;
       }, [annotated, typeFilter, sort, hideBorderline]);

@@ -45,6 +45,15 @@ CENTROID_CUTOFF = 0.95
 # value; will be tuned against the user's TP/FP examples on the real DB.
 MIN_PAIR_CUTOFF = 0.60
 
+# L2 below this between two unit-norm encodings means the two crops are the
+# *same image* (a duplicate photo import or a doubled InsightFace detection),
+# NOT evidence that two groups are the same person. The library accumulated
+# ~9k duplicate-encoding groups after the Google Takeout + phone imports, so a
+# single shared duplicate face was driving min_pair_dist to 0.000 on otherwise
+# unrelated clusters ("STRONG · 0.000" on a kid → an adult). robust_min_pair_dist
+# ignores these so the tier reflects the closest *genuinely distinct* crop.
+DUP_PAIR_EPS = 0.05
+
 
 @dataclass
 class GroupInfo:
@@ -72,6 +81,11 @@ class Suggestion:
     centroid_dist: float
     min_pair_dist: float
     shared_days: Optional[int]    # None if either group lacks dates
+    # robust_min_pair_dist ignores duplicate-image pairs (< DUP_PAIR_EPS) so a
+    # single shared duplicate photo can't fake a "0.000" match. dup_pair_count
+    # is how many cross-group crop pairs were that-close (i.e. duplicates).
+    robust_min_pair_dist: float = float("inf")
+    dup_pair_count: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -89,6 +103,11 @@ class Suggestion:
             },
             "centroid_dist": float(self.centroid_dist),
             "min_pair_dist": float(self.min_pair_dist),
+            "robust_min_pair_dist": (
+                None if self.robust_min_pair_dist == float("inf")
+                else float(self.robust_min_pair_dist)
+            ),
+            "dup_pair_count": int(self.dup_pair_count),
             "shared_days": self.shared_days,
         }
 
@@ -290,16 +309,20 @@ def compute_suggestions(
             cd = float(cent_dists[i, j])
             if cd > centroid_cutoff:
                 continue
-            md = _min_pair_dist(gi.encodings, gj.encodings)
+            md, robust, dup_n = _min_pair_stats(gi.encodings, gj.encodings)
             if md > min_pair_cutoff:
                 continue
             left, right = _canonical_order(gi, gj)
             suggestions.append(Suggestion(
                 left=left, right=right,
                 centroid_dist=cd, min_pair_dist=md,
+                robust_min_pair_dist=robust, dup_pair_count=dup_n,
                 shared_days=_date_overlap_days(left, right),
             ))
 
+    # Sort by raw min_pair then centroid (stable, matches the JSON consumers'
+    # expectations). The /merges UI re-sorts by the robust score so
+    # duplicate-driven 0.000 noise drops below genuine matches there.
     suggestions.sort(key=lambda s: (s.min_pair_dist, s.centroid_dist))
     return suggestions
 
@@ -324,6 +347,28 @@ def _min_pair_dist(A: np.ndarray, B: np.ndarray) -> float:
     sq = 2.0 - 2.0 * sims
     np.maximum(sq, 0.0, out=sq)
     return float(np.sqrt(sq.min()))
+
+
+def _min_pair_stats(A: np.ndarray, B: np.ndarray) -> tuple[float, float, int]:
+    """Return (min_dist, robust_min_dist, dup_pair_count).
+
+    ``robust_min_dist`` is the smallest cross-group L2 *excluding* duplicate-image
+    pairs (distance < ``DUP_PAIR_EPS``) — i.e. the closest genuinely-distinct crop
+    match, so a single duplicated photo shared between the two groups can't drive
+    the headline score to 0. ``inf`` if every cross pair is a duplicate (or a side
+    is empty). ``dup_pair_count`` is how many cross pairs were duplicate-close.
+    """
+    if A.size == 0 or B.size == 0:
+        return float("inf"), float("inf"), 0
+    sims = A @ B.T
+    sq = 2.0 - 2.0 * sims
+    np.maximum(sq, 0.0, out=sq)
+    d = np.sqrt(sq)
+    mn = float(d.min())
+    dup_count = int((d < DUP_PAIR_EPS).sum())
+    nondup = d[d >= DUP_PAIR_EPS]
+    robust = float(nondup.min()) if nondup.size else float("inf")
+    return mn, robust, dup_count
 
 
 def _canonical_order(a: GroupInfo, b: GroupInfo) -> tuple[GroupInfo, GroupInfo]:

@@ -490,3 +490,38 @@ def test_split_cluster_grandfathers_null_det_score(db):
     }
     assert None not in cluster_ids, "NULL det_score must be grandfathered, not dropped"
     assert cluster_ids != {501}, "grandfathered faces should be renumbered into a new cluster"
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-aware scoring (robust_min_pair_dist / dup_pair_count)
+# ---------------------------------------------------------------------------
+
+def test_min_pair_stats_discounts_duplicate_pairs():
+    """A duplicate face shared across two otherwise-different groups must not
+    drive the robust score to 0 — that's the contaminated-cluster bug behind the
+    bogus 'STRONG · 0.000' suggestions."""
+    from photosearch.face_merge import _min_pair_stats
+
+    dup = _base(7)                       # the duplicate-import face
+    a_person = _base(11)                 # group A is really person 11
+    b_person = _base(99)                 # group B is really person 99 (different)
+
+    A = np.stack([a_person, _perturb(a_person, 1, 0.2), dup]).astype(np.float32)
+    B = np.stack([b_person, _perturb(b_person, 2, 0.2), dup]).astype(np.float32)
+
+    mn, robust, dup_n = _min_pair_stats(A, B)
+    assert mn < 1e-4           # the shared duplicate gives a raw min of ~0
+    assert dup_n >= 1          # detected the duplicate pair
+    assert robust > 0.8        # the genuine closest crop is far → not a real match
+
+
+def test_suggestion_as_dict_has_robust_fields():
+    shared = _base(3)
+    a = _make_group("cluster", 1, "A", [shared, _perturb(shared, 5, 0.02)])
+    b = _make_group("person", 2, "B", [shared, _perturb(shared, 6, 0.02)])
+    sugs = compute_suggestions([a, b])
+    assert sugs, "a shared near-identical face should still produce a suggestion"
+    d = sugs[0].as_dict()
+    assert "robust_min_pair_dist" in d
+    assert "dup_pair_count" in d
+    assert d["dup_pair_count"] >= 1
