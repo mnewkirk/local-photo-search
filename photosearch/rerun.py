@@ -59,17 +59,43 @@ def nas_base() -> Optional[str]:
     return (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/") or None
 
 
+# LM Studio fallback models when no role env var is configured. These are this
+# deployment's loaded models; override with PHOTOSEARCH_LLM_<ROLE>_MODEL. The
+# raw Ollama defaults in _PASS_LLM are NOT valid LM Studio ids, so without these
+# the OpenAI-compatible call 404s and the pass silently defers.
+_LMSTUDIO_DEFAULTS = {"describe": "qwen2.5-vl-7b-instruct",
+                      "verify":   "qwen2.5-vl-7b-instruct",
+                      "visual":   "qwen2.5-vl-7b-instruct",
+                      "text":     "llama-3.2-3b-instruct"}
+
+
 def _resolve_model(pass_type: str) -> str:
     """Resolve the model name to pass to the worker processor for ``pass_type``.
 
-    On an OpenAI-compatible backend (LM Studio) the per-role env var wins so the
-    correct loaded model is used *and* logged; otherwise the Ollama default (or
-    an explicit PHOTOSEARCH_LLM_<ROLE>_MODEL override) is used."""
+    On an OpenAI-compatible backend (LM Studio) the per-role env var wins; absent
+    that, vision roles reuse PHOTOSEARCH_LLM_VISUAL_MODEL if set, then fall back
+    to this box's loaded models (_LMSTUDIO_DEFAULTS). Otherwise the Ollama
+    default (or an explicit PHOTOSEARCH_LLM_<ROLE>_MODEL override) is used."""
     role, default = _PASS_LLM[pass_type]
     if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
-        from .describe import _resolve_openai_model
-        return _resolve_openai_model(default, role)
+        env = (os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL")
+               or os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL"))
+        if env:
+            return env
+        if role in ("describe", "verify"):
+            return os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL") or _LMSTUDIO_DEFAULTS[role]
+        return _LMSTUDIO_DEFAULTS[role]
     return os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL") or default
+
+
+def _model_version(model: str) -> Optional[str]:
+    """Provenance digest for the generations log. On an OpenAI-compatible
+    backend there is no Ollama to query, and ``worker._model_version`` would
+    block ~80s retrying localhost:11434 — so use a static marker instead."""
+    if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return "lmstudio"
+    from .worker import _model_version as _wv
+    return _wv(model)
 
 
 # ---------------------------------------------------------------------------
@@ -169,32 +195,32 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             model = _resolve_model("describe")
             results = W._process_describe(downloaded, model=model)
             kwargs = {"describe_results": results, "model": model,
-                      "model_version": W._model_version(model)}
+                      "model_version": _model_version(model)}
         elif pass_type == "verify":
             regen = _resolve_model("describe")
             results = W._process_verify(downloaded, client=client,
                                         verify_model=_resolve_model("verify"),
                                         regen_model=regen)
             kwargs = {"verify_results": results, "model": regen,
-                      "model_version": W._model_version(regen)}
+                      "model_version": _model_version(regen)}
         elif pass_type == "category-content":
             model = _resolve_model("category-content")
             results = W._process_category_content([info], model=model)
-            mv = W._model_version(model)
+            mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
             kwargs = {"category_content_results": results}
         elif pass_type == "category-visual":
             model = _resolve_model("category-visual")
             results = W._process_category_visual(downloaded, model=model)
-            mv = W._model_version(model)
+            mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
             kwargs = {"category_visual_results": results}
         elif pass_type == "keywords":
             model = _resolve_model("keywords")
             results = W._process_keywords([info], model=model)
-            mv = W._model_version(model)
+            mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
             kwargs = {"keywords_results": results}
@@ -245,15 +271,21 @@ def mirror_photos(db, photo_ids: list[int], server: Optional[str] = None) -> dic
         return {"mirrored": 0, "errors": 0, "missing": 0, "skipped": "not replica"}
 
     import urllib.request
+    import urllib.error
     mirrored = errors = missing = 0
     for pid in photo_ids:
         try:
             with urllib.request.urlopen(
                 f"{base}/api/photos/{pid}/mirror-fields", timeout=30) as r:
-                if r.status == 404:
-                    missing += 1
-                    continue
                 fields = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # 404 → no such photo on the NAS (or NAS predates /mirror-fields);
+            # count as missing, not a transport error.
+            if e.code == 404:
+                missing += 1
+            else:
+                errors += 1
+            continue
         except Exception:
             errors += 1
             continue
