@@ -1091,6 +1091,64 @@ def api_photos_geojson():
     return {"count": len(points), "points": points}
 
 
+@app.get("/api/photos/{photo_id}/mirror-fields")
+def api_photo_mirror_fields(photo_id: int):
+    """Authoritative per-photo derived fields for the M28 re-run mirror.
+
+    A replica calls this after a pass is re-run on the NAS to apply the exact
+    canonical values locally — text/scalar columns verbatim, plus the CLIP
+    embedding and face rows — so the local search index reflects the re-run
+    without waiting for the nightly sync-replica.sh full pull. See
+    photosearch/rerun.py:mirror_photos.
+    """
+    from .db import _deserialize_float_list, CLIP_DIMENSIONS, FACE_DIMENSIONS
+    with _get_db() as db:
+        row = db.conn.execute(
+            """SELECT description, categories, visual_tags, keywords, tags,
+                      verified_at, verification_status, hallucination_flags,
+                      aesthetic_score, aesthetic_concepts, aesthetic_critique
+                 FROM photos WHERE id = ?""",
+            (photo_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Photo not found")
+        out = {k: row[k] for k in row.keys()}
+
+        # CLIP embedding (None if not yet embedded — the mirror DELETEs the
+        # local row so a cleared-but-not-reprocessed pass shows as un-embedded).
+        emb = None
+        try:
+            er = db.conn.execute(
+                "SELECT embedding FROM clip_embeddings WHERE photo_id = ?",
+                (photo_id,)).fetchone()
+            if er:
+                emb = list(_deserialize_float_list(er["embedding"], CLIP_DIMENSIONS))
+        except Exception:
+            pass
+        out["clip_embedding"] = emb
+
+        # Faces with encodings (bbox order matches db.add_face: top,right,bottom,left).
+        faces = []
+        try:
+            for fr in db.conn.execute(
+                """SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                          f.det_score, e.encoding
+                     FROM faces f LEFT JOIN face_encodings e ON e.face_id = f.id
+                    WHERE f.photo_id = ?""", (photo_id,)).fetchall():
+                enc = (list(_deserialize_float_list(fr["encoding"], FACE_DIMENSIONS))
+                       if fr["encoding"] is not None else [])
+                faces.append({
+                    "bbox": [fr["bbox_top"], fr["bbox_right"],
+                             fr["bbox_bottom"], fr["bbox_left"]],
+                    "encoding": enc,
+                    "det_score": fr["det_score"],
+                })
+        except Exception:
+            pass
+        out["faces"] = faces
+        return out
+
+
 @app.get("/api/photos/{photo_id}")
 def api_photo_detail(photo_id: int):
     """Get full metadata for a single photo, including face matches."""

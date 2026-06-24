@@ -611,3 +611,176 @@ def admin_restart():
         return {"ok": True, "note": note, "helper_container": helper_id}
     finally:
         _op_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Re-run index passes (M28) — image-view "re-run this pass" + bulk re-queue.
+# Compute on the desktop (LM Studio / GPU), write authoritative to the NAS,
+# mirror the touched rows into the local replica DB. See photosearch/rerun.py.
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel  # noqa: E402
+
+
+class RerunRequest(BaseModel):
+    photo_ids: list[int]
+    passes: list[str]
+    mode: str = "sync"  # "sync" = compute now in-process; "queue" = re-queue for the fleet
+
+
+class MirrorRequest(BaseModel):
+    photo_ids: list[int]
+
+
+@router.post("/rerun-passes")
+def admin_rerun_passes(req: RerunRequest):
+    """Re-run index passes on specific photos.
+
+    mode='sync'  — compute each (photo, pass) here via LM Studio / local models,
+                   submit to the NAS, and mirror the result into the local DB.
+                   Instant feedback; best for one photo from the image view.
+    mode='queue' — clear the (photo, pass) state on the NAS so the worker fleet
+                   re-processes it (poll /rerun-passes mirror or /mirror-photos
+                   to pull results once a worker finishes).
+    """
+    from . import rerun
+    if not req.photo_ids:
+        raise HTTPException(400, "photo_ids is required (explicit scoping)")
+    bad = [p for p in req.passes if p not in rerun.ALL_PASSES]
+    if bad:
+        raise HTTPException(400, f"unknown pass type(s): {', '.join(bad)}")
+    if not req.passes:
+        raise HTTPException(400, "passes is required")
+
+    if req.mode == "queue":
+        try:
+            return {"mode": "queue", "result": rerun.requeue_passes(req.photo_ids, req.passes)}
+        except Exception as e:
+            raise HTTPException(500, f"re-queue failed: {e}")
+
+    if req.mode != "sync":
+        raise HTTPException(400, "mode must be 'sync' or 'queue'")
+
+    # sync — compute each pass for each photo in dependency order (describe
+    # before the text passes that read its output).
+    order = [p for p in rerun.ALL_PASSES if p in req.passes]
+    from . import web
+    results, errors = [], []
+    with web._get_db() as db:
+        for pid in req.photo_ids:
+            for pass_type in order:
+                try:
+                    results.append(rerun.run_pass_sync(db, pid, pass_type))
+                except Exception as e:
+                    errors.append({"photo_id": pid, "pass": pass_type, "error": str(e)})
+    return {"mode": "sync", "results": results, "errors": errors}
+
+
+@router.post("/mirror-photos")
+def admin_mirror_photos(req: MirrorRequest):
+    """Pull authoritative fields for the given photos from the NAS into the
+    local replica DB (used to refresh after a queued re-run completes)."""
+    from . import rerun, web
+    if not req.photo_ids:
+        raise HTTPException(400, "photo_ids is required")
+    with web._get_db() as db:
+        return rerun.mirror_photos(db, req.photo_ids)
+
+
+# ---------------------------------------------------------------------------
+# Worker fleet control (M28) — launch/stop/inspect the native worker fleet from
+# /status. Workers point at the authoritative server (NAS in replica mode) and
+# compute locally; LM Studio role models are passed through from this process's
+# env (with sensible defaults when an OpenAI-compatible backend is configured).
+# ---------------------------------------------------------------------------
+
+# Fleet name so /status-launched workers are managed as their own group, leaving
+# any hand-launched fleet untouched.
+_UI_FLEET_NAME = "ui"
+
+
+class WorkersStartRequest(BaseModel):
+    passes: list[str]
+    count: int = 2
+
+
+def _run_workers_script() -> str:
+    return str(Path(_native_repo_dir()) / "run-workers.sh")
+
+
+def _fleet_server_url() -> str:
+    """Authoritative server the fleet submits to — the NAS in replica mode,
+    else this host's own server."""
+    nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    return nas or "http://localhost:8000"
+
+
+def _fleet_env() -> dict:
+    """Env for run-workers.sh — inherits ours, filling LM Studio role models
+    with defaults when PHOTOSEARCH_TEXT_LLM_URL is set so the LLM passes route
+    to LM Studio out of the box."""
+    env = os.environ.copy()
+    if env.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        visual = env.get("PHOTOSEARCH_LLM_VISUAL_MODEL") or "qwen2.5-vl-7b-instruct"
+        env.setdefault("PHOTOSEARCH_LLM_VISUAL_MODEL", visual)
+        env.setdefault("PHOTOSEARCH_LLM_DESCRIBE_MODEL", visual)
+        env.setdefault("PHOTOSEARCH_LLM_VERIFY_MODEL", visual)
+        env.setdefault("PHOTOSEARCH_LLM_TEXT_MODEL", "llama-3.2-3b-instruct")
+    return env
+
+
+@router.post("/workers/start")
+def admin_workers_start(req: WorkersStartRequest):
+    """Launch a native worker fleet for the given passes (run-workers.sh)."""
+    from . import rerun
+    bad = [p for p in req.passes if p not in rerun.ALL_PASSES]
+    if bad:
+        raise HTTPException(400, f"unknown pass type(s): {', '.join(bad)}")
+    if not req.passes:
+        raise HTTPException(400, "passes is required")
+    n = max(1, min(int(req.count), 8))
+    script = _run_workers_script()
+    if not Path(script).exists():
+        raise HTTPException(404, f"run-workers.sh not found: {script}")
+    cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
+           "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
+    try:
+        r = subprocess.run(cmd, cwd=_native_repo_dir(), env=_fleet_env(),
+                           capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "worker launch timed out (still starting?)")
+    if r.returncode != 0:
+        raise HTTPException(500, f"worker launch failed: {(r.stderr or r.stdout)[-500:]}")
+    return {"ok": True, "count": n, "passes": req.passes,
+            "server": _fleet_server_url(), "output": (r.stdout or "")[-2000:]}
+
+
+@router.post("/workers/stop")
+def admin_workers_stop():
+    """Stop the /status-launched worker fleet."""
+    script = _run_workers_script()
+    if not Path(script).exists():
+        raise HTTPException(404, f"run-workers.sh not found: {script}")
+    cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME, "--stop"]
+    r = subprocess.run(cmd, cwd=_native_repo_dir(), env=os.environ.copy(),
+                       capture_output=True, text=True, timeout=60)
+    return {"ok": r.returncode == 0, "output": ((r.stdout or "") + (r.stderr or ""))[-2000:]}
+
+
+@router.get("/workers/fleet-status")
+def admin_workers_fleet_status():
+    """Process-level status of the /status-launched fleet (run-workers.sh --status).
+
+    Distinct from /api/worker/status, which reports queue depth + active claims.
+    """
+    script = _run_workers_script()
+    if not Path(script).exists():
+        return {"available": False, "output": "run-workers.sh not found"}
+    cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME, "--status"]
+    try:
+        r = subprocess.run(cmd, cwd=_native_repo_dir(), env=os.environ.copy(),
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return {"available": True, "output": "(status timed out)"}
+    return {"available": True, "server": _fleet_server_url(),
+            "output": ((r.stdout or "") + (r.stderr or ""))[-4000:]}

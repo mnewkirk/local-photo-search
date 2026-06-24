@@ -185,10 +185,94 @@
     var _gensLoading = useState(false);
     var gensLoading = _gensLoading[0];   var setGensLoading = _gensLoading[1];
 
-    // Reset gen state when the focused photo changes
+    // ---- Re-run-passes state (M28) ----
+    var RERUN_PASSES = ['describe', 'category-content', 'category-visual',
+                        'keywords', 'verify', 'clip', 'faces', 'quality'];
+    var _rerunOpen = useState(false);
+    var rerunOpen = _rerunOpen[0];       var setRerunOpen = _rerunOpen[1];
+    var _rerunSel = useState({});         // { pass: true }
+    var rerunSel = _rerunSel[0];          var setRerunSel = _rerunSel[1];
+    var _rerunMode = useState('sync');    // 'sync' | 'queue'
+    var rerunMode = _rerunMode[0];        var setRerunMode = _rerunMode[1];
+    var _rerunBusy = useState(false);
+    var rerunBusy = _rerunBusy[0];        var setRerunBusy = _rerunBusy[1];
+    var _rerunMsg = useState(null);
+    var rerunMsg = _rerunMsg[0];          var setRerunMsg = _rerunMsg[1];
+
+    // Reset gen + re-run state when the focused photo changes
     useEffect(function () {
       setGens(null); setGensOpen(false); setGensLoading(false);
+      setRerunSel({}); setRerunMsg(null); setRerunBusy(false);
     }, [photo && photo.id]);
+
+    // Toggle one pass. Selecting describe also selects the text passes derived
+    // from the description (category-content + keywords) — re-describing alone
+    // leaves those stale (the exact failure that mislabels e.g. soccer photos).
+    function toggleRerunPass(p) {
+      setRerunSel(function (prev) {
+        var next = Object.assign({}, prev);
+        if (next[p]) { delete next[p]; }
+        else {
+          next[p] = true;
+          if (p === 'describe') { next['category-content'] = true; next['keywords'] = true; }
+        }
+        return next;
+      });
+    }
+
+    function submitRerun() {
+      var passes = RERUN_PASSES.filter(function (p) { return rerunSel[p]; });
+      if (!photo || passes.length === 0) return;
+      setRerunBusy(true);
+      setRerunMsg({ kind: 'info', text: (rerunMode === 'sync' ? 'Running ' : 'Queuing ') + passes.join(', ') + '…' });
+      fetch(API + '/api/admin/rerun-passes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ photo_ids: [photo.id], passes: passes, mode: rerunMode }),
+      }).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+      }).then(function (res) {
+        if (!res.ok) {
+          setRerunMsg({ kind: 'err', text: (res.d && res.d.detail) || 'Re-run failed' });
+          setRerunBusy(false);
+          return;
+        }
+        if (rerunMode === 'queue') {
+          setRerunMsg({ kind: 'ok', text: 'Queued — a worker will process it; click Refresh once done.' });
+          setRerunBusy(false);
+          return;
+        }
+        var errs = (res.d && res.d.errors) || [];
+        var done = (res.d && res.d.results) || [];
+        setRerunMsg({ kind: errs.length ? 'err' : 'ok',
+          text: 'Re-ran ' + done.length + ' pass(es)' + (errs.length ? ', ' + errs.length + ' failed: ' + errs.map(function (x) { return x.pass; }).join(', ') : '') + '.' });
+        refreshDetail();
+        setRerunBusy(false);
+      }).catch(function (e) {
+        setRerunMsg({ kind: 'err', text: 'Re-run error: ' + e });
+        setRerunBusy(false);
+      });
+    }
+
+    // Pull the freshly-mirrored row and update the visible detail. For queue
+    // mode this also serves as the "Refresh" action (mirror first, then re-read).
+    function refreshDetail(mirrorFirst) {
+      if (!photo) return Promise.resolve();
+      var pre = mirrorFirst
+        ? fetch(API + '/api/admin/mirror-photos', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ photo_ids: [photo.id] }),
+          }).catch(function () {})
+        : Promise.resolve();
+      return pre.then(function () {
+        return fetch(API + '/api/photos/' + photo.id).then(function (r) { return r.json(); });
+      }).then(function (d) {
+        if (fetchDetailProp) setInternalDetail(d);
+        if (onDetailChanged) onDetailChanged(d);
+        if (onDetailLoaded) onDetailLoaded(d);
+        setGens(null);  // force re-fetch of generation history on next expand
+      }).catch(function () {});
+    }
 
     function toggleGens() {
       if (!photo) return;
@@ -1108,6 +1192,53 @@
                   g.generated_text
                 ));
               })
+            )
+          ),
+
+          // Re-run passes (M28) — recompute any index pass on this photo.
+          // Synchronous (compute now via the local models) or queued for the
+          // worker fleet; writes to the NAS and mirrors back to the replica.
+          e('div', { className: 'detail-section' },
+            e('h3', {
+              onClick: function () { setRerunOpen(!rerunOpen); },
+              style: { cursor: 'pointer', userSelect: 'none' },
+              title: 'Recompute index passes on this photo',
+            }, (rerunOpen ? '▾ ' : '▸ ') + 'Re-run passes'),
+            rerunOpen && e('div', null,
+              e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', margin: '6px 0 10px' } },
+                RERUN_PASSES.map(function (p) {
+                  return e('label', { key: p, style: { fontSize: 12, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' } },
+                    e('input', { type: 'checkbox', checked: !!rerunSel[p],
+                      onChange: function () { toggleRerunPass(p); } }),
+                    p);
+                })
+              ),
+              e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, fontSize: 12 } },
+                e('label', { style: { display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' } },
+                  e('input', { type: 'radio', name: 'rerunmode-' + photo.id, checked: rerunMode === 'sync',
+                    onChange: function () { setRerunMode('sync'); } }), 'Run now'),
+                e('label', { style: { display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' } },
+                  e('input', { type: 'radio', name: 'rerunmode-' + photo.id, checked: rerunMode === 'queue',
+                    onChange: function () { setRerunMode('queue'); } }), 'Queue for fleet')
+              ),
+              e('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                e('button', {
+                  onClick: submitRerun,
+                  disabled: rerunBusy || RERUN_PASSES.filter(function (p) { return rerunSel[p]; }).length === 0,
+                  style: { fontSize: 12, padding: '4px 12px', cursor: rerunBusy ? 'wait' : 'pointer' },
+                }, rerunBusy ? 'Working…' : (rerunMode === 'sync' ? 'Run now' : 'Queue')),
+                e('button', {
+                  onClick: function () { setRerunMsg({ kind: 'info', text: 'Refreshing…' }); refreshDetail(true).then(function () { setRerunMsg({ kind: 'ok', text: 'Refreshed.' }); }); },
+                  disabled: rerunBusy,
+                  title: 'Pull the latest values from the NAS into this view',
+                  style: { fontSize: 12, padding: '4px 12px', cursor: 'pointer' },
+                }, 'Refresh')
+              ),
+              rerunMsg && e('p', {
+                style: { fontSize: 12, marginTop: 8,
+                  color: rerunMsg.kind === 'err' ? 'var(--danger, #c0392b)'
+                       : rerunMsg.kind === 'ok' ? 'var(--success, #2e7d32)' : 'var(--text-muted)' },
+              }, rerunMsg.text)
             )
           ),
 

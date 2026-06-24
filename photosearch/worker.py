@@ -121,16 +121,20 @@ def _retry(fn, max_retries=5, base_delay=5, label="request"):
 class WorkerClient:
     """HTTP client for the worker API on the NAS."""
 
-    def __init__(self, server_url: str, worker_id: str = None):
+    def __init__(self, server_url: str, worker_id: str = None, probe: bool = True):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.session = requests.Session()
-        # Quick connectivity test
-        try:
-            r = self.session.get(f"{self.server_url}/api/stats", timeout=10)
-            r.raise_for_status()
-        except Exception as e:
-            raise ConnectionError(f"Cannot reach server at {self.server_url}: {e}")
+        # Quick connectivity test. `/api/stats` runs heavy count scans and can
+        # time out when the NAS is busy, so callers that just want to submit a
+        # single result (the M28 sync re-run path) pass probe=False to skip it —
+        # the targeted download/submit calls have their own timeouts + retries.
+        if probe:
+            try:
+                r = self.session.get(f"{self.server_url}/api/stats", timeout=10)
+                r.raise_for_status()
+            except Exception as e:
+                raise ConnectionError(f"Cannot reach server at {self.server_url}: {e}")
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Send a request, transparently backing off on HTTP 503 (server in

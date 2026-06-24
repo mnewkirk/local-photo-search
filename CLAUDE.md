@@ -585,6 +585,44 @@ The `on_progress` + `should_abort` callback pair added to `stacking.py` is
 the reference shape for instrumenting other long-running jobs (reclustering,
 describe, etc.) with SSE progress + cancel.
 
+## On-demand pass re-runs + status-page fleet launcher (M28)
+
+Re-run any index pass on a photo from the image view, and launch a worker
+fleet for chosen passes from `/status`. The NAS (weak N100, no GPU) can't
+compute, so the desktop always does the model work; results are written
+**NAS-authoritative then mirrored into the local replica DB** (the M26b
+read-local / write-NAS / mirror-local model — don't wait for the nightly
+`sync-replica.sh` full pull). Module: `photosearch/rerun.py`.
+
+- **Image view** — `PS.PhotoModal` (`frontend/dist/shared.js`) has a "Re-run
+  passes" section: checkboxes for all 8 passes, **Run now** (synchronous) vs
+  **Queue for fleet**, plus a **Refresh** button (mirror + re-read). Checking
+  `describe` auto-selects `category-content` + `keywords` — re-describing alone
+  leaves those stale (the exact failure that mislabeled a sailboat/life-jacket
+  photo as "soccer": truncated describe → text-only category pass hallucinated
+  soccer tags, and verify never ran).
+- **`POST /api/admin/rerun-passes`** `{photo_ids, passes, mode}` —
+  `mode=sync` computes each pass in-process (reusing `worker._process_*` + a
+  synthetic-batch submit; `submit-results` applies by `photo_id` even without a
+  live claim) and submits to the NAS, then mirrors. `mode=queue` calls the NAS
+  `clear-pass` (which already accepts `photo_ids`) so the fleet re-processes it.
+- **`POST /api/admin/mirror-photos`** `{photo_ids}` + NAS
+  **`GET /api/photos/{id}/mirror-fields`** — targeted per-photo refresh of
+  text/scalar columns + CLIP embedding + face rows (no full sync). `rerun.py`
+  applies it (`_apply_mirror`).
+- **Status page** — a "Worker fleet" panel launches the **native** fleet via
+  `run-workers.sh --native --name ui -s <NAS> -p <passes> -n <N>`, exporting LM
+  Studio role models (defaults filled when `PHOTOSEARCH_TEXT_LLM_URL` is set).
+  Endpoints `POST /api/admin/workers/start|stop`, `GET /workers/fleet-status`
+  (process status — distinct from `/api/worker/status`'s queue depth).
+
+`WorkerClient(..., probe=False)` skips the `/api/stats` connectivity probe
+(heavy count scan — times out when the NAS is busy) for single-result submits.
+
+**Mirror needs the NAS running M28 code** — `/mirror-fields` 404s on older
+NAS images, so `mirrored:0` until the NAS is redeployed; the sync compute +
+authoritative write still work, and the local UI catches up on the next sync.
+
 ## Deploy panel (Version / Build / Restart)
 
 `/status` has a Deployment card backed by `photosearch/admin_api.py`. It

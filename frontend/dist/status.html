@@ -1077,6 +1077,96 @@
       );
     }
 
+    // M28 — launch a native worker fleet for chosen passes from /status.
+    // Workers compute locally (LM Studio / GPU) and submit to the authoritative
+    // server (the NAS in replica mode). Managed as the named "ui" fleet so it
+    // doesn't disturb any hand-launched fleet.
+    var FLEET_PASSES = ['clip', 'faces', 'quality', 'describe',
+                        'category-content', 'category-visual', 'keywords', 'verify'];
+
+    function FleetLauncher() {
+      var _sel = useState({ describe: true, 'category-content': true, keywords: true });
+      var sel = _sel[0]; var setSel = _sel[1];
+      var _n = useState(2); var count = _n[0]; var setCount = _n[1];
+      var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
+      var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];
+      var _status = useState(null); var status = _status[0]; var setStatus = _status[1];
+
+      function loadStatus() {
+        fetch('/api/admin/workers/fleet-status')
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setStatus(d); })
+          .catch(function () {});
+      }
+      useEffect(function () { loadStatus(); }, []);
+
+      function toggle(p) {
+        var next = Object.assign({}, sel);
+        if (next[p]) delete next[p]; else next[p] = true;
+        setSel(next);
+      }
+
+      function start() {
+        var passes = FLEET_PASSES.filter(function (p) { return sel[p]; });
+        if (passes.length === 0) return;
+        setBusy(true); setMsg({ kind: 'info', text: 'Launching ' + count + ' worker(s)…' });
+        fetch('/api/admin/workers/start', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passes: passes, count: Number(count) }),
+        }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+          .then(function (res) {
+            setMsg(res.ok
+              ? { kind: 'ok', text: 'Launched ' + res.d.count + ' worker(s) → ' + res.d.server }
+              : { kind: 'err', text: (res.d && res.d.detail) || 'Launch failed' });
+            setBusy(false); loadStatus();
+          }).catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
+      }
+
+      function stop() {
+        setBusy(true); setMsg({ kind: 'info', text: 'Stopping fleet…' });
+        fetch('/api/admin/workers/stop', { method: 'POST' })
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setMsg({ kind: 'ok', text: 'Stopped.' }); setBusy(false); loadStatus(); })
+          .catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
+      }
+
+      return e('div', null,
+        e('h2', null, 'Worker fleet'),
+        e('div', { className: 'workers-wrap' },
+          e('div', { style: { fontSize: 13, color: 'var(--text-muted)', marginBottom: 8 } },
+            'Launch local workers (compute here via LM Studio / GPU; results written to the authoritative server).'),
+          e('div', { className: 'queue-grid' },
+            FLEET_PASSES.map(function (p) {
+              return e('label', { key: p, className: 'queue-pill' + (sel[p] ? '' : ' empty'),
+                  style: { cursor: 'pointer' }, onClick: function () { toggle(p); } },
+                e('span', { className: 'q-pass' },
+                  e('input', { type: 'checkbox', checked: !!sel[p], readOnly: true,
+                    style: { marginRight: 6, verticalAlign: 'middle' } }), p));
+            })
+          ),
+          e('div', { className: 'workers-head', style: { marginTop: 10 } },
+            e('span', { className: 'workers-title' }, 'Workers: '),
+            e('input', { type: 'number', min: 1, max: 8, value: count,
+              onChange: function (ev) { setCount(ev.target.value); },
+              style: { width: 56, marginLeft: 6 } }),
+            e('button', { className: 'btn', style: { marginLeft: 12 },
+              onClick: start, disabled: busy }, busy ? 'Working…' : 'Start fleet'),
+            e('button', { className: 'btn', style: { marginLeft: 8 },
+              onClick: stop, disabled: busy }, 'Stop fleet'),
+            e('button', { className: 'btn', style: { marginLeft: 'auto' },
+              onClick: loadStatus, disabled: busy }, 'Refresh')
+          ),
+          msg && e('p', { style: { fontSize: 12, marginTop: 8,
+              color: msg.kind === 'err' ? 'var(--danger, #c0392b)'
+                   : msg.kind === 'ok' ? 'var(--success, #2e7d32)' : 'var(--text-muted)' } }, msg.text),
+          status && status.output && e('pre', {
+            style: { fontSize: 11, marginTop: 8, padding: 8, borderRadius: 4,
+              background: 'var(--surface2)', border: '1px solid var(--border)',
+              whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto' } }, status.output)
+        )
+      );
+    }
+
     var STACK_DEFAULTS = {
       time_window_sec: 5.0,
       clip_threshold: 0.05,
@@ -1458,6 +1548,7 @@
           ),
           e(GenerationsByModel, null),
           e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
+          e(FleetLauncher, null),
           e(ActivityChart, { activity: activity }),
           e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
           e(ErrorsLog, { errors: indexErrors }),
