@@ -33,6 +33,7 @@ logger = logging.getLogger("photosearch.maintenance")
 # and clears ignored_clusters, so a nightly auto-run would wipe "ignore"
 # decisions — gate it to a slower/manual cadence per the M25 plan).
 SWEEP_STAGE_ORDER = (
+    "dedup_photos",
     "geocode",
     "normalize",
     "infer",
@@ -370,6 +371,157 @@ def _stage_recluster(db, apply, emit, check_abort):
 
 
 # ---------------------------------------------------------------------------
+# Duplicate-photo detection (shared by the CLI, the sweep stage, and validate)
+# ---------------------------------------------------------------------------
+
+def find_duplicate_photo_plan(db, check_abort=None) -> dict:
+    """Group duplicate photos (same image imported twice) — DB-only, no image reads.
+
+    Two signals, unioned with union-find over photo ids:
+      - exact file dup    — two photos share a non-empty ``file_hash``
+      - same-image dup    — two photos share a byte-identical face encoding
+                            (catches Takeout/phone re-exports the file_hash
+                            dedup missed: `DSC04898 (1).JPG`, one image as two ids)
+
+    Within each group one CANONICAL photo is kept (most person-tagged faces, then
+    most faces, then a description, then lowest id); the rest are redundant.
+
+    Returns {"groups": [{"keep", "drop", "members":[meta...]}], "redundant_ids":
+    [...], "n_encodings": int, "n_groups": int, "n_redundant": int}.
+    Limitation: a dup pair where neither copy has a detected face AND the files
+    differ can't be seen here (needs a perceptual hash over the originals).
+    """
+    import hashlib
+    c = db.conn
+
+    parent: dict = {}
+
+    def find(x: int) -> int:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    # Signal 1: shared file_hash
+    for r in c.execute(
+        "SELECT GROUP_CONCAT(id) ids FROM photos "
+        "WHERE file_hash IS NOT NULL AND file_hash != '' "
+        "GROUP BY file_hash HAVING COUNT(*) > 1"
+    ).fetchall():
+        ids = [int(x) for x in r["ids"].split(",")]
+        for other in ids[1:]:
+            union(ids[0], other)
+
+    if check_abort:
+        check_abort()
+
+    # Signal 2: shared byte-identical face encoding (same-image proxy)
+    face_photo = {int(r["id"]): int(r["photo_id"])
+                  for r in c.execute("SELECT id, photo_id FROM faces").fetchall()}
+    enc_to_photos: dict = {}
+    n_enc = 0
+    for r in c.execute("SELECT face_id, encoding FROM face_encodings"):
+        pid = face_photo.get(int(r["face_id"]))
+        if pid is None:
+            continue
+        h = hashlib.md5(bytes(r["encoding"])).digest()
+        enc_to_photos.setdefault(h, set()).add(pid)
+        n_enc += 1
+    for photos in enc_to_photos.values():
+        if len(photos) > 1:
+            ids = sorted(photos)
+            for other in ids[1:]:
+                union(ids[0], other)
+
+    if check_abort:
+        check_abort()
+
+    roots: dict = {}
+    for node in list(parent.keys()):
+        roots.setdefault(find(node), []).append(node)
+    raw_groups = [sorted(set(v)) for v in roots.values() if len(set(v)) > 1]
+    if not raw_groups:
+        return {"groups": [], "redundant_ids": [], "n_encodings": n_enc,
+                "n_groups": 0, "n_redundant": 0}
+
+    all_ids = [pid for g in raw_groups for pid in g]
+    meta: dict = {}
+    for i in range(0, len(all_ids), 900):
+        batch = all_ids[i:i + 900]
+        ph = ",".join("?" * len(batch))
+        for r in c.execute(
+            f"""SELECT p.id, p.filepath,
+                      (p.description IS NOT NULL AND p.description != '') AS has_desc,
+                      (SELECT COUNT(*) FROM faces f WHERE f.photo_id = p.id) AS n_faces,
+                      (SELECT COUNT(*) FROM faces f WHERE f.photo_id = p.id
+                             AND f.person_id IS NOT NULL) AS n_named
+               FROM photos p WHERE p.id IN ({ph})""", batch).fetchall():
+            meta[int(r["id"])] = {
+                "id": int(r["id"]), "filepath": r["filepath"],
+                "has_desc": int(r["has_desc"] or 0),
+                "n_faces": int(r["n_faces"] or 0), "n_named": int(r["n_named"] or 0),
+            }
+
+    def keep_rank(pid: int) -> tuple:
+        m = meta.get(pid, {})
+        return (m.get("n_named", 0), m.get("n_faces", 0), m.get("has_desc", 0), -pid)
+
+    groups, redundant_ids = [], []
+    for g in raw_groups:
+        keep = max(g, key=keep_rank)
+        drop = [pid for pid in g if pid != keep]
+        redundant_ids.extend(drop)
+        groups.append({"keep": keep, "drop": drop,
+                       "members": [meta.get(pid, {"id": pid}) for pid in g]})
+    groups.sort(key=lambda p: -len(p["drop"]))
+    return {"groups": groups, "redundant_ids": redundant_ids, "n_encodings": n_enc,
+            "n_groups": len(groups), "n_redundant": len(redundant_ids)}
+
+
+def _stage_dedup_photos(db, apply, emit, check_abort):
+    """Prune duplicate photos (same image imported twice). Opt-in + destructive.
+
+    Off by default like recluster: it DELETES redundant photo rows (faces
+    cascade) and then clears the now-dangling vec0 encoding rows. Reversible only
+    by re-indexing the file. Runs first in the sweep so downstream face/colors/
+    stacking stages work on the deduplicated set.
+    """
+    plan = find_duplicate_photo_plan(db, check_abort=check_abort)
+    would = plan["n_redundant"]
+    if would == 0:
+        return {"stage": "dedup_photos", "would": 0, "applied": 0, "status": "skipped",
+                "groups": 0}
+    if not apply:
+        return {"stage": "dedup_photos", "would": would, "applied": 0,
+                "status": "preview", "groups": plan["n_groups"]}
+    c = db.conn
+    ids = plan["redundant_ids"]
+    deleted = 0
+    for i in range(0, len(ids), 500):
+        check_abort()
+        batch = ids[i:i + 500]
+        ph = ",".join("?" * len(batch))
+        c.execute(f"DELETE FROM photos WHERE id IN ({ph})", batch)
+        deleted += len(batch)
+    c.execute("DELETE FROM photo_stacks WHERE id NOT IN "
+              "(SELECT DISTINCT stack_id FROM stack_members)")
+    db.conn.commit()
+    # Photos cascade-delete faces, but vec0 tables can't cascade — clear orphans.
+    vec = db.cleanup_vec_orphans(dry_run=False)
+    return {"stage": "dedup_photos", "would": would, "applied": deleted,
+            "status": "done", "groups": plan["n_groups"],
+            "vec_cleaned": vec.get("clip_deleted", 0) + vec.get("face_deleted", 0)}
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -381,6 +533,7 @@ def run_maintenance_sweep(
     do_stacking: bool = True,
     do_match: bool = True,
     do_recluster: bool = False,
+    do_dedup: bool = False,
     window_minutes: int = 30,
     max_drift_km: float = 25.0,
     min_confidence: float = 0.0,
@@ -395,6 +548,8 @@ def run_maintenance_sweep(
             *would* touch and writes nothing. When True, stages run.
         do_colors / do_stacking: toggle those (heavier) stages.
         do_recluster: opt-in — clears ignored_clusters, so off by default.
+        do_dedup: opt-in — DELETES duplicate photos (destructive), so off by
+            default. Runs first so downstream stages work on the deduped set.
         window_minutes / max_drift_km / min_confidence: infer-locations tuning.
         on_progress: callback(dict) invoked per stage (and inside long stages)
             with a {"phase": "sweep", "stage": ..., "status": ...} event.
@@ -406,7 +561,11 @@ def run_maintenance_sweep(
     emit = _make_emit(on_progress)
     check_abort = _make_abort(should_abort)
 
-    plan = [
+    plan = []
+    # Dedup first (when enabled) so every later stage skips the redundant copies.
+    if do_dedup:
+        plan.append(("dedup_photos", lambda: _stage_dedup_photos(db, apply, emit, check_abort)))
+    plan += [
         ("geocode", lambda: _stage_geocode(db, apply, emit, check_abort)),
         ("normalize", lambda: _stage_normalize(db, apply, emit, check_abort)),
         ("infer", lambda: _stage_infer(
@@ -539,6 +698,23 @@ def validate_data(db, sample: int = 5) -> dict:
     report["garbage_tag_sets"] = {
         "count": garbage,
         "hint": "run `photosearch clean-garbage-tags` to clear these",
+    }
+
+    # 7. Duplicate photos — cheap exact-file signal only (shared file_hash). The
+    #    full same-image detection (byte-identical encodings, catches Takeout
+    #    re-exports) is heavier, so it lives in `find-duplicate-photos` / the
+    #    opt-in dedup_photos sweep stage; surface a count here + point at them.
+    dup_hash = c.execute(
+        "SELECT COALESCE(SUM(n - 1), 0) AS redundant, COUNT(*) AS groups FROM "
+        "(SELECT COUNT(*) AS n FROM photos "
+        " WHERE file_hash IS NOT NULL AND file_hash != '' "
+        " GROUP BY file_hash HAVING COUNT(*) > 1)"
+    ).fetchone()
+    report["duplicate_photos"] = {
+        "count": int(dup_hash["redundant"] or 0),
+        "groups_by_file_hash": int(dup_hash["groups"] or 0),
+        "hint": "exact-file dups only; run `photosearch find-duplicate-photos` for "
+                "full same-image detection (+ the opt-in dedup_photos sweep stage)",
     }
 
     return report

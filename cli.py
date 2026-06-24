@@ -1771,121 +1771,34 @@ def find_duplicate_photos(db, json_out, sample, apply):
     Dry-run by default. `--apply` deletes the redundant photo rows (faces cascade);
     follow with `cleanup-orphans` to drop the dangling vec0 encoding rows.
     """
-    import hashlib
     import json as _json
+    from photosearch.maintenance import find_duplicate_photo_plan
     with PhotoDB(db) as pdb:
         c = pdb.conn
-
-        # ----- union-find over photo ids -----
-        parent: dict[int, int] = {}
-
-        def find(x: int) -> int:
-            parent.setdefault(x, x)
-            root = x
-            while parent[root] != root:
-                root = parent[root]
-            while parent[x] != root:
-                parent[x], x = root, parent[x]
-            return root
-
-        def union(a: int, b: int) -> None:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[max(ra, rb)] = min(ra, rb)
-
-        # Signal 1: shared file_hash
-        click.echo("Scanning for shared file_hash…")
-        fh_groups = c.execute(
-            """SELECT file_hash, GROUP_CONCAT(id) ids FROM photos
-               WHERE file_hash IS NOT NULL AND file_hash != ''
-               GROUP BY file_hash HAVING COUNT(*) > 1"""
-        ).fetchall()
-        for r in fh_groups:
-            ids = [int(x) for x in r["ids"].split(",")]
-            for other in ids[1:]:
-                union(ids[0], other)
-
-        # Signal 2: shared byte-identical face encoding (same-image proxy)
-        click.echo("Scanning for byte-identical face encodings (same image)…")
-        face_photo = {
-            int(r["id"]): int(r["photo_id"])
-            for r in c.execute("SELECT id, photo_id FROM faces").fetchall()
-        }
-        enc_to_photos: dict[str, set] = {}
-        n_enc = 0
-        for r in c.execute("SELECT face_id, encoding FROM face_encodings"):
-            pid = face_photo.get(int(r["face_id"]))
-            if pid is None:
-                continue
-            h = hashlib.md5(bytes(r["encoding"])).digest()
-            enc_to_photos.setdefault(h, set()).add(pid)
-            n_enc += 1
-        for photos in enc_to_photos.values():
-            if len(photos) > 1:
-                ids = sorted(photos)
-                for other in ids[1:]:
-                    union(ids[0], other)
-
-        # ----- assemble groups -----
-        roots: dict[int, list] = {}
-        for node in list(parent.keys()):
-            roots.setdefault(find(node), []).append(node)
-        groups = [sorted(set(v)) for v in roots.values() if len(set(v)) > 1]
+        click.echo("Scanning file_hash + byte-identical face encodings…")
+        result = find_duplicate_photo_plan(pdb)
+        groups = result["groups"]
+        redundant_ids = result["redundant_ids"]
 
         if not groups:
             click.echo("\nNo duplicate photos found (by file_hash or identical encoding).")
             return
 
-        # ----- per-group metadata + canonical pick -----
-        all_ids = [pid for g in groups for pid in g]
-        meta: dict[int, dict] = {}
-        for i in range(0, len(all_ids), 900):
-            batch = all_ids[i:i + 900]
-            ph = ",".join("?" * len(batch))
-            for r in c.execute(
-                f"""SELECT p.id, p.filepath, p.date_taken,
-                          (p.description IS NOT NULL AND p.description != '') AS has_desc,
-                          (SELECT COUNT(*) FROM faces f WHERE f.photo_id = p.id) AS n_faces,
-                          (SELECT COUNT(*) FROM faces f WHERE f.photo_id = p.id
-                                 AND f.person_id IS NOT NULL) AS n_named
-                   FROM photos p WHERE p.id IN ({ph})""", batch).fetchall():
-                meta[int(r["id"])] = {
-                    "id": int(r["id"]), "filepath": r["filepath"],
-                    "date_taken": r["date_taken"],
-                    "has_desc": int(r["has_desc"] or 0),
-                    "n_faces": int(r["n_faces"] or 0),
-                    "n_named": int(r["n_named"] or 0),
-                }
-
-        def keep_rank(pid: int) -> tuple:
-            m = meta.get(pid, {})
-            # higher is better; lowest id breaks ties (negate id to keep low)
-            return (m.get("n_named", 0), m.get("n_faces", 0), m.get("has_desc", 0), -pid)
-
-        plan = []
-        redundant_ids = []
-        for g in groups:
-            keep = max(g, key=keep_rank)
-            drop = [pid for pid in g if pid != keep]
-            redundant_ids.extend(drop)
-            plan.append({"keep": keep, "drop": drop,
-                         "members": [meta.get(pid, {"id": pid}) for pid in g]})
-
-        plan.sort(key=lambda p: -len(p["drop"]))
-        total_redundant = len(redundant_ids)
+        total_redundant = result["n_redundant"]
         click.echo(
-            f"\n{len(groups):,} duplicate group(s) covering "
-            f"{len(all_ids):,} photo rows — {total_redundant:,} redundant copies "
-            f"(keeping 1 per group). Scanned {n_enc:,} encodings.")
+            f"\n{result['n_groups']:,} duplicate group(s) — {total_redundant:,} "
+            f"redundant copies (keeping 1 per group). Scanned "
+            f"{result['n_encodings']:,} encodings.")
 
         click.echo("\nSample (largest groups first):")
-        for p in plan[:sample]:
-            k = meta.get(p["keep"], {})
+        for p in groups[:sample]:
+            members = {m["id"]: m for m in p["members"]}
+            k = members.get(p["keep"], {})
             click.echo(f"  group of {len(p['members'])}: KEEP #{p['keep']} "
                        f"({(k.get('filepath') or '').split('/')[-1]}, "
                        f"{k.get('n_named',0)} named / {k.get('n_faces',0)} faces)")
             for pid in p["drop"][:4]:
-                m = meta.get(pid, {})
+                m = members.get(pid, {})
                 click.echo(f"      drop #{pid}  {(m.get('filepath') or '').split('/')[-1]}  "
                            f"{m.get('n_named',0)} named / {m.get('n_faces',0)} faces")
             if len(p["drop"]) > 4:
@@ -1893,7 +1806,7 @@ def find_duplicate_photos(db, json_out, sample, apply):
 
         if json_out:
             with open(json_out, "w") as f:
-                _json.dump({"groups": plan, "redundant_ids": sorted(redundant_ids)}, f, indent=2)
+                _json.dump({"groups": groups, "redundant_ids": sorted(redundant_ids)}, f, indent=2)
             click.echo(f"\nWrote plan: {json_out}")
 
         if not apply:
@@ -1912,10 +1825,12 @@ def find_duplicate_photos(db, json_out, sample, apply):
             "DELETE FROM photo_stacks WHERE id NOT IN "
             "(SELECT DISTINCT stack_id FROM stack_members)").rowcount
         pdb.conn.commit()
+        vec = pdb.cleanup_vec_orphans(dry_run=False)
         click.echo(f"  Deleted {deleted:,} photos (+ cascaded faces); "
-                   f"removed {orphan_stacks:,} now-empty stacks.")
-        click.echo("\nNext: `cleanup-orphans` to drop dangling encodings, then "
-                   "`recluster-faces` to regroup the affected clusters.")
+                   f"removed {orphan_stacks:,} now-empty stacks; "
+                   f"cleared {vec.get('clip_deleted',0) + vec.get('face_deleted',0):,} "
+                   "dangling encodings.")
+        click.echo("\nNext: run `recluster-faces` to regroup the affected clusters.")
 
 
 @cli.command("backfill-image-orientation")
@@ -2023,11 +1938,14 @@ def backfill_folders(db, apply, force):
                    "heavy stages peg the N100 and starve the server).")
 @click.option("--recluster", is_flag=True, default=False,
               help="Include recluster-faces (clears ignored_clusters — off by default).")
+@click.option("--dedup-photos", is_flag=True, default=False,
+              help="Include duplicate-photo pruning (DELETES redundant copies — off "
+                   "by default; runs first so later stages skip the dups).")
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
 def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, recluster,
-                      window_minutes, max_drift_km, min_confidence):
+                      dedup_photos, window_minutes, max_drift_km, min_confidence):
     """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
 
     Backfills nothing else schedules: structured locations, inferred GPS, colors,
@@ -2057,7 +1975,8 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
         try:
             res = run_maintenance_sweep(
                 pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
-                do_match=not no_match, do_recluster=recluster, window_minutes=window_minutes,
+                do_match=not no_match, do_recluster=recluster, do_dedup=dedup_photos,
+                window_minutes=window_minutes,
                 max_drift_km=max_drift_km, min_confidence=min_confidence,
                 on_progress=on_prog)
         except KeyboardInterrupt:

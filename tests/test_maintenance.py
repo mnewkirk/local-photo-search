@@ -246,3 +246,74 @@ def test_maintenance_sweep_endpoint_smoke(client):
 def test_maintenance_sweep_endpoint_validates_params(client):
     r = client.post("/api/admin/maintenance-sweep", json={"window_minutes": 0})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-photo detection + dedup stage
+# ---------------------------------------------------------------------------
+
+def test_find_duplicate_photo_plan_groups_and_picks_canonical(seeded_db):
+    from photosearch.maintenance import find_duplicate_photo_plan
+    db = seeded_db
+    keep = db.add_photo(filepath="2021/x/keep.jpg", filename="keep.jpg",
+                        date_taken="2021-05-01 10:00:00", file_hash="DEADBEEF",
+                        description="a real description")   # has_desc -> canonical
+    drop = db.add_photo(filepath="2021/x/dup.jpg", filename="dup.jpg",
+                        date_taken="2021-05-01 10:00:00", file_hash="DEADBEEF")
+    db.conn.commit()
+    plan = find_duplicate_photo_plan(db)
+    assert plan["n_groups"] == 1
+    assert plan["redundant_ids"] == [drop]
+    assert plan["groups"][0]["keep"] == keep
+
+
+def test_dedup_stage_off_by_default(seeded_db):
+    from photosearch.maintenance import run_maintenance_sweep
+    res = run_maintenance_sweep(seeded_db, apply=False, do_colors=False,
+                                do_stacking=False, do_match=False)
+    assert not any(s["stage"] == "dedup_photos" for s in res["stages"])
+
+
+def test_dedup_stage_runs_first_and_previews(seeded_db):
+    from photosearch.maintenance import run_maintenance_sweep
+    db = seeded_db
+    db.add_photo(filepath="2021/x/k.jpg", filename="k.jpg",
+                 date_taken="2021-05-01 10:00:00", file_hash="H1")
+    db.add_photo(filepath="2021/x/d.jpg", filename="d.jpg",
+                 date_taken="2021-05-01 10:00:00", file_hash="H1")
+    db.conn.commit()
+    res = run_maintenance_sweep(db, apply=False, do_colors=False, do_stacking=False,
+                                do_match=False, do_dedup=True)
+    assert res["stages"][0]["stage"] == "dedup_photos"   # runs first
+    dd = res["stages"][0]
+    assert dd["status"] == "preview" and dd["would"] == 1 and dd["applied"] == 0
+    # dry-run mutated nothing
+    assert db.conn.execute("SELECT COUNT(*) FROM photos WHERE file_hash='H1'").fetchone()[0] == 2
+
+
+def test_dedup_stage_apply_deletes_redundant(seeded_db):
+    from photosearch.maintenance import _stage_dedup_photos
+    db = seeded_db
+    keep = db.add_photo(filepath="2021/x/k.jpg", filename="k.jpg",
+                        date_taken="2021-05-01 10:00:00", file_hash="H2",
+                        description="keep me")
+    drop = db.add_photo(filepath="2021/x/d.jpg", filename="d.jpg",
+                        date_taken="2021-05-01 10:00:00", file_hash="H2")
+    db.conn.commit()
+    out = _stage_dedup_photos(db, apply=True, emit=lambda e: None, check_abort=lambda: None)
+    assert out["status"] == "done" and out["applied"] == 1
+    assert db.conn.execute("SELECT COUNT(*) FROM photos WHERE id=?", (drop,)).fetchone()[0] == 0
+    assert db.conn.execute("SELECT COUNT(*) FROM photos WHERE id=?", (keep,)).fetchone()[0] == 1
+
+
+def test_validate_reports_duplicate_photos(seeded_db):
+    from photosearch.maintenance import validate_data
+    db = seeded_db
+    db.add_photo(filepath="d/1.jpg", filename="1.jpg",
+                 date_taken="2021-05-01 10:00:00", file_hash="HX")
+    db.add_photo(filepath="d/2.jpg", filename="2.jpg",
+                 date_taken="2021-05-01 10:00:00", file_hash="HX")
+    db.conn.commit()
+    rep = validate_data(db)
+    assert "duplicate_photos" in rep
+    assert rep["duplicate_photos"]["count"] >= 1

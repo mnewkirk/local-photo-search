@@ -3354,6 +3354,7 @@ async def api_maintenance_sweep(request: Request):
     do_stacking = bool(data.get("do_stacking", False))
     do_match = bool(data.get("do_match", False))
     do_recluster = bool(data.get("do_recluster", False))
+    do_dedup = bool(data.get("do_dedup", False))
     window_minutes = int(data.get("window_minutes", 30))
     max_drift_km = float(data.get("max_drift_km", 25.0))
     min_confidence = float(data.get("min_confidence", 0.0))
@@ -3390,6 +3391,7 @@ async def api_maintenance_sweep(request: Request):
                 "do_stacking": do_stacking,
                 "do_match": do_match,
                 "do_recluster": do_recluster,
+                "do_dedup": do_dedup,
             })
             with _get_db() as db:
                 result = run_maintenance_sweep(
@@ -3399,6 +3401,7 @@ async def api_maintenance_sweep(request: Request):
                     do_stacking=do_stacking,
                     do_match=do_match,
                     do_recluster=do_recluster,
+                    do_dedup=do_dedup,
                     window_minutes=window_minutes,
                     max_drift_km=max_drift_km,
                     min_confidence=min_confidence,

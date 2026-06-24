@@ -715,6 +715,7 @@
     // Human labels for the maintenance-sweep stages (matches
     // maintenance.SWEEP_STAGE_ORDER).
     var SWEEP_STAGE_LABELS = {
+      dedup_photos: 'Prune duplicate photos',
       geocode: 'Reverse-geocode place names',
       normalize: 'Structured location columns',
       infer: 'Infer GPS from neighbors',
@@ -1075,6 +1076,7 @@
       var _st = useState(false); var doStacking = _st[0]; var setStacking = _st[1];
       var _m = useState(false);  var doMatch = _m[0]; var setMatch = _m[1];
       var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
+      var _dd = useState(false); var doDedup = _dd[0]; var setDedup = _dd[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
       var _stg = useState({}); var stages = _stg[0]; var setStages = _stg[1];
       var _r = useState(null);  var result = _r[0]; var setResult = _r[1];
@@ -1096,6 +1098,11 @@
           'Recluster renumbers every unknown face cluster and clears '
           + 'ignored_clusters. Continue?'
         )) return;
+        if (doApply && doDedup && !confirm(
+          'Prune duplicate photos DELETES the redundant copies (the most-curated '
+          + 'copy in each duplicate group is kept; faces cascade). This is '
+          + 'destructive — reversible only by re-indexing the file. Continue?'
+        )) return;
         if (doApply && !confirm(
           'Apply mode WRITES to the database (idempotent, missing-only). Continue?'
         )) return;
@@ -1116,6 +1123,7 @@
               do_stacking: doStacking,
               do_match: doMatch,
               do_recluster: doRecluster,
+              do_dedup: doDedup,
             }),
             signal: controller.signal,
           });
@@ -1200,7 +1208,7 @@
           .finally(function() { setVBusy(false); });
       }
 
-      var order = ['geocode', 'normalize', 'infer', 'normalize_inferred',
+      var order = ['dedup_photos', 'geocode', 'normalize', 'infer', 'normalize_inferred',
                    'colors', 'stacking', 'match_faces', 'resolve_dups', 'recluster'];
       var stageRows = order.filter(function(s) { return stages[s]; }).map(function(s) {
         var st = stages[s];
@@ -1267,7 +1275,11 @@
             e('label', null,
               e('input', { type: 'checkbox', checked: doRecluster, disabled: busy,
                 onChange: function(ev) { setRecluster(ev.target.checked); } }),
-              'Recluster faces (clears ignored)')
+              'Recluster faces (clears ignored)'),
+            e('label', { title: 'Deletes duplicate photos (same image imported twice), keeping the most-curated copy. Destructive; runs first.' },
+              e('input', { type: 'checkbox', checked: doDedup, disabled: busy,
+                onChange: function(ev) { setDedup(ev.target.checked); } }),
+              'Prune duplicate photos (deletes)')
           ),
           e('div', { className: 'stack-actions' },
             busy
