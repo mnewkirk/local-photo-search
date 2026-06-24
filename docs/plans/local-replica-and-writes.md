@@ -1,7 +1,10 @@
 # Local Read-Replica Deployment + Write Tools (M26)
 
-**Status:** 🟡 **M26a partially shipped** (image-proxy fallback, sync script,
-sync/status endpoints + `/status` card). **M26b (writes) shipped 2026-06-23** —
+**Status:** ✅ **M26a shipped** (image-proxy fallback, sync script, sync/status
+endpoints + `/status` card, nightly Windows Task Scheduler pull, end-to-end
+serve-off-replica with local LM Studio — all verified 2026-06-23; only the
+optional thumbnail bulk pre-warm is deferred, lazy proxy covers it).
+**M26b (writes) shipped 2026-06-23** —
 all three agent-facing write tools `set_photo_location` / `set_photo_tags` /
 `add_to_collection` now live in the shared tool layer (`photosearch/tools.py`)
 with the full read-local / write-NAS-authoritative / mirror-local dual-write
@@ -33,9 +36,28 @@ enough for v1). Independent of M25. (Status authority: see
 - `POST /api/admin/replica-sync` (SSE) + `GET /api/admin/replica-status`
   (freshness/drift) + a "Local replica" card on `/status` (hidden on the NAS).
 
-**M26a still TODO:** schedule the nightly pull (cron/Task Scheduler); optional
-thumbnail pre-warm (bulk mirror) — lazy proxy covers it for now; a real
-end-to-end run of `serve` off the replica with local LM Studio.
+**M26a nightly schedule — DONE (2026-06-23).** Windows Task Scheduler task
+`PhotosearchReplicaSync` runs daily at 03:30 local:
+`wsl.exe -d Ubuntu -u mattn -- bash -lc "~/.local/bin/photosearch-sync-replica.sh"`.
+The wrapper `cd`s to the repo, runs `sync-replica.sh`, and appends a timestamped
+record to `replica-sync.log` (start/end markers + rc). Runs only when the user
+is logged on (no stored password); `StartWhenAvailable` so a missed run (machine
+asleep at 03:30) fires on next wake; 30-min `ExecutionTimeLimit`. SSH to the NAS
+is key-file based (`~/.ssh/id_ed25519`, no agent), so the non-interactive
+scheduler context authenticates fine. Verified by triggering once
+(`LastTaskResult=0`, replica refreshed to 163,330 photos, `quick_check ok`).
+Note: that daytime run took ~886 s (vs the documented ~128 s) because the NAS
+was busy serving + workers + ollama; the 03:30 slot is quiet (after the 03:00
+ingest cron), so expect the faster time.
+
+**M26a end-to-end run — DONE (2026-06-23).** `serve` off the replica
+(`PHOTOSEARCH_DB=./photo_index.db.local`) with local LM Studio
+(`PHOTOSEARCH_TEXT_LLM_URL=http://localhost:1234/v1`, agent `qwen/qwen3.5-9b`)
+proven live — multiple `/api/ask` queries answered end-to-end against it.
+
+**M26a still TODO:** only the optional thumbnail pre-warm (bulk mirror) — lazy
+proxy covers it for now. Everything else (sync, endpoints, `/status` card,
+nightly schedule, end-to-end run) is shipped.
 
 **Measured reality (correcting §2 estimates):** the DB is **~1.6 GB** (not
 ~1 GB). The sync is a **full snapshot each run** (~128 s), not a delta — fine
