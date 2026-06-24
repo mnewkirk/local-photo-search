@@ -367,10 +367,13 @@ async def admin_light_index(directory: str = "/photos"):
     """`docker compose run --rm photosearch index <dir> --no-colors` — SSE.
 
     Light index pass: walk <dir> and insert EXIF + file-hash rows for any new
-    photos. No CLIP, no colors, no faces/quality/describe — just the rows. This
-    is the prerequisite that creates DB records so the worker fleet can then
-    claim them for the heavy passes. Idempotent: only files not already in the
-    DB are added, so it's safe to re-run on the whole library.
+    photos. No CLIP, no colors, no faces/quality/describe, and --no-geocode (the
+    reverse-geocode stage loads the GeoNames dataset and OOM-killed the run on
+    the 8 GB N100 — place_names are backfilled by the maintenance sweep's geocode
+    stage instead). Just the rows. This is the prerequisite that creates DB
+    records so the worker fleet can then claim them for the heavy passes.
+    Idempotent: only files not already in the DB are added, so it's safe to
+    re-run on the whole library.
 
     Runs in a throwaway sibling container (not in-process, so the scan doesn't
     run inside the web server); `--no-deps` keeps it off ollama. The `index`
@@ -389,7 +392,7 @@ async def admin_light_index(directory: str = "/photos"):
     cmd = [
         "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
         "run", "--rm", "--no-deps", COMPOSE_SERVICE,
-        "index", norm, "--no-colors",
+        "index", norm, "--no-colors", "--no-geocode",
     ]
 
     async def gen():

@@ -44,6 +44,9 @@ def cli():
 @click.option("--batch-size", default=8, help="Batch size for CLIP embedding.")
 @click.option("--clip", is_flag=True, help="Generate CLIP embeddings (required for semantic search).")
 @click.option("--no-colors", is_flag=True, help="Skip dominant color extraction.")
+@click.option("--no-geocode", is_flag=True,
+              help="Skip the reverse-geocoding stage (loads the GeoNames dataset — "
+                   "memory-heavy on the N100; leave it to the maintenance sweep).")
 @click.option("--faces", is_flag=True, help="Detect and encode faces.")
 @click.option("--force-faces", is_flag=True, help="Clear all face data and re-run detection on every photo.")
 @click.option("--force-clip", is_flag=True, help="Clear and regenerate CLIP embeddings for photos in this directory. Use to fix stale embeddings.")
@@ -66,7 +69,7 @@ def cli():
               help="Ollama model for the keywords pass.")
 @click.option("--full", is_flag=True, help="Enable all optional pipelines: --faces --describe --quality --category-content --category-visual --keywords.")
 @click.option("--verify", is_flag=True, help="Run hallucination verification after indexing (requires descriptions).")
-def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colors, faces,
+def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colors, no_geocode, faces,
           force_faces, force_clip, describe, force_describe, describe_model, quality, force_quality,
           category_content, force_category_content, category_visual, force_category_visual,
           keywords, force_keywords, category_content_model, category_visual_model, keywords_model,
@@ -101,6 +104,7 @@ def index(photo_dir, collection_id, expand_stacks, db, batch_size, clip, no_colo
         batch_size=batch_size,
         enable_clip=clip or force_clip,
         enable_colors=not no_colors,
+        enable_geocode=not no_geocode,
         enable_faces=faces or force_faces,
         force_faces=force_faces,
         force_clip=force_clip,

@@ -108,6 +108,7 @@ def _index_collection(
     batch_size: int = 8,
     enable_clip: bool = True,
     enable_colors: bool = True,
+    enable_geocode: bool = True,
     enable_faces: bool = False,
     force_faces: bool = False,
     force_clip: bool = False,
@@ -197,7 +198,7 @@ def _index_collection(
 
         # ── Reverse geocoding ──────────────────────────────────────
         photo_id_set = {pid for pid, _ in photo_pairs}
-        if photo_id_set:
+        if enable_geocode and photo_id_set:
             placeholders = ",".join("?" * len(photo_id_set))
             ungeo = db.conn.execute(
                 f"SELECT id, gps_lat, gps_lon FROM photos "
@@ -749,6 +750,7 @@ def index_directory(
     skip_existing: bool = True,
     enable_clip: bool = True,
     enable_colors: bool = True,
+    enable_geocode: bool = True,
     enable_faces: bool = False,
     force_faces: bool = False,
     force_clip: bool = False,
@@ -823,6 +825,7 @@ def index_directory(
             batch_size=batch_size,
             enable_clip=enable_clip,
             enable_colors=enable_colors,
+            enable_geocode=enable_geocode,
             enable_faces=enable_faces,
             force_faces=force_faces,
             force_clip=force_clip,
@@ -1006,7 +1009,7 @@ def index_directory(
         dir_photo_ids = set(pid for pid, _ in _get_dir_photos())
         ungeo = [r for r in ungeo if r["id"] in dir_photo_ids]
 
-        if ungeo:
+        if enable_geocode and ungeo:
             from .geocode import reverse_geocode_batch
             print(f"\nReverse geocoding {len(ungeo)} photo(s) with GPS data...")
             db.begin_batch(batch_size=200)
