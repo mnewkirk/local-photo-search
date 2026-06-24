@@ -954,6 +954,43 @@ photos (~18% of the library). `exif.py` swaps forward; `backfill-image-orientati
 fixes existing rows (header-only read, run where the files live, idempotent).
 Face *data* was always correct — this was overlay-rendering only.
 
+## Maintenance sweep & duplicate pruning (M25 + M28)
+
+`maintenance-sweep` (CLI) / `POST /api/admin/maintenance-sweep` (SSE) /
+the `/status` Maintenance-sweep card all run the **same** orchestrator:
+`maintenance.run_maintenance_sweep`. It is **one dependency-ordered backfill
+over many stages**, not a menu of independent jobs. Dry-run is the default
+(`apply=False`) — every stage reports a `would` count and writes nothing.
+
+Default stage order (each gated by a "what's still missing" SQL predicate, so a
+fully-enriched library is nearly free): `geocode` → `normalize` → `infer` →
+`normalize_inferred` → `colors` → `stacking` → `match_faces` → `resolve_dups`.
+Opt-in extras flip a single stage on but **do not narrow the sweep**:
+
+- `do_dedup` ("Prune duplicate photos") — prepends the destructive
+  `dedup_photos` stage (DELETEs redundant copies, runs *first* so later stages
+  see the deduped set).
+- `do_recluster` — appends global DBSCAN (clears `ignored_clusters`).
+
+**Gotcha (the thing that surprises you on `/status`):** toggling "Prune
+duplicate photos" still previews/applies *every other default stage too* —
+`infer` showing e.g. "would 1,356" is the infer-GPS stage doing its normal
+missing-only backfill, not something dedup triggered. Applying the sweep with
+dedup on therefore both deletes duplicates *and* writes inferred GPS
+(`location_source='inferred'`), re-runs stacking, etc.
+
+**When to use which:**
+- **Prune duplicates only, nothing else** → `photosearch find-duplicate-photos`
+  (preview, full same-image detection) + its standalone prune. No GPS/stacking
+  side effects.
+- **Periodic catch-up backfill after imports** → `maintenance-sweep` (the whole
+  point: one idempotent pass that fills geocode/infer/colors/stacking/faces for
+  new photos). Add `--apply`; leave dedup/recluster off unless you want them.
+- **Sweep + prune in one go** → `maintenance-sweep` with dedup on, accepting the
+  full-sweep side effects above.
+- **One photo / a few photos, recompute a model pass** → M28 "Re-run passes" in
+  the image view, *not* the sweep.
+
 ## Planned milestones (see `docs/plans/`)
 
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
