@@ -455,6 +455,19 @@ RECLUSTER_MIN_SAMPLES = 3
 SESSION_STACK_EPS = 0.50
 SESSION_STACK_WINDOW_MINUTES = 60.0
 
+# hnswlib ANN params for the precomputed-radius-graph DBSCAN backend. On the
+# full library (~204k unknown faces) this is ~20x faster than ball_tree
+# (~2.3min vs ~50min) and produces identical labels (ARI 1.0 at every tested
+# scale). See evals/recluster_neighbor_bench.py for the validation harness.
+RECLUSTER_HNSW_K = 512            # KNN fan-out per point when building the graph
+RECLUSTER_HNSW_EF_CONSTRUCTION = 200
+RECLUSTER_HNSW_M = 32
+# scipy/sklearn drop explicit-zero entries from a sparse matrix, which would
+# delete edges between byte-identical (duplicate-photo) encodings that sit at
+# true distance 0. Floor every stored distance to this and widen eps to match
+# so no real neighbor is silently excluded.
+_GRAPH_ZERO_FLOOR = 1e-6
+
 
 def _session_stack_noise(
     face_ids: list[int],
@@ -556,6 +569,49 @@ def _session_stack_noise(
     return new_labels, session_cluster_count
 
 
+def _radius_graph_hnsw(X, eps, k, ef_construction=RECLUSTER_HNSW_EF_CONSTRUCTION,
+                       M=RECLUSTER_HNSW_M):
+    """Build a sparse euclidean radius-neighborhood graph via hnswlib ANN.
+
+    Returns ``(csr_graph, n_saturated)``. ``csr_graph`` holds, for each row,
+    every neighbor within ``eps`` (self included), ready for
+    ``DBSCAN(metric="precomputed")`` — turning DBSCAN's O(n^2) neighbor search
+    into a near-linear ANN query. ``n_saturated`` is the number of points whose
+    eps-neighborhood was truncated by ``k`` (k-th neighbor still within eps);
+    >0 means the graph is missing edges and ``k`` should be raised.
+
+    Distances are floored to ``_GRAPH_ZERO_FLOOR`` so duplicate-encoding edges
+    (true distance 0) survive the sparse build.
+    """
+    import hnswlib
+    from scipy import sparse
+    from sklearn.neighbors import sort_graph_by_row_values
+
+    n = len(X)
+    k = min(k, n)
+    index = hnswlib.Index(space="l2", dim=X.shape[1])
+    index.init_index(max_elements=n, ef_construction=ef_construction, M=M)
+    index.add_items(X, np.arange(n), num_threads=-1)
+    index.set_ef(max(k * 2, 64))
+    neighbors, dists_sq = index.knn_query(X, k=k, num_threads=-1)
+
+    # hnswlib's "l2" space returns SQUARED distances; sqrt to compare against the
+    # euclidean eps the DBSCAN params are calibrated in.
+    dists = np.sqrt(np.maximum(dists_sq, 0.0))
+    mask = dists <= eps
+    counts = mask.sum(axis=1)
+    rows_i = np.repeat(np.arange(n), counts)
+    cols_j = neighbors[mask]
+    data = np.maximum(dists[mask], _GRAPH_ZERO_FLOOR)
+    n_saturated = int((counts == k).sum())
+
+    g = sparse.csr_matrix((data, (rows_i, cols_j)), shape=(n, n))
+    # DBSCAN(metric="precomputed") wants per-row sorted values; do it up front to
+    # avoid sklearn's EfficiencyWarning + internal re-sort.
+    sort_graph_by_row_values(g, copy=False, warn_when_not_sorted=False)
+    return g, n_saturated
+
+
 def recluster_unknown_faces(
     db,
     eps: float = RECLUSTER_EPS,
@@ -566,6 +622,8 @@ def recluster_unknown_faces(
     session_window_minutes: float = SESSION_STACK_WINDOW_MINUTES,
     min_det_score: float = CLUSTER_MIN_DET_SCORE,
     min_bbox_edge: int = CLUSTER_MIN_BBOX_EDGE,
+    neighbor_backend: str = "auto",
+    hnsw_k: int = RECLUSTER_HNSW_K,
 ) -> dict:
     """Globally recluster all person_id IS NULL faces via DBSCAN.
 
@@ -628,15 +686,39 @@ def recluster_unknown_faces(
         flush=True,
     )
 
-    labels = DBSCAN(
-        eps=eps,
-        min_samples=min_samples,
-        metric="euclidean",
-        algorithm="ball_tree",
-        n_jobs=-1,
-    ).fit_predict(X)
+    # Pick the neighbor-search backend. "auto" prefers the hnswlib ANN graph
+    # (~20x faster than ball_tree on the full library, identical labels) and
+    # falls back to ball_tree when hnswlib isn't installed — so boxes without
+    # the wheel keep working unchanged.
+    backend = neighbor_backend
+    if backend == "auto":
+        try:
+            import hnswlib  # noqa: F401
+            backend = "hnsw"
+        except ImportError:
+            backend = "ball_tree"
+
+    if backend == "hnsw":
+        graph, n_saturated = _radius_graph_hnsw(X, eps, hnsw_k)
+        labels = DBSCAN(
+            eps=eps + _GRAPH_ZERO_FLOOR,  # widen for the zero-distance floor
+            min_samples=min_samples,
+            metric="precomputed",
+        ).fit_predict(graph)
+        backend_note = f"hnsw k={hnsw_k}"
+        if n_saturated:
+            backend_note += f", {n_saturated} neighborhoods truncated — raise hnsw_k"
+    else:
+        labels = DBSCAN(
+            eps=eps,
+            min_samples=min_samples,
+            metric="euclidean",
+            algorithm="ball_tree",
+            n_jobs=-1,
+        ).fit_predict(X)
+        backend_note = "ball_tree"
     t_dbscan = time.time()
-    print(f"  DBSCAN done in {t_dbscan - t_load:.1f}s.", flush=True)
+    print(f"  DBSCAN ({backend_note}) done in {t_dbscan - t_load:.1f}s.", flush=True)
 
     primary_cluster_count = int(len({int(lab) for lab in labels.tolist() if lab != -1}))
     dbscan_noise_count = int((labels == -1).sum())

@@ -19,6 +19,7 @@ open-clip-torch>=2.24
 sqlite-vec>=0.1
 scipy>=1.10              # Hierarchical clustering for shoot review
 scikit-learn>=1.3        # DBSCAN for face reclustering
+hnswlib>=0.7             # ANN radius graph -> ~20x faster recluster (ball_tree fallback if absent)
 
 # Face recognition (InsightFace + ArcFace)
 insightface>=0.7
