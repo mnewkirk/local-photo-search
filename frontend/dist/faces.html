@@ -737,11 +737,27 @@
       const subSelected = useCallback(
         (sid) => { const ids = subFaceIds[sid] || []; return ids.length > 0 && ids.every(id => sel.has(id)); },
         [subFaceIds, sel]);
-      const toggleSub = useCallback((sid) => {
+      // Anchor index for shift-click range selection over the sub-cluster cards.
+      const [lastSubIdx, setLastSubIdx] = useState(null);
+      const toggleSub = useCallback((sid, idx, ev) => {
+        // Shift-click: add the inclusive range of cards between the last-clicked
+        // anchor and this one to the selection.
+        if (ev && ev.shiftKey && lastSubIdx != null && data) {
+          const lo = Math.min(lastSubIdx, idx), hi = Math.max(lastSubIdx, idx);
+          setSel(prev => {
+            const n = new Set(prev);
+            for (let i = lo; i <= hi; i++)
+              (subFaceIds[data.sub_clusters[i].sub_id] || []).forEach(id => n.add(id));
+            return n;
+          });
+          setLastSubIdx(idx);
+          return;
+        }
         const ids = subFaceIds[sid] || [];
         const allIn = ids.length > 0 && ids.every(id => sel.has(id));
         setSel(prev => { const n = new Set(prev); ids.forEach(id => allIn ? n.delete(id) : n.add(id)); return n; });
-      }, [subFaceIds, sel]);
+        setLastSubIdx(idx);
+      }, [subFaceIds, sel, lastSubIdx, data]);
 
       // Faces for the current scope (a drilled-in sub-cluster, or ranked-all).
       const scopeFaces = useMemo(() => {
@@ -815,18 +831,20 @@
             !loading && data && view === 'subs' && activeSub == null && e('div', null,
               e('div', { className: 'insp-sub', style: { marginBottom: 10 } },
                 'Cards outlined amber have a high median distance to the core — likely a different person. ' +
-                'Click a card to review; tick the ☐ corner to select whole sub-clusters, then unassign or reassign them all at once below.'),
+                'Click a card to review; tick the ☐ corner to select a sub-cluster, shift-click to select a range, ' +
+                'then unassign or reassign them all at once below.'),
               e('div', { className: 'insp-subgrid' },
-                ...data.sub_clusters.map(s => e('div', {
+                ...data.sub_clusters.map((s, idx) => e('div', {
                   key: s.sub_id,
                   className: 'insp-card' + (s.sub_id !== -1 && s.median_dist > 0.95 ? ' suspect' : '')
                     + (subSelected(s.sub_id) ? ' selected' : ''),
-                  onClick: () => drillSub(s.sub_id),
+                  // Plain click drills in; shift-click selects a range of cards.
+                  onClick: (ev) => { if (ev.shiftKey) { ev.preventDefault(); toggleSub(s.sub_id, idx, ev); } else { drillSub(s.sub_id); } },
                 },
                   e('div', {
                     className: 'insp-card-check',
-                    title: 'Select this whole sub-cluster (' + s.size + ' faces)',
-                    onClick: (ev) => { ev.stopPropagation(); toggleSub(s.sub_id); },
+                    title: 'Select this sub-cluster (' + s.size + ' faces) · shift-click for a range',
+                    onClick: (ev) => { ev.stopPropagation(); ev.preventDefault(); toggleSub(s.sub_id, idx, ev); },
                   }, subSelected(s.sub_id) ? '✓' : ''),
                   e('img', { src: API + '/api/faces/crop/' + s.rep_face_id + '?size=200', loading: 'lazy' }),
                   e('div', { className: 'insp-card-meta' },
