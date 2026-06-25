@@ -509,7 +509,7 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     with _get_db() as db:
         row = db.conn.execute(
             """SELECT f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                      ph.filepath
+                      ph.filepath, ph.image_width, ph.image_height
                FROM faces f
                JOIN photos ph ON ph.id = f.photo_id
                WHERE f.id = ?""",
@@ -542,8 +542,26 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     top, right, bottom, left = row["bbox_top"], row["bbox_right"], row["bbox_bottom"], row["bbox_left"]
 
     img = Image.open(filepath)
+    # Decode the JPEG at a reduced scale when the source is far larger than the
+    # crop we need. libjpeg can decode at 1/2, 1/4, 1/8 via draft(), and that
+    # full-resolution decode is the dominant cost of crop generation on the
+    # N100. Pick the coarsest scale that still leaves the face >= `size` px, so
+    # there's no quality loss vs. a full decode. Non-JPEG sources (PNG/HEIC)
+    # ignore draft() and stay at scale 1.0.
+    raw_w0 = img.size[0]
+    iw, ih = row["image_width"], row["image_height"]
+    face_w0, face_h0 = (right - left), (bottom - top)
+    if iw and ih and face_w0 > 0 and face_h0 > 0:
+        frac = min(face_w0 / iw, face_h0 / ih)   # face's relative extent (oriented)
+        if frac > 0:
+            need = int(size / frac) + 1          # whole image must reach this
+            img.draft("RGB", (need, need))
+    scale = img.size[0] / raw_w0                  # < 1.0 only if draft downscaled
     img = ImageOps.exif_transpose(img)
     img_w, img_h = img.size
+    if scale != 1.0:
+        top, right = int(top * scale), int(right * scale)
+        bottom, left = int(bottom * scale), int(left * scale)
 
     # Add 20% padding around the face for tight framing
     face_w = right - left
