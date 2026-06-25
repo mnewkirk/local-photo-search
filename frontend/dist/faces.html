@@ -688,11 +688,11 @@
     // person never draws all crops at once.
     // -----------------------------------------------------------------------
     const INSP_PAGE = 120;
-    function FaceTile({ f, selected, onToggle }) {
+    function FaceTile({ f, selected, idx, onToggle }) {
       const far = f.dist > 1.0;
       return e('div', {
         className: 'face-tile' + (selected ? ' sel' : '') + (far ? ' far' : ''),
-        onClick: () => onToggle(f.face_id),
+        onClick: (ev) => { if (ev.shiftKey) ev.preventDefault(); onToggle(f.face_id, idx, ev); },
       },
         e('img', { src: API + '/api/faces/crop/' + f.face_id + '?size=120', loading: 'lazy' }),
         e('span', { className: 'dist-badge' }, f.dist.toFixed(2)),
@@ -721,8 +721,25 @@
       }, [person.id]);
       useEffect(() => { load(); }, [load]);
 
-      const toggle = useCallback((fid) => {
+      // Face-grid selection (ranked / drilled-in views). lastFaceIdx is the
+      // shift-click anchor (index into scopeFaces); scopeRef holds the current
+      // ordered scope so a range can be resolved at click time.
+      const lastFaceIdx = useRef(null);
+      const scopeRef = useRef([]);
+      const toggle = useCallback((fid, idx, ev) => {
+        if (ev && ev.shiftKey && lastFaceIdx.current != null && idx != null) {
+          const scope = scopeRef.current;
+          const lo = Math.min(lastFaceIdx.current, idx), hi = Math.max(lastFaceIdx.current, idx);
+          setSel(prev => {
+            const n = new Set(prev);
+            for (let i = lo; i <= hi; i++) { const ff = scope[i]; if (ff) n.add(ff.face_id); }
+            return n;
+          });
+          lastFaceIdx.current = idx;
+          return;
+        }
         setSel(prev => { const n = new Set(prev); n.has(fid) ? n.delete(fid) : n.add(fid); return n; });
+        if (idx != null) lastFaceIdx.current = idx;
       }, []);
 
       // sub_id -> [face_id, ...], so a whole sub-cluster can be selected at once
@@ -770,6 +787,10 @@
         }
         return [];
       }, [data, view, activeSub]);
+      // Keep the click handler's view of the ordered scope current, and drop the
+      // shift-click anchor when the scope changes (its index no longer maps).
+      scopeRef.current = scopeFaces;
+      useEffect(() => { lastFaceIdx.current = null; }, [view, activeSub]);
 
       const pageFaces = useMemo(
         () => scopeFaces.slice(page * INSP_PAGE, (page + 1) * INSP_PAGE),
@@ -870,7 +891,7 @@
                 e('button', { className: 'insp-btn', onClick: selectAllScope }, 'Select all ' + scopeFaces.length),
               ),
               e('div', { className: 'insp-facegrid' },
-                ...pageFaces.map(f => e(FaceTile, { key: f.face_id, f, selected: sel.has(f.face_id), onToggle: toggle })),
+                ...pageFaces.map((f, j) => e(FaceTile, { key: f.face_id, f, selected: sel.has(f.face_id), idx: page * INSP_PAGE + j, onToggle: toggle })),
               ),
             ),
           ),
