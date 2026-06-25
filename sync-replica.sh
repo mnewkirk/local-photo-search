@@ -12,9 +12,14 @@
 # atomically swap it into place so a running `serve` picks it up on its next
 # per-request connection (in-flight requests finish on the old inode).
 #
-# Thumbnails are NOT mirrored here — replica image routes lazily proxy + cache
-# them from the NAS web API on demand (see web.py _fetch_from_nas). A bulk
-# pre-warm flag can be added later.
+# Photo thumbnails/previews are NOT mirrored here — replica image routes lazily
+# proxy + cache them from the NAS web API on demand (see web.py _fetch_from_nas).
+#
+# Face crops ARE mirrored (set SYNC_FACE_CROPS=0 to skip): the per-face grid on
+# /faces issues one cold crop round-trip per face, so a large person (10k+ faces)
+# crawls on first browse. Crops are immutable per face_id and append-only, so the
+# tar delta is tiny after the first pull. Generate them on the NAS first with
+# `photosearch warm-face-crops` so there's something to mirror.
 #
 # Schedule nightly (cron / Task Scheduler) and/or trigger on demand via the
 # /status "Sync replica" button (POST /api/admin/replica-sync).
@@ -57,9 +62,40 @@ echo "[3/4] atomic swap into place…"
 rm -f "${TARGET}-wal" "${TARGET}-shm"
 mv "${TARGET}.tmp" "${TARGET}"
 
-echo "[4/4] cleaning up snapshot on NAS…"
+echo "[4/5] cleaning up snapshot on NAS…"
 ssh "${NAS_HOST}" "${remote} run --rm --entrypoint rm photosearch ${REMOTE_DUMP}" \
   || echo "[sync-replica]   (remote cleanup failed; next sync overwrites it)"
+
+# Mirror face crops (skip with SYNC_FACE_CROPS=0). Same container tar/cat-stream
+# trick as the DB above — UGREEN blocks rsync into the volume, and a named docker
+# volume has no host path to rsync from. Incremental via mtime: we pass the last
+# successful sync time as --since so only crops generated since then are tarred
+# (append-only + immutable per face_id → tiny delta after the first pull).
+if [ "${SYNC_FACE_CROPS:-1}" != "0" ]; then
+  echo "[5/5] mirroring face crops…"
+  CROP_DIR="$(dirname "${TARGET}")/thumbnails/face_crops"
+  mkdir -p "${CROP_DIR}"
+  MARKER="${CROP_DIR}/.last_sync"
+  since=$(cat "${MARKER}" 2>/dev/null || echo 0)
+  this_run=$(date +%s)
+  REMOTE_TAR="/data/face-crops-delta.tar"
+  crops_ok=1
+  ssh "${NAS_HOST}" "${remote} run --rm -T --entrypoint python photosearch cli.py export-face-crops --since ${since} --to ${REMOTE_TAR}" \
+    || crops_ok=0
+  if [ "${crops_ok}" = "1" ]; then
+    ssh "${NAS_HOST}" "${remote} run --rm -T --entrypoint cat photosearch ${REMOTE_TAR}" \
+      | tar -xf - -C "${CROP_DIR}" || crops_ok=0
+    ssh "${NAS_HOST}" "${remote} run --rm --entrypoint rm photosearch ${REMOTE_TAR}" \
+      || echo "[sync-replica]   (remote crop-tar cleanup failed; next sync overwrites it)"
+  fi
+  if [ "${crops_ok}" = "1" ]; then
+    echo "${this_run}" > "${MARKER}"   # only advance the watermark on full success
+    total=$(find "${CROP_DIR}" -maxdepth 1 -name '*.jpg' 2>/dev/null | wc -l | tr -d ' ')
+    echo "[sync-replica]   face crops: ${total} cached locally"
+  else
+    echo "[sync-replica]   face-crop mirror failed; watermark unchanged (retries next sync)." >&2
+  fi
+fi
 
 human_size=$(du -h "${TARGET}" 2>/dev/null | cut -f1 || echo "?")
 echo "[sync-replica] done in $(( $(date +%s) - started ))s — ${human_size} at ${TARGET}"

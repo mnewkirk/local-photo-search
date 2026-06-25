@@ -4687,5 +4687,201 @@ def generation_history(photo_id, db):
             click.echo()
 
 
+@cli.command("warm-face-crops")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--person", "persons", multiple=True,
+              help="Warm only this person's faces (case-insensitive name). Repeatable. "
+                   "Overrides --matched-only/--all.")
+@click.option("--matched-only/--all", "matched_only", default=True,
+              help="Default: only faces assigned to a person. --all warms every detected "
+                   "face (includes unknown clusters; ~5x the work).")
+@click.option("--sizes", default="120,200",
+              help="Comma-separated crop sizes to generate. Default: 120,200 (the grid + "
+                   "rep-card sizes). All sizes come from one decode, so extra sizes are cheap.")
+@click.option("--workers", default=3, type=int,
+              help="Parallel decode workers. Default 3 (leaves a core free on the N100).")
+@click.option("--force", is_flag=True, default=False,
+              help="Regenerate crops even if already cached on disk.")
+@click.option("--nas-url", default=None, envvar="PHOTOSEARCH_NAS_URL",
+              help="When an original isn't on local disk (replica mode), proxy the crop from "
+                   "this NAS web URL instead. Defaults to $PHOTOSEARCH_NAS_URL.")
+def warm_face_crops(db, persons, matched_only, sizes, workers, force, nas_url):
+    """Pre-generate face-crop thumbnails so the cache is warm before browsing.
+
+    The local read-replica generates face crops by proxying one cold round-trip
+    per crop from the NAS (a full image decode on the N100, ~2s each), so opening
+    a large person — e.g. one with 10k+ faces — crawls on first browse. This
+    bulk-generates the crops ahead of time.
+
+    \b
+    Run it where the original photos live (NAS or Mac); it decodes each photo
+    once and writes every --sizes crop. Then `sync-replica.sh` mirrors the
+    thumbnails/face_crops directory down to the replica. In replica mode (no
+    local originals), pass --nas-url to proxy+cache crops locally instead.
+
+    \b
+    Examples:
+      photosearch warm-face-crops --person Nicole        # one person (fast)
+      photosearch warm-face-crops                        # all matched persons
+      photosearch warm-face-crops --all --workers 4      # every face (overnight)
+    """
+    import time
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from photosearch.face_crop import (
+        face_crop_cache_dir, crop_cache_path, render_face_crops, write_crop_atomic,
+    )
+
+    size_list = sorted({int(s) for s in sizes.split(",") if s.strip()})
+    if not size_list:
+        raise click.ClickException("--sizes must list at least one size.")
+
+    cache_dir = face_crop_cache_dir(db)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    with PhotoDB(db) as pdb:
+        # Build the scope predicate.
+        params: list = []
+        if persons:
+            placeholders = ",".join("?" for _ in persons)
+            rows = pdb.conn.execute(
+                f"SELECT id, name FROM persons WHERE LOWER(name) IN ({placeholders})",
+                [p.lower() for p in persons],
+            ).fetchall()
+            found = {r["name"].lower(): r["id"] for r in rows}
+            missing = [p for p in persons if p.lower() not in found]
+            if missing:
+                raise click.ClickException(f"Unknown person(s): {', '.join(missing)}")
+            pid_ph = ",".join("?" for _ in found)
+            where = f"f.person_id IN ({pid_ph})"
+            params = list(found.values())
+            scope_label = f"person(s) {', '.join(r['name'] for r in rows)}"
+        elif matched_only:
+            where = "f.person_id IS NOT NULL"
+            scope_label = "all matched persons"
+        else:
+            where = "1=1"
+            scope_label = "ALL faces"
+
+        rows = pdb.conn.execute(
+            f"""SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                       ph.filepath, ph.image_width, ph.image_height
+                FROM faces f JOIN photos ph ON ph.id = f.photo_id
+                WHERE f.bbox_top IS NOT NULL AND ({where})""",
+            params,
+        ).fetchall()
+        # Resolve paths up front (DB access is single-threaded; workers are pure CPU/IO).
+        tasks = [(r, pdb.resolve_filepath(r["filepath"])) for r in rows]
+
+    click.echo(f"Scope: {scope_label} — {len(tasks)} faces × sizes {size_list}")
+
+    # Skip faces already fully cached (unless --force).
+    if not force:
+        pending = []
+        for r, fp in tasks:
+            if not all(os.path.exists(crop_cache_path(cache_dir, r["id"], s)) for s in size_list):
+                pending.append((r, fp))
+        skipped = len(tasks) - len(pending)
+        tasks = pending
+        if skipped:
+            click.echo(f"  {skipped} already cached, {len(tasks)} to generate.")
+    if not tasks:
+        click.echo("Nothing to do — cache is warm.")
+        return
+
+    nas_url = nas_url.rstrip("/") if nas_url else None
+
+    def warm_one(item):
+        r, fp = item
+        try:
+            if fp and os.path.exists(fp):
+                bbox = (r["bbox_top"], r["bbox_right"], r["bbox_bottom"], r["bbox_left"])
+                crops = render_face_crops(fp, bbox, r["image_width"], r["image_height"], size_list)
+                for s in size_list:
+                    write_crop_atomic(crop_cache_path(cache_dir, r["id"], s), crops[s])
+            elif nas_url:
+                for s in size_list:
+                    url = f"{nas_url}/api/faces/crop/{r['id']}?size={s}"
+                    with urllib.request.urlopen(url, timeout=40) as resp:
+                        write_crop_atomic(crop_cache_path(cache_dir, r["id"], s), resp.read())
+            else:
+                return ("missing", r["id"])
+            return ("ok", r["id"])
+        except Exception as e:  # noqa: BLE001 — one bad photo shouldn't kill the run
+            return ("error", f"{r['id']}: {e}")
+
+    started = time.time()
+    ok = miss = err = done = 0
+    errors_shown = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(warm_one, t) for t in tasks]
+        for fut in as_completed(futures):
+            status, info = fut.result()
+            done += 1
+            if status == "ok":
+                ok += 1
+            elif status == "missing":
+                miss += 1
+            else:
+                err += 1
+                if errors_shown < 5:
+                    click.echo(f"  ! {info}", err=True)
+                    errors_shown += 1
+            if done % 500 == 0 or done == len(tasks):
+                elapsed = time.time() - started
+                rate = done / elapsed if elapsed else 0
+                eta = (len(tasks) - done) / rate if rate else 0
+                click.echo(f"  {done}/{len(tasks)}  ok={ok} miss={miss} err={err}  "
+                           f"{rate:.1f}/s  eta {eta/60:.1f}m")
+
+    elapsed = time.time() - started
+    click.echo(f"Done in {elapsed/60:.1f}m — ok={ok} missing={miss} errors={err}")
+    if miss:
+        click.echo("  (missing = original not on local disk; pass --nas-url to proxy in replica mode)")
+
+
+@cli.command("export-face-crops")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--since", default=0.0, type=float,
+              help="Only include crops modified after this Unix epoch. 0 = all (full export).")
+@click.option("--to", "to_path", default=None,
+              help="Write the tar to this file instead of stdout (used by sync-replica.sh to "
+                   "avoid any stdout-banner corruption, mirroring the dump-db pattern).")
+def export_face_crops(db, since, to_path):
+    """Stream a tar of cached face crops (for the replica mirror; see sync-replica.sh).
+
+    Crops are append-only and immutable per face_id, so --since yields an
+    incremental delta. With no --to, the tar goes to stdout and ALL status is
+    written to stderr so the stream stays clean.
+    """
+    import sys
+    import tarfile
+
+    from photosearch.face_crop import face_crop_cache_dir
+
+    base = face_crop_cache_dir(db)
+    out = open(to_path, "wb") if to_path else sys.stdout.buffer
+    n = 0
+    try:
+        tf = tarfile.open(fileobj=out, mode="w|")
+        if os.path.isdir(base):
+            with os.scandir(base) as it:
+                for entry in it:
+                    if not entry.name.endswith(".jpg"):
+                        continue
+                    try:
+                        if entry.stat().st_mtime > since:
+                            tf.add(entry.path, arcname=entry.name)
+                            n += 1
+                    except FileNotFoundError:
+                        continue
+        tf.close()
+    finally:
+        if to_path:
+            out.close()
+    click.echo(f"exported {n} face crops (since={since})", err=True)
+
+
 if __name__ == "__main__":
     cli()

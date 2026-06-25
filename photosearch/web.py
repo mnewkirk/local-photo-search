@@ -504,8 +504,6 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
-    from PIL import Image, ImageOps
-
     with _get_db() as db:
         row = db.conn.execute(
             """SELECT f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
@@ -539,65 +537,11 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     if row["bbox_top"] is None:
         raise HTTPException(400, "Face has no bounding box")
 
-    top, right, bottom, left = row["bbox_top"], row["bbox_right"], row["bbox_bottom"], row["bbox_left"]
+    from photosearch.face_crop import render_face_crops, write_crop_atomic
 
-    img = Image.open(filepath)
-    # Decode the JPEG at a reduced scale when the source is far larger than the
-    # crop we need. libjpeg can decode at 1/2, 1/4, 1/8 via draft(), and that
-    # full-resolution decode is the dominant cost of crop generation on the
-    # N100. Pick the coarsest scale that still leaves the face >= `size` px, so
-    # there's no quality loss vs. a full decode. Non-JPEG sources (PNG/HEIC)
-    # ignore draft() and stay at scale 1.0.
-    raw_w0 = img.size[0]
-    iw, ih = row["image_width"], row["image_height"]
-    face_w0, face_h0 = (right - left), (bottom - top)
-    if iw and ih and face_w0 > 0 and face_h0 > 0:
-        frac = min(face_w0 / iw, face_h0 / ih)   # face's relative extent (oriented)
-        if frac > 0:
-            need = int(size / frac) + 1          # whole image must reach this
-            img.draft("RGB", (need, need))
-    scale = img.size[0] / raw_w0                  # < 1.0 only if draft downscaled
-    img = ImageOps.exif_transpose(img)
-    img_w, img_h = img.size
-    if scale != 1.0:
-        top, right = int(top * scale), int(right * scale)
-        bottom, left = int(bottom * scale), int(left * scale)
-
-    # Add 20% padding around the face for tight framing
-    face_w = right - left
-    face_h = bottom - top
-    pad_x = int(face_w * 0.2)
-    pad_y = int(face_h * 0.2)
-    crop_left = max(0, left - pad_x)
-    crop_top = max(0, top - pad_y)
-    crop_right = min(img_w, right + pad_x)
-    crop_bottom = min(img_h, bottom + pad_y)
-
-    # Make it square (expand the shorter dimension, centered)
-    cw = crop_right - crop_left
-    ch = crop_bottom - crop_top
-    if cw > ch:
-        diff = cw - ch
-        crop_top = max(0, crop_top - diff // 2)
-        crop_bottom = crop_top + cw
-        if crop_bottom > img_h:
-            crop_bottom = img_h
-            crop_top = max(0, crop_bottom - cw)
-    elif ch > cw:
-        diff = ch - cw
-        crop_left = max(0, crop_left - diff // 2)
-        crop_right = crop_left + ch
-        if crop_right > img_w:
-            crop_right = img_w
-            crop_left = max(0, crop_right - ch)
-
-    face_img = img.crop((crop_left, crop_top, crop_right, crop_bottom))
-    face_img = face_img.resize((size, size), Image.LANCZOS)
-
-    # Write atomically — save to a temp path in the same dir, then rename.
-    tmp_path = cache_path + f".tmp.{os.getpid()}"
-    face_img.save(tmp_path, format="JPEG", quality=85)
-    os.replace(tmp_path, cache_path)
+    bbox = (row["bbox_top"], row["bbox_right"], row["bbox_bottom"], row["bbox_left"])
+    crops = render_face_crops(filepath, bbox, row["image_width"], row["image_height"], [size])
+    write_crop_atomic(cache_path, crops[size])
 
     return FileResponse(
         cache_path, media_type="image/jpeg",
