@@ -576,14 +576,25 @@
     .insp-body { flex: 1; overflow-y: auto; padding: 16px 20px 90px; }
     .insp-subgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
     .insp-card {
+      position: relative;
       border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
       background: var(--surface2); cursor: pointer; transition: border-color .15s;
     }
     .insp-card:hover { border-color: var(--accent); }
     .insp-card.suspect { border-color: #f59e0b; }
+    .insp-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
     .insp-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
     .insp-card-meta { padding: 6px 8px; font-size: 12px; }
     .insp-card-meta .d { color: var(--text-muted); }
+    /* Selection checkbox corner — toggles the whole sub-cluster into the
+       shared face selection without drilling into the card. */
+    .insp-card-check {
+      position: absolute; top: 6px; left: 6px; width: 24px; height: 24px;
+      border-radius: 6px; border: 1px solid var(--border);
+      background: rgba(0,0,0,.55); color: #fff; font-size: 15px; line-height: 22px;
+      text-align: center; cursor: pointer; user-select: none; z-index: 2;
+    }
+    .insp-card.selected .insp-card-check { background: var(--accent); border-color: var(--accent); }
     .face-tile {
       position: relative; border: 2px solid transparent; border-radius: 6px;
       overflow: hidden; cursor: pointer; background: var(--surface2);
@@ -714,6 +725,24 @@
         setSel(prev => { const n = new Set(prev); n.has(fid) ? n.delete(fid) : n.add(fid); return n; });
       }, []);
 
+      // sub_id -> [face_id, ...], so a whole sub-cluster can be selected at once
+      // from the card view (bulk unassign / reassign multiple clusters without
+      // drilling into each). The shared `sel` set means the existing action bar
+      // applies unchanged.
+      const subFaceIds = useMemo(() => {
+        const m = {};
+        if (data) for (const f of data.faces) (m[f.sub_id] || (m[f.sub_id] = [])).push(f.face_id);
+        return m;
+      }, [data]);
+      const subSelected = useCallback(
+        (sid) => { const ids = subFaceIds[sid] || []; return ids.length > 0 && ids.every(id => sel.has(id)); },
+        [subFaceIds, sel]);
+      const toggleSub = useCallback((sid) => {
+        const ids = subFaceIds[sid] || [];
+        const allIn = ids.length > 0 && ids.every(id => sel.has(id));
+        setSel(prev => { const n = new Set(prev); ids.forEach(id => allIn ? n.delete(id) : n.add(id)); return n; });
+      }, [subFaceIds, sel]);
+
       // Faces for the current scope (a drilled-in sub-cluster, or ranked-all).
       const scopeFaces = useMemo(() => {
         if (!data) return [];
@@ -785,13 +814,20 @@
             // ---- Sub-cluster cards ----
             !loading && data && view === 'subs' && activeSub == null && e('div', null,
               e('div', { className: 'insp-sub', style: { marginBottom: 10 } },
-                'Cards outlined amber have a high median distance to the core — likely a different person. Click to review & re-map.'),
+                'Cards outlined amber have a high median distance to the core — likely a different person. ' +
+                'Click a card to review; tick the ☐ corner to select whole sub-clusters, then unassign or reassign them all at once below.'),
               e('div', { className: 'insp-subgrid' },
                 ...data.sub_clusters.map(s => e('div', {
                   key: s.sub_id,
-                  className: 'insp-card' + (s.sub_id !== -1 && s.median_dist > 0.95 ? ' suspect' : ''),
+                  className: 'insp-card' + (s.sub_id !== -1 && s.median_dist > 0.95 ? ' suspect' : '')
+                    + (subSelected(s.sub_id) ? ' selected' : ''),
                   onClick: () => drillSub(s.sub_id),
                 },
+                  e('div', {
+                    className: 'insp-card-check',
+                    title: 'Select this whole sub-cluster (' + s.size + ' faces)',
+                    onClick: (ev) => { ev.stopPropagation(); toggleSub(s.sub_id); },
+                  }, subSelected(s.sub_id) ? '✓' : ''),
                   e('img', { src: API + '/api/faces/crop/' + s.rep_face_id + '?size=200', loading: 'lazy' }),
                   e('div', { className: 'insp-card-meta' },
                     e('div', null, s.sub_id === -1 ? ('Outliers · ' + s.size) : ('Sub #' + s.sub_id + ' · ' + s.size)),
