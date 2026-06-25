@@ -813,6 +813,36 @@ def admin_workers_stop():
     return {"ok": r.returncode == 0, "output": ((r.stdout or "") + (r.stderr or ""))[-2000:]}
 
 
+@router.get("/workers/queue-status")
+def admin_workers_queue_status():
+    """Worker queue depth + active claims for the **authoritative** server.
+
+    The Workers panel must show the queue the fleet actually pulls from. In
+    replica mode that's the NAS (PHOTOSEARCH_NAS_URL) — the local replica DB is
+    a fully-processed synced snapshot, so its own /api/worker/status reports ~0
+    backlog even while the NAS has thousands of freshly-ingested photos awaiting
+    clip/faces/etc. When no NAS is configured this host *is* authoritative, so
+    fall through to the local queue.
+    """
+    nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if nas:
+        import requests
+        try:
+            r = requests.get(f"{nas}/api/worker/status", timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            data["source"] = nas
+            return data
+        except requests.RequestException as exc:
+            # Surface the failure rather than silently showing local zeros.
+            return {"active_claims": [], "queue_depth": {}, "source": nas,
+                    "error": f"could not reach authoritative server: {exc}"}
+    from .worker_api import worker_status
+    data = worker_status()
+    data["source"] = "local"
+    return data
+
+
 @router.get("/workers/fleet-status")
 def admin_workers_fleet_status():
     """Process-level status of the /status-launched fleet (run-workers.sh --status).

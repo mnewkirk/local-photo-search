@@ -735,6 +735,23 @@
       try { return JSON.parse(m[1]); } catch (_) { return null; }
     }
 
+    // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
+    // worker processes it; it would render a perpetual-0 pill).
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'category-content', 'category-visual', 'keywords', 'verify'];
+
+    function formatTtl(expiresAtStr) {
+      if (!expiresAtStr) return { text: '—', cls: '' };
+      // expires_at is UTC in SQLite ('YYYY-MM-DD HH:MM:SS'), treat as UTC
+      var isoUtc = expiresAtStr.replace(' ', 'T') + 'Z';
+      var deltaMs = new Date(isoUtc).getTime() - Date.now();
+      if (isNaN(deltaMs)) return { text: '—', cls: '' };
+      if (deltaMs <= 0) return { text: 'expired', cls: 'expired' };
+      var mins = Math.floor(deltaMs / 60000);
+      var secs = Math.floor((deltaMs % 60000) / 1000);
+      var text = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+      return { text: text + ' left', cls: mins < 2 ? 'expiring' : '' };
+    }
+
     function IngestIncoming() {
       var _b = useState(false); var busy = _b[0];   var setBusy = _b[1];
       var _d = useState(false); var dryRun = _d[0]; var setDryRun = _d[1];
@@ -1608,6 +1625,208 @@
       );
     }
 
+    // Worker fleet — queue depth + active claims (presentational), plus the
+    // launcher. Moved here from /status so all the worker/indexer controls live
+    // together on the maintenance page.
+    function Workers(props) {
+      var data = props.data;
+      var _cb = useState(false); var clearing = _cb[0]; var setClearing = _cb[1];
+      if (!data) return null;
+      var queue = data.queue_depth || {};
+      var active = data.active_claims || [];
+      var totalQueue = PASS_ORDER.reduce(function(s, p) { return s + (queue[p] || 0); }, 0);
+
+      function clearClaims() {
+        var msg = active.length === 0
+          ? 'No active claims to clear. Continue anyway?'
+          : 'Release all ' + active.length + ' active claim'
+            + (active.length === 1 ? '' : 's') + '? '
+            + 'Their photos become reclaimable immediately. '
+            + 'Live workers will still have their results accepted.';
+        if (!window.confirm(msg)) return;
+        setClearing(true);
+        fetch('/api/worker/clear-claims', { method: 'POST' })
+          .then(function(r) { return r.json(); })
+          .then(function() {
+            if (props.onRefresh) props.onRefresh();
+          })
+          .catch(function(err) {
+            window.alert('Failed to clear claims: ' + (err && err.message ? err.message : err));
+          })
+          .then(function() { setClearing(false); });
+      }
+
+      var srcLabel = data.source && data.source !== 'local'
+        ? data.source.replace(/^https?:\/\//, '')
+        : null;
+
+      return e('div', null,
+        e('h2', null, 'Workers' + (srcLabel ? ' — ' + srcLabel : '')),
+        e('div', { className: 'workers-wrap' },
+          data.error && e('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, data.error),
+          e('div', { className: 'workers-head' },
+            e('span', { className: 'workers-title' },
+              active.length === 0
+                ? 'No active workers'
+                : active.length + ' active worker' + (active.length === 1 ? '' : 's')
+            ),
+            e('span', { className: 'workers-idle' },
+              totalQueue === 0
+                ? 'queue empty'
+                : totalQueue.toLocaleString() + ' photos queued across passes'
+            ),
+            e('button', {
+              className: 'btn',
+              style: { marginLeft: 'auto' },
+              onClick: clearClaims,
+              disabled: clearing,
+              title: 'Release all active worker claims so their photos can be reclaimed immediately',
+            }, clearing ? 'Clearing…' : 'Clear claims')
+          ),
+          e('div', { className: 'queue-grid' },
+            PASS_ORDER.map(function(pass) {
+              var count = queue[pass] || 0;
+              return e('div', {
+                key: pass,
+                className: 'queue-pill' + (count === 0 ? ' empty' : '')
+              },
+                e('span', { className: 'q-pass' }, pass),
+                e('span', { className: 'q-count' }, count.toLocaleString())
+              );
+            })
+          ),
+          active.length > 0 && e('div', null,
+            active.map(function(c) {
+              var ttl = formatTtl(c.expires_at);
+              return e('div', { key: c.batch_id, className: 'active-row' },
+                e('span', { className: 'active-pass' }, c.pass_type),
+                e('span', { className: 'active-worker', title: c.worker_id }, c.worker_id),
+                e('span', { className: 'active-count' }, c.photo_count + ' photos'),
+                e('span', { className: 'active-ttl ' + ttl.cls }, ttl.text)
+              );
+            })
+          )
+        )
+      );
+    }
+
+    // Self-polling wrapper: fetch /api/worker/status every 5s, plus a 1s tick so
+    // active-claim TTLs count down live between fetches.
+    function WorkersPanel() {
+      var _w = useState(null); var data = _w[0]; var setData = _w[1];
+      var _tick = useState(0); var setTick = _tick[1];
+
+      // Show the AUTHORITATIVE server's queue (the NAS in replica mode) — that's
+      // where the fleet pulls work + submits results. The local replica DB is a
+      // fully-processed snapshot, so its own queue reads ~0. See
+      // /api/admin/workers/queue-status.
+      function loadWorkers() {
+        fetch('/api/admin/workers/queue-status')
+          .then(function(r) { return r.json(); })
+          .then(function(d) { setData(d); })
+          .catch(function() {});
+      }
+
+      useEffect(function() {
+        loadWorkers();
+        var pollId = setInterval(loadWorkers, 5000);
+        var tickId = setInterval(function() { setTick(function(t) { return t + 1; }); }, 1000);
+        return function() { clearInterval(pollId); clearInterval(tickId); };
+      }, []);
+
+      return e(Workers, { data: data, onRefresh: loadWorkers });
+    }
+
+    // M28 — launch a native worker fleet for chosen passes. Workers compute
+    // locally (LM Studio / GPU) and submit to the authoritative server (the NAS
+    // in replica mode). Managed as the named "ui" fleet so it doesn't disturb
+    // any hand-launched fleet.
+    var FLEET_PASSES = ['clip', 'faces', 'quality', 'describe',
+                        'category-content', 'category-visual', 'keywords', 'verify'];
+
+    function FleetLauncher() {
+      var _sel = useState({ describe: true, 'category-content': true, keywords: true });
+      var sel = _sel[0]; var setSel = _sel[1];
+      var _n = useState(2); var count = _n[0]; var setCount = _n[1];
+      var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
+      var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];
+      var _status = useState(null); var status = _status[0]; var setStatus = _status[1];
+
+      function loadStatus() {
+        fetch('/api/admin/workers/fleet-status')
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setStatus(d); })
+          .catch(function () {});
+      }
+      useEffect(function () { loadStatus(); }, []);
+
+      function toggle(p) {
+        var next = Object.assign({}, sel);
+        if (next[p]) delete next[p]; else next[p] = true;
+        setSel(next);
+      }
+
+      function start() {
+        var passes = FLEET_PASSES.filter(function (p) { return sel[p]; });
+        if (passes.length === 0) return;
+        setBusy(true); setMsg({ kind: 'info', text: 'Launching ' + count + ' worker(s)…' });
+        fetch('/api/admin/workers/start', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passes: passes, count: Number(count) }),
+        }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+          .then(function (res) {
+            setMsg(res.ok
+              ? { kind: 'ok', text: 'Launched ' + res.d.count + ' worker(s) → ' + res.d.server }
+              : { kind: 'err', text: (res.d && res.d.detail) || 'Launch failed' });
+            setBusy(false); loadStatus();
+          }).catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
+      }
+
+      function stop() {
+        setBusy(true); setMsg({ kind: 'info', text: 'Stopping fleet…' });
+        fetch('/api/admin/workers/stop', { method: 'POST' })
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setMsg({ kind: 'ok', text: 'Stopped.' }); setBusy(false); loadStatus(); })
+          .catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
+      }
+
+      return e('div', null,
+        e('h2', null, 'Worker fleet'),
+        e('div', { className: 'workers-wrap' },
+          e('div', { style: { fontSize: 13, color: 'var(--text-muted)', marginBottom: 8 } },
+            'Launch local workers (compute here via LM Studio / GPU; results written to the authoritative server).'),
+          e('div', { className: 'queue-grid' },
+            FLEET_PASSES.map(function (p) {
+              return e('label', { key: p, className: 'queue-pill' + (sel[p] ? '' : ' empty'),
+                  style: { cursor: 'pointer' }, onClick: function () { toggle(p); } },
+                e('span', { className: 'q-pass' },
+                  e('input', { type: 'checkbox', checked: !!sel[p], readOnly: true,
+                    style: { marginRight: 6, verticalAlign: 'middle' } }), p));
+            })
+          ),
+          e('div', { className: 'workers-head', style: { marginTop: 10 } },
+            e('span', { className: 'workers-title' }, 'Workers: '),
+            e('input', { type: 'number', min: 1, max: 8, value: count,
+              onChange: function (ev) { setCount(ev.target.value); },
+              style: { width: 56, marginLeft: 6 } }),
+            e('button', { className: 'btn', style: { marginLeft: 12 },
+              onClick: start, disabled: busy }, busy ? 'Working…' : 'Start fleet'),
+            e('button', { className: 'btn', style: { marginLeft: 8 },
+              onClick: stop, disabled: busy }, 'Stop fleet'),
+            e('button', { className: 'btn', style: { marginLeft: 'auto' },
+              onClick: loadStatus, disabled: busy }, 'Refresh')
+          ),
+          msg && e('p', { style: { fontSize: 12, marginTop: 8,
+              color: msg.kind === 'err' ? 'var(--danger, #c0392b)'
+                   : msg.kind === 'ok' ? 'var(--success, #2e7d32)' : 'var(--text-muted)' } }, msg.text),
+          status && status.output && e('pre', {
+            style: { fontSize: 11, marginTop: 8, padding: 8, borderRadius: 4,
+              background: 'var(--surface2)', border: '1px solid var(--border)',
+              whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto' } }, status.output)
+        )
+      );
+    }
+
     function Page() {
       var noop = function () {};
       return e('div', null,
@@ -1616,6 +1835,8 @@
           e('h1', null, 'Maintenance'),
           e('p', { style: { color: 'var(--text-muted)', marginBottom: 18, maxWidth: 760 } },
             'CPU-light backfills + on-demand jobs. Heavy GPU passes stay with the worker fleet.'),
+          e(WorkersPanel, null),
+          e(FleetLauncher, null),
           e(LightIndex, null),
           e(IngestIncoming, null),
           e(StackingForm, { onComplete: noop }),

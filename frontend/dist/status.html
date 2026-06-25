@@ -930,21 +930,6 @@
       );
     }
 
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'tags', 'category-content', 'category-visual', 'keywords', 'verify'];
-
-    function formatTtl(expiresAtStr) {
-      if (!expiresAtStr) return { text: '—', cls: '' };
-      // expires_at is UTC in SQLite ('YYYY-MM-DD HH:MM:SS'), treat as UTC
-      var isoUtc = expiresAtStr.replace(' ', 'T') + 'Z';
-      var deltaMs = new Date(isoUtc).getTime() - Date.now();
-      if (isNaN(deltaMs)) return { text: '—', cls: '' };
-      if (deltaMs <= 0) return { text: 'expired', cls: 'expired' };
-      var mins = Math.floor(deltaMs / 60000);
-      var secs = Math.floor((deltaMs % 60000) / 1000);
-      var text = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
-      return { text: text + ' left', cls: mins < 2 ? 'expiring' : '' };
-    }
-
     // ── Generations by model ─────────────────────────────────────────────
     // Surface the v21 generations provenance log on /status. For each text
     // type (describe / tags / verify), show which model produced each photo's
@@ -996,173 +981,6 @@
               );
             })
           )
-        )
-      );
-    }
-
-    function Workers(props) {
-      var data = props.data;
-      var _cb = useState(false); var clearing = _cb[0]; var setClearing = _cb[1];
-      if (!data) return null;
-      var queue = data.queue_depth || {};
-      var active = data.active_claims || [];
-      var totalQueue = PASS_ORDER.reduce(function(s, p) { return s + (queue[p] || 0); }, 0);
-
-      function clearClaims() {
-        var msg = active.length === 0
-          ? 'No active claims to clear. Continue anyway?'
-          : 'Release all ' + active.length + ' active claim'
-            + (active.length === 1 ? '' : 's') + '? '
-            + 'Their photos become reclaimable immediately. '
-            + 'Live workers will still have their results accepted.';
-        if (!window.confirm(msg)) return;
-        setClearing(true);
-        fetch('/api/worker/clear-claims', { method: 'POST' })
-          .then(function(r) { return r.json(); })
-          .then(function() {
-            if (props.onRefresh) props.onRefresh();
-          })
-          .catch(function(err) {
-            window.alert('Failed to clear claims: ' + (err && err.message ? err.message : err));
-          })
-          .then(function() { setClearing(false); });
-      }
-
-      return e('div', null,
-        e('h2', null, 'Workers'),
-        e('div', { className: 'workers-wrap' },
-          e('div', { className: 'workers-head' },
-            e('span', { className: 'workers-title' },
-              active.length === 0
-                ? 'No active workers'
-                : active.length + ' active worker' + (active.length === 1 ? '' : 's')
-            ),
-            e('span', { className: 'workers-idle' },
-              totalQueue === 0
-                ? 'queue empty'
-                : totalQueue.toLocaleString() + ' photos queued across passes'
-            ),
-            e('button', {
-              className: 'btn',
-              style: { marginLeft: 'auto' },
-              onClick: clearClaims,
-              disabled: clearing,
-              title: 'Release all active worker claims so their photos can be reclaimed immediately',
-            }, clearing ? 'Clearing…' : 'Clear claims')
-          ),
-          e('div', { className: 'queue-grid' },
-            PASS_ORDER.map(function(pass) {
-              var count = queue[pass] || 0;
-              return e('div', {
-                key: pass,
-                className: 'queue-pill' + (count === 0 ? ' empty' : '')
-              },
-                e('span', { className: 'q-pass' }, pass),
-                e('span', { className: 'q-count' }, count.toLocaleString())
-              );
-            })
-          ),
-          active.length > 0 && e('div', null,
-            active.map(function(c) {
-              var ttl = formatTtl(c.expires_at);
-              return e('div', { key: c.batch_id, className: 'active-row' },
-                e('span', { className: 'active-pass' }, c.pass_type),
-                e('span', { className: 'active-worker', title: c.worker_id }, c.worker_id),
-                e('span', { className: 'active-count' }, c.photo_count + ' photos'),
-                e('span', { className: 'active-ttl ' + ttl.cls }, ttl.text)
-              );
-            })
-          )
-        )
-      );
-    }
-
-    // M28 — launch a native worker fleet for chosen passes from /status.
-    // Workers compute locally (LM Studio / GPU) and submit to the authoritative
-    // server (the NAS in replica mode). Managed as the named "ui" fleet so it
-    // doesn't disturb any hand-launched fleet.
-    var FLEET_PASSES = ['clip', 'faces', 'quality', 'describe',
-                        'category-content', 'category-visual', 'keywords', 'verify'];
-
-    function FleetLauncher() {
-      var _sel = useState({ describe: true, 'category-content': true, keywords: true });
-      var sel = _sel[0]; var setSel = _sel[1];
-      var _n = useState(2); var count = _n[0]; var setCount = _n[1];
-      var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
-      var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];
-      var _status = useState(null); var status = _status[0]; var setStatus = _status[1];
-
-      function loadStatus() {
-        fetch('/api/admin/workers/fleet-status')
-          .then(function (r) { return r.json(); })
-          .then(function (d) { setStatus(d); })
-          .catch(function () {});
-      }
-      useEffect(function () { loadStatus(); }, []);
-
-      function toggle(p) {
-        var next = Object.assign({}, sel);
-        if (next[p]) delete next[p]; else next[p] = true;
-        setSel(next);
-      }
-
-      function start() {
-        var passes = FLEET_PASSES.filter(function (p) { return sel[p]; });
-        if (passes.length === 0) return;
-        setBusy(true); setMsg({ kind: 'info', text: 'Launching ' + count + ' worker(s)…' });
-        fetch('/api/admin/workers/start', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ passes: passes, count: Number(count) }),
-        }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
-          .then(function (res) {
-            setMsg(res.ok
-              ? { kind: 'ok', text: 'Launched ' + res.d.count + ' worker(s) → ' + res.d.server }
-              : { kind: 'err', text: (res.d && res.d.detail) || 'Launch failed' });
-            setBusy(false); loadStatus();
-          }).catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
-      }
-
-      function stop() {
-        setBusy(true); setMsg({ kind: 'info', text: 'Stopping fleet…' });
-        fetch('/api/admin/workers/stop', { method: 'POST' })
-          .then(function (r) { return r.json(); })
-          .then(function (d) { setMsg({ kind: 'ok', text: 'Stopped.' }); setBusy(false); loadStatus(); })
-          .catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
-      }
-
-      return e('div', null,
-        e('h2', null, 'Worker fleet'),
-        e('div', { className: 'workers-wrap' },
-          e('div', { style: { fontSize: 13, color: 'var(--text-muted)', marginBottom: 8 } },
-            'Launch local workers (compute here via LM Studio / GPU; results written to the authoritative server).'),
-          e('div', { className: 'queue-grid' },
-            FLEET_PASSES.map(function (p) {
-              return e('label', { key: p, className: 'queue-pill' + (sel[p] ? '' : ' empty'),
-                  style: { cursor: 'pointer' }, onClick: function () { toggle(p); } },
-                e('span', { className: 'q-pass' },
-                  e('input', { type: 'checkbox', checked: !!sel[p], readOnly: true,
-                    style: { marginRight: 6, verticalAlign: 'middle' } }), p));
-            })
-          ),
-          e('div', { className: 'workers-head', style: { marginTop: 10 } },
-            e('span', { className: 'workers-title' }, 'Workers: '),
-            e('input', { type: 'number', min: 1, max: 8, value: count,
-              onChange: function (ev) { setCount(ev.target.value); },
-              style: { width: 56, marginLeft: 6 } }),
-            e('button', { className: 'btn', style: { marginLeft: 12 },
-              onClick: start, disabled: busy }, busy ? 'Working…' : 'Start fleet'),
-            e('button', { className: 'btn', style: { marginLeft: 8 },
-              onClick: stop, disabled: busy }, 'Stop fleet'),
-            e('button', { className: 'btn', style: { marginLeft: 'auto' },
-              onClick: loadStatus, disabled: busy }, 'Refresh')
-          ),
-          msg && e('p', { style: { fontSize: 12, marginTop: 8,
-              color: msg.kind === 'err' ? 'var(--danger, #c0392b)'
-                   : msg.kind === 'ok' ? 'var(--success, #2e7d32)' : 'var(--text-muted)' } }, msg.text),
-          status && status.output && e('pre', {
-            style: { fontSize: 11, marginTop: 8, padding: 8, borderRadius: 4,
-              background: 'var(--surface2)', border: '1px solid var(--border)',
-              whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto' } }, status.output)
         )
       );
     }
@@ -1223,159 +1041,6 @@
       );
     }
 
-    function VerifyFailures(props) {
-      var failures = props.failures;
-      var onReload = props.onReload;
-      var onOpen = props.onOpen;
-      var _t = useState(null); var toast = _t[0]; var setToast = _t[1];
-      var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
-      var _sf = useState(true); var showFail = _sf[0]; var setShowFail = _sf[1];
-      var _sr = useState(true); var showRegen = _sr[0]; var setShowRegen = _sr[1];
-
-      if (!failures) return null;
-
-      var counts = { fail: 0, regenerated: 0 };
-      failures.forEach(function(p) {
-        if (counts[p.status] !== undefined) counts[p.status]++;
-      });
-
-      var visible = failures.filter(function(p) {
-        if (p.status === 'fail') return showFail;
-        if (p.status === 'regenerated') return showRegen;
-        return false;
-      });
-
-      var activeStatuses = [];
-      if (showFail) activeStatuses.push('fail');
-      if (showRegen) activeStatuses.push('regenerated');
-
-      if (failures.length === 0) {
-        return e('div', null,
-          e('h2', null, 'Verify flags'),
-          e('div', { className: 'fail-wrap' },
-            e('div', { className: 'stat-sub' }, 'No photos have hallucination flags recorded.')
-          )
-        );
-      }
-
-      function collect() {
-        if (activeStatuses.length === 0) {
-          setToast({ msg: 'Select at least one status to collect', err: true });
-          return;
-        }
-        var label = activeStatuses.join('+');
-        var name = window.prompt(
-          'Name for collection containing ' + visible.length + ' photo(s) (' + label + '):',
-          'Verify ' + label + ' ' + new Date().toISOString().slice(0, 10)
-        );
-        if (!name) return;
-        setBusy(true);
-        setToast(null);
-        fetch('/api/verify/failures/collect', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name.trim(), statuses: activeStatuses }),
-        })
-          .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
-          .then(function(res) {
-            setBusy(false);
-            if (!res.ok) {
-              setToast({ msg: res.data.error || 'Failed to create collection', err: true });
-              return;
-            }
-            var c = res.data.collection;
-            setToast({
-              msg: 'Added ' + res.data.added + ' photos to collection "' + c.name + '"',
-              err: false,
-              link: '/collections/' + c.id,
-            });
-          })
-          .catch(function(err) {
-            setBusy(false);
-            setToast({ msg: 'Error: ' + err.message, err: true });
-          });
-      }
-
-      function flagSummary(flags) {
-        if (!flags || !flags.length) return '';
-        var items = flags.slice(0, 3).map(function(f) {
-          return f.noun || f.tag || '';
-        }).filter(Boolean);
-        var extra = flags.length > 3 ? ' +' + (flags.length - 3) : '';
-        return items.join(', ') + extra;
-      }
-
-      var cards = visible.map(function(p) {
-        var badgeClass = 'status-badge ' + (p.status || 'fail');
-        return e('div', {
-          key: p.id,
-          className: 'fail-card',
-          onClick: function() { onOpen && onOpen(p); },
-          title: p.filepath + ' — status=' + p.status,
-        },
-          e('img', { className: 'fail-thumb', src: p.thumbnail, loading: 'lazy' }),
-          e('div', { className: 'fail-meta' },
-            e('div', { className: 'fail-filename' },
-              e('span', { className: badgeClass }, p.status === 'regenerated' ? 'regen' : 'fail'),
-              p.filename || ('id=' + p.id)
-            ),
-            e('div', { className: 'fail-flag' }, flagSummary(p.hallucination_flags) || '(no flags)')
-          )
-        );
-      });
-
-      return e('div', null,
-        e('h2', null, 'Verify flags (' + visible.length + ' shown / ' + failures.length + ' total)'),
-        e('div', { className: 'fail-wrap' },
-          e('div', { className: 'fail-header' },
-            e('div', null,
-              e('div', { className: 'stat-sub', style: { marginBottom: '6px' } },
-                'Photos where the verifier flagged hallucinations. "fail" = description still bad; "regen" = description was rewritten.'),
-              e('div', { className: 'fail-filter' },
-                e('label', null,
-                  e('input', {
-                    type: 'checkbox',
-                    checked: showFail,
-                    onChange: function(ev) { setShowFail(ev.target.checked); },
-                  }),
-                  e('span', { className: 'status-badge fail' }, 'fail'),
-                  counts.fail + ' not regenerated'
-                ),
-                e('label', null,
-                  e('input', {
-                    type: 'checkbox',
-                    checked: showRegen,
-                    onChange: function(ev) { setShowRegen(ev.target.checked); },
-                  }),
-                  e('span', { className: 'status-badge regenerated' }, 'regen'),
-                  counts.regenerated + ' regenerated (review recommended)'
-                )
-              )
-            ),
-            e('div', { style: { display: 'flex', gap: '8px' } },
-              e('button', { className: 'btn', onClick: onReload }, 'Reload'),
-              e('button', {
-                className: 'btn btn-primary',
-                onClick: collect,
-                disabled: busy || activeStatuses.length === 0,
-              }, busy ? 'Collecting…' : 'Collect selected into collection')
-            )
-          ),
-          visible.length === 0
-            ? e('div', { className: 'stat-sub', style: { padding: '20px 0' } },
-                'Nothing matches the current filter.')
-            : e('div', { className: 'fail-grid' }, cards),
-          toast && e('div', { className: 'toast' + (toast.err ? ' err' : '') },
-            toast.msg,
-            toast.link && e('a', {
-              href: toast.link,
-              style: { color: 'var(--accent)', marginLeft: '8px', textDecoration: 'underline' }
-            }, 'Open →')
-          )
-        )
-      );
-    }
-
     function StatusPage() {
       var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
       var _e = useState(null); var error = _e[0]; var setError = _e[1];
@@ -1383,18 +1048,6 @@
       var _t = useState(null); var lastUpdated = _t[0]; var setLastUpdated = _t[1];
       var _a = useState(null); var activity = _a[0]; var setActivity = _a[1];
       var _er = useState(null); var indexErrors = _er[0]; var setIndexErrors = _er[1];
-      var _f = useState(null); var failures = _f[0]; var setFailures = _f[1];
-      var _m = useState(null); var modalPhoto = _m[0]; var setModalPhoto = _m[1];
-      var _p = useState([]); var persons = _p[0]; var setPersons = _p[1];
-      var _w = useState(null); var workerStatus = _w[0]; var setWorkerStatus = _w[1];
-      var _tick = useState(0); var setTick = _tick[1];
-
-      function loadWorkers() {
-        fetch('/api/worker/status')
-          .then(function(r) { return r.json(); })
-          .then(function(d) { setWorkerStatus(d); })
-          .catch(function() {});
-      }
 
       function load() {
         setLoading(true);
@@ -1402,13 +1055,11 @@
           fetch('/api/stats').then(function(r) { return r.json(); }),
           fetch('/api/stats/activity').then(function(r) { return r.json(); }),
           fetch('/api/stats/errors').then(function(r) { return r.json(); }),
-          fetch('/api/verify/failures').then(function(r) { return r.json(); }),
         ])
           .then(function(results) {
             setStats(results[0]);
             setActivity(results[1]);
             setIndexErrors(results[2]);
-            setFailures((results[3] && results[3].photos) || []);
             setLastUpdated(new Date().toLocaleTimeString());
             setLoading(false);
             setError(null);
@@ -1417,36 +1068,6 @@
             setError('Failed to load stats: ' + err.message);
             setLoading(false);
           });
-        loadWorkers();
-      }
-
-      // Poll worker status every 5s so active-worker counts + TTLs stay live
-      // without forcing a full /api/stats refresh (which does expensive COUNTs).
-      // Separate 1s tick re-renders active-row TTLs between fetches.
-      useEffect(function() {
-        var pollId = setInterval(loadWorkers, 5000);
-        var tickId = setInterval(function() { setTick(function(t) { return t + 1; }); }, 1000);
-        return function() { clearInterval(pollId); clearInterval(tickId); };
-      }, []);
-
-      useEffect(function() {
-        fetch('/api/persons')
-          .then(function(r) { return r.json(); })
-          .then(function(d) { setPersons(d.persons || d || []); })
-          .catch(function() {});
-      }, []);
-
-      function openModal(photo) {
-        setModalPhoto({ id: photo.id });
-      }
-      function closeModal() { setModalPhoto(null); }
-      function navModal(dir) {
-        if (!modalPhoto || !failures) return;
-        var idx = failures.findIndex(function(p) { return p.id === modalPhoto.id; });
-        if (idx < 0) return;
-        var next = idx + dir;
-        if (next < 0 || next >= failures.length) return;
-        setModalPhoto({ id: failures[next].id });
       }
 
       useEffect(function() { load(); }, []);
@@ -1548,10 +1169,7 @@
             })
           ),
           e(GenerationsByModel, null),
-          e(Workers, { data: workerStatus, onRefresh: loadWorkers }),
-          e(FleetLauncher, null),
           e(ActivityChart, { activity: activity }),
-          e(VerifyFailures, { failures: failures, onReload: load, onOpen: openModal }),
           e(ErrorsLog, { errors: indexErrors }),
           e('div', { style: { marginTop: 24, color: 'var(--text-muted)', fontSize: 13 } },
             'CLI command reference lives in the ',
@@ -1562,30 +1180,12 @@
         );
       }
 
-      var modalIndex = modalPhoto && failures
-        ? failures.findIndex(function(p) { return p.id === modalPhoto.id; })
-        : -1;
-
       return e('div', null,
         header,
         e('div', { className: 'container' },
           e('h1', null, 'Indexing Status'),
           content
-        ),
-        modalPhoto && e(PS.PhotoModal, {
-          photo: modalPhoto,
-          onClose: closeModal,
-          onPrev: function() { navModal(-1); },
-          onNext: function() { navModal(1); },
-          index: modalIndex >= 0 ? modalIndex : 0,
-          total: failures ? failures.length : 0,
-          persons: persons,
-          fetchDetail: true,
-          showFaces: true,
-          showCollections: true,
-          showLocation: true,
-          showAesthetics: true,
-        })
+        )
       );
     }
 
