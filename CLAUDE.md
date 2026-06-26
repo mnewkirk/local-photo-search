@@ -343,6 +343,36 @@ TTL expired and another worker re-processed the same photo.
 $DC photosearch cleanup-orphans [--dry-run]
 ```
 
+## Non-image rows & the clip-claim infinite re-claim
+
+CLIP is the **only** worker pass with no `worker_processed.attempts >=
+MAX_PROCESS_ATTEMPTS` cap — the claim/count predicates (`db.py
+get_unprocessed_photos`/`count_unprocessed_photos`) just check
+`id NOT IN (SELECT photo_id FROM clip_embeddings)`, and the clip branch of
+`worker_api.submit_results` never calls `mark_processed`. So a photo that can't
+be loaded leaves *no trace* (no embedding, no attempts row) and is re-claimed
+every TTL forever. SQLite returns the claim set in rowid order, so the same
+unloadable rows sit at the front of every claim — workers churn at ~290% CPU
+and `queue_depth.clip` never reaches 0 ("workers won't drain").
+
+The usual culprit: files whose extension lies about their content — iOS Live
+Photo / motion bundles saved as `IMG_xxxx(1).JPG` that are actually **ZIP
+archives** wrapping a `.mov` (`PK` magic; PIL: "cannot identify image file").
+
+`index.py:is_real_image()` (magic-byte allowlist) now gates row creation in
+`index_directory` and reclassifies such files as move-only companions in
+`ingest.py`, so no new bogus rows are created. Purge existing ones (runs on the
+**NAS**, where the files live):
+
+```bash
+$DC run --rm photosearch purge-nonimage-photos                 # dry-run, no-CLIP set
+$DC run --rm photosearch purge-nonimage-photos --audit /data/nonimage.csv --apply
+```
+
+Default scans only photos with no CLIP embedding (the stuck set); `--all` scans
+everything. `--apply` requires `--audit` (deletes are reversible only by
+re-import). Cascades faces/stacks; runs `cleanup-orphans` internally.
+
 ## Phone-photo daily ingest
 
 `/photos/_incoming/<source>/` is the staging area for camera-roll syncs from

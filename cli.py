@@ -1685,6 +1685,108 @@ def prune_missing(db, apply, sample):
         click.echo("\nNext: run `cleanup-orphans` to drop dangling clip_embeddings / face_encodings rows.")
 
 
+@cli.command("purge-nonimage-photos")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False, help="Actually delete the bogus rows. Default is dry-run.")
+@click.option("--all", "scan_all", is_flag=True, default=False,
+              help="Scan every photo. Default scans only photos with no CLIP embedding "
+                   "(the stuck set) — far faster and where these files always land.")
+@click.option("--audit", "audit_path", default=None,
+              help="Write a CSV audit (id,filepath,file_hash,magic) of purged rows before deleting.")
+@click.option("--sample", default=15, show_default=True, help="Number of sample paths to print.")
+def purge_nonimage_photos(db, apply, scan_all, audit_path, sample):
+    """Delete photos rows whose file content is not a decodable image.
+
+    Targets ZIP-wrapped iOS Live Photo bundles saved as IMG_xxxx(1).JPG (PK
+    magic, a .mov inside) that PIL can't open: they never get a CLIP embedding
+    and, because the clip claim path has no attempts cap, the worker fleet
+    re-claims them on every TTL cycle forever — the clip queue never reaches 0.
+
+    Default scans only photos with no CLIP embedding (the stuck set). Cascades
+    via FK to faces/stack_members/collection_photos/review_selections; run
+    cleanup-orphans afterward to drop any dangling vec0 rows.
+    """
+    import csv
+    from photosearch.index import is_real_image
+
+    with PhotoDB(db) as photo_db:
+        if photo_db.photo_root and not os.path.isdir(photo_db.photo_root):
+            click.echo(f"Photo root not accessible: {photo_db.photo_root}")
+            click.echo("Refusing to scan — run this where the photo files are mounted (the NAS).")
+            return
+
+        if scan_all:
+            rows = photo_db.conn.execute("SELECT id, filepath, file_hash FROM photos").fetchall()
+        else:
+            rows = photo_db.conn.execute(
+                "SELECT id, filepath, file_hash FROM photos "
+                "WHERE id NOT IN (SELECT photo_id FROM clip_embeddings)"
+            ).fetchall()
+        click.echo(f"Scanning {len(rows):,} candidate photos "
+                   f"({'all' if scan_all else 'no-CLIP-embedding'} set)…")
+
+        bad = []  # (id, filepath, file_hash, magic)
+        missing = 0
+        for r in rows:
+            abs_path = photo_db.resolve_filepath(r["filepath"])
+            if not abs_path or not os.path.exists(abs_path):
+                missing += 1
+                continue
+            if not is_real_image(abs_path):
+                try:
+                    with open(abs_path, "rb") as f:
+                        magic = f.read(4).hex()
+                except OSError:
+                    magic = "?"
+                bad.append((r["id"], r["filepath"], r["file_hash"], magic))
+
+        click.echo(f"\nNon-image rows: {len(bad):,}   (skipped {missing:,} missing files)")
+        if bad:
+            click.echo("\nSample:")
+            for bid, fp, _h, magic in bad[:sample]:
+                click.echo(f"  [{bid}] {fp}  (magic 0x{magic})")
+            if len(bad) > sample:
+                click.echo(f"  … and {len(bad) - sample:,} more")
+
+        if not bad:
+            click.echo("\nNothing to purge.")
+            return
+
+        if audit_path:
+            with open(audit_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["id", "filepath", "file_hash", "magic_hex"])
+                w.writerows(bad)
+            click.echo(f"\nWrote audit of {len(bad):,} rows to {audit_path}")
+
+        if not apply:
+            click.echo("\nDry run — no changes written. Re-run with --apply to delete.")
+            return
+
+        if audit_path is None:
+            click.echo("\nRefusing to --apply without --audit (deletes are reversible only by "
+                       "re-import; keep a record). Re-run with --audit PATH.")
+            return
+
+        click.echo("\nDeleting…")
+        ids = [b[0] for b in bad]
+        deleted = 0
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            photo_db.conn.execute(f"DELETE FROM photos WHERE id IN ({ph})", batch)
+            deleted += len(batch)
+        orphan_stacks = photo_db.conn.execute(
+            "DELETE FROM photo_stacks WHERE id NOT IN "
+            "(SELECT DISTINCT stack_id FROM stack_members)"
+        ).rowcount
+        photo_db.conn.commit()
+        vec = photo_db.cleanup_vec_orphans(dry_run=False)
+        click.echo(f"  Deleted {deleted:,} photos rows (+ cascaded faces/stack_members/etc.).")
+        click.echo(f"  Removed {orphan_stacks:,} now-empty photo_stacks.")
+        click.echo(f"  Cleaned {vec['clip_deleted']} clip + {vec['face_deleted']} face vec0 orphans.")
+
+
 @cli.command("cleanup-orphans")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--dry-run", is_flag=True, default=False, help="Report orphan counts without deleting.")

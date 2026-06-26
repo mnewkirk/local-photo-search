@@ -14,10 +14,23 @@ from photosearch.db import PhotoDB
 from photosearch.ingest import ingest_incoming
 
 
+# Valid magic bytes per image extension so ingest's content-sniff
+# (is_real_image) treats these stubs as real photos. Companion extensions
+# (.mov/.arw) aren't sniffed, so they need no magic.
+_EXT_MAGIC = {
+    ".jpg": b"\xff\xd8\xff\xe0", ".jpeg": b"\xff\xd8\xff\xe0",
+    ".heic": b"\x00\x00\x00\x18ftypheic", ".heif": b"\x00\x00\x00\x18ftypheic",
+}
+
+
 def _touch(path: Path, content: bytes = b"jpeg-bytes") -> None:
-    """Create a file with given content (used to control file_hash())."""
+    """Create a file with given content (used to control file_hash()).
+
+    A correct image-magic prefix for the extension is prepended so the file
+    passes ingest's content sniff; the caller-supplied tail keeps hashes distinct.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
+    path.write_bytes(_EXT_MAGIC.get(path.suffix.lower(), b"") + content)
 
 
 def _patch_exif(monkeypatch, date_taken: str | None):
@@ -272,7 +285,31 @@ def test_filename_collision_appends_suffix(tmp_path, tmp_db_path, monkeypatch):
     assert existing.read_bytes() == b"old-different-photo"
     suffixed = photos / "2026" / "2026-04-12_phone-matt" / "IMG_0001_1.jpg"
     assert suffixed.exists()
-    assert suffixed.read_bytes() == b"different-new-photo"
+    assert suffixed.read_bytes() == _EXT_MAGIC[".jpg"] + b"different-new-photo"
+
+
+def test_zip_wrapped_jpg_reclassified_as_companion(tmp_path, tmp_db_path, monkeypatch):
+    """A .JPG whose content is a ZIP (iOS Live Photo bundle) is moved like a
+    companion: relocated into the library but never imported as a photo row."""
+    incoming, photos = _setup_dirs(tmp_path)
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    # ZIP magic (PK\x03\x04), not an image — bypass _touch's magic prefix.
+    src = incoming / "matt" / "IMG_4678(1).JPG"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"PK\x03\x04" + b"\x00" * 20)
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    s = result["sources"]["matt"]
+    assert s["non_image_reclassified"] == 1
+    assert s["imported"] == 0
+    assert s["companions_moved"] == 1
+    # File reached the library (move-only), but no DB row was created.
+    moved = photos / "2026" / "2026-04-12_phone-matt" / "IMG_4678(1).JPG"
+    assert moved.exists()
+    with PhotoDB(tmp_db_path) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0] == 0
 
 
 def test_per_source_folder_split(tmp_path, tmp_db_path, monkeypatch):

@@ -38,6 +38,50 @@ def file_hash(filepath: str, chunk_size: int = 8192) -> str:
     return h.hexdigest()
 
 
+def _image_header_ok(head: bytes) -> bool:
+    """True if ``head`` (first ~12 bytes) is the magic of a decodable still image.
+
+    Positive allowlist of standard image signatures — anything not matching is
+    rejected. The format we actually need to reject is a ZIP archive (``PK``
+    magic): iOS Live Photo / motion bundles get saved with a ``.JPG`` extension
+    but contain a zipped ``.mov``, which no decoder can open.
+    """
+    if len(head) < 3:
+        return False
+    if head[:3] == b"\xff\xd8\xff":                       # JPEG
+        return True
+    if head[:8] == b"\x89PNG\r\n\x1a\n":                  # PNG
+        return True
+    if head[:6] in (b"GIF87a", b"GIF89a"):               # GIF
+        return True
+    if head[:4] in (b"II*\x00", b"MM\x00*"):             # TIFF (and many RAWs)
+        return True
+    if head[:2] == b"BM":                                # BMP
+        return True
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":    # WebP
+        return True
+    if head[4:8] == b"ftyp":                              # HEIF/HEIC/AVIF (ISO-BMFF)
+        return True
+    return False
+
+
+def is_real_image(filepath: str) -> bool:
+    """True if the file's *content* is a decodable still image.
+
+    Guards against files whose extension lies about their content — most
+    importantly ZIP-wrapped iOS Live Photo bundles saved as ``IMG_xxxx(1).JPG``
+    (PK magic, a ``.mov`` inside) that PIL can't open. Such files must never get
+    a ``photos`` row: they can't be CLIP-embedded, and the clip claim path has no
+    attempts cap, so the workers would re-claim them on every TTL cycle forever.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return False
+    return _image_header_ok(head)
+
+
 # Subfolder names that are excluded from indexing.
 # Built-in set covers project-internal folders. Deployment-specific
 # folders (e.g. organizational duplicate trees) come from the
@@ -897,6 +941,7 @@ def index_directory(
         new_photos = []  # list of (photo_id, absolute_path)
         db.begin_batch(batch_size=100)
         skipped = 0
+        invalid = 0
         for i, photo_path in enumerate(photos, 1):
             abs_path = str(Path(photo_path).resolve())
             stored_path = db.relative_filepath(abs_path)
@@ -904,6 +949,21 @@ def index_directory(
                 skipped += 1
                 if skipped % 500 == 0 or i == len(photos):
                     print(f"  [{i}/{len(photos)}] Skipped {skipped} already-indexed photos so far...")
+                continue
+
+            # Content sniff before creating a row: an image-extension file whose
+            # bytes aren't a decodable image (e.g. a ZIP-wrapped Live Photo saved
+            # as .JPG) must not get a photos row — it can never be CLIP-embedded
+            # and would re-cycle through the clip claim queue forever.
+            if not is_real_image(photo_path):
+                invalid += 1
+                if invalid <= 10:
+                    print(f"  Skipping non-image content: {os.path.basename(photo_path)}")
+                try:
+                    db.log_error("index", os.path.basename(photo_path),
+                                 "not a decodable image (extension/content mismatch)")
+                except Exception:
+                    pass
                 continue
 
             try:
@@ -933,6 +993,8 @@ def index_directory(
 
         if skipped:
             print(f"  Skipped {skipped} already-indexed photos.")
+        if invalid:
+            print(f"  Skipped {invalid} non-image files (extension/content mismatch).")
 
         # Build a set of stored paths for O(1) lookups at 200K scale.
         # Paths in the DB may be relative (to photo_root) or absolute.

@@ -27,7 +27,7 @@ from typing import Iterable, Optional
 
 from .db import PhotoDB
 from .exif import extract_exif
-from .index import file_hash, JPEG_EXTENSIONS, HEIC_EXTENSIONS
+from .index import file_hash, is_real_image, JPEG_EXTENSIONS, HEIC_EXTENSIONS
 
 # Phones produce JPEG (Android default) and HEIC (iPhone default). These are
 # the types we CLIP-index. Camera SD cards also bring RAW + video — we relocate
@@ -210,7 +210,8 @@ def ingest_incoming(
 
     per_source: dict[str, dict] = {}
     _zero = lambda: {"scanned": 0, "imported": 0, "deduped": 0,
-                     "companions_moved": 0, "companions_deduped": 0, "errors": 0}
+                     "companions_moved": 0, "companions_deduped": 0,
+                     "non_image_reclassified": 0, "errors": 0}
     totals = _zero()
 
     with PhotoDB(db_path) as db:
@@ -224,6 +225,13 @@ def ingest_incoming(
             for src_file in _iter_source_files(source_root):
                 stats["scanned"] += 1
                 is_photo = src_file.suffix.lower() in INGEST_EXTENSIONS
+                # An image-extension file whose content isn't a decodable image
+                # (e.g. a ZIP-wrapped iOS Live Photo saved as .JPG) is moved into
+                # the library like a companion but never gets a DB row / CLIP pass
+                # — those rows can't be embedded and re-cycle the clip queue forever.
+                if is_photo and not is_real_image(str(src_file)):
+                    is_photo = False
+                    stats["non_image_reclassified"] += 1
                 try:
                     h = file_hash(str(src_file))
                 except Exception as exc:
