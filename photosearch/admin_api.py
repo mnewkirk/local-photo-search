@@ -828,7 +828,13 @@ def admin_workers_queue_status():
     if nas:
         import requests
         try:
-            r = requests.get(f"{nas}/api/worker/status", timeout=8)
+            # /api/worker/status runs per-pass count_unprocessed scans on the
+            # NAS; on the N100 those spike past 8s under worker-fleet write load
+            # (claim-batch/submit), surfacing a scary "could not reach
+            # authoritative server" on the maintenance page for a box that's
+            # actually up. This is a 5s background poll, so a generous read
+            # timeout is harmless — prefer stale-but-shown over a false error.
+            r = requests.get(f"{nas}/api/worker/status", timeout=30)
             r.raise_for_status()
             data = r.json()
             data["source"] = nas
