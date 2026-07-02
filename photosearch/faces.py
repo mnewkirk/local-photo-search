@@ -77,6 +77,35 @@ def unload_model() -> None:
     _gc.collect()
 
 
+def _rocm_device_available() -> bool:
+    """True if the HIP runtime can actually enumerate a GPU.
+
+    ort.get_available_providers() only says the ROCm EP was *compiled in*.
+    If HIP device enumeration fails at session-create time, onnxruntime
+    throws a C++ OnnxRuntimeException ("HIP failure 100: no ROCm-capable
+    device is detected") that terminate()s the whole worker process — seen
+    on WSL2 when the dxg paravirtual GPU channel is wedged (dmesg shows
+    `dxgkio_query_adapter_info: Ioctl failed`; `wsl --shutdown` + relaunch
+    fixes it). Probe hipGetDeviceCount via ctypes first — it returns an
+    error code instead of aborting — so we can log and fall back to CPU.
+    """
+    import ctypes
+    for name in ("libamdhip64.so", "/opt/rocm/lib/libamdhip64.so"):
+        try:
+            hip = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    else:
+        return False
+    count = ctypes.c_int(0)
+    try:
+        rc = hip.hipGetDeviceCount(ctypes.byref(count))
+    except Exception:
+        return False
+    return rc == 0 and count.value > 0
+
+
 def _select_face_providers() -> tuple[list[str], int]:
     """Pick onnxruntime providers + InsightFace ctx_id.
 
@@ -94,6 +123,12 @@ def _select_face_providers() -> tuple[list[str], int]:
         use_gpu = "ROCMExecutionProvider" in available
     else:
         use_gpu = "ROCMExecutionProvider" in available
+
+    if use_gpu and not _rocm_device_available():
+        print("  ROCm EP installed but HIP sees no GPU — falling back to CPU "
+              "(on WSL2 check `dmesg | grep dxg`; `wsl --shutdown` + relaunch "
+              "usually restores the device)", flush=True)
+        use_gpu = False
 
     if use_gpu:
         return ["ROCMExecutionProvider", "CPUExecutionProvider"], 0
