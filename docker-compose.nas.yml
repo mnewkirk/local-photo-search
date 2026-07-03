@@ -1,21 +1,21 @@
 # ============================================================================
-# local-photo-search — UGREEN NAS deployment with Tailscale
+# local-photo-search — UGREEN NAS deployment
 #
-# This compose file deploys three containers:
-#   photosearch — web UI + indexing engine (port 8000, internal only)
+# This compose file deploys these containers:
+#   photosearch — web UI + indexing engine (port 8000)
+#   photosearch-mcp — MCP server (port 8848)
 #   ollama      — LLaVA model server for scene descriptions
-#   tailscale   — encrypted tunnel for remote access via your tailnet
+#   syncthing   — receives phone camera-roll uploads into _incoming/
 #
-# Tailscale shares the photosearch container's network, so port 8000
-# is accessible at http://<tailscale-hostname>:8000 from any device
-# on your Tailscale network.
+# Remote access is via **host-level Tailscale on the NAS** (node DXP4800-F976).
+# The old in-compose `tailscale` sidecar was removed 2026-07-03 — it shared the
+# photosearch netns and could only expose :8000, not host ssh/smb, and its netns
+# coupling made restarts fragile. The host tailnet IP serves the published :8000.
 #
 # Quick start (see NAS_SETUP.md for full walkthrough):
 #   1. Copy .env.example to .env and set PHOTO_DIR
 #   2. docker compose -f docker-compose.nas.yml up -d
-#   3. docker compose -f docker-compose.nas.yml logs tailscale
-#      → visit the auth URL shown in the logs
-#   4. Access at http://photosearch:8000 from your tailnet
+#   3. Access at http://<nas-tailscale-ip>:8000 from your tailnet
 #
 # First-time model setup:
 #   docker compose -f docker-compose.nas.yml exec ollama ollama pull llava
@@ -54,12 +54,17 @@ services:
       # into the year/date library tree. Docker-sock is already mounted, so
       # ro on this volume wasn't buying meaningful isolation.
       - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photos:rw
-      # Phone-photo staging area lives outside PHOTO_DIR (in the repo dir,
-      # alongside docker-compose) so Syncthing and ingest-incoming share
-      # the same host path. Overlay-mounted at /photos/_incoming so the
-      # CLI's default --incoming-root just works. Excluded from indexing
-      # by _BUILTIN_EXCLUDED_DIRS in photosearch/index.py.
-      - ./photos/_incoming:/photos/_incoming:rw
+      # _incoming is the natural ${PHOTO_DIR}/_incoming subdir of the /photos
+      # mount above — the SAME place the SD-card importer writes (via the
+      # personal_folder SMB share, Samba path=%H = /home/cantimatt) and where
+      # Syncthing lands phone rolls (see the syncthing service below).
+      # Do NOT re-add a `./photos/_incoming:/photos/_incoming` overlay: that
+      # relative bind (a) put staging in the repo dir, diverging from where the
+      # Mac writes, and (b) resolved to a bogus /repo/photos/_incoming when the
+      # /status restart helper ran `compose up -w /repo`, shadowing the real
+      # files so ingest-incoming saw an empty dir. Keeping _incoming under
+      # PHOTO_DIR with no relative bind avoids both. Excluded from indexing by
+      # _BUILTIN_EXCLUDED_DIRS in photosearch/index.py.
       - photosearch-data:/data
       # Deploy-control panel (/status): mount the repo so git pull + docker
       # compose build / up can be triggered from the UI. WARNING:
@@ -165,7 +170,7 @@ services:
     # The daily `ingest-incoming` cron evacuates those files into the
     # year/date library tree — see CLAUDE.md "Phone-photo daily ingest".
     # PUID/PGID = cantimatt (1000) / admin (10) — must match the host
-    # owner of ./photos/_incoming so ingest-incoming can move files.
+    # owner of ${PHOTO_DIR}/_incoming so ingest-incoming can move files.
     image: lscr.io/linuxserver/syncthing:latest
     container_name: photosearch-syncthing
     hostname: photosearch-nas
@@ -176,38 +181,28 @@ services:
       - TZ=America/Los_Angeles
     volumes:
       - ./syncthing-config:/config
-      - ./photos/_incoming:/incoming
+      # Absolute ${PHOTO_DIR}/_incoming (NOT a relative ./ path) so phone rolls
+      # land in the SAME staging dir the photosearch container reads as
+      # /photos/_incoming and the SD-card importer writes to. Was
+      # ./photos/_incoming (the repo dir), which diverged from PHOTO_DIR and
+      # left phone uploads invisible to ingest for the same reason.
+      - ${PHOTO_DIR}/_incoming:/incoming
     ports:
       - "8384:8384"          # web GUI
       - "22000:22000/tcp"    # sync protocol
       - "22000:22000/udp"    # sync protocol (QUIC)
       - "21027:21027/udp"    # LAN discovery
 
-  tailscale:
-    image: tailscale/tailscale:latest
-    container_name: photosearch-tailscale
-    restart: unless-stopped
-    network_mode: "service:photosearch"
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    volumes:
-      - tailscale-state:/var/lib/tailscale
-      - /dev/net/tun:/dev/net/tun
-    environment:
-      # Set TS_AUTHKEY in .env for headless auth (optional).
-      # Without it, check 'docker logs photosearch-tailscale' for the auth URL.
-      - TS_AUTHKEY=${TS_AUTHKEY:-}
-      - TS_HOSTNAME=${TS_HOSTNAME:-photosearch}
-      - TS_STATE_DIR=/var/lib/tailscale
-      - TS_USERSPACE=false
-    depends_on:
-      - photosearch
+  # NOTE: the photosearch-tailscale sidecar was removed 2026-07-03. It ran in
+  # this compose's network namespace (network_mode: service:photosearch), so it
+  # could only expose the app's :8000 over Tailscale — never the host's ssh/smb.
+  # The NAS host now runs Tailscale natively (node DXP4800-F976), which serves
+  # the published :8000 plus host ssh/smb, so the sidecar was redundant and its
+  # netns coupling made restarts fragile (a --force-recreate cut off all remote
+  # ssh/smb). Re-add ONLY as a properly-scoped subnet router if ever needed.
 
 volumes:
   photosearch-data:
     driver: local
   ollama-models:
-    driver: local
-  tailscale-state:
     driver: local
