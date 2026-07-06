@@ -306,6 +306,82 @@ def test_dedup_stage_apply_deletes_redundant(seeded_db):
     assert db.conn.execute("SELECT COUNT(*) FROM photos WHERE id=?", (keep,)).fetchone()[0] == 1
 
 
+# ---------------------------------------------------------------------------
+# Re-queue stuck worker passes
+# ---------------------------------------------------------------------------
+
+def test_requeue_off_by_default(seeded_db):
+    from photosearch.maintenance import run_maintenance_sweep
+    res = run_maintenance_sweep(seeded_db, apply=False, do_colors=False,
+                                do_stacking=False, do_match=False)
+    assert not any(s["stage"] == "requeue" for s in res["stages"])
+
+
+def _seed_requeue_cases(db):
+    """Three describe photos: one silently stuck via empty-string, one stuck
+    via the attempts cap, one legitimately still-claimable (should be left)."""
+    from photosearch.db import MAX_PROCESS_ATTEMPTS
+    empty = db.add_photo(filepath="2021/x/empty.jpg", filename="empty.jpg",
+                         date_taken="2021-05-01 10:00:00", description="")
+    capped = db.add_photo(filepath="2021/x/capped.jpg", filename="capped.jpg",
+                          date_taken="2021-05-01 10:00:00")  # description NULL
+    for _ in range(MAX_PROCESS_ATTEMPTS):
+        db.mark_processed([capped], "describe")
+    fresh = db.add_photo(filepath="2021/x/fresh.jpg", filename="fresh.jpg",
+                         date_taken="2021-05-01 10:00:00")  # NULL, no attempts
+    db.conn.commit()
+    return empty, capped, fresh
+
+
+def test_requeue_preview_targets_only_stuck(seeded_db):
+    from photosearch.maintenance import _stage_requeue
+    db = seeded_db
+    empty, capped, fresh = _seed_requeue_cases(db)
+    out = _stage_requeue(db, apply=False, emit=lambda e: None,
+                         check_abort=lambda: None, passes=("describe",))
+    # empty-string + attempts-capped are stuck; the fresh NULL is still queued.
+    assert out["status"] == "preview"
+    assert out["would"] == 2
+    assert out["by_pass"]["describe"] == 2
+    # dry-run wrote nothing
+    assert db.conn.execute("SELECT COUNT(*) FROM worker_processed "
+                           "WHERE photo_id=? AND pass_type='describe'",
+                           (capped,)).fetchone()[0] == 1
+
+
+def test_requeue_apply_clears_markers_and_reenters_queue(seeded_db):
+    from photosearch.maintenance import _stage_requeue
+    db = seeded_db
+    empty, capped, fresh = _seed_requeue_cases(db)
+    before = db.count_unprocessed_photos("describe")
+    out = _stage_requeue(db, apply=True, emit=lambda e: None,
+                         check_abort=lambda: None, passes=("describe",))
+    assert out["status"] == "done" and out["applied"] == 2
+    # empty-string reset to NULL, capped attempts row deleted
+    assert db.conn.execute("SELECT description FROM photos WHERE id=?",
+                           (empty,)).fetchone()[0] is None
+    assert db.conn.execute("SELECT COUNT(*) FROM worker_processed "
+                           "WHERE photo_id=? AND pass_type='describe'",
+                           (capped,)).fetchone()[0] == 0
+    # both now show up in the claimable queue (fresh was already there)
+    assert db.count_unprocessed_photos("describe") == before + 2
+
+
+def test_requeue_skips_description_blocked_content(seeded_db):
+    """category-content on a photo with no description is blocked upstream on
+    describe, not stuck — requeue must not touch it."""
+    from photosearch.maintenance import _stage_requeue
+    db = seeded_db
+    blocked = db.add_photo(filepath="2021/x/nodesc.jpg", filename="nodesc.jpg",
+                           date_taken="2021-05-01 10:00:00", categories="")
+    for _ in range(3):
+        db.mark_processed([blocked], "category-content")
+    db.conn.commit()
+    out = _stage_requeue(db, apply=False, emit=lambda e: None,
+                         check_abort=lambda: None, passes=("category-content",))
+    assert out["would"] == 0 and out["status"] == "skipped"
+
+
 def test_validate_reports_duplicate_photos(seeded_db):
     from photosearch.maintenance import validate_data
     db = seeded_db

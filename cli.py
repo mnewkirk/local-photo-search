@@ -2047,11 +2047,20 @@ def backfill_folders(db, apply, force):
 @click.option("--dedup-photos", is_flag=True, default=False,
               help="Include duplicate-photo pruning (DELETES redundant copies — off "
                    "by default; runs first so later stages skip the dups).")
+@click.option("--requeue", is_flag=True, default=False,
+              help="Re-open stuck worker passes (describe/category-content/"
+                   "category-visual/keywords): clears the worker_processed markers "
+                   "for photos missing the output that the fleet will never re-claim "
+                   "(non-NULL empty values or attempts-capped). Bypasses the retry "
+                   "cap — use after fixing a root cause. The fleet does the work.")
+@click.option("--requeue-passes", default=None,
+              help="Comma-separated subset of passes for --requeue (default: all four).")
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
 def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, recluster,
-                      dedup_photos, window_minutes, max_drift_km, min_confidence):
+                      dedup_photos, requeue, requeue_passes, window_minutes,
+                      max_drift_km, min_confidence):
     """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
 
     Backfills nothing else schedules: structured locations, inferred GPS, colors,
@@ -2063,6 +2072,9 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
     from photosearch.maintenance import run_maintenance_sweep
     if light:
         no_colors = no_stacking = no_match = True
+    rq_passes = None
+    if requeue_passes:
+        rq_passes = tuple(p.strip() for p in requeue_passes.split(",") if p.strip())
 
     def on_prog(ev):
         if ev.get("status") == "scanning":
@@ -2082,6 +2094,7 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
             res = run_maintenance_sweep(
                 pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
                 do_match=not no_match, do_recluster=recluster, do_dedup=dedup_photos,
+                do_requeue=requeue, requeue_passes=rq_passes,
                 window_minutes=window_minutes,
                 max_drift_km=max_drift_km, min_confidence=min_confidence,
                 on_progress=on_prog)

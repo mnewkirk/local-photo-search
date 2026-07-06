@@ -3286,7 +3286,8 @@ async def api_maintenance_sweep(request: Request):
     """M25 — SSE stream of the dependency-ordered backfill sweep.
 
     Body (all optional; defaults match the CLI, ``apply`` defaults False):
-      {"apply"?, "do_colors"?, "do_stacking"?, "do_recluster"?,
+      {"apply"?, "do_colors"?, "do_stacking"?, "do_recluster"?, "do_dedup"?,
+       "do_requeue"?, "requeue_passes"?,
        "window_minutes"?, "max_drift_km"?, "min_confidence"?}
 
     Wraps ``maintenance.run_maintenance_sweep`` in a worker thread and bridges
@@ -3317,6 +3318,10 @@ async def api_maintenance_sweep(request: Request):
     do_match = bool(data.get("do_match", False))
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
+    do_requeue = bool(data.get("do_requeue", False))
+    requeue_passes = data.get("requeue_passes") or None
+    if requeue_passes is not None and not isinstance(requeue_passes, (list, tuple)):
+        raise HTTPException(400, "requeue_passes must be a list of pass names")
     window_minutes = int(data.get("window_minutes", 30))
     max_drift_km = float(data.get("max_drift_km", 25.0))
     min_confidence = float(data.get("min_confidence", 0.0))
@@ -3354,6 +3359,7 @@ async def api_maintenance_sweep(request: Request):
                 "do_match": do_match,
                 "do_recluster": do_recluster,
                 "do_dedup": do_dedup,
+                "do_requeue": do_requeue,
             })
             with _get_db() as db:
                 result = run_maintenance_sweep(
@@ -3364,6 +3370,8 @@ async def api_maintenance_sweep(request: Request):
                     do_match=do_match,
                     do_recluster=do_recluster,
                     do_dedup=do_dedup,
+                    do_requeue=do_requeue,
+                    requeue_passes=tuple(requeue_passes) if requeue_passes else None,
                     window_minutes=window_minutes,
                     max_drift_km=max_drift_km,
                     min_confidence=min_confidence,

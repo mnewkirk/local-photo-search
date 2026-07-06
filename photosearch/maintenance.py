@@ -34,6 +34,7 @@ logger = logging.getLogger("photosearch.maintenance")
 # decisions — gate it to a slower/manual cadence per the M25 plan).
 SWEEP_STAGE_ORDER = (
     "dedup_photos",
+    "requeue",
     "geocode",
     "normalize",
     "infer",
@@ -521,6 +522,100 @@ def _stage_dedup_photos(db, apply, emit, check_abort):
             "vec_cleaned": vec.get("clip_deleted", 0) + vec.get("face_deleted", 0)}
 
 
+# Worker LLM/tag passes the requeue stage can re-open, with each pass's
+# photos column and its upstream dependency (category-content / keywords are
+# text-only passes derived from the description, so a photo with no description
+# is *blocked upstream* on describe — not stuck — and must be excluded).
+_REQUEUE_PASS_COLUMNS = {
+    "describe":         ("description", ""),
+    "category-content": ("categories",  " AND description IS NOT NULL AND description != ''"),
+    "category-visual":  ("visual_tags", ""),
+    "keywords":         ("keywords",    " AND description IS NOT NULL AND description != ''"),
+}
+_DEFAULT_REQUEUE_PASSES = ("describe", "category-content", "category-visual", "keywords")
+
+
+def _requeue_stuck_ids(db, pass_type):
+    """IDs the worker queue will *never* re-claim for ``pass_type`` yet still
+    lack the output — the "silently stuck" set.
+
+    A photo is claimable (already queued) only when ``col IS NULL`` AND it has
+    no attempts-capped ``worker_processed`` row (see ``get_unprocessed_photos``
+    in db.py). So a photo is stuck iff it's missing the output but *not*
+    claimable, which reduces to two disjoint cases:
+      (a) the column holds a non-NULL empty value ('' or '[]') — the queue's
+          ``col IS NULL`` check skips it (llava/qwen regurgitation drops land
+          here), or
+      (b) the column IS NULL but an ``attempts >= MAX_PROCESS_ATTEMPTS`` row
+          has retired it from the queue.
+    """
+    from .db import MAX_PROCESS_ATTEMPTS
+    col, dep = _REQUEUE_PASS_COLUMNS[pass_type]
+    rows = db.conn.execute(
+        f"""SELECT id FROM photos p
+            WHERE ({col} IS NULL OR {col} = '' OR {col} = '[]'){dep}
+              AND ({col} IS NOT NULL
+                   OR EXISTS (SELECT 1 FROM worker_processed wp
+                              WHERE wp.photo_id = p.id AND wp.pass_type = ?
+                                AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}))""",
+        (pass_type,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _stage_requeue(db, apply, emit, check_abort, passes=_DEFAULT_REQUEUE_PASSES):
+    """Re-open worker passes for photos the fleet will otherwise never retry.
+
+    Opt-in (``do_requeue``): deliberately bypasses the ``attempts`` cap, so it
+    can re-churn genuinely-unprocessable files — run it when you've fixed the
+    root cause (a flaky LLM backend, a swapped vision model) and want the
+    now-stuck backlog re-attempted. Mirrors ``worker_api.clear_pass`` for the
+    describe / category-content / category-visual / keywords columns: NULLs the
+    column and deletes the ``worker_processed`` rows so the photo re-enters the
+    claim set. Nothing is computed here — the worker fleet does the work on its
+    next claim.
+    """
+    by_pass = {}
+    would = 0
+    for pt in passes:
+        if pt not in _REQUEUE_PASS_COLUMNS:
+            continue
+        check_abort()
+        ids = _requeue_stuck_ids(db, pt)
+        by_pass[pt] = {"count": len(ids), "ids": ids}
+        would += len(ids)
+
+    if would == 0:
+        return {"stage": "requeue", "would": 0, "applied": 0, "status": "skipped",
+                "by_pass": {pt: 0 for pt in by_pass}}
+    if not apply:
+        return {"stage": "requeue", "would": would, "applied": 0, "status": "preview",
+                "by_pass": {pt: v["count"] for pt, v in by_pass.items()}}
+
+    c = db.conn
+    applied = 0
+    applied_by_pass = {}
+    for pt, v in by_pass.items():
+        col = _REQUEUE_PASS_COLUMNS[pt][0]
+        ids = v["ids"]
+        cleared = 0
+        for i in range(0, len(ids), 500):
+            check_abort()
+            batch = ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            c.execute(f"UPDATE photos SET {col} = NULL WHERE id IN ({ph})", batch)
+            c.execute(f"DELETE FROM worker_processed WHERE pass_type = ? "
+                      f"AND photo_id IN ({ph})", [pt] + batch)
+            cleared += len(batch)
+        applied_by_pass[pt] = cleared
+        applied += cleared
+        emit({"phase": "sweep", "stage": "requeue", "status": "running",
+              "done": applied, "total": would, "message": f"{pt}: {cleared}"})
+    db.conn.commit()
+    return {"stage": "requeue", "would": would, "applied": applied,
+            "status": "done", "by_pass": applied_by_pass}
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -534,6 +629,8 @@ def run_maintenance_sweep(
     do_match: bool = True,
     do_recluster: bool = False,
     do_dedup: bool = False,
+    do_requeue: bool = False,
+    requeue_passes: Optional[tuple] = None,
     window_minutes: int = 30,
     max_drift_km: float = 25.0,
     min_confidence: float = 0.0,
@@ -550,6 +647,11 @@ def run_maintenance_sweep(
         do_recluster: opt-in — clears ignored_clusters, so off by default.
         do_dedup: opt-in — DELETES duplicate photos (destructive), so off by
             default. Runs first so downstream stages work on the deduped set.
+        do_requeue: opt-in — re-opens stuck worker LLM/tag passes (describe /
+            category-content / category-visual / keywords) by clearing their
+            worker_processed markers so the fleet re-claims them. Bypasses the
+            attempts cap, so off by default (run it after fixing a root cause).
+        requeue_passes: restrict do_requeue to these passes (default: all four).
         window_minutes / max_drift_km / min_confidence: infer-locations tuning.
         on_progress: callback(dict) invoked per stage (and inside long stages)
             with a {"phase": "sweep", "stage": ..., "status": ...} event.
@@ -565,6 +667,11 @@ def run_maintenance_sweep(
     # Dedup first (when enabled) so every later stage skips the redundant copies.
     if do_dedup:
         plan.append(("dedup_photos", lambda: _stage_dedup_photos(db, apply, emit, check_abort)))
+    # Re-open stuck worker passes early so the fleet can start draining them
+    # while the CPU backfill stages below run. It only clears markers (no compute).
+    if do_requeue:
+        _rq_passes = requeue_passes or _DEFAULT_REQUEUE_PASSES
+        plan.append(("requeue", lambda: _stage_requeue(db, apply, emit, check_abort, passes=_rq_passes)))
     plan += [
         ("geocode", lambda: _stage_geocode(db, apply, emit, check_abort)),
         ("normalize", lambda: _stage_normalize(db, apply, emit, check_abort)),

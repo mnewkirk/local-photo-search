@@ -716,6 +716,7 @@
     // maintenance.SWEEP_STAGE_ORDER).
     var SWEEP_STAGE_LABELS = {
       dedup_photos: 'Prune duplicate photos',
+      requeue: 'Re-queue stuck worker passes',
       geocode: 'Reverse-geocode place names',
       normalize: 'Structured location columns',
       infer: 'Infer GPS from neighbors',
@@ -1189,6 +1190,7 @@
       var _m = useState(false);  var doMatch = _m[0]; var setMatch = _m[1];
       var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
       var _dd = useState(false); var doDedup = _dd[0]; var setDedup = _dd[1];
+      var _rq = useState(false); var doRequeue = _rq[0]; var setRequeue = _rq[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
       var _stg = useState({}); var stages = _stg[0]; var setStages = _stg[1];
       var _r = useState(null);  var result = _r[0]; var setResult = _r[1];
@@ -1215,6 +1217,12 @@
           + 'copy in each duplicate group is kept; faces cascade). This is '
           + 'destructive — reversible only by re-indexing the file. Continue?'
         )) return;
+        if (doApply && doRequeue && !confirm(
+          'Re-queue clears the processed-markers for stuck describe/category/'
+          + 'keyword passes so the worker fleet re-attempts them. It bypasses the '
+          + 'retry cap — only useful once the root cause (flaky LLM backend, wrong '
+          + 'model) is fixed and a fleet is running. Continue?'
+        )) return;
         if (doApply && !confirm(
           'Apply mode WRITES to the database (idempotent, missing-only). Continue?'
         )) return;
@@ -1236,6 +1244,7 @@
               do_match: doMatch,
               do_recluster: doRecluster,
               do_dedup: doDedup,
+              do_requeue: doRequeue,
             }),
             signal: controller.signal,
           });
@@ -1320,7 +1329,7 @@
           .finally(function() { setVBusy(false); });
       }
 
-      var order = ['dedup_photos', 'geocode', 'normalize', 'infer', 'normalize_inferred',
+      var order = ['dedup_photos', 'requeue', 'geocode', 'normalize', 'infer', 'normalize_inferred',
                    'colors', 'stacking', 'match_faces', 'resolve_dups', 'recluster'];
       var stageRows = order.filter(function(s) { return stages[s]; }).map(function(s) {
         var st = stages[s];
@@ -1391,7 +1400,11 @@
             e('label', { title: 'Deletes duplicate photos (same image imported twice), keeping the most-curated copy. Destructive; runs first.' },
               e('input', { type: 'checkbox', checked: doDedup, disabled: busy,
                 onChange: function(ev) { setDedup(ev.target.checked); } }),
-              'Prune duplicate photos (deletes)')
+              'Prune duplicate photos (deletes)'),
+            e('label', { title: 'Clears processed-markers for photos stuck on describe/category/keyword passes (non-NULL empties or attempts-capped) so the worker fleet re-attempts them. Bypasses the retry cap; the fleet does the work.' },
+              e('input', { type: 'checkbox', checked: doRequeue, disabled: busy,
+                onChange: function(ev) { setRequeue(ev.target.checked); } }),
+              'Re-queue stuck passes')
           ),
           e('div', { className: 'stack-actions' },
             busy
