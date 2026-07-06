@@ -200,6 +200,23 @@
       outline: 3px solid #fff;
       outline-offset: -3px;
     }
+    /* Geotag place chip on a result tile */
+    .place-badge {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      max-width: 70%;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: rgba(74, 158, 255, 0.82);
+      font-size: 11px;
+      font-weight: 600;
+      color: #fff;
+      z-index: 2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .grid-item .select-check {
       position: absolute;
       top: 8px;
@@ -1467,6 +1484,11 @@
         onClick,
       },
         multiSelect && e('div', { className: 'select-check' }, isSelected ? '\u2713' : ''),
+        photo.place_name && e('div', {
+          className: 'place-badge',
+          title: photo.place_name,
+          style: multiSelect ? { left: 44 } : null,
+        }, '\ud83d\udccd ' + photo.place_name.split(',')[0].trim()),
         showBadge && e('div', {
           className: 'stack-badge',
           onClick: (ev) => {

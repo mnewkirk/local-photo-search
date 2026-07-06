@@ -204,7 +204,7 @@ def select_best_photos(
         lo = date_from or "0000-01-01"
         hi = date_to or "9999-12-31"
         rows = db.conn.execute(
-            "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath "
+            "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath, place_name "
             "FROM photos WHERE date_taken IS NOT NULL "
             "AND substr(date_taken, 1, 10) >= ? AND substr(date_taken, 1, 10) <= ?",
             (lo, hi),
@@ -222,7 +222,7 @@ def select_best_photos(
 
         # Get all photos in the directory
         all_rows = db.conn.execute(
-            "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath "
+            "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath, place_name "
             "FROM photos"
         ).fetchall()
 
@@ -546,7 +546,8 @@ def load_selections(db: PhotoDB, directory: str) -> Optional[list[dict]]:
     directory = _resolve_scope_key(directory)
     rows = db.conn.execute(
         """SELECT rs.photo_id, rs.selected, rs.cluster_id, rs.rank_in_cluster,
-                  p.filepath, p.filename, p.aesthetic_score, p.date_taken, p.raw_filepath
+                  p.filepath, p.filename, p.aesthetic_score, p.date_taken,
+                  p.raw_filepath, p.place_name
            FROM review_selections rs
            JOIN photos p ON p.id = rs.photo_id
            WHERE rs.directory = ?

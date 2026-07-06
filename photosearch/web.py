@@ -2101,6 +2101,7 @@ def api_review_run(
                 "cluster_id": p.get("cluster_id"),
                 "rank_in_cluster": p.get("rank_in_cluster"),
                 "has_raw": bool(p.get("raw_filepath")),
+                "place_name": p.get("place_name"),
             }
             stack_info = db.get_photo_stack(p["id"])
             if stack_info:
@@ -2149,6 +2150,7 @@ def api_review_load(
                 "cluster_id": p.get("cluster_id"),
                 "rank_in_cluster": p.get("rank_in_cluster"),
                 "has_raw": bool(p.get("raw_filepath")),
+                "place_name": p.get("place_name"),
             }
             stack_info = db.get_photo_stack(p["photo_id"])
             if stack_info:

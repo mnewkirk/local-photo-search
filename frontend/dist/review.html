@@ -325,6 +325,35 @@
     }
     .timeline-day-header .day-date { font-size: 16px; font-weight: 700; }
     .timeline-day-header .day-meta { font-size: 12px; color: var(--text-muted); }
+    .timeline-day-header .day-places {
+      font-size: 12px;
+      color: var(--accent);
+      font-weight: 600;
+      margin-left: auto;
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 55%;
+    }
+    /* Geotag place chip on a photo tile */
+    .place-badge {
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 78%;
+      padding: 2px 9px;
+      border-radius: 10px;
+      background: rgba(74, 158, 255, 0.82);
+      font-size: 11px;
+      font-weight: 600;
+      color: #fff;
+      z-index: 5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .tier-legend {
       display: flex;
       align-items: center;
@@ -994,8 +1023,17 @@
           if (!dayMap.has(day)) dayMap.set(day, []);
           dayMap.get(day).push(m);
         });
+        // Short, deduped locality names per day (geotag highlight).
+        const shortPlace = (s) => (s || '').split(',')[0].trim();
         const days = Array.from(dayMap.entries())
-          .map(([date, ms]) => ({ date, moments: ms }))
+          .map(([date, ms]) => {
+            const places = [];
+            ms.forEach(m => m.members.forEach(p => {
+              const sp = shortPlace(p.place_name);
+              if (sp && !places.includes(sp)) places.push(sp);
+            }));
+            return { date, moments: ms, places };
+          })
           .sort((a, b) => {
             if (a.date === 'Undated') return 1;
             if (b.date === 'Undated') return -1;
@@ -1609,7 +1647,7 @@
     // -----------------------------------------------------------------------
     function ReviewGridItem({ photo, dimmed, onClick, onToggle, isStackMember,
                               expandedStacks, toggleStack,
-                              tier, momentMember, extraCount, expanded, onExpand }) {
+                              tier, momentMember, extraCount, expanded, onExpand, showPlace }) {
       const [loaded, setLoaded] = useState(false);
       const [error, setError] = useState(false);
 
@@ -1647,8 +1685,14 @@
           },
         }, isExpanded ? '\u2715' : '\u00d7' + photo.stack_count),
 
-        // Cluster badge
-        photo.cluster_id != null &&
+        // Place chip (geotag highlight) — takes the top-center slot in the
+        // timeline where the location matters more than the cluster id.
+        showPlace && photo.place_name &&
+          e('div', { className: 'place-badge', title: photo.place_name },
+            '📍 ' + photo.place_name.split(',')[0].trim()),
+
+        // Cluster badge (suppressed when we're showing the place chip instead)
+        !showPlace && photo.cluster_id != null &&
           e('div', { className: 'cluster-badge' }, 'C' + photo.cluster_id),
 
         // Quality badge
@@ -1707,6 +1751,7 @@
             tier: m.tier,
             extraCount: extra,
             expanded,
+            showPlace: true,
             onExpand: () => toggleMoment(m.key),
             onClick: () => openModal(m.hero),
             onToggle: (ev) => { ev.stopPropagation(); togglePhoto(m.hero.id); },
@@ -1717,6 +1762,7 @@
             key: p.id,
             photo: p,
             momentMember: true,
+            showPlace: true,
             onClick: () => openModal(p),
             onToggle: (ev) => { ev.stopPropagation(); togglePhoto(p.id); },
           })));
@@ -1743,6 +1789,10 @@
               e('span', { className: 'day-date' }, fmtDay(day.date)),
               e('span', { className: 'day-meta' },
                 day.moments.length + ' moment' + (day.moments.length !== 1 ? 's' : '')),
+              day.places && day.places.length > 0 &&
+                e('span', { className: 'day-places', title: day.places.join(' · ') },
+                  '📍 ' + day.places.slice(0, 4).join(' · ')
+                  + (day.places.length > 4 ? ' +' + (day.places.length - 4) : '')),
             ),
             e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
               ...day.moments.flatMap(renderMoment),

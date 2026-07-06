@@ -18,8 +18,8 @@ from photosearch import tools
 # Read-only tools advertised by default (include_images=True, include_writes=False).
 READ_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
-    "search_photos", "summarize", "representatives", "rerank_photos",
-    "get_photo", "get_photo_image",
+    "search_photos", "summarize", "representatives", "daily_highlights",
+    "rerank_photos", "get_photo", "get_photo_image",
 }
 # M26b mutation tools — gated out of the default projections.
 WRITE_TOOLS = {"set_photo_location", "set_photo_tags", "add_to_collection"}
@@ -617,3 +617,52 @@ def test_representatives_max_buckets_orders_best_first(db):
 def test_representatives_max_buckets_spec_exposed():
     spec = {s.name: s for s in tools.all_tools()}["representatives"]
     assert "max_buckets" in spec.parameters["properties"]
+
+
+# ---------------------------------------------------------------------------
+# daily_highlights
+# ---------------------------------------------------------------------------
+
+def test_daily_highlights_registered_and_schema():
+    spec = {s.name: s for s in tools.all_tools()}.get("daily_highlights")
+    assert spec is not None
+    props = spec.parameters["properties"]
+    assert "per_day" in props and "window_minutes" in props
+
+
+def test_daily_highlights_collapses_within_window(db):
+    # Fixture: 5 photos on 2026-03-13 at 10:00, 10:05, 11:30, 14:00, 16:00.
+    # The 10:00 (6.2) and 10:05 (5.4) are 5 min apart → collapse to the best.
+    res = tools.call_tool(db, "daily_highlights",
+                          {"per_day": 20, "window_minutes": 10})
+    assert res["returned"] == 4
+    names = [r["filename"] for r in res["results"]]
+    assert "DSC04878.JPG" in names       # 10:00, higher score → kept
+    assert "DSC04880.JPG" not in names   # 10:05, near-dup → dropped
+    # Chronological output order.
+    dts = [r["date_taken"] for r in res["results"]]
+    assert dts == sorted(dts)
+
+
+def test_daily_highlights_window_zero_keeps_all(db):
+    res = tools.call_tool(db, "daily_highlights", {"window_minutes": 0})
+    assert res["returned"] == 5
+
+
+def test_daily_highlights_per_day_cap(db):
+    res = tools.call_tool(db, "daily_highlights",
+                          {"per_day": 2, "window_minutes": 10})
+    assert res["returned"] == 2
+    # Keeps the two best distinct moments (9.1 and 8.3).
+    scores = sorted(r["aesthetic_score"] for r in res["results"])
+    assert scores == [8.3, 9.1]
+
+
+def test_daily_highlights_day_summary_places(db):
+    res = tools.call_tool(db, "daily_highlights", {"window_minutes": 10})
+    assert res["days"] == 1
+    summary = res["day_summary"][0]
+    assert summary["day"] == "2026-03-13"
+    assert "Big Sur, CA" in summary["places"]
+    # Every result carries its geotagged place for location highlighting.
+    assert all("place_name" in r for r in res["results"])

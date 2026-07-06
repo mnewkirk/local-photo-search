@@ -1084,6 +1084,130 @@ _register(ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Tool: daily_highlights  (best-per-day, near-dup-collapsed, chronological)
+# ---------------------------------------------------------------------------
+
+_DAILY_MAX_PER_DAY = 50
+
+
+def _h_daily_highlights(db: PhotoDB, args: dict) -> dict:
+    per_day = _clamp(args.get("per_day"), 20, 1, _DAILY_MAX_PER_DAY)
+    try:
+        window_min = float(args.get("window_minutes"))
+    except (TypeError, ValueError):
+        window_min = 10.0
+    window_min = max(0.0, min(window_min, 1440.0))
+    window_s = window_min * 60.0
+
+    where, params = _build_filter_sql(db, args)
+    # Best-first within each day so the dedup keeps the STRONGEST shot of each
+    # burst/time window; only rows with a parseable YYYY-MM-DD date qualify.
+    sql = (
+        "SELECT photos.*, substr(date_taken,1,10) AS _day, "
+        "(SELECT sm.stack_id FROM stack_members sm WHERE sm.photo_id = photos.id) AS _stack "
+        f"FROM photos WHERE ({where}) AND "
+        "date_taken GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
+        "ORDER BY _day, aesthetic_score IS NULL, aesthetic_score DESC LIMIT 20000"
+    )
+    try:
+        rows = [dict(r) for r in db.conn.execute(sql, params).fetchall()]
+    except Exception as exc:
+        return {"error": f"daily_highlights failed: {exc}"}
+
+    # Per-day near-duplicate collapse: walking best-first, drop a photo that is
+    # in the same burst stack as an already-kept one, or within window_minutes
+    # of one — so each time window yields its single best frame.
+    kept: list = []
+    per_day_kept: dict = {}
+    for d in rows:
+        day = d.get("_day")
+        sel = per_day_kept.setdefault(day, [])
+        if len(sel) >= per_day:
+            continue
+        stack = d.get("_stack")
+        if stack is not None and any(s.get("_stack") == stack for s in sel):
+            continue
+        t = _parse_dt(d.get("date_taken"))
+        if window_s > 0 and t is not None and any(
+                (st := _parse_dt(s.get("date_taken"))) is not None
+                and abs((t - st).total_seconds()) < window_s for s in sel):
+            continue
+        sel.append(d)
+        kept.append(d)
+
+    # Present chronologically (day asc, then within-day time asc).
+    kept.sort(key=lambda d: (d.get("date_taken") or ""))
+
+    # Per-day rollups, including the distinct geotagged places seen that day.
+    days_summary = []
+    for day in sorted(per_day_kept.keys()):
+        day_rows = [d for d in kept if d.get("_day") == day]
+        places: list = []
+        for d in day_rows:
+            p = d.get("place_name")
+            if p and p not in places:
+                places.append(p)
+        days_summary.append({"day": day, "count": len(day_rows), "places": places[:8]})
+
+    return {
+        "per_day": per_day,
+        "window_minutes": window_min,
+        "days": len(days_summary),
+        "returned": len(kept),
+        "day_summary": days_summary,
+        "results": [_compact_hit(d) for d in kept],
+    }
+
+
+_register(ToolSpec(
+    name="daily_highlights",
+    description=(
+        "A chronological day-by-day highlight reel: the best photos PER DAY with "
+        "near-duplicates collapsed. For each day it keeps up to `per_day` photos "
+        "(default 20), and within each day it keeps only the single best frame of "
+        "any burst/near-duplicate group — one representative per burst stack and "
+        "per `window_minutes` time window (default 10) — then returns everything "
+        "in CHRONOLOGICAL order. Use this for 'the best photos from <trip / date "
+        "range>, top N per day, chronological, no duplicates'. search_photos (a "
+        "flat ranked list) and representatives (best-first per year/month/place, "
+        "not per-day and not time-collapsed) CANNOT express it. Same structured "
+        "filters as search_photos (no free-text `query`). Each day's distinct "
+        "geotagged places come back in `day_summary[].places`. Example: 'best "
+        "photos between 2026-06-28 and 2026-07-04, top 20 per day, chronological, "
+        "avoid duplicates within 10 minutes' → date_from='2026-06-28', "
+        "date_to='2026-07-04', per_day=20, window_minutes=10."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "date_from": {"type": "string", "description": "Earliest date, YYYY-MM-DD."},
+            "date_to": {"type": "string", "description": "Latest date, YYYY-MM-DD."},
+            "per_day": {"type": "integer",
+                        "description": "Max photos per day (default 20, max 50)."},
+            "window_minutes": {"type": "number",
+                        "description": "Collapse near-duplicates within this many minutes "
+                        "to their single best frame (default 10; 0 = only collapse "
+                        "formal burst stacks)."},
+            "people": {"type": "array", "items": {"type": "string"},
+                       "description": "Registered names; matches photos with ALL of them."},
+            "location": {"type": "string", "description": "Place/region name."},
+            "category": {"type": "string", "description": "Exact content category."},
+            "visual_tag": {"type": "string", "description": "Visual-quality tag."},
+            "keyword": {"type": "string", "description": "Keyword substring."},
+            "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            "only_these_people": {"type": "boolean",
+                "description": "Keep only photos whose ONLY faces are the named "
+                "`people` (no others). Requires `people`."},
+            "faces_in_frame": {"type": "boolean",
+                "description": "Keep only photos where no face is cropped at the edge."},
+        },
+        "additionalProperties": False,
+    },
+    handler=_h_daily_highlights,
+))
+
+
+# ---------------------------------------------------------------------------
 # Tool: get_photo
 # ---------------------------------------------------------------------------
 
