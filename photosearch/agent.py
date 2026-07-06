@@ -673,10 +673,12 @@ def run_agent(
                         result = {"error": f"unknown tool: {name}"}
                     except Exception as exc:
                         result = {"error": str(exc)}
-                    if (name in ("search_photos", "representatives", "rerank_photos")
+                    if (name in ("search_photos", "representatives", "rerank_photos",
+                                 "daily_highlights")
                             and isinstance(result, dict) and "results" in result):
                         last_photos = result.get("results", [])
-                        last_total = result.get("total", len(last_photos))
+                        last_total = result.get("total", result.get("returned",
+                                                                    len(last_photos)))
                     summ = _summarize(name, result)
                     rec = {"name": name, "args": call.get("arguments", {}), "summary": summ,
                            "step": step + 1, "t": round(time.time() - session["started"], 1)}

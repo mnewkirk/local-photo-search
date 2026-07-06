@@ -57,6 +57,22 @@ def test_loop_search_then_answer(db, monkeypatch):
     assert events[-1]["text"] == "Found 3 photos of Alex."
 
 
+def test_daily_highlights_results_render(db, monkeypatch):
+    """daily_highlights results must reach the on-page `photos` event — the
+    regression where the UI showed the prose answer but 0 photos because the
+    agent only promoted a hardcoded set of tools' results."""
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("daily_highlights", {"per_day": 20, "window_minutes": 10}),
+        _answer("Here is the day-by-day highlight reel."),
+    ))
+    events = _run(db, "best photos per day, chronological, no duplicates")
+    assert [t for t in _types(events) if t != "step"] == \
+        ["tool_call", "tool_result", "photos", "answer"]
+    photos = next(e for e in events if e["type"] == "photos")
+    assert len(photos["results"]) > 0
+    assert photos["total"] == len(photos["results"])  # falls back to `returned`
+
+
 def test_loop_grounds_then_searches(db, monkeypatch):
     # Model lists people first, then searches — two tool steps, then answers.
     monkeypatch.setattr(agent, "_chat", _script(
