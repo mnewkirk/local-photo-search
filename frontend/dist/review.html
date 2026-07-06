@@ -552,6 +552,8 @@
       const p = new URLSearchParams(window.location.search);
       return {
         folder: p.get('folder') || '',
+        date_from: p.get('date_from') || '',
+        date_to: p.get('date_to') || '',
         target_pct: p.get('target_pct') || '10',
         view: p.get('view') || 'all',
         grid: p.get('grid') || 'normal',
@@ -566,6 +568,12 @@
       const [folders, setFolders] = useState([]);  // [{path, max_date}, ...]
       const [selectedFolder, setSelectedFolder] = useState(initParams.folder);
       const [folderSearch, setFolderSearch] = useState(initParams.folder || '');
+      // 'folder' = review one folder; 'range' = review a date range spanning
+      // every folder (per-camera subfolders from the same shoot).
+      const [reviewMode, setReviewMode] = useState(
+        (initParams.date_from || initParams.date_to) ? 'range' : 'folder');
+      const [dateFrom, setDateFrom] = useState(initParams.date_from);
+      const [dateTo, setDateTo] = useState(initParams.date_to);
       const [folderDropdownOpen, setFolderDropdownOpen] = useState(false);
       const folderInputRef = useRef(null);
       const folderDropdownRef = useRef(null);
@@ -717,6 +725,16 @@
         });
       }, [folders, folderSearch]);
 
+      // The persistence key for the current review. Folder mode uses the folder
+      // path; date-range mode uses a synthetic "range:<from>..<to>" key that the
+      // API stores/looks-up verbatim across every folder in the window.
+      const reviewScope = useMemo(() => {
+        if (reviewMode === 'range') {
+          return (dateFrom && dateTo) ? ('range:' + dateFrom + '..' + dateTo) : '';
+        }
+        return selectedFolder;
+      }, [reviewMode, dateFrom, dateTo, selectedFolder]);
+
       // Close folder dropdown when clicking outside
       useEffect(() => {
         const handler = (ev) => {
@@ -731,16 +749,21 @@
       // Update browser URL with current review state
       const updateReviewUrl = useCallback((folder, pct, view, grid) => {
         const p = new URLSearchParams();
-        if (folder) p.set('folder', folder);
+        if (reviewMode === 'range') {
+          if (dateFrom) p.set('date_from', dateFrom);
+          if (dateTo) p.set('date_to', dateTo);
+        } else if (folder) {
+          p.set('folder', folder);
+        }
         if (pct && pct !== '10') p.set('target_pct', pct);
         if (view && view !== 'all') p.set('view', view);
         if (grid && grid !== 'normal') p.set('grid', grid);
         const newUrl = window.location.pathname + (p.toString() ? '?' + p.toString() : '');
         window.history.replaceState(null, '', newUrl);
-      }, []);
+      }, [reviewMode, dateFrom, dateTo]);
 
       const runReview = useCallback(() => {
-        if (!selectedFolder) return;
+        if (!reviewScope) return;
         setLoading(true);
         setPhotos([]);
         setStats(null);
@@ -749,10 +772,15 @@
         updateReviewUrl(selectedFolder, targetPct, viewMode, gridSize);
 
         const params = new URLSearchParams({
-          directory: selectedFolder,
           target_pct: targetPct === '' ? 0.10 : parseFloat(targetPct) / 100,
           distance_threshold: threshold === '' ? 0.0 : parseFloat(threshold),
         });
+        if (reviewMode === 'range') {
+          params.set('date_from', dateFrom);
+          params.set('date_to', dateTo);
+        } else {
+          params.set('directory', selectedFolder);
+        }
         fetch(API + '/api/review/run?' + params)
           .then(r => r.json())
           .then(data => {
@@ -761,12 +789,12 @@
             setLoading(false);
           })
           .catch(() => { setLoading(false); });
-      }, [selectedFolder, targetPct, threshold, viewMode, gridSize, updateReviewUrl]);
+      }, [reviewScope, reviewMode, dateFrom, dateTo, selectedFolder, targetPct, threshold, viewMode, gridSize, updateReviewUrl]);
 
       const loadExisting = useCallback(() => {
-        if (!selectedFolder) return;
+        if (!reviewScope) return;
         setLoading(true);
-        fetch(API + '/api/review/load?directory=' + encodeURIComponent(selectedFolder))
+        fetch(API + '/api/review/load?directory=' + encodeURIComponent(reviewScope))
           .then(r => r.json())
           .then(data => {
             if (data.photos && data.photos.length > 0) {
@@ -776,12 +804,12 @@
             setLoading(false);
           })
           .catch(() => { setLoading(false); });
-      }, [selectedFolder]);
+      }, [reviewScope]);
 
-      // Auto-load existing selections when folder changes
+      // Auto-load existing selections when the review scope changes
       useEffect(() => {
-        if (selectedFolder) loadExisting();
-      }, [selectedFolder]);
+        if (reviewScope) loadExisting();
+      }, [reviewScope]);
 
       const togglePhoto = useCallback((photoId) => {
         setPhotos(prev => {
@@ -874,20 +902,20 @@
       }, [photos, viewMode]);
 
       const doDownload = useCallback(() => {
-        if (!selectedFolder) return;
+        if (!reviewScope) return;
         // Navigating to the endpoint downloads the zip (attachment header) without
         // leaving the page. The Include-ARW toggle applies here too.
         const params = new URLSearchParams({
-          directory: selectedFolder,
+          directory: reviewScope,
           include_raw: exportRaw,
         });
         window.location.href = API + '/api/review/download?' + params;
-      }, [selectedFolder, exportRaw]);
+      }, [reviewScope, exportRaw]);
 
       const openExport = useCallback(() => {
-        if (!selectedFolder) return;
+        if (!reviewScope) return;
         const params = new URLSearchParams({
-          directory: selectedFolder,
+          directory: reviewScope,
           include_raw: exportRaw,
         });
         fetch(API + '/api/review/export?' + params)
@@ -897,7 +925,7 @@
             setShowExport(true);
           })
           .catch(() => {});
-      }, [selectedFolder, exportRaw]);
+      }, [reviewScope, exportRaw]);
 
       const copyExportList = useCallback(() => {
         const text = exportFiles.map(f => f.path).join('\n');
@@ -905,13 +933,15 @@
       }, [exportFiles]);
 
       const openSaveCollection = useCallback(() => {
-        // Default name from folder
-        const defaultName = selectedFolder || '';
+        // Default name from the folder, or the date range in range mode.
+        const defaultName = reviewMode === 'range'
+          ? ((dateFrom && dateTo) ? (dateFrom + ' – ' + dateTo) : '')
+          : (selectedFolder || '');
         setSaveCollName(defaultName);
         setSaveCollError(null);
         setSaveCollSuccess(null);
         setShowSaveCollection(true);
-      }, [selectedFolder]);
+      }, [reviewMode, dateFrom, dateTo, selectedFolder]);
 
       const doSaveCollection = useCallback(async () => {
         const name = saveCollName.trim();
@@ -1006,8 +1036,21 @@
       return e('div', null,
         // Header
         e(PS.SharedHeader, { activePage: 'review' },
+          // Mode toggle: review one folder, or a whole date range (all folders).
+          e('div', { className: 'view-toggle' },
+            e('button', {
+              className: reviewMode === 'folder' ? 'active' : '',
+              onClick: () => setReviewMode('folder'),
+              title: 'Review a single folder',
+            }, 'Folder'),
+            e('button', {
+              className: reviewMode === 'range' ? 'active' : '',
+              onClick: () => setReviewMode('range'),
+              title: 'Review every folder within a date range (e.g. multiple camera bodies from one shoot)',
+            }, 'Date range'),
+          ),
           // Folder selector — searchable input with dropdown
-          e('div', { className: 'control-group', style: { position: 'relative' }, ref: folderDropdownRef },
+          reviewMode === 'folder' && e('div', { className: 'control-group', style: { position: 'relative' }, ref: folderDropdownRef },
             e('input', {
               ref: folderInputRef,
               type: 'text',
@@ -1058,6 +1101,25 @@
               ),
             ),
           ),
+          // Date-range selector — spans every folder in the window
+          reviewMode === 'range' && e('div', { className: 'control-group' },
+            e('span', { className: 'control-label' }, 'From:'),
+            e('input', {
+              className: 'ctrl-input',
+              type: 'date',
+              value: dateFrom,
+              onChange: (ev) => setDateFrom(ev.target.value),
+              style: { width: 150 },
+            }),
+            e('span', { className: 'control-label' }, 'To:'),
+            e('input', {
+              className: 'ctrl-input',
+              type: 'date',
+              value: dateTo,
+              onChange: (ev) => setDateTo(ev.target.value),
+              style: { width: 150 },
+            }),
+          ),
           // Target %
           e('div', { className: 'control-group' },
             e('span', { className: 'control-label' }, 'Target:'),
@@ -1075,7 +1137,8 @@
           e('button', {
             className: 'btn btn-primary',
             onClick: runReview,
-            disabled: !selectedFolder || loading,
+            disabled: !reviewScope || loading,
+            title: reviewMode === 'range' && !reviewScope ? 'Pick a start and end date' : '',
           }, loading ? 'Analyzing...' : 'Run Review'),
         ),
 
@@ -1164,7 +1227,7 @@
         e('div', { className: 'content' },
           !photos.length && !loading && e('div', { className: 'empty-state' },
             e('h2', null, 'Shoot Review'),
-            e('p', null, 'Select a folder to analyze. The algorithm will cluster visually similar photos and pick the best from each group.'),
+            e('p', null, 'Pick a folder — or switch to Date range to review every folder in a window at once (e.g. multiple camera bodies from one shoot). The algorithm clusters visually similar photos and picks the best from each group.'),
             e('p', { style: { color: 'var(--text-muted)', fontSize: 13 } },
               'Aim for ~10% of your shoot \u2014 the best, most diverse selection.'),
           ),

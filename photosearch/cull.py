@@ -144,17 +144,24 @@ def _cluster_photos(
 
 def select_best_photos(
     db: PhotoDB,
-    directory: str,
+    directory: Optional[str] = None,
     target_pct: float = 0.10,
     distance_threshold: float = 0.0,
     min_quality: float = 4.0,
     high_quality: float = 6.0,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ) -> list[dict]:
-    """Select the best representative photos from a directory.
+    """Select the best representative photos from a directory or date range.
+
+    Provide either ``directory`` (single folder) or ``date_from``/``date_to``
+    (a date range spanning every folder — e.g. per-camera subfolders from the
+    same shoot). Date-range mode lets a single review cover multiple source
+    folders without picking each one.
 
     Args:
         db: Open PhotoDB instance.
-        directory: Absolute path to the photo directory.
+        directory: Absolute path to the photo directory (folder mode).
         target_pct: Target percentage of photos to select (~0.10 = 10%).
         distance_threshold: How similar photos must be to cluster together.
             Default 0.0 means adaptive (auto-determine from the data).
@@ -162,26 +169,53 @@ def select_best_photos(
         high_quality: Score threshold above which a photo is considered
             "high quality" — runner-ups in large clusters with scores above
             this are also included.
+        date_from: Inclusive start date ("YYYY-MM-DD") for date-range mode.
+        date_to: Inclusive end date ("YYYY-MM-DD") for date-range mode.
 
     Returns:
         List of dicts with photo info and selection metadata:
         [{"id", "filepath", "filename", "aesthetic_score", "cluster_id",
           "selected", "rank_in_cluster"}, ...]
     """
-    directory = str(Path(directory).resolve())
+    use_range = bool(date_from or date_to)
 
-    # Get all photos in the directory
-    all_rows = db.conn.execute(
-        "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath "
-        "FROM photos"
-    ).fetchall()
+    if use_range:
+        # Date-range mode: pull every photo whose date_taken falls in the
+        # window, regardless of which (per-camera) folder it lives in. Compare
+        # the leading YYYY-MM-DD so the bounds are inclusive whole days and
+        # separator-agnostic ("2026-03-13 10:00" and "2026-03-13T10:00" both
+        # match), and callers pass plain dates.
+        lo = date_from or "0000-01-01"
+        hi = date_to or "9999-12-31"
+        rows = db.conn.execute(
+            "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath "
+            "FROM photos WHERE date_taken IS NOT NULL "
+            "AND substr(date_taken, 1, 10) >= ? AND substr(date_taken, 1, 10) <= ?",
+            (lo, hi),
+        ).fetchall()
+        dir_photos = [
+            dict(row) | {"_abs_path": db.resolve_filepath(row["filepath"])}
+            for row in rows
+        ]
+        logger.info("Review (date range %s..%s): %d photos across all folders",
+                    date_from, date_to, len(dir_photos))
+    else:
+        if not directory:
+            return []
+        directory = str(Path(directory).resolve())
 
-    # Filter to the target directory — match both relative and absolute paths
-    dir_photos = []
-    for row in all_rows:
-        abs_path = db.resolve_filepath(row["filepath"])
-        if abs_path and abs_path.startswith(directory + "/"):
-            dir_photos.append(dict(row) | {"_abs_path": abs_path})
+        # Get all photos in the directory
+        all_rows = db.conn.execute(
+            "SELECT id, filepath, filename, aesthetic_score, date_taken, raw_filepath "
+            "FROM photos"
+        ).fetchall()
+
+        # Filter to the target directory — match both relative and absolute paths
+        dir_photos = []
+        for row in all_rows:
+            abs_path = db.resolve_filepath(row["filepath"])
+            if abs_path and abs_path.startswith(directory + "/"):
+                dir_photos.append(dict(row) | {"_abs_path": abs_path})
 
     if not dir_photos:
         return []
@@ -423,12 +457,25 @@ def select_best_photos(
 # Persistence — save/load selections
 # ---------------------------------------------------------------------------
 
+def _resolve_scope_key(key: str) -> str:
+    """Normalize a review scope key for the ``review_selections.directory`` slot.
+
+    Folder reviews are keyed by their resolved absolute path. Date-range
+    reviews use a synthetic ``range:<from>..<to>`` key that must be stored
+    verbatim — running it through ``Path().resolve()`` would corrupt it into a
+    cwd-relative path and break save/load matching.
+    """
+    if key.startswith("range:"):
+        return key
+    return str(Path(key).resolve())
+
+
 def save_selections(db: PhotoDB, directory: str, selections: list[dict]):
-    """Persist photo selections for a directory review session.
+    """Persist photo selections for a directory (or date-range) review session.
 
     Stores in the review_selections table so the web UI can load them.
     """
-    directory = str(Path(directory).resolve())
+    directory = _resolve_scope_key(directory)
 
     # Clear previous selections for this directory
     db.conn.execute(
@@ -451,7 +498,7 @@ def load_selections(db: PhotoDB, directory: str) -> Optional[list[dict]]:
 
     Returns list of {photo_id, selected, cluster_id, rank_in_cluster} or None.
     """
-    directory = str(Path(directory).resolve())
+    directory = _resolve_scope_key(directory)
     rows = db.conn.execute(
         """SELECT rs.photo_id, rs.selected, rs.cluster_id, rs.rank_in_cluster,
                   p.filepath, p.filename, p.aesthetic_score, p.date_taken, p.raw_filepath

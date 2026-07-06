@@ -383,3 +383,57 @@ class TestSelectionPersistence:
             assert "filename" in row
             assert "aesthetic_score" in row
             assert "filepath" in row
+
+
+# ---------------------------------------------------------------------------
+# Date-range mode (review across multiple folders in a window)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_SCIPY, reason="scipy required for selection tests")
+class TestDateRangeReview:
+    """Date-range mode selects photos across every folder in a window and
+    persists under a synthetic ``range:`` scope key."""
+
+    def test_range_selects_all_photos_in_window(self, cull_db):
+        """All 30 fixture photos fall on 2026-03-13, regardless of folder."""
+        result = select_best_photos(
+            cull_db, date_from="2026-03-13", date_to="2026-03-13"
+        )
+        assert len(result) == 30
+        assert any(p["selected"] for p in result)
+
+    def test_range_excludes_out_of_window(self, cull_db):
+        """A window with no photos returns an empty selection."""
+        result = select_best_photos(
+            cull_db, date_from="2020-01-01", date_to="2020-12-31"
+        )
+        assert result == []
+
+    def test_range_open_ended_bounds(self, cull_db):
+        """Only a start date (open upper bound) still matches the window."""
+        result = select_best_photos(cull_db, date_from="2026-01-01")
+        assert len(result) == 30
+
+    def test_range_scope_key_stored_verbatim(self, cull_db):
+        """A ``range:`` key must not be path-resolved on save/load."""
+        key = "range:2026-03-13..2026-03-13"
+        selections = select_best_photos(
+            cull_db, date_from="2026-03-13", date_to="2026-03-13"
+        )
+        save_selections(cull_db, key, selections)
+
+        # Stored under the exact synthetic key.
+        row = cull_db.conn.execute(
+            "SELECT COUNT(*) AS c FROM review_selections WHERE directory = ?", (key,)
+        ).fetchone()
+        assert row["c"] == len(selections)
+
+        loaded = load_selections(cull_db, key)
+        assert loaded is not None
+        saved_selected = {p["id"] for p in selections if p["selected"]}
+        loaded_selected = {r["photo_id"] for r in loaded if r["selected"]}
+        assert saved_selected == loaded_selected
+
+    def test_directory_none_without_range_returns_empty(self, cull_db):
+        """No directory and no date range → nothing to select."""
+        assert select_best_photos(cull_db) == []

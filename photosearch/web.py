@@ -2031,26 +2031,56 @@ def api_review_folders():
     return {"folders": [{"path": r["path"], "max_date": r["max_date"]} for r in rows]}
 
 
+def _resolve_review_scope(db, directory: str) -> str:
+    """Resolve a review scope key into the persistence key used everywhere.
+
+    Folder reviews get the photo_root prefix (so a relative folder name
+    resolves to an absolute path); date-range reviews use a synthetic
+    ``range:<from>..<to>`` key that is stored/looked-up verbatim.
+    """
+    if directory.startswith("range:"):
+        return directory
+    if db.photo_root and not Path(directory).is_absolute():
+        return str(Path(db.photo_root) / directory)
+    return directory
+
+
 @app.get("/api/review/run")
 def api_review_run(
-    directory: str = Query(..., description="Directory path to review"),
+    directory: str = Query("", description="Directory path to review (folder mode)"),
     target_pct: float = Query(0.10, description="Target selection percentage"),
     distance_threshold: float = Query(0.0, description="Clustering distance threshold (0 = adaptive)"),
+    date_from: str = Query("", description="Inclusive start date YYYY-MM-DD (date-range mode)"),
+    date_to: str = Query("", description="Inclusive end date YYYY-MM-DD (date-range mode)"),
 ):
-    """Run the culling algorithm on a directory and return selections."""
+    """Run the culling algorithm on a directory OR a date range and return
+    selections. Date-range mode spans every folder (per-camera subfolders from
+    the same shoot) so one review can cover multiple sources."""
     from .cull import select_best_photos, save_selections
 
-    with _get_db() as db:
-        # Resolve the directory — could be relative to photo_root
-        resolved_dir = directory
-        if db.photo_root and not Path(directory).is_absolute():
-            resolved_dir = str(Path(db.photo_root) / directory)
+    use_range = bool(date_from or date_to)
+    if not use_range and not directory:
+        raise HTTPException(400, "Provide either a directory or a date range")
 
-        selections = select_best_photos(
-            db, resolved_dir,
-            target_pct=target_pct,
-            distance_threshold=distance_threshold,
-        )
+    with _get_db() as db:
+        if use_range:
+            # Synthetic scope key so save/load/download all key off one string.
+            scope_key = f"range:{date_from or ''}..{date_to or ''}"
+            selections = select_best_photos(
+                db,
+                target_pct=target_pct,
+                distance_threshold=distance_threshold,
+                date_from=date_from or None,
+                date_to=date_to or None,
+            )
+        else:
+            scope_key = _resolve_review_scope(db, directory)
+            selections = select_best_photos(
+                db, scope_key,
+                target_pct=target_pct,
+                distance_threshold=distance_threshold,
+            )
+        resolved_dir = scope_key
 
         if not selections:
             return {"photos": [], "stats": {"total": 0, "selected": 0}}
@@ -2101,9 +2131,7 @@ def api_review_load(
     from .cull import load_selections
 
     with _get_db() as db:
-        resolved_dir = directory
-        if db.photo_root and not Path(directory).is_absolute():
-            resolved_dir = str(Path(db.photo_root) / directory)
+        resolved_dir = _resolve_review_scope(db, directory)
 
         selections = load_selections(db, resolved_dir)
         if not selections:
@@ -2163,9 +2191,7 @@ def api_review_export(
     from .cull import load_selections
 
     with _get_db() as db:
-        resolved_dir = directory
-        if db.photo_root and not Path(directory).is_absolute():
-            resolved_dir = str(Path(db.photo_root) / directory)
+        resolved_dir = _resolve_review_scope(db, directory)
 
         selections = load_selections(db, resolved_dir)
         if not selections:
@@ -2185,40 +2211,19 @@ def api_review_export(
     return {"files": files, "count": len(files)}
 
 
-@app.get("/api/review/download")
-def api_review_download(
-    directory: str = Query(..., description="Directory path"),
-    include_raw: bool = Query(False, description="Include ARW raw files in the zip"),
-):
-    """Stream a ZIP of the selected photos in a review folder — a real download,
-    unlike /export which only lists paths to copy. Originals are read from disk
-    (or fetched from the NAS in replica mode). Built to a temp file and deleted
-    after the response so a large selection never buffers in RAM on the N100."""
+def _build_photo_zip_response(entries: list, zipname: str):
+    """Stream a ZIP from ``(kind, arcname, abs_path_or_None, photo_id)`` entries.
+
+    Built to a temp file (deleted after the response) so a large selection
+    never buffers in RAM on the N100. Missing local files fall back to the NAS
+    full image in replica mode. Duplicate basenames across subfolders are
+    de-collided. Raises HTTPException(404) if nothing could be read. Shared by
+    the review-folder and collection download endpoints."""
     import tempfile
     import zipfile
     from starlette.background import BackgroundTask
-    from .cull import load_selections
 
-    with _get_db() as db:
-        resolved_dir = directory
-        if db.photo_root and not Path(directory).is_absolute():
-            resolved_dir = str(Path(db.photo_root) / directory)
-
-        selections = load_selections(db, resolved_dir)
-        chosen = [p for p in (selections or []) if p["selected"]]
-        if not chosen:
-            raise HTTPException(404, "No selected photos in that folder")
-
-        # Resolve every source while the DB is open (needed for NAS fallback).
-        entries = []  # (kind, arcname, abs_path_or_None, photo_id)
-        for p in chosen:
-            entries.append(("jpg", p["filename"], db.resolve_filepath(p["filepath"]), p["photo_id"]))
-            if include_raw and p.get("raw_filepath"):
-                raw_abs = db.resolve_filepath(p["raw_filepath"])
-                entries.append(("arw", Path(raw_abs).name if raw_abs else "",
-                                raw_abs, p["photo_id"]))
-
-    tmp = tempfile.NamedTemporaryFile(prefix="review_dl_", suffix=".zip", delete=False)
+    tmp = tempfile.NamedTemporaryFile(prefix="photo_dl_", suffix=".zip", delete=False)
     used: dict = {}   # de-collide duplicate basenames across subfolders
     added = 0
     try:
@@ -2252,12 +2257,44 @@ def api_review_download(
         os.unlink(tmp.name)
         raise HTTPException(404, "None of the selected files could be read")
 
-    zipname = f"{Path(directory).name or 'selected'}_selected.zip"
     return FileResponse(
         tmp.name, media_type="application/zip",
         headers={"Content-Disposition": _attachment_header(zipname)},
         background=BackgroundTask(os.unlink, tmp.name),
     )
+
+
+@app.get("/api/review/download")
+def api_review_download(
+    directory: str = Query(..., description="Directory path or range: scope key"),
+    include_raw: bool = Query(False, description="Include ARW raw files in the zip"),
+):
+    """Stream a ZIP of the selected photos in a review folder (or date range) —
+    a real download, unlike /export which only lists paths to copy."""
+    from .cull import load_selections
+
+    with _get_db() as db:
+        resolved_dir = _resolve_review_scope(db, directory)
+
+        selections = load_selections(db, resolved_dir)
+        chosen = [p for p in (selections or []) if p["selected"]]
+        if not chosen:
+            raise HTTPException(404, "No selected photos in that folder")
+
+        # Resolve every source while the DB is open (needed for NAS fallback).
+        entries = []  # (kind, arcname, abs_path_or_None, photo_id)
+        for p in chosen:
+            entries.append(("jpg", p["filename"], db.resolve_filepath(p["filepath"]), p["photo_id"]))
+            if include_raw and p.get("raw_filepath"):
+                raw_abs = db.resolve_filepath(p["raw_filepath"])
+                entries.append(("arw", Path(raw_abs).name if raw_abs else "",
+                                raw_abs, p["photo_id"]))
+
+    if directory.startswith("range:"):
+        stem = directory[len("range:"):].replace("..", "_to_") or "range"
+    else:
+        stem = Path(directory).name or "selected"
+    return _build_photo_zip_response(entries, f"{stem}_selected.zip")
 
 
 @app.get("/api/stats")
@@ -2963,6 +3000,46 @@ def api_get_collection(collection_id: int):
         collection["photo_count"] = len(photos)
 
     return {"collection": collection, "photos": photos}
+
+
+@app.get("/api/collections/{collection_id}/download")
+def api_collection_download(
+    collection_id: int,
+    photo_ids: str = Query("", description="Comma-separated photo ids to download; empty = whole collection"),
+    include_raw: bool = Query(False, description="Include ARW raw files in the zip"),
+):
+    """Stream a ZIP of a collection's photos. With no ``photo_ids`` the whole
+    collection is bundled; otherwise only the given ids (must belong to the
+    collection) — the multi-select subset from the collection UI."""
+    wanted = None
+    if photo_ids.strip():
+        try:
+            wanted = {int(x) for x in photo_ids.split(",") if x.strip()}
+        except ValueError:
+            raise HTTPException(400, "photo_ids must be a comma-separated list of integers")
+
+    with _get_db() as db:
+        collection = db.get_collection(collection_id)
+        if not collection:
+            raise HTTPException(404, "Collection not found")
+
+        photos = db.get_collection_photos(collection_id)
+        if wanted is not None:
+            photos = [p for p in photos if p["id"] in wanted]
+        if not photos:
+            raise HTTPException(404, "No photos to download")
+
+        entries = []  # (kind, arcname, abs_path_or_None, photo_id)
+        for p in photos:
+            entries.append(("jpg", p.get("filename") or "", db.resolve_filepath(p.get("filepath", "")), p["id"]))
+            if include_raw and p.get("raw_filepath"):
+                raw_abs = db.resolve_filepath(p["raw_filepath"])
+                entries.append(("arw", Path(raw_abs).name if raw_abs else "", raw_abs, p["id"]))
+
+    import re
+    safe_name = re.sub(r"[^\w.-]+", "_", collection.get("name") or f"collection_{collection_id}").strip("_")
+    suffix = "_selected" if wanted is not None else ""
+    return _build_photo_zip_response(entries, f"{safe_name or 'collection'}{suffix}.zip")
 
 
 @app.put("/api/collections/{collection_id}")

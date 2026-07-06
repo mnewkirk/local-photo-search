@@ -1402,6 +1402,21 @@
         load();
       };
 
+      // Download the whole collection as a ZIP (attachment header → the browser
+      // downloads without navigating away).
+      const doDownloadAll = () => {
+        window.location.href = `/api/collections/${collectionId}/download`;
+      };
+
+      // Download just the multi-selected subset (reuses the shift/right-click
+      // selection set already used for removal).
+      const doDownloadSelected = () => {
+        const ids = Array.from(selectedForRemoval);
+        if (!ids.length) return;
+        const params = new URLSearchParams({ photo_ids: ids.join(',') });
+        window.location.href = `/api/collections/${collectionId}/download?` + params;
+      };
+
       const doGoogleUpload = async (albumTitle, includeDesc, existingAlbumId, forceReupload, onProgress, signal, forceReuploadIds) => {
         const photoIds = photos.map(p => p.id);
         const payload = {
@@ -1486,6 +1501,11 @@
               title: 'Upload collection to Google Photos',
               style: { color: '#4a9eff' },
             }, '\uD83D\uDDBC\uFE0F Upload to Google Photos'),
+            photos.length > 0 && e('button', {
+              className: 'btn btn-sm',
+              onClick: doDownloadAll,
+              title: 'Download every photo in this collection as a ZIP',
+            }, '\u2193 Download All'),
             e('button', { className: 'btn btn-sm', onClick: () => setShowRename(true) }, 'Rename'),
             e('button', { className: 'btn btn-sm btn-danger', onClick: () => setShowDeleteConfirm(true) }, 'Delete'),
           ),
@@ -1503,6 +1523,7 @@
           e('span', null, `${selectedForRemoval.size} photo${selectedForRemoval.size !== 1 ? 's' : ''} selected`),
           e('div', { style: { display: 'flex', gap: 8 } },
             e('button', { className: 'btn btn-sm', onClick: () => setSelectedForRemoval(new Set()) }, 'Cancel'),
+            e('button', { className: 'btn btn-sm', onClick: doDownloadSelected, title: 'Download the selected photos as a ZIP' }, '↓ Download Selected'),
             e('button', { className: 'btn btn-sm btn-danger', onClick: doRemoveSelected }, 'Remove from Collection'),
           ),
         ),
@@ -1513,6 +1534,8 @@
         ),
 
         photos.length > 0 && e('div', { style: { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 8 } },
+          selectedForRemoval.size === 0 && e('span', { style: { marginRight: 'auto', fontSize: 11, color: 'var(--text-muted)' } },
+            'Shift- or right-click photos to select for download or removal'),
           e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc'] }),
           hasStacks && e('button', {
             className: 'btn btn-sm',
