@@ -306,6 +306,73 @@ class TestSelectBestPhotos:
         )
 
 
+@pytest.fixture
+def dup_heavy_db(tmp_path):
+    """A PhotoDB with one big near-identical high-quality cluster (20 photos)
+    plus 5 visually distinct photos — the shape that made the review select the
+    same scene many times over.
+    """
+    db_path = str(tmp_path / "dup_test.db")
+    db = PhotoDB(db_path)
+    photo_dir = tmp_path / "photos" / "shoot1"
+    photo_dir.mkdir(parents=True)
+    db.set_photo_root(str(tmp_path / "photos"))
+
+    # 20 near-identical, high-quality photos — one tight visual cluster.
+    dup_centroid = _make_unit_vec(seed=7)
+    idx = 0
+    for i in range(20):
+        fname = f"IMG_{idx:04d}.JPG"
+        (photo_dir / fname).write_bytes(b"fake")
+        rng = np.random.RandomState(500 + i)
+        v = dup_centroid + rng.randn(512).astype(np.float32) * 0.005
+        v /= np.linalg.norm(v)
+        pid = db.add_photo(filepath=f"shoot1/{fname}", filename=fname,
+                           date_taken=f"2026-03-13T10:{i:02d}:00",
+                           aesthetic_score=6.0 + i * 0.02)
+        db.add_clip_embedding(pid, v.tolist())
+        idx += 1
+
+    # 5 visually distinct photos, each its own cluster.
+    for c in range(5):
+        fname = f"IMG_{idx:04d}.JPG"
+        (photo_dir / fname).write_bytes(b"fake")
+        v = _make_unit_vec(seed=9000 + c * 111)
+        pid = db.add_photo(filepath=f"shoot1/{fname}", filename=fname,
+                           date_taken=f"2026-03-13T12:{c:02d}:00",
+                           aesthetic_score=5.5)
+        db.add_clip_embedding(pid, v.tolist())
+        idx += 1
+
+    db.conn.commit()
+    db._test_photo_dir = str(photo_dir)
+    yield db
+    db.close()
+
+
+@pytest.mark.skipif(not HAS_SCIPY, reason="scipy required for selection tests")
+class TestPerClusterCap:
+    """The top-up phases must not over-represent a single near-duplicate scene."""
+
+    def test_dup_cluster_capped(self, dup_heavy_db):
+        """Even with a generous target, the 20-photo near-dup cluster should
+        contribute at most _MAX_PER_CLUSTER selections."""
+        from photosearch.cull import _MAX_PER_CLUSTER
+
+        result = select_best_photos(
+            dup_heavy_db, dup_heavy_db._test_photo_dir, target_pct=0.5
+        )
+        from collections import Counter
+        counts = Counter(
+            p["cluster_id"] for p in result
+            if p["selected"] and p["cluster_id"] is not None
+        )
+        assert counts, "expected some selections"
+        assert max(counts.values()) <= _MAX_PER_CLUSTER, (
+            f"a single cluster over-represented: {dict(counts)}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Persistence tests
 # ---------------------------------------------------------------------------

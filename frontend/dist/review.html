@@ -309,6 +309,60 @@
       z-index: 5;
     }
 
+    /* Timeline / moments view */
+    .timeline-day { margin-bottom: 24px; }
+    .timeline-day-header {
+      position: sticky;
+      top: 0;
+      z-index: 6;
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      padding: 10px 4px 8px;
+      margin-bottom: 8px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }
+    .timeline-day-header .day-date { font-size: 16px; font-weight: 700; }
+    .timeline-day-header .day-meta { font-size: 12px; color: var(--text-muted); }
+    .tier-legend {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin: 2px 4px 12px;
+    }
+    .tier-legend .swatch {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      margin-right: 5px;
+      vertical-align: -1px;
+    }
+    .grid-item.tier-best { box-shadow: inset 0 0 0 3px var(--green); }
+    .grid-item.tier-good { box-shadow: inset 0 0 0 3px var(--yellow); }
+    .grid-item.moment-member { outline: 2px dashed rgba(255,255,255,0.25); outline-offset: -2px; }
+    .more-badge {
+      position: absolute;
+      bottom: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.72);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 10px;
+      z-index: 5;
+      cursor: pointer;
+      border: 1px solid rgba(255,255,255,0.25);
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+    .more-badge:hover { background: var(--accent); }
+
     /* Modal overlay */
     .modal-overlay {
       position: fixed;
@@ -596,6 +650,21 @@
       const [targetPct, setTargetPct] = useState(initParams.target_pct);
       const [threshold, setThreshold] = useState('0');
 
+      // ---- Timeline (moments) view state ----
+      // Consecutive selected photos of the same scene taken within this window
+      // collapse to one hero, so the timeline reads as distinct moments rather
+      // than near-identical repeats. Matches the "best of the stack within a
+      // ten-minute period" mental model.
+      const [timelineWindow, setTimelineWindow] = useState('10');
+      const [expandedMoments, setExpandedMoments] = useState(new Set());
+      const toggleMoment = useCallback((key) => {
+        setExpandedMoments(prev => {
+          const next = new Set(prev);
+          if (next.has(key)) next.delete(key); else next.add(key);
+          return next;
+        });
+      }, []);
+
       // ---- Stack expansion state ----
       const [expandedStacks, setExpandedStacks] = useState(new Set());
       const [stackMembers, setStackMembers] = useState({});
@@ -840,8 +909,101 @@
 
       const visiblePhotos = useMemo(() => {
         if (viewMode === 'selected') return photos.filter(p => p.selected);
+        if (viewMode === 'timeline') {
+          // Chronological selected — also the modal nav order for this view.
+          return photos.filter(p => p.selected).slice().sort((a, b) => {
+            const ta = a.date_taken || '', tb = b.date_taken || '';
+            return ta < tb ? -1 : ta > tb ? 1 : 0;
+          });
+        }
         return photos;
       }, [photos, viewMode]);
+
+      // Timeline: collapse near-duplicate selected photos into "moments" and
+      // group them by day. A moment = consecutive selected shots that are the
+      // same scene (shared review cluster within the window) or a tight burst.
+      // The hero is the best-scored member; the rest fold behind a "+N" chip.
+      const timelineMoments = useMemo(() => {
+        if (viewMode !== 'timeline') return null;
+        const windowMs = (parseFloat(timelineWindow) || 10) * 60000;
+        const BURST_MS = 120000;  // <=2 min apart = same burst regardless of cluster
+        const parseT = (s) => {
+          if (!s) return null;
+          const d = new Date(String(s).replace(' ', 'T'));
+          const t = d.getTime();
+          return isNaN(t) ? null : t;
+        };
+
+        const dated = [], undated = [];
+        visiblePhotos.forEach(p => {
+          const t = parseT(p.date_taken);
+          if (t == null) undated.push(p); else dated.push({ p, t });
+        });
+        dated.sort((a, b) => a.t - b.t);
+
+        const moments = [];
+        let cur = null;
+        dated.forEach(({ p, t }) => {
+          if (cur) {
+            const gap = t - cur.lastT;
+            const sameCluster = p.cluster_id != null && cur.clusters.has(p.cluster_id);
+            if (gap <= BURST_MS || (gap <= windowMs && sameCluster)) {
+              cur.members.push(p);
+              cur.lastT = t;
+              if (p.cluster_id != null) cur.clusters.add(p.cluster_id);
+              return;
+            }
+          }
+          cur = { startT: t, lastT: t, members: [p],
+                  clusters: new Set(p.cluster_id != null ? [p.cluster_id] : []) };
+          moments.push(cur);
+        });
+
+        // Selected photos with no parseable date still deserve a home — each
+        // becomes its own moment under an "Undated" day rather than vanishing.
+        undated.forEach(p => {
+          moments.push({ startT: Infinity, lastT: Infinity, members: [p],
+                         clusters: new Set(), _undated: true });
+        });
+
+        moments.forEach(m => {
+          m.members.sort((a, b) => (b.aesthetic_score || 0) - (a.aesthetic_score || 0));
+          m.hero = m.members[0];
+          m.key = 'm' + m.startT + '-' + m.hero.id;
+        });
+
+        // Tier the moments by their hero's score, relative to this shoot's
+        // distribution (terciles) so "best" is meaningful per-shoot.
+        const heroScores = moments
+          .map(m => m.hero.aesthetic_score || 0)
+          .filter(s => s > 0)
+          .sort((a, b) => a - b);
+        const pctl = (q) => heroScores.length
+          ? heroScores[Math.min(heroScores.length - 1, Math.floor(q * heroScores.length))]
+          : 0;
+        const goodCut = pctl(0.34), bestCut = pctl(0.67);
+        moments.forEach(m => {
+          const s = m.hero.aesthetic_score || 0;
+          m.tier = s >= bestCut ? 'best' : s >= goodCut ? 'good' : 'rest';
+        });
+
+        // Group moments by calendar day; keep "Undated" pinned to the end.
+        const dayMap = new Map();
+        moments.forEach(m => {
+          const day = m._undated ? 'Undated' : ((m.hero.date_taken || '').slice(0, 10) || 'Undated');
+          if (!dayMap.has(day)) dayMap.set(day, []);
+          dayMap.get(day).push(m);
+        });
+        const days = Array.from(dayMap.entries())
+          .map(([date, ms]) => ({ date, moments: ms }))
+          .sort((a, b) => {
+            if (a.date === 'Undated') return 1;
+            if (b.date === 'Undated') return -1;
+            return a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
+          });
+
+        return { days, undated, momentCount: moments.length, bestCut, goodCut };
+      }, [viewMode, visiblePhotos, timelineWindow]);
 
       const sortedVisible = useMemo(() => PS.applySortOrder(visiblePhotos, sortBy), [visiblePhotos, sortBy]);
 
@@ -1162,6 +1324,27 @@
               className: viewMode === 'clusters' ? 'active' : '',
               onClick: () => { setViewMode('clusters'); updateReviewUrl(selectedFolder, targetPct, 'clusters', gridSize); },
             }, 'Clusters'),
+            e('button', {
+              className: viewMode === 'timeline' ? 'active' : '',
+              onClick: () => { setViewMode('timeline'); updateReviewUrl(selectedFolder, targetPct, 'timeline', gridSize); },
+            }, 'Timeline'),
+          ),
+
+          // Timeline window control — only meaningful in the timeline view
+          viewMode === 'timeline' && e('div', { className: 'control-group', style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--text-muted)' } },
+            e('label', { htmlFor: 'tl-window' }, 'Collapse within'),
+            e('input', {
+              id: 'tl-window',
+              className: 'ctrl-input',
+              type: 'number',
+              min: '1',
+              max: '120',
+              step: '1',
+              value: timelineWindow,
+              onChange: (ev) => setTimelineWindow(ev.target.value),
+              style: { width: 56 },
+            }),
+            e('span', null, 'min'),
           ),
 
           // Grid size
@@ -1177,7 +1360,8 @@
           ),
 
           // Sort control
-          e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc'] }),
+          viewMode !== 'timeline' &&
+            e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc'] }),
 
           // Export controls
           e('div', { className: 'control-group' },
@@ -1255,8 +1439,18 @@
                 ),
               )
             ),
+          // Timeline (moments) view
+          photos.length > 0 && !loading && viewMode === 'timeline' && timelineMoments &&
+            e(TimelineView, {
+              data: timelineMoments,
+              gridSize,
+              expandedMoments,
+              toggleMoment,
+              openModal,
+              togglePhoto,
+            }),
           // Expand/Close Stacks button (normal grid views only)
-          photos.length > 0 && !loading && viewMode !== 'clusters' && hasStacks &&
+          photos.length > 0 && !loading && viewMode !== 'clusters' && viewMode !== 'timeline' && hasStacks &&
             e('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 8 } },
               e('button', {
                 className: 'btn btn-outline',
@@ -1264,7 +1458,7 @@
               }, expandedStacks.size > 0 ? 'Close Stacks' : 'Expand Stacks'),
             ),
           // Normal grid views
-          photos.length > 0 && !loading && viewMode !== 'clusters' && e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
+          photos.length > 0 && !loading && viewMode !== 'clusters' && viewMode !== 'timeline' && e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
             ...displayItems.map(item => e(ReviewGridItem, {
               key: (item.isStackMember ? 'sm-' : '') + item.photo.id,
               photo: item.photo,
@@ -1413,7 +1607,9 @@
     // -----------------------------------------------------------------------
     // Review grid item
     // -----------------------------------------------------------------------
-    function ReviewGridItem({ photo, dimmed, onClick, onToggle, isStackMember, expandedStacks, toggleStack }) {
+    function ReviewGridItem({ photo, dimmed, onClick, onToggle, isStackMember,
+                              expandedStacks, toggleStack,
+                              tier, momentMember, extraCount, expanded, onExpand }) {
       const [loaded, setLoaded] = useState(false);
       const [error, setError] = useState(false);
 
@@ -1424,7 +1620,8 @@
       const showBadge = photo.stack_count > 1 && photo.stack_is_top;
 
       return e('div', {
-        className: 'grid-item' + (dimmed ? ' dimmed' : '') + (isStackMember ? ' stack-member' : ''),
+        className: 'grid-item' + (dimmed ? ' dimmed' : '') + (isStackMember ? ' stack-member' : '')
+                   + (tier ? ' tier-' + tier : '') + (momentMember ? ' moment-member' : ''),
         onClick: onClick,
       },
         // Selection badge
@@ -1432,6 +1629,14 @@
           className: 'select-badge' + (photo.selected ? ' checked' : ''),
           onClick: onToggle,
         }, photo.selected ? '\u2713' : ''),
+
+        // "+N similar" chip \u2014 folds the rest of this moment behind the hero
+        extraCount > 0 && e('div', {
+          className: 'more-badge',
+          onClick: (ev) => { ev.stopPropagation(); if (onExpand) onExpand(); },
+          title: expanded ? 'Hide the other shots from this moment'
+                          : extraCount + ' more near-duplicate' + (extraCount !== 1 ? 's' : '') + ' in this moment',
+        }, expanded ? '\u2715 hide' : '+' + extraCount + ' similar'),
 
         // Stack badge
         showBadge && e('div', {
@@ -1480,6 +1685,72 @@
     }
 
 
+    // -----------------------------------------------------------------------
+    // Timeline (moments) view
+    // -----------------------------------------------------------------------
+    function TimelineView({ data, gridSize, expandedMoments, toggleMoment, openModal, togglePhoto }) {
+      const fmtDay = (iso) => {
+        if (!iso || iso === 'Undated') return 'Undated';
+        const d = new Date(iso + 'T00:00:00');
+        if (isNaN(d.getTime())) return iso;
+        return d.toLocaleDateString(undefined,
+          { weekday: 'short', year: 'numeric', month: 'long', day: 'numeric' });
+      };
+
+      const renderMoment = (m) => {
+        const extra = m.members.length - 1;
+        const expanded = expandedMoments.has(m.key);
+        const tiles = [
+          e(ReviewGridItem, {
+            key: m.hero.id,
+            photo: m.hero,
+            tier: m.tier,
+            extraCount: extra,
+            expanded,
+            onExpand: () => toggleMoment(m.key),
+            onClick: () => openModal(m.hero),
+            onToggle: (ev) => { ev.stopPropagation(); togglePhoto(m.hero.id); },
+          }),
+        ];
+        if (expanded && extra > 0) {
+          m.members.slice(1).forEach(p => tiles.push(e(ReviewGridItem, {
+            key: p.id,
+            photo: p,
+            momentMember: true,
+            onClick: () => openModal(p),
+            onToggle: (ev) => { ev.stopPropagation(); togglePhoto(p.id); },
+          })));
+        }
+        return tiles;
+      };
+
+      return e('div', null,
+        // Legend
+        e('div', { className: 'tier-legend' },
+          e('span', null,
+            e('span', { className: 'swatch', style: { background: 'var(--green)' } }),
+            'Best'),
+          e('span', null,
+            e('span', { className: 'swatch', style: { background: 'var(--yellow)' } }),
+            'Good'),
+          e('span', { style: { marginLeft: 'auto' } },
+            data.momentCount + ' moment' + (data.momentCount !== 1 ? 's' : '')
+            + ' · near-duplicates within the window fold behind the hero'),
+        ),
+        data.days.map(day =>
+          e('div', { key: day.date, className: 'timeline-day' },
+            e('div', { className: 'timeline-day-header' },
+              e('span', { className: 'day-date' }, fmtDay(day.date)),
+              e('span', { className: 'day-meta' },
+                day.moments.length + ' moment' + (day.moments.length !== 1 ? 's' : '')),
+            ),
+            e('div', { className: 'grid' + (gridSize === 'large' ? ' large' : '') },
+              ...day.moments.flatMap(renderMoment),
+            ),
+          )
+        ),
+      );
+    }
 
 
     // -----------------------------------------------------------------------

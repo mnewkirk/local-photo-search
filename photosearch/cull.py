@@ -30,6 +30,22 @@ logger = logging.getLogger(__name__)
 from .db import PhotoDB, CLIP_DIMENSIONS, _deserialize_float_list
 
 
+# Cap how many photos a single visual cluster may contribute to the final
+# selection. Phase 1 already picks exactly one rep per cluster; without a cap
+# the top-up phases (2-4) can pile several near-identical members of the SAME
+# cluster into the selection — the "same lake vista three times" problem. A
+# cluster earns one extra slot per ``_CLUSTER_EXTRA_EVERY`` members, capped at
+# ``_MAX_PER_CLUSTER``, so tight near-duplicate clusters stay at a single
+# representative while only large, genuinely varied clusters get a few.
+_CLUSTER_EXTRA_EVERY = 8
+_MAX_PER_CLUSTER = 4
+
+
+def _cluster_cap(size: int) -> int:
+    """Max selections allowed from a cluster of ``size`` members."""
+    return min(_MAX_PER_CLUSTER, 1 + size // _CLUSTER_EXTRA_EVERY)
+
+
 # ---------------------------------------------------------------------------
 # Clustering
 # ---------------------------------------------------------------------------
@@ -336,6 +352,21 @@ def select_best_photos(
         if rep["score"] >= min_quality:
             selected_ids.add(rep["photo"]["id"])
 
+    # Per-cluster selection accounting — used to stop the top-up phases below
+    # from over-representing a single scene with near-identical extras.
+    from collections import Counter
+    cid_of = {p["id"]: p["cluster_id"] for p in photos_with_emb}
+    cluster_sizes = {cid: len(members) for cid, members in cluster_groups.items()}
+    cluster_selected = Counter(cid_of.get(pid) for pid in selected_ids)
+
+    def _can_take(pid: int) -> bool:
+        cid = cid_of.get(pid)
+        return cluster_selected[cid] < _cluster_cap(cluster_sizes.get(cid, 1))
+
+    def _take(pid: int):
+        selected_ids.add(pid)
+        cluster_selected[cid_of.get(pid)] += 1
+
     n_singles = sum(1 for r in cluster_reps if r["size"] <= 2)
     logger.info("Phase 1: %d clusters -> %d reps selected (%d singletons/pairs), "
                 "budget=%d, %d clusters total",
@@ -396,7 +427,9 @@ def select_best_photos(
         for n_rare, score, p in diversity_candidates:
             if len(selected_ids) >= max_budget:
                 break
-            selected_ids.add(p["id"])
+            if not _can_take(p["id"]):
+                continue  # this cluster is already at its representation cap
+            _take(p["id"])
             phase2_added += 1
 
     logger.info("Phase 2 tag diversity: added %d, total now %d",
@@ -415,10 +448,14 @@ def select_best_photos(
         for score, rank, p in runner_ups:
             if len(selected_ids) >= target_count:
                 break
-            selected_ids.add(p["id"])
+            if not _can_take(p["id"]):
+                continue  # don't stack another near-dup onto a capped cluster
+            _take(p["id"])
 
     # Phase 4: If still under target (e.g., low-quality folder), fill with
-    # the best remaining unselected photos by score
+    # the best remaining unselected photos by score. Respect the per-cluster
+    # cap first so we don't refill the budget with near-duplicates; only if
+    # diversity is too thin to reach the target do we relax the cap.
     if len(selected_ids) < target_count:
         remaining = [
             p for p in photos_with_emb if p["id"] not in selected_ids
@@ -427,7 +464,15 @@ def select_best_photos(
         for p in remaining:
             if len(selected_ids) >= target_count:
                 break
-            selected_ids.add(p["id"])
+            if _can_take(p["id"]):
+                _take(p["id"])
+        # Cap-relaxed fallback: low-diversity folder couldn't reach the target
+        # under the per-cluster cap, so fill with the best remaining regardless.
+        if len(selected_ids) < target_count:
+            for p in remaining:
+                if len(selected_ids) >= target_count:
+                    break
+                selected_ids.add(p["id"])
 
     # Build final result with rank info
     result = []
