@@ -738,7 +738,7 @@
 
     // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
     // worker processes it; it would render a perpetual-0 pill).
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'category-content', 'category-visual', 'keywords', 'verify'];
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics'];
 
     function formatTtl(expiresAtStr) {
       if (!expiresAtStr) return { text: '—', cls: '' };
@@ -1755,7 +1755,7 @@
     // in replica mode). Managed as the named "ui" fleet so it doesn't disturb
     // any hand-launched fleet.
     var FLEET_PASSES = ['clip', 'faces', 'quality', 'describe',
-                        'category-content', 'category-visual', 'keywords', 'verify'];
+                        'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics'];
 
     function FleetLauncher() {
       var _sel = useState({ describe: true, 'category-content': true, keywords: true });

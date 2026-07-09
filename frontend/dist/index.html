@@ -630,6 +630,7 @@
         date_from: p.get('date_from') || '',
         date_to: p.get('date_to') || '',
         min_quality: p.get('min_quality') || '',
+        min_aesthetic: p.get('min_aesthetic') || '',
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
         sort: p.get('sort') || '',
@@ -648,6 +649,7 @@
       const [matchSource, setMatchSource] = useState(initParams.match_source);
       const [colorFilter, setColorFilter] = useState(initParams.color);
       const [minQuality, setMinQuality] = useState(initParams.min_quality);
+      const [minAesthetic, setMinAesthetic] = useState(initParams.min_aesthetic);
       const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
       const [locationFilter, setLocationFilter] = useState(initParams.location);
       const [dateFrom, setDateFrom] = useState(initParams.date_from);
@@ -835,8 +837,10 @@
       // the user hasn't supplied any criteria.
       const buildSearchParams = useCallback(() => {
         const mqVal = minQuality ? parseFloat(minQuality) : null;
+        const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
         if (!query && !personFilter && !colorFilter && !locationFilter
-            && !dateFrom && !dateTo && mqVal == null && !matchSource) return null;
+            && !dateFrom && !dateTo && mqVal == null && maVal == null && !matchSource
+            && sortBy !== 'aesthetic_desc') return null;
         const params = new URLSearchParams();
         if (query) params.set('q', query);
         if (personFilter) params.set('person', personFilter);
@@ -845,11 +849,12 @@
         if (dateFrom) params.set('date_from', dateFrom);
         if (dateTo) params.set('date_to', dateTo);
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
+        if (maVal != null && !isNaN(maVal)) params.set('min_aesthetic', maVal);
         if (sortQuality) params.set('sort_quality', 'true');
         if (matchSource) params.set('match_source', matchSource);
         if (sortBy) params.set('sort', sortBy);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, sortQuality, locationFilter, dateFrom, dateTo, matchSource, sortBy]);
+      }, [query, personFilter, colorFilter, minQuality, minAesthetic, sortQuality, locationFilter, dateFrom, dateTo, matchSource, sortBy]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -870,7 +875,7 @@
 
         // Date-only searches return all photos (no limit needed).
         const isDateOnly = dateFrom && !query && !personFilter && !colorFilter
-                           && !locationFilter && !minQuality;
+                           && !locationFilter && !minQuality && !minAesthetic;
         if (!isDateOnly) {
           params.set('limit', String(PAGE_SIZE));
           params.set('offset', '0');
@@ -890,7 +895,7 @@
             setHasMore(false);
             setLoading(false);
           });
-      }, [buildSearchParams, dateFrom, query, personFilter, colorFilter, locationFilter, minQuality]);
+      }, [buildSearchParams, dateFrom, query, personFilter, colorFilter, locationFilter, minQuality, minAesthetic]);
 
       // Ask mode: stream the local-LLM agent (POST /api/ask SSE). Narration
       // (tool_call/tool_result) renders as a status panel; the final `photos`
@@ -1202,6 +1207,19 @@
             }),
           ),
           e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Min aesthetic %:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'number',
+              placeholder: '0–100',
+              title: 'Minimum VLM aesthetic percentile (0–100)',
+              value: minAesthetic,
+              onChange: (ev) => setMinAesthetic(ev.target.value),
+              min: 0, max: 100, step: 5,
+              style: { width: 72 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
             e('label', {
               style: { display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer',
                        fontSize: 13, color: 'var(--text-muted)' },
@@ -1320,7 +1338,7 @@
             e(PhotoGrid, { results: askMode ? results : PS.applySortOrder(results, sortBy),
                            sortBy: askMode ? null : sortBy,
                            setSortBy: askMode ? null : setSortBy,
-                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc'],
+                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'aesthetic_desc'],
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack, query,
                            totalResults, hasMore, loadingMore, onLoadMore: loadMore }),

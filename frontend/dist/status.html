@@ -723,6 +723,7 @@
       tags: 'Tags',
       'category-content': 'Categories',
       'category-visual': 'Visual tags',
+      aesthetics: 'Aesthetics',
       keywords: 'Keywords',
     };
 
@@ -1201,6 +1202,7 @@
       } else {
         var total = stats.photos;
         var qs = stats.quality_stats;
+        var aes = stats.aesthetics_stats;
 
 
         content = e(React.Fragment, null,
@@ -1243,6 +1245,16 @@
                 ? pct(stats.quality_scored, total) + '% — avg ' + qs.mean + ' / 10'
                 : pct(stats.quality_scored, total) + '% — run index --quality',
               n: stats.quality_scored,
+              total: total
+            }),
+            e(StatCard, {
+              label: 'Aesthetics (VLM)',
+              value: (stats.aesthetics_scored || 0).toLocaleString(),
+              sub: aes
+                ? pct(stats.aesthetics_scored, total) + '% — avg ' + aes.mean + ' / 10'
+                    + ' · ' + (aes.normalized || 0).toLocaleString() + ' normalized'
+                : pct(stats.aesthetics_scored || 0, total) + '% — run the aesthetics worker pass',
+              n: stats.aesthetics_scored || 0,
               total: total
             }),
             e(StatCard, {

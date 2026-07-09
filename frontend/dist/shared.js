@@ -187,7 +187,7 @@
 
     // ---- Re-run-passes state (M28) ----
     var RERUN_PASSES = ['describe', 'category-content', 'category-visual',
-                        'keywords', 'verify', 'clip', 'faces', 'quality'];
+                        'keywords', 'verify', 'clip', 'faces', 'quality', 'aesthetics'];
     var _rerunOpen = useState(false);
     var rerunOpen = _rerunOpen[0];       var setRerunOpen = _rerunOpen[1];
     var _rerunSel = useState({});         // { pass: true }
@@ -797,6 +797,73 @@
       );
     }
 
+    // M-aesthetics: rich VLM per-attribute breakdown (detail.aesthetics).
+    var DIM_LABELS = { technical: 'Technical Excellence', composition: 'Composition',
+                       impact: 'Impact & Storytelling' };
+    function _scoreColor(v) {
+      return v == null ? 'var(--text-muted)' : v >= 7.5 ? '#4ade80'
+           : v >= 5.5 ? '#facc15' : v >= 3.5 ? '#fb923c' : '#f87171';
+    }
+    function renderVlmAesthetics() {
+      var a = detail && detail.aesthetics;
+      if (!a) return null;
+      var pct = a.overall_pct;
+      var overall = a.overall;
+      var bars = Object.keys(DIM_LABELS).map(function (dim) {
+        var d = (a.dimensions && a.dimensions[dim]) || {};
+        var sc = d.score;
+        var subs = d.subs || {};
+        return e('div', { key: dim, style: { marginBottom: 8 } },
+          e('div', { style: { display: 'flex', justifyContent: 'space-between',
+                              alignItems: 'baseline', fontSize: 13, marginBottom: 3 } },
+            e('span', null, DIM_LABELS[dim]),
+            e('span', { style: { fontWeight: 600, color: _scoreColor(sc) } },
+              sc == null ? '–' : sc.toFixed(1)),
+          ),
+          e('div', { style: { height: 5, background: 'var(--surface2)', borderRadius: 3,
+                              overflow: 'hidden' } },
+            e('div', { style: { width: ((sc || 0) * 10) + '%', height: '100%',
+                                background: _scoreColor(sc), borderRadius: 3 } })),
+          d.critique && e('div', { style: { fontSize: 11, color: 'var(--text-muted)',
+                                            fontStyle: 'italic', marginTop: 2 } }, d.critique),
+          e('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 2 } },
+            Object.keys(subs).map(function (k) {
+              return k.replace(/_/g, ' ') + ' ' + (subs[k] == null ? '–' : subs[k].toFixed(0));
+            }).join(' · ')),
+        );
+      });
+      var facets = a.style || {};
+      var facetRows = Object.keys(facets).filter(function (k) { return facets[k]; }).map(function (k) {
+        return e('div', { key: k, style: { fontSize: 12, marginBottom: 2 } },
+          e('span', { style: { color: 'var(--text-muted)' } }, k.replace(/_/g, ' ') + ': '),
+          facets[k]);
+      });
+      return e('div', { className: 'detail-section' },
+        e('h3', null, 'Aesthetic Evaluation'),
+        e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 } },
+          e('span', { style: { fontSize: 28, fontWeight: 700,
+                               color: _scoreColor(overall) } },
+            pct == null ? (overall == null ? '–' : overall.toFixed(1)) : Math.round(pct)),
+          e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } },
+            pct == null ? '/ 10 overall'
+              : 'percentile · ' + (overall != null ? overall.toFixed(1) + '/10 raw' : '')),
+        ),
+        bars,
+        facetRows.length > 0 && e('div', { style: { marginTop: 8 } },
+          e('div', { style: { fontSize: 12, fontWeight: 600, marginBottom: 3 } }, 'Style'),
+          facetRows),
+        a.style_tags && a.style_tags.length > 0 && e('div', {
+          style: { marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 4 } },
+          a.style_tags.map(function (t, i) {
+            return e('span', { key: i, style: {
+              fontSize: 11, padding: '2px 7px', borderRadius: 10,
+              background: 'var(--surface2)', color: 'var(--text-muted)' } }, t);
+          })),
+        a.model && e('div', { style: { fontSize: 10, color: 'var(--text-muted)', marginTop: 8 } },
+          'model: ' + a.model),
+      );
+    }
+
     function renderCamera() {
       var d = detail;
       if (!d) return null;
@@ -1135,6 +1202,7 @@
           ),
 
           // Aesthetic quality
+          showAesthetics && renderVlmAesthetics(),
           showAesthetics && renderAesthetics(),
 
           // Tags
@@ -1514,6 +1582,7 @@
     date_desc:    { label: 'Newest first',   icon: '\u2193' },  // ↓
     date_asc:     { label: 'Oldest first',   icon: '\u2191' },  // ↑
     quality_desc: { label: 'Best quality',   icon: '\u2b50' },  // ⭐ (using ★ variant)
+    aesthetic_desc: { label: 'Best aesthetics', icon: '\u2728' },  // sparkle - VLM percentile
     name_asc:     { label: 'Name A\u2013Z',  icon: 'Az' },
   };
 
@@ -1607,6 +1676,11 @@
       case 'quality_desc':
         sorted.sort(function (a, b) {
           return (b.aesthetic_score || 0) - (a.aesthetic_score || 0);
+        });
+        break;
+      case 'aesthetic_desc':
+        sorted.sort(function (a, b) {
+          return (b.aes_overall_pct || 0) - (a.aes_overall_pct || 0);
         });
         break;
       case 'name_asc':
