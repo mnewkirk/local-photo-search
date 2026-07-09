@@ -615,6 +615,16 @@ The `on_progress` + `should_abort` callback pair added to `stacking.py` is
 the reference shape for instrumenting other long-running jobs (reclustering,
 describe, etc.) with SSE progress + cancel.
 
+## Replica freshness card + "Sync from NAS" (M26a UI)
+
+`/status` renders a **Replica** card — drift pill (local vs NAS photo counts
+via `GET /api/admin/replica-status`), last-sync age, and a **Sync from NAS**
+button that streams `POST /api/admin/replica-sync` (= `sync-replica.sh`:
+consistent `dump-db` pull + atomic swap) into an inline log, same SSE shape as
+the deploy-page buttons. The card only renders when `replica_mode` is true
+(`PHOTOSEARCH_NAS_URL` set), so the NAS's own /status is unchanged. This is
+the "sync now" button from the M26a plan; the nightly pull still reconciles.
+
 ## On-demand pass re-runs + status-page fleet launcher (M28)
 
 Re-run any index pass on a photo from the image view, and launch a worker

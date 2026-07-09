@@ -1019,6 +1019,125 @@
     // or null if the chunk is a keepalive or unrecognized.
 
 
+    // ── Replica freshness + sync (M26a) ──────────────────────────────────
+    // Rendered only when this instance runs off a synced read-replica
+    // (PHOTOSEARCH_NAS_URL set → replica_mode from /api/admin/replica-status),
+    // so the card is invisible on the NAS itself. The button streams
+    // `sync-replica.sh` (dump-db pull + atomic swap) over the same SSE shape
+    // as the deploy-page buttons: events carry cmd / line / returncode / error.
+    function ReplicaCard() {
+      var _st = useState(null); var status = _st[0]; var setStatus = _st[1];
+      var _sy = useState(false); var syncing = _sy[0]; var setSyncing = _sy[1];
+      var _lg = useState(''); var log = _lg[0]; var setLog = _lg[1];
+      var logRef = useRef(null);
+
+      function loadStatus() {
+        fetch('/api/admin/replica-status')
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (d) { if (d) setStatus(d); })
+          .catch(function () {});     // endpoint absent (old build) → card stays hidden
+      }
+      useEffect(function () { loadStatus(); }, []);
+      useEffect(function () {
+        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+      }, [log]);
+
+      if (!status || !status.replica_mode) return null;
+
+      function appendLog(line) {
+        setLog(function (prev) { return prev + line + '\n'; });
+      }
+
+      function startSync() {
+        setSyncing(true);
+        setLog('');
+        fetch('/api/admin/replica-sync', { method: 'POST' })
+          .then(function (response) {
+            if (!response.ok) {
+              // 409 = another admin op holds the lock; 404 = sync script missing
+              return response.text().then(function (t) {
+                throw new Error('HTTP ' + response.status + ': ' + t);
+              });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            function pump() {
+              return reader.read().then(function (chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function (evt) {
+                  var dataLine = evt.split('\n').filter(function (l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.error) appendLog('✗ ' + payload.error);
+                    if (payload.returncode != null) {
+                      appendLog(payload.returncode === 0
+                        ? '✓ replica synced — reload any page you were browsing'
+                        : '✗ sync failed (rc=' + payload.returncode + ')');
+                    }
+                  } catch (err) { /* keepalive / unparsable chunk */ }
+                });
+                return pump();
+              });
+            }
+            return pump();
+          })
+          .catch(function (err) { appendLog('✗ ' + err.message); })
+          .then(function () { setSyncing(false); loadStatus(); });
+      }
+
+      var pill;
+      if (status.nas_photos == null) {
+        pill = { cls: 'unknown', text: 'NAS unreachable' };
+      } else if (status.drift === 0) {
+        pill = { cls: 'ok', text: 'in sync' };
+      } else if (status.drift > 0) {
+        pill = { cls: 'behind', text: status.drift.toLocaleString() + ' behind' };
+      } else {
+        pill = { cls: 'unknown', text: (-status.drift).toLocaleString() + ' ahead of NAS?' };
+      }
+
+      function age(sec) {
+        if (sec == null) return 'never';
+        if (sec < 90) return sec + 's ago';
+        if (sec < 5400) return Math.round(sec / 60) + 'm ago';
+        if (sec < 129600) return Math.round(sec / 3600) + 'h ago';
+        return Math.round(sec / 86400) + 'd ago';
+      }
+
+      return e('div', null,
+        e('h2', null, 'Replica'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-head' },
+            e('span', { className: 'deploy-state ' + pill.cls }, pill.text),
+            e('span', { className: 'deploy-meta' },
+              (status.local_photos != null ? status.local_photos.toLocaleString() : '?') + ' photos local · ',
+              (status.nas_photos != null ? status.nas_photos.toLocaleString() + ' on NAS' : 'NAS count unavailable'),
+              ' · synced ' + age(status.last_sync && status.last_sync.age_seconds)
+            )
+          ),
+          e('div', { className: 'deploy-meta' },
+            'source: ', e('span', { className: 'sha' }, status.nas_url || '—'),
+            ' · db: ', e('span', { className: 'sha' }, status.db_path || '—')
+          ),
+          e('div', { className: 'deploy-actions' },
+            e('button', {
+              className: 'btn btn-primary',
+              disabled: syncing,
+              onClick: startSync,
+            }, syncing ? 'Syncing…' : 'Sync from NAS')
+          ),
+          log && e('div', { className: 'deploy-log' + (syncing ? ' running' : ''), ref: logRef }, log)
+        )
+      );
+    }
+
     function ErrorsLog(props) {
       var errors = props.errors;
       if (!errors || errors.length === 0) return null;
@@ -1089,6 +1208,7 @@
             lastUpdated && e('span', null, 'Updated ' + lastUpdated),
             e('button', { className: 'btn', onClick: load }, loading ? 'Refreshing…' : 'Refresh')
           ),
+          e(ReplicaCard, null),
           e('div', { className: 'grid' },
             e(StatCard, {
               label: 'Photos indexed',
