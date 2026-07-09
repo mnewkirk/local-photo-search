@@ -51,6 +51,11 @@ DESCRIPTION_ABSENCE_PENALTY = 0.02  # Smaller penalty when a description exists 
 CLIP_MIN_FOR_DESC_BOOST = -0.05  # Don't apply description boost unless CLIP score is
                                  # at least this high. Prevents hallucinated descriptions
                                  # from surfacing visually irrelevant photos.
+CLIP_ONLY_MIN_SCORE = 0.15  # When a query DOES produce text (keyword/description/tag)
+                            # matches, hold CLIP-only candidates (no text match) to this
+                            # stricter floor so weak/negative visual neighbours don't
+                            # pollute results. Pure-visual queries (no text matches at
+                            # all) keep the permissive CLIP_MIN_SCORE floor.
 
 # Negation patterns: if the description contains "no <keyword>" or "no visible <keyword>"
 # and the query mentions that keyword, the photo gets a penalty instead of a boost.
@@ -652,6 +657,34 @@ def search_descriptions(db: PhotoDB, query: str, limit: int = 10) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def search_text_fields(db: PhotoDB, query: str, limit: int = 300) -> list[int]:
+    """Retrieve photo ids whose text metadata matches the query.
+
+    Unlike ``search_descriptions`` (which only scans ``description``), this scans
+    the concatenation of ``description`` + ``keywords`` + ``categories`` +
+    ``visual_tags`` so a photo tagged with a keyword the CLIP embedding misses
+    (e.g. a wide landscape whose only "marmot" signal is the keyword) is still
+    retrieved. Every query word must appear somewhere in that combined text.
+    Returns ids only (callers grade relevance with the per-field scorers), most
+    recent first, capped at ``limit``.
+    """
+    words = [w for w in query.lower().split() if w]
+    if not words:
+        return []
+    field_expr = ("LOWER(COALESCE(description,'') || ' ' || COALESCE(keywords,'') || ' ' "
+                  "|| COALESCE(categories,'') || ' ' || COALESCE(visual_tags,''))")
+    conditions = " AND ".join([f"{field_expr} LIKE ?" for _ in words])
+    params = [f"%{w}%" for w in words] + [limit]
+    rows = db.conn.execute(
+        f"""SELECT id FROM photos
+            WHERE {conditions}
+            ORDER BY date_taken DESC
+            LIMIT ?""",
+        params,
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def search_semantic(
     db: PhotoDB,
     query: str,
@@ -752,6 +785,40 @@ def search_semantic(
                         "SELECT id, keywords FROM photos WHERE keywords IS NOT NULL")}
     _dbg(f"TEXT CACHES: cat={len(cat_cache)} visual={len(visual_cache)} kw={len(kw_cache)} mode={text_match}")
 
+    def _text_rel(pid: int) -> tuple[float, list[str]]:
+        """Graded text relevance for one photo across the enabled signals.
+
+        Combines the per-field scorers (description / categories / visual /
+        keywords) with the same weights the CLIP re-rank used, so a strong
+        keyword hit (e.g. 'marmot') yields a large positive value that ranks
+        the photo above CLIP-only neighbours. Returns (score, debug_parts).
+        """
+        if not positive_query:
+            return 0.0, []
+        rel = 0.0
+        parts: list[str] = []
+        if use_dict and pid in desc_cache:
+            r = _description_relevance(desc_cache[pid], positive_query)
+            rel += r * 0.6
+            if r != 0:
+                parts.append(f"dict={r:+.3f}")
+        if use_categories and pid in cat_cache:
+            r = _categories_match_query(cat_cache.get(pid), positive_query)
+            rel += r * 1.0
+            if r != 0:
+                parts.append(f"cat={r:+.3f}")
+        if use_visual and pid in visual_cache:
+            r = _visual_match_query(visual_cache.get(pid), positive_query)
+            rel += r * 0.7
+            if r != 0:
+                parts.append(f"vis={r:+.3f}")
+        if use_keywords and pid in kw_cache:
+            r = _keywords_match_query(kw_cache.get(pid), positive_query)
+            rel += r * 1.2
+            if r != 0:
+                parts.append(f"kw={r:+.3f}")
+        return rel, parts
+
     # Pre-load filenames for debug logging
     name_cache: dict[int, str] = {}
     if debug:
@@ -791,89 +858,84 @@ def search_semantic(
             score += face_adj
             steps.append(f"face_boost=+{face_adj:.3f} ({face_counts[photo_id]} faces)")
 
-        # Description / tag relevance against the positive query
-        if positive_query:
-            # Build text relevance from the configured signals.
-            text_rel = 0.0
-            parts = []
-            if use_dict and photo_id in desc_cache:
-                r = _description_relevance(desc_cache[photo_id], positive_query)
-                text_rel += r * 0.6
-                if r != 0:
-                    parts.append(f"dict={r:+.3f}")
-            if use_categories and photo_id in cat_cache:
-                r = _categories_match_query(cat_cache.get(photo_id), positive_query)
-                text_rel += r * 1.0
-                if r != 0:
-                    parts.append(f"cat={r:+.3f}")
-            if use_visual and photo_id in visual_cache:
-                r = _visual_match_query(visual_cache.get(photo_id), positive_query)
-                text_rel += r * 0.7
-                if r != 0:
-                    parts.append(f"vis={r:+.3f}")
-            if use_keywords and photo_id in kw_cache:
-                r = _keywords_match_query(kw_cache.get(photo_id), positive_query)
-                text_rel += r * 1.2
-                if r != 0:
-                    parts.append(f"kw={r:+.3f}")
-            # Re-apply the existing CLIP-minimum gate.
-            if text_rel > 0 and raw_score < CLIP_MIN_FOR_DESC_BOOST:
-                steps.append(f"text_boost_blocked (rel=+{text_rel:.3f} but clip too low; "
-                             + " ".join(parts) + ")")
-            else:
-                score += text_rel
-                if text_rel != 0:
-                    label = "text_boost" if text_rel > 0 else "text_penalty"
-                    steps.append(f"{label}={text_rel:+.3f} (" + " ".join(parts) + ")")
-        elif photo_id not in desc_cache:
-            steps.append("no_description")
+        # Graded text relevance (keywords / categories / visual / description).
+        # A positive text match now DOMINATES the score, so it always ranks above
+        # CLIP-only neighbours, and CLIP can only *add* support — it can never drag
+        # a real keyword hit below the floor (the old code blocked the boost whenever
+        # CLIP was unsure, which silently dropped exact matches like "marmot").
+        clip_base = score  # raw CLIP (+ any people/face boost applied above)
+        text_rel, parts = _text_rel(photo_id)
+        is_text_match = text_rel > 0
+        if is_text_match:
+            score = text_rel + max(clip_base, 0.0)
+            steps.append(f"text_match={text_rel:+.3f} (" + " ".join(parts)
+                         + f") clip_support=+{max(clip_base, 0.0):.3f}")
+        else:
+            score = clip_base + text_rel  # text_rel <= 0 (penalty or neutral)
+            if text_rel < 0:
+                steps.append(f"text_penalty={text_rel:+.3f} (" + " ".join(parts) + ")")
+            elif positive_query and photo_id not in desc_cache:
+                steps.append("no_description")
 
         steps.append(f"final={score:.5f}")
-
-        if score < min_score:
-            reason = f"EXCLUDED {fname}: {' → '.join(steps)} < min_score={min_score}"
-            excluded_log.append(reason)
-            _dbg(reason)
-            continue
-
-        _dbg(f"INCLUDED {fname}: {' → '.join(steps)}")
+        _dbg(f"CANDIDATE {fname}: {' → '.join(steps)}")
 
         photo = db.get_photo(photo_id)
         if photo:
             photo["score"] = score
             photo["clip_score"] = raw_score
+            photo["_text_match"] = is_text_match
             results_by_id[photo_id] = photo
 
-    # Also surface photos that match on description but weren't in CLIP results.
-    # These have no CLIP support, so we require face confirmation for people
-    # queries to avoid hallucinated descriptions surfacing irrelevant photos.
+    # Also surface photos whose TEXT metadata (keywords / categories / visual /
+    # description) matches but that CLIP never ranked into the candidate pool —
+    # e.g. a wide landscape keyword-tagged 'marmot'. This makes text a real
+    # retrieval path, not just a re-rank of the CLIP neighbours.
     if positive_query:
-        desc_matches = search_descriptions(db, positive_query, limit=fetch_limit)
-        _dbg(f"DESC-ONLY CANDIDATES: {len(desc_matches)} text matches")
-        for desc_photo in desc_matches:
-            pid = desc_photo["id"]
-            if pid not in results_by_id:
-                fname = name_cache.get(pid, f"id={pid}")
-                # Apply exclusion filter
-                desc_text = desc_photo.get("description", "")
-                if has_exclusions and _description_contains_excluded(desc_text, excluded_terms):
-                    _dbg(f"EXCLUDED {fname} (desc-only): description contains excluded term")
-                    continue
-                if negate_people and pid in face_counts:
-                    _dbg(f"EXCLUDED {fname} (desc-only): has faces but people excluded")
-                    continue
-                rel = _description_relevance(desc_text, positive_query)
-                if rel > 0:
-                    if boost_people and pid not in face_counts:
-                        _dbg(f"EXCLUDED {fname} (desc-only): people query but no faces")
-                        continue
-                    desc_photo["score"] = rel
-                    desc_photo["clip_score"] = None
-                    results_by_id[pid] = desc_photo
-                    _dbg(f"INCLUDED {fname} (desc-only): score={rel:.3f}")
+        text_pids = search_text_fields(db, positive_query, limit=max(limit * 5, 300))
+        _dbg(f"TEXT-FIELD CANDIDATES: {len(text_pids)} matches")
+        for pid in text_pids:
+            if pid in results_by_id:
+                continue
+            fname = name_cache.get(pid, f"id={pid}")
+            rel, parts = _text_rel(pid)
+            if rel <= 0:
+                continue
+            # Same exclusion / people gates as the CLIP path.
+            desc_text = desc_cache.get(pid, "")
+            if has_exclusions and _description_contains_excluded(desc_text, excluded_terms):
+                _dbg(f"EXCLUDED {fname} (text-only): contains excluded term")
+                continue
+            if negate_people and pid in face_counts:
+                _dbg(f"EXCLUDED {fname} (text-only): has faces but people excluded")
+                continue
+            if boost_people and pid not in face_counts:
+                _dbg(f"EXCLUDED {fname} (text-only): people query but no faces")
+                continue
+            photo = db.get_photo(pid)
+            if photo:
+                photo["score"] = rel
+                photo["clip_score"] = None
+                photo["_text_match"] = True
+                results_by_id[pid] = photo
+                _dbg(f"INCLUDED {fname} (text-only): score={rel:.3f} (" + " ".join(parts) + ")")
+
+    # Drop CLIP-only noise. When the query produced real text matches, hold the
+    # text-less candidates to the stricter CLIP_ONLY_MIN_SCORE floor so weak /
+    # negative visual neighbours vanish; pure-visual queries (no text match
+    # anywhere) keep the permissive min_score floor so recall is unchanged.
+    has_text_matches = any(r.get("_text_match") for r in results_by_id.values())
+    clip_only_floor = CLIP_ONLY_MIN_SCORE if has_text_matches else min_score
+    kept: list[dict] = []
+    for r in results_by_id.values():
+        if r.pop("_text_match", False):
+            kept.append(r)  # real text match — always keep
+        elif r["score"] >= min_score and (
+                r.get("clip_score") is None or r["clip_score"] >= clip_only_floor):
+            kept.append(r)
 
     # Re-sort by combined score, descending
-    results = sorted(results_by_id.values(), key=lambda r: r["score"], reverse=True)
+    results = sorted(kept, key=lambda r: r["score"], reverse=True)
     final = _dedupe_by_hash(results)[:limit]
 
     if debug:
