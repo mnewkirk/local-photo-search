@@ -217,10 +217,11 @@ is captured per artifact.
 
 The valid worker passes (`-p`/`--passes`, enforced by `valid_passes` in
 `cli.py`) are: `clip`, `faces`, `quality`, `describe`, `category-content`,
-`category-visual`, `keywords`, `verify`. The full LLM-backed pass list is:
+`category-visual`, `keywords`, `verify`, `aesthetics`. The full LLM-backed
+pass list is:
 
 ```
-clip,faces,quality,describe,category-content,category-visual,keywords,verify
+clip,faces,quality,describe,category-content,category-visual,keywords,verify,aesthetics
 ```
 
 **The old `tags` pass was removed** and split into three first-class passes —
@@ -232,6 +233,47 @@ passing `--passes tags` now errors with "unknown pass type". The split:
   description (`--category-content-model`, default `llama3.2:3b`).
 - **`keywords`** (text-only) — free-form keywords from the description
   (`--keywords-model`, default `llama3.2:3b`).
+- **`aesthetics`** (vision) — rich VLM aesthetic scoring (`--aesthetics-model`,
+  default `qwen2.5-vl`; role `aesthetics` →
+  `PHOTOSEARCH_LLM_AESTHETICS_MODEL`). See below.
+
+### VLM aesthetic scoring (the `aesthetics` pass)
+
+Replaces the compressed **LAION CLIP `aesthetic_score`** (in `quality.py`) as
+the *primary* quality signal — that predictor's 1–10 scale tops out ~6.9 even on
+curated Unsplash, so the library never exceeds ~6.2. The LAION `quality` pass +
+column are **kept as a cheap prior**; the VLM `aesthetics` pass is primary.
+
+`photosearch/aesthetics.py` prompts a vision LLM (qwen*-VL via the existing
+`describe._ollama_chat_with_retry(role="aesthetics")` routing — Ollama or LM
+Studio) for a rubric-anchored JSON critique: three dimensions — **Technical
+Excellence** (sharpness/exposure/depth_of_field/white_balance), **Composition**
+(framing/leading_lines/rule_of_thirds/balance), **Impact & Storytelling**
+(emotion/originality/wow) — each the mean of its sub-attributes, plus a free-text
+style critique (lighting/mood/tonal_character/color) and controlled style tags.
+
+Schema v26 adds `aes_*` columns to `photos`: `aes_overall` (weighted mean,
+default weights Technical .30 / Composition .30 / Impact .40 in
+`DIMENSION_WEIGHTS`, **retunable without a VLM re-run**), the 3 dimension + 11
+sub-attribute scores, `aes_style`/`aes_style_tags` (JSON), and
+`aes_overall_pct`. The `aes_technical_iqa`/`aes_overall_iqa` columns are reserved
+for an optional objective-IQA anchor (pyiqa MUSIQ/TOPIQ / VisualQuality-R1) if
+the Phase-0 bakeoff (`evals/aesthetics_bakeoff.py`) keeps it.
+
+**The 6.2-ceiling fix is percentile normalization.** VLMs cluster raw scores
+6–8 just like LAION compresses, so ranking/search use `aes_overall_pct` — the
+library-relative percentile of `aes_overall`. Two no-VLM backfills maintain it:
+
+```bash
+photosearch recompute-aesthetic-overall --apply   # after retuning weights
+photosearch normalize-aesthetics --apply           # refresh percentiles
+```
+
+`normalize-aesthetics` is also a `maintenance-sweep` stage (percentile refresh
+only — the VLM scoring stays with the worker fleet). Search: `sort=aesthetic_desc`,
+`min_aesthetic` (percentile), `min_technical`/`min_composition`/`min_impact`,
+`style_tag`. The `/status` "Aesthetics (VLM)" card + `PhotoModal` "Aesthetic
+Evaluation" breakdown + M28 re-run checkbox surface it in the UI.
 
 ### Per-pass model strategy (Ollama defaults)
 
