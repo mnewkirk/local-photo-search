@@ -79,7 +79,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -508,6 +508,28 @@ class PhotoDB:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_technical ON photos(aes_technical)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_composition ON photos(aes_composition)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_impact ON photos(aes_impact)")
+
+        # v27: subject-aware quality. subject_boxes is a JSON array of
+        # {label, bbox:[x1,y1,x2,y2] normalized 0-1, area_frac} for the main
+        # subject(s) (grounded by the same VLM); [] = no clear subject
+        # (landscape), NULL = not yet grounded. aes_subject_overall (+ _pct
+        # percentile) is the aesthetic score of the PRIMARY subject's crop —
+        # judges the subject, not the background — indexed for sort/filter.
+        # aes_subject holds the full parsed crop breakdown (dim/sub scores,
+        # style) as JSON. NULL subject scores mean no subject or the subject
+        # fills the frame (search falls back to aes_overall). See
+        # photosearch/subjects.py + docs/plans/subject-aware-quality.md.
+        try:
+            cur.execute("SELECT subject_boxes FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN subject_boxes TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_overall REAL")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_overall_pct REAL")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_subject TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_model TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_scored_at TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall ON photos(aes_subject_overall)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall_pct ON photos(aes_subject_overall_pct)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.

@@ -1144,9 +1144,10 @@ _OPEN_DATE_HI = "9999-12-31"
 
 
 def _has_aesthetic_filters(min_aesthetic, min_technical, min_composition,
-                           min_impact, style_tag) -> bool:
+                           min_impact, style_tag, min_subject_aesthetic=None) -> bool:
     return any(v is not None for v in
-               (min_aesthetic, min_technical, min_composition, min_impact)) \
+               (min_aesthetic, min_technical, min_composition, min_impact,
+                min_subject_aesthetic)) \
         or bool(style_tag)
 
 
@@ -1164,13 +1165,17 @@ def _style_tag_matches(row: dict, style_tag: str) -> bool:
 
 
 def _filter_aesthetic(results: list[dict], min_aesthetic=None, min_technical=None,
-                      min_composition=None, min_impact=None, style_tag=None) -> list[dict]:
-    """Filter to photos meeting the aesthetic thresholds. min_aesthetic is on the
-    library-relative percentile (aes_overall_pct, 0-100); the per-dimension
+                      min_composition=None, min_impact=None, style_tag=None,
+                      min_subject_aesthetic=None) -> list[dict]:
+    """Filter to photos meeting the aesthetic thresholds. min_aesthetic /
+    min_subject_aesthetic are on the library-relative percentiles
+    (aes_overall_pct / aes_subject_overall_pct, 0-100); the per-dimension
     thresholds are on the raw 1-10 dimension scores."""
     out = []
     for r in results:
         if min_aesthetic is not None and (r.get("aes_overall_pct") or -1) < min_aesthetic:
+            continue
+        if min_subject_aesthetic is not None and (r.get("aes_subject_overall_pct") or -1) < min_subject_aesthetic:
             continue
         if min_technical is not None and (r.get("aes_technical") or -1) < min_technical:
             continue
@@ -1225,7 +1230,8 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
 
 # Allowed values for search_combined's `sort` param. Kept as a module
 # constant so callers (web.py, cli.py) and tests reference one list.
-SORT_MODES = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc", "relevance")
+SORT_MODES = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
+              "subject_aesthetic_desc", "relevance")
 
 # Reciprocal Rank Fusion constant. Textbook default is 60 — smaller k
 # makes the top-ranked item in each filter dominate more; larger k
@@ -1327,6 +1333,17 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
         return sorted(
             merged,
             key=lambda r: (r.get("aes_overall_pct") or 0),
+            reverse=True,
+        )
+    if sort == "subject_aesthetic_desc":
+        # Rank by the SUBJECT-crop percentile (best subject shots lead),
+        # falling back to the full-frame percentile for photos without a
+        # subject score (subject fills the frame / landscape / not yet scored).
+        return sorted(
+            merged,
+            key=lambda r: (r["aes_subject_overall_pct"]
+                           if r.get("aes_subject_overall_pct") is not None
+                           else (r.get("aes_overall_pct") or 0)),
             reverse=True,
         )
     # Date sorts: split dated / undated so NULLs land at the tail.
@@ -1558,6 +1575,7 @@ def search_combined(
     min_composition: Optional[float] = None,
     min_impact: Optional[float] = None,
     style_tag: Optional[str] = None,
+    min_subject_aesthetic: Optional[float] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1787,15 +1805,21 @@ def search_combined(
     # Aesthetics-only browse: no content filters, just aesthetic thresholds
     # and/or the aesthetic sort — return the library ranked by percentile.
     _aes_filtered = _has_aesthetic_filters(
-        min_aesthetic, min_technical, min_composition, min_impact, style_tag)
-    if not result_sets and (_aes_filtered or sort == "aesthetic_desc"):
+        min_aesthetic, min_technical, min_composition, min_impact, style_tag,
+        min_subject_aesthetic)
+    if not result_sets and (_aes_filtered
+                            or sort in ("aesthetic_desc", "subject_aesthetic_desc")):
+        # Subject sort ranks by the subject-crop percentile, falling back to the
+        # full-frame percentile for photos without a subject score.
+        order = ("COALESCE(aes_subject_overall_pct, aes_overall_pct)"
+                 if sort == "subject_aesthetic_desc" else "aes_overall_pct")
         rows = db.conn.execute(
-            "SELECT * FROM photos WHERE aes_overall_pct IS NOT NULL "
-            "ORDER BY aes_overall_pct DESC"
+            f"SELECT * FROM photos WHERE aes_overall_pct IS NOT NULL "
+            f"ORDER BY {order} DESC"
         ).fetchall()
         results = _filter_aesthetic(
             [dict(r) for r in rows], min_aesthetic, min_technical,
-            min_composition, min_impact, style_tag)
+            min_composition, min_impact, style_tag, min_subject_aesthetic)
         if date_from:
             results = _filter_by_date(results, date_from, date_to or _OPEN_DATE_HI)
         return _wrap(results)
@@ -1844,7 +1868,7 @@ def search_combined(
     if _aes_filtered:
         merged = _filter_aesthetic(
             merged, min_aesthetic, min_technical, min_composition,
-            min_impact, style_tag)
+            min_impact, style_tag, min_subject_aesthetic)
 
     # Back-compat: sort_quality=True overrides sort to quality_desc.
     # Prefer the explicit `sort` param in new callers.

@@ -171,6 +171,13 @@ class AestheticsResult(BaseModel):
     scores: dict[str, float] = {}
     aes_style: Optional[str] = None       # JSON: {facets, critiques}
     aes_style_tags: Optional[str] = None  # JSON array of style tags
+    # Subject-aware quality (schema v27). subject_boxes: JSON array of the main
+    # subject box(es); aes_subject_overall + aes_subject (JSON breakdown): the
+    # primary subject's crop aesthetic score. All optional so older workers /
+    # non-subject runs submit cleanly.
+    subject_boxes: Optional[str] = None
+    aes_subject_overall: Optional[float] = None
+    aes_subject: Optional[str] = None
     model: Optional[str] = None
     model_version: Optional[str] = None
 
@@ -558,6 +565,15 @@ def submit_results(req: SubmitRequest):
                     fields["aes_style_tags"] = r.aes_style_tags
                     fields["aes_model"] = r.model
                     fields["aes_scored_at"] = now
+                    # Subject-aware quality (v27) — additive; subject_boxes may be
+                    # [] (no subject) with a NULL subject score.
+                    if r.subject_boxes is not None:
+                        fields["subject_boxes"] = r.subject_boxes
+                        if r.aes_subject_overall is not None:
+                            fields["aes_subject_overall"] = r.aes_subject_overall
+                            fields["aes_subject"] = r.aes_subject
+                            fields["aes_subject_model"] = r.model
+                            fields["aes_subject_scored_at"] = now
                     db.update_photo(r.photo_id, **fields)
                     db.log_generation(
                         r.photo_id, "aesthetics",

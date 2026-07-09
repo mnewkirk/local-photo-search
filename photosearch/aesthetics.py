@@ -436,6 +436,27 @@ def normalize_overall(db, apply: bool = True) -> int:
     return len(rows)
 
 
+def normalize_subject_overall(db, apply: bool = True) -> int:
+    """Compute aes_subject_overall_pct as the library-relative percentile (0–100)
+    of aes_subject_overall across every subject-scored photo — the subject-crop
+    analogue of `normalize_overall`. Returns rows updated. See
+    photosearch/subjects.py + docs/plans/subject-aware-quality.md.
+    """
+    rows = db.conn.execute(
+        "SELECT id, aes_subject_overall FROM photos WHERE aes_subject_overall IS NOT NULL"
+    ).fetchall()
+    if not rows or not apply:
+        return len(rows)
+    ids = [r["id"] for r in rows]
+    pcts = percentile_ranks([r["aes_subject_overall"] for r in rows])
+    db.conn.executemany(
+        "UPDATE photos SET aes_subject_overall_pct=? WHERE id=?",
+        [(p, i) for p, i in zip(pcts, ids)],
+    )
+    db.conn.commit()
+    return len(rows)
+
+
 def score_photo_aesthetics(
     image_path: str,
     model: str = MODEL,

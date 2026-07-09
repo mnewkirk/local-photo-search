@@ -248,7 +248,8 @@ def api_search(
     min_composition: Optional[float] = Query(None, description="Minimum Composition score (1-10)"),
     min_impact: Optional[float] = Query(None, description="Minimum Impact & Storytelling score (1-10)"),
     style_tag: Optional[str] = Query(None, description="Filter by aesthetic style tag (e.g. golden-hour)"),
-    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, aesthetic_desc, relevance"),
+    min_subject_aesthetic: Optional[float] = Query(None, description="Minimum SUBJECT-crop aesthetic percentile (0-100)"),
+    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, aesthetic_desc, subject_aesthetic_desc, relevance"),
     sort_quality: bool = Query(False, description="Legacy: equivalent to sort=quality_desc"),
     text_match: str = Query("all", description="Text matching mode: all, dict, categories, visual, keywords, off"),
     tag_match: Optional[str] = Query(None, deprecated=True, description="Deprecated; use text_match"),
@@ -279,7 +280,8 @@ def api_search(
                 min_quality is not None, date_from, date_to, location,
                 min_aesthetic is not None, min_technical is not None,
                 min_composition is not None, min_impact is not None, style_tag,
-                sort == "aesthetic_desc"]):
+                min_subject_aesthetic is not None,
+                sort in ("aesthetic_desc", "subject_aesthetic_desc")]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
 
@@ -318,6 +320,7 @@ def api_search(
             min_composition=min_composition,
             min_impact=min_impact,
             style_tag=style_tag,
+            min_subject_aesthetic=min_subject_aesthetic,
         )
 
         logger.info(
@@ -1219,6 +1222,9 @@ def api_photo_detail(photo_id: int):
             # the 11 sub-attributes, model, scored_at) for quick inspection —
             # the structured `aesthetics` block nests the same values.
             "aes_raw": {k: v for k, v in photo.items() if k.startswith("aes_")},
+            # Subject-aware quality (v27): primary-subject box(es), normalized
+            # 0-1; the subject-crop scores live in aes_raw (aes_subject_*).
+            "subject_boxes": json.loads(photo["subject_boxes"]) if photo.get("subject_boxes") else None,
             "camera_make": photo.get("camera_make"),
             "camera_model": photo.get("camera_model"),
             "focal_length": photo.get("focal_length"),

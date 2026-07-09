@@ -2068,6 +2068,27 @@ def normalize_aesthetics(db, apply):
             click.echo(f"Normalized aes_overall_pct across {n} photo(s).")
 
 
+@cli.command("normalize-subject-aesthetics")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write aes_subject_overall_pct. Default: dry-run.")
+def normalize_subject_aesthetics(db, apply):
+    """Compute the library-relative percentile (aes_subject_overall_pct, 0-100)
+    of every photo's subject-crop score. `sort=subject_aesthetic_desc` and
+    min_subject_aesthetic use the percentile. Re-run after each subject-scoring
+    batch. See docs/plans/subject-aware-quality.md.
+    """
+    from photosearch.aesthetics import normalize_subject_overall
+    with PhotoDB(db) as pdb:
+        n = normalize_subject_overall(pdb, apply=apply)
+        if not apply:
+            click.echo(f"Would normalize subject percentiles across {n} scored "
+                       f"photo(s). Re-run with --apply.")
+        else:
+            click.echo(f"Normalized aes_subject_overall_pct across {n} photo(s).")
+
+
 # ---------------------------------------------------------------------------
 # maintenance-sweep / validate-data / repair-data (M25)
 # ---------------------------------------------------------------------------

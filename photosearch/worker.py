@@ -594,7 +594,30 @@ def _process_aesthetics(
                     {"facets": aes["style"], "critiques": aes["critiques"]}),
                 "aes_style_tags": json.dumps(aes["style_tags"]),
             }
-            print(f" ({elapsed:.1f}s) overall={aes['overall']}")
+            # Subject-aware quality: ground the primary subject and re-score its
+            # crop so wow/impact judge the subject, not the background. Additive —
+            # a grounding/crop failure just omits the subject fields (the
+            # full-frame score above still lands). See photosearch/subjects.py.
+            subj_note = ""
+            try:
+                from .subjects import score_photo_subject
+                subj = score_photo_subject(path, model=model)
+                if subj["subject_boxes"] is not None:
+                    row["subject_boxes"] = json.dumps(subj["subject_boxes"])
+                    sa = subj["subject_aes"]
+                    if sa:
+                        row["aes_subject_overall"] = sa["overall"]
+                        row["aes_subject"] = json.dumps({
+                            "dim_scores": sa["dim_scores"],
+                            "sub_scores": sa["sub_scores"],
+                            "style": sa["style"], "style_tags": sa["style_tags"],
+                            "critiques": sa["critiques"]})
+                        subj_note = f" subj={sa['overall']}"
+                    else:
+                        subj_note = f" subj=none({len(subj['subject_boxes'])} box)"
+            except Exception as e:
+                subj_note = f" subj_err={e}"
+            print(f" ({elapsed:.1f}s) overall={aes['overall']}{subj_note}")
             results.append(row)
         except Exception as e:
             print(f" ERROR: {e}")
