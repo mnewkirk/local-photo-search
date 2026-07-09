@@ -107,20 +107,53 @@ def score_vlm(model, photos, cache, verbose=True):
     return out
 
 
-def score_iqa(metric_name, photos, cache, device=None, verbose=True):
-    """Score with a pyiqa No-Reference metric. Returns {name: score}."""
+def _load_capped_tensor(path, max_edge):
+    """Load an image as a (1,3,H,W) float tensor in [0,1], downscaled so its
+    longer edge is <= max_edge.
+
+    This cap is the whole reason the IQA path doesn't nuke the machine. MUSIQ
+    (and other native-resolution metrics) tile the image into patch_size=32
+    patches and run self-attention over ALL of them (`pyiqa` sets MUSIQ's
+    `max_seq_len_from_original_res=-1`). A 56MP camera JPEG → ~55k patches →
+    a ~55k x 55k attention matrix (tens of GB), which OOM-kills the whole WSL
+    VM. Downscaling to a 1536px long edge caps that at ~1.5k patches, and
+    quality metrics are robust to moderate downscaling. Importing photosearch
+    registers the HEIF/HEIC opener so .heic samples load like every other format.
+    """
+    import numpy as np
+    import torch
+    from PIL import Image, ImageOps
+    import photosearch  # noqa: F401 — registers the HEIF/HEIC opener with PIL
+
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    if max_edge and max(img.size) > max_edge:
+        img.thumbnail((max_edge, max_edge), Image.LANCZOS)
+    arr = np.asarray(img, dtype=np.float32) / 255.0  # H,W,3 in [0,1]
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # 1,3,H,W
+
+
+def score_iqa(metric_name, photos, cache, device=None, max_edge=1536, verbose=True):
+    """Score with a pyiqa No-Reference metric. Returns {name: score}.
+
+    Images are downscaled to `max_edge` (longer side, px) before scoring — see
+    `_load_capped_tensor` for why that cap is load-bearing. Pass max_edge=0 to
+    feed native resolution (will OOM on large photos with MUSIQ)."""
     import pyiqa
     import torch
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if verbose:
-        print(f"  loading pyiqa metric {metric_name} on {dev} ...")
+        cap = f"<= {max_edge}px long edge" if max_edge else "native resolution"
+        print(f"  loading pyiqa metric {metric_name} on {dev} ({cap}) ...")
     metric = pyiqa.create_metric(metric_name, device=dev)
     out = dict(cache)
     for i, (name, path) in enumerate(photos, 1):
         if name in out and out[name] is not None:
             continue
         try:
-            out[name] = float(metric(path).item())
+            inp = _load_capped_tensor(path, max_edge) if max_edge else path
+            with torch.inference_mode():
+                out[name] = float(metric(inp).item())
         except Exception as e:
             if verbose:
                 print(f"    ! {name}: {e}")
@@ -321,6 +354,10 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "aesthetics-bakeoff"))
     ap.add_argument("--top-n", type=int, default=60)
     ap.add_argument("--device", default=None, help="torch device for pyiqa.")
+    ap.add_argument("--max-edge", type=int, default=1536,
+                    help="Downscale images to this longer-edge px before IQA "
+                         "scoring (0 = native resolution — will OOM MUSIQ on "
+                         "large photos). Default 1536.")
     args = ap.parse_args()
 
     if not args.vlm and not args.iqa:
@@ -347,7 +384,7 @@ def main():
         print(f"[iqa] {metric}")
         try:
             scores[metric] = score_iqa(metric, photos, scores.get(metric, {}),
-                                       device=args.device)
+                                       device=args.device, max_edge=args.max_edge)
         except ImportError:
             print("  ! pyiqa not installed — `pip install pyiqa`; skipping.")
             continue
