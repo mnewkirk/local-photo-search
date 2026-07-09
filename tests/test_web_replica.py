@@ -93,3 +93,42 @@ def test_no_nas_url_still_404s(client, monkeypatch):
     pid = res["results"][0]["id"]
     r = client.get(f"/api/photos/{pid}/thumbnail")
     assert r.status_code == 404
+
+
+# ── M26a UI: replica freshness card + Sync-from-NAS button on /status ────────
+
+def test_status_page_ships_replica_card(client):
+    """/status carries the ReplicaCard markup. It renders only when
+    /api/admin/replica-status reports replica_mode, so the NAS's own status
+    page stays visually unchanged — but the component must ship in the HTML."""
+    body = client.get("/status").text
+    assert "Sync from NAS" in body
+    assert "/api/admin/replica-status" in body
+    assert "/api/admin/replica-sync" in body
+
+
+def test_replica_status_endpoint_reflects_env(client, monkeypatch, tmp_path):
+    # Not a replica: no PHOTOSEARCH_NAS_URL → replica_mode False.
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    monkeypatch.setenv("PHOTOSEARCH_DB", str(tmp_path / "replica-status-probe.db"))
+    r = client.get("/api/admin/replica-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["replica_mode"] is False
+    assert body["nas_url"] is None
+
+    # Replica mode: URL is normalized (trailing slash stripped) and reported;
+    # the NAS count probe is stubbed out so the test never touches a network.
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://fake-nas:8000/")
+    import urllib.request
+
+    def no_network(*a, **k):
+        raise OSError("no network in tests")
+    monkeypatch.setattr(urllib.request, "urlopen", no_network)
+
+    body = client.get("/api/admin/replica-status").json()
+    assert body["replica_mode"] is True
+    assert body["nas_url"] == "http://fake-nas:8000"
+    assert body["nas_photos"] is None          # probe failed → None, not an error
+    assert body["drift"] is None
+    assert "last_sync" in body and "sync_script" in body
