@@ -442,12 +442,35 @@ def _visual_match_query(visual_json: Optional[str], query: str) -> float:
     return score
 
 
+def _stem_eq(a: str, b: str) -> bool:
+    """Loose word equality tolerant of a short plural/inflection suffix.
+
+    True when the words are equal, or the shorter is a prefix of the longer
+    with a length difference <= 2 (marmot/marmots, dog/dogs) — but only for
+    stems of length >= 4 so short tokens don't over-match. This is a WHOLE-WORD
+    test: it never matches "arm" against "marmot" (which naive substring did).
+    """
+    if a == b:
+        return True
+    lo, hi = sorted((a, b), key=len)
+    return len(lo) >= 4 and len(hi) - len(lo) <= 2 and hi.startswith(lo)
+
+
+def _phrase_subset(short: str, long_: str) -> bool:
+    """True if every word of `short` appears (stem-aware) as a whole word in
+    `long_`. Catches "marmot" ⊂ "marmot burrow" without matching sub-word
+    substrings like "arm" ⊂ "marmot"."""
+    long_words = long_.split()
+    return all(any(_stem_eq(w, lw) for lw in long_words) for w in short.split())
+
+
 def _keywords_match_query(keywords_json: Optional[str], query: str) -> float:
     """Score a keywords array against a query.
 
     Tiers per keyword:
       +1.2  whole-query equals the keyword
-      +0.6  query contains the keyword OR keyword contains the query (substring)
+      +0.6  query is a whole-word (stem-aware) subset of the keyword, or vice
+            versa — e.g. "marmot" ⊂ "marmot burrow" (NOT "arm" ⊂ "marmot")
       +0.3  any token shared between query and the keyword's tokens
     """
     if not keywords_json or not query:
@@ -467,7 +490,7 @@ def _keywords_match_query(keywords_json: Optional[str], query: str) -> float:
         kw_l = kw.lower()
         if kw_l == q_lower:
             score += 1.2
-        elif q_lower in kw_l or kw_l in q_lower:
+        elif _phrase_subset(q_lower, kw_l) or _phrase_subset(kw_l, q_lower):
             score += 0.6
         else:
             if set(kw_l.split()) & q_words:
