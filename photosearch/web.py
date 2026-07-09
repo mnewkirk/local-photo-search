@@ -1215,6 +1215,10 @@ def api_photo_detail(photo_id: int):
             "aesthetic_concepts": json.loads(photo["aesthetic_concepts"]) if photo.get("aesthetic_concepts") else None,
             "aesthetic_critique": photo.get("aesthetic_critique"),
             "aesthetics": _aesthetics_from_row(photo),
+            # Flat map of every raw aes_* column (overall/pct, the 3 dimensions,
+            # the 11 sub-attributes, model, scored_at) for quick inspection —
+            # the structured `aesthetics` block nests the same values.
+            "aes_raw": {k: v for k, v in photo.items() if k.startswith("aes_")},
             "camera_make": photo.get("camera_make"),
             "camera_model": photo.get("camera_model"),
             "focal_length": photo.get("focal_length"),
