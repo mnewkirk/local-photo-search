@@ -2025,6 +2025,49 @@ def backfill_folders(db, apply, force):
         click.echo(f"Set folder on {n} photo(s).")
 
 
+@cli.command("recompute-aesthetic-overall")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write the recomputed scores. Default: dry-run.")
+def recompute_aesthetic_overall(db, apply):
+    """Re-derive aes_overall (+ per-dimension scores) from the stored VLM
+    sub-attribute scores using the current DIMENSION_WEIGHTS. No VLM calls —
+    run this after retuning the weights in photosearch/aesthetics.py, then
+    re-run `normalize-aesthetics` to refresh the percentiles.
+    """
+    from photosearch.aesthetics import recompute_overall_scores
+    with PhotoDB(db) as pdb:
+        n = recompute_overall_scores(pdb, apply=apply)
+        if not apply:
+            click.echo(f"Would recompute aes_overall for {n} scored photo(s). "
+                       f"Re-run with --apply.")
+        else:
+            click.echo(f"Recomputed aes_overall for {n} photo(s). "
+                       f"Run `normalize-aesthetics --apply` to refresh percentiles.")
+
+
+@cli.command("normalize-aesthetics")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Write aes_overall_pct. Default: dry-run.")
+def normalize_aesthetics(db, apply):
+    """Compute the library-relative percentile (aes_overall_pct, 0-100) of every
+    photo's aes_overall. Search/ranking use the percentile, so this is what
+    makes the best photo read as top-tier despite the raw model's compressed
+    scale. Re-run after each large scoring batch or a weight recompute.
+    """
+    from photosearch.aesthetics import normalize_overall
+    with PhotoDB(db) as pdb:
+        n = normalize_overall(pdb, apply=apply)
+        if not apply:
+            click.echo(f"Would normalize percentiles across {n} scored photo(s). "
+                       f"Re-run with --apply.")
+        else:
+            click.echo(f"Normalized aes_overall_pct across {n} photo(s).")
+
+
 # ---------------------------------------------------------------------------
 # maintenance-sweep / validate-data / repair-data (M25)
 # ---------------------------------------------------------------------------
@@ -4246,9 +4289,12 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Ollama model for the category-visual pass (vision).")
 @click.option("--keywords-model", default="llama3.2:3b", show_default=True,
               help="Ollama model for the keywords pass (text-only).")
+@click.option("--aesthetics-model", default="qwen2.5-vl", show_default=True,
+              help="Vision model for the aesthetics scoring pass.")
 def worker(server, passes, collection_id, directory, batch_size, model_batch_size, ttl,
            one_shot, force, describe_model, tags_model, verify_model,
-           category_content_model, category_visual_model, keywords_model):
+           category_content_model, category_visual_model, keywords_model,
+           aesthetics_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -4282,7 +4328,7 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
     pass_list = [p.strip() for p in passes.split(",")]
     valid_passes = {
         "clip", "faces", "quality", "describe", "verify",
-        "category-content", "category-visual", "keywords",
+        "category-content", "category-visual", "keywords", "aesthetics",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.
@@ -4307,6 +4353,7 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
         category_content_model=category_content_model,
         category_visual_model=category_visual_model,
         keywords_model=keywords_model,
+        aesthetics_model=aesthetics_model,
     )
 
 

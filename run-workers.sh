@@ -71,6 +71,7 @@ FORCE=""
 DESCRIBE_MODEL=""
 TAGS_MODEL=""
 VERIFY_MODEL=""
+AESTHETICS_MODEL=""
 
 # OpenAI-compatible (LM Studio / llama-server) routing for the LLM passes.
 # When --text-llm-url is set, describe.py routes ALL text+vision calls there
@@ -82,6 +83,7 @@ LLM_DESCRIBE_MODEL="${PHOTOSEARCH_LLM_DESCRIBE_MODEL:-}"
 LLM_VERIFY_MODEL="${PHOTOSEARCH_LLM_VERIFY_MODEL:-}"
 LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-}"
 LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-}"
+LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-}"
 
 # Execution mode. `native` runs `cli.py worker` processes directly from the
 # repo venv (GPU-capable — picks up CUDA/ROCm torch); `docker` runs the
@@ -371,6 +373,7 @@ required_ollama_models() {
             category-visual)  echo "${CATEGORY_VISUAL_MODEL:-llava}" ;;
             category-content) echo "${CATEGORY_CONTENT_MODEL:-llama3.2:3b}" ;;
             keywords)         echo "${KEYWORDS_MODEL:-llama3.2:3b}" ;;
+            aesthetics)       echo "${AESTHETICS_MODEL:-qwen2.5-vl}" ;;
             verify)
                 echo "${VERIFY_MODEL:-llava}"
                 echo "${DESCRIBE_MODEL:-llama3.2-vision}"
@@ -735,11 +738,13 @@ while [[ $# -gt 0 ]]; do
         --describe-model)   DESCRIBE_MODEL="$2";   shift 2 ;;
         --tags-model)       TAGS_MODEL="$2";       shift 2 ;;
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
+        --aesthetics-model) AESTHETICS_MODEL="$2"; shift 2 ;;
         --text-llm-url)     TEXT_LLM_URL="$2";        shift 2 ;;
         --llm-describe-model) LLM_DESCRIBE_MODEL="$2"; shift 2 ;;
         --llm-verify-model)   LLM_VERIFY_MODEL="$2";   shift 2 ;;
         --llm-visual-model)   LLM_VISUAL_MODEL="$2";   shift 2 ;;
         --llm-text-model)     LLM_TEXT_MODEL="$2";     shift 2 ;;
+        --llm-aesthetics-model) LLM_AESTHETICS_MODEL="$2"; shift 2 ;;
         --native)           MODE="native";         shift ;;
         --docker)           MODE="docker";         shift ;;
         --name)             FLEET_NAME="$2";       shift 2 ;;
@@ -767,6 +772,7 @@ LLM_ENV_PAIRS=()
 [ -n "$LLM_VERIFY_MODEL" ]   && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_VERIFY_MODEL=$LLM_VERIFY_MODEL")
 [ -n "$LLM_VISUAL_MODEL" ]   && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_VISUAL_MODEL=$LLM_VISUAL_MODEL")
 [ -n "$LLM_TEXT_MODEL" ]     && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_TEXT_MODEL=$LLM_TEXT_MODEL")
+[ -n "$LLM_AESTHETICS_MODEL" ] && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_AESTHETICS_MODEL=$LLM_AESTHETICS_MODEL")
 LLM_ENV_DOCKER=()
 for _kv in ${LLM_ENV_PAIRS[@]+"${LLM_ENV_PAIRS[@]}"}; do
     LLM_ENV_DOCKER+=("-e" "$_kv")
@@ -839,6 +845,9 @@ if [ -n "$TAGS_MODEL" ]; then
 fi
 if [ -n "$VERIFY_MODEL" ]; then
     WORKER_CMD="$WORKER_CMD --verify-model $VERIFY_MODEL"
+fi
+if [ -n "$AESTHETICS_MODEL" ]; then
+    WORKER_CMD="$WORKER_CMD --aesthetics-model $AESTHETICS_MODEL"
 fi
 
 SCOPE=""

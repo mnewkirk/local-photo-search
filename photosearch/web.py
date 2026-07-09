@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTM
 from fastapi.staticfiles import StaticFiles
 
 from .db import PhotoDB
+from .aesthetics import aesthetics_from_row as _aesthetics_from_row
 from .worker_api import (
     router as worker_router,
     configure as configure_worker,
@@ -242,7 +243,12 @@ def api_search(
     offset: int = Query(0, ge=0),
     min_score: float = Query(-0.25, description="Minimum CLIP score"),
     min_quality: Optional[float] = Query(None, description="Minimum aesthetic quality (1-10)"),
-    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, relevance"),
+    min_aesthetic: Optional[float] = Query(None, description="Minimum VLM aesthetic percentile (0-100)"),
+    min_technical: Optional[float] = Query(None, description="Minimum Technical Excellence score (1-10)"),
+    min_composition: Optional[float] = Query(None, description="Minimum Composition score (1-10)"),
+    min_impact: Optional[float] = Query(None, description="Minimum Impact & Storytelling score (1-10)"),
+    style_tag: Optional[str] = Query(None, description="Filter by aesthetic style tag (e.g. golden-hour)"),
+    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, aesthetic_desc, relevance"),
     sort_quality: bool = Query(False, description="Legacy: equivalent to sort=quality_desc"),
     text_match: str = Query("all", description="Text matching mode: all, dict, categories, visual, keywords, off"),
     tag_match: Optional[str] = Query(None, deprecated=True, description="Deprecated; use text_match"),
@@ -270,7 +276,10 @@ def api_search(
         category = tag
 
     if not any([q, person, color, place, category, visual_tag, keyword,
-                min_quality is not None, date_from, date_to, location]):
+                min_quality is not None, date_from, date_to, location,
+                min_aesthetic is not None, min_technical is not None,
+                min_composition is not None, min_impact is not None, style_tag,
+                sort == "aesthetic_desc"]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
 
@@ -304,6 +313,11 @@ def api_search(
             category=category,
             visual_tag=visual_tag,
             keyword=keyword,
+            min_aesthetic=min_aesthetic,
+            min_technical=min_technical,
+            min_composition=min_composition,
+            min_impact=min_impact,
+            style_tag=style_tag,
         )
 
         logger.info(
@@ -324,6 +338,11 @@ def api_search(
                 "score": r.get("score"),
                 "clip_score": r.get("clip_score"),
                 "aesthetic_score": r.get("aesthetic_score"),
+                "aes_overall": r.get("aes_overall"),
+                "aes_overall_pct": r.get("aes_overall_pct"),
+                "aes_technical": r.get("aes_technical"),
+                "aes_composition": r.get("aes_composition"),
+                "aes_impact": r.get("aes_impact"),
                 "description": r.get("description"),
                 "camera_model": r.get("camera_model"),
                 "focal_length": r.get("focal_length"),
@@ -1064,11 +1083,19 @@ def api_photo_mirror_fields(photo_id: int):
     photosearch/rerun.py:mirror_photos.
     """
     from .db import _deserialize_float_list, CLIP_DIMENSIONS, FACE_DIMENSIONS
+    from .aesthetics import ALL_SUBATTRS, DIMENSIONS
+    _aes_cols = [
+        "aes_overall", "aes_overall_pct", "aes_technical_iqa", "aes_overall_iqa",
+        "aes_style", "aes_style_tags", "aes_model", "aes_scored_at",
+        *(f"aes_{s}" for s in ALL_SUBATTRS),
+        *(f"aes_{d}" for d in DIMENSIONS),
+    ]
     with _get_db() as db:
         row = db.conn.execute(
-            """SELECT description, categories, visual_tags, keywords, tags,
+            f"""SELECT description, categories, visual_tags, keywords, tags,
                       verified_at, verification_status, hallucination_flags,
-                      aesthetic_score, aesthetic_concepts, aesthetic_critique
+                      aesthetic_score, aesthetic_concepts, aesthetic_critique,
+                      {', '.join(_aes_cols)}
                  FROM photos WHERE id = ?""",
             (photo_id,),
         ).fetchone()
@@ -1187,6 +1214,7 @@ def api_photo_detail(photo_id: int):
             "aesthetic_score": photo.get("aesthetic_score"),
             "aesthetic_concepts": json.loads(photo["aesthetic_concepts"]) if photo.get("aesthetic_concepts") else None,
             "aesthetic_critique": photo.get("aesthetic_critique"),
+            "aesthetics": _aesthetics_from_row(photo),
             "camera_make": photo.get("camera_make"),
             "camera_model": photo.get("camera_model"),
             "focal_length": photo.get("focal_length"),
@@ -2349,6 +2377,24 @@ def api_stats():
             "SELECT COUNT(*) as c FROM photos WHERE keywords IS NOT NULL AND keywords != '[]'"
         ).fetchone()["c"]
 
+        aes_scored = db.conn.execute(
+            "SELECT COUNT(*) as c FROM photos WHERE aes_overall IS NOT NULL"
+        ).fetchone()["c"]
+        aesthetics_stats = None
+        if aes_scored > 0:
+            row = db.conn.execute(
+                """SELECT MIN(aes_overall) as min_s, MAX(aes_overall) as max_s,
+                          AVG(aes_overall) as avg_s,
+                          SUM(CASE WHEN aes_overall_pct IS NOT NULL THEN 1 ELSE 0 END) as pct_done
+                   FROM photos WHERE aes_overall IS NOT NULL"""
+            ).fetchone()
+            aesthetics_stats = {
+                "min": round(row["min_s"], 2),
+                "max": round(row["max_s"], 2),
+                "mean": round(row["avg_s"], 2),
+                "normalized": row["pct_done"],
+            }
+
         verify_rows = db.conn.execute(
             """SELECT verification_status AS status, COUNT(*) AS c
                FROM photos
@@ -2369,6 +2415,8 @@ def api_stats():
         "described": described,
         "quality_scored": scored,
         "quality_stats": quality_stats,
+        "aesthetics_scored": aes_scored,
+        "aesthetics_stats": aesthetics_stats,
         "concepts_analyzed": concepts_analyzed,
         "category_tagged": category_tagged,
         "visual_tagged": visual_tagged,

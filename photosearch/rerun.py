@@ -36,7 +36,8 @@ from typing import Optional
 
 # Passes this module can re-run. Mirrors worker_api._ALL_PASSES order.
 ALL_PASSES = ("clip", "faces", "quality", "describe",
-              "category-content", "category-visual", "keywords", "verify")
+              "category-content", "category-visual", "keywords", "verify",
+              "aesthetics")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
@@ -50,6 +51,7 @@ _PASS_LLM = {
     "category-content": ("text",     "llama3.2:3b"),
     "keywords":         ("text",     "llama3.2:3b"),
     "category-visual":  ("visual",   "llava"),
+    "aesthetics":       ("aesthetics", "qwen2.5-vl"),
 }
 
 
@@ -66,6 +68,7 @@ def nas_base() -> Optional[str]:
 _LMSTUDIO_DEFAULTS = {"describe": "qwen2.5-vl-7b-instruct",
                       "verify":   "qwen2.5-vl-7b-instruct",
                       "visual":   "qwen2.5-vl-7b-instruct",
+                      "aesthetics": "qwen2.5-vl-7b-instruct",
                       "text":     "llama-3.2-3b-instruct"}
 
 
@@ -82,7 +85,7 @@ def _resolve_model(pass_type: str) -> str:
                or os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL"))
         if env:
             return env
-        if role in ("describe", "verify"):
+        if role in ("describe", "verify", "aesthetics"):
             return os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL") or _LMSTUDIO_DEFAULTS[role]
         return _LMSTUDIO_DEFAULTS[role]
     return os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL") or default
@@ -224,6 +227,13 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             for r in results:
                 r["model"], r["model_version"] = model, mv
             kwargs = {"keywords_results": results}
+        elif pass_type == "aesthetics":
+            model = _resolve_model("aesthetics")
+            results = W._process_aesthetics(downloaded, model=model)
+            mv = _model_version(model)
+            for r in results:
+                r["model"], r["model_version"] = model, mv
+            kwargs = {"aesthetics_results": results}
         else:  # pragma: no cover - guarded above
             raise ValueError(f"unknown pass type: {pass_type}")
 
@@ -252,10 +262,21 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
 # ---------------------------------------------------------------------------
 
 # Scalar / text columns mirrored verbatim from /mirror-fields.
+def _aes_mirror_columns() -> tuple[str, ...]:
+    from .aesthetics import ALL_SUBATTRS, DIMENSIONS
+    return (
+        "aes_overall", "aes_overall_pct", "aes_technical_iqa", "aes_overall_iqa",
+        "aes_style", "aes_style_tags", "aes_model", "aes_scored_at",
+        *(f"aes_{s}" for s in ALL_SUBATTRS),
+        *(f"aes_{d}" for d in DIMENSIONS),
+    )
+
+
 _MIRROR_COLUMNS = (
     "description", "categories", "visual_tags", "keywords", "tags",
     "verified_at", "verification_status", "hallucination_flags",
     "aesthetic_score", "aesthetic_concepts", "aesthetic_critique",
+    *_aes_mirror_columns(),
 )
 
 

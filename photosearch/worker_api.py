@@ -163,6 +163,18 @@ class KeywordsResult(BaseModel):
     model_version: Optional[str] = None
 
 
+class AestheticsResult(BaseModel):
+    photo_id: int
+    # Flat aes_* scalar columns (aes_overall, aes_technical, aes_sharpness, ...).
+    # Passed through by name to update_photo, so the worker and server stay
+    # decoupled from the exact sub-attribute set.
+    scores: dict[str, float] = {}
+    aes_style: Optional[str] = None       # JSON: {facets, critiques}
+    aes_style_tags: Optional[str] = None  # JSON array of style tags
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
 class SubmitRequest(BaseModel):
     batch_id: str
     pass_type: str
@@ -175,6 +187,7 @@ class SubmitRequest(BaseModel):
     category_content_results: Optional[list[CategoryContentResult]] = None
     category_visual_results: Optional[list[CategoryVisualResult]] = None
     keywords_results: Optional[list[KeywordsResult]] = None
+    aesthetics_results: Optional[list[AestheticsResult]] = None
     # Model provenance for describe/tags/verify — logged to the generations
     # table. Optional so older workers still submit cleanly.
     model: Optional[str] = None
@@ -520,6 +533,49 @@ def submit_results(req: SubmitRequest):
             if processed_photo_ids:
                 db.mark_processed(processed_photo_ids, "keywords")
 
+        elif req.pass_type == "aesthetics":
+            from .aesthetics import ALL_SUBATTRS, DIMENSIONS
+            # Allowlist the aes_* scalar columns a client may set — update_photo
+            # interpolates keys into SQL, so never trust arbitrary column names.
+            allowed_score_cols = (
+                {"aes_overall", "aes_technical_iqa", "aes_overall_iqa"}
+                | {f"aes_{s}" for s in ALL_SUBATTRS}
+                | {f"aes_{d}" for d in DIMENSIONS}
+            )
+            aesthetics_results = req.aesthetics_results or []
+            now = db.conn.execute("SELECT datetime('now')").fetchone()[0]
+            db.begin_batch(batch_size=100)
+            for r in aesthetics_results:
+                processed_photo_ids.append(r.photo_id)
+                try:
+                    fields = {k: v for k, v in (r.scores or {}).items()
+                              if k in allowed_score_cols and v is not None}
+                    if not fields or "aes_overall" not in fields:
+                        # Nothing usable — skip (worker already omits deferrals,
+                        # so this is a defensive guard, not the normal path).
+                        continue
+                    fields["aes_style"] = r.aes_style
+                    fields["aes_style_tags"] = r.aes_style_tags
+                    fields["aes_model"] = r.model
+                    fields["aes_scored_at"] = now
+                    db.update_photo(r.photo_id, **fields)
+                    db.log_generation(
+                        r.photo_id, "aesthetics",
+                        json.dumps({"scores": fields.get("aes_overall"),
+                                    "style": r.aes_style,
+                                    "tags": r.aes_style_tags}),
+                        r.model, r.model_version)
+                    written += 1
+                except Exception as e:
+                    logger.warning(f"Failed to store aesthetics for photo {r.photo_id}: {e}")
+                    try:
+                        db.log_error("aesthetics", str(r.photo_id), str(e))
+                    except Exception:
+                        pass
+            db.end_batch()
+            if processed_photo_ids:
+                db.mark_processed(processed_photo_ids, "aesthetics")
+
         # Log activity for the chart
         if written > 0:
             db.log_activity(req.pass_type, "index", written)
@@ -682,6 +738,24 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM worker_processed WHERE pass_type = 'keywords' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
+        elif req.pass_type == "aesthetics":
+            from .aesthetics import ALL_SUBATTRS, DIMENSIONS
+            aes_cols = (
+                ["aes_overall", "aes_overall_pct", "aes_technical_iqa",
+                 "aes_overall_iqa", "aes_style", "aes_style_tags",
+                 "aes_model", "aes_scored_at"]
+                + [f"aes_{s}" for s in ALL_SUBATTRS]
+                + [f"aes_{d}" for d in DIMENSIONS]
+            )
+            set_clause = ", ".join(f"{c} = NULL" for c in aes_cols)
+            cur = db.conn.execute(
+                f"UPDATE photos SET {set_clause} WHERE id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'aesthetics' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         else:
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
@@ -734,7 +808,8 @@ def photo_detail(photo_id: int):
 # v23 migration, so count_unprocessed("tags") is pinned at the full library size
 # forever. Including it in queue_depth just showed a confusing dead counter.
 _ALL_PASSES = ("clip", "faces", "quality", "describe",
-               "category-content", "category-visual", "keywords", "verify")
+               "category-content", "category-visual", "keywords", "verify",
+               "aesthetics")
 
 
 @router.get("/status")

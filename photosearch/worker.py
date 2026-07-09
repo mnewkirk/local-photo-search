@@ -549,6 +549,59 @@ def _process_category_visual(
     return results
 
 
+def _process_aesthetics(
+    downloaded: list[tuple[dict, str]],
+    model: str = "qwen2.5-vl",
+) -> list[dict]:
+    """Vision pass: score photos across aesthetic dimensions + style critique.
+
+    Returns one row per photo that scored successfully, each carrying the flat
+    scalar columns for the DB plus the JSON style/critique fields. Photos whose
+    VLM response couldn't be parsed are OMITTED (not returned with nulls) so the
+    server doesn't mark them permanently done — the attempts cap in the claim
+    predicate retires genuinely-unparseable photos after N tries.
+    """
+    from .aesthetics import score_photo_aesthetics, compute_overall
+    from .describe import check_available
+    check_available(model)
+    results = []
+    total = len(downloaded)
+    for idx, (photo, path) in enumerate(downloaded, 1):
+        fname = photo["filename"]
+        print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
+        t0 = time.time()
+        try:
+            aes = score_photo_aesthetics(path, model=model)
+            elapsed = time.time() - t0
+            if not aes:
+                # Send an empty-scores row so the server marks the photo
+                # processed (attempts++). The attempts cap then retires
+                # genuinely-unparseable photos after N tries, while a still-NULL
+                # aes_overall lets transient failures retry until then — avoids
+                # the CLIP-style infinite re-claim.
+                print(f" ({elapsed:.1f}s) no aesthetics (deferred)")
+                results.append({"photo_id": photo["id"], "scores": {}})
+                continue
+            # Flatten sub-attribute + dimension + overall scores into aes_* cols
+            # in a `scores` dict the server passes straight to update_photo.
+            scores = {f"aes_{sub}": val for sub, val in aes["sub_scores"].items()}
+            scores.update({f"aes_{dim}": val for dim, val in aes["dim_scores"].items()})
+            scores["aes_overall"] = aes["overall"]
+            row = {
+                "photo_id": photo["id"],
+                "scores": scores,
+                "aes_style": json.dumps(
+                    {"facets": aes["style"], "critiques": aes["critiques"]}),
+                "aes_style_tags": json.dumps(aes["style_tags"]),
+            }
+            print(f" ({elapsed:.1f}s) overall={aes['overall']}")
+            results.append(row)
+        except Exception as e:
+            print(f" ERROR: {e}")
+            results.append({"photo_id": photo["id"], "scores": {}})
+    return results
+
+
 def _process_verify(
     downloaded: list[tuple[dict, str]],
     client: "WorkerClient",
@@ -726,6 +779,7 @@ def run_worker(
     category_content_model: str = "llama3.2:3b",
     category_visual_model: str = "llava",
     keywords_model: str = "llama3.2:3b",
+    aesthetics_model: str = "qwen2.5-vl",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
@@ -745,6 +799,7 @@ def run_worker(
         category_content_model: Ollama model for category-content text pass (default: llama3.2:3b)
         category_visual_model: Ollama model for category-visual vision pass (default: llava)
         keywords_model: Ollama model for keywords text pass (default: llama3.2:3b)
+        aesthetics_model: Vision model for the aesthetics scoring pass (default: qwen2.5-vl)
     """
     print(f"Connecting to {server}...")
     client = WorkerClient(server)
@@ -903,6 +958,13 @@ def run_worker(
                         r["model"] = keywords_model
                         r["model_version"] = mv
                     kwargs = {"keywords_results": results}
+                elif pass_type == "aesthetics":
+                    results = _process_aesthetics(downloaded, model=aesthetics_model)
+                    mv = _model_version(aesthetics_model)
+                    for r in results:
+                        r["model"] = aesthetics_model
+                        r["model_version"] = mv
+                    kwargs = {"aesthetics_results": results}
                 else:
                     print(f"  Pass type '{pass_type}' not yet implemented in worker.")
                     heartbeat.stop()
@@ -933,7 +995,7 @@ def run_worker(
                 n_processed = resp.get("processed", n_written)
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
-                elif pass_type in ("describe", "category-content", "category-visual", "keywords"):
+                elif pass_type in ("describe", "category-content", "category-visual", "keywords", "aesthetics"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")

@@ -79,7 +79,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -473,6 +473,41 @@ class PhotoDB:
                 "WHERE filepath IS NOT NULL"
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
+
+        # Migration: VLM aesthetics columns (schema v26). The new "aesthetics"
+        # worker pass writes a rich, per-attribute evaluation that replaces the
+        # compressed LAION `aesthetic_score` as the primary quality signal (which
+        # is kept as a cheap prior). aes_overall is a weighted mean of the three
+        # dimension scores; aes_overall_pct is its library-relative percentile
+        # (0-100), backfilled by `normalize-aesthetics`. The dimension + overall
+        # columns are indexed (common sort/filter axes); the 11 sub-attributes
+        # are plain REAL (filter scans are sub-second). aes_style / aes_style_tags
+        # hold the searchable style critique (JSON) and controlled tags (JSON
+        # array). aes_*_iqa are optional objective-IQA anchors (populated only if
+        # the bakeoff keeps the hybrid MUSIQ/VisualQuality-R1 path). See
+        # photosearch/aesthetics.py and the approved plan.
+        try:
+            cur.execute("SELECT aes_overall FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            for col in (
+                "aes_overall", "aes_overall_pct",
+                "aes_technical", "aes_composition", "aes_impact",
+                "aes_sharpness", "aes_exposure", "aes_depth_of_field",
+                "aes_white_balance", "aes_framing", "aes_leading_lines",
+                "aes_rule_of_thirds", "aes_balance",
+                "aes_emotion", "aes_originality", "aes_wow",
+                "aes_technical_iqa", "aes_overall_iqa",
+            ):
+                cur.execute(f"ALTER TABLE photos ADD COLUMN {col} REAL")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_style TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_style_tags TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_model TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_scored_at TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_overall ON photos(aes_overall)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_overall_pct ON photos(aes_overall_pct)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_technical ON photos(aes_technical)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_composition ON photos(aes_composition)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_impact ON photos(aes_impact)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
@@ -1879,6 +1914,32 @@ class PhotoDB:
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
+        elif pass_type == "aesthetics":
+            # VLM aesthetic scoring — no description dependency (scores the image
+            # directly). Unscored = aes_overall IS NULL. attempts cap so a photo
+            # the model can't parse stops being claimed after MAX_PROCESS_ATTEMPTS.
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE id IN ({placeholders})
+                        AND aes_overall IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
+                        LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""SELECT id, filepath FROM photos
+                        WHERE aes_overall IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
+                        LIMIT ?""",
+                    (limit + len(claimed),),
+                ).fetchall()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")
 
@@ -2006,6 +2067,26 @@ class PhotoDB:
                     """SELECT COUNT(*) FROM photos
                        WHERE description IS NOT NULL
                        AND verified_at IS NULL"""
+                ).fetchone()
+        elif pass_type == "aesthetics":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE id IN ({placeholders})
+                        AND aes_overall IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos
+                        WHERE aes_overall IS NULL
+                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
+                                        WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"""
                 ).fetchone()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")

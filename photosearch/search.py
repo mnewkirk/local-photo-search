@@ -1058,6 +1058,47 @@ def search_by_face_reference(db: PhotoDB, image_path: str, limit: int = 10) -> l
 _OPEN_DATE_HI = "9999-12-31"
 
 
+def _has_aesthetic_filters(min_aesthetic, min_technical, min_composition,
+                           min_impact, style_tag) -> bool:
+    return any(v is not None for v in
+               (min_aesthetic, min_technical, min_composition, min_impact)) \
+        or bool(style_tag)
+
+
+def _style_tag_matches(row: dict, style_tag: str) -> bool:
+    """True if `style_tag` is present in the row's aes_style_tags JSON array."""
+    raw = row.get("aes_style_tags")
+    if not raw:
+        return False
+    try:
+        import json as _json
+        tags = _json.loads(raw) if isinstance(raw, str) else raw
+        return style_tag.lower() in {str(t).lower() for t in (tags or [])}
+    except Exception:
+        return False
+
+
+def _filter_aesthetic(results: list[dict], min_aesthetic=None, min_technical=None,
+                      min_composition=None, min_impact=None, style_tag=None) -> list[dict]:
+    """Filter to photos meeting the aesthetic thresholds. min_aesthetic is on the
+    library-relative percentile (aes_overall_pct, 0-100); the per-dimension
+    thresholds are on the raw 1-10 dimension scores."""
+    out = []
+    for r in results:
+        if min_aesthetic is not None and (r.get("aes_overall_pct") or -1) < min_aesthetic:
+            continue
+        if min_technical is not None and (r.get("aes_technical") or -1) < min_technical:
+            continue
+        if min_composition is not None and (r.get("aes_composition") or -1) < min_composition:
+            continue
+        if min_impact is not None and (r.get("aes_impact") or -1) < min_impact:
+            continue
+        if style_tag and not _style_tag_matches(r, style_tag):
+            continue
+        out.append(r)
+    return out
+
+
 def _filter_by_date(results: list[dict], date_from: str, date_to: str) -> list[dict]:
     """Filter results to those whose date_taken falls within [date_from, date_to]."""
     filtered = []
@@ -1099,7 +1140,7 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
 
 # Allowed values for search_combined's `sort` param. Kept as a module
 # constant so callers (web.py, cli.py) and tests reference one list.
-SORT_MODES = ("date_desc", "date_asc", "quality_desc", "relevance")
+SORT_MODES = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc", "relevance")
 
 # Reciprocal Rank Fusion constant. Textbook default is 60 — smaller k
 # makes the top-ranked item in each filter dominate more; larger k
@@ -1194,6 +1235,13 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
         return sorted(
             merged,
             key=lambda r: (r.get("aesthetic_score") or 0),
+            reverse=True,
+        )
+    if sort == "aesthetic_desc":
+        # Rank by the library-relative percentile so the best photos lead.
+        return sorted(
+            merged,
+            key=lambda r: (r.get("aes_overall_pct") or 0),
             reverse=True,
         )
     # Date sorts: split dated / undated so NULLs land at the tail.
@@ -1420,6 +1468,11 @@ def search_combined(
     visual_tag: Optional[str] = None,
     keyword: Optional[str] = None,
     person_ids: Optional[list[int]] = None,
+    min_aesthetic: Optional[float] = None,
+    min_technical: Optional[float] = None,
+    min_composition: Optional[float] = None,
+    min_impact: Optional[float] = None,
+    style_tag: Optional[str] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1646,6 +1699,22 @@ def search_combined(
             results = _filter_by_date(results, date_from, date_to or _OPEN_DATE_HI)
         return _wrap(results)
 
+    # Aesthetics-only browse: no content filters, just aesthetic thresholds
+    # and/or the aesthetic sort — return the library ranked by percentile.
+    _aes_filtered = _has_aesthetic_filters(
+        min_aesthetic, min_technical, min_composition, min_impact, style_tag)
+    if not result_sets and (_aes_filtered or sort == "aesthetic_desc"):
+        rows = db.conn.execute(
+            "SELECT * FROM photos WHERE aes_overall_pct IS NOT NULL "
+            "ORDER BY aes_overall_pct DESC"
+        ).fetchall()
+        results = _filter_aesthetic(
+            [dict(r) for r in rows], min_aesthetic, min_technical,
+            min_composition, min_impact, style_tag)
+        if date_from:
+            results = _filter_by_date(results, date_from, date_to or _OPEN_DATE_HI)
+        return _wrap(results)
+
     if not result_sets:
         return _wrap([])
 
@@ -1685,6 +1754,12 @@ def search_combined(
             r for r in merged
             if r.get("aesthetic_score") is not None and r["aesthetic_score"] >= min_quality
         ]
+
+    # Apply VLM aesthetic filters (percentile + per-dimension + style tag)
+    if _aes_filtered:
+        merged = _filter_aesthetic(
+            merged, min_aesthetic, min_technical, min_composition,
+            min_impact, style_tag)
 
     # Back-compat: sort_quality=True overrides sort to quality_desc.
     # Prefer the explicit `sort` param in new callers.

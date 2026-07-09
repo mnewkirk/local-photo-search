@@ -43,6 +43,7 @@ SWEEP_STAGE_ORDER = (
     "stacking",
     "match_faces",
     "resolve_dups",
+    "normalize_aesthetics",
     "recluster",
 )
 
@@ -241,6 +242,28 @@ def _stage_colors(db, apply, emit, check_abort, batch_size=100):
                   "done": i, "total": would})
     db.conn.commit()
     return {"stage": "colors", "would": would, "applied": applied, "status": "done"}
+
+
+def _stage_normalize_aesthetics(db, apply, emit, check_abort):
+    """Refresh aes_overall_pct (library-relative percentile) when new photos
+    have been scored by the fleet's aesthetics pass. The VLM scoring itself is
+    a heavy worker pass and is NOT run here — this only recomputes the cheap
+    percentile so newly-scored photos rank correctly. Percentile is a whole-
+    library statistic, so any row missing a percentile triggers a full recompute.
+    """
+    would = db.conn.execute(
+        "SELECT COUNT(*) FROM photos "
+        "WHERE aes_overall IS NOT NULL AND aes_overall_pct IS NULL"
+    ).fetchone()[0]
+    if would == 0 or not apply:
+        return {"stage": "normalize_aesthetics", "would": would, "applied": 0,
+                "status": "skipped" if would == 0 else "preview"}
+    from .aesthetics import normalize_overall
+    n = normalize_overall(db, apply=True)
+    emit({"phase": "sweep", "stage": "normalize_aesthetics", "status": "running",
+          "done": n, "total": n})
+    return {"stage": "normalize_aesthetics", "would": would, "applied": n,
+            "status": "done"}
 
 
 def _abort_flag(check_abort) -> bool:
@@ -693,6 +716,8 @@ def run_maintenance_sweep(
     if do_match:
         plan.append(("match_faces", lambda: _stage_match_faces(db, apply, emit, check_abort)))
     plan.append(("resolve_dups", lambda: _stage_resolve_dups(db, apply, emit, check_abort)))
+    plan.append(("normalize_aesthetics",
+                 lambda: _stage_normalize_aesthetics(db, apply, emit, check_abort)))
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
 
