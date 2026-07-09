@@ -256,9 +256,19 @@ Schema v26 adds `aes_*` columns to `photos`: `aes_overall` (weighted mean,
 default weights Technical .30 / Composition .30 / Impact .40 in
 `DIMENSION_WEIGHTS`, **retunable without a VLM re-run**), the 3 dimension + 11
 sub-attribute scores, `aes_style`/`aes_style_tags` (JSON), and
-`aes_overall_pct`. The `aes_technical_iqa`/`aes_overall_iqa` columns are reserved
-for an optional objective-IQA anchor (pyiqa MUSIQ/TOPIQ / VisualQuality-R1) if
-the Phase-0 bakeoff (`evals/aesthetics_bakeoff.py`) keeps it.
+`aes_overall_pct`. The `aes_technical_iqa`/`aes_overall_iqa` columns were
+reserved for an optional objective-IQA anchor (pyiqa MUSIQ/TOPIQ /
+VisualQuality-R1). **Phase-0 bakeoff (2026-07-09) rejected the anchor:** on a
+28-photo hand-ranked sample, qwen2.5-vl-7b beat both IQA metrics on Spearman vs
+the human ranking (ρ **0.70** vs topiq_nr 0.61, musiq 0.55), and the two IQA
+metrics correlated with each other (ρ 0.82) more than with the human — i.e. they
+measure a technical-cleanliness axis partly orthogonal to actual preference. So
+**the VLM (qwen2.5-vl) is the sole primary signal; no IQA anchor.** This keeps
+`pyiqa`/MUSIQ out of the production path entirely (it only ever ran in the
+bakeoff eval — and was the OOM-killer there until `evals/aesthetics_bakeoff.py`
+gained the resolution cap). The `aes_*_iqa` columns stay as unused/reserved
+(harmless NULLs); revisit only if a qwen+IQA blend is ever shown to beat qwen
+alone. Bakeoff harness + report: `evals/aesthetics_bakeoff.py`.
 
 **The 6.2-ceiling fix is percentile normalization.** VLMs cluster raw scores
 6–8 just like LAION compresses, so ranking/search use `aes_overall_pct` — the
