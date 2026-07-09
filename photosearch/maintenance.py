@@ -44,6 +44,7 @@ SWEEP_STAGE_ORDER = (
     "match_faces",
     "resolve_dups",
     "normalize_aesthetics",
+    "normalize_subject_aesthetics",
     "recluster",
 )
 
@@ -263,6 +264,26 @@ def _stage_normalize_aesthetics(db, apply, emit, check_abort):
     emit({"phase": "sweep", "stage": "normalize_aesthetics", "status": "running",
           "done": n, "total": n})
     return {"stage": "normalize_aesthetics", "would": would, "applied": n,
+            "status": "done"}
+
+
+def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort):
+    """Refresh aes_subject_overall_pct (library-relative percentile of the
+    subject-crop score) when new photos have been subject-scored by the fleet.
+    Cheap percentile recompute only — the VLM subject scoring is a worker pass.
+    See photosearch/subjects.py + docs/plans/subject-aware-quality.md."""
+    would = db.conn.execute(
+        "SELECT COUNT(*) FROM photos "
+        "WHERE aes_subject_overall IS NOT NULL AND aes_subject_overall_pct IS NULL"
+    ).fetchone()[0]
+    if would == 0 or not apply:
+        return {"stage": "normalize_subject_aesthetics", "would": would, "applied": 0,
+                "status": "skipped" if would == 0 else "preview"}
+    from .aesthetics import normalize_subject_overall
+    n = normalize_subject_overall(db, apply=True)
+    emit({"phase": "sweep", "stage": "normalize_subject_aesthetics", "status": "running",
+          "done": n, "total": n})
+    return {"stage": "normalize_subject_aesthetics", "would": would, "applied": n,
             "status": "done"}
 
 
@@ -718,6 +739,8 @@ def run_maintenance_sweep(
     plan.append(("resolve_dups", lambda: _stage_resolve_dups(db, apply, emit, check_abort)))
     plan.append(("normalize_aesthetics",
                  lambda: _stage_normalize_aesthetics(db, apply, emit, check_abort)))
+    plan.append(("normalize_subject_aesthetics",
+                 lambda: _stage_normalize_subject_aesthetics(db, apply, emit, check_abort)))
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
 
