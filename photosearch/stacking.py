@@ -308,13 +308,22 @@ def save_stacks(
     stacks: list[list[int]],
     on_progress: Optional[Callable[[dict], None]] = None,
     should_abort: Optional[Callable[[], bool]] = None,
+    scope_photo_ids: list[int] | None = None,
 ):
     """Clear existing stacks and save new ones.
 
     Each stack list is ordered by aesthetic score descending —
     the first element becomes the top photo.
+
+    scope_photo_ids: when set (a scoped detection, e.g. an ingest indexing one
+    folder), clear ONLY stacks overlapping that scope instead of wiping the whole
+    library. This is the fix for the ingest cron silently deleting every stack in
+    the library each night — a scoped run must replace only its own stacks.
     """
-    db.clear_stacks()
+    if scope_photo_ids:
+        db.clear_stacks_for_photos(scope_photo_ids)
+    else:
+        db.clear_stacks()
     total = len(stacks)
     last_emit = time.monotonic()
     if on_progress:
@@ -369,5 +378,8 @@ def run_stacking(
         on_progress=on_progress, should_abort=should_abort,
     )
     if not dry_run and stacks:
-        save_stacks(db, stacks, on_progress=on_progress, should_abort=should_abort)
+        # Scoped runs (photo_ids set) clear only their own stacks; a full-library
+        # run clears everything. Prevents the ingest cron from wiping all stacks.
+        save_stacks(db, stacks, on_progress=on_progress, should_abort=should_abort,
+                    scope_photo_ids=photo_ids)
     return stacks

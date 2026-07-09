@@ -1544,10 +1544,31 @@ class PhotoDB:
         return [dict(r) for r in rows]
 
     def clear_stacks(self):
-        """Remove all stacks (useful before re-running detection)."""
+        """Remove all stacks (useful before re-running FULL-library detection)."""
         self.conn.execute("DELETE FROM stack_members")
         self.conn.execute("DELETE FROM photo_stacks")
         self.conn.commit()
+
+    def clear_stacks_for_photos(self, photo_ids: list[int]) -> int:
+        """Remove only stacks that contain any of `photo_ids` (and all their
+        members). Used by SCOPED re-detection (e.g. an ingest indexing a single
+        folder) so it replaces just that scope's stacks instead of wiping the
+        whole library. Returns the number of stacks removed."""
+        if not photo_ids:
+            return 0
+        placeholders = ",".join("?" for _ in photo_ids)
+        rows = self.conn.execute(
+            f"SELECT DISTINCT stack_id FROM stack_members WHERE photo_id IN ({placeholders})",
+            photo_ids,
+        ).fetchall()
+        stack_ids = [r["stack_id"] for r in rows]
+        if not stack_ids:
+            return 0
+        sp = ",".join("?" for _ in stack_ids)
+        self.conn.execute(f"DELETE FROM stack_members WHERE stack_id IN ({sp})", stack_ids)
+        self.conn.execute(f"DELETE FROM photo_stacks WHERE id IN ({sp})", stack_ids)
+        self.conn.commit()
+        return len(stack_ids)
 
     # ------------------------------------------------------------------
     # Worker claims (distributed indexing)

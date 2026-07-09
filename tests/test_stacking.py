@@ -491,3 +491,34 @@ class TestSaveAndRun:
         # Save again — should replace, not duplicate
         save_stacks(db, stacks)
         assert len(db.get_all_stacks()) == len(stacks)
+
+    def test_scoped_save_preserves_out_of_scope_stacks(self, db):
+        """A scoped save (scope_photo_ids set) must clear only stacks overlapping
+        the scope — NOT wipe the whole library. Regression for the ingest cron
+        deleting every stack each night."""
+        pids = [p["id"] for p in db.get_all_photos()] if hasattr(db, "get_all_photos") else None
+        # Two disjoint stacks: A and B.
+        rows = db.conn.execute("SELECT id FROM photos ORDER BY id").fetchall()
+        ids = [r["id"] for r in rows]
+        A, B = ids[:2], ids[2:4]
+        save_stacks(db, [A, B])
+        assert len(db.get_all_stacks()) == 2
+        # Re-detect scoped to B only (as an ingest of B's folder would) — A survives.
+        save_stacks(db, [B], scope_photo_ids=B)
+        assert len(db.get_all_stacks()) == 2
+        surviving = db.conn.execute(
+            "SELECT COUNT(*) FROM stack_members WHERE photo_id = ?", (A[0],)
+        ).fetchone()[0]
+        assert surviving == 1  # A's stack was NOT wiped by the scoped B run
+
+    def test_run_stacking_scoped_does_not_wipe_others(self, db):
+        """run_stacking(photo_ids=...) threads the scope into save_stacks."""
+        rows = db.conn.execute("SELECT id FROM photos ORDER BY id").fetchall()
+        ids = [r["id"] for r in rows]
+        save_stacks(db, [ids[:2], ids[2:4]])
+        before = len(db.get_all_stacks())
+        assert before == 2
+        # Scoped run over an isolated photo finds nothing → no stacks saved, but
+        # crucially the existing two are NOT cleared (scoped clear only).
+        run_stacking(db, photo_ids=[ids[-1]])
+        assert len(db.get_all_stacks()) == before
