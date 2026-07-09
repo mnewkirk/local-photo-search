@@ -78,6 +78,9 @@ photos/
 # Syncthing runtime config — holds private keys, TLS certs, and the apikey
 syncthing-config/
 
+# Syncing between the NAS and local replica
+replica-sync.log
+
 # eval bake-off outputs (regenerable)
 evals/bakeoff_results.json
 evals/bakeoff_report.html
