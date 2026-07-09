@@ -759,7 +759,11 @@ def clear_pass(req: ClearPassRequest):
             aes_cols = (
                 ["aes_overall", "aes_overall_pct", "aes_technical_iqa",
                  "aes_overall_iqa", "aes_style", "aes_style_tags",
-                 "aes_model", "aes_scored_at"]
+                 "aes_model", "aes_scored_at",
+                 # Subject-aware quality (v27) — reset so a re-score doesn't
+                 # leave stale subject data on a now-subjectless photo.
+                 "subject_boxes", "aes_subject_overall", "aes_subject_overall_pct",
+                 "aes_subject", "aes_subject_model", "aes_subject_scored_at"]
                 + [f"aes_{s}" for s in ALL_SUBATTRS]
                 + [f"aes_{d}" for d in DIMENSIONS]
             )
