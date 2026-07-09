@@ -848,6 +848,26 @@
             pct == null ? '/ 10 overall'
               : 'percentile · ' + (overall != null ? overall.toFixed(1) + '/10 raw' : '')),
         ),
+        (function () {
+          // Subject-aware quality (v27): the primary subject's crop score, which
+          // judges the subject rather than the background. From aes_raw.
+          var raw = (detail && detail.aes_raw) || {};
+          var so = raw.aes_subject_overall, sp = raw.aes_subject_overall_pct;
+          var boxes = (detail && detail.subject_boxes) || null;
+          if (so != null) {
+            var lbl = boxes && boxes.length ? (boxes[0].label || 'subject') : 'subject';
+            return e('div', { style: { fontSize: 13, marginBottom: 10, padding: '5px 9px',
+                                       background: 'var(--surface2)', borderRadius: 6 } },
+              e('span', { style: { color: 'var(--text-muted)' } }, 'Subject (' + lbl + '): '),
+              e('span', { style: { fontWeight: 700, color: _scoreColor(so) } },
+                (sp != null ? Math.round(sp) + ' pct' : '') + ' · ' + so.toFixed(1) + '/10'));
+          }
+          if (boxes && boxes.length === 0) {
+            return e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 } },
+              'No distinct subject — scored on the full frame.');
+          }
+          return null;
+        })(),
         bars,
         facetRows.length > 0 && e('div', { style: { marginTop: 8 } },
           e('div', { style: { fontSize: 12, fontWeight: 600, marginBottom: 3 } }, 'Style'),
@@ -1583,6 +1603,7 @@
     date_asc:     { label: 'Oldest first',   icon: '\u2191' },  // ↑
     quality_desc: { label: 'Best quality',   icon: '\u2b50' },  // ⭐ (using ★ variant)
     aesthetic_desc: { label: 'Best aesthetics', icon: '\u2728' },  // sparkle - VLM percentile
+    subject_aesthetic_desc: { label: 'Best subject', icon: '\ud83d\udfe2' },  // \ud83d\udfe2 - subject-crop percentile
     name_asc:     { label: 'Name A\u2013Z',  icon: 'Az' },
   };
 
