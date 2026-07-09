@@ -245,9 +245,49 @@ def load_ground_truth(path):
 # Report
 # --------------------------------------------------------------------------
 
+def _thumb_data_uri(path, box=(300, 220)):
+    """Return a downscaled base64 JPEG data URI for `path`.
+
+    The report embeds thumbnails inline instead of linking `file://<abspath>`.
+    A WSL absolute path (`file:///home/mattn/...`) resolves to `C:\\home\\...`
+    when the HTML is opened in a Windows browser over the \\\\wsl.localhost
+    mount, so linked images never load. Embedding makes the report
+    self-contained and path-independent. `draft` decodes big JPEGs at reduced
+    scale so even a 56MP source stays cheap."""
+    import base64
+    import io
+    from PIL import Image, ImageOps
+    try:
+        import photosearch  # noqa: F401 — registers the HEIF/HEIC opener
+    except Exception:
+        pass
+    try:
+        im = Image.open(path)
+        try:
+            im.draft("RGB", box)  # fast reduced-scale decode for JPEG sources
+        except Exception:
+            pass
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im.thumbnail(box, Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=78)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
 def write_report(out_dir, photos, scores, gt, top_n=60):
     path_by_name = {name: p for name, p in photos}
     scorers = list(scores.keys())
+
+    # Build each thumbnail once (a name can appear in several scorer galleries).
+    thumb_cache = {}
+
+    def thumb(name):
+        if name not in thumb_cache:
+            p = path_by_name.get(name, "")
+            thumb_cache[name] = _thumb_data_uri(p) if p else ""
+        return thumb_cache[name]
 
     # Metrics table
     rows = []
@@ -298,14 +338,16 @@ def write_report(out_dir, photos, scores, gt, top_n=60):
                         key=lambda kv: kv[1], reverse=True)[:top_n]
         cards = []
         for rank, (name, val) in enumerate(ranked, 1):
-            p = path_by_name.get(name, "")
             gtxt = ""
             if gt and name in gt:
                 gtxt = f"<span class=gt>you:{-gt[name]:.0f}</span>" if gt[name] < 0 \
                     else f"<span class=gt>you:{gt[name]:.1f}</span>"
+            src = thumb(name)
+            img = f'<img loading=lazy src="{src}">' if src \
+                else '<div class=noimg>no image</div>'
             cards.append(
                 f'<div class=card><div class=rank>#{rank}</div>'
-                f'<img loading=lazy src="file://{html.escape(p)}">'
+                f'{img}'
                 f'<div class=score>{val:.2f} {gtxt}</div>'
                 f'<div class=name>{html.escape(name)}</div></div>')
         galleries.append(
@@ -323,6 +365,7 @@ def write_report(out_dir, photos, scores, gt, top_n=60):
  .grid{{display:flex;flex-wrap:wrap;gap:10px}}
  .card{{width:150px;background:#1c1c1c;border-radius:6px;padding:6px;position:relative}}
  .card img{{width:100%;height:110px;object-fit:cover;border-radius:4px;background:#222}}
+ .noimg{{width:100%;height:110px;border-radius:4px;background:#222;display:flex;align-items:center;justify-content:center;color:#666;font-size:11px}}
  .rank{{position:absolute;top:8px;left:8px;background:#000a;padding:1px 6px;border-radius:8px;font-size:11px;color:#aaa}}
  .score{{font-weight:700;color:#7fd;margin-top:4px;font-size:14px}}
  .gt{{color:#ffd27f;font-weight:400;font-size:11px;margin-left:4px}}
