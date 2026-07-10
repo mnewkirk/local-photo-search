@@ -868,8 +868,11 @@
         setExpandedStacks(new Set());
         setStackMembers({});
 
-        // Update browser URL without reload
+        // Update browser URL without reload. Keep an open photo's ?photo= deep
+        // link if one is present so a search doesn't strip it from the address bar.
         const urlParams = new URLSearchParams(params);
+        const curPhoto = new URLSearchParams(window.location.search).get('photo');
+        if (curPhoto) urlParams.set('photo', curPhoto);
         const newUrl = window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '');
         window.history.pushState(null, '', newUrl);
 
@@ -1028,6 +1031,14 @@
 
       const [selectedIndex, setSelectedIndex] = useState(-1);
 
+      // Reflect the open photo in the address bar (?photo=<id>) so any photo's
+      // info page is a copyable/shareable deep link. Preserves other params.
+      const setPhotoInUrl = useCallback((id) => {
+        const u = new URL(window.location.href);
+        if (id) u.searchParams.set('photo', id); else u.searchParams.delete('photo');
+        window.history.replaceState(null, '', u.pathname + u.search);
+      }, []);
+
       const openPhotoAt = useCallback((index) => {
         if (!results || results.length === 0) return;
         // Wrap around for looping
@@ -1035,12 +1046,13 @@
         const photo = results[i];
         setSelectedIndex(i);
         setSelectedPhoto(photo);
+        setPhotoInUrl(photo.id);
         setPhotoDetail(null);
         fetch(API + '/api/photos/' + photo.id)
           .then(r => r.json())
           .then(setPhotoDetail)
           .catch(() => {});
-      }, [results]);
+      }, [results, setPhotoInUrl]);
 
       const openPhoto = useCallback((photo) => {
         const idx = results ? results.findIndex(r => r.id === photo.id) : -1;
@@ -1051,6 +1063,23 @@
         setSelectedPhoto(null);
         setSelectedIndex(-1);
         setPhotoDetail(null);
+        setPhotoInUrl(null);
+      }, [setPhotoInUrl]);
+
+      // Deep link: /?photo=<id> opens that photo's info modal directly, even if
+      // it isn't in the current result set (handy from a raw /preview URL).
+      useEffect(() => {
+        const pid = new URLSearchParams(window.location.search).get('photo');
+        if (!pid) return;
+        fetch(API + '/api/photos/' + pid)
+          .then(r => (r.ok ? r.json() : null))
+          .then(d => {
+            if (!d || !d.id) return;
+            setSelectedPhoto({ id: d.id, filename: d.filename });
+            setSelectedIndex(-1);
+            setPhotoDetail(d);
+          })
+          .catch(() => {});
       }, []);
 
       const goPrev = useCallback(() => { openPhotoAt(selectedIndex - 1); }, [selectedIndex, openPhotoAt]);
@@ -1358,6 +1387,7 @@
           onStackNavigate: (member) => {
             // Navigate to a stack member within the modal
             setSelectedPhoto(member);
+            setPhotoInUrl(member.id);
             setPhotoDetail(null);
             // Update index so arrow-key navigation works from the correct position
             const idx = results ? results.findIndex(r => r.id === member.id) : -1;
