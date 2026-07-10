@@ -1411,11 +1411,11 @@
               e('input', { type: 'checkbox', checked: doRequeue, disabled: busy,
                 onChange: function(ev) { setRequeue(ev.target.checked); } }),
               'Re-queue stuck passes'),
-            e('label', { title: 'Force a full re-rank of the full-frame aesthetic percentile (aes_overall_pct) across the whole library. Normally only new rows get one; run this after a scoring batch shifts the distribution or after retuning the dimension weights.' },
+            e('label', { title: 'Force a full re-rank of the full-frame aesthetic percentile (aes_overall_pct) — both library-wide AND per-day (aes_overall_day_pct) — across the whole library. Normally only new rows get one; run this after a scoring batch shifts the distribution or after retuning the dimension weights.' },
               e('input', { type: 'checkbox', checked: doNormAes, disabled: busy,
                 onChange: function(ev) { setNormAes(ev.target.checked); } }),
               'Normalize aesthetics'),
-            e('label', { title: 'Force a full re-rank of the SUBJECT-crop aesthetic percentile (aes_subject_overall_pct) across the whole library. Run after a subject-scoring batch or a weight retune.' },
+            e('label', { title: 'Force a full re-rank of the SUBJECT-crop aesthetic percentile (aes_subject_overall_pct) — library-wide AND per-day — across the whole library. Run after a subject-scoring batch or a weight retune.' },
               e('input', { type: 'checkbox', checked: doNormSubjAes, disabled: busy,
                 onChange: function(ev) { setNormSubjAes(ev.target.checked); } }),
               'Normalize subject aesthetics')

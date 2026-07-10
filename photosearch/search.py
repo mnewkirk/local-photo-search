@@ -1231,7 +1231,7 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
 # Allowed values for search_combined's `sort` param. Kept as a module
 # constant so callers (web.py, cli.py) and tests reference one list.
 SORT_MODES = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
-              "subject_aesthetic_desc", "relevance")
+              "subject_aesthetic_desc", "day_quality_desc", "relevance")
 
 # Reciprocal Rank Fusion constant. Textbook default is 60 — smaller k
 # makes the top-ranked item in each filter dominate more; larger k
@@ -1341,6 +1341,18 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
         return sorted(
             merged,
             key=lambda r: (r.get("aes_overall_pct") or 0),
+            reverse=True,
+        )
+    if sort == "day_quality_desc":
+        # "Best of day": rank by the per-day percentile (subject-aware, then
+        # full-frame), so each day's strongest photos lead regardless of how
+        # good the light was that day. Unscored/undated sort last.
+        return sorted(
+            merged,
+            key=lambda r: (r["aes_subject_overall_day_pct"]
+                           if r.get("aes_subject_overall_day_pct") is not None
+                           else (r.get("aes_overall_day_pct")
+                                 if r.get("aes_overall_day_pct") is not None else -1)),
             reverse=True,
         )
     if sort == "subject_aesthetic_desc":

@@ -258,14 +258,15 @@ def _stage_normalize_aesthetics(db, apply, emit, check_abort, force=False):
     existing rows must be re-ranked) or after retuning the dimension weights.
     """
     would = db.conn.execute(
-        "SELECT COUNT(*) FROM photos "
-        "WHERE aes_overall IS NOT NULL AND aes_overall_pct IS NULL"
+        "SELECT COUNT(*) FROM photos WHERE aes_overall IS NOT NULL "
+        "AND (aes_overall_pct IS NULL OR aes_overall_day_pct IS NULL)"
     ).fetchone()[0]
     if (would == 0 and not force) or not apply:
         return {"stage": "normalize_aesthetics", "would": would, "applied": 0,
                 "status": "skipped" if (would == 0 and not force) else "preview"}
-    from .aesthetics import normalize_overall
+    from .aesthetics import normalize_overall, normalize_overall_by_day
     n = normalize_overall(db, apply=True)
+    normalize_overall_by_day(db, apply=True)  # per-day percentile (v28)
     emit({"phase": "sweep", "stage": "normalize_aesthetics", "status": "running",
           "done": n, "total": n})
     return {"stage": "normalize_aesthetics", "would": would, "applied": n,
@@ -280,14 +281,15 @@ def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort, force=Fals
     distribution shift / weight retune). See photosearch/subjects.py +
     docs/plans/subject-aware-quality.md."""
     would = db.conn.execute(
-        "SELECT COUNT(*) FROM photos "
-        "WHERE aes_subject_overall IS NOT NULL AND aes_subject_overall_pct IS NULL"
+        "SELECT COUNT(*) FROM photos WHERE aes_subject_overall IS NOT NULL "
+        "AND (aes_subject_overall_pct IS NULL OR aes_subject_overall_day_pct IS NULL)"
     ).fetchone()[0]
     if (would == 0 and not force) or not apply:
         return {"stage": "normalize_subject_aesthetics", "would": would, "applied": 0,
                 "status": "skipped" if (would == 0 and not force) else "preview"}
-    from .aesthetics import normalize_subject_overall
+    from .aesthetics import normalize_subject_overall, normalize_subject_overall_by_day
     n = normalize_subject_overall(db, apply=True)
+    normalize_subject_overall_by_day(db, apply=True)  # per-day percentile (v28)
     emit({"phase": "sweep", "stage": "normalize_subject_aesthetics", "status": "running",
           "done": n, "total": n})
     return {"stage": "normalize_subject_aesthetics", "would": would, "applied": n,

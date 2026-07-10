@@ -66,8 +66,12 @@ def test_force_normalize_aesthetics_reranks_when_nothing_missing(seeded_db):
     from photosearch import maintenance
     c = seeded_db.conn
     ids = [r[0] for r in c.execute("SELECT id FROM photos ORDER BY id LIMIT 2").fetchall()]
-    c.execute("UPDATE photos SET aes_overall=?, aes_overall_pct=? WHERE id=?", (7.0, 50.0, ids[0]))
-    c.execute("UPDATE photos SET aes_overall=?, aes_overall_pct=? WHERE id=?", (5.0, 50.0, ids[1]))
+    # Seed both the library-wide AND per-day percentile so the missing-only
+    # predicate finds nothing (day_pct is part of it since v28).
+    c.execute("UPDATE photos SET aes_overall=?, aes_overall_pct=?, aes_overall_day_pct=? WHERE id=?",
+              (7.0, 50.0, 50.0, ids[0]))
+    c.execute("UPDATE photos SET aes_overall=?, aes_overall_pct=?, aes_overall_day_pct=? WHERE id=?",
+              (5.0, 50.0, 50.0, ids[1]))
     seeded_db.conn.commit()
 
     skipped = maintenance._stage_normalize_aesthetics(seeded_db, True, lambda e: None, lambda: None)

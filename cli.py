@@ -2058,14 +2058,16 @@ def normalize_aesthetics(db, apply):
     makes the best photo read as top-tier despite the raw model's compressed
     scale. Re-run after each large scoring batch or a weight recompute.
     """
-    from photosearch.aesthetics import normalize_overall
+    from photosearch.aesthetics import normalize_overall, normalize_overall_by_day
     with PhotoDB(db) as pdb:
         n = normalize_overall(pdb, apply=apply)
+        if apply:
+            normalize_overall_by_day(pdb, apply=True)  # per-day percentile (v28)
         if not apply:
             click.echo(f"Would normalize percentiles across {n} scored photo(s). "
                        f"Re-run with --apply.")
         else:
-            click.echo(f"Normalized aes_overall_pct across {n} photo(s).")
+            click.echo(f"Normalized aes_overall_pct (+ per-day) across {n} photo(s).")
 
 
 @cli.command("normalize-subject-aesthetics")
@@ -2079,14 +2081,17 @@ def normalize_subject_aesthetics(db, apply):
     min_subject_aesthetic use the percentile. Re-run after each subject-scoring
     batch. See docs/plans/subject-aware-quality.md.
     """
-    from photosearch.aesthetics import normalize_subject_overall
+    from photosearch.aesthetics import (normalize_subject_overall,
+                                         normalize_subject_overall_by_day)
     with PhotoDB(db) as pdb:
         n = normalize_subject_overall(pdb, apply=apply)
+        if apply:
+            normalize_subject_overall_by_day(pdb, apply=True)  # per-day (v28)
         if not apply:
             click.echo(f"Would normalize subject percentiles across {n} scored "
                        f"photo(s). Re-run with --apply.")
         else:
-            click.echo(f"Normalized aes_subject_overall_pct across {n} photo(s).")
+            click.echo(f"Normalized aes_subject_overall_pct (+ per-day) across {n} photo(s).")
 
 
 # ---------------------------------------------------------------------------

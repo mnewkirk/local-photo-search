@@ -79,7 +79,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -530,6 +530,20 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_scored_at TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall ON photos(aes_subject_overall)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall_pct ON photos(aes_subject_overall_pct)")
+
+        # v28: per-day aesthetic percentiles. Same score, normalized within the
+        # photo's capture DAY instead of the whole library, so "best of the day"
+        # is comparable across days (a great-light day doesn't crowd out an
+        # ordinary one) — the natural ranking for date-scoped review/culling.
+        # aes_overall_day_pct / aes_subject_overall_day_pct mirror the library-
+        # wide *_pct columns; NULL when the photo has no determinable day.
+        try:
+            cur.execute("SELECT aes_overall_day_pct FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_overall_day_pct REAL")
+            cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_overall_day_pct REAL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_overall_day_pct ON photos(aes_overall_day_pct)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall_day_pct ON photos(aes_subject_overall_day_pct)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.

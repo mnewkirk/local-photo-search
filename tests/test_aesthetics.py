@@ -347,6 +347,52 @@ def test_normalize_overall_writes_percentiles(tmp_path):
         assert pcts[3] > 80  # top photo reads top-tier
 
 
+def test_normalize_overall_by_day_ranks_within_each_day(tmp_path):
+    from photosearch.db import PhotoDB
+    p = str(tmp_path / "day.db")
+    with PhotoDB(p) as db:
+        # Day A has a low(3) + high(9); day B a low(4) + high(5). Globally 9>5>4>3,
+        # but per-day each day's best should read high and worst low.
+        seed = [(1, 3.0, "2026-06-28"), (2, 9.0, "2026-06-28"),
+                (3, 4.0, "2026-06-29"), (4, 5.0, "2026-06-29")]
+        for pid, base, day in seed:
+            cols = {f"aes_{s}": base for s in A.ALL_SUBATTRS}
+            cols["aes_overall"] = base
+            db.conn.execute(
+                "INSERT INTO photos (id, filepath, filename, date_taken) VALUES (?,?,?,?)",
+                (pid, f"{pid}.jpg", f"{pid}.jpg", day + " 10:00:00"))
+            db.update_photo(pid, **cols)
+        db.conn.commit()
+
+        assert A.normalize_overall_by_day(db, apply=False) == 4  # dry-run no write
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM photos WHERE aes_overall_day_pct IS NOT NULL"
+        ).fetchone()[0] == 0
+
+        A.normalize_overall_by_day(db, apply=True)
+        d = {r["id"]: r["aes_overall_day_pct"] for r in db.conn.execute(
+            "SELECT id, aes_overall_day_pct FROM photos").fetchall()}
+        # Each day's worst == 25, best == 75 (n=2 per day) — so photo 4 (global
+        # score 5, day B's best) outranks photo 1 (score 3) AND photo 3 (score 4),
+        # which a library-wide percentile would not do.
+        assert d[1] < d[2] and d[3] < d[4]
+        assert d[2] == d[4]        # both days' best rank equally per-day
+        assert d[1] == d[3]        # both days' worst rank equally per-day
+
+
+def test_normalize_by_day_skips_undated(tmp_path):
+    from photosearch.db import PhotoDB
+    with PhotoDB(str(tmp_path / "u.db")) as db:
+        cols = {f"aes_{s}": 5.0 for s in A.ALL_SUBATTRS}
+        cols["aes_overall"] = 5.0
+        db.conn.execute("INSERT INTO photos (id, filepath, filename) VALUES (1,'a','a')")
+        db.update_photo(1, **cols)  # no date_taken/date_created
+        db.conn.commit()
+        A.normalize_overall_by_day(db, apply=True)
+        assert db.conn.execute(
+            "SELECT aes_overall_day_pct FROM photos WHERE id=1").fetchone()[0] is None
+
+
 def test_search_aesthetic_sort_and_filters(client):
     # score both photos, normalize percentiles
     from photosearch.db import PhotoDB

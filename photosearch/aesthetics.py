@@ -457,6 +457,47 @@ def normalize_subject_overall(db, apply: bool = True) -> int:
     return len(rows)
 
 
+def _normalize_by_day(db, score_col: str, pct_col: str, apply: bool) -> int:
+    """Per-day percentile of ``score_col`` written to ``pct_col``: rank each
+    photo against only the others taken on its capture day (YYYY-MM-DD of
+    date_taken, else date_created). Photos with no determinable day are left
+    NULL. Returns rows updated. Shared by the two public wrappers below."""
+    rows = db.conn.execute(
+        f"SELECT id, {score_col} AS s, "
+        "substr(COALESCE(date_taken, date_created), 1, 10) AS day "
+        f"FROM photos WHERE {score_col} IS NOT NULL "
+        "AND COALESCE(date_taken, date_created) IS NOT NULL"
+    ).fetchall()
+    if not rows or not apply:
+        return len(rows)
+    from collections import defaultdict
+    by_day: dict = defaultdict(list)
+    for r in rows:
+        by_day[r["day"]].append(r)
+    updates = []
+    for group in by_day.values():
+        pcts = percentile_ranks([g["s"] for g in group])
+        updates.extend((p, g["id"]) for g, p in zip(group, pcts))
+    db.conn.executemany(
+        f"UPDATE photos SET {pct_col}=? WHERE id=?", updates)
+    db.conn.commit()
+    return len(updates)
+
+
+def normalize_overall_by_day(db, apply: bool = True) -> int:
+    """Per-day analogue of `normalize_overall`: aes_overall_day_pct is the
+    percentile of aes_overall within the photo's own capture day, so 'best of
+    the day' is comparable across days. Returns rows updated."""
+    return _normalize_by_day(db, "aes_overall", "aes_overall_day_pct", apply)
+
+
+def normalize_subject_overall_by_day(db, apply: bool = True) -> int:
+    """Per-day analogue of `normalize_subject_overall` for the subject-crop
+    score (aes_subject_overall_day_pct). Returns rows updated."""
+    return _normalize_by_day(
+        db, "aes_subject_overall", "aes_subject_overall_day_pct", apply)
+
+
 def score_photo_aesthetics(
     image_path: str,
     model: str = MODEL,

@@ -1109,6 +1109,17 @@
               'No distinct subject — scored on the full frame.'),
           );
         })(),
+        // Per-day rank (v28): how this photo ranks among others taken the same
+        // day — the ranking the "Best of day" sort uses.
+        (function () {
+          var raw = (detail && detail.aes_raw) || {};
+          var d = raw.aes_subject_overall_day_pct != null ? raw.aes_subject_overall_day_pct
+                : raw.aes_overall_day_pct;
+          if (d == null) return null;
+          return e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 } },
+            e('span', { style: { textTransform: 'uppercase', letterSpacing: '0.04em' } }, 'Best of day'),
+            ': ' + Math.round(d) + ' percentile');
+        })(),
         bars,
         facetRows.length > 0 && e('div', { style: { marginTop: 8 } },
           e('div', { style: { fontSize: 12, fontWeight: 600, marginBottom: 3 } }, 'Style'),
@@ -1898,6 +1909,7 @@
     quality_desc: { label: 'Best quality',   icon: '\u2b50' },  // ⭐ (using ★ variant)
     aesthetic_desc: { label: 'Best aesthetics', icon: '\u2728' },  // sparkle - VLM percentile
     subject_aesthetic_desc: { label: 'Best subject', icon: '\ud83d\udfe2' },  // \ud83d\udfe2 - subject-crop percentile
+    day_quality_desc: { label: 'Best of day', icon: '\ud83d\udcc5' },  // \ud83d\udcc5 - per-day percentile
     name_asc:     { label: 'Name A\u2013Z',  icon: 'Az' },
   };
 
@@ -1921,6 +1933,16 @@
     if (photo.aes_subject_overall_pct != null) return photo.aes_subject_overall_pct;
     if (photo.aes_overall_pct != null) return photo.aes_overall_pct;
     return null;
+  };
+
+  // Per-day percentile (v28): the photo's rank within its own capture day.
+  // Returns -1 (sorts last) when unscored/undated. Used by the "Best of day"
+  // sort; the whole-library effective pct above still drives the card badge.
+  PS.effectiveAestheticDayPct = function (photo) {
+    if (!photo) return -1;
+    if (photo.aes_subject_overall_day_pct != null) return photo.aes_subject_overall_day_pct;
+    if (photo.aes_overall_day_pct != null) return photo.aes_overall_day_pct;
+    return -1;
   };
 
   // Monotonic sort value so "Best quality" ranks VLM-scored photos (by
@@ -2054,6 +2076,13 @@
           var bv = b.aes_subject_overall_pct != null ? b.aes_subject_overall_pct
                  : (b.aes_overall_pct != null ? b.aes_overall_pct : -1);
           return bv - av;
+        });
+        break;
+      case 'day_quality_desc':
+        // "Best of day": per-day percentile (subject-aware, then full-frame),
+        // so each day's strongest photos lead across a multi-day range.
+        sorted.sort(function (a, b) {
+          return PS.effectiveAestheticDayPct(b) - PS.effectiveAestheticDayPct(a);
         });
         break;
       case 'name_asc':
