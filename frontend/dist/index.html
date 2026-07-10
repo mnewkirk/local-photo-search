@@ -631,11 +631,13 @@
         date_to: p.get('date_to') || '',
         min_quality: p.get('min_quality') || '',
         min_aesthetic: p.get('min_aesthetic') || '',
+        min_day_aesthetic: p.get('min_day_aesthetic') || '',
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
         camera: p.get('camera') || '',
         sort: p.get('sort') || '',
         ask: p.get('ask') || '',
+        group_by: p.get('group_by') || '',
       };
     }
 
@@ -651,6 +653,7 @@
       const [colorFilter, setColorFilter] = useState(initParams.color);
       const [minQuality, setMinQuality] = useState(initParams.min_quality);
       const [minAesthetic, setMinAesthetic] = useState(initParams.min_aesthetic);
+      const [minDayAesthetic, setMinDayAesthetic] = useState(initParams.min_day_aesthetic);
       const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
       const [locationFilter, setLocationFilter] = useState(initParams.location);
       const [cameraFilter, setCameraFilter] = useState(initParams.camera);
@@ -666,6 +669,9 @@
       // oldest 1000" — misleading. Backend now honors `sort=` param;
       // flipped the default to match what users expect.
       const [sortBy, setSortBy] = useState(initParams.sort || 'date_desc');
+      // Client-side "Group by" for structured search (''=off | day | month |
+      // place_name | camera_model). Ask uses tool-driven grouping instead.
+      const [groupByAttr, setGroupByAttr] = useState(initParams.group_by || '');
       const [loading, setLoading] = useState(false);
       // Photos per page. Bumped from 200 to 1000 after user reported
       // that "Calvin in Lucas Valley" (5,946 matches) was capped at the
@@ -696,6 +702,8 @@
       const [asking, setAsking] = useState(false);
       const [askLog, setAskLog] = useState([]);      // narration lines
       const [askAnswer, setAskAnswer] = useState(''); // final prose answer
+      const [askGroups, setAskGroups] = useState(null);      // section headers [{key,label,sublabel}]
+      const [askGroupField, setAskGroupField] = useState(null); // per-hit key to group on
       const askAbortRef = useRef(null);
       // Thinking toggle. On a reasoning model (qwen3.5) the traces are ~71% of the
       // generated tokens and about half the wall-clock. null = never touched, so we
@@ -823,6 +831,15 @@
         return () => window.removeEventListener('keydown', handler);
       }, [multiSelect, exitMultiSelect]);
 
+      // Keep ?group_by= in the address bar in sync when the control changes,
+      // so the grouped view is reloadable/shareable even without re-searching.
+      useEffect(() => {
+        const u = new URL(window.location.href);
+        if (groupByAttr) u.searchParams.set('group_by', groupByAttr);
+        else u.searchParams.delete('group_by');
+        window.history.replaceState(null, '', u.pathname + u.search);
+      }, [groupByAttr]);
+
       // 'm' key enters multi-select (when not in modal or typing)
       useEffect(() => {
         if (multiSelect || selectedPhoto) return;
@@ -851,8 +868,9 @@
       const buildSearchParams = useCallback(() => {
         const mqVal = minQuality ? parseFloat(minQuality) : null;
         const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
+        const mdaVal = minDayAesthetic ? parseFloat(minDayAesthetic) : null;
         if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter
-            && !dateFrom && !dateTo && mqVal == null && maVal == null && !matchSource
+            && !dateFrom && !dateTo && mqVal == null && maVal == null && mdaVal == null && !matchSource
             && sortBy !== 'aesthetic_desc' && sortBy !== 'subject_aesthetic_desc') return null;
         const params = new URLSearchParams();
         if (query) params.set('q', query);
@@ -864,11 +882,12 @@
         if (dateTo) params.set('date_to', dateTo);
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
         if (maVal != null && !isNaN(maVal)) params.set('min_aesthetic', maVal);
+        if (mdaVal != null && !isNaN(mdaVal)) params.set('min_day_aesthetic', mdaVal);
         if (sortQuality) params.set('sort_quality', 'true');
         if (matchSource) params.set('match_source', matchSource);
         if (sortBy) params.set('sort', sortBy);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, minAesthetic, sortQuality, locationFilter, cameraFilter, dateFrom, dateTo, matchSource, sortBy]);
+      }, [query, personFilter, colorFilter, minQuality, minAesthetic, minDayAesthetic, sortQuality, locationFilter, cameraFilter, dateFrom, dateTo, matchSource, sortBy]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -887,6 +906,7 @@
         const urlParams = new URLSearchParams(params);
         const curPhoto = new URLSearchParams(window.location.search).get('photo');
         if (curPhoto) urlParams.set('photo', curPhoto);
+        if (groupByAttr) urlParams.set('group_by', groupByAttr);
         const newUrl = window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '');
         window.history.pushState(null, '', newUrl);
 
@@ -922,9 +942,25 @@
         const q = (query || '').trim();
         if (!q || asking) return;
 
-        // Make the Ask reproducible/shareable: reflect it in the URL (?ask=).
+        // Make the Ask reproducible/shareable: reflect the query AND every
+        // pinned filter in the URL (same param names as structured search, so
+        // reloading restores both the Ask text and the filter bar).
+        const askUrl = new URLSearchParams();
+        askUrl.set('ask', q);
+        if (personFilter) askUrl.set('person', personFilter);
+        if (matchSource) askUrl.set('match_source', matchSource);
+        if (colorFilter) askUrl.set('color', colorFilter);
+        if (locationFilter) askUrl.set('location', locationFilter);
+        if (cameraFilter) askUrl.set('camera', cameraFilter);
+        if (dateFrom) askUrl.set('date_from', dateFrom);
+        if (dateTo) askUrl.set('date_to', dateTo);
+        if (minQuality) askUrl.set('min_quality', minQuality);
+        if (minAesthetic) askUrl.set('min_aesthetic', minAesthetic);
+        if (minDayAesthetic) askUrl.set('min_day_aesthetic', minDayAesthetic);
+        if (sortQuality) askUrl.set('sort_quality', 'true');
+        if (groupByAttr) askUrl.set('group_by', groupByAttr);
         window.history.pushState(null, '',
-          window.location.pathname + '?ask=' + encodeURIComponent(q));
+          window.location.pathname + '?' + askUrl.toString());
 
         // Cancel any in-flight ask.
         if (askAbortRef.current) askAbortRef.current.abort();
@@ -936,6 +972,8 @@
         setAskAnswer('');
         setResults(null);
         setTotalResults(0);
+        setAskGroups(null);
+        setAskGroupField(null);
         setHasMore(false);
 
         // Pin the structured filter bar as HARD inputs to the Ask — the server
@@ -951,6 +989,7 @@
         if (dateTo) askFilters.date_to = dateTo;
         if (minQuality) askFilters.min_quality = parseFloat(minQuality);
         if (minAesthetic) askFilters.min_aesthetic = parseFloat(minAesthetic);
+        if (minDayAesthetic) askFilters.min_day_aesthetic = parseFloat(minDayAesthetic);
         if (sortQuality) askFilters.sort = 'quality_desc';
 
         const askBody = { message: q, filters: askFilters };
@@ -997,6 +1036,8 @@
                 } else if (p.type === 'photos') {
                   setResults(p.results || []);
                   setTotalResults(p.total || (p.results || []).length);
+                  setAskGroups(p.groups || null);
+                  setAskGroupField(p.group_field || null);
                   setHasMore(false);
                 } else if (p.type === 'answer') {
                   setAskAnswer(p.text || '');
@@ -1015,8 +1056,8 @@
             setAsking(false);
           });
       }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
-          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, sortQuality,
-          thinking]);
+          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, minDayAesthetic,
+          sortQuality, thinking]);
 
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
@@ -1297,6 +1338,7 @@
               className: 'filter-input',
               type: 'number',
               placeholder: '1–10',
+              title: 'Minimum RAW aesthetic score (the aes_overall 1–10 shown on the photo)',
               value: minQuality,
               onChange: (ev) => setMinQuality(ev.target.value),
               min: 1, max: 10, step: 0.5,
@@ -1309,9 +1351,22 @@
               className: 'filter-input',
               type: 'number',
               placeholder: '0–100',
-              title: 'Minimum VLM aesthetic percentile (0–100)',
+              title: 'Minimum VLM aesthetic percentile across the WHOLE library (0–100)',
               value: minAesthetic,
               onChange: (ev) => setMinAesthetic(ev.target.value),
+              min: 0, max: 100, step: 5,
+              style: { width: 72 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Min day %:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'number',
+              placeholder: '0–100',
+              title: 'Minimum PER-DAY aesthetic percentile — rank among photos taken the same day (0–100). Good for trips.',
+              value: minDayAesthetic,
+              onChange: (ev) => setMinDayAesthetic(ev.target.value),
               min: 0, max: 100, step: 5,
               style: { width: 72 },
             }),
@@ -1327,6 +1382,22 @@
                 onChange: (ev) => setSortQuality(ev.target.checked),
               }),
               'Sort by quality',
+            ),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Group by:'),
+            e('select', {
+              className: 'filter-input',
+              value: groupByAttr,
+              onChange: (ev) => setGroupByAttr(ev.target.value),
+              title: 'Break results into labeled sections',
+              style: { width: 120 },
+            },
+              e('option', { value: '' }, 'None'),
+              e('option', { value: 'day' }, 'Day'),
+              e('option', { value: 'month' }, 'Month'),
+              e('option', { value: 'place_name' }, 'Location'),
+              e('option', { value: 'camera_model' }, 'Camera'),
             ),
           ),
           stats && e('div', { className: 'stats-bar' },
@@ -1436,6 +1507,11 @@
                            sortBy: askMode ? null : sortBy,
                            setSortBy: askMode ? null : setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc', 'day_quality_desc'],
+                           // Ask uses tool-driven grouping (ordered labels); structured
+                           // search uses the client-side "Group by" control. In Ask mode a
+                           // "Group by" selection is a fallback when no tool grouped.
+                           groups: (askMode && askGroupField) ? askGroups : null,
+                           groupField: (askMode ? (askGroupField || groupByAttr) : groupByAttr) || null,
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack, query,
                            totalResults, hasMore, loadingMore, onLoadMore: loadMore }),
@@ -1498,7 +1574,7 @@
       return _FILENAME_RE.test(stem);
     }
 
-    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query, totalResults, hasMore, loadingMore, onLoadMore }) {
+    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, groups, groupField, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query, totalResults, hasMore, loadingMore, onLoadMore }) {
       // Build display list: filter out non-top stack members, insert expanded members after their top photo
       // Exception: filename searches always show the matched photo regardless of stack position
       const isFilenameSearch = useMemo(() => looksLikeFilename(query), [query]);
@@ -1537,36 +1613,91 @@
       // far across pages. When they diverge, show both.
       const showTotal = totalResults && totalResults > loadedCount;
 
+      const renderItem = (item) => {
+        const photo = item.photo;
+        return e(GridItem, {
+          key: (item.isStackMember ? 'sm-' : '') + photo.id,
+          photo,
+          multiSelect,
+          isSelected: selected && selected.has(photo.id),
+          isStackMember: item.isStackMember,
+          stackId: item.stackId || photo.stack_id,
+          expandedStacks,
+          toggleStack,
+          onClick: (ev) => {
+            if (multiSelect) { onToggleSelect(photo.id, ev); return; }
+            onSelect(photo);
+          },
+        });
+      };
+
+      // Grouped ("photobook") layout: break the grid into labeled sections.
+      // `groupField` names the per-photo key ('day'/'month' are derived from
+      // date_taken; else a raw column like place_name / camera_model / chapter).
+      // When `groups` is supplied (Ask tools) it gives the section ORDER +
+      // labels/sublabels; otherwise sections are auto-derived in encounter order
+      // (so they follow the active sort), keyed by the value itself.
+      const groupKeyOf = (photo) => {
+        if (groupField === 'day') return (photo.date_taken || '').slice(0, 10) || 'Undated';
+        if (groupField === 'month') return (photo.date_taken || '').slice(0, 7) || 'Undated';
+        const v = photo[groupField];
+        return (v == null || v === '') ? null : v;
+      };
+      const sections = groupField ? (() => {
+        const byKey = new Map();
+        const order = [];
+        displayItems.forEach(it => {
+          const k = groupKeyOf(it.photo);
+          const kk = (k == null ? '—' : String(k));
+          if (!byKey.has(kk)) { byKey.set(kk, []); order.push(kk); }
+          byKey.get(kk).push(it);
+        });
+        if (groups && groups.length) {
+          const out = [];
+          const seen = new Set();
+          groups.forEach(g => {
+            const kk = String(g.key);
+            seen.add(kk);
+            const items = byKey.get(kk) || [];
+            if (items.length) out.push({ g, items });
+          });
+          order.forEach(kk => {
+            if (!seen.has(kk)) out.push({ g: { key: kk, label: kk }, items: byKey.get(kk) });
+          });
+          return out;
+        }
+        // Structured "Group by": encounter order, value as the label.
+        return order.map(kk => ({
+          g: { key: kk, label: kk === '—' ? '(none)' : kk },
+          items: byKey.get(kk),
+        }));
+      })() : null;
+
       return e('div', null,
         e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
           e('span', null, visibleCount.toLocaleString() + ' result' + (visibleCount !== 1 ? 's' : '') +
             (visibleCount < loadedCount ? ' (of ' + loadedCount.toLocaleString() + ' loaded)' : '') +
             (showTotal ? ' · ' + loadedCount.toLocaleString() + ' of '
                          + totalResults.toLocaleString() + ' total' : '') +
+            (sections ? ' · ' + sections.length + ' group' + (sections.length !== 1 ? 's' : '') : '') +
             (stackCount > 0 ? ' (' + stackCount + ' stacked)' : '')),
           sortBy && setSortBy && e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: sortOptions }),
           multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
             'Click to select \u00B7 Shift-click for range'),
         ),
-        e('div', { className: 'grid' },
-          ...displayItems.map(item => {
-            const photo = item.photo;
-            return e(GridItem, {
-              key: (item.isStackMember ? 'sm-' : '') + photo.id,
-              photo,
-              multiSelect,
-              isSelected: selected && selected.has(photo.id),
-              isStackMember: item.isStackMember,
-              stackId: item.stackId || photo.stack_id,
-              expandedStacks,
-              toggleStack,
-              onClick: (ev) => {
-                if (multiSelect) { onToggleSelect(photo.id, ev); return; }
-                onSelect(photo);
-              },
-            });
-          }),
-        ),
+        sections
+          ? sections.map(sec => e('div', { key: sec.g.key, style: { marginBottom: 28 } },
+              e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10,
+                                  flexWrap: 'wrap', padding: '6px 0 10px',
+                                  borderBottom: '1px solid var(--border)', marginBottom: 12 } },
+                e('span', { style: { fontSize: 17, fontWeight: 700, color: 'var(--text)' } }, sec.g.label),
+                sec.g.sublabel && e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, sec.g.sublabel),
+                e('span', { style: { fontSize: 12, color: 'var(--text-muted)', marginLeft: 'auto' } },
+                  sec.items.length + ' photo' + (sec.items.length !== 1 ? 's' : '')),
+              ),
+              e('div', { className: 'grid' }, ...sec.items.map(renderItem)),
+            ))
+          : e('div', { className: 'grid' }, ...displayItems.map(renderItem)),
         hasMore && e('div', {
           style: {
             textAlign: 'center',

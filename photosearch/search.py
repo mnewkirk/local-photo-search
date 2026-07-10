@@ -1144,10 +1144,11 @@ _OPEN_DATE_HI = "9999-12-31"
 
 
 def _has_aesthetic_filters(min_aesthetic, min_technical, min_composition,
-                           min_impact, style_tag, min_subject_aesthetic=None) -> bool:
+                           min_impact, style_tag, min_subject_aesthetic=None,
+                           min_day_aesthetic=None) -> bool:
     return any(v is not None for v in
                (min_aesthetic, min_technical, min_composition, min_impact,
-                min_subject_aesthetic)) \
+                min_subject_aesthetic, min_day_aesthetic)) \
         or bool(style_tag)
 
 
@@ -1166,16 +1167,23 @@ def _style_tag_matches(row: dict, style_tag: str) -> bool:
 
 def _filter_aesthetic(results: list[dict], min_aesthetic=None, min_technical=None,
                       min_composition=None, min_impact=None, style_tag=None,
-                      min_subject_aesthetic=None) -> list[dict]:
+                      min_subject_aesthetic=None, min_day_aesthetic=None) -> list[dict]:
     """Filter to photos meeting the aesthetic thresholds. min_aesthetic /
     min_subject_aesthetic are on the library-relative percentiles
-    (aes_overall_pct / aes_subject_overall_pct, 0-100); the per-dimension
+    (aes_overall_pct / aes_subject_overall_pct, 0-100); min_day_aesthetic is on
+    the PER-DAY percentile (how the photo ranks among others taken the same day —
+    subject day-pct when present, else full-frame day-pct); the per-dimension
     thresholds are on the raw 1-10 dimension scores."""
+    def _day_pct(r):
+        v = r.get("aes_subject_overall_day_pct")
+        return v if v is not None else r.get("aes_overall_day_pct")
     out = []
     for r in results:
         if min_aesthetic is not None and (r.get("aes_overall_pct") or -1) < min_aesthetic:
             continue
         if min_subject_aesthetic is not None and (r.get("aes_subject_overall_pct") or -1) < min_subject_aesthetic:
+            continue
+        if min_day_aesthetic is not None and (_day_pct(r) if _day_pct(r) is not None else -1) < min_day_aesthetic:
             continue
         if min_technical is not None and (r.get("aes_technical") or -1) < min_technical:
             continue
@@ -1596,6 +1604,7 @@ def search_combined(
     min_impact: Optional[float] = None,
     style_tag: Optional[str] = None,
     min_subject_aesthetic: Optional[float] = None,
+    min_day_aesthetic: Optional[float] = None,
     camera: Optional[str] = None,
 ):
     """Run multiple search types and merge results.
@@ -1604,7 +1613,8 @@ def search_combined(
     ranked by the primary search type (person > semantic > color > place).
 
     Args:
-        min_quality: If set, filter out photos with aesthetic_score below this value.
+        min_quality: If set, floor on the RAW aesthetic score shown on the photo —
+            VLM `aes_overall` (1-10) when scored, else legacy `aesthetic_score`.
         sort_quality: If True, sort final results by aesthetic_score (highest first)
                      instead of the default relevance ordering.
         date_from: If set, filter to photos taken on or after this date (YYYY-MM-DD).
@@ -1818,12 +1828,16 @@ def search_combined(
         return _wrap(_search_by_date(db, date_from, date_to or _OPEN_DATE_HI, limit=0))
 
     # Quality-only search: if no other criteria given but min_quality is set,
-    # return the highest-quality photos in the collection.
+    # return the highest-quality photos in the collection. min_quality is a floor
+    # on the RAW aesthetic score the photo modal shows — the VLM `aes_overall`
+    # (1-10) when scored, else the legacy LAION `aesthetic_score` — so setting
+    # "min quality 5.5" matches the 5.5 displayed on a photo.
     if not result_sets and min_quality is not None:
         rows = db.conn.execute(
             """SELECT * FROM photos
-               WHERE aesthetic_score IS NOT NULL AND aesthetic_score >= ?
-               ORDER BY aesthetic_score DESC""",
+               WHERE COALESCE(aes_overall, aesthetic_score) IS NOT NULL
+                 AND COALESCE(aes_overall, aesthetic_score) >= ?
+               ORDER BY COALESCE(aes_overall, aesthetic_score) DESC""",
             (min_quality,),
         ).fetchall()
         results = [dict(r) for r in rows]
@@ -1835,7 +1849,7 @@ def search_combined(
     # and/or the aesthetic sort — return the library ranked by percentile.
     _aes_filtered = _has_aesthetic_filters(
         min_aesthetic, min_technical, min_composition, min_impact, style_tag,
-        min_subject_aesthetic)
+        min_subject_aesthetic, min_day_aesthetic)
     if not result_sets and (_aes_filtered
                             or sort in ("aesthetic_desc", "subject_aesthetic_desc")):
         # Subject sort ranks by the subject-crop percentile, falling back to the
@@ -1848,7 +1862,8 @@ def search_combined(
         ).fetchall()
         results = _filter_aesthetic(
             [dict(r) for r in rows], min_aesthetic, min_technical,
-            min_composition, min_impact, style_tag, min_subject_aesthetic)
+            min_composition, min_impact, style_tag, min_subject_aesthetic,
+            min_day_aesthetic)
         if date_from:
             results = _filter_by_date(results, date_from, date_to or _OPEN_DATE_HI)
         return _wrap(results)
@@ -1886,18 +1901,22 @@ def search_combined(
     if date_from:
         merged = _filter_by_date(merged, date_from, date_to or _OPEN_DATE_HI)
 
-    # Apply quality filter
+    # Apply quality filter — floor on the RAW aesthetic score shown on the photo
+    # (VLM aes_overall when scored, else legacy aesthetic_score).
     if min_quality is not None:
+        def _raw_quality(r):
+            v = r.get("aes_overall")
+            return v if v is not None else r.get("aesthetic_score")
         merged = [
             r for r in merged
-            if r.get("aesthetic_score") is not None and r["aesthetic_score"] >= min_quality
+            if _raw_quality(r) is not None and _raw_quality(r) >= min_quality
         ]
 
     # Apply VLM aesthetic filters (percentile + per-dimension + style tag)
     if _aes_filtered:
         merged = _filter_aesthetic(
             merged, min_aesthetic, min_technical, min_composition,
-            min_impact, style_tag, min_subject_aesthetic)
+            min_impact, style_tag, min_subject_aesthetic, min_day_aesthetic)
 
     # Back-compat: sort_quality=True overrides sort to quality_desc.
     # Prefer the explicit `sort` param in new callers.

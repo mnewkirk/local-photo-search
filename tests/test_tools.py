@@ -823,3 +823,19 @@ def test_server_instructions_carry_routing_and_gate_writes():
     assert tools.GROUNDING_WITH_FACTS in withfacts
     assert "LIBRARY FACTS:" in withfacts
     assert tools.GROUNDING_WITHOUT_FACTS not in withfacts
+
+
+# ---------------------------------------------------------------------------
+# min_day_aesthetic (per-day percentile filter)
+# ---------------------------------------------------------------------------
+
+def test_min_day_aesthetic_filters_on_day_percentile(db):
+    pid = db.conn.execute(
+        "SELECT id FROM photos WHERE filename='DSC04922.JPG'").fetchone()["id"]
+    db.conn.execute("UPDATE photos SET aes_overall_day_pct = 20")
+    db.conn.execute("UPDATE photos SET aes_overall_day_pct = 90 WHERE id = ?", (pid,))
+    db.conn.commit()
+    # representatives flows the filter through _build_filter_sql.
+    res = tools.call_tool(db, "representatives",
+                          {"bucket": "year", "n": 10, "min_day_aesthetic": 50})
+    assert {h["id"] for h in res["results"]} == {pid}

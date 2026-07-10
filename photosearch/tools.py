@@ -522,6 +522,12 @@ _CURATION_FILTER_PROPS = {
                               "where it hasn't run this matches ZERO photos, so check "
                               "get_library_overview first. For a plain 'best'/'top' "
                               "request use sort='quality_desc' and NO score floor."},
+    "min_day_aesthetic": {"type": "number", "minimum": 0, "maximum": 100,
+               "description": "Minimum PER-DAY aesthetic percentile, 0-100 — how a "
+                              "photo ranks among others taken the SAME day, not the "
+                              "whole library. Use for 'the best of each day' on a "
+                              "trip where a whole day may sit below the library "
+                              "median (e.g. 'top 40% of each day')."},
     "style_tag": {"type": "string",
                "description": "Aesthetic STYLE tag from the VLM style pass — how the "
                               "photo was lit/graded (e.g. 'golden-hour', "
@@ -645,6 +651,7 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         match_source=(args.get("match_source") or "").strip() or None,
         min_quality=min_quality,
         min_aesthetic=_opt_float(args.get("min_aesthetic")),
+        min_day_aesthetic=_opt_float(args.get("min_day_aesthetic")),
         sort=sort,
         limit=limit,
         with_total=True,
@@ -710,12 +717,13 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag (see list_vocab)."},
             "keyword": {"type": "string", "description": "Keyword substring (see list_vocab)."},
             "min_quality": {"type": "number", "minimum": 1, "maximum": 10,
-                            "description": "Minimum legacy aesthetic score, 1-10. Set "
-                                           "this ONLY when the user names an explicit "
-                                           "bar ('quality above 7'). Do NOT add it for "
-                                           "'best'/'good' — scores cluster ~5 and a "
-                                           "floor can exclude everything; use "
-                                           "sort='quality_desc' instead."},
+                            "description": "Minimum RAW aesthetic score, 1-10 — the "
+                            "VLM aes_overall shown on the photo (legacy score if not "
+                            "VLM-scored); the raw counterpart of min_aesthetic (the "
+                            "percentile). Set this ONLY when the user names an explicit "
+                            "bar ('quality above 7'). Do NOT add it for 'best'/'good' — "
+                            "raw scores cluster ~5 and a floor can exclude everything; "
+                            "use sort='quality_desc' instead."},
             **_CURATION_FILTER_PROPS,
             "match_source": {"type": "string", "enum": ["strict", "temporal", "manual"],
                 "description": "Restrict person matches by confidence source "
@@ -890,13 +898,15 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
         clauses.append("keywords LIKE ?")
         params.append(f"%{kw}%")
 
-    mq = args.get("min_quality")
+    # min_quality is a floor on the RAW aesthetic score the photo modal shows —
+    # VLM aes_overall when scored, else legacy aesthetic_score.
+    mq = _opt_float(args.get("min_quality"))
     if mq is not None:
-        try:
+        if _has_column(db, "aes_overall"):
+            clauses.append("COALESCE(aes_overall, aesthetic_score) >= ?")
+        else:
             clauses.append("aesthetic_score >= ?")
-            params.append(float(mq))
-        except (TypeError, ValueError):
-            pass
+        params.append(mq)
 
     # Curation filters shared with structured Search: exact camera, VLM aesthetic
     # percentile floor, and style tag. The aes_* columns arrived in schema v26,
@@ -910,6 +920,12 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
     if ma is not None and _has_column(db, "aes_overall_pct"):
         clauses.append("aes_overall_pct >= ?")
         params.append(ma)
+
+    mda = _opt_float(args.get("min_day_aesthetic"))
+    if mda is not None and _has_column(db, "aes_overall_day_pct"):
+        clauses.append(
+            "COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct) >= ?")
+        params.append(mda)
 
     st = (args.get("style_tag") or "").strip()
     if st and _has_column(db, "aes_style_tags"):

@@ -282,7 +282,12 @@ photosearch normalize-aesthetics --apply           # refresh percentiles
 `normalize-aesthetics` is also a `maintenance-sweep` stage (percentile refresh
 only — the VLM scoring stays with the worker fleet). Search: `sort=aesthetic_desc`,
 `min_aesthetic` (percentile), `min_technical`/`min_composition`/`min_impact`,
-`style_tag`. The `/status` "Aesthetics (VLM)" card + `PhotoModal` "Aesthetic
+`style_tag`. The `min_quality` filter is the **raw** counterpart of
+`min_aesthetic`: it floors on `COALESCE(aes_overall, aesthetic_score)` — the raw
+VLM `aes_overall` (1-10) shown on the photo modal, falling back to the legacy
+LAION `aesthetic_score` for photos the VLM hasn't scored — so "min quality 5.5"
+matches the 5.5 the modal displays (it used to floor on the legacy score alone).
+The `/status` "Aesthetics (VLM)" card + `PhotoModal` "Aesthetic
 Evaluation" breakdown + M28 re-run checkbox surface it in the UI.
 
 ### Per-pass model strategy (Ollama defaults)
@@ -1146,6 +1151,17 @@ dedup on therefore both deletes duplicates *and* writes inferred GPS
   photos" — the tool schemas simply hadn't exposed `camera`, so the model
   dropped it). Compact search hits now carry `camera_model` so the shared grid
   📷 badge renders on Ask cards too.
+
+  **Grouped photobook results + per-day aesthetics:** the book tools now drive a
+  **sectioned** results view — `agent._grouping_for` emits `group_field`+`groups`
+  on the `photos` event (chapters/scenes/day/bucket) and `PhotoGrid` renders
+  labeled sections (like Review's Timeline) instead of a flat grid, so chapters
+  are actually visible. Ask also mirrors its query+pinned-filters into the URL.
+  New `min_day_aesthetic` filter floors on the PER-DAY percentile
+  (`COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct)`) rather than the
+  library-wide `aes_overall_pct` of `min_aesthetic` — "best of each day" on a
+  trip. Threaded through `search_combined`, `/api/search`, the Ask tools, and a
+  "Min day %" UI input.
 
 - `docs/plans/backfill-maintenance-sweep.md` — M25. **SHIPPED (2026-06-21).**
   `maintenance-sweep` / `validate-data` / `repair-data` CLIs + `photosearch/

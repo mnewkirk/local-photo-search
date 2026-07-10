@@ -515,7 +515,7 @@ _FILTER_TOOLS = {"search_photos", "representatives", "daily_highlights",
 # inferred; every other key hard-overrides the model's value.
 _LOCKED_KEYS = ("people", "location", "date_from", "date_to", "color", "category",
                 "visual_tag", "keyword", "min_quality", "min_aesthetic",
-                "style_tag", "match_source", "camera", "sort")
+                "min_day_aesthetic", "style_tag", "match_source", "camera", "sort")
 
 
 def _normalize_locked(locked) -> dict:
@@ -554,7 +554,8 @@ _LOCKED_LABELS = {
     "people": "people", "location": "location", "date_from": "on/after",
     "date_to": "on/before", "color": "color", "category": "category",
     "visual_tag": "visual tag", "keyword": "keyword", "min_quality": "min quality",
-    "min_aesthetic": "min aesthetic pct", "style_tag": "style",
+    "min_aesthetic": "min aesthetic pct",
+    "min_day_aesthetic": "min per-day aesthetic pct", "style_tag": "style",
     "match_source": "match source", "camera": "camera", "sort": "sort",
 }
 
@@ -574,6 +575,55 @@ def _locked_prompt(locked: dict) -> str:
             "do NOT restate them in your tool calls, and do NOT drop the person/"
             "subject to manufacture results — just plan the REST of the request "
             "around them): " + "; ".join(bits) + ".\n")
+
+
+# ---------------------------------------------------------------------------
+# Result grouping — so the UI can render photobook sections, not a flat grid
+# ---------------------------------------------------------------------------
+#
+# The book/curation tools already tag their results with a grouping key
+# (chapter / scene / bucket) and return an ordered group summary. `_grouping_for`
+# normalizes that into `(group_field, groups)` — `group_field` names the per-hit
+# key the UI groups on ('day' is derived from date_taken), `groups` is the
+# ordered list of section headers `[{key, label, sublabel}]`.
+
+def _grouping_for(name: str, result) -> tuple[Optional[str], Optional[list]]:
+    if not isinstance(result, dict):
+        return None, None
+    if name == "group_into_chapters":
+        groups = []
+        for c in result.get("chapters", []):
+            df, dt = c.get("date_from"), c.get("date_to")
+            span = df if df == dt else f"{df} – {dt}"
+            sub = f"{span} · {c.get('photo_count', 0)} photos"
+            groups.append({"key": c.get("index"),
+                           "label": c.get("title") or f"Chapter {c.get('index')}",
+                           "sublabel": sub})
+        return "chapter", groups
+    if name == "daily_scene_breakdown":
+        groups = []
+        for s in result.get("scenes", []):
+            st = (s.get("start") or "")[11:16]
+            en = (s.get("end") or "")[11:16]
+            span = st if st == en else f"{st}–{en}"
+            sub = " · ".join(x for x in (span, f"{s.get('photo_count', 0)} photos") if x)
+            groups.append({"key": s.get("index"),
+                           "label": s.get("place") or f"Scene {s.get('index')}",
+                           "sublabel": sub})
+        return "scene", groups
+    if name == "daily_highlights":
+        groups = [{"key": d.get("day"), "label": d.get("day"),
+                   "sublabel": ", ".join(d.get("places") or [])}
+                  for d in result.get("day_summary", [])]
+        return "day", groups
+    if name == "representatives":
+        seen: list = []
+        for h in result.get("results", []):
+            b = h.get("bucket")
+            if b is not None and b not in seen:
+                seen.append(b)
+        return "bucket", [{"key": b, "label": str(b)} for b in seen]
+    return None, None
 
 
 def run_agent(
@@ -607,6 +657,13 @@ def run_agent(
         session["answer"] = text
         return text
 
+    def _photos_event():
+        ev = {"type": "photos", "results": last_photos, "total": last_total}
+        if last_group_field and last_groups:
+            ev["group_field"] = last_group_field
+            ev["groups"] = last_groups
+        return ev
+
     try:
         deadline = time.monotonic() + float(
             os.environ.get("PHOTOSEARCH_AGENT_DEADLINE_S") or _DEFAULT_DEADLINE_S)
@@ -637,6 +694,8 @@ def run_agent(
 
         last_photos: Optional[list] = None
         last_total = 0
+        last_group_field: Optional[str] = None
+        last_groups: Optional[list] = None
         made_tool_call = False
         nudges = 0
         summary_nudged = False
@@ -709,6 +768,7 @@ def run_agent(
                         last_photos = result.get("results", [])
                         last_total = result.get("total", result.get("returned",
                                                                     len(last_photos)))
+                        last_group_field, last_groups = _grouping_for(name, result)
                     summ = _summarize(name, result)
                     rec = {"name": name, "args": eff_args, "summary": summ,
                            "step": step + 1, "t": round(time.time() - session["started"], 1)}
@@ -764,13 +824,13 @@ def run_agent(
                     yield ev
                 return
             if last_photos is not None:
-                yield {"type": "photos", "results": last_photos, "total": last_total}
+                yield _photos_event()
             yield {"type": "answer", "text": _set_answer(content or f"Found {last_total} photo(s).")}
             return
 
         # Hit the step cap or the time budget — emit whatever we have.
         if last_photos is not None:
-            yield {"type": "photos", "results": last_photos, "total": last_total}
+            yield _photos_event()
         lead = ("Stopped — this query hit the time budget. "
                 if timed_out else "Stopped after %d steps. " % max_steps)
         if timed_out and last_photos is None:

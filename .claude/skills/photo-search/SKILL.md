@@ -1845,9 +1845,32 @@ Nothing leaves the NAS.
 - **Frontend:** the "✨ Ask" toggle in `index.html` swaps the search bar to an
   NL box but **keeps the structured filter bar visible** (labeled "✨ Pinned to
   Ask"); `runAsk` collects the filter state into `askFilters` and sends it as
-  `filters`. Narration streams into a status panel and the final `photos`
-  event feeds the **existing** `PhotoGrid` via `setResults` (compact hits share
-  the grid's photo shape, including `camera_model` for the 📷 badge).
+  `filters`, and mirrors both the query and the pinned filters into the URL
+  (`?ask=…&camera=…&min_quality=…`) so an Ask is reloadable/shareable.
+  Narration streams into a status panel and the final `photos` event feeds the
+  **existing** `PhotoGrid` via `setResults` (compact hits share the grid's photo
+  shape, including `camera_model` for the 📷 badge).
+- **Grouped ("photobook") results.** The book/curation tools tag each hit with a
+  grouping key and return an ordered group summary; `agent._grouping_for` turns
+  that into `group_field` + `groups` on the `photos` event
+  (`group_into_chapters`→`chapter`, `daily_scene_breakdown`→`scene`,
+  `daily_highlights`→`day`, `representatives`→`bucket`). `PhotoGrid` renders
+  labeled sections (header = label + sublabel like a date span / places) instead
+  of a flat grid — so chapters/days/scenes are actually visible, like Review's
+  Timeline. **Structured search has the same sectioning** via a client-side
+  "Group by" control (None / Day / Month / Location / Camera, `?group_by=`): when
+  `groups` isn't supplied (no Ask tool grouping), `PhotoGrid` auto-derives
+  sections from the loaded results in encounter order, keyed by the chosen
+  attribute (`day`/`month` derived from `date_taken`, else a raw column like
+  `place_name`/`camera_model`). In Ask mode a tool's grouping wins; a "Group by"
+  selection is the fallback when no tool grouped.
+- **Per-day aesthetic filter.** `min_day_aesthetic` (0-100) floors on the
+  PER-DAY percentile `COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct)`
+  — how a photo ranks among others taken the SAME day — vs `min_aesthetic`'s
+  library-wide `aes_overall_pct`. Threaded through `search_combined`
+  (`_filter_aesthetic`), `/api/search`, the tool filter set, and the "Min day %"
+  UI input; pinnable into Ask. Use it for "best of each day" on a trip whose
+  whole days sit below the library median.
 - **Tests:** `tests/test_agent.py` (10 cases, chat client mocked; tool dispatch
   runs for real against the fixture DB). **Still TODO:** a live smoke test
   against the LM Studio backend once deployed.
