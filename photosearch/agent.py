@@ -34,6 +34,7 @@ endpoint can bridge it through the established thread→asyncio.Queue pattern:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import date
@@ -41,6 +42,8 @@ from typing import Callable, Iterator, Optional
 
 from .db import PhotoDB
 from . import tools as toolmod
+
+logger = logging.getLogger("photosearch.agent")
 
 # Bound the loop so a confused model can't spin forever. Each step is one LLM
 # round-trip (which may issue several tool calls).
@@ -369,11 +372,19 @@ def _tool_result_msg(call: dict, result) -> dict:
 
 _SINGLE_SHOT_INSTRUCTION = (
     "Translate the user's request into a JSON object of search_photos "
-    "arguments. Valid keys: query (string, free-text visual), people (array of "
-    "names), location (string), date_from / date_to (YYYY-MM-DD), color, "
-    "category, visual_tag, keyword, min_quality (number), limit (integer). "
-    "Include ONLY the keys you can infer; omit the rest. Respond with the JSON "
-    "object and nothing else."
+    "arguments. Valid keys: query (string), people (array of names), location "
+    "(string), date_from / date_to (YYYY-MM-DD), color, category, visual_tag, "
+    "keyword, sort (string), limit (integer).\n"
+    "CRITICAL:\n"
+    "- `query` is CLIP visual-content search ONLY (e.g. 'sunset', 'birthday "
+    "cake'). NEVER put topic/place/trip words in it — 'Europe trip', "
+    "'highlights', 'vacation', a place name, or a person's name all match ZERO "
+    "photos via CLIP. For a trip or date range, set date_from/date_to and OMIT "
+    "`query` entirely. Put place names in `location`, names in `people`.\n"
+    "- Do NOT emit min_quality (it can exclude everything). For 'best'/'top' use "
+    "sort='quality_desc' with no floor.\n"
+    "- Include ONLY the keys you can actually infer; omit the rest.\n"
+    "Respond with the JSON object and nothing else."
 )
 
 
@@ -397,8 +408,22 @@ def _run_single_shot(db: PhotoDB, message: str,
         args = json.loads(text[start:end + 1]) if start >= 0 and end > start else {}
     except (ValueError, TypeError):
         args = {}
+    if not isinstance(args, dict):
+        args = {}
+    # Defensive cleanup — the model often ignores the instruction and emits a
+    # topic-word `query` (CLIP → 0) or a min_quality floor (excludes everything).
+    # Drop min_quality outright; drop a `query` that is really a topic/trip phrase
+    # so a dated request still returns its photos instead of 0.
+    args.pop("min_quality", None)
+    q = str(args.get("query") or "")
+    if q and (args.get("date_from") or args.get("date_to") or args.get("location")
+              or args.get("people")):
+        low = q.lower()
+        if any(w in low for w in ("trip", "highlight", "vacation", "holiday",
+                                  "getaway", "travel")):
+            args.pop("query", None)
     # Enforce the pinned filters even on the single-shot path.
-    args = _merge_locked("search_photos", args if isinstance(args, dict) else {}, locked or {})
+    args = _merge_locked("search_photos", args, locked or {})
     if not isinstance(args, dict) or not args:
         yield {"type": "answer",
                "text": "I couldn't turn that into a search. Try rephrasing, or "
@@ -754,6 +779,12 @@ def run_agent(
         nudges = 0
         summary_nudged = False
         timed_out = False
+        # Loop guard: a thinking model can re-issue the SAME tool call verbatim
+        # (observed: qwen3.5 ran an identical search(mode=chapters) twice, burning
+        # a round). Remember each (name, args) we've already executed and short-
+        # circuit an exact repeat with a "you already ran this — answer now" note
+        # instead of recomputing (CLIP embed / KNN).
+        seen_calls: dict = {}
 
         for step in range(max_steps):
             if should_abort and should_abort():
@@ -775,8 +806,12 @@ def run_agent(
                 # once; the model likely can't tool-call against this endpoint.
                 if step == 0:
                     session["mode"] = "single_shot_fallback"
+                    session["fallback_error"] = f"{type(exc).__name__}: {exc}"
+                    logger.warning("tool-calling failed on step 0 (%s); "
+                                   "falling back to single-shot", session["fallback_error"])
                     yield {"type": "tool_result", "tool": "_fallback",
-                           "summary": "tool-calling failed; trying single-shot"}
+                           "summary": f"tool-calling failed ({type(exc).__name__}: "
+                                      f"{str(exc)[:160]}); trying single-shot"}
                     for ev in _run_single_shot(db, message,
                                                timeout=max(5.0, deadline - time.monotonic()),
                                                locked=locked, reasoning_effort=reasoning_effort):
@@ -804,6 +839,24 @@ def run_agent(
                     eff_args = _merge_locked(name, call.get("arguments", {}), locked)
                     yield {"type": "tool_call", "tool": name, "arguments": eff_args,
                            "step": step + 1, "elapsed": round(time.time() - session["started"], 1)}
+                    # Loop guard: an exact repeat of a call we already ran gets a
+                    # "you already did this — answer now" note instead of a costly
+                    # recompute, breaking the thinking-model repeat loop.
+                    call_key = f"{name}:{json.dumps(eff_args, sort_keys=True, default=str)}"
+                    if call_key in seen_calls:
+                        summ = "duplicate call — skipped; answer now"
+                        session["tool_calls"].append(
+                            {"name": name, "args": eff_args, "summary": summ,
+                             "step": step + 1, "t": round(time.time() - session["started"], 1)})
+                        yield {"type": "tool_result", "tool": name, "summary": summ,
+                               "step": step + 1,
+                               "elapsed": round(time.time() - session["started"], 1)}
+                        messages.append(_tool_result_msg(call, {
+                            "repeat": True,
+                            "note": f"You already ran this exact call — it returned "
+                                    f"{seen_calls[call_key]}. Do NOT call it again; "
+                                    f"write your answer now from those results."}))
+                        continue
                     # A vision rerank is slow; grant extra wall-clock so the turn
                     # that reads its scores isn't killed by the deadline.
                     if name == "rerank_photos":
@@ -824,6 +877,7 @@ def run_agent(
                                                                     len(last_photos)))
                         last_group_field, last_groups = _grouping_for(name, result)
                     summ = _summarize(name, result)
+                    seen_calls[call_key] = summ   # remember for the loop guard
                     rec = {"name": name, "args": eff_args, "summary": summ,
                            "step": step + 1, "t": round(time.time() - session["started"], 1)}
                     if isinstance(result, dict) and isinstance(result.get("results"), list):

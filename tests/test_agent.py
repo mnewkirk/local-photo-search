@@ -499,3 +499,45 @@ def test_run_agent_consolidated_offers_search_not_family(db, monkeypatch):
     list(agent.run_agent(db, "hi", consolidated=True))
     assert "search" in seen["names"]
     assert "search_photos" not in seen["names"] and "daily_highlights" not in seen["names"]
+
+
+def test_duplicate_tool_call_is_skipped_not_reexecuted(db, monkeypatch):
+    """A thinking model can re-issue the same call verbatim (observed on
+    qwen3.5). The loop guard must execute it once and short-circuit the repeat
+    with a 'you already ran this' note, not recompute."""
+    ran = {"n": 0}
+    real_call = agent.toolmod.call_tool
+    def counting_call(d, name, args):
+        if name == "search_photos":
+            ran["n"] += 1
+        return real_call(d, name, args)
+    monkeypatch.setattr(agent.toolmod, "call_tool", counting_call)
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search_photos", {"people": ["Alex"]}),   # round 1
+        _tc("search_photos", {"people": ["Alex"]}),   # round 2 — identical
+        _answer("Found Alex's photos."),
+    ))
+    events = _run(db, "photos of Alex")
+    # search_photos executed exactly once despite two identical tool calls
+    assert ran["n"] == 1
+    summaries = [e.get("summary") for e in events if e["type"] == "tool_result"]
+    assert any("duplicate call" in (s or "") for s in summaries)
+    assert events[-1]["type"] == "answer"
+
+
+def test_non_identical_calls_both_run(db, monkeypatch):
+    """The guard keys on (name, args) — different args must NOT be deduped."""
+    ran = {"n": 0}
+    real_call = agent.toolmod.call_tool
+    def counting_call(d, name, args):
+        if name == "search_photos":
+            ran["n"] += 1
+        return real_call(d, name, args)
+    monkeypatch.setattr(agent.toolmod, "call_tool", counting_call)
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search_photos", {"people": ["Alex"]}),
+        _tc("search_photos", {"people": ["Jamie"]}),   # different args
+        _answer("done"),
+    ))
+    _run(db, "x")
+    assert ran["n"] == 2
