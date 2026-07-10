@@ -30,9 +30,10 @@ def test_api_cameras_lists_models_with_counts(client, db):
     assert by_model["TESTCAM-A"]["count"] == 2
     assert by_model["TESTCAM-A"]["make"] == "Sony"
     assert by_model["TESTCAM-B"]["count"] == 1
-    # results are ordered by count desc overall
-    counts = [c["count"] for c in cams]
-    assert counts == sorted(counts, reverse=True)
+    # ordered by most-recently-used: TESTCAM-B (2026-06-03) is newer than
+    # TESTCAM-A (2026-06-02), so it sorts ahead despite fewer photos.
+    order = [c["model"] for c in cams]
+    assert order.index("TESTCAM-B") < order.index("TESTCAM-A")
 
 
 def test_search_camera_filter(client, db):

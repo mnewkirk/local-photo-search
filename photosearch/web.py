@@ -1322,20 +1322,23 @@ def api_persons():
 @app.get("/api/cameras")
 def api_cameras():
     """Distinct camera models with photo counts — feeds the camera filter
-    dropdown on search/review/faces/collections/geotag. Ordered by count desc
-    so the most-used bodies lead."""
+    dropdown on search/review/faces/collections/geotag. Ordered by most-recently-
+    used (latest photo timestamp) so the body you're shooting now leads; cameras
+    with no dated photos fall to the end, tie-broken by count."""
     with _get_db() as db:
         rows = db.conn.execute(
             "SELECT camera_model AS model, "
             "       MAX(camera_make) AS make, "
-            "       COUNT(*) AS count "
+            "       COUNT(*) AS count, "
+            "       MAX(date_taken) AS last_taken "
             "FROM photos "
             "WHERE camera_model IS NOT NULL AND camera_model != '' "
             "GROUP BY camera_model "
-            "ORDER BY count DESC, model ASC"
+            "ORDER BY MAX(date_taken) IS NULL, MAX(date_taken) DESC, count DESC"
         ).fetchall()
     return {"cameras": [{"model": r["model"], "make": r["make"],
-                         "count": r["count"]} for r in rows]}
+                         "count": r["count"], "last_taken": r["last_taken"]}
+                        for r in rows]}
 
 
 # ---------------------------------------------------------------------------
