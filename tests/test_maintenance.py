@@ -219,6 +219,22 @@ def test_repair_apply_fixes_corrupt_date_from_folder(seeded_db):
     assert report["corrupt_date_taken"]["count"] == 0
 
 
+def test_repair_fixes_zero_and_ddmmyyyy_dates(seeded_db):
+    # A well-formatted-but-impossible date (0000-00-00) + a DD/MM/YYYY import —
+    # both should be flagged and repaired from the YYYY-MM-DD folder name.
+    z = seeded_db.add_photo(filepath="2011/2011-03-09_x/z.jpg", filename="z.jpg",
+                            date_taken="0000-00-00 00:00:00")
+    d = seeded_db.add_photo(filepath="2015/2015-11-29_x/d.jpg", filename="d.jpg",
+                            date_taken="29/11/2015")
+    seeded_db.conn.commit()
+    assert validate_data(seeded_db)["corrupt_date_taken"]["count"] == 2
+
+    repair_data(seeded_db, apply=True)
+    assert seeded_db.get_photo(z)["date_taken"] == "2011-03-09 00:00:00"
+    assert seeded_db.get_photo(d)["date_taken"] == "2015-11-29 00:00:00"
+    assert validate_data(seeded_db)["corrupt_date_taken"]["count"] == 0
+
+
 def test_repair_apply_nulls_bad_gps(seeded_db):
     pid = seeded_db.add_photo(
         filepath="2021/2021-05-01_trip/g.jpg", filename="g.jpg",

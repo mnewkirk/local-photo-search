@@ -60,17 +60,32 @@ _JSON_ARRAY_COLUMNS = ("tags", "categories", "visual_tags", "keywords", "dominan
 _VALID_DATE_PREFIX_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
 _FOLDER_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
+# SQL WHERE fragment (on column `date_taken`) matching CORRUPT values: a
+# non-YYYY-MM-DD prefix (control bytes, DD/MM/YYYY imports) OR a well-formatted-
+# but-impossible date (zero year/month/day, e.g. '0000-00-00'). Shared by
+# validate_data + repair_data so both catch the same set.
+_CORRUPT_DATE_WHERE = (
+    f"(substr(date_taken,1,10) NOT GLOB '{_VALID_DATE_PREFIX_GLOB}' "
+    "OR substr(date_taken,1,4) = '0000' "
+    "OR substr(date_taken,6,2) = '00' "
+    "OR substr(date_taken,9,2) = '00')"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _valid_date_taken(s: Optional[str]) -> bool:
-    """True if ``s`` looks like a real date_taken (YYYY-MM-DD prefix)."""
+    """True if ``s`` is a real date_taken (YYYY-MM-DD prefix with a possible
+    year/month/day — rejects zero/impossible components like '0000-00-00')."""
     if not s or len(s) < 10:
         return False
-    head = s[:10]
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", head))
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s[:10])
+    if not m:
+        return False
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return y >= 1 and 1 <= mo <= 12 and 1 <= d <= 31
 
 
 def _folder_date_from_path(filepath: str) -> Optional[str]:
@@ -790,11 +805,11 @@ def validate_data(db, sample: int = 5) -> dict:
     c = db.conn
     report = {}
 
-    # 1. Corrupt date_taken (bad YYYY-MM-DD prefix — e.g. control bytes).
+    # 1. Corrupt date_taken (bad YYYY-MM-DD prefix — control bytes / DD/MM/YYYY —
+    #    or an impossible zero-component date like '0000-00-00').
     bad_dates = c.execute(
         "SELECT id, filepath, date_taken FROM photos "
-        "WHERE date_taken IS NOT NULL "
-        f"AND substr(date_taken, 1, 10) NOT GLOB '{_VALID_DATE_PREFIX_GLOB}'"
+        f"WHERE date_taken IS NOT NULL AND {_CORRUPT_DATE_WHERE}"
     ).fetchall()
     report["corrupt_date_taken"] = {
         "count": len(bad_dates),
@@ -916,8 +931,7 @@ def repair_data(
     # --- 1. Corrupt date_taken --------------------------------------------
     bad_dates = c.execute(
         "SELECT id, filepath, date_created, date_taken FROM photos "
-        "WHERE date_taken IS NOT NULL "
-        f"AND substr(date_taken, 1, 10) NOT GLOB '{_VALID_DATE_PREFIX_GLOB}'"
+        f"WHERE date_taken IS NOT NULL AND {_CORRUPT_DATE_WHERE}"
     ).fetchall()
     date_summary = {"count": len(bad_dates), "from_exif": 0, "from_folder": 0,
                     "from_mtime": 0, "nulled": 0}
