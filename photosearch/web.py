@@ -1325,16 +1325,23 @@ def api_cameras():
     dropdown on search/review/faces/collections/geotag. Ordered by most-recently-
     used (latest photo timestamp) so the body you're shooting now leads; cameras
     with no dated photos fall to the end, tie-broken by count."""
+    # Only well-formed YYYY-MM-DD dates count toward recency — corrupt values
+    # (control bytes, DD/MM/YYYY imports) sort lexically ABOVE real 2026 dates
+    # and would float dead cameras to the top. Malformed-only cameras get a NULL
+    # last_taken and fall to the end.
+    valid_date = ("MAX(CASE WHEN date_taken GLOB "
+                  "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
+                  "THEN date_taken END)")
     with _get_db() as db:
         rows = db.conn.execute(
             "SELECT camera_model AS model, "
             "       MAX(camera_make) AS make, "
             "       COUNT(*) AS count, "
-            "       MAX(date_taken) AS last_taken "
+            f"      {valid_date} AS last_taken "
             "FROM photos "
             "WHERE camera_model IS NOT NULL AND camera_model != '' "
             "GROUP BY camera_model "
-            "ORDER BY MAX(date_taken) IS NULL, MAX(date_taken) DESC, count DESC"
+            "ORDER BY last_taken IS NULL, last_taken DESC, count DESC"
         ).fetchall()
     return {"cameras": [{"model": r["model"], "make": r["make"],
                          "count": r["count"], "last_taken": r["last_taken"]}
