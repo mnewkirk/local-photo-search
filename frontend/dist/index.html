@@ -637,6 +637,7 @@
         camera: p.get('camera') || '',
         sort: p.get('sort') || '',
         ask: p.get('ask') || '',
+        group_by: p.get('group_by') || '',
       };
     }
 
@@ -668,6 +669,9 @@
       // oldest 1000" — misleading. Backend now honors `sort=` param;
       // flipped the default to match what users expect.
       const [sortBy, setSortBy] = useState(initParams.sort || 'date_desc');
+      // Client-side "Group by" for structured search (''=off | day | month |
+      // place_name | camera_model). Ask uses tool-driven grouping instead.
+      const [groupByAttr, setGroupByAttr] = useState(initParams.group_by || '');
       const [loading, setLoading] = useState(false);
       // Photos per page. Bumped from 200 to 1000 after user reported
       // that "Calvin in Lucas Valley" (5,946 matches) was capped at the
@@ -816,6 +820,15 @@
         return () => window.removeEventListener('keydown', handler);
       }, [multiSelect, exitMultiSelect]);
 
+      // Keep ?group_by= in the address bar in sync when the control changes,
+      // so the grouped view is reloadable/shareable even without re-searching.
+      useEffect(() => {
+        const u = new URL(window.location.href);
+        if (groupByAttr) u.searchParams.set('group_by', groupByAttr);
+        else u.searchParams.delete('group_by');
+        window.history.replaceState(null, '', u.pathname + u.search);
+      }, [groupByAttr]);
+
       // 'm' key enters multi-select (when not in modal or typing)
       useEffect(() => {
         if (multiSelect || selectedPhoto) return;
@@ -882,6 +895,7 @@
         const urlParams = new URLSearchParams(params);
         const curPhoto = new URLSearchParams(window.location.search).get('photo');
         if (curPhoto) urlParams.set('photo', curPhoto);
+        if (groupByAttr) urlParams.set('group_by', groupByAttr);
         const newUrl = window.location.pathname + (urlParams.toString() ? '?' + urlParams.toString() : '');
         window.history.pushState(null, '', newUrl);
 
@@ -933,6 +947,7 @@
         if (minAesthetic) askUrl.set('min_aesthetic', minAesthetic);
         if (minDayAesthetic) askUrl.set('min_day_aesthetic', minDayAesthetic);
         if (sortQuality) askUrl.set('sort_quality', 'true');
+        if (groupByAttr) askUrl.set('group_by', groupByAttr);
         window.history.pushState(null, '',
           window.location.pathname + '?' + askUrl.toString());
 
@@ -1335,6 +1350,22 @@
               'Sort by quality',
             ),
           ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Group by:'),
+            e('select', {
+              className: 'filter-input',
+              value: groupByAttr,
+              onChange: (ev) => setGroupByAttr(ev.target.value),
+              title: 'Break results into labeled sections',
+              style: { width: 120 },
+            },
+              e('option', { value: '' }, 'None'),
+              e('option', { value: 'day' }, 'Day'),
+              e('option', { value: 'month' }, 'Month'),
+              e('option', { value: 'place_name' }, 'Location'),
+              e('option', { value: 'camera_model' }, 'Camera'),
+            ),
+          ),
           stats && e('div', { className: 'stats-bar' },
             stats.photos + ' photos indexed · ' +
             stats.described + ' described · ' +
@@ -1442,8 +1473,11 @@
                            sortBy: askMode ? null : sortBy,
                            setSortBy: askMode ? null : setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc', 'day_quality_desc'],
-                           groups: askMode ? askGroups : null,
-                           groupField: askMode ? askGroupField : null,
+                           // Ask uses tool-driven grouping (ordered labels); structured
+                           // search uses the client-side "Group by" control. In Ask mode a
+                           // "Group by" selection is a fallback when no tool grouped.
+                           groups: (askMode && askGroupField) ? askGroups : null,
+                           groupField: (askMode ? (askGroupField || groupByAttr) : groupByAttr) || null,
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack, query,
                            totalResults, hasMore, loadingMore, onLoadMore: loadMore }),
@@ -1563,32 +1597,46 @@
         });
       };
 
-      // Grouped ("photobook") layout: when the Ask returned section headers,
-      // break the grid into labeled sections (chapter / day / scene / bucket)
-      // in the given order, like Review's Timeline. `groupField` names the key
-      // on each photo; 'day' is derived from date_taken.
-      const groupKeyOf = (photo) => groupField === 'day'
-        ? ((photo.date_taken || '').slice(0, 10) || 'Undated')
-        : photo[groupField];
-      const sections = (groups && groups.length && groupField) ? (() => {
+      // Grouped ("photobook") layout: break the grid into labeled sections.
+      // `groupField` names the per-photo key ('day'/'month' are derived from
+      // date_taken; else a raw column like place_name / camera_model / chapter).
+      // When `groups` is supplied (Ask tools) it gives the section ORDER +
+      // labels/sublabels; otherwise sections are auto-derived in encounter order
+      // (so they follow the active sort), keyed by the value itself.
+      const groupKeyOf = (photo) => {
+        if (groupField === 'day') return (photo.date_taken || '').slice(0, 10) || 'Undated';
+        if (groupField === 'month') return (photo.date_taken || '').slice(0, 7) || 'Undated';
+        const v = photo[groupField];
+        return (v == null || v === '') ? null : v;
+      };
+      const sections = groupField ? (() => {
         const byKey = new Map();
+        const order = [];
         displayItems.forEach(it => {
-          const kk = (() => { const k = groupKeyOf(it.photo); return k == null ? 'Other' : String(k); })();
-          if (!byKey.has(kk)) byKey.set(kk, []);
+          const k = groupKeyOf(it.photo);
+          const kk = (k == null ? '—' : String(k));
+          if (!byKey.has(kk)) { byKey.set(kk, []); order.push(kk); }
           byKey.get(kk).push(it);
         });
-        const out = [];
-        const seen = new Set();
-        groups.forEach(g => {
-          const kk = String(g.key);
-          seen.add(kk);
-          const items = byKey.get(kk) || [];
-          if (items.length) out.push({ g, items });
-        });
-        byKey.forEach((items, kk) => {
-          if (!seen.has(kk)) out.push({ g: { key: kk, label: kk }, items });
-        });
-        return out;
+        if (groups && groups.length) {
+          const out = [];
+          const seen = new Set();
+          groups.forEach(g => {
+            const kk = String(g.key);
+            seen.add(kk);
+            const items = byKey.get(kk) || [];
+            if (items.length) out.push({ g, items });
+          });
+          order.forEach(kk => {
+            if (!seen.has(kk)) out.push({ g: { key: kk, label: kk }, items: byKey.get(kk) });
+          });
+          return out;
+        }
+        // Structured "Group by": encounter order, value as the label.
+        return order.map(kk => ({
+          g: { key: kk, label: kk === '—' ? '(none)' : kk },
+          items: byKey.get(kk),
+        }));
       })() : null;
 
       return e('div', null,

@@ -1857,8 +1857,13 @@ Nothing leaves the NAS.
   `daily_highlights`→`day`, `representatives`→`bucket`). `PhotoGrid` renders
   labeled sections (header = label + sublabel like a date span / places) instead
   of a flat grid — so chapters/days/scenes are actually visible, like Review's
-  Timeline. Structured search stays ungrouped (`groups`/`group_field` are only
-  passed in Ask mode).
+  Timeline. **Structured search has the same sectioning** via a client-side
+  "Group by" control (None / Day / Month / Location / Camera, `?group_by=`): when
+  `groups` isn't supplied (no Ask tool grouping), `PhotoGrid` auto-derives
+  sections from the loaded results in encounter order, keyed by the chosen
+  attribute (`day`/`month` derived from `date_taken`, else a raw column like
+  `place_name`/`camera_model`). In Ask mode a tool's grouping wins; a "Group by"
+  selection is the fallback when no tool grouped.
 - **Per-day aesthetic filter.** `min_day_aesthetic` (0-100) floors on the
   PER-DAY percentile `COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct)`
   — how a photo ranks among others taken the SAME day — vs `min_aesthetic`'s
