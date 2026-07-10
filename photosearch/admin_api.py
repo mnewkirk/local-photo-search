@@ -771,6 +771,7 @@ def _fleet_env() -> dict:
         env.setdefault("PHOTOSEARCH_LLM_VISUAL_MODEL", visual)
         env.setdefault("PHOTOSEARCH_LLM_DESCRIBE_MODEL", visual)
         env.setdefault("PHOTOSEARCH_LLM_VERIFY_MODEL", visual)
+        env.setdefault("PHOTOSEARCH_LLM_AESTHETICS_MODEL", visual)
         env.setdefault("PHOTOSEARCH_LLM_TEXT_MODEL", "llama-3.2-3b-instruct")
     return env
 

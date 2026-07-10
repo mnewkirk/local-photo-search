@@ -93,3 +93,33 @@ def test_tag_visual_photo_regurgitation_guard_at_12(monkeypatch, tmp_path):
     monkeypatch.setattr(d, "_encode_image_for_ollama", lambda p: "encoded")
     out = d.tag_visual_photo(str(img))
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_openai_model — LM Studio role → model mapping. Regression for the
+# aesthetics pass sending the bare Ollama default "qwen2.5-vl" (an invalid LM
+# Studio id → "Invalid model identifier") when its own role env var is unset.
+# ---------------------------------------------------------------------------
+
+def test_resolve_openai_model_role_env_wins(monkeypatch):
+    from photosearch.describe import _resolve_openai_model
+    monkeypatch.setenv("PHOTOSEARCH_LLM_AESTHETICS_MODEL", "custom-vl@q4")
+    assert _resolve_openai_model("qwen2.5-vl", "aesthetics") == "custom-vl@q4"
+
+
+def test_resolve_openai_model_vision_falls_back_to_visual(monkeypatch):
+    from photosearch.describe import _resolve_openai_model
+    monkeypatch.delenv("PHOTOSEARCH_LLM_AESTHETICS_MODEL", raising=False)
+    monkeypatch.delenv("PHOTOSEARCH_TEXT_LLM_MODEL", raising=False)
+    monkeypatch.setenv("PHOTOSEARCH_LLM_VISUAL_MODEL", "qwen2.5-vl-7b-instruct")
+    # Bare Ollama default must not leak through for any vision role.
+    for role in ("aesthetics", "describe", "verify", "visual"):
+        assert _resolve_openai_model("qwen2.5-vl", role) == "qwen2.5-vl-7b-instruct"
+
+
+def test_resolve_openai_model_text_role_not_visual(monkeypatch):
+    from photosearch.describe import _resolve_openai_model
+    monkeypatch.delenv("PHOTOSEARCH_LLM_TEXT_MODEL", raising=False)
+    monkeypatch.setenv("PHOTOSEARCH_LLM_VISUAL_MODEL", "qwen2.5-vl-7b-instruct")
+    # text is not a vision role — it must NOT borrow the visual model.
+    assert _resolve_openai_model("llama3.2:3b", "text") == "llama3.2:3b"

@@ -442,10 +442,11 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
     """Resolve the OpenAI / LM Studio model id for a call by its descriptive
     ROLE, not by model name. Roles name the *pass* the call serves:
 
-        text     -> category-content + keywords      PHOTOSEARCH_LLM_TEXT_MODEL
-        describe -> describe pass + verify regen      PHOTOSEARCH_LLM_DESCRIBE_MODEL
-        verify   -> verify's independent verifier     PHOTOSEARCH_LLM_VERIFY_MODEL
-        visual   -> category-visual tags              PHOTOSEARCH_LLM_VISUAL_MODEL
+        text       -> category-content + keywords    PHOTOSEARCH_LLM_TEXT_MODEL
+        describe   -> describe pass + verify regen    PHOTOSEARCH_LLM_DESCRIBE_MODEL
+        verify     -> verify's independent verifier   PHOTOSEARCH_LLM_VERIFY_MODEL
+        visual     -> category-visual tags            PHOTOSEARCH_LLM_VISUAL_MODEL
+        aesthetics -> VLM aesthetic scoring           PHOTOSEARCH_LLM_AESTHETICS_MODEL
 
     So you point each role at whatever you actually loaded in LM Studio (Gemma,
     Qwen-VL, llava, ...) without the config keys pretending to be model names.
@@ -456,6 +457,15 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
         v = os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL")
         if v:
             return v
+        # Vision roles reuse the configured vision model if their own role env
+        # var is unset — the raw Ollama defaults (e.g. "qwen2.5-vl",
+        # "llama3.2-vision") are NOT valid LM Studio ids, so falling through to
+        # `model` would 400 with "Invalid model identifier". Mirrors
+        # rerun._resolve_model. `aesthetics` is the pass that surfaced this.
+        if role in ("describe", "verify", "visual", "aesthetics"):
+            visual = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
+            if visual:
+                return visual
     return os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL") or model
 
 
