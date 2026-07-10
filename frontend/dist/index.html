@@ -697,6 +697,17 @@
       const [askLog, setAskLog] = useState([]);      // narration lines
       const [askAnswer, setAskAnswer] = useState(''); // final prose answer
       const askAbortRef = useRef(null);
+      // Thinking toggle. On a reasoning model (qwen3.5) the traces are ~71% of the
+      // generated tokens and about half the wall-clock. null = never touched, so we
+      // send nothing and the server's PHOTOSEARCH_LLM_REASONING_EFFORT decides.
+      const [thinking, setThinking] = useState(() => {
+        const v = localStorage.getItem('ps_ask_thinking');
+        return v === null ? null : v === '1';
+      });
+      const setThinkingPersist = (on) => {
+        localStorage.setItem('ps_ask_thinking', on ? '1' : '0');
+        setThinking(on);
+      };
 
       const toggleStack = useCallback((stackId) => {
         setExpandedStacks(prev => {
@@ -942,10 +953,15 @@
         if (minAesthetic) askFilters.min_aesthetic = parseFloat(minAesthetic);
         if (sortQuality) askFilters.sort = 'quality_desc';
 
+        const askBody = { message: q, filters: askFilters };
+        // Only send the key once the user has actually chosen; otherwise the
+        // server-side PHOTOSEARCH_LLM_REASONING_EFFORT default stands.
+        if (thinking !== null) askBody.thinking = thinking;
+
         fetch(API + '/api/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: q, filters: askFilters }),
+          body: JSON.stringify(askBody),
           signal: ac.signal,
         })
           .then(response => {
@@ -999,7 +1015,8 @@
             setAsking(false);
           });
       }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
-          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, sortQuality]);
+          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, sortQuality,
+          thinking]);
 
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
@@ -1179,6 +1196,23 @@
             style: { fontSize: 12, color: 'var(--text-muted)', fontStyle: 'italic' },
             title: 'These filters are applied to every search the assistant runs.',
           }, '✨ Pinned to Ask:'),
+          askMode && e('div', { className: 'filter-group' },
+            e('label', {
+              style: { fontSize: 12, display: 'flex', alignItems: 'center', gap: 4,
+                       cursor: 'pointer', color: 'var(--text-muted)' },
+              title: 'Let the model reason step-by-step before answering. More '
+                   + 'thorough on hard questions, but roughly twice as slow — the '
+                   + 'reasoning is most of what it generates. Uncheck for speed.',
+            },
+              e('input', {
+                type: 'checkbox',
+                checked: thinking !== false,
+                disabled: asking,
+                onChange: (ev) => setThinkingPersist(ev.target.checked),
+              }),
+              'Thinking',
+            ),
+          ),
           e('div', { className: 'filter-group' },
             e('span', { className: 'filter-label' }, 'Person:'),
             e('select', {

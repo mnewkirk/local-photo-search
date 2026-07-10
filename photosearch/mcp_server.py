@@ -15,6 +15,12 @@ tool schemas are owned by ``tools.py`` and fed in verbatim via
 in-app agent. FastMCP would re-derive schemas from function signatures and
 duplicate them.
 
+The server also serves ``tools.server_instructions()`` as its MCP
+``instructions`` and exposes the library facts as a resource. The schemas say
+what each tool *is*; the instructions say how to choose among them. Serving the
+tools without them measured 42% argument accuracy on qwen3.5-9b vs 85% for the
+in-app agent, which had the same tools plus that text (``evals/mcp_bakeoff.py``).
+
 Image policy: ``get_photo_image`` is only advertised / callable when
 ``PHOTOSEARCH_MCP_ALLOW_IMAGES`` is truthy. Default off — text metadata only.
 
@@ -29,6 +35,9 @@ Env:
     PHOTOSEARCH_ALLOW_WRITES       M26b write tools (set_photo_location /
                                    set_photo_tags / add_to_collection) — ON by
                                    default; set 0/false to disable
+    PHOTOSEARCH_MCP_FACTS          snapshot library facts into `instructions` at
+                                   startup — ON by default; set 0/false to skip
+                                   the vocabulary scan
 """
 
 from __future__ import annotations
@@ -40,11 +49,16 @@ import logging
 import os
 
 from .db import PhotoDB
-from .tools import call_tool, get_tool, mcp_tools
+from .tools import call_tool, get_tool, mcp_tools, server_instructions
 
 logger = logging.getLogger("photosearch.mcp")
 
 SERVER_NAME = "photosearch"
+
+# URI of the library-facts resource. Hosts that read resources can pull the
+# people / places / vocab / date-span snapshot; the same text is also folded
+# into `instructions` because most hosts don't fetch resources on their own.
+FACTS_URI = "photosearch://library/facts"
 
 
 def _images_allowed() -> bool:
@@ -79,6 +93,31 @@ def _open_db() -> PhotoDB:
     return PhotoDB(_db_path(), photo_root=os.environ.get("PHOTO_ROOT"))
 
 
+def _facts_enabled() -> bool:
+    """Whether to snapshot the library facts into `instructions` at startup.
+    ON by default; set PHOTOSEARCH_MCP_FACTS to a falsy value to skip the scan."""
+    v = os.environ.get("PHOTOSEARCH_MCP_FACTS")
+    if v is None or not v.strip():
+        return True
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _library_facts() -> str:
+    """People / places / vocab / date span, as the agent injects them. Without
+    this an MCP client must spend tool calls rediscovering the vocabulary — and
+    measurably tends to ground and then stop without searching. Best-effort: a
+    failure here must not stop the server from serving tools."""
+    if not _facts_enabled():
+        return ""
+    try:
+        from .agent import _library_context
+        with _open_db() as db:
+            return _library_context(db)
+    except Exception as exc:  # pragma: no cover - startup best-effort
+        logger.warning("library facts unavailable (%s); serving without them", exc)
+        return ""
+
+
 def build_server():
     """Construct the low-level MCP ``Server`` with our tools registered."""
     from mcp.server.lowlevel import Server
@@ -86,7 +125,30 @@ def build_server():
 
     allow_images = _images_allowed()
     allow_writes = _writes_allowed()
-    app = Server(SERVER_NAME)
+    facts = _library_facts()
+    app = Server(
+        SERVER_NAME,
+        # The routing knowledge. Without it a client sees the tool list and none
+        # of the rules for choosing among the search-family tools.
+        instructions=server_instructions(include_writes=allow_writes,
+                                         library_facts=facts),
+    )
+
+    @app.list_resources()
+    async def list_resources() -> list:
+        if not facts:
+            return []
+        return [types.Resource(
+            uri=FACTS_URI, name="Library facts",
+            description="Registered people, common places, tag vocabulary and "
+                        "date span for this photo library.",
+            mimeType="text/plain")]
+
+    @app.read_resource()
+    async def read_resource(uri) -> str:
+        if str(uri) != FACTS_URI:
+            raise ValueError(f"unknown resource: {uri}")
+        return facts
 
     @app.list_tools()
     async def list_tools() -> list:

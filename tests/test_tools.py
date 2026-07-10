@@ -134,11 +134,30 @@ def test_list_places_query_filter(db):
 
 def test_list_vocab_all_kinds(db):
     vocab = tools.call_tool(db, "list_vocab", {})
-    assert set(vocab) == {"categories", "visual_tags", "keywords"}
+    assert set(vocab) == {"categories", "visual_tags", "keywords", "style_tags"}
     cats = {c["value"] for c in vocab["categories"]}
     assert {"landscape", "people"} <= cats
     vis = {v["value"] for v in vocab["visual_tags"]}
     assert {"dramatic", "golden hour"} <= vis
+
+
+def test_list_vocab_covers_every_vocab_filter():
+    """search_photos exposes category / visual_tag / keyword / style_tag; each
+    must be groundable via list_vocab, or the model can only guess the value
+    (qwen3.5-9b picked style_tag='moody' — a filter that matched nothing —
+    because style_tags was unlistable)."""
+    kinds = set(tools.get_tool("list_vocab").parameters["properties"]["kind"]["enum"])
+    props = tools.get_tool("search_photos").parameters["properties"]
+    for arg, kind in (("category", "categories"), ("visual_tag", "visual_tags"),
+                      ("keyword", "keywords"), ("style_tag", "style_tags")):
+        assert arg in props
+        assert kind in kinds, f"{arg} filter has no list_vocab kind"
+
+
+def test_list_vocab_style_tags(db):
+    vocab = tools.call_tool(db, "list_vocab", {"kind": "style_tags"})
+    assert set(vocab) == {"style_tags"}
+    assert isinstance(vocab["style_tags"], list)
 
 
 def test_list_vocab_kind_restriction(db):
@@ -758,3 +777,49 @@ def test_suggest_layout_partitions_and_picks_hero(db):
 
 def test_suggest_layout_requires_ids(db):
     assert "error" in tools.call_tool(db, "suggest_layout", {"photo_ids": []})
+
+
+# ---------------------------------------------------------------------------
+# Routing guidance shared by both adapters (MCP instructions / agent prompt)
+# ---------------------------------------------------------------------------
+
+def test_tool_descriptions_do_not_mandate_grounding():
+    """The grounding directive is adapter-specific: the agent pre-injects the
+    library facts and should skip the list_* tools, an MCP client must call
+    them. So the descriptions must not hardcode either stance — they used to say
+    'ALWAYS call this first' / 'You MUST call this before', contradicting the
+    agent's system prompt in the same context window."""
+    for name in ("get_library_overview", "list_people"):
+        desc = tools.get_tool(name).description
+        assert "ALWAYS call this first" not in desc
+        assert "You MUST call this before" not in desc
+
+
+def test_grounding_directives_are_opposites():
+    assert "go STRAIGHT to search_photos" in tools.GROUNDING_WITH_FACTS
+    assert "Never stop after a list_* call" in tools.GROUNDING_WITHOUT_FACTS
+
+
+def test_daily_highlights_does_not_claim_flat_best_of_range():
+    """'best photos from <date range>' is search_photos(sort='quality_desc').
+    daily_highlights used to claim that exact phrasing and won the tool choice
+    on qwen3.5-9b for p03/p10."""
+    desc = tools.get_tool("daily_highlights").description
+    assert "ONLY use this when" in desc
+    assert "is NOT this tool" in desc
+    assert "sort='quality_desc'" in desc
+
+
+def test_server_instructions_carry_routing_and_gate_writes():
+    plain = tools.server_instructions(include_writes=False)
+    assert tools.ROUTING_GUIDANCE in plain
+    assert tools.GROUNDING_WITHOUT_FACTS in plain
+    assert "set_photo_location" not in plain
+
+    writeful = tools.server_instructions(include_writes=True)
+    assert tools.WRITE_GUIDANCE in writeful
+
+    withfacts = tools.server_instructions(library_facts="People: Calvin, Ellie.")
+    assert tools.GROUNDING_WITH_FACTS in withfacts
+    assert "LIBRARY FACTS:" in withfacts
+    assert tools.GROUNDING_WITHOUT_FACTS not in withfacts

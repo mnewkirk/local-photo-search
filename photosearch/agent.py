@@ -86,6 +86,25 @@ def _agent_model() -> str:
     )
 
 
+# Thinking models (qwen3.5) spend most of their decode budget on reasoning traces
+# the user never sees — measured at ~71% of generated tokens across the Ask
+# prompts, and suppressing them roughly halved median latency with no measurable
+# accuracy change (evals/mcp_bakeoff.py). Only "none" actually disables them on
+# LM Studio; chat_template_kwargs and reasoning_effort="low" are ignored.
+_REASONING_OFF = "none"
+
+
+def _resolve_reasoning_effort(override: Optional[str] = None) -> str:
+    """Per-request override > PHOTOSEARCH_LLM_REASONING_EFFORT > model default.
+
+    Returns "" to send no `reasoning_effort` at all (model default / thinking on),
+    which is also what non-OpenAI backends need.
+    """
+    if override is not None:
+        return (override or "").strip()
+    return os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
+
+
 _CONTEXT_CACHE: dict = {}
 _CONTEXT_TTL_S = 600
 
@@ -145,134 +164,27 @@ def _library_context(db) -> str:
     return text
 
 
-_WRITE_GUIDANCE = (
-    "\n\nWRITES (you can edit the library): set_photo_location, set_photo_tags, "
-    "and add_to_collection mutate the library. STRICT protocol:\n"
-    "- They act ONLY on an explicit photo_ids list — pass the exact ids from a "
-    "search you already ran and the user saw. NEVER make up ids or write to a set "
-    "the user hasn't seen.\n"
-    "- ALWAYS preview first: call with confirm=false (the default) to show how "
-    "many photos would change and a before→after sample. Report that to the user "
-    "and ask them to confirm.\n"
-    "- Only call again with confirm=true AFTER the user explicitly says yes in the "
-    "conversation. Never pass confirm=true on your own initiative.\n"
-    "- If the preview says confirm_large is needed (a big batch), tell the user "
-    "the count and get a second explicit go-ahead before adding confirm_large=true.\n"
-)
-
-
 def _system_prompt(db=None, allow_writes: bool = False) -> str:
-    base = (
-        "You are a photo-library search assistant. The user describes what they "
-        "want in natural language; find the matching photos with the tools, then "
-        "give a one- or two-sentence answer.\n\n"
-        "You are given LIBRARY FACTS below (people, places, tags, date span), so "
-        "usually go STRAIGHT to search_photos — you do NOT need get_library_overview "
-        "or the list_* tools. Use list_* only to look up something not in the facts.\n\n"
-        "Rules:\n"
-        "- Fill ONLY the filters you actually inferred; OMIT every other field. "
-        "Never send empty strings/arrays or a filter 'just in case'.\n"
-        "- Dates: set date_from/date_to only when the request implies a time range, "
-        "computed from today's date. NEVER filter by today's date for a request "
-        "that isn't about today.\n"
-        "- 'best'/'top'/'favorite'/'good' = rank by quality: sort='quality_desc'. "
-        "Do NOT put those words in `query`, and do NOT add min_quality — a hard "
-        "quality floor can exclude everything (many good photos score ~5). Only "
-        "set min_quality if the user gives an explicit bar ('quality above 7').\n"
-        "- EXCLUDE with `query`: a leading '-' or 'no <thing>', e.g. "
-        "query='landscape -people'. Don't express exclusion via structured filters.\n"
-        "- Resolve group terms from USER NOTES / the people list: 'the kids', "
-        "'the family', 'everyone' -> the specific registered names as a `people` "
-        "list (AND-intersected).\n"
-        "- Read `total`: if 0, relax a SECONDARY filter and retry (drop "
-        "min_quality, widen dates, or move a term into `query`); if huge, add a "
-        "filter. Iterate once or twice before answering. But NEVER drop the "
-        "person/subject the user named to manufacture results — if a search that "
-        "INCLUDES that person returns 0, answer that no matching photos were found "
-        "(say what you tried); do NOT return photos without them.\n"
-        "- For 'which year / how many / when / who / how often' questions, use "
-        "summarize(filters, group_by=year|month|location|person) — it COUNTS by "
-        "a dimension instead of returning photos. For multi-step questions like "
-        "'which year were we in both X and Y', summarize each by year, intersect "
-        "the years yourself, then search_photos for that year.\n"
-        "- For 'one/N per year' / 'best of each year' / 'a few from each trip' "
-        "(a representative SPREAD, not a flat list), use representatives(filters, "
-        "bucket=year|month|location|person, n). search_photos CANNOT do "
-        "per-bucket selection. E.g. 'best photo of Matt, one per year, last 10 "
-        "years' → representatives(people=['Matt'], bucket='year', n=1, "
-        "date_from=<10 years ago>).\n"
-        "- For a CHRONOLOGICAL day-by-day highlight reel — 'the best photos from "
-        "<trip / date range>, top N per day, in order, no duplicates / best of "
-        "each burst within X minutes' — use daily_highlights(date_from, date_to, "
-        "per_day, window_minutes). It caps each day, collapses bursts/near-dupes "
-        "within the window to one best frame, and returns results in time order; "
-        "neither search_photos nor representatives can do per-day + time-collapse. "
-        "E.g. 'best of 2026-06-28..2026-07-04, top 20/day, no dupes within 10 min' "
-        "→ daily_highlights(date_from='2026-06-28', date_to='2026-07-04', "
-        "per_day=20, window_minutes=10).\n"
-        "- 'X is the foreground/primary subject' / 'X featured prominently': "
-        "for a flat 'best photos of X (foreground)' in ONE scope (a year, a "
-        "place) use search_photos(people=['X'], sort='subject', ...); for a "
-        "SPREAD ('one/N per year where X is foreground') use "
-        "representatives(people=['X'], rank_by='subject', bucket='year', n=...). "
-        "Both rank by the person's face size in frame — prefer them over "
-        "rerank_photos for subject prominence.\n"
-        "- FRAMING / who-else-is-in-it constraints are METADATA, not vision — use "
-        "the flags, do NOT reach for rerank_photos for these: 'only the four of "
-        "us / nobody else / just X and Y' -> only_these_people=true (with the "
-        "`people` set); 'everyone fully in the frame / no one cropped / each face "
-        "fully visible' -> faces_in_frame=true. Both work on search_photos, "
-        "representatives, and summarize. They're exact and fast, so APPLY THEM "
-        "FIRST and only then, if a constraint truly needs eyes ('looking at the "
-        "camera', 'eyes and mouth visible', 'smiling') call rerank_photos on the "
-        "narrowed set. Do NOT call get_photo per-result to check face counts or "
-        "framing — that's what these flags are for.\n"
-        "- For VISUAL precision a vision model must judge — 'the one where X is "
-        "doing Y', a specific ACTIVITY/sport ('playing soccer', 'on a bike'), or "
-        "'the sharpest/best-composed' — get candidates first (search_photos with "
-        "sort='quality_desc', or representatives; fetch ~15-24), then "
-        "rerank_photos(photo_ids=<those ids>, criteria=<the visual thing>). "
-        "IMPORTANT for activities: category/tag matches include false positives "
-        "(a beach photo mis-tagged 'soccer'), so for 'top N photos of X playing "
-        "<sport>' you MUST rerank to verify the activity is actually happening — "
-        "don't trust category alone. It LOOKS at each image and re-sorts; it's "
-        "slow, so keep the set <=24.\n"
-        "- Then stop and write a 1-3 sentence answer that EXPLAINS how you "
-        "interpreted the request — which filters and sort you used and why "
-        "(e.g. \"'best' so I sorted by quality; 'the kids' = Calvin and Ellie\") "
-        "— and what the photos show. Never list photo ids; the UI shows them.\n\n"
-        "Examples (plan straight to search_photos using the facts):\n"
-        "  'photos of Calvin' -> people=['Calvin']\n"
-        "  'Nicole and Matt together' -> people=['Nicole','Matt']\n"
-        "  'best beach photos last summer' -> query='beach', date_from=<jun1 last yr>, "
-        "date_to=<aug31 last yr>, sort='quality_desc'\n"
-        "  'landscapes with no people' -> query='landscape -people'\n"
-        "  'most moody shots' -> visual_tag='moody', sort='quality_desc'\n"
-        "  'the kids playing soccer' -> people=<the kids>, category='soccer'\n"
-        "  'top 3 photos of Calvin playing soccer' -> search_photos(people=['Calvin'], "
-        "category='soccer', sort='quality_desc') THEN rerank_photos(photo_ids="
-        "<the returned ids>, criteria='a child actively playing soccer on a field', "
-        "top_n=3) — rerank (category tags have false positives) and pass top_n to "
-        "honor the requested count and drop low-scoring non-matches\n"
-        "  'best photo of Matt, Calvin, Nicole, Ellie each year, only the four of "
-        "them, everyone fully in frame' -> representatives(people=['Matt','Calvin',"
-        "'Nicole','Ellie'], bucket='year', n=1, rank_by='subject', "
-        "only_these_people=true, faces_in_frame=true) — the flags enforce 'only "
-        "them' + 'not cropped' in metadata; no rerank needed unless they also ask "
-        "for eyes/smiles\n"
-        "  'top 10 photos from France last year, no more than 1 from each location' "
-        "-> representatives(location='France', date_from=<jan1 last yr>, "
-        "date_to=<dec31 last yr>, bucket='location', n=1, max_buckets=10) — 'no "
-        "more than 1 per location' is n=1; the '10' is max_buckets (the cap on how "
-        "many locations come back), NOT n. Putting 10 in n returns up to 10 PER "
-        "location\n"
-    )
+    """The agent's system prompt. The routing rules live in tools.py so the MCP
+    server can serve the identical text as its ``instructions`` — same
+    single-source-of-truth argument as the schemas themselves."""
     try:
         ctx = _library_context(db) if db is not None else ""
     except Exception:
         ctx = ""
+    # The agent injects the facts whenever it has a db, so it gets the "skip the
+    # list_* tools" directive; an MCP client without the facts gets the opposite
+    # one. That conditional is exactly why the tool descriptions themselves must
+    # stay neutral about whether to ground first.
+    base = (
+        "You are a photo-library search assistant. The user describes what they "
+        "want in natural language; find the matching photos with the tools, then "
+        "give a one- or two-sentence answer.\n\n"
+        + (toolmod.GROUNDING_WITH_FACTS if ctx else toolmod.GROUNDING_WITHOUT_FACTS)
+        + "\n\n" + toolmod.ROUTING_GUIDANCE
+    )
     hints = os.environ.get("PHOTOSEARCH_AGENT_HINTS", "").strip()
-    out = base + (_WRITE_GUIDANCE if allow_writes else "")
+    out = base + (toolmod.WRITE_GUIDANCE if allow_writes else "")
     if ctx:
         out += "\nLIBRARY FACTS:\n" + ctx + "\n"
     if hints:
@@ -286,7 +198,8 @@ def _system_prompt(db=None, allow_writes: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def _chat(messages: list, tools: Optional[list], temperature: float = 0.0,
-          timeout: float = _HTTP_TIMEOUT_S) -> dict:
+          timeout: float = _HTTP_TIMEOUT_S,
+          reasoning_effort: Optional[str] = None) -> dict:
     """One chat round-trip. Returns a normalized dict:
         {"content": str|None, "tool_calls": [{"id", "name", "arguments"}]}
 
@@ -296,12 +209,15 @@ def _chat(messages: list, tools: Optional[list], temperature: float = 0.0,
     """
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
     if base:
-        return _chat_openai(base, messages, tools, temperature, timeout)
+        return _chat_openai(base, messages, tools, temperature, timeout,
+                            _resolve_reasoning_effort(reasoning_effort))
+    # Ollama has no reasoning_effort knob; the setting is a no-op there.
     return _chat_ollama(messages, tools, temperature)
 
 
 def _chat_openai(base_url: str, messages: list, tools: Optional[list],
-                 temperature: float, timeout: float = _HTTP_TIMEOUT_S) -> dict:
+                 temperature: float, timeout: float = _HTTP_TIMEOUT_S,
+                 reasoning_effort: str = "") -> dict:
     import urllib.request
 
     url = base_url.rstrip("/") + "/chat/completions"
@@ -315,6 +231,8 @@ def _chat_openai(base_url: str, messages: list, tools: Optional[list],
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"})
@@ -334,6 +252,8 @@ def _chat_openai(base_url: str, messages: list, tools: Optional[list],
         calls.append({"id": tc.get("id"), "name": fn.get("name"),
                       "arguments": args or {}})
     return {"content": msg.get("content"), "tool_calls": calls,
+            # Token accounting, so evals can split prefill from decode.
+            "usage": data.get("usage") or {},
             "reasoning": msg.get("reasoning_content") or msg.get("reasoning")}
 
 
@@ -457,12 +377,13 @@ _SINGLE_SHOT_INSTRUCTION = (
 
 def _run_single_shot(db: PhotoDB, message: str,
                      timeout: float = _HTTP_TIMEOUT_S,
-                     locked: Optional[dict] = None) -> Iterator[dict]:
+                     locked: Optional[dict] = None,
+                     reasoning_effort: Optional[str] = None) -> Iterator[dict]:
     reply = _chat(
         [{"role": "system", "content": _SINGLE_SHOT_INSTRUCTION
           + (_locked_prompt(locked) if locked else "")},
          {"role": "user", "content": message}],
-        tools=None, timeout=timeout,
+        tools=None, timeout=timeout, reasoning_effort=reasoning_effort,
     )
     text = (reply.get("content") or "").strip()
     # Strip ```json fences if present.
@@ -662,15 +583,22 @@ def run_agent(
     max_steps: int = _MAX_STEPS,
     should_abort: Optional[Callable[[], bool]] = None,
     locked_filters: Optional[dict] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Iterator[dict]:
-    """Drive the tool-calling loop; yield event dicts. See module docstring."""
+    """Drive the tool-calling loop; yield event dicts. See module docstring.
+
+    ``reasoning_effort`` overrides PHOTOSEARCH_LLM_REASONING_EFFORT for this run
+    ("none" disables a thinking model's reasoning traces; "" = model default).
+    """
     if not (message or "").strip():
         yield {"type": "error", "message": "empty message"}
         return
 
     locked = _normalize_locked(locked_filters)
 
-    session = {"message": message, "model": _agent_model(), "started": time.time(),
+    effective_effort = _resolve_reasoning_effort(reasoning_effort)
+    session = {"message": message, "model": _agent_model(),
+               "reasoning_effort": effective_effort or "default", "started": time.time(),
                "mode": "agent", "steps": [], "tool_calls": [], "answer": None,
                "error": None, "history_len": len(history or []), "rounds": 0,
                "locked_filters": locked or None}
@@ -727,7 +655,8 @@ def run_agent(
             yield {"type": "step", "n": step + 1, "max": max_steps,
                    "elapsed": round(time.time() - session["started"], 1)}
             try:
-                reply = _chat(messages, tools, timeout=min(_HTTP_TIMEOUT_S, remaining))
+                reply = _chat(messages, tools, timeout=min(_HTTP_TIMEOUT_S, remaining),
+                              reasoning_effort=reasoning_effort)
             except Exception as exc:
                 # First step with no progress → try the single-shot fallback
                 # once; the model likely can't tool-call against this endpoint.
@@ -737,7 +666,7 @@ def run_agent(
                            "summary": "tool-calling failed; trying single-shot"}
                     for ev in _run_single_shot(db, message,
                                                timeout=max(5.0, deadline - time.monotonic()),
-                                               locked=locked):
+                                               locked=locked, reasoning_effort=reasoning_effort):
                         if ev.get("type") == "answer":
                             session["answer"] = ev.get("text")
                         yield ev

@@ -286,6 +286,13 @@ def _h_get_library_overview(db: PhotoDB, args: dict) -> dict:
         "categorized": _count("categories IS NOT NULL AND categories != '[]'"),
         "with_gps": _count("gps_lat IS NOT NULL"),
         "quality_scored": _count("aesthetic_score IS NOT NULL"),
+        # Coverage for the filters that silently match nothing when their pass
+        # never ran: min_aesthetic reads aes_overall_pct, style_tag reads
+        # aes_style_tags, visual_tag reads visual_tags. A model that sees a 0
+        # here knows not to filter on it.
+        "visual_tagged": _count("visual_tags IS NOT NULL AND visual_tags != '[]'"),
+        "aesthetic_scored": _count("aes_overall_pct IS NOT NULL"),
+        "style_tagged": _count("aes_style_tags IS NOT NULL AND aes_style_tags != '[]'"),
         "registered_people": c.execute("SELECT COUNT(*) AS n FROM persons").fetchone()["n"],
         "photos_with_faces": c.execute(
             "SELECT COUNT(DISTINCT photo_id) AS n FROM faces").fetchone()["n"],
@@ -296,10 +303,13 @@ _register(ToolSpec(
     name="get_library_overview",
     description=(
         "Get a high-level summary of the photo library: total photo count, the "
-        "earliest and latest photo dates, how many photos have descriptions / "
-        "categories / GPS / quality scores, and how many people are registered. "
-        "ALWAYS call this first when starting a new search session — it tells you "
-        "what data is available to filter on and what date range exists."
+        "earliest and latest photo dates, how many photos carry each enrichment "
+        "(descriptions / categories / GPS / quality scores / visual tags / VLM "
+        "aesthetic scores / style tags), and how many people are registered. "
+        "Call this when you don't already know the library's date range or which "
+        "enrichments exist — a filter whose backing pass never ran (a 0 count "
+        "here) matches ZERO photos. If you already have those facts, skip it and "
+        "search directly."
     ),
     parameters={"type": "object", "properties": {}, "additionalProperties": False},
     handler=_h_get_library_overview,
@@ -331,9 +341,10 @@ _register(ToolSpec(
     name="list_people",
     description=(
         "List the people registered for face search, with how many photos each "
-        "appears in. You MUST call this before filtering a search by a person's "
-        "name — only names returned here can be used in search_photos' `people` "
-        "argument. Optionally pass `query` to substring-filter the names."
+        "appears in. Only names returned here work in search_photos' `people` "
+        "argument, so call this when you don't already know the exact registered "
+        "names — then go on to search. If the names are already known to you, skip "
+        "it. Optionally pass `query` to substring-filter the names."
     ),
     parameters={
         "type": "object",
@@ -422,7 +433,12 @@ _register(ToolSpec(
 
 _VOCAB_COLUMNS = {"categories": "categories",
                   "visual_tags": "visual_tags",
-                  "keywords": "keywords"}
+                  "keywords": "keywords",
+                  # search_photos exposes a `style_tag` filter, so its vocabulary
+                  # has to be listable here too — otherwise the only way to reach
+                  # that filter is to guess a value. Written by the VLM aesthetics
+                  # pass, so it is empty on libraries where that pass never ran.
+                  "style_tags": "aes_style_tags"}
 
 
 def _aggregate_json_vocab(db: PhotoDB, column: str, q: str, limit: int) -> list[dict]:
@@ -460,16 +476,18 @@ _register(ToolSpec(
     description=(
         "List the controlled vocabulary the library actually uses: distinct "
         "`categories` (content categories), `visual_tags` (visual-quality tags), "
-        "and `keywords`, each with photo counts. Call this before using "
-        "search_photos' `category` / `visual_tag` / `keyword` arguments so you "
-        "filter on terms that exist instead of guessing. Pass `kind` to restrict "
-        "to one of categories|visual_tags|keywords, and `query` to substring-filter."
+        "`keywords`, and `style_tags` (VLM aesthetic style), each with photo "
+        "counts. Call this before using search_photos' `category` / `visual_tag` "
+        "/ `keyword` / `style_tag` arguments so you filter on terms that exist "
+        "instead of guessing — a value that isn't listed here matches ZERO photos. "
+        "Pass `kind` to restrict to one vocabulary, and `query` to substring-filter."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "kind": {"type": "string", "enum": ["categories", "visual_tags", "keywords"],
-                     "description": "Restrict to one vocabulary; omit for all three."},
+            "kind": {"type": "string",
+                     "enum": ["categories", "visual_tags", "keywords", "style_tags"],
+                     "description": "Restrict to one vocabulary; omit for all four."},
             "query": {"type": "string",
                       "description": "Case-insensitive substring to filter values by."},
             "limit": {"type": "integer",
@@ -495,14 +513,24 @@ _CURATION_FILTER_PROPS = {
                               "'ILCE-7RM6', 'iPhone 15 Pro' — matches only photos "
                               "shot on that camera body (see summarize "
                               "group_by='camera_model' for the exact strings)."},
-    "min_aesthetic": {"type": "number",
+    "min_aesthetic": {"type": "number", "minimum": 0, "maximum": 100,
                "description": "Minimum VLM aesthetic PERCENTILE, 0-100 "
                               "(library-relative; 90 = top 10%). Prefer this over "
-                              "min_quality for a 'high quality' bar — percentiles "
-                              "spread evenly whereas raw scores cluster ~5-7."},
+                              "min_quality for an explicit 'high quality' bar — "
+                              "percentiles spread evenly whereas raw scores cluster "
+                              "~5-7. Set by the VLM aesthetics pass; on a library "
+                              "where it hasn't run this matches ZERO photos, so check "
+                              "get_library_overview first. For a plain 'best'/'top' "
+                              "request use sort='quality_desc' and NO score floor."},
     "style_tag": {"type": "string",
-               "description": "Aesthetic style tag, e.g. 'golden-hour', "
-                              "'black-and-white', 'moody' (from the VLM style pass)."},
+               "description": "Aesthetic STYLE tag from the VLM style pass — how the "
+                              "photo was lit/graded (e.g. 'golden-hour', "
+                              "'black-and-white'). This is a DIFFERENT vocabulary from "
+                              "`visual_tag`: for a mood/look word the user says (moody, "
+                              "dramatic, candid), reach for `visual_tag` first. Only "
+                              "use a value returned by list_vocab(kind='style_tags') — "
+                              "the pass has not run on every library, and an unlisted "
+                              "value matches ZERO photos."},
 }
 
 _COLUMN_CACHE: dict = {}
@@ -681,8 +709,13 @@ _register(ToolSpec(
             "category": {"type": "string", "description": "Exact content category (see list_vocab)."},
             "visual_tag": {"type": "string", "description": "Visual-quality tag (see list_vocab)."},
             "keyword": {"type": "string", "description": "Keyword substring (see list_vocab)."},
-            "min_quality": {"type": "number",
-                            "description": "Minimum aesthetic score, 1-10."},
+            "min_quality": {"type": "number", "minimum": 1, "maximum": 10,
+                            "description": "Minimum legacy aesthetic score, 1-10. Set "
+                                           "this ONLY when the user names an explicit "
+                                           "bar ('quality above 7'). Do NOT add it for "
+                                           "'best'/'good' — scores cluster ~5 and a "
+                                           "floor can exclude everything; use "
+                                           "sort='quality_desc' instead."},
             **_CURATION_FILTER_PROPS,
             "match_source": {"type": "string", "enum": ["strict", "temporal", "manual"],
                 "description": "Restrict person matches by confidence source "
@@ -700,9 +733,12 @@ _register(ToolSpec(
                 "fully in frame', 'no one cropped', 'each face fully visible'."},
             "sort": {"type": "string", "enum": list(_VALID_SORTS),
                      "description": "Result order; defaults to relevance for a query, "
-                                    "else date_desc. 'subject' (with a `people` filter) "
-                                    "ranks by how foreground/prominent that person is — "
-                                    "for 'best photos of X where X is the main subject'."},
+                                    "else date_desc. Any 'best'/'top'/'favorite'/'good' "
+                                    "request means sort='quality_desc' — put those words "
+                                    "HERE, never in `query`, and add no score floor. "
+                                    "'subject' (with a `people` filter) ranks by how "
+                                    "foreground/prominent that person is — for 'best "
+                                    "photos of X where X is the main subject'."},
             "limit": {"type": "integer",
                       "description": f"Max results (default {_SEARCH_DEFAULT_LIMIT}, "
                                      f"max {_SEARCH_MAX_LIMIT})."},
@@ -1247,15 +1283,19 @@ _register(ToolSpec(
         "(default 20), and within each day it keeps only the single best frame of "
         "any burst/near-duplicate group — one representative per burst stack and "
         "per `window_minutes` time window (default 10) — then returns everything "
-        "in CHRONOLOGICAL order. Use this for 'the best photos from <trip / date "
-        "range>, top N per day, chronological, no duplicates'. search_photos (a "
-        "flat ranked list) and representatives (best-first per year/month/place, "
-        "not per-day and not time-collapsed) CANNOT express it. Same structured "
-        "filters as search_photos (no free-text `query`). Each day's distinct "
-        "geotagged places come back in `day_summary[].places`. Example: 'best "
-        "photos between 2026-06-28 and 2026-07-04, top 20 per day, chronological, "
-        "avoid duplicates within 10 minutes' → date_from='2026-06-28', "
-        "date_to='2026-07-04', per_day=20, window_minutes=10."
+        "in CHRONOLOGICAL order. ONLY use this when the request explicitly asks for "
+        "a PER-DAY quota, chronological/day-by-day order, or de-duplicated bursts "
+        "— e.g. 'top N per day', 'day by day', 'in order, no duplicates', 'best of "
+        "each burst within X minutes'. A plain 'best photos from <trip / date "
+        "range>' is NOT this tool: that is a flat ranked list, so use "
+        "search_photos(date_from, date_to, sort='quality_desc'). search_photos and "
+        "representatives cannot express per-day + time-collapse; this tool cannot "
+        "express a flat overall ranking. Same structured filters as search_photos "
+        "(no free-text `query`). Each day's distinct geotagged places come back in "
+        "`day_summary[].places`. Example: 'best photos between 2026-06-28 and "
+        "2026-07-04, top 20 per day, chronological, avoid duplicates within 10 "
+        "minutes' → date_from='2026-06-28', date_to='2026-07-04', per_day=20, "
+        "window_minutes=10."
     ),
     parameters={
         "type": "object",
@@ -2543,3 +2583,170 @@ _register(ToolSpec(
     },
     handler=_h_add_to_collection,
 ))
+
+
+# ---------------------------------------------------------------------------
+# Cross-tool routing guidance (shared by both adapters)
+# ---------------------------------------------------------------------------
+#
+# The schemas above say what each tool *is*. These strings say how to CHOOSE
+# among them — knowledge that lived only in agent.py's system prompt, so an MCP
+# client got the tools with none of the routing. Same reasoning as the schema
+# registry: define it once, project it into both adapters (agent -> system
+# prompt, MCP -> Server(instructions=...)).
+#
+# Deliberately excluded: the persona line and the "you already have the library
+# facts, skip the list_* tools" directive. Whether the facts are pre-injected is
+# an adapter property, not a tool property, so each adapter supplies its own
+# GROUNDING_* line below.
+
+GROUNDING_WITH_FACTS = (
+    "You are given LIBRARY FACTS below (people, places, tags, date span), so "
+    "usually go STRAIGHT to search_photos — you do NOT need get_library_overview "
+    "or the list_* tools. Use list_* only to look up something not in the facts."
+)
+
+GROUNDING_WITHOUT_FACTS = (
+    "You do NOT yet know this library's people, places, or tag vocabulary. When a "
+    "request names a person, place, category or tag, first call the matching "
+    "list_* tool (list_people / list_places / list_vocab) to resolve the EXACT "
+    "stored value — a value that doesn't exist matches ZERO photos. Then ALWAYS "
+    "follow up with the actual search in the same turn: grounding alone answers "
+    "nothing. Never stop after a list_* call."
+)
+
+ROUTING_GUIDANCE = (
+    "Rules:\n"
+    "- Fill ONLY the filters you actually inferred; OMIT every other field. "
+    "Never send empty strings/arrays or a filter 'just in case'.\n"
+    "- Dates: set date_from/date_to only when the request implies a time range, "
+    "computed from today's date. NEVER filter by today's date for a request "
+    "that isn't about today.\n"
+    "- 'best'/'top'/'favorite'/'good' = rank by quality: sort='quality_desc'. "
+    "Do NOT put those words in `query`, and do NOT add min_quality or "
+    "min_aesthetic — a hard quality floor can exclude everything. Only set a "
+    "floor if the user gives an explicit bar ('quality above 7').\n"
+    "- A mood/look word the user says ('moody', 'dramatic', 'candid') is a "
+    "`visual_tag`, not a `style_tag`. `style_tag` is the VLM style pass "
+    "(golden-hour, black-and-white) and is empty on some libraries. Validate "
+    "either against list_vocab before using it.\n"
+    "- EXCLUDE with `query`: a leading '-' or 'no <thing>', e.g. "
+    "query='landscape -people'. Don't express exclusion via structured filters.\n"
+    "- Resolve group terms ('the kids', 'the family', 'everyone') to the "
+    "specific registered names as a `people` list (AND-intersected).\n"
+    "- Read `total`: if 0, relax a SECONDARY filter and retry (drop the quality "
+    "floor, widen dates, or move a term into `query`); if huge, add a filter. "
+    "Iterate once or twice before answering. But NEVER drop the person/subject "
+    "the user named to manufacture results — if a search that INCLUDES that "
+    "person returns 0, answer that no matching photos were found (say what you "
+    "tried); do NOT return photos without them.\n"
+    "- For 'which year / how many / when / who / how often' questions, use "
+    "summarize(filters, group_by=year|month|location|person) — it COUNTS by "
+    "a dimension instead of returning photos. For multi-step questions like "
+    "'which year were we in both X and Y', summarize each by year, intersect "
+    "the years yourself, then search_photos for that year.\n"
+    "- For 'one/N per year' / 'best of each year' / 'a few from each trip' "
+    "(a representative SPREAD, not a flat list), use representatives(filters, "
+    "bucket=year|month|location|person, n). search_photos CANNOT do "
+    "per-bucket selection. E.g. 'best photo of Matt, one per year, last 10 "
+    "years' -> representatives(people=['Matt'], bucket='year', n=1, "
+    "date_from=<10 years ago>).\n"
+    "- daily_highlights ONLY when the request asks for a PER-DAY quota, "
+    "day-by-day chronological order, or burst de-duplication ('top N per day', "
+    "'in order, no duplicates'). A plain 'best photos from <trip / date range>' "
+    "is a FLAT ranked list -> search_photos(date_from, date_to, "
+    "sort='quality_desc').\n"
+    "- 'X is the foreground/primary subject' / 'X featured prominently': "
+    "for a flat 'best photos of X (foreground)' in ONE scope (a year, a "
+    "place) use search_photos(people=['X'], sort='subject', ...); for a "
+    "SPREAD ('one/N per year where X is foreground') use "
+    "representatives(people=['X'], rank_by='subject', bucket='year', n=...). "
+    "Both rank by the person's face size in frame — prefer them over "
+    "rerank_photos for subject prominence.\n"
+    "- FRAMING / who-else-is-in-it constraints are METADATA, not vision — use "
+    "the flags, do NOT reach for rerank_photos for these: 'only the four of "
+    "us / nobody else / just X and Y' -> only_these_people=true (with the "
+    "`people` set); 'everyone fully in the frame / no one cropped / each face "
+    "fully visible' -> faces_in_frame=true. Both work on search_photos, "
+    "representatives, and summarize. They're exact and fast, so APPLY THEM "
+    "FIRST and only then, if a constraint truly needs eyes ('looking at the "
+    "camera', 'eyes and mouth visible', 'smiling') call rerank_photos on the "
+    "narrowed set. Do NOT call get_photo per-result to check face counts or "
+    "framing — that's what these flags are for.\n"
+    "- For VISUAL precision a vision model must judge — 'the one where X is "
+    "doing Y', a specific ACTIVITY/sport ('playing soccer', 'on a bike'), or "
+    "'the sharpest/best-composed' — get candidates first (search_photos with "
+    "sort='quality_desc', or representatives; fetch ~15-24), then "
+    "rerank_photos(photo_ids=<those ids>, criteria=<the visual thing>). "
+    "IMPORTANT for activities: category/tag matches include false positives "
+    "(a beach photo mis-tagged 'soccer'), so for 'top N photos of X playing "
+    "<sport>' you MUST rerank to verify the activity is actually happening — "
+    "don't trust category alone. It LOOKS at each image and re-sorts; it's "
+    "slow, so keep the set <=24.\n"
+    "- Then stop and write a 1-3 sentence answer that EXPLAINS how you "
+    "interpreted the request — which filters and sort you used and why "
+    "(e.g. \"'best' so I sorted by quality; 'the kids' = Calvin and Ellie\") "
+    "— and what the photos show. Never list photo ids; the UI shows them.\n\n"
+    "Examples:\n"
+    "  'photos of Calvin' -> search_photos(people=['Calvin'])\n"
+    "  'Nicole and Matt together' -> search_photos(people=['Nicole','Matt'])\n"
+    "  'best beach photos last summer' -> search_photos(query='beach', "
+    "date_from=<jun1 last yr>, date_to=<aug31 last yr>, sort='quality_desc')\n"
+    "  'landscapes with no people' -> search_photos(query='landscape -people')\n"
+    "  'most moody shots' -> search_photos(visual_tag='moody', sort='quality_desc')\n"
+    "  'the kids playing soccer' -> search_photos(people=<the kids>, category='soccer')\n"
+    "  'top 3 photos of Calvin playing soccer' -> search_photos(people=['Calvin'], "
+    "category='soccer', sort='quality_desc') THEN rerank_photos(photo_ids="
+    "<the returned ids>, criteria='a child actively playing soccer on a field', "
+    "top_n=3) — rerank (category tags have false positives) and pass top_n to "
+    "honor the requested count and drop low-scoring non-matches\n"
+    "  'best photo of Matt, Calvin, Nicole, Ellie each year, only the four of "
+    "them, everyone fully in frame' -> representatives(people=['Matt','Calvin',"
+    "'Nicole','Ellie'], bucket='year', n=1, rank_by='subject', "
+    "only_these_people=true, faces_in_frame=true) — the flags enforce 'only "
+    "them' + 'not cropped' in metadata; no rerank needed unless they also ask "
+    "for eyes/smiles\n"
+    "  'top 10 photos from France last year, no more than 1 from each location' "
+    "-> representatives(location='France', date_from=<jan1 last yr>, "
+    "date_to=<dec31 last yr>, bucket='location', n=1, max_buckets=10) — 'no "
+    "more than 1 per location' is n=1; the '10' is max_buckets (the cap on how "
+    "many locations come back), NOT n. Putting 10 in n returns up to 10 PER "
+    "location\n"
+)
+
+WRITE_GUIDANCE = (
+    "\n\nWRITES (you can edit the library): set_photo_location, set_photo_tags, "
+    "and add_to_collection mutate the library. STRICT protocol:\n"
+    "- They act ONLY on an explicit photo_ids list — pass the exact ids from a "
+    "search you already ran and the user saw. NEVER make up ids or write to a set "
+    "the user hasn't seen.\n"
+    "- ALWAYS preview first: call with confirm=false (the default) to show how "
+    "many photos would change and a before→after sample. Report that to the user "
+    "and ask them to confirm.\n"
+    "- Only call again with confirm=true AFTER the user explicitly says yes in the "
+    "conversation. Never pass confirm=true on your own initiative.\n"
+    "- If the preview says confirm_large is needed (a big batch), tell the user "
+    "the count and get a second explicit go-ahead before adding confirm_large=true.\n"
+)
+
+
+def server_instructions(include_writes: bool = False,
+                        library_facts: str = "") -> str:
+    """The MCP ``Server(instructions=...)`` text: the routing knowledge an MCP
+    host should put in front of these tools. Mirrors what agent.py puts in its
+    system prompt, minus the agent-only recovery machinery.
+
+    ``library_facts`` (from agent._library_context) flips the grounding directive
+    — with the facts in hand the model should skip the list_* round-trips.
+    """
+    parts = ["You are a photo-library search assistant. The user describes what "
+             "they want in natural language; find the matching photos with these "
+             "tools, then give a one- or two-sentence answer.\n"]
+    parts.append((GROUNDING_WITH_FACTS if library_facts
+                  else GROUNDING_WITHOUT_FACTS) + "\n")
+    parts.append(ROUTING_GUIDANCE)
+    if include_writes:
+        parts.append(WRITE_GUIDANCE)
+    if library_facts:
+        parts.append("\nLIBRARY FACTS:\n" + library_facts + "\n")
+    return "\n".join(parts)

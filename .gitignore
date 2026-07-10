@@ -84,6 +84,8 @@ replica-sync.log
 # eval bake-off outputs (regenerable)
 evals/bakeoff_results.json
 evals/bakeoff_report.html
+evals/mcp_bakeoff_results*.json
+evals/mcp_bakeoff_report*.html
 
 # personal Ask-agent glossary
 .agent-hints

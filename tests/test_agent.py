@@ -5,6 +5,8 @@ the loop is deterministic — no real LLM needed. Tool calls run for real
 against the conftest `db` fixture (Alex: 3 photos, Jamie: 2, Sam: 1).
 """
 
+import json
+
 import pytest
 
 from photosearch import agent
@@ -12,12 +14,14 @@ from photosearch import agent
 
 def _script(*replies):
     """Return a fake _chat that yields the given replies in order."""
-    calls = {"n": 0}
+    calls = {"n": 0, "reasoning_effort": []}
     seq = list(replies)
 
-    def fake_chat(messages, tools, temperature=0.0, timeout=None):
+    def fake_chat(messages, tools, temperature=0.0, timeout=None,
+                  reasoning_effort=None):
         i = calls["n"]
         calls["n"] += 1
+        calls["reasoning_effort"].append(reasoning_effort)
         return seq[min(i, len(seq) - 1)]
     fake_chat.calls = calls
     return fake_chat
@@ -210,7 +214,8 @@ def test_chat_failure_falls_back_to_single_shot(db, monkeypatch):
     # First _chat raises (e.g. endpoint can't tool-call) → single-shot kicks in.
     state = {"n": 0}
 
-    def flaky_chat(messages, tools, temperature=0.0, timeout=None):
+    def flaky_chat(messages, tools, temperature=0.0, timeout=None,
+                   reasoning_effort=None):
         state["n"] += 1
         if state["n"] == 1:
             raise RuntimeError("400 tools not supported")
@@ -292,3 +297,83 @@ def test_locked_camera_match_keeps_results(db, monkeypatch):
     events = _run(db, "photos of Alex", locked_filters={"camera": "ILCE-7M4"})
     photos = next(e for e in events if e["type"] == "photos")
     assert photos["total"] == 3
+
+
+def test_filter_tools_matches_the_tools_that_accept_locked_filters():
+    """_merge_locked only enforces pinned filters on tools named in
+    _FILTER_TOOLS. Add a filter-accepting tool to tools.py and forget this set
+    and the UI's pinned filters are silently ignored on it."""
+    from photosearch import tools as toolmod
+    lockable = set(agent._LOCKED_KEYS)
+    accepts = {
+        spec["name"]
+        for spec in toolmod.mcp_tools(include_images=True, include_writes=True)
+        if set(spec["inputSchema"]["properties"]) & lockable
+    }
+    assert accepts == agent._FILTER_TOOLS
+
+
+def test_system_prompt_uses_the_shared_routing_guidance(db):
+    from photosearch import tools as toolmod
+    prompt = agent._system_prompt(db, allow_writes=False)
+    assert toolmod.ROUTING_GUIDANCE in prompt
+    # db present -> facts injected -> the "skip the list_* tools" directive
+    assert toolmod.GROUNDING_WITH_FACTS in prompt
+    assert toolmod.WRITE_GUIDANCE not in prompt
+    assert toolmod.WRITE_GUIDANCE in agent._system_prompt(db, allow_writes=True)
+
+
+# ---------------------------------------------------------------------------
+# Thinking toggle (reasoning_effort): UI override > env > model default
+# ---------------------------------------------------------------------------
+
+def test_reasoning_effort_resolution(monkeypatch):
+    monkeypatch.delenv("PHOTOSEARCH_LLM_REASONING_EFFORT", raising=False)
+    assert agent._resolve_reasoning_effort() == ""          # model default
+    assert agent._resolve_reasoning_effort("none") == "none"  # explicit override
+    assert agent._resolve_reasoning_effort("") == ""          # explicit "thinking on"
+
+    monkeypatch.setenv("PHOTOSEARCH_LLM_REASONING_EFFORT", "none")
+    assert agent._resolve_reasoning_effort() == "none"        # env default
+    # An explicit per-request "" must beat the env, so the UI can turn thinking
+    # back ON for one query even when the deployment defaults it off.
+    assert agent._resolve_reasoning_effort("") == ""
+
+
+def test_run_agent_threads_reasoning_effort_to_the_chat_call(db, monkeypatch):
+    fake = _script(_tc("search_photos", {"people": ["Alex"]}), _answer("done"))
+    monkeypatch.setattr(agent, "_chat", fake)
+    list(agent.run_agent(db, "photos of Alex", reasoning_effort="none"))
+    assert fake.calls["reasoning_effort"] == ["none", "none"]
+
+
+def test_run_agent_defaults_reasoning_effort_to_none_sentinel(db, monkeypatch):
+    """No override -> pass None down so _chat consults the env var itself."""
+    fake = _script(_answer("hi"))
+    monkeypatch.setattr(agent, "_chat", fake)
+    list(agent.run_agent(db, "hello"))
+    assert fake.calls["reasoning_effort"] == [None]
+
+
+def test_chat_openai_sends_reasoning_effort_only_when_set(monkeypatch):
+    sent = {}
+
+    class _Resp:
+        def read(self):
+            return b'{"choices":[{"message":{"content":"ok"}}],"usage":{}}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=None):
+        sent.clear()
+        sent.update(json.loads(req.data))
+        return _Resp()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    agent._chat_openai("http://x/v1", [], None, 0.0, 5.0, "none")
+    assert sent["reasoning_effort"] == "none"
+
+    agent._chat_openai("http://x/v1", [], None, 0.0, 5.0, "")
+    assert "reasoning_effort" not in sent

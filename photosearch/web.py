@@ -3795,7 +3795,10 @@ async def api_ask(request: Request):
     Body: {"message": str, "history"?: [{"role","content"}, ...],
            "filters"?: {people/location/date_from/date_to/color/category/
                         visual_tag/keyword/min_quality/min_aesthetic/style_tag/
-                        match_source/camera/sort}}.
+                        match_source/camera/sort},
+           "thinking"?: bool, "reasoning_effort"?: str}.
+    `thinking` toggles a reasoning model's traces for this request (false =>
+    reasoning_effort="none"). Omit it to use PHOTOSEARCH_LLM_REASONING_EFFORT.
     `filters` is the structured Search filter bar pinned in the UI — fed into
     every search the agent runs as a HARD constraint (enforced server-side, not
     a post-filter on results), so e.g. a pinned camera can't be dropped.
@@ -3824,6 +3827,19 @@ async def api_ask(request: Request):
     # every search the agent runs (not a post-filter on its results). The agent
     # normalizes + enforces them; see agent._normalize_locked / _merge_locked.
     locked_filters = data.get("filters") if isinstance(data.get("filters"), dict) else None
+    # Thinking toggle. `thinking: false` suppresses a reasoning model's traces —
+    # ~71% of its generated tokens, and roughly half the wall-clock, with no
+    # measurable accuracy change (evals/mcp_bakeoff.py). Omit the key to fall back
+    # to PHOTOSEARCH_LLM_REASONING_EFFORT. `reasoning_effort` is the escape hatch
+    # for a backend that understands the other levels.
+    reasoning_effort = data.get("reasoning_effort")
+    if not isinstance(reasoning_effort, str):
+        reasoning_effort = None
+    if reasoning_effort is None and "thinking" in data:
+        thinking = data.get("thinking")
+        if isinstance(thinking, str):
+            thinking = thinking.strip().lower() in ("1", "true", "yes", "on")
+        reasoning_effort = "" if thinking else "none"
     if not message:
         raise HTTPException(400, "message is required")
 
@@ -3841,6 +3857,7 @@ async def api_ask(request: Request):
                     db, message, history=history,
                     should_abort=cancel_event.is_set,
                     locked_filters=locked_filters,
+                    reasoning_effort=reasoning_effort,
                 ):
                     _emit(event)
                     if cancel_event.is_set():
