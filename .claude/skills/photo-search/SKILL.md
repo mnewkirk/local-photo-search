@@ -93,7 +93,13 @@ local-photo-search/
 
 ---
 
-## Database Schema (v23)
+## Database Schema (v28)
+
+> Version note: this section documents the v23 baseline; later migrations added
+> structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
+> (v25), the VLM aesthetics `aes_*` columns (v26), and per-day aesthetic
+> percentile normalization (v28). `SCHEMA_VERSION` in `db.py` is the source of
+> truth — currently **28**. See CLAUDE.md for the aesthetics + folder details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -1716,17 +1722,44 @@ Full design: `docs/plans/llm-driven-search.md`.
 **Shared tool layer** — `photosearch/tools.py` is the single source of truth:
 a registry of `ToolSpec`s (name + LLM-facing description + JSON Schema +
 `fn(db, args)` handler) over `PhotoDB`, dispatched by `call_tool(db, name,
-args)`. Tools: `get_library_overview`, `list_people`, `list_places`,
-`list_vocab`, `search_photos`, `get_photo`, `get_photo_image`. `search`
-(hence CLIP/torch) is imported lazily inside handlers, so the module imports
-cheap and is unit-testable without the CLIP stack. Tests:
-`tests/test_tools.py` (26 cases). The same registry will feed the in-app
-`/api/ask` agent (M24b) via `openai_tools()`.
+args)`. `search` (hence CLIP/torch) is imported lazily inside handlers, so
+the module imports cheap and is unit-testable without the CLIP stack. The
+same registry feeds both the MCP server (`mcp_tools()`) and the in-app
+`/api/ask` agent (`openai_tools()`).
+
+**Current tools** (`all_tools()` order): `get_library_overview`,
+`list_people`, `list_places`, `list_vocab`, `search_photos`, `summarize`
+(facet/COUNT by year/month/location/person/camera_model), `representatives`
+(top-N best per bucket — "one per year"; `max_buckets` cap;
+`rank_by=quality|subject`), `daily_highlights` (best-per-day, burst/near-dup
+collapsed, chronological), **`group_into_chapters`** (split a trip into
+place-based book chapters), **`daily_scene_breakdown`** (split one day into
+sub-scenes), **`suggest_layout`** (a house-style spread/layout plan for an
+explicit photo set), `get_photo`, `rerank_photos` (VLM re-rank of a candidate
+set), `get_photo_image` (image-gated), plus the M26b **write** tools
+`set_photo_location` / `set_photo_tags` / `add_to_collection` (gated by
+`PHOTOSEARCH_ALLOW_WRITES`; dry-run→`confirm=true`). The last three
+book-curation tools are the "Shutterfly photo-book tools for Ask" — chapter
+grouping mirrors the trip-book structure, scene breakdown the "sizing to the
+day" cut, and `suggest_layout` the archetypes in
+`~/shutterfly-proofs/BOOK_STYLE_GUIDE.md` (matched 2-up / asymmetric collage /
+dense grid / full-spread panorama, hero = highest-aesthetic frame).
+
+**One shared filter vocabulary.** Every search-like tool honors the same
+structured filters as `search_combined`, via `_build_filter_sql` and the
+`_CURATION_FILTER_PROPS` JSON-Schema fragment spliced into each tool's
+`properties` — so `search_photos`/`representatives`/`daily_highlights`/
+`summarize`/`group_into_chapters`/`daily_scene_breakdown` all accept
+`camera`, `min_aesthetic` (VLM percentile), `style_tag` (and `search_photos`
+also `match_source`), not just the original people/location/date/vocab set.
+Adding a filter here means adding it to `_build_filter_sql` + the fragment,
+and to `search_combined` for the `search_photos` path. Tests:
+`tests/test_tools.py`.
 
 `search_photos` resolves `people` names → ids and passes them to
-`search_combined`'s `person_ids` param (the only change to existing search
-code — routes to `search_by_all_persons` for AND-intersection). It returns
-compact hits (`description` truncated to 240 chars) + a `total` so the model
+`search_combined`'s `person_ids` param (routes to `search_by_all_persons` for
+AND-intersection). It returns compact hits (`description` truncated to 240
+chars, plus `camera_model` for the grid 📷 badge) + a `total` so the model
 can broaden/narrow.
 
 **Server** — `photosearch/mcp_server.py` uses the SDK's **low-level
@@ -1773,12 +1806,28 @@ search page (`/`). The user describes what they want; a server-side agent
 loop plans the search with the same tool layer the MCP server exposes.
 Nothing leaves the NAS.
 
-- **`photosearch/agent.py`** — `run_agent(db, message, history, should_abort)`
-  is a synchronous generator yielding event dicts (`tool_call` / `tool_result`
-  / `photos` / `answer` / `error`). It has its **own** tool-calling chat client
-  (`_chat`) because describe.py's client is text-only — routes to
-  `PHOTOSEARCH_TEXT_LLM_URL` (OpenAI-compatible, the LM Studio path) with
-  `tools=`/`tool_choice=auto`, else Ollama. Loop capped at `_MAX_STEPS=6`.
+- **`photosearch/agent.py`** — `run_agent(db, message, history, should_abort,
+  locked_filters=None)` is a synchronous generator yielding event dicts
+  (`tool_call` / `tool_result` / `photos` / `answer` / `error`). It has its
+  **own** tool-calling chat client (`_chat`) because describe.py's client is
+  text-only — routes to `PHOTOSEARCH_TEXT_LLM_URL` (OpenAI-compatible, the LM
+  Studio path) with `tools=`/`tool_choice=auto`, else Ollama. Loop capped at
+  `_MAX_STEPS=6`. The `photos` event now also fires for `representatives` /
+  `daily_highlights` / `group_into_chapters` / `daily_scene_breakdown` /
+  `suggest_layout` results, not just `search_photos`.
+- **Filters as HARD Ask inputs (`locked_filters`):** the structured Search
+  filter bar is fed in as `filters` on `POST /api/ask` and ENFORCED, not used
+  as a post-filter on results. `_normalize_locked` keeps the recognized keys;
+  `_merge_locked` injects them into every filter-consuming tool call (`people`
+  unions, scalars hard-override) BEFORE dispatch; `_locked_prompt` adds an
+  "ACTIVE FILTERS" note to the system prompt so the model plans the rest of the
+  request around them. This is why a pinned camera is guaranteed applied even
+  if the model omits it (the "KODAK PIXPRO WPZ2 → non-Kodak photos" bug: the
+  tool schemas hadn't exposed `camera`, so the model silently dropped it).
+  Filter-consuming tools: `search_photos`, `representatives`,
+  `daily_highlights`, `summarize`, `group_into_chapters`,
+  `daily_scene_breakdown` (`_FILTER_TOOLS`). Pinned filters are logged in the
+  per-query Ask log.
 - **Model:** `PHOTOSEARCH_LLM_AGENT_MODEL` (role-resolved, falls back to
   `PHOTOSEARCH_LLM_TEXT_MODEL` → `PHOTOSEARCH_TEXT_LLM_MODEL` → `llama3.1`).
   Needs a **tool-calling-capable** model (qwen2.5-instruct / qwen3 /
@@ -1791,12 +1840,14 @@ Nothing leaves the NAS.
 - **`POST /api/ask`** (web.py, SSE) bridges the sync generator through the
   thread→`asyncio.Queue` pattern (same as the stacking stream), with
   `is_disconnected()` cancellation and a terminal `{"type":"done"}`. Body
-  `{message, history?}`.
+  `{message, history?, filters?}` — `filters` is the pinned filter bar (see
+  `locked_filters` above).
 - **Frontend:** the "✨ Ask" toggle in `index.html` swaps the search bar to an
-  NL box, hides the structured filters, streams narration into a status panel,
-  and feeds the final `photos` event into the **existing** `PhotoGrid` via
-  `setResults` (compact hits share the grid's photo shape). Additive — the
-  structured search UI is untouched.
+  NL box but **keeps the structured filter bar visible** (labeled "✨ Pinned to
+  Ask"); `runAsk` collects the filter state into `askFilters` and sends it as
+  `filters`. Narration streams into a status panel and the final `photos`
+  event feeds the **existing** `PhotoGrid` via `setResults` (compact hits share
+  the grid's photo shape, including `camera_model` for the 📷 badge).
 - **Tests:** `tests/test_agent.py` (10 cases, chat client mocked; tool dispatch
   runs for real against the fixture DB). **Still TODO:** a live smoke test
   against the LM Studio backend once deployed.
@@ -2007,7 +2058,7 @@ def my_command(db):
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py` (currently 23)
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 28)
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies

@@ -19,6 +19,7 @@ from photosearch import tools
 READ_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
     "search_photos", "summarize", "representatives", "daily_highlights",
+    "group_into_chapters", "daily_scene_breakdown", "suggest_layout",
     "rerank_photos", "get_photo", "get_photo_image",
 }
 # M26b mutation tools — gated out of the default projections.
@@ -666,3 +667,94 @@ def test_daily_highlights_day_summary_places(db):
     assert "Big Sur, CA" in summary["places"]
     # Every result carries its geotagged place for location highlighting.
     assert all("place_name" in r for r in res["results"])
+
+
+# ---------------------------------------------------------------------------
+# camera filter + camera_model on compact hits (Ask card badge)
+# ---------------------------------------------------------------------------
+
+def test_search_photos_camera_filter(db):
+    res = tools.call_tool(db, "search_photos", {"camera": "ILCE-7M4"})
+    assert res["total"] == 5
+    # Every hit carries camera_model so the grid's shared 📷 badge renders.
+    assert all(h["camera_model"] == "ILCE-7M4" for h in res["results"])
+
+
+def test_search_photos_camera_filter_no_match(db):
+    res = tools.call_tool(db, "search_photos", {"camera": "KODAK PIXPRO WPZ2"})
+    assert res["total"] == 0
+
+
+def test_representatives_camera_filter(db):
+    # Camera flows through _build_filter_sql into the faceting tools too.
+    res = tools.call_tool(db, "representatives",
+                          {"bucket": "location", "n": 1, "camera": "ILCE-7M4"})
+    assert res["returned"] >= 1
+    res0 = tools.call_tool(db, "representatives",
+                           {"bucket": "location", "n": 1, "camera": "nope"})
+    assert res0["returned"] == 0
+
+
+# ---------------------------------------------------------------------------
+# group_into_chapters
+# ---------------------------------------------------------------------------
+
+def test_group_into_chapters_by_place(db):
+    res = tools.call_tool(db, "group_into_chapters", {"min_photos": 1})
+    titles = [c["title"] for c in res["chapters"]]
+    # Chronological: Morro Bay (10:00, 10:05) then Big Sur (11:30, 14:00, 16:00).
+    assert titles == ["Morro Bay, CA", "Big Sur, CA"]
+    assert res["chapters"][0]["photo_count"] == 2
+    assert res["chapters"][1]["photo_count"] == 3
+    assert res["chapters"][0]["date_from"] == "2026-03-13"
+    # Representative photos come back so the grid can render them.
+    assert res["returned"] >= 1
+    assert all(h.get("chapter") for h in res["results"])
+
+
+def test_group_into_chapters_min_photos_drops_small(db):
+    res = tools.call_tool(db, "group_into_chapters", {"min_photos": 3})
+    # Only Big Sur (3) survives; Morro Bay (2) is dropped as transient.
+    assert [c["title"] for c in res["chapters"]] == ["Big Sur, CA"]
+    assert res["dropped_small_chapters"] == 1
+
+
+# ---------------------------------------------------------------------------
+# daily_scene_breakdown
+# ---------------------------------------------------------------------------
+
+def test_daily_scene_breakdown_splits_on_gap_and_place(db):
+    res = tools.call_tool(db, "daily_scene_breakdown",
+                          {"date": "2026-03-13", "gap_minutes": 40})
+    # Morro (10:00-10:05), then Big Sur splits at each >40min gap (11:30/14:00/16:00).
+    assert res["scenes_found"] == 4
+    assert res["scenes"][0]["place"] == "Morro Bay, CA"
+    assert res["scenes"][0]["photo_count"] == 2
+    assert all(s["place"] == "Big Sur, CA" for s in res["scenes"][1:])
+
+
+def test_daily_scene_breakdown_requires_date(db):
+    assert "error" in tools.call_tool(db, "daily_scene_breakdown", {})
+
+
+# ---------------------------------------------------------------------------
+# suggest_layout
+# ---------------------------------------------------------------------------
+
+def test_suggest_layout_partitions_and_picks_hero(db):
+    ids = [h["id"] for h in
+           tools.call_tool(db, "search_photos", {"camera": "ILCE-7M4"})["results"]]
+    res = tools.call_tool(db, "suggest_layout",
+                          {"photo_ids": ids, "spread_count": 2})
+    assert res["spread_count"] == 2
+    assert res["photo_count"] == 5
+    # 5 photos → spreads of 3 and 2.
+    assert sorted(s["photo_count"] for s in res["spreads"]) == [2, 3]
+    # Every spread names a hero drawn from its own photos.
+    for s in res["spreads"]:
+        assert s["hero_id"] in s["photo_ids"]
+    assert {"matched 2-up", "asymmetric collage"} == {s["archetype"] for s in res["spreads"]}
+
+
+def test_suggest_layout_requires_ids(db):
+    assert "error" in tools.call_tool(db, "suggest_layout", {"photo_ids": []})

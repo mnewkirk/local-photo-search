@@ -22,7 +22,7 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 25. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 28. Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
 (v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
@@ -1108,19 +1108,44 @@ dedup on therefore both deletes duplicates *and* writes inferred GPS
   inferred-geotag recall on camera photos.
 - `docs/plans/llm-driven-search.md` — M24 **(SHIPPED)**. Stop hand-assembling
   search filters; let an LLM be the query planner. One **shared tool layer**
-  (`photosearch/tools.py`: `search_photos` / `list_people` / `list_places`
-  / `list_vocab` / `get_photo` / `get_photo_image` / `get_library_overview`)
-  consumed by two adapters — **M24a** a streamable-HTTP MCP server
-  (`photosearch/mcp_server.py`, low-level `Server`) as the `photosearch-mcp`
-  NAS container (`mcp>=1.2`), and **M24b** an in-app `POST /api/ask` SSE agent
-  loop (`photosearch/agent.py`) on the **local** LM Studio/Ollama backend
-  (nothing leaves the NAS), surfaced as an "✨ Ask" mode toggle on the search
-  page. Agent model via `PHOTOSEARCH_LLM_AGENT_MODEL` (falls back to the text
-  role); tool-calling loop capped at 6 steps with a single-shot NL→filters
-  fallback (`PHOTOSEARCH_AGENT_SINGLE_SHOT=1`) for non-tool-calling models.
-  Image returns gated by `PHOTOSEARCH_MCP_ALLOW_IMAGES` (default off). Only
-  existing-code change: a `person_ids` path in `search_combined`. No schema
-  bump. Tests: `tests/test_tools.py`, `tests/test_agent.py`.
+  (`photosearch/tools.py`) consumed by two adapters — **M24a** a
+  streamable-HTTP MCP server (`photosearch/mcp_server.py`, low-level `Server`)
+  as the `photosearch-mcp` NAS container (`mcp>=1.2`), and **M24b** an in-app
+  `POST /api/ask` SSE agent loop (`photosearch/agent.py`) on the **local** LM
+  Studio/Ollama backend (nothing leaves the NAS), surfaced as an "✨ Ask" mode
+  toggle on the search page. Agent model via `PHOTOSEARCH_LLM_AGENT_MODEL`
+  (falls back to the text role); tool-calling loop capped at 6 steps with a
+  single-shot NL→filters fallback (`PHOTOSEARCH_AGENT_SINGLE_SHOT=1`) for
+  non-tool-calling models. Image returns gated by
+  `PHOTOSEARCH_MCP_ALLOW_IMAGES` (default off). Tests: `tests/test_tools.py`,
+  `tests/test_agent.py`.
+
+  **The registry has grown well past the original 7 tools** — the current set
+  (`all_tools()` order) is: `get_library_overview`, `list_people`,
+  `list_places`, `list_vocab`, `search_photos`, `summarize` (facet/COUNT by
+  year/month/location/person/camera_model), `representatives` (top-N best per
+  bucket — "one per year", `max_buckets` cap, `rank_by=quality|subject`),
+  `daily_highlights` (best-per-day, burst/near-dup collapsed, chronological),
+  `group_into_chapters` + `daily_scene_breakdown` + `suggest_layout` (the
+  **photo-book curation tools** — geographic chapters, per-day sub-scenes, and
+  a house-style spread/layout plan), `get_photo`, `rerank_photos` (VLM
+  re-rank), `get_photo_image` (image-gated), plus the M26b **write** tools
+  `set_photo_location` / `set_photo_tags` / `add_to_collection` (gated by
+  `PHOTOSEARCH_ALLOW_WRITES`, dry-run→confirm). All the search-like tools share
+  one filter vocabulary via `_build_filter_sql` / the `_CURATION_FILTER_PROPS`
+  schema fragment, so they stay in lockstep with structured Search — including
+  `camera`, `min_aesthetic` (VLM percentile), `style_tag`, and `match_source`.
+
+  **Filters-as-Ask-inputs:** the "✨ Ask" mode now KEEPS the structured filter
+  bar visible; whatever the user pins there is sent to `/api/ask` as a
+  `filters` object and **enforced server-side** — `agent._normalize_locked` /
+  `_merge_locked` inject them into every filter-consuming tool call (people
+  union; scalars hard-override) and `_locked_prompt` tells the model they're
+  pinned. So a pinned filter is a HARD input to the agent's queries, not a
+  post-filter on its results (fixes "camera=KODAK PIXPRO WPZ2 returns non-Kodak
+  photos" — the tool schemas simply hadn't exposed `camera`, so the model
+  dropped it). Compact search hits now carry `camera_model` so the shared grid
+  📷 badge renders on Ask cards too.
 
 - `docs/plans/backfill-maintenance-sweep.md` — M25. **SHIPPED (2026-06-21).**
   `maintenance-sweep` / `validate-data` / `repair-data` CLIs + `photosearch/

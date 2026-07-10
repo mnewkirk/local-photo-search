@@ -236,3 +236,59 @@ def test_deadline_returns_gracefully_without_hanging(db, monkeypatch):
     assert called["n"] == 0
     assert events[-1]["type"] == "answer"
     assert "time budget" in events[-1]["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Locked filters — the structured Search filter bar pinned as HARD Ask inputs
+# ---------------------------------------------------------------------------
+
+def test_normalize_locked_drops_empty():
+    out = agent._normalize_locked({"camera": "X", "location": "", "people": [],
+                                   "date_from": None, "bogus": "y", "min_quality": 7})
+    assert out == {"camera": "X", "min_quality": 7}
+
+
+def test_merge_locked_overrides_scalars_and_unions_people():
+    merged = agent._merge_locked(
+        "search_photos",
+        {"people": ["Alex"], "camera": "SonyA"},
+        {"camera": "KODAK", "people": ["Jamie"], "date_from": "2026-06-28"})
+    # people unions; camera hard-overrides; date_from injected.
+    assert set(merged["people"]) == {"Alex", "Jamie"}
+    assert merged["camera"] == "KODAK"
+    assert merged["date_from"] == "2026-06-28"
+
+
+def test_merge_locked_only_filter_tools():
+    # rerank_photos takes ids, not filters — locked filters must not leak in.
+    args = {"photo_ids": [1, 2], "criteria": "x"}
+    assert agent._merge_locked("rerank_photos", args, {"camera": "KODAK"}) == args
+
+
+def test_locked_prompt_mentions_pinned_values():
+    p = agent._locked_prompt({"camera": "KODAK PIXPRO WPZ2", "date_from": "2026-06-28"})
+    assert "ACTIVE FILTERS" in p and "KODAK PIXPRO WPZ2" in p
+
+
+def test_locked_camera_is_enforced_even_when_model_omits_it(db, monkeypatch):
+    # The model plans a plain people search; the pinned (non-matching) camera
+    # must still be applied server-side, yielding zero results — the KODAK bug.
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search_photos", {"people": ["Alex"]}),
+        _answer("No photos from that camera."),
+    ))
+    events = _run(db, "photos of Alex", locked_filters={"camera": "nope-cam"})
+    call = next(e for e in events if e["type"] == "tool_call")
+    assert call["arguments"]["camera"] == "nope-cam"   # enforced into the call
+    photos = next(e for e in events if e["type"] == "photos")
+    assert photos["total"] == 0
+
+
+def test_locked_camera_match_keeps_results(db, monkeypatch):
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search_photos", {"people": ["Alex"]}),
+        _answer("Three photos of Alex on that camera."),
+    ))
+    events = _run(db, "photos of Alex", locked_filters={"camera": "ILCE-7M4"})
+    photos = next(e for e in events if e["type"] == "photos")
+    assert photos["total"] == 3

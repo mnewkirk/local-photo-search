@@ -154,6 +154,16 @@ def _clamp(value: Any, default: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
 
 
+def _opt_float(value: Any) -> Optional[float]:
+    """Coerce an optional numeric tool arg to float, or None if absent/blank."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _truthy(value: Any) -> bool:
     """Coerce a tool-supplied boolean flag. Small models sometimes send the
     JSON bool as a string ('true'/'1'); accept those too."""
@@ -216,6 +226,9 @@ def _compact_hit(photo: dict) -> dict:
         "filename": photo.get("filename"),
         "date_taken": photo.get("date_taken"),
         "place_name": photo.get("place_name"),
+        # camera_model so the grid's shared 📷 badge renders on Ask cards too
+        # (the structured-search cards already show it).
+        "camera_model": photo.get("camera_model"),
         "description": _truncate(photo.get("description")),
         "categories": _json_array(photo.get("categories")),
         "aesthetic_score": photo.get("aesthetic_score"),
@@ -472,7 +485,45 @@ _register(ToolSpec(
 # Tool: search_photos
 # ---------------------------------------------------------------------------
 
-_VALID_SORTS = ("date_desc", "date_asc", "quality_desc", "relevance", "subject")
+# Reusable JSON-Schema fragment for the curation filters that every search-like
+# tool now honors (camera / aesthetic percentile / style). Spliced into each
+# tool's `properties` so there's ONE definition — the structured Search filters
+# and the Ask tools stay in lockstep.
+_CURATION_FILTER_PROPS = {
+    "camera": {"type": "string",
+               "description": "Exact camera model, e.g. 'KODAK PIXPRO WPZ2', "
+                              "'ILCE-7RM6', 'iPhone 15 Pro' — matches only photos "
+                              "shot on that camera body (see summarize "
+                              "group_by='camera_model' for the exact strings)."},
+    "min_aesthetic": {"type": "number",
+               "description": "Minimum VLM aesthetic PERCENTILE, 0-100 "
+                              "(library-relative; 90 = top 10%). Prefer this over "
+                              "min_quality for a 'high quality' bar — percentiles "
+                              "spread evenly whereas raw scores cluster ~5-7."},
+    "style_tag": {"type": "string",
+               "description": "Aesthetic style tag, e.g. 'golden-hour', "
+                              "'black-and-white', 'moody' (from the VLM style pass)."},
+}
+
+_COLUMN_CACHE: dict = {}
+
+
+def _has_column(db, col: str) -> bool:
+    """Cached check for whether `photos` has a column — lets the filter builder
+    degrade gracefully on a DB migrated before the aes_* columns existed."""
+    key = getattr(db, "db_path", "?")
+    cache = _COLUMN_CACHE.setdefault(key, {})
+    if col not in cache:
+        try:
+            db.conn.execute(f"SELECT {col} FROM photos LIMIT 1")
+            cache[col] = True
+        except Exception:
+            cache[col] = False
+    return cache[col]
+
+
+_VALID_SORTS = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
+                "day_quality_desc", "relevance", "subject")
 
 
 def _subject_ranked_search(db: PhotoDB, args: dict, person_ids: list, limit: int) -> dict:
@@ -561,7 +612,11 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         category=(args.get("category") or "").strip() or None,
         visual_tag=(args.get("visual_tag") or "").strip() or None,
         keyword=(args.get("keyword") or "").strip() or None,
+        camera=(args.get("camera") or "").strip() or None,
+        style_tag=(args.get("style_tag") or "").strip() or None,
+        match_source=(args.get("match_source") or "").strip() or None,
         min_quality=min_quality,
+        min_aesthetic=_opt_float(args.get("min_aesthetic")),
         sort=sort,
         limit=limit,
         with_total=True,
@@ -628,6 +683,11 @@ _register(ToolSpec(
             "keyword": {"type": "string", "description": "Keyword substring (see list_vocab)."},
             "min_quality": {"type": "number",
                             "description": "Minimum aesthetic score, 1-10."},
+            **_CURATION_FILTER_PROPS,
+            "match_source": {"type": "string", "enum": ["strict", "temporal", "manual"],
+                "description": "Restrict person matches by confidence source "
+                "(strict = high-confidence face match, temporal = same-session "
+                "inference, manual = hand-labeled)."},
             "only_these_people": {"type": "boolean",
                 "description": "Keep only photos whose ONLY faces are the named "
                 "`people` (total detected faces == number of names) — i.e. no "
@@ -802,6 +862,24 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
         except (TypeError, ValueError):
             pass
 
+    # Curation filters shared with structured Search: exact camera, VLM aesthetic
+    # percentile floor, and style tag. The aes_* columns arrived in schema v26,
+    # so guard them for DBs migrated before that.
+    cam = (args.get("camera") or "").strip()
+    if cam:
+        clauses.append("camera_model = ?")
+        params.append(cam)
+
+    ma = _opt_float(args.get("min_aesthetic"))
+    if ma is not None and _has_column(db, "aes_overall_pct"):
+        clauses.append("aes_overall_pct >= ?")
+        params.append(ma)
+
+    st = (args.get("style_tag") or "").strip()
+    if st and _has_column(db, "aes_style_tags"):
+        clauses.append("aes_style_tags LIKE ?")
+        params.append(f'%"{st}"%')
+
     # Pure-metadata face-framing filters: "only these people in frame" and
     # "nobody cropped at the edge". Appended last so their params line up.
     fc, fp = _face_constraint_clauses(
@@ -887,6 +965,7 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag."},
             "keyword": {"type": "string", "description": "Keyword substring."},
             "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            **_CURATION_FILTER_PROPS,
             "only_these_people": {"type": "boolean",
                 "description": "Count only photos whose ONLY faces are the named "
                 "`people` (no extra people). Requires `people`."},
@@ -1069,6 +1148,7 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag."},
             "keyword": {"type": "string", "description": "Keyword substring."},
             "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            **_CURATION_FILTER_PROPS,
             "only_these_people": {"type": "boolean",
                 "description": "Keep only photos whose ONLY faces are the named "
                 "`people` (no extra/other people in the shot). Requires `people`."},
@@ -1195,6 +1275,7 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag."},
             "keyword": {"type": "string", "description": "Keyword substring."},
             "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            **_CURATION_FILTER_PROPS,
             "only_these_people": {"type": "boolean",
                 "description": "Keep only photos whose ONLY faces are the named "
                 "`people` (no others). Requires `people`."},
@@ -1204,6 +1285,372 @@ _register(ToolSpec(
         "additionalProperties": False,
     },
     handler=_h_daily_highlights,
+))
+
+
+# ---------------------------------------------------------------------------
+# Tool: group_into_chapters  (photo-book structure — geographic chapters)
+# ---------------------------------------------------------------------------
+
+def _h_group_into_chapters(db: PhotoDB, args: dict) -> dict:
+    """Split a date range into place-based chapters for a photo book. Walks the
+    filtered photos chronologically and starts a new chapter whenever the
+    reverse-geocoded place changes, or the same place resumes after a gap longer
+    than `gap_hours` (a revisit). Mirrors how the trip books are structured
+    (Varenna → Ortisei → Zurich → …)."""
+    gap_hours = _opt_float(args.get("gap_hours"))
+    gap_hours = 12.0 if gap_hours is None else max(1.0, min(gap_hours, 240.0))
+    min_photos = _clamp(args.get("min_photos"), 8, 1, 100000)
+    per_chapter = _clamp(args.get("per_chapter"), 4, 0, 12)
+    gap_s = gap_hours * 3600.0
+
+    where, params = _build_filter_sql(db, args)
+    sql = (
+        "SELECT id, filename, date_taken, place_name, camera_model, file_hash, "
+        "aesthetic_score, description, categories FROM photos "
+        f"WHERE ({where}) AND "
+        "date_taken GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
+        "ORDER BY date_taken LIMIT 60000")
+    try:
+        rows = [dict(r) for r in db.conn.execute(sql, params).fetchall()]
+    except Exception as exc:
+        return {"error": f"group_into_chapters failed: {exc}"}
+    if not rows:
+        return {"chapters_found": 0, "chapters": [], "returned": 0, "results": []}
+
+    chapters: list = []
+    cur: Optional[dict] = None
+    for d in rows:
+        key = d.get("place_name") or "Unknown"
+        t = _parse_dt(d.get("date_taken"))
+        if cur is None:
+            cur = {"key": key, "rows": [d], "last_t": t}
+            continue
+        gap_ok = (t is not None and cur["last_t"] is not None
+                  and (t - cur["last_t"]).total_seconds() <= gap_s)
+        if key == cur["key"] and gap_ok:
+            cur["rows"].append(d)
+            cur["last_t"] = t or cur["last_t"]
+        else:
+            chapters.append(cur)
+            cur = {"key": key, "rows": [d], "last_t": t}
+    if cur:
+        chapters.append(cur)
+
+    dropped = sum(1 for ch in chapters if len(ch["rows"]) < min_photos)
+    chapters = [ch for ch in chapters if len(ch["rows"]) >= min_photos]
+
+    out_chapters, results = [], []
+    for idx, ch in enumerate(chapters, 1):
+        rws = ch["rows"]
+        dates = [r.get("date_taken") for r in rws if r.get("date_taken")]
+        places: list = []
+        for r in rws:
+            p = r.get("place_name")
+            if p and p not in places:
+                places.append(p)
+        rep_hits = []
+        if per_chapter:
+            best = sorted(rws, key=lambda r: (r.get("aesthetic_score") is None,
+                                              -(r.get("aesthetic_score") or 0)))
+            reps = _dedupe_ranked([dict(r, _bucket=idx) for r in best], per_chapter)
+            for r in reps:
+                h = _compact_hit(r)
+                h["chapter"] = idx
+                rep_hits.append(h)
+            results.extend(rep_hits)
+        out_chapters.append({
+            "index": idx,
+            "title": ch["key"],
+            "date_from": (min(dates)[:10] if dates else None),
+            "date_to": (max(dates)[:10] if dates else None),
+            "days": len({(dd or "")[:10] for dd in dates}),
+            "photo_count": len(rws),
+            "places": places[:8],
+            "representative_ids": [h["id"] for h in rep_hits],
+        })
+    return {
+        "chapters_found": len(out_chapters),
+        "dropped_small_chapters": dropped,
+        "min_photos": min_photos,
+        "gap_hours": gap_hours,
+        "chapters": out_chapters,
+        "returned": len(results),
+        "results": results,
+    }
+
+
+_register(ToolSpec(
+    name="group_into_chapters",
+    description=(
+        "Organize a trip / date range into place-based CHAPTERS for a photo book. "
+        "Walks the photos chronologically and cuts a new chapter each time the "
+        "location changes (or the same place resumes after a gap longer than "
+        "`gap_hours`). Returns each chapter's title (place), date span, day count, "
+        "photo count, the distinct places it covers, and a few representative best "
+        "photos — the skeleton for a travelogue book. Same structured filters as "
+        "search_photos (no free-text `query`); combine with date_from/date_to for "
+        "the trip window and `camera` to a single body. Example: 'break our "
+        "2026-06-27..2026-08-06 Europe trip into chapters' → date_from/date_to set, "
+        "then read the chapters. Follow up with daily_scene_breakdown on a big day "
+        "or suggest_layout on a chapter's photos."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "date_from": {"type": "string", "description": "Trip start, YYYY-MM-DD."},
+            "date_to": {"type": "string", "description": "Trip end, YYYY-MM-DD."},
+            "gap_hours": {"type": "number",
+                          "description": "Hours of inactivity at the same place that "
+                          "starts a new chapter on return (default 12)."},
+            "min_photos": {"type": "integer",
+                           "description": "Drop transient chapters below this many "
+                           "photos — rest stops, single-photo hops (default 8)."},
+            "per_chapter": {"type": "integer",
+                            "description": "Representative best photos to return per "
+                            "chapter (default 4, 0 = none)."},
+            "people": {"type": "array", "items": {"type": "string"},
+                       "description": "Registered names; matches photos with ALL of them."},
+            "location": {"type": "string", "description": "Place/region name."},
+            **_CURATION_FILTER_PROPS,
+            "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            "category": {"type": "string", "description": "Exact content category."},
+            "visual_tag": {"type": "string", "description": "Visual-quality tag."},
+            "keyword": {"type": "string", "description": "Keyword substring."},
+        },
+        "additionalProperties": False,
+    },
+    handler=_h_group_into_chapters,
+))
+
+
+# ---------------------------------------------------------------------------
+# Tool: daily_scene_breakdown  (split ONE day into sub-scenes)
+# ---------------------------------------------------------------------------
+
+def _h_daily_scene_breakdown(db: PhotoDB, args: dict) -> dict:
+    """Break a single day into distinct SCENES (sub-events) for a photo book —
+    e.g. a castle day into walk-up / lunch / tower / windows / view. Cuts a new
+    scene on a time gap longer than `gap_minutes` or a place change."""
+    day = (args.get("date") or args.get("day") or "").strip()[:10]
+    if not day:
+        return {"error": "date is required (YYYY-MM-DD)"}
+    gap_min = _opt_float(args.get("gap_minutes"))
+    gap_min = 40.0 if gap_min is None else max(1.0, min(gap_min, 600.0))
+    per_scene = _clamp(args.get("per_scene"), 3, 1, 12)
+    gap_s = gap_min * 60.0
+
+    where, params = _build_filter_sql(db, args)
+    sql = ("SELECT id, filename, date_taken, place_name, camera_model, file_hash, "
+           "aesthetic_score, description FROM photos "
+           f"WHERE ({where}) AND substr(date_taken,1,10) = ? "
+           "ORDER BY date_taken LIMIT 20000")
+    try:
+        rows = [dict(r) for r in db.conn.execute(sql, (*params, day)).fetchall()]
+    except Exception as exc:
+        return {"error": f"daily_scene_breakdown failed: {exc}"}
+    if not rows:
+        return {"date": day, "scenes_found": 0, "scenes": [], "returned": 0, "results": []}
+
+    scenes: list = []
+    cur: Optional[dict] = None
+    for d in rows:
+        key = d.get("place_name") or "Unknown"
+        t = _parse_dt(d.get("date_taken"))
+        if cur is None:
+            cur = {"key": key, "rows": [d], "last_t": t}
+            continue
+        gap_ok = (t is not None and cur["last_t"] is not None
+                  and (t - cur["last_t"]).total_seconds() <= gap_s)
+        if key == cur["key"] and gap_ok:
+            cur["rows"].append(d)
+            cur["last_t"] = t or cur["last_t"]
+        else:
+            scenes.append(cur)
+            cur = {"key": key, "rows": [d], "last_t": t}
+    if cur:
+        scenes.append(cur)
+
+    out_scenes, results = [], []
+    for idx, sc in enumerate(scenes, 1):
+        rws = sc["rows"]
+        times = [r.get("date_taken") for r in rws if r.get("date_taken")]
+        best = sorted(rws, key=lambda r: (r.get("aesthetic_score") is None,
+                                          -(r.get("aesthetic_score") or 0)))
+        reps = _dedupe_ranked([dict(r, _bucket=idx) for r in best], per_scene)
+        rep_hits = []
+        for r in reps:
+            h = _compact_hit(r)
+            h["scene"] = idx
+            rep_hits.append(h)
+        results.extend(rep_hits)
+        out_scenes.append({
+            "index": idx,
+            "place": sc["key"],
+            "start": (min(times) if times else None),
+            "end": (max(times) if times else None),
+            "photo_count": len(rws),
+            "representative_ids": [h["id"] for h in rep_hits],
+        })
+    return {"date": day, "scenes_found": len(out_scenes), "gap_minutes": gap_min,
+            "scenes": out_scenes, "returned": len(results), "results": results}
+
+
+_register(ToolSpec(
+    name="daily_scene_breakdown",
+    description=(
+        "Break ONE day into distinct SCENES (sub-events) for a photo book — a "
+        "big-event day (a castle, a hike, a wedding) split into its beats "
+        "(arrival / lunch / tower / view / blue hour) so each can get its own "
+        "spread. Cuts a new scene on a time gap longer than `gap_minutes` or a "
+        "location change. Returns each scene's place, time span, photo count and a "
+        "few best representative photos. Use after group_into_chapters when a "
+        "chapter's day earns a multi-spread sequence. `date` is required "
+        "(YYYY-MM-DD). Same structured filters as search_photos otherwise."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "description": "The day to break down, YYYY-MM-DD."},
+            "gap_minutes": {"type": "number",
+                            "description": "Minutes of inactivity (or a place change) "
+                            "that starts a new scene (default 40)."},
+            "per_scene": {"type": "integer",
+                          "description": "Representative best photos per scene (default 3)."},
+            "people": {"type": "array", "items": {"type": "string"},
+                       "description": "Registered names; matches photos with ALL of them."},
+            "location": {"type": "string", "description": "Place/region name."},
+            **_CURATION_FILTER_PROPS,
+            "min_quality": {"type": "number", "description": "Minimum aesthetic score, 1-10."},
+            "category": {"type": "string", "description": "Exact content category."},
+            "visual_tag": {"type": "string", "description": "Visual-quality tag."},
+        },
+        "additionalProperties": False,
+    },
+    handler=_h_daily_scene_breakdown,
+))
+
+
+# ---------------------------------------------------------------------------
+# Tool: suggest_layout  (photo-book spread plan for an explicit photo set)
+# ---------------------------------------------------------------------------
+
+_LAYOUT_MAX = 400
+
+
+def _h_suggest_layout(db: PhotoDB, args: dict) -> dict:
+    """Propose a spread-by-spread layout in the house style for an EXPLICIT photo
+    set (the ids the user already curated — this tool never searches on its own).
+    Heuristic: chronological partition into `spread_count` spreads, each assigned
+    an archetype by photo count (matched 2-up / asymmetric collage / dense grid),
+    with a very wide frame promoted to a full-spread panorama and the
+    highest-aesthetic frame marked as the spread's hero."""
+    raw = args.get("photo_ids") or []
+    if isinstance(raw, str):
+        raw = _coerce_str_list(raw)
+    try:
+        ids = [int(x) for x in raw][:_LAYOUT_MAX]
+    except (TypeError, ValueError):
+        return {"error": "photo_ids must be a list of integers"}
+    if not ids:
+        return {"error": "photo_ids is required — pass the curated set from a "
+                         "prior search / chapter (this tool never searches on its own)"}
+
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: dict(r) for r in db.conn.execute(
+        f"SELECT id, filename, date_taken, place_name, camera_model, aesthetic_score, "
+        f"image_width, image_height, description FROM photos WHERE id IN ({ph})",
+        ids).fetchall()}
+    photos = [rows[i] for i in ids if i in rows]
+    photos.sort(key=lambda d: (d.get("date_taken") or ""))
+    n = len(photos)
+    if n == 0:
+        return {"error": "none of those photo_ids exist"}
+
+    try:
+        target = int(args["spread_count"]) if args.get("spread_count") is not None else None
+    except (TypeError, ValueError):
+        target = None
+    if not target:
+        target = max(1, round(n / 4.0))   # ~4 photos/spread is the house default
+    target = max(1, min(target, n))
+
+    def _aspect(d):
+        w, h = d.get("image_width") or 0, d.get("image_height") or 0
+        return (w / h) if (w and h) else 1.0
+
+    def _archetype(k):
+        if k == 1:
+            return "full-bleed single"
+        if k == 2:
+            return "matched 2-up"
+        if k <= 7:
+            return "asymmetric collage"
+        return "dense grid"
+
+    spreads = []
+    base, extra = divmod(n, target)
+    i = 0
+    for s in range(target):
+        k = base + (1 if s < extra else 0)
+        if k == 0:
+            continue
+        chunk = photos[i:i + k]
+        i += k
+        hero = max(chunk, key=lambda d: (d.get("aesthetic_score") or 0))
+        arch = _archetype(len(chunk))
+        if len(chunk) == 1 and _aspect(chunk[0]) >= 2.0:
+            arch = "full-spread panorama"
+        spreads.append({
+            "index": s + 1,
+            "archetype": arch,
+            "photo_count": len(chunk),
+            "hero_id": hero["id"],
+            "photo_ids": [c["id"] for c in chunk],
+            "place": hero.get("place_name"),
+            "date": (hero.get("date_taken") or "")[:10] or None,
+        })
+
+    return {
+        "spread_count": len(spreads),
+        "photo_count": n,
+        "note": ("Heuristic chronological layout in the house style — matched 2-up, "
+                 "asymmetric collage (one anchor), dense grid for sequences, and a "
+                 "full-spread panorama for a very wide frame. Hero = the "
+                 "highest-aesthetic photo in each spread. Adjust spread_count to "
+                 "pace it (2–4 photos/spread typical; 1–2 for breathers)."),
+        "spreads": spreads,
+        "results": [_compact_hit(p) for p in photos],
+    }
+
+
+_register(ToolSpec(
+    name="suggest_layout",
+    description=(
+        "Propose a spread-by-spread photo-book LAYOUT for a SPECIFIC set of photos "
+        "(by id — the curated set from a prior search / chapter; this tool never "
+        "searches on its own). Partitions them chronologically into `spread_count` "
+        "spreads and assigns each an archetype from the house style — matched 2-up, "
+        "asymmetric collage (one anchor photo), dense grid for sequences, "
+        "full-spread panorama for a very wide frame — marking the highest-aesthetic "
+        "photo as each spread's hero. Use it to turn a chapter or a shortlist into "
+        "a concrete book skeleton. Pass `spread_count` to control pacing (omit for "
+        "~4 photos/spread)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "photo_ids": {"type": "array", "items": {"type": "integer"},
+                          "description": "The exact photos to lay out, in the order "
+                          "you want (defaults to chronological)."},
+            "spread_count": {"type": "integer",
+                             "description": "Target number of spreads. Omit to auto-size "
+                             "(~4 photos per spread)."},
+        },
+        "required": ["photo_ids"],
+        "additionalProperties": False,
+    },
+    handler=_h_suggest_layout,
 ))
 
 

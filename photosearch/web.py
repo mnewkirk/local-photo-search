@@ -3792,7 +3792,13 @@ def api_validate_data(sample: int = 5):
 async def api_ask(request: Request):
     """M24b — natural-language search via the local-LLM agent loop (SSE).
 
-    Body: {"message": str, "history"?: [{"role","content"}, ...]}.
+    Body: {"message": str, "history"?: [{"role","content"}, ...],
+           "filters"?: {people/location/date_from/date_to/color/category/
+                        visual_tag/keyword/min_quality/min_aesthetic/style_tag/
+                        match_source/camera/sort}}.
+    `filters` is the structured Search filter bar pinned in the UI — fed into
+    every search the agent runs as a HARD constraint (enforced server-side, not
+    a post-filter on results), so e.g. a pinned camera can't be dropped.
 
     Runs photosearch.agent.run_agent over the shared tool layer on the LOCAL
     LLM backend (LM Studio / Ollama). Nothing leaves the NAS. Streams the same
@@ -3814,6 +3820,10 @@ async def api_ask(request: Request):
     data = data or {}
     message = (data.get("message") or "").strip()
     history = data.get("history") if isinstance(data.get("history"), list) else None
+    # Structured Search filters pinned in the UI, fed in as HARD constraints on
+    # every search the agent runs (not a post-filter on its results). The agent
+    # normalizes + enforces them; see agent._normalize_locked / _merge_locked.
+    locked_filters = data.get("filters") if isinstance(data.get("filters"), dict) else None
     if not message:
         raise HTTPException(400, "message is required")
 
@@ -3830,6 +3840,7 @@ async def api_ask(request: Request):
                 for event in run_agent(
                     db, message, history=history,
                     should_abort=cancel_event.is_set,
+                    locked_filters=locked_filters,
                 ):
                     _emit(event)
                     if cancel_event.is_set():

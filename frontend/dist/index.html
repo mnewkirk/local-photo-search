@@ -927,10 +927,25 @@
         setTotalResults(0);
         setHasMore(false);
 
+        // Pin the structured filter bar as HARD inputs to the Ask — the server
+        // feeds these into every search the agent runs (not a post-filter on
+        // its results), so e.g. a chosen camera can't be dropped.
+        const askFilters = {};
+        if (personFilter) askFilters.people = [personFilter];
+        if (matchSource) askFilters.match_source = matchSource;
+        if (colorFilter) askFilters.color = colorFilter;
+        if (locationFilter) askFilters.location = locationFilter;
+        if (cameraFilter) askFilters.camera = cameraFilter;
+        if (dateFrom) askFilters.date_from = dateFrom;
+        if (dateTo) askFilters.date_to = dateTo;
+        if (minQuality) askFilters.min_quality = parseFloat(minQuality);
+        if (minAesthetic) askFilters.min_aesthetic = parseFloat(minAesthetic);
+        if (sortQuality) askFilters.sort = 'quality_desc';
+
         fetch(API + '/api/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: q }),
+          body: JSON.stringify({ message: q, filters: askFilters }),
           signal: ac.signal,
         })
           .then(response => {
@@ -983,7 +998,8 @@
             if (err.name !== 'AbortError') setAskLog(prev => prev.concat(['✗ ' + err.message]));
             setAsking(false);
           });
-      }, [query, asking]);
+      }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
+          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, sortQuality]);
 
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
@@ -1133,7 +1149,7 @@
                 type: 'button',
                 className: 'mode-seg' + (askMode ? ' active' : ''),
                 onClick: () => setAskMode(true),
-                title: 'Ask in natural language — the assistant picks the filters',
+                title: 'Ask in natural language — the assistant picks the filters; any filters you set below are pinned as hard constraints',
               }, '✨ Ask'),
             ),
             e('input', {
@@ -1154,8 +1170,15 @@
           ),
         ),
 
-        // Filters bar (hidden in Ask mode — the LLM picks the filters)
-        !askMode && e('div', { className: 'filters' },
+        // Filters bar. In Search mode these filter the query; in Ask mode they
+        // are pinned as HARD inputs fed into every search the agent runs (see
+        // runAsk's askFilters) — not a post-filter on the Ask's results.
+        e('div', { className: 'filters' },
+          askMode && e('div', {
+            className: 'filter-group',
+            style: { fontSize: 12, color: 'var(--text-muted)', fontStyle: 'italic' },
+            title: 'These filters are applied to every search the assistant runs.',
+          }, '✨ Pinned to Ask:'),
           e('div', { className: 'filter-group' },
             e('span', { className: 'filter-label' }, 'Person:'),
             e('select', {

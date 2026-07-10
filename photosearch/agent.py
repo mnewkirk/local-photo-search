@@ -456,9 +456,11 @@ _SINGLE_SHOT_INSTRUCTION = (
 
 
 def _run_single_shot(db: PhotoDB, message: str,
-                     timeout: float = _HTTP_TIMEOUT_S) -> Iterator[dict]:
+                     timeout: float = _HTTP_TIMEOUT_S,
+                     locked: Optional[dict] = None) -> Iterator[dict]:
     reply = _chat(
-        [{"role": "system", "content": _SINGLE_SHOT_INSTRUCTION},
+        [{"role": "system", "content": _SINGLE_SHOT_INSTRUCTION
+          + (_locked_prompt(locked) if locked else "")},
          {"role": "user", "content": message}],
         tools=None, timeout=timeout,
     )
@@ -472,6 +474,8 @@ def _run_single_shot(db: PhotoDB, message: str,
         args = json.loads(text[start:end + 1]) if start >= 0 and end > start else {}
     except (ValueError, TypeError):
         args = {}
+    # Enforce the pinned filters even on the single-shot path.
+    args = _merge_locked("search_photos", args if isinstance(args, dict) else {}, locked or {})
     if not isinstance(args, dict) or not args:
         yield {"type": "answer",
                "text": "I couldn't turn that into a search. Try rephrasing, or "
@@ -533,6 +537,9 @@ def _write_ask_log(session: dict) -> None:
              f"{len(session.get('tool_calls') or [])} tool call(s)", ""]
         if session.get("error"):
             L.append(f"**error:** {session['error']}")
+        if session.get("locked_filters"):
+            L.append(f"**Pinned filters:** "
+                     f"{json.dumps(session['locked_filters'], ensure_ascii=False)}")
         if session.get("tool_calls"):
             L.append("**Calls (time since request → tool):**")
             for tc in session["tool_calls"]:
@@ -567,21 +574,106 @@ def _write_ask_log(session: dict) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Locked filters — the structured Search filter bar, injected as HARD inputs
+# ---------------------------------------------------------------------------
+#
+# The Ask box carries the natural-language intent; the filter bar carries
+# constraints the user pinned in the UI. We do NOT post-filter the agent's
+# results by them — we feed them INTO every search the agent runs, and enforce
+# them server-side (merge into each tool call) so a filter can't be dropped by
+# a model that forgot it (the "KODAK PIXPRO WPZ2 returns non-Kodak" bug).
+
+# Tools whose arguments are structured search filters — kept in sync with the
+# filter-consuming tools in tools.py. rerank_photos / get_photo / list_* / the
+# write tools take ids or lookups, not filters, so they're excluded.
+_FILTER_TOOLS = {"search_photos", "representatives", "daily_highlights",
+                 "summarize", "group_into_chapters", "daily_scene_breakdown"}
+
+# Locked-filter keys (tool-arg names). `people` unions with whatever the model
+# inferred; every other key hard-overrides the model's value.
+_LOCKED_KEYS = ("people", "location", "date_from", "date_to", "color", "category",
+                "visual_tag", "keyword", "min_quality", "min_aesthetic",
+                "style_tag", "match_source", "camera", "sort")
+
+
+def _normalize_locked(locked) -> dict:
+    """Keep only recognized, non-empty locked-filter keys."""
+    out: dict = {}
+    if not isinstance(locked, dict):
+        return out
+    for k in _LOCKED_KEYS:
+        v = locked.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        if isinstance(v, (list, tuple)) and not v:
+            continue
+        out[k] = v
+    return out
+
+
+def _merge_locked(name: str, args: dict, locked: dict) -> dict:
+    """Inject the pinned UI filters into a filter-consuming tool call so they're
+    ENFORCED regardless of what the model emitted. `people` unions; scalars
+    override (the user set them explicitly)."""
+    if not locked or name not in _FILTER_TOOLS:
+        return args or {}
+    merged = dict(args or {})
+    for k, v in locked.items():
+        if k == "people":
+            have = toolmod._coerce_str_list(merged.get("people"))
+            add = toolmod._coerce_str_list(v)
+            merged["people"] = list(dict.fromkeys(have + add))
+        else:
+            merged[k] = v
+    return merged
+
+
+_LOCKED_LABELS = {
+    "people": "people", "location": "location", "date_from": "on/after",
+    "date_to": "on/before", "color": "color", "category": "category",
+    "visual_tag": "visual tag", "keyword": "keyword", "min_quality": "min quality",
+    "min_aesthetic": "min aesthetic pct", "style_tag": "style",
+    "match_source": "match source", "camera": "camera", "sort": "sort",
+}
+
+
+def _locked_prompt(locked: dict) -> str:
+    """System-prompt paragraph telling the model which filters the UI already
+    pinned, so it plans the rest of the request around them instead of guessing
+    or contradicting them."""
+    if not locked:
+        return ""
+    bits = []
+    for k, v in locked.items():
+        val = ", ".join(str(x) for x in v) if isinstance(v, (list, tuple)) else v
+        bits.append(f"{_LOCKED_LABELS.get(k, k)}={val}")
+    return ("\nACTIVE FILTERS (the user pinned these in the UI; they are applied "
+            "AUTOMATICALLY to every search you run and you cannot override them — "
+            "do NOT restate them in your tool calls, and do NOT drop the person/"
+            "subject to manufacture results — just plan the REST of the request "
+            "around them): " + "; ".join(bits) + ".\n")
+
+
 def run_agent(
     db: PhotoDB,
     message: str,
     history: Optional[list] = None,
     max_steps: int = _MAX_STEPS,
     should_abort: Optional[Callable[[], bool]] = None,
+    locked_filters: Optional[dict] = None,
 ) -> Iterator[dict]:
     """Drive the tool-calling loop; yield event dicts. See module docstring."""
     if not (message or "").strip():
         yield {"type": "error", "message": "empty message"}
         return
 
+    locked = _normalize_locked(locked_filters)
+
     session = {"message": message, "model": _agent_model(), "started": time.time(),
                "mode": "agent", "steps": [], "tool_calls": [], "answer": None,
-               "error": None, "history_len": len(history or []), "rounds": 0}
+               "error": None, "history_len": len(history or []), "rounds": 0,
+               "locked_filters": locked or None}
 
     def _set_answer(text):
         session["answer"] = text
@@ -594,7 +686,9 @@ def run_agent(
         if os.environ.get("PHOTOSEARCH_AGENT_SINGLE_SHOT", "").strip().lower() in (
                 "1", "true", "yes", "on"):
             session["mode"] = "single_shot"
-            for ev in _run_single_shot(db, message, timeout=max(5.0, deadline - time.monotonic())):
+            for ev in _run_single_shot(db, message,
+                                       timeout=max(5.0, deadline - time.monotonic()),
+                                       locked=locked):
                 if ev.get("type") == "answer":
                     session["answer"] = ev.get("text")
                 if ev.get("type") == "tool_call":
@@ -606,7 +700,8 @@ def run_agent(
         allow_writes = _writes_enabled()
         tools = toolmod.openai_tools(include_images=False, include_writes=allow_writes)
         messages: list = [{"role": "system",
-                           "content": _system_prompt(db, allow_writes=allow_writes)}]
+                           "content": _system_prompt(db, allow_writes=allow_writes)
+                           + _locked_prompt(locked)}]
         for h in (history or []):
             if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
                 messages.append({"role": h["role"], "content": str(h["content"])})
@@ -641,7 +736,8 @@ def run_agent(
                     yield {"type": "tool_result", "tool": "_fallback",
                            "summary": "tool-calling failed; trying single-shot"}
                     for ev in _run_single_shot(db, message,
-                                               timeout=max(5.0, deadline - time.monotonic())):
+                                               timeout=max(5.0, deadline - time.monotonic()),
+                                               locked=locked):
                         if ev.get("type") == "answer":
                             session["answer"] = ev.get("text")
                         yield ev
@@ -660,7 +756,11 @@ def run_agent(
                 messages.append(_assistant_tool_msg(reply))
                 for call in calls:
                     name = call.get("name") or ""
-                    yield {"type": "tool_call", "tool": name, "arguments": call.get("arguments", {}),
+                    # Enforce the pinned UI filters: merge them into the args the
+                    # tool actually runs with (and show the enforced set in the
+                    # narration, so a dropped filter is visible).
+                    eff_args = _merge_locked(name, call.get("arguments", {}), locked)
+                    yield {"type": "tool_call", "tool": name, "arguments": eff_args,
                            "step": step + 1, "elapsed": round(time.time() - session["started"], 1)}
                     # A vision rerank is slow; grant extra wall-clock so the turn
                     # that reads its scores isn't killed by the deadline.
@@ -668,19 +768,20 @@ def run_agent(
                         deadline = max(deadline,
                                        time.monotonic() + _RERANK_DEADLINE_EXTEND_S)
                     try:
-                        result = toolmod.call_tool(db, name, call.get("arguments", {}))
+                        result = toolmod.call_tool(db, name, eff_args)
                     except KeyError:
                         result = {"error": f"unknown tool: {name}"}
                     except Exception as exc:
                         result = {"error": str(exc)}
                     if (name in ("search_photos", "representatives", "rerank_photos",
-                                 "daily_highlights")
+                                 "daily_highlights", "group_into_chapters",
+                                 "daily_scene_breakdown", "suggest_layout")
                             and isinstance(result, dict) and "results" in result):
                         last_photos = result.get("results", [])
                         last_total = result.get("total", result.get("returned",
                                                                     len(last_photos)))
                     summ = _summarize(name, result)
-                    rec = {"name": name, "args": call.get("arguments", {}), "summary": summ,
+                    rec = {"name": name, "args": eff_args, "summary": summ,
                            "step": step + 1, "t": round(time.time() - session["started"], 1)}
                     if isinstance(result, dict) and isinstance(result.get("results"), list):
                         hits = [h for h in result["results"] if isinstance(h, dict)]
