@@ -1323,11 +1323,19 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
             reverse=True,
         )
     if sort == "quality_desc":
-        return sorted(
-            merged,
-            key=lambda r: (r.get("aesthetic_score") or 0),
-            reverse=True,
-        )
+        # "Best quality" now ranks by the new VLM score (subject-aware, then
+        # full-frame percentile), falling back to the old LAION aesthetic_score
+        # for photos the VLM hasn't scored yet. One comparable scale: VLM-scored
+        # (1000..1100) rank above old-scored (0..~10) above unscored.
+        def _quality_key(r):
+            pct = r.get("aes_subject_overall_pct")
+            if pct is None:
+                pct = r.get("aes_overall_pct")
+            if pct is not None:
+                return 1000 + pct
+            aes = r.get("aesthetic_score")
+            return aes if aes is not None else -1
+        return sorted(merged, key=_quality_key, reverse=True)
     if sort == "aesthetic_desc":
         # Rank by the library-relative percentile so the best photos lead.
         return sorted(

@@ -1515,7 +1515,9 @@
 
           // Aesthetic quality
           showAesthetics && renderVlmAesthetics(),
-          showAesthetics && renderAesthetics(),
+          // Old LAION quality section is a FALLBACK only — shown when the photo
+          // hasn't been VLM-scored yet (so we never show both scores at once).
+          showAesthetics && !(detail && detail.aesthetics) && renderAesthetics(),
 
           // Tags
           detail && detail.tags && detail.tags.length > 0 && e('div', { className: 'detail-section' },
@@ -1908,6 +1910,56 @@
    *   onChange: (newKey) => void
    *   options: array of sort keys to show (defaults to all)
    */
+  // ---- Aesthetic score: single source of truth for every card + sort --------
+  // The new VLM score is a library-relative percentile (0-100). The effective
+  // score is the subject-crop percentile when present (what search ranks on),
+  // else the full-frame percentile. Only ~a fraction of the library is VLM-
+  // scored, so when neither exists we fall back to the OLD LAION aesthetic_score
+  // (/10), shown faded + marked provisional.
+  PS.effectiveAestheticPct = function (photo) {
+    if (!photo) return null;
+    if (photo.aes_subject_overall_pct != null) return photo.aes_subject_overall_pct;
+    if (photo.aes_overall_pct != null) return photo.aes_overall_pct;
+    return null;
+  };
+
+  // Monotonic sort value so "Best quality" ranks VLM-scored photos (by
+  // percentile) above old-scored ones (by /10) above unscored — one comparable
+  // scale. Higher = better.
+  PS.aestheticSortValue = function (photo) {
+    var pct = PS.effectiveAestheticPct(photo);
+    if (pct != null) return 1000 + pct;                       // 1000..1100
+    if (photo && photo.aesthetic_score != null) return photo.aesthetic_score; // 0..~10
+    return -1;
+  };
+
+  // The badge every card renders. Green/yellow/orange by percentile when VLM-
+  // scored; a faded ★/10 (provisional) when only the old model has run; null
+  // when neither exists. opts.style merges onto the span.
+  PS.aestheticBadge = function (photo, opts) {
+    opts = opts || {};
+    var pct = PS.effectiveAestheticPct(photo);
+    if (pct != null) {
+      var v = Math.round(pct);
+      var col = pct >= 75 ? '#4ade80' : pct >= 40 ? '#facc15' : '#fb923c';
+      var subj = photo.aes_subject_overall_pct != null;
+      return e('span', {
+        className: 'aes-badge',
+        title: 'Aesthetic percentile ' + v + (subj ? ' (subject-aware)' : ' (full frame)'),
+        style: Object.assign({ color: col, fontWeight: 600, whiteSpace: 'nowrap' }, opts.style || {}),
+      }, '✨' + v);
+    }
+    if (photo && photo.aesthetic_score != null) {
+      return e('span', {
+        className: 'aes-badge aes-badge-old',
+        title: 'Provisional — old quality model (not yet VLM-scored)',
+        style: Object.assign({ color: 'var(--text-muted, #999)', opacity: 0.7,
+                               fontStyle: 'italic', whiteSpace: 'nowrap' }, opts.style || {}),
+      }, '★' + photo.aesthetic_score.toFixed(1));
+    }
+    return null;
+  };
+
   PS.SortControl = function SortControl(props) {
     var value = props.value;
     var onChange = props.onChange;
@@ -1987,13 +2039,21 @@
         sorted.sort(function (a, b) { return cmp(a, b, 'asc'); });
         break;
       case 'quality_desc':
+      case 'aesthetic_desc':
+        // "Best quality" now ranks by the new VLM score (subject-aware, then
+        // full-frame percentile), falling back to the old model for photos the
+        // VLM hasn't scored yet. Single comparable scale via aestheticSortValue.
         sorted.sort(function (a, b) {
-          return (b.aesthetic_score || 0) - (a.aesthetic_score || 0);
+          return PS.aestheticSortValue(b) - PS.aestheticSortValue(a);
         });
         break;
-      case 'aesthetic_desc':
+      case 'subject_aesthetic_desc':
         sorted.sort(function (a, b) {
-          return (b.aes_overall_pct || 0) - (a.aes_overall_pct || 0);
+          var av = a.aes_subject_overall_pct != null ? a.aes_subject_overall_pct
+                 : (a.aes_overall_pct != null ? a.aes_overall_pct : -1);
+          var bv = b.aes_subject_overall_pct != null ? b.aes_subject_overall_pct
+                 : (b.aes_overall_pct != null ? b.aes_overall_pct : -1);
+          return bv - av;
         });
         break;
       case 'name_asc':

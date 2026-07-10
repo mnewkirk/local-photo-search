@@ -1564,6 +1564,17 @@
                 className: 'stack-badge',
                 onClick: (ev) => { ev.stopPropagation(); toggleStack(p.stack_id); },
               }, isExpanded ? '\u2715' : '\u00d7' + p.stack_count),
+              // Shared aesthetic badge \u2014 same score every other card shows.
+              (() => {
+                const b = PS.aestheticBadge(p);
+                return b ? e('span', {
+                  style: {
+                    position: 'absolute', left: 4, bottom: 4, background: 'rgba(0,0,0,0.6)',
+                    borderRadius: 4, padding: '1px 5px', fontSize: 11, lineHeight: 1.5,
+                    pointerEvents: 'none',
+                  },
+                }, b) : null;
+              })(),
               e('span', { className: 'remove-badge' }, '\u00d7'),
             );
           }),

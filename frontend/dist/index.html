@@ -1367,7 +1367,7 @@
             e(PhotoGrid, { results: askMode ? results : PS.applySortOrder(results, sortBy),
                            sortBy: askMode ? null : sortBy,
                            setSortBy: askMode ? null : setSortBy,
-                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'aesthetic_desc', 'subject_aesthetic_desc'],
+                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc'],
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack, query,
                            totalResults, hasMore, loadingMore, onLoadMore: loadMore }),
@@ -1561,10 +1561,7 @@
         e('div', { className: 'overlay' },
           e('span', { className: 'filename' }, photo.filename),
           e('span', { style: { float: 'right', display: 'flex', gap: 8 } },
-            photo.aesthetic_score != null && e('span', {
-              style: { color: photo.aesthetic_score >= 6 ? '#4ade80' : photo.aesthetic_score >= 4.5 ? '#facc15' : '#f87171' },
-              title: 'Aesthetic quality',
-            }, '\u2605' + photo.aesthetic_score.toFixed(1)),
+            PS.aestheticBadge(photo),
             photo.score != null && e('span', { className: 'score' }, photo.score.toFixed(3)),
           ),
           photo.colors && photo.colors.length > 0 &&

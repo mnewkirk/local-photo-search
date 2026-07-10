@@ -1651,8 +1651,7 @@
       const [loaded, setLoaded] = useState(false);
       const [error, setError] = useState(false);
 
-      const qualityColor = photo.aesthetic_score >= 6 ? 'var(--green)' :
-                           photo.aesthetic_score >= 4.5 ? 'var(--yellow)' : 'var(--red)';
+      const aesBadge = PS.aestheticBadge(photo);
 
       const isExpanded = photo.stack_id && expandedStacks && expandedStacks.has(photo.stack_id);
       const showBadge = photo.stack_count > 1 && photo.stack_is_top;
@@ -1695,12 +1694,13 @@
         !showPlace && photo.cluster_id != null &&
           e('div', { className: 'cluster-badge' }, 'C' + photo.cluster_id),
 
-        // Quality badge
-        photo.aesthetic_score != null &&
+        // Quality badge (shared aesthetic score — VLM percentile, faded old
+        // score as fallback). Always visible for at-a-glance culling.
+        aesBadge &&
           e('div', {
             className: 'quality-badge',
-            style: { background: qualityColor + '22', color: qualityColor },
-          }, photo.aesthetic_score.toFixed(1)),
+            style: { background: 'rgba(0,0,0,0.55)', fontSize: 11 },
+          }, aesBadge),
 
         // Raw indicator
         photo.has_raw && e('div', { className: 'raw-badge' }, 'RAW'),
