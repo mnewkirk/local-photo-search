@@ -632,6 +632,7 @@
         min_quality: p.get('min_quality') || '',
         min_aesthetic: p.get('min_aesthetic') || '',
         min_day_aesthetic: p.get('min_day_aesthetic') || '',
+        per_day: p.get('per_day') || '',
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
         camera: p.get('camera') || '',
@@ -654,6 +655,10 @@
       const [minQuality, setMinQuality] = useState(initParams.min_quality);
       const [minAesthetic, setMinAesthetic] = useState(initParams.min_aesthetic);
       const [minDayAesthetic, setMinDayAesthetic] = useState(initParams.min_day_aesthetic);
+      // Ask-only: caps daily_highlights at N photos/day. The model otherwise
+      // picks per_day inconsistently (10 vs 50 on identical trips); pinning it
+      // makes the photobook reproducible. Enforced server-side on daily_highlights.
+      const [perDay, setPerDay] = useState(initParams.per_day);
       const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
       const [locationFilter, setLocationFilter] = useState(initParams.location);
       const [cameraFilter, setCameraFilter] = useState(initParams.camera);
@@ -715,6 +720,17 @@
       const setThinkingPersist = (on) => {
         localStorage.setItem('ps_ask_thinking', on ? '1' : '0');
         setThinking(on);
+      };
+      // Consolidated-search toggle: one search(mode=…) tool vs the 5 separate
+      // ones. ~44% smaller prompt (faster first answer, fits small contexts),
+      // routes on par at adequate context. null = server default (env).
+      const [consolidatedSearch, setConsolidatedSearch] = useState(() => {
+        const v = localStorage.getItem('ps_ask_consolidated');
+        return v === null ? null : v === '1';
+      });
+      const setConsolidatedPersist = (on) => {
+        localStorage.setItem('ps_ask_consolidated', on ? '1' : '0');
+        setConsolidatedSearch(on);
       };
 
       const toggleStack = useCallback((stackId) => {
@@ -957,6 +973,7 @@
         if (minQuality) askUrl.set('min_quality', minQuality);
         if (minAesthetic) askUrl.set('min_aesthetic', minAesthetic);
         if (minDayAesthetic) askUrl.set('min_day_aesthetic', minDayAesthetic);
+        if (perDay) askUrl.set('per_day', perDay);
         if (sortQuality) askUrl.set('sort_quality', 'true');
         if (groupByAttr) askUrl.set('group_by', groupByAttr);
         window.history.pushState(null, '',
@@ -990,12 +1007,14 @@
         if (minQuality) askFilters.min_quality = parseFloat(minQuality);
         if (minAesthetic) askFilters.min_aesthetic = parseFloat(minAesthetic);
         if (minDayAesthetic) askFilters.min_day_aesthetic = parseFloat(minDayAesthetic);
+        if (perDay) askFilters.per_day = parseInt(perDay, 10);
         if (sortQuality) askFilters.sort = 'quality_desc';
 
         const askBody = { message: q, filters: askFilters };
         // Only send the key once the user has actually chosen; otherwise the
         // server-side PHOTOSEARCH_LLM_REASONING_EFFORT default stands.
         if (thinking !== null) askBody.thinking = thinking;
+        if (consolidatedSearch !== null) askBody.consolidated = consolidatedSearch;
 
         fetch(API + '/api/ask', {
           method: 'POST',
@@ -1057,7 +1076,7 @@
           });
       }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
           cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, minDayAesthetic,
-          sortQuality, thinking]);
+          perDay, sortQuality, thinking, consolidatedSearch]);
 
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
@@ -1254,6 +1273,23 @@
               'Thinking',
             ),
           ),
+          askMode && e('div', { className: 'filter-group' },
+            e('label', {
+              style: { fontSize: 12, display: 'flex', alignItems: 'center', gap: 4,
+                       cursor: 'pointer', color: 'var(--text-muted)' },
+              title: 'Give the assistant one search tool with a mode instead of '
+                   + 'several. Smaller prompt → faster first answer; routes about '
+                   + 'the same. Experimental.',
+            },
+              e('input', {
+                type: 'checkbox',
+                checked: consolidatedSearch === true,
+                disabled: asking,
+                onChange: (ev) => setConsolidatedPersist(ev.target.checked),
+              }),
+              'Unified search',
+            ),
+          ),
           e('div', { className: 'filter-group' },
             e('span', { className: 'filter-label' }, 'Person:'),
             e('select', {
@@ -1368,6 +1404,22 @@
               value: minDayAesthetic,
               onChange: (ev) => setMinDayAesthetic(ev.target.value),
               min: 0, max: 100, step: 5,
+              style: { width: 72 },
+            }),
+          ),
+          // Ask-only: caps a day-by-day highlight reel (daily_highlights) at N
+          // photos per day. Meaningless in structured Search, so gated to Ask.
+          askMode && e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Per day:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'number',
+              placeholder: 'auto',
+              title: 'For a day-by-day / photobook answer, cap each day at this many photos. '
+                   + 'Leave blank to let the assistant choose (it varies run to run). 1–50.',
+              value: perDay,
+              onChange: (ev) => setPerDay(ev.target.value),
+              min: 1, max: 50, step: 1,
               style: { width: 72 },
             }),
           ),

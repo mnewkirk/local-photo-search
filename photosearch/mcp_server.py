@@ -38,6 +38,9 @@ Env:
     PHOTOSEARCH_MCP_FACTS          snapshot library facts into `instructions` at
                                    startup — ON by default; set 0/false to skip
                                    the vocabulary scan
+    PHOTOSEARCH_CONSOLIDATED_SEARCH  offer one search(mode=...) tool instead of
+                                   the 5 search-family tools — ~44% smaller
+                                   surface; default off
 """
 
 from __future__ import annotations

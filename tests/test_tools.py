@@ -24,7 +24,11 @@ READ_TOOLS = {
 }
 # M26b mutation tools — gated out of the default projections.
 WRITE_TOOLS = {"set_photo_location", "set_photo_tags", "add_to_collection"}
-EXPECTED_TOOLS = READ_TOOLS | WRITE_TOOLS
+# `search` is registered but only advertised in consolidated mode (it's XOR'd
+# with the 5 family tools in the projections), so it's in the registry, not the
+# default READ_TOOLS surface.
+CONSOLIDATED_TOOLS = {"search"}
+EXPECTED_TOOLS = READ_TOOLS | WRITE_TOOLS | CONSOLIDATED_TOOLS
 
 
 def test_registry_has_all_tools():
@@ -796,18 +800,31 @@ def test_tool_descriptions_do_not_mandate_grounding():
 
 
 def test_grounding_directives_are_opposites():
-    assert "go STRAIGHT to search_photos" in tools.GROUNDING_WITH_FACTS
+    # Grounding text must NOT name a specific search tool (search_photos is
+    # hidden in consolidated mode) — it says "go straight to searching".
+    assert "go STRAIGHT to searching" in tools.GROUNDING_WITH_FACTS
+    assert "search_photos" not in tools.GROUNDING_WITH_FACTS
     assert "Never stop after a list_* call" in tools.GROUNDING_WITHOUT_FACTS
 
 
-def test_daily_highlights_does_not_claim_flat_best_of_range():
-    """'best photos from <date range>' is search_photos(sort='quality_desc').
-    daily_highlights used to claim that exact phrasing and won the tool choice
-    on qwen3.5-9b for p03/p10."""
+def test_daily_highlights_leads_with_trigger_and_keeps_flat_boundary():
+    """daily_highlights must (a) lead with its positive day-by-day trigger so a
+    weak model actually routes to it, and (b) still redirect a plain flat
+    'best of the whole range' to search_photos (the p03/p10 boundary), now as a
+    short note rather than a heavy block."""
     desc = tools.get_tool("daily_highlights").description
-    assert "ONLY use this when" in desc
-    assert "is NOT this tool" in desc
-    assert "sort='quality_desc'" in desc
+    assert "day by day" in desc.lower() and "USE THIS whenever" in desc
+    assert "sort='quality_desc'" in desc          # still points flat requests out
+    # The positive trigger must come BEFORE the search_photos redirect.
+    assert desc.index("USE THIS") < desc.index("search_photos")
+
+
+def test_search_photos_signposts_the_grouping_tools():
+    """search_photos is where a weak model defaults, so its description must
+    point OUT to the specialized tools it should defer to."""
+    desc = tools.get_tool("search_photos").description
+    for tool in ("daily_highlights", "representatives", "group_into_chapters"):
+        assert tool in desc
 
 
 def test_server_instructions_carry_routing_and_gate_writes():
@@ -839,3 +856,49 @@ def test_min_day_aesthetic_filters_on_day_percentile(db):
     res = tools.call_tool(db, "representatives",
                           {"bucket": "year", "n": 10, "min_day_aesthetic": 50})
     assert {h["id"] for h in res["results"]} == {pid}
+
+
+# ---------------------------------------------------------------------------
+# Consolidated search(mode=...) — one tool subsuming the search family
+# ---------------------------------------------------------------------------
+
+def test_consolidated_projection_is_xor():
+    """Consolidated offers `search` and hides the 5 family tools; classic does
+    the reverse. Neither surface offers both."""
+    fam = set(tools._SEARCH_FAMILY)
+    classic = {t["name"] for t in tools.mcp_tools(consolidated=False)}
+    con = {t["name"] for t in tools.mcp_tools(consolidated=True)}
+    assert "search" not in classic and fam <= classic
+    assert "search" in con and not (fam & con)
+    # everything else (grounding, get_photo, rerank) present in both
+    assert (classic - fam) == (con - {"search"})
+
+
+def test_consolidated_search_schema_unions_family_params():
+    s = tools.get_tool("search").parameters
+    assert s["required"] == ["mode"]
+    assert set(s["properties"]["mode"]["enum"]) == {"flat", "daily", "per_bucket",
+                                                    "chapters", "scenes"}
+    # a param from each family member must be present
+    for k in ("query", "sort", "per_day", "window_minutes", "bucket", "n"):
+        assert k in s["properties"], k
+
+
+def test_search_dispatches_by_mode(db):
+    # flat -> search_photos behavior (has `total`); bad mode -> error
+    flat = tools.call_tool(db, "search", {"mode": "flat", "people": ["Alex"]})
+    assert flat.get("total") == 3
+    assert "error" in tools.call_tool(db, "search", {"mode": "nope"})
+
+
+def test_routing_guidance_matches_surface():
+    assert "search_photos" in tools.routing_guidance(consolidated=False)
+    con = tools.routing_guidance(consolidated=True)
+    assert "search(mode" in con and "search_photos" not in con
+
+
+def test_server_instructions_consolidated_swaps_guidance():
+    plain = tools.server_instructions(consolidated=False)
+    con = tools.server_instructions(consolidated=True)
+    assert tools.ROUTING_GUIDANCE in plain
+    assert tools.CONSOLIDATED_GUIDANCE in con and tools.ROUTING_GUIDANCE not in con

@@ -164,10 +164,12 @@ def _library_context(db) -> str:
     return text
 
 
-def _system_prompt(db=None, allow_writes: bool = False) -> str:
+def _system_prompt(db=None, allow_writes: bool = False,
+                   consolidated: Optional[bool] = None) -> str:
     """The agent's system prompt. The routing rules live in tools.py so the MCP
     server can serve the identical text as its ``instructions`` — same
-    single-source-of-truth argument as the schemas themselves."""
+    single-source-of-truth argument as the schemas themselves. ``consolidated``
+    (None = env) selects the routing guidance matching the offered tool surface."""
     try:
         ctx = _library_context(db) if db is not None else ""
     except Exception:
@@ -181,7 +183,7 @@ def _system_prompt(db=None, allow_writes: bool = False) -> str:
         "want in natural language; find the matching photos with the tools, then "
         "give a one- or two-sentence answer.\n\n"
         + (toolmod.GROUNDING_WITH_FACTS if ctx else toolmod.GROUNDING_WITHOUT_FACTS)
-        + "\n\n" + toolmod.ROUTING_GUIDANCE
+        + "\n\n" + toolmod.routing_guidance(consolidated)
     )
     hints = os.environ.get("PHOTOSEARCH_AGENT_HINTS", "").strip()
     out = base + (toolmod.WRITE_GUIDANCE if allow_writes else "")
@@ -509,7 +511,9 @@ def _write_ask_log(session: dict) -> None:
 # filter-consuming tools in tools.py. rerank_photos / get_photo / list_* / the
 # write tools take ids or lookups, not filters, so they're excluded.
 _FILTER_TOOLS = {"search_photos", "representatives", "daily_highlights",
-                 "summarize", "group_into_chapters", "daily_scene_breakdown"}
+                 "summarize", "group_into_chapters", "daily_scene_breakdown",
+                 # consolidated mode: the one tool that subsumes the search family
+                 "search"}
 
 # Locked-filter keys (tool-arg names). `people` unions with whatever the model
 # inferred; every other key hard-overrides the model's value.
@@ -517,9 +521,19 @@ _LOCKED_KEYS = ("people", "location", "date_from", "date_to", "color", "category
                 "visual_tag", "keyword", "min_quality", "min_aesthetic",
                 "min_day_aesthetic", "style_tag", "match_source", "camera", "sort")
 
+# Tool-SCOPED locked params: unlike _LOCKED_KEYS (generic filters injected into
+# every filter-consuming tool), these only apply where the param exists. `per_day`
+# is a daily_highlights knob, so pinning it must NOT leak onto search_photos etc.
+# Maps key -> the tools it's injected into.
+_SCOPED_LOCKED = {
+    # daily_highlights in classic mode; `search` (mode=daily) in consolidated mode.
+    # On non-daily search modes the handler simply ignores per_day.
+    "per_day": ("daily_highlights", "search"),
+}
+
 
 def _normalize_locked(locked) -> dict:
-    """Keep only recognized, non-empty locked-filter keys."""
+    """Keep only recognized, non-empty locked keys (generic + tool-scoped)."""
     out: dict = {}
     if not isinstance(locked, dict):
         return out
@@ -530,17 +544,35 @@ def _normalize_locked(locked) -> dict:
         if isinstance(v, (list, tuple)) and not v:
             continue
         out[k] = v
+    for k in _SCOPED_LOCKED:
+        v = locked.get(k)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if iv > 0:
+            out[k] = iv
     return out
 
 
 def _merge_locked(name: str, args: dict, locked: dict) -> dict:
-    """Inject the pinned UI filters into a filter-consuming tool call so they're
-    ENFORCED regardless of what the model emitted. `people` unions; scalars
-    override (the user set them explicitly)."""
-    if not locked or name not in _FILTER_TOOLS:
+    """Inject the pinned UI filters into a tool call so they're ENFORCED
+    regardless of what the model emitted. Generic filters apply to every
+    _FILTER_TOOLS call (`people` unions, scalars override); tool-scoped params
+    (_SCOPED_LOCKED) apply only to the tools that actually accept them."""
+    if not locked:
         return args or {}
     merged = dict(args or {})
     for k, v in locked.items():
+        scope = _SCOPED_LOCKED.get(k)
+        if scope is not None:
+            if name in scope:
+                merged[k] = v
+            continue
+        if name not in _FILTER_TOOLS:
+            continue
         if k == "people":
             have = toolmod._coerce_str_list(merged.get("people"))
             add = toolmod._coerce_str_list(v)
@@ -566,15 +598,26 @@ def _locked_prompt(locked: dict) -> str:
     or contradicting them."""
     if not locked:
         return ""
+    out = ""
+    # Generic filters — enforced on every search-like tool.
     bits = []
     for k, v in locked.items():
+        if k in _SCOPED_LOCKED:
+            continue
         val = ", ".join(str(x) for x in v) if isinstance(v, (list, tuple)) else v
         bits.append(f"{_LOCKED_LABELS.get(k, k)}={val}")
-    return ("\nACTIVE FILTERS (the user pinned these in the UI; they are applied "
-            "AUTOMATICALLY to every search you run and you cannot override them — "
-            "do NOT restate them in your tool calls, and do NOT drop the person/"
-            "subject to manufacture results — just plan the REST of the request "
-            "around them): " + "; ".join(bits) + ".\n")
+    if bits:
+        out += ("\nACTIVE FILTERS (the user pinned these in the UI; they are "
+                "applied AUTOMATICALLY to every search you run and you cannot "
+                "override them — do NOT restate them in your tool calls, and do "
+                "NOT drop the person/subject to manufacture results — just plan "
+                "the REST of the request around them): " + "; ".join(bits) + ".\n")
+    # Tool-scoped: per_day only means anything for a day-by-day result.
+    if "per_day" in locked:
+        out += (f"\nThe user set a per-day cap of {locked['per_day']}: when you "
+                f"produce a day-by-day highlight reel (daily_highlights), use "
+                f"per_day={locked['per_day']}.\n")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -588,11 +631,14 @@ def _locked_prompt(locked: dict) -> str:
 # ordered list of section headers `[{key, label, sublabel}]`.
 
 def _grouping_for(name: str, result) -> tuple[Optional[str], Optional[list]]:
+    """Photobook sectioning, keyed off the RESULT SHAPE rather than the tool name
+    — so it works identically whether the model called the separate tools or the
+    consolidated `search(mode=...)` (whose result is whichever sub-handler ran)."""
     if not isinstance(result, dict):
         return None, None
-    if name == "group_into_chapters":
+    if result.get("chapters"):                       # group_into_chapters / mode=chapters
         groups = []
-        for c in result.get("chapters", []):
+        for c in result["chapters"]:
             df, dt = c.get("date_from"), c.get("date_to")
             span = df if df == dt else f"{df} – {dt}"
             sub = f"{span} · {c.get('photo_count', 0)} photos"
@@ -600,9 +646,9 @@ def _grouping_for(name: str, result) -> tuple[Optional[str], Optional[list]]:
                            "label": c.get("title") or f"Chapter {c.get('index')}",
                            "sublabel": sub})
         return "chapter", groups
-    if name == "daily_scene_breakdown":
+    if result.get("scenes"):                          # daily_scene_breakdown / mode=scenes
         groups = []
-        for s in result.get("scenes", []):
+        for s in result["scenes"]:
             st = (s.get("start") or "")[11:16]
             en = (s.get("end") or "")[11:16]
             span = st if st == en else f"{st}–{en}"
@@ -611,14 +657,15 @@ def _grouping_for(name: str, result) -> tuple[Optional[str], Optional[list]]:
                            "label": s.get("place") or f"Scene {s.get('index')}",
                            "sublabel": sub})
         return "scene", groups
-    if name == "daily_highlights":
+    if "day_summary" in result:                       # daily_highlights / mode=daily
         groups = [{"key": d.get("day"), "label": d.get("day"),
                    "sublabel": ", ".join(d.get("places") or [])}
                   for d in result.get("day_summary", [])]
         return "day", groups
-    if name == "representatives":
+    if any(isinstance(h, dict) and h.get("bucket") is not None
+           for h in result.get("results", [])):       # representatives / mode=per_bucket
         seen: list = []
-        for h in result.get("results", []):
+        for h in result["results"]:
             b = h.get("bucket")
             if b is not None and b not in seen:
                 seen.append(b)
@@ -634,9 +681,12 @@ def run_agent(
     should_abort: Optional[Callable[[], bool]] = None,
     locked_filters: Optional[dict] = None,
     reasoning_effort: Optional[str] = None,
+    consolidated: Optional[bool] = None,
 ) -> Iterator[dict]:
     """Drive the tool-calling loop; yield event dicts. See module docstring.
 
+    ``consolidated`` (None = PHOTOSEARCH_CONSOLIDATED_SEARCH) offers one
+    ``search(mode=...)`` tool instead of the 5 search-family tools.
     ``reasoning_effort`` overrides PHOTOSEARCH_LLM_REASONING_EFFORT for this run
     ("none" disables a thinking model's reasoning traces; "" = model default).
     """
@@ -683,9 +733,13 @@ def run_agent(
             return
 
         allow_writes = _writes_enabled()
-        tools = toolmod.openai_tools(include_images=False, include_writes=allow_writes)
+        consolidated = (consolidated if consolidated is not None
+                        else toolmod.consolidated_search_enabled())
+        tools = toolmod.openai_tools(include_images=False, include_writes=allow_writes,
+                                     consolidated=consolidated)
         messages: list = [{"role": "system",
-                           "content": _system_prompt(db, allow_writes=allow_writes)
+                           "content": _system_prompt(db, allow_writes=allow_writes,
+                                                     consolidated=consolidated)
                            + _locked_prompt(locked)}]
         for h in (history or []):
             if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content"):
@@ -763,7 +817,7 @@ def run_agent(
                         result = {"error": str(exc)}
                     if (name in ("search_photos", "representatives", "rerank_photos",
                                  "daily_highlights", "group_into_chapters",
-                                 "daily_scene_breakdown", "suggest_layout")
+                                 "daily_scene_breakdown", "suggest_layout", "search")
                             and isinstance(result, dict) and "results" in result):
                         last_photos = result.get("results", [])
                         last_total = result.get("total", result.get("returned",
@@ -799,9 +853,9 @@ def run_agent(
                 yield {"type": "tool_result", "tool": "_nudge",
                        "summary": "empty model turn — nudging it to search"}
                 messages.append({"role": "user", "content":
-                    "You haven't returned any photos yet. Call the search_photos "
-                    "tool now with the appropriate filters, then give a brief "
-                    "answer. Do not stop until you have searched."})
+                    "You haven't returned any photos yet. Call the search tool "
+                    "now with the appropriate filters, then give a brief answer. "
+                    "Do not stop until you have searched."})
                 continue
 
             # Results in hand but an empty final turn — instead of a terse

@@ -302,15 +302,78 @@ def test_locked_camera_match_keeps_results(db, monkeypatch):
 def test_filter_tools_matches_the_tools_that_accept_locked_filters():
     """_merge_locked only enforces pinned filters on tools named in
     _FILTER_TOOLS. Add a filter-accepting tool to tools.py and forget this set
-    and the UI's pinned filters are silently ignored on it."""
+    and the UI's pinned filters are silently ignored on it. Unions both tool
+    surfaces (classic + consolidated) so `search` is covered too."""
     from photosearch import tools as toolmod
     lockable = set(agent._LOCKED_KEYS)
-    accepts = {
-        spec["name"]
-        for spec in toolmod.mcp_tools(include_images=True, include_writes=True)
-        if set(spec["inputSchema"]["properties"]) & lockable
-    }
+    accepts = set()
+    for con in (False, True):
+        for spec in toolmod.mcp_tools(include_images=True, include_writes=True,
+                                      consolidated=con):
+            if set(spec["inputSchema"]["properties"]) & lockable:
+                accepts.add(spec["name"])
     assert accepts == agent._FILTER_TOOLS
+
+
+def test_run_agent_forces_pinned_per_day_on_daily_highlights(db, monkeypatch):
+    """End-to-end: the tool_call event carries the MERGED args (what actually
+    runs), so a model that emits per_day=99 must execute per_day=1 when the UI
+    pinned 1 — the fix for 'per_day varies 10 vs 50 run to run'."""
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("daily_highlights", {"per_day": 99}),
+        _answer("done"),
+    ))
+    events = _run(db, "day by day reel", locked_filters={"per_day": 1})
+    call = next(e for e in events if e["type"] == "tool_call")
+    assert call["tool"] == "daily_highlights"
+    assert call["arguments"]["per_day"] == 1   # pin overrode the model's 99
+
+
+def test_run_agent_does_not_inject_per_day_into_search_photos(db, monkeypatch):
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search_photos", {"people": ["Alex"]}),
+        _answer("done"),
+    ))
+    events = _run(db, "photos of Alex", locked_filters={"per_day": 1, "camera": "X"})
+    call = next(e for e in events if e["type"] == "tool_call")
+    assert "per_day" not in call["arguments"]   # scoped out
+    assert call["arguments"]["camera"] == "X"    # generic filter still injected
+
+
+def test_per_day_lock_only_reaches_daily_highlights():
+    """per_day is a tool-scoped lock: it must be injected into daily_highlights
+    and NOT leak onto the generic search-family tools (where it's meaningless)."""
+    locked = agent._normalize_locked({"per_day": 20, "location": "France"})
+    assert locked["per_day"] == 20  # coerced to int
+    # daily_highlights: per_day + the generic location filter both applied.
+    dh = agent._merge_locked("daily_highlights", {"per_day": 5}, locked)
+    assert dh["per_day"] == 20 and dh["location"] == "France"
+    # search_photos: generic location applied, per_day NOT injected.
+    sp = agent._merge_locked("search_photos", {}, locked)
+    assert "per_day" not in sp and sp["location"] == "France"
+    assert "per_day" not in agent._merge_locked("representatives", {}, locked)
+
+
+def test_normalize_locked_drops_bad_per_day():
+    assert "per_day" not in agent._normalize_locked({"per_day": "abc"})
+    assert "per_day" not in agent._normalize_locked({"per_day": 0})
+    assert "per_day" not in agent._normalize_locked({"per_day": ""})
+
+
+def test_locked_prompt_scopes_per_day_out_of_the_generic_line():
+    p = agent._locked_prompt(agent._normalize_locked({"per_day": 15, "camera": "ILCE-7M4"}))
+    # per_day gets its own daily_highlights-specific hint, not the generic
+    # "applied to every search" line (which would be false for it).
+    assert "per-day cap of 15" in p
+    generic_line = p.split("The user set a per-day cap")[0]
+    assert "per_day" not in generic_line and "per-day cap" not in generic_line
+    assert "camera=ILCE-7M4" in generic_line
+
+
+def test_per_day_alone_still_emits_a_prompt():
+    p = agent._locked_prompt(agent._normalize_locked({"per_day": 8}))
+    assert "per-day cap of 8" in p
+    assert "ACTIVE FILTERS" not in p  # no generic filters pinned
 
 
 def test_system_prompt_uses_the_shared_routing_guidance(db):
@@ -412,3 +475,27 @@ def test_photos_event_carries_chapter_grouping(db, monkeypatch):
     photos = next(e for e in events if e["type"] == "photos")
     assert photos.get("group_field") == "chapter"
     assert [g["label"] for g in photos["groups"]] == ["Morro Bay, CA", "Big Sur, CA"]
+
+
+def test_grouping_is_shape_based_not_name_based(db, monkeypatch):
+    """_grouping_for keys off result shape, so the consolidated `search` tool
+    sections correctly (mode=chapters -> chapter groups) without naming it."""
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search", {"mode": "chapters", "min_photos": 1}),
+        _answer("Two chapters."),
+    ))
+    events = _run(db, "break the trip into chapters")
+    photos = next(e for e in events if e["type"] == "photos")
+    assert photos.get("group_field") == "chapter"
+    assert photos.get("groups")
+
+
+def test_run_agent_consolidated_offers_search_not_family(db, monkeypatch):
+    seen = {}
+    def cap(messages, tools, temperature=0.0, timeout=None, reasoning_effort=None):
+        seen["names"] = {t["function"]["name"] for t in (tools or [])}
+        return _answer("done")
+    monkeypatch.setattr(agent, "_chat", cap)
+    list(agent.run_agent(db, "hi", consolidated=True))
+    assert "search" in seen["names"]
+    assert "search_photos" not in seen["names"] and "daily_highlights" not in seen["names"]

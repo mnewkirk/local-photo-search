@@ -90,28 +90,59 @@ def call_tool(db: PhotoDB, name: str, args: Optional[dict] = None) -> Any:
     return spec.handler(db, args or {})
 
 
-def _visible(spec: ToolSpec, include_images: bool, include_writes: bool) -> bool:
-    """Whether a tool is advertised given the image / write gates. Write tools
-    (M26b) are off by default so a plain ``serve`` never exposes mutation to the
-    LLM; the gate is enforced again at the call boundary in the agent / MCP."""
+# The 5 search-family tools the consolidated `search(mode=...)` tool subsumes.
+# In consolidated mode they're hidden and `search` is offered instead — a weak
+# model (qwen3.5-9b) routes 5/5 by filling one `mode` enum vs ~2-3/5 when it has
+# to pick among these by name (evals/mcp_bakeoff.py routing arm).
+_SEARCH_FAMILY = ("search_photos", "daily_highlights", "representatives",
+                  "group_into_chapters", "daily_scene_breakdown")
+_MODE_TO_TOOL = {"flat": "search_photos", "daily": "daily_highlights",
+                 "per_bucket": "representatives", "chapters": "group_into_chapters",
+                 "scenes": "daily_scene_breakdown"}
+
+
+def consolidated_search_enabled() -> bool:
+    """Whether to offer one ``search(mode=...)`` tool instead of the 5 separate
+    search-family tools. Opt-in via PHOTOSEARCH_CONSOLIDATED_SEARCH (default off,
+    so the shipped MCP surface is unchanged); the agent can also override
+    per-request."""
+    v = os.environ.get("PHOTOSEARCH_CONSOLIDATED_SEARCH")
+    return bool(v) and v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _visible(spec: ToolSpec, include_images: bool, include_writes: bool,
+             consolidated: bool) -> bool:
+    """Whether a tool is advertised given the image / write / consolidation gates.
+    Write tools (M26b) are off by default so a plain ``serve`` never exposes
+    mutation to the LLM; the gate is enforced again at the call boundary."""
     if not include_images and spec.name == "get_photo_image":
         return False
     if spec.writes and not include_writes:
         return False
+    # Consolidation: offer `search` XOR the 5 family tools it subsumes.
+    if consolidated and spec.name in _SEARCH_FAMILY:
+        return False
+    if not consolidated and spec.name == "search":
+        return False
     return True
 
 
-def openai_tools(include_images: bool = True,
-                 include_writes: bool = False) -> list[dict]:
+def _resolve_consolidated(consolidated: Optional[bool]) -> bool:
+    return consolidated_search_enabled() if consolidated is None else consolidated
+
+
+def openai_tools(include_images: bool = True, include_writes: bool = False,
+                 consolidated: Optional[bool] = None) -> list[dict]:
     """Project the registry into OpenAI/LM-Studio ``tools=[...]`` format.
 
     ``include_images=False`` drops ``get_photo_image``; ``include_writes=False``
-    (default) drops the M26b mutation tools — so the model is never even told
-    they exist unless the operator opts in.
+    (default) drops the M26b mutation tools; ``consolidated`` (None = env) offers
+    one ``search(mode=...)`` in place of the 5 search-family tools.
     """
+    consolidated = _resolve_consolidated(consolidated)
     out = []
     for spec in _REGISTRY.values():
-        if not _visible(spec, include_images, include_writes):
+        if not _visible(spec, include_images, include_writes, consolidated):
             continue
         out.append({
             "type": "function",
@@ -124,15 +155,16 @@ def openai_tools(include_images: bool = True,
     return out
 
 
-def mcp_tools(include_images: bool = True,
-              include_writes: bool = False) -> list[dict]:
+def mcp_tools(include_images: bool = True, include_writes: bool = False,
+              consolidated: Optional[bool] = None) -> list[dict]:
     """Project the registry into the shape an MCP ``list_tools`` needs:
     ``[{name, description, inputSchema}]``. The low-level MCP server wraps
     these in ``types.Tool(...)``.
     """
+    consolidated = _resolve_consolidated(consolidated)
     out = []
     for spec in _REGISTRY.values():
-        if not _visible(spec, include_images, include_writes):
+        if not _visible(spec, include_images, include_writes, consolidated):
             continue
         out.append({
             "name": spec.name,
@@ -685,16 +717,25 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
 _register(ToolSpec(
     name="search_photos",
     description=(
-        "Search the photo library. Fill in only the filters you've inferred from "
-        "the user's request; omit the rest. Filters combine as an AND-intersection. "
-        "`query` is free-text semantic search (CLIP) — use it for visual content "
-        "('sunset', 'birthday cake'); omit it for pure metadata searches. `people` "
-        "is a list of registered names (validate with list_people first) and "
-        "matches photos containing ALL of them. `location` matches a place/region "
-        "(validate with list_places). `category`/`visual_tag`/`keyword` filter on "
-        "the controlled vocabulary (validate with list_vocab). Dates are "
-        "YYYY-MM-DD. Returns the matching photos plus `total` — if `total` is far "
-        "larger or smaller than expected, adjust the filters and search again."
+        "Search the photo library and return a single FLAT list (ranked or "
+        "dated). WRONG TOOL if the request wants photos ORGANIZED into groups — "
+        "first check: 'day by day' / 'top N per day' / 'chronological, no "
+        "duplicates' -> use daily_highlights; 'one/a few per year/place/person', "
+        "'best of each ___' -> use representatives; 'break the trip into chapters' "
+        "/ photo-book -> use group_into_chapters. Use search_photos only for a "
+        "plain flat result. "
+        "Fill in only the filters you've inferred; omit the rest. Filters combine "
+        "as an AND-intersection. `query` is free-text semantic search (CLIP) — use "
+        "it ONLY for concrete VISUAL content ('sunset', 'birthday cake'); NEVER "
+        "put topic/meta words like 'trip', 'highlights', 'vacation', 'best' in it "
+        "(CLIP matches nothing and you get 0 results) — express those via dates / "
+        "sort / the grouping tools instead. `people` is a list of registered "
+        "names (validate with list_people first) and matches photos containing "
+        "ALL of them. `location` matches a place/region (validate with "
+        "list_places). `category`/`visual_tag`/`keyword` filter on the controlled "
+        "vocabulary (validate with list_vocab). Dates are YYYY-MM-DD. Returns the "
+        "matching photos plus `total` — if `total` is 0 or far off, drop the "
+        "free-text `query` first, then adjust filters and search again."
     ),
     parameters={
         "type": "object",
@@ -1294,24 +1335,20 @@ def _h_daily_highlights(db: PhotoDB, args: dict) -> dict:
 _register(ToolSpec(
     name="daily_highlights",
     description=(
-        "A chronological day-by-day highlight reel: the best photos PER DAY with "
-        "near-duplicates collapsed. For each day it keeps up to `per_day` photos "
-        "(default 20), and within each day it keeps only the single best frame of "
-        "any burst/near-duplicate group — one representative per burst stack and "
-        "per `window_minutes` time window (default 10) — then returns everything "
-        "in CHRONOLOGICAL order. ONLY use this when the request explicitly asks for "
-        "a PER-DAY quota, chronological/day-by-day order, or de-duplicated bursts "
-        "— e.g. 'top N per day', 'day by day', 'in order, no duplicates', 'best of "
-        "each burst within X minutes'. A plain 'best photos from <trip / date "
-        "range>' is NOT this tool: that is a flat ranked list, so use "
-        "search_photos(date_from, date_to, sort='quality_desc'). search_photos and "
-        "representatives cannot express per-day + time-collapse; this tool cannot "
-        "express a flat overall ranking. Same structured filters as search_photos "
-        "(no free-text `query`). Each day's distinct geotagged places come back in "
-        "`day_summary[].places`. Example: 'best photos between 2026-06-28 and "
-        "2026-07-04, top 20 per day, chronological, avoid duplicates within 10 "
-        "minutes' → date_from='2026-06-28', date_to='2026-07-04', per_day=20, "
-        "window_minutes=10."
+        "THE tool for a day-by-day highlight reel of a trip or date range. USE "
+        "THIS whenever the request says any of: 'day by day', 'day-by-day', 'each "
+        "day', 'per day', 'top N per day', 'best of each day', 'daily', "
+        "'chronological, no duplicates', or asks to summarize a trip in time "
+        "order. It keeps up to `per_day` photos per day (default 20), collapses "
+        "burst/near-duplicate frames within `window_minutes` (default 10) to one "
+        "best frame, and returns them in CHRONOLOGICAL order. Each day's distinct "
+        "geotagged places come back in `day_summary[].places`. (Only for a single "
+        "FLAT 'best of the whole range' with NO per-day structure, use "
+        "search_photos + sort='quality_desc' instead.) Same structured filters as "
+        "search_photos, but NO free-text `query`. Example: 'best photos between "
+        "2026-06-28 and 2026-07-04, top 20 per day, chronological, avoid "
+        "duplicates within 10 minutes' → date_from='2026-06-28', "
+        "date_to='2026-07-04', per_day=20, window_minutes=10."
     ),
     parameters={
         "type": "object",
@@ -2602,6 +2639,76 @@ _register(ToolSpec(
 
 
 # ---------------------------------------------------------------------------
+# Consolidated search — one tool, `mode` dispatches to the family handlers
+# ---------------------------------------------------------------------------
+#
+# A weak model routes far better by filling one `mode` enum than by choosing
+# among 5 similarly-shaped tools (it defaults to the general one). This tool
+# subsumes search_photos / daily_highlights / representatives /
+# group_into_chapters / daily_scene_breakdown; `mode` selects which handler
+# runs. Opt-in (consolidated_search_enabled) — when on, the projections hide
+# the 5 originals and offer this instead. Reuses their handlers verbatim.
+
+def _h_search(db: PhotoDB, args: dict) -> dict:
+    mode = (args.get("mode") or "flat").strip().lower()
+    sub = _MODE_TO_TOOL.get(mode)
+    if sub is None:
+        return {"error": f"unknown mode: {mode}. "
+                         "Use flat | daily | per_bucket | chapters | scenes."}
+    inner = {k: v for k, v in args.items() if k != "mode"}
+    # dispatch to the original handler; it ignores any params it doesn't use
+    return _REGISTRY[sub].handler(db, inner)
+
+
+def _build_search_schema() -> dict:
+    """Union every family tool's params under one schema + the `mode` selector,
+    so the consolidated tool stays in lockstep with the originals automatically
+    (no 6th copy of the filter vocabulary)."""
+    props: dict = {
+        "mode": {
+            "type": "string",
+            "enum": ["flat", "daily", "per_bucket", "chapters", "scenes"],
+            "description": (
+                "REQUIRED — how to shape the results; pick from the request:\n"
+                "- 'flat': one plain ranked/dated list (DEFAULT). 'photos of X', "
+                "'best beach shots', 'most recent'.\n"
+                "- 'daily': a day-by-day highlight reel — top `per_day` per day, "
+                "chronological, bursts collapsed. Triggers: 'day by day', 'per "
+                "day', 'each day', 'best of each day', 'chronological, no dupes'.\n"
+                "- 'per_bucket': the best N per year/month/place/person — a "
+                "representative SPREAD. 'one per year', 'a few from each place', "
+                "'best of each ___'. Set `bucket` + `n`.\n"
+                "- 'chapters': place-based photo-book chapters of a trip. 'break "
+                "the trip into chapters', 'make a photobook'.\n"
+                "- 'scenes': sub-scenes within a single day (needs a `day`)."
+            ),
+        },
+    }
+    # setdefault so the first (search_photos) definition of a shared key wins —
+    # its wording is the most general.
+    for name in _SEARCH_FAMILY:
+        for k, v in _REGISTRY[name].parameters.get("properties", {}).items():
+            props.setdefault(k, v)
+    return {"type": "object", "properties": props, "required": ["mode"],
+            "additionalProperties": False}
+
+
+_register(ToolSpec(
+    name="search",
+    description=(
+        "Search the photo library — the ONE tool for every photo request. The "
+        "`mode` argument shapes the results: a flat list, a day-by-day reel, a "
+        "per-year/place/person spread, or photo-book chapters. Also takes the "
+        "usual filters (people, location, dates, category, visual_tag, min_quality, "
+        "camera, …). Validate people/places/vocab with the list_* tools first when "
+        "you don't already know the exact stored values."
+    ),
+    parameters=_build_search_schema(),
+    handler=_h_search,
+))
+
+
+# ---------------------------------------------------------------------------
 # Cross-tool routing guidance (shared by both adapters)
 # ---------------------------------------------------------------------------
 #
@@ -2618,7 +2725,7 @@ _register(ToolSpec(
 
 GROUNDING_WITH_FACTS = (
     "You are given LIBRARY FACTS below (people, places, tags, date span), so "
-    "usually go STRAIGHT to search_photos — you do NOT need get_library_overview "
+    "usually go STRAIGHT to searching — you do NOT need get_library_overview "
     "or the list_* tools. Use list_* only to look up something not in the facts."
 )
 
@@ -2730,6 +2837,48 @@ ROUTING_GUIDANCE = (
     "location\n"
 )
 
+# Routing guidance for CONSOLIDATED mode. The `mode` enum in the schema already
+# carries tool selection, so this is just the cross-cutting rules — much shorter
+# than ROUTING_GUIDANCE, and it never names tools the model isn't offered.
+CONSOLIDATED_GUIDANCE = (
+    "Rules:\n"
+    "- Every photo request is ONE `search` call. Set `mode` "
+    "(flat/daily/per_bucket/chapters/scenes) from the request; add only the "
+    "filters you inferred and omit the rest.\n"
+    "- Dates: set date_from/date_to only when the request implies a time range, "
+    "computed from today's date. NEVER filter by today for a request that isn't "
+    "about today.\n"
+    "- 'best'/'top'/'favorite'/'good' → sort='quality_desc' (usually mode='flat'). "
+    "Do NOT put those words in `query`, and do NOT add a min_quality/min_aesthetic "
+    "floor unless the user gives an explicit bar ('quality above 7').\n"
+    "- `query` is CLIP visual content ONLY ('sunset', 'birthday cake') — NEVER "
+    "topic words like 'trip', 'highlights', 'vacation' (CLIP matches nothing → 0 "
+    "results). Express a trip via date_from/date_to + the right `mode`.\n"
+    "- EXCLUDE with `query`: a leading '-' or 'no <thing>', e.g. "
+    "query='landscape -people'.\n"
+    "- Resolve group terms ('the kids', 'the family', 'everyone') to the specific "
+    "registered names as a `people` list (AND-intersected).\n"
+    "- Read `total`: if 0, DROP `query` first, then relax a secondary filter; if "
+    "huge, add one. Never drop the person the user named to manufacture results.\n"
+    "- FRAMING / who-else-is-in-it are metadata flags, not vision: "
+    "only_these_people / faces_in_frame. Only when a constraint truly needs eyes "
+    "('the one where X is doing Y', 'sharpest', a specific activity) get candidates "
+    "then call rerank_photos(photo_ids=…, criteria=…).\n"
+    "- Then write a 1-3 sentence answer explaining how you interpreted the request "
+    "(which mode + filters and why). Never list photo ids.\n"
+    "Examples:\n"
+    "  'photos of Calvin' → search(mode='flat', people=['Calvin'])\n"
+    "  'best beach photos last summer' → search(mode='flat', query='beach', "
+    "date_from=<jun1 last yr>, date_to=<aug31 last yr>, sort='quality_desc')\n"
+    "  'day by day highlights of our Italy trip' → search(mode='daily', "
+    "location='Italy', date_from=…, date_to=…, per_day=10)\n"
+    "  'one best photo per year of Matt' → search(mode='per_bucket', "
+    "people=['Matt'], bucket='year', n=1)\n"
+    "  'break our Europe trip into chapters' → search(mode='chapters', "
+    "date_from=…, date_to=…)\n"
+)
+
+
 WRITE_GUIDANCE = (
     "\n\nWRITES (you can edit the library): set_photo_location, set_photo_tags, "
     "and add_to_collection mutate the library. STRICT protocol:\n"
@@ -2746,21 +2895,29 @@ WRITE_GUIDANCE = (
 )
 
 
-def server_instructions(include_writes: bool = False,
-                        library_facts: str = "") -> str:
+def routing_guidance(consolidated: Optional[bool] = None) -> str:
+    """The routing rules matching the offered tool surface — the compact
+    mode-based text in consolidated mode, the per-tool text otherwise."""
+    return CONSOLIDATED_GUIDANCE if _resolve_consolidated(consolidated) \
+        else ROUTING_GUIDANCE
+
+
+def server_instructions(include_writes: bool = False, library_facts: str = "",
+                        consolidated: Optional[bool] = None) -> str:
     """The MCP ``Server(instructions=...)`` text: the routing knowledge an MCP
     host should put in front of these tools. Mirrors what agent.py puts in its
     system prompt, minus the agent-only recovery machinery.
 
     ``library_facts`` (from agent._library_context) flips the grounding directive
     — with the facts in hand the model should skip the list_* round-trips.
+    ``consolidated`` (None = env) picks the guidance matching the tool surface.
     """
     parts = ["You are a photo-library search assistant. The user describes what "
              "they want in natural language; find the matching photos with these "
              "tools, then give a one- or two-sentence answer.\n"]
     parts.append((GROUNDING_WITH_FACTS if library_facts
                   else GROUNDING_WITHOUT_FACTS) + "\n")
-    parts.append(ROUTING_GUIDANCE)
+    parts.append(routing_guidance(consolidated))
     if include_writes:
         parts.append(WRITE_GUIDANCE)
     if library_facts:

@@ -3842,6 +3842,15 @@ async def api_ask(request: Request):
         if isinstance(thinking, str):
             thinking = thinking.strip().lower() in ("1", "true", "yes", "on")
         reasoning_effort = "" if thinking else "none"
+    # Consolidated-search toggle. When true, the agent is offered ONE
+    # search(mode=...) tool instead of the 5 separate search-family tools — a
+    # ~44% smaller prompt (fits small contexts; ~11s less cold prefill) that
+    # routes on par at adequate context. Omit to use PHOTOSEARCH_CONSOLIDATED_SEARCH.
+    consolidated = data.get("consolidated")
+    if isinstance(consolidated, str):
+        consolidated = consolidated.strip().lower() in ("1", "true", "yes", "on")
+    elif not isinstance(consolidated, bool):
+        consolidated = None
     if not message:
         raise HTTPException(400, "message is required")
 
@@ -3860,6 +3869,7 @@ async def api_ask(request: Request):
                     should_abort=cancel_event.is_set,
                     locked_filters=locked_filters,
                     reasoning_effort=reasoning_effort,
+                    consolidated=consolidated,
                 ):
                     _emit(event)
                     if cancel_event.is_set():
