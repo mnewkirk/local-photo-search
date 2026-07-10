@@ -2119,11 +2119,19 @@ def normalize_subject_aesthetics(db, apply):
                    "cap — use after fixing a root cause. The fleet does the work.")
 @click.option("--requeue-passes", default=None,
               help="Comma-separated subset of passes for --requeue (default: all four).")
+@click.option("--normalize-aesthetics", is_flag=True, default=False,
+              help="Force a full re-rank of the full-frame aesthetic percentile "
+                   "(aes_overall_pct) across the whole library, even with nothing "
+                   "missing — after a scoring batch or a weight retune.")
+@click.option("--normalize-subject-aesthetics", is_flag=True, default=False,
+              help="Force a full re-rank of the subject-crop aesthetic percentile "
+                   "(aes_subject_overall_pct) across the whole library.")
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
 def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, recluster,
-                      dedup_photos, requeue, requeue_passes, window_minutes,
+                      dedup_photos, requeue, requeue_passes, normalize_aesthetics,
+                      normalize_subject_aesthetics, window_minutes,
                       max_drift_km, min_confidence):
     """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
 
@@ -2159,6 +2167,8 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
                 pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
                 do_match=not no_match, do_recluster=recluster, do_dedup=dedup_photos,
                 do_requeue=requeue, requeue_passes=rq_passes,
+                force_normalize_aesthetics=normalize_aesthetics,
+                force_normalize_subject_aesthetics=normalize_subject_aesthetics,
                 window_minutes=window_minutes,
                 max_drift_km=max_drift_km, min_confidence=min_confidence,
                 on_progress=on_prog)

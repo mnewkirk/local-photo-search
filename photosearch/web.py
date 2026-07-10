@@ -25,7 +25,7 @@ import numpy as np
 logger = logging.getLogger("photosearch.web")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-from fastapi import FastAPI, Query, HTTPException, Response, Request
+from fastapi import FastAPI, Query, HTTPException, Response, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -219,6 +219,30 @@ def _fetch_from_nas(photo_id: int, kind: str, timeout: float = 30.0) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "photosearch-replica"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def _nas_json(method: str, path: str, body: Optional[dict] = None,
+              timeout: float = 120.0) -> dict:
+    """Call a NAS write/compute endpoint (replica mode) and return its JSON.
+
+    Used by the face-edit endpoints so features 4/5/6 work from the replica UI:
+    the compute (InsightFace + originals) only exists on the NAS, so the replica
+    proxies the mutation there, then mirrors the touched photo's face rows back
+    into the local DB. Raises on any non-2xx so callers can surface it."""
+    import urllib.request
+    import urllib.error
+    url = f"{_nas_url}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"User-Agent": "photosearch-replica",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        raise HTTPException(status_code=e.code, detail=f"NAS: {detail}")
 
 
 def _cache_bytes_atomic(path: str, data: bytes) -> None:
@@ -1124,16 +1148,22 @@ def api_photo_mirror_fields(photo_id: int):
         try:
             for fr in db.conn.execute(
                 """SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                          f.det_score, e.encoding
+                          f.det_score, f.person_id, f.cluster_id, f.match_source,
+                          e.encoding
                      FROM faces f LEFT JOIN face_encodings e ON e.face_id = f.id
                     WHERE f.photo_id = ?""", (photo_id,)).fetchall():
                 enc = (list(_deserialize_float_list(fr["encoding"], FACE_DIMENSIONS))
                        if fr["encoding"] is not None else [])
+                # person_id/cluster_id mirror verbatim — the replica is a full DB
+                # copy so ids match — preserving assignments across a face mirror.
                 faces.append({
                     "bbox": [fr["bbox_top"], fr["bbox_right"],
                              fr["bbox_bottom"], fr["bbox_left"]],
                     "encoding": enc,
                     "det_score": fr["det_score"],
+                    "person_id": fr["person_id"],
+                    "cluster_id": fr["cluster_id"],
+                    "match_source": fr["match_source"],
                 })
         except Exception:
             pass
@@ -1153,7 +1183,7 @@ def api_photo_detail(photo_id: int):
         faces = db.conn.execute(
             """SELECT f.id, f.person_id, f.bbox_top, f.bbox_right,
                       f.bbox_bottom, f.bbox_left, f.cluster_id,
-                      f.match_source, p.name as person_name
+                      f.match_source, f.det_score, p.name as person_name
                FROM faces f
                LEFT JOIN persons p ON p.id = f.person_id
                WHERE f.photo_id = ?""",
@@ -1173,6 +1203,7 @@ def api_photo_detail(photo_id: int):
                 } if f["bbox_top"] is not None else None,
                 "cluster_id": f["cluster_id"],
                 "match_source": f["match_source"],
+                "det_score": f["det_score"],
             })
 
         colors = []
@@ -1318,6 +1349,109 @@ def api_clear_face(face_id: int):
         )
         db.conn.commit()
         return {"ok": True}
+
+
+def _abs_photo_path(db, photo: dict) -> str:
+    """Absolute path to a photo's original file (photo_root + relative path)."""
+    fp = photo["filepath"]
+    if db.photo_root and not os.path.isabs(fp):
+        return str(Path(db.photo_root) / fp)
+    return fp
+
+
+def _mirror_face_photo(photo_id: int) -> dict:
+    """Replica-mode helper: re-sync one photo's authoritative face rows from the
+    NAS into the local DB after a NAS-side face mutation. Returns mirror stats."""
+    from . import rerun
+    with _get_db() as db:
+        return rerun.mirror_photos(db, [photo_id])
+
+
+@app.delete("/api/faces/{face_id}")
+def api_delete_face(face_id: int):
+    """Delete a face detection box entirely (row + vec0 encoding). Distinct from
+    /clear, which only removes the person assignment. Used to drop spurious
+    detections (e.g. a mis-fired box on a non-face).
+
+    Replica mode: proxy the delete to the NAS (authoritative), then mirror the
+    photo's faces back so the local grid updates without a full sync."""
+    if _nas_url:
+        with _get_db() as db:
+            row = db.conn.execute(
+                "SELECT photo_id FROM faces WHERE id = ?", (face_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Face not found")
+        photo_id = row["photo_id"]
+        resp = _nas_json("DELETE", f"/api/faces/{face_id}")
+        resp["mirror"] = _mirror_face_photo(photo_id)
+        return resp
+    with _get_db() as db:
+        if not db.delete_face(face_id):
+            raise HTTPException(404, "Face not found")
+        db.conn.commit()
+        logger.info("FACE DELETE  face_id=%d", face_id)
+        return {"ok": True, "face_id": face_id}
+
+
+@app.post("/api/photos/{photo_id}/detect-faces")
+def api_redetect_faces(photo_id: int, data: dict = Body(default=None)):
+    """Manually re-run face detection on one photo. Body `{replace?: bool}`.
+
+    Default (augment) keeps existing faces and adds only non-overlapping new
+    detections. `replace=true` wipes existing faces first. The compute runs
+    where the originals + InsightFace live (the NAS); in replica mode this
+    proxies there and mirrors the result locally."""
+    replace = bool((data or {}).get("replace"))
+    if _nas_url:
+        resp = _nas_json("POST", f"/api/photos/{photo_id}/detect-faces",
+                         {"replace": replace})
+        resp["mirror"] = _mirror_face_photo(photo_id)
+        return resp
+    with _get_db() as db:
+        photo = db.get_photo(photo_id)
+        if not photo:
+            raise HTTPException(404, "Photo not found")
+        abs_path = _abs_photo_path(db, photo)
+        if not os.path.exists(abs_path):
+            raise HTTPException(400, "original image not available on this host")
+        try:
+            from .face_edit import redetect_photo_faces
+            result = redetect_photo_faces(db, photo_id, abs_path, replace=replace)
+        except Exception as e:
+            logger.exception("re-detect faces failed for photo %d", photo_id)
+            raise HTTPException(500, f"detection failed: {e}")
+        logger.info("FACE REDETECT photo_id=%d %s", photo_id, result)
+        return result
+
+
+@app.post("/api/photos/{photo_id}/add-face-box")
+def api_add_face_box(photo_id: int, data: dict = Body(...)):
+    """Add a face at a user-drawn box. Body `{bbox: {top,right,bottom,left} in
+    0-1 EXIF-oriented coords, person?: name}`. Crops the box and runs InsightFace
+    to recover an encoding; stores the box with no encoding if none is found.
+    Replica mode proxies to the NAS (which has the original) and mirrors back."""
+    bbox = data.get("bbox")
+    if not bbox:
+        raise HTTPException(400, "bbox required (normalized 0-1)")
+    person = (data.get("person") or "").strip() or None
+    if _nas_url:
+        resp = _nas_json("POST", f"/api/photos/{photo_id}/add-face-box",
+                         {"bbox": bbox, "person": person})
+        resp["mirror"] = _mirror_face_photo(photo_id)
+        return resp
+    with _get_db() as db:
+        photo = db.get_photo(photo_id)
+        if not photo:
+            raise HTTPException(404, "Photo not found")
+        abs_path = _abs_photo_path(db, photo)
+        if not os.path.exists(abs_path):
+            raise HTTPException(400, "original image not available on this host")
+        from .face_edit import add_manual_face
+        result = add_manual_face(db, photo_id, abs_path, photo, bbox, person_name=person)
+        if not result.get("ok"):
+            raise HTTPException(500, result.get("error", "add face failed"))
+        logger.info("FACE ADD-BOX photo_id=%d %s", photo_id, result)
+        return result
 
 
 @app.post("/api/faces/bulk-collect")
@@ -3456,6 +3590,12 @@ async def api_maintenance_sweep(request: Request):
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
     do_requeue = bool(data.get("do_requeue", False))
+    # Opt-in full re-rank of the aesthetic percentiles — needed after a scoring
+    # batch shifts the distribution (missing-only fills new rows but doesn't
+    # re-rank existing ones) or after retuning the dimension weights.
+    force_normalize_aesthetics = bool(data.get("force_normalize_aesthetics", False))
+    force_normalize_subject_aesthetics = bool(
+        data.get("force_normalize_subject_aesthetics", False))
     requeue_passes = data.get("requeue_passes") or None
     if requeue_passes is not None and not isinstance(requeue_passes, (list, tuple)):
         raise HTTPException(400, "requeue_passes must be a list of pass names")
@@ -3508,6 +3648,8 @@ async def api_maintenance_sweep(request: Request):
                     do_recluster=do_recluster,
                     do_dedup=do_dedup,
                     do_requeue=do_requeue,
+                    force_normalize_aesthetics=force_normalize_aesthetics,
+                    force_normalize_subject_aesthetics=force_normalize_subject_aesthetics,
                     requeue_passes=tuple(requeue_passes) if requeue_passes else None,
                     window_minutes=window_minutes,
                     max_drift_km=max_drift_km,

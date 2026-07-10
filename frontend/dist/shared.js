@@ -353,6 +353,20 @@
 
     var editInputRef = useRef(null);
 
+    // ---- Manual face detection / box editing (features 4-6) ----
+    var _faceBusy = useState(null);      // status message string | null
+    var faceBusy = _faceBusy[0];
+    var setFaceBusy = _faceBusy[1];
+
+    var _addingBox = useState(false);    // "Add face box" drag mode armed
+    var addingBox = _addingBox[0];
+    var setAddingBox = _addingBox[1];
+
+    var _dragBox = useState(null);       // live drag rect in normalized 0-1 coords
+    var dragBox = _dragBox[0];
+    var setDragBox = _dragBox[1];
+    var dragStartRef = useRef(null);
+
     // ---- Image rect for face bounding boxes ----
     var _imgRect = useState(null);
     var imgRect = _imgRect[0];
@@ -502,6 +516,69 @@
         .catch(function () { cancelEdit(); });
     }, [onFaceAssigned, cancelEdit, updateDetailFace]);
 
+    // Delete a face detection box entirely (feature 4). Distinct from Unset,
+    // which only removes the person name; this drops the row + encoding.
+    var deleteFaceBox = useCallback(function (faceId) {
+      setFaceBusy('Removing box…');
+      fetch(API + '/api/faces/' + faceId, { method: 'DELETE' })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (res.ok) {
+            setFaceBusy(null);
+            cancelEdit();
+            refreshDetail();
+          } else {
+            setFaceBusy((res.d && res.d.detail) || 'Remove failed');
+          }
+        })
+        .catch(function (e) { setFaceBusy('Remove error: ' + e); });
+    }, [cancelEdit]);
+
+    // Re-run InsightFace on this photo (feature 5). Augment keeps tagged faces
+    // and adds only non-overlapping detections; replace wipes first.
+    var redetectFaces = useCallback(function (replace) {
+      if (!photo) return;
+      setFaceBusy(replace ? 'Re-detecting (replace)…' : 'Detecting faces…');
+      fetch(API + '/api/photos/' + photo.id + '/detect-faces', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ replace: !!replace }),
+      })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (res.ok) {
+            var d = res.d || {};
+            setFaceBusy('Added ' + (d.added || 0) + ', kept ' + (d.kept || 0)
+              + (d.removed ? ', removed ' + d.removed : '') + '.');
+            refreshDetail();
+          } else {
+            setFaceBusy((res.d && res.d.detail) || 'Detection failed');
+          }
+        })
+        .catch(function (e) { setFaceBusy('Detect error: ' + e); });
+    }, [photo]);
+
+    // Persist a hand-drawn face box (feature 6). bbox is normalized 0-1.
+    var addFaceBox = useCallback(function (bbox) {
+      if (!photo) return;
+      setFaceBusy('Adding box…');
+      fetch(API + '/api/photos/' + photo.id + '/add-face-box', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bbox: bbox }),
+      })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (res) {
+          if (res.ok) {
+            var d = res.d || {};
+            setFaceBusy(d.encoded ? 'Face added (encoded — matchable).'
+              : 'Box added (no face found — assign a name manually).');
+            refreshDetail();
+          } else {
+            setFaceBusy((res.d && res.d.detail) || 'Add box failed');
+          }
+        })
+        .catch(function (e) { setFaceBusy('Add box error: ' + e); });
+    }, [photo]);
+
     // ---- Collection helpers ----
     var refreshPhotoColls = useCallback(function () {
       if (!photo) return;
@@ -590,7 +667,47 @@
     // Clear stale imgRect when photo changes so face overlays don't flash
     useEffect(function () {
       setImgRect(null);
+      setAddingBox(false);
+      setDragBox(null);
+      setFaceBusy(null);
+      dragStartRef.current = null;
     }, [photo && photo.id]);
+
+    // ---- Drag-to-add-face-box handlers (feature 6) ----
+    function _evToNorm(ev) {
+      if (!imgRect) return null;
+      var cont = ev.currentTarget.getBoundingClientRect();
+      var x = (ev.clientX - cont.left - imgRect.ox) / imgRect.dw;
+      var y = (ev.clientY - cont.top - imgRect.oy) / imgRect.dh;
+      return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
+    }
+    function onImgMouseDown(ev) {
+      if (!addingBox || !imgRect) return;
+      ev.preventDefault();
+      var p = _evToNorm(ev);
+      dragStartRef.current = p;
+      setDragBox({ left: p.x, top: p.y, right: p.x, bottom: p.y });
+    }
+    function onImgMouseMove(ev) {
+      if (!addingBox || !dragStartRef.current) return;
+      var s = dragStartRef.current, p = _evToNorm(ev);
+      setDragBox({ left: Math.min(s.x, p.x), top: Math.min(s.y, p.y),
+                   right: Math.max(s.x, p.x), bottom: Math.max(s.y, p.y) });
+    }
+    function onImgMouseUp(ev) {
+      if (!addingBox || !dragStartRef.current) return;
+      var s = dragStartRef.current, p = _evToNorm(ev);
+      dragStartRef.current = null;
+      setDragBox(null);
+      setAddingBox(false);
+      var box = { left: Math.min(s.x, p.x), top: Math.min(s.y, p.y),
+                  right: Math.max(s.x, p.x), bottom: Math.max(s.y, p.y) };
+      if ((box.right - box.left) > 0.02 && (box.bottom - box.top) > 0.02) {
+        addFaceBox({ top: box.top, right: box.right, bottom: box.bottom, left: box.left });
+      } else {
+        setFaceBusy('Box too small — cancelled.');
+      }
+    }
 
     // Build face bounding box overlay data
     var faceOverlays = useMemo(function () {
@@ -679,6 +796,11 @@
         return e('div', { key: f.id, className: 'face-edit-panel' },
           e('div', { style: { fontWeight: 600, marginBottom: 2 } },
             f.person_name || ('Unknown #' + (f.cluster_id || '?'))),
+          f.det_score != null && e('div', { style: { fontSize: 10,
+            color: f.det_score < 0.65 ? '#fb923c' : 'var(--text-muted)', marginBottom: 4 } },
+            'detection ' + f.det_score.toFixed(2)
+              + (f.det_score < 0.65 ? ' · low confidence' : '')
+              + (f.match_source === 'manual_box' ? ' · hand-drawn' : '')),
 
           // Pick existing person
           editMode === 'pick' && e('select', {
@@ -703,6 +825,11 @@
               className: 'danger',
               onClick: function () { clearFaceName(f.id); },
             }, 'Unset'),
+            e('button', {
+              className: 'danger',
+              title: 'Delete this detection box entirely',
+              onClick: function () { deleteFaceBox(f.id); },
+            }, 'Remove box'),
             e('button', { onClick: cancelEdit }, 'Cancel'),
           ),
 
@@ -840,33 +967,59 @@
       });
       return e('div', { className: 'detail-section' },
         e('h3', null, 'Aesthetic Evaluation'),
-        e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 } },
-          e('span', { style: { fontSize: 28, fontWeight: 700,
-                               color: _scoreColor(overall) } },
-            pct == null ? (overall == null ? '–' : overall.toFixed(1)) : Math.round(pct)),
-          e('span', { style: { fontSize: 13, color: 'var(--text-muted)' } },
-            pct == null ? '/ 10 overall'
-              : 'percentile · ' + (overall != null ? overall.toFixed(1) + '/10 raw' : '')),
-        ),
         (function () {
-          // Subject-aware quality (v27): the primary subject's crop score, which
-          // judges the subject rather than the background. From aes_raw.
+          // Full-frame vs subject scores, side by side (v27). The subject-crop
+          // score judges the primary subject rather than the background; search
+          // ranks on the subject score when present, else the full-frame score
+          // (COALESCE(aes_subject_overall_pct, aes_overall_pct)) — the RANKED
+          // badge marks whichever one that is.
           var raw = (detail && detail.aes_raw) || {};
           var so = raw.aes_subject_overall, sp = raw.aes_subject_overall_pct;
           var boxes = (detail && detail.subject_boxes) || null;
-          if (so != null) {
-            var lbl = boxes && boxes.length ? (boxes[0].label || 'subject') : 'subject';
-            return e('div', { style: { fontSize: 13, marginBottom: 10, padding: '5px 9px',
-                                       background: 'var(--surface2)', borderRadius: 6 } },
-              e('span', { style: { color: 'var(--text-muted)' } }, 'Subject (' + lbl + '): '),
-              e('span', { style: { fontWeight: 700, color: _scoreColor(so) } },
-                (sp != null ? Math.round(sp) + ' pct' : '') + ' · ' + so.toFixed(1) + '/10'));
+          var subjScored = so != null;
+          var subjLabels = (boxes && boxes.length)
+            ? boxes.map(function (bx) { return bx.label || 'subject'; }).join(', ')
+            : null;
+          var LBL = { fontSize: 11, color: 'var(--text-muted)', width: 74,
+                      textTransform: 'uppercase', letterSpacing: '0.04em' };
+          function rankBadge() {
+            return e('span', { title: 'Score search ranks this photo on',
+              style: { fontSize: 10, fontWeight: 700, marginLeft: 6, padding: '1px 6px',
+                       borderRadius: 8, background: '#2563eb', color: '#fff',
+                       verticalAlign: 'middle', letterSpacing: '0.04em' } }, 'RANKED');
           }
-          if (boxes && boxes.length === 0) {
-            return e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 10 } },
-              'No distinct subject — scored on the full frame.');
-          }
-          return null;
+          return e('div', null,
+            // Full-frame headline
+            e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8,
+                                marginBottom: (subjScored || subjLabels) ? 6 : 10 } },
+              e('span', { style: LBL }, 'Full frame'),
+              e('span', { style: { fontSize: 26, fontWeight: 700, color: _scoreColor(overall) } },
+                pct == null ? (overall == null ? '–' : overall.toFixed(1)) : Math.round(pct)),
+              e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } },
+                pct == null ? '/ 10'
+                  : 'pct' + (overall != null ? ' · ' + overall.toFixed(1) + '/10' : '')),
+              !subjScored && rankBadge(),
+            ),
+            // Subject score (only when the subject was separately crop-scored)
+            subjScored && e('div', { style: { display: 'flex', alignItems: 'baseline',
+                                              gap: 8, marginBottom: 10 } },
+              e('span', { style: LBL }, 'Subject'),
+              e('span', { style: { fontSize: 26, fontWeight: 700, color: _scoreColor(so) } },
+                sp != null ? Math.round(sp) : so.toFixed(1)),
+              e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } },
+                (sp != null ? 'pct · ' : '') + so.toFixed(1) + '/10'
+                  + (subjLabels ? ' · ' + subjLabels : '')),
+              rankBadge(),
+            ),
+            // Grounded, but the subject fills the frame → no separate crop score.
+            !subjScored && subjLabels && e('div', { style: { fontSize: 12,
+              color: 'var(--text-muted)', marginBottom: 10 } },
+              'Subject: ' + subjLabels + ' — fills the frame, scored on the full frame.'),
+            // Grounded, no distinct subject (landscape).
+            !subjScored && boxes && boxes.length === 0 && e('div', { style: { fontSize: 12,
+              color: 'var(--text-muted)', marginBottom: 10 } },
+              'No distinct subject — scored on the full frame.'),
+          );
         })(),
         bars,
         facetRows.length > 0 && e('div', { style: { marginTop: 8 } },
@@ -1024,26 +1177,47 @@
       total > 1 && onNext && e('button', { className: 'modal-nav next', onClick: function (ev) { ev.stopPropagation(); onNext(); }, title: 'Next (\u2192)' }, '\u203A'),
       e('div', { className: 'modal' },
         // Image pane
-        e('div', { className: 'modal-image', style: { position: 'relative' } },
+        e('div', { className: 'modal-image',
+                   style: { position: 'relative', cursor: addingBox ? 'crosshair' : 'default' },
+                   onMouseDown: onImgMouseDown,
+                   onMouseMove: onImgMouseMove,
+                   onMouseUp: onImgMouseUp,
+                   onMouseLeave: function () { if (addingBox) { dragStartRef.current = null; setDragBox(null); } } },
           e('img', {
             key: 'photo-' + photo.id,
             ref: imgRef,
             src: API + '/api/photos/' + photo.id + '/preview',
             alt: photo.filename,
             onLoad: updateImgRect,
+            draggable: false,
           }),
-          // Face bounding box overlays (only for hovered face)
-          faceOverlays.filter(function (ov) { return hoveredFace === ov.id; }).map(function (ov) {
+          // Face bounding box overlays (hovered face, or ALL while arming a box
+          // so the user sees what already exists before drawing a new one).
+          faceOverlays.filter(function (ov) { return addingBox || hoveredFace === ov.id; }).map(function (ov) {
+            var active = hoveredFace === ov.id;
             return e('div', {
               key: 'bbox-' + ov.id,
               className: 'face-bbox-overlay',
-              style: Object.assign({}, ov.style, { borderColor: '#4ade80' }),
+              style: Object.assign({}, ov.style,
+                { borderColor: '#4ade80', opacity: (addingBox && !active) ? 0.4 : 1 }),
             },
               e('span', {
                 className: 'face-bbox-label',
                 style: { background: '#4ade80', color: '#000' },
               }, ov.label),
             );
+          }),
+          // Live drag rectangle while drawing a new box.
+          addingBox && dragBox && imgRect && e('div', {
+            className: 'face-bbox-overlay',
+            style: {
+              position: 'absolute',
+              left: imgRect.ox + dragBox.left * imgRect.dw,
+              top: imgRect.oy + dragBox.top * imgRect.dh,
+              width: (dragBox.right - dragBox.left) * imgRect.dw,
+              height: (dragBox.bottom - dragBox.top) * imgRect.dh,
+              border: '2px dashed #60a5fa', background: 'rgba(96,165,250,0.15)',
+            },
           }),
         ),
 
@@ -1216,9 +1390,39 @@
           ),
 
           // Faces
-          showFaces && detail && detail.faces && detail.faces.length > 0 && e('div', { className: 'detail-section' },
+          showFaces && detail && detail.faces && e('div', { className: 'detail-section' },
             e('h3', null, 'People'),
-            detail.faces.map(renderFaceTag),
+            detail.faces.length > 0
+              ? detail.faces.map(renderFaceTag)
+              : e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 } },
+                  'No faces detected.'),
+            // Detection tools (features 5 + 6). Compute runs on the NAS (originals
+            // + InsightFace); replica mode proxies + mirrors, so it works here too.
+            (function () {
+              var btn = { fontSize: 11, padding: '3px 9px', borderRadius: 4,
+                          border: '1px solid var(--border)', background: 'var(--surface2)',
+                          color: 'var(--text)', cursor: 'pointer' };
+              var btnActive = Object.assign({}, btn, { background: '#2563eb',
+                                                       borderColor: '#2563eb', color: '#fff' });
+              return e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 } },
+                e('button', { style: btn, disabled: !!addingBox,
+                  onClick: function () { redetectFaces(false); } }, 'Detect faces'),
+                detail.faces.length > 0 && e('button', { style: btn,
+                  title: 'Delete all faces on this photo and re-detect from scratch',
+                  onClick: function () {
+                    if (window.confirm('Replace all faces on this photo? This wipes any names you assigned.'))
+                      redetectFaces(true);
+                  } }, 'Re-detect (replace)'),
+                e('button', { style: addingBox ? btnActive : btn,
+                  onClick: function () {
+                    var next = !addingBox;
+                    setAddingBox(next);
+                    setFaceBusy(next ? 'Draw a box around the face on the image →' : null);
+                  } }, addingBox ? 'Cancel box' : 'Add face box'),
+              );
+            })(),
+            faceBusy && e('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 6 } },
+              faceBusy),
           ),
 
           // Aesthetic quality

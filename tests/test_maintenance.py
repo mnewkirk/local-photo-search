@@ -60,6 +60,27 @@ def seeded_db(tmp_db_path):
     db.close()
 
 
+def test_force_normalize_aesthetics_reranks_when_nothing_missing(seeded_db):
+    # Two scored photos that ALREADY have percentiles (nothing missing) — the
+    # default missing-only stage skips, but force re-ranks the whole library.
+    from photosearch import maintenance
+    c = seeded_db.conn
+    ids = [r[0] for r in c.execute("SELECT id FROM photos ORDER BY id LIMIT 2").fetchall()]
+    c.execute("UPDATE photos SET aes_overall=?, aes_overall_pct=? WHERE id=?", (7.0, 50.0, ids[0]))
+    c.execute("UPDATE photos SET aes_overall=?, aes_overall_pct=? WHERE id=?", (5.0, 50.0, ids[1]))
+    seeded_db.conn.commit()
+
+    skipped = maintenance._stage_normalize_aesthetics(seeded_db, True, lambda e: None, lambda: None)
+    assert skipped["status"] == "skipped"  # nothing missing → default no-op
+
+    forced = maintenance._stage_normalize_aesthetics(
+        seeded_db, True, lambda e: None, lambda: None, force=True)
+    assert forced["status"] == "done" and forced["applied"] == 2
+    pcts = dict(c.execute(
+        "SELECT id, aes_overall_pct FROM photos WHERE id IN (?,?)", (ids[0], ids[1])).fetchall())
+    assert pcts[ids[0]] != pcts[ids[1]]  # re-ranked apart
+
+
 # ---------------------------------------------------------------------------
 # Sweep predicates (dry-run)
 # ---------------------------------------------------------------------------

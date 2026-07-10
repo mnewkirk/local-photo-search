@@ -340,6 +340,13 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
             db.conn.execute(f"DELETE FROM face_encodings WHERE face_id IN ({ph})", old)
             db.conn.execute("DELETE FROM faces WHERE photo_id=?", (photo_id,))
         for f in faces:
-            db.add_face(photo_id=photo_id, bbox=tuple(f["bbox"]),
-                        encoding=f["encoding"], det_score=f.get("det_score"))
+            fid = db.add_face(photo_id=photo_id, bbox=tuple(f["bbox"]),
+                              encoding=f["encoding"], det_score=f.get("det_score"),
+                              person_id=f.get("person_id"),
+                              cluster_id=f.get("cluster_id"))
+            # match_source isn't an add_face param — set it so mirrored manual /
+            # temporal assignments keep their provenance locally.
+            if f.get("match_source") is not None:
+                db.conn.execute("UPDATE faces SET match_source=? WHERE id=?",
+                                (f["match_source"], fid))
     db.conn.commit()

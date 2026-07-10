@@ -245,20 +245,25 @@ def _stage_colors(db, apply, emit, check_abort, batch_size=100):
     return {"stage": "colors", "would": would, "applied": applied, "status": "done"}
 
 
-def _stage_normalize_aesthetics(db, apply, emit, check_abort):
+def _stage_normalize_aesthetics(db, apply, emit, check_abort, force=False):
     """Refresh aes_overall_pct (library-relative percentile) when new photos
     have been scored by the fleet's aesthetics pass. The VLM scoring itself is
     a heavy worker pass and is NOT run here — this only recomputes the cheap
     percentile so newly-scored photos rank correctly. Percentile is a whole-
     library statistic, so any row missing a percentile triggers a full recompute.
+
+    ``force`` recomputes the whole-library percentile even when nothing is
+    missing — needed after a big scoring batch (every new row already got a
+    percentile from the missing-only trigger, but the DISTRIBUTION shifted, so
+    existing rows must be re-ranked) or after retuning the dimension weights.
     """
     would = db.conn.execute(
         "SELECT COUNT(*) FROM photos "
         "WHERE aes_overall IS NOT NULL AND aes_overall_pct IS NULL"
     ).fetchone()[0]
-    if would == 0 or not apply:
+    if (would == 0 and not force) or not apply:
         return {"stage": "normalize_aesthetics", "would": would, "applied": 0,
-                "status": "skipped" if would == 0 else "preview"}
+                "status": "skipped" if (would == 0 and not force) else "preview"}
     from .aesthetics import normalize_overall
     n = normalize_overall(db, apply=True)
     emit({"phase": "sweep", "stage": "normalize_aesthetics", "status": "running",
@@ -267,18 +272,20 @@ def _stage_normalize_aesthetics(db, apply, emit, check_abort):
             "status": "done"}
 
 
-def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort):
+def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort, force=False):
     """Refresh aes_subject_overall_pct (library-relative percentile of the
     subject-crop score) when new photos have been subject-scored by the fleet.
     Cheap percentile recompute only — the VLM subject scoring is a worker pass.
-    See photosearch/subjects.py + docs/plans/subject-aware-quality.md."""
+    ``force`` re-ranks the whole library even with nothing missing (post-batch
+    distribution shift / weight retune). See photosearch/subjects.py +
+    docs/plans/subject-aware-quality.md."""
     would = db.conn.execute(
         "SELECT COUNT(*) FROM photos "
         "WHERE aes_subject_overall IS NOT NULL AND aes_subject_overall_pct IS NULL"
     ).fetchone()[0]
-    if would == 0 or not apply:
+    if (would == 0 and not force) or not apply:
         return {"stage": "normalize_subject_aesthetics", "would": would, "applied": 0,
-                "status": "skipped" if would == 0 else "preview"}
+                "status": "skipped" if (would == 0 and not force) else "preview"}
     from .aesthetics import normalize_subject_overall
     n = normalize_subject_overall(db, apply=True)
     emit({"phase": "sweep", "stage": "normalize_subject_aesthetics", "status": "running",
@@ -674,6 +681,8 @@ def run_maintenance_sweep(
     do_recluster: bool = False,
     do_dedup: bool = False,
     do_requeue: bool = False,
+    force_normalize_aesthetics: bool = False,
+    force_normalize_subject_aesthetics: bool = False,
     requeue_passes: Optional[tuple] = None,
     window_minutes: int = 30,
     max_drift_km: float = 25.0,
@@ -738,9 +747,13 @@ def run_maintenance_sweep(
         plan.append(("match_faces", lambda: _stage_match_faces(db, apply, emit, check_abort)))
     plan.append(("resolve_dups", lambda: _stage_resolve_dups(db, apply, emit, check_abort)))
     plan.append(("normalize_aesthetics",
-                 lambda: _stage_normalize_aesthetics(db, apply, emit, check_abort)))
+                 lambda: _stage_normalize_aesthetics(
+                     db, apply, emit, check_abort,
+                     force=force_normalize_aesthetics)))
     plan.append(("normalize_subject_aesthetics",
-                 lambda: _stage_normalize_subject_aesthetics(db, apply, emit, check_abort)))
+                 lambda: _stage_normalize_subject_aesthetics(
+                     db, apply, emit, check_abort,
+                     force=force_normalize_subject_aesthetics)))
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
 

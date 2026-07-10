@@ -968,6 +968,16 @@ class PhotoDB:
         self._maybe_commit()
         return face_id
 
+    def delete_face(self, face_id: int) -> bool:
+        """Delete a single face row and its vec0 encoding. Returns True if a
+        face row was removed. The face_encodings virtual table can't cascade
+        (FKs don't reach vec0), so delete it explicitly — same reason
+        cleanup-orphans exists."""
+        cur = self.conn.execute("DELETE FROM faces WHERE id = ?", (face_id,))
+        self.conn.execute("DELETE FROM face_encodings WHERE face_id = ?", (face_id,))
+        self._maybe_commit()
+        return cur.rowcount > 0
+
     def search_faces(self, query_encoding: list[float], limit: int = 10) -> list[dict]:
         """Find faces most similar to a query encoding."""
         if not HAS_SQLITE_VEC:

@@ -725,6 +725,8 @@
       stacking: 'Burst/bracket stacking',
       match_faces: 'Match faces to persons',
       resolve_dups: 'Resolve duplicate persons',
+      normalize_aesthetics: 'Normalize aesthetics',
+      normalize_subject_aesthetics: 'Normalize subject aesthetics',
       recluster: 'Recluster unknown faces',
     };
 
@@ -1191,6 +1193,8 @@
       var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
       var _dd = useState(false); var doDedup = _dd[0]; var setDedup = _dd[1];
       var _rq = useState(false); var doRequeue = _rq[0]; var setRequeue = _rq[1];
+      var _na = useState(false); var doNormAes = _na[0]; var setNormAes = _na[1];
+      var _nsa = useState(false); var doNormSubjAes = _nsa[0]; var setNormSubjAes = _nsa[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
       var _stg = useState({}); var stages = _stg[0]; var setStages = _stg[1];
       var _r = useState(null);  var result = _r[0]; var setResult = _r[1];
@@ -1245,6 +1249,8 @@
               do_recluster: doRecluster,
               do_dedup: doDedup,
               do_requeue: doRequeue,
+              force_normalize_aesthetics: doNormAes,
+              force_normalize_subject_aesthetics: doNormSubjAes,
             }),
             signal: controller.signal,
           });
@@ -1404,7 +1410,15 @@
             e('label', { title: 'Clears processed-markers for photos stuck on describe/category/keyword passes (non-NULL empties or attempts-capped) so the worker fleet re-attempts them. Bypasses the retry cap; the fleet does the work.' },
               e('input', { type: 'checkbox', checked: doRequeue, disabled: busy,
                 onChange: function(ev) { setRequeue(ev.target.checked); } }),
-              'Re-queue stuck passes')
+              'Re-queue stuck passes'),
+            e('label', { title: 'Force a full re-rank of the full-frame aesthetic percentile (aes_overall_pct) across the whole library. Normally only new rows get one; run this after a scoring batch shifts the distribution or after retuning the dimension weights.' },
+              e('input', { type: 'checkbox', checked: doNormAes, disabled: busy,
+                onChange: function(ev) { setNormAes(ev.target.checked); } }),
+              'Normalize aesthetics'),
+            e('label', { title: 'Force a full re-rank of the SUBJECT-crop aesthetic percentile (aes_subject_overall_pct) across the whole library. Run after a subject-scoring batch or a weight retune.' },
+              e('input', { type: 'checkbox', checked: doNormSubjAes, disabled: busy,
+                onChange: function(ev) { setNormSubjAes(ev.target.checked); } }),
+              'Normalize subject aesthetics')
           ),
           e('div', { className: 'stack-actions' },
             busy
