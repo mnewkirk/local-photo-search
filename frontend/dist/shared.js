@@ -1982,6 +1982,52 @@
     return null;
   };
 
+  // ---- Camera: shared badge + filter dropdown, used on every grid ----------
+  PS.cameraLabel = function (photo) {
+    if (!photo) return null;
+    return photo.camera_model || photo.camera_make || null;
+  };
+
+  // The camera badge every card renders (📷 model). opts.style merges on.
+  PS.cameraBadge = function (photo, opts) {
+    opts = opts || {};
+    var label = PS.cameraLabel(photo);
+    if (!label) return null;
+    return e('span', {
+      className: 'camera-badge',
+      title: 'Camera: ' + label + (photo.camera_make && photo.camera_make !== label
+                                   ? ' (' + photo.camera_make + ')' : ''),
+      style: Object.assign({ color: 'var(--text-muted, #999)', whiteSpace: 'nowrap' },
+                           opts.style || {}),
+    }, '📷 ' + label);
+  };
+
+  // Reusable camera filter <select>. Fetches /api/cameras once; props:
+  //   value (model | ''), onChange(model), style?, allLabel?
+  PS.CameraFilter = function CameraFilter(props) {
+    var _c = useState(null);
+    var cams = _c[0];
+    var setCams = _c[1];
+    useEffect(function () {
+      fetch(API + '/api/cameras')
+        .then(function (r) { return r.json(); })
+        .then(function (d) { setCams(d.cameras || []); })
+        .catch(function () { setCams([]); });
+    }, []);
+    return e('select', {
+      value: props.value || '',
+      onChange: function (ev) { props.onChange(ev.target.value); },
+      title: 'Filter by camera',
+      style: props.style || {},
+    },
+      e('option', { value: '' }, props.allLabel || 'All cameras'),
+      (cams || []).map(function (c) {
+        return e('option', { key: c.model, value: c.model },
+          (c.model || c.make) + ' (' + c.count + ')');
+      }),
+    );
+  };
+
   PS.SortControl = function SortControl(props) {
     var value = props.value;
     var onChange = props.onChange;

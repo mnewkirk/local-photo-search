@@ -677,6 +677,7 @@
       if (c.date_to) s += '&date_to=' + encodeURIComponent(c.date_to);
       if (c.location) s += '&location=' + encodeURIComponent(c.location);
       if (c.q) s += '&q=' + encodeURIComponent(c.q);
+      if (c.camera) s += '&camera=' + encodeURIComponent(c.camera);
       return s;
     }
 
@@ -946,7 +947,7 @@
       const [filter, setFilter] = useState(initParams.filter);
       // Content filters (date / place / semantic q). Applied on submit, not per
       // keystroke; restrict clusters/persons to those in matching photos.
-      const [cf, setCf] = useState({ date_from: '', date_to: '', location: '', q: '' });
+      const [cf, setCf] = useState({ date_from: '', date_to: '', location: '', q: '', camera: '' });
       const PAGE_SIZE = 200;
       const [selectedGroup, setSelectedGroup] = useState(null);
       const [groupPhotos, setGroupPhotos] = useState([]);
@@ -1487,7 +1488,7 @@
       const namedCount = counts.named;
       const unknownCount = counts.unknown;
       const ignoredCount = counts.ignored;
-      const cfActive = !!(cf.date_from || cf.date_to || cf.location || cf.q);
+      const cfActive = !!(cf.date_from || cf.date_to || cf.location || cf.q || cf.camera);
 
       return e('div', null,
         // Header
@@ -1542,9 +1543,12 @@
               e('input', { type: 'text', placeholder: 'search\u2026', value: cf.q, style: { width: '150px' },
                 onChange: ev => setCf({ ...cf, q: ev.target.value }),
                 onKeyDown: ev => { if (ev.key === 'Enter') loadGroups(null, cf); } }),
+              e(PS.CameraFilter, { value: cf.camera,
+                onChange: v => { const next = { ...cf, camera: v }; setCf(next); loadGroups(null, next); },
+                style: { maxWidth: '150px' } }),
               e('button', { onClick: () => loadGroups(null, cf) }, 'Apply'),
               cfActive && e('button', {
-                onClick: () => { const empty = { date_from: '', date_to: '', location: '', q: '' }; setCf(empty); loadGroups(null, empty); },
+                onClick: () => { const empty = { date_from: '', date_to: '', location: '', q: '', camera: '' }; setCf(empty); loadGroups(null, empty); },
               }, 'Clear'),
               cfActive && e('span', { style: { fontSize: '12px', color: 'var(--accent, #4a9)', alignSelf: 'center' } },
                 total + ' matching group' + (total === 1 ? '' : 's')),

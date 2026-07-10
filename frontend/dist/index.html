@@ -633,6 +633,7 @@
         min_aesthetic: p.get('min_aesthetic') || '',
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
+        camera: p.get('camera') || '',
         sort: p.get('sort') || '',
         ask: p.get('ask') || '',
       };
@@ -652,6 +653,7 @@
       const [minAesthetic, setMinAesthetic] = useState(initParams.min_aesthetic);
       const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
       const [locationFilter, setLocationFilter] = useState(initParams.location);
+      const [cameraFilter, setCameraFilter] = useState(initParams.camera);
       const [dateFrom, setDateFrom] = useState(initParams.date_from);
       const [dateTo, setDateTo] = useState(initParams.date_to);
       const [results, setResults] = useState(null);
@@ -838,7 +840,7 @@
       const buildSearchParams = useCallback(() => {
         const mqVal = minQuality ? parseFloat(minQuality) : null;
         const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
-        if (!query && !personFilter && !colorFilter && !locationFilter
+        if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter
             && !dateFrom && !dateTo && mqVal == null && maVal == null && !matchSource
             && sortBy !== 'aesthetic_desc' && sortBy !== 'subject_aesthetic_desc') return null;
         const params = new URLSearchParams();
@@ -846,6 +848,7 @@
         if (personFilter) params.set('person', personFilter);
         if (colorFilter) params.set('color', colorFilter);
         if (locationFilter) params.set('location', locationFilter);
+        if (cameraFilter) params.set('camera', cameraFilter);
         if (dateFrom) params.set('date_from', dateFrom);
         if (dateTo) params.set('date_to', dateTo);
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
@@ -854,7 +857,7 @@
         if (matchSource) params.set('match_source', matchSource);
         if (sortBy) params.set('sort', sortBy);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, minAesthetic, sortQuality, locationFilter, dateFrom, dateTo, matchSource, sortBy]);
+      }, [query, personFilter, colorFilter, minQuality, minAesthetic, sortQuality, locationFilter, cameraFilter, dateFrom, dateTo, matchSource, sortBy]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -1012,7 +1015,7 @@
         if (p.ask) {
           hasAutoSearched.current = true;
           runAsk();
-        } else if (p.q || p.person || p.color || p.location || p.date_from || p.date_to || p.min_quality || p.match_source) {
+        } else if (p.q || p.person || p.color || p.location || p.camera || p.date_from || p.date_to || p.min_quality || p.match_source) {
           hasAutoSearched.current = true;
           doSearch();
         }
@@ -1201,6 +1204,14 @@
               value: locationFilter,
               onChange: (ev) => setLocationFilter(ev.target.value),
               style: { width: 130 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Camera:'),
+            e(PS.CameraFilter, {
+              value: cameraFilter,
+              onChange: setCameraFilter,
+              style: { maxWidth: 170 },
             }),
           ),
           e('div', { className: 'filter-group' },
@@ -1560,7 +1571,8 @@
         }, photo.filename),
         e('div', { className: 'overlay' },
           e('span', { className: 'filename' }, photo.filename),
-          e('span', { style: { float: 'right', display: 'flex', gap: 8 } },
+          e('span', { style: { float: 'right', display: 'flex', gap: 8, alignItems: 'center' } },
+            PS.cameraBadge(photo, { style: { fontSize: 11 } }),
             PS.aestheticBadge(photo),
             photo.score != null && e('span', { className: 'score' }, photo.score.toFixed(3)),
           ),

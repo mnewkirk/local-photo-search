@@ -1263,6 +1263,7 @@
       const [collection, setCollection] = useState(null);
       const [photos, setPhotos] = useState([]);
       const [sortBy, setSortBy] = useState('relevance');  // 'relevance' = manual/original order
+      const [cameraFilter, setCameraFilter] = useState('');  // client-side camera filter
       const [selectedForRemoval, setSelectedForRemoval] = useState(new Set());
       const [showRename, setShowRename] = useState(false);
       const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -1315,7 +1316,10 @@
 
       const collapseAllStacks = useCallback(() => { setExpandedStacks(new Set()); }, []);
 
-      const sortedPhotos = useMemo(() => PS.applySortOrder(photos, sortBy), [photos, sortBy]);
+      const sortedPhotos = useMemo(() => {
+        const base = cameraFilter ? photos.filter(p => p.camera_model === cameraFilter) : photos;
+        return PS.applySortOrder(base, sortBy);
+      }, [photos, sortBy, cameraFilter]);
 
       const displayItems = useMemo(() => {
         // Every photo in the collection was explicitly added — always show it.
@@ -1537,6 +1541,7 @@
           selectedForRemoval.size === 0 && e('span', { style: { marginRight: 'auto', fontSize: 11, color: 'var(--text-muted)' } },
             'Shift- or right-click photos to select for download or removal'),
           e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc'] }),
+          e(PS.CameraFilter, { value: cameraFilter, onChange: setCameraFilter, style: { maxWidth: 160 } }),
           hasStacks && e('button', {
             className: 'btn btn-sm',
             onClick: () => { expandedStacks.size > 0 ? collapseAllStacks() : expandAllStacks(); },
@@ -1564,16 +1569,26 @@
                 className: 'stack-badge',
                 onClick: (ev) => { ev.stopPropagation(); toggleStack(p.stack_id); },
               }, isExpanded ? '\u2715' : '\u00d7' + p.stack_count),
-              // Shared aesthetic badge \u2014 same score every other card shows.
+              // Shared aesthetic + camera badges \u2014 same as every other card.
               (() => {
-                const b = PS.aestheticBadge(p);
-                return b ? e('span', {
+                const ab = PS.aestheticBadge(p);
+                const cb = PS.cameraBadge(p);
+                if (!ab && !cb) return null;
+                const chip = {
+                  background: 'rgba(0,0,0,0.6)', borderRadius: 4, padding: '1px 5px',
+                  lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap', maxWidth: '100%',
+                };
+                return e('div', {
                   style: {
-                    position: 'absolute', left: 4, bottom: 4, background: 'rgba(0,0,0,0.6)',
-                    borderRadius: 4, padding: '1px 5px', fontSize: 11, lineHeight: 1.5,
-                    pointerEvents: 'none',
+                    position: 'absolute', left: 4, bottom: 4, display: 'flex',
+                    flexDirection: 'column', gap: 2, alignItems: 'flex-start',
+                    pointerEvents: 'none', maxWidth: '90%',
                   },
-                }, b) : null;
+                },
+                  ab && e('span', { style: Object.assign({ fontSize: 11 }, chip) }, ab),
+                  cb && e('span', { style: Object.assign({ fontSize: 10 }, chip) }, cb),
+                );
               })(),
               e('span', { className: 'remove-badge' }, '\u00d7'),
             );

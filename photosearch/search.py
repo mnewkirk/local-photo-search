@@ -1596,6 +1596,7 @@ def search_combined(
     min_impact: Optional[float] = None,
     style_tag: Optional[str] = None,
     min_subject_aesthetic: Optional[float] = None,
+    camera: Optional[str] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1794,6 +1795,14 @@ def search_combined(
                 pass
         result_sets.append({r["id"]: r for r in matched_rows})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
+
+    if camera:
+        rows = db.conn.execute(
+            "SELECT * FROM photos WHERE camera_model = ?", (camera,)
+        ).fetchall()
+        results = [dict(r) for r in rows]
+        result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     def _wrap(items: list[dict]):
         """Honor the caller's with_total + sort preferences on early-

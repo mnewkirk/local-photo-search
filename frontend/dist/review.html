@@ -662,6 +662,7 @@
       const folderDropdownRef = useRef(null);
       const [photos, setPhotos] = useState([]);
       const [sortBy, setSortBy] = useState('relevance');  // 'relevance' = default order (selected first, then quality)
+      const [cameraFilter, setCameraFilter] = useState('');  // client-side camera filter
       const [stats, setStats] = useState(null);
       const [loading, setLoading] = useState(false);
       const [viewMode, setViewMode] = useState(initParams.view);       // all | selected | obscure | clusters
@@ -937,16 +938,18 @@
       }, [photos]);
 
       const visiblePhotos = useMemo(() => {
-        if (viewMode === 'selected') return photos.filter(p => p.selected);
-        if (viewMode === 'timeline') {
+        let base;
+        if (viewMode === 'selected') base = photos.filter(p => p.selected);
+        else if (viewMode === 'timeline') {
           // Chronological selected — also the modal nav order for this view.
-          return photos.filter(p => p.selected).slice().sort((a, b) => {
+          base = photos.filter(p => p.selected).slice().sort((a, b) => {
             const ta = a.date_taken || '', tb = b.date_taken || '';
             return ta < tb ? -1 : ta > tb ? 1 : 0;
           });
-        }
-        return photos;
-      }, [photos, viewMode]);
+        } else base = photos;
+        if (cameraFilter) base = base.filter(p => p.camera_model === cameraFilter);
+        return base;
+      }, [photos, viewMode, cameraFilter]);
 
       // Timeline: collapse near-duplicate selected photos into "moments" and
       // group them by day. A moment = consecutive selected shots that are the
@@ -1401,6 +1404,10 @@
           viewMode !== 'timeline' &&
             e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'day_quality_desc'] }),
 
+          // Camera filter (client-side over the loaded review set)
+          e(PS.CameraFilter, { value: cameraFilter, onChange: setCameraFilter,
+            allLabel: 'All cameras', style: { maxWidth: 160 } }),
+
           // Export controls
           e('div', { className: 'control-group' },
             e('label', { style: { display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 13, color: 'var(--text-muted)' } },
@@ -1652,6 +1659,7 @@
       const [error, setError] = useState(false);
 
       const aesBadge = PS.aestheticBadge(photo);
+      const camBadge = PS.cameraBadge(photo);
 
       const isExpanded = photo.stack_id && expandedStacks && expandedStacks.has(photo.stack_id);
       const showBadge = photo.stack_count > 1 && photo.stack_is_top;
@@ -1701,6 +1709,17 @@
             className: 'quality-badge',
             style: { background: 'rgba(0,0,0,0.55)', fontSize: 11 },
           }, aesBadge),
+
+        // Camera badge (shared) — always-visible bottom-left chip.
+        camBadge &&
+          e('div', {
+            style: {
+              position: 'absolute', left: 4, bottom: 4, background: 'rgba(0,0,0,0.55)',
+              borderRadius: 4, padding: '1px 5px', fontSize: 10, lineHeight: 1.5,
+              pointerEvents: 'none', maxWidth: '88%', overflow: 'hidden',
+              textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            },
+          }, camBadge),
 
         // Raw indicator
         photo.has_raw && e('div', { className: 'raw-badge' }, 'RAW'),

@@ -284,6 +284,7 @@ def api_search(
     category: Optional[str] = Query(None, description="Filter by exact category match"),
     visual_tag: Optional[str] = Query(None, description="Filter by visual tag"),
     keyword: Optional[str] = Query(None, description="Filter by keyword (substring match)"),
+    camera: Optional[str] = Query(None, description="Filter by exact camera_model"),
     tag: Optional[str] = Query(None, deprecated=True, description="Deprecated; use category"),
 ):
     """Search photos using any combination of criteria."""
@@ -300,7 +301,7 @@ def api_search(
     if tag and not category:
         category = tag
 
-    if not any([q, person, color, place, category, visual_tag, keyword,
+    if not any([q, person, color, place, category, visual_tag, keyword, camera,
                 min_quality is not None, date_from, date_to, location,
                 min_aesthetic is not None, min_technical is not None,
                 min_composition is not None, min_impact is not None, style_tag,
@@ -345,6 +346,7 @@ def api_search(
             min_impact=min_impact,
             style_tag=style_tag,
             min_subject_aesthetic=min_subject_aesthetic,
+            camera=camera,
         )
 
         logger.info(
@@ -374,6 +376,7 @@ def api_search(
                 "aes_composition": r.get("aes_composition"),
                 "aes_impact": r.get("aes_impact"),
                 "description": r.get("description"),
+                "camera_make": r.get("camera_make"),
                 "camera_model": r.get("camera_model"),
                 "focal_length": r.get("focal_length"),
                 "exposure_time": r.get("exposure_time"),
@@ -680,20 +683,21 @@ def _similarity_sort(groups: list[dict], encodings: dict[int, list[float]]) -> l
 _SIMILARITY_SORT_GROUP_LIMIT = 500
 
 
-def _face_filter_photo_ids(db, date_from, date_to, location, q, person):
+def _face_filter_photo_ids(db, date_from, date_to, location, q, person, camera=None):
     """Photo-id set matching the given content filters, or None when none are set.
 
     Reuses search_combined for semantic/person queries (CLIP-ranked, capped);
-    falls back to a direct, unbounded date/location SQL scan otherwise. Used to
-    restrict /api/faces/groups to clusters/persons appearing in matching photos.
+    falls back to a direct, unbounded date/location/camera SQL scan otherwise.
+    Used to restrict /api/faces/groups to clusters/persons appearing in matching
+    photos.
     """
-    if not any([date_from, date_to, location, q, person]):
+    if not any([date_from, date_to, location, q, person, camera]):
         return None
     if q or person:
         from .search import search_combined
         res = search_combined(db, query=q or None, location=location, person=person,
-                              date_from=date_from, date_to=date_to, limit=5000,
-                              sort="date_desc")
+                              date_from=date_from, date_to=date_to, camera=camera,
+                              limit=5000, sort="date_desc")
         rows = res[0] if isinstance(res, tuple) else res
         return {r["id"] for r in rows}
     sql, params = "SELECT id FROM photos WHERE 1=1", []
@@ -703,6 +707,8 @@ def _face_filter_photo_ids(db, date_from, date_to, location, q, person):
         sql += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
     if location:
         sql += " AND place_name LIKE ?"; params.append(f"%{location}%")
+    if camera:
+        sql += " AND camera_model = ?"; params.append(camera)
     return {r["id"] for r in db.conn.execute(sql, params).fetchall()}
 
 
@@ -718,6 +724,7 @@ def api_face_groups(
     location: str | None = Query(None),
     q: str | None = Query(None),
     person: str | None = Query(None),
+    camera: str | None = Query(None),
 ):
     """List face identities grouped by person or cluster, with filtering and pagination.
 
@@ -753,7 +760,7 @@ def api_face_groups(
         # Optional content filter: restrict to groups whose faces appear in the
         # matching photos. Materialize the matching photo-ids into a temp table
         # and inject an EXISTS-style predicate into the group queries.
-        filter_pids = _face_filter_photo_ids(db, date_from, date_to, location, q, person)
+        filter_pids = _face_filter_photo_ids(db, date_from, date_to, location, q, person, camera)
         filtering = filter_pids is not None
         if filtering:
             db.conn.execute("CREATE TEMP TABLE IF NOT EXISTS _facefilter (pid INTEGER PRIMARY KEY)")
@@ -1310,6 +1317,25 @@ def api_persons():
         ).fetchall()
 
     return {"persons": [dict(r) for r in rows]}
+
+
+@app.get("/api/cameras")
+def api_cameras():
+    """Distinct camera models with photo counts — feeds the camera filter
+    dropdown on search/review/faces/collections/geotag. Ordered by count desc
+    so the most-used bodies lead."""
+    with _get_db() as db:
+        rows = db.conn.execute(
+            "SELECT camera_model AS model, "
+            "       MAX(camera_make) AS make, "
+            "       COUNT(*) AS count "
+            "FROM photos "
+            "WHERE camera_model IS NOT NULL AND camera_model != '' "
+            "GROUP BY camera_model "
+            "ORDER BY count DESC, model ASC"
+        ).fetchall()
+    return {"cameras": [{"model": r["model"], "make": r["make"],
+                         "count": r["count"]} for r in rows]}
 
 
 # ---------------------------------------------------------------------------
@@ -2275,6 +2301,8 @@ def api_review_run(
                 "aes_subject_overall_pct": p.get("aes_subject_overall_pct"),
                 "aes_overall_day_pct": p.get("aes_overall_day_pct"),
                 "aes_subject_overall_day_pct": p.get("aes_subject_overall_day_pct"),
+                "camera_make": p.get("camera_make"),
+                "camera_model": p.get("camera_model"),
                 "date_taken": p.get("date_taken"),
                 "selected": p.get("selected", False),
                 "cluster_id": p.get("cluster_id"),
@@ -2328,6 +2356,8 @@ def api_review_load(
                 "aes_subject_overall_pct": p.get("aes_subject_overall_pct"),
                 "aes_overall_day_pct": p.get("aes_overall_day_pct"),
                 "aes_subject_overall_day_pct": p.get("aes_subject_overall_day_pct"),
+                "camera_make": p.get("camera_make"),
+                "camera_model": p.get("camera_model"),
                 "date_taken": p.get("date_taken"),
                 "selected": bool(p["selected"]),
                 "cluster_id": p.get("cluster_id"),
@@ -2797,7 +2827,10 @@ def api_infer_apply(data: dict):
 
 
 @app.get("/api/geotag/folders")
-def api_geotag_folders(include_fully_tagged: bool = False):
+def api_geotag_folders(include_fully_tagged: bool = False,
+                        camera: Optional[str] = None,
+                        date_from: Optional[str] = None,
+                        date_to: Optional[str] = None):
     """Folder summary keyed for the /geotag left panel.
 
     Returns folders sorted by no_gps count descending. A folder's entry
@@ -2805,7 +2838,8 @@ def api_geotag_folders(include_fully_tagged: bool = False):
     plus date range, so the UI can prioritize which folders to tackle.
 
     With `include_fully_tagged=true` the response also covers folders
-    where every photo already has GPS; default is to hide them.
+    where every photo already has GPS; default is to hide them. `camera` /
+    `date_from` / `date_to` narrow which photos count toward each folder.
     """
     # Aggregate over the indexed `folder` column (schema v25, M27) in one SQL
     # pass instead of loading every photo row and grouping in Python.
@@ -2813,6 +2847,13 @@ def api_geotag_folders(include_fully_tagged: bool = False):
     # become a folder's date_from. The HAVING clause applies the
     # hide-fully-tagged filter server-side.
     having = "" if include_fully_tagged else "HAVING no_gps > 0"
+    where, params = ["folder IS NOT NULL"], []
+    if camera:
+        where.append("camera_model = ?"); params.append(camera)
+    if date_from:
+        where.append("substr(date_taken,1,10) >= ?"); params.append(date_from[:10])
+    if date_to:
+        where.append("substr(date_taken,1,10) <= ?"); params.append(date_to[:10])
     with _get_db() as db:
         rows = db.conn.execute(
             "SELECT folder AS path, "
@@ -2823,10 +2864,11 @@ def api_geotag_folders(include_fully_tagged: bool = False):
             "       MIN(NULLIF(date_taken, '')) AS date_from, "
             "       MAX(NULLIF(date_taken, '')) AS date_to "
             "FROM photos "
-            "WHERE folder IS NOT NULL "
+            f"WHERE {' AND '.join(where)} "
             "GROUP BY folder "
             f"{having} "
-            "ORDER BY no_gps DESC, path ASC"
+            "ORDER BY no_gps DESC, path ASC",
+            params,
         ).fetchall()
 
     out = [{"path": r["path"], "total": r["total"], "with_exif": r["with_exif"],
@@ -2837,6 +2879,9 @@ def api_geotag_folders(include_fully_tagged: bool = False):
 
 @app.get("/api/geotag/folder-photos")
 def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
+                              camera: Optional[str] = None,
+                              date_from: Optional[str] = None,
+                              date_to: Optional[str] = None,
                               limit: int = 1000):
     """Photos in one folder for the /geotag thumbnails panel.
 
@@ -2844,7 +2889,8 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
     need tagging). With `show_inferred=true`, also includes photos where
     `location_source='inferred'` so the user can manually correct any M19
     misfires. `location_source='exif'` photos are always excluded — those
-    came from the camera and are authoritative.
+    came from the camera and are authoritative. `camera`/`date_from`/`date_to`
+    narrow the set to match the folder-picker filters.
     """
     # Match the exact folder via the indexed `folder` column (schema v25) — no
     # LIKE + Python subfolder guard. This also fixes a latent bug in the old
@@ -2856,14 +2902,23 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
             gps_where = "(gps_lat IS NULL OR location_source='inferred')"
         else:
             gps_where = "gps_lat IS NULL"
+        extra, params = "", [folder.rstrip("/")]
+        if camera:
+            extra += " AND camera_model = ?"; params.append(camera)
+        if date_from:
+            extra += " AND substr(date_taken,1,10) >= ?"; params.append(date_from[:10])
+        if date_to:
+            extra += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
+        params.append(limit)
         rows = db.conn.execute(
             f"""SELECT id, filepath, filename, date_taken, gps_lat, gps_lon,
-                       place_name, location_source, location_confidence
+                       place_name, location_source, location_confidence,
+                       camera_make, camera_model
                 FROM photos
-                WHERE folder = ? AND {gps_where}
+                WHERE folder = ? AND {gps_where}{extra}
                 ORDER BY COALESCE(date_taken, filepath)
                 LIMIT ?""",
-            (folder.rstrip("/"), limit),
+            params,
         ).fetchall()
 
     photos = [dict(r) for r in rows]

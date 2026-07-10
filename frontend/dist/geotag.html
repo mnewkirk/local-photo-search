@@ -442,6 +442,20 @@
             }),
             ' Show fully-tagged folders'),
         ),
+        // Camera + date-range filters — scope the folder list and each folder's
+        // photos to one body / a trip's dates.
+        e('div', { className: 'folder-toolbar', style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
+          e(PS.CameraFilter, { value: props.camera, onChange: props.onCamera, style: { maxWidth: 150 } }),
+          e('input', { type: 'date', value: props.dateFrom, title: 'photos on/after',
+            onChange: (ev) => props.onDateFrom(ev.target.value), style: { fontSize: 12 } }),
+          e('span', { style: { color: 'var(--text-muted)' } }, '–'),
+          e('input', { type: 'date', value: props.dateTo, title: 'photos on/before',
+            onChange: (ev) => props.onDateTo(ev.target.value), style: { fontSize: 12 } }),
+          (props.camera || props.dateFrom || props.dateTo) && e('button', {
+            className: 'btn', title: 'Clear filters',
+            onClick: () => { props.onCamera(''); props.onDateFrom(''); props.onDateTo(''); },
+          }, '✕'),
+        ),
         e('div', { className: 'col-body' },
           !props.folders ? e('div', { className: 'loading' }, 'Scanning…')
             : props.folders.length === 0 ? e('div', { className: 'empty-state' },
@@ -766,16 +780,29 @@
       const [chosen, setChosen] = useState(null);
       const [applying, setApplying] = useState(false);
       const [toast, setToast] = useState(null);
+      // Camera + date-range filters scope the folder picker AND the photos.
+      const [cameraFilter, setCameraFilter] = useState('');
+      const [dateFrom, setDateFrom] = useState('');
+      const [dateTo, setDateTo] = useState('');
+
+      const filterQS = useCallback(() => {
+        let s = '';
+        if (cameraFilter) s += '&camera=' + encodeURIComponent(cameraFilter);
+        if (dateFrom) s += '&date_from=' + encodeURIComponent(dateFrom);
+        if (dateTo) s += '&date_to=' + encodeURIComponent(dateTo);
+        return s;
+      }, [cameraFilter, dateFrom, dateTo]);
 
       const loadFolders = useCallback((includeTagged) => {
         setFolders(null);
-        const url = '/api/geotag/folders'
-                    + (includeTagged ? '?include_fully_tagged=true' : '');
+        const url = '/api/geotag/folders?_=1'
+                    + (includeTagged ? '&include_fully_tagged=true' : '')
+                    + filterQS();
         fetch(url)
           .then(r => r.json())
           .then(body => setFolders(body.folders || []))
           .catch(() => setFolders([]));
-      }, []);
+      }, [filterQS]);
 
       useEffect(() => { loadFolders(false); }, [loadFolders]);
 
@@ -784,7 +811,8 @@
         setLoadingPhotos(true);
         const url = '/api/geotag/folder-photos?folder='
                     + encodeURIComponent(folder)
-                    + (inferred ? '&show_inferred=true' : '');
+                    + (inferred ? '&show_inferred=true' : '')
+                    + filterQS();
         fetch(url)
           .then(r => r.json())
           .then(body => {
@@ -795,7 +823,14 @@
           })
           .catch(() => setPhotos([]))
           .finally(() => setLoadingPhotos(false));
-      }, []);
+      }, [filterQS]);
+
+      // Reload the active folder's photos when the camera/date filters change.
+      const _didMountPhotos = useRef(false);
+      useEffect(() => {
+        if (!_didMountPhotos.current) { _didMountPhotos.current = true; return; }
+        if (activeFolder) loadPhotos(activeFolder, showInferred);
+      }, [loadPhotos]);
 
       function selectFolder(path) {
         setActiveFolder(path);
@@ -929,6 +964,9 @@
             activeFolder: activeFolder,
             onReload: loadFolders,
             onSelect: selectFolder,
+            camera: cameraFilter, onCamera: setCameraFilter,
+            dateFrom: dateFrom, onDateFrom: setDateFrom,
+            dateTo: dateTo, onDateTo: setDateTo,
           }),
           e(PhotosPanel, {
             folder: activeFolder,
