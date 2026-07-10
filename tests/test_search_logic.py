@@ -192,6 +192,24 @@ class TestCombinedSearch:
         for r in results:
             assert r.get("aesthetic_score", 0) >= 7.0
 
+    def test_min_quality_uses_raw_aes_overall_when_present(self, db):
+        # min_quality is a floor on the RAW aesthetic score the modal shows —
+        # the VLM aes_overall when scored, not the legacy aesthetic_score. Give a
+        # high-legacy photo a LOW aes_overall and it must drop out.
+        from photosearch.search import search_combined
+
+        pid = db.conn.execute(
+            "SELECT id FROM photos WHERE filename = 'DSC04922.JPG'").fetchone()["id"]
+        # DSC04922: legacy aesthetic_score 9.1 → set VLM aes_overall to 4.0.
+        db.conn.execute("UPDATE photos SET aes_overall = 4.0 WHERE id = ?", (pid,))
+        db.conn.commit()
+
+        ids = {r["id"] for r in search_combined(db, min_quality=7.0)}
+        assert pid not in ids   # 9.1 legacy but 4.0 raw VLM → excluded
+        # A photo with only the legacy score >= 7 still qualifies (fallback).
+        assert any(r.get("aesthetic_score", 0) >= 7.0
+                   for r in search_combined(db, min_quality=7.0))
+
     def test_search_combined_sort_quality(self, db):
         from photosearch.search import search_combined
 

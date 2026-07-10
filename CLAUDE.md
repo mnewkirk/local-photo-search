@@ -282,7 +282,12 @@ photosearch normalize-aesthetics --apply           # refresh percentiles
 `normalize-aesthetics` is also a `maintenance-sweep` stage (percentile refresh
 only — the VLM scoring stays with the worker fleet). Search: `sort=aesthetic_desc`,
 `min_aesthetic` (percentile), `min_technical`/`min_composition`/`min_impact`,
-`style_tag`. The `/status` "Aesthetics (VLM)" card + `PhotoModal` "Aesthetic
+`style_tag`. The `min_quality` filter is the **raw** counterpart of
+`min_aesthetic`: it floors on `COALESCE(aes_overall, aesthetic_score)` — the raw
+VLM `aes_overall` (1-10) shown on the photo modal, falling back to the legacy
+LAION `aesthetic_score` for photos the VLM hasn't scored — so "min quality 5.5"
+matches the 5.5 the modal displays (it used to floor on the legacy score alone).
+The `/status` "Aesthetics (VLM)" card + `PhotoModal` "Aesthetic
 Evaluation" breakdown + M28 re-run checkbox surface it in the UI.
 
 ### Per-pass model strategy (Ollama defaults)

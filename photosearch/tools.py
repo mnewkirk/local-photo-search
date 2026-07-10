@@ -682,7 +682,10 @@ _register(ToolSpec(
             "visual_tag": {"type": "string", "description": "Visual-quality tag (see list_vocab)."},
             "keyword": {"type": "string", "description": "Keyword substring (see list_vocab)."},
             "min_quality": {"type": "number",
-                            "description": "Minimum aesthetic score, 1-10."},
+                            "description": "Minimum RAW aesthetic score, 1-10 — the "
+                            "VLM aes_overall shown on the photo (legacy score if not "
+                            "VLM-scored). This is the raw counterpart of min_aesthetic "
+                            "(the percentile)."},
             **_CURATION_FILTER_PROPS,
             "match_source": {"type": "string", "enum": ["strict", "temporal", "manual"],
                 "description": "Restrict person matches by confidence source "
@@ -854,13 +857,15 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
         clauses.append("keywords LIKE ?")
         params.append(f"%{kw}%")
 
-    mq = args.get("min_quality")
+    # min_quality is a floor on the RAW aesthetic score the photo modal shows —
+    # VLM aes_overall when scored, else legacy aesthetic_score.
+    mq = _opt_float(args.get("min_quality"))
     if mq is not None:
-        try:
+        if _has_column(db, "aes_overall"):
+            clauses.append("COALESCE(aes_overall, aesthetic_score) >= ?")
+        else:
             clauses.append("aesthetic_score >= ?")
-            params.append(float(mq))
-        except (TypeError, ValueError):
-            pass
+        params.append(mq)
 
     # Curation filters shared with structured Search: exact camera, VLM aesthetic
     # percentile floor, and style tag. The aes_* columns arrived in schema v26,

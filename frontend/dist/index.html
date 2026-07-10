@@ -911,9 +911,23 @@
         const q = (query || '').trim();
         if (!q || asking) return;
 
-        // Make the Ask reproducible/shareable: reflect it in the URL (?ask=).
+        // Make the Ask reproducible/shareable: reflect the query AND every
+        // pinned filter in the URL (same param names as structured search, so
+        // reloading restores both the Ask text and the filter bar).
+        const askUrl = new URLSearchParams();
+        askUrl.set('ask', q);
+        if (personFilter) askUrl.set('person', personFilter);
+        if (matchSource) askUrl.set('match_source', matchSource);
+        if (colorFilter) askUrl.set('color', colorFilter);
+        if (locationFilter) askUrl.set('location', locationFilter);
+        if (cameraFilter) askUrl.set('camera', cameraFilter);
+        if (dateFrom) askUrl.set('date_from', dateFrom);
+        if (dateTo) askUrl.set('date_to', dateTo);
+        if (minQuality) askUrl.set('min_quality', minQuality);
+        if (minAesthetic) askUrl.set('min_aesthetic', minAesthetic);
+        if (sortQuality) askUrl.set('sort_quality', 'true');
         window.history.pushState(null, '',
-          window.location.pathname + '?ask=' + encodeURIComponent(q));
+          window.location.pathname + '?' + askUrl.toString());
 
         // Cancel any in-flight ask.
         if (askAbortRef.current) askAbortRef.current.abort();
@@ -1263,6 +1277,7 @@
               className: 'filter-input',
               type: 'number',
               placeholder: '1–10',
+              title: 'Minimum RAW aesthetic score (the aes_overall 1–10 shown on the photo)',
               value: minQuality,
               onChange: (ev) => setMinQuality(ev.target.value),
               min: 1, max: 10, step: 0.5,

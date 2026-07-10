@@ -1604,7 +1604,8 @@ def search_combined(
     ranked by the primary search type (person > semantic > color > place).
 
     Args:
-        min_quality: If set, filter out photos with aesthetic_score below this value.
+        min_quality: If set, floor on the RAW aesthetic score shown on the photo —
+            VLM `aes_overall` (1-10) when scored, else legacy `aesthetic_score`.
         sort_quality: If True, sort final results by aesthetic_score (highest first)
                      instead of the default relevance ordering.
         date_from: If set, filter to photos taken on or after this date (YYYY-MM-DD).
@@ -1818,12 +1819,16 @@ def search_combined(
         return _wrap(_search_by_date(db, date_from, date_to or _OPEN_DATE_HI, limit=0))
 
     # Quality-only search: if no other criteria given but min_quality is set,
-    # return the highest-quality photos in the collection.
+    # return the highest-quality photos in the collection. min_quality is a floor
+    # on the RAW aesthetic score the photo modal shows — the VLM `aes_overall`
+    # (1-10) when scored, else the legacy LAION `aesthetic_score` — so setting
+    # "min quality 5.5" matches the 5.5 displayed on a photo.
     if not result_sets and min_quality is not None:
         rows = db.conn.execute(
             """SELECT * FROM photos
-               WHERE aesthetic_score IS NOT NULL AND aesthetic_score >= ?
-               ORDER BY aesthetic_score DESC""",
+               WHERE COALESCE(aes_overall, aesthetic_score) IS NOT NULL
+                 AND COALESCE(aes_overall, aesthetic_score) >= ?
+               ORDER BY COALESCE(aes_overall, aesthetic_score) DESC""",
             (min_quality,),
         ).fetchall()
         results = [dict(r) for r in rows]
@@ -1886,11 +1891,15 @@ def search_combined(
     if date_from:
         merged = _filter_by_date(merged, date_from, date_to or _OPEN_DATE_HI)
 
-    # Apply quality filter
+    # Apply quality filter — floor on the RAW aesthetic score shown on the photo
+    # (VLM aes_overall when scored, else legacy aesthetic_score).
     if min_quality is not None:
+        def _raw_quality(r):
+            v = r.get("aes_overall")
+            return v if v is not None else r.get("aesthetic_score")
         merged = [
             r for r in merged
-            if r.get("aesthetic_score") is not None and r["aesthetic_score"] >= min_quality
+            if _raw_quality(r) is not None and _raw_quality(r) >= min_quality
         ]
 
     # Apply VLM aesthetic filters (percentile + per-dimension + style tag)
