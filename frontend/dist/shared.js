@@ -367,6 +367,24 @@
     var setDragBox = _dragBox[1];
     var dragStartRef = useRef(null);
 
+    // Local face patches applied on top of `detail.faces` so add/remove show
+    // instantly — the modal's `detail` may be an external prop we can't re-fetch
+    // into. Dedup against detail.faces means pages that DO re-fetch converge
+    // (the real row supersedes the optimistic one). Reset on photo change.
+    var _removedFaceIds = useState(function () { return {}; });
+    var removedFaceIds = _removedFaceIds[0];
+    var setRemovedFaceIds = _removedFaceIds[1];
+
+    var _addedFaces = useState(function () { return []; });
+    var addedFaces = _addedFaces[0];
+    var setAddedFaces = _addedFaces[1];
+
+    // Server-truth face list re-fetched after a mutation, overriding a stale
+    // external `detail.faces`. null = fall back to detail.faces. Reset per photo.
+    var _liveFaces = useState(null);
+    var liveFaces = _liveFaces[0];
+    var setLiveFaces = _liveFaces[1];
+
     // ---- Image rect for face bounding boxes ----
     var _imgRect = useState(null);
     var imgRect = _imgRect[0];
@@ -472,6 +490,17 @@
         setInternalDetail(updater);
       }
       if (onDetailChanged) onDetailChanged(updater);
+      // Keep the local face patches' labels in sync when a face is renamed/unset
+      // before a re-fetch replaces them (added boxes + the liveFaces override).
+      var relabel = function (f) {
+        return f.id === faceId
+          ? Object.assign({}, f, { person_name: personName,
+                                   match_source: personName ? 'manual'
+                                     : (f.match_source === 'manual_box' ? 'manual_box' : null) })
+          : f;
+      };
+      setAddedFaces(function (prev) { return prev.map(relabel); });
+      setLiveFaces(function (prev) { return prev ? prev.map(relabel) : prev; });
     }, [fetchDetailProp, onDetailChanged]);
 
     var saveExistingName = useCallback(function (faceId) {
@@ -516,6 +545,18 @@
         .catch(function () { cancelEdit(); });
     }, [onFaceAssigned, cancelEdit, updateDetailFace]);
 
+    // Re-fetch the authoritative face list after a mutation (the endpoints
+    // already mirrored to the local DB in replica mode), so re-detect's new
+    // faces surface and add/remove reconcile — without a page reload. Overrides
+    // a stale external `detail.faces` via `liveFaces`.
+    var syncFaces = useCallback(function () {
+      if (!photo) return;
+      fetch(API + '/api/photos/' + photo.id)
+        .then(function (r) { return r.json(); })
+        .then(function (d) { if (d && d.faces) setLiveFaces(d.faces); })
+        .catch(function () {});
+    }, [photo]);
+
     // Delete a face detection box entirely (feature 4). Distinct from Unset,
     // which only removes the person name; this drops the row + encoding.
     var deleteFaceBox = useCallback(function (faceId) {
@@ -524,15 +565,23 @@
         .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
         .then(function (res) {
           if (res.ok) {
+            // Hide it immediately (works even when `detail` is an external prop);
+            // refreshDetail() re-syncs pages that own their detail.
+            setRemovedFaceIds(function (prev) {
+              var n = Object.assign({}, prev); n[faceId] = true; return n;
+            });
+            setAddedFaces(function (prev) {
+              return prev.filter(function (f) { return f.id !== faceId; });
+            });
             setFaceBusy(null);
             cancelEdit();
-            refreshDetail();
+            syncFaces();
           } else {
             setFaceBusy((res.d && res.d.detail) || 'Remove failed');
           }
         })
         .catch(function (e) { setFaceBusy('Remove error: ' + e); });
-    }, [cancelEdit]);
+    }, [cancelEdit, syncFaces]);
 
     // Re-run InsightFace on this photo (feature 5). Augment keeps tagged faces
     // and adds only non-overlapping detections; replace wipes first.
@@ -549,13 +598,15 @@
             var d = res.d || {};
             setFaceBusy('Added ' + (d.added || 0) + ', kept ' + (d.kept || 0)
               + (d.removed ? ', removed ' + d.removed : '') + '.');
-            refreshDetail();
+            setRemovedFaceIds({});
+            setAddedFaces([]);
+            syncFaces();
           } else {
             setFaceBusy((res.d && res.d.detail) || 'Detection failed');
           }
         })
         .catch(function (e) { setFaceBusy('Detect error: ' + e); });
-    }, [photo]);
+    }, [photo, syncFaces]);
 
     // Persist a hand-drawn face box (feature 6). bbox is normalized 0-1.
     var addFaceBox = useCallback(function (bbox) {
@@ -569,15 +620,35 @@
         .then(function (res) {
           if (res.ok) {
             var d = res.d || {};
+            // Surface the new box immediately with the coords the user drew
+            // (the response has no bbox); dedup drops it once a re-fetch lands.
+            var iw = (detail && detail.image_width) || 0;
+            var ih = (detail && detail.image_height) || 0;
+            if (d.face_id && iw && ih) {
+              var nf = {
+                id: d.face_id,
+                person_name: d.person_name || null,
+                cluster_id: null,
+                match_source: d.person_id ? 'manual' : 'manual_box',
+                det_score: d.det_score != null ? d.det_score : null,
+                bbox: {
+                  top: Math.round(bbox.top * ih),
+                  right: Math.round(bbox.right * iw),
+                  bottom: Math.round(bbox.bottom * ih),
+                  left: Math.round(bbox.left * iw),
+                },
+              };
+              setAddedFaces(function (prev) { return prev.concat([nf]); });
+            }
             setFaceBusy(d.encoded ? 'Face added (encoded — matchable).'
               : 'Box added (no face found — assign a name manually).');
-            refreshDetail();
+            syncFaces();
           } else {
             setFaceBusy((res.d && res.d.detail) || 'Add box failed');
           }
         })
         .catch(function (e) { setFaceBusy('Add box error: ' + e); });
-    }, [photo]);
+    }, [photo, detail, syncFaces]);
 
     // ---- Collection helpers ----
     var refreshPhotoColls = useCallback(function () {
@@ -670,6 +741,9 @@
       setAddingBox(false);
       setDragBox(null);
       setFaceBusy(null);
+      setRemovedFaceIds({});
+      setAddedFaces([]);
+      setLiveFaces(null);
       dragStartRef.current = null;
     }, [photo && photo.id]);
 
@@ -709,16 +783,30 @@
       }
     }
 
+    // detail.faces with local add/remove patches applied (see the patch state
+    // above). Added faces not yet present in detail are appended; deduped by id
+    // so a page that re-fetches converges without doubling the row.
+    var visibleFaces = useMemo(function () {
+      var src = liveFaces != null ? liveFaces : ((detail && detail.faces) || []);
+      var base = src.filter(function (f) { return !removedFaceIds[f.id]; });
+      var seen = {};
+      base.forEach(function (f) { seen[f.id] = 1; });
+      var extra = addedFaces.filter(function (f) {
+        return !seen[f.id] && !removedFaceIds[f.id];
+      });
+      return base.concat(extra);
+    }, [detail, liveFaces, removedFaceIds, addedFaces]);
+
     // Build face bounding box overlay data
     var faceOverlays = useMemo(function () {
-      if (!detail || !detail.faces || !imgRect) return [];
+      if (!detail || !imgRect) return [];
       // Use original image dimensions for bbox scaling.
       // imgRect.nw/nh is the PREVIEW image size (≤1920px), but bbox coords are
       // stored in original image space (e.g. 4608px). Using detail.image_width
       // gives the correct scale factor regardless of which image tier is served.
       var origW = (detail && detail.image_width) ? detail.image_width : imgRect.nw;
       var origH = (detail && detail.image_height) ? detail.image_height : imgRect.nh;
-      return detail.faces.filter(function (f) { return f.bbox; }).map(function (f) {
+      return visibleFaces.filter(function (f) { return f.bbox; }).map(function (f) {
         var bbox = f.bbox;
         var sx = imgRect.dw / origW;
         var sy = imgRect.dh / origH;
@@ -733,7 +821,7 @@
           },
         };
       });
-    }, [detail, imgRect]);
+    }, [detail, imgRect, visibleFaces]);
 
     // ---- Keyboard navigation ----
     useEffect(function () {
@@ -1392,8 +1480,8 @@
           // Faces
           showFaces && detail && detail.faces && e('div', { className: 'detail-section' },
             e('h3', null, 'People'),
-            detail.faces.length > 0
-              ? detail.faces.map(renderFaceTag)
+            visibleFaces.length > 0
+              ? visibleFaces.map(renderFaceTag)
               : e('div', { style: { fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 } },
                   'No faces detected.'),
             // Detection tools (features 5 + 6). Compute runs on the NAS (originals
@@ -1407,7 +1495,7 @@
               return e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 } },
                 e('button', { style: btn, disabled: !!addingBox,
                   onClick: function () { redetectFaces(false); } }, 'Detect faces'),
-                detail.faces.length > 0 && e('button', { style: btn,
+                visibleFaces.length > 0 && e('button', { style: btn,
                   title: 'Delete all faces on this photo and re-detect from scratch',
                   onClick: function () {
                     if (window.confirm('Replace all faces on this photo? This wipes any names you assigned.'))
