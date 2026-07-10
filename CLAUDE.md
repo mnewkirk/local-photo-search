@@ -1152,6 +1152,17 @@ dedup on therefore both deletes duplicates *and* writes inferred GPS
   dropped it). Compact search hits now carry `camera_model` so the shared grid
   📷 badge renders on Ask cards too.
 
+  **Grouped photobook results + per-day aesthetics:** the book tools now drive a
+  **sectioned** results view — `agent._grouping_for` emits `group_field`+`groups`
+  on the `photos` event (chapters/scenes/day/bucket) and `PhotoGrid` renders
+  labeled sections (like Review's Timeline) instead of a flat grid, so chapters
+  are actually visible. Ask also mirrors its query+pinned-filters into the URL.
+  New `min_day_aesthetic` filter floors on the PER-DAY percentile
+  (`COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct)`) rather than the
+  library-wide `aes_overall_pct` of `min_aesthetic` — "best of each day" on a
+  trip. Threaded through `search_combined`, `/api/search`, the Ask tools, and a
+  "Min day %" UI input.
+
 - `docs/plans/backfill-maintenance-sweep.md` — M25. **SHIPPED (2026-06-21).**
   `maintenance-sweep` / `validate-data` / `repair-data` CLIs + `photosearch/
   maintenance.py` (dependency-ordered, missing-only, dry-run default, on_progress/

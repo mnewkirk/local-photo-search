@@ -1043,3 +1043,20 @@ def test_resolve_location_bbox_falls_back_to_region(db, monkeypatch):
                         lambda d, q, limit=5: ([{"lat": 37.97, "lon": -122.53,
                                                  "bbox": [37.9, 38.05, -122.6, -122.45]}], "x"))
     assert S._resolve_location_bbox(db, "San Rafael") is not None
+
+    def test_min_day_aesthetic_filters_per_day(self, db):
+        # Per-day percentile floor: photos are gated on how they rank among
+        # the SAME day's photos (aes_overall_day_pct), not the whole library.
+        from photosearch.search import search_combined
+
+        # Give every photo a library percentile so the aesthetics browse
+        # includes them, and a LOW per-day percentile...
+        db.conn.execute("UPDATE photos SET aes_overall_pct = 50, aes_overall_day_pct = 10")
+        pid = db.conn.execute(
+            "SELECT id FROM photos WHERE filename = 'DSC04922.JPG'").fetchone()["id"]
+        # ...except one photo that's top-of-its-day.
+        db.conn.execute("UPDATE photos SET aes_overall_day_pct = 90 WHERE id = ?", (pid,))
+        db.conn.commit()
+
+        ids = {r["id"] for r in search_combined(db, min_day_aesthetic=50)}
+        assert ids == {pid}

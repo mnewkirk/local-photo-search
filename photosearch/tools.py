@@ -500,6 +500,12 @@ _CURATION_FILTER_PROPS = {
                               "(library-relative; 90 = top 10%). Prefer this over "
                               "min_quality for a 'high quality' bar — percentiles "
                               "spread evenly whereas raw scores cluster ~5-7."},
+    "min_day_aesthetic": {"type": "number",
+               "description": "Minimum PER-DAY aesthetic percentile, 0-100 — how a "
+                              "photo ranks among others taken the SAME day, not the "
+                              "whole library. Use for 'the best of each day' on a "
+                              "trip where a whole day may sit below the library "
+                              "median (e.g. 'top 40% of each day')."},
     "style_tag": {"type": "string",
                "description": "Aesthetic style tag, e.g. 'golden-hour', "
                               "'black-and-white', 'moody' (from the VLM style pass)."},
@@ -617,6 +623,7 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         match_source=(args.get("match_source") or "").strip() or None,
         min_quality=min_quality,
         min_aesthetic=_opt_float(args.get("min_aesthetic")),
+        min_day_aesthetic=_opt_float(args.get("min_day_aesthetic")),
         sort=sort,
         limit=limit,
         with_total=True,
@@ -879,6 +886,12 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
     if ma is not None and _has_column(db, "aes_overall_pct"):
         clauses.append("aes_overall_pct >= ?")
         params.append(ma)
+
+    mda = _opt_float(args.get("min_day_aesthetic"))
+    if mda is not None and _has_column(db, "aes_overall_day_pct"):
+        clauses.append(
+            "COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct) >= ?")
+        params.append(mda)
 
     st = (args.get("style_tag") or "").strip()
     if st and _has_column(db, "aes_style_tags"):

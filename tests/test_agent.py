@@ -292,3 +292,38 @@ def test_locked_camera_match_keeps_results(db, monkeypatch):
     events = _run(db, "photos of Alex", locked_filters={"camera": "ILCE-7M4"})
     photos = next(e for e in events if e["type"] == "photos")
     assert photos["total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Result grouping (photobook sections)
+# ---------------------------------------------------------------------------
+
+def test_grouping_for_representatives_uses_bucket_in_order():
+    res = {"results": [{"id": 1, "bucket": "2026"}, {"id": 2, "bucket": "2025"},
+                       {"id": 3, "bucket": "2026"}]}
+    gf, groups = agent._grouping_for("representatives", res)
+    assert gf == "bucket"
+    assert [g["key"] for g in groups] == ["2026", "2025"]
+
+
+def test_grouping_for_daily_highlights_uses_day():
+    res = {"day_summary": [{"day": "2026-03-13", "places": ["Big Sur, CA"]}], "results": []}
+    gf, groups = agent._grouping_for("daily_highlights", res)
+    assert gf == "day"
+    assert groups[0]["label"] == "2026-03-13"
+    assert "Big Sur, CA" in groups[0]["sublabel"]
+
+
+def test_grouping_for_plain_search_is_none():
+    assert agent._grouping_for("search_photos", {"results": []}) == (None, None)
+
+
+def test_photos_event_carries_chapter_grouping(db, monkeypatch):
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("group_into_chapters", {"min_photos": 1}),
+        _answer("Two chapters: Morro Bay then Big Sur."),
+    ))
+    events = _run(db, "break our trip into chapters")
+    photos = next(e for e in events if e["type"] == "photos")
+    assert photos.get("group_field") == "chapter"
+    assert [g["label"] for g in photos["groups"]] == ["Morro Bay, CA", "Big Sur, CA"]

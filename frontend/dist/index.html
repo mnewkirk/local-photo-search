@@ -631,6 +631,7 @@
         date_to: p.get('date_to') || '',
         min_quality: p.get('min_quality') || '',
         min_aesthetic: p.get('min_aesthetic') || '',
+        min_day_aesthetic: p.get('min_day_aesthetic') || '',
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
         camera: p.get('camera') || '',
@@ -651,6 +652,7 @@
       const [colorFilter, setColorFilter] = useState(initParams.color);
       const [minQuality, setMinQuality] = useState(initParams.min_quality);
       const [minAesthetic, setMinAesthetic] = useState(initParams.min_aesthetic);
+      const [minDayAesthetic, setMinDayAesthetic] = useState(initParams.min_day_aesthetic);
       const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
       const [locationFilter, setLocationFilter] = useState(initParams.location);
       const [cameraFilter, setCameraFilter] = useState(initParams.camera);
@@ -696,6 +698,8 @@
       const [asking, setAsking] = useState(false);
       const [askLog, setAskLog] = useState([]);      // narration lines
       const [askAnswer, setAskAnswer] = useState(''); // final prose answer
+      const [askGroups, setAskGroups] = useState(null);      // section headers [{key,label,sublabel}]
+      const [askGroupField, setAskGroupField] = useState(null); // per-hit key to group on
       const askAbortRef = useRef(null);
 
       const toggleStack = useCallback((stackId) => {
@@ -840,8 +844,9 @@
       const buildSearchParams = useCallback(() => {
         const mqVal = minQuality ? parseFloat(minQuality) : null;
         const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
+        const mdaVal = minDayAesthetic ? parseFloat(minDayAesthetic) : null;
         if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter
-            && !dateFrom && !dateTo && mqVal == null && maVal == null && !matchSource
+            && !dateFrom && !dateTo && mqVal == null && maVal == null && mdaVal == null && !matchSource
             && sortBy !== 'aesthetic_desc' && sortBy !== 'subject_aesthetic_desc') return null;
         const params = new URLSearchParams();
         if (query) params.set('q', query);
@@ -853,11 +858,12 @@
         if (dateTo) params.set('date_to', dateTo);
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
         if (maVal != null && !isNaN(maVal)) params.set('min_aesthetic', maVal);
+        if (mdaVal != null && !isNaN(mdaVal)) params.set('min_day_aesthetic', mdaVal);
         if (sortQuality) params.set('sort_quality', 'true');
         if (matchSource) params.set('match_source', matchSource);
         if (sortBy) params.set('sort', sortBy);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, minAesthetic, sortQuality, locationFilter, cameraFilter, dateFrom, dateTo, matchSource, sortBy]);
+      }, [query, personFilter, colorFilter, minQuality, minAesthetic, minDayAesthetic, sortQuality, locationFilter, cameraFilter, dateFrom, dateTo, matchSource, sortBy]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -925,6 +931,7 @@
         if (dateTo) askUrl.set('date_to', dateTo);
         if (minQuality) askUrl.set('min_quality', minQuality);
         if (minAesthetic) askUrl.set('min_aesthetic', minAesthetic);
+        if (minDayAesthetic) askUrl.set('min_day_aesthetic', minDayAesthetic);
         if (sortQuality) askUrl.set('sort_quality', 'true');
         window.history.pushState(null, '',
           window.location.pathname + '?' + askUrl.toString());
@@ -939,6 +946,8 @@
         setAskAnswer('');
         setResults(null);
         setTotalResults(0);
+        setAskGroups(null);
+        setAskGroupField(null);
         setHasMore(false);
 
         // Pin the structured filter bar as HARD inputs to the Ask — the server
@@ -954,6 +963,7 @@
         if (dateTo) askFilters.date_to = dateTo;
         if (minQuality) askFilters.min_quality = parseFloat(minQuality);
         if (minAesthetic) askFilters.min_aesthetic = parseFloat(minAesthetic);
+        if (minDayAesthetic) askFilters.min_day_aesthetic = parseFloat(minDayAesthetic);
         if (sortQuality) askFilters.sort = 'quality_desc';
 
         fetch(API + '/api/ask', {
@@ -995,6 +1005,8 @@
                 } else if (p.type === 'photos') {
                   setResults(p.results || []);
                   setTotalResults(p.total || (p.results || []).length);
+                  setAskGroups(p.groups || null);
+                  setAskGroupField(p.group_field || null);
                   setHasMore(false);
                 } else if (p.type === 'answer') {
                   setAskAnswer(p.text || '');
@@ -1013,7 +1025,7 @@
             setAsking(false);
           });
       }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
-          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, sortQuality]);
+          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, minDayAesthetic, sortQuality]);
 
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
@@ -1290,9 +1302,22 @@
               className: 'filter-input',
               type: 'number',
               placeholder: '0–100',
-              title: 'Minimum VLM aesthetic percentile (0–100)',
+              title: 'Minimum VLM aesthetic percentile across the WHOLE library (0–100)',
               value: minAesthetic,
               onChange: (ev) => setMinAesthetic(ev.target.value),
+              min: 0, max: 100, step: 5,
+              style: { width: 72 },
+            }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Min day %:'),
+            e('input', {
+              className: 'filter-input',
+              type: 'number',
+              placeholder: '0–100',
+              title: 'Minimum PER-DAY aesthetic percentile — rank among photos taken the same day (0–100). Good for trips.',
+              value: minDayAesthetic,
+              onChange: (ev) => setMinDayAesthetic(ev.target.value),
               min: 0, max: 100, step: 5,
               style: { width: 72 },
             }),
@@ -1417,6 +1442,8 @@
                            sortBy: askMode ? null : sortBy,
                            setSortBy: askMode ? null : setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc', 'day_quality_desc'],
+                           groups: askMode ? askGroups : null,
+                           groupField: askMode ? askGroupField : null,
                            onSelect: openPhoto, multiSelect, selected, onToggleSelect: toggleSelect,
                            expandedStacks, stackMembers, toggleStack, query,
                            totalResults, hasMore, loadingMore, onLoadMore: loadMore }),
@@ -1479,7 +1506,7 @@
       return _FILENAME_RE.test(stem);
     }
 
-    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query, totalResults, hasMore, loadingMore, onLoadMore }) {
+    function PhotoGrid({ results, sortBy, setSortBy, sortOptions, groups, groupField, onSelect, multiSelect, selected, onToggleSelect, expandedStacks, stackMembers, toggleStack, query, totalResults, hasMore, loadingMore, onLoadMore }) {
       // Build display list: filter out non-top stack members, insert expanded members after their top photo
       // Exception: filename searches always show the matched photo regardless of stack position
       const isFilenameSearch = useMemo(() => looksLikeFilename(query), [query]);
@@ -1518,36 +1545,77 @@
       // far across pages. When they diverge, show both.
       const showTotal = totalResults && totalResults > loadedCount;
 
+      const renderItem = (item) => {
+        const photo = item.photo;
+        return e(GridItem, {
+          key: (item.isStackMember ? 'sm-' : '') + photo.id,
+          photo,
+          multiSelect,
+          isSelected: selected && selected.has(photo.id),
+          isStackMember: item.isStackMember,
+          stackId: item.stackId || photo.stack_id,
+          expandedStacks,
+          toggleStack,
+          onClick: (ev) => {
+            if (multiSelect) { onToggleSelect(photo.id, ev); return; }
+            onSelect(photo);
+          },
+        });
+      };
+
+      // Grouped ("photobook") layout: when the Ask returned section headers,
+      // break the grid into labeled sections (chapter / day / scene / bucket)
+      // in the given order, like Review's Timeline. `groupField` names the key
+      // on each photo; 'day' is derived from date_taken.
+      const groupKeyOf = (photo) => groupField === 'day'
+        ? ((photo.date_taken || '').slice(0, 10) || 'Undated')
+        : photo[groupField];
+      const sections = (groups && groups.length && groupField) ? (() => {
+        const byKey = new Map();
+        displayItems.forEach(it => {
+          const kk = (() => { const k = groupKeyOf(it.photo); return k == null ? 'Other' : String(k); })();
+          if (!byKey.has(kk)) byKey.set(kk, []);
+          byKey.get(kk).push(it);
+        });
+        const out = [];
+        const seen = new Set();
+        groups.forEach(g => {
+          const kk = String(g.key);
+          seen.add(kk);
+          const items = byKey.get(kk) || [];
+          if (items.length) out.push({ g, items });
+        });
+        byKey.forEach((items, kk) => {
+          if (!seen.has(kk)) out.push({ g: { key: kk, label: kk }, items });
+        });
+        return out;
+      })() : null;
+
       return e('div', null,
         e('div', { style: { marginBottom: 12, fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
           e('span', null, visibleCount.toLocaleString() + ' result' + (visibleCount !== 1 ? 's' : '') +
             (visibleCount < loadedCount ? ' (of ' + loadedCount.toLocaleString() + ' loaded)' : '') +
             (showTotal ? ' · ' + loadedCount.toLocaleString() + ' of '
                          + totalResults.toLocaleString() + ' total' : '') +
+            (sections ? ' · ' + sections.length + ' group' + (sections.length !== 1 ? 's' : '') : '') +
             (stackCount > 0 ? ' (' + stackCount + ' stacked)' : '')),
           sortBy && setSortBy && e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: sortOptions }),
           multiSelect && e('span', { style: { color: 'var(--accent)', fontSize: 12 } },
             'Click to select \u00B7 Shift-click for range'),
         ),
-        e('div', { className: 'grid' },
-          ...displayItems.map(item => {
-            const photo = item.photo;
-            return e(GridItem, {
-              key: (item.isStackMember ? 'sm-' : '') + photo.id,
-              photo,
-              multiSelect,
-              isSelected: selected && selected.has(photo.id),
-              isStackMember: item.isStackMember,
-              stackId: item.stackId || photo.stack_id,
-              expandedStacks,
-              toggleStack,
-              onClick: (ev) => {
-                if (multiSelect) { onToggleSelect(photo.id, ev); return; }
-                onSelect(photo);
-              },
-            });
-          }),
-        ),
+        sections
+          ? sections.map(sec => e('div', { key: sec.g.key, style: { marginBottom: 28 } },
+              e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10,
+                                  flexWrap: 'wrap', padding: '6px 0 10px',
+                                  borderBottom: '1px solid var(--border)', marginBottom: 12 } },
+                e('span', { style: { fontSize: 17, fontWeight: 700, color: 'var(--text)' } }, sec.g.label),
+                sec.g.sublabel && e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, sec.g.sublabel),
+                e('span', { style: { fontSize: 12, color: 'var(--text-muted)', marginLeft: 'auto' } },
+                  sec.items.length + ' photo' + (sec.items.length !== 1 ? 's' : '')),
+              ),
+              e('div', { className: 'grid' }, ...sec.items.map(renderItem)),
+            ))
+          : e('div', { className: 'grid' }, ...displayItems.map(renderItem)),
         hasMore && e('div', {
           style: {
             textAlign: 'center',

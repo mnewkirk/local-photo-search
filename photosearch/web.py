@@ -273,6 +273,7 @@ def api_search(
     min_impact: Optional[float] = Query(None, description="Minimum Impact & Storytelling score (1-10)"),
     style_tag: Optional[str] = Query(None, description="Filter by aesthetic style tag (e.g. golden-hour)"),
     min_subject_aesthetic: Optional[float] = Query(None, description="Minimum SUBJECT-crop aesthetic percentile (0-100)"),
+    min_day_aesthetic: Optional[float] = Query(None, description="Minimum PER-DAY aesthetic percentile (0-100) — rank among photos taken the same day"),
     sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, aesthetic_desc, subject_aesthetic_desc, relevance"),
     sort_quality: bool = Query(False, description="Legacy: equivalent to sort=quality_desc"),
     text_match: str = Query("all", description="Text matching mode: all, dict, categories, visual, keywords, off"),
@@ -305,7 +306,7 @@ def api_search(
                 min_quality is not None, date_from, date_to, location,
                 min_aesthetic is not None, min_technical is not None,
                 min_composition is not None, min_impact is not None, style_tag,
-                min_subject_aesthetic is not None,
+                min_subject_aesthetic is not None, min_day_aesthetic is not None,
                 sort in ("aesthetic_desc", "subject_aesthetic_desc")]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
@@ -346,6 +347,7 @@ def api_search(
             min_impact=min_impact,
             style_tag=style_tag,
             min_subject_aesthetic=min_subject_aesthetic,
+            min_day_aesthetic=min_day_aesthetic,
             camera=camera,
         )
 
