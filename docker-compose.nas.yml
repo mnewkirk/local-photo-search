@@ -140,9 +140,9 @@ services:
       - PHOTOSEARCH_CACHE=/data/.cache/photosearch
       - PHOTOSEARCH_MCP_HOST=0.0.0.0
       - PHOTOSEARCH_MCP_PORT=8848
-      # Image returns are OFF by default — text metadata only. Set to 1 to let
+      # Image returns are ON by default. Set to 0 to only allow text metadata;
       # connected MCP clients pull thumbnails (pixels then leave the NAS).
-      - PHOTOSEARCH_MCP_ALLOW_IMAGES=${PHOTOSEARCH_MCP_ALLOW_IMAGES:-0}
+      - PHOTOSEARCH_MCP_ALLOW_IMAGES=${PHOTOSEARCH_MCP_ALLOW_IMAGES:-1}
     command: ["mcp"]
     depends_on:
       photosearch:

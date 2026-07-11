@@ -43,7 +43,7 @@ case "${1:-serve}" in
         echo "=== local-photo-search: starting MCP server ==="
         echo "  Database: ${PHOTOSEARCH_DB}"
         echo "  Port:     ${PHOTOSEARCH_MCP_PORT:-8848}"
-        echo "  Images:   ${PHOTOSEARCH_MCP_ALLOW_IMAGES:-0}"
+        echo "  Images:   ${PHOTOSEARCH_MCP_ALLOW_IMAGES:-1}"
         echo ""
         exec python -m photosearch.mcp_server
         ;;
