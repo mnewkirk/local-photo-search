@@ -692,10 +692,12 @@
       // ---- Multi-select state ----
       const [multiSelect, setMultiSelect] = useState(false);
       const [selected, setSelected] = useState(new Set()); // set of photo IDs
-      const [multiAction, setMultiAction] = useState(null); // 'add-to-coll' | null
+      const [multiAction, setMultiAction] = useState(null); // 'add-to-coll' | 'add-to-book' | null
       const [allColls, setAllColls] = useState([]);
       const [newCollName, setNewCollName] = useState('');
       const [collBusy, setCollBusy] = useState(false);
+      const [allBooks, setAllBooks] = useState([]);
+      const [newBookName, setNewBookName] = useState('');
       const lastSelectedIdx = useRef(null);
 
       // ---- Stack expansion state ----
@@ -804,6 +806,7 @@
         setSelected(new Set());
         setMultiAction(null);
         setNewCollName('');
+        setNewBookName('');
         lastSelectedIdx.current = null;
       }, []);
 
@@ -838,6 +841,47 @@
           exitMultiSelect();
         }).catch(() => setCollBusy(false));
       }, [selected, newCollName, exitMultiSelect]);
+
+      // Add-to-book: push the selected search results into a photobook's
+      // candidate pool (full search filter bar feeds a book — the culled
+      // Varenna-style set the book tray's minimal search can't build).
+      const startAddToBook = useCallback(() => {
+        fetch(API + '/api/books').then(r => r.json()).then(d => setAllBooks(d.books || [])).catch(() => {});
+        setMultiAction('add-to-book');
+        setNewBookName('');
+      }, []);
+
+      const addSelectedToBook = useCallback((bookId) => {
+        setCollBusy(true);
+        fetch(API + '/api/books/' + bookId + '/candidates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: Array.from(selected) }),
+        }).then(r => r.json()).then(() => {
+          setCollBusy(false);
+          exitMultiSelect();
+          window.location.href = '/book/' + bookId;
+        }).catch(() => setCollBusy(false));
+      }, [selected, exitMultiSelect]);
+
+      const createBookAndAdd = useCallback(() => {
+        const name = newBookName.trim();
+        if (!name || selected.size === 0) return;
+        setCollBusy(true);
+        fetch(API + '/api/books', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        }).then(r => r.json()).then(d => {
+          const bid = d.book && d.book.id;
+          if (!bid) throw new Error('book create failed');
+          return fetch(API + '/api/books/' + bid + '/candidates', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ photo_ids: Array.from(selected) }),
+          }).then(() => { setCollBusy(false); exitMultiSelect(); window.location.href = '/book/' + bid; });
+        }).catch(() => setCollBusy(false));
+      }, [selected, newBookName, exitMultiSelect]);
 
       // Escape exits multi-select
       useEffect(() => {
@@ -1516,6 +1560,39 @@
               className: 'primary',
               onClick: startAddToColl,
             }, 'Add to Collection'),
+            !multiAction && selected.size > 0 && e('button', {
+              onClick: startAddToBook,
+              title: 'Add these to a photobook’s candidate pool',
+            }, '📖 Add to Book'),
+
+            // Add-to-book sub-action: pick existing
+            multiAction === 'add-to-book' && allBooks.length > 0 && e('select', {
+              value: '',
+              disabled: collBusy,
+              onChange: (ev) => { if (ev.target.value) addSelectedToBook(parseInt(ev.target.value)); },
+            },
+              e('option', { value: '' }, 'Choose book…'),
+              ...allBooks.map(b =>
+                e('option', { key: b.id, value: b.id }, b.name + ' (' + (b.candidate_count || 0) + ')')
+              ),
+            ),
+            multiAction === 'add-to-book' && e('input', {
+              className: 'inline-input',
+              value: newBookName,
+              disabled: collBusy,
+              onChange: (ev) => setNewBookName(ev.target.value),
+              onKeyDown: (ev) => {
+                if (ev.key === 'Enter') createBookAndAdd();
+                if (ev.key === 'Escape') { ev.stopPropagation(); setMultiAction(null); }
+              },
+              placeholder: 'Or create new book…',
+            }),
+            multiAction === 'add-to-book' && e('button', {
+              className: 'primary',
+              onClick: createBookAndAdd,
+              disabled: !newBookName.trim() || collBusy,
+            }, collBusy ? 'Adding…' : 'Create & Add'),
+            multiAction === 'add-to-book' && e('button', { onClick: () => setMultiAction(null) }, 'Back'),
 
             // Add-to-collection sub-action: pick existing
             multiAction === 'add-to-coll' && allColls.length > 0 && e('select', {

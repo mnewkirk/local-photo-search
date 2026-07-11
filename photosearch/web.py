@@ -3614,14 +3614,21 @@ def api_book_update_cell(book_id: int, cell_id: int, body: dict):
 @app.post("/api/books/{book_id}/auto-arrange")
 def api_book_auto_arrange(book_id: int, body: dict):
     """Materialize spreads from the included candidate pool via the deterministic
-    suggest_layout partition (skips excluded photos)."""
+    suggest_layout partition (skips excluded photos). ``per_day`` keeps only the
+    best N photos of each day first — the best-of-day cull that turns a big pool
+    into a Varenna-scale book."""
+    from . import book_ai
     with _get_books() as bs, _get_db() as pdb:
         if not bs.get_book_row(book_id):
             return JSONResponse({"error": "Book not found"}, status_code=404)
         pids = body.get("photo_ids")
-        n = bs.auto_arrange(pdb, book_id,
-                            [int(i) for i in pids] if pids else None,
-                            body.get("spread_count"),
+        ids = [int(i) for i in pids] if pids else None
+        per_day = body.get("per_day")
+        if per_day:
+            base = ids if ids is not None else bs.included_ids(book_id)
+            excluded = {p for p, d in bs.decision_map(book_id).items() if d == "exclude"}
+            ids = book_ai._thin_per_day(pdb, [i for i in base if i not in excluded], int(per_day))
+        n = bs.auto_arrange(pdb, book_id, ids, body.get("spread_count"),
                             replace=body.get("replace", True))
         return {"spreads_created": n, "book": bs.get_book(book_id)}
 
