@@ -3882,8 +3882,18 @@ def api_book_pick_heroes(book_id: int, beat_id: int, body: dict):
             bs.set_beat_candidate(beat_id, pid, {
                 "role": "hero" if is_hero else "candidate",
                 "position": pos, "vlm_score": r.get("score"), "vlm_reason": r.get("reason"),
-                "crop_mode": book_authoring.suggest_crop_mode(pdb, pid) if is_hero else "crop"})
+                "crop_mode": r.get("crop_mode") or "crop"})
         return {"outline": bs.get_outline(book_id)}
+
+
+@app.get("/api/books/{book_id}/authoring/preview")
+def api_book_preview(book_id: int):
+    """The computed spread layout for the current outline (not persisted) — powers
+    the review's live spread previews so you see how beats come together."""
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        return bs.preview_spreads(pdb, book_id)
 
 
 @app.post("/api/books/{book_id}/authoring/assemble")

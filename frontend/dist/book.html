@@ -112,6 +112,13 @@
     .covers { display:flex; gap:18px; margin-bottom:12px; }
     .covers .slot { text-align:center; }
     .covers img { height:58px; border-radius:4px; border:1px solid var(--border); display:block; }
+    .previews { display:flex; gap:8px; overflow-x:auto; padding:6px 0 10px; }
+    .ministage { position:relative; width:190px; background:#fff; border:1px solid var(--border);
+      border-radius:3px; overflow:hidden; flex:0 0 auto; }
+    .minicell { position:absolute; overflow:hidden; background-repeat:no-repeat; }
+    .minispine { position:absolute; top:0; bottom:0; left:50%; border-left:1px dashed rgba(0,0,0,.15); }
+    .minilabel { font-size:10px; color:var(--text-muted); text-align:center; max-width:190px;
+      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
     /* Proof */
     .proof .stage { border:0; box-shadow:0 1px 6px rgba(0,0,0,.4); margin:0 auto 4px; }
@@ -542,18 +549,41 @@
       return JSON.stringify(ev);
     }
 
+    // A tiny non-interactive render of a computed spread (for the review preview).
+    function MiniSpread({ sw, sh, spread }) {
+      return e('div', null,
+        e('div', { className:'ministage', style:{ aspectRatio:sw+' / '+sh } },
+          spread.cells.map((c, i) => e('div', { key:i, className:'minicell', style:{
+            left:(c.x/sw*100)+'%', top:(c.y/sh*100)+'%',
+            width:(c.w/sw*100)+'%', height:(c.h/sh*100)+'%',
+            backgroundImage:'url('+thumb(c.photo_id)+')',
+            backgroundSize: c.fit==='contain' ? 'contain' : 'cover',
+            backgroundPosition: c.fit==='contain' ? 'center' :
+              ((c.crop_cx!=null?c.crop_cx*100:50)+'% '+(c.crop_cy!=null?c.crop_cy*100:50)+'%'),
+            backgroundColor: c.fit==='contain' ? '#fff' : '#000',
+          } })),
+          e('div', { className:'minispine' })),
+        e('div', { className:'minilabel' }, spread.label || ''));
+    }
+
+    const CROP_CYCLE = ['crop', 'w80', 'h80', 'both80', 'full'];
+    const CROP_LABEL = { crop:'crop', w80:'≥80%w', h80:'≥80%h', both80:'≥80%', full:'FULL' };
+
     function AuthorWizard({ bookId }) {
       const [book, setBook] = useState(null);
       const [stage, setStage] = useState('setup');   // setup | drafting | review
       const [form, setForm] = useState({ date_from:'', date_to:'', camera:'', place:'', target_spreads:19, notes:'' });
       const [prog, setProg] = useState([]);
       const [outline, setOutline] = useState(null);
+      const [preview, setPreview] = useState(null);
       const set = (k, v) => setForm(f => Object.assign({}, f, { [k]:v }));
+      const refreshPreview = useCallback(() =>
+        api('/api/books/'+bookId+'/authoring/preview').then(setPreview).catch(()=>{}), [bookId]);
       const loadOutline = useCallback(() =>
         api('/api/books/'+bookId+'/authoring/outline').then(d => {
           setOutline(d.outline); setBook(d.book);
-          if (d.outline && d.outline.length) setStage('review');
-        }), [bookId]);
+          if (d.outline && d.outline.length) { setStage('review'); refreshPreview(); }
+        }), [bookId, refreshPreview]);
       useEffect(() => { loadOutline(); }, [loadOutline]);
 
       const draft = async () => {
@@ -570,14 +600,12 @@
       // outline edit helpers
       const setCand = (beatId, pid, fields) =>
         api('/api/books/'+bookId+'/authoring/beats/'+beatId+'/candidates/'+pid, { method:'PUT', body:JSON.stringify(fields) });
-      const makeHero = (beat, pid) => {
-        const ps = beat.candidates.filter(c => c.role==='hero' && c.photo_id!==pid)
-          .map(c => setCand(beat.id, c.photo_id, { role:'candidate' }));
-        ps.push(setCand(beat.id, pid, { role:'hero', crop_mode:'crop' }));
-        Promise.all(ps).then(loadOutline);
-      };
+      // Toggle a candidate hero on/off WITHOUT unselecting the others — the
+      // spread budget controls how many spreads, not the number of chosen photos.
+      const toggleHero = (beat, c) => setCand(beat.id, c.photo_id, { role: c.role==='hero'?'candidate':'hero' }).then(loadOutline);
       const toggleReject = (beat, c) => setCand(beat.id, c.photo_id, { role: c.role==='rejected'?'candidate':'rejected' }).then(loadOutline);
-      const cropToggle = (beat, c) => setCand(beat.id, c.photo_id, { crop_mode: c.crop_mode==='full'?'crop':'full' }).then(loadOutline);
+      const cropCycle = (beat, c) => { const i = CROP_CYCLE.indexOf(c.crop_mode||'crop');
+        setCand(beat.id, c.photo_id, { crop_mode: CROP_CYCLE[(i+1)%CROP_CYCLE.length] }).then(loadOutline); };
       const setCover = (field, pid) => api('/api/books/'+bookId, { method:'PUT', body:JSON.stringify({ [field]:pid }) }).then(d => setBook(d.book));
       const beatUpd = (id, fields) => api('/api/books/'+bookId+'/authoring/beats/'+id, { method:'PUT', body:JSON.stringify(fields) }).then(d => setOutline(d.outline));
       const rePick = (id) => { setProg([]); api('/api/books/'+bookId+'/authoring/beats/'+id+'/pick-heroes', { method:'POST', body:'{}' }).then(d => setOutline(d.outline)); };
@@ -603,12 +631,16 @@
             e('button', { onClick:()=>setStage('setup') }, 'Re-draft'),
             e('button', { className:'primary', onClick:assemble }, 'Assemble & open book →')),
           e('p', { className:'muted', style:{ marginBottom:12 } },
-            'Review the story: toggle beats in/out, fix titles + spread budget, click a candidate to make it the hero (★), and hover a shot for “cover”/“title”. Rejected shots are dimmed. Then assemble.'),
+            'Review the story: toggle beats in/out, fix titles + spread budget, click candidates to add/remove heroes (★, add several), click a hero’s ★badge to cycle its crop (crop → ≥80% → FULL), hover a shot for “cover”/“title”. The preview below shows how the pages come together. Then assemble.'),
           e('div', { className:'covers' }, [
             ['cover_photo_id', 'Front cover'], ['title_page_photo_id', 'Title page'], ['back_cover_photo_id', 'Back cover'],
           ].map(([f, lab]) => e('div', { key:f, className:'slot' },
             e('div', { className:'muted' }, lab),
             (book && book[f]) ? e('img', { src:thumb(book[f]) }) : e('div', { className:'muted', style:{ padding:'18px 20px' } }, '—')))),
+          preview && preview.spreads ? e('div', null,
+            e('div', { className:'muted', style:{ marginBottom:4 } }, 'Spread preview — '+preview.spreads.length+' pages'),
+            e('div', { className:'previews' }, preview.spreads.map((sp, i) =>
+              e(MiniSpread, { key:i, sw:preview.stage_w, sh:preview.stage_h, spread:sp })))) : null,
           outline.map(beat => e('div', { key:beat.id, className:'beat'+(beat.status==='in'?'':' out') },
             e('div', { className:'beat-head' },
               e('input', { type:'checkbox', checked:beat.status==='in', title:'include this beat',
@@ -626,10 +658,11 @@
               const cov = book && (book.cover_photo_id===c.photo_id ? 'COVER'
                 : book.title_page_photo_id===c.photo_id ? 'TITLE'
                 : book.back_cover_photo_id===c.photo_id ? 'BACK' : null);
-              return e('div', { key:c.photo_id, className:cls, onClick:()=>makeHero(beat, c.photo_id),
-                  title:(c.vlm_reason||'') },
+              return e('div', { key:c.photo_id, className:cls, onClick:()=>toggleHero(beat, c),
+                  title:(c.vlm_reason||'')+(c.role==='hero'?' — click ★ to change crop':' — click to add as hero') },
                 e('img', { src:thumb(c.photo_id), loading:'lazy' }),
-                c.role==='hero' ? e('span', { className:'hbadge' }, '★ '+(c.crop_mode==='full'?'FULL':'crop')) : null,
+                c.role==='hero' ? e('span', { className:'hbadge', title:'click to cycle crop',
+                  onClick:ev=>{ ev.stopPropagation(); cropCycle(beat, c); } }, '★ '+(CROP_LABEL[c.crop_mode]||'crop')) : null,
                 cov ? e('span', { className:'cvbadge' }, cov) : null,
                 e('div', { className:'setb' },
                   e('button', { className:'tiny', onClick:ev=>{ ev.stopPropagation(); setCover('cover_photo_id', c.photo_id); } }, 'cover'),
@@ -637,8 +670,6 @@
                   e('button', { className:'tiny', onClick:ev=>{ ev.stopPropagation(); setCover('back_cover_photo_id', c.photo_id); } }, 'back')),
                 e('span', { className:'rx', onClick:ev=>{ ev.stopPropagation(); toggleReject(beat, c); } }, c.role==='rejected'?'↺':'✕'),
                 c.vlm_score!=null ? e('span', { className:'sc' }, 'vlm '+c.vlm_score) : null,
-                c.role==='hero' ? e('span', { className:'sc', style:{ top:20, bottom:'auto', cursor:'pointer' },
-                  onClick:ev=>{ ev.stopPropagation(); cropToggle(beat, c); } }, 'crop: '+(c.crop_mode||'crop')+' ⇄') : null,
               );
             })),
           ))));

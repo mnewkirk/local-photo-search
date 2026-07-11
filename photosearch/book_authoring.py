@@ -214,12 +214,50 @@ def _validate_beats(beats, scenes) -> list[dict]:
 _HERO_WORKERS = 6
 
 
+def _vision_hero(base_url: str, model: str, image_b64: str, criteria: str):
+    """One VLM call scoring a candidate AND judging whether it must be shown
+    uncropped. Returns {score, reason, full_frame} or None."""
+    import urllib.request
+    prompt = (
+        "You are choosing photos for a family travel photo book.\n"
+        f'This photo is a candidate to represent: "{criteria}".\n'
+        "Look at the image and reply with ONLY JSON:\n"
+        '{"score": <0.0-1.0, how well it represents that moment>, '
+        '"full_frame": <true if it MUST be shown uncropped — it is a portrait/'
+        'vertical, or the subject fills the frame or reaches the edges so cropping '
+        'to a wide box would cut it; false if it is a wide scene that crops fine>, '
+        '"reason": "<one short phrase>"}')
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+    ]}], "max_tokens": 150, "temperature": 0}).encode("utf-8")
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions",
+                                     data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            content = json.loads(r.read())["choices"][0]["message"]["content"] or ""
+    except Exception:
+        return None
+    a, b = content.find("{"), content.rfind("}")
+    if a < 0 or b <= a:
+        return None
+    try:
+        o = json.loads(content[a:b + 1])
+        score = float(o.get("score"))
+    except (ValueError, TypeError):
+        return None
+    return {"score": max(0.0, min(1.0, score)),
+            "reason": str(o.get("reason", ""))[:120],
+            "full_frame": bool(o.get("full_frame"))}
+
+
 def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
                 n_heroes: int = 1) -> dict:
-    """Have the vision model LOOK AT each candidate and score how well it
-    represents the beat, then return heroes (top-N) + rejects with reasons.
-    Falls back to input order (aesthetic-sorted upstream) with no VLM."""
-    from .tools import _vision_score, _thumb_b64
+    """Have the vision model LOOK AT each candidate: score how well it represents
+    the beat AND whether it must be shown uncropped ('full' vs croppable). Returns
+    heroes (top-N) + all candidates ranked, each with a VLM-decided crop_mode.
+    Falls back to the geometric suggest_crop_mode with no VLM."""
+    from .tools import _thumb_b64
     ids = list(dict.fromkeys(int(i) for i in candidate_ids))
     if not ids:
         return {"heroes": [], "ranked": []}
@@ -229,7 +267,8 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
                 "travel photo book — clearly shows the moment/place, the family "
                 "visible when relevant, sharp and well composed, not a duplicate")
     if not (base and model):
-        ranked = [{"id": i, "score": None, "reason": "no vision model"} for i in ids]
+        ranked = [{"id": i, "score": None, "reason": "no vision model",
+                   "crop_mode": suggest_crop_mode(pdb, i)} for i in ids]
         return {"heroes": ids[:n_heroes], "ranked": ranked, "reranked": False}
 
     # Resolve thumbnails in THIS thread — _thumb_b64's local branch touches the
@@ -238,7 +277,7 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
 
     def _score(pid):
         b = b64s.get(pid)
-        return pid, (_vision_score(base, model, b, criteria) if b else None)
+        return pid, (_vision_hero(base, model, b, criteria) if b else None)
 
     scores: dict = {}
     with ThreadPoolExecutor(max_workers=_HERO_WORKERS) as pool:
@@ -248,8 +287,24 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
     scored.sort(key=lambda i: scores[i]["score"], reverse=True)
     failed = [i for i in ids if not scores.get(i)]
     order = scored + failed
-    ranked = [{"id": i, "score": (scores[i]["score"] if scores.get(i) else None),
-               "reason": (scores[i]["reason"] if scores.get(i) else None)} for i in order]
+    # Aspect gate: a wide LANDSCAPE crops fine and should fill its cell — only
+    # honor the VLM's 'full_frame' on it when the geometry also says so (portrait /
+    # subject-fills). Otherwise the VLM over-flags full and every spread goes sparse.
+    ph = ",".join("?" * len(ids))
+    ar = {r["id"]: ((r["w"] / r["h"]) if r["w"] and r["h"] else 1.5)
+          for r in pdb.conn.execute(
+              f"SELECT id, image_width w, image_height h FROM photos WHERE id IN ({ph})", ids)}
+    ranked = []
+    for i in order:
+        sc = scores.get(i)
+        geo = suggest_crop_mode(pdb, i)      # 'full' for portrait / subject-fills
+        vlm_full = bool(sc and sc.get("full_frame"))
+        # Honor the VLM's 'full' only for portrait/near-square frames (verticality
+        # the crop can't preserve). Landscapes — incl. 4:3 — fill their cell and
+        # only stay uncropped when the geometry says the subject fills the frame.
+        mode = "full" if (geo == "full" or (vlm_full and ar.get(i, 1.5) < 0.95)) else "crop"
+        ranked.append({"id": i, "score": (sc["score"] if sc else None),
+                       "reason": (sc["reason"] if sc else None), "crop_mode": mode})
     return {"heroes": order[:n_heroes], "ranked": ranked, "reranked": True}
 
 
@@ -296,7 +351,7 @@ def draft_book(pdb, bs, book_id: int, filters: dict, notes: Optional[str],
                     "photo_id": pid, "position": pos,
                     "role": "hero" if is_hero else "candidate",
                     "vlm_score": r.get("score"), "vlm_reason": r.get("reason"),
-                    "crop_mode": suggest_crop_mode(pdb, pid) if is_hero else "crop"})
+                    "crop_mode": r.get("crop_mode") or "crop"})
                 if is_hero and (r.get("score") or 0) > best_cover[1]:
                     best_cover = (pid, r.get("score") or 0)
             done += 1

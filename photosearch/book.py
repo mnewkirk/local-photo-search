@@ -123,13 +123,41 @@ class BookStore:
                     CHECK (role IN ('hero','candidate','rejected')),
                 vlm_score REAL,
                 vlm_reason TEXT,
-                crop_mode TEXT NOT NULL DEFAULT 'crop' CHECK (crop_mode IN ('crop','full')),
+                crop_mode TEXT NOT NULL DEFAULT 'crop'
+                    CHECK (crop_mode IN ('crop','w80','h80','both80','full')),
                 PRIMARY KEY (beat_id, photo_id)
             );
             CREATE INDEX IF NOT EXISTS idx_beats_book ON book_beats(book_id, position);
             CREATE INDEX IF NOT EXISTS idx_beatcands_beat ON book_beat_candidates(beat_id, position);
             """
         )
+        # Widen the crop_mode CHECK on an existing sidecar (M30 shipped it binary
+        # crop/full; graded levels were added later). Rebuild the table if the old
+        # 2-value CHECK is present.
+        r = c.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                      "AND name='book_beat_candidates'").fetchone()
+        if r and r[0] and "IN ('crop','full')" in r[0]:
+            c.executescript(
+                """
+                ALTER TABLE book_beat_candidates RENAME TO _bbc_old;
+                CREATE TABLE book_beat_candidates (
+                    beat_id INTEGER NOT NULL REFERENCES book_beats(id) ON DELETE CASCADE,
+                    photo_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    role TEXT NOT NULL DEFAULT 'candidate'
+                        CHECK (role IN ('hero','candidate','rejected')),
+                    vlm_score REAL, vlm_reason TEXT,
+                    crop_mode TEXT NOT NULL DEFAULT 'crop'
+                        CHECK (crop_mode IN ('crop','w80','h80','both80','full')),
+                    PRIMARY KEY (beat_id, photo_id)
+                );
+                INSERT INTO book_beat_candidates SELECT * FROM _bbc_old;
+                DROP TABLE _bbc_old;
+                CREATE INDEX IF NOT EXISTS idx_beatcands_beat
+                    ON book_beat_candidates(beat_id, position);
+                """
+            )
+
         # Additive column migrations for an existing sidecar (books predates M30).
         for col, ddl in (
             ("back_cover_photo_id", "INTEGER"),
@@ -417,76 +445,108 @@ class BookStore:
             f"WHERE beat_id = ? AND photo_id = ?", vals)
         self.conn.commit()
 
-    def _face_counts(self, pdb, ids: list[int]) -> dict[int, int]:
+    def _photo_meta(self, pdb, ids: list[int]) -> dict[int, dict]:
+        """{id: {'ar': w/h, 'nf': face_count}} for layout decisions."""
         if not ids:
             return {}
         ph = ",".join("?" * len(ids))
-        return {r["id"]: r["nf"] for r in pdb.conn.execute(
-            f"SELECT id, (SELECT COUNT(*) FROM faces f WHERE f.photo_id = photos.id) nf "
-            f"FROM photos WHERE id IN ({ph})", ids).fetchall()}
+        out = {}
+        for r in pdb.conn.execute(
+            f"SELECT id, image_width w, image_height h, "
+            f"(SELECT COUNT(*) FROM faces f WHERE f.photo_id = photos.id) nf "
+            f"FROM photos WHERE id IN ({ph})", ids).fetchall():
+            ar = (r["w"] / r["h"]) if (r["w"] and r["h"]) else 1.5
+            out[r["id"]] = {"ar": ar, "nf": r["nf"]}
+        return out
 
-    def assemble_from_outline(self, pdb, book_id: int, per_spread: int = 3) -> int:
-        """Turn the included beats into spreads: a title-page spread (blank left /
-        hero right) if set, then each in-beat's non-rejected candidates (hero first)
-        chunked into its spread_budget spreads. The hero cell honors crop_mode
-        ('full' -> the 100/100 no-crop constraint). Returns spreads created."""
-        self.conn.execute("DELETE FROM book_spreads WHERE book_id = ?", (book_id,))
+    def _build_spreads(self, pdb, book_id: int, per_spread: int = 3):
+        """Compute the spread specs from the outline WITHOUT persisting — the
+        single source of truth for both assemble and the review preview. Returns
+        ``(stage_w, stage_h, specs)`` where each spec is
+        ``{label, archetype, cells:[{photo_id,x,y,w,h,fit,crop_min_w,crop_min_h,crop_cx,crop_cy}]}``."""
         book = self.get_book_row(book_id) or {}
         sw, sh = self.stage_dims(book_id)
-        pos = 0
-        # Title page: blank verso, single hero on the recto (right half).
+        specs: list[dict] = []
         tp = book.get("title_page_photo_id")
         if tp:
-            cur = self.conn.execute(
-                "INSERT INTO book_spreads (book_id, position, label, archetype) "
-                "VALUES (?,?,?,?)", (book_id, pos, "Title page", "title"))
             cx, cy = self._seed_center(pdb, int(tp))
-            m = 0.5
-            self.conn.execute(
-                "INSERT INTO book_cells (spread_id, position, photo_id, x, y, w, h, "
-                "crop_cx, crop_cy) VALUES (?,?,?,?,?,?,?,?,?)",
-                (cur.lastrowid, 0, int(tp), sw / 2 + m, m, sw / 2 - 2 * m, sh - 2 * m, cx, cy))
-            pos += 1
+            mm = 0.5
+            specs.append({"label": "Title page", "archetype": "title", "cells": [
+                {"photo_id": int(tp), "x": sw / 2 + mm, "y": mm, "w": sw / 2 - 2 * mm,
+                 "h": sh - 2 * mm, "fit": "cover", "crop_min_w": 0, "crop_min_h": 0,
+                 "crop_cx": cx, "crop_cy": cy}]})
+        variant = len(specs)
         for beat in self.get_outline(book_id):
             if beat["status"] != "in":
                 continue
             cands = [c for c in beat["candidates"] if c["role"] != "rejected"]
             if not cands:
                 continue
+            meta = self._photo_meta(pdb, [c["photo_id"] for c in cands])
             budget = max(1, beat.get("spread_budget") or 1)
-            # One hero per spread; supporting shots interleaved people/scenery so a
-            # spread isn't three near-identical views.
-            facemap = self._face_counts(pdb, [c["photo_id"] for c in cands])
             heroes = [c for c in cands if c["role"] == "hero"]
             rest = _interleave_variety(
-                [c for c in cands if c["role"] != "hero"], facemap)
-            spreads_cells: list[list] = [[] for _ in range(budget)]
+                [c for c in cands if c["role"] != "hero"],
+                {p: m["nf"] for p, m in meta.items()})
+            groups: list[list] = [[] for _ in range(budget)]
             for i, h in enumerate(heroes[:budget]):
-                spreads_cells[i].append(h)
-            fill = heroes[budget:] + rest      # extra heroes demote to supporting
+                groups[i].append(h)
             si = 0
-            for c in fill:
+            for c in heroes[budget:] + rest:
                 for _ in range(budget):
                     idx = si % budget; si += 1
-                    if len(spreads_cells[idx]) < per_spread:
-                        spreads_cells[idx].append(c); break
-            for chunk in spreads_cells:
+                    if len(groups[idx]) < per_spread:
+                        groups[idx].append(c); break
+            for chunk in groups:
                 if not chunk:
                     continue
-                cur = self.conn.execute(
-                    "INSERT INTO book_spreads (book_id, position, label, archetype) "
-                    "VALUES (?,?,?,?)",
-                    (book_id, pos, beat.get("title"), archetype_for(len(chunk))))
-                self._layout_spread(pdb, book_id, cur.lastrowid,
-                                    archetype_for(len(chunk)), [c["photo_id"] for c in chunk])
-                if chunk[0].get("crop_mode") == "full":   # hero is cell 0
-                    self.conn.execute(
-                        "UPDATE book_cells SET fit='contain', crop_min_w=1, crop_min_h=1 "
-                        "WHERE spread_id=? AND position=0", (cur.lastrowid,))
-                pos += 1
+                items = [{"photo_id": c["photo_id"],
+                          "ar": meta.get(c["photo_id"], {}).get("ar", 1.5),
+                          "mode": c.get("crop_mode") or "crop"} for c in chunk]
+                cells = compose_cells(items, sw, sh, variant)
+                for cell in cells:
+                    if cell["fit"] == "cover":
+                        cx, cy = self._seed_center(pdb, cell["photo_id"])
+                        cell["crop_cx"], cell["crop_cy"] = cx, cy
+                specs.append({"label": beat.get("title"),
+                              "archetype": archetype_for(len(chunk)), "cells": cells})
+                variant += 1
+        return sw, sh, specs
+
+    def preview_spreads(self, pdb, book_id: int) -> dict:
+        """The computed spreads for the review preview (not persisted)."""
+        sw, sh, specs = self._build_spreads(pdb, book_id)
+        return {"stage_w": sw, "stage_h": sh, "spreads": specs}
+
+    def assemble_from_outline(self, pdb, book_id: int, per_spread: int = 3) -> int:
+        """Persist the computed spreads, then seed the flat builder's candidate
+        pool from every non-rejected candidate so removing/swapping a photo in the
+        builder reuses the same pool instead of forcing a fresh search."""
+        _sw, _sh, specs = self._build_spreads(pdb, book_id, per_spread)
+        self.conn.execute("DELETE FROM book_spreads WHERE book_id = ?", (book_id,))
+        for pos, spec in enumerate(specs):
+            cur = self.conn.execute(
+                "INSERT INTO book_spreads (book_id, position, label, archetype) "
+                "VALUES (?,?,?,?)", (book_id, pos, spec["label"], spec["archetype"]))
+            for cpos, cell in enumerate(spec["cells"]):
+                self.conn.execute(
+                    "INSERT INTO book_cells (spread_id, position, photo_id, x, y, w, h, "
+                    "fit, crop_cx, crop_cy, crop_min_w, crop_min_h) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (cur.lastrowid, cpos, cell["photo_id"], cell["x"], cell["y"],
+                     cell["w"], cell["h"], cell.get("fit", "cover"),
+                     cell.get("crop_cx", 0.5), cell.get("crop_cy", 0.5),
+                     cell.get("crop_min_w", 0), cell.get("crop_min_h", 0)))
+        # Seed the flat builder pool with every candidate the author saw.
+        pool = [r["photo_id"] for r in self.conn.execute(
+            """SELECT DISTINCT c.photo_id FROM book_beat_candidates c
+               JOIN book_beats b ON c.beat_id = b.id
+               WHERE b.book_id = ? AND c.role != 'rejected'""", (book_id,)).fetchall()]
+        if pool:
+            self.add_candidates(book_id, pool)
         self._touch(book_id)
         self.conn.commit()
-        return pos
+        return len(specs)
 
     # -- cells -------------------------------------------------------------
     def set_cell(self, pdb, cell_id: int, fields: dict) -> None:
@@ -615,6 +675,81 @@ class BookStore:
 # ---------------------------------------------------------------------------
 # Archetype → cell rects (inches on the stage). One source of truth for layout.
 # ---------------------------------------------------------------------------
+
+# Crop modes → (min-visible-w, min-visible-h, fit). 'full' = never crop (contain).
+CROP_MAP = {
+    "crop": (0.0, 0.0, "cover"),
+    "w80": (0.8, 0.0, "cover"),
+    "h80": (0.0, 0.8, "cover"),
+    "both80": (0.8, 0.8, "cover"),
+    "full": (1.0, 1.0, "contain"),
+}
+
+
+def _place(item: dict, x: float, y: float, w: float, h: float) -> dict:
+    """Place one photo in an allotted region. A 'full' (uncropped) photo gets a
+    cell whose aspect matches the photo (centered, no crop, no big letterbox); a
+    croppable photo fills the region (subject-centered crop)."""
+    pid, ar, mode = item["photo_id"], item.get("ar") or 1.5, item.get("mode") or "crop"
+    mnw, mnh, fit = CROP_MAP.get(mode, (0.0, 0.0, "cover"))
+    if mode == "full":
+        if w / h > ar:
+            cw, ch = h * ar, h
+        else:
+            cw, ch = w, w / ar
+        return {"photo_id": pid, "x": x + (w - cw) / 2, "y": y + (h - ch) / 2,
+                "w": cw, "h": ch, "fit": "contain", "crop_min_w": 1.0, "crop_min_h": 1.0}
+    return {"photo_id": pid, "x": x, "y": y, "w": w, "h": h,
+            "fit": fit, "crop_min_w": mnw, "crop_min_h": mnh}
+
+
+def _grid_place(items: list[dict], x0: float, y0: float, w: float, h: float,
+                cols: int, g: float) -> list[dict]:
+    cols = max(1, cols)
+    rows = max(1, math.ceil(len(items) / cols))
+    cw = (w - (cols - 1) * g) / cols
+    ch = (h - (rows - 1) * g) / rows
+    out = []
+    for i, it in enumerate(items):
+        r, c = divmod(i, cols)
+        out.append(_place(it, x0 + c * (cw + g), y0 + r * (ch + g), cw, ch))
+    return out
+
+
+def compose_cells(items: list[dict], sw: float, sh: float, variant: int = 0,
+                  m: float = 0.4, g: float = 0.5) -> list[dict]:
+    """Orientation- & croppability-aware spread layout. ``items`` are dicts with
+    ``photo_id``, ``ar`` (w/h), ``mode`` (crop level), hero first. Portraits get
+    portrait cells, panoramas go full-bleed, the anchor side alternates by
+    ``variant`` — so spreads stop all looking like anchor-left + two-right."""
+    n = len(items)
+    inner_w, inner_h = sw - 2 * m, sh - 2 * m
+    if n == 1:
+        it = items[0]
+        if (it.get("ar") or 1.5) >= 2.0 and it.get("mode") != "full":
+            return [_place(it, 0, 0, sw, sh)]           # panorama → full bleed
+        return [_place(it, m, m, inner_w, inner_h)]     # margined, matched if full
+    if n == 2:
+        portrait = sum(1 for it in items if (it.get("ar") or 1.5) < 0.9)
+        if portrait == 0 and all((it.get("ar") or 1.5) >= 1.7 for it in items):
+            ch = (inner_h - g) / 2                       # two wide frames stacked
+            return [_place(items[0], m, m, inner_w, ch),
+                    _place(items[1], m, m + ch + g, inner_w, ch)]
+        cw = (inner_w - g) / 2                            # matched 2-up
+        return [_place(items[0], m, m, cw, inner_h),
+                _place(items[1], m + cw + g, m, cw, inner_h)]
+    # n >= 3: anchor + rest grid; alternate the anchor side.
+    rest = items[1:]
+    anchor_w = sw * 0.52
+    if variant % 2 == 0:
+        a = (m, m, anchor_w - m - g / 2, inner_h)
+        rx, rw = anchor_w + g / 2, sw - (anchor_w + g / 2) - m
+    else:
+        a = (sw - anchor_w + g / 2, m, anchor_w - m - g / 2, inner_h)
+        rx, rw = m, sw - anchor_w - g / 2 - m
+    cols = 1 if len(rest) <= 2 else 2
+    return [_place(items[0], *a)] + _grid_place(rest, rx, m, rw, inner_h, cols, g)
+
 
 def archetype_for(k: int) -> str:
     """House-style archetype name for a photo count (matches archetype_layout)."""
