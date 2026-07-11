@@ -82,6 +82,28 @@
     .warn { color:var(--amber); font-size:12px; }
     .preset-btns button.active { background:var(--accent); color:#04101f; border-color:var(--accent); }
 
+    /* Authoring wizard */
+    .setup { max-width:640px; background:var(--surface); border:1px solid var(--border);
+      border-radius:8px; padding:16px; display:grid; gap:10px; }
+    .setup label { display:grid; gap:3px; font-size:13px; color:var(--text-muted); }
+    .prog { font-family:ui-monospace,monospace; font-size:12px; background:#000; border:1px solid var(--border);
+      border-radius:6px; padding:10px; max-height:340px; overflow:auto; white-space:pre-wrap; }
+    .beat { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+      padding:10px; margin-bottom:10px; }
+    .beat.out { opacity:.45; }
+    .beat-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .strip { display:flex; gap:6px; overflow-x:auto; margin-top:8px; padding-bottom:4px; }
+    .strip .cand { flex:0 0 128px; cursor:pointer; }
+    .strip .cand img { height:86px; }
+    .strip .cand.hero { outline:2px solid var(--green); outline-offset:-2px; }
+    .strip .cand.rej { opacity:.3; }
+    .strip .cand .sc { position:absolute; bottom:0; left:0; right:0; font-size:9px;
+      background:rgba(0,0,0,.65); padding:1px 4px; color:#ddd; }
+    .strip .cand .hbadge { position:absolute; top:2px; left:2px; font-size:10px;
+      background:var(--green); color:#04101f; border-radius:3px; padding:0 3px; font-weight:700; }
+    .strip .cand .rx { position:absolute; top:2px; right:2px; background:rgba(0,0,0,.6);
+      border-radius:3px; font-size:10px; padding:0 4px; }
+
     /* Proof */
     .proof .stage { border:0; box-shadow:0 1px 6px rgba(0,0,0,.4); margin:0 auto 4px; }
     @media print {
@@ -423,6 +445,7 @@
               'Best/day',
               e('input', { type:'number', min:0, max:40, value:perDay, disabled:!!busy,
                 onChange:ev=>setPerDay(parseInt(ev.target.value)||0), style:{ width:52 } })),
+            e('a', { className:'nav-link', href:'/book/'+bookId+'/author', title:'Auto-draft the whole book from a trip window (beats + VLM heroes)' }, '✨ Author ↗'),
             e('button', { onClick:aiDraft, disabled:!!busy, title:'LLM: cull best/day, arrange + captions' }, '✨ AI draft'),
             e('button', { onClick:autoArrange, disabled:!!busy, title:'Deterministic layout, no LLM' }, 'Auto-arrange'),
             e('button', { onClick:captionAll, disabled:!!busy }, 'Draft captions'),
@@ -444,7 +467,7 @@
       useEffect(()=>{ refresh(); }, []);
       const create = () => { if (!name.trim()) return;
         api('/api/books', { method:'POST', body:JSON.stringify({ name:name.trim(), subtitle:sub.trim()||null }) })
-          .then(r => { window.location.href = '/book/'+r.book.id; }); };
+          .then(r => { window.location.href = '/book/'+r.book.id+'/author'; }); };
       const del = (id) => { if (confirm('Delete this book project?')) api('/api/books/'+id, { method:'DELETE' }).then(refresh); };
       return e('div', null,
         e(PS.SharedHeader, { activePage:'book' }),
@@ -463,13 +486,157 @@
                 b.subtitle ? e('span', { className:'muted' }, ' — '+b.subtitle) : null,
                 e('div', { className:'muted' }, (b.spread_count||0)+' spreads · '+(b.candidate_count||0)+' candidates')),
               e('div', { className:'row' },
+                e('a', { className:'nav-link', href:'/book/'+b.id+'/author' }, '✨ Author'),
                 e('a', { className:'nav-link', href:'/book/'+b.id }, 'Open'),
                 e('a', { className:'nav-link', href:'/book/'+b.id+'/proof', target:'_blank' }, 'Proof'),
                 e('button', { className:'tiny danger', onClick:()=>del(b.id) }, 'Delete')))),
         ));
     }
 
+    // ---------------------------------------------------------- Authoring wizard
+    async function postSSE(path, body, onEvent) {
+      const r = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+      const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream:true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+          const line = chunk.split('\n').find(l => l.startsWith('data:'));
+          if (line) { try { onEvent(JSON.parse(line.slice(5).trim())); } catch (e) {} }
+        }
+      }
+    }
+
+    function progLine(ev) {
+      if (ev.phase === 'segmented') return 'Segmented into ' + ev.scenes + ' scenes';
+      if (ev.phase === 'outlined') return 'Drafted outline: ' + ev.included + '/' + ev.beats + ' beats included';
+      if (ev.phase === 'heroes') return '  hero ' + ev.done + '/' + ev.total + ' — ' + ev.title;
+      if (ev.phase === 'assemble') return 'Assembling spreads…';
+      if (ev.phase === 'captions') return 'Drafting captions…';
+      if (ev.phase === 'segment') return 'Segmenting the window…';
+      if (ev.phase === 'outline') return 'Reading the story (LLM)…';
+      if (ev.type === 'done') return '✓ Done — ' + ev.spreads + ' spreads, ' + ev.included + ' beats.';
+      if (ev.type === 'fatal') return '✗ ' + ev.message;
+      return JSON.stringify(ev);
+    }
+
+    function AuthorWizard({ bookId }) {
+      const [book, setBook] = useState(null);
+      const [stage, setStage] = useState('setup');   // setup | drafting | review
+      const [form, setForm] = useState({ date_from:'', date_to:'', camera:'', place:'', target_spreads:19, notes:'' });
+      const [prog, setProg] = useState([]);
+      const [outline, setOutline] = useState(null);
+      const set = (k, v) => setForm(f => Object.assign({}, f, { [k]:v }));
+      const loadOutline = useCallback(() =>
+        api('/api/books/'+bookId+'/authoring/outline').then(d => {
+          setOutline(d.outline); setBook(d.book);
+          if (d.outline && d.outline.length) setStage('review');
+        }), [bookId]);
+      useEffect(() => { loadOutline(); }, [loadOutline]);
+
+      const draft = async () => {
+        setStage('drafting'); setProg([]);
+        const filters = {};
+        ['date_from','date_to','camera','place'].forEach(k => { if (form[k]) filters[k] = form[k]; });
+        try {
+          await postSSE('/api/books/'+bookId+'/authoring/draft',
+            { filters, notes:form.notes||null, target_spreads:+form.target_spreads },
+            ev => { setProg(p => [...p, progLine(ev)]); if (ev.type==='done'||ev.type==='fatal') loadOutline(); });
+        } catch (e) { setProg(p => [...p, '✗ '+e.message]); }
+      };
+
+      // outline edit helpers
+      const setCand = (beatId, pid, fields) =>
+        api('/api/books/'+bookId+'/authoring/beats/'+beatId+'/candidates/'+pid, { method:'PUT', body:JSON.stringify(fields) });
+      const makeHero = (beat, pid) => {
+        const ps = beat.candidates.filter(c => c.role==='hero' && c.photo_id!==pid)
+          .map(c => setCand(beat.id, c.photo_id, { role:'candidate' }));
+        ps.push(setCand(beat.id, pid, { role:'hero', crop_mode:'crop' }));
+        Promise.all(ps).then(loadOutline);
+      };
+      const toggleReject = (beat, c) => setCand(beat.id, c.photo_id, { role: c.role==='rejected'?'candidate':'rejected' }).then(loadOutline);
+      const cropToggle = (beat, c) => setCand(beat.id, c.photo_id, { crop_mode: c.crop_mode==='full'?'crop':'full' }).then(loadOutline);
+      const beatUpd = (id, fields) => api('/api/books/'+bookId+'/authoring/beats/'+id, { method:'PUT', body:JSON.stringify(fields) }).then(d => setOutline(d.outline));
+      const rePick = (id) => { setProg([]); api('/api/books/'+bookId+'/authoring/beats/'+id+'/pick-heroes', { method:'POST', body:'{}' }).then(d => setOutline(d.outline)); };
+      const assemble = () => api('/api/books/'+bookId+'/authoring/assemble', { method:'POST', body:'{}' }).then(() => { window.location.href = '/book/'+bookId; });
+
+      const header = e(PS.SharedHeader, { activePage:'book' });
+
+      if (stage === 'drafting') {
+        return e('div', null, header, e('div', { className:'container' },
+          e('h2', null, '✨ Drafting the book…'),
+          e('p', { className:'muted' }, 'Segmenting the window, reading the story, and having the vision model pick a hero per beat. This takes a minute or two.'),
+          e('div', { className:'prog' }, prog.join('\n') || 'starting…')));
+      }
+
+      if (stage === 'review' && outline) {
+        const inCount = outline.filter(b => b.status==='in').length;
+        return e('div', null, header, e('div', { className:'container' },
+          e('div', { className:'row', style:{ marginBottom:10 } },
+            e('a', { href:'/book' }, '‹ all books'),
+            e('h2', null, (book && book.name) || 'Book'),
+            e('span', { className:'muted' }, inCount+' beats in · '+outline.length+' total'),
+            e('span', { style:{ flex:1 } }),
+            e('button', { onClick:()=>setStage('setup') }, 'Re-draft'),
+            e('button', { className:'primary', onClick:assemble }, 'Assemble & open book →')),
+          e('p', { className:'muted', style:{ marginBottom:12 } },
+            'Review the story: toggle beats in/out, fix titles + spread budget, and click a candidate to make it the hero (★). Rejected shots are dimmed. Then assemble.'),
+          outline.map(beat => e('div', { key:beat.id, className:'beat'+(beat.status==='in'?'':' out') },
+            e('div', { className:'beat-head' },
+              e('input', { type:'checkbox', checked:beat.status==='in', title:'include this beat',
+                onChange:ev=>beatUpd(beat.id, { status:ev.target.checked?'in':'out' }) }),
+              e('span', { className:'muted' }, beat.day),
+              e('input', { value:beat.title||'', onChange:ev=>setOutline(o=>o.map(b=>b.id===beat.id?Object.assign({},b,{title:ev.target.value}):b)),
+                onBlur:ev=>beatUpd(beat.id, { title:ev.target.value }), style:{ width:320 } }),
+              e('label', { className:'muted' }, 'spreads ',
+                e('input', { type:'number', min:1, max:4, value:beat.spread_budget,
+                  onChange:ev=>beatUpd(beat.id, { spread_budget:parseInt(ev.target.value)||1 }), style:{ width:46 } })),
+              e('button', { className:'tiny', onClick:()=>rePick(beat.id), title:'Re-run the vision model hero pick' }, '✨ re-pick'),
+              e('span', { className:'muted' }, (beat.candidates||[]).length+' candidates')),
+            e('div', { className:'strip' }, (beat.candidates||[]).map(c => {
+              const cls = 'cand'+(c.role==='hero'?' hero':'')+(c.role==='rejected'?' rej':'');
+              return e('div', { key:c.photo_id, className:cls, onClick:()=>makeHero(beat, c.photo_id),
+                  title:(c.vlm_reason||'') },
+                e('img', { src:thumb(c.photo_id), loading:'lazy' }),
+                c.role==='hero' ? e('span', { className:'hbadge' }, '★ '+(c.crop_mode==='full'?'FULL':'crop')) : null,
+                e('span', { className:'rx', onClick:ev=>{ ev.stopPropagation(); toggleReject(beat, c); } }, c.role==='rejected'?'↺':'✕'),
+                c.vlm_score!=null ? e('span', { className:'sc' }, 'vlm '+c.vlm_score) : null,
+                c.role==='hero' ? e('span', { className:'sc', style:{ top:20, bottom:'auto', cursor:'pointer' },
+                  onClick:ev=>{ ev.stopPropagation(); cropToggle(beat, c); } }, 'crop: '+(c.crop_mode||'crop')+' ⇄') : null,
+              );
+            })),
+          ))));
+      }
+
+      // setup
+      return e('div', null, header, e('div', { className:'container' },
+        e('div', { className:'row', style:{ marginBottom:10 } },
+          e('a', { href:'/book' }, '‹ all books'),
+          e('h2', null, '✨ Author: '+((book&&book.name)||'book'))),
+        e('p', { className:'muted', style:{ marginBottom:12 } },
+          'Point at a trip window and auto-draft the whole book — story beats, a vision-model-picked hero per beat, crops, captions, covers — then refine.'),
+        e('div', { className:'setup' },
+          e('div', { className:'row' },
+            e('label', { style:{ flex:1 } }, 'From', e('input', { type:'date', value:form.date_from, onChange:ev=>set('date_from', ev.target.value) })),
+            e('label', { style:{ flex:1 } }, 'To', e('input', { type:'date', value:form.date_to, onChange:ev=>set('date_to', ev.target.value) }))),
+          e('div', { className:'row' },
+            e('label', { style:{ flex:1 } }, 'Camera (optional)', e('input', { value:form.camera, onChange:ev=>set('camera', ev.target.value), placeholder:'e.g. ILCE-7RM6' })),
+            e('label', { style:{ flex:1 } }, 'Place (optional)', e('input', { value:form.place, onChange:ev=>set('place', ev.target.value), placeholder:'e.g. Varenna' })),
+            e('label', null, 'Target spreads', e('input', { type:'number', min:5, max:57, value:form.target_spreads, onChange:ev=>set('target_spreads', ev.target.value), style:{ width:70 } }))),
+          e('label', null, 'Trip notes / itinerary (optional — feeds the story analysis)',
+            e('textarea', { value:form.notes, rows:4, onChange:ev=>set('notes', ev.target.value),
+              placeholder:'Paste an itinerary or a few lines about what mattered on this trip…' })),
+          e('div', { className:'row' },
+            e('button', { className:'primary', onClick:draft, disabled:!form.date_from||!form.date_to }, '✨ Draft the book'),
+            e('span', { className:'muted' }, 'needs a date range')))));
+    }
+
     function App() {
+      const a = window.location.pathname.match(/^\/book\/(\d+)\/author/);
+      if (a) return e(AuthorWizard, { bookId:+a[1] });
       const m = window.location.pathname.match(/^\/book\/(\d+)(\/proof)?/);
       if (m) return e(Builder, { bookId:+m[1], proof:!!m[2] });
       return e(BookList);

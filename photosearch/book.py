@@ -102,8 +102,45 @@ class BookStore:
             );
             CREATE INDEX IF NOT EXISTS idx_spreads_book ON book_spreads(book_id, position);
             CREATE INDEX IF NOT EXISTS idx_cells_spread ON book_cells(spread_id, position);
+
+            -- M30 authoring pipeline: editable beat outline + per-beat candidates.
+            CREATE TABLE IF NOT EXISTS book_beats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL DEFAULT 0,
+                day TEXT,
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'in' CHECK (status IN ('in','out')),
+                spread_budget INTEGER NOT NULL DEFAULT 1,
+                scene_meta TEXT,
+                notes TEXT
+            );
+            CREATE TABLE IF NOT EXISTS book_beat_candidates (
+                beat_id INTEGER NOT NULL REFERENCES book_beats(id) ON DELETE CASCADE,
+                photo_id INTEGER NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                role TEXT NOT NULL DEFAULT 'candidate'
+                    CHECK (role IN ('hero','candidate','rejected')),
+                vlm_score REAL,
+                vlm_reason TEXT,
+                crop_mode TEXT NOT NULL DEFAULT 'crop' CHECK (crop_mode IN ('crop','full')),
+                PRIMARY KEY (beat_id, photo_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_beats_book ON book_beats(book_id, position);
+            CREATE INDEX IF NOT EXISTS idx_beatcands_beat ON book_beat_candidates(beat_id, position);
             """
         )
+        # Additive column migrations for an existing sidecar (books predates M30).
+        for col, ddl in (
+            ("back_cover_photo_id", "INTEGER"),
+            ("title_page_photo_id", "INTEGER"),
+            ("notes", "TEXT"),
+            ("target_spreads", "INTEGER"),
+        ):
+            try:
+                c.execute(f"SELECT {col} FROM books LIMIT 1")
+            except sqlite3.OperationalError:
+                c.execute(f"ALTER TABLE books ADD COLUMN {col} {ddl}")
         c.commit()
 
     def close(self) -> None:
@@ -147,7 +184,8 @@ class BookStore:
         return dict(r) if r else None
 
     def update_book(self, book_id: int, fields: dict) -> None:
-        allowed = {"name", "subtitle", "cover_photo_id", "trim_w", "trim_h", "style_json"}
+        allowed = {"name", "subtitle", "cover_photo_id", "trim_w", "trim_h", "style_json",
+                   "back_cover_photo_id", "title_page_photo_id", "notes", "target_spreads"}
         sets, vals = [], []
         for k, v in fields.items():
             if k in allowed:
@@ -312,6 +350,126 @@ class BookStore:
         self._touch(book_id)
         self.conn.commit()
 
+    # -- authoring outline (M30) ------------------------------------------
+    def replace_outline(self, book_id: int, beats: list[dict]) -> None:
+        """Wipe and rewrite the beat outline. Each beat: {title, day, status,
+        spread_budget, scene_meta, candidates:[{photo_id, role, vlm_score,
+        vlm_reason, crop_mode}]}."""
+        self.conn.execute("DELETE FROM book_beats WHERE book_id = ?", (book_id,))
+        for pos, b in enumerate(beats):
+            cur = self.conn.execute(
+                "INSERT INTO book_beats (book_id, position, day, title, status, "
+                "spread_budget, scene_meta) VALUES (?,?,?,?,?,?,?)",
+                (book_id, pos, b.get("day"), b.get("title"),
+                 b.get("status", "in"), int(b.get("spread_budget") or 1),
+                 json.dumps(b.get("scene_meta")) if b.get("scene_meta") is not None else None))
+            bid = cur.lastrowid
+            for cpos, cand in enumerate(b.get("candidates") or []):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO book_beat_candidates (beat_id, photo_id, "
+                    "position, role, vlm_score, vlm_reason, crop_mode) VALUES (?,?,?,?,?,?,?)",
+                    (bid, int(cand["photo_id"]), cpos, cand.get("role", "candidate"),
+                     cand.get("vlm_score"), cand.get("vlm_reason"),
+                     cand.get("crop_mode", "crop")))
+        self._touch(book_id)
+        self.conn.commit()
+
+    def get_outline(self, book_id: int) -> list[dict]:
+        beats = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM book_beats WHERE book_id = ? ORDER BY position, id",
+            (book_id,)).fetchall()]
+        cand_by_beat: dict[int, list] = {}
+        for r in self.conn.execute(
+            """SELECT c.* FROM book_beat_candidates c JOIN book_beats b ON c.beat_id=b.id
+               WHERE b.book_id = ? ORDER BY c.beat_id, c.position, c.vlm_score DESC""",
+            (book_id,)).fetchall():
+            cand_by_beat.setdefault(r["beat_id"], []).append(dict(r))
+        for b in beats:
+            b["scene_meta"] = json.loads(b["scene_meta"]) if b.get("scene_meta") else None
+            b["candidates"] = cand_by_beat.get(b["id"], [])
+        return beats
+
+    def update_beat(self, beat_id: int, fields: dict) -> None:
+        row = self.conn.execute("SELECT book_id FROM book_beats WHERE id = ?",
+                                (beat_id,)).fetchone()
+        if not row:
+            raise KeyError("beat not found")
+        sets, vals = [], []
+        for k in ("title", "status", "spread_budget", "notes", "position", "day"):
+            if k in fields:
+                sets.append(f"{k} = ?"); vals.append(fields[k])
+        if sets:
+            vals.append(beat_id)
+            self.conn.execute(f"UPDATE book_beats SET {', '.join(sets)} WHERE id = ?", vals)
+        self._touch(row["book_id"])
+        self.conn.commit()
+
+    def set_beat_candidate(self, beat_id: int, photo_id: int, fields: dict) -> None:
+        sets, vals = [], []
+        for k in ("role", "crop_mode", "position", "vlm_score", "vlm_reason"):
+            if k in fields:
+                sets.append(f"{k} = ?"); vals.append(fields[k])
+        if not sets:
+            return
+        vals += [beat_id, photo_id]
+        self.conn.execute(
+            f"UPDATE book_beat_candidates SET {', '.join(sets)} "
+            f"WHERE beat_id = ? AND photo_id = ?", vals)
+        self.conn.commit()
+
+    def assemble_from_outline(self, pdb, book_id: int, per_spread: int = 3) -> int:
+        """Turn the included beats into spreads: a title-page spread (blank left /
+        hero right) if set, then each in-beat's non-rejected candidates (hero first)
+        chunked into its spread_budget spreads. The hero cell honors crop_mode
+        ('full' -> the 100/100 no-crop constraint). Returns spreads created."""
+        self.conn.execute("DELETE FROM book_spreads WHERE book_id = ?", (book_id,))
+        book = self.get_book_row(book_id) or {}
+        sw, sh = self.stage_dims(book_id)
+        pos = 0
+        # Title page: blank verso, single hero on the recto (right half).
+        tp = book.get("title_page_photo_id")
+        if tp:
+            cur = self.conn.execute(
+                "INSERT INTO book_spreads (book_id, position, label, archetype) "
+                "VALUES (?,?,?,?)", (book_id, pos, "Title page", "title"))
+            cx, cy = self._seed_center(pdb, int(tp))
+            m = 0.5
+            self.conn.execute(
+                "INSERT INTO book_cells (spread_id, position, photo_id, x, y, w, h, "
+                "crop_cx, crop_cy) VALUES (?,?,?,?,?,?,?,?,?)",
+                (cur.lastrowid, 0, int(tp), sw / 2 + m, m, sw / 2 - 2 * m, sh - 2 * m, cx, cy))
+            pos += 1
+        for beat in self.get_outline(book_id):
+            if beat["status"] != "in":
+                continue
+            cands = [c for c in beat["candidates"] if c["role"] != "rejected"]
+            cands.sort(key=lambda c: (c["role"] != "hero", c["position"]))
+            if not cands:
+                continue
+            budget = max(1, beat.get("spread_budget") or 1)
+            chunks = _chunk(cands, budget, per_spread)
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                arch = None  # let archetype_layout pick by count
+                cur = self.conn.execute(
+                    "INSERT INTO book_spreads (book_id, position, label, archetype) "
+                    "VALUES (?,?,?,?)",
+                    (book_id, pos, beat.get("title"),
+                     archetype_for(len(chunk))))
+                self._layout_spread(pdb, book_id, cur.lastrowid,
+                                    archetype_for(len(chunk)), [c["photo_id"] for c in chunk])
+                # Honor crop_mode on the hero (first) cell.
+                hero = chunk[0]
+                if hero.get("crop_mode") == "full":
+                    self.conn.execute(
+                        "UPDATE book_cells SET fit='contain', crop_min_w=1, crop_min_h=1 "
+                        "WHERE spread_id=? AND position=0", (cur.lastrowid,))
+                pos += 1
+        self._touch(book_id)
+        self.conn.commit()
+        return pos
+
     # -- cells -------------------------------------------------------------
     def set_cell(self, pdb, cell_id: int, fields: dict) -> None:
         cell = self.conn.execute("SELECT * FROM book_cells WHERE id = ?",
@@ -439,6 +597,33 @@ class BookStore:
 # ---------------------------------------------------------------------------
 # Archetype → cell rects (inches on the stage). One source of truth for layout.
 # ---------------------------------------------------------------------------
+
+def archetype_for(k: int) -> str:
+    """House-style archetype name for a photo count (matches archetype_layout)."""
+    if k <= 1:
+        return "full-bleed single"
+    if k == 2:
+        return "matched 2-up"
+    if k <= 7:
+        return "asymmetric collage"
+    return "dense grid"
+
+
+def _chunk(items: list, budget: int, per_spread: int) -> list[list]:
+    """Split up to ``budget*per_spread`` items into ``budget`` roughly-even groups
+    (spreads), hero-first order preserved."""
+    take = items[:max(1, budget) * max(1, per_spread)]
+    n, b = len(take), max(1, budget)
+    base, extra = divmod(n, b)
+    out, i = [], 0
+    for s in range(b):
+        k = base + (1 if s < extra else 0)
+        if k == 0:
+            continue
+        out.append(take[i:i + k])
+        i += k
+    return out
+
 
 def _grid_rects(n: int, x0: float, y0: float, w: float, h: float,
                 cols: int, g: float) -> list[list[float]]:

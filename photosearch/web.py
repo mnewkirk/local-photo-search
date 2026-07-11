@@ -3769,6 +3769,133 @@ def api_book_export(book_id: int,
 
 
 # ---------------------------------------------------------------------------
+# Authoring pipeline (M30) — auto-draft a book from a raw window, then refine.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/books/{book_id}/authoring/draft")
+async def api_book_authoring_draft(book_id: int, request: Request):
+    """SSE one-shot draft: segment → outline → VLM heroes → assemble → captions.
+    Body: {filters:{date_from,date_to,camera,place,...}, notes?, target_spreads?,
+    gap_minutes?, per_scene?, captions?}. Streams {type:'progress'|'done'|'fatal',
+    phase, ...}."""
+    import asyncio, threading
+    from . import book_authoring
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    filters = data.get("filters") or {}
+    notes = data.get("notes")
+    target_spreads = int(data.get("target_spreads") or 19)
+    gap_minutes = float(data.get("gap_minutes") or 20)
+    per_scene = int(data.get("per_scene") or 8)
+    captions = bool(data.get("captions", True))
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(ev):
+        asyncio.run_coroutine_threadsafe(aqueue.put(ev), loop)
+
+    def run():
+        try:
+            with _get_db() as pdb, _get_books() as bs:
+                if not bs.get_book_row(book_id):
+                    _emit({"type": "fatal", "message": "book not found"}); return
+                # Persist the notes/target on the book for reproducibility.
+                bs.update_book(book_id, {"notes": notes, "target_spreads": target_spreads})
+                for ev in book_authoring.draft_book(
+                        pdb, bs, book_id, filters, notes, target_spreads,
+                        gap_minutes, per_scene, captions):
+                    if cancel_event.is_set():
+                        _emit({"type": "cancelled", "message": "cancelled"}); return
+                    out = dict(ev)
+                    out["type"] = "done" if ev.get("phase") == "done" else "progress"
+                    _emit(out)
+        except Exception as exc:
+            logger.exception("AUTHORING draft failed")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    threading.Thread(target=run, daemon=True).start()
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    cancel_event.set(); return
+                try:
+                    ev = await asyncio.wait_for(aqueue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"; continue
+                yield f"data: {json.dumps(ev)}\n\n"
+                if ev.get("type") in ("done", "fatal", "cancelled"):
+                    return
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/books/{book_id}/authoring/outline")
+def api_book_outline(book_id: int):
+    with _get_books() as bs:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        return {"outline": bs.get_outline(book_id), "book": bs.get_book_row(book_id)}
+
+
+@app.put("/api/books/{book_id}/authoring/beats/{beat_id}")
+def api_book_update_beat(book_id: int, beat_id: int, body: dict):
+    with _get_books() as bs:
+        try:
+            bs.update_beat(beat_id, body)
+        except KeyError:
+            return JSONResponse({"error": "Beat not found"}, status_code=404)
+        return {"outline": bs.get_outline(book_id)}
+
+
+@app.put("/api/books/{book_id}/authoring/beats/{beat_id}/candidates/{photo_id}")
+def api_book_set_beat_candidate(book_id: int, beat_id: int, photo_id: int, body: dict):
+    with _get_books() as bs:
+        bs.set_beat_candidate(beat_id, photo_id, body)
+        return {"ok": True}
+
+
+@app.post("/api/books/{book_id}/authoring/beats/{beat_id}/pick-heroes")
+def api_book_pick_heroes(book_id: int, beat_id: int, body: dict):
+    """Re-run the VLM hero pick for one beat over its current candidates."""
+    from . import book_authoring
+    with _get_books() as bs, _get_db() as pdb:
+        beats = {b["id"]: b for b in bs.get_outline(book_id)}
+        beat = beats.get(beat_id)
+        if not beat:
+            return JSONResponse({"error": "Beat not found"}, status_code=404)
+        cand_ids = [c["photo_id"] for c in beat["candidates"] if c["role"] != "rejected"]
+        n = int(body.get("n_heroes") or beat.get("spread_budget") or 1)
+        picked = book_authoring.pick_heroes(pdb, cand_ids, beat.get("title") or "", n)
+        heroes = set(picked["heroes"])
+        for pos, r in enumerate(picked["ranked"]):
+            pid = r["id"]
+            is_hero = pid in heroes
+            bs.set_beat_candidate(beat_id, pid, {
+                "role": "hero" if is_hero else "candidate",
+                "position": pos, "vlm_score": r.get("score"), "vlm_reason": r.get("reason"),
+                "crop_mode": book_authoring.suggest_crop_mode(pdb, pid) if is_hero else "crop"})
+        return {"outline": bs.get_outline(book_id)}
+
+
+@app.post("/api/books/{book_id}/authoring/assemble")
+def api_book_assemble(book_id: int, body: dict):
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        n = bs.assemble_from_outline(pdb, book_id)
+        return {"spreads_created": n, "book": bs.get_book(book_id)}
+
+
+# ---------------------------------------------------------------------------
 # Photo stacks (burst/bracket groups)
 # ---------------------------------------------------------------------------
 
@@ -4943,6 +5070,14 @@ if _frontend_dir.exists():
     @app.get("/book/{book_id}/proof")
     def serve_book_proof(book_id: int):
         """Serve the print-friendly proof view (same page; JS renders proof mode)."""
+        page = _frontend_dir / "book.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Book page not found</h1>")
+
+    @app.get("/book/{book_id}/author")
+    def serve_book_author(book_id: int):
+        """Serve the authoring wizard (same page; JS renders the wizard)."""
         page = _frontend_dir / "book.html"
         if page.exists():
             return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
