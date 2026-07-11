@@ -83,6 +83,9 @@ fi
 
 export PHOTOSEARCH_DB="${REPLICA_DB}"
 export PHOTOSEARCH_NAS_URL="${NAS_URL}"
+# Photobook builder sidecar store (M29) — kept SEPARATE from the replica DB so a
+# `--sync` (which atomically swaps REPLICA_DB) can't wipe book/curation state.
+export PHOTOSEARCH_BOOKS_DB="${PHOTOSEARCH_BOOKS_DB:-./photobooks.db.local}"
 export PHOTOSEARCH_TEXT_LLM_URL="${LM_URL}"
 [ -n "${AGENT_MODEL}" ] && export PHOTOSEARCH_LLM_AGENT_MODEL="${AGENT_MODEL}"
 # Vision model for rerank_photos (VLM re-ranking). Override with VISUAL_MODEL=.

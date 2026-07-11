@@ -118,6 +118,20 @@ def _get_db() -> PhotoDB:
     return PhotoDB(_db_path, photo_root=_photo_root)
 
 
+# Photobook builder — curation state lives in a SEPARATE sidecar sqlite file so a
+# full replica re-sync (sync-replica.sh atomically swaps _db_path) can't wipe it.
+_books_db_path: str = (
+    os.environ.get("PHOTOSEARCH_BOOKS_DB")
+    or str(Path(_db_path).resolve().parent / "photobooks.db.local")
+)
+
+
+def _get_books():
+    """Open the sidecar photobook store (fresh connection per request)."""
+    from .book import BookStore
+    return BookStore(_books_db_path)
+
+
 def _ensure_thumb_dir():
     """Create thumbnail cache directory if needed."""
     global _thumb_dir
@@ -3436,6 +3450,183 @@ def api_photo_collections(photo_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Photobook builder (M29) — interactive proof suggestion/creation.
+# State lives in the sidecar store (see _get_books); reads photo metadata from
+# the replica DB. Candidate pool queries reuse the existing /api/search endpoint
+# client-side (frontend posts the resulting ids here), or import a collection.
+# ---------------------------------------------------------------------------
+
+def _book_candidate_hits(bs, pdb, book_id: int) -> list[dict]:
+    """Compact hits for a book's candidate pool, annotated with decision + used."""
+    from .tools import _compact_hit
+    dm = bs.decision_map(book_id)
+    used = bs.used_photo_ids(book_id)
+    ids = list(dm.keys())
+    hits = []
+    rmap = {}
+    if ids:
+        ph = ",".join("?" * len(ids))
+        rows = pdb.conn.execute(
+            f"SELECT id, filename, date_taken, place_name, camera_model, description, "
+            f"categories, aesthetic_score, image_width, image_height "
+            f"FROM photos WHERE id IN ({ph})", ids).fetchall()
+        rmap = {r["id"]: dict(r) for r in rows}
+    for pid in ids:
+        r = rmap.get(pid)
+        hit = _compact_hit(r) if r else {"id": pid, "filename": None}
+        if r:
+            hit["image_width"] = r.get("image_width")
+            hit["image_height"] = r.get("image_height")
+        hit["decision"] = dm[pid]
+        hit["used"] = pid in used
+        hits.append(hit)
+    hits.sort(key=lambda h: (h.get("date_taken") or "", h.get("id") or 0))
+    return hits
+
+
+@app.get("/api/books")
+def api_list_books():
+    with _get_books() as bs:
+        return {"books": bs.list_books()}
+
+
+@app.post("/api/books")
+def api_create_book(body: dict):
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    with _get_books() as bs:
+        bid = bs.create_book(name, body.get("subtitle"),
+                             float(body.get("trim_w") or 14),
+                             float(body.get("trim_h") or 11))
+        return {"book": bs.get_book_row(bid)}
+
+
+@app.get("/api/books/{book_id}")
+def api_get_book(book_id: int):
+    with _get_books() as bs, _get_db() as pdb:
+        doc = bs.get_book(book_id)
+        if not doc:
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        doc["candidates"] = _book_candidate_hits(bs, pdb, book_id)
+        return doc
+
+
+@app.put("/api/books/{book_id}")
+def api_update_book(book_id: int, body: dict):
+    with _get_books() as bs:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        bs.update_book(book_id, body)
+        return {"book": bs.get_book_row(book_id)}
+
+
+@app.delete("/api/books/{book_id}")
+def api_delete_book(book_id: int):
+    with _get_books() as bs:
+        bs.delete_book(book_id)
+    return {"ok": True}
+
+
+@app.post("/api/books/{book_id}/candidates")
+def api_book_add_candidates(book_id: int, body: dict):
+    """Add photos to the candidate pool. Body: {photo_ids?: [...],
+    collection_id?: int} — a collection imports all its photos."""
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        ids = list(body.get("photo_ids") or [])
+        cid = body.get("collection_id")
+        if cid is not None:
+            ids += [p["id"] for p in pdb.get_collection_photos(int(cid))]
+        added = bs.add_candidates(book_id, [int(i) for i in ids]) if ids else 0
+        return {"added": added, "candidates": _book_candidate_hits(bs, pdb, book_id)}
+
+
+@app.get("/api/books/{book_id}/candidates")
+def api_book_candidates(book_id: int):
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        return {"candidates": _book_candidate_hits(bs, pdb, book_id)}
+
+
+@app.put("/api/books/{book_id}/decisions/{photo_id}")
+def api_book_decision(book_id: int, photo_id: int, body: dict):
+    """Lasting 'use this / don't use this' verdict on a photo."""
+    decision = body.get("decision")
+    if decision not in ("include", "exclude"):
+        return JSONResponse({"error": "decision must be include|exclude"}, status_code=400)
+    with _get_books() as bs:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        bs.set_decision(book_id, photo_id, decision, body.get("note"))
+    return {"ok": True}
+
+
+@app.post("/api/books/{book_id}/spreads")
+def api_book_add_spread(book_id: int, body: dict):
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        sid = bs.add_spread(pdb, book_id,
+                            archetype=body.get("archetype") or "matched 2-up",
+                            photo_ids=[int(i) for i in (body.get("photo_ids") or [])],
+                            label=body.get("label"), bg=body.get("bg") or "#ffffff")
+        return {"spread_id": sid, "book": bs.get_book(book_id)}
+
+
+@app.put("/api/books/{book_id}/spreads/{spread_id}")
+def api_book_update_spread(book_id: int, spread_id: int, body: dict):
+    with _get_books() as bs, _get_db() as pdb:
+        try:
+            bs.update_spread(pdb, spread_id, body)
+        except KeyError:
+            return JSONResponse({"error": "Spread not found"}, status_code=404)
+        return {"book": bs.get_book(book_id)}
+
+
+@app.delete("/api/books/{book_id}/spreads/{spread_id}")
+def api_book_delete_spread(book_id: int, spread_id: int):
+    with _get_books() as bs:
+        bs.delete_spread(spread_id)
+    return {"ok": True}
+
+
+@app.post("/api/books/{book_id}/spreads/reorder")
+def api_book_reorder_spreads(book_id: int, body: dict):
+    order = body.get("order") or []
+    with _get_books() as bs:
+        bs.reorder_spreads(book_id, [int(x) for x in order])
+        return {"book": bs.get_book(book_id)}
+
+
+@app.put("/api/books/{book_id}/cells/{cell_id}")
+def api_book_update_cell(book_id: int, cell_id: int, body: dict):
+    with _get_books() as bs, _get_db() as pdb:
+        try:
+            bs.set_cell(pdb, cell_id, body)
+        except KeyError:
+            return JSONResponse({"error": "Cell not found"}, status_code=404)
+        return {"ok": True}
+
+
+@app.post("/api/books/{book_id}/auto-arrange")
+def api_book_auto_arrange(book_id: int, body: dict):
+    """Materialize spreads from the included candidate pool via the deterministic
+    suggest_layout partition (skips excluded photos)."""
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        pids = body.get("photo_ids")
+        n = bs.auto_arrange(pdb, book_id,
+                            [int(i) for i in pids] if pids else None,
+                            body.get("spread_count"),
+                            replace=body.get("replace", True))
+        return {"spreads_created": n, "book": bs.get_book(book_id)}
+
+
+# ---------------------------------------------------------------------------
 # Photo stacks (burst/bracket groups)
 # ---------------------------------------------------------------------------
 
@@ -4597,6 +4788,23 @@ if _frontend_dir.exists():
             return HTMLResponse(coll_page.read_text(),
                                 headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Collections page not found</h1>")
+
+    @app.get("/book")
+    @app.get("/book/{book_id}")
+    def serve_book(book_id: int = 0):
+        """Serve the photobook builder (JS reads the id from the URL)."""
+        page = _frontend_dir / "book.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Book page not found</h1>")
+
+    @app.get("/book/{book_id}/proof")
+    def serve_book_proof(book_id: int):
+        """Serve the print-friendly proof view (same page; JS renders proof mode)."""
+        page = _frontend_dir / "book.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Book page not found</h1>")
 
     @app.get("/status")
     def serve_status():

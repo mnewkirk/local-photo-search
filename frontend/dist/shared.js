@@ -87,6 +87,7 @@
       { href: '/faces',       label: 'Faces',       id: 'faces' },
       { href: '/merges',      label: 'Merges',      id: 'merges' },
       { href: '/collections', label: 'Collections', id: 'collections' },
+      { href: '/book',        label: 'Books',       id: 'book' },
       { href: '/map',         label: 'Map',         id: 'map' },
       { href: '/geotag',      label: 'Geotag',      id: 'geotag' },
       { href: '/status',      label: 'Status',      id: 'status' },

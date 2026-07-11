@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Books — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#0f0f0f; --surface:#1a1a1a; --surface2:#242424; --border:#333;
+      --text:#e8e8e8; --text-muted:#888; --accent:#4a9eff; --accent-hover:#6bb3ff;
+      --green:#4ade80; --red:#f87171; --amber:#fbbf24; --radius:8px;
+    }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+      background:var(--bg); color:var(--text); line-height:1.5; min-height:100vh; }
+    .nav-link { font-size:13px; color:var(--accent); text-decoration:none; margin-left:4px; }
+    .nav-link:hover { text-decoration:underline; }
+    .nav-link.active { color:var(--text); font-weight:600; }
+    .container { max-width:1600px; margin:0 auto; padding:16px 24px; }
+    button { font:inherit; cursor:pointer; border:1px solid var(--border); background:var(--surface2);
+      color:var(--text); border-radius:6px; padding:6px 10px; }
+    button:hover { border-color:var(--accent); }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#04101f; font-weight:600; }
+    button.danger:hover { border-color:var(--red); color:var(--red); }
+    button.tiny { padding:2px 6px; font-size:12px; }
+    input, select, textarea { font:inherit; background:var(--surface); color:var(--text);
+      border:1px solid var(--border); border-radius:6px; padding:6px 8px; }
+    a { color:var(--accent); }
+    .muted { color:var(--text-muted); font-size:12px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+
+    /* Book list */
+    .book-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+      padding:14px; display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+
+    /* Builder layout */
+    .builder { display:grid; grid-template-columns:300px 1fr; gap:16px; align-items:start; }
+    .tray { position:sticky; top:12px; max-height:calc(100vh - 90px); overflow:auto;
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:10px; }
+    .tray-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:8px; }
+    .cand { position:relative; border:1px solid var(--border); border-radius:5px; overflow:hidden;
+      background:#000; cursor:grab; }
+    .cand img { width:100%; height:80px; object-fit:cover; display:block; }
+    .cand.excluded { opacity:.32; }
+    .cand.used { outline:2px solid var(--green); outline-offset:-2px; }
+    .cand .badges { position:absolute; top:2px; left:2px; display:flex; gap:3px; }
+    .cand .tag { font-size:9px; padding:1px 4px; border-radius:3px; background:rgba(0,0,0,.7); }
+    .cand .acts { position:absolute; bottom:0; left:0; right:0; display:flex;
+      opacity:0; transition:opacity .1s; }
+    .cand:hover .acts { opacity:1; }
+    .cand .acts button { flex:1; border-radius:0; border:0; font-size:10px; padding:2px; }
+
+    /* Spread stage */
+    .spread { margin-bottom:18px; }
+    .spread-head { display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap; }
+    .stage { position:relative; width:100%; background:#fff; border:1px solid var(--border);
+      border-radius:4px; overflow:hidden; }
+    .stage .spine { position:absolute; top:0; bottom:0; left:50%; width:0; border-left:1px dashed rgba(0,0,0,.18); }
+    .cell { position:absolute; overflow:hidden; background:transparent; }
+    .cell.selected { outline:2px solid var(--accent); outline-offset:-2px; z-index:5; }
+    .cell.empty { background:repeating-linear-gradient(45deg,#e9e9e9,#e9e9e9 8px,#dedede 8px,#dedede 16px);
+      display:flex; align-items:center; justify-content:center; }
+    .cell.empty span { color:#999; font-size:11px; }
+    .cell img { position:absolute; user-select:none; -webkit-user-drag:none; }
+    .cell .facebox { position:absolute; border:1px solid rgba(74,158,255,.9); box-shadow:0 0 0 1px rgba(0,0,0,.4); }
+    .cell .cap { position:absolute; left:4%; right:4%; bottom:5%; font-family:Georgia,serif;
+      font-style:italic; text-align:center; }
+    .cell .cap span { background:rgba(255,255,255,.62); color:#222; padding:2px 8px; border-radius:8px;
+      box-decoration-break:clone; -webkit-box-decoration-break:clone; }
+    .cell .cap.dark span { background:rgba(0,0,0,.45); color:#fff; }
+
+    /* Cell toolbar */
+    .celltools { position:sticky; bottom:0; z-index:20; background:var(--surface2);
+      border:1px solid var(--accent); border-radius:8px; padding:10px; margin-top:10px; display:flex;
+      gap:14px; align-items:center; flex-wrap:wrap; }
+    .warn { color:var(--amber); font-size:12px; }
+    .preset-btns button.active { background:var(--accent); color:#04101f; border-color:var(--accent); }
+
+    /* Proof */
+    .proof .stage { border:0; box-shadow:0 1px 6px rgba(0,0,0,.4); margin:0 auto 4px; }
+    @media print {
+      .no-print { display:none !important; }
+      body { background:#fff; }
+      .proof .stage { box-shadow:none; page-break-after:always; break-after:page; }
+      @page { size:landscape; margin:0.3in; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    const e = React.createElement;
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    const ARCHES = ['matched 2-up','asymmetric collage','dense grid','full-bleed single','full-spread panorama'];
+    const CROP_PRESETS = [
+      { label:'No restriction', w:0, h:0 },
+      { label:'≥80% width', w:0.8, h:0 },
+      { label:'≥80% height', w:0, h:0.8 },
+      { label:'≥80% both', w:0.8, h:0.8 },
+      { label:'100% (full view)', w:1, h:1 },
+    ];
+    const thumb = id => '/api/photos/' + id + '/thumbnail';
+    const preview = id => '/api/photos/' + id + '/preview';
+
+    async function api(path, opts) {
+      const r = await fetch(path, Object.assign({ headers:{'Content-Type':'application/json'} }, opts || {}));
+      if (!r.ok) throw new Error((await r.text()) || r.statusText);
+      return r.status === 204 ? null : r.json();
+    }
+
+    // ---- Crop geometry: percent-of-cell layout for an <img>, aspect-preserving ----
+    // Ac = cell aspect (w/h inches); An = image natural aspect (natW/natH).
+    // Returns Pw/Ph (% of cell w/h) + left/top (% of cell) honoring zoom, the
+    // graded min-visible constraints, and contain/full-view. Also the visible
+    // source window [x0,y0,x1,y1] (normalized) for the subject-safety check.
+    function planCell(cell, An) {
+      const Ac = (cell.w || 1) / (cell.h || 1);
+      const t = An / Ac;
+      const minw = cell.crop_min_w || 0, minh = cell.crop_min_h || 0;
+      const containPw = t >= 1 ? 100 : 100 * t;
+      const containPh = t >= 1 ? 100 / t : 100;
+      const contain = cell.fit === 'contain' || (minw >= 1 && minh >= 1);
+      let Pw, Ph;
+      if (contain) {
+        Pw = containPw; Ph = containPh;
+        const left = (100 - Pw) / 2, top = (100 - Ph) / 2;
+        return { Pw, Ph, left, top, win:[0,0,1,1], contain:true };
+      }
+      const z = Math.max(1, cell.crop_zoom || 1);
+      if (t >= 1) { Ph = 100 * z; Pw = Ph * t; } else { Pw = 100 * z; Ph = Pw / t; }
+      if (minw > 0 && Pw > 100 / minw) { const s = (100 / minw) / Pw; Pw *= s; Ph *= s; }
+      if (minh > 0 && Ph > 100 / minh) { const s = (100 / minh) / Ph; Ph *= s; Pw *= s; }
+      if (Pw < containPw - 1e-6 || Ph < containPh - 1e-6) { Pw = containPw; Ph = containPh; }
+      const cx = cell.crop_cx == null ? 0.5 : cell.crop_cx;
+      const cy = cell.crop_cy == null ? 0.5 : cell.crop_cy;
+      let left = 50 - cx * Pw, top = 50 - cy * Ph;
+      left = Pw >= 100 ? Math.min(0, Math.max(100 - Pw, left)) : (100 - Pw) / 2;
+      top  = Ph >= 100 ? Math.min(0, Math.max(100 - Ph, top))  : (100 - Ph) / 2;
+      const cxe = (50 - left) / Pw, cye = (50 - top) / Ph;
+      const vw = 100 / Pw, vh = 100 / Ph;
+      return { Pw, Ph, left, top, contain:false,
+               win:[cxe - vw/2, cye - vh/2, cxe + vw/2, cye + vh/2] };
+    }
+
+    function facesCut(win, faces) {
+      if (!faces || !faces.length) return false;
+      const eps = 0.02;
+      return faces.some(f => f[0] < win[0]-eps || f[1] < win[1]-eps || f[2] > win[2]+eps || f[3] > win[3]+eps);
+    }
+
+    // ---- photo-detail cache (faces + subject boxes, normalized) ----
+    const detailCache = {};
+    async function loadDetail(id) {
+      if (detailCache[id]) return detailCache[id];
+      const d = await api('/api/photos/' + id);
+      const W = d.image_width || 0, H = d.image_height || 0;
+      const faces = [];
+      (d.faces || []).forEach(f => {
+        const b = f.bbox; if (!b || !W || !H) return;
+        faces.push([b.left/W, b.top/H, b.right/W, b.bottom/H]);
+      });
+      // subject_boxes: [{label, bbox:[x1,y1,x2,y2] normalized, area_frac}]
+      (d.subject_boxes || []).forEach(s => {
+        const b = s.bbox; if (!b || b.length !== 4) return;
+        faces.push([b[0], b[1], b[2], b[3]]);
+      });
+      detailCache[id] = { faces, w:W, h:H };
+      return detailCache[id];
+    }
+
+    // ---------------------------------------------------------------- Cell
+    function Cell({ cell, stageW, stageH, selected, proof, onSelect, onPatch, onDrop, showFaces, detail }) {
+      const [nat, setNat] = useState(null);
+      const style = {
+        left:(cell.x/stageW*100)+'%', top:(cell.y/stageH*100)+'%',
+        width:(cell.w/stageW*100)+'%', height:(cell.h/stageH*100)+'%',
+      };
+      const drag = useRef(null);
+      if (!cell.photo_id) {
+        return e('div', { className:'cell empty', style,
+          onDragOver: ev => ev.preventDefault(),
+          onDrop: ev => { ev.preventDefault(); const pid = ev.dataTransfer.getData('pid'); if (pid) onDrop(+pid); },
+          onClick: () => onSelect && onSelect() },
+          e('span', null, proof ? '' : 'drop photo'));
+      }
+      const An = nat ? nat.w/nat.h : ((detail && detail.w) ? detail.w/detail.h : 1.5);
+      const p = planCell(cell, An);
+      const imgStyle = { left:p.left+'%', top:p.top+'%', width:p.Pw+'%', height:p.Ph+'%' };
+      const onDown = ev => {
+        if (proof || p.contain) return;
+        ev.preventDefault(); ev.stopPropagation();
+        const rect = ev.currentTarget.parentElement.getBoundingClientRect();
+        drag.current = { x:ev.clientX, y:ev.clientY, cx:cell.crop_cx==null?0.5:cell.crop_cx,
+                         cy:cell.crop_cy==null?0.5:cell.crop_cy, rect };
+        const move = m => {
+          const d = drag.current; if (!d) return;
+          const dxp = (m.clientX - d.x)/d.rect.width*100, dyp = (m.clientY - d.y)/d.rect.height*100;
+          let cx = d.cx - dxp/p.Pw, cy = d.cy - dyp/p.Ph;
+          cx = Math.min(1, Math.max(0, cx)); cy = Math.min(1, Math.max(0, cy));
+          onPatch({ crop_cx:cx, crop_cy:cy }, false);
+        };
+        const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
+          if (drag.current) { onPatch({ crop_cx:cell.crop_cx, crop_cy:cell.crop_cy }, true); drag.current = null; } };
+        window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
+      };
+      const cap = cell.__caption;
+      return e('div', { className:'cell'+(selected?' selected':''), style,
+          onClick: ev => { ev.stopPropagation(); onSelect && onSelect(); },
+          onDragOver: ev => ev.preventDefault(),
+          onDrop: ev => { ev.preventDefault(); const pid = ev.dataTransfer.getData('pid'); if (pid) onDrop(+pid); } },
+        e('img', { src:preview(cell.photo_id), style:imgStyle, draggable:false,
+          onMouseDown:onDown, onLoad: ev => setNat({ w:ev.target.naturalWidth, h:ev.target.naturalHeight }),
+          onError: ev => { if (!ev.target.dataset.fb) { ev.target.dataset.fb='1'; ev.target.src = thumb(cell.photo_id); } } }),
+        showFaces && selected && !proof && detail && detail.faces ? detail.faces.map((f,i) =>
+          e('div', { key:i, className:'facebox', style:{
+            left:(p.left + f[0]*p.Pw)+'%', top:(p.top + f[1]*p.Ph)+'%',
+            width:((f[2]-f[0])*p.Pw)+'%', height:((f[3]-f[1])*p.Ph)+'%' } })) : null,
+        cap ? e('div', { className:'cap'+(cap.dark?' dark':''), style:{ fontSize:(stageH*0.9)+'px' } },
+          e('span', null, cap.text)) : null,
+      );
+    }
+
+    // ------------------------------------------------------------- Spread
+    function Spread({ book, spread, sel, onSel, reload, patchLocal, showFaces, details }) {
+      const stageW = book.stage_w, stageH = book.stage_h;
+      const put = (fields) => api('/api/books/'+book.book.id+'/spreads/'+spread.id, { method:'PUT', body:JSON.stringify(fields) }).then(r=>reload(r.book));
+      const del = () => { if (confirm('Delete this spread?')) api('/api/books/'+book.book.id+'/spreads/'+spread.id, { method:'DELETE' }).then(()=>reload()); };
+      const cap = spread.caption;
+      const dark = spread.bg && spread.bg !== '#ffffff';
+      const cells = spread.cells.map(c => Object.assign({}, c, { __caption: cap && c.position===0 ? cap : null }));
+      return e('div', { className:'spread' },
+        !book.__proof && e('div', { className:'spread-head no-print' },
+          e('span', { className:'muted' }, '#'+(spread.position+1)),
+          e('input', { value:spread.label||'', placeholder:'label',
+            onChange: ev => patchLocal(spread.id, { label:ev.target.value }),
+            onBlur: ev => put({ label:ev.target.value }), style:{ width:150 } }),
+          e('select', { value:spread.archetype||'', onChange: ev => put({ archetype:ev.target.value }) },
+            ARCHES.map(a => e('option', { key:a, value:a }, a))),
+          e('button', { className:'tiny', onClick:()=>put({ bg: dark?'#ffffff':'#111111' }) }, dark?'☀ light':'☾ dark'),
+          e('button', { className:'tiny', onClick:()=>{ const t = prompt('Caption (blank to clear):', cap?cap.text:''); if (t===null) return;
+            put({ caption: t.trim()? { text:t.trim(), dark:dark } : null }); } }, 'caption'),
+          e('button', { className:'tiny', onClick:()=>put({ position:spread.position-1 }) }, '↑'),
+          e('button', { className:'tiny', onClick:()=>put({ position:spread.position+2 }) }, '↓'),
+          e('button', { className:'tiny danger', onClick:del }, '✕'),
+        ),
+        e('div', { className:'stage', style:{ aspectRatio: stageW+' / '+stageH, background: spread.bg||'#fff' },
+            onClick:()=>onSel(null) },
+          cells.map(c => e(Cell, { key:c.id, cell:c, stageW, stageH,
+            selected: sel && sel.cellId===c.id, proof:book.__proof, showFaces,
+            detail: details[c.photo_id],
+            onSelect: ()=>onSel({ spreadId:spread.id, cellId:c.id }),
+            onPatch: (fields, persist) => { patchCell(book, spread.id, c.id, fields, patchLocal); if (persist) api('/api/books/'+book.book.id+'/cells/'+c.id, { method:'PUT', body:JSON.stringify(fields) }); },
+            onDrop: (pid) => api('/api/books/'+book.book.id+'/cells/'+c.id, { method:'PUT', body:JSON.stringify({ photo_id:pid }) }).then(()=>reload()),
+          })),
+          e('div', { className:'spine' }),
+        ),
+      );
+    }
+
+    function patchCell(book, spreadId, cellId, fields, patchLocal) {
+      patchLocal(null, null, (b) => {
+        const sp = b.spreads.find(s=>s.id===spreadId); if (!sp) return;
+        const c = sp.cells.find(x=>x.id===cellId); if (c) Object.assign(c, fields);
+      });
+    }
+
+    // --------------------------------------------------------- Cell toolbar
+    function CellTools({ book, sel, reload, patchLocal, showFaces, setShowFaces, detail }) {
+      const sp = book.spreads.find(s=>s.id===sel.spreadId);
+      const cell = sp && sp.cells.find(c=>c.id===sel.cellId);
+      if (!cell) return null;
+      const put = (fields) => { patchCell(book, sp.id, cell.id, fields, patchLocal);
+        api('/api/books/'+book.book.id+'/cells/'+cell.id, { method:'PUT', body:JSON.stringify(fields) }); };
+      const nat = detail && detail.w ? detail.w/detail.h : 1.5;
+      const plan = cell.photo_id ? planCell(cell, nat) : null;
+      const cut = cell.photo_id && plan && !plan.contain && detail && facesCut(plan.win, detail.faces);
+      const activePreset = CROP_PRESETS.findIndex(p => (p.w===(cell.crop_min_w||0)) && (p.h===(cell.crop_min_h||0)));
+      return e('div', { className:'celltools no-print' },
+        e('strong', null, 'Cell '),
+        cell.photo_id ? e('span', { className:'muted' }, '#'+cell.photo_id) : e('span', { className:'muted' }, 'empty'),
+        cell.photo_id && e('label', { className:'row' }, 'Zoom',
+          e('input', { type:'range', min:1, max:3, step:0.05, value:cell.crop_zoom||1,
+            disabled: cell.fit==='contain' || (cell.crop_min_w>=1&&cell.crop_min_h>=1),
+            onChange: ev => put({ crop_zoom: parseFloat(ev.target.value) }) })),
+        cell.photo_id && e('div', { className:'row preset-btns' }, e('span', { className:'muted' }, 'Keep:'),
+          CROP_PRESETS.map((p,i) => e('button', { key:i, className:'tiny'+(i===activePreset?' active':''),
+            onClick: ()=>put({ crop_min_w:p.w, crop_min_h:p.h, fit:(p.w>=1&&p.h>=1)?'contain':'cover' }) }, p.label))),
+        cell.photo_id && e('button', { className:'tiny', onClick:()=>put({ fit: cell.fit==='contain'?'cover':'contain' }) },
+          cell.fit==='contain'?'fit: contain':'fit: cover'),
+        cell.photo_id && e('label', { className:'row muted' },
+          e('input', { type:'checkbox', checked:showFaces, onChange:ev=>setShowFaces(ev.target.checked) }), 'subjects'),
+        cut ? e('span', { className:'warn' }, '⚠ a subject is cropped out') : null,
+        cell.photo_id && e('button', { className:'tiny danger', onClick:()=>{ put({ photo_id:null }); } }, 'remove photo'),
+      );
+    }
+
+    // ------------------------------------------------------------ Candidate tray
+    function Tray({ book, reload }) {
+      const bid = book.book.id;
+      const [q, setQ] = useState(''); const [df, setDf] = useState(''); const [dt, setDt] = useState('');
+      const [colls, setColls] = useState([]); const [msg, setMsg] = useState('');
+      useEffect(()=>{ api('/api/collections').then(d=>setColls(d.collections||[])).catch(()=>{}); }, []);
+      const searchAdd = async () => {
+        setMsg('searching…');
+        const params = new URLSearchParams(); if (q) params.set('q', q);
+        if (df) params.set('date_from', df); if (dt) params.set('date_to', dt);
+        params.set('limit', '300');
+        const d = await api('/api/search?' + params.toString());
+        const ids = (d.results||[]).map(r=>r.id);
+        if (!ids.length) { setMsg('no results'); return; }
+        const r = await api('/api/books/'+bid+'/candidates', { method:'POST', body:JSON.stringify({ photo_ids:ids }) });
+        setMsg('added '+r.added+' of '+ids.length); reload();
+      };
+      const importColl = async (cid) => {
+        if (!cid) return;
+        const r = await api('/api/books/'+bid+'/candidates', { method:'POST', body:JSON.stringify({ collection_id:+cid }) });
+        setMsg('imported '+r.added+' photos'); reload();
+      };
+      const decide = (pid, decision) => api('/api/books/'+bid+'/decisions/'+pid, { method:'PUT', body:JSON.stringify({ decision }) }).then(()=>reload());
+      const cands = book.candidates || [];
+      return e('div', { className:'tray no-print' },
+        e('strong', null, 'Candidates '), e('span', { className:'muted' }, cands.length+' · '+cands.filter(c=>c.decision==='include').length+' in'),
+        e('div', { style:{ marginTop:8 } },
+          e('input', { placeholder:'search query', value:q, onChange:ev=>setQ(ev.target.value),
+            onKeyDown:ev=>{ if(ev.key==='Enter') searchAdd(); }, style:{ width:'100%' } }),
+          e('div', { className:'row', style:{ marginTop:6 } },
+            e('input', { type:'date', value:df, onChange:ev=>setDf(ev.target.value), style:{ flex:1 } }),
+            e('input', { type:'date', value:dt, onChange:ev=>setDt(ev.target.value), style:{ flex:1 } })),
+          e('button', { className:'primary tiny', style:{ marginTop:6, width:'100%' }, onClick:searchAdd }, 'Search & add to pool'),
+          e('select', { style:{ marginTop:6, width:'100%' }, onChange:ev=>{ importColl(ev.target.value); ev.target.value=''; } },
+            e('option', { value:'' }, 'Import a collection…'),
+            colls.map(c => e('option', { key:c.id, value:c.id }, c.name))),
+          msg ? e('div', { className:'muted', style:{ marginTop:4 } }, msg) : null,
+        ),
+        e('div', { className:'tray-grid' }, cands.map(c =>
+          e('div', { key:c.id, className:'cand'+(c.decision==='exclude'?' excluded':'')+(c.used?' used':''),
+              draggable:true, onDragStart:ev=>ev.dataTransfer.setData('pid', String(c.id)),
+              title:(c.date_taken||'')+' '+(c.place_name||'') },
+            e('img', { src:thumb(c.id), loading:'lazy' }),
+            e('div', { className:'badges' }, c.used ? e('span', { className:'tag', style:{ color:'#4ade80' } }, '✓ used') : null),
+            e('div', { className:'acts' },
+              c.decision==='exclude'
+                ? e('button', { onClick:()=>decide(c.id,'include') }, 'use')
+                : e('button', { onClick:()=>decide(c.id,'exclude') }, "don't use")),
+          ))),
+      );
+    }
+
+    // -------------------------------------------------------------- Builder
+    function Builder({ bookId, proof }) {
+      const [book, setBook] = useState(null);
+      const [sel, setSel] = useState(null);
+      const [showFaces, setShowFaces] = useState(true);
+      const [details, setDetails] = useState({});
+      const load = useCallback((partial) => {
+        if (partial) { partial.__proof = proof; setBook(b => Object.assign({}, partial, { candidates: b?b.candidates:partial.candidates, __proof:proof })); return; }
+        api('/api/books/'+bookId).then(d => { d.__proof = proof; setBook(d); });
+      }, [bookId, proof]);
+      useEffect(()=>{ load(); }, [load]);
+      // Local optimistic patch: patchLocal(spreadId, fields) or patchLocal(null,null,mutator)
+      const patchLocal = useCallback((spreadId, fields, mutator) => {
+        setBook(b => { if (!b) return b; const nb = Object.assign({}, b, { spreads: b.spreads.map(s=>Object.assign({}, s, { cells:s.cells.map(c=>Object.assign({}, c)) })) });
+          if (mutator) mutator(nb);
+          else { const sp = nb.spreads.find(s=>s.id===spreadId); if (sp) Object.assign(sp, fields); }
+          return nb; });
+      }, []);
+      // Prefetch faces/subject boxes for photos in spreads (for overlay + safety).
+      useEffect(()=>{
+        if (!book) return;
+        const ids = new Set(); book.spreads.forEach(s=>s.cells.forEach(c=>{ if (c.photo_id) ids.add(c.photo_id); }));
+        ids.forEach(id => { if (!details[id]) loadDetail(id).then(d => setDetails(x=>Object.assign({}, x, { [id]:d }))).catch(()=>{}); });
+      }, [book]);
+      if (!book) return e('div', { className:'container' }, 'Loading…');
+      if (book.error) return e('div', { className:'container' }, 'Not found');
+
+      const reload = (partial) => load(partial);
+      const spreadsView = e('div', null, book.spreads.map(sp =>
+        e(Spread, { key:sp.id, book, spread:sp, sel, onSel:setSel, reload, patchLocal, showFaces, details })));
+
+      if (proof) {
+        return e('div', { className:'proof' },
+          e('div', { className:'container' },
+            e('div', { className:'no-print row', style:{ marginBottom:12 } },
+              e('a', { href:'/book/'+bookId }, '‹ back to editor'),
+              e('button', { onClick:()=>window.print() }, 'Print / Save PDF'),
+              e('h2', { style:{ marginLeft:8 } }, book.book.name)),
+            spreadsView));
+      }
+
+      const selDetail = sel ? (()=>{ const sp=book.spreads.find(s=>s.id===sel.spreadId); const c=sp&&sp.cells.find(x=>x.id===sel.cellId); return c&&c.photo_id?details[c.photo_id]:null; })() : null;
+      const addSpread = () => api('/api/books/'+bookId+'/spreads', { method:'POST', body:JSON.stringify({ archetype:'matched 2-up' }) }).then(r=>reload(r.book));
+      const autoArrange = () => { if (!confirm('Auto-arrange the included candidates into spreads? This replaces the current spreads.')) return;
+        api('/api/books/'+bookId+'/auto-arrange', { method:'POST', body:JSON.stringify({ replace:true }) }).then(r=>reload(r.book)); };
+      return e('div', null,
+        e(PS.SharedHeader, { activePage:'book' }),
+        e('div', { className:'container' },
+          e('div', { className:'row no-print', style:{ marginBottom:12 } },
+            e('a', { href:'/book' }, '‹ all books'),
+            e('h2', null, book.book.name),
+            book.book.subtitle ? e('span', { className:'muted' }, book.book.subtitle) : null,
+            e('span', { style:{ flex:1 } }),
+            e('button', { onClick:autoArrange }, '✨ Auto-arrange'),
+            e('button', { onClick:addSpread }, '+ Spread'),
+            e('a', { className:'nav-link', href:'/book/'+bookId+'/proof', target:'_blank' }, 'Open proof ↗')),
+          e('div', { className:'builder' },
+            e(Tray, { book, reload }),
+            e('div', null, spreadsView,
+              sel ? e(CellTools, { book, sel, reload, patchLocal, showFaces, setShowFaces, detail:selDetail }) : null),
+          )));
+    }
+
+    // ------------------------------------------------------------- Book list
+    function BookList() {
+      const [books, setBooks] = useState(null);
+      const [name, setName] = useState(''); const [sub, setSub] = useState('');
+      const refresh = () => api('/api/books').then(d=>setBooks(d.books||[]));
+      useEffect(()=>{ refresh(); }, []);
+      const create = () => { if (!name.trim()) return;
+        api('/api/books', { method:'POST', body:JSON.stringify({ name:name.trim(), subtitle:sub.trim()||null }) })
+          .then(r => { window.location.href = '/book/'+r.book.id; }); };
+      const del = (id) => { if (confirm('Delete this book project?')) api('/api/books/'+id, { method:'DELETE' }).then(refresh); };
+      return e('div', null,
+        e(PS.SharedHeader, { activePage:'book' }),
+        e('div', { className:'container' },
+          e('h1', null, '📖 Photo books'),
+          e('p', { className:'muted' }, 'Build a Shutterfly-style proof from the library — lasting picks, live cropping, printable proof.'),
+          e('div', { className:'book-card', style:{ marginTop:14 } },
+            e('div', { className:'row' },
+              e('input', { placeholder:'New book name', value:name, onChange:ev=>setName(ev.target.value) }),
+              e('input', { placeholder:'subtitle (optional)', value:sub, onChange:ev=>setSub(ev.target.value) }),
+              e('button', { className:'primary', onClick:create }, 'Create'))),
+          books === null ? e('p', null, 'Loading…') :
+            books.length === 0 ? e('p', { className:'muted' }, 'No books yet.') :
+            books.map(b => e('div', { key:b.id, className:'book-card' },
+              e('div', null, e('a', { href:'/book/'+b.id, style:{ fontWeight:600, fontSize:16 } }, b.name),
+                b.subtitle ? e('span', { className:'muted' }, ' — '+b.subtitle) : null,
+                e('div', { className:'muted' }, (b.spread_count||0)+' spreads · '+(b.candidate_count||0)+' candidates')),
+              e('div', { className:'row' },
+                e('a', { className:'nav-link', href:'/book/'+b.id }, 'Open'),
+                e('a', { className:'nav-link', href:'/book/'+b.id+'/proof', target:'_blank' }, 'Proof'),
+                e('button', { className:'tiny danger', onClick:()=>del(b.id) }, 'Delete')))),
+        ));
+    }
+
+    function App() {
+      const m = window.location.pathname.match(/^\/book\/(\d+)(\/proof)?/);
+      if (m) return e(Builder, { bookId:+m[1], proof:!!m[2] });
+      return e(BookList);
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html>

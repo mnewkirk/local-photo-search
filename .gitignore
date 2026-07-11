@@ -64,6 +64,9 @@ vocab_candidates.json
 # Local copy of prod DB pulled by debug-db.sh
 photo_index.db.local*
 
+# Photobook builder sidecar store (M29) — desktop curation workspace, local only
+photobooks.db.local*
+
 # Claude Code per-checkout config — never tracked
 .claude/settings.local.json
 .claude/settings.json
