@@ -522,3 +522,45 @@ class TestSaveAndRun:
         # crucially the existing two are NOT cleared (scoped clear only).
         run_stacking(db, photo_ids=[ids[-1]])
         assert len(db.get_all_stacks()) == before
+
+    def test_run_stacking_directory_scope_preserves_other_folders(self, db):
+        """run_stacking(directory=...) — the ACTUAL ingest-cron path — must clear
+        only the directory's stacks, not the whole library. Regression for the
+        nightly ingest reducing the library to just the freshly-ingested folder's
+        stacks (the original scoped fix threaded photo_ids but left directory=
+        wiping everything)."""
+        db.set_photo_root("/photos")  # so resolve_filepath prepends a real dir
+        # Burst A lives under folderA, burst B under folderB (distinct dirs).
+        base = _make_unit_vec(512, seed=1234)
+        def _add_burst(folder, seed):
+            pids = []
+            for i in range(3):
+                pid = db.add_photo(
+                    filepath=f"{folder}/burst_{i}.jpg",
+                    filename=f"burst_{i}.jpg",
+                    date_taken=f"2026-05-0{seed}T10:00:0{i}",
+                    aesthetic_score=5.0 + i,
+                )
+                v = base + np.random.RandomState(seed * 10 + i).randn(512).astype(np.float32) * 0.001
+                v /= np.linalg.norm(v)
+                db.add_clip_embedding(pid, v.tolist())
+                pids.append(pid)
+            db.conn.commit()
+            return pids
+
+        a_ids = _add_burst("folderA", seed=1)
+        b_ids = _add_burst("folderB", seed=2)
+
+        # Full detect first — both folders' bursts become stacks.
+        run_stacking(db)
+        stacks_before = db.get_all_stacks()
+        assert len(stacks_before) >= 2
+
+        # Now a directory-scoped run over folderB only (as ingest of folderB does).
+        run_stacking(db, directory=str(Path(db.photo_root) / "folderB"))
+
+        # folderA's stack must survive the scoped folderB run.
+        surviving_a = db.conn.execute(
+            "SELECT COUNT(*) FROM stack_members WHERE photo_id = ?", (a_ids[0],)
+        ).fetchone()[0]
+        assert surviving_a == 1, "folderA stack was wiped by a folderB-scoped run"

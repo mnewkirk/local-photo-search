@@ -320,7 +320,10 @@ def save_stacks(
     library. This is the fix for the ingest cron silently deleting every stack in
     the library each night — a scoped run must replace only its own stacks.
     """
-    if scope_photo_ids:
+    if scope_photo_ids is not None:
+        # Scoped run — clear only stacks overlapping this scope. An empty scope
+        # clears NOTHING (an empty list is still a scope, not a full-library
+        # wipe); only scope_photo_ids=None means "full re-detect, clear all".
         db.clear_stacks_for_photos(scope_photo_ids)
     else:
         db.clear_stacks()
@@ -339,6 +342,21 @@ def save_stacks(
     if on_progress:
         on_progress({"phase": "save", "saved": total, "total": total})
     logger.info("Saved %d stacks to database", total)
+
+
+def _resolve_directory_photo_ids(db: PhotoDB, directory: str) -> list[int]:
+    """Resolve the photo IDs whose files live under `directory`, matching the
+    same prefix logic detect_stacks uses to scope a directory run. Used to build
+    the clear-scope for a directory-scoped stacking run so it replaces only that
+    folder's stacks instead of wiping the whole library."""
+    prefix = directory.rstrip("/") + "/"
+    rows = db.conn.execute("SELECT id, filepath FROM photos").fetchall()
+    ids = []
+    for r in rows:
+        abs_path = db.resolve_filepath(r["filepath"])
+        if abs_path and abs_path.startswith(prefix):
+            ids.append(r["id"])
+    return ids
 
 
 def run_stacking(
@@ -378,8 +396,17 @@ def run_stacking(
         on_progress=on_progress, should_abort=should_abort,
     )
     if not dry_run and stacks:
-        # Scoped runs (photo_ids set) clear only their own stacks; a full-library
-        # run clears everything. Prevents the ingest cron from wiping all stacks.
+        # Scoped runs clear only their own stacks; a full-library run clears
+        # everything. Prevents the ingest cron from wiping all stacks. The scope
+        # is whatever restricted this run: an explicit photo_ids set (collection
+        # mode) OR the photos under `directory` (the ingest path — index_directory
+        # calls run_stacking(directory=...), which is what nightly ingest hits).
+        # Resolving directory→ids here is the missing half of the original fix,
+        # which only threaded photo_ids and left the directory path wiping the
+        # whole library.
+        scope_photo_ids = photo_ids
+        if scope_photo_ids is None and directory is not None:
+            scope_photo_ids = _resolve_directory_photo_ids(db, directory)
         save_stacks(db, stacks, on_progress=on_progress, should_abort=should_abort,
-                    scope_photo_ids=photo_ids)
+                    scope_photo_ids=scope_photo_ids)
     return stacks
