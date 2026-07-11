@@ -94,7 +94,10 @@ _OUTLINE_SYSTEM = (
     "photo DESCRIPTIONS, and don't attach a famous-landmark name (a castle, a "
     "church) to a beat unless the descriptions actually show it.\n"
     "- Decide which beats belong in the book (include=true) and which to cut "
-    "(include=false) — cut weak, redundant, or purely-incidental scenes.\n"
+    "(include=false). BE SELECTIVE AND RUTHLESS: the book has room for only about "
+    "as many spreads as the target, so include at most that many beats and cut the "
+    "rest. Most trip moments are forgettable — cut weak, redundant, transit, and "
+    "purely-incidental scenes; keep the story beats that carry the trip.\n"
     "- SIZE TO THE DAY. A scene-dense stretch at one place/activity (roughly 5+ "
     "scenes — a castle visit, a long hike, a big museum) is a BIG EVENT: split it "
     "into several distinct sub-beats (arrival / lunch / the tower / the view / "
@@ -150,16 +153,34 @@ def draft_outline(scenes: list[dict], notes: Optional[str],
 
 
 def allocate_budget(beats: list[dict], target_spreads: int) -> None:
-    """Deterministically distribute the spread budget across INCLUDED beats,
-    weighted by scene density, so big-event days (many scenes) earn multi-spread
-    treatment and the totals land near the target. Mutates beats in place — the
-    LLM's per-beat spread guess is unreliable arithmetic; this fixes it."""
+    """Make the book land near ``target_spreads`` — the LLM over-includes and its
+    per-beat spread guess is unreliable arithmetic, so fix both here. Mutates in
+    place.
+
+    - Too MANY included beats for the target → keep the strongest ``target`` (by
+      scene density), one spread each, and CUT the rest (``include=False``).
+      Breadth beats depth when frugal. Cut beats stay in the review as 'out' so
+      you can add them back.
+    - Room to spare → one spread each + hand the remainder to the densest beats
+      (big-event days earn 2+ spreads)."""
     inc = [b for b in beats if b.get("include")]
     if not inc:
         return
+    target = max(1, int(target_spreads))
+    if len(inc) > target:
+        idx = {id(b): i for i, b in enumerate(inc)}
+        ranked = sorted(inc, key=lambda b: (-len(b.get("scenes") or []), idx[id(b)]))
+        keep = {id(b) for b in ranked[:target]}
+        for b in inc:
+            if id(b) in keep:
+                b["spreads"] = 1
+            else:
+                b["include"] = False
+                b["spreads"] = 0
+        return
     n = len(inc)
     weights = [max(1, len(b.get("scenes") or [])) for b in inc]
-    extra = max(0, int(target_spreads) - n)      # 1 base spread each, share the rest
+    extra = target - n                            # 1 base spread each, share the rest
     tw = sum(weights) or 1
     raw = [extra * w / tw for w in weights]
     add = [int(x) for x in raw]
