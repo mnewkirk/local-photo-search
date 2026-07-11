@@ -13,6 +13,12 @@
     }
     body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
       background:var(--bg); color:var(--text); line-height:1.5; min-height:100vh; }
+    .header { background:var(--surface); border-bottom:1px solid var(--border);
+      padding:16px 24px; position:sticky; top:0; z-index:100; }
+    .header-inner { max-width:1600px; margin:0 auto; display:flex; align-items:center;
+      gap:16px; min-height:42px; }
+    .logo { font-size:18px; font-weight:700; letter-spacing:-0.5px; }
+    .logo span { color:var(--accent); }
     .nav-link { font-size:13px; color:var(--accent); text-decoration:none; margin-left:4px; }
     .nav-link:hover { text-decoration:underline; }
     .nav-link.active { color:var(--text); font-weight:600; }
