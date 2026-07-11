@@ -167,12 +167,52 @@ def render_spread(spread: dict, stage_w: float, stage_h: float,
     return canvas.convert("RGB")
 
 
+def render_cover(img: Optional[Image.Image], title: Optional[str],
+                 subtitle: Optional[str], trim_w: float, trim_h: float,
+                 dpi: int, back: bool = False) -> Image.Image:
+    """A single cover page (trim_w × trim_h): white ground, the hero photo in the
+    top region (contained, uncropped), serif title + subtitle below on the front."""
+    W, H = max(1, round(trim_w * dpi)), max(1, round(trim_h * dpi))
+    canvas = Image.new("RGB", (W, H), "#ffffff")
+    photo_h = int(H * (0.9 if back else 0.66))
+    if img is not None:
+        fit = img.copy()
+        fit.thumbnail((int(W * 0.9), photo_h), Image.LANCZOS)
+        canvas.paste(fit, ((W - fit.width) // 2, int(H * 0.05)))
+    if not back and title:
+        d = ImageDraw.Draw(canvas)
+        ts = max(18, round(H * 0.05))
+        tf, sf = _font(ts), _font(max(12, round(ts * 0.55)))
+        ty = int(H * 0.05) + photo_h + int(H * 0.04)
+        tw = d.textlength(title, font=tf)
+        d.text(((W - tw) / 2, ty), title, font=tf, fill=(34, 34, 34))
+        if subtitle:
+            sw2 = d.textlength(subtitle, font=sf)
+            d.text(((W - sw2) / 2, ty + ts * 1.4), subtitle, font=sf, fill=(120, 120, 120))
+    return canvas
+
+
 def export_book(doc: dict, fetch_image: Callable[[int], Optional[Image.Image]],
                 dpi: int = 150) -> tuple[list[bytes], bytes]:
-    """Render every spread. Returns ``(per_spread_jpegs, pdf_bytes)``."""
+    """Render covers + every spread. Returns ``(per_page_jpegs, pdf_bytes)``."""
     sw, sh = doc.get("stage_w", 28), doc.get("stage_h", 11)
-    images = [render_spread(sp, sw, sh, fetch_image, dpi)
-              for sp in doc.get("spreads", [])]
+    book = doc.get("book", {}) or {}
+    tw, th = book.get("trim_w") or 14, book.get("trim_h") or 11
+    images: list[Image.Image] = []
+    if book.get("cover_photo_id"):
+        try:
+            images.append(render_cover(fetch_image(book["cover_photo_id"]),
+                          book.get("name"), book.get("subtitle"), tw, th, dpi))
+        except Exception:
+            pass
+    images += [render_spread(sp, sw, sh, fetch_image, dpi)
+               for sp in doc.get("spreads", [])]
+    if book.get("back_cover_photo_id"):
+        try:
+            images.append(render_cover(fetch_image(book["back_cover_photo_id"]),
+                          None, None, tw, th, dpi, back=True))
+        except Exception:
+            pass
     jpegs = []
     for im in images:
         b = io.BytesIO()

@@ -87,7 +87,12 @@ _OUTLINE_SYSTEM = (
     "trip's photo SCENES in chronological order (each = a time+place cluster of "
     "photos, already de-duplicated). Group them into the book's STORY: day-by-day "
     "BEATS, each a spread-worthy moment. Your job is EDITORIAL:\n"
-    "- Give each beat a short, specific title (place/activity), house voice.\n"
+    "- Give each beat a short, specific title (place/activity), house voice. NOTE: "
+    "the place label on each scene is an approximate reverse-geocode (the town/"
+    "comune), NOT a specific landmark — e.g. lakeside scenes near Varenna may be "
+    "geocoded 'Vezio' or 'Perledo'. Name the actual activity/landmark from the "
+    "photo DESCRIPTIONS, and don't attach a famous-landmark name (a castle, a "
+    "church) to a beat unless the descriptions actually show it.\n"
     "- Decide which beats belong in the book (include=true) and which to cut "
     "(include=false) — cut weak, redundant, or purely-incidental scenes.\n"
     "- SIZE TO THE DAY. A scene-dense stretch at one place/activity (roughly 5+ "
@@ -142,6 +147,42 @@ def draft_outline(scenes: list[dict], notes: Optional[str],
     # Fallback: every scene is its own included beat.
     return [{"title": (s.get("place") or "Untitled"), "day": s["day"],
              "scenes": [s["gindex"]], "include": True, "spreads": 1} for s in scenes]
+
+
+def allocate_budget(beats: list[dict], target_spreads: int) -> None:
+    """Deterministically distribute the spread budget across INCLUDED beats,
+    weighted by scene density, so big-event days (many scenes) earn multi-spread
+    treatment and the totals land near the target. Mutates beats in place — the
+    LLM's per-beat spread guess is unreliable arithmetic; this fixes it."""
+    inc = [b for b in beats if b.get("include")]
+    if not inc:
+        return
+    n = len(inc)
+    weights = [max(1, len(b.get("scenes") or [])) for b in inc]
+    extra = max(0, int(target_spreads) - n)      # 1 base spread each, share the rest
+    tw = sum(weights) or 1
+    raw = [extra * w / tw for w in weights]
+    add = [int(x) for x in raw]
+    left = extra - sum(add)
+    for i in sorted(range(n), key=lambda i: raw[i] - int(raw[i]), reverse=True)[:left]:
+        add[i] += 1
+    for b, a in zip(inc, add):
+        b["spreads"] = max(1, min(4, 1 + a))
+
+
+def pick_cover(pdb, filters: dict) -> Optional[int]:
+    """A house-style front cover = a wide scenic establishing frame: landscape
+    orientation, few/no faces, highest aesthetic. (The people 'we're on our way'
+    shot stays the title page.)"""
+    from .tools import _build_filter_sql
+    where, params = _build_filter_sql(pdb, filters)
+    row = pdb.conn.execute(
+        f"SELECT id FROM photos WHERE ({where}) "
+        f"AND image_width > image_height * 1.4 "
+        f"AND (SELECT COUNT(*) FROM faces f WHERE f.photo_id = photos.id) <= 1 "
+        f"ORDER BY COALESCE(aes_overall, aesthetic_score, 0) DESC LIMIT 1",
+        params).fetchone()
+    return row["id"] if row else None
 
 
 def _validate_beats(beats, scenes) -> list[dict]:
@@ -230,8 +271,10 @@ def draft_book(pdb, bs, book_id: int, filters: dict, notes: Optional[str],
 
     yield {"phase": "outline"}
     raw = draft_outline(scenes, notes, target_spreads)
+    allocate_budget(raw, target_spreads)   # density-weighted; big days go multi-spread
     included = [b for b in raw if b.get("include")]
-    yield {"phase": "outlined", "beats": len(raw), "included": len(included)}
+    yield {"phase": "outlined", "beats": len(raw), "included": len(included),
+           "spread_budget": sum(b.get("spreads", 1) for b in included)}
 
     beats: list[dict] = []
     best_cover = (None, -1.0)   # (photo_id, vlm_score) for an auto cover
@@ -269,8 +312,8 @@ def draft_book(pdb, bs, book_id: int, filters: dict, notes: Optional[str],
     # Auto covers/title page for a complete draft (only if unset).
     book = bs.get_book_row(book_id) or {}
     upd = {}
-    if not book.get("cover_photo_id") and best_cover[0]:
-        upd["cover_photo_id"] = best_cover[0]
+    if not book.get("cover_photo_id"):
+        upd["cover_photo_id"] = pick_cover(pdb, filters) or best_cover[0]
     if not book.get("title_page_photo_id"):
         first_in = next((bt for bt in beats if bt["status"] == "in" and bt["candidates"]), None)
         if first_in:

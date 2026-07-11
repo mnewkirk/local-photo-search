@@ -103,6 +103,15 @@
       background:var(--green); color:#04101f; border-radius:3px; padding:0 3px; font-weight:700; }
     .strip .cand .rx { position:absolute; top:2px; right:2px; background:rgba(0,0,0,.6);
       border-radius:3px; font-size:10px; padding:0 4px; }
+    .strip .cand .setb { position:absolute; top:20px; left:2px; right:2px; display:none;
+      gap:2px; justify-content:center; }
+    .strip .cand:hover .setb { display:flex; }
+    .strip .cand .setb button { font-size:8px; padding:0 3px; }
+    .strip .cand .cvbadge { position:absolute; top:2px; left:2px; font-size:9px;
+      background:var(--accent); color:#04101f; border-radius:3px; padding:0 3px; font-weight:700; }
+    .covers { display:flex; gap:18px; margin-bottom:12px; }
+    .covers .slot { text-align:center; }
+    .covers img { height:58px; border-radius:4px; border:1px solid var(--border); display:block; }
 
     /* Proof */
     .proof .stage { border:0; box-shadow:0 1px 6px rgba(0,0,0,.4); margin:0 auto 4px; }
@@ -414,13 +423,23 @@
         e(Spread, { key:sp.id, book, spread:sp, sel, onSel:setSel, reload, patchLocal, showFaces, details })));
 
       if (proof) {
+        const bk = book.book;
+        const cover = (pid, ttl, sub) => pid ? e('div', { className:'stage',
+            style:{ aspectRatio:(bk.trim_w||14)+' / '+(bk.trim_h||11), background:'#fff',
+                    display:'flex', flexDirection:'column', alignItems:'center', padding:'4% 6%', maxWidth:'50%' } },
+          e('img', { src:preview(pid), onError:ev=>{ ev.target.src = thumb(pid); },
+            style:{ maxWidth:'92%', maxHeight: ttl?'64%':'92%', objectFit:'contain' } }),
+          ttl ? e('div', { style:{ fontFamily:'Georgia,serif', fontSize:'26px', color:'#222', marginTop:'5%', textAlign:'center' } }, ttl) : null,
+          sub ? e('div', { style:{ fontFamily:'Georgia,serif', fontSize:'15px', color:'#777', textAlign:'center', marginTop:'6px' } }, sub) : null) : null;
         return e('div', { className:'proof' },
           e('div', { className:'container' },
             e('div', { className:'no-print row', style:{ marginBottom:12 } },
               e('a', { href:'/book/'+bookId }, '‹ back to editor'),
               e('button', { onClick:()=>window.print() }, 'Print / Save PDF'),
-              e('h2', { style:{ marginLeft:8 } }, book.book.name)),
-            spreadsView));
+              e('h2', { style:{ marginLeft:8 } }, bk.name)),
+            cover(bk.cover_photo_id, bk.name, bk.subtitle),
+            spreadsView,
+            cover(bk.back_cover_photo_id, null, null)));
       }
 
       const selDetail = sel ? (()=>{ const sp=book.spreads.find(s=>s.id===sel.spreadId); const c=sp&&sp.cells.find(x=>x.id===sel.cellId); return c&&c.photo_id?details[c.photo_id]:null; })() : null;
@@ -559,6 +578,7 @@
       };
       const toggleReject = (beat, c) => setCand(beat.id, c.photo_id, { role: c.role==='rejected'?'candidate':'rejected' }).then(loadOutline);
       const cropToggle = (beat, c) => setCand(beat.id, c.photo_id, { crop_mode: c.crop_mode==='full'?'crop':'full' }).then(loadOutline);
+      const setCover = (field, pid) => api('/api/books/'+bookId, { method:'PUT', body:JSON.stringify({ [field]:pid }) }).then(d => setBook(d.book));
       const beatUpd = (id, fields) => api('/api/books/'+bookId+'/authoring/beats/'+id, { method:'PUT', body:JSON.stringify(fields) }).then(d => setOutline(d.outline));
       const rePick = (id) => { setProg([]); api('/api/books/'+bookId+'/authoring/beats/'+id+'/pick-heroes', { method:'POST', body:'{}' }).then(d => setOutline(d.outline)); };
       const assemble = () => api('/api/books/'+bookId+'/authoring/assemble', { method:'POST', body:'{}' }).then(() => { window.location.href = '/book/'+bookId; });
@@ -583,7 +603,12 @@
             e('button', { onClick:()=>setStage('setup') }, 'Re-draft'),
             e('button', { className:'primary', onClick:assemble }, 'Assemble & open book →')),
           e('p', { className:'muted', style:{ marginBottom:12 } },
-            'Review the story: toggle beats in/out, fix titles + spread budget, and click a candidate to make it the hero (★). Rejected shots are dimmed. Then assemble.'),
+            'Review the story: toggle beats in/out, fix titles + spread budget, click a candidate to make it the hero (★), and hover a shot for “cover”/“title”. Rejected shots are dimmed. Then assemble.'),
+          e('div', { className:'covers' }, [
+            ['cover_photo_id', 'Front cover'], ['title_page_photo_id', 'Title page'], ['back_cover_photo_id', 'Back cover'],
+          ].map(([f, lab]) => e('div', { key:f, className:'slot' },
+            e('div', { className:'muted' }, lab),
+            (book && book[f]) ? e('img', { src:thumb(book[f]) }) : e('div', { className:'muted', style:{ padding:'18px 20px' } }, '—')))),
           outline.map(beat => e('div', { key:beat.id, className:'beat'+(beat.status==='in'?'':' out') },
             e('div', { className:'beat-head' },
               e('input', { type:'checkbox', checked:beat.status==='in', title:'include this beat',
@@ -598,10 +623,18 @@
               e('span', { className:'muted' }, (beat.candidates||[]).length+' candidates')),
             e('div', { className:'strip' }, (beat.candidates||[]).map(c => {
               const cls = 'cand'+(c.role==='hero'?' hero':'')+(c.role==='rejected'?' rej':'');
+              const cov = book && (book.cover_photo_id===c.photo_id ? 'COVER'
+                : book.title_page_photo_id===c.photo_id ? 'TITLE'
+                : book.back_cover_photo_id===c.photo_id ? 'BACK' : null);
               return e('div', { key:c.photo_id, className:cls, onClick:()=>makeHero(beat, c.photo_id),
                   title:(c.vlm_reason||'') },
                 e('img', { src:thumb(c.photo_id), loading:'lazy' }),
                 c.role==='hero' ? e('span', { className:'hbadge' }, '★ '+(c.crop_mode==='full'?'FULL':'crop')) : null,
+                cov ? e('span', { className:'cvbadge' }, cov) : null,
+                e('div', { className:'setb' },
+                  e('button', { className:'tiny', onClick:ev=>{ ev.stopPropagation(); setCover('cover_photo_id', c.photo_id); } }, 'cover'),
+                  e('button', { className:'tiny', onClick:ev=>{ ev.stopPropagation(); setCover('title_page_photo_id', c.photo_id); } }, 'title'),
+                  e('button', { className:'tiny', onClick:ev=>{ ev.stopPropagation(); setCover('back_cover_photo_id', c.photo_id); } }, 'back')),
                 e('span', { className:'rx', onClick:ev=>{ ev.stopPropagation(); toggleReject(beat, c); } }, c.role==='rejected'?'↺':'✕'),
                 c.vlm_score!=null ? e('span', { className:'sc' }, 'vlm '+c.vlm_score) : null,
                 c.role==='hero' ? e('span', { className:'sc', style:{ top:20, bottom:'auto', cursor:'pointer' },

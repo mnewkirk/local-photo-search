@@ -417,6 +417,14 @@ class BookStore:
             f"WHERE beat_id = ? AND photo_id = ?", vals)
         self.conn.commit()
 
+    def _face_counts(self, pdb, ids: list[int]) -> dict[int, int]:
+        if not ids:
+            return {}
+        ph = ",".join("?" * len(ids))
+        return {r["id"]: r["nf"] for r in pdb.conn.execute(
+            f"SELECT id, (SELECT COUNT(*) FROM faces f WHERE f.photo_id = photos.id) nf "
+            f"FROM photos WHERE id IN ({ph})", ids).fetchall()}
+
     def assemble_from_outline(self, pdb, book_id: int, per_spread: int = 3) -> int:
         """Turn the included beats into spreads: a title-page spread (blank left /
         hero right) if set, then each in-beat's non-rejected candidates (hero first)
@@ -443,25 +451,35 @@ class BookStore:
             if beat["status"] != "in":
                 continue
             cands = [c for c in beat["candidates"] if c["role"] != "rejected"]
-            cands.sort(key=lambda c: (c["role"] != "hero", c["position"]))
             if not cands:
                 continue
             budget = max(1, beat.get("spread_budget") or 1)
-            chunks = _chunk(cands, budget, per_spread)
-            for chunk in chunks:
+            # One hero per spread; supporting shots interleaved people/scenery so a
+            # spread isn't three near-identical views.
+            facemap = self._face_counts(pdb, [c["photo_id"] for c in cands])
+            heroes = [c for c in cands if c["role"] == "hero"]
+            rest = _interleave_variety(
+                [c for c in cands if c["role"] != "hero"], facemap)
+            spreads_cells: list[list] = [[] for _ in range(budget)]
+            for i, h in enumerate(heroes[:budget]):
+                spreads_cells[i].append(h)
+            fill = heroes[budget:] + rest      # extra heroes demote to supporting
+            si = 0
+            for c in fill:
+                for _ in range(budget):
+                    idx = si % budget; si += 1
+                    if len(spreads_cells[idx]) < per_spread:
+                        spreads_cells[idx].append(c); break
+            for chunk in spreads_cells:
                 if not chunk:
                     continue
-                arch = None  # let archetype_layout pick by count
                 cur = self.conn.execute(
                     "INSERT INTO book_spreads (book_id, position, label, archetype) "
                     "VALUES (?,?,?,?)",
-                    (book_id, pos, beat.get("title"),
-                     archetype_for(len(chunk))))
+                    (book_id, pos, beat.get("title"), archetype_for(len(chunk))))
                 self._layout_spread(pdb, book_id, cur.lastrowid,
                                     archetype_for(len(chunk)), [c["photo_id"] for c in chunk])
-                # Honor crop_mode on the hero (first) cell.
-                hero = chunk[0]
-                if hero.get("crop_mode") == "full":
+                if chunk[0].get("crop_mode") == "full":   # hero is cell 0
                     self.conn.execute(
                         "UPDATE book_cells SET fit='contain', crop_min_w=1, crop_min_h=1 "
                         "WHERE spread_id=? AND position=0", (cur.lastrowid,))
@@ -607,6 +625,20 @@ def archetype_for(k: int) -> str:
     if k <= 7:
         return "asymmetric collage"
     return "dense grid"
+
+
+def _interleave_variety(cands: list[dict], facemap: dict[int, int]) -> list[dict]:
+    """Alternate people shots and scenery so a spread mixes subjects instead of
+    stacking three near-identical views. Preserves VLM rank within each group."""
+    people = [c for c in cands if facemap.get(c["photo_id"], 0) > 0]
+    scenery = [c for c in cands if facemap.get(c["photo_id"], 0) == 0]
+    out = []
+    while people or scenery:
+        if people:
+            out.append(people.pop(0))
+        if scenery:
+            out.append(scenery.pop(0))
+    return out
 
 
 def _chunk(items: list, budget: int, per_spread: int) -> list[list]:
