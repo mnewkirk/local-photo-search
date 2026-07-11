@@ -242,7 +242,9 @@
             ARCHES.map(a => e('option', { key:a, value:a }, a))),
           e('button', { className:'tiny', onClick:()=>put({ bg: dark?'#ffffff':'#111111' }) }, dark?'☀ light':'☾ dark'),
           e('button', { className:'tiny', onClick:()=>{ const t = prompt('Caption (blank to clear):', cap?cap.text:''); if (t===null) return;
-            put({ caption: t.trim()? { text:t.trim(), dark:dark } : null }); } }, 'caption'),
+            put({ caption: t.trim()? { text:t.trim(), dark:dark } : null }); } }, cap?'caption':'+ caption'),
+          e('button', { className:'tiny', title:'Draft caption with the LLM',
+            onClick:()=>api('/api/books/'+book.book.id+'/spreads/'+spread.id+'/caption', { method:'POST', body:'{}' }).then(r=>reload(r.book)) }, '✨'),
           e('button', { className:'tiny', onClick:()=>put({ position:spread.position-1 }) }, '↑'),
           e('button', { className:'tiny', onClick:()=>put({ position:spread.position+2 }) }, '↓'),
           e('button', { className:'tiny danger', onClick:del }, '✕'),
@@ -354,6 +356,7 @@
     function Builder({ bookId, proof }) {
       const [book, setBook] = useState(null);
       const [sel, setSel] = useState(null);
+      const [busy, setBusy] = useState('');
       const [showFaces, setShowFaces] = useState(true);
       const [details, setDetails] = useState({});
       const load = useCallback((partial) => {
@@ -392,9 +395,13 @@
       }
 
       const selDetail = sel ? (()=>{ const sp=book.spreads.find(s=>s.id===sel.spreadId); const c=sp&&sp.cells.find(x=>x.id===sel.cellId); return c&&c.photo_id?details[c.photo_id]:null; })() : null;
+      const run = async (label, fn) => { setBusy(label); try { await fn(); } catch(e) { alert(e.message); } setBusy(''); };
       const addSpread = () => api('/api/books/'+bookId+'/spreads', { method:'POST', body:JSON.stringify({ archetype:'matched 2-up' }) }).then(r=>reload(r.book));
       const autoArrange = () => { if (!confirm('Auto-arrange the included candidates into spreads? This replaces the current spreads.')) return;
-        api('/api/books/'+bookId+'/auto-arrange', { method:'POST', body:JSON.stringify({ replace:true }) }).then(r=>reload(r.book)); };
+        run('Arranging…', async()=>{ const r=await api('/api/books/'+bookId+'/auto-arrange', { method:'POST', body:JSON.stringify({ replace:true }) }); reload(r.book); }); };
+      const aiDraft = () => { if (!confirm('AI draft: auto-arrange the included candidates into spreads AND write house-voice captions? Replaces the current spreads.')) return;
+        run('AI drafting… (LLM per spread)', async()=>{ const r=await api('/api/books/'+bookId+'/ai-draft', { method:'POST', body:JSON.stringify({}) }); reload(r.book); }); };
+      const captionAll = () => run('Drafting captions…', async()=>{ const r=await api('/api/books/'+bookId+'/caption-all', { method:'POST', body:JSON.stringify({}) }); reload(r.book); });
       return e('div', null,
         e(PS.SharedHeader, { activePage:'book' }),
         e('div', { className:'container' },
@@ -403,8 +410,12 @@
             e('h2', null, book.book.name),
             book.book.subtitle ? e('span', { className:'muted' }, book.book.subtitle) : null,
             e('span', { style:{ flex:1 } }),
-            e('button', { onClick:autoArrange }, '✨ Auto-arrange'),
-            e('button', { onClick:addSpread }, '+ Spread'),
+            busy ? e('span', { className:'muted' }, busy) : null,
+            e('button', { onClick:aiDraft, disabled:!!busy, title:'LLM: arrange + captions' }, '✨ AI draft'),
+            e('button', { onClick:autoArrange, disabled:!!busy, title:'Deterministic layout, no LLM' }, 'Auto-arrange'),
+            e('button', { onClick:captionAll, disabled:!!busy }, 'Draft captions'),
+            e('button', { onClick:addSpread, disabled:!!busy }, '+ Spread'),
+            e('a', { className:'nav-link', href:'/api/books/'+bookId+'/export?format=pdf', target:'_blank' }, 'Export PDF ↓'),
             e('a', { className:'nav-link', href:'/book/'+bookId+'/proof', target:'_blank' }, 'Open proof ↗')),
           e('div', { className:'builder' },
             e(Tray, { book, reload }),

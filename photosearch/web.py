@@ -3626,6 +3626,141 @@ def api_book_auto_arrange(book_id: int, body: dict):
         return {"spreads_created": n, "book": bs.get_book(book_id)}
 
 
+# -- LLM drafting (whole-book draft + captions) --------------------------------
+
+@app.post("/api/books/{book_id}/ai-draft")
+def api_book_ai_draft(book_id: int, body: dict):
+    """Whole-book first draft: thin the included pool (optional per_day best-of),
+    auto-arrange into spreads, and draft a house-voice caption per spread."""
+    from . import book_ai
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        res = book_ai.ai_draft_book(pdb, bs, book_id,
+                                    per_day=body.get("per_day"),
+                                    spread_count=body.get("spread_count"),
+                                    caption=body.get("caption", True))
+        if res.get("error"):
+            return JSONResponse(res, status_code=400)
+        res["book"] = bs.get_book(book_id)
+        return res
+
+
+@app.post("/api/books/{book_id}/spreads/{spread_id}/caption")
+def api_book_draft_caption(book_id: int, spread_id: int, body: dict):
+    """Draft (or redraft) one spread's caption from its photos."""
+    from . import book_ai
+    with _get_books() as bs, _get_db() as pdb:
+        book = bs.get_book(book_id)
+        if not book:
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        sp = next((s for s in book["spreads"] if s["id"] == spread_id), None)
+        if not sp:
+            return JSONResponse({"error": "Spread not found"}, status_code=404)
+        pids = [c["photo_id"] for c in sp["cells"] if c["photo_id"]]
+        cap = book_ai.draft_caption(pdb, pids, book["book"].get("name"))
+        dark = (sp.get("bg") or "#ffffff") != "#ffffff"
+        bs.update_spread(pdb, spread_id, {"caption": {"text": cap, "dark": dark} if cap else None})
+        return {"caption": cap, "book": bs.get_book(book_id)}
+
+
+@app.post("/api/books/{book_id}/caption-all")
+def api_book_caption_all(book_id: int, body: dict):
+    """Draft captions for every spread lacking one (overwrite=true redrafts all)."""
+    from . import book_ai
+    with _get_books() as bs, _get_db() as pdb:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        n = book_ai.caption_all(pdb, bs, book_id, overwrite=body.get("overwrite", False))
+        return {"captioned": n, "book": bs.get_book(book_id)}
+
+
+# -- Print-grade export (Pillow, WYSIWYG with the proof) -----------------------
+
+def _full_image_fetcher(pdb, kind: str = "full"):
+    """Build a fetch(photo_id)->PIL.Image for export: the local original if
+    present, else the NAS proxy (``/full`` or ``/preview``). Always EXIF-oriented
+    to match the crop coordinates."""
+    import io as _io
+    from PIL import Image as _Image, ImageOps as _ImageOps
+
+    def fetch(pid: int):
+        img = None
+        row = pdb.conn.execute("SELECT filepath FROM photos WHERE id = ?", (pid,)).fetchone()
+        fp = pdb.resolve_filepath(row["filepath"]) if row and row["filepath"] else None
+        try:
+            if kind == "full" and fp and os.path.exists(fp):
+                img = _Image.open(fp)
+            elif _nas_url:
+                img = _Image.open(_io.BytesIO(_fetch_from_nas(pid, kind, timeout=60.0)))
+            elif fp and os.path.exists(fp):
+                img = _Image.open(fp)
+        except Exception:
+            img = None
+        if img is None:
+            # last resort: a locally-cached thumbnail (keeps export working offline
+            # / when the NAS is unreachable, at reduced resolution)
+            for cand in (os.path.join(_thumb_dir or "thumbnails", f"{pid}_thumb.jpg"),
+                         os.path.join(_preview_dir or "previews", f"{pid}_preview.jpg")):
+                if os.path.exists(cand):
+                    img = _Image.open(cand)
+                    break
+        if img is None:
+            return None
+        return _ImageOps.exif_transpose(img).convert("RGB")
+    return fetch
+
+
+@app.get("/api/books/{book_id}/render/{spread_id}")
+def api_book_render_spread(book_id: int, spread_id: int,
+                           dpi: int = Query(96, ge=48, le=300),
+                           scope: str = Query("preview")):
+    """Render a single spread to JPEG (in-server preview / validation)."""
+    from . import book_export
+    with _get_books() as bs, _get_db() as pdb:
+        doc = bs.get_book(book_id)
+        if not doc:
+            raise HTTPException(404, "Book not found")
+        sp = next((s for s in doc["spreads"] if s["id"] == spread_id), None)
+        if not sp:
+            raise HTTPException(404, "Spread not found")
+        img = book_export.render_spread(sp, doc["stage_w"], doc["stage_h"],
+                                        _full_image_fetcher(pdb, scope), dpi)
+    import io as _io
+    buf = _io.BytesIO(); img.save(buf, "JPEG", quality=88); buf.seek(0)
+    return StreamingResponse(buf, media_type="image/jpeg")
+
+
+@app.get("/api/books/{book_id}/export")
+def api_book_export(book_id: int,
+                    format: str = Query("pdf", pattern="^(pdf|zip)$"),
+                    dpi: int = Query(150, ge=72, le=300),
+                    scope: str = Query("full", pattern="^(full|preview)$")):
+    """Export the whole book as a print-grade PDF (one spread per page) or a ZIP
+    of per-spread JPEGs + the PDF. Full-res originals stream from the NAS proxy."""
+    from . import book_export
+    import io as _io, re as _re, zipfile as _zip
+    with _get_books() as bs, _get_db() as pdb:
+        doc = bs.get_book(book_id)
+        if not doc:
+            raise HTTPException(404, "Book not found")
+        if not doc["spreads"]:
+            raise HTTPException(400, "Book has no spreads to export")
+        jpegs, pdf = book_export.export_book(doc, _full_image_fetcher(pdb, scope), dpi)
+        name = _re.sub(r"[^\w.-]+", "_", doc["book"].get("name") or f"book_{book_id}").strip("_") or "book"
+    if format == "pdf":
+        return StreamingResponse(_io.BytesIO(pdf), media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{name}.pdf"'})
+    zbuf = _io.BytesIO()
+    with _zip.ZipFile(zbuf, "w", _zip.ZIP_STORED) as zf:
+        for i, jb in enumerate(jpegs, 1):
+            zf.writestr(f"{name}/spread_{i:03d}.jpg", jb)
+        zf.writestr(f"{name}/{name}.pdf", pdf)
+    zbuf.seek(0)
+    return StreamingResponse(zbuf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
+
+
 # ---------------------------------------------------------------------------
 # Photo stacks (burst/bracket groups)
 # ---------------------------------------------------------------------------
