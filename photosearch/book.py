@@ -72,7 +72,8 @@ class BookStore:
                 bg TEXT NOT NULL DEFAULT '#ffffff',
                 caption_json TEXT,
                 notes TEXT,
-                locked INTEGER NOT NULL DEFAULT 0
+                locked INTEGER NOT NULL DEFAULT 0,
+                bleed INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS book_cells (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,6 +170,11 @@ class BookStore:
                 c.execute(f"SELECT {col} FROM books LIMIT 1")
             except sqlite3.OperationalError:
                 c.execute(f"ALTER TABLE books ADD COLUMN {col} {ddl}")
+        # Per-spread full-bleed framing flag (edge-to-edge, no white margin).
+        try:
+            c.execute("SELECT bleed FROM book_spreads LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE book_spreads ADD COLUMN bleed INTEGER NOT NULL DEFAULT 0")
         c.commit()
 
     def close(self) -> None:
@@ -314,14 +320,16 @@ class BookStore:
 
     def add_spread(self, pdb, book_id: int, archetype: str = "matched 2-up",
                    photo_ids: Optional[list[int]] = None, label: Optional[str] = None,
-                   bg: str = "#ffffff", position: Optional[int] = None) -> int:
+                   bg: str = "#ffffff", position: Optional[int] = None,
+                   bleed: bool = False) -> int:
         if position is None:
             position = self._next_spread_pos(book_id)
         cur = self.conn.execute(
-            "INSERT INTO book_spreads (book_id, position, label, archetype, bg) "
-            "VALUES (?,?,?,?,?)", (book_id, position, label, archetype, bg))
+            "INSERT INTO book_spreads (book_id, position, label, archetype, bg, bleed) "
+            "VALUES (?,?,?,?,?,?)",
+            (book_id, position, label, archetype, bg, 1 if bleed else 0))
         spread_id = cur.lastrowid
-        self._layout_spread(pdb, book_id, spread_id, archetype, photo_ids or [])
+        self._layout_spread(pdb, book_id, spread_id, archetype, photo_ids or [], bleed)
         self._touch(book_id)
         self.conn.commit()
         return spread_id
@@ -347,18 +355,26 @@ class BookStore:
             cap = fields["caption"]
             sets.append("caption_json = ?")
             vals.append(json.dumps(cap) if cap else None)
+        if "archetype" in fields:
+            sets.append("archetype = ?"); vals.append(fields["archetype"])
+        if "bleed" in fields:
+            sets.append("bleed = ?"); vals.append(1 if fields["bleed"] else 0)
         if sets:
             vals.append(spread_id)
             self.conn.execute(f"UPDATE book_spreads SET {', '.join(sets)} WHERE id = ?", vals)
-        # Changing the archetype re-lays out the cells, preserving photo order.
-        if "archetype" in fields and fields["archetype"] != sp["archetype"]:
+        # Changing the archetype OR the framing mode (framed ↔ full-bleed)
+        # re-lays out the cells, preserving photo order.
+        arch_changed = "archetype" in fields and fields["archetype"] != sp["archetype"]
+        bleed_changed = ("bleed" in fields
+                         and (1 if fields["bleed"] else 0) != (sp["bleed"] or 0))
+        if arch_changed or bleed_changed:
             keep = [r["photo_id"] for r in self.conn.execute(
                 "SELECT photo_id FROM book_cells WHERE spread_id = ? ORDER BY position, id",
                 (spread_id,)).fetchall()]
-            self.conn.execute("UPDATE book_spreads SET archetype = ? WHERE id = ?",
-                              (fields["archetype"], spread_id))
+            new_arch = fields.get("archetype", sp["archetype"])
+            new_bleed = bool(fields["bleed"]) if "bleed" in fields else bool(sp["bleed"])
             self.conn.execute("DELETE FROM book_cells WHERE spread_id = ?", (spread_id,))
-            self._layout_spread(pdb, book_id, spread_id, fields["archetype"], keep)
+            self._layout_spread(pdb, book_id, spread_id, new_arch, keep, new_bleed)
         self._touch(book_id)
         self.conn.commit()
 
@@ -612,10 +628,14 @@ class BookStore:
 
     # -- layout + crop-seed helpers ---------------------------------------
     def _layout_spread(self, pdb, book_id: int, spread_id: int, archetype: str,
-                       photo_ids: list[int]) -> None:
+                       photo_ids: list[int], bleed: bool = False) -> None:
         sw, sh = self.stage_dims(book_id)
-        n = max(len(photo_ids), 1)
-        rects = archetype_layout(archetype, len(photo_ids) or 1, sw, sh)
+        # Full-bleed drops the outer white margin to zero and thins the gutter so
+        # photos run edge-to-edge (mockup house-style mode b); framed keeps the
+        # floated-on-white margins (mode a).
+        m, g = (0.0, 0.12) if bleed else (0.4, 0.5)
+        n_cells = archetype_cell_count(archetype, len(photo_ids))
+        rects = archetype_layout(archetype, n_cells, sw, sh, m=m, g=g)
         for i, rect in enumerate(rects):
             pid = photo_ids[i] if i < len(photo_ids) else None
             cx, cy = (0.5, 0.5)
@@ -751,6 +771,24 @@ def compose_cells(items: list[dict], sw: float, sh: float, variant: int = 0,
     return [_place(items[0], *a)] + _grid_place(rest, rx, m, rw, inner_h, cols, g)
 
 
+def archetype_cell_count(archetype: Optional[str], n_photos: int) -> int:
+    """How many cells the archetype should lay out for ``n_photos`` photos.
+
+    Fixed-count archetypes ('matched 2-up', 'gallery row') return their natural
+    cell count even when fewer photos are present, so switching a 1-photo spread
+    to 'matched 2-up' opens an empty second slot to drop a photo into (instead of
+    silently rendering an unchanged single frame). Photo-driven archetypes
+    (collage/grid) scale with the photos present."""
+    if archetype in _PANORAMA:
+        return 1
+    if archetype == "matched 2-up":
+        return 2
+    if archetype == "gallery row":
+        return max(2, n_photos)
+    # asymmetric collage / dense grid / unknown → one cell per photo.
+    return max(1, n_photos)
+
+
 def archetype_for(k: int) -> str:
     """House-style archetype name for a photo count (matches archetype_layout)."""
     if k <= 1:
@@ -816,6 +854,9 @@ def archetype_layout(archetype: Optional[str], n: int, sw: float, sh: float,
     if arch in _PANORAMA or n == 1:
         return [[0, 0, sw, sh]]
     inner_w, inner_h = sw - 2 * m, sh - 2 * m
+    if arch == "gallery row":
+        # N equal full-height columns (mockup 3-across "lanes" style).
+        return _grid_rects(n, m, m, inner_w, inner_h, n, g)
     if arch == "matched 2-up" or n == 2:
         cw = (inner_w - g) / 2
         return [[m, m, cw, inner_h], [m + cw + g, m, cw, inner_h]]

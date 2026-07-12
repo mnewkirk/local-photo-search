@@ -139,7 +139,7 @@
     const e = React.createElement;
     const { useState, useEffect, useCallback, useRef } = React;
 
-    const ARCHES = ['matched 2-up','asymmetric collage','dense grid','full-bleed single','full-spread panorama'];
+    const ARCHES = ['matched 2-up','gallery row','asymmetric collage','dense grid','full-bleed single','full-spread panorama'];
     const CROP_PRESETS = [
       { label:'No restriction', w:0, h:0 },
       { label:'≥80% width', w:0.8, h:0 },
@@ -285,6 +285,8 @@
           e('select', { value:spread.archetype||'', onChange: ev => put({ archetype:ev.target.value }) },
             ARCHES.map(a => e('option', { key:a, value:a }, a))),
           e('button', { className:'tiny', onClick:()=>put({ bg: dark?'#ffffff':'#111111' }) }, dark?'☀ light':'☾ dark'),
+          e('button', { className:'tiny', title:'Full-bleed: photos run edge-to-edge with no white frame',
+            onClick:()=>put({ bleed: spread.bleed?0:1 }) }, spread.bleed?'▣ bleed':'❐ framed'),
           e('button', { className:'tiny', onClick:()=>{ const t = prompt('Caption (blank to clear):', cap?cap.text:''); if (t===null) return;
             put({ caption: t.trim()? { text:t.trim(), dark:dark } : null }); } }, cap?'caption':'+ caption'),
           e('button', { className:'tiny', title:'Draft caption with the LLM',
