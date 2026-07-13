@@ -139,7 +139,19 @@
     const e = React.createElement;
     const { useState, useEffect, useCallback, useRef } = React;
 
-    const ARCHES = ['matched 2-up','gallery row','asymmetric collage','dense grid','full-bleed single','full-spread panorama'];
+    // value = canonical archetype key (stored in DB / read by archetype_layout);
+    // label = friendly name shown in the dropdown.
+    const ARCHES = [
+      { value:'single (framed)',        label:'single (framed)' },
+      { value:'full-bleed single',      label:'single (full-bleed)' },
+      { value:'matched 2-up',           label:'matched 2-up' },
+      { value:'gallery row',            label:'matched 3-up (row)' },
+      { value:'hero + sidebar',         label:'hero + sidebar (L)' },
+      { value:'hero + sidebar (right)', label:'hero + sidebar (R)' },
+      { value:'asymmetric collage',     label:'collage' },
+      { value:'dense grid',             label:'grid' },
+      { value:'full-spread panorama',   label:'full-spread' },
+    ];
     const CROP_PRESETS = [
       { label:'No restriction', w:0, h:0 },
       { label:'≥80% width', w:0.8, h:0 },
@@ -283,7 +295,7 @@
             onChange: ev => patchLocal(spread.id, { label:ev.target.value }),
             onBlur: ev => put({ label:ev.target.value }), style:{ width:150 } }),
           e('select', { value:spread.archetype||'', onChange: ev => put({ archetype:ev.target.value }) },
-            ARCHES.map(a => e('option', { key:a, value:a }, a))),
+            ARCHES.map(a => e('option', { key:a.value, value:a.value }, a.label))),
           e('button', { className:'tiny', onClick:()=>put({ bg: dark?'#ffffff':'#111111' }) }, dark?'☀ light':'☾ dark'),
           e('button', { className:'tiny', title:'Full-bleed: photos run edge-to-edge with no white frame',
             onClick:()=>put({ bleed: spread.bleed?0:1 }) }, spread.bleed?'▣ bleed':'❐ framed'),

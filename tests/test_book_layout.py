@@ -53,12 +53,49 @@ def test_single_photo_is_full_bleed_regardless_of_archetype():
     assert archetype_layout("asymmetric collage", 1, SW, SH) == [[0, 0, SW, SH]]
 
 
+def test_framed_single_floats_on_margin_not_full_bleed():
+    # 'single (framed)' must escape the n==1 full-bleed short-circuit and float
+    # the photo inside the outer white margin.
+    r = _rects("single (framed)", 1, bleed=False)
+    assert len(r) == 1
+    x, y, w, h = r[0]
+    assert x == 0.4 and y == 0.4           # floated by the margin
+    assert w == SW - 0.8 and h == SH - 0.8
+
+
+def test_hero_sidebar_anchor_wider_than_half_and_stacked():
+    r = _rects("hero + sidebar", 4, bleed=False)
+    assert len(r) == 4
+    anchor = r[0]
+    assert anchor[0] == 0.4                 # anchor on the left
+    assert anchor[2] > SW * 0.5             # wider than a 50% split
+    # sidebar cells stack in a single right-hand column (shared x, equal width)
+    side = r[1:]
+    assert len({round(c[0], 4) for c in side}) == 1
+    assert len({round(c[2], 4) for c in side}) == 1
+    assert side[0][0] > anchor[0] + anchor[2]   # column sits right of the anchor
+
+
+def test_hero_sidebar_right_flips_anchor_but_keeps_it_cell_zero():
+    r = _rects("hero + sidebar (right)", 4, bleed=False)
+    anchor = r[0]
+    # anchor is still cell 0 (caption + hero slot) but now hugs the right edge
+    assert abs((anchor[0] + anchor[2]) - (SW - 0.4)) < 1e-6
+    assert anchor[2] > SW * 0.5
+    # sidebar column is to the LEFT of the anchor
+    assert r[1][0] < anchor[0]
+
+
 def test_cell_count_opens_empty_slot_for_fixed_archetypes():
     # 1 photo, switch to matched 2-up -> 2 cells (second is an empty drop slot)
     assert archetype_cell_count("matched 2-up", 1) == 2
     assert archetype_cell_count("matched 2-up", 0) == 2
     assert archetype_cell_count("full-bleed single", 1) == 1
     assert archetype_cell_count("full-spread panorama", 3) == 1
+    assert archetype_cell_count("single (framed)", 3) == 1     # always one photo
+    # hero + sidebar keeps at least 2 (anchor + one sidebar slot), else scales
+    assert archetype_cell_count("hero + sidebar", 1) == 2
+    assert archetype_cell_count("hero + sidebar (right)", 5) == 5
     # gallery row keeps at least 2, else one per photo
     assert archetype_cell_count("gallery row", 1) == 2
     assert archetype_cell_count("gallery row", 4) == 4

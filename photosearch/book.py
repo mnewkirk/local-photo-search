@@ -30,6 +30,11 @@ from typing import Any, Optional
 # Archetype names mirror photosearch.tools._h_suggest_layout so auto_arrange can
 # consume its output directly.
 _PANORAMA = {"full-bleed single", "full-spread panorama"}
+# Hero + narrow stacked sidebar; the (right) variant flips the anchor side.
+_HERO_SIDEBAR = {"hero + sidebar", "hero + sidebar (right)"}
+# One photo floated on the white margin (contain-fit, portrait-preserving) — the
+# opposite of the full-bleed single, for title/breather/chapter pages.
+_FRAMED_SINGLE = "single (framed)"
 
 
 class BookStore:
@@ -636,15 +641,43 @@ class BookStore:
         m, g = (0.0, 0.12) if bleed else (0.4, 0.5)
         n_cells = archetype_cell_count(archetype, len(photo_ids))
         rects = archetype_layout(archetype, n_cells, sw, sh, m=m, g=g)
+        framed_single = (archetype == _FRAMED_SINGLE)
         for i, rect in enumerate(rects):
             pid = photo_ids[i] if i < len(photo_ids) else None
             cx, cy = (0.5, 0.5)
+            rx, ry, rw, rh = rect
+            fit, cmin_w, cmin_h = "cover", 0.0, 0.0
             if pid:
                 cx, cy = self._seed_center(pdb, int(pid))
+                if framed_single:
+                    # Shrink the cell to the photo's aspect (centered) and
+                    # contain-fit, so a portrait stays a portrait cell instead
+                    # of being cover-cropped to fill the landscape stage.
+                    ar = self._photo_ar(pdb, int(pid)) or 1.5
+                    if rw / rh > ar:
+                        cw, ch = rh * ar, rh
+                    else:
+                        cw, ch = rw, rw / ar
+                    rx, ry = rx + (rw - cw) / 2, ry + (rh - ch) / 2
+                    rw, rh = cw, ch
+                    fit, cmin_w, cmin_h = "contain", 1.0, 1.0
             self.conn.execute(
                 "INSERT INTO book_cells (spread_id, position, photo_id, x, y, w, h, "
-                "crop_cx, crop_cy) VALUES (?,?,?,?,?,?,?,?,?)",
-                (spread_id, i, pid, rect[0], rect[1], rect[2], rect[3], cx, cy))
+                "fit, crop_cx, crop_cy, crop_min_w, crop_min_h) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (spread_id, i, pid, rx, ry, rw, rh, fit, cx, cy, cmin_w, cmin_h))
+
+    def _photo_ar(self, pdb, photo_id: int) -> Optional[float]:
+        """Aspect ratio (w/h) from the stored EXIF-oriented dimensions, or None."""
+        try:
+            row = pdb.conn.execute(
+                "SELECT image_width, image_height FROM photos WHERE id = ?",
+                (photo_id,)).fetchone()
+        except Exception:
+            return None
+        if not row or not row["image_width"] or not row["image_height"]:
+            return None
+        return row["image_width"] / row["image_height"]
 
     def _seed_center(self, pdb, photo_id: int) -> tuple[float, float]:
         """Subject-aware crop center (0–1) from face + subject boxes (ported from
@@ -779,11 +812,15 @@ def archetype_cell_count(archetype: Optional[str], n_photos: int) -> int:
     to 'matched 2-up' opens an empty second slot to drop a photo into (instead of
     silently rendering an unchanged single frame). Photo-driven archetypes
     (collage/grid) scale with the photos present."""
-    if archetype in _PANORAMA:
+    if archetype in _PANORAMA or archetype == _FRAMED_SINGLE:
         return 1
     if archetype == "matched 2-up":
         return 2
     if archetype == "gallery row":
+        return max(2, n_photos)
+    if archetype in _HERO_SIDEBAR:
+        # anchor + at least one stacked sidebar cell, so switching a 1-photo
+        # spread to hero+sidebar opens a slot to drop the sidebar photo into.
         return max(2, n_photos)
     # asymmetric collage / dense grid / unknown → one cell per photo.
     return max(1, n_photos)
@@ -851,9 +888,26 @@ def archetype_layout(archetype: Optional[str], n: int, sw: float, sh: float,
     n = max(1, n)
     arch = archetype or ("matched 2-up" if n == 2 else
                          "asymmetric collage" if n <= 7 else "dense grid")
+    inner_w, inner_h = sw - 2 * m, sh - 2 * m
+    if arch == _FRAMED_SINGLE:
+        # One photo floated on the white margin (checked BEFORE the n==1
+        # full-bleed short-circuit). _layout_spread fits it to the photo aspect.
+        return [[m, m, inner_w, inner_h]]
     if arch in _PANORAMA or n == 1:
         return [[0, 0, sw, sh]]
-    inner_w, inner_h = sw - 2 * m, sh - 2 * m
+    if arch in _HERO_SIDEBAR:
+        # One anchor ~64% wide + the rest stacked in a single narrow column.
+        anchor_w = sw * 0.64
+        rest = max(1, n - 1)
+        if arch == "hero + sidebar (right)":
+            anchor = [sw - anchor_w + g / 2, m, anchor_w - m - g / 2, inner_h]
+            sidebar = _grid_rects(rest, m, m, sw - anchor_w - g / 2 - m, inner_h, 1, g)
+        else:
+            anchor = [m, m, anchor_w - g / 2 - m, inner_h]
+            rx = anchor_w + g / 2
+            sidebar = _grid_rects(rest, rx, m, sw - rx - m, inner_h, 1, g)
+        # Anchor stays cell 0 (caption slot + hero) regardless of side.
+        return [anchor] + sidebar
     if arch == "gallery row":
         # N equal full-height columns (mockup 3-across "lanes" style).
         return _grid_rects(n, m, m, inner_w, inner_h, n, g)
