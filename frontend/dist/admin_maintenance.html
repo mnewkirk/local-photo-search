@@ -1778,6 +1778,9 @@
       var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
       var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];
       var _status = useState(null); var status = _status[0]; var setStatus = _status[1];
+      // Optional collection scope — '' means the whole queue (no --collection).
+      var _cols = useState([]); var cols = _cols[0]; var setCols = _cols[1];
+      var _col = useState(''); var col = _col[0]; var setCol = _col[1];
 
       function loadStatus() {
         fetch('/api/admin/workers/fleet-status')
@@ -1785,7 +1788,13 @@
           .then(function (d) { setStatus(d); })
           .catch(function () {});
       }
-      useEffect(function () { loadStatus(); }, []);
+      useEffect(function () {
+        loadStatus();
+        fetch('/api/collections')
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setCols((d && d.collections) || []); })
+          .catch(function () {});
+      }, []);
 
       function toggle(p) {
         var next = Object.assign({}, sel);
@@ -1797,13 +1806,17 @@
         var passes = FLEET_PASSES.filter(function (p) { return sel[p]; });
         if (passes.length === 0) return;
         setBusy(true); setMsg({ kind: 'info', text: 'Launching ' + count + ' worker(s)…' });
+        var body = { passes: passes, count: Number(count) };
+        if (col !== '') body.collection = Number(col);
         fetch('/api/admin/workers/start', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ passes: passes, count: Number(count) }),
+          body: JSON.stringify(body),
         }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
           .then(function (res) {
+            var scope = (res.d && res.d.collection)
+              ? ' (collection ' + res.d.collection + ')' : '';
             setMsg(res.ok
-              ? { kind: 'ok', text: 'Launched ' + res.d.count + ' worker(s) → ' + res.d.server }
+              ? { kind: 'ok', text: 'Launched ' + res.d.count + ' worker(s) → ' + res.d.server + scope }
               : { kind: 'err', text: (res.d && res.d.detail) || 'Launch failed' });
             setBusy(false); loadStatus();
           }).catch(function (er) { setMsg({ kind: 'err', text: 'Error: ' + er }); setBusy(false); });
@@ -1832,7 +1845,16 @@
             })
           ),
           e('div', { className: 'workers-head', style: { marginTop: 10 } },
-            e('span', { className: 'workers-title' }, 'Workers: '),
+            e('span', { className: 'workers-title' }, 'Collection: '),
+            e('select', { value: col, style: { marginLeft: 6, maxWidth: 220 },
+                onChange: function (ev) { setCol(ev.target.value); } },
+              e('option', { value: '' }, 'All photos (whole queue)'),
+              cols.map(function (c) {
+                return e('option', { key: c.id, value: String(c.id) },
+                  c.name + ' (' + (c.photo_count || 0) + ')');
+              })
+            ),
+            e('span', { className: 'workers-title', style: { marginLeft: 16 } }, 'Workers: '),
             e('input', { type: 'number', min: 1, max: 8, value: count,
               onChange: function (ev) { setCount(ev.target.value); },
               style: { width: 56, marginLeft: 6 } }),

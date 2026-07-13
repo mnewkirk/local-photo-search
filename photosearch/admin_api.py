@@ -748,6 +748,7 @@ _UI_FLEET_NAME = "ui"
 class WorkersStartRequest(BaseModel):
     passes: list[str]
     count: int = 2
+    collection: int | None = None  # optional: scope the fleet to one collection
 
 
 def _run_workers_script() -> str:
@@ -791,6 +792,10 @@ def admin_workers_start(req: WorkersStartRequest):
         raise HTTPException(404, f"run-workers.sh not found: {script}")
     cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
            "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
+    if req.collection is not None:
+        if req.collection <= 0:
+            raise HTTPException(400, "collection must be a positive id")
+        cmd += ["-c", str(req.collection)]
     try:
         r = subprocess.run(cmd, cwd=_native_repo_dir(), env=_fleet_env(),
                            capture_output=True, text=True, timeout=180)
@@ -798,7 +803,7 @@ def admin_workers_start(req: WorkersStartRequest):
         raise HTTPException(504, "worker launch timed out (still starting?)")
     if r.returncode != 0:
         raise HTTPException(500, f"worker launch failed: {(r.stderr or r.stdout)[-500:]}")
-    return {"ok": True, "count": n, "passes": req.passes,
+    return {"ok": True, "count": n, "passes": req.passes, "collection": req.collection,
             "server": _fleet_server_url(), "output": (r.stdout or "")[-2000:]}
 
 
