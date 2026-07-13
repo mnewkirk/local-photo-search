@@ -436,6 +436,23 @@
         const ids = new Set(); book.spreads.forEach(s=>s.cells.forEach(c=>{ if (c.photo_id) ids.add(c.photo_id); }));
         ids.forEach(id => { if (!details[id]) loadDetail(id).then(d => setDetails(x=>Object.assign({}, x, { [id]:d }))).catch(()=>{}); });
       }, [book]);
+      // Undo/redo: server keeps a per-book layout snapshot history; these restore
+      // a neighbor snapshot and reload the whole document.
+      const doUndo = useCallback(() => api('/api/books/'+bookId+'/undo', { method:'POST' }).then(r=>load(r.book)), [bookId, load]);
+      const doRedo = useCallback(() => api('/api/books/'+bookId+'/redo', { method:'POST' }).then(r=>load(r.book)), [bookId, load]);
+      useEffect(()=>{
+        if (proof) return;
+        const onKey = (ev) => {
+          if (!(ev.metaKey || ev.ctrlKey)) return;
+          const tag = (ev.target && ev.target.tagName) || '';
+          if (tag==='INPUT' || tag==='TEXTAREA' || (ev.target && ev.target.isContentEditable)) return;
+          const k = ev.key.toLowerCase();
+          if (k==='z' && !ev.shiftKey) { ev.preventDefault(); doUndo(); }
+          else if ((k==='z' && ev.shiftKey) || k==='y') { ev.preventDefault(); doRedo(); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [proof, doUndo, doRedo]);
       if (!book) return e('div', { className:'container' }, 'Loading…');
       if (book.error) return e('div', { className:'container' }, 'Not found');
 
@@ -481,6 +498,8 @@
             book.book.subtitle ? e('span', { className:'muted' }, book.book.subtitle) : null,
             e('span', { style:{ flex:1 } }),
             busy ? e('span', { className:'muted' }, busy) : null,
+            e('button', { onClick:doUndo, disabled:!!busy || !book.can_undo, title:'Undo (Ctrl/Cmd+Z)' }, '↶ Undo'),
+            e('button', { onClick:doRedo, disabled:!!busy || !book.can_redo, title:'Redo (Ctrl/Cmd+Shift+Z)' }, '↷ Redo'),
             e('label', { className:'row muted', title:'Keep only the best N photos of each day before arranging (0 = keep all). ~6–8 gives a Varenna-scale book.' },
               'Best/day',
               e('input', { type:'number', min:0, max:40, value:perDay, disabled:!!busy,

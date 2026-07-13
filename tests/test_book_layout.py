@@ -96,8 +96,10 @@ def test_cell_count_opens_empty_slot_for_fixed_archetypes():
     # hero + sidebar keeps at least 2 (anchor + one sidebar slot), else scales
     assert archetype_cell_count("hero + sidebar", 1) == 2
     assert archetype_cell_count("hero + sidebar (right)", 5) == 5
-    # gallery row keeps at least 2, else one per photo
-    assert archetype_cell_count("gallery row", 1) == 2
+    # gallery row ("matched 3-up (row)") keeps at least 3 open slots — so
+    # switching back to it after a photo was dropped gives an empty re-drop slot
+    assert archetype_cell_count("gallery row", 1) == 3
+    assert archetype_cell_count("gallery row", 2) == 3
     assert archetype_cell_count("gallery row", 4) == 4
     # photo-driven archetypes scale with the photos present
     assert archetype_cell_count("asymmetric collage", 5) == 5

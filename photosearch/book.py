@@ -135,6 +135,18 @@ class BookStore:
             );
             CREATE INDEX IF NOT EXISTS idx_beats_book ON book_beats(book_id, position);
             CREATE INDEX IF NOT EXISTS idx_beatcands_beat ON book_beat_candidates(beat_id, position);
+
+            -- Undo/redo: per-book linear snapshot history of the spreads+cells
+            -- layout. books.history_seq is the seq currently reflected in the DB;
+            -- undo restores seq-1, redo restores seq+1, a new edit truncates the
+            -- redo tail (any seq > history_seq).
+            CREATE TABLE IF NOT EXISTS book_history (
+                book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (book_id, seq)
+            );
             """
         )
         # Widen the crop_mode CHECK on an existing sidecar (M30 shipped it binary
@@ -170,6 +182,7 @@ class BookStore:
             ("title_page_photo_id", "INTEGER"),
             ("notes", "TEXT"),
             ("target_spreads", "INTEGER"),
+            ("history_seq", "INTEGER"),   # undo/redo cursor (NULL until first edit)
         ):
             try:
                 c.execute(f"SELECT {col} FROM books LIMIT 1")
@@ -195,6 +208,126 @@ class BookStore:
         self.conn.execute(
             "UPDATE books SET updated_at = datetime('now') WHERE id = ?", (book_id,)
         )
+
+    # -- undo/redo history -------------------------------------------------
+    _HISTORY_LIMIT = 60   # keep the last N layout snapshots per book
+
+    def _serialize_layout(self, book_id: int) -> str:
+        """Full spreads+cells state of a book as a JSON string (undo snapshot)."""
+        spreads = []
+        for s in self.conn.execute(
+            "SELECT * FROM book_spreads WHERE book_id = ? ORDER BY position, id",
+            (book_id,)).fetchall():
+            sd = dict(s)
+            sd["cells"] = [dict(c) for c in self.conn.execute(
+                "SELECT * FROM book_cells WHERE spread_id = ? ORDER BY position, id",
+                (s["id"],)).fetchall()]
+            spreads.append(sd)
+        return json.dumps(spreads)
+
+    def _restore_layout(self, book_id: int, payload: str) -> None:
+        """Rebuild all spreads+cells for a book from a serialized snapshot."""
+        spreads = json.loads(payload)
+        self.conn.execute("DELETE FROM book_spreads WHERE book_id = ?", (book_id,))
+        for sp in spreads:
+            cur = self.conn.execute(
+                "INSERT INTO book_spreads (book_id, position, label, archetype, bg, "
+                "caption_json, notes, locked, bleed) VALUES (?,?,?,?,?,?,?,?,?)",
+                (book_id, sp.get("position", 0), sp.get("label"), sp.get("archetype"),
+                 sp.get("bg") or "#ffffff", sp.get("caption_json"), sp.get("notes"),
+                 sp.get("locked", 0), sp.get("bleed", 0)))
+            sid = cur.lastrowid
+            for c in sp.get("cells", []):
+                self.conn.execute(
+                    "INSERT INTO book_cells (spread_id, position, photo_id, x, y, w, h, "
+                    "fit, crop_cx, crop_cy, crop_zoom, crop_min_w, crop_min_h, align) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (sid, c.get("position", 0), c.get("photo_id"), c.get("x", 0),
+                     c.get("y", 0), c.get("w", 0), c.get("h", 0), c.get("fit", "cover"),
+                     c.get("crop_cx", 0.5), c.get("crop_cy", 0.5), c.get("crop_zoom", 1),
+                     c.get("crop_min_w", 0), c.get("crop_min_h", 0), c.get("align")))
+
+    def _history_begin(self, book_id: int) -> None:
+        """Seed the undo baseline before the first edit of a book — captures the
+        pre-mutation state as seq 0 so that edit is itself undoable. A no-op once
+        history exists (the invariant DB == snapshot[history_seq] already holds)."""
+        row = self.conn.execute(
+            "SELECT history_seq FROM books WHERE id = ?", (book_id,)).fetchone()
+        if row is None or row["history_seq"] is not None:
+            return
+        self.conn.execute(
+            "INSERT OR REPLACE INTO book_history (book_id, seq, payload) VALUES (?,0,?)",
+            (book_id, self._serialize_layout(book_id)))
+        self.conn.execute("UPDATE books SET history_seq = 0 WHERE id = ?", (book_id,))
+
+    def _history_commit(self, book_id: int) -> None:
+        """Record the post-mutation state as the new current snapshot, dropping any
+        redo tail. Call at the end of every layout mutation (after _history_begin)."""
+        row = self.conn.execute(
+            "SELECT history_seq FROM books WHERE id = ?", (book_id,)).fetchone()
+        if row is None:
+            return
+        seq = row["history_seq"] if row["history_seq"] is not None else -1
+        new = seq + 1
+        # Truncate the redo tail, then append the new state.
+        self.conn.execute(
+            "DELETE FROM book_history WHERE book_id = ? AND seq > ?", (book_id, seq))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO book_history (book_id, seq, payload) VALUES (?,?,?)",
+            (book_id, new, self._serialize_layout(book_id)))
+        # Cap the ring so long editing sessions don't grow unbounded.
+        self.conn.execute(
+            "DELETE FROM book_history WHERE book_id = ? AND seq <= ?",
+            (book_id, new - self._HISTORY_LIMIT))
+        self.conn.execute("UPDATE books SET history_seq = ? WHERE id = ?", (new, book_id))
+
+    def _history_flags(self, book_id: int) -> tuple[bool, bool]:
+        """(can_undo, can_redo) for a book, from which neighbor snapshots exist."""
+        row = self.conn.execute(
+            "SELECT history_seq FROM books WHERE id = ?", (book_id,)).fetchone()
+        if row is None or row["history_seq"] is None:
+            return (False, False)
+        seq = row["history_seq"]
+        has = lambda s: self.conn.execute(
+            "SELECT 1 FROM book_history WHERE book_id = ? AND seq = ?",
+            (book_id, s)).fetchone() is not None
+        return (has(seq - 1), has(seq + 1))
+
+    def undo(self, book_id: int) -> bool:
+        """Restore the previous layout snapshot. Returns False if nothing to undo."""
+        row = self.conn.execute(
+            "SELECT history_seq FROM books WHERE id = ?", (book_id,)).fetchone()
+        if row is None or row["history_seq"] is None:
+            return False
+        target = row["history_seq"] - 1
+        snap = self.conn.execute(
+            "SELECT payload FROM book_history WHERE book_id = ? AND seq = ?",
+            (book_id, target)).fetchone()
+        if snap is None:
+            return False
+        self._restore_layout(book_id, snap["payload"])
+        self.conn.execute("UPDATE books SET history_seq = ? WHERE id = ?", (target, book_id))
+        self._touch(book_id)
+        self.conn.commit()
+        return True
+
+    def redo(self, book_id: int) -> bool:
+        """Re-apply the next layout snapshot. Returns False if nothing to redo."""
+        row = self.conn.execute(
+            "SELECT history_seq FROM books WHERE id = ?", (book_id,)).fetchone()
+        if row is None or row["history_seq"] is None:
+            return False
+        target = row["history_seq"] + 1
+        snap = self.conn.execute(
+            "SELECT payload FROM book_history WHERE book_id = ? AND seq = ?",
+            (book_id, target)).fetchone()
+        if snap is None:
+            return False
+        self._restore_layout(book_id, snap["payload"])
+        self.conn.execute("UPDATE books SET history_seq = ? WHERE id = ?", (target, book_id))
+        self._touch(book_id)
+        self.conn.commit()
+        return True
 
     # -- books -------------------------------------------------------------
     def list_books(self) -> list[dict]:
@@ -268,8 +401,10 @@ class BookStore:
             "SELECT photo_id, decision FROM book_decisions WHERE book_id = ?",
             (book_id,)).fetchall()}
         sw, sh = self.stage_dims(book_id)
+        can_undo, can_redo = self._history_flags(book_id)
         return {"book": book, "spreads": spreads, "decisions": decisions,
-                "stage_w": sw, "stage_h": sh}
+                "stage_w": sw, "stage_h": sh,
+                "can_undo": can_undo, "can_redo": can_redo}
 
     # -- decisions / candidate pool ---------------------------------------
     def add_candidates(self, book_id: int, photo_ids: list[int]) -> int:
@@ -327,6 +462,7 @@ class BookStore:
                    photo_ids: Optional[list[int]] = None, label: Optional[str] = None,
                    bg: str = "#ffffff", position: Optional[int] = None,
                    bleed: bool = False) -> int:
+        self._history_begin(book_id)
         if position is None:
             position = self._next_spread_pos(book_id)
         cur = self.conn.execute(
@@ -336,6 +472,7 @@ class BookStore:
         spread_id = cur.lastrowid
         self._layout_spread(pdb, book_id, spread_id, archetype, photo_ids or [], bleed)
         self._touch(book_id)
+        self._history_commit(book_id)
         self.conn.commit()
         return spread_id
 
@@ -345,6 +482,7 @@ class BookStore:
         if not sp:
             raise KeyError("spread not found")
         book_id = sp["book_id"]
+        self._history_begin(book_id)
         sets, vals = [], []
         if "label" in fields:
             sets.append("label = ?"); vals.append(fields["label"])
@@ -381,22 +519,28 @@ class BookStore:
             self.conn.execute("DELETE FROM book_cells WHERE spread_id = ?", (spread_id,))
             self._layout_spread(pdb, book_id, spread_id, new_arch, keep, new_bleed)
         self._touch(book_id)
+        self._history_commit(book_id)
         self.conn.commit()
 
     def delete_spread(self, spread_id: int) -> None:
         sp = self.conn.execute("SELECT book_id FROM book_spreads WHERE id = ?",
                                (spread_id,)).fetchone()
+        if sp:
+            self._history_begin(sp["book_id"])
         self.conn.execute("DELETE FROM book_spreads WHERE id = ?", (spread_id,))
         if sp:
             self._touch(sp["book_id"])
+            self._history_commit(sp["book_id"])
         self.conn.commit()
 
     def reorder_spreads(self, book_id: int, order: list[int]) -> None:
+        self._history_begin(book_id)
         for pos, sid in enumerate(order):
             self.conn.execute(
                 "UPDATE book_spreads SET position = ? WHERE id = ? AND book_id = ?",
                 (pos, int(sid), book_id))
         self._touch(book_id)
+        self._history_commit(book_id)
         self.conn.commit()
 
     # -- authoring outline (M30) ------------------------------------------
@@ -578,6 +722,7 @@ class BookStore:
         book_id = self.conn.execute(
             "SELECT book_id FROM book_spreads WHERE id = ?", (cell["spread_id"],)
         ).fetchone()["book_id"]
+        self._history_begin(book_id)
         # Assigning a new photo re-seeds the subject-aware crop for this cell.
         if "photo_id" in fields and fields["photo_id"] != cell["photo_id"]:
             pid = fields["photo_id"]
@@ -598,6 +743,7 @@ class BookStore:
             vals.append(cell_id)
             self.conn.execute(f"UPDATE book_cells SET {', '.join(sets)} WHERE id = ?", vals)
         self._touch(book_id)
+        self._history_commit(book_id)
         self.conn.commit()
 
     # -- auto-arrange ------------------------------------------------------
@@ -613,6 +759,7 @@ class BookStore:
         ids = [int(i) for i in ids if int(i) not in excluded]
         if not ids:
             return 0
+        self._history_begin(book_id)
         plan = tools._h_suggest_layout(pdb, {"photo_ids": ids, "spread_count": spread_count})
         spreads = plan.get("spreads") or []
         if replace:
@@ -628,6 +775,7 @@ class BookStore:
             self._layout_spread(pdb, book_id, cur.lastrowid, sp.get("archetype"),
                                 sp.get("photo_ids") or [])
         self._touch(book_id)
+        self._history_commit(book_id)
         self.conn.commit()
         return len(spreads)
 
@@ -817,7 +965,10 @@ def archetype_cell_count(archetype: Optional[str], n_photos: int) -> int:
     if archetype == "matched 2-up":
         return 2
     if archetype == "gallery row":
-        return max(2, n_photos)
+        # Labeled "matched 3-up (row)" in the editor: always open at least 3
+        # columns so switching back to it after a photo was dropped gives an
+        # empty slot to re-drop into (not silently stuck at the current count).
+        return max(3, n_photos)
     if archetype in _HERO_SIDEBAR:
         # anchor + at least one stacked sidebar cell, so switching a 1-photo
         # spread to hero+sidebar opens a slot to drop the sidebar photo into.

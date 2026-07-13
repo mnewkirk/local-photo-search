@@ -3611,6 +3611,24 @@ def api_book_update_cell(book_id: int, cell_id: int, body: dict):
         return {"ok": True}
 
 
+@app.post("/api/books/{book_id}/undo")
+def api_book_undo(book_id: int):
+    with _get_books() as bs:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        did = bs.undo(book_id)
+        return {"ok": did, "book": bs.get_book(book_id)}
+
+
+@app.post("/api/books/{book_id}/redo")
+def api_book_redo(book_id: int):
+    with _get_books() as bs:
+        if not bs.get_book_row(book_id):
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        did = bs.redo(book_id)
+        return {"ok": did, "book": bs.get_book(book_id)}
+
+
 @app.post("/api/books/{book_id}/auto-arrange")
 def api_book_auto_arrange(book_id: int, body: dict):
     """Materialize spreads from the included candidate pool via the deterministic
