@@ -257,10 +257,16 @@
           const dxp = (m.clientX - d.x)/d.rect.width*100, dyp = (m.clientY - d.y)/d.rect.height*100;
           let cx = d.cx - dxp/p.Pw, cy = d.cy - dyp/p.Ph;
           cx = Math.min(1, Math.max(0, cx)); cy = Math.min(1, Math.max(0, cy));
+          d.lastcx = cx; d.lastcy = cy;
           onPatch({ crop_cx:cx, crop_cy:cy }, false);
         };
+        // Commit the LAST dragged position, not cell.crop_cx/cy — patchLocal clones
+        // cells on every update, so the closed-over `cell` keeps its pre-drag values
+        // and committing those would snap the photo back to center.
         const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
-          if (drag.current) { onPatch({ crop_cx:cell.crop_cx, crop_cy:cell.crop_cy }, true); drag.current = null; } };
+          const d = drag.current;
+          if (d) { const fx = d.lastcx==null?d.cx:d.lastcx, fy = d.lastcy==null?d.cy:d.lastcy;
+            onPatch({ crop_cx:fx, crop_cy:fy }, true); drag.current = null; } };
         window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
       };
       const cap = cell.__caption;
