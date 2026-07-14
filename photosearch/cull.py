@@ -218,7 +218,16 @@ def select_best_photos(
     else:
         if not directory:
             return []
-        directory = str(Path(directory).resolve())
+        # The scope key may arrive absolute (photo_root set on the NAS, or an
+        # absolute CLI path) or relative (replica mode: photo_root is None, so
+        # resolve_filepath() also returns RELATIVE stored paths). Match against
+        # both a resolved-absolute prefix AND a plain-normalized relative prefix,
+        # so the filter works in either space — .resolve() alone would CWD-anchor
+        # a relative scope key and match zero relative stored paths.
+        dir_prefixes = (
+            str(Path(directory).resolve()) + "/",
+            str(Path(directory)) + "/",
+        )
 
         # Get all photos in the directory
         all_rows = db.conn.execute(
@@ -230,7 +239,7 @@ def select_best_photos(
         dir_photos = []
         for row in all_rows:
             abs_path = db.resolve_filepath(row["filepath"])
-            if abs_path and abs_path.startswith(directory + "/"):
+            if abs_path and abs_path.startswith(dir_prefixes):
                 dir_photos.append(dict(row) | {"_abs_path": abs_path})
 
     if not dir_photos:
