@@ -1138,3 +1138,63 @@ def test_mark_processed_blocks_after_max_attempts_category_content(tmp_path):
         for _ in range(MAX_PROCESS_ATTEMPTS):
             db.mark_processed(photo_ids, "category-content")
         assert db.count_unprocessed_photos("category-content") == 0
+
+
+def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
+    """A v28 DB gains maintenance_runs on open, and the version is stamped 29."""
+    import sqlite3
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO schema_info (key, value) VALUES ('version', '28')")
+    conn.commit()
+    conn.close()
+
+    with PhotoDB(path) as db:
+        cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(maintenance_runs)")}
+        assert cols == {"stage", "last_run_at", "photo_count",
+                        "photo_max_id", "applied", "source"}
+        version = db.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 29
+
+
+def test_record_and_get_maintenance_runs(db):
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=10, photo_max_id=99, applied=3, source="replica",
+    )
+    runs = db.get_maintenance_runs()
+    assert runs["stacking"]["source"] == "replica"
+    assert runs["stacking"]["applied"] == 3
+    assert runs["stacking"]["photo_max_id"] == 99
+
+    # Same stage again -> upsert, not a second row.
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T10:00:00+00:00",
+        photo_count=11, photo_max_id=100, applied=4, source="nas",
+    )
+    runs = db.get_maintenance_runs()
+    assert len(runs) == 1
+    assert runs["stacking"]["last_run_at"] == "2026-07-17T10:00:00+00:00"
+    assert runs["stacking"]["source"] == "nas"
+
+
+def test_record_maintenance_run_commit_false_is_rollback_able(db):
+    """commit=False must leave the write in the caller's transaction.
+
+    /api/admin/maintenance-apply stamps the watermark inside the same
+    transaction that replaces the stacks; if a rollback left the stamp behind,
+    the NAS would claim work it doesn't have.
+    """
+    db.conn.execute("BEGIN IMMEDIATE")
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica",
+        commit=False,
+    )
+    db.conn.rollback()
+    assert db.get_maintenance_runs() == {}

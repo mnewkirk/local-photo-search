@@ -79,7 +79,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -578,6 +578,22 @@ class PhotoDB:
                 rank_in_cluster INTEGER,
                 created_at TEXT DEFAULT (datetime('now')),
                 UNIQUE(photo_id, directory)
+            )
+        """)
+
+        # M-sync: per-stage watermark for the maintenance sweep. Lives in the
+        # main DB on BOTH machines. A replica re-sync overwrites the replica's
+        # copy with the NAS's, which is correct: after a successful push both
+        # sides already agree, and after a failed push the sync wipes the local
+        # results AND the record of them together, so they stay consistent.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_runs (
+                stage            TEXT PRIMARY KEY,
+                last_run_at      TEXT NOT NULL,
+                photo_count      INTEGER,
+                photo_max_id     INTEGER,
+                applied          INTEGER,
+                source           TEXT
             )
         """)
 
@@ -1708,6 +1724,51 @@ class PhotoDB:
                 (photo_id, text_type, generated_text, model_used, model_version),
             )
         self._maybe_commit()
+
+    def record_maintenance_run(self, stage: str, last_run_at: str,
+                               photo_count: Optional[int] = None,
+                               photo_max_id: Optional[int] = None,
+                               applied: Optional[int] = None,
+                               source: str = "nas",
+                               commit: bool = True) -> None:
+        """Stamp a stage's watermark. Upserts — one row per stage.
+
+        ``commit=False`` leaves the write in the caller's open transaction —
+        needed by /api/admin/maintenance-apply, which stamps inside the same
+        BEGIN IMMEDIATE that replaces the stacks, so a failure can't leave the
+        watermark claiming work that was rolled back.
+        """
+        self.conn.execute(
+            "INSERT INTO maintenance_runs "
+            "  (stage, last_run_at, photo_count, photo_max_id, applied, source) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(stage) DO UPDATE SET "
+            "  last_run_at=excluded.last_run_at, "
+            "  photo_count=excluded.photo_count, "
+            "  photo_max_id=excluded.photo_max_id, "
+            "  applied=excluded.applied, "
+            "  source=excluded.source",
+            (stage, last_run_at, photo_count, photo_max_id, applied, source),
+        )
+        if commit:
+            self.conn.commit()
+
+    def get_maintenance_runs(self) -> dict:
+        """Every stage watermark, keyed by stage name."""
+        rows = self.conn.execute(
+            "SELECT stage, last_run_at, photo_count, photo_max_id, applied, source "
+            "FROM maintenance_runs"
+        ).fetchall()
+        return {
+            r["stage"]: {
+                "last_run_at": r["last_run_at"],
+                "photo_count": r["photo_count"],
+                "photo_max_id": r["photo_max_id"],
+                "applied": r["applied"],
+                "source": r["source"],
+            }
+            for r in rows
+        }
 
     # ------------------------------------------------------------------
     # Manual/agent metadata writes (M26b) — one impl shared by the web
