@@ -22,6 +22,7 @@ this one about RECONCILING them.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 import requests
@@ -169,6 +170,27 @@ def fetch_nas_fingerprint(nas_url: str, timeout: int = 10) -> dict:
     return r.json()
 
 
+def _sse_has_fatal(body: str) -> bool:
+    """True if an SSE body contains a terminal 'fatal' event.
+
+    Parses the `data:` lines rather than substring-matching the raw text: the
+    latter silently depends on json.dumps' default separators, so a compact
+    re-serialization server-side would make a REAL failure read as success.
+    Unparseable lines are ignored — a malformed frame is not a fatal event.
+    """
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[len("data:"):].strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "fatal":
+            return True
+    return False
+
+
 def push_to_nas(db, nas_url: str, stage_results: list, *,
                 timeout: int = 900) -> dict:
     """Reconcile a completed local sweep to the NAS. Returns per-stage results.
@@ -194,14 +216,19 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
         try:
             r = requests.post(f"{nas_url}/api/admin/maintenance-apply",
                               json=body, timeout=timeout)
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             logger.warning("maintenance push (transfer) failed: %s", e)
             return {"ok": False, "error": "unreachable", "stages": out}
         if r.status_code == 409:
             return {"ok": False, "error": "fingerprint_mismatch", "stages": out}
         if r.status_code != 200:
             return {"ok": False, "error": f"http_{r.status_code}", "stages": out}
-        out.update(r.json().get("applied") or {})
+        try:
+            applied = r.json().get("applied") or {}
+        except (ValueError, TypeError) as e:
+            logger.warning("maintenance push (transfer) bad response body: %s", e)
+            return {"ok": False, "error": "bad_response", "stages": out}
+        out.update(applied)
 
     # --- trigger ----------------------------------------------------------
     trigger = sorted(n for n, i in stages.items() if i["mode"] == "trigger")
@@ -212,12 +239,12 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
             r = requests.post(f"{nas_url}/api/admin/maintenance-sweep",
                               json={"apply": True, "stages": trigger},
                               timeout=timeout)
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             logger.warning("maintenance push (trigger) failed: %s", e)
             for name in trigger:
                 out[name] = {"status": "failed", "reason": "unreachable"}
             return {"ok": False, "error": "unreachable", "stages": out}
-        if r.status_code != 200 or '"type": "fatal"' in (r.text or ""):
+        if r.status_code != 200 or _sse_has_fatal(r.text):
             for name in trigger:
                 out[name] = {"status": "failed", "reason": f"http_{r.status_code}"}
             return {"ok": False, "error": f"http_{r.status_code}", "stages": out}

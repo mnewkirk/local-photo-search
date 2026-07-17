@@ -5,6 +5,7 @@ the timestamp comparison rules, and the NAS-side apply path.
 """
 
 import pytest
+import requests
 
 from photosearch.maintenance_sync import (
     EXCLUDED_STAGES,
@@ -437,6 +438,40 @@ class _FakeResponse:
         return self._payload
 
 
+# ---------------------------------------------------------------------------
+# _sse_has_fatal
+# ---------------------------------------------------------------------------
+
+def test_sse_has_fatal_detects_default_separator():
+    from photosearch.maintenance_sync import _sse_has_fatal
+    body = 'event: message\ndata: {"type": "fatal"}\n\n'
+    assert _sse_has_fatal(body) is True
+
+
+def test_sse_has_fatal_detects_compact_separator():
+    """The whole point: a compact (no-space) json.dumps must still be caught.
+
+    The old check was a substring match on '"type": "fatal"' (with a space),
+    which silently stops matching if the server ever serializes compactly.
+    """
+    from photosearch.maintenance_sync import _sse_has_fatal
+    body = 'event: message\ndata: {"type":"fatal"}\n\n'
+    assert _sse_has_fatal(body) is True
+
+
+def test_sse_has_fatal_false_on_done():
+    from photosearch.maintenance_sync import _sse_has_fatal
+    body = 'event: message\ndata: {"type": "done"}\n\n'
+    assert _sse_has_fatal(body) is False
+
+
+def test_sse_has_fatal_ignores_word_in_message_text():
+    """A message that merely mentions 'fatal' must not false-positive."""
+    from photosearch.maintenance_sync import _sse_has_fatal
+    body = 'data: {"type": "progress", "message": "no fatal errors"}\n\n'
+    assert _sse_has_fatal(body) is False
+
+
 def test_push_sends_transfer_before_trigger(db, monkeypatch):
     from photosearch import maintenance_sync
 
@@ -497,3 +532,34 @@ def test_push_with_nothing_eligible_is_a_noop(db, monkeypatch):
                                           [{"stage": "geocode", "status": "skipped"}])
     assert result["ok"] is True
     assert result["stages"] == {}
+
+
+def test_push_partial_failure_keeps_successful_transfer_stage(db, monkeypatch):
+    """Transfer succeeds, trigger fails: the successful half must not be
+    collapsed by the failed half — each stage reports its own outcome."""
+    from photosearch import maintenance_sync
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        if url.endswith("/maintenance-apply"):
+            return _FakeResponse(200, {"applied": {"stacking": {"status": "applied"}}})
+        raise requests.exceptions.ConnectionError("NAS unreachable")
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+    db.record_maintenance_run(
+        stage="normalize_aesthetics", last_run_at="2026-07-17T09:00:01+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+
+    result = maintenance_sync.push_to_nas(db, "http://nas:8000", [
+        {"stage": "stacking", "status": "done"},
+        {"stage": "normalize_aesthetics", "status": "done"},
+    ])
+
+    assert result["ok"] is False
+    assert result["error"] == "unreachable"
+    assert result["stages"]["stacking"]["status"] == "applied"
+    assert result["stages"]["normalize_aesthetics"]["status"] == "failed"
+    assert result["stages"]["normalize_aesthetics"]["reason"] == "unreachable"
