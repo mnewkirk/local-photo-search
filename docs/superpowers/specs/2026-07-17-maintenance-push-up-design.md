@@ -237,7 +237,7 @@ allowed — they write nothing.
 | Push fails (network) | Local results stand; `maintenance_runs` keeps replica timestamps; card shows "Replica ahead — unpushed"; Retry available. |
 | Push rejected (fingerprint moved mid-run) | Same state, same Retry. One user-initiated retry, no auto-loop. |
 | Sweep cancelled mid-stage | Only stages reporting `status='done'` are push-eligible. A half-finished stacking run never ships. |
-| NAS mid-restart | It returns `503 Retry-After` on admin paths during the shutdown handshake. Reuse `WorkerClient._request()`'s existing sleep-and-retry; do not invent a second backoff. |
+| NAS mid-restart | Surfaces as a **connection error**, not a 503. The shutdown middleware only guards `/api/worker/*` and `/api/photos/*/full` (`web.py:85`) — `/api/admin/*` is deliberately left serving so the browser UI keeps working during a drain. So there is nothing to reuse from `WorkerClient._request()` here, and no backoff to add: the push reports `unreachable` and the user retries. (An earlier draft of this spec claimed admin paths were 503-gated. They are not.) |
 
 **Transactionality.** The transfer path applies in one NAS-side transaction
 (replace both tables, stamp `maintenance_runs`, commit). Trigger stages are a
