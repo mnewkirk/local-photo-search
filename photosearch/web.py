@@ -2538,6 +2538,24 @@ def api_review_download(
     return _build_photo_zip_response(entries, f"{stem}_selected.zip")
 
 
+def _ask_available() -> bool:
+    """True when this instance has an LLM backend the Ask agent can reach.
+
+    Ask (M24b) runs the agent loop against a LOCAL model backend. On the
+    replica that's LM Studio via PHOTOSEARCH_TEXT_LLM_URL. On the NAS nothing
+    is configured — the N100 has no GPU and the containerized Ollama was
+    dropped — so every Ask there ended as a model-not-found 404 from the
+    agent's fallback model. Rather than let the UI offer a button that cannot
+    work, gate it on an explicitly configured backend: the OpenAI-compatible
+    URL, or an explicit Ollama agent-model opt-in for anyone self-hosting one.
+    """
+    return bool(
+        (os.environ.get("PHOTOSEARCH_TEXT_LLM_URL") or "").strip()
+        or (os.environ.get("PHOTOSEARCH_AGENT_OLLAMA_MODEL") or "").strip()
+        or (os.environ.get("PHOTOSEARCH_LLM_AGENT_MODEL") or "").strip()
+    )
+
+
 @app.get("/api/stats")
 def api_stats():
     """Database statistics."""
@@ -2637,6 +2655,11 @@ def api_stats():
         "verify_passed": verify_counts["pass"],
         "verify_failed": verify_counts["fail"],
         "verify_regenerated": verify_counts["regenerated"],
+        # Capability flag for the "✨ Ask" toggle. The agent needs a local LLM
+        # backend; on the NAS there is none (the N100 can't run one usefully),
+        # so Ask there 404s at the model layer. Piggy-backed on /api/stats
+        # because the search page already fetches it on mount.
+        "ask_available": _ask_available(),
     }
 
 
