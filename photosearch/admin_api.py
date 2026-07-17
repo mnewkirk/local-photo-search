@@ -413,6 +413,40 @@ def _replica_sync_script() -> str:
     return str(Path(__file__).resolve().parent.parent / "sync-replica.sh")
 
 
+def run_replica_sync_blocking(timeout: int = 1800) -> None:
+    """Run sync-replica.sh to completion. Raises on failure.
+
+    A blocking SIBLING of the /api/admin/replica-sync SSE endpoint, not a
+    refactor of it: that endpoint streams output line-by-line via
+    _stream_subprocess (async), so it has no blocking invocation to share.
+    The genuinely shared unit is _replica_sync_script(), which both use.
+
+    Callers are off the event loop (the maintenance pre-flight runs in the
+    sweep's worker thread), so blocking here is fine.
+
+    Takes _op_lock like every other admin op: this runs sync-replica.sh, which
+    ATOMICALLY SWAPS the whole DB file. An unguarded swap could race a manual
+    Sync-from-NAS or a Restart. Raises RuntimeError rather than queueing --
+    an aborted sweep is cheap; a corrupted swap is not.
+    """
+    script = _replica_sync_script()
+    if not Path(script).exists():
+        raise FileNotFoundError(f"sync script not found: {script}")
+
+    if not _op_lock.acquire(blocking=False):
+        raise RuntimeError(
+            "another admin operation is in progress; retry when it finishes")
+    try:
+        subprocess.run(
+            ["bash", script],
+            env=os.environ.copy(),
+            check=True, capture_output=True, timeout=timeout,
+        )
+    finally:
+        # finally, so a failed sync can't wedge every future admin op.
+        _op_lock.release()
+
+
 @router.get("/replica-status")
 def admin_replica_status():
     """Replica freshness for the /status card (M26a).
@@ -583,6 +617,14 @@ def admin_maintenance_apply(payload: dict):
             raise
 
     return {"applied": applied}
+
+
+@router.get("/maintenance-push-status")
+def admin_maintenance_push_status():
+    """Last/current replica->NAS push. Backs the Retry affordance."""
+    from . import web
+    with web._push_lock:
+        return dict(web._push_status)
 
 
 @router.post("/replica-sync")

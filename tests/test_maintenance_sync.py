@@ -606,3 +606,28 @@ def test_excluded_stage_allowed_on_the_nas(client, monkeypatch):
     r = client.post("/api/admin/maintenance-sweep",
                     json={"apply": True, "do_colors": True})
     assert r.status_code == 200
+
+
+def test_push_status_starts_idle(client):
+    r = client.get("/api/admin/maintenance-push-status")
+    assert r.status_code == 200
+    assert r.json()["state"] == "idle"
+
+
+def test_push_status_reflects_last_push(client):
+    from photosearch import web
+
+    with web._push_lock:
+        web._push_status.update({
+            "state": "failed", "error": "fingerprint_mismatch",
+            "stages": {"stacking": {"status": "failed"}},
+            "finished_at": "2026-07-17T09:00:00+00:00",
+        })
+    try:
+        body = client.get("/api/admin/maintenance-push-status").json()
+        assert body["state"] == "failed"
+        assert body["error"] == "fingerprint_mismatch"
+    finally:
+        with web._push_lock:
+            web._push_status.update({"state": "idle", "error": None,
+                                     "stages": {}, "finished_at": None})

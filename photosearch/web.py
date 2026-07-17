@@ -15,6 +15,7 @@ Launch with:
 import json
 import logging
 import os
+import threading
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -130,6 +131,46 @@ def _get_books():
     """Open the sidecar photobook store (fresh connection per request)."""
     from .book import BookStore
     return BookStore(_books_db_path)
+
+
+# Maintenance push state. The push outlives its request (it runs detached so a
+# closed tab can't kill it), so the UI polls this to drive the Retry affordance.
+_push_lock = threading.Lock()
+_push_status: dict = {"state": "idle", "stages": {}, "error": None,
+                      "finished_at": None}
+
+
+def _start_push(stage_results) -> None:
+    """Reconcile a finished local sweep to the NAS, detached.
+
+    Non-blocking with respect to the sweep: its results are already reported.
+    Detached from the request so closing the tab can't kill an in-flight push.
+    """
+    nas_url = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if not nas_url:
+        return
+
+    def _run():
+        from datetime import datetime, timezone
+        from .maintenance_sync import push_to_nas
+        with _push_lock:
+            _push_status.update({"state": "running", "stages": {}, "error": None,
+                                 "finished_at": None})
+        try:
+            with _get_db() as db:
+                res = push_to_nas(db, nas_url, stage_results)
+        except Exception as e:  # never let the thread die silently
+            logger.exception("maintenance push crashed")
+            res = {"ok": False, "error": str(e), "stages": {}}
+        with _push_lock:
+            _push_status.update({
+                "state": "ok" if res.get("ok") else "failed",
+                "stages": res.get("stages") or {},
+                "error": res.get("error"),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+    threading.Thread(target=_run, name="maintenance-push", daemon=True).start()
 
 
 def _ensure_thumb_dir():
@@ -4247,6 +4288,40 @@ async def api_maintenance_sweep(request: Request):
                 "do_dedup": do_dedup,
                 "do_requeue": do_requeue,
             })
+            # Pre-flight BEFORE compute: a sync replaces the whole local DB, so
+            # discovering drift after a local stacking run would destroy the very
+            # results we intend to push.
+            if nas_url_now and apply:
+                from .maintenance_sync import (
+                    fetch_nas_fingerprint, fingerprints_match, photo_fingerprint,
+                )
+                remote = fetch_nas_fingerprint(nas_url_now)
+                with _get_db() as db:
+                    local = photo_fingerprint(db)
+                if not fingerprints_match(local, remote):
+                    _emit({"type": "progress", "phase": "preflight",
+                           "status": "syncing",
+                           "message": "Photo index drifted — syncing from the NAS "
+                                      "before computing."})
+                    from .admin_api import run_replica_sync_blocking
+                    try:
+                        run_replica_sync_blocking()
+                    except Exception as exc:
+                        # Includes "another admin operation is in progress" — the
+                        # sync takes _op_lock, since it swaps the whole DB file.
+                        _emit({"type": "fatal",
+                               "message": f"Replica sync failed, so the local DB "
+                                          f"is still stale: {exc}"})
+                        return
+                    with _get_db() as db:
+                        local = photo_fingerprint(db)
+                    remote = fetch_nas_fingerprint(nas_url_now)
+                    if not fingerprints_match(local, remote):
+                        _emit({"type": "fatal",
+                               "message": "Sync did not reconcile the photo index; "
+                                          "refusing to compute against a stale DB."})
+                        return
+
             with _get_db() as db:
                 result = run_maintenance_sweep(
                     db,
@@ -4265,6 +4340,7 @@ async def api_maintenance_sweep(request: Request):
                     min_confidence=min_confidence,
                     on_progress=_on_progress,
                     should_abort=_should_abort,
+                    source="replica" if nas_url_now else "nas",
                 )
             stages = result.get("stages", [])
             _emit({
@@ -4275,6 +4351,9 @@ async def api_maintenance_sweep(request: Request):
                 "total_applied": sum(s.get("applied", 0) for s in stages),
                 "duration_seconds": round(time.monotonic() - started, 2),
             })
+            # Deliberately last: ONE push after ALL stages, never between them.
+            if nas_url_now and apply:
+                _start_push(stages)
         except InterruptedError:
             _emit({"type": "cancelled", "message": "Maintenance sweep cancelled"})
         except Exception as exc:
