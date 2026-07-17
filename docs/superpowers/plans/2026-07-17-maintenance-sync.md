@@ -1492,11 +1492,11 @@ In `photosearch/web.py`, inside `api_maintenance_sweep`'s `run()`, replace the `
             # Pre-flight BEFORE compute: a sync replaces the whole local DB, so
             # discovering drift after a local stacking run would destroy the very
             # results we intend to push.
-            if _nas_url and apply:
+            if nas_url_now and apply:
                 from .maintenance_sync import (
                     fetch_nas_fingerprint, fingerprints_match, photo_fingerprint,
                 )
-                remote = fetch_nas_fingerprint(_nas_url)
+                remote = fetch_nas_fingerprint(nas_url_now)
                 with _get_db() as db:
                     local = photo_fingerprint(db)
                 if not fingerprints_match(local, remote):
@@ -1508,7 +1508,7 @@ In `photosearch/web.py`, inside `api_maintenance_sweep`'s `run()`, replace the `
                     run_replica_sync_blocking()
                     with _get_db() as db:
                         local = photo_fingerprint(db)
-                    remote = fetch_nas_fingerprint(_nas_url)
+                    remote = fetch_nas_fingerprint(nas_url_now)
                     if not fingerprints_match(local, remote):
                         _emit({"type": "fatal",
                                "message": "Sync did not reconcile the photo index; "
@@ -1533,14 +1533,14 @@ In `photosearch/web.py`, inside `api_maintenance_sweep`'s `run()`, replace the `
                     min_confidence=min_confidence,
                     on_progress=_on_progress,
                     should_abort=_should_abort,
-                    source="replica" if _nas_url else "nas",
+                    source="replica" if nas_url_now else "nas",
                 )
 ```
 
 Then, immediately **after** the existing `_emit({"type": "done", ...})` call, add the push. It is deliberately last — one push after ALL stages, never between them:
 
 ```python
-            if _nas_url and apply:
+            if nas_url_now and apply:
                 _start_push(result["stages"])
 ```
 

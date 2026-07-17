@@ -4162,8 +4162,13 @@ async def api_maintenance_sweep(request: Request):
     # sync-replica.sh replaces wholesale. So an apply here is only legitimate
     # if we can hand the results to the NAS afterwards.
     from .maintenance_sync import EXCLUDED_STAGES
-    _nas_url = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
-    if _nas_url and apply:
+    # Deliberately NOT the module-level _nas_url (web.py:102), which is captured
+    # at IMPORT time. This gate must see the value as of THIS request, so it is
+    # re-read here and given a distinct name — a local called `_nas_url` would
+    # shadow the global, and anyone deleting it as "redundant" would silently
+    # revert the gate to a stale import-time value while the tests stayed green.
+    nas_url_now = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if nas_url_now and apply:
         requested_excluded = [
             name for name, on in (
                 ("colors", do_colors),
@@ -4184,7 +4189,7 @@ async def api_maintenance_sweep(request: Request):
             })
         from .maintenance_sync import fetch_nas_fingerprint
         try:
-            fetch_nas_fingerprint(_nas_url)
+            fetch_nas_fingerprint(nas_url_now)
         except Exception as e:
             raise HTTPException(status_code=503, detail={
                 "error": "nas_unreachable",
