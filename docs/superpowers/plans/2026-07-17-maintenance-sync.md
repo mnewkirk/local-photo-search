@@ -1582,22 +1582,49 @@ def _start_push(stage_results: list) -> None:
     threading.Thread(target=_run, name="maintenance-push", daemon=True).start()
 ```
 
-- [ ] **Step 8: Extract the blocking replica sync**
+- [ ] **Step 8: Add a blocking replica sync as a SIBLING (corrected 2026-07-17)**
 
-In `photosearch/admin_api.py`, find the existing `replica-sync` endpoint. Extract its subprocess invocation into a reusable blocking helper, and have the endpoint call it:
+> **This step's original text was wrong** and is kept corrected rather than
+> deleted, so the mistake isn't reintroduced. It said to *extract* the existing
+> endpoint's `subprocess.run` into a shared helper. There is no such call:
+> `admin_replica_sync` (`admin_api.py:589`) is `async def` and streams via
+> `_stream_subprocess` / `asyncio.create_subprocess_exec`. "Extracting" would
+> have forced the SSE endpoint onto a blocking call and destroyed its
+> line-by-line streaming. It also hardcoded `./sync-replica.sh` + a `cwd`,
+> ignoring `_replica_sync_script()`'s `PHOTOSEARCH_REPLICA_SYNC_SCRIPT` override.
+
+Add `run_replica_sync_blocking` as a **sibling**. Leave `admin_replica_sync`
+untouched. The genuinely shared unit is `_replica_sync_script()`, which is
+already shared.
 
 ```python
 def run_replica_sync_blocking(timeout: int = 1800) -> None:
-    """Run sync-replica.sh to completion. Raises CalledProcessError on failure.
+    """Run sync-replica.sh to completion, blocking. Raises on failure.
 
-    Shared by the /api/admin/replica-sync SSE endpoint and the maintenance
-    pre-flight, which must sync BEFORE computing.
+    Sibling of the /api/admin/replica-sync SSE endpoint — deliberately NOT an
+    extraction of it: that endpoint is async and streams output line-by-line,
+    which a blocking run would destroy. The shared unit is
+    _replica_sync_script().
+
+    Used by the maintenance pre-flight, which must sync BEFORE computing (a sync
+    replaces the whole DB file, so syncing after a local compute would destroy
+    the very results we intend to push). It runs inside the sweep's worker
+    thread, so blocking is fine there.
+
+    Takes _op_lock like every other admin op: the pre-flight must not race a
+    manual Sync-from-NAS or a Restart swapping the DB underneath it. Aborting a
+    sweep is cheap and recoverable; a corrupted atomic swap is not.
     """
-    subprocess.run(
-        ["./sync-replica.sh"],
-        cwd=os.environ.get("PHOTOSEARCH_REPO_DIR", "."),
-        check=True, capture_output=True, timeout=timeout,
-    )
+    script = _replica_sync_script()
+    if not Path(script).exists():
+        raise FileNotFoundError(f"sync script not found: {script}")
+    if not _op_lock.acquire(blocking=False):
+        raise RuntimeError("another admin operation is in progress")
+    try:
+        subprocess.run(["bash", script], check=True,
+                       capture_output=True, timeout=timeout)
+    finally:
+        _op_lock.release()
 ```
 
 - [ ] **Step 9: Run the full suite**
