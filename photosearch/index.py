@@ -8,6 +8,7 @@ M8: Aesthetic quality scoring.
 
 import hashlib
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -146,6 +147,40 @@ def find_photos(directory: str) -> list[str]:
     return photos
 
 
+def _write_geocode_results(db, ungeo) -> int:
+    """Reverse-geocode the given rows and write place_name. Returns count filled.
+
+    Tolerant of 'database is locked': a busy NAS — a heavy maintenance-sweep
+    stage (match_faces / full-library stacking) plus the worker fleet writing
+    submit results — can hold SQLite's single write lock past the 60s
+    busy_timeout. Rather than abort the whole index over transient contention,
+    DEFER: the GPS coordinates are already stored, so place_name simply stays
+    NULL and the next index / maintenance geocode pass fills it in. Aborting here
+    used to drop an entire folder's place names silently (observed 2026-07-17).
+    """
+    if not ungeo:
+        return 0
+    from .geocode import reverse_geocode_batch
+    print(f"\nReverse geocoding {len(ungeo)} photo(s) with GPS data...")
+    coords = [(row["gps_lat"], row["gps_lon"]) for row in ungeo]
+    places = reverse_geocode_batch(coords)
+    try:
+        db.begin_batch(batch_size=200)
+        geo_count = 0
+        for row, place in zip(ungeo, places):
+            if place:
+                db.update_photo(row["id"], place_name=place)
+                geo_count += 1
+        db.end_batch()
+        print(f"  Geocoded {geo_count}/{len(ungeo)} photos.")
+        return geo_count
+    except sqlite3.OperationalError as e:
+        db.abort_batch()
+        print(f"  Geocoding deferred — the database was busy ({e}). Place names "
+              f"will fill on the next index / maintenance geocode pass.")
+        return 0
+
+
 def _index_collection(
     collection_id: int,
     db_path: str = "photo_index.db",
@@ -250,19 +285,7 @@ def _index_collection(
                 f"AND gps_lat IS NOT NULL AND gps_lon IS NOT NULL AND place_name IS NULL",
                 list(photo_id_set),
             ).fetchall()
-            if ungeo:
-                from .geocode import reverse_geocode_batch
-                print(f"\nReverse geocoding {len(ungeo)} photo(s) with GPS data...")
-                db.begin_batch(batch_size=200)
-                coords = [(row["gps_lat"], row["gps_lon"]) for row in ungeo]
-                places = reverse_geocode_batch(coords)
-                geo_count = 0
-                for row, place in zip(ungeo, places):
-                    if place:
-                        db.update_photo(row["id"], place_name=place)
-                        geo_count += 1
-                db.end_batch()
-                print(f"  Geocoded {geo_count}/{len(ungeo)} photos.")
+            _write_geocode_results(db, ungeo)
 
         # ── CLIP embeddings ────────────────────────────────────────
         if enable_clip:
@@ -1072,18 +1095,7 @@ def index_directory(
         ungeo = [r for r in ungeo if r["id"] in dir_photo_ids]
 
         if enable_geocode and ungeo:
-            from .geocode import reverse_geocode_batch
-            print(f"\nReverse geocoding {len(ungeo)} photo(s) with GPS data...")
-            db.begin_batch(batch_size=200)
-            coords = [(row["gps_lat"], row["gps_lon"]) for row in ungeo]
-            places = reverse_geocode_batch(coords)
-            geo_count = 0
-            for row, place in zip(ungeo, places):
-                if place:
-                    db.update_photo(row["id"], place_name=place)
-                    geo_count += 1
-            db.end_batch()
-            print(f"  Geocoded {geo_count}/{len(ungeo)} photos.")
+            _write_geocode_results(db, ungeo)
 
         if not new_photos and not enable_describe and not enable_faces and not enable_quality and not enable_category_content and not enable_category_visual and not enable_keywords:
             if not ungeo:

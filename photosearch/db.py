@@ -173,6 +173,21 @@ class PhotoDB:
         self.flush_batch()
         self._batch_mode = False
 
+    def abort_batch(self):
+        """Roll back any pending batch and exit batch mode.
+
+        For error paths that cannot commit — e.g. a write that raised
+        'database is locked' mid-batch under heavy concurrent write load.
+        Leaves the connection usable rather than stuck in batch mode with an
+        open transaction. Best-effort: a failed rollback is swallowed.
+        """
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+        self._batch_count = 0
+        self._batch_mode = False
+
     def _maybe_commit(self):
         """Commit immediately, or defer if in batch mode."""
         if self._batch_mode:
