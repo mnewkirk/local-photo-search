@@ -1737,6 +1737,13 @@ class PhotoDB:
         needed by /api/admin/maintenance-apply, which stamps inside the same
         BEGIN IMMEDIATE that replaces the stacks, so a failure can't leave the
         watermark claiming work that was rolled back.
+
+        Deliberately uses ``conn.commit()`` rather than the ``_maybe_commit()``
+        that the other writers here share: ``_maybe_commit`` DEFERS while a
+        ``start_batch()`` is open, which would make a parameter literally named
+        ``commit=True`` sometimes not commit. A watermark's whole job is
+        durability — the caller decides via ``commit``, and that decision is
+        honored exactly. Reviewed 2026-07-17; not an oversight.
         """
         self.conn.execute(
             "INSERT INTO maintenance_runs "
