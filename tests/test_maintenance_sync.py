@@ -563,3 +563,46 @@ def test_push_partial_failure_keeps_successful_transfer_stage(db, monkeypatch):
     assert result["stages"]["stacking"]["status"] == "applied"
     assert result["stages"]["normalize_aesthetics"]["status"] == "failed"
     assert result["stages"]["normalize_aesthetics"]["reason"] == "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# Replica-mode gating
+# ---------------------------------------------------------------------------
+
+def test_apply_blocked_in_replica_mode_when_nas_unreachable(client, monkeypatch):
+    """THE gate: never write results that the next sync is guaranteed to wipe."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://unreachable:8000")
+
+    from photosearch import maintenance_sync
+
+    def boom(*a, **kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(maintenance_sync.requests, "get", boom)
+
+    r = client.post("/api/admin/maintenance-sweep", json={"apply": True})
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "nas_unreachable"
+
+
+def test_dry_run_allowed_in_replica_mode_without_nas(client, monkeypatch):
+    """Dry-runs write nothing, so there's nothing to lose."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://unreachable:8000")
+    r = client.post("/api/admin/maintenance-sweep", json={"apply": False})
+    assert r.status_code == 200
+
+
+def test_excluded_stage_rejected_in_replica_mode(client, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": True, "do_colors": True})
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "excluded_stage_in_replica_mode"
+    assert "colors" in r.json()["detail"]["stages"]
+
+
+def test_excluded_stage_allowed_on_the_nas(client, monkeypatch):
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": True, "do_colors": True})
+    assert r.status_code == 200

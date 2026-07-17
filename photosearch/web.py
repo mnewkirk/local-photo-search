@@ -4156,6 +4156,44 @@ async def api_maintenance_sweep(request: Request):
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
     do_requeue = bool(data.get("do_requeue", False))
+
+    # --- replica-mode gating ------------------------------------------------
+    # A sweep on the replica writes to photo_index.db.local, which the next
+    # sync-replica.sh replaces wholesale. So an apply here is only legitimate
+    # if we can hand the results to the NAS afterwards.
+    from .maintenance_sync import EXCLUDED_STAGES
+    _nas_url = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if _nas_url and apply:
+        requested_excluded = [
+            name for name, on in (
+                ("colors", do_colors),
+                ("match_faces", do_match),
+                ("recluster", do_recluster),
+                ("dedup_photos", do_dedup),
+                ("requeue", do_requeue),
+            ) if on and name in EXCLUDED_STAGES
+        ]
+        if requested_excluded:
+            # These can't produce a correct result here (colors needs pixels the
+            # replica doesn't have) or must not cross machines (dedup DELETEs).
+            raise HTTPException(status_code=400, detail={
+                "error": "excluded_stage_in_replica_mode",
+                "stages": requested_excluded,
+                "message": "These stages must run on the NAS. See the "
+                           "maintenance-sync spec for why.",
+            })
+        from .maintenance_sync import fetch_nas_fingerprint
+        try:
+            fetch_nas_fingerprint(_nas_url)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail={
+                "error": "nas_unreachable",
+                "message": (
+                    "Refusing to apply: results computed here would be lost on "
+                    f"the next replica sync and the NAS is unreachable ({e})."
+                ),
+            })
+
     # Opt-in full re-rank of the aesthetic percentiles — needed after a scoring
     # batch shifts the distribution (missing-only fills new rows but doesn't
     # re-rank existing ones) or after retuning the dimension weights.
