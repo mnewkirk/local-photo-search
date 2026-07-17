@@ -437,11 +437,24 @@ def run_replica_sync_blocking(timeout: int = 1800) -> None:
         raise RuntimeError(
             "another admin operation is in progress; retry when it finishes")
     try:
-        subprocess.run(
-            ["bash", script],
-            env=os.environ.copy(),
-            check=True, capture_output=True, timeout=timeout,
-        )
+        try:
+            subprocess.run(
+                ["bash", script],
+                env=os.environ.copy(),
+                check=True, capture_output=True, timeout=timeout,
+            )
+        except subprocess.CalledProcessError as e:
+            # capture_output=True discards stderr into the exception, but
+            # CalledProcessError's default message is just "returned non-zero
+            # exit status N" — surface a stderr tail so the pre-flight's
+            # wrapped error (web.py) actually says WHY the sync failed.
+            stderr = e.stderr or b""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            tail = stderr[-500:]
+            raise RuntimeError(
+                f"{script} failed (exit {e.returncode}): {tail}"
+            ) from e
     finally:
         # finally, so a failed sync can't wedge every future admin op.
         _op_lock.release()

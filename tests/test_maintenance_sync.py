@@ -631,3 +631,92 @@ def test_push_status_reflects_last_push(client):
         with web._push_lock:
             web._push_status.update({"state": "idle", "error": None,
                                      "stages": {}, "finished_at": None})
+
+
+def test_start_push_sets_running_before_thread_completes(client, monkeypatch):
+    """_start_push must flip state to "running" SYNCHRONOUSLY, before the
+    background thread starts — the sweep's SSE stream has already closed by
+    the time _start_push runs, so a client polling maintenance-push-status
+    right after the "done" event must never observe a stale PREVIOUS push's
+    terminal state (e.g. "ok" with an old finished_at) as if the new push had
+    already succeeded."""
+    import threading
+    from photosearch import maintenance_sync, web
+
+    release = threading.Event()
+
+    def blocking_push(db, nas_url, stage_results):
+        release.wait(timeout=5)
+        return {"ok": True, "stages": {}}
+
+    monkeypatch.setattr(maintenance_sync, "push_to_nas", blocking_push)
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+
+    # Seed a stale terminal state, as if left over from a previous push.
+    with web._push_lock:
+        web._push_status.update({
+            "state": "ok", "stages": {"stacking": {"status": "applied"}},
+            "error": None, "finished_at": "2026-01-01T00:00:00+00:00",
+        })
+
+    try:
+        web._start_push([{"stage": "stacking", "status": "done"}])
+
+        # The push thread is blocked on `release`, so this observes exactly
+        # what _start_push left behind before returning — not anything the
+        # thread itself could have written.
+        assert web._push_status["state"] == "running"
+        assert web._push_status["finished_at"] is None
+        assert web._push_status["error"] is None
+    finally:
+        release.set()
+        for t in threading.enumerate():
+            if t.name == "maintenance-push":
+                t.join(timeout=5)
+        with web._push_lock:
+            web._push_status.update({"state": "idle", "error": None,
+                                     "stages": {}, "finished_at": None})
+
+
+def test_preflight_sync_runs_before_sweep_compute(client, db, monkeypatch):
+    """THE central guarantee: the fingerprint check + auto-sync must complete
+    BEFORE the sweep computes. sync-replica.sh REPLACES the whole local DB
+    file, so if the sweep ran first, the sync it triggers would destroy the
+    very results the sweep just computed."""
+    from photosearch import admin_api, maintenance, maintenance_sync
+
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+
+    local_fp = maintenance_sync.photo_fingerprint(db)
+    # Start deliberately mismatched so the pre-flight takes the sync path.
+    state = {"remote": {"photo_count": local_fp["photo_count"] + 1,
+                        "photo_max_id": local_fp["photo_max_id"]}}
+    calls = []
+
+    def fake_fetch_fingerprint(nas_url):
+        return dict(state["remote"])
+
+    def fake_sync(timeout=1800):
+        calls.append("sync")
+        # A real sync reconciles the local DB to the NAS; flip the fake
+        # fingerprint to match so the post-sync re-check passes and the
+        # sweep is reached.
+        state["remote"] = dict(local_fp)
+
+    def fake_sweep(db, **kwargs):
+        calls.append("sweep")
+        return {"stages": []}
+
+    def fake_push(*a, **kw):
+        return {"ok": True, "stages": {}}
+
+    monkeypatch.setattr(maintenance_sync, "fetch_nas_fingerprint",
+                        fake_fetch_fingerprint)
+    monkeypatch.setattr(admin_api, "run_replica_sync_blocking", fake_sync)
+    monkeypatch.setattr(maintenance, "run_maintenance_sweep", fake_sweep)
+    monkeypatch.setattr(maintenance_sync, "push_to_nas", fake_push)
+
+    r = client.post("/api/admin/maintenance-sweep", json={"apply": True})
+    assert r.status_code == 200
+
+    assert calls == ["sync", "sweep"], calls

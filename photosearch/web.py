@@ -150,12 +150,18 @@ def _start_push(stage_results) -> None:
     if not nas_url:
         return
 
+    # Set synchronously, before the thread starts: the SSE stream has already
+    # closed by the time _start_push is called (this runs after the sweep's
+    # "done" event), so a client polling maintenance-push-status right after
+    # would otherwise see the PREVIOUS push's terminal state (e.g. "ok" with a
+    # stale finished_at) and report success for a push that hasn't begun.
+    with _push_lock:
+        _push_status.update({"state": "running", "stages": {}, "error": None,
+                             "finished_at": None})
+
     def _run():
         from datetime import datetime, timezone
         from .maintenance_sync import push_to_nas
-        with _push_lock:
-            _push_status.update({"state": "running", "stages": {}, "error": None,
-                                 "finished_at": None})
         try:
             with _get_db() as db:
                 res = push_to_nas(db, nas_url, stage_results)
