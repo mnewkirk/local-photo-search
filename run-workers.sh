@@ -92,6 +92,7 @@ LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-}"
 # host) and docker everywhere else. Override with --native / --docker.
 MODE="auto"               # auto | native | docker
 OLLAMA_HOST_OVERRIDE=""   # --ollama-host: base URL where Ollama is reachable
+NO_OLLAMA=0               # --no-ollama: never auto-start/require an Ollama backend
 ACTION="start"            # start | status | logs | stop | scale
 SCALE_TARGET=""
 # Fleet instance name. Empty = the default fleet (back-compat). Set via --name to
@@ -166,11 +167,15 @@ Start workers:
       --name NAME         Fleet instance name. Lets multiple fleets run at once
                           (e.g. a CPU text fleet + a GPU vision fleet) without
                           colliding. Pass the same --name to --status/--logs/--stop.
+      --no-ollama         Never auto-start or require an Ollama backend, even
+                          for describe/verify/category-* passes. Implied when
+                          --text-llm-url (or PHOTOSEARCH_TEXT_LLM_URL) is set.
       --ollama-host URL   Base URL for Ollama (default: localhost, or the
                           Windows-host gateway in native WSL2 mode)
 
 Manage workers:
-      --status            Show running workers and their progress
+      --status            Show running workers, remaining queue (scoped to the
+                          fleet's --collection/--directory), and progress
       --logs              Tail logs from all workers
       --stop              Stop all workers
       --scale N           Adjust fleet to N workers (inherits image + cmd + env
@@ -215,8 +220,12 @@ ollama_needed() {
     # is a vision pass; category-content/keywords are text-only but still hit
     # Ollama (small text model on the existing description).
     # When --text-llm-url is set, the LLM passes route to an OpenAI-compatible
-    # backend (LM Studio) instead, so Ollama is never needed.
+    # backend (LM Studio) instead, so Ollama is never needed. --no-ollama is the
+    # explicit opt-out for any other backend arrangement (e.g. a native Ollama
+    # you manage yourself) — it only suppresses the auto-start/bootstrap here,
+    # it does not change where describe.py sends its calls.
     [ -n "$TEXT_LLM_URL" ] && return 1
+    [ "$NO_OLLAMA" -eq 1 ] && return 1
     local IFS=','
     for p in $PASSES; do
         case "$p" in
@@ -438,6 +447,72 @@ stop_managed_ollama_if_idle() {
 # Management commands (no server required)
 # ---------------------------------------------------------------------------
 
+# Launch writes the fleet's server/passes/scope to this file so --status (which
+# runs without -s/-p/--collection) can query the scoped remaining-queue counts.
+fleet_meta_file() { echo "$NATIVE_RUNDIR/fleet-meta.env"; }
+
+write_fleet_meta() {
+    mkdir -p "$NATIVE_RUNDIR"
+    {
+        printf 'META_SERVER=%q\n' "$SERVER"
+        printf 'META_PASSES=%q\n' "$PASSES"
+        printf 'META_COLLECTION=%q\n' "$COLLECTION"
+        printf 'META_DIRECTORY=%q\n' "$DIRECTORY"
+    } > "$(fleet_meta_file)"
+}
+
+print_remaining_queue() {
+    # Queries /api/worker/status with the fleet's launch scope and prints the
+    # per-pass remaining counts. Degrades to a hint if the metadata or server
+    # is unavailable — never blocks the rest of --status.
+    local metaf
+    metaf=$(fleet_meta_file)
+    if [ ! -f "$metaf" ]; then
+        echo "=== Remaining Queue ==="
+        echo ""
+        echo "  (no fleet metadata — relaunch workers with this script to enable counts)"
+        echo ""
+        return
+    fi
+    local META_SERVER="" META_PASSES="" META_COLLECTION="" META_DIRECTORY=""
+    # shellcheck disable=SC1090
+    source "$metaf"
+    local scope=""
+    [ -n "$META_COLLECTION" ] && scope=" (collection $META_COLLECTION)"
+    [ -n "$META_DIRECTORY" ] && scope=" (directory $META_DIRECTORY)"
+    echo "=== Remaining Queue${scope} ==="
+    echo ""
+    local resp
+    resp=$(curl -sf --max-time 20 -G "$META_SERVER/api/worker/status" \
+        --data-urlencode "passes=$META_PASSES" \
+        ${META_COLLECTION:+--data-urlencode "collection_id=$META_COLLECTION"} \
+        ${META_DIRECTORY:+--data-urlencode "directory=$META_DIRECTORY"} \
+        2>/dev/null) || true
+    if [ -z "$resp" ]; then
+        echo "  (server unreachable: $META_SERVER)"
+        echo ""
+        return
+    fi
+    echo "$resp" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+queue = data.get('queue_depth', {})
+order = [p.strip() for p in sys.argv[1].split(',') if p.strip()]
+claimed = {}
+for c in data.get('active_claims', []):
+    claimed[c['pass_type']] = claimed.get(c['pass_type'], 0) + c['photo_count']
+total = 0
+for p in order:
+    if p not in queue:
+        continue
+    total += queue[p]
+    extra = f'  ({claimed[p]} claimed)' if claimed.get(p) else ''
+    print(f'  {p:<18}{queue[p]:>9,}{extra}')
+print(f'  {\"total\":<18}{total:>9,}')
+" "$META_PASSES" 2>/dev/null || echo "  (could not parse response from $META_SERVER)"
+    echo ""
+}
+
 do_status() {
     local FILTER="label=$FLEET_LABEL"
     echo "=== Worker Containers ==="
@@ -461,6 +536,8 @@ do_status() {
     docker stats --no-stream --filter "$FILTER" \
                  --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}" 2>/dev/null || true
     echo ""
+
+    print_remaining_queue
 
     # Show recent log lines per container (last batch progress)
     echo "=== Recent Progress ==="
@@ -672,6 +749,7 @@ do_status_native() {
     done
     [ "$live" -eq 0 ] && echo "  (no live workers — all exited; queue likely drained)"
     echo ""
+    print_remaining_queue
     echo "=== Recent Progress ==="
     echo ""
     for logf in "$NATIVE_RUNDIR"/worker-*.log; do
@@ -749,6 +827,7 @@ while [[ $# -gt 0 ]]; do
         --docker)           MODE="docker";         shift ;;
         --name)             FLEET_NAME="$2";       shift 2 ;;
         --ollama-host)      OLLAMA_HOST_OVERRIDE="$2"; shift 2 ;;
+        --no-ollama)        NO_OLLAMA=1;              shift ;;
         --status)           ACTION="status";       shift ;;
         --logs)             ACTION="logs";         shift ;;
         --stop)             ACTION="stop";         shift ;;
@@ -943,6 +1022,9 @@ fi
 echo "Starting $NUM_WORKERS workers..."
 echo ""
 
+# Persist the launch scope so --status can show scoped remaining-queue counts.
+write_fleet_meta
+
 if [ "$MODE" = "docker" ]; then
     for i in $(seq 1 "$NUM_WORKERS"); do
         CONTAINER_NAME="${PROJECT}-${i}"
@@ -986,7 +1068,7 @@ echo "=== $NUM_WORKERS workers launched ==="
 echo ""
 NAME_ARG="${FLEET_NAME:+--name $FLEET_NAME }"
 echo "Monitor:"
-echo "  ./run-workers.sh ${NAME_ARG}--status    # container status + memory + recent progress"
+echo "  ./run-workers.sh ${NAME_ARG}--status    # worker status + remaining queue + recent progress"
 echo "  ./run-workers.sh ${NAME_ARG}--logs      # tail all worker logs live"
 echo "  ./run-workers.sh ${NAME_ARG}--stop      # stop all workers"
 echo ""

@@ -1044,19 +1044,63 @@ def test_resolve_location_bbox_falls_back_to_region(db, monkeypatch):
                                                  "bbox": [37.9, 38.05, -122.6, -122.45]}], "x"))
     assert S._resolve_location_bbox(db, "San Rafael") is not None
 
-    def test_min_day_aesthetic_filters_per_day(self, db):
-        # Per-day percentile floor: photos are gated on how they rank among
-        # the SAME day's photos (aes_overall_day_pct), not the whole library.
-        from photosearch.search import search_combined
 
-        # Give every photo a library percentile so the aesthetics browse
-        # includes them, and a LOW per-day percentile...
-        db.conn.execute("UPDATE photos SET aes_overall_pct = 50, aes_overall_day_pct = 10")
-        pid = db.conn.execute(
-            "SELECT id FROM photos WHERE filename = 'DSC04922.JPG'").fetchone()["id"]
-        # ...except one photo that's top-of-its-day.
-        db.conn.execute("UPDATE photos SET aes_overall_day_pct = 90 WHERE id = ?", (pid,))
-        db.conn.commit()
+def test_min_day_aesthetic_filters_per_day(db):
+    # Per-day percentile floor: photos are gated on how they rank among
+    # the SAME day's photos (aes_overall_day_pct), not the whole library.
+    from photosearch.search import search_combined
 
-        ids = {r["id"] for r in search_combined(db, min_day_aesthetic=50)}
-        assert ids == {pid}
+    # Give every photo a library percentile so the aesthetics browse
+    # includes them, and a LOW per-day percentile...
+    db.conn.execute("UPDATE photos SET aes_overall_pct = 50, aes_overall_day_pct = 10")
+    pid = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'DSC04922.JPG'").fetchone()["id"]
+    # ...except one photo that's top-of-its-day.
+    db.conn.execute("UPDATE photos SET aes_overall_day_pct = 90 WHERE id = ?", (pid,))
+    db.conn.commit()
+
+    ids = {r["id"] for r in search_combined(db, min_day_aesthetic=50)}
+    assert ids == {pid}
+
+
+def test_date_only_search_honors_aesthetic_filters(db):
+    """date range + min_aesthetic / min_day_aesthetic must apply the floor.
+
+    Regression: the date-as-primary-search shortcut returned every photo in
+    the range before the aesthetic filters were consulted, so MCP/Ask
+    search_photos with only dates + min_aesthetic ignored the floor (while
+    summarize, which builds SQL directly, honored it).
+    """
+    from photosearch.search import search_combined
+
+    db.conn.execute("UPDATE photos SET aes_overall_pct = 10, aes_overall_day_pct = 10")
+    pid = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'DSC04922.JPG'").fetchone()["id"]
+    db.conn.execute(
+        "UPDATE photos SET aes_overall_pct = 90, aes_overall_day_pct = 90 WHERE id = ?",
+        (pid,))
+    db.conn.commit()
+
+    all_in_range = search_combined(db, date_from="2026-01-01", limit=50)
+    assert len(all_in_range) > 1  # the range alone matches several photos
+
+    ids = {r["id"] for r in search_combined(
+        db, date_from="2026-01-01", min_aesthetic=50, limit=50)}
+    assert ids == {pid}
+
+    ids = {r["id"] for r in search_combined(
+        db, date_from="2026-01-01", min_day_aesthetic=50, limit=50)}
+    assert ids == {pid}
+
+    # with_total must reflect the filtered count, not the raw range count.
+    _, total = search_combined(db, date_from="2026-01-01", min_aesthetic=50,
+                               limit=50, with_total=True)
+    assert total == 1
+
+    # Same class of bug in the quality-only branch: min_quality combined with
+    # an aesthetic floor must apply BOTH.
+    db.conn.execute("UPDATE photos SET aes_overall = 6.0")
+    db.conn.commit()
+    ids = {r["id"] for r in search_combined(
+        db, min_quality=5.0, min_aesthetic=50, limit=50)}
+    assert ids == {pid}

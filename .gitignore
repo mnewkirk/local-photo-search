@@ -102,3 +102,6 @@ ask-logs/
 # dedup revert lists + desktop->NAS face-state artifacts (written to /repo at runtime)
 *-assigned.txt
 faces-state.db
+
+# Local LLM (LM Studio) per-machine config — keep .example tracked
+lmstudio.env

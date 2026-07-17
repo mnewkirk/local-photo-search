@@ -112,6 +112,10 @@
     .mode-seg + .mode-seg { border-left: 1px solid var(--border); }
     .mode-seg:hover { color: var(--text); }
     .mode-seg.active { background: var(--accent); color: #fff; }
+    /* Ask with no LLM backend (e.g. served from the NAS) — kept visible and
+       hoverable so the title tooltip explains where to go instead. */
+    .mode-seg.disabled { opacity: 0.45; cursor: not-allowed; }
+    .mode-seg.disabled:hover { color: var(--text-muted); }
 
     /* Filter bar */
     .filters {
@@ -706,6 +710,17 @@
 
       // ---- Ask mode (M24b: natural-language LLM agent) ----
       const [askMode, setAskMode] = useState(!!initParams.ask);
+      // Ask needs a local LLM backend. /api/stats reports whether this server
+      // has one; the NAS does not, so the toggle is disabled there (with a
+      // tooltip pointing at the replica) instead of failing at request time.
+      // Undefined until stats load — treat unknown as available so the button
+      // doesn't flicker disabled on a normal replica load.
+      const askDisabled = !!stats && stats.ask_available === false;
+      // A shared ?ask= URL opened against a backend-less server (the NAS) would
+      // otherwise sit in Ask mode and fail on submit — fall back to Search.
+      useEffect(() => {
+        if (askDisabled) setAskMode(false);
+      }, [askDisabled]);
       const [asking, setAsking] = useState(false);
       const [askLog, setAskLog] = useState([]);      // narration lines
       const [askAnswer, setAskAnswer] = useState(''); // final prose answer
@@ -1268,9 +1283,13 @@
               }, '🔍 Search'),
               e('button', {
                 type: 'button',
-                className: 'mode-seg' + (askMode ? ' active' : ''),
-                onClick: () => setAskMode(true),
-                title: 'Ask in natural language — the assistant picks the filters; any filters you set below are pinned as hard constraints',
+                className: 'mode-seg' + (askMode ? ' active' : '') + (askDisabled ? ' disabled' : ''),
+                onClick: () => { if (!askDisabled) setAskMode(true); },
+                disabled: askDisabled,
+                'aria-disabled': askDisabled ? 'true' : 'false',
+                title: askDisabled
+                  ? 'Ask needs a local LLM backend, which this server has no access to — open the photo search on the local replica to use Ask.'
+                  : 'Ask in natural language — the assistant picks the filters; any filters you set below are pinned as hard constraints',
               }, '✨ Ask'),
             ),
             e('input', {

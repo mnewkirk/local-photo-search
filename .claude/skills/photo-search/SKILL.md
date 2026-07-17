@@ -595,9 +595,12 @@ panel to recover (since the panel container is now dead too).
 useless to a sibling container. `setsid`/`nohup` don't fix this either;
 they detach from process groups, not PID namespaces.
 
-`--no-deps` is also required — without it, compose follows depends_on
-and tries to recreate ollama too, hitting a name conflict on
-`photosearch-ollama` and aborting.
+`--no-deps` was originally required because compose followed `depends_on`
+and tried to recreate ollama too, hitting a name conflict on
+`photosearch-ollama`. The ollama service was removed from
+docker-compose.nas.yml on 2026-07-17 (nothing used it — see the compose
+header), so that conflict is gone; `--no-deps` is kept because the panel
+should only ever swap the photosearch container itself.
 
 **Graceful shutdown handshake.** When the panel triggers restart:
 1. `/api/admin/restart` first runs

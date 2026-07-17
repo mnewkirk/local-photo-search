@@ -203,6 +203,77 @@ Do not explain. Do not add anything else.\
 """
 
 
+# Phrases that signal the verifier editorialized (meta-commentary about the
+# photo/description) instead of naming a concrete absent object. These produce
+# false fails and pollute the regen "do NOT mention" list, so they're dropped.
+_META_WRONG_PATTERNS = (
+    "composite", "two images", "cannot identify", "can't identify", "unable to",
+    "appears to be", "seems to be", "this part of the image", "no objects",
+    "the description", "the image is", "the photo is",
+)
+
+# Tokens that begin a verb/preposition/relative clause — i.e. where a noun
+# phrase ends. Used to clip a sentence-shaped WRONG line down to its head noun.
+# Only finite verb forms (runs/flies/holds), NOT -ing gerunds — those are often
+# adjectives ("flying saucer", "running shoes", "human being"); cutting on them
+# would mangle legitimate noun phrases.
+_WRONG_CLAUSE_BOUNDARY = re.compile(
+    r"\b(?:that|which|who|whom|with|runs|ran|flies|flew|walks|stands|sits|"
+    r"holds|is|are|was|were|in|on|at|near|above|below|over|under|"
+    r"beside|behind|next\s+to)\b",
+    re.IGNORECASE,
+)
+
+# Single words too generic to be a useful CLIP query / regen exclusion.
+_GENERIC_DROP = {
+    "photo", "image", "picture", "scene", "object", "objects", "thing",
+    "things", "activity", "area", "part", "background", "foreground",
+}
+
+
+def _clean_wrong_item(raw: str) -> Optional[str]:
+    """Normalize a raw LLM 'WRONG:' line into a short, CLIP-checkable noun phrase,
+    or None if it's meta-commentary rather than a named absent object.
+
+    Verifiers frequently violate the 'WRONG: <object>' format and emit whole
+    sentences ("A golden retriever dog runs ahead of them", "There are no other
+    people visible in the image"). Taken verbatim those (a) read as garbage FAIL
+    reasons, (b) defeat the Pass-3 CLIP cross-check — a long phrase embedded as
+    "a photo of <sentence>" always scores below median, so it's never overridden
+    and gets falsely confirmed — and (c) pollute the regeneration's "do NOT
+    mention" list. This reduces them to the head noun.
+    """
+    if not raw:
+        return None
+    s = raw.strip().strip('"').strip().rstrip(".").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if any(p in low for p in _META_WRONG_PATTERNS):
+        return None
+    # Negation sentence: "(there is/are) no [other] X [visible/present/in...]" -> X
+    neg = re.search(
+        r"\bno\s+(?:other\s+|visible\s+|any\s+|more\s+)*"
+        r"([a-z][a-z\- ]*?)"
+        r"(?:\s+(?:visible|present|seen|that|which|is|are|in|on|near)\b|$)",
+        low,
+    )
+    if neg:
+        s = neg.group(1).strip()
+    # Clip at the first clause/verb/preposition boundary -> keep the head noun.
+    # Leading articles are intentionally KEPT ("a flying saucer" stays as-is).
+    s = _WRONG_CLAUSE_BOUNDARY.split(s, maxsplit=1)[0].strip().rstrip(",;:").strip()
+    words = s.split()
+    if not words:
+        return None
+    if len(words) > 6:
+        words = words[:6]
+        s = " ".join(words)
+    if len(words) == 1 and words[0].lower() in _GENERIC_DROP:
+        return None
+    return s
+
+
 def llm_verify_description(
     image_path: str,
     description: str,
@@ -270,9 +341,13 @@ def llm_verify_description(
     for line in response.strip().split("\n"):
         match = re.match(r"^\s*WRONG:\s*(.+)", line, re.IGNORECASE)
         if match:
-            wrong_item = match.group(1).strip().rstrip(".")
-            confirmed.append({"noun": wrong_item, "llm_says": "NO"})
-            logger.info("    WRONG: %s", wrong_item)
+            raw_item = match.group(1).strip().rstrip(".")
+            noun = _clean_wrong_item(raw_item)
+            if not noun:
+                logger.info("    WRONG (dropped as meta/empty): %s", raw_item)
+                continue
+            confirmed.append({"noun": noun, "llm_says": "NO"})
+            logger.info("    WRONG: %s (raw: %s)", noun, raw_item)
 
     return confirmed
 

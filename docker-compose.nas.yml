@@ -4,8 +4,16 @@
 # This compose file deploys these containers:
 #   photosearch — web UI + indexing engine (port 8000)
 #   photosearch-mcp — MCP server (port 8848)
-#   ollama      — LLaVA model server for scene descriptions
 #   syncthing   — receives phone camera-roll uploads into _incoming/
+#
+# There is NO ollama service here (removed 2026-07-17). The N100 has no GPU, so
+# every LLM pass runs on the desktop — the worker fleet against LM Studio, and
+# the Ask agent on the local replica. The container that used to sit here had
+# served zero successful calls in the retained log: its models (llava, moondream,
+# llama3.2:3b) had drifted off every current default, so NAS-side describe
+# (llama3.2-vision) and Ask (llama3.1) both 404'd at the model layer. Its
+# `ollama-models` volume is left on disk — `docker volume rm
+# photosearch_ollama-models` to reclaim ~8.4 GB once you're happy.
 #
 # Remote access is via **host-level Tailscale on the NAS** (node DXP4800-F976).
 # The old in-compose `tailscale` sidecar was removed 2026-07-03 — it shared the
@@ -16,10 +24,6 @@
 #   1. Copy .env.example to .env and set PHOTO_DIR
 #   2. docker compose -f docker-compose.nas.yml up -d
 #   3. Access at http://<nas-tailscale-ip>:8000 from your tailnet
-#
-# First-time model setup:
-#   docker compose -f docker-compose.nas.yml exec ollama ollama pull llava
-#   docker compose -f docker-compose.nas.yml exec ollama ollama pull minicpm-v
 #
 # Index photos:
 #   docker compose -f docker-compose.nas.yml run --rm photosearch \
@@ -74,7 +78,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - PHOTOSEARCH_DB=/data/photo_index.db
-      - OLLAMA_HOST=http://ollama:11434
       - INSIGHTFACE_HOME=/data/.insightface
       - PHOTO_ROOT=/photos
       - PYTHONUNBUFFERED=1
@@ -93,9 +96,6 @@ services:
       - PHOTOSEARCH_EXCLUDED_DIRS=01 - Organizational folders:02 - Gopro
       # If deploying a DB built on Mac, set this once to remap paths:
       # - REMAP_FROM=/Users/yourname/Pictures
-    depends_on:
-      ollama:
-        condition: service_started
     command: ["serve"]
     # Workers pull /api/photos/<id>/full in long-running streamed transfers.
     # On Restart, uvicorn gets SIGTERM and enters "waiting for connections to
@@ -104,13 +104,11 @@ services:
     # ports/state half-cleaned and sometimes wedging the new container's
     # startup. 60s is comfortably more than the longest /full transfer.
     stop_grace_period: 60s
-    # The N100 has 4 cores and 8 GB RAM. Indexing is memory-intensive
-    # (CLIP + InsightFace + LLaVA all load models). Serving is lightweight
-    # for browsing, but worker batches that pull /api/photos/<id>/full hold
-    # several MB per concurrent photo in memory — a 16-photo batch + model
-    # state can push past 6G and trigger the OOM killer (exit 137). With
-    # describe routed to Windows-native Ollama, the ollama container's 6G
-    # limit is mostly slack, so giving photosearch more headroom is safe.
+    # The N100 has 4 cores and 8 GB RAM. Serving is lightweight for browsing,
+    # but worker batches that pull /api/photos/<id>/full hold several MB per
+    # concurrent photo in memory — a 16-photo batch + model state can push past
+    # 6G and trigger the OOM killer (exit 137). With the ollama container gone,
+    # the whole 6G it used to reserve is free, so this headroom is safe.
     deploy:
       resources:
         limits:
@@ -152,19 +150,6 @@ services:
         limits:
           memory: 3G
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: photosearch-ollama
-    restart: unless-stopped
-    volumes:
-      - ollama-models:/root/.ollama
-    # Use llava (7B) on the N100 — 13B needs more RAM than available.
-    # 7B runs fine on CPU, just slower (~60-90s per photo for descriptions).
-    deploy:
-      resources:
-        limits:
-          memory: 6G
-
   syncthing:
     # Receives phone camera-roll uploads into /photos/_incoming/<source>/.
     # The daily `ingest-incoming` cron evacuates those files into the
@@ -204,5 +189,7 @@ services:
 volumes:
   photosearch-data:
     driver: local
-  ollama-models:
-    driver: local
+  # ollama-models intentionally dropped along with the ollama service. Compose
+  # does not delete the underlying volume, so the pulled models survive on disk
+  # until you `docker volume rm photosearch_ollama-models` — re-adding the
+  # service would pick them straight back up.

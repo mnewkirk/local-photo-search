@@ -229,6 +229,37 @@ _DEFAULT_OLLAMA_TIMEOUT_S = 120
 # have not shown this stall).
 _TEXT_OLLAMA_TIMEOUT_S = 10
 
+# --- LLM call instrumentation (diagnosing the freeze-then-bulk-release stall) ---
+# Always-on slow-call warning + an in-flight watchdog so a frozen slot is visible
+# live in the worker log (with wall-clock timestamps + token counts), instead of
+# only showing up as one big per-photo number.
+#   PHOTOSEARCH_LLM_TRACE=1        -> log every call's timing + tokens (not just slow ones)
+#   PHOTOSEARCH_LLM_SLOW_WARN_S=60 -> warn when one call exceeds this many seconds
+#   PHOTOSEARCH_LLM_WATCHDOG_S=30  -> "still waiting Ns" heartbeat cadence during a call
+_LLM_TRACE = bool(os.environ.get("PHOTOSEARCH_LLM_TRACE"))
+_LLM_SLOW_WARN_S = float(os.environ.get("PHOTOSEARCH_LLM_SLOW_WARN_S", "60"))
+_LLM_WATCHDOG_S = float(os.environ.get("PHOTOSEARCH_LLM_WATCHDOG_S", "30"))
+
+
+def _llm_trace(role, model, elapsed, completion_tokens=None, prompt_tokens=None):
+    """Emit a per-call timing line. Always fires for slow calls (>=
+    _LLM_SLOW_WARN_S); fires for every call when PHOTOSEARCH_LLM_TRACE is set.
+    The computed t/s is the headline signal — a healthy decode is tens of t/s;
+    the stall drops it below ~1 t/s."""
+    slow = elapsed >= _LLM_SLOW_WARN_S
+    if not (_LLM_TRACE or slow):
+        return
+    parts = [f"role={role or '?'}", f"model={model}", f"elapsed={elapsed:.1f}s"]
+    if completion_tokens:
+        parts.append(f"out_tok={completion_tokens}")
+        if elapsed > 0:
+            parts.append(f"t/s={completion_tokens / elapsed:.2f}")
+    if prompt_tokens:
+        parts.append(f"in_tok={prompt_tokens}")
+    tag = "⚠ SLOW-LLM" if slow else "llm-trace"
+    print(f"\n  [{tag} {time.strftime('%H:%M:%S')}] " + " ".join(parts), flush=True)
+
+
 # Substrings that signal the llama runner was OOM-killed rather than a genuine
 # transient network error. Surfaces in Ollama errors as:
 #   "llama runner process has terminated: %!w(<nil>) (status code: 500)"
@@ -399,12 +430,21 @@ def _openai_chat_with_retry(
     timeout: Optional[float] = None,
     temperature: float = 0.0,
     max_tokens: int = 768,
+    role: Optional[str] = None,
 ) -> Optional[str]:
     """Call an OpenAI-compatible /chat/completions endpoint (LM Studio,
     llama-server, ...). Same return contract as _ollama_chat_with_retry: text on
     success, None on empty, raises on persistent timeout/connection error so the
     caller's defer-on-error path still works.
+
+    `timeout` is a true WALL-CLOCK cap per attempt: the request runs in a daemon
+    thread and is abandoned via queue.get(timeout=) if it overruns, mirroring the
+    Ollama route. urllib's own timeout is only a socket-*idle* timeout — a server
+    that trickles tokens (a frozen llama.cpp slot at <1 t/s) never trips it and
+    would otherwise run unbounded (a 966s LM Studio call was observed).
     """
+    import queue as _queue
+    import threading as _threading
     import urllib.request
     if timeout is None:
         timeout = _DEFAULT_OLLAMA_TIMEOUT_S
@@ -417,24 +457,60 @@ def _openai_chat_with_retry(
         "stream": False,
     }).encode("utf-8")
     for attempt in range(1, retries + 1):
+        t0 = time.time()
+        wd_stop = _threading.Event()
+        result_q: _queue.Queue = _queue.Queue(maxsize=1)
+
+        def _watchdog(start=t0, att=attempt):
+            while not wd_stop.wait(_LLM_WATCHDOG_S):
+                print(
+                    f"\n  ⏳ [{time.strftime('%H:%M:%S')}] LLM {role or 'call'} "
+                    f"still waiting {time.time() - start:.0f}s "
+                    f"(model={model}, attempt {att}/{retries})",
+                    flush=True,
+                )
+
+        def _do_request():
+            try:
+                req = urllib.request.Request(
+                    url, data=payload, headers={"Content-Type": "application/json"})
+                # urllib's timeout is socket-idle only; kept as a backstop so an
+                # abandoned thread eventually dies.
+                resp = urllib.request.urlopen(req, timeout=timeout)
+                result_q.put(("ok", json.loads(resp.read())))
+            except Exception as ex:
+                result_q.put(("err", ex))
+
+        _threading.Thread(target=_watchdog, daemon=True).start()
+        _threading.Thread(target=_do_request, daemon=True).start()
         try:
-            req = urllib.request.Request(
-                url, data=payload, headers={"Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            data = json.loads(resp.read())
+            kind, val = result_q.get(timeout=timeout)  # hard wall-clock cap
+        except _queue.Empty:
+            kind, val = "err", TimeoutError(
+                f"openai chat exceeded {timeout}s wall-clock on attempt {attempt}/{retries}")
+        finally:
+            wd_stop.set()
+
+        if kind == "ok":
+            data = val
+            usage = data.get("usage") or {}
+            _llm_trace(role, model, time.time() - t0,
+                       usage.get("completion_tokens"), usage.get("prompt_tokens"))
             text = (data["choices"][0]["message"]["content"] or "").strip()
             return text if text else None
-        except Exception as e:
-            es = str(e).lower()
-            transient = any(k in es for k in [
-                "timeout", "timed out", "connection", "refused", "reset",
-                "broken pipe", "502", "503", "500", "unavailable",
-            ])
-            if transient and attempt < retries:
-                print(f" [retry {attempt}/{retries} in {_RETRY_DELAY}s: {e}]", end="", flush=True)
-                time.sleep(_RETRY_DELAY)
-            else:
-                raise
+
+        e = val
+        es = str(e).lower()
+        transient = any(k in es for k in [
+            "timeout", "timed out", "exceeded", "connection", "refused", "reset",
+            "broken pipe", "502", "503", "500", "unavailable",
+        ])
+        if transient and attempt < retries:
+            print(f" [retry {attempt}/{retries} after {time.time() - t0:.0f}s, "
+                  f"in {_RETRY_DELAY}s: {e}]", end="", flush=True)
+            time.sleep(_RETRY_DELAY)
+        else:
+            raise e
     return None
 
 
@@ -501,7 +577,7 @@ def _openai_route(base, model, messages, retries, timeout, options, role=None):
     temp = (options or {}).get("temperature", 0.0)
     return _openai_chat_with_retry(
         base, _resolve_openai_model(model, role), conv,
-        retries=retries, timeout=timeout, temperature=temp)
+        retries=retries, timeout=timeout, temperature=temp, role=role)
 
 
 def _text_chat_with_retry(model, messages, options=None, timeout=None):
