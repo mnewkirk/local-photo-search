@@ -421,3 +421,79 @@ def test_apply_skips_stage_when_timestamps_are_equal(client, db, monkeypatch):
     body = _payload_for(db, last_run_at=same, stacking=[])
     r = client.post("/api/admin/maintenance-apply", json=body)
     assert r.json()["applied"]["stacking"]["status"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# push_to_nas orchestration (NAS calls mocked)
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text or 'event: message\ndata: {"type": "done"}\n\n'
+
+    def json(self):
+        return self._payload
+
+
+def test_push_sends_transfer_before_trigger(db, monkeypatch):
+    from photosearch import maintenance_sync
+
+    calls = []
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        calls.append(url)
+        if url.endswith("/maintenance-apply"):
+            return _FakeResponse(200, {"applied": {"stacking": {"status": "applied"}}})
+        return _FakeResponse(200, {})
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+    db.record_maintenance_run(
+        stage="normalize_aesthetics", last_run_at="2026-07-17T09:00:01+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+
+    result = maintenance_sync.push_to_nas(db, "http://nas:8000", [
+        {"stage": "stacking", "status": "done"},
+        {"stage": "normalize_aesthetics", "status": "done"},
+    ])
+
+    assert result["ok"] is True
+    assert calls[0].endswith("/maintenance-apply"), "transfer must go first"
+    assert calls[1].endswith("/maintenance-sweep"), "triggers go second"
+    assert result["stages"]["stacking"]["status"] == "applied"
+    assert result["stages"]["normalize_aesthetics"]["status"] == "triggered"
+
+
+def test_push_reports_fingerprint_mismatch(db, monkeypatch):
+    from photosearch import maintenance_sync
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        return _FakeResponse(409, {"detail": {"error": "fingerprint_mismatch"}})
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+
+    result = maintenance_sync.push_to_nas(db, "http://nas:8000",
+                                          [{"stage": "stacking", "status": "done"}])
+    assert result["ok"] is False
+    assert result["error"] == "fingerprint_mismatch"
+
+
+def test_push_with_nothing_eligible_is_a_noop(db, monkeypatch):
+    from photosearch import maintenance_sync
+
+    def boom(*a, **kw):
+        raise AssertionError("must not call the NAS with nothing to push")
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", boom)
+    result = maintenance_sync.push_to_nas(db, "http://nas:8000",
+                                          [{"stage": "geocode", "status": "skipped"}])
+    assert result["ok"] is True
+    assert result["stages"] == {}

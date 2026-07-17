@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 # Cheap + deterministic: the NAS redoes these itself in ~a second.
@@ -146,3 +148,82 @@ def collect_payload(db, stage_results: list) -> dict:
     if "stacking" in stages:
         payload["stacking"] = collect_stacking_rows(db)
     return payload
+
+
+def fetch_nas_fingerprint(nas_url: str, timeout: int = 10) -> dict:
+    """GET the NAS's fingerprint. Raises on any failure.
+
+    Lives here (rather than inline in web.py) so both the pre-flight gate and
+    the drift panel share one implementation, and so tests can patch a single
+    seam.
+
+    Note on restarts: web.py's shutdown middleware only 503s /api/worker/* and
+    /api/photos/*/full — NOT /api/admin/*. So a NAS mid-restart surfaces here as
+    a connection error, not a 503 with Retry-After. That's why there's no
+    retry/backoff in this module: the caller treats it as 'unreachable' and the
+    user retries. Do not add a second backoff for a case that can't arise.
+    """
+    r = requests.get(f"{nas_url.rstrip('/')}/api/admin/maintenance-fingerprint",
+                     timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def push_to_nas(db, nas_url: str, stage_results: list, *,
+                timeout: int = 900) -> dict:
+    """Reconcile a completed local sweep to the NAS. Returns per-stage results.
+
+    Transfer first (fast + bounded), triggers second (geocode can be slow on the
+    N100). The two modes are separate calls, so they can partially succeed
+    relative to each other — hence per-stage results rather than one boolean.
+    """
+    nas_url = (nas_url or "").rstrip("/")
+    payload = collect_payload(db, stage_results)
+    stages = payload["stages"]
+    if not stages:
+        return {"ok": True, "stages": {}}
+
+    out: dict = {}
+
+    # --- transfer ---------------------------------------------------------
+    transfer = {n: i for n, i in stages.items() if i["mode"] == "transfer"}
+    if transfer:
+        body = {"fingerprint": payload["fingerprint"],
+                "stages": transfer,
+                "stacking": payload["stacking"]}
+        try:
+            r = requests.post(f"{nas_url}/api/admin/maintenance-apply",
+                              json=body, timeout=timeout)
+        except Exception as e:
+            logger.warning("maintenance push (transfer) failed: %s", e)
+            return {"ok": False, "error": "unreachable", "stages": out}
+        if r.status_code == 409:
+            return {"ok": False, "error": "fingerprint_mismatch", "stages": out}
+        if r.status_code != 200:
+            return {"ok": False, "error": f"http_{r.status_code}", "stages": out}
+        out.update(r.json().get("applied") or {})
+
+    # --- trigger ----------------------------------------------------------
+    trigger = sorted(n for n, i in stages.items() if i["mode"] == "trigger")
+    if trigger:
+        try:
+            # The NAS sweep endpoint is SSE; requests reads the finite stream to
+            # completion and hands back the whole body.
+            r = requests.post(f"{nas_url}/api/admin/maintenance-sweep",
+                              json={"apply": True, "stages": trigger},
+                              timeout=timeout)
+        except Exception as e:
+            logger.warning("maintenance push (trigger) failed: %s", e)
+            for name in trigger:
+                out[name] = {"status": "failed", "reason": "unreachable"}
+            return {"ok": False, "error": "unreachable", "stages": out}
+        if r.status_code != 200 or '"type": "fatal"' in (r.text or ""):
+            for name in trigger:
+                out[name] = {"status": "failed", "reason": f"http_{r.status_code}"}
+            return {"ok": False, "error": f"http_{r.status_code}", "stages": out}
+        for name in trigger:
+            out[name] = {"status": "triggered"}
+
+    ok = all(v.get("status") in ("applied", "triggered", "skipped")
+             for v in out.values())
+    return {"ok": ok, "stages": out}
