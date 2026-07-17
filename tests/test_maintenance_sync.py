@@ -115,3 +115,77 @@ def test_unknown_stage_subset_is_rejected(db):
 
     with pytest.raises(ValueError, match="unknown maintenance stage"):
         run_maintenance_sweep(db, apply=True, stages=["bogus_stage"])
+
+
+# ---------------------------------------------------------------------------
+# Payload collection
+# ---------------------------------------------------------------------------
+
+from photosearch.maintenance_sync import (  # noqa: E402
+    collect_payload,
+    collect_stacking_rows,
+    eligible_stages,
+)
+
+
+def test_eligible_stages_only_includes_done_and_pushable():
+    results = [
+        {"stage": "normalize_aesthetics", "status": "done"},
+        {"stage": "geocode", "status": "skipped"},
+        {"stage": "stacking", "status": "done"},
+        {"stage": "colors", "status": "done"},      # excluded mode
+        {"stage": "infer", "status": "preview"},
+    ]
+    assert eligible_stages(results) == ["normalize_aesthetics", "stacking"]
+
+
+def test_cancelled_stage_is_not_eligible():
+    """A half-finished stacking run must never ship."""
+    results = [{"stage": "stacking", "status": "cancelled"}]
+    assert eligible_stages(results) == []
+
+
+def _make_stack(db, photo_ids, top_index=0):
+    cur = db.conn.execute("INSERT INTO photo_stacks DEFAULT VALUES")
+    stack_id = cur.lastrowid
+    for i, pid in enumerate(photo_ids):
+        db.conn.execute(
+            "INSERT INTO stack_members (stack_id, photo_id, is_top) VALUES (?, ?, ?)",
+            (stack_id, pid, 1 if i == top_index else 0),
+        )
+    db.conn.commit()
+    return stack_id
+
+
+def test_collect_stacking_rows_groups_members_by_stack(db):
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 3")]
+    _make_stack(db, pids[:2], top_index=1)
+
+    rows = collect_stacking_rows(db)
+    assert len(rows) == 1
+    members = rows[0]["members"]
+    assert {m["photo_id"] for m in members} == set(pids[:2])
+    assert sum(m["is_top"] for m in members) == 1
+
+
+def test_collect_payload_includes_stacking_only_when_stacking_ran(db):
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+    db.record_maintenance_run(
+        stage="normalize_aesthetics", last_run_at="2026-07-17T09:00:01+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+
+    with_stacking = collect_payload(db, [
+        {"stage": "stacking", "status": "done"},
+        {"stage": "normalize_aesthetics", "status": "done"},
+    ])
+    assert with_stacking["stacking"] is not None
+    assert with_stacking["stages"]["stacking"]["mode"] == "transfer"
+    assert with_stacking["stages"]["normalize_aesthetics"]["mode"] == "trigger"
+    assert with_stacking["fingerprint"] == photo_fingerprint(db)
+
+    without = collect_payload(db, [{"stage": "normalize_aesthetics", "status": "done"}])
+    assert without["stacking"] is None
+    assert "stacking" not in without["stages"]

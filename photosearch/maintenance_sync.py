@@ -86,3 +86,63 @@ def fingerprints_match(a: dict, b: dict) -> bool:
     """True when two fingerprints describe the same photo index."""
     return (a.get("photo_count") == b.get("photo_count")
             and a.get("photo_max_id") == b.get("photo_max_id"))
+
+
+def eligible_stages(stage_results: list) -> list:
+    """Stage names from a sweep result that may be pushed to the NAS.
+
+    Only 'done' stages qualify: 'skipped' changed nothing, 'preview' was a
+    dry-run, and 'cancelled' left partial state that must never ship. Excluded
+    stages are dropped defensively — they should have been rejected before the
+    sweep ever ran them.
+    """
+    out = []
+    for result in stage_results:
+        name = result.get("stage")
+        if result.get("status") != "done":
+            continue
+        if not name or push_mode(name) == "excluded":
+            continue
+        out.append(name)
+    return out
+
+
+def collect_stacking_rows(db) -> list:
+    """Every stack as {"members": [{"photo_id", "is_top"}, ...]}.
+
+    Stack ids are deliberately NOT carried: they're local autoincrement values
+    and the NAS re-mints its own on apply. Photo ids ARE stable (AUTOINCREMENT,
+    and the replica is a dump of the NAS), so they're safe join keys.
+    """
+    grouped: dict = {}
+    for row in db.conn.execute(
+        "SELECT stack_id, photo_id, is_top FROM stack_members "
+        "ORDER BY stack_id, photo_id"
+    ):
+        grouped.setdefault(row["stack_id"], []).append(
+            {"photo_id": row["photo_id"], "is_top": row["is_top"]}
+        )
+    return [{"members": members} for members in grouped.values()]
+
+
+def collect_payload(db, stage_results: list) -> dict:
+    """Build the maintenance-apply request body from a sweep's stages list."""
+    names = eligible_stages(stage_results)
+    runs = db.get_maintenance_runs()
+    stages = {}
+    for name in names:
+        run = runs.get(name)
+        if not run:
+            # Not stamped -> the sweep didn't consider it applied. Skip.
+            logger.warning("stage %s eligible but unstamped; skipping push", name)
+            continue
+        stages[name] = {"mode": push_mode(name), "last_run_at": run["last_run_at"]}
+
+    payload = {
+        "fingerprint": photo_fingerprint(db),
+        "stages": stages,
+        "stacking": None,
+    }
+    if "stacking" in stages:
+        payload["stacking"] = collect_stacking_rows(db)
+    return payload
