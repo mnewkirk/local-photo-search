@@ -537,7 +537,20 @@ def admin_maintenance_apply(payload: dict):
                     continue
 
                 if name == "stacking":
-                    rows = payload.get("stacking") or []
+                    rows = payload.get("stacking")
+                    if rows is None:
+                        # Distinguish "replica found zero stacks" ([] - a
+                        # legitimate full-replace-with-nothing) from "no
+                        # stacking payload was sent at all" (missing/None -
+                        # a client bug that would otherwise silently wipe
+                        # every stack on the NAS).
+                        raise HTTPException(status_code=400, detail={
+                            "error": "stacking_payload_missing",
+                            "message": "stages included 'stacking' but no "
+                                       "stacking payload was sent; refusing "
+                                       "to wipe the NAS's stacks. Send [] to "
+                                       "mean 'zero stacks computed'.",
+                        })
                     # Full replace: stacking is a full re-detect, so replace is
                     # its natural semantics. stack_members cascades on delete.
                     db.conn.execute("DELETE FROM photo_stacks")
@@ -560,7 +573,7 @@ def admin_maintenance_apply(payload: dict):
                     last_run_at=incoming,
                     photo_count=local_fp["photo_count"],
                     photo_max_id=local_fp["photo_max_id"],
-                    applied=applied[name].get("stacks"),
+                    applied=applied.get(name, {}).get("stacks"),
                     source="replica",
                     commit=False,
                 )

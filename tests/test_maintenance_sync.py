@@ -248,12 +248,122 @@ def _payload_for(db, *, last_run_at, stacking=None):
 
 def test_apply_rejects_fingerprint_mismatch(client, db, monkeypatch):
     monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
-    body = _payload_for(db, last_run_at="2026-07-17T09:00:00+00:00")
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 2")]
+    stack_id = _make_stack(db, pids[:2])
+
+    body = _payload_for(
+        db, last_run_at="2026-07-17T09:00:00+00:00",
+        stacking=[{"members": [{"photo_id": pids[0], "is_top": 1}]}],
+    )
     body["fingerprint"]["photo_count"] += 1
 
     r = client.post("/api/admin/maintenance-apply", json=body)
     assert r.status_code == 409
     assert r.json()["detail"]["error"] == "fingerprint_mismatch"
+
+    # Nothing was written: the seeded stack is unchanged.
+    rows = db.conn.execute(
+        "SELECT photo_id FROM stack_members WHERE stack_id = ?",
+        (stack_id,)).fetchall()
+    assert {r["photo_id"] for r in rows} == set(pids[:2])
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photo_stacks").fetchone()["n"] == 1
+
+
+def test_apply_rejects_missing_stacking_payload(client, db, monkeypatch):
+    """A missing 'stacking' key must NOT be treated as 'zero stacks'.
+
+    [] means "the replica ran stacking and found nothing" (a legitimate
+    full-replace-to-empty). A missing/None key means no stacking payload
+    was sent at all, and must be rejected rather than silently wiping
+    every stack on the NAS.
+    """
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 2")]
+    stack_id = _make_stack(db, pids[:2])
+
+    fp = photo_fingerprint(db)
+    body = {
+        "fingerprint": fp,
+        "stages": {"stacking": {"mode": "transfer",
+                                 "last_run_at": "2026-07-17T09:00:00+00:00"}},
+        # Deliberately no "stacking" key at all.
+    }
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "stacking_payload_missing"
+
+    # The pre-existing stack must still be present and unchanged.
+    rows = db.conn.execute(
+        "SELECT photo_id FROM stack_members WHERE stack_id = ?",
+        (stack_id,)).fetchall()
+    assert {r["photo_id"] for r in rows} == set(pids[:2])
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photo_stacks").fetchone()["n"] == 1
+
+
+def test_apply_rolls_back_on_foreign_key_violation(client, db, monkeypatch):
+    """One transaction: a failure must leave prior state intact.
+
+    A stacking row referencing a photo_id that doesn't exist violates the
+    stack_members -> photos foreign key. The whole apply must roll back,
+    not leave a half-replaced stack table.
+
+    Uses a raise_server_exceptions=False TestClient (rather than the shared
+    `client` fixture) so the unhandled sqlite3.IntegrityError surfaces as
+    the 500 response a real deployment would return, instead of propagating
+    out of the test itself.
+    """
+    from fastapi.testclient import TestClient
+    from photosearch import web
+
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 2")]
+    stack_id = _make_stack(db, pids[:2])
+    bogus_photo_id = db.conn.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1000000 AS m FROM photos").fetchone()["m"]
+
+    body = _payload_for(
+        db, last_run_at="2026-07-17T09:00:00+00:00",
+        stacking=[{"members": [{"photo_id": bogus_photo_id, "is_top": 1}]}],
+    )
+    with TestClient(web.app, raise_server_exceptions=False) as lenient_client:
+        r = lenient_client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code >= 400 and r.status_code < 600 and r.status_code != 200
+
+    # The original stack survived the rollback, unchanged.
+    rows = db.conn.execute(
+        "SELECT photo_id FROM stack_members WHERE stack_id = ?",
+        (stack_id,)).fetchall()
+    assert {r["photo_id"] for r in rows} == set(pids[:2])
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photo_stacks").fetchone()["n"] == 1
+    # No watermark was stamped for the failed apply.
+    runs = db.get_maintenance_runs()
+    assert "stacking" not in runs
+
+
+def test_apply_reports_not_transfer_mode_for_trigger_stage(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    fp = photo_fingerprint(db)
+    body = {
+        "fingerprint": fp,
+        "stages": {
+            "normalize_aesthetics": {
+                "mode": "trigger",
+                "last_run_at": "2026-07-17T09:00:00+00:00",
+            },
+        },
+    }
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 200
+    assert r.json()["applied"]["normalize_aesthetics"] == {
+        "status": "skipped",
+        "reason": "not_transfer_mode",
+    }
 
 
 def test_apply_replaces_stacks_and_stamps_watermark(client, db, monkeypatch):
