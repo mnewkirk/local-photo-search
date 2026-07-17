@@ -460,6 +460,13 @@
     }
     .stack-result.ok { color: var(--green); }
     .stack-result.err { color: #f87171; }
+    /* NAS-vs-replica maintenance drift panel (PS.MaintenanceSyncPanel) */
+    .ms-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .ms-table th, .ms-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+    .ms-warn { color: #f87171; font-weight: 600; }
+    .ms-ok { color: var(--green); }
+    .ms-info { color: var(--yellow); }
+    .ms-none { color: var(--text-muted); }
     .stack-progress {
       margin-top: 12px;
       padding: 10px 12px;
@@ -1200,7 +1207,19 @@
       var _r = useState(null);  var result = _r[0]; var setResult = _r[1];
       var _v = useState(null);  var report = _v[0]; var setReport = _v[1];
       var _vb = useState(false); var vBusy = _vb[0]; var setVBusy = _vb[1];
+      var _rm = useState(false); var replicaMode = _rm[0]; var setReplicaMode = _rm[1];
       var abortRef = useRef(null);
+
+      // Colors/match-faces need the photo originals, which the replica
+      // doesn't have — the server already 400s on them in replica mode
+      // (Task 8), so grey the checkboxes out here rather than let the user
+      // hit an avoidable error.
+      useEffect(function() {
+        fetch('/api/admin/maintenance-fingerprint')
+          .then(function(r) { return r.json(); })
+          .then(function(d) { setReplicaMode(!!d.replica_mode); })
+          .catch(function() {});
+      }, []);
 
       function setStage(stage, patch) {
         setStages(function(prev) {
@@ -1382,21 +1401,24 @@
             + '(colors/stacking/match) peg the N100 and starve the server — '
             + 'leave them off here and run the full sweep off-hours via cron. '
             + 'Dry-run unless Apply is checked.'),
+          e(PS.MaintenanceSyncPanel, { compact: false }),
           e('div', { className: 'stack-toggles' },
             e('label', null,
               e('input', { type: 'checkbox', checked: doApply, disabled: busy,
                 onChange: function(ev) { setApply(ev.target.checked); } }),
               'Apply (write changes)'),
-            e('label', null,
-              e('input', { type: 'checkbox', checked: doColors, disabled: busy,
+            e('label', { title: replicaMode ? 'Needs the photo originals — run on the NAS, not the replica.' : '' },
+              e('input', { type: 'checkbox', checked: doColors,
+                disabled: busy || replicaMode,
                 onChange: function(ev) { setColors(ev.target.checked); } }),
               'Colors (heavy)'),
             e('label', null,
               e('input', { type: 'checkbox', checked: doStacking, disabled: busy,
                 onChange: function(ev) { setStacking(ev.target.checked); } }),
               'Stacking (heavy)'),
-            e('label', null,
-              e('input', { type: 'checkbox', checked: doMatch, disabled: busy,
+            e('label', { title: replicaMode ? 'Already served by export-face-state / apply-face-state — run on the NAS.' : '' },
+              e('input', { type: 'checkbox', checked: doMatch,
+                disabled: busy || replicaMode,
                 onChange: function(ev) { setMatch(ev.target.checked); } }),
               'Match faces (heavy)'),
             e('label', null,

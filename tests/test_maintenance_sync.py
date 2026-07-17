@@ -241,6 +241,59 @@ def test_fingerprint_endpoint_reports_index_and_stages(client, db, monkeypatch):
     assert body["replica_mode"] is False
 
 
+def test_nas_fingerprint_proxy_returns_error_body_outside_replica_mode(client, monkeypatch):
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    r = client.get("/api/admin/maintenance-nas-fingerprint")
+    assert r.status_code == 200
+    assert r.json() == {"error": "not in replica mode", "stages": {}}
+
+
+def test_nas_fingerprint_proxy_forwards_the_nas_response(client, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+    nas_body = {
+        "photo_count": 10, "photo_max_id": 99,
+        "stages": {"stacking": {"last_run_at": "2026-07-17T09:00:00+00:00",
+                                 "source": "nas", "applied": 3}},
+        "replica_mode": False,
+    }
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return nas_body
+
+    def fake_get(url, timeout=None):
+        assert url == "http://nas:8000/api/admin/maintenance-fingerprint"
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    r = client.get("/api/admin/maintenance-nas-fingerprint")
+    assert r.status_code == 200
+    assert r.json() == nas_body
+
+
+def test_nas_fingerprint_proxy_returns_error_body_when_nas_unreachable(client, monkeypatch):
+    # Mirrors the admin_workers_queue_status proxy: a degraded NAS comes back
+    # as a normal 200 with an `error` field, not an HTTP error status, so the
+    # frontend's plain fetch().then(r => r.json()) chain doesn't need to
+    # special-case a non-2xx response.
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://unreachable:8000")
+
+    def boom(url, timeout=None):
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", boom)
+
+    r = client.get("/api/admin/maintenance-nas-fingerprint")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stages"] == {}
+    assert "connection refused" in body["error"]
+
+
 def _payload_for(db, *, last_run_at, stacking=None):
     fp = photo_fingerprint(db)
     stages = {"stacking": {"mode": "transfer", "last_run_at": last_run_at}}

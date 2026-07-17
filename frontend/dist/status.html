@@ -460,6 +460,13 @@
     }
     .stack-result.ok { color: var(--green); }
     .stack-result.err { color: #f87171; }
+    /* NAS-vs-replica maintenance drift panel (PS.MaintenanceSyncPanel) */
+    .ms-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .ms-table th, .ms-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+    .ms-warn { color: #f87171; font-weight: 600; }
+    .ms-ok { color: var(--green); }
+    .ms-info { color: var(--yellow); }
+    .ms-none { color: var(--text-muted); }
     .stack-progress {
       margin-top: 12px;
       padding: 10px 12px;
@@ -1129,6 +1136,7 @@
             'source: ', e('span', { className: 'sha' }, status.nas_url || '—'),
             ' · db: ', e('span', { className: 'sha' }, status.db_path || '—')
           ),
+          e(PS.MaintenanceSyncPanel, { compact: true }),
           e('div', { className: 'deploy-actions' },
             e('button', {
               className: 'btn btn-primary',

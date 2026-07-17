@@ -540,6 +540,28 @@ def admin_maintenance_fingerprint():
     }
 
 
+@router.get("/maintenance-nas-fingerprint")
+def admin_maintenance_nas_fingerprint():
+    """Proxy the NAS's own /maintenance-fingerprint for the drift panel (Task 10).
+
+    The browser can't reach the NAS directly (CORS / tailnet), so this host
+    fetches on its behalf — mirrors admin_workers_queue_status's proxy shape.
+    Like that endpoint, a failure comes back as a normal 200 with an `error`
+    field rather than a non-2xx status, so the frontend's `fetch(...).then(r
+    => r.json())` chain doesn't need special-casing for HTTP error responses.
+    """
+    nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if not nas:
+        return {"error": "not in replica mode", "stages": {}}
+    import requests
+    try:
+        r = requests.get(f"{nas}/api/admin/maintenance-fingerprint", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        return {"error": f"could not reach NAS: {exc}", "stages": {}}
+
+
 @router.post("/maintenance-apply")
 def admin_maintenance_apply(payload: dict):
     """Receive replica-computed maintenance results (the transfer path).

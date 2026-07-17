@@ -2145,4 +2145,97 @@
     return sorted;
   };
 
+  // =========================================================================
+  // Maintenance NAS-vs-replica drift panel (M26b follow-up)
+  // =========================================================================
+
+  // Per-stage NAS-vs-replica drift. "Replica ahead — unpushed" is the state
+  // that matters: it means locally-computed maintenance work will be
+  // destroyed by the next replica sync unless it's pushed first. Renders
+  // null outside replica mode (i.e. on the NAS itself, or a non-replica
+  // single-machine deployment) — there's no drift to show.
+  PS.MaintenanceSyncPanel = function MaintenanceSyncPanel(props) {
+    var compact = props && props.compact;
+    var st = useState(null), data = st[0], setData = st[1];
+    var ps = useState(null), push = ps[0], setPush = ps[1];
+
+    var load = useCallback(function () {
+      fetch('/api/admin/maintenance-fingerprint')
+        .then(function (r) { return r.json(); })
+        .then(function (l) {
+          if (!l.replica_mode) { setData({ replica_mode: false }); return; }
+          fetch('/api/admin/maintenance-nas-fingerprint')
+            .then(function (r) { return r.json(); })
+            .then(function (n) { setData({ replica_mode: true, local: l, nas: n }); })
+            .catch(function () { setData({ replica_mode: true, local: l, nas: null }); });
+        })
+        .catch(function () {});  // endpoint absent (old build) → panel stays hidden
+      fetch('/api/admin/maintenance-push-status')
+        .then(function (r) { return r.json(); }).then(setPush).catch(function () {});
+    }, []);
+
+    useEffect(function () { load(); }, [load]);
+
+    if (!data || !data.replica_mode) return null;
+    var local = data.local, nas = data.nas;
+    // The proxy (admin_maintenance_nas_fingerprint) returns a normal 200 with
+    // an `error` field on failure rather than a non-2xx status — same
+    // convention as /api/admin/workers/queue-status — so `nas` is always a
+    // JSON object here; check for `.stages` rather than fetch rejection.
+    if (!nas || nas.error || !nas.stages) {
+      var unreachableMsg = 'NAS unreachable — drift unknown.'
+        + (nas && nas.error ? ' (' + nas.error + ')' : '');
+      return e('div', { className: 'deploy-meta' }, unreachableMsg);
+    }
+
+    var drift = local.photo_count !== nas.photo_count || local.photo_max_id !== nas.photo_max_id;
+    var names = Object.keys(local.stages).concat(Object.keys(nas.stages))
+      .filter(function (v, i, a) { return a.indexOf(v) === i; }).sort();
+
+    var rows = names.map(function (name) {
+      var l = local.stages[name], n = nas.stages[name];
+      var state, cls;
+      if (!l && !n) { state = 'Never run'; cls = 'ms-none'; }
+      else if (l && (!n || l.last_run_at > n.last_run_at)) {
+        state = 'Replica ahead — unpushed'; cls = 'ms-warn';
+      } else if (n && (!l || n.last_run_at > l.last_run_at)) {
+        state = 'NAS ahead'; cls = 'ms-info';
+      } else { state = 'In sync'; cls = 'ms-ok'; }
+      return e('tr', { key: name, className: cls },
+        e('td', null, name),
+        e('td', null, n ? n.last_run_at : '—'),
+        e('td', null, l ? l.last_run_at : '—'),
+        e('td', null, state));
+    });
+
+    var unpushed = names.filter(function (name) {
+      var l = local.stages[name], n = nas.stages[name];
+      return l && (!n || l.last_run_at > n.last_run_at);
+    });
+
+    if (compact) {
+      return e('div', { className: 'deploy-meta' },
+        drift ? e('span', { className: 'ms-warn' }, 'Photo index drift — sync needed. ') : null,
+        unpushed.length
+          ? e('a', { href: '/admin_maintenance' },
+              unpushed.length + ' stage(s) unpushed — will be lost on next sync →')
+          : e('span', { className: 'ms-ok' }, 'Maintenance in sync'));
+    }
+
+    return e('div', { className: 'deploy-wrap' },
+      e('h3', null, 'Maintenance: NAS vs replica'),
+      drift ? e('div', { className: 'ms-warn' },
+        'Photo index drift: NAS ' + nas.photo_count + ' photos / max id '
+        + nas.photo_max_id + ', replica ' + local.photo_count + ' / '
+        + local.photo_max_id + '. A push will auto-sync first.') : null,
+      push && push.state === 'failed'
+        ? e('div', { className: 'ms-warn' }, 'Last push failed: ' + (push.error || 'unknown'))
+        : null,
+      e('table', { className: 'ms-table' },
+        e('thead', null, e('tr', null,
+          e('th', null, 'Stage'), e('th', null, 'NAS'),
+          e('th', null, 'Replica'), e('th', null, 'State'))),
+        e('tbody', null, rows)));
+  };
+
 })();
