@@ -493,6 +493,85 @@ def admin_maintenance_fingerprint():
     }
 
 
+@router.post("/maintenance-apply")
+def admin_maintenance_apply(payload: dict):
+    """Receive replica-computed maintenance results (the transfer path).
+
+    Only 'transfer' stages arrive here; 'trigger' stages are a separate call to
+    this host's own maintenance-sweep. Applies in ONE transaction so a failure
+    can't leave half-replaced stacks.
+    """
+    from .db import PhotoDB
+    from .maintenance_sync import fingerprints_match, photo_fingerprint, push_mode
+
+    db_path = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
+    remote_fp = payload.get("fingerprint") or {}
+    stages = payload.get("stages") or {}
+    applied = {}
+
+    with PhotoDB(db_path) as db:
+        local_fp = photo_fingerprint(db)
+        if not fingerprints_match(local_fp, remote_fp):
+            # The photo index moved under the replica (e.g. the nightly ingest
+            # landed mid-run). Its results describe a different library, so
+            # reject the WHOLE request rather than applying part of it.
+            raise HTTPException(status_code=409, detail={
+                "error": "fingerprint_mismatch",
+                "local": local_fp,
+                "remote": remote_fp,
+            })
+
+        runs = db.get_maintenance_runs()
+        try:
+            db.conn.execute("BEGIN IMMEDIATE")
+            for name, info in stages.items():
+                if push_mode(name) != "transfer":
+                    applied[name] = {"status": "skipped", "reason": "not_transfer_mode"}
+                    continue
+
+                incoming = info.get("last_run_at") or ""
+                existing = (runs.get(name) or {}).get("last_run_at") or ""
+                if existing and incoming <= existing:
+                    # ISO8601 UTC strings sort lexicographically == chronologically.
+                    applied[name] = {"status": "skipped", "reason": "nas_fresher"}
+                    continue
+
+                if name == "stacking":
+                    rows = payload.get("stacking") or []
+                    # Full replace: stacking is a full re-detect, so replace is
+                    # its natural semantics. stack_members cascades on delete.
+                    db.conn.execute("DELETE FROM photo_stacks")
+                    for stack in rows:
+                        cur = db.conn.execute("INSERT INTO photo_stacks DEFAULT VALUES")
+                        stack_id = cur.lastrowid
+                        for member in stack.get("members") or []:
+                            db.conn.execute(
+                                "INSERT INTO stack_members (stack_id, photo_id, is_top) "
+                                "VALUES (?, ?, ?)",
+                                (stack_id, member["photo_id"], int(member.get("is_top", 0))),
+                            )
+                    applied[name] = {"status": "applied", "stacks": len(rows)}
+
+                # commit=False: stamp inside the SAME transaction that replaced
+                # the stacks, so a rollback can't leave a watermark claiming
+                # work that didn't land.
+                db.record_maintenance_run(
+                    stage=name,
+                    last_run_at=incoming,
+                    photo_count=local_fp["photo_count"],
+                    photo_max_id=local_fp["photo_max_id"],
+                    applied=applied[name].get("stacks"),
+                    source="replica",
+                    commit=False,
+                )
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
+
+    return {"applied": applied}
+
+
 @router.post("/replica-sync")
 async def admin_replica_sync():
     """`bash sync-replica.sh` — SSE stream of a fresh replica pull (M26a).

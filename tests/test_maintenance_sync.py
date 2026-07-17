@@ -238,3 +238,76 @@ def test_fingerprint_endpoint_reports_index_and_stages(client, db, monkeypatch):
     assert body["stages"]["stacking"]["source"] == "replica"
     assert body["stages"]["stacking"]["last_run_at"] == "2026-07-17T09:00:00+00:00"
     assert body["replica_mode"] is False
+
+
+def _payload_for(db, *, last_run_at, stacking=None):
+    fp = photo_fingerprint(db)
+    stages = {"stacking": {"mode": "transfer", "last_run_at": last_run_at}}
+    return {"fingerprint": fp, "stages": stages, "stacking": stacking or []}
+
+
+def test_apply_rejects_fingerprint_mismatch(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    body = _payload_for(db, last_run_at="2026-07-17T09:00:00+00:00")
+    body["fingerprint"]["photo_count"] += 1
+
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "fingerprint_mismatch"
+
+
+def test_apply_replaces_stacks_and_stamps_watermark(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 3")]
+    # Pre-existing stack that must be REPLACED, not merged.
+    _make_stack(db, pids[:2])
+
+    body = _payload_for(
+        db, last_run_at="2026-07-17T09:00:00+00:00",
+        stacking=[{"members": [{"photo_id": pids[2], "is_top": 1}]}],
+    )
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 200
+    assert r.json()["applied"]["stacking"]["status"] == "applied"
+
+    rows = db.conn.execute(
+        "SELECT photo_id, is_top FROM stack_members").fetchall()
+    assert [r["photo_id"] for r in rows] == [pids[2]]
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photo_stacks").fetchone()["n"] == 1
+
+    runs = db.get_maintenance_runs()
+    assert runs["stacking"]["source"] == "replica"
+    assert runs["stacking"]["last_run_at"] == "2026-07-17T09:00:00+00:00"
+
+
+def test_apply_skips_stage_when_nas_is_fresher(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T12:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="nas")
+    pids = [r["id"] for r in db.conn.execute("SELECT id FROM photos LIMIT 1")]
+
+    body = _payload_for(
+        db, last_run_at="2026-07-17T09:00:00+00:00",  # older than the NAS
+        stacking=[{"members": [{"photo_id": pids[0], "is_top": 1}]}],
+    )
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 200
+    assert r.json()["applied"]["stacking"]["status"] == "skipped"
+    assert r.json()["applied"]["stacking"]["reason"] == "nas_fresher"
+    # Watermark untouched.
+    assert db.get_maintenance_runs()["stacking"]["source"] == "nas"
+
+
+def test_apply_skips_stage_when_timestamps_are_equal(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    same = "2026-07-17T09:00:00+00:00"
+    db.record_maintenance_run(
+        stage="stacking", last_run_at=same,
+        photo_count=1, photo_max_id=1, applied=1, source="nas")
+
+    body = _payload_for(db, last_run_at=same, stacking=[])
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.json()["applied"]["stacking"]["status"] == "skipped"
