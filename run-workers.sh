@@ -92,6 +92,7 @@ LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-}"
 # host) and docker everywhere else. Override with --native / --docker.
 MODE="auto"               # auto | native | docker
 OLLAMA_HOST_OVERRIDE=""   # --ollama-host: base URL where Ollama is reachable
+NO_OLLAMA=0               # --no-ollama: never auto-start/require an Ollama backend
 ACTION="start"            # start | status | logs | stop | scale
 SCALE_TARGET=""
 # Fleet instance name. Empty = the default fleet (back-compat). Set via --name to
@@ -166,6 +167,9 @@ Start workers:
       --name NAME         Fleet instance name. Lets multiple fleets run at once
                           (e.g. a CPU text fleet + a GPU vision fleet) without
                           colliding. Pass the same --name to --status/--logs/--stop.
+      --no-ollama         Never auto-start or require an Ollama backend, even
+                          for describe/verify/category-* passes. Implied when
+                          --text-llm-url (or PHOTOSEARCH_TEXT_LLM_URL) is set.
       --ollama-host URL   Base URL for Ollama (default: localhost, or the
                           Windows-host gateway in native WSL2 mode)
 
@@ -216,8 +220,12 @@ ollama_needed() {
     # is a vision pass; category-content/keywords are text-only but still hit
     # Ollama (small text model on the existing description).
     # When --text-llm-url is set, the LLM passes route to an OpenAI-compatible
-    # backend (LM Studio) instead, so Ollama is never needed.
+    # backend (LM Studio) instead, so Ollama is never needed. --no-ollama is the
+    # explicit opt-out for any other backend arrangement (e.g. a native Ollama
+    # you manage yourself) — it only suppresses the auto-start/bootstrap here,
+    # it does not change where describe.py sends its calls.
     [ -n "$TEXT_LLM_URL" ] && return 1
+    [ "$NO_OLLAMA" -eq 1 ] && return 1
     local IFS=','
     for p in $PASSES; do
         case "$p" in
@@ -819,6 +827,7 @@ while [[ $# -gt 0 ]]; do
         --docker)           MODE="docker";         shift ;;
         --name)             FLEET_NAME="$2";       shift 2 ;;
         --ollama-host)      OLLAMA_HOST_OVERRIDE="$2"; shift 2 ;;
+        --no-ollama)        NO_OLLAMA=1;              shift ;;
         --status)           ACTION="status";       shift ;;
         --logs)             ACTION="logs";         shift ;;
         --stop)             ACTION="stop";         shift ;;

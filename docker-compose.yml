@@ -3,16 +3,19 @@
 #
 # Services:
 #   photosearch — the main app: web UI + CLI for indexing/searching
-#   ollama      — LLaVA model server for generating scene descriptions
+#   ollama      — OPT-IN LLaVA model server (profile: ollama; see below)
 #
 # Quick start:
 #   1. Copy .env.example to .env and set PHOTO_DIR to your library path
 #   2. docker compose up -d
 #   3. Open http://localhost:8000
 #
-# To pull required Ollama models (first time):
-#   docker compose exec ollama ollama pull llava:13b
-#   docker compose exec ollama ollama pull minicpm-v
+# LLM passes (describe / category-* / keywords / verify / aesthetics) need a
+# model backend. Point OLLAMA_HOST at a native Ollama, or set
+# PHOTOSEARCH_TEXT_LLM_URL to an OpenAI-compatible endpoint (LM Studio) — see
+# CLAUDE.md. Only if you want the containerized Ollama, opt in explicitly:
+#   docker compose --profile ollama up -d
+#   docker compose --profile ollama exec ollama ollama pull llava:13b
 #
 # To index photos (first time or after adding new photos):
 #   docker compose run --rm photosearch index /photos --faces --describe
@@ -41,14 +44,19 @@ services:
       - INSIGHTFACE_HOME=/data/.insightface
       - PYTHONUNBUFFERED=1
       - PHOTOSEARCH_CACHE=/data/.cache/photosearch
-    depends_on:
-      ollama:
-        condition: service_started
     # Default: run the web UI
     # Override with: docker compose run --rm photosearch index /photos
     command: ["serve"]
 
   ollama:
+    # OPT-IN. Behind a compose profile, so a plain `docker compose up` does NOT
+    # start it — the LLM passes route to LM Studio (PHOTOSEARCH_TEXT_LLM_URL)
+    # or to a native Ollama on the host, and this container was left running
+    # idle either way. Start it explicitly when you want the containerized one:
+    #   docker compose --profile ollama up -d
+    # The photosearch service deliberately has no depends_on here: with the
+    # profile off, a hard dependency would fail the whole `up`.
+    profiles: ["ollama"]
     image: ollama/ollama:latest
     container_name: photosearch-ollama
     restart: unless-stopped
