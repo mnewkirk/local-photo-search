@@ -1088,6 +1088,43 @@ dedup on therefore both deletes duplicates *and* writes inferred GPS
 - **One photo / a few photos, recompute a model pass** → M28 "Re-run passes" in
   the image view, *not* the sweep.
 
+### Scheduling + replica-mode maintenance (2026-07-17)
+
+`maintenance-sweep` is intended to run nightly on the NAS from **root's
+crontab** at **01:00 UTC** (`CRON_TZ=UTC`, so it never drifts with DST). That
+is 18:00 America/Los_Angeles — chosen deliberately over the 03:00 Pacific
+ingest slot; accepted tradeoff is that it runs during California evening. Log:
+`/var/log/photo-maintenance.log`. `--recluster` / `--dedup-photos` stay OFF
+(recluster clears `ignored_clusters`; dedup DELETEs photos).
+
+**This cron entry is not yet installed** — it ships as an operator runbook
+step, not an automated change (installing it touches root's crontab and
+`/var/log` on the live NAS over SSH that UGOS auto-blocks on retry storms).
+`CRON_TZ` support on UGOS's cron is unverified; the runbook has the operator
+check it first, with a documented fallback (`0 18 * * *` host-local, which
+drifts to 02:00 UTC in Pacific winter) if it isn't supported. See the operator
+runbook at the bottom of `docs/superpowers/plans/2026-07-17-maintenance-sync.md`.
+
+**Replica mode is now gated.** A sweep writes to whatever `PHOTOSEARCH_DB`
+points at, and `sync-replica.sh` replaces the replica's DB wholesale — so a
+replica-side apply used to be silently destroyed on the next sync. Now:
+
+- `apply=true` on the replica with the NAS unreachable → **503, refuses to run**.
+- `colors` / `match_faces` / `dedup_photos` / `recluster` / `requeue` → **400**
+  in replica mode (colors needs pixels the replica doesn't have; the rest must
+  not cross machines or already have `export-face-state`).
+- Everything else: pre-flight fingerprint → auto-sync if drifted → compute →
+  one push at the end. Cheap deterministic stages are **re-triggered** on the
+  NAS rather than transferred; only `stacking` ships rows (the one stage
+  expensive enough on the N100 to be worth avoiding).
+
+`maintenance_runs` (schema v29) holds the per-stage watermark on both machines.
+The `/status` Replica card and `/admin_maintenance` show per-stage drift;
+**"Replica ahead — unpushed"** means local work will be lost on the next sync.
+
+Module: `photosearch/maintenance_sync.py`. Spec:
+`docs/superpowers/specs/2026-07-17-maintenance-push-up-design.md`.
+
 ## Planned milestones (see `docs/plans/`)
 
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
