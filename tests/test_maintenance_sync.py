@@ -79,19 +79,51 @@ def test_push_mode_rejects_unknown_stage():
 def test_sweep_stamps_watermark_only_for_done_stages(db):
     from photosearch.maintenance import run_maintenance_sweep
 
+    # source="nas": every planned stage runs (no replica deferral), so the
+    # "only done stages get stamped" invariant is exercised directly.
     result = run_maintenance_sweep(db, apply=True, do_colors=False,
                                    do_stacking=False, do_match=False,
-                                   source="replica")
+                                   source="nas")
     runs = db.get_maintenance_runs()
     done = {s["stage"] for s in result["stages"] if s["status"] == "done"}
-    skipped = {s["stage"] for s in result["stages"] if s["status"] != "done"}
+    not_done = {s["stage"] for s in result["stages"] if s["status"] != "done"}
 
     assert done, "expected at least one stage to run against the fixture"
     assert done <= set(runs), "every done stage must be stamped"
-    assert not (skipped & set(runs)), "skipped stages must not be stamped"
+    assert not (not_done & set(runs)), "non-done stages must not be stamped"
     for stage in done:
-        assert runs[stage]["source"] == "replica"
+        assert runs[stage]["source"] == "nas"
         assert runs[stage]["last_run_at"]
+
+
+def test_replica_sweep_defers_trigger_stages(db):
+    """On the replica, trigger-mode stages are NOT executed locally — the NAS
+    recomputes them authoritatively via the push. They must not run, must leave
+    NO local watermark (which would falsely read as 'replica has newer data'),
+    and must appear in deferred_triggers so the push knows to fire them."""
+    from photosearch.maintenance import run_maintenance_sweep
+    from photosearch.maintenance_sync import TRIGGER_STAGES
+
+    # The default (light) plan is entirely trigger-mode, so all of it defers.
+    result = run_maintenance_sweep(db, apply=True, do_colors=False,
+                                   do_stacking=False, do_match=False,
+                                   source="replica")
+
+    assert result["deferred_triggers"], "expected trigger stages to be deferred"
+    assert set(result["deferred_triggers"]) <= TRIGGER_STAGES
+    # Deferred stages neither ran nor stamped a watermark.
+    ran = {s["stage"] for s in result["stages"]}
+    assert not (ran & TRIGGER_STAGES), "trigger stages must not run locally"
+    assert db.get_maintenance_runs() == {}
+
+
+def test_nas_sweep_defers_nothing(db):
+    """source='nas' (the default) never defers — every planned stage runs."""
+    from photosearch.maintenance import run_maintenance_sweep
+    result = run_maintenance_sweep(db, apply=True, do_colors=False,
+                                   do_stacking=False, do_match=False,
+                                   source="nas")
+    assert result["deferred_triggers"] == []
 
 
 def test_dry_run_stamps_nothing(db):
@@ -298,6 +330,19 @@ def _payload_for(db, *, last_run_at, stacking=None):
     fp = photo_fingerprint(db)
     stages = {"stacking": {"mode": "transfer", "last_run_at": last_run_at}}
     return {"fingerprint": fp, "stages": stages, "stacking": stacking or []}
+
+
+def test_apply_rejects_unknown_stage_with_400_not_500(client, db, monkeypatch):
+    """An unknown stage name is a clean 400, not a ValueError surfacing as a
+    500 mid-transaction."""
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    body = _payload_for(db, last_run_at="2026-07-17T09:00:00+00:00")
+    body["stages"] = {"stakcing": {"mode": "transfer",
+                                   "last_run_at": "2026-07-17T09:00:00+00:00"}}
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "unknown_stage"
+    assert r.json()["detail"]["stage"] == "stakcing"
 
 
 def test_apply_rejects_fingerprint_mismatch(client, db, monkeypatch):
@@ -612,6 +657,58 @@ def test_push_with_nothing_eligible_is_a_noop(db, monkeypatch):
     assert result["stages"] == {}
 
 
+def test_push_fires_deferred_triggers_without_a_local_run(db, monkeypatch):
+    """Trigger stages the replica deferred (never ran, so absent from
+    stage_results and unstamped) are still fired on the NAS via the explicit
+    deferred_triggers list."""
+    from photosearch import maintenance_sync
+
+    seen = {}
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        seen["url"] = url
+        seen["stages"] = (json or {}).get("stages")
+        return _FakeResponse(200, {})
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+    # Empty stage_results, nothing stamped — only deferred_triggers drives it.
+    result = maintenance_sync.push_to_nas(
+        db, "http://nas:8000", [],
+        deferred_triggers=["normalize", "geocode"])
+
+    assert seen["url"].endswith("/maintenance-sweep")
+    assert seen["stages"] == ["geocode", "normalize"], "sorted trigger set"
+    assert result["ok"] is True
+    assert result["stages"]["geocode"]["status"] == "triggered"
+
+
+def test_push_partial_when_transfer_lands_but_trigger_fails(db, monkeypatch):
+    """Transfer (stacking) applied on the NAS but the trigger call then fails →
+    the result is PARTIAL, not a blanket failure, and the landed stage is
+    preserved so the UI doesn't prompt a needless re-push."""
+    from photosearch import maintenance_sync
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        if url.endswith("/maintenance-apply"):
+            return _FakeResponse(200, {"applied": {"stacking": {"status": "applied"}}})
+        raise maintenance_sync.requests.exceptions.ConnectionError("NAS restarting")
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica")
+
+    result = maintenance_sync.push_to_nas(
+        db, "http://nas:8000",
+        [{"stage": "stacking", "status": "done"}],
+        deferred_triggers=["geocode"])
+
+    assert result["ok"] is False
+    assert result["partial"] is True, "stacking landed, so this is partial"
+    assert result["stages"]["stacking"]["status"] == "applied"
+    assert result["stages"]["geocode"]["status"] == "failed"
+
+
 def test_push_partial_failure_keeps_successful_transfer_stage(db, monkeypatch):
     """Transfer succeeds, trigger fails: the successful half must not be
     collapsed by the failed half — each stage reports its own outcome."""
@@ -684,6 +781,37 @@ def test_excluded_stage_allowed_on_the_nas(client, monkeypatch):
     r = client.post("/api/admin/maintenance-sweep",
                     json={"apply": True, "do_colors": True})
     assert r.status_code == 200
+
+
+def test_second_apply_sweep_rejected_while_one_is_running(client, monkeypatch):
+    """Concurrent APPLY sweeps would race _push_status and fire two concurrent
+    maintenance-apply POSTs. The second must be rejected with 409 while the
+    first holds _sweep_lock."""
+    from photosearch import web
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+
+    web._sweep_lock.acquire()  # simulate a sweep already in flight
+    try:
+        r = client.post("/api/admin/maintenance-sweep", json={"apply": True})
+        assert r.status_code == 409
+        assert r.json()["detail"]["error"] == "sweep_in_progress"
+    finally:
+        web._sweep_lock.release()
+
+
+def test_dry_run_not_blocked_by_running_sweep(client, monkeypatch):
+    """A dry-run writes nothing and doesn't push, so it is NOT guarded — it must
+    still run even while an apply sweep holds the lock."""
+    from photosearch import web
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+
+    web._sweep_lock.acquire()
+    try:
+        r = client.post("/api/admin/maintenance-sweep", json={
+            "apply": False, "do_colors": False, "do_stacking": False})
+        assert r.status_code == 200
+    finally:
+        web._sweep_lock.release()
 
 
 def test_push_status_starts_idle(client):

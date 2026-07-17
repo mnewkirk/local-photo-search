@@ -139,12 +139,23 @@ _push_lock = threading.Lock()
 _push_status: dict = {"state": "idle", "stages": {}, "error": None,
                       "finished_at": None}
 
+# Serializes APPLY sweeps so two can't run at once and race _push_status / fire
+# two concurrent maintenance-apply POSTs. Distinct from admin_api._op_lock ON
+# PURPOSE: the pre-flight auto-sync takes _op_lock, so reusing it here would
+# self-deadlock the moment a sweep needs to sync. Dry-runs write nothing and are
+# not guarded.
+_sweep_lock = threading.Lock()
 
-def _start_push(stage_results) -> None:
+
+def _start_push(stage_results, deferred_triggers=None) -> None:
     """Reconcile a finished local sweep to the NAS, detached.
 
     Non-blocking with respect to the sweep: its results are already reported.
     Detached from the request so closing the tab can't kill an in-flight push.
+
+    ``deferred_triggers`` are the trigger-mode stages the replica skipped locally
+    (run_maintenance_sweep drops them on the replica); the push fires them on the
+    NAS.
     """
     nas_url = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
     if not nas_url:
@@ -164,13 +175,23 @@ def _start_push(stage_results) -> None:
         from .maintenance_sync import push_to_nas
         try:
             with _get_db() as db:
-                res = push_to_nas(db, nas_url, stage_results)
+                res = push_to_nas(db, nas_url, stage_results,
+                                  deferred_triggers=deferred_triggers)
         except Exception as e:  # never let the thread die silently
             logger.exception("maintenance push crashed")
             res = {"ok": False, "error": str(e), "stages": {}}
+        # "partial" when SOME stages landed but others failed — a blanket
+        # "failed" would read as "nothing pushed" and prompt a needless re-push
+        # of, e.g., stacks the NAS already received.
+        if res.get("ok"):
+            state = "ok"
+        elif res.get("partial"):
+            state = "partial"
+        else:
+            state = "failed"
         with _push_lock:
             _push_status.update({
-                "state": "ok" if res.get("ok") else "failed",
+                "state": state,
                 "stages": res.get("stages") or {},
                 "error": res.get("error"),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -4386,12 +4407,30 @@ async def api_maintenance_sweep(request: Request):
             })
             # Deliberately last: ONE push after ALL stages, never between them.
             if nas_url_now and apply:
-                _start_push(stages)
+                _start_push(stages, result.get("deferred_triggers") or [])
         except InterruptedError:
             _emit({"type": "cancelled", "message": "Maintenance sweep cancelled"})
         except Exception as exc:
             logger.exception("MAINTENANCE sweep stream failed")
             _emit({"type": "fatal", "message": str(exc)})
+        finally:
+            if sweep_held:
+                _sweep_lock.release()
+
+    # Guard concurrent APPLY sweeps: two at once would race _push_status and
+    # fire two concurrent maintenance-apply POSTs at the NAS. Acquired here —
+    # after all validation, so a rejected request can't leak it — and released
+    # in run()'s finally. Held across the whole sweep INCLUDING its pre-flight
+    # sync (which takes the separate _op_lock, so no deadlock).
+    sweep_held = False
+    if apply:
+        if not _sweep_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail={
+                "error": "sweep_in_progress",
+                "message": "A maintenance sweep is already running; wait for it "
+                           "to finish before starting another.",
+            })
+        sweep_held = True
 
     threading.Thread(target=run, daemon=True).start()
 

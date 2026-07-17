@@ -192,23 +192,33 @@ def _sse_has_fatal(body: str) -> bool:
 
 
 def push_to_nas(db, nas_url: str, stage_results: list, *,
-                timeout: int = 900) -> dict:
+                deferred_triggers=None, timeout: int = 900) -> dict:
     """Reconcile a completed local sweep to the NAS. Returns per-stage results.
 
     Transfer first (fast + bounded), triggers second (geocode can be slow on the
     N100). The two modes are separate calls, so they can partially succeed
     relative to each other — hence per-stage results rather than one boolean.
+
+    ``deferred_triggers`` is the set of trigger-mode stages the replica sweep
+    chose NOT to run locally (see run_maintenance_sweep) — the push fires them on
+    the NAS. When None, the trigger set falls back to whatever trigger stages
+    actually ran (the NAS-side / legacy path); a replica sweep passes the
+    explicit list.
     """
     nas_url = (nas_url or "").rstrip("/")
     payload = collect_payload(db, stage_results)
     stages = payload["stages"]
-    if not stages:
-        return {"ok": True, "stages": {}}
+    transfer = {n: i for n, i in stages.items() if i["mode"] == "transfer"}
+    if deferred_triggers is not None:
+        trigger = sorted(set(deferred_triggers))
+    else:
+        trigger = sorted(n for n, i in stages.items() if i["mode"] == "trigger")
+    if not transfer and not trigger:
+        return {"ok": True, "partial": False, "error": None, "stages": {}}
 
     out: dict = {}
 
     # --- transfer ---------------------------------------------------------
-    transfer = {n: i for n, i in stages.items() if i["mode"] == "transfer"}
     if transfer:
         body = {"fingerprint": payload["fingerprint"],
                 "stages": transfer,
@@ -218,20 +228,19 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
                               json=body, timeout=timeout)
         except requests.exceptions.RequestException as e:
             logger.warning("maintenance push (transfer) failed: %s", e)
-            return {"ok": False, "error": "unreachable", "stages": out}
+            return _push_result("unreachable", out)
         if r.status_code == 409:
-            return {"ok": False, "error": "fingerprint_mismatch", "stages": out}
+            return _push_result("fingerprint_mismatch", out)
         if r.status_code != 200:
-            return {"ok": False, "error": f"http_{r.status_code}", "stages": out}
+            return _push_result(f"http_{r.status_code}", out)
         try:
             applied = r.json().get("applied") or {}
         except (ValueError, TypeError) as e:
             logger.warning("maintenance push (transfer) bad response body: %s", e)
-            return {"ok": False, "error": "bad_response", "stages": out}
+            return _push_result("bad_response", out)
         out.update(applied)
 
     # --- trigger ----------------------------------------------------------
-    trigger = sorted(n for n, i in stages.items() if i["mode"] == "trigger")
     if trigger:
         try:
             # The NAS sweep endpoint is SSE; requests reads the finite stream to
@@ -243,14 +252,33 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
             logger.warning("maintenance push (trigger) failed: %s", e)
             for name in trigger:
                 out[name] = {"status": "failed", "reason": "unreachable"}
-            return {"ok": False, "error": "unreachable", "stages": out}
+            return _push_result("unreachable", out)
         if r.status_code != 200 or _sse_has_fatal(r.text):
             for name in trigger:
                 out[name] = {"status": "failed", "reason": f"http_{r.status_code}"}
-            return {"ok": False, "error": f"http_{r.status_code}", "stages": out}
+            return _push_result(f"http_{r.status_code}", out)
         for name in trigger:
             out[name] = {"status": "triggered"}
 
-    ok = all(v.get("status") in ("applied", "triggered", "skipped")
-             for v in out.values())
-    return {"ok": ok, "stages": out}
+    return _push_result(None, out)
+
+
+# A stage outcome counts as landed if it applied, was triggered on the NAS, or
+# was intentionally skipped (e.g. the NAS was already fresher).
+_OK_STATUSES = ("applied", "triggered", "skipped")
+
+
+def _push_result(error, out: dict) -> dict:
+    """Shape a push outcome, distinguishing total failure from PARTIAL success.
+
+    The transfer and trigger legs are separate HTTP calls: the transfer
+    (stacking rows) can land on the NAS and a later trigger call still fail. A
+    blanket ``ok=False`` then reads as "nothing pushed" and prompts a needless
+    re-push of stacks the NAS already has. ``partial`` says some stages landed
+    so the UI can report honestly.
+    """
+    landed = [s for s in out.values() if s.get("status") in _OK_STATUSES]
+    failed = [s for s in out.values() if s.get("status") not in _OK_STATUSES]
+    if not failed and error is None:
+        return {"ok": True, "partial": False, "error": None, "stages": out}
+    return {"ok": False, "partial": bool(landed), "error": error, "stages": out}

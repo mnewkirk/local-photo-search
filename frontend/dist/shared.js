@@ -2149,6 +2149,27 @@
   // Maintenance NAS-vs-replica drift panel (M26b follow-up)
   // =========================================================================
 
+  // Push-status banner. Distinguishes a PARTIAL push (some stages landed on the
+  // NAS, some failed) from a total failure — a blanket "failed" would read as
+  // "nothing pushed" and prompt a needless re-push. Names the stages that
+  // actually failed so the message is honest about what did and didn't land.
+  function pushBanner(push) {
+    if (!push || (push.state !== 'failed' && push.state !== 'partial')) return null;
+    var stages = push.stages || {};
+    var okSet = { applied: 1, triggered: 1, skipped: 1 };
+    var failedNames = Object.keys(stages).filter(function (k) {
+      return !okSet[(stages[k] || {}).status];
+    });
+    var detail = failedNames.length ? ' (failed: ' + failedNames.join(', ') + ')' : '';
+    if (push.state === 'partial') {
+      return e('div', { className: 'ms-info' },
+        'Last push partially applied — some stages landed, some failed: '
+        + (push.error || 'unknown') + detail);
+    }
+    return e('div', { className: 'ms-warn' },
+      'Last push failed: ' + (push.error || 'unknown') + detail);
+  }
+
   // Per-stage NAS-vs-replica drift. "Replica ahead — unpushed" is the state
   // that matters: it means locally-computed maintenance work will be
   // destroyed by the next replica sync unless it's pushed first. Renders
@@ -2159,10 +2180,20 @@
     var st = useState(null), data = st[0], setData = st[1];
     var ps = useState(null), push = ps[0], setPush = ps[1];
 
+    // Report replica_mode up to a parent (admin_maintenance's MaintenanceSweep
+    // uses it to grey out replica-impossible checkboxes) so this panel stays the
+    // SINGLE fetcher of /maintenance-fingerprint — the parent no longer fetches
+    // it separately. onReplicaMode is expected to be a stable setter.
+    var onReplicaMode = props && props.onReplicaMode;
+    var reportMode = useCallback(function (m) {
+      if (onReplicaMode) onReplicaMode(!!m);
+    }, [onReplicaMode]);
+
     var load = useCallback(function () {
       fetch('/api/admin/maintenance-fingerprint')
         .then(function (r) { return r.json(); })
         .then(function (l) {
+          reportMode(l.replica_mode);
           if (!l.replica_mode) { setData({ replica_mode: false }); return; }
           fetch('/api/admin/maintenance-nas-fingerprint')
             .then(function (r) { return r.json(); })
@@ -2172,9 +2203,16 @@
         .catch(function () {});  // endpoint absent (old build) → panel stays hidden
       fetch('/api/admin/maintenance-push-status')
         .then(function (r) { return r.json(); }).then(setPush).catch(function () {});
-    }, []);
+    }, [reportMode]);
 
-    useEffect(function () { load(); }, [load]);
+    // Poll so the panel reflects the current sync state after a sweep/push —
+    // the whole point of the panel is to make drift visible, and a load-once
+    // effect would freeze on the pre-sweep state until a manual page reload.
+    useEffect(function () {
+      load();
+      var id = setInterval(load, 5000);
+      return function () { clearInterval(id); };
+    }, [load]);
 
     if (!data || !data.replica_mode) return null;
     var local = data.local, nas = data.nas;
@@ -2228,9 +2266,7 @@
         'Photo index drift: NAS ' + nas.photo_count + ' photos / max id '
         + nas.photo_max_id + ', replica ' + local.photo_count + ' / '
         + local.photo_max_id + '. A push will auto-sync first.') : null,
-      push && push.state === 'failed'
-        ? e('div', { className: 'ms-warn' }, 'Last push failed: ' + (push.error || 'unknown'))
-        : null,
+      pushBanner(push),
       e('table', { className: 'ms-table' },
         e('thead', null, e('tr', null,
           e('th', null, 'Stage'), e('th', null, 'NAS'),

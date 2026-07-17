@@ -590,6 +590,20 @@ def admin_maintenance_apply(payload: dict):
                 "remote": remote_fp,
             })
 
+        # Validate stage names BEFORE opening the transaction so an unknown name
+        # (client typo, or a newer replica naming a stage this build doesn't
+        # know) is a clean 400, not a ValueError raised mid-transaction that
+        # surfaces as an unhelpful 500.
+        for name in stages:
+            try:
+                push_mode(name)
+            except ValueError:
+                raise HTTPException(status_code=400, detail={
+                    "error": "unknown_stage",
+                    "stage": name,
+                    "message": f"unknown maintenance stage: {name!r}",
+                })
+
         runs = db.get_maintenance_runs()
         try:
             db.conn.execute("BEGIN IMMEDIATE")

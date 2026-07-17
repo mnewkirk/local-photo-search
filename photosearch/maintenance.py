@@ -776,12 +776,33 @@ def run_maintenance_sweep(
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
 
+    from .maintenance_sync import push_mode
+
     if stages is not None:
-        from .maintenance_sync import push_mode
         for name in stages:
             push_mode(name)  # raises ValueError on an unknown stage name
         wanted = set(stages)
         plan = [(name, fn) for name, fn in plan if name in wanted]
+
+    # On the replica, trigger-mode stages are recomputed AUTHORITATIVELY on the
+    # NAS by the push (they're cheap + deterministic there). Running them here
+    # would (a) double the work and (b) write possibly-inferior rows — e.g.
+    # geocode without the rich GeoNames dataset — into the replica's throwaway
+    # DB. So drop them from local execution and hand their names to the push
+    # instead. On the NAS (source != "replica") nothing is deferred; every
+    # planned stage runs normally.
+    deferred_triggers = []
+    if apply and source == "replica":
+        kept = []
+        for name, fn in plan:
+            if push_mode(name) == "trigger":
+                deferred_triggers.append(name)
+            else:
+                kept.append((name, fn))
+        plan = kept
+        for name in deferred_triggers:
+            emit({"phase": "sweep", "stage": name, "status": "deferred",
+                  "message": "recomputed on the NAS via push"})
 
     from datetime import datetime, timezone
     from .maintenance_sync import photo_fingerprint
@@ -812,7 +833,8 @@ def run_maintenance_sweep(
               "message": result.get("message")})
         logger.info("sweep stage %s: %s", name, result)
 
-    return {"apply": apply, "stages": stage_results}
+    return {"apply": apply, "stages": stage_results,
+            "deferred_triggers": deferred_triggers}
 
 
 # ---------------------------------------------------------------------------

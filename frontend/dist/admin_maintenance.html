@@ -1213,13 +1213,9 @@
       // Colors/match-faces need the photo originals, which the replica
       // doesn't have — the server already 400s on them in replica mode
       // (Task 8), so grey the checkboxes out here rather than let the user
-      // hit an avoidable error.
-      useEffect(function() {
-        fetch('/api/admin/maintenance-fingerprint')
-          .then(function(r) { return r.json(); })
-          .then(function(d) { setReplicaMode(!!d.replica_mode); })
-          .catch(function() {});
-      }, []);
+      // hit an avoidable error. replicaMode is fed up from
+      // MaintenanceSyncPanel below (the single /maintenance-fingerprint
+      // fetcher) via its onReplicaMode callback — no separate fetch here.
 
       function setStage(stage, patch) {
         setStages(function(prev) {
@@ -1401,7 +1397,7 @@
             + '(colors/stacking/match) peg the N100 and starve the server — '
             + 'leave them off here and run the full sweep off-hours via cron. '
             + 'Dry-run unless Apply is checked.'),
-          e(PS.MaintenanceSyncPanel, { compact: false }),
+          e(PS.MaintenanceSyncPanel, { compact: false, onReplicaMode: setReplicaMode }),
           e('div', { className: 'stack-toggles' },
             e('label', null,
               e('input', { type: 'checkbox', checked: doApply, disabled: busy,
