@@ -4171,8 +4171,16 @@ async def api_maintenance_sweep(request: Request):
 
     Body (all optional; defaults match the CLI, ``apply`` defaults False):
       {"apply"?, "do_colors"?, "do_stacking"?, "do_recluster"?, "do_dedup"?,
-       "do_requeue"?, "requeue_passes"?,
+       "do_requeue"?, "requeue_passes"?, "stages"?,
        "window_minutes"?, "max_drift_km"?, "min_confidence"?}
+
+    ``stages``, when present, restricts the run to that subset of stage names
+    (passed straight through to ``run_maintenance_sweep``'s own ``stages``
+    filter) — this is how maintenance_sync.push_to_nas's "trigger" push asks
+    the NAS to recompute only its handful of cheap/deterministic stages
+    instead of the endpoint's whole default plan. An unknown stage name
+    raises ValueError inside the sweep, which the ``run()`` closure below
+    catches and reports as a ``fatal`` SSE event, not an unhandled 500.
 
     Wraps ``maintenance.run_maintenance_sweep`` in a worker thread and bridges
     its ``on_progress`` events to the client over the same thread→asyncio.Queue
@@ -4255,6 +4263,24 @@ async def api_maintenance_sweep(request: Request):
     requeue_passes = data.get("requeue_passes") or None
     if requeue_passes is not None and not isinstance(requeue_passes, (list, tuple)):
         raise HTTPException(400, "requeue_passes must be a list of pass names")
+    # Restrict the sweep to a named subset of stages — this is how
+    # maintenance_sync.push_to_nas's "trigger" push asks the NAS to recompute
+    # only the cheap/deterministic stages it needs, instead of the endpoint's
+    # whole default plan. Unknown stage names are validated deep inside
+    # run_maintenance_sweep (raises ValueError); only the outer shape (a list
+    # of strings) is checked here so a malformed body 400s immediately rather
+    # than starting the background sweep thread first.
+    # Named `stage_filter`, NOT `stages` — `run()` below already has its own
+    # local `stages` (the sweep's per-stage RESULT list), and Python's scoping
+    # would make an outer `stages` here silently become that same local,
+    # raising UnboundLocalError the moment run() referenced it before its own
+    # assignment ran.
+    stage_filter = data.get("stages") or None
+    if stage_filter is not None and not (
+        isinstance(stage_filter, (list, tuple))
+        and all(isinstance(s, str) for s in stage_filter)
+    ):
+        raise HTTPException(400, "stages must be a list of stage names")
     window_minutes = int(data.get("window_minutes", 30))
     max_drift_km = float(data.get("max_drift_km", 25.0))
     min_confidence = float(data.get("min_confidence", 0.0))
@@ -4344,6 +4370,7 @@ async def api_maintenance_sweep(request: Request):
                     window_minutes=window_minutes,
                     max_drift_km=max_drift_km,
                     min_confidence=min_confidence,
+                    stages=stage_filter,
                     on_progress=_on_progress,
                     should_abort=_should_abort,
                     source="replica" if nas_url_now else "nas",

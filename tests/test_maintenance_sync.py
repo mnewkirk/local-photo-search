@@ -358,6 +358,31 @@ def test_apply_rejects_missing_stacking_payload(client, db, monkeypatch):
         "SELECT COUNT(*) AS n FROM photo_stacks").fetchone()["n"] == 1
 
 
+def test_apply_with_empty_stacking_list_wipes_stacks(client, db, monkeypatch):
+    """Pin the None-vs-[] distinction the sibling test above guards the other
+    side of: 'stacking' missing/None means no payload was sent (400, refuse
+    to wipe), but 'stacking': [] means the replica ran stacking and genuinely
+    found zero stacks — that must still legitimately WIPE every existing
+    stack (full-replace semantics). Without this test, "hardening" [] into a
+    400 alongside None reads like a reasonable fix and would ship with every
+    other test green, silently breaking legitimate empty-stacking pushes.
+    """
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 2")]
+    _make_stack(db, pids[:2])
+
+    body = _payload_for(db, last_run_at="2026-07-17T09:00:00+00:00", stacking=[])
+    r = client.post("/api/admin/maintenance-apply", json=body)
+    assert r.status_code == 200
+    assert r.json()["applied"]["stacking"]["status"] == "applied"
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photo_stacks").fetchone()["n"] == 0
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM stack_members").fetchone()["n"] == 0
+
+
 def test_apply_rolls_back_on_foreign_key_violation(client, db, monkeypatch):
     """One transaction: a failure must leave prior state intact.
 
@@ -773,3 +798,48 @@ def test_preflight_sync_runs_before_sweep_compute(client, db, monkeypatch):
     assert r.status_code == 200
 
     assert calls == ["sync", "sweep"], calls
+
+
+def test_maintenance_sweep_endpoint_threads_stages_kwarg(client, db, monkeypatch):
+    """THE fix: the endpoint parses body['stages'] but must also PASS it
+    through to run_maintenance_sweep — a function-level test of
+    run_maintenance_sweep(stages=...) alone can't catch the endpoint dropping
+    it on the floor between parsing and the call. Push_to_nas's "trigger"
+    mode relies on exactly this to ask the NAS for a stage subset instead of
+    its whole default plan."""
+    from photosearch import maintenance
+
+    captured = {}
+
+    def fake_sweep(db, **kwargs):
+        captured.update(kwargs)
+        return {"stages": [{"stage": "normalize_aesthetics", "status": "done",
+                             "would": 0, "applied": 0}]}
+
+    monkeypatch.setattr(maintenance, "run_maintenance_sweep", fake_sweep)
+
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": True, "stages": ["normalize_aesthetics"]})
+    assert r.status_code == 200
+    assert captured.get("stages") == ["normalize_aesthetics"], captured.get("stages")
+
+
+def test_maintenance_sweep_endpoint_rejects_malformed_stages(client, monkeypatch):
+    """'stages' must be a list of strings; a malformed value 400s immediately
+    rather than starting the background sweep thread and exploding deep
+    inside run_maintenance_sweep."""
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": True, "stages": "normalize_aesthetics"})
+    assert r.status_code == 400
+
+
+def test_maintenance_sweep_endpoint_reports_unknown_stage_as_fatal_not_500(client, monkeypatch):
+    """An unknown-but-well-shaped stage name is validated deep inside
+    run_maintenance_sweep (raises ValueError). That must surface as a clean
+    SSE 'fatal' event — the sweep runs on a background thread, so an
+    unhandled exception there would otherwise never reach the client as a
+    normal HTTP error."""
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": True, "stages": ["bogus_stage"]})
+    assert r.status_code == 200
+    assert '"type": "fatal"' in r.text or '"type":"fatal"' in r.text

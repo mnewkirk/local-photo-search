@@ -1122,6 +1122,12 @@ replica-side apply used to be silently destroyed on the next sync. Now:
 The `/status` Replica card and `/admin_maintenance` show per-stage drift;
 **"Replica ahead — unpushed"** means local work will be lost on the next sync.
 
+**Redeploy the NAS before the replica** (same shape as M28's `/mirror-fields`
+gotcha above) — a stale NAS 404s `GET /api/admin/maintenance-fingerprint`,
+which makes the replica's pre-flight gate 503 with "NAS unreachable" and
+blocks **every** replica apply, even though the real problem is just an old
+NAS image.
+
 Module: `photosearch/maintenance_sync.py`. Spec:
 `docs/superpowers/specs/2026-07-17-maintenance-push-up-design.md`.
 
