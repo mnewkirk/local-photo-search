@@ -19,7 +19,14 @@
 - Do **not** add HTTP retry/backoff to this work. The NAS's shutdown middleware guards only `/api/worker/*` and `/api/photos/*/full` (`web.py:85`); `/api/admin/*` keeps serving during a drain, so a mid-restart NAS surfaces as a plain connection error. Treat it as `unreachable` and let the user retry. (The spec's first draft claimed otherwise; it has been corrected.)
 - Timestamps are UTC ISO8601 strings, produced by `datetime.now(timezone.utc).isoformat()`.
 - Do not enable `--recluster` or `--dedup-photos` anywhere in this work. Recluster clears `ignored_clusters`; dedup DELETEs photos.
-- Run tests with the venv binary directly: `./.venv/bin/pytest` (do NOT `source venv/bin/activate`).
+- **Test command.** This worktree has no venv of its own — the interpreter lives in the main checkout. Export this once per shell, then use `"$VENV"/pytest` everywhere:
+
+  ```bash
+  export VENV=/Users/mattnewkirk/Documents/Claude/Projects/photo_organization/local-photo-search/venv/bin
+  ```
+
+  Run from the worktree root. Verified: this resolves the **worktree's** `photosearch`, not the main checkout's. Call the binary directly; do **not** `source venv/bin/activate`.
+- **Baseline:** `"$VENV"/pytest tests/test_maintenance.py -q` → **23 passed** before any change. A task that leaves this red is not done.
 
 ## File Structure
 
@@ -46,7 +53,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: table `maintenance_runs(stage TEXT PRIMARY KEY, last_run_at TEXT NOT NULL, photo_count INTEGER, photo_max_id INTEGER, applied INTEGER, source TEXT)`; `PhotoDB.record_maintenance_run(stage, last_run_at, photo_count, photo_max_id, applied, source) -> None`; `PhotoDB.get_maintenance_runs() -> dict[str, dict]` keyed by stage, each value `{"last_run_at", "photo_count", "photo_max_id", "applied", "source"}`.
+- Produces: table `maintenance_runs(stage TEXT PRIMARY KEY, last_run_at TEXT NOT NULL, photo_count INTEGER, photo_max_id INTEGER, applied INTEGER, source TEXT)`; `PhotoDB.record_maintenance_run(stage, last_run_at, photo_count=None, photo_max_id=None, applied=None, source="nas", commit=True) -> None` — `commit=False` leaves the write in the caller's open transaction (Task 6 needs this); `PhotoDB.get_maintenance_runs() -> dict[str, dict]` keyed by stage, each value `{"last_run_at", "photo_count", "photo_max_id", "applied", "source"}`.
 
 - [ ] **Step 1: Write the failing migration test**
 
@@ -94,12 +101,29 @@ def test_record_and_get_maintenance_runs(db):
     assert len(runs) == 1
     assert runs["stacking"]["last_run_at"] == "2026-07-17T10:00:00+00:00"
     assert runs["stacking"]["source"] == "nas"
+
+
+def test_record_maintenance_run_commit_false_is_rollback_able(db):
+    """commit=False must leave the write in the caller's transaction.
+
+    /api/admin/maintenance-apply stamps the watermark inside the same
+    transaction that replaces the stacks; if a rollback left the stamp behind,
+    the NAS would claim work it doesn't have.
+    """
+    db.conn.execute("BEGIN IMMEDIATE")
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=1, photo_max_id=1, applied=1, source="replica",
+        commit=False,
+    )
+    db.conn.rollback()
+    assert db.get_maintenance_runs() == {}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_db.py -k "maintenance_runs" -v
+"$VENV"/pytest tests/test_db.py -k "maintenance_runs" -v
 ```
 
 Expected: FAIL — `sqlite3.OperationalError: no such table: maintenance_runs` on the first, `AttributeError: 'PhotoDB' object has no attribute 'record_maintenance_run'` on the second.
@@ -143,8 +167,15 @@ In `photosearch/db.py`, add near `log_generation`:
                                photo_count: Optional[int] = None,
                                photo_max_id: Optional[int] = None,
                                applied: Optional[int] = None,
-                               source: str = "nas") -> None:
-        """Stamp a stage's watermark. Upserts — one row per stage."""
+                               source: str = "nas",
+                               commit: bool = True) -> None:
+        """Stamp a stage's watermark. Upserts — one row per stage.
+
+        ``commit=False`` leaves the write in the caller's open transaction —
+        needed by /api/admin/maintenance-apply, which stamps inside the same
+        BEGIN IMMEDIATE that replaces the stacks, so a failure can't leave the
+        watermark claiming work that was rolled back.
+        """
         self.conn.execute(
             "INSERT INTO maintenance_runs "
             "  (stage, last_run_at, photo_count, photo_max_id, applied, source) "
@@ -157,7 +188,8 @@ In `photosearch/db.py`, add near `log_generation`:
             "  source=excluded.source",
             (stage, last_run_at, photo_count, photo_max_id, applied, source),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def get_maintenance_runs(self) -> dict:
         """Every stage watermark, keyed by stage name."""
@@ -180,7 +212,7 @@ In `photosearch/db.py`, add near `log_generation`:
 - [ ] **Step 6: Run the tests to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_db.py -k "maintenance_runs" -v
+"$VENV"/pytest tests/test_db.py -k "maintenance_runs" -v
 ```
 
 Expected: 2 passed.
@@ -188,7 +220,7 @@ Expected: 2 passed.
 - [ ] **Step 7: Run the full db suite for regressions**
 
 ```bash
-./.venv/bin/pytest tests/test_db.py -q
+"$VENV"/pytest tests/test_db.py -q
 ```
 
 Expected: all pass. The version bump touches every DB open, so this must be green before moving on.
@@ -293,7 +325,7 @@ def test_push_mode_rejects_unknown_stage():
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -v
+"$VENV"/pytest tests/test_maintenance_sync.py -v
 ```
 
 Expected: collection error — `ModuleNotFoundError: No module named 'photosearch.maintenance_sync'`.
@@ -396,7 +428,7 @@ def fingerprints_match(a: dict, b: dict) -> bool:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -v
+"$VENV"/pytest tests/test_maintenance_sync.py -v
 ```
 
 Expected: all pass. If `test_taxonomy_covers_every_sweep_stage_exactly_once` fails, a stage name in `maintenance.py:_STAGES` is missing from the taxonomy — add it to the correct set rather than loosening the test.
@@ -474,7 +506,7 @@ def test_unknown_stage_subset_is_rejected(db):
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k "sweep or stages_subset or dry_run or unknown_stage" -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k "sweep or stages_subset or dry_run or unknown_stage" -v
 ```
 
 Expected: FAIL — `TypeError: run_maintenance_sweep() got an unexpected keyword argument 'source'`.
@@ -541,7 +573,7 @@ In `photosearch/maintenance.py`, replace the execution loop (currently lines 777
 - [ ] **Step 5: Run to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -v
+"$VENV"/pytest tests/test_maintenance_sync.py -v
 ```
 
 Expected: all pass.
@@ -549,7 +581,7 @@ Expected: all pass.
 - [ ] **Step 6: Run the existing maintenance suite for regressions**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance.py -q
+"$VENV"/pytest tests/test_maintenance.py -q
 ```
 
 Expected: all pass — the return shape is unchanged and `source` defaults to `"nas"`.
@@ -655,7 +687,7 @@ def test_collect_payload_includes_stacking_only_when_stacking_ran(db):
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k "eligible or collect or cancelled" -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k "eligible or collect or cancelled" -v
 ```
 
 Expected: FAIL — `ImportError: cannot import name 'collect_payload'`.
@@ -728,7 +760,7 @@ def collect_payload(db, stage_results: list) -> dict:
 - [ ] **Step 4: Run to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -v
+"$VENV"/pytest tests/test_maintenance_sync.py -v
 ```
 
 Expected: all pass.
@@ -780,7 +812,7 @@ def test_fingerprint_endpoint_reports_index_and_stages(client, db):
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k fingerprint_endpoint -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k fingerprint_endpoint -v
 ```
 
 Expected: FAIL — `assert 404 == 200`.
@@ -824,7 +856,7 @@ def admin_maintenance_fingerprint():
 - [ ] **Step 4: Run to verify it passes**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k fingerprint_endpoint -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k fingerprint_endpoint -v
 ```
 
 Expected: PASS.
@@ -925,7 +957,7 @@ def test_apply_skips_stage_when_timestamps_are_equal(client, db):
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k "apply_" -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k "apply_" -v
 ```
 
 Expected: FAIL — `assert 404 == 409`.
@@ -994,17 +1026,17 @@ def admin_maintenance_apply(payload: dict):
                             )
                     applied[name] = {"status": "applied", "stacks": len(rows)}
 
-                db.conn.execute(
-                    "INSERT INTO maintenance_runs "
-                    "  (stage, last_run_at, photo_count, photo_max_id, applied, source) "
-                    "VALUES (?, ?, ?, ?, ?, 'replica') "
-                    "ON CONFLICT(stage) DO UPDATE SET "
-                    "  last_run_at=excluded.last_run_at, "
-                    "  photo_count=excluded.photo_count, "
-                    "  photo_max_id=excluded.photo_max_id, "
-                    "  applied=excluded.applied, source='replica'",
-                    (name, incoming, local_fp["photo_count"],
-                     local_fp["photo_max_id"], applied[name].get("stacks")),
+                # commit=False: stamp inside the SAME transaction that replaced
+                # the stacks, so a rollback can't leave a watermark claiming
+                # work that didn't land.
+                db.record_maintenance_run(
+                    stage=name,
+                    last_run_at=incoming,
+                    photo_count=local_fp["photo_count"],
+                    photo_max_id=local_fp["photo_max_id"],
+                    applied=applied[name].get("stacks"),
+                    source="replica",
+                    commit=False,
                 )
             db.conn.commit()
         except Exception:
@@ -1017,7 +1049,7 @@ def admin_maintenance_apply(payload: dict):
 - [ ] **Step 4: Run to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k "apply_" -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k "apply_" -v
 ```
 
 Expected: 4 passed.
@@ -1125,7 +1157,7 @@ def test_push_with_nothing_eligible_is_a_noop(db, monkeypatch):
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k push_ -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k push_ -v
 ```
 
 Expected: FAIL — `AttributeError: module 'photosearch.maintenance_sync' has no attribute 'requests'`.
@@ -1223,7 +1255,7 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
 - [ ] **Step 4: Run to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -v
+"$VENV"/pytest tests/test_maintenance_sync.py -v
 ```
 
 Expected: all pass.
@@ -1298,7 +1330,7 @@ def test_excluded_stage_allowed_on_the_nas(client, monkeypatch):
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k "replica_mode or dry_run_allowed or excluded_stage" -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k "replica_mode or dry_run_allowed or excluded_stage" -v
 ```
 
 Expected: FAIL — `assert 200 == 503`.
@@ -1353,7 +1385,7 @@ Confirm `HTTPException` is imported in `web.py`; if not, add it to the existing 
 - [ ] **Step 4: Run to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k "replica_mode or dry_run_allowed or excluded_stage" -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k "replica_mode or dry_run_allowed or excluded_stage" -v
 ```
 
 Expected: 4 passed.
@@ -1412,7 +1444,7 @@ def test_push_status_reflects_last_push(client):
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k push_status -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k push_status -v
 ```
 
 Expected: FAIL — `assert 404 == 200`.
@@ -1447,7 +1479,7 @@ def admin_maintenance_push_status():
 - [ ] **Step 5: Run to verify they pass**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py -k push_status -v
+"$VENV"/pytest tests/test_maintenance_sync.py -k push_status -v
 ```
 
 Expected: 2 passed.
@@ -1571,7 +1603,7 @@ def run_replica_sync_blocking(timeout: int = 1800) -> None:
 - [ ] **Step 9: Run the full suite**
 
 ```bash
-./.venv/bin/pytest tests/test_maintenance_sync.py tests/test_maintenance.py -q
+"$VENV"/pytest tests/test_maintenance_sync.py tests/test_maintenance.py -q
 ```
 
 Expected: all pass.
@@ -1741,19 +1773,15 @@ In `frontend/dist/admin_maintenance.html`, the Colors / Match faces checkboxes m
 
 Apply the same `disabled: busy || replicaMode` and `title` to the "Match faces (heavy)" checkbox.
 
-- [ ] **Step 6: Verify manually**
+- [ ] **Step 6: Syntax-check the changed JS**
 
-Start the replica against the NAS and open the page:
+There is no JS test harness and no build step, so a syntax error would only surface as a blank page in the browser. Catch it here:
 
 ```bash
-./run-local-replica.sh --model qwen/qwen2.5-7b-instruct
+node --check frontend/dist/shared.js
 ```
 
-Then open `http://localhost:8001/admin_maintenance` and confirm:
-1. The "Maintenance: NAS vs replica" table renders one row per stage.
-2. "Colors (heavy)" and "Match faces (heavy)" are greyed out with the tooltip.
-3. Running a light apply produces stage rows that settle to "In sync" once the push lands.
-4. `http://localhost:8001/status` shows the compact one-liner in the Replica card.
+Expected: no output (exit 0). Browser verification is the operator's — see the runbook at the bottom of this plan. Do NOT start a server in this task.
 
 - [ ] **Step 7: Commit**
 
@@ -1764,58 +1792,22 @@ git commit -m "feat(ui): NAS-vs-replica maintenance drift panel; disable exclude
 
 ---
 
-### Task 11: Schedule the sweep on the NAS + document the model
+### Task 11: Document the scheduling + replica-mode model (docs only)
 
 **Files:**
 - Modify: `CLAUDE.md`, `.claude/skills/photo-search/SKILL.md`
-- Runbook: root's crontab on the NAS (host config, not in the repo)
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: documentation only. No code.
+- Produces: documentation only. **No code, and no changes to the NAS.**
 
-- [ ] **Step 1: Verify `CRON_TZ` is supported on the NAS**
+> **Scope decision (2026-07-17):** installing the cron entry touches production
+> — root's crontab and `/var/log` on the live NAS, over SSH that UGOS
+> auto-blocks on retry storms. That is **not** an agent action. This task writes
+> the docs only; the operator runs the install from the runbook at the bottom of
+> this plan. Do NOT ssh anywhere in this task.
 
-The whole UTC pin depends on this. Do NOT skip.
-
-```bash
-ssh cantimatt@dxp4800-f976 'man 5 crontab | grep -c CRON_TZ'
-```
-
-Expected: a non-zero count. If it prints `0`, `CRON_TZ` is unsupported — use the documented fallback (`0 18 * * *` host-local, drifting to 02:00 UTC in Pacific winter) and record the substitution in `CLAUDE.md`.
-
-Do not retry-storm SSH — UGOS auto-blocks the client IP. One attempt; if it fails, diagnose before retrying.
-
-- [ ] **Step 2: Create the log file with the right ownership**
-
-```bash
-ssh cantimatt@dxp4800-f976 \
-  'sudo touch /var/log/photo-maintenance.log && sudo chown cantimatt:admin /var/log/photo-maintenance.log'
-```
-
-- [ ] **Step 3: Install the cron entry**
-
-Via a temp file — the `( crontab -l; echo ... ) | crontab -` one-liner is paste-fragile and yields `"-":1: bad minute`:
-
-```bash
-ssh cantimatt@dxp4800-f976 'sudo crontab -l > /tmp/rootcron 2>/dev/null; \
-  grep -q CRON_TZ /tmp/rootcron || echo "CRON_TZ=UTC" >> /tmp/rootcron; \
-  echo "0 1 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep --apply >> /var/log/photo-maintenance.log 2>&1" >> /tmp/rootcron; \
-  sudo crontab /tmp/rootcron && rm /tmp/rootcron && sudo crontab -l'
-```
-
-Expected: the printed crontab contains `CRON_TZ=UTC` and the `0 1 * * *` line alongside the existing `0 3 * * *` ingest entry.
-
-- [ ] **Step 4: Smoke-test the command the cron will run**
-
-```bash
-ssh cantimatt@dxp4800-f976 'cd /volume1/docker/photosearch && \
-  docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep'
-```
-
-Expected: a dry-run report with per-stage `would` counts and no writes. This validates the exact command line before trusting it to a 01:00 UTC unattended run.
-
-- [ ] **Step 5: Document in CLAUDE.md**
+- [ ] **Step 1: Document in CLAUDE.md**
 
 Add to the maintenance section of `CLAUDE.md`:
 
@@ -1849,11 +1841,11 @@ Module: `photosearch/maintenance_sync.py`. Spec:
 `docs/superpowers/specs/2026-07-17-maintenance-push-up-design.md`.
 ```
 
-- [ ] **Step 6: Mirror into the skill doc**
+- [ ] **Step 2: Mirror into the skill doc**
 
 Add the same section to `.claude/skills/photo-search/SKILL.md` under its maintenance heading, so the skill and CLAUDE.md don't disagree.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add CLAUDE.md .claude/skills/photo-search/SKILL.md
@@ -1862,17 +1854,73 @@ git commit -m "docs: schedule maintenance-sweep at 01:00 UTC; document replica-m
 
 ---
 
-## Manual verification (not covered by tests)
+## Operator runbook — steps the agents deliberately do NOT perform
 
-Per the spec, a real replica → NAS round-trip is a manual smoke test:
+These touch production or need human eyes. Agents finish at Task 11; the
+operator runs these. Deploy the new code to the NAS first (`/status` → Build →
+Restart, or the manual recovery sequence in CLAUDE.md) — the NAS needs the v29
+schema and the new endpoints before any push can land.
 
-1. Sync the replica: `./sync-replica.sh`
-2. Start it: `./run-local-replica.sh --model qwen/qwen2.5-7b-instruct`
-3. Open `/admin_maintenance`, check **Apply**, leave the heavy stages off, run.
-4. Confirm the SSE log shows stage results, then a `push` event.
-5. On the NAS, confirm the watermark crossed over:
-   `curl -s http://<nas>:8000/api/admin/maintenance-fingerprint | python3 -m json.tool`
-   — the pushed stages should show `"source": "replica"`.
-6. Re-open `/admin_maintenance`: every pushed stage reads **In sync**.
-7. Kill the NAS (or point `PHOTOSEARCH_NAS_URL` at a dead host) and retry an
-   apply — it must refuse with the 503, not write.
+### 1. Verify `CRON_TZ` is supported — the UTC pin depends on it
+
+```bash
+ssh cantimatt@dxp4800-f976 'man 5 crontab | grep -c CRON_TZ'
+```
+
+Non-zero → supported. `0` → use the fallback `0 18 * * *` (host-local; drifts to
+02:00 UTC in Pacific winter) and correct the `CLAUDE.md` section Task 11 wrote.
+
+**One attempt.** UGOS auto-blocks the client IP on SSH retry storms; if it
+fails, diagnose before retrying.
+
+### 2. Smoke-test the exact cron command as a dry run, before trusting it unattended
+
+```bash
+ssh cantimatt@dxp4800-f976 'cd /volume1/docker/photosearch && \
+  docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep'
+```
+
+Expected: per-stage `would` counts, no writes.
+
+### 3. Create the log file
+
+```bash
+ssh cantimatt@dxp4800-f976 \
+  'sudo touch /var/log/photo-maintenance.log && sudo chown cantimatt:admin /var/log/photo-maintenance.log'
+```
+
+### 4. Install the cron entry
+
+Via a temp file — the `( crontab -l; echo ... ) | crontab -` one-liner is
+paste-fragile and yields `"-":1: bad minute`:
+
+```bash
+ssh cantimatt@dxp4800-f976 'sudo crontab -l > /tmp/rootcron 2>/dev/null; \
+  grep -q CRON_TZ /tmp/rootcron || echo "CRON_TZ=UTC" >> /tmp/rootcron; \
+  echo "0 1 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep --apply >> /var/log/photo-maintenance.log 2>&1" >> /tmp/rootcron; \
+  sudo crontab /tmp/rootcron && rm /tmp/rootcron && sudo crontab -l'
+```
+
+Expected: the printed crontab shows `CRON_TZ=UTC` and `0 1 * * *` alongside the
+existing `0 3 * * *` ingest entry.
+
+### 5. Replica → NAS round-trip (the smoke test no automated test covers)
+
+1. `./sync-replica.sh`
+2. `./run-local-replica.sh --model qwen/qwen2.5-7b-instruct`
+3. `/admin_maintenance` → the drift table renders one row per stage; **Colors**
+   and **Match faces** are greyed out with a tooltip.
+4. Check **Apply**, heavy stages off, run. The log shows stage results, then a
+   `push` event.
+5. Confirm the watermark crossed over:
+   ```bash
+   curl -s http://100.115.143.4:8000/api/admin/maintenance-fingerprint | python3 -m json.tool
+   ```
+   Pushed stages should read `"source": "replica"`.
+6. Reload `/admin_maintenance` — every pushed stage reads **In sync**.
+7. `/status` shows the compact one-liner in the Replica card.
+
+### 6. Verify the gate that motivated all of this
+
+Point `PHOTOSEARCH_NAS_URL` at a dead host and try an apply. It must refuse with
+a 503 and write nothing. If it writes, the central bug is not fixed.
