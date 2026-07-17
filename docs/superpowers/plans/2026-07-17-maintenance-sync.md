@@ -309,9 +309,9 @@ def test_taxonomy_covers_every_sweep_stage_exactly_once():
     Guards against a new stage being added to maintenance.py without a
     reconciliation decision — which would silently mean 'lost on next sync'.
     """
-    from photosearch.maintenance import _STAGES
+    from photosearch.maintenance import SWEEP_STAGE_ORDER
     known = TRIGGER_STAGES | TRANSFER_STAGES | EXCLUDED_STAGES
-    assert set(_STAGES) - known == set(), "sweep stage with no push mode"
+    assert set(SWEEP_STAGE_ORDER) - known == set(), "sweep stage with no push mode"
     assert not (TRIGGER_STAGES & TRANSFER_STAGES)
     assert not (TRIGGER_STAGES & EXCLUDED_STAGES)
     assert not (TRANSFER_STAGES & EXCLUDED_STAGES)
@@ -431,7 +431,7 @@ def fingerprints_match(a: dict, b: dict) -> bool:
 "$VENV"/pytest tests/test_maintenance_sync.py -v
 ```
 
-Expected: all pass. If `test_taxonomy_covers_every_sweep_stage_exactly_once` fails, a stage name in `maintenance.py:_STAGES` is missing from the taxonomy — add it to the correct set rather than loosening the test.
+Expected: all pass. If `test_taxonomy_covers_every_sweep_stage_exactly_once` fails, a stage name in `maintenance.py:SWEEP_STAGE_ORDER` is missing from the taxonomy — add it to the correct set rather than loosening the test.
 
 - [ ] **Step 5: Commit**
 
