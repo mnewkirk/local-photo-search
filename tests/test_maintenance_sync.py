@@ -214,3 +214,27 @@ def test_collect_payload_includes_stacking_only_when_stacking_ran(db):
     without = collect_payload(db, [{"stage": "normalize_aesthetics", "status": "done"}])
     assert without["stacking"] is None
     assert "stacking" not in without["stages"]
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_endpoint_reports_index_and_stages(client, db, monkeypatch):
+    # admin_api reads PHOTOSEARCH_DB fresh per-request (not web._db_path, which
+    # the `client` fixture patches) — mirrors test_web_replica.py's
+    # test_replica_status_endpoint_reflects_env for the sibling endpoint.
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    db.record_maintenance_run(
+        stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
+        photo_count=3, photo_max_id=42, applied=2, source="replica")
+
+    r = client.get("/api/admin/maintenance-fingerprint")
+    assert r.status_code == 200
+    body = r.json()
+    expected = photo_fingerprint(db)
+    assert body["photo_count"] == expected["photo_count"]
+    assert body["photo_max_id"] == expected["photo_max_id"]
+    assert body["stages"]["stacking"]["source"] == "replica"
+    assert body["stages"]["stacking"]["last_run_at"] == "2026-07-17T09:00:00+00:00"
+    assert body["replica_mode"] is False

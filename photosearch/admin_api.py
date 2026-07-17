@@ -462,6 +462,37 @@ def admin_replica_status():
     }
 
 
+@router.get("/maintenance-fingerprint")
+def admin_maintenance_fingerprint():
+    """Photo-index fingerprint + per-stage watermarks. Cheap — two indexed
+    queries (~7ms on 150k photos), unlike /api/stats' full COUNT scans.
+
+    Serves two consumers: the replica's pre-flight guard before a push, and the
+    NAS-vs-replica drift panel on /status.
+    """
+    from .db import PhotoDB
+    from .maintenance_sync import photo_fingerprint
+
+    db_path = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
+    with PhotoDB(db_path) as db:
+        fp = photo_fingerprint(db)
+        runs = db.get_maintenance_runs()
+
+    return {
+        "photo_count": fp["photo_count"],
+        "photo_max_id": fp["photo_max_id"],
+        "stages": {
+            name: {
+                "last_run_at": r["last_run_at"],
+                "source": r["source"],
+                "applied": r["applied"],
+            }
+            for name, r in runs.items()
+        },
+        "replica_mode": bool((os.environ.get("PHOTOSEARCH_NAS_URL") or "").strip()),
+    }
+
+
 @router.post("/replica-sync")
 async def admin_replica_sync():
     """`bash sync-replica.sh` — SSE stream of a fresh replica pull (M26a).
