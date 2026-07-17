@@ -70,6 +70,7 @@ compute on the desktop.
 - The freshness check is cheap — no per-row update-date comparison.
 - The `/status` page makes NAS-vs-replica drift obvious.
 - Heavy stages (stacking) compute on the desktop, not the N100.
+- The sweep runs on a schedule, so derived data stops going stale by default.
 
 ## Non-goals
 
@@ -77,8 +78,6 @@ compute on the desktop.
 - Pushing destructive operations (`dedup`) across machines.
 - A second face-state bridge. `export-face-state` / `apply-face-state` already
   covers recluster/match.
-- Wiring `maintenance-sweep` to cron. Worth doing, but out of scope here; see
-  Future work.
 
 ## Design
 
@@ -272,12 +271,78 @@ Plus:
 **Not covered by automated tests:** a real replica → NAS round-trip. Manual
 smoke test, same caveat M24b carries for its LM Studio path.
 
+## Scheduling: wire `maintenance-sweep` to cron on the NAS
+
+The M25 plan proposed this and never shipped it; it is the reason derived data
+goes stale. It is in scope here.
+
+### The entry
+
+Runs at **01:00 UTC**, pinned to UTC so it never drifts with anyone's DST:
+
+```cron
+CRON_TZ=UTC
+0 1 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep --apply >> /var/log/photo-maintenance.log 2>&1
+```
+
+Goes in **root's crontab** (`sudo crontab -l`) alongside the existing ingest
+entry — a normal `crontab -l` as `cantimatt` is empty. Load it via a temp file;
+the `( crontab -l; echo '...' ) | crontab -` one-liner is paste-fragile (mangled
+continuations → `"-":1: bad minute`). The log needs
+`sudo chown cantimatt:admin /var/log/photo-maintenance.log`, mirroring
+`/var/log/photo-ingest.log`.
+
+### Timing rationale
+
+The NAS runs `TZ=America/Los_Angeles` (`docker-compose.nas.yml:181`), verified
+against its HTTP `Date` header. So:
+
+| | |
+|---|---|
+| 01:00 UTC | the scheduled slot |
+| = 03:00 CEST | the requested wall-clock time |
+| = 18:00 America/Los_Angeles | when it actually runs at the NAS |
+| existing ingest at `0 3 * * *` | 03:00 Pacific — **nine hours clear**, no collision |
+
+**Accepted tradeoff:** 18:00 Pacific is evening prime time where the NAS lives,
+and the heavy stages "peg the N100 and starve the server"
+(`admin_maintenance.html:1381`). This was chosen deliberately over chaining onto
+the ingest line at 03:00 Pacific. Revisit if the household notices the NAS
+dragging in the evening — the fix is to move the slot, not to change the design.
+
+`CRON_TZ` is a Vixie/Debian-cron feature. UGOS ships a Debian-derived cron (it
+is missing only the setgid `crontab` setup, per CLAUDE.md), so this should work
+— but **verify it on the box before relying on it**. If unsupported, the
+fallback is `0 18 * * *` in host-local time, which drifts to 02:00 UTC in
+Pacific winter; accept the drift or wrap the command in a UTC-aware guard.
+
+### Stage selection
+
+The bare `maintenance-sweep --apply` runs the default plan: geocode, normalize,
+infer, normalize_inferred, colors, stacking, match_faces, resolve_dups, plus
+both aesthetic normalizes. `--recluster` and `--dedup-photos` are off by default
+and **stay off** — recluster clears `ignored_clusters` (re-running it nightly
+would wipe ignore decisions every night, the exact hazard the M25 plan flagged),
+and dedup DELETEs photos.
+
+### Interaction with the push path
+
+The two compose safely through the same watermark, with no extra machinery:
+
+- Cron keeps the NAS fresh nightly; the replica picks that up on its next sync,
+  where it lands as **NAS ahead** — informational, no action.
+- If the user runs stacking on the replica *after* the last cron run, their
+  `last_run_at` is newer and the push applies.
+- If cron ran stacking *more recently* than the replica's local run, the push
+  skips that stage — the existing rule ("replica's `last_run_at` must be newer,
+  else skip") already covers it. No new conflict logic.
+
+With cron running nightly, the push path becomes the exception rather than the
+rule: it only carries work the user explicitly chose to do *now* rather than
+wait for tonight.
+
 ## Future work
 
-- **Wire `maintenance-sweep` to cron on the NAS.** The M25 plan proposed it and
-  never shipped it; it is the reason derived data goes stale. Independent of
-  this spec but strongly complementary — with cron running the cheap stages
-  nightly, the push path only ever carries stacking.
 - Extend transfer mode to `match_faces` if the `export-face-state` bridge proves
   awkward in practice. Not before.
 - Reconsider the strict fingerprint guard if the sync → run → push window proves
