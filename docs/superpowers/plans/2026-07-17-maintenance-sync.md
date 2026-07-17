@@ -1277,7 +1277,7 @@ git commit -m "feat(sync): push_to_nas — transfer then trigger, per-stage resu
 
 **Interfaces:**
 - Consumes: `EXCLUDED_STAGES` (Task 2).
-- Produces: `api_maintenance_sweep` returns **400** `{"detail": {"error": "excluded_stage_in_replica_mode", "stages": [...]}}` when replica mode requests an excluded stage with `apply=true`, and **503** `{"detail": {"error": "nas_unreachable"}}` when replica mode + `apply=true` + the NAS fingerprint is unreachable. Adds module-level `_push_status: dict` and `_push_lock: threading.Lock`.
+- Produces: `api_maintenance_sweep` returns **400** `{"detail": {"error": "excluded_stage_in_replica_mode", "stages": [...]}}` when replica mode requests an excluded stage with `apply=true`, and **503** `{"detail": {"error": "nas_unreachable"}}` when replica mode + `apply=true` + the NAS fingerprint is unreachable. (`_push_status` / `_push_lock` are **Task 9's**, not this task's — an earlier draft of this line wrongly claimed them here.)
 
 - [ ] **Step 1: Write the failing tests**
 
