@@ -169,6 +169,31 @@ def test_collect_stacking_rows_groups_members_by_stack(db):
     assert sum(m["is_top"] for m in members) == 1
 
 
+def test_collect_stacking_rows_keeps_separate_stacks_separate(db):
+    """Two stacks must stay two stacks.
+
+    The single-stack case can't catch a grouping bug that merges every member
+    into one bucket, so this asserts the members of distinct stacks are not
+    flattened together.
+    """
+    pids = [r["id"] for r in db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 4")]
+    assert len(pids) >= 4, "fixture needs at least 4 photos"
+    _make_stack(db, pids[0:2], top_index=0)
+    _make_stack(db, pids[2:4], top_index=1)
+
+    rows = collect_stacking_rows(db)
+    assert len(rows) == 2, "two stacks must not be merged into one"
+
+    grouped = sorted(
+        [sorted(m["photo_id"] for m in row["members"]) for row in rows]
+    )
+    assert grouped == [sorted(pids[0:2]), sorted(pids[2:4])]
+    # Exactly one top per stack.
+    for row in rows:
+        assert sum(m["is_top"] for m in row["members"]) == 1
+
+
 def test_collect_payload_includes_stacking_only_when_stacking_ran(db):
     db.record_maintenance_run(
         stage="stacking", last_run_at="2026-07-17T09:00:00+00:00",
