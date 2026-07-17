@@ -69,3 +69,49 @@ def test_taxonomy_covers_every_sweep_stage_exactly_once():
 def test_push_mode_rejects_unknown_stage():
     with pytest.raises(ValueError, match="unknown maintenance stage"):
         push_mode("not_a_stage")
+
+
+# ---------------------------------------------------------------------------
+# The sweep stamps watermarks
+# ---------------------------------------------------------------------------
+
+def test_sweep_stamps_watermark_only_for_done_stages(db):
+    from photosearch.maintenance import run_maintenance_sweep
+
+    result = run_maintenance_sweep(db, apply=True, do_colors=False,
+                                   do_stacking=False, do_match=False,
+                                   source="replica")
+    runs = db.get_maintenance_runs()
+    done = {s["stage"] for s in result["stages"] if s["status"] == "done"}
+    skipped = {s["stage"] for s in result["stages"] if s["status"] != "done"}
+
+    assert done, "expected at least one stage to run against the fixture"
+    assert done <= set(runs), "every done stage must be stamped"
+    assert not (skipped & set(runs)), "skipped stages must not be stamped"
+    for stage in done:
+        assert runs[stage]["source"] == "replica"
+        assert runs[stage]["last_run_at"]
+
+
+def test_dry_run_stamps_nothing(db):
+    from photosearch.maintenance import run_maintenance_sweep
+
+    run_maintenance_sweep(db, apply=False, do_colors=False,
+                          do_stacking=False, do_match=False)
+    assert db.get_maintenance_runs() == {}
+
+
+def test_stages_subset_runs_only_those_stages(db):
+    from photosearch.maintenance import run_maintenance_sweep
+
+    result = run_maintenance_sweep(
+        db, apply=True, stages=["normalize_aesthetics"],
+    )
+    assert [s["stage"] for s in result["stages"]] == ["normalize_aesthetics"]
+
+
+def test_unknown_stage_subset_is_rejected(db):
+    from photosearch.maintenance import run_maintenance_sweep
+
+    with pytest.raises(ValueError, match="unknown maintenance stage"):
+        run_maintenance_sweep(db, apply=True, stages=["bogus_stage"])

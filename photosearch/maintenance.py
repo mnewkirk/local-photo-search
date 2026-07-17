@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 logger = logging.getLogger("photosearch.maintenance")
 
@@ -704,6 +704,8 @@ def run_maintenance_sweep(
     window_minutes: int = 30,
     max_drift_km: float = 25.0,
     min_confidence: float = 0.0,
+    stages: Optional[Sequence[str]] = None,
+    source: str = "nas",
     on_progress: Optional[Callable[[dict], None]] = None,
     should_abort: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -774,20 +776,43 @@ def run_maintenance_sweep(
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
 
-    stages = []
+    if stages is not None:
+        from .maintenance_sync import push_mode
+        for name in stages:
+            push_mode(name)  # raises ValueError on an unknown stage name
+        wanted = set(stages)
+        plan = [(name, fn) for name, fn in plan if name in wanted]
+
+    from datetime import datetime, timezone
+    from .maintenance_sync import photo_fingerprint
+
+    stage_results = []
     for name, fn in plan:
         check_abort()
         emit({"phase": "sweep", "stage": name, "status": "scanning"})
         t0 = time.monotonic()
         result = fn()
         result["seconds"] = round(time.monotonic() - t0, 2)
-        stages.append(result)
+        stage_results.append(result)
+        # Stamp the watermark only for stages that actually did work. A skipped
+        # or preview stage changed nothing, and a cancelled one left partial
+        # state — neither is eligible to push.
+        if apply and result.get("status") == "done":
+            fp = photo_fingerprint(db)
+            db.record_maintenance_run(
+                stage=name,
+                last_run_at=datetime.now(timezone.utc).isoformat(),
+                photo_count=fp["photo_count"],
+                photo_max_id=fp["photo_max_id"],
+                applied=result.get("applied"),
+                source=source,
+            )
         emit({"phase": "sweep", "stage": name, "status": result.get("status", "done"),
               "would": result.get("would", 0), "applied": result.get("applied", 0),
               "message": result.get("message")})
         logger.info("sweep stage %s: %s", name, result)
 
-    return {"apply": apply, "stages": stages}
+    return {"apply": apply, "stages": stage_results}
 
 
 # ---------------------------------------------------------------------------
