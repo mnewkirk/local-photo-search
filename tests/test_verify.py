@@ -25,6 +25,7 @@ _root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_root))
 
 from photosearch.verify import (
+    _clean_wrong_item,
     _extract_nouns,
     _flag_by_clip,
     _save_verification,
@@ -350,6 +351,54 @@ class TestLlmVerifyDescription:
         mock_chat.return_value = None
         result = llm_verify_description("/fake/photo.jpg", "A dog", [])
         assert result == []
+
+    @patch("photosearch.describe._ollama_chat_with_retry")
+    def test_sentence_wrong_line_reduced_to_noun(self, mock_chat):
+        """A sentence-shaped WRONG line is reduced to its head noun phrase."""
+        mock_chat.return_value = "WRONG: A golden retriever dog runs ahead of them on the sand"
+        result = llm_verify_description("/fake/photo.jpg", "desc", [])
+        assert len(result) == 1
+        assert result[0]["noun"] == "A golden retriever dog"
+
+    @patch("photosearch.describe._ollama_chat_with_retry")
+    def test_meta_wrong_line_dropped(self, mock_chat):
+        """Meta-commentary WRONG lines (no concrete object) are dropped."""
+        mock_chat.return_value = "WRONG: The photo is a composite of two images"
+        result = llm_verify_description("/fake/photo.jpg", "desc", [])
+        assert result == []
+
+
+class TestCleanWrongItem:
+    """_clean_wrong_item normalizes raw 'WRONG:' lines to a short, CLIP-checkable
+    noun phrase, or None for meta-commentary / empty."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("unicorn", "unicorn"),
+        ("spaceship", "spaceship"),
+        ("dragon", "dragon"),
+        ("a flying saucer", "a flying saucer"),           # -ing adjective preserved
+        ("a golden retriever dog", "a golden retriever dog"),  # articles kept
+        ("A golden retriever dog runs ahead of them on the sand", "A golden retriever dog"),
+        ("a bright red kite flies in the sky above the water", "a bright red kite"),
+        ("balcony railing with a white and black checkered pattern", "balcony railing"),
+    ])
+    def test_normalizes_to_head_noun(self, raw, expected):
+        assert _clean_wrong_item(raw) == expected
+
+    def test_extracts_object_from_negation_sentence(self):
+        assert _clean_wrong_item("There are no other people visible in the image") == "people"
+
+    @pytest.mark.parametrize("raw", [
+        "The photo is a composite of two images",
+        "",
+        "   ",
+    ])
+    def test_drops_meta_or_empty(self, raw):
+        assert _clean_wrong_item(raw) is None
+
+    def test_caps_phrase_length(self):
+        out = _clean_wrong_item("alpha beta gamma delta epsilon zeta eta theta")
+        assert out is not None and len(out.split()) <= 6
 
     @patch("photosearch.describe._ollama_chat_with_retry")
     def test_wrong_strips_trailing_period(self, mock_chat):
