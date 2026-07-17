@@ -1822,9 +1822,15 @@ def search_combined(
         page = items[offset:offset + limit] if limit else items[offset:]
         return (page, len(items)) if with_total else page
 
+    _aes_filtered = _has_aesthetic_filters(
+        min_aesthetic, min_technical, min_composition, min_impact, style_tag,
+        min_subject_aesthetic, min_day_aesthetic)
+
     # Date as a primary search: if only date is specified (no other criteria)
     # No limit — return all photos in the range so the user sees every shot from that day.
-    if date_from and not result_sets and min_quality is None:
+    # Aesthetic floors must NOT take this shortcut — they'd be silently dropped
+    # (the aesthetics-only branch below handles date + aesthetic instead).
+    if date_from and not result_sets and min_quality is None and not _aes_filtered:
         return _wrap(_search_by_date(db, date_from, date_to or _OPEN_DATE_HI, limit=0))
 
     # Quality-only search: if no other criteria given but min_quality is set,
@@ -1843,13 +1849,14 @@ def search_combined(
         results = [dict(r) for r in rows]
         if date_from:
             results = _filter_by_date(results, date_from, date_to or _OPEN_DATE_HI)
+        if _aes_filtered:
+            results = _filter_aesthetic(
+                results, min_aesthetic, min_technical, min_composition,
+                min_impact, style_tag, min_subject_aesthetic, min_day_aesthetic)
         return _wrap(results)
 
     # Aesthetics-only browse: no content filters, just aesthetic thresholds
     # and/or the aesthetic sort — return the library ranked by percentile.
-    _aes_filtered = _has_aesthetic_filters(
-        min_aesthetic, min_technical, min_composition, min_impact, style_tag,
-        min_subject_aesthetic, min_day_aesthetic)
     if not result_sets and (_aes_filtered
                             or sort in ("aesthetic_desc", "subject_aesthetic_desc")):
         # Subject sort ranks by the subject-crop percentile, falling back to the
