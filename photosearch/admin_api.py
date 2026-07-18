@@ -1069,6 +1069,38 @@ def admin_workers_queue_status():
     return data
 
 
+@router.get("/incoming-status")
+def admin_incoming_status():
+    """Disposition of everything sitting in /photos/_incoming/, per source.
+
+    The pre-ingest half of the pipeline funnel — what the next `ingest-incoming`
+    sweep will do with each file (staged / blocked / companion / other). Cheap:
+    extension + a 12-byte magic-byte read, no hashing or EXIF (see
+    ``ingest.scan_incoming``), so it's safe to poll from the maintenance page.
+
+    In replica mode _incoming only physically exists on the NAS (the desktop has
+    no photo files), so proxy to PHOTOSEARCH_NAS_URL exactly like
+    /workers/queue-status.
+    """
+    nas = (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+    if nas:
+        import requests
+        try:
+            r = requests.get(f"{nas}/api/admin/incoming-status", timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            data["source"] = nas
+            return data
+        except requests.RequestException as exc:
+            return {"sources": {}, "totals": {}, "exists": False, "source": nas,
+                    "error": f"could not reach authoritative server: {exc}"}
+    from .ingest import scan_incoming
+    root = os.path.join(os.environ.get("PHOTO_ROOT", "/photos"), "_incoming")
+    data = scan_incoming(root)
+    data["source"] = "local"
+    return data
+
+
 @router.get("/workers/fleet-status")
 def admin_workers_fleet_status():
     """Process-level status of the /status-launched fleet (run-workers.sh --status).

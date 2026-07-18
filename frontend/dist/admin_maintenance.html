@@ -540,6 +540,53 @@
     .queue-pill .q-pass { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
     .queue-pill .q-count { font-weight: 600; }
     .queue-pill.empty .q-count { color: var(--text-muted); font-weight: 400; }
+
+    /* Pipeline funnel — _incoming disposition (stages 1-2) + library backlog (3-4). */
+    .funnel-groups { display: flex; flex-wrap: wrap; gap: 16px; align-items: stretch; }
+    .funnel-group { flex: 1 1 320px; display: flex; flex-direction: column; }
+    .funnel-group .fg-head {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-muted); margin-bottom: 6px;
+    }
+    .funnel-row { display: flex; gap: 10px; flex: 1; }
+    .funnel-stage {
+      flex: 1; background: var(--surface2); border: 1px solid var(--border);
+      border-left: 3px solid var(--border); border-radius: 8px; padding: 12px;
+      min-width: 132px;
+    }
+    .funnel-stage.s-staged  { border-left-color: #4a9eff; }
+    .funnel-stage.s-blocked { border-left-color: #e0a34a; }
+    .funnel-stage.s-clip    { border-left-color: #a67bd8; }
+    .funnel-stage.s-enrich  { border-left-color: #4ad07a; }
+    .funnel-label { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+    .funnel-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+    .funnel-num.zero { color: var(--text-muted); font-weight: 400; }
+    .funnel-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+    .funnel-breakdown { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+    .funnel-br-row { display: flex; justify-content: space-between; font-size: 11px; gap: 10px; }
+    .funnel-br-row .lbl { color: var(--text-muted); }
+    .funnel-br-row .n { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .funnel-br-row .n.zero { color: var(--text-muted); font-weight: 400; }
+    .funnel-mini { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px; }
+    .funnel-mini .m {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+      padding: 2px 6px; font-size: 10px; display: flex; gap: 5px;
+    }
+    .funnel-mini .m .mp { color: var(--text-muted); }
+    .funnel-arrow { align-self: center; color: var(--text-muted); font-size: 18px; }
+    .funnel-src { margin-top: 12px; font-size: 11px; }
+    .funnel-src table { border-collapse: collapse; width: 100%; margin-top: 6px; }
+    .funnel-src td, .funnel-src th {
+      text-align: right; padding: 3px 8px; font-variant-numeric: tabular-nums;
+      border-bottom: 1px solid var(--border);
+    }
+    .funnel-src th { color: var(--text-muted); font-weight: 500; }
+    .funnel-src th:first-child, .funnel-src td:first-child { text-align: left; }
+    .link-btn {
+      background: none; border: none; color: var(--accent); cursor: pointer;
+      font-size: 11px; padding: 0; margin-left: 8px;
+    }
+    .link-btn:hover { color: var(--accent-hover); }
     .active-row {
       font-size: 12px;
       font-family: "SF Mono", "Fira Code", Menlo, monospace;
@@ -1897,6 +1944,140 @@
       );
     }
 
+    // Pipeline funnel — the whole "what's happening on the NAS" flow in one view:
+    //   _incoming staging (ready / can't-ingest) → library backlog (CLIP / passes).
+    // Stages 1-2 come from /api/admin/incoming-status (cheap _incoming scan);
+    // stages 3-4 from the same authoritative queue the Workers panel polls.
+    var ENRICH_PASSES = ['faces', 'quality', 'describe', 'category-content',
+                         'category-visual', 'keywords', 'verify', 'aesthetics'];
+
+    function fmt(n) { return (n || 0).toLocaleString(); }
+
+    function PipelineFunnel() {
+      var _inc = useState(null); var inc = _inc[0]; var setInc = _inc[1];
+      var _q = useState(null);   var q = _q[0];     var setQ = _q[1];
+      var _ex = useState(false); var showSrc = _ex[0]; var setShowSrc = _ex[1];
+
+      function load() {
+        fetch('/api/admin/incoming-status')
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setInc(d); }).catch(function () {});
+        fetch('/api/admin/workers/queue-status')
+          .then(function (r) { return r.json(); })
+          .then(function (d) { setQ(d); }).catch(function () {});
+      }
+      useEffect(function () {
+        load();
+        // 20s — gentler than the Workers panel's 5s (queue-status is a heavy
+        // per-pass scan on the N100); _incoming scan is cheap either way.
+        var id = setInterval(load, 20000);
+        return function () { clearInterval(id); };
+      }, []);
+
+      var totals = (inc && inc.totals) || {};
+      var queue = (q && q.queue_depth) || {};
+      var clipQ = queue.clip || 0;
+      var enrichActive = ENRICH_PASSES.filter(function (p) { return (queue[p] || 0) > 0; });
+      var enrichTotal = ENRICH_PASSES.reduce(function (s, p) { return s + (queue[p] || 0); }, 0);
+      var cantTotal = (totals.blocked || 0) + (totals.companion || 0) + (totals.other || 0);
+      var srcNames = inc && inc.sources ? Object.keys(inc.sources) : [];
+
+      function stageNum(n, cls) {
+        return e('div', { className: 'funnel-num' + ((n || 0) === 0 ? ' zero' : '') + (cls ? ' ' + cls : '') }, fmt(n));
+      }
+      function brRow(label, n) {
+        return e('div', { className: 'funnel-br-row' },
+          e('span', { className: 'lbl' }, label),
+          e('span', { className: 'n' + ((n || 0) === 0 ? ' zero' : '') }, fmt(n)));
+      }
+
+      // Stage 1 — ready to ingest (JPEG/HEIC with valid image bytes).
+      var stageStaged = e('div', { className: 'funnel-stage s-staged' },
+        e('div', { className: 'funnel-label' }, 'Ready to ingest'),
+        stageNum(totals.staged),
+        e('div', { className: 'funnel-sub' },
+          inc && inc.exists === false
+            ? '_incoming not found'
+            : 'JPEG/HEIC staged — new + duplicates (run dry-run below to split)')
+      );
+
+      // Stage 2 — in _incoming but won't become a searchable photo.
+      var stageBlocked = e('div', { className: 'funnel-stage s-blocked' },
+        e('div', { className: 'funnel-label' }, "Can't be indexed"),
+        stageNum(cantTotal),
+        e('div', { className: 'funnel-breakdown' },
+          brRow('RAW / video (moved only)', totals.companion),
+          brRow('Corrupt / mislabeled', totals.blocked),
+          brRow('Other (left in place)', totals.other)
+        )
+      );
+
+      // Stage 3 — ingested (has a photos row) but no CLIP embedding yet.
+      var stageClip = e('div', { className: 'funnel-stage s-clip' },
+        e('div', { className: 'funnel-label' }, 'Awaiting CLIP index'),
+        stageNum(clipQ),
+        e('div', { className: 'funnel-sub' },
+          q && q.error ? 'queue unavailable' : 'ingested, not yet embedded')
+      );
+
+      // Stage 4 — embedded, awaiting the enrichment passes.
+      var stageEnrich = e('div', { className: 'funnel-stage s-enrich' },
+        e('div', { className: 'funnel-label' }, 'Awaiting enrichment'),
+        stageNum(enrichTotal),
+        enrichActive.length === 0
+          ? e('div', { className: 'funnel-sub' },
+              q && q.error ? 'queue unavailable' : 'all passes caught up')
+          : e('div', { className: 'funnel-mini' },
+              enrichActive.map(function (p) {
+                return e('div', { className: 'm', key: p },
+                  e('span', { className: 'mp' }, p),
+                  e('span', null, fmt(queue[p])));
+              }))
+      );
+
+      var srcTable = showSrc && srcNames.length > 0 && e('div', { className: 'funnel-src' },
+        e('table', null,
+          e('thead', null, e('tr', null,
+            e('th', null, 'Source'), e('th', null, 'Ready'), e('th', null, 'RAW/vid'),
+            e('th', null, 'Corrupt'), e('th', null, 'Other'))),
+          e('tbody', null,
+            srcNames.map(function (name) {
+              var s = inc.sources[name];
+              return e('tr', { key: name },
+                e('td', null, name), e('td', null, fmt(s.staged)),
+                e('td', null, fmt(s.companion)), e('td', null, fmt(s.blocked)),
+                e('td', null, fmt(s.other)));
+            }))
+        )
+      );
+
+      var srcLabel = inc && inc.source && inc.source !== 'local'
+        ? inc.source.replace(/^https?:\/\//, '') : null;
+
+      return e('div', null,
+        e('h2', null, 'Pipeline' + (srcLabel ? ' — ' + srcLabel : '')),
+        e('div', { className: 'workers-wrap' },
+          inc && inc.error && e('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, inc.error),
+          e('div', { className: 'funnel-groups' },
+            e('div', { className: 'funnel-group' },
+              e('div', { className: 'fg-head' }, '_incoming — staging'),
+              e('div', { className: 'funnel-row' }, stageStaged, stageBlocked)
+            ),
+            e('div', { className: 'funnel-arrow' }, '→'),
+            e('div', { className: 'funnel-group' },
+              e('div', { className: 'fg-head' }, 'Library — indexing backlog'),
+              e('div', { className: 'funnel-row' }, stageClip, stageEnrich)
+            )
+          ),
+          srcNames.length > 0 && e('div', { style: { marginTop: 10 } },
+            e('button', { className: 'link-btn', onClick: function () { setShowSrc(!showSrc); } },
+              showSrc ? 'Hide per-source breakdown' : 'Show per-source breakdown (' + srcNames.length + ')')
+          ),
+          srcTable
+        )
+      );
+    }
+
     function Page() {
       var noop = function () {};
       return e('div', null,
@@ -1905,6 +2086,7 @@
           e('h1', null, 'Maintenance'),
           e('p', { style: { color: 'var(--text-muted)', marginBottom: 18, maxWidth: 760 } },
             'CPU-light backfills + on-demand jobs. Heavy GPU passes stay with the worker fleet.'),
+          e(PipelineFunnel, null),
           e(WorkersPanel, null),
           e(FleetLauncher, null),
           e(LightIndex, null),

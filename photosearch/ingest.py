@@ -115,6 +115,79 @@ def _iter_source_files(source_root: Path) -> list[Path]:
     return out
 
 
+def scan_incoming(incoming_root: str) -> dict:
+    """Classify every file under _incoming/<source>/ by ingest disposition.
+
+    A *cheap* read-only preview of what the next `ingest-incoming` sweep will do
+    — a directory walk plus a 12-byte magic-byte read per image-extension file.
+    It does NOT hash or read EXIF, so unlike the full `--dry-run` sweep it can't
+    tell a genuinely-new photo from one that will dedup against an existing
+    `photos.file_hash`; both count as ``staged``. That split needs the hash
+    sweep. Being cheap, this is safe to call from a web request on every poll.
+
+    Returns per-source + total counts across four disposition buckets:
+
+      - ``staged``    — JPEG/HEIC whose content is a decodable image. Gets a
+                        ``photos`` row + CLIP embedding on the next sweep (unless
+                        it dedups away).
+      - ``blocked``   — image *extension* but the content is NOT a decodable
+                        image (e.g. a ZIP-wrapped iOS Live Photo saved as .JPG).
+                        Relocated as a move-only companion, never searchable.
+      - ``companion`` — RAW/video. Moved into the dated library folder so it
+                        reaches the NAS, but never indexed (no DB row, no CLIP).
+      - ``other``     — non-media (Sony sidecars, .aae edits, etc.). Left in
+                        place entirely; ``ingest-incoming`` never touches it.
+
+    Shape::
+
+        {
+          "incoming_root": str, "exists": bool,
+          "sources": { "<source>": {staged, blocked, companion, other,
+                                    total, bytes}, ... },
+          "totals":  {staged, blocked, companion, other, total, bytes},
+        }
+    """
+    incoming = Path(incoming_root).resolve()
+    _zero = lambda: {"staged": 0, "blocked": 0, "companion": 0, "other": 0,
+                     "total": 0, "bytes": 0}
+    result: dict = {"incoming_root": str(incoming), "exists": incoming.is_dir(),
+                    "sources": {}, "totals": _zero()}
+    if not incoming.is_dir():
+        return result
+
+    sources = [p for p in sorted(incoming.iterdir())
+               if p.is_dir() and not p.name.startswith(".")]
+    totals = result["totals"]
+    for source_root in sources:
+        counts = _zero()
+        for root, dirs, files in os.walk(source_root):
+            dirs[:] = [d for d in dirs if d != ARCHIVE_DIRNAME]
+            for fname in sorted(files):
+                # Skip AppleDouble sidecars (._*) and other hidden clutter
+                # (.DS_Store, Thumbs.db) — never user media, so counting them as
+                # "cannot ingest" would just be noise.
+                if fname.startswith("."):
+                    continue
+                fpath = Path(root) / fname
+                ext = fpath.suffix.lower()
+                if ext in INGEST_EXTENSIONS:
+                    bucket = "staged" if is_real_image(str(fpath)) else "blocked"
+                elif ext in COMPANION_EXTENSIONS:
+                    bucket = "companion"
+                else:
+                    bucket = "other"
+                counts[bucket] += 1
+                counts["total"] += 1
+                try:
+                    counts["bytes"] += fpath.stat().st_size
+                except OSError:
+                    pass
+        result["sources"][source_root.name] = counts
+        for k in totals:
+            totals[k] += counts[k]
+    return result
+
+
 def _parse_date_taken(exif_value: Optional[str]) -> Optional[datetime]:
     """extract_exif returns 'YYYY-MM-DD HH:MM:SS' (already normalized)."""
     if not exif_value:

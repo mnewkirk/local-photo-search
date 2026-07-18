@@ -388,3 +388,51 @@ def test_hidden_top_level_dirs_are_skipped(tmp_path, tmp_db_path, monkeypatch):
 
     # .syncthing-stversions never appears as a source
     assert list(result["sources"].keys()) == ["matt"]
+
+
+def test_scan_incoming_classifies_by_disposition(tmp_path):
+    """scan_incoming buckets files without hashing/EXIF: staged / blocked /
+    companion / other, per source, skipping hidden files and the archive dir."""
+    from photosearch.ingest import scan_incoming
+
+    incoming = tmp_path / "_incoming"
+    # matt: 1 staged jpg, 1 staged heic, 1 blocked (PK zip as .JPG), 1 other sidecar
+    _touch(incoming / "matt" / "good.jpg", b"a")
+    _touch(incoming / "matt" / "pic.heic", b"b")
+    (incoming / "matt" / "live(1).JPG").write_bytes(b"PK\x03\x04" + b"\x00" * 20)
+    (incoming / "matt" / "edit.aae").write_bytes(b"<plist/>")
+    # hidden clutter — must be ignored
+    (incoming / "matt" / ".DS_Store").write_bytes(b"x")
+    (incoming / "matt" / "._good.jpg").write_bytes(b"x")
+    # archive dir contents — must be ignored
+    (incoming / "matt" / ".processed").mkdir()
+    _touch(incoming / "matt" / ".processed" / "old.jpg", b"old")
+    # camera source: RAW + video companions (move-only, never indexed)
+    (incoming / "ILCE-7RM6" / "shot.ARW").parent.mkdir(parents=True)
+    (incoming / "ILCE-7RM6" / "shot.ARW").write_bytes(b"II*\x00" + b"\x00" * 20)
+    (incoming / "ILCE-7RM6" / "clip.mp4").write_bytes(b"\x00" * 20)
+
+    result = scan_incoming(str(incoming))
+
+    assert result["exists"] is True
+    assert result["sources"]["matt"] == {
+        "staged": 2, "blocked": 1, "companion": 0, "other": 1,
+        "total": 4, "bytes": result["sources"]["matt"]["bytes"],
+    }
+    assert result["sources"]["ILCE-7RM6"]["companion"] == 2
+    assert result["sources"]["ILCE-7RM6"]["staged"] == 0
+    assert result["totals"]["staged"] == 2
+    assert result["totals"]["blocked"] == 1
+    assert result["totals"]["companion"] == 2
+    assert result["totals"]["other"] == 1
+
+
+def test_scan_incoming_missing_dir_returns_empty(tmp_path):
+    """A non-existent _incoming reports exists=False with zeroed totals rather
+    than raising (the endpoint polls it on a schedule)."""
+    from photosearch.ingest import scan_incoming
+
+    result = scan_incoming(str(tmp_path / "nope"))
+    assert result["exists"] is False
+    assert result["sources"] == {}
+    assert result["totals"]["total"] == 0
