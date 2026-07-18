@@ -206,6 +206,26 @@ auto-detected via torch+rocm / cuda) with `HSA_ENABLE_DXG_DETECTION=1` and
 in `/tmp/photosearch-worker-fleet/worker-N.log`; `--status` / `--logs` /
 `--stop` work in both modes.
 
+**Filter-scoped runs (no collection needed):** besides `--collection` /
+`--directory`, the fleet can be scoped by a **structured filter set** — the
+same vocabulary as `search`: `--from` / `--to` (date), `--person` (repeatable,
+AND-intersected), `--location`, `--min-quality`, `--min-aesthetic`, `--camera`,
+`--category`, `--visual-tag`, `--keyword`, `--style-tag`. The three scope kinds
+are mutually exclusive. Available on `cli.py worker`, `run-workers.sh`, and the
+`/admin/maintenance` **Worker fleet** panel (a filter row that overrides the
+collection dropdown). This replaces the old "make a collection from a date
+range, then run a job against it" workflow — e.g. score aesthetics for a trip:
+`./run-workers.sh --native -s <NAS> -p aesthetics --from 2026-06-27 --to
+2026-08-06 -n 2`. `cli.py worker … --dry-run` prints per-pass queue depth for
+the scope without claiming.
+
+The filter set is resolved **server-side** to a photo-id scope via
+`worker_api._resolve_scope_ids` (reuses `tools._build_filter_sql`), so the NAS
+must run this code — an older NAS image ignores `filters` and would claim the
+whole library. A broad scope (a whole camera, a frequent person) can be tens of
+thousands of ids; `_unprocessed_scoped` / `_count_scoped` chunk the scope under
+`SQLITE_MAX_VARIABLE_NUMBER` so large scopes don't blow the SQL parameter cap.
+
 Key files: `photosearch/worker.py` (client), `photosearch/worker_api.py` (server endpoints),
 `run-workers.sh` (Docker fleet launcher). API routes under `/api/worker/*`.
 Claims have TTL (default 30min) for crash recovery. `submit_results` for the

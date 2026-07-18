@@ -963,6 +963,43 @@ class WorkersStartRequest(BaseModel):
     passes: list[str]
     count: int = 2
     collection: int | None = None  # optional: scope the fleet to one collection
+    # optional: scope the fleet to a structured filter set (date range, people,
+    # location, quality/aesthetic, camera, tags) — mutually exclusive with
+    # `collection`. Resolved server-side to a photo-id set.
+    filters: dict | None = None
+
+
+# filters-dict key → run-workers.sh flag. `people` fans out to repeated
+# --person; everything else is a single scalar flag.
+_FILTER_FLAG = {
+    "date_from": "--from",
+    "date_to": "--to",
+    "location": "--location",
+    "min_quality": "--min-quality",
+    "min_aesthetic": "--min-aesthetic",
+    "camera": "--camera",
+    "category": "--category",
+    "visual_tag": "--visual-tag",
+    "keyword": "--keyword",
+    "style_tag": "--style-tag",
+}
+
+
+def _filters_to_worker_flags(filters: dict) -> list[str]:
+    """Turn a structured filter dict into run-workers.sh CLI flags."""
+    flags: list[str] = []
+    for name in filters.get("people") or []:
+        name = str(name).strip()
+        if name:
+            flags += ["--person", name]
+    for key, flag in _FILTER_FLAG.items():
+        val = filters.get(key)
+        if val is None:
+            continue
+        val = str(val).strip()
+        if val:
+            flags += [flag, val]
+    return flags
 
 
 def _run_workers_script() -> str:
@@ -1006,10 +1043,14 @@ def admin_workers_start(req: WorkersStartRequest):
         raise HTTPException(404, f"run-workers.sh not found: {script}")
     cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
            "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
+    filter_flags = _filters_to_worker_flags(req.filters) if req.filters else []
+    if req.collection is not None and filter_flags:
+        raise HTTPException(400, "collection and filters are mutually exclusive")
     if req.collection is not None:
         if req.collection <= 0:
             raise HTTPException(400, "collection must be a positive id")
         cmd += ["-c", str(req.collection)]
+    cmd += filter_flags
     try:
         r = subprocess.run(cmd, cwd=_native_repo_dir(), env=_fleet_env(),
                            capture_output=True, text=True, timeout=180)

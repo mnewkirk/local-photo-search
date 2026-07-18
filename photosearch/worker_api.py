@@ -97,6 +97,11 @@ class ClaimRequest(BaseModel):
     limit: int = 16
     collection_id: Optional[int] = None
     directory: Optional[str] = None  # e.g. "/photos/2026/2026-04-09"
+    # Structured filter set (the same vocabulary _build_filter_sql / search_photos
+    # accept: date_from/date_to, people, location, min_quality, min_aesthetic,
+    # camera, category, visual_tag, keyword, style_tag). Resolved server-side to a
+    # photo-id scope — a third way to produce scope_ids alongside collection/dir.
+    filters: Optional[dict] = None
     ttl_minutes: int = 30
 
 
@@ -202,6 +207,79 @@ class SubmitRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Scope resolution
+# ---------------------------------------------------------------------------
+
+# A scope resolved from a broad filter (a whole camera model, a frequent
+# person) can be tens of thousands of ids. get_unprocessed_photos binds each
+# scope id as a SQL parameter, so a large scope would blow past
+# SQLITE_MAX_VARIABLE_NUMBER (32766 on a default-compiled libsqlite3). Chunk the
+# scope below that so queue reads stay valid regardless of scope size. Normal
+# directory/collection/date-range scopes are far smaller and never chunk.
+_SCOPE_CHUNK = 20000
+
+
+def _unprocessed_scoped(db, pass_type, scope_ids, limit, commit_cleanup):
+    """get_unprocessed_photos with large-scope chunking. Chunks are disjoint id
+    ranges, each excluding already-claimed photos, so we accumulate up to `limit`
+    fresh rows across chunks."""
+    if not scope_ids or len(scope_ids) <= _SCOPE_CHUNK:
+        return db.get_unprocessed_photos(
+            pass_type=pass_type, photo_ids=scope_ids, limit=limit,
+            commit_cleanup=commit_cleanup)
+    out: list = []
+    for i in range(0, len(scope_ids), _SCOPE_CHUNK):
+        chunk = scope_ids[i:i + _SCOPE_CHUNK]
+        out.extend(db.get_unprocessed_photos(
+            pass_type=pass_type, photo_ids=chunk, limit=limit - len(out),
+            commit_cleanup=commit_cleanup))
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _count_scoped(db, pass_type, scope_ids):
+    """count_unprocessed_photos with the same large-scope chunking."""
+    if not scope_ids or len(scope_ids) <= _SCOPE_CHUNK:
+        return db.count_unprocessed_photos(pass_type, photo_ids=scope_ids)
+    return sum(
+        db.count_unprocessed_photos(pass_type, photo_ids=scope_ids[i:i + _SCOPE_CHUNK])
+        for i in range(0, len(scope_ids), _SCOPE_CHUNK))
+
+
+def _resolve_scope_ids(db, collection_id, directory, filters):
+    """Collapse the mutually-exclusive scoping inputs into a flat photo-id list
+    (or None = whole library). Precedence: collection > directory > filters.
+
+    `filters` is the structured filter set (_build_filter_sql vocabulary). An
+    empty dict, or one whose keys don't build any clause, is treated as
+    "no scope" (whole library) rather than an all-rows IN list. Raises 404 when
+    a scope is requested but matches zero photos.
+    """
+    if collection_id is not None:
+        ids = db.get_collection_photo_ids(collection_id)
+        if not ids:
+            raise HTTPException(404, f"Collection {collection_id} has no photos")
+        return ids
+    if directory is not None:
+        ids = db.get_directory_photo_ids(directory)
+        if not ids:
+            raise HTTPException(404, f"No photos found in directory {directory}")
+        return ids
+    if filters:
+        from .tools import _build_filter_sql  # local import: keeps CLIP/torch out of import path
+        where, params = _build_filter_sql(db, filters)
+        if where == "1":
+            return None  # no recognized filter key → whole library
+        ids = [r[0] for r in db.conn.execute(
+            f"SELECT id FROM photos WHERE {where}", params).fetchall()]
+        if not ids:
+            raise HTTPException(404, "No photos match the given filters")
+        return ids
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -212,16 +290,9 @@ def claim_batch(req: ClaimRequest):
     Returns photo metadata + download URLs. The claim expires after ttl_minutes.
     """
     with _get_db() as db:
-        # Scope to collection or directory if requested
-        scope_ids = None
-        if req.collection_id is not None:
-            scope_ids = db.get_collection_photo_ids(req.collection_id)
-            if not scope_ids:
-                raise HTTPException(404, f"Collection {req.collection_id} has no photos")
-        elif req.directory is not None:
-            scope_ids = db.get_directory_photo_ids(req.directory)
-            if not scope_ids:
-                raise HTTPException(404, f"No photos found in directory {req.directory}")
+        # Scope to collection, directory, or a structured filter set if requested
+        scope_ids = _resolve_scope_ids(
+            db, req.collection_id, req.directory, req.filters)
 
         # BEGIN IMMEDIATE acquires the SQLite writer lock up front so concurrent
         # claim-batch calls serialize here instead of racing through the
@@ -233,12 +304,8 @@ def claim_batch(req: ClaimRequest):
         # outer transaction early.
         db.conn.execute("BEGIN IMMEDIATE")
         try:
-            photos = db.get_unprocessed_photos(
-                pass_type=req.pass_type,
-                photo_ids=scope_ids,
-                limit=req.limit,
-                commit_cleanup=False,
-            )
+            photos = _unprocessed_scoped(
+                db, req.pass_type, scope_ids, req.limit, commit_cleanup=False)
 
             if not photos:
                 db.conn.commit()
@@ -263,10 +330,7 @@ def claim_batch(req: ClaimRequest):
         # on large libraries. The count doesn't subtract active claims, so the
         # value is slightly inflated, but it's purely informational (worker
         # logs it; no decision is made on it).
-        remaining = db.count_unprocessed_photos(
-            pass_type=req.pass_type,
-            photo_ids=scope_ids,
-        )
+        remaining = _count_scoped(db, req.pass_type, scope_ids)
 
         # Fetch description for every claimed photo in one query so text-only
         # passes (category-content, keywords) can run without downloading image bytes.
@@ -641,6 +705,7 @@ class ClearPassRequest(BaseModel):
     pass_type: str
     collection_id: Optional[int] = None
     directory: Optional[str] = None
+    filters: Optional[dict] = None  # structured filter set (_build_filter_sql)
     photo_ids: Optional[list[int]] = None
 
 
@@ -655,20 +720,15 @@ def clear_pass(req: ClearPassRequest):
     If collection_id is set, only affects photos in that collection.
     """
     with _get_db() as db:
-        if req.collection_id is not None:
-            photo_ids = db.get_collection_photo_ids(req.collection_id)
-            if not photo_ids:
-                raise HTTPException(404, f"Collection {req.collection_id} has no photos")
-        elif req.directory is not None:
-            photo_ids = db.get_directory_photo_ids(req.directory)
-            if not photo_ids:
-                raise HTTPException(404, f"No photos found in directory {req.directory}")
-        elif req.photo_ids is not None:
-            photo_ids = req.photo_ids
-            if not photo_ids:
-                raise HTTPException(400, "photo_ids list is empty")
-        else:
-            raise HTTPException(400, "collection_id, directory, or photo_ids is required for clear-pass (safety)")
+        photo_ids = _resolve_scope_ids(
+            db, req.collection_id, req.directory, req.filters)
+        if photo_ids is None:
+            if req.photo_ids is not None:
+                photo_ids = req.photo_ids
+                if not photo_ids:
+                    raise HTTPException(400, "photo_ids list is empty")
+            else:
+                raise HTTPException(400, "collection_id, directory, filters, or photo_ids is required for clear-pass (safety)")
 
         placeholders = ",".join("?" * len(photo_ids))
         cleared = 0
@@ -837,6 +897,7 @@ def worker_status(
     collection_id: Optional[int] = None,
     directory: Optional[str] = None,
     passes: Optional[str] = None,
+    filters: Optional[str] = None,  # JSON-encoded structured filter set
 ):
     """Show queue depth and active claims for the worker system.
 
@@ -855,6 +916,13 @@ def worker_status(
             requested = _ALL_PASSES
     else:
         requested = _ALL_PASSES
+
+    filters_obj = None
+    if filters:
+        try:
+            filters_obj = json.loads(filters)
+        except (ValueError, TypeError):
+            raise HTTPException(400, "filters must be a JSON object")
 
     with _get_db() as db:
         # Active claims (read-only; no expire sweep)
@@ -876,19 +944,16 @@ def worker_status(
             })
 
         # Queue depth per requested pass type — count of photos missing each pass
-        scope_ids = None
-        if collection_id is not None:
-            scope_ids = db.get_collection_photo_ids(collection_id)
-        elif directory is not None:
-            scope_ids = db.get_directory_photo_ids(directory)
+        scope_ids = _resolve_scope_ids(db, collection_id, directory, filters_obj)
 
         queue = {}
         for pass_type in requested:
-            queue[pass_type] = db.count_unprocessed_photos(pass_type, photo_ids=scope_ids)
+            queue[pass_type] = _count_scoped(db, pass_type, scope_ids)
 
         return {
             "active_claims": active,
             "queue_depth": queue,
             "collection_id": collection_id,
             "directory": directory,
+            "filters": filters_obj,
         }

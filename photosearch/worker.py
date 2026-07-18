@@ -166,6 +166,7 @@ class WorkerClient:
     def claim_batch(self, pass_type: str, limit: int = 16,
                     collection_id: Optional[int] = None,
                     directory: Optional[str] = None,
+                    filters: Optional[dict] = None,
                     ttl_minutes: int = 30) -> dict:
         """Claim a batch of photos. Returns {batch_id, pass_type, photos: [...]}."""
         payload = {
@@ -178,6 +179,8 @@ class WorkerClient:
             payload["collection_id"] = collection_id
         if directory is not None:
             payload["directory"] = directory
+        if filters:
+            payload["filters"] = filters
         r = self._request("POST", f"{self.server_url}/api/worker/claim-batch", json=payload, timeout=30)
         if not r.ok:
             detail = r.text[:200] if r.text else r.reason
@@ -228,7 +231,8 @@ class WorkerClient:
 
     def get_status(self, collection_id: Optional[int] = None,
                    directory: Optional[str] = None,
-                   passes: Optional[list[str]] = None) -> dict:
+                   passes: Optional[list[str]] = None,
+                   filters: Optional[dict] = None) -> dict:
         """Get worker queue status.
 
         If passes is provided, the server only computes queue depth for those
@@ -241,18 +245,23 @@ class WorkerClient:
             params["directory"] = directory
         if passes:
             params["passes"] = ",".join(passes)
+        if filters:
+            params["filters"] = json.dumps(filters)
         r = self.session.get(f"{self.server_url}/api/worker/status", params=params, timeout=60)
         r.raise_for_status()
         return r.json()
 
     def clear_pass(self, pass_type: str, collection_id: Optional[int] = None,
-                   directory: Optional[str] = None) -> dict:
-        """Clear processing state for a pass type on a collection or directory."""
+                   directory: Optional[str] = None,
+                   filters: Optional[dict] = None) -> dict:
+        """Clear processing state for a pass type on a collection, directory, or filter set."""
         payload = {"pass_type": pass_type}
         if collection_id is not None:
             payload["collection_id"] = collection_id
         if directory is not None:
             payload["directory"] = directory
+        if filters:
+            payload["filters"] = filters
         r = self.session.post(
             f"{self.server_url}/api/worker/clear-pass",
             json=payload,
@@ -791,6 +800,7 @@ def run_worker(
     passes: list[str],
     collection_id: Optional[int] = None,
     directory: Optional[str] = None,
+    filters: Optional[dict] = None,
     batch_size: int = 16,
     model_batch_size: int = 8,
     ttl_minutes: int = 30,
@@ -811,6 +821,9 @@ def run_worker(
         passes: List of pass types to process (clip, faces, quality, describe, verify, ...)
         collection_id: Optional collection to scope work to
         directory: Optional directory path on the NAS to scope work to
+        filters: Optional structured filter set (date_from/date_to, people,
+            location, min_quality, min_aesthetic, camera, category, visual_tag,
+            keyword, style_tag) resolved server-side to a photo-id scope
         batch_size: Number of photos to claim per batch
         model_batch_size: Batch size for model inference
         ttl_minutes: Claim TTL in minutes
@@ -830,18 +843,19 @@ def run_worker(
 
     scope_label = (f"collection {collection_id}" if collection_id
                    else f"directory {directory}" if directory
+                   else f"filters {filters}" if filters
                    else "all photos")
 
     # Force mode: clear existing data for the requested passes
     if force:
-        if collection_id is None and directory is None:
-            print("Error: --force requires --collection or --directory (safety measure).",
+        if collection_id is None and directory is None and not filters:
+            print("Error: --force requires --collection, --directory, or a filter (safety measure).",
                   file=sys.stderr)
             return
         for pass_type in passes:
             print(f"Clearing {pass_type} data for {scope_label}...")
             resp = client.clear_pass(pass_type, collection_id=collection_id,
-                                     directory=directory)
+                                     directory=directory, filters=filters)
             print(f"  Cleared {resp['cleared']} entries across {resp['photo_count']} photos.")
 
     # Show initial status — informational only, non-fatal. Under concurrent
@@ -850,6 +864,7 @@ def run_worker(
     try:
         status = client.get_status(
             collection_id=collection_id, directory=directory, passes=passes,
+            filters=filters,
         )
         print(f"\nQueue depth:")
         for pass_type, count in status["queue_depth"].items():
@@ -888,7 +903,7 @@ def run_worker(
                         lambda pt=pass_type: client.claim_batch(
                             pass_type=pt, limit=batch_size,
                             collection_id=collection_id, directory=directory,
-                            ttl_minutes=ttl_minutes,
+                            filters=filters, ttl_minutes=ttl_minutes,
                         ),
                         label=f"claim {pass_type}",
                     )

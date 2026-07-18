@@ -63,6 +63,19 @@ SERVER=""
 PASSES="clip"
 DIRECTORY=""
 COLLECTION=""
+# Structured filter scope (mutually exclusive with --directory/--collection).
+# Resolved server-side to a photo-id set — the same vocabulary as `search`.
+FROM_DATE=""
+TO_DATE=""
+PERSONS=()          # repeatable --person (AND-intersected server-side)
+LOCATION=""
+MIN_QUALITY=""
+MIN_AESTHETIC=""
+CAMERA=""
+CATEGORY=""
+VISUAL_TAG=""
+KEYWORD=""
+STYLE_TAG=""
 BATCH_SIZE=16
 MODEL_BATCH_SIZE=8
 TTL=30
@@ -142,6 +155,18 @@ Start workers:
   -p, --passes PASSES     Comma-separated passes (default: clip)
   -d, --directory DIR      Scope to directory on NAS (e.g. /photos/2026)
   -c, --collection ID     Scope to collection ID
+      --from DATE         Filter scope: photos on/after DATE (YYYY-MM-DD)
+      --to DATE           Filter scope: photos on/before DATE (YYYY-MM-DD)
+      --person NAME       Filter scope: registered person (repeatable, AND)
+      --location TEXT     Filter scope: place-name substring
+      --min-quality N     Filter scope: raw aesthetic floor
+      --min-aesthetic N   Filter scope: VLM aesthetic percentile floor (0-100)
+      --camera MODEL      Filter scope: exact camera_model
+      --category TAG      Filter scope: content category
+      --visual-tag TAG    Filter scope: visual tag
+      --keyword TEXT      Filter scope: keyword substring
+      --style-tag TAG     Filter scope: VLM style tag (e.g. golden-hour)
+                          (--directory / --collection / filters are exclusive)
   -n, --num-workers N     Number of workers (default: 4)
   -m, --memory LIMIT      Memory limit per container, docker mode only (default: 3g)
       --batch-size N      Photos per batch (default: 16)
@@ -807,6 +832,17 @@ while [[ $# -gt 0 ]]; do
         -p|--passes)        PASSES="$2";           shift 2 ;;
         -d|--directory)     DIRECTORY="$2";        shift 2 ;;
         -c|--collection)    COLLECTION="$2";       shift 2 ;;
+        --from)             FROM_DATE="$2";        shift 2 ;;
+        --to)               TO_DATE="$2";          shift 2 ;;
+        --person)           PERSONS+=("$2");       shift 2 ;;
+        --location)         LOCATION="$2";         shift 2 ;;
+        --min-quality)      MIN_QUALITY="$2";      shift 2 ;;
+        --min-aesthetic)    MIN_AESTHETIC="$2";    shift 2 ;;
+        --camera)           CAMERA="$2";           shift 2 ;;
+        --category)         CATEGORY="$2";         shift 2 ;;
+        --visual-tag)       VISUAL_TAG="$2";       shift 2 ;;
+        --keyword)          KEYWORD="$2";          shift 2 ;;
+        --style-tag)        STYLE_TAG="$2";        shift 2 ;;
         -n|--num-workers)   NUM_WORKERS="$2";      shift 2 ;;
         -m|--memory)        MEM_LIMIT="$2";        shift 2 ;;
         --batch-size)       BATCH_SIZE="$2";       shift 2 ;;
@@ -896,42 +932,74 @@ if [[ "$SERVER" != http://* && "$SERVER" != https://* ]]; then
     SERVER="http://$SERVER"
 fi
 
-if [ -n "$DIRECTORY" ] && [ -n "$COLLECTION" ]; then
-    echo "Error: --directory and --collection are mutually exclusive." >&2
+# Detect a structured filter scope (any filter flag set).
+HAS_FILTER=""
+if [ -n "$FROM_DATE" ] || [ -n "$TO_DATE" ] || [ ${#PERSONS[@]} -gt 0 ] \
+   || [ -n "$LOCATION" ] || [ -n "$MIN_QUALITY" ] || [ -n "$MIN_AESTHETIC" ] \
+   || [ -n "$CAMERA" ] || [ -n "$CATEGORY" ] || [ -n "$VISUAL_TAG" ] \
+   || [ -n "$KEYWORD" ] || [ -n "$STYLE_TAG" ]; then
+    HAS_FILTER="1"
+fi
+
+# --directory, --collection, and the filter flags are three mutually-exclusive
+# ways to scope the fleet.
+_scope_count=0
+[ -n "$DIRECTORY" ] && _scope_count=$((_scope_count + 1))
+[ -n "$COLLECTION" ] && _scope_count=$((_scope_count + 1))
+[ -n "$HAS_FILTER" ] && _scope_count=$((_scope_count + 1))
+if [ "$_scope_count" -gt 1 ]; then
+    echo "Error: --directory, --collection, and the filter flags are mutually exclusive." >&2
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Build the worker command
 # ---------------------------------------------------------------------------
+# An ARRAY (not a flat string) so filter values with spaces — person names,
+# place names, camera models like "KODAK PIXPRO WPZ2" — survive to the worker
+# intact. Expanded as "${WORKER_CMD[@]}" in both launch paths below.
 
-WORKER_CMD="worker --server $SERVER --passes $PASSES --batch-size $BATCH_SIZE --model-batch-size $MODEL_BATCH_SIZE --ttl $TTL"
+WORKER_CMD=(worker --server "$SERVER" --passes "$PASSES"
+            --batch-size "$BATCH_SIZE" --model-batch-size "$MODEL_BATCH_SIZE"
+            --ttl "$TTL")
 
-if [ -n "$DIRECTORY" ]; then
-    WORKER_CMD="$WORKER_CMD --directory $DIRECTORY"
-fi
-if [ -n "$COLLECTION" ]; then
-    WORKER_CMD="$WORKER_CMD --collection $COLLECTION"
-fi
-if [ -n "$FORCE" ]; then
-    WORKER_CMD="$WORKER_CMD --force"
-fi
-if [ -n "$DESCRIBE_MODEL" ]; then
-    WORKER_CMD="$WORKER_CMD --describe-model $DESCRIBE_MODEL"
-fi
-if [ -n "$TAGS_MODEL" ]; then
-    WORKER_CMD="$WORKER_CMD --tags-model $TAGS_MODEL"
-fi
-if [ -n "$VERIFY_MODEL" ]; then
-    WORKER_CMD="$WORKER_CMD --verify-model $VERIFY_MODEL"
-fi
-if [ -n "$AESTHETICS_MODEL" ]; then
-    WORKER_CMD="$WORKER_CMD --aesthetics-model $AESTHETICS_MODEL"
-fi
+[ -n "$DIRECTORY" ]    && WORKER_CMD+=(--directory "$DIRECTORY")
+[ -n "$COLLECTION" ]   && WORKER_CMD+=(--collection "$COLLECTION")
+[ -n "$FROM_DATE" ]    && WORKER_CMD+=(--from "$FROM_DATE")
+[ -n "$TO_DATE" ]      && WORKER_CMD+=(--to "$TO_DATE")
+for _p in "${PERSONS[@]}"; do WORKER_CMD+=(--person "$_p"); done
+[ -n "$LOCATION" ]     && WORKER_CMD+=(--location "$LOCATION")
+[ -n "$MIN_QUALITY" ]  && WORKER_CMD+=(--min-quality "$MIN_QUALITY")
+[ -n "$MIN_AESTHETIC" ] && WORKER_CMD+=(--min-aesthetic "$MIN_AESTHETIC")
+[ -n "$CAMERA" ]       && WORKER_CMD+=(--camera "$CAMERA")
+[ -n "$CATEGORY" ]     && WORKER_CMD+=(--category "$CATEGORY")
+[ -n "$VISUAL_TAG" ]   && WORKER_CMD+=(--visual-tag "$VISUAL_TAG")
+[ -n "$KEYWORD" ]      && WORKER_CMD+=(--keyword "$KEYWORD")
+[ -n "$STYLE_TAG" ]    && WORKER_CMD+=(--style-tag "$STYLE_TAG")
+[ -n "$FORCE" ]        && WORKER_CMD+=(--force)
+[ -n "$DESCRIBE_MODEL" ]   && WORKER_CMD+=(--describe-model "$DESCRIBE_MODEL")
+[ -n "$TAGS_MODEL" ]       && WORKER_CMD+=(--tags-model "$TAGS_MODEL")
+[ -n "$VERIFY_MODEL" ]     && WORKER_CMD+=(--verify-model "$VERIFY_MODEL")
+[ -n "$AESTHETICS_MODEL" ] && WORKER_CMD+=(--aesthetics-model "$AESTHETICS_MODEL")
 
 SCOPE=""
 if [ -n "$DIRECTORY" ]; then SCOPE=" (directory: $DIRECTORY)"; fi
 if [ -n "$COLLECTION" ]; then SCOPE=" (collection: $COLLECTION)"; fi
+if [ -n "$HAS_FILTER" ]; then
+    _fparts=()
+    [ -n "$FROM_DATE" ] && _fparts+=("from $FROM_DATE")
+    [ -n "$TO_DATE" ] && _fparts+=("to $TO_DATE")
+    [ ${#PERSONS[@]} -gt 0 ] && _fparts+=("person ${PERSONS[*]}")
+    [ -n "$LOCATION" ] && _fparts+=("location $LOCATION")
+    [ -n "$MIN_QUALITY" ] && _fparts+=("min-quality $MIN_QUALITY")
+    [ -n "$MIN_AESTHETIC" ] && _fparts+=("min-aesthetic $MIN_AESTHETIC")
+    [ -n "$CAMERA" ] && _fparts+=("camera $CAMERA")
+    [ -n "$CATEGORY" ] && _fparts+=("category $CATEGORY")
+    [ -n "$VISUAL_TAG" ] && _fparts+=("visual-tag $VISUAL_TAG")
+    [ -n "$KEYWORD" ] && _fparts+=("keyword $KEYWORD")
+    [ -n "$STYLE_TAG" ] && _fparts+=("style-tag $STYLE_TAG")
+    _IFS_SAVE="$IFS"; IFS=", "; SCOPE=" (filter: ${_fparts[*]})"; IFS="$_IFS_SAVE"
+fi
 
 # ---------------------------------------------------------------------------
 # Header
@@ -1045,7 +1113,7 @@ if [ "$MODE" = "docker" ]; then
             -e PHOTOSEARCH_CACHE=/model-cache/photosearch \
             ${LLM_ENV_DOCKER[@]+"${LLM_ENV_DOCKER[@]}"} \
             "$IMAGE_TAG" \
-            $WORKER_CMD \
+            "${WORKER_CMD[@]}" \
             > /dev/null
     done
 else
@@ -1058,7 +1126,7 @@ else
         echo "  Starting worker-$i → $LOGF"
         HSA_ENABLE_DXG_DETECTION=1 OLLAMA_HOST="$OLLAMA_URL" PYTHONUNBUFFERED=1 \
             nohup env ${LLM_ENV_PAIRS[@]+"${LLM_ENV_PAIRS[@]}"} \
-            "$VENV_PYTHON" cli.py $WORKER_CMD > "$LOGF" 2>&1 &
+            "$VENV_PYTHON" cli.py "${WORKER_CMD[@]}" > "$LOGF" 2>&1 &
         echo $! > "$NATIVE_RUNDIR/worker-$i.pid"
     done
 fi

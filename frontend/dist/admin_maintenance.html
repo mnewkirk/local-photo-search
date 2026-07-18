@@ -1849,6 +1849,25 @@
       // Optional collection scope — '' means the whole queue (no --collection).
       var _cols = useState([]); var cols = _cols[0]; var setCols = _cols[1];
       var _col = useState(''); var col = _col[0]; var setCol = _col[1];
+      // Optional structured-filter scope (date range / person / location /
+      // aesthetic / camera). Any set field wins over the collection dropdown.
+      var _flt = useState({ date_from: '', date_to: '', person: '', location: '',
+                            min_aesthetic: '', camera: '' });
+      var flt = _flt[0]; var setFlt = _flt[1];
+      function setF(k, v) { var n = Object.assign({}, flt); n[k] = v; setFlt(n); }
+      function buildFilters() {
+        var f = {};
+        if (flt.date_from) f.date_from = flt.date_from;
+        if (flt.date_to) f.date_to = flt.date_to;
+        if (flt.person.trim()) {
+          f.people = flt.person.split(',').map(function (s) { return s.trim(); })
+            .filter(function (s) { return s; });
+        }
+        if (flt.location.trim()) f.location = flt.location.trim();
+        if (flt.min_aesthetic !== '') f.min_aesthetic = Number(flt.min_aesthetic);
+        if (flt.camera.trim()) f.camera = flt.camera.trim();
+        return f;
+      }
 
       function loadStatus() {
         fetch('/api/admin/workers/fleet-status')
@@ -1874,15 +1893,21 @@
         var passes = FLEET_PASSES.filter(function (p) { return sel[p]; });
         if (passes.length === 0) return;
         setBusy(true); setMsg({ kind: 'info', text: 'Launching ' + count + ' worker(s)…' });
+        var filters = buildFilters();
+        var hasFilter = Object.keys(filters).length > 0;
         var body = { passes: passes, count: Number(count) };
-        if (col !== '') body.collection = Number(col);
+        // Filters take precedence over the collection dropdown (the server
+        // rejects both at once). A set filter scopes the whole fleet.
+        if (hasFilter) body.filters = filters;
+        else if (col !== '') body.collection = Number(col);
         fetch('/api/admin/workers/start', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
           .then(function (res) {
             var scope = (res.d && res.d.collection)
-              ? ' (collection ' + res.d.collection + ')' : '';
+              ? ' (collection ' + res.d.collection + ')'
+              : hasFilter ? ' (filtered)' : '';
             setMsg(res.ok
               ? { kind: 'ok', text: 'Launched ' + res.d.count + ' worker(s) → ' + res.d.server + scope }
               : { kind: 'err', text: (res.d && res.d.detail) || 'Launch failed' });
@@ -1933,6 +1958,33 @@
             e('button', { className: 'btn', style: { marginLeft: 'auto' },
               onClick: loadStatus, disabled: busy }, 'Refresh')
           ),
+          e('div', { style: { marginTop: 10, display: 'flex', flexWrap: 'wrap',
+              gap: 8, alignItems: 'center' } },
+            e('span', { className: 'workers-title' }, 'Filter scope: '),
+            e('input', { type: 'date', title: 'From date', value: flt.date_from,
+              onChange: function (ev) { setF('date_from', ev.target.value); },
+              style: { maxWidth: 150 } }),
+            e('span', { style: { color: 'var(--text-muted)' } }, '→'),
+            e('input', { type: 'date', title: 'To date', value: flt.date_to,
+              onChange: function (ev) { setF('date_to', ev.target.value); },
+              style: { maxWidth: 150 } }),
+            e('input', { type: 'text', placeholder: 'person(s), comma-sep',
+              value: flt.person, title: 'Registered person name(s), AND-intersected',
+              onChange: function (ev) { setF('person', ev.target.value); },
+              style: { width: 170 } }),
+            e('input', { type: 'text', placeholder: 'location', value: flt.location,
+              onChange: function (ev) { setF('location', ev.target.value); },
+              style: { width: 130 } }),
+            e('input', { type: 'text', placeholder: 'camera model', value: flt.camera,
+              onChange: function (ev) { setF('camera', ev.target.value); },
+              style: { width: 140 } }),
+            e('input', { type: 'number', placeholder: 'min aes %', min: 0, max: 100,
+              value: flt.min_aesthetic, title: 'VLM aesthetic percentile floor (0-100)',
+              onChange: function (ev) { setF('min_aesthetic', ev.target.value); },
+              style: { width: 90 } })
+          ),
+          e('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 4 } },
+            'Any filter here scopes the whole fleet and overrides the collection dropdown.'),
           msg && e('p', { style: { fontSize: 12, marginTop: 8,
               color: msg.kind === 'err' ? 'var(--danger, #c0392b)'
                    : msg.kind === 'ok' ? 'var(--success, #2e7d32)' : 'var(--text-muted)' } }, msg.text),

@@ -4307,12 +4307,37 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Scope work to a specific collection (by ID).")
 @click.option("--directory", "-d", default=None,
               help="Scope work to a directory on the NAS (e.g. /photos/2026/2026-04-09).")
+# Structured filter scope — resolved server-side to a photo-id set (the same
+# vocabulary as `search`). Mutually exclusive with --collection/--directory.
+@click.option("--from", "date_from", default=None,
+              help="Filter scope: photos on/after this date (YYYY-MM-DD).")
+@click.option("--to", "date_to", default=None,
+              help="Filter scope: photos on/before this date (YYYY-MM-DD).")
+@click.option("--person", "persons", multiple=True,
+              help="Filter scope: registered person name (repeatable; AND-intersected).")
+@click.option("--location", default=None,
+              help="Filter scope: place name / location substring.")
+@click.option("--min-quality", type=float, default=None,
+              help="Filter scope: raw aesthetic floor (aes_overall/aesthetic_score).")
+@click.option("--min-aesthetic", type=float, default=None,
+              help="Filter scope: VLM aesthetic percentile floor (0-100).")
+@click.option("--camera", default=None,
+              help="Filter scope: exact camera_model.")
+@click.option("--category", default=None,
+              help="Filter scope: content category tag.")
+@click.option("--visual-tag", default=None,
+              help="Filter scope: visual tag.")
+@click.option("--keyword", default=None,
+              help="Filter scope: free-form keyword substring.")
+@click.option("--style-tag", default=None,
+              help="Filter scope: VLM style tag (e.g. golden-hour).")
 @click.option("--batch-size", default=16, show_default=True, help="Photos per batch.")
 @click.option("--model-batch-size", default=8, show_default=True,
               help="Batch size for model inference (CLIP, quality).")
 @click.option("--ttl", default=30, show_default=True, help="Claim TTL in minutes.")
 @click.option("--one-shot", is_flag=True, help="Process one batch per pass and exit (don't loop).")
-@click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection).")
+@click.option("--dry-run", is_flag=True, help="Resolve the scope and print per-pass queue depth, then exit (no claims).")
+@click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection, --directory, or a filter).")
 @click.option("--describe-model", default="llama3.2-vision", show_default=True,
               help="Ollama model for descriptions.")
 @click.option("--tags-model", default="llava", show_default=True,
@@ -4327,8 +4352,11 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Ollama model for the keywords pass (text-only).")
 @click.option("--aesthetics-model", default="qwen2.5-vl", show_default=True,
               help="Vision model for the aesthetics scoring pass.")
-def worker(server, passes, collection_id, directory, batch_size, model_batch_size, ttl,
-           one_shot, force, describe_model, tags_model, verify_model,
+def worker(server, passes, collection_id, directory,
+           date_from, date_to, persons, location, min_quality, min_aesthetic,
+           camera, category, visual_tag, keyword, style_tag,
+           batch_size, model_batch_size, ttl,
+           one_shot, dry_run, force, describe_model, tags_model, verify_model,
            category_content_model, category_visual_model, keywords_model,
            aesthetics_model):
     """Run a remote indexing worker that processes photos from a NAS server.
@@ -4349,6 +4377,12 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
       # Run CLIP + quality for a collection:
       python cli.py worker -s http://nas.local:8000 -p clip,quality --collection 3
 
+      # Score aesthetics for a date range (no collection needed):
+      python cli.py worker -s http://nas.local:8000 -p aesthetics --from 2026-06-27 --to 2026-08-06
+
+      # Preview the scope's queue depth without claiming:
+      python cli.py worker -s http://nas.local:8000 -p aesthetics --person Calvin --dry-run
+
       # Run descriptions with moondream model:
       python cli.py worker -s http://nas.local:8000 -p describe --describe-model moondream
 
@@ -4357,8 +4391,36 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
     """
     from photosearch.worker import run_worker
 
-    if collection_id is not None and directory is not None:
-        click.echo("Error: --collection and --directory are mutually exclusive.", err=True)
+    # Assemble the structured filter set (omit unset keys — an empty dict means
+    # "no filter scope"). Mirrors the _build_filter_sql / search_photos vocabulary.
+    filters = {}
+    if date_from:
+        filters["date_from"] = date_from
+    if date_to:
+        filters["date_to"] = date_to
+    if persons:
+        filters["people"] = list(persons)
+    if location:
+        filters["location"] = location
+    if min_quality is not None:
+        filters["min_quality"] = min_quality
+    if min_aesthetic is not None:
+        filters["min_aesthetic"] = min_aesthetic
+    if camera:
+        filters["camera"] = camera
+    if category:
+        filters["category"] = category
+    if visual_tag:
+        filters["visual_tag"] = visual_tag
+    if keyword:
+        filters["keyword"] = keyword
+    if style_tag:
+        filters["style_tag"] = style_tag
+    filters = filters or None
+
+    scopes = [s for s in (collection_id is not None, directory is not None, filters is not None) if s]
+    if len(scopes) > 1:
+        click.echo("Error: --collection, --directory, and the filter flags are mutually exclusive.", err=True)
         raise SystemExit(1)
 
     pass_list = [p.strip() for p in passes.split(",")]
@@ -4373,11 +4435,33 @@ def worker(server, passes, collection_id, directory, batch_size, model_batch_siz
             click.echo(f"Error: unknown pass type '{p}'. Valid: {', '.join(sorted(valid_passes))}", err=True)
             raise SystemExit(1)
 
+    if dry_run:
+        from photosearch.worker import WorkerClient
+        client = WorkerClient(server, probe=False)
+        try:
+            status = client.get_status(
+                collection_id=collection_id, directory=directory,
+                filters=filters, passes=pass_list,
+            )
+        except Exception as e:
+            click.echo(f"Error: could not fetch scope status: {e}", err=True)
+            raise SystemExit(1)
+        scope_label = (f"collection {collection_id}" if collection_id
+                       else f"directory {directory}" if directory
+                       else f"filters {filters}" if filters
+                       else "all photos")
+        click.echo(f"Scope: {scope_label}")
+        click.echo("Queue depth (photos still needing each pass):")
+        for p in pass_list:
+            click.echo(f"  {p}: {status['queue_depth'].get(p, 0)}")
+        return
+
     run_worker(
         server=server,
         passes=pass_list,
         collection_id=collection_id,
         directory=directory,
+        filters=filters,
         batch_size=batch_size,
         model_batch_size=model_batch_size,
         ttl_minutes=ttl,
