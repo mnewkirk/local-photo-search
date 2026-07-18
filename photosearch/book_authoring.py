@@ -75,7 +75,56 @@ def segment_pool(pdb, filters: dict, gap_minutes: float = 20.0,
                 "descriptions": [h.get("description") for h in reps if h.get("description")][:4],
                 "people": _scene_people(pdb, rep_ids),
             })
-    return scenes[:max_scenes]
+    return _cap_scenes(scenes, max_scenes)
+
+
+def _cap_scenes(scenes: list[dict], max_scenes: int) -> list[dict]:
+    """Trim to ``max_scenes`` WITHOUT starving later days.
+
+    The naive ``scenes[:max_scenes]`` truncates chronologically, so a single
+    photo-dense early day (e.g. a playground afternoon that over-segments into
+    dozens of burst clusters) can eat the whole budget — and the trip's later,
+    often best, days get zero scenes (observed on the Wengen leg: 07-14's 44
+    scenes crowded out the 851-photo 07-15 waterfalls/glacier-gorge day and all of
+    07-16). Instead give each day a share of the budget proportional to how many
+    photos it holds (floor 1/day), and within a day keep its densest scenes,
+    re-sorted into time order so the morning→evening arc survives."""
+    if len(scenes) <= max_scenes:
+        return scenes
+    from collections import defaultdict
+    by_day: dict[str, list] = defaultdict(list)
+    for s in scenes:
+        by_day[s["day"]].append(s)
+    days = sorted(by_day)
+    weights = {d: sum((x.get("photo_count") or 1) for x in by_day[d]) for d in days}
+    tw = sum(weights.values()) or 1
+    budget = {d: max(1, int(max_scenes * weights[d] / tw)) for d in days}
+    # Floors can overshoot the cap — trim the least-dense days back down (never below 1).
+    while sum(budget.values()) > max_scenes:
+        trimmable = [d for d in days if budget[d] > 1]
+        if not trimmable:
+            break
+        budget[min(trimmable, key=lambda d: weights[d])] -= 1
+    # Spare capacity → hand to the densest days first.
+    for d in sorted(days, key=lambda d: weights[d], reverse=True):
+        if sum(budget.values()) >= max_scenes:
+            break
+        budget[d] += 1
+    kept: list[dict] = []
+    for d in days:
+        day_scenes = by_day[d]
+        q = budget[d]
+        if len(day_scenes) <= q:
+            kept.extend(day_scenes)
+        else:
+            dense = sorted(day_scenes, key=lambda s: (s.get("photo_count") or 0),
+                           reverse=True)[:q]
+            dense.sort(key=lambda s: (s.get("start") or ""))
+            kept.extend(dense)
+    kept.sort(key=lambda s: (s["day"], s.get("start") or ""))
+    for i, s in enumerate(kept):
+        s["gindex"] = i
+    return kept
 
 
 # ---------------------------------------------------------------------------
