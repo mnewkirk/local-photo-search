@@ -483,6 +483,7 @@ write_fleet_meta() {
         printf 'META_PASSES=%q\n' "$PASSES"
         printf 'META_COLLECTION=%q\n' "$COLLECTION"
         printf 'META_DIRECTORY=%q\n' "$DIRECTORY"
+        printf 'META_FILTERS=%q\n' "$FILTERS_JSON"
     } > "$(fleet_meta_file)"
 }
 
@@ -499,12 +500,13 @@ print_remaining_queue() {
         echo ""
         return
     fi
-    local META_SERVER="" META_PASSES="" META_COLLECTION="" META_DIRECTORY=""
+    local META_SERVER="" META_PASSES="" META_COLLECTION="" META_DIRECTORY="" META_FILTERS=""
     # shellcheck disable=SC1090
     source "$metaf"
     local scope=""
     [ -n "$META_COLLECTION" ] && scope=" (collection $META_COLLECTION)"
     [ -n "$META_DIRECTORY" ] && scope=" (directory $META_DIRECTORY)"
+    [ -n "$META_FILTERS" ] && [ "$META_FILTERS" != "{}" ] && scope=" (filter $META_FILTERS)"
     echo "=== Remaining Queue${scope} ==="
     echo ""
     local resp
@@ -512,6 +514,7 @@ print_remaining_queue() {
         --data-urlencode "passes=$META_PASSES" \
         ${META_COLLECTION:+--data-urlencode "collection_id=$META_COLLECTION"} \
         ${META_DIRECTORY:+--data-urlencode "directory=$META_DIRECTORY"} \
+        ${META_FILTERS:+--data-urlencode "filters=$META_FILTERS"} \
         2>/dev/null) || true
     if [ -z "$resp" ]; then
         echo "  (server unreachable: $META_SERVER)"
@@ -950,6 +953,36 @@ _scope_count=0
 if [ "$_scope_count" -gt 1 ]; then
     echo "Error: --directory, --collection, and the filter flags are mutually exclusive." >&2
     exit 1
+fi
+
+# Serialize the filter set to JSON once (via python3, which is already required)
+# so it can be persisted in the fleet metadata and re-sent to /api/worker/status
+# by --status — otherwise the status view queries unscoped and reports the whole
+# library. Values pass through the environment to survive spaces/quotes safely.
+FILTERS_JSON=""
+if [ -n "$HAS_FILTER" ]; then
+    FILTERS_JSON=$(
+        FROM_DATE="$FROM_DATE" TO_DATE="$TO_DATE" LOCATION="$LOCATION" \
+        MIN_QUALITY="$MIN_QUALITY" MIN_AESTHETIC="$MIN_AESTHETIC" CAMERA="$CAMERA" \
+        CATEGORY="$CATEGORY" VISUAL_TAG="$VISUAL_TAG" KEYWORD="$KEYWORD" \
+        STYLE_TAG="$STYLE_TAG" \
+        PERSONS_JOINED="$(printf '%s\n' ${PERSONS[@]+"${PERSONS[@]}"})" \
+        python3 -c '
+import os, json
+f = {}
+for key, envk in (("date_from","FROM_DATE"),("date_to","TO_DATE"),
+                  ("location","LOCATION"),("camera","CAMERA"),
+                  ("category","CATEGORY"),("visual_tag","VISUAL_TAG"),
+                  ("keyword","KEYWORD"),("style_tag","STYLE_TAG")):
+    v = os.environ.get(envk, "").strip()
+    if v: f[key] = v
+for key, envk in (("min_quality","MIN_QUALITY"),("min_aesthetic","MIN_AESTHETIC")):
+    v = os.environ.get(envk, "").strip()
+    if v: f[key] = float(v)
+people = [p for p in os.environ.get("PERSONS_JOINED","").split("\n") if p.strip()]
+if people: f["people"] = people
+print(json.dumps(f))
+')
 fi
 
 # ---------------------------------------------------------------------------
