@@ -88,6 +88,11 @@
       background:rgba(0,0,0,.72); line-height:1.5; letter-spacing:.2px; }
     .ppi-badge.warn { color:#04101f; background:var(--amber); }
     .ppi-badge.bad  { color:#fff; background:var(--red); }
+    /* Full-spread border when any cell prints soft (drawn over the photos, so a
+       full-bleed image can't hide it; never blocks clicks or prints). */
+    .lowppi-frame { position:absolute; inset:0; pointer-events:none; z-index:7; border-radius:4px; }
+    .lowppi-frame.warn { border:10px solid var(--amber); }
+    .lowppi-frame.bad  { border:10px solid var(--red); }
     /* Print-quality readout + alternatives in the cell toolbar */
     .pq { display:flex; flex-direction:column; gap:2px; font-size:12px; max-width:340px; }
     .pq .dpi { font-weight:700; }
@@ -371,6 +376,16 @@
       const cap = spread.caption;
       const dark = spread.bg && spread.bg !== '#ffffff';
       const cells = spread.cells.map(c => Object.assign({}, c, { __caption: cap && c.position===0 ? cap : null }));
+      // Worst print-resolution severity across the spread's cells → a full-frame
+      // border warning (editor only). 'bad' (red, <150 DPI) wins over 'warn'.
+      let lowPpi = null;
+      cells.forEach(c => {
+        if (!c.photo_id) return;
+        const det = details[c.photo_id];
+        if (!det || !det.w) return;
+        const pq = printQuality(c, det, planCell(c, det.w/det.h));
+        if (pq && pq.ppi < PPI_MIN) { if (pq.ppi < PPI_BAD) lowPpi = 'bad'; else if (lowPpi !== 'bad') lowPpi = 'warn'; }
+      });
       return e('div', { className:'spread' },
         !book.__proof && e('div', { className:'spread-head no-print' },
           e('span', { className:'muted' }, '#'+(spread.position+1)),
@@ -411,6 +426,8 @@
             onDrop: (pid) => api('/api/books/'+book.book.id+'/cells/'+c.id, { method:'PUT', body:JSON.stringify({ photo_id:pid }) }).then(()=>reload()),
           })),
           e('div', { className:'spine' }),
+          (!book.__proof && lowPpi) ? e('div', { className:'lowppi-frame no-print '+lowPpi,
+            title:'This spread has a photo below '+PPI_MIN+' DPI — it will print soft. Select the flagged cell for details.' }) : null,
         ),
       );
     }
