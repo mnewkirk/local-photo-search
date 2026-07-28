@@ -1265,6 +1265,29 @@ def api_photo_mirror_fields(photo_id: int):
         return out
 
 
+@app.get("/api/photos/dimensions")
+def api_photos_dimensions(ids: str = ""):
+    """Batch EXIF-oriented pixel dimensions for many photos in one call:
+    {"dims": {"<id>": [w, h], ...}}. Registered before /api/photos/{photo_id}
+    so the literal path wins over the int route. Used by the book editor to
+    render print-resolution badges immediately (no per-photo detail fetch)."""
+    want = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+    if not want:
+        return {"dims": {}}
+    out = {}
+    with _get_db() as db:
+        # Chunk under SQLITE_MAX_VARIABLE_NUMBER for large books.
+        for i in range(0, len(want), 900):
+            chunk = want[i:i + 900]
+            ph = ",".join("?" * len(chunk))
+            for r in db.conn.execute(
+                f"SELECT id, image_width, image_height FROM photos WHERE id IN ({ph})",
+                chunk):
+                if r["image_width"] and r["image_height"]:
+                    out[str(r["id"])] = [r["image_width"], r["image_height"]]
+    return {"dims": out}
+
+
 @app.get("/api/photos/{photo_id}")
 def api_photo_detail(photo_id: int):
     """Get full metadata for a single photo, including face matches."""

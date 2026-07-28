@@ -556,11 +556,31 @@
           else { const sp = nb.spreads.find(s=>s.id===spreadId); if (sp) Object.assign(sp, fields); }
           return nb; });
       }, []);
-      // Prefetch faces/subject boxes for photos in spreads (for overlay + safety).
+      // Immediately batch-fetch pixel dimensions for every placed photo in ONE
+      // call and seed them into `details` (as {w,h}), so print-resolution badges
+      // render on first paint instead of waiting on N lazy per-photo detail
+      // fetches. Faces/subject boxes still load lazily below and merge in.
+      useEffect(()=>{
+        if (!book) return;
+        const need = [];
+        book.spreads.forEach(s=>s.cells.forEach(c=>{
+          if (c.photo_id && !(details[c.photo_id] && details[c.photo_id].w)) need.push(c.photo_id); }));
+        if (!need.length) return;
+        api('/api/photos/dimensions?ids=' + Array.from(new Set(need)).join(',')).then(d => {
+          const dims = d.dims || {};
+          setDetails(x => { const nx = Object.assign({}, x);
+            Object.keys(dims).forEach(id => { const [w,h] = dims[id];
+              nx[id] = Object.assign({ w, h }, nx[id], { w, h }); });
+            return nx; });
+        }).catch(()=>{});
+      }, [book]);
+      // Prefetch faces/subject boxes (for overlay + subject-safety). Runs even
+      // after the dims seed above — the guard also fires when faces aren't loaded
+      // yet — and loadDetail returns the complete {faces,w,h} which merges in.
       useEffect(()=>{
         if (!book) return;
         const ids = new Set(); book.spreads.forEach(s=>s.cells.forEach(c=>{ if (c.photo_id) ids.add(c.photo_id); }));
-        ids.forEach(id => { if (!details[id]) loadDetail(id).then(d => setDetails(x=>Object.assign({}, x, { [id]:d }))).catch(()=>{}); });
+        ids.forEach(id => { if (!details[id] || !details[id].faces) loadDetail(id).then(d => setDetails(x=>Object.assign({}, x, { [id]:d }))).catch(()=>{}); });
       }, [book]);
       // Undo/redo: server keeps a per-book layout snapshot history; these restore
       // a neighbor snapshot and reload the whole document.
