@@ -99,7 +99,10 @@
     .pq .dpi.good { color:var(--green); } .pq .dpi.ok { color:var(--text); }
     .pq .dpi.warn { color:var(--amber); } .pq .dpi.bad { color:var(--red); }
     .pq .why { color:var(--text-muted); }
-    .alts { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; max-width:520px; }
+    .alts-wrap { width:100%; max-width:560px; margin-top:4px; }
+    .alts-head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:4px; }
+    .alts-head button { padding:0 7px; line-height:1.6; }
+    .alts { display:flex; gap:6px; flex-wrap:wrap; max-height:172px; overflow-y:auto; padding-right:2px; }
     .alt { position:relative; width:96px; border:1px solid var(--border); border-radius:5px;
       overflow:hidden; background:#000; }
     .alt img { width:100%; height:70px; object-fit:cover; display:block; }
@@ -459,11 +462,11 @@
       const findAlts = () => {
         setAltMsg('searching…'); setAlts(null);
         api('/api/books/'+book.book.id+'/cells/'+cell.id+'/print-alternatives')
-          .then(d => { const items = d.alternatives || [];
-            setAlts({ cellId:cell.id, items });
-            setAltMsg(items.length ? '' : 'no sharper look-alikes in the library'); })
+          .then(d => { setAlts({ cellId:cell.id, items:d.alternatives || [], note:d.note });
+            setAltMsg(''); })
           .catch(e => setAltMsg('error: '+(e.message||e)));
       };
+      const closeAlts = () => { setAlts(null); setAltMsg(''); };
       const swapTo = (pid) => api('/api/books/'+book.book.id+'/cells/'+cell.id,
         { method:'PUT', body:JSON.stringify({ photo_id:pid }) }).then(()=>{ setAlts(null); setAltMsg(''); reload(); });
       const activePreset = CROP_PRESETS.findIndex(p => (p.w===(cell.crop_min_w||0)) && (p.h===(cell.crop_min_h||0)));
@@ -495,14 +498,21 @@
           pq.ppi < PPI_MIN ? e('button', { className:'tiny', onClick:findAlts },
             '🔍 find sharper similar photos') : null,
           altMsg ? e('span', { className:'muted' }, altMsg) : null,
-          (alts && alts.cellId === cell.id && alts.items.length) ? e('div', { className:'alts' },
-            alts.items.map(a => e('div', { key:a.id, className:'alt',
-                title:(a.place_name||'') + ' ' + (a.date_taken||'') + ' · ' + a.mp + ' MP · ' + a.width + '×' + a.height },
-              e('img', { src:thumb(a.id), loading:'lazy' }),
-              e('div', { className:'meta' },
-                e('span', { className:'ok' }, a.projected_ppi + ' DPI'),
-                e('span', null, a.mp + 'MP')),
-              e('button', { className:'tiny', onClick:()=>swapTo(a.id) }, 'use')))) : null,
+          (alts && alts.cellId === cell.id) ? e('div', { className:'alts-wrap' },
+            e('div', { className:'alts-head' },
+              e('span', { className:'muted' }, alts.items.length
+                ? ('sharper same-day stand-ins (' + alts.items.length + ')')
+                : (alts.note || 'no sharper same-day frames found')),
+              e('button', { className:'tiny', onClick:closeAlts, title:'Dismiss' }, '✕')),
+            alts.items.length ? e('div', { className:'alts' },
+              alts.items.map(a => e('div', { key:a.id, className:'alt',
+                  title:(a.place_name||'') + ' ' + (a.date_taken||'') + ' · ' + a.mp + ' MP · ' + a.width + '×' + a.height },
+                e('img', { src:thumb(a.id), loading:'lazy' }),
+                e('div', { className:'meta' },
+                  e('span', { className:'ok' }, a.projected_ppi + ' DPI'),
+                  e('span', null, a.mp + 'MP')),
+                e('button', { className:'tiny', onClick:()=>swapTo(a.id) }, 'use')))) : null,
+          ) : null,
         ) : null,
         cell.photo_id && e('button', { className:'tiny danger', onClick:()=>{ put({ photo_id:null }); } }, 'remove photo'),
       );

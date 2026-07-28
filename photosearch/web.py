@@ -3732,12 +3732,18 @@ def api_book_update_cell(book_id: int, cell_id: int, body: dict):
 @app.get("/api/books/{book_id}/cells/{cell_id}/print-alternatives")
 def api_book_print_alternatives(book_id: int, cell_id: int,
                                 target: float = 240.0, limit: int = 8,
-                                max_distance: float = 0.72):
-    """Visually-similar photos that would print sharper in this cell than the
-    current one. Ranks CLIP neighbors of the cell's photo, keeps those whose
-    full-frame print resolution clears ``target`` PPI at this cell's size, and
-    excludes the current photo + anything already placed in this book."""
+                                max_distance: float = 0.50, window_days: float = 3.0):
+    """Sharper stand-ins for THIS shot: CLIP neighbors of the cell's photo that
+    (a) print sharper (clear ``target`` PPI at this cell's size), (b) are the
+    *same moment* — within ``max_distance`` CLIP AND ``window_days`` of the
+    photo's date, and (c) aren't already in the book or a near-duplicate of
+    anything already placed. Tight by design: a real swap is a burst/near-dup,
+    not another year's look-alike."""
+    from datetime import datetime
     from .book import cover_ppi
+    from .db import _deserialize_float_list, CLIP_DIMENSIONS
+    import numpy as np
+    NEAR_DUP = 0.20   # CLIP L2 below this ≈ same frame → already-in-book duplicate
     with _get_books() as bs, _get_db() as pdb:
         book = bs.get_book(book_id)
         if not book:
@@ -3756,39 +3762,87 @@ def api_book_print_alternatives(book_id: int, cell_id: int,
         if not pid:
             return {"alternatives": [], "target": target, "note": "empty cell"}
         w_in, h_in = cell["w"], cell["h"]
+        cur = pdb.conn.execute(
+            "SELECT image_width w, image_height h, date_taken FROM photos WHERE id = ?",
+            (pid,)).fetchone()
+
+        def _dt(s):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime((s or "")[:len(fmt) + 2], fmt)
+                except ValueError:
+                    continue
+            return None
+        src_dt = _dt(cur["date_taken"]) if cur else None
+
+        # Embeddings of everything already placed → drop near-duplicate candidates
+        # (a different id that's visually the same as a photo already in the book).
+        placed = [i for i in used_ids if i != pid]
+        placed_vecs = []
+        for i in range(0, len(placed), 900):
+            chunk = placed[i:i + 900]
+            ph = ",".join("?" * len(chunk))
+            for r in pdb.conn.execute(
+                f"SELECT embedding FROM clip_embeddings WHERE photo_id IN ({ph})", chunk):
+                v = np.asarray(_deserialize_float_list(r["embedding"], CLIP_DIMENSIONS), np.float32)
+                n = np.linalg.norm(v)
+                if n:
+                    placed_vecs.append(v / n)
+        placed_mat = np.vstack(placed_vecs) if placed_vecs else None
+
+        def _dup_of_placed(npid):
+            if placed_mat is None:
+                return False
+            row = pdb.conn.execute(
+                "SELECT embedding FROM clip_embeddings WHERE photo_id = ?", (npid,)).fetchone()
+            if not row:
+                return False
+            v = np.asarray(_deserialize_float_list(row["embedding"], CLIP_DIMENSIONS), np.float32)
+            n = np.linalg.norm(v)
+            if not n:
+                return False
+            v /= n
+            d = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * (placed_mat @ v)))  # L2 to each placed
+            return bool(d.min() < NEAR_DUP)
+
         neighbors = pdb.similar_by_photo(int(pid), limit=200)
-        alts = []
+        alts, skipped_year = [], 0
         for nb in neighbors:
             npid = nb["photo_id"]
-            if npid == pid or npid in used_ids:
-                continue
-            if nb["distance"] > max_distance:
+            if npid == pid or npid in used_ids or nb["distance"] > max_distance:
                 continue
             row = pdb.conn.execute(
                 "SELECT image_width w, image_height h, date_taken, place_name, "
                 "camera_model FROM photos WHERE id = ?", (npid,)).fetchone()
             if not row or not row["w"] or not row["h"]:
                 continue
-            ppi = cover_ppi(row["w"], row["h"], w_in, h_in)
-            if ppi < target:
+            # Same-moment gate: reject a visually-similar frame from another trip.
+            if src_dt is not None:
+                cand_dt = _dt(row["date_taken"])
+                if cand_dt is None or abs((cand_dt - src_dt).total_seconds()) > window_days * 86400:
+                    skipped_year += 1
+                    continue
+            if cover_ppi(row["w"], row["h"], w_in, h_in) < target:
+                continue
+            if _dup_of_placed(npid):
                 continue
             alts.append({
                 "id": npid, "distance": round(nb["distance"], 4),
                 "width": row["w"], "height": row["h"],
                 "mp": round(row["w"] * row["h"] / 1e6, 1),
-                "projected_ppi": int(ppi),
+                "projected_ppi": int(cover_ppi(row["w"], row["h"], w_in, h_in)),
                 "date_taken": row["date_taken"], "place_name": row["place_name"],
                 "camera_model": row["camera_model"],
             })
             if len(alts) >= limit:
                 break
-        cur = pdb.conn.execute(
-            "SELECT image_width w, image_height h FROM photos WHERE id = ?",
-            (pid,)).fetchone()
         current_ppi = (int(cover_ppi(cur["w"], cur["h"], w_in, h_in))
                        if cur and cur["w"] else None)
-        return {"alternatives": alts, "target": target,
-                "cell": {"w": w_in, "h": h_in},
+        note = None
+        if not alts and skipped_year:
+            note = "no sharper frame from the same day — nearby look-alikes are from other trips"
+        return {"alternatives": alts, "target": target, "window_days": window_days,
+                "cell": {"w": w_in, "h": h_in}, "note": note,
                 "current": {"id": pid, "cover_ppi": current_ppi}}
 
 
