@@ -117,6 +117,24 @@ def test_fixed_collage_cell_count_is_six():
     assert archetype_cell_count("collage 2+4", 0) == 6
 
 
+def test_hero_2_verticals_is_large_plus_two_portrait_columns():
+    # 1 large anchor + 2 full-height portrait columns side-by-side (distinct from
+    # hero+sidebar, whose sidebar cells are stacked and landscape-shaped).
+    for arch, right in (("hero + 2 verticals", False), ("hero + 2 verticals (right)", True)):
+        r = _rects(arch, 3, bleed=False)
+        assert len(r) == 3
+        anchor, c1, c2 = r
+        assert anchor[2] / anchor[3] > 1.1                 # anchor is wide/large
+        assert c1[2] / c1[3] < 0.9 and c2[2] / c2[3] < 0.9  # columns are portrait
+        assert round(c1[3], 4) == round(anchor[3], 4)      # columns full height
+        assert abs(c1[0] - c2[0]) > 1                       # side by side, not stacked
+        assert (anchor[0] > SW * 0.4) == right              # anchor side follows variant
+    # opens 3 slots from any photo count (empty verticals become drop targets)
+    assert archetype_cell_count("hero + 2 verticals", 1) == 3
+    assert archetype_cell_count("hero + 2 verticals", 2) == 3
+    assert archetype_cell_count("hero + 2 verticals", 4) == 4
+
+
 def test_cover_ppi_binds_on_the_tighter_axis():
     # 3:2 landscape (6000x4000) full-bleed across the 28x11 spread: height binds
     # (4000/11 = 364) below width (6000/28 = 214)? No — min picks the smaller.

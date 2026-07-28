@@ -32,6 +32,12 @@ from typing import Any, Optional
 _PANORAMA = {"full-bleed single", "full-spread panorama"}
 # Hero + narrow stacked sidebar; the (right) variant flips the anchor side.
 _HERO_SIDEBAR = {"hero + sidebar", "hero + sidebar (right)"}
+# "One large photo + two vertical (portrait) photos side-by-side" — a fixed
+# 3-cell template: a wide anchor on one side, the two portraits as tall columns
+# on the other. Distinct from hero+sidebar, whose sidebar cells are stacked and
+# landscape-shaped (they crop a portrait). Opens empty slots from any count.
+_HERO_VERTS = {"hero + 2 verticals", "hero + 2 verticals (right)"}
+_HERO_RIGHT = {"hero + sidebar (right)", "hero + 2 verticals (right)"}
 # One photo floated on the white margin (contain-fit, portrait-preserving) — the
 # opposite of the full-bleed single, for title/breather/chapter pages.
 _FRAMED_SINGLE = "single (framed)"
@@ -1061,6 +1067,10 @@ def archetype_cell_count(archetype: Optional[str], n_photos: int) -> int:
         # columns so switching back to it after a photo was dropped gives an
         # empty slot to re-drop into (not silently stuck at the current count).
         return max(3, n_photos)
+    if archetype in _HERO_VERTS:
+        # one large anchor + two portrait columns (the "large left, two verticals
+        # right" layout), opening empty slots to drop the verticals into.
+        return max(3, n_photos)
     if archetype in _HERO_SIDEBAR:
         # anchor + at least one stacked sidebar cell, so switching a 1-photo
         # spread to hero+sidebar opens a slot to drop the sidebar photo into.
@@ -1149,7 +1159,7 @@ def archetype_layout(archetype: Optional[str], n: int, sw: float, sh: float,
         # One anchor ~64% wide + the rest stacked in a single narrow column.
         anchor_w = sw * 0.64
         rest = max(1, n - 1)
-        if arch == "hero + sidebar (right)":
+        if arch in _HERO_RIGHT:
             anchor = [sw - anchor_w + g / 2, m, anchor_w - m - g / 2, inner_h]
             sidebar = _grid_rects(rest, m, m, sw - anchor_w - g / 2 - m, inner_h, 1, g)
         else:
@@ -1158,6 +1168,19 @@ def archetype_layout(archetype: Optional[str], n: int, sw: float, sh: float,
             sidebar = _grid_rects(rest, rx, m, sw - rx - m, inner_h, 1, g)
         # Anchor stays cell 0 (caption slot + hero) regardless of side.
         return [anchor] + sidebar
+    if arch in _HERO_VERTS:
+        # Wide anchor (~52%) on one side + the rest as equal FULL-HEIGHT columns
+        # (portrait cells) on the other — "large + two verticals". Anchor is cell 0.
+        anchor_w = sw * 0.52
+        rest = max(1, n - 1)
+        if arch in _HERO_RIGHT:
+            anchor = [sw - anchor_w + g / 2, m, anchor_w - m - g / 2, inner_h]
+            cols = _grid_rects(rest, m, m, sw - anchor_w - g / 2 - m, inner_h, rest, g)
+        else:
+            anchor = [m, m, anchor_w - g / 2 - m, inner_h]
+            rx = anchor_w + g / 2
+            cols = _grid_rects(rest, rx, m, sw - rx - m, inner_h, rest, g)
+        return [anchor] + cols
     if arch == "gallery row":
         # N equal full-height columns (mockup 3-across "lanes" style).
         return _grid_rects(n, m, m, inner_w, inner_h, n, g)
