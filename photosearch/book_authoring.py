@@ -283,6 +283,25 @@ def _validate_beats(beats, scenes) -> list[dict]:
 
 _HERO_WORKERS = 6
 
+# A hero gets the most prominent placement (often a full-bleed 28x11 or a
+# full-page single), so a low-resolution source there prints soft. Bias hero
+# selection toward sources that hold up at full-page size — a multiplicative
+# PENALTY on the VLM score, not a hard exclusion, so a beat whose only good
+# representative shot is low-res still gets its best photo (just demoted vs an
+# equally-good higher-res alternative). Reference is the worst case, full bleed.
+_HERO_REF_W, _HERO_REF_H = 28.0, 11.0
+
+
+def _res_factor(w, h) -> float:
+    """Hero-selection resolution multiplier for a w×h px source at full-page
+    size: 1.0 if it prints crisp (≥300 DPI), 0.9 if merely printable (≥200),
+    0.6 if it would print soft. See [[feedback_book_print_resolution]]."""
+    from .book import cover_ppi, PPI_GOOD, PPI_MIN
+    ppi = cover_ppi(w or 0, h or 0, _HERO_REF_W, _HERO_REF_H)
+    if ppi >= PPI_GOOD:
+        return 1.0
+    return 0.9 if ppi >= PPI_MIN else 0.6
+
 
 def _vision_hero(base_url: str, model: str, image_b64: str, criteria: str):
     """One VLM call scoring a candidate AND judging whether it must be shown
@@ -328,18 +347,32 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
     heroes (top-N) + all candidates ranked, each with a VLM-decided crop_mode.
     Falls back to the geometric suggest_crop_mode with no VLM."""
     from .tools import _thumb_b64
+    from .book import cover_ppi
     ids = list(dict.fromkeys(int(i) for i in candidate_ids))
     if not ids:
         return {"heroes": [], "ranked": []}
+    # Source dimensions up front — used to bias hero selection away from photos
+    # too low-res to hold up at full-page size (print-resolution guard).
+    ph0 = ",".join("?" * len(ids))
+    dims = {r["id"]: (r["w"], r["h"]) for r in pdb.conn.execute(
+        f"SELECT id, image_width w, image_height h FROM photos WHERE id IN ({ph0})", ids)}
+    def _rf(i):
+        w, h = dims.get(i, (0, 0)); return _res_factor(w, h)
+    def _pp(i):
+        w, h = dims.get(i, (0, 0)); return int(cover_ppi(w or 0, h or 0, _HERO_REF_W, _HERO_REF_H))
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
     model = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
     criteria = (f"the single best photo to represent \"{beat_title}\" in a family "
                 "travel photo book — clearly shows the moment/place, the family "
                 "visible when relevant, sharp and well composed, not a duplicate")
     if not (base and model):
+        # No VLM to judge editorial fit — order by full-page print resolution so
+        # the hero slot at least isn't handed to a low-res frame over a sharp one.
+        order = sorted(ids, key=_rf, reverse=True)
         ranked = [{"id": i, "score": None, "reason": "no vision model",
-                   "crop_mode": suggest_crop_mode(pdb, i)} for i in ids]
-        return {"heroes": ids[:n_heroes], "ranked": ranked, "reranked": False}
+                   "crop_mode": suggest_crop_mode(pdb, i), "print_ppi": _pp(i)}
+                  for i in order]
+        return {"heroes": order[:n_heroes], "ranked": ranked, "reranked": False}
 
     # Resolve thumbnails in THIS thread — _thumb_b64's local branch touches the
     # sqlite conn, which can't cross threads; only the VLM HTTP call is fanned out.
@@ -354,16 +387,17 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
         for pid, sc in pool.map(_score, ids):
             scores[pid] = sc
     scored = [i for i in ids if scores.get(i)]
-    scored.sort(key=lambda i: scores[i]["score"], reverse=True)
+    # Rank by VLM editorial score DISCOUNTED by print resolution, so among
+    # comparably-good candidates the sharper-in-print one wins the hero slot and a
+    # clearly-too-low-res frame is demoted (but a uniquely-good low-res shot with a
+    # much higher raw score can still surface — the factor floors at 0.6).
+    scored.sort(key=lambda i: scores[i]["score"] * _rf(i), reverse=True)
     failed = [i for i in ids if not scores.get(i)]
     order = scored + failed
     # Aspect gate: a wide LANDSCAPE crops fine and should fill its cell — only
     # honor the VLM's 'full_frame' on it when the geometry also says so (portrait /
     # subject-fills). Otherwise the VLM over-flags full and every spread goes sparse.
-    ph = ",".join("?" * len(ids))
-    ar = {r["id"]: ((r["w"] / r["h"]) if r["w"] and r["h"] else 1.5)
-          for r in pdb.conn.execute(
-              f"SELECT id, image_width w, image_height h FROM photos WHERE id IN ({ph})", ids)}
+    ar = {i: ((w / h) if w and h else 1.5) for i, (w, h) in dims.items()}
     ranked = []
     for i in order:
         sc = scores.get(i)
@@ -374,7 +408,8 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
         # only stay uncropped when the geometry says the subject fills the frame.
         mode = "full" if (geo == "full" or (vlm_full and ar.get(i, 1.5) < 0.95)) else "crop"
         ranked.append({"id": i, "score": (sc["score"] if sc else None),
-                       "reason": (sc["reason"] if sc else None), "crop_mode": mode})
+                       "reason": (sc["reason"] if sc else None), "crop_mode": mode,
+                       "print_ppi": _pp(i)})
     return {"heroes": order[:n_heroes], "ranked": ranked, "reranked": True}
 
 
