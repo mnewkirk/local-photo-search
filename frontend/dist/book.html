@@ -150,6 +150,8 @@
       { value:'hero + sidebar (right)', label:'hero + sidebar (R)' },
       { value:'asymmetric collage',     label:'collage' },
       { value:'dense grid',             label:'grid' },
+      { value:'collage 3+3',            label:'collage 3+3 (6·portrait)' },
+      { value:'collage 2+4',            label:'collage 2+4 (6·1 landscape)' },
       { value:'full-spread panorama',   label:'full-spread' },
     ];
     const CROP_PRESETS = [
@@ -290,6 +292,21 @@
     function Spread({ book, spread, sel, onSel, reload, patchLocal, showFaces, details }) {
       const stageW = book.stage_w, stageH = book.stage_h;
       const put = (fields) => api('/api/books/'+book.book.id+'/spreads/'+spread.id, { method:'PUT', body:JSON.stringify(fields) }).then(r=>reload(r.book));
+      // Archetype change regenerates cells and discards custom geometry. The
+      // backend refuses (409) when the layout is hand-tuned; on that we confirm
+      // and retry with regenerate_cells, otherwise revert the select via reload.
+      const setArchetype = (val) => {
+        if (val === (spread.archetype||'')) return;
+        api('/api/books/'+book.book.id+'/spreads/'+spread.id, { method:'PUT', body:JSON.stringify({ archetype:val }) })
+          .then(r=>reload(r.book))
+          .catch(err => {
+            if (/regenerate_cells/.test(String(err.message||err))) {
+              if (confirm('This spread has a hand-tuned layout. Switching template will discard it and regenerate the cells. Continue?')) {
+                api('/api/books/'+book.book.id+'/spreads/'+spread.id, { method:'PUT', body:JSON.stringify({ archetype:val, regenerate_cells:true }) }).then(r=>reload(r.book));
+              } else { reload(); }
+            } else { alert('Failed to change archetype: '+(err.message||err)); reload(); }
+          });
+      };
       const del = () => { if (confirm('Delete this spread?')) api('/api/books/'+book.book.id+'/spreads/'+spread.id, { method:'DELETE' }).then(()=>reload()); };
       const cap = spread.caption;
       const dark = spread.bg && spread.bg !== '#ffffff';
@@ -300,8 +317,19 @@
           e('input', { value:spread.label||'', placeholder:'label',
             onChange: ev => patchLocal(spread.id, { label:ev.target.value }),
             onBlur: ev => put({ label:ev.target.value }), style:{ width:150 } }),
-          e('select', { value:spread.archetype||'', onChange: ev => put({ archetype:ev.target.value }) },
-            ARCHES.map(a => e('option', { key:a.value, value:a.value }, a.label))),
+          (() => {
+            const cur = spread.archetype || '';
+            const known = ARCHES.some(a => a.value === cur);
+            // When the stored archetype isn't a real template, an HTML <select>
+            // would silently show its FIRST option — misrepresenting the layout,
+            // and any pick then regenerates the cells. Prepend a disabled option
+            // showing the real name so the editor tells the truth and the user
+            // must deliberately choose a template to trigger regeneration.
+            const opts = (known ? [] : [e('option',
+              { key:'__custom', value:cur, disabled:true }, '⟨custom: '+(cur||'—')+'⟩')])
+              .concat(ARCHES.map(a => e('option', { key:a.value, value:a.value }, a.label)));
+            return e('select', { value:cur, onChange: ev => setArchetype(ev.target.value) }, opts);
+          })(),
           e('button', { className:'tiny', onClick:()=>put({ bg: dark?'#ffffff':'#111111' }) }, dark?'☀ light':'☾ dark'),
           e('button', { className:'tiny', title:'Full-bleed: photos run edge-to-edge with no white frame',
             onClick:()=>put({ bleed: spread.bleed?0:1 }) }, spread.bleed?'▣ bleed':'❐ framed'),

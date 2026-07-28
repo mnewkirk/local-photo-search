@@ -86,6 +86,37 @@ def test_hero_sidebar_right_flips_anchor_but_keeps_it_cell_zero():
     assert r[1][0] < anchor[0]
 
 
+def test_collage_3plus3_six_equal_portrait_cells_within_pages():
+    r = archetype_layout("collage 3+3", 6, SW, SH)
+    assert len(r) == 6
+    # every cell is a 3:4 portrait (aspect 0.75) — zero crop on a 3:4 photo
+    for x, y, w, h in r:
+        assert abs((w / h) - 0.75) < 1e-6
+    # three cells per page; none straddles the x=14 gutter
+    left = [c for c in r if c[0] < 14]
+    right = [c for c in r if c[0] >= 14]
+    assert len(left) == 3 and len(right) == 3
+    assert all(c[0] + c[2] <= 14 + 1e-9 for c in left)
+    assert all(c[0] >= 14 - 1e-9 for c in right)
+
+
+def test_collage_2plus4_has_one_landscape_and_five_portraits():
+    r = archetype_layout("collage 2+4", 6, SW, SH)
+    assert len(r) == 6
+    landscape = [c for c in r if c[2] / c[3] > 1]
+    portraits = [c for c in r if c[2] / c[3] < 1]
+    assert len(landscape) == 1 and len(portraits) == 5
+    assert abs((landscape[0][2] / landscape[0][3]) - 1.5) < 1e-6   # exact 3:2
+    for c in portraits:
+        assert abs((c[2] / c[3]) - 0.75) < 1e-3                    # ~3:4
+
+
+def test_fixed_collage_cell_count_is_six():
+    assert archetype_cell_count("collage 3+3", 6) == 6
+    assert archetype_cell_count("collage 3+3", 1) == 6   # opens all six slots
+    assert archetype_cell_count("collage 2+4", 0) == 6
+
+
 def test_cell_count_opens_empty_slot_for_fixed_archetypes():
     # 1 photo, switch to matched 2-up -> 2 cells (second is an empty drop slot)
     assert archetype_cell_count("matched 2-up", 1) == 2

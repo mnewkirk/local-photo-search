@@ -3669,11 +3669,15 @@ def api_book_add_spread(book_id: int, body: dict):
 
 @app.put("/api/books/{book_id}/spreads/{spread_id}")
 def api_book_update_spread(book_id: int, spread_id: int, body: dict):
+    from .book import LayoutConflict
     with _get_books() as bs, _get_db() as pdb:
         try:
             bs.update_spread(pdb, spread_id, body)
         except KeyError:
             return JSONResponse({"error": "Spread not found"}, status_code=404)
+        except LayoutConflict as e:
+            return JSONResponse(
+                {"error": str(e), "needs_regenerate": True}, status_code=409)
         return {"book": bs.get_book(book_id)}
 
 

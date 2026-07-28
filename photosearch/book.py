@@ -36,6 +36,35 @@ _HERO_SIDEBAR = {"hero + sidebar", "hero + sidebar (right)"}
 # opposite of the full-bleed single, for title/breather/chapter pages.
 _FRAMED_SINGLE = "single (framed)"
 
+# Fixed-geometry six-cell collages. Unlike the other archetypes these carry
+# hand-tuned rects whose cell aspects exactly match the intended photo aspects
+# (zero crop) — so they ignore the generic margin/gutter math. Coordinates are
+# authored on the reference 28×11 stage and scaled to the actual stage dims in
+# archetype_layout. The gutter falls at x = 14, so every cell stays on one page.
+_FIXED_COLLAGE_REF = (28.0, 11.0)
+_FIXED_COLLAGE = {
+    # Six equal 3:4 portraits, three per page (aspect 0.750, exact 3:4 match).
+    "collage 3+3": [
+        [x, 2.70, 4.20, 5.60]
+        for x in (0.40, 4.90, 9.40, 14.40, 18.90, 23.40)
+    ],
+    # One 3:2 landscape + a 3:4 portrait on the left page, four 3:4 portraits
+    # on the right — for a set with a single landscape among portraits.
+    "collage 2+4": [
+        [0.40, 2.60, 8.70, 5.80],   # landscape (aspect 1.500, exact 3:2)
+        [9.40, 2.60, 4.20, 5.60],   # portrait  (aspect 0.750)
+        [14.40, 3.42, 3.11, 4.15],  # right-page portraits (aspect 0.750)
+        [17.75, 3.42, 3.11, 4.15],
+        [21.10, 3.42, 3.11, 4.15],
+        [24.45, 3.42, 3.11, 4.15],
+    ],
+}
+
+
+class LayoutConflict(Exception):
+    """Raised when an archetype change would overwrite a hand-tuned layout and
+    the caller has not opted in with ``regenerate_cells: true``."""
+
 
 class BookStore:
     """CRUD + curation over the sidecar photobook DB.
@@ -482,6 +511,17 @@ class BookStore:
         if not sp:
             raise KeyError("spread not found")
         book_id = sp["book_id"]
+        # Guard hand-tuned layouts: an archetype change regenerates the cells and
+        # discards custom geometry, so refuse it (before touching anything) unless
+        # the caller explicitly opts in with regenerate_cells=true.
+        arch_changing = ("archetype" in fields
+                         and fields["archetype"] != sp["archetype"])
+        if (arch_changing and not fields.get("regenerate_cells")
+                and self._is_hand_tuned(pdb, book_id, spread_id,
+                                        sp["archetype"], bool(sp["bleed"]))):
+            raise LayoutConflict(
+                "spread has a hand-tuned layout; pass regenerate_cells=true to "
+                "overwrite it")
         self._history_begin(book_id)
         sets, vals = [], []
         if "label" in fields:
@@ -780,40 +820,73 @@ class BookStore:
         return len(spreads)
 
     # -- layout + crop-seed helpers ---------------------------------------
-    def _layout_spread(self, pdb, book_id: int, spread_id: int, archetype: str,
-                       photo_ids: list[int], bleed: bool = False) -> None:
+    def _spread_rects(self, pdb, book_id: int, archetype: str,
+                      photo_ids: list[int], bleed: bool) -> list[tuple]:
+        """The (photo_id, x, y, w, h) each cell of a spread would get for this
+        archetype — the single source of truth shared by ``_layout_spread`` (which
+        inserts them) and the hand-tuned guard (which compares against them).
+        Full-bleed drops the outer white margin to zero and thins the gutter so
+        photos run edge-to-edge (mockup mode b); framed keeps the floated-on-white
+        margins (mode a)."""
         sw, sh = self.stage_dims(book_id)
-        # Full-bleed drops the outer white margin to zero and thins the gutter so
-        # photos run edge-to-edge (mockup house-style mode b); framed keeps the
-        # floated-on-white margins (mode a).
         m, g = (0.0, 0.12) if bleed else (0.4, 0.5)
         n_cells = archetype_cell_count(archetype, len(photo_ids))
         rects = archetype_layout(archetype, n_cells, sw, sh, m=m, g=g)
         framed_single = (archetype == _FRAMED_SINGLE)
-        for i, rect in enumerate(rects):
+        out = []
+        for i, (rx, ry, rw, rh) in enumerate(rects):
             pid = photo_ids[i] if i < len(photo_ids) else None
+            if pid and framed_single:
+                # Shrink the cell to the photo's aspect (centered) so a portrait
+                # stays a portrait cell instead of being cover-cropped to fill
+                # the landscape stage.
+                ar = self._photo_ar(pdb, int(pid)) or 1.5
+                if rw / rh > ar:
+                    cw, ch = rh * ar, rh
+                else:
+                    cw, ch = rw, rw / ar
+                rx, ry = rx + (rw - cw) / 2, ry + (rh - ch) / 2
+                rw, rh = cw, ch
+            out.append((pid, rx, ry, rw, rh))
+        return out
+
+    def _layout_spread(self, pdb, book_id: int, spread_id: int, archetype: str,
+                       photo_ids: list[int], bleed: bool = False) -> None:
+        framed_single = (archetype == _FRAMED_SINGLE)
+        for i, (pid, rx, ry, rw, rh) in enumerate(
+                self._spread_rects(pdb, book_id, archetype, photo_ids, bleed)):
             cx, cy = (0.5, 0.5)
-            rx, ry, rw, rh = rect
             fit, cmin_w, cmin_h = "cover", 0.0, 0.0
             if pid:
                 cx, cy = self._seed_center(pdb, int(pid))
                 if framed_single:
-                    # Shrink the cell to the photo's aspect (centered) and
-                    # contain-fit, so a portrait stays a portrait cell instead
-                    # of being cover-cropped to fill the landscape stage.
-                    ar = self._photo_ar(pdb, int(pid)) or 1.5
-                    if rw / rh > ar:
-                        cw, ch = rh * ar, rh
-                    else:
-                        cw, ch = rw, rw / ar
-                    rx, ry = rx + (rw - cw) / 2, ry + (rh - ch) / 2
-                    rw, rh = cw, ch
                     fit, cmin_w, cmin_h = "contain", 1.0, 1.0
             self.conn.execute(
                 "INSERT INTO book_cells (spread_id, position, photo_id, x, y, w, h, "
                 "fit, crop_cx, crop_cy, crop_min_w, crop_min_h) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (spread_id, i, pid, rx, ry, rw, rh, fit, cx, cy, cmin_w, cmin_h))
+
+    def _is_hand_tuned(self, pdb, book_id: int, spread_id: int, archetype: str,
+                       bleed: bool) -> bool:
+        """True when the spread's current cell geometry differs from what
+        ``archetype`` would generate — i.e. someone hand-placed the cells, so
+        regenerating from a template would silently discard their work."""
+        cells = self.conn.execute(
+            "SELECT photo_id, x, y, w, h FROM book_cells WHERE spread_id = ? "
+            "ORDER BY position, id", (spread_id,)).fetchall()
+        if not cells:
+            return False
+        expected = self._spread_rects(
+            pdb, book_id, archetype, [c["photo_id"] for c in cells], bleed)
+        if len(expected) != len(cells):
+            return True
+        tol = 0.05
+        for c, (_pid, rx, ry, rw, rh) in zip(cells, expected):
+            if (abs(c["x"] - rx) > tol or abs(c["y"] - ry) > tol
+                    or abs(c["w"] - rw) > tol or abs(c["h"] - rh) > tol):
+                return True
+        return False
 
     def _photo_ar(self, pdb, photo_id: int) -> Optional[float]:
         """Aspect ratio (w/h) from the stored EXIF-oriented dimensions, or None."""
@@ -962,6 +1035,10 @@ def archetype_cell_count(archetype: Optional[str], n_photos: int) -> int:
     (collage/grid) scale with the photos present."""
     if archetype in _PANORAMA or archetype == _FRAMED_SINGLE:
         return 1
+    if archetype in _FIXED_COLLAGE:
+        # Fixed six-cell templates: always open all six slots (empty ones become
+        # drop targets) regardless of how many photos are present.
+        return len(_FIXED_COLLAGE[archetype])
     if archetype == "matched 2-up":
         return 2
     if archetype == "gallery row":
@@ -1040,6 +1117,13 @@ def archetype_layout(archetype: Optional[str], n: int, sw: float, sh: float,
     arch = archetype or ("matched 2-up" if n == 2 else
                          "asymmetric collage" if n <= 7 else "dense grid")
     inner_w, inner_h = sw - 2 * m, sh - 2 * m
+    if arch in _FIXED_COLLAGE:
+        # Hand-tuned rects on the reference stage, scaled to the actual dims.
+        ref_w, ref_h = _FIXED_COLLAGE_REF
+        sx, sy = sw / ref_w, sh / ref_h
+        rects = [[x * sx, y * sy, cw * sx, ch * sy]
+                 for x, y, cw, ch in _FIXED_COLLAGE[arch]]
+        return rects[:n] if n < len(rects) else rects
     if arch == _FRAMED_SINGLE:
         # One photo floated on the white margin (checked BEFORE the n==1
         # full-bleed short-circuit). _layout_spread fits it to the photo aspect.

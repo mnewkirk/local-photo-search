@@ -7,7 +7,9 @@ row (gallery row now always opens >=3 slots).
 """
 import sqlite3
 
-from photosearch.book import BookStore
+import pytest
+
+from photosearch.book import BookStore, LayoutConflict
 
 
 class _FakePDB:
@@ -87,6 +89,36 @@ def test_new_edit_truncates_the_redo_tail():
     sid2 = bs.get_book(bid)["spreads"][-1]["id"]   # id changed after restore
     bs.update_spread(pdb, sid2, {"archetype": "dense grid"})
     assert bs.get_book(bid)["can_redo"] is False
+
+
+def test_archetype_switch_on_template_layout_is_unguarded():
+    # A spread whose cells still match its template regenerates freely.
+    bs, pdb, bid = _make()
+    sid = bs.add_spread(pdb, bid, archetype="asymmetric collage", photo_ids=[1, 2, 3])
+    bs.update_spread(pdb, sid, {"archetype": "matched 2-up"})   # no raise
+    assert len(_last_pids(bs, bid)) == 2
+
+
+def test_archetype_switch_refuses_to_destroy_hand_tuned_layout():
+    bs, pdb, bid = _make()
+    sid = bs.add_spread(pdb, bid, archetype="matched 2-up", photo_ids=[1, 2])
+    cell0 = bs.get_book(bid)["spreads"][-1]["cells"][0]["id"]
+    bs.set_cell(pdb, cell0, {"x": 3.21, "y": 1.5, "w": 6.0, "h": 8.0})  # hand-tune
+    with pytest.raises(LayoutConflict):
+        bs.update_spread(pdb, sid, {"archetype": "gallery row"})
+    # nothing changed — still the two hand-tuned cells
+    assert len(_last_pids(bs, bid)) == 2
+    assert bs.get_book(bid)["spreads"][-1]["archetype"] == "matched 2-up"
+
+
+def test_regenerate_cells_flag_overrides_hand_tuned_guard():
+    bs, pdb, bid = _make()
+    sid = bs.add_spread(pdb, bid, archetype="matched 2-up", photo_ids=[1, 2])
+    cell0 = bs.get_book(bid)["spreads"][-1]["cells"][0]["id"]
+    bs.set_cell(pdb, cell0, {"x": 3.21, "y": 1.5, "w": 6.0, "h": 8.0})
+    bs.update_spread(pdb, sid, {"archetype": "gallery row", "regenerate_cells": True})
+    assert bs.get_book(bid)["spreads"][-1]["archetype"] == "gallery row"
+    assert len(_last_pids(bs, bid)) == 3    # regenerated to the 3-up row
 
 
 def test_cell_photo_swap_is_undoable():
