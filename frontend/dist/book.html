@@ -82,6 +82,27 @@
     .warn { color:var(--amber); font-size:12px; }
     .preset-btns button.active { background:var(--accent); color:#04101f; border-color:var(--accent); }
 
+    /* Print-resolution warning badge (editor overlay, never printed) */
+    .ppi-badge { position:absolute; left:3px; bottom:3px; z-index:6; font-size:10px;
+      font-weight:700; padding:1px 5px; border-radius:4px; pointer-events:none;
+      background:rgba(0,0,0,.72); line-height:1.5; letter-spacing:.2px; }
+    .ppi-badge.warn { color:#04101f; background:var(--amber); }
+    .ppi-badge.bad  { color:#fff; background:var(--red); }
+    /* Print-quality readout + alternatives in the cell toolbar */
+    .pq { display:flex; flex-direction:column; gap:2px; font-size:12px; max-width:340px; }
+    .pq .dpi { font-weight:700; }
+    .pq .dpi.good { color:var(--green); } .pq .dpi.ok { color:var(--text); }
+    .pq .dpi.warn { color:var(--amber); } .pq .dpi.bad { color:var(--red); }
+    .pq .why { color:var(--text-muted); }
+    .alts { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; max-width:520px; }
+    .alt { position:relative; width:96px; border:1px solid var(--border); border-radius:5px;
+      overflow:hidden; background:#000; }
+    .alt img { width:100%; height:70px; object-fit:cover; display:block; }
+    .alt .meta { font-size:9px; color:#ddd; padding:1px 3px; background:rgba(0,0,0,.6);
+      display:flex; justify-content:space-between; }
+    .alt .meta .ok { color:var(--green); font-weight:700; }
+    .alt button { width:100%; border-radius:0; border:0; font-size:10px; padding:2px; }
+
     /* Authoring wizard */
     .setup { max-width:640px; background:var(--surface); border:1px solid var(--border);
       border-radius:8px; padding:16px; display:grid; gap:10px; }
@@ -204,6 +225,39 @@
                win:[cxe - vw/2, cye - vh/2, cxe + vw/2, cye + vh/2] };
     }
 
+    // Print-resolution thresholds (mirror photosearch/book.py). Stage units are
+    // physical inches (1 unit = 1 in), so cell.w/h are the printed cell size.
+    const PPI_GOOD = 300, PPI_MIN = 200, PPI_BAD = 150;
+    // Effective print PPI of a placed cell. plan (from planCell) already folds in
+    // zoom, min-visible constraints and contain, so the visible source pixels are
+    // pw*(100/Pw) across cell.w inches (and likewise for height). The tighter axis
+    // binds. Also classifies WHY it's low: an over-crop (the source could print
+    // fine full-frame) vs a source that's too small for this cell size at all.
+    function printQuality(cell, detail, plan) {
+      if (!cell || !cell.photo_id || !detail || !detail.w || !detail.h || !plan) return null;
+      const pw = detail.w, ph = detail.h, w = cell.w || 0, h = cell.h || 0;
+      if (w <= 0 || h <= 0 || !plan.Pw || !plan.Ph) return null;
+      const ppi = Math.round(Math.min((pw * 100 / plan.Pw) / w, (ph * 100 / plan.Ph) / h));
+      const ceil = Math.min(pw / w, ph / h);   // best possible: full-frame cover, zoom 1
+      const z = Math.max(1, cell.crop_zoom || 1);
+      const level = ppi >= PPI_GOOD ? 'good' : ppi >= PPI_MIN ? 'ok' : ppi >= PPI_BAD ? 'warn' : 'bad';
+      let reason = null, fix = null;
+      if (ppi < PPI_MIN) {
+        if (ceil < PPI_MIN) {
+          reason = 'source too low-res for this cell size';
+          fix = 'use a higher-res photo or make the cell smaller — need ~'
+                + Math.ceil(PPI_GOOD * w) + '×' + Math.ceil(PPI_GOOD * h)
+                + ' px, have ' + pw + '×' + ph;
+        } else {
+          reason = 'cropped/zoomed in too far';
+          fix = 'zoom out or loosen the crop — full-frame here prints ~'
+                + Math.round(ceil) + ' DPI' + (z > 1.01 ? ' (now ' + z.toFixed(2) + '×)' : '');
+        }
+      }
+      return { ppi, level, ceil: Math.round(ceil), zoom: z,
+               mp: +(pw * ph / 1e6).toFixed(1), pw, ph, reason, fix };
+    }
+
     function facesCut(win, faces) {
       if (!faces || !faces.length) return false;
       const eps = 0.02;
@@ -272,6 +326,9 @@
         window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
       };
       const cap = cell.__caption;
+      // Low print-resolution warning (editor only, never in the printed/proof view).
+      const pq = printQuality(cell, detail, p);
+      const lowPpi = pq && pq.ppi < PPI_MIN;
       return e('div', { className:'cell'+(selected?' selected':''), style,
           onClick: ev => { ev.stopPropagation(); onSelect && onSelect(); },
           onDragOver: ev => ev.preventDefault(),
@@ -279,6 +336,9 @@
         e('img', { src:preview(cell.photo_id), style:imgStyle, draggable:false,
           onMouseDown:onDown, onLoad: ev => setNat({ w:ev.target.naturalWidth, h:ev.target.naturalHeight }),
           onError: ev => { if (!ev.target.dataset.fb) { ev.target.dataset.fb='1'; ev.target.src = thumb(cell.photo_id); } } }),
+        !proof && lowPpi ? e('div', { className:'ppi-badge no-print '+(pq.ppi<PPI_BAD?'bad':'warn'),
+          title: pq.ppi + ' DPI — ' + pq.reason + '. ' + (pq.fix||'') },
+          '⚠ ' + pq.ppi + ' DPI') : null,
         showFaces && selected && !proof && detail && detail.faces ? detail.faces.map((f,i) =>
           e('div', { key:i, className:'facebox', style:{
             left:(p.left + f[0]*p.Pw)+'%', top:(p.top + f[1]*p.Ph)+'%',
@@ -364,6 +424,8 @@
 
     // --------------------------------------------------------- Cell toolbar
     function CellTools({ book, sel, reload, patchLocal, showFaces, setShowFaces, detail }) {
+      const [alts, setAlts] = useState(null);     // {cellId, items} for the selected cell
+      const [altMsg, setAltMsg] = useState('');
       const sp = book.spreads.find(s=>s.id===sel.spreadId);
       const cell = sp && sp.cells.find(c=>c.id===sel.cellId);
       if (!cell) return null;
@@ -372,6 +434,17 @@
       const nat = detail && detail.w ? detail.w/detail.h : 1.5;
       const plan = cell.photo_id ? planCell(cell, nat) : null;
       const cut = cell.photo_id && plan && !plan.contain && detail && facesCut(plan.win, detail.faces);
+      const pq = cell.photo_id ? printQuality(cell, detail, plan) : null;
+      const findAlts = () => {
+        setAltMsg('searching…'); setAlts(null);
+        api('/api/books/'+book.book.id+'/cells/'+cell.id+'/print-alternatives')
+          .then(d => { const items = d.alternatives || [];
+            setAlts({ cellId:cell.id, items });
+            setAltMsg(items.length ? '' : 'no sharper look-alikes in the library'); })
+          .catch(e => setAltMsg('error: '+(e.message||e)));
+      };
+      const swapTo = (pid) => api('/api/books/'+book.book.id+'/cells/'+cell.id,
+        { method:'PUT', body:JSON.stringify({ photo_id:pid }) }).then(()=>{ setAlts(null); setAltMsg(''); reload(); });
       const activePreset = CROP_PRESETS.findIndex(p => (p.w===(cell.crop_min_w||0)) && (p.h===(cell.crop_min_h||0)));
       return e('div', { className:'celltools no-print' },
         e('strong', null, 'Cell '),
@@ -388,6 +461,25 @@
         cell.photo_id && e('label', { className:'row muted' },
           e('input', { type:'checkbox', checked:showFaces, onChange:ev=>setShowFaces(ev.target.checked) }), 'subjects'),
         cut ? e('span', { className:'warn' }, '⚠ a subject is cropped out') : null,
+        pq ? e('div', { className:'pq' },
+          e('div', null,
+            e('span', { className:'dpi '+pq.level }, pq.ppi + ' DPI'),
+            e('span', { className:'muted' }, ' · ' + cell.w.toFixed(1) + '×' + cell.h.toFixed(1)
+              + ' in · src ' + pq.pw + '×' + pq.ph + ' (' + pq.mp + ' MP)'
+              + (pq.zoom > 1.01 ? ' · ' + pq.zoom.toFixed(2) + '× zoom' : ''))),
+          pq.reason ? e('div', { className:'why' }, '⚠ ' + pq.reason + ' — ' + pq.fix) : null,
+          pq.ppi < PPI_MIN ? e('button', { className:'tiny', onClick:findAlts },
+            '🔍 find sharper similar photos') : null,
+          altMsg ? e('span', { className:'muted' }, altMsg) : null,
+          (alts && alts.cellId === cell.id && alts.items.length) ? e('div', { className:'alts' },
+            alts.items.map(a => e('div', { key:a.id, className:'alt',
+                title:(a.place_name||'') + ' ' + (a.date_taken||'') + ' · ' + a.mp + ' MP · ' + a.width + '×' + a.height },
+              e('img', { src:thumb(a.id), loading:'lazy' }),
+              e('div', { className:'meta' },
+                e('span', { className:'ok' }, a.projected_ppi + ' DPI'),
+                e('span', null, a.mp + 'MP')),
+              e('button', { className:'tiny', onClick:()=>swapTo(a.id) }, 'use')))) : null,
+        ) : null,
         cell.photo_id && e('button', { className:'tiny danger', onClick:()=>{ put({ photo_id:null }); } }, 'remove photo'),
       );
     }

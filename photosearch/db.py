@@ -944,6 +944,31 @@ class PhotoDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def similar_by_photo(self, photo_id: int, limit: int = 100) -> list[dict]:
+        """CLIP nearest-neighbors of an existing photo, by its own embedding.
+        Returns [{photo_id, distance}] sorted nearest-first (the query photo
+        itself is included at distance ~0). Empty if the photo has no embedding."""
+        if not HAS_SQLITE_VEC:
+            return []
+        row = self.conn.execute(
+            "SELECT embedding FROM clip_embeddings WHERE photo_id = ?",
+            (photo_id,)).fetchone()
+        if not row:
+            return []
+        blob = row["embedding"]
+        limit = min(limit, 4096)
+        try:
+            rows = self.conn.execute(
+                "SELECT photo_id, distance FROM clip_embeddings "
+                "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                (blob, limit)).fetchall()
+        except sqlite3.OperationalError:
+            rows = self.conn.execute(
+                "SELECT photo_id, distance FROM clip_embeddings "
+                "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (blob, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Vec0 orphan cleanup
     # ------------------------------------------------------------------

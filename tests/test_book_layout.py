@@ -4,7 +4,7 @@ Covers the two house-style framing modes (framed / full-bleed), the equal-column
 'gallery row' archetype, and the per-archetype cell count that lets switching a
 1-photo spread to 'matched 2-up' open an empty second slot.
 """
-from photosearch.book import archetype_layout, archetype_cell_count
+from photosearch.book import archetype_layout, archetype_cell_count, cover_ppi
 
 SW, SH = 28.0, 11.0
 
@@ -115,6 +115,19 @@ def test_fixed_collage_cell_count_is_six():
     assert archetype_cell_count("collage 3+3", 6) == 6
     assert archetype_cell_count("collage 3+3", 1) == 6   # opens all six slots
     assert archetype_cell_count("collage 2+4", 0) == 6
+
+
+def test_cover_ppi_binds_on_the_tighter_axis():
+    # 3:2 landscape (6000x4000) full-bleed across the 28x11 spread: height binds
+    # (4000/11 = 364) below width (6000/28 = 214)? No — min picks the smaller.
+    assert round(cover_ppi(6000, 4000, 28, 11)) == 214
+    # a 28MP frame in a 10x11 cell prints ~395 DPI full-frame (the Seceda case)
+    assert round(cover_ppi(6528, 4352, 10.02, 11.0)) == 396
+    # a 10MP phone frame stretched across a full 28-inch spread is ~130 DPI
+    assert round(cover_ppi(3648, 2736, 28, 11)) == 130
+    # degenerate inputs never divide by zero
+    assert cover_ppi(0, 4000, 10, 10) == 0.0
+    assert cover_ppi(6000, 4000, 0, 10) == 0.0
 
 
 def test_cell_count_opens_empty_slot_for_fixed_archetypes():

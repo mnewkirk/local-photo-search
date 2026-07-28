@@ -960,6 +960,21 @@ CROP_MAP = {
 }
 
 
+# Print-resolution thresholds (PPI) shared with the editor (frontend/dist/book.html).
+PPI_GOOD, PPI_MIN, PPI_BAD = 300, 200, 150
+
+
+def cover_ppi(pw: float, ph: float, w_in: float, h_in: float) -> float:
+    """Effective print resolution (PPI) of a ``pw``×``ph`` px photo shown
+    full-frame *cover* (zoom 1) in a ``w_in``×``h_in`` inch cell. Cover crops the
+    overflow axis, so the binding axis is the tighter ratio → min(). This is the
+    best a given source can do at a given cell size; the live editor applies the
+    same idea to the actual crop window."""
+    if not pw or not ph or w_in <= 0 or h_in <= 0:
+        return 0.0
+    return min(pw / w_in, ph / h_in)
+
+
 def _place(item: dict, x: float, y: float, w: float, h: float) -> dict:
     """Place one photo in an allotted region. A 'full' (uncropped) photo gets a
     cell whose aspect matches the photo (centered, no crop, no big letterbox); a

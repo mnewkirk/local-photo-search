@@ -3706,6 +3706,69 @@ def api_book_update_cell(book_id: int, cell_id: int, body: dict):
         return {"ok": True}
 
 
+@app.get("/api/books/{book_id}/cells/{cell_id}/print-alternatives")
+def api_book_print_alternatives(book_id: int, cell_id: int,
+                                target: float = 240.0, limit: int = 8,
+                                max_distance: float = 0.72):
+    """Visually-similar photos that would print sharper in this cell than the
+    current one. Ranks CLIP neighbors of the cell's photo, keeps those whose
+    full-frame print resolution clears ``target`` PPI at this cell's size, and
+    excludes the current photo + anything already placed in this book."""
+    from .book import cover_ppi
+    with _get_books() as bs, _get_db() as pdb:
+        book = bs.get_book(book_id)
+        if not book:
+            return JSONResponse({"error": "Book not found"}, status_code=404)
+        cell = None
+        used_ids = set()
+        for sp in book["spreads"]:
+            for c in sp["cells"]:
+                if c.get("photo_id"):
+                    used_ids.add(c["photo_id"])
+                if c["id"] == cell_id:
+                    cell = c
+        if not cell:
+            return JSONResponse({"error": "Cell not found"}, status_code=404)
+        pid = cell.get("photo_id")
+        if not pid:
+            return {"alternatives": [], "target": target, "note": "empty cell"}
+        w_in, h_in = cell["w"], cell["h"]
+        neighbors = pdb.similar_by_photo(int(pid), limit=200)
+        alts = []
+        for nb in neighbors:
+            npid = nb["photo_id"]
+            if npid == pid or npid in used_ids:
+                continue
+            if nb["distance"] > max_distance:
+                continue
+            row = pdb.conn.execute(
+                "SELECT image_width w, image_height h, date_taken, place_name, "
+                "camera_model FROM photos WHERE id = ?", (npid,)).fetchone()
+            if not row or not row["w"] or not row["h"]:
+                continue
+            ppi = cover_ppi(row["w"], row["h"], w_in, h_in)
+            if ppi < target:
+                continue
+            alts.append({
+                "id": npid, "distance": round(nb["distance"], 4),
+                "width": row["w"], "height": row["h"],
+                "mp": round(row["w"] * row["h"] / 1e6, 1),
+                "projected_ppi": int(ppi),
+                "date_taken": row["date_taken"], "place_name": row["place_name"],
+                "camera_model": row["camera_model"],
+            })
+            if len(alts) >= limit:
+                break
+        cur = pdb.conn.execute(
+            "SELECT image_width w, image_height h FROM photos WHERE id = ?",
+            (pid,)).fetchone()
+        current_ppi = (int(cover_ppi(cur["w"], cur["h"], w_in, h_in))
+                       if cur and cur["w"] else None)
+        return {"alternatives": alts, "target": target,
+                "cell": {"w": w_in, "h": h_in},
+                "current": {"id": pid, "cover_ppi": current_ppi}}
+
+
 @app.post("/api/books/{book_id}/undo")
 def api_book_undo(book_id: int):
     with _get_books() as bs:
