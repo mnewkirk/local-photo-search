@@ -259,8 +259,12 @@
                 + Math.round(ceil) + ' DPI' + (z > 1.01 ? ' (now ' + z.toFixed(2) + '×)' : '');
         }
       }
+      // Pixel targets for THIS cell size: crisp (300) and the badge floor (200).
+      const needW = Math.ceil(PPI_GOOD * w), needH = Math.ceil(PPI_GOOD * h);
+      const floorW = Math.ceil(PPI_MIN * w), floorH = Math.ceil(PPI_MIN * h);
       return { ppi, level, ceil: Math.round(ceil), zoom: z,
-               mp: +(pw * ph / 1e6).toFixed(1), pw, ph, reason, fix };
+               mp: +(pw * ph / 1e6).toFixed(1), pw, ph, reason, fix,
+               needW, needH, floorW, floorH };
     }
 
     function facesCut(win, faces) {
@@ -484,6 +488,9 @@
             e('span', { className:'muted' }, ' · ' + cell.w.toFixed(1) + '×' + cell.h.toFixed(1)
               + ' in · src ' + pq.pw + '×' + pq.ph + ' (' + pq.mp + ' MP)'
               + (pq.zoom > 1.01 ? ' · ' + pq.zoom.toFixed(2) + '× zoom' : ''))),
+          e('div', { className:'why' }, 'this cell wants ≥ ' + pq.needW + '×' + pq.needH
+            + ' px for 300 DPI (≥ ' + pq.floorW + '×' + pq.floorH + ' px to clear the '
+            + PPI_MIN + ' DPI floor)'),
           pq.reason ? e('div', { className:'why' }, '⚠ ' + pq.reason + ' — ' + pq.fix) : null,
           pq.ppi < PPI_MIN ? e('button', { className:'tiny', onClick:findAlts },
             '🔍 find sharper similar photos') : null,
