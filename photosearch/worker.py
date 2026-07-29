@@ -27,6 +27,7 @@ import requests
 from requests.exceptions import (
     ConnectionError as ReqConnectionError,
     Timeout as ReqTimeout,
+    ReadTimeout as ReqReadTimeout,
     ChunkedEncodingError,
     ContentDecodingError,
 )
@@ -126,13 +127,22 @@ class WorkerClient:
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.session = requests.Session()
         # Quick connectivity test. `/api/stats` runs heavy count scans and can
-        # time out when the NAS is busy, so callers that just want to submit a
-        # single result (the M28 sync re-run path) pass probe=False to skip it —
-        # the targeted download/submit calls have their own timeouts + retries.
+        # take >10s on a cold N100 NAS (full-table COUNT/MIN/MAX over photos,
+        # faces, clip_embeddings). A *read* timeout means the TCP connection
+        # succeeded — the server is reachable, just slow to compute stats — so
+        # it's a false negative to treat it as unreachable (this is why the
+        # first fleet launch failed and the second, cache-warm, succeeded).
+        # Only genuine connection failures are fatal; a read timeout warns and
+        # proceeds (the real claim/download/submit calls have their own timeouts
+        # + retries). Callers that just submit a single result (the M28 sync
+        # re-run path) pass probe=False to skip it entirely.
         if probe:
             try:
-                r = self.session.get(f"{self.server_url}/api/stats", timeout=10)
+                r = self.session.get(f"{self.server_url}/api/stats", timeout=30)
                 r.raise_for_status()
+            except ReqReadTimeout:
+                print(f"  ⚠ {self.server_url}/api/stats slow to respond (cold cache?) — "
+                      f"server is reachable, continuing")
             except Exception as e:
                 raise ConnectionError(f"Cannot reach server at {self.server_url}: {e}")
 
