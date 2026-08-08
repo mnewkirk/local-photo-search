@@ -38,7 +38,16 @@ for _mod in _OPTIONAL_DEPS:
         try:
             __import__(_mod)
         except ImportError:
-            sys.modules[_mod] = MagicMock()
+            _mock = MagicMock()
+            if _mod == "torch":
+                # scipy's array_api_compat does `issubclass(cls, torch.Tensor)`
+                # on every array it touches; a MagicMock attribute raises
+                # TypeError there and poisons all of sklearn (which imports
+                # scipy.stats), breaking the DBSCAN recluster/split tests.
+                # Give the mock a real class so the isinstance check just
+                # returns False.
+                _mock.Tensor = type("Tensor", (), {})
+            sys.modules[_mod] = _mock
 
 # Provide a mock embed_text only when CLIP isn't really available, so
 # search_combined can be called without actual CLIP inference in unit tests.
