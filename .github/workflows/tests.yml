@@ -62,5 +62,8 @@ jobs:
           print("sqlite-vec OK:", c.execute("select vec_version()").fetchone()[0])
           PY
 
+      # -rs prints the reason for every skip. Without it a test that silently
+      # starts skipping in CI (missing optional dep, platform guard) looks
+      # identical to one that passes.
       - name: Run tests
-        run: pytest -q
+        run: pytest -q -rs
