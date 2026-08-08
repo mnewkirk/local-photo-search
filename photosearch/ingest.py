@@ -363,6 +363,15 @@ def ingest_incoming(
                      "non_image_reclassified": 0, "vanished": 0, "errors": 0}
     totals = _zero()
 
+    # Content hashes already relocated by THIS sweep, hash -> destination.
+    # The DB-hash dedup below can't see them: ingest never inserts photo rows
+    # itself (the follow-up index_directory pass does, after every source has
+    # been swept), so two copies of one photo under two source labels would
+    # both look new and both land in the library. That is exactly how a
+    # truncated 'LCE-7RM6' importer label produced 236 duplicate files
+    # alongside their 'ILCE-7RM6' originals. First source wins (sorted order).
+    seen_hashes: dict[str, Path] = {}
+
     # A dry run touches nothing, so it doesn't need (or take) the mutex.
     lock = _sweep_lock(db_path) if not dry_run else _no_lock()
     with lock, PhotoDB(db_path) as db:
@@ -395,6 +404,15 @@ def ingest_incoming(
                 except Exception as exc:
                     stats["errors"] += 1
                     print(f"  [{source}] HASH FAIL {src_file.name}: {exc}")
+                    continue
+
+                # Same bytes already relocated earlier in this sweep (usually a
+                # second source label for the same camera). Archive the copy
+                # instead of landing it in the library a second time.
+                if h in seen_hashes:
+                    stats["deduped" if is_photo else "companions_deduped"] += 1
+                    if not dry_run:
+                        _archive(source_root, src_file, source, stats)
                     continue
 
                 if is_photo:
@@ -451,6 +469,9 @@ def ingest_incoming(
                 target = _unique_target_path(tdir, src_file.name)
 
                 if dry_run:
+                    # Record even on a dry run so the preview counts a
+                    # duplicate pair the same way a real sweep would.
+                    seen_hashes[h] = target
                     if is_photo:
                         stats["imported"] += 1
                         new_dirs.add(tdir)
@@ -469,6 +490,7 @@ def ingest_incoming(
                     print(f"  [{source}] MOVE FAIL {src_file.name} -> {target}: {exc}")
                     continue
 
+                seen_hashes[h] = target
                 if is_photo:
                     # new_dirs drives the follow-up CLIP index pass. Companion
                     # folders are deliberately left out — RAW/video are never

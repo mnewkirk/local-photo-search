@@ -526,3 +526,47 @@ def test_second_concurrent_sweep_is_refused(tmp_path, tmp_db_path, monkeypatch):
     # Lock released — a normal sweep runs again.
     result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
     assert result["totals"]["imported"] == 1
+
+
+def test_same_photo_under_two_source_labels_lands_once(tmp_path, tmp_db_path, monkeypatch):
+    """Ingest inserts no photo rows itself (index_directory does, afterwards),
+    so the DB-hash dedup can't see a copy moved earlier in the SAME sweep. The
+    intra-run hash set covers it — this is how a truncated importer label
+    ('LCE-7RM6' next to 'ILCE-7RM6') produced duplicate library files."""
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "ILCE-7RM6" / "DSC06192.jpg", b"same-bytes")
+    _touch(incoming / "LCE-7RM6" / "DSC06192.jpg", b"same-bytes")
+    _patch_exif(monkeypatch, "2026-08-05 10:00:00")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    # First source (sorted: ILCE < LCE) wins; the second is archived, not landed.
+    assert result["totals"]["imported"] == 1
+    assert result["totals"]["deduped"] == 1
+    assert (photos / "2026" / "2026-08-05_ILCE-7RM6" / "DSC06192.jpg").exists()
+    assert not (photos / "2026" / "2026-08-05_LCE-7RM6").exists()
+    assert (incoming / "LCE-7RM6" / ".processed" / "DSC06192.jpg").exists()
+
+
+def test_intra_run_dedup_also_covers_companions(tmp_path, tmp_db_path, monkeypatch):
+    """RAW/video have no DB row at all, so the destination-path check is their
+    only guard — and it misses a duplicate routed to a DIFFERENT dated folder."""
+    incoming, photos = _setup_dirs(tmp_path)
+    for label in ("ILCE-7RM6", "LCE-7RM6"):
+        p = incoming / label / "DSC06192.ARW"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"II*\x00raw-bytes")
+    _patch_exif(monkeypatch, "2026-08-05 10:00:00")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["companions_moved"] == 1
+    assert result["totals"]["companions_deduped"] == 1
+    assert (photos / "2026" / "2026-08-05_ILCE-7RM6" / "DSC06192.ARW").exists()
+    assert not (photos / "2026" / "2026-08-05_LCE-7RM6").exists()
