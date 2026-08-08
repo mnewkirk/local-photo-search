@@ -99,25 +99,40 @@ def main() -> int:
                   f"-> {good_dir.relative_to(photo_root)}"
                   f"{'' if good_dir.is_dir() else '  [twin does not exist]'}")
 
+            # Size index of the good folder, so a bad file can be matched
+            # against ANY file there, not just the same-named one: an
+            # interrupted earlier copy left `DSC01362_1.JPG` twins whose
+            # same-name counterpart is a different (larger) image entirely.
+            # Size is the cheap pre-filter; only same-size files get hashed.
+            good_by_size: dict[int, list[Path]] = {}
+            if good_dir.is_dir():
+                for p in good_dir.iterdir():
+                    if p.is_file():
+                        good_by_size.setdefault(p.stat().st_size, []).append(p)
+            hash_cache: dict[Path, str] = {}
+
             for src in files:
                 rel_bad = str(src.relative_to(photo_root))
-                # instr() is a literal substring match — no wildcard traps.
                 row = c.execute(
                     "SELECT id FROM photos WHERE filepath = ? OR filepath = ?",
                     (rel_bad, str(src)),
                 ).fetchone()
                 photo_id = row["id"] if row else None
 
-                twin = good_dir / src.name
-                identical = False
-                if twin.exists():
-                    try:
-                        identical = sha256(src) == sha256(twin)
-                    except OSError as exc:
-                        print(f"  ! {src.name}: unreadable ({exc}) — skipped")
-                        continue
+                try:
+                    src_hash = sha256(src)
+                    twin = None
+                    for cand in good_by_size.get(src.stat().st_size, []):
+                        if cand not in hash_cache:
+                            hash_cache[cand] = sha256(cand)
+                        if hash_cache[cand] == src_hash:
+                            twin = cand
+                            break
+                except OSError as exc:
+                    print(f"  ! {src.name}: unreadable ({exc}) — skipped")
+                    continue
 
-                if identical:
+                if twin is not None:
                     actions.append({"action": "delete-duplicate", "src": rel_bad,
                                     "dst": str(twin.relative_to(photo_root)),
                                     "photo_id": photo_id or ""})
@@ -126,8 +141,9 @@ def main() -> int:
                         if photo_id is not None:
                             c.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
                 else:
-                    # No twin, or a same-named but different file: keep it, but
-                    # under the correct label. _unique suffix avoids clobbering.
+                    # Content that exists nowhere in the good folder: keep it,
+                    # but under the correct label. _unique suffix avoids
+                    # clobbering a same-named but different image.
                     dst = good_dir / src.name
                     n = 1
                     while dst.exists():
