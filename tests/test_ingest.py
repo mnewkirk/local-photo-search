@@ -436,3 +436,93 @@ def test_scan_incoming_missing_dir_returns_empty(tmp_path):
     assert result["exists"] is False
     assert result["sources"] == {}
     assert result["totals"]["total"] == 0
+
+
+# --- concurrency: two sweeps must not race on the same files ----------------
+
+def test_file_vanishing_mid_sweep_is_skipped_not_fatal(tmp_path, tmp_db_path, monkeypatch):
+    """A file removed between the directory walk and the move (concurrent sweep
+    or an SD-card import still writing) is counted and skipped — the rest of
+    the sweep still completes."""
+    incoming, photos = _setup_dirs(tmp_path)
+    doomed = incoming / "matt" / "DCIM" / "IMG_0001.jpg"
+    survivor = incoming / "matt" / "DCIM" / "IMG_0002.jpg"
+    _touch(doomed, b"doomed")
+    _touch(survivor, b"survivor")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    # Delete the first file after the listing snapshot is taken.
+    real_iter = ingest_mod._iter_source_files
+
+    def racing_iter(source_root):
+        files = real_iter(source_root)
+        doomed.unlink()
+        return files
+
+    monkeypatch.setattr(ingest_mod, "_iter_source_files", racing_iter)
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["vanished"] == 1
+    assert result["totals"]["errors"] == 0
+    assert result["totals"]["imported"] == 1
+    assert (photos / "2026" / "2026-04-12_phone-matt" / "IMG_0002.jpg").exists()
+
+
+def test_archive_failure_does_not_abort_sweep(tmp_path, tmp_db_path, monkeypatch):
+    """The dedup path archives the source file; if that move fails (the file
+    was already archived by a concurrent sweep) the run keeps going."""
+    incoming, photos = _setup_dirs(tmp_path)
+    dup = incoming / "matt" / "DCIM" / "IMG_0001.jpg"
+    fresh = incoming / "matt" / "DCIM" / "IMG_0002.jpg"
+    _touch(dup, b"dup")
+    _touch(fresh, b"fresh")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    from photosearch.index import file_hash
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+        db.add_photo(
+            filepath="2026/already.jpg",
+            filename="already.jpg",
+            file_hash=file_hash(str(dup)),
+        )
+
+    def exploding_move(source_root, src_file):
+        raise FileNotFoundError(str(src_file))
+
+    monkeypatch.setattr(ingest_mod, "_move_to_archive", exploding_move)
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["deduped"] == 1
+    assert result["totals"]["vanished"] == 1
+    assert result["totals"]["imported"] == 1
+
+
+def test_second_concurrent_sweep_is_refused(tmp_path, tmp_db_path, monkeypatch):
+    """The cross-process flock makes a second sweep raise instead of racing the
+    first one for the same files (the crash this guard was added for)."""
+    from photosearch.ingest import IngestAlreadyRunning, _sweep_lock
+
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "DCIM" / "IMG_0001.jpg", b"one")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    with _sweep_lock(tmp_db_path):  # stand in for the already-running sweep
+        with pytest.raises(IngestAlreadyRunning):
+            ingest_incoming(str(incoming), str(photos), tmp_db_path)
+        # dry runs write nothing, so they're allowed through
+        preview = ingest_incoming(str(incoming), str(photos), tmp_db_path,
+                                  dry_run=True)
+        assert preview["totals"]["imported"] == 1
+
+    # Lock released — a normal sweep runs again.
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+    assert result["totals"]["imported"] == 1

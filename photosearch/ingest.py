@@ -21,9 +21,15 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
+
+try:  # POSIX only — the deployment (Linux container) and dev Mac both have it.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 
 from .db import PhotoDB
 from .exif import extract_exif
@@ -56,6 +62,12 @@ ARCHIVE_DIRNAME = ".processed"
 # Should be exceptionally rare for phone-sourced media.
 UNDATED_DIRNAME = "_undated"
 
+# Cross-process mutex for the sweep, held for the duration of one run. Lives
+# next to the DB (the /data volume both the web container and the throwaway
+# `compose run` ingest container share), NOT under _incoming/ — that tree is a
+# Syncthing receive-only folder where a stray file shows up as a local change.
+LOCKFILE_NAME = ".ingest-incoming.lock"
+
 # A source label like 'ILCE-7RM6' / 'ILCE-7M4' / 'EOS R5' is an EXIF camera
 # model (the SD-card import path names _incoming/<model>/ subdirs after the
 # body). Those land in YYYY-MM-DD_<model>/ — no 'phone-' prefix. Human source
@@ -67,6 +79,61 @@ _CAMERA_MODEL_RE = re.compile(r"^[A-Z0-9][A-Z0-9 ._-]*$")
 # model (mostly video). Treated as bare so it doesn't masquerade as a phone
 # roll (`_phone-unknown-camera`).
 _DEFAULT_BARE_SOURCES = frozenset({"unknown-camera"})
+
+
+class IngestAlreadyRunning(RuntimeError):
+    """Another `ingest-incoming` sweep is already holding the lock.
+
+    Two concurrent sweeps walk the same file list and move files out from under
+    each other, so the second one crashes on a file the first already archived.
+    Refusing to start is the fix; the caller should just wait for the running
+    sweep (nothing is missed — the next run picks up whatever is left).
+    """
+
+
+@contextmanager
+def _no_lock() -> Iterator[None]:
+    """No-op stand-in for `_sweep_lock` (dry runs write nothing)."""
+    yield None
+
+
+@contextmanager
+def _sweep_lock(db_path: str) -> Iterator[Optional[Path]]:
+    """Hold an exclusive `flock` for one sweep; raise if another holds it.
+
+    `flock` is per open-file-description and released by the kernel when the
+    process exits, so a crashed/killed sweep never leaves a stale lock behind
+    (unlike a PID file). It works across containers because the lockfile is one
+    inode on the shared /data volume.
+
+    If the lockfile can't be created (read-only dir, no fcntl), the sweep runs
+    unguarded rather than failing — losing the mutex is better than losing the
+    daily ingest.
+    """
+    lock_path = Path(db_path).expanduser().resolve().parent / LOCKFILE_NAME
+    if fcntl is None:
+        yield None
+        return
+    try:
+        fh = open(lock_path, "w")
+    except OSError as exc:
+        print(f"  [ingest] WARNING: no lockfile at {lock_path} ({exc}) — "
+              f"running without a concurrency guard")
+        yield None
+        return
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise IngestAlreadyRunning(
+                f"another ingest-incoming sweep is already running "
+                f"(lock held on {lock_path}) — wait for it to finish"
+            ) from None
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+        yield lock_path
+    finally:
+        fh.close()  # closing the fd releases our flock (and only ours)
 
 
 def _looks_like_camera_model(source: str) -> bool:
@@ -257,19 +324,28 @@ def ingest_incoming(
     against the destination (same name + same hash already present) since they
     have no DB row.
 
+    Only one sweep may run at a time (cross-process `flock`); a second one
+    raises `IngestAlreadyRunning` instead of racing the first for the same
+    files. `dry_run` skips the lock — it writes nothing, so previewing while a
+    sweep runs is safe.
+
     Returns a stats dict:
         {
           "sources": {
             <source>: {
               "scanned": int, "imported": int, "deduped": int,
               "companions_moved": int, "companions_deduped": int,
-              "errors": int, "new_dirs": [str, ...],
+              "vanished": int, "errors": int, "new_dirs": [str, ...],
             }, ...
           },
           "totals": {"scanned", "imported", "deduped", "companions_moved",
-                     "companions_deduped", "errors"},
+                     "companions_deduped", "vanished", "errors"},
           "dry_run": bool,
         }
+
+    `vanished` counts files that disappeared between the directory walk and the
+    move — the importer or a phone sync still writing into _incoming/. They are
+    skipped, never fatal, and picked up by the next sweep if they reappear.
     """
     incoming = Path(incoming_root).resolve()
     photo_dir = Path(photo_root).resolve()
@@ -284,10 +360,12 @@ def ingest_incoming(
     per_source: dict[str, dict] = {}
     _zero = lambda: {"scanned": 0, "imported": 0, "deduped": 0,
                      "companions_moved": 0, "companions_deduped": 0,
-                     "non_image_reclassified": 0, "errors": 0}
+                     "non_image_reclassified": 0, "vanished": 0, "errors": 0}
     totals = _zero()
 
-    with PhotoDB(db_path) as db:
+    # A dry run touches nothing, so it doesn't need (or take) the mutex.
+    lock = _sweep_lock(db_path) if not dry_run else _no_lock()
+    with lock, PhotoDB(db_path) as db:
         for source_root in sources:
             source = source_root.name
             suffix = _folder_suffix(source, bare_sources, phone_sources)
@@ -297,6 +375,13 @@ def ingest_incoming(
 
             for src_file in _iter_source_files(source_root):
                 stats["scanned"] += 1
+                # The listing is a snapshot; the SD-card importer / phone sync
+                # may still be writing (and moving) files under _incoming/. A
+                # file that's gone by the time we reach it is skipped, not an
+                # error, and certainly not fatal to the rest of the sweep.
+                if not src_file.exists():
+                    stats["vanished"] += 1
+                    continue
                 is_photo = src_file.suffix.lower() in INGEST_EXTENSIONS
                 # An image-extension file whose content isn't a decodable image
                 # (e.g. a ZIP-wrapped iOS Live Photo saved as .JPG) is moved into
@@ -324,7 +409,7 @@ def ingest_incoming(
                     if existing is not None:
                         stats["deduped"] += 1
                         if not dry_run:
-                            _move_to_archive(source_root, src_file)
+                            _archive(source_root, src_file, source, stats)
                         continue
 
                 # Date routing. extract_exif is photo-oriented and may not read
@@ -360,7 +445,7 @@ def ingest_incoming(
                         if same:
                             stats["companions_deduped"] += 1
                             if not dry_run:
-                                _move_to_archive(source_root, src_file)
+                                _archive(source_root, src_file, source, stats)
                             continue
 
                 target = _unique_target_path(tdir, src_file.name)
@@ -376,6 +461,9 @@ def ingest_incoming(
                 try:
                     tdir.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(src_file), str(target))
+                except FileNotFoundError:
+                    stats["vanished"] += 1
+                    continue
                 except Exception as exc:
                     stats["errors"] += 1
                     print(f"  [{source}] MOVE FAIL {src_file.name} -> {target}: {exc}")
@@ -396,6 +484,22 @@ def ingest_incoming(
                 totals[k] += stats[k]
 
     return {"sources": per_source, "totals": totals, "dry_run": dry_run}
+
+
+def _archive(source_root: Path, src_file: Path, source: str, stats: dict) -> None:
+    """`_move_to_archive` that records failures instead of aborting the sweep.
+
+    Archiving is bookkeeping for an already-safe outcome (the photo is in the
+    library or was a dedup) — a file that vanished under us, or a permission
+    blip, must never take down the remaining thousands of files.
+    """
+    try:
+        _move_to_archive(source_root, src_file)
+    except FileNotFoundError:
+        stats["vanished"] += 1
+    except Exception as exc:
+        stats["errors"] += 1
+        print(f"  [{source}] ARCHIVE FAIL {src_file.name}: {exc}")
 
 
 def _move_to_archive(source_root: Path, src_file: Path) -> None:

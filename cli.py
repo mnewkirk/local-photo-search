@@ -2270,7 +2270,7 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
     reaches the NAS; they dedup against the destination). Files that imported
     successfully are physically moved, not copied.
     """
-    from photosearch.ingest import ingest_incoming
+    from photosearch.ingest import ingest_incoming, IngestAlreadyRunning
 
     def _csv_env(name):
         return [s.strip() for s in os.environ.get(name, "").split(",") if s.strip()]
@@ -2278,14 +2278,20 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
     bare = set(bare_sources) | set(_csv_env("PHOTOSEARCH_INGEST_BARE_SOURCES"))
     phone = set(phone_sources) | set(_csv_env("PHOTOSEARCH_INGEST_PHONE_SOURCES"))
 
-    result = ingest_incoming(
-        incoming_root=incoming_root,
-        photo_root=photo_root,
-        db_path=db,
-        dry_run=dry_run,
-        bare_sources=bare,
-        phone_sources=phone,
-    )
+    try:
+        result = ingest_incoming(
+            incoming_root=incoming_root,
+            photo_root=photo_root,
+            db_path=db,
+            dry_run=dry_run,
+            bare_sources=bare,
+            phone_sources=phone,
+        )
+    except IngestAlreadyRunning as exc:
+        # Expected when the cron and the /status button overlap — a clean
+        # message, not a traceback. Nothing is missed: the running sweep
+        # covers these files.
+        raise click.ClickException(str(exc)) from None
 
     totals = result["totals"]
     click.echo(f"Scanned {totals['scanned']:,} files across {len(result['sources'])} sources.")
@@ -2295,6 +2301,7 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
             f"imported={stats['imported']:,} deduped={stats['deduped']:,} "
             f"companions={stats['companions_moved']:,} "
             f"(deduped={stats['companions_deduped']:,}) "
+            f"vanished={stats['vanished']:,} "
             f"errors={stats['errors']:,}"
         )
         for new_dir in stats["new_dirs"]:
@@ -2303,8 +2310,15 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
         f"Totals: imported={totals['imported']:,}  "
         f"deduped={totals['deduped']:,}  "
         f"companions(RAW/video)={totals['companions_moved']:,}  "
+        f"vanished={totals['vanished']:,}  "
         f"errors={totals['errors']:,}"
     )
+    if totals["vanished"]:
+        click.echo(
+            f"  ({totals['vanished']:,} file(s) disappeared mid-sweep — the SD-card "
+            f"importer or a phone sync was still writing. They'll be picked up "
+            f"by the next run.)"
+        )
 
     if dry_run:
         click.echo("\nDry run — no files moved, no DB rows written.")
