@@ -5223,5 +5223,48 @@ def shutterfly_manifest(book_id, out, db, books_db):
                f"{len(manifest['photos'])} photos)")
 
 
+# ---------------------------------------------------------------------------
+# shutterfly-gphotos-push
+# ---------------------------------------------------------------------------
+
+def _load_book_doc(book_id: int, db: str, books_db: str) -> dict | None:
+    books_db = books_db or _books_db_default(db)
+    with BookStore(books_db) as bs:
+        return bs.get_book(book_id)
+
+
+def _load_photo_rows_resolved(ids: list[int], db: str):
+    with PhotoDB(db) as pdb:
+        return _photo_rows(pdb, ids), pdb.resolve_filepath
+
+
+@cli.command("shutterfly-gphotos-push")
+@click.option("--book", "book_id", type=int, required=True)
+@click.option("--album-title", "album_title", default=None,
+              help="GP album title (default: '2026 Summer — <book name>')")
+@click.option("--dry-run", is_flag=True, help="List records without uploading")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
+@click.option("--books-db", "books_db", default=None, envvar="PHOTOSEARCH_BOOKS_DB")
+def shutterfly_gphotos_push(book_id, album_title, dry_run, db, books_db):
+    """Upload a book's placed photos to a per-book Google Photos album."""
+    from photosearch import google_photos as gp
+    doc = _load_book_doc(book_id, db, books_db)
+    if not doc:
+        raise click.ClickException(f"Book {book_id} not found")
+    ids = sfx.placed_photo_order(doc)
+    rows, resolve = _load_photo_rows_resolved(ids, db)
+    records = sfx.build_gphotos_records(ids, rows, resolve)
+    title = album_title or f"2026 Summer — {doc['book'].get('name')}"
+    click.echo(f"{len(records)} photo(s) -> album {title!r}")
+    for r in records:
+        click.echo(f"  {r['filename']}  <-  {r['orig_filename']}")
+    if dry_run:
+        return
+    album_id = gp.create_album(db, title)
+    results = gp.upload_photos(db, records, album_id=album_id)
+    ok = sum(1 for x in results if x.get("status") == "uploaded")
+    click.echo(f"Uploaded {ok}/{len(results)} to album {album_id}")
+
+
 if __name__ == "__main__":
     cli()
