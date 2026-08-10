@@ -53,3 +53,25 @@ def test_build_book_manifest_shape():
     assert m["spreads"][1]["cells"][0]["photo_id"] == 240599
     # every placed photo id appears in the photos map (filenames filled in Task 4/runbook)
     assert set(m["photos"].keys()) == {"240539", "240599", "240555"}
+
+from photosearch.shutterfly_export import build_gphotos_records
+
+def test_build_gphotos_records_maps_and_orders():
+    rows = {
+        240599: {"filepath": "2026/2026-07-24/DSC1.JPG", "filename": "DSC1.JPG",
+                 "description": "castle"},
+        240539: {"filepath": "2026/2026-07-24/DSC2.JPG", "filename": "DSC2.JPG",
+                 "description": None},
+        999999: {"filepath": "x", "filename": "x.jpg", "description": None},  # not requested
+    }
+    resolve = lambda p: "/photos/" + p
+    recs = build_gphotos_records([240539, 240599], rows, resolve)
+    assert [r["filename"] for r in recs] == ["sfly-240539.jpg", "sfly-240599.jpg"]
+    assert recs[0]["_resolved_filepath"] == "/photos/2026/2026-07-24/DSC2.JPG"
+    assert recs[0]["orig_filename"] == "DSC2.JPG"
+    assert recs[1]["description"] == "castle"
+
+def test_build_gphotos_records_skips_missing_rows():
+    recs = build_gphotos_records([1, 2], {1: {"filepath": "a", "filename": "a.jpg",
+                                              "description": None}}, lambda p: p)
+    assert [r["filename"] for r in recs] == ["sfly-1.jpg"]

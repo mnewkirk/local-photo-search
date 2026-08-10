@@ -64,3 +64,28 @@ def build_book_manifest(doc: dict) -> dict:
         "spreads": doc.get("spreads", []),
         "photos": photos,
     }
+
+
+def build_gphotos_records(
+    photo_ids: list[int],
+    rows: dict[int, dict],
+    resolve: Callable[[str], str],
+) -> list[dict]:
+    """Build google_photos.upload_photos records with deterministic filenames.
+
+    ``rows`` maps photo_id -> {filepath, filename, description}. ``resolve``
+    turns a stored (possibly relative) filepath into an absolute path.
+    """
+    records: list[dict] = []
+    for pid in photo_ids:
+        row = rows.get(int(pid))
+        if not row:
+            continue
+        orig = row.get("filename")
+        records.append({
+            "_resolved_filepath": resolve(row.get("filepath", "")),
+            "filename": upload_filename(int(pid), orig),
+            "orig_filename": orig,
+            "description": row.get("description"),
+        })
+    return records
