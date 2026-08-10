@@ -99,3 +99,12 @@ def enrich_manifest_filenames(manifest: dict, rows: dict[int, dict]) -> dict:
             rec["orig_filename"] = row.get("filename")
             rec["upload_filename"] = upload_filename(int(pid_str), row.get("filename"))
     return manifest
+
+
+def manifest_photo_ids(manifest: dict) -> list[int]:
+    """Ordered photo ids from a manifest's ``photos`` map (keys are str ids).
+
+    Lets the Google Photos push run NAS-side from a manifest (built on the
+    replica, which owns the books DB) without needing the books DB itself.
+    """
+    return [int(k) for k in manifest.get("photos", {}).keys()]

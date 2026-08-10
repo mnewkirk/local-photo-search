@@ -5239,22 +5239,40 @@ def _load_photo_rows_resolved(ids: list[int], db: str):
 
 
 @cli.command("shutterfly-gphotos-push")
-@click.option("--book", "book_id", type=int, required=True)
+@click.option("--book", "book_id", type=int, default=None,
+              help="Book id (reads the books DB; run where the books DB lives)")
+@click.option("--manifest", "manifest_path", default=None,
+              help="Push from a shutterfly-manifest JSON instead of the books DB — "
+                   "run NAS-side (photo files + Google Photos auth) with a manifest "
+                   "generated on the replica (which owns the books DB)")
 @click.option("--album-title", "album_title", default=None,
               help="GP album title (default: '2026 Summer — <book name>')")
 @click.option("--dry-run", is_flag=True, help="List records without uploading")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
 @click.option("--books-db", "books_db", default=None, envvar="PHOTOSEARCH_BOOKS_DB")
-def shutterfly_gphotos_push(book_id, album_title, dry_run, db, books_db):
-    """Upload a book's placed photos to a per-book Google Photos album."""
+def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, books_db):
+    """Upload a book's placed photos to a per-book Google Photos album.
+
+    Give exactly one of --book (reads the books DB) or --manifest (reads a
+    manifest JSON, so it can run on the NAS, which has the photo files and
+    Google Photos auth but not the books DB).
+    """
     from photosearch import google_photos as gp
-    doc = _load_book_doc(book_id, db, books_db)
-    if not doc:
-        raise click.ClickException(f"Book {book_id} not found")
-    ids = sfx.placed_photo_order(doc)
+    if (book_id is None) == (manifest_path is None):
+        raise click.ClickException("Provide exactly one of --book or --manifest")
+    if manifest_path is not None:
+        manifest = json.loads(Path(manifest_path).read_text())
+        ids = sfx.manifest_photo_ids(manifest)
+        default_title = f"2026 Summer — {manifest.get('name')}"
+    else:
+        doc = _load_book_doc(book_id, db, books_db)
+        if not doc:
+            raise click.ClickException(f"Book {book_id} not found")
+        ids = sfx.placed_photo_order(doc)
+        default_title = f"2026 Summer — {doc['book'].get('name')}"
     rows, resolve = _load_photo_rows_resolved(ids, db)
     records = sfx.build_gphotos_records(ids, rows, resolve)
-    title = album_title or f"2026 Summer — {doc['book'].get('name')}"
+    title = album_title or default_title
     click.echo(f"{len(records)} photo(s) -> album {title!r}")
     for r in records:
         click.echo(f"  {r['filename']}  <-  {r['orig_filename']}")

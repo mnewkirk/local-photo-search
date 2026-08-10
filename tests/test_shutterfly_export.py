@@ -75,3 +75,14 @@ def test_build_gphotos_records_skips_missing_rows():
     recs = build_gphotos_records([1, 2], {1: {"filepath": "a", "filename": "a.jpg",
                                               "description": None}}, lambda p: p)
     assert [r["filename"] for r in recs] == ["sfly-1.jpg"]
+
+
+def test_manifest_photo_ids_orders_and_ints():
+    from photosearch.shutterfly_export import manifest_photo_ids
+    m = {"photos": {"240539": {}, "240599": {}, "240555": {}}}
+    assert manifest_photo_ids(m) == [240539, 240599, 240555]
+
+
+def test_manifest_photo_ids_empty():
+    from photosearch.shutterfly_export import manifest_photo_ids
+    assert manifest_photo_ids({}) == []

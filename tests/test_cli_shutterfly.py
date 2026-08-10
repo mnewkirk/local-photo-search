@@ -35,3 +35,26 @@ def test_gphotos_push_dry_run_lists_records(monkeypatch, tmp_path):
     assert r.exit_code == 0, r.output
     assert "sfly-5.jpg" in r.output
     assert "1 photo" in r.output
+
+
+def test_gphotos_push_manifest_dry_run(monkeypatch, tmp_path):
+    import json as _json
+    manifest = {"name": "The South of France",
+                "photos": {"5": {"upload_filename": "sfly-5.jpg",
+                                 "orig_filename": "A.JPG", "sfly_asset_id": None}}}
+    p = tmp_path / "m.json"
+    p.write_text(_json.dumps(manifest))
+    monkeypatch.setattr(cli_mod, "_load_photo_rows_resolved",
+                        lambda ids, db: ({5: {"filepath": "a", "filename": "A.JPG",
+                                              "description": None}}, lambda x: "/photos/" + x))
+    r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push",
+                                         "--manifest", str(p), "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "sfly-5.jpg" in r.output
+    assert "2026 Summer — The South of France" in r.output
+
+
+def test_gphotos_push_requires_exactly_one_source():
+    r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push", "--dry-run"])
+    assert r.exit_code != 0
+    assert "exactly one" in r.output.lower()
