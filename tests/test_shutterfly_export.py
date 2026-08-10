@@ -1,0 +1,55 @@
+from photosearch.shutterfly_export import (
+    placed_photo_order, upload_filename, build_book_manifest,
+)
+
+def _doc():
+    return {
+        "book": {"id": 17, "name": "The South of France", "subtitle": "Provence",
+                 "cover_photo_id": 240555, "title_page_photo_id": 240539,
+                 "back_cover_photo_id": None},
+        "stage_w": 28.0, "stage_h": 11.0,
+        "spreads": [
+            {"position": 0, "archetype": "title", "bg": "#ffffff",
+             "caption": {"text": "We found a castle.", "dark": False},
+             "cells": [{"photo_id": 240539, "x": 14.5, "y": 0.5, "w": 13.0, "h": 10.0,
+                        "fit": "cover", "crop_cx": 0.53, "crop_cy": 0.55,
+                        "crop_zoom": 1.0, "crop_min_w": 0.0, "crop_min_h": 0.0,
+                        "align": None, "position": 0}]},
+            {"position": 1, "archetype": "matched 2-up", "bg": "#ffffff",
+             "caption": None,
+             "cells": [
+                {"photo_id": 240599, "x": 0.4, "y": 0.4, "w": 8.7, "h": 10.2,
+                 "fit": "cover", "crop_cx": 0.5, "crop_cy": 0.5, "crop_zoom": 1.0,
+                 "crop_min_w": 0.0, "crop_min_h": 0.0, "align": None, "position": 0},
+                {"photo_id": 240539, "x": 9.4, "y": 0.4, "w": 8.7, "h": 10.2,
+                 "fit": "cover", "crop_cx": 0.5, "crop_cy": 0.5, "crop_zoom": 1.0,
+                 "crop_min_w": 0.0, "crop_min_h": 0.0, "align": None, "position": 1}]},
+        ],
+    }
+
+def test_placed_photo_order_is_unique_and_ordered():
+    # 240539 appears in both spreads but only once; cover 240555 appended last
+    assert placed_photo_order(_doc()) == [240539, 240599, 240555]
+
+def test_placed_photo_order_skips_none_cover():
+    doc = _doc()
+    doc["book"]["cover_photo_id"] = None
+    doc["book"]["title_page_photo_id"] = None
+    assert placed_photo_order(doc) == [240539, 240599]
+
+def test_upload_filename_uses_photo_id_and_ext():
+    assert upload_filename(240599, "DSC06241.JPG") == "sfly-240599.jpg"
+    assert upload_filename(7, "no_ext") == "sfly-7"
+
+def test_build_book_manifest_shape():
+    m = build_book_manifest(_doc())
+    assert m["book_id"] == 17
+    assert m["name"] == "The South of France"
+    assert m["stage_w"] == 28.0 and m["stage_h"] == 11.0
+    assert m["spread_count"] == 2
+    # spreads passed through with cells + captions preserved
+    assert m["spreads"][0]["archetype"] == "title"
+    assert m["spreads"][0]["caption"] == {"text": "We found a castle.", "dark": False}
+    assert m["spreads"][1]["cells"][0]["photo_id"] == 240599
+    # every placed photo id appears in the photos map (filenames filled in Task 4/runbook)
+    assert set(m["photos"].keys()) == {"240539", "240599", "240555"}
