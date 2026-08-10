@@ -1,5 +1,5 @@
 from photosearch.shutterfly_export import (
-    placed_photo_order, upload_filename, build_book_manifest,
+    placed_photo_order, build_book_manifest,
 )
 
 def _doc():
@@ -37,10 +37,6 @@ def test_placed_photo_order_skips_none_cover():
     doc["book"]["title_page_photo_id"] = None
     assert placed_photo_order(doc) == [240539, 240599]
 
-def test_upload_filename_uses_photo_id_and_ext():
-    assert upload_filename(240599, "DSC06241.JPG") == "sfly-240599.jpg"
-    assert upload_filename(7, "no_ext") == "sfly-7"
-
 def test_build_book_manifest_shape():
     m = build_book_manifest(_doc())
     assert m["book_id"] == 17
@@ -66,7 +62,8 @@ def test_build_gphotos_records_maps_and_orders():
     }
     resolve = lambda p: "/photos/" + p
     recs = build_gphotos_records([240539, 240599], rows, resolve)
-    assert [r["filename"] for r in recs] == ["sfly-240539.jpg", "sfly-240599.jpg"]
+    # keeps the original filename (unique per book; the mapping key)
+    assert [r["filename"] for r in recs] == ["DSC2.JPG", "DSC1.JPG"]
     assert recs[0]["_resolved_filepath"] == "/photos/2026/2026-07-24/DSC2.JPG"
     assert recs[0]["orig_filename"] == "DSC2.JPG"
     assert recs[1]["description"] == "castle"
@@ -74,7 +71,7 @@ def test_build_gphotos_records_maps_and_orders():
 def test_build_gphotos_records_skips_missing_rows():
     recs = build_gphotos_records([1, 2], {1: {"filepath": "a", "filename": "a.jpg",
                                               "description": None}}, lambda p: p)
-    assert [r["filename"] for r in recs] == ["sfly-1.jpg"]
+    assert [r["filename"] for r in recs] == ["a.jpg"]
 
 
 def test_manifest_photo_ids_orders_and_ints():

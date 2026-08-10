@@ -1,23 +1,20 @@
 """Translate a photo-search book (BookStore.get_book) into artifacts for the
-Shutterfly export: an ordered placed-photo list, a deterministic upload-filename
-scheme, and a JSON manifest that Phase 2 (native rebuild) will consume.
+Shutterfly export: an ordered placed-photo list and a JSON manifest that Phase 2
+(native rebuild) consumes.
+
+Photos are identified across the Google Photos → Shutterfly hop by their
+**original filename**, which is unique within a book (the cameras use
+non-overlapping filename sequences). An earlier ``sfly-<id>`` upload-rename was
+dropped: Google Photos keeps the raw-upload filename (the original basename) and
+ignores the ``simpleMediaItem.fileName`` override, so the rename never reached
+Shutterfly — and it was unnecessary given filenames are already unique.
 
 Pure functions only — no DB or network. The CLI wires these to PhotoDB/BookStore
 and google_photos.
 """
 from __future__ import annotations
 
-import os
-from typing import Callable, Optional
-
-
-def upload_filename(photo_id: int, orig_filename: Optional[str]) -> str:
-    """Deterministic, mapping-friendly Google Photos filename for a photo.
-
-    ``sfly-<photo_id><ext>`` — recovery parses ``^sfly-(\\d+)``.
-    """
-    ext = os.path.splitext(orig_filename or "")[1].lower()
-    return f"sfly-{photo_id}{ext}"
+from typing import Callable
 
 
 def placed_photo_order(doc: dict) -> list[int]:
@@ -45,11 +42,11 @@ def placed_photo_order(doc: dict) -> list[int]:
 
 def build_book_manifest(doc: dict) -> dict:
     """Structural manifest: book meta + verbatim spreads/cells/captions + a
-    photos map keyed by str(photo_id). Upload/asset filenames are filled later
-    by the CLI/runbook (left empty here so this stays pure)."""
+    photos map keyed by str(photo_id). ``orig_filename`` (the mapping key back to
+    Shutterfly) and ``sfly_asset_id`` are filled later by the CLI/runbook (left
+    empty here so this stays pure)."""
     book = doc.get("book", {})
-    photos = {str(pid): {"upload_filename": None, "orig_filename": None,
-                         "sfly_asset_id": None}
+    photos = {str(pid): {"orig_filename": None, "sfly_asset_id": None}
               for pid in placed_photo_order(doc)}
     return {
         "book_id": book.get("id"),
@@ -71,7 +68,7 @@ def build_gphotos_records(
     rows: dict[int, dict],
     resolve: Callable[[str], str],
 ) -> list[dict]:
-    """Build google_photos.upload_photos records with deterministic filenames.
+    """Build google_photos.upload_photos records, keeping the original filename.
 
     ``rows`` maps photo_id -> {filepath, filename, description}. ``resolve``
     turns a stored (possibly relative) filepath into an absolute path.
@@ -84,7 +81,7 @@ def build_gphotos_records(
         orig = row.get("filename")
         records.append({
             "_resolved_filepath": resolve(row.get("filepath", "")),
-            "filename": upload_filename(int(pid), orig),
+            "filename": orig,
             "orig_filename": orig,
             "description": row.get("description"),
         })
@@ -92,12 +89,11 @@ def build_gphotos_records(
 
 
 def enrich_manifest_filenames(manifest: dict, rows: dict[int, dict]) -> dict:
-    """Fill photos[*].upload_filename / orig_filename from photo rows in place."""
+    """Fill photos[*].orig_filename from photo rows, in place."""
     for pid_str, rec in manifest.get("photos", {}).items():
         row = rows.get(int(pid_str))
         if row:
             rec["orig_filename"] = row.get("filename")
-            rec["upload_filename"] = upload_filename(int(pid_str), row.get("filename"))
     return manifest
 
 

@@ -1,12 +1,10 @@
 from photosearch.shutterfly_export import enrich_manifest_filenames
 
 
-def test_enrich_manifest_filenames_fills_upload_and_orig():
-    manifest = {"photos": {"240599": {"upload_filename": None, "orig_filename": None,
-                                      "sfly_asset_id": None}}}
+def test_enrich_manifest_filenames_fills_orig():
+    manifest = {"photos": {"240599": {"orig_filename": None, "sfly_asset_id": None}}}
     rows = {240599: {"filepath": "p", "filename": "DSC06241.JPG", "description": None}}
     out = enrich_manifest_filenames(manifest, rows)
-    assert out["photos"]["240599"]["upload_filename"] == "sfly-240599.jpg"
     assert out["photos"]["240599"]["orig_filename"] == "DSC06241.JPG"
 
 
@@ -33,7 +31,7 @@ def test_gphotos_push_dry_run_lists_records(monkeypatch, tmp_path):
     r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push", "--book", "3",
                                          "--dry-run"])
     assert r.exit_code == 0, r.output
-    assert "sfly-5.jpg" in r.output
+    assert "A.JPG" in r.output
     assert "1 photo" in r.output
 
 
@@ -50,7 +48,7 @@ def test_gphotos_push_manifest_dry_run(monkeypatch, tmp_path):
     r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push",
                                          "--manifest", str(p), "--dry-run"])
     assert r.exit_code == 0, r.output
-    assert "sfly-5.jpg" in r.output
+    assert "A.JPG" in r.output
     assert "2026 Summer — The South of France" in r.output
 
 
@@ -88,6 +86,6 @@ def test_gphotos_push_streams_per_photo_progress(monkeypatch, tmp_path):
     r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push",
                                          "--manifest", str(p)])
     assert r.exit_code == 0, r.output
-    assert "[1/2] uploaded sfly-5.jpg" in r.output
-    assert "[2/2] uploaded sfly-6.jpg" in r.output
+    assert "[1/2] uploaded A.JPG" in r.output
+    assert "[2/2] uploaded B.JPG" in r.output
     assert "Uploaded 2/2 to album ALBUM123" in r.output

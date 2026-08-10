@@ -13,7 +13,7 @@
 - **No hardcoded network identifiers.** Never write the tailnet IP or NAS hostname into any tracked file. Use the existing `PHOTOSEARCH_NAS_URL` env var / `<nas-tailscale-ip>` placeholder convention. (User global rule + repo convention.)
 - **Books DB is a sidecar.** Book data lives in `photobooks.db.local` (via `BookStore`), separate from the main `photo_index.db` (via `PhotoDB`). Photo file paths/metadata come from `PhotoDB`.
 - **CLI convention.** Every command uses `@cli.command("name")`, `--db` with `envvar="PHOTOSEARCH_DB"`, and (new) `--books-db` with `envvar="PHOTOSEARCH_BOOKS_DB"` defaulting to `photobooks.db.local` alongside `--db`.
-- **Deterministic upload filename scheme:** `sfly-<photo_id><ext>` (e.g. `sfly-240599.jpg`), where `<ext>` is the original file's extension. Mapping recovery parses `^sfly-(\d+)`.
+- **Mapping key = original filename.** Photos are matched across Google Photos → Shutterfly by their **original filename**, which is unique within a book (cameras use non-overlapping sequences; verified 130/136/132 with zero dups for books 17/14/12). A `sfly-<id>` upload-rename was tried and **abandoned** — Google Photos keeps the raw-upload header name (original basename) and ignores `simpleMediaItem.fileName`, so the rename never reached Shutterfly, and it was unnecessary. (See "Spike S1 findings".)
 - **Gentleness.** Reuse `upload_photos`' existing batching; do not add parallelism. It's Matt's own account/photos.
 - **Faithful-ish fidelity** (Phase 2 concern) — the manifest carries raw cell geometry/crop verbatim for Phase 2; Phase 1 does not transform crops.
 
@@ -571,13 +571,22 @@ Expected: three GP albums named `2026 Summer — <name>`, each with the book's p
 
 ---
 
-## Spike S1 findings
+## Spike S1 findings (2026-08-09 — done live on all three books)
 
-_(Fill in during Task 1.)_
-
-- Which filename Shutterfly keeps on GP import (`simpleMediaItem.fileName` vs upload-header basename):
-- Decision (scheme works as-is / needs `_upload_raw_bytes` override):
-- Scratch GP album + test assets deleted: yes/no
+- **Shutterfly keeps the ORIGINAL filename**, not `sfly-<id>`. Google Photos
+  stores the raw-upload header name (`X-Goog-Upload-File-Name`, set by
+  `_upload_raw_bytes` to the original basename), which wins over the
+  `simpleMediaItem.fileName` override — so the rename never reached Google Photos
+  or Shutterfly.
+- **Decision: drop the rename; map by original filename.** Original filenames are
+  unique within each book (verified 130/136/132 placed photos, zero duplicate
+  filenames for books 17/14/12; the cameras use non-overlapping sequences). No
+  `_upload_raw_bytes` override and **no re-upload** needed. `build_gphotos_records`
+  now keeps the original filename; the manifest's `photos[*].orig_filename` is the
+  Phase 2 mapping key.
+- Book 14: Shutterfly album showed 192 vs 136 in Google Photos — Shutterfly's
+  search-based GP import pulled in ~56 photos from another book. Harmless (Phase 2
+  keys off each book's known filenames).
 
 ---
 

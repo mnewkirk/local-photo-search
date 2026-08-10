@@ -133,9 +133,9 @@ Phase 2 needs. Reuses existing Google Photos code end-to-end.
    geometry, crop, and the spread caption. Record each photo's original filename
    too.
 2. **Push to a per-book Google Photos album:** `create_album("2026 Summer — <name>")`
-   then `upload_photos(...)` for that book's photos, with `filename` set to a
-   deterministic, collision-free value (e.g. `<photo_id>.jpg`). Be gentle
-   (existing batching + pauses).
+   then `upload_photos(...)` for that book's photos, keeping the **original
+   filename** (see the Update note below — an earlier `<photo_id>.jpg` rename was
+   abandoned). Be gentle (existing batching + pauses).
 3. **Import into Shutterfly:** in the editor, "Add More Photos" → Google Photos →
    select the book's album → import into the project's photo tray.
 4. **Recover mapping:** read the Shutterfly photo/asset list (via `builderApp` or
@@ -144,6 +144,16 @@ Phase 2 needs. Reuses existing Google Photos code end-to-end.
 
 Deliverable: all three books' photos in Shutterfly, one album each, plus a
 manifest carrying the asset mapping.
+
+> **Update (2026-08-09) — Phase 1 executed; mapping is by original filename.**
+> All three books were uploaded to per-book Google Photos albums and imported into
+> Shutterfly. The `<photo_id>.jpg` rename was **abandoned**: Google Photos keeps
+> the raw-upload header filename (the original basename) and ignores
+> `simpleMediaItem.fileName`, so the rename never reached Shutterfly — and it was
+> unnecessary because original filenames are already unique within a book (cameras
+> use non-overlapping sequences; verified 130/136/132 with zero dups for books
+> 17/14/12). Phase 2 maps Shutterfly assets → `photo_id` by **original filename**,
+> scoped to each book's album. See the Phase 1 plan's "Spike S1 findings".
 
 ## Phase 2 — Native layout rebuild (faithful-ish, then polish)
 
