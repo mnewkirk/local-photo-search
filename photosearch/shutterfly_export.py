@@ -89,3 +89,13 @@ def build_gphotos_records(
             "description": row.get("description"),
         })
     return records
+
+
+def enrich_manifest_filenames(manifest: dict, rows: dict[int, dict]) -> dict:
+    """Fill photos[*].upload_filename / orig_filename from photo rows in place."""
+    for pid_str, rec in manifest.get("photos", {}).items():
+        row = rows.get(int(pid_str))
+        if row:
+            rec["orig_filename"] = row.get("filename")
+            rec["upload_filename"] = upload_filename(int(pid_str), row.get("filename"))
+    return manifest

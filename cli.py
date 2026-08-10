@@ -14,6 +14,7 @@ from pathlib import Path
 
 import click
 
+from photosearch.book import BookStore
 from photosearch.db import PhotoDB
 from photosearch.index import index_directory
 from photosearch.search import (
@@ -21,6 +22,7 @@ from photosearch.search import (
     symlink_results,
     make_results_subdir,
 )
+from photosearch import shutterfly_export as sfx
 
 
 @click.group()
@@ -5177,6 +5179,48 @@ def export_face_crops(db, since, to_path):
         if to_path:
             out.close()
     click.echo(f"exported {n} face crops (since={since})", err=True)
+
+
+# ---------------------------------------------------------------------------
+# shutterfly-manifest
+# ---------------------------------------------------------------------------
+
+def _books_db_default(db: str) -> str:
+    return (os.environ.get("PHOTOSEARCH_BOOKS_DB")
+            or str(Path(db).resolve().parent / "photobooks.db.local"))
+
+
+def _photo_rows(pdb: PhotoDB, ids: list[int]) -> dict:
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    return {r["id"]: {"filepath": r["filepath"], "filename": r["filename"],
+                      "description": r["description"]}
+            for r in pdb.conn.execute(
+                f"SELECT id, filepath, filename, description FROM photos "
+                f"WHERE id IN ({ph})", ids).fetchall()}
+
+
+@cli.command("shutterfly-manifest")
+@click.option("--book", "book_id", type=int, required=True, help="Book id")
+@click.option("--out", default=None, help="Output JSON path")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
+@click.option("--books-db", "books_db", default=None, envvar="PHOTOSEARCH_BOOKS_DB")
+def shutterfly_manifest(book_id, out, db, books_db):
+    """Write the Shutterfly build manifest for a book."""
+    books_db = books_db or _books_db_default(db)
+    with BookStore(books_db) as bs, PhotoDB(db) as pdb:
+        doc = bs.get_book(book_id)
+        if not doc:
+            raise click.ClickException(f"Book {book_id} not found")
+        manifest = sfx.build_book_manifest(doc)
+        ids = [int(p) for p in manifest["photos"].keys()]
+        rows = _photo_rows(pdb, ids)
+        sfx.enrich_manifest_filenames(manifest, rows)
+    out = out or f"shutterfly-manifest-{book_id}.json"
+    Path(out).write_text(json.dumps(manifest, indent=2))
+    click.echo(f"Wrote {out} ({manifest['spread_count']} spreads, "
+               f"{len(manifest['photos'])} photos)")
 
 
 if __name__ == "__main__":
