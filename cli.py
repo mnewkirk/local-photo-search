@@ -5279,7 +5279,15 @@ def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, bo
     if dry_run:
         return
     album_id = gp.create_album(db, title)
-    results = gp.upload_photos(db, records, album_id=album_id)
+
+    def _progress(done, total, filename, status, error, media_item_id):
+        if status == "error":
+            click.echo(f"  [{done}/{total}] ERROR {filename}: {error}")
+        else:
+            click.echo(f"  [{done}/{total}] {status} {filename}")
+
+    results = gp.upload_photos(db, records, album_id=album_id,
+                              progress_callback=_progress)
     ok = sum(1 for x in results if x.get("status") == "uploaded")
     click.echo(f"Uploaded {ok}/{len(results)} to album {album_id}")
 

@@ -58,3 +58,36 @@ def test_gphotos_push_requires_exactly_one_source():
     r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push", "--dry-run"])
     assert r.exit_code != 0
     assert "exactly one" in r.output.lower()
+
+
+def test_gphotos_push_streams_per_photo_progress(monkeypatch, tmp_path):
+    import json as _json
+    import photosearch.google_photos as real_gp
+    manifest = {"name": "X", "photos": {
+        "5": {"upload_filename": "sfly-5.jpg", "orig_filename": "A.JPG"},
+        "6": {"upload_filename": "sfly-6.jpg", "orig_filename": "B.JPG"}}}
+    p = tmp_path / "m.json"
+    p.write_text(_json.dumps(manifest))
+    monkeypatch.setattr(cli_mod, "_load_photo_rows_resolved",
+                        lambda ids, db: (
+                            {5: {"filepath": "a", "filename": "A.JPG", "description": None},
+                             6: {"filepath": "b", "filename": "B.JPG", "description": None}},
+                            lambda x: "/photos/" + x))
+    monkeypatch.setattr(real_gp, "create_album", lambda db, title: "ALBUM123")
+
+    def fake_upload(db, records, album_id=None, progress_callback=None, **kw):
+        assert progress_callback is not None, "CLI must pass a progress_callback"
+        out = []
+        for i, r in enumerate(records, 1):
+            progress_callback(i, len(records), r["filename"], "uploaded", None, "mid")
+            out.append({"filename": r["filename"], "status": "uploaded",
+                        "media_item_id": "mid"})
+        return out
+    monkeypatch.setattr(real_gp, "upload_photos", fake_upload)
+
+    r = CliRunner().invoke(cli_mod.cli, ["shutterfly-gphotos-push",
+                                         "--manifest", str(p)])
+    assert r.exit_code == 0, r.output
+    assert "[1/2] uploaded sfly-5.jpg" in r.output
+    assert "[2/2] uploaded sfly-6.jpg" in r.output
+    assert "Uploaded 2/2 to album ALBUM123" in r.output
