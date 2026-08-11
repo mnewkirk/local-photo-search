@@ -7,8 +7,15 @@ import os
 import subprocess
 import sys
 import tarfile
+from unittest.mock import MagicMock
 
+import pytest
 from PIL import Image
+
+# conftest leaves either the real torch or a MagicMock in sys.modules. The
+# mock is enough for in-process tests, but not for one that shells out.
+# (importlib.util.find_spec can't be used here — it raises on a mocked module.)
+_TORCH_REAL = not isinstance(sys.modules.get("torch"), MagicMock)
 
 from photosearch.face_crop import (
     crop_cache_path,
@@ -77,6 +84,11 @@ def test_write_crop_atomic(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["x_120.jpg"]
 
 
+@pytest.mark.skipif(
+    not _TORCH_REAL,
+    reason="shells out to cli.py in a subprocess, which imports the real ML "
+           "stack — conftest's mocks don't reach a child process",
+)
 def test_export_face_crops_tar_and_since(tmp_path):
     """export-face-crops streams a tar of the cache dir, honoring --since."""
     db = tmp_path / "photo_index.db"

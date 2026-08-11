@@ -91,10 +91,10 @@ describe('PS.SharedHeader', () => {
   test('renders all nav links', () => {
     render(e(PS.SharedHeader, { activePage: 'search' }));
     const links = document.querySelectorAll('.nav-link');
-    expect(links.length).toBe(12);
+    expect(links.length).toBe(13);
     const labels = Array.from(links).map(l => l.textContent);
     expect(labels).toEqual(['Search', 'Review', 'Faces', 'Merges', 'Collections',
-      'Map', 'Geotag', 'Status', 'Deploy', 'Maint', 'Vocab', 'Logs']);
+      'Books', 'Map', 'Geotag', 'Status', 'Deploy', 'Maint', 'Vocab', 'Logs']);
   });
 
   test('marks active page with active class', () => {
@@ -112,7 +112,7 @@ describe('PS.SharedHeader', () => {
     const links = document.querySelectorAll('.nav-link');
     const hrefs = Array.from(links).map(l => l.getAttribute('href'));
     expect(hrefs).toEqual(['/', '/review', '/faces', '/merges', '/collections',
-      '/map', '/geotag', '/status', '/admin/deploy', '/admin/maintenance',
+      '/book', '/map', '/geotag', '/status', '/admin/deploy', '/admin/maintenance',
       '/admin/vocab', '/logs']);
   });
 
