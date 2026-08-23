@@ -5447,6 +5447,14 @@ if _frontend_dir.exists():
                                 headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Collections page not found</h1>")
 
+    @app.get("/split")
+    def serve_split():
+        """Serve the multi-panel print planner (JS reads ?photo= from the URL)."""
+        page = _frontend_dir / "split.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Split page not found</h1>")
+
     @app.get("/book")
     @app.get("/book/{book_id}")
     def serve_book(book_id: int = 0):

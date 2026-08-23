@@ -807,6 +807,59 @@ binary, so paths are translated with `wslpath -w` before being handed over
 avoids a `\\wsl.localhost` round trip per read/write and is measurably faster
 for large files.
 
+## Split — multi-panel print planner (M31)
+
+`/split?photo=<id>` plans one photo across several **borderless** sheets — a
+diptych, triptych, or grid up to 4×3 — ranks the arrangements, and says exactly
+how many pixels land on each inch of paper. Reached from the image view's
+**⊞ Split print →** link. Ported from a design handoff whose own README names
+this repo as the intended host.
+
+**The governing constraint: every panel is one whole borderless sheet.** Nothing
+is cut or trimmed, so panel sizes are the printer's stock sizes (4×6 … 13×19,
+Epson XP-15000) and the piece's dimensions are whatever those sheets add up to,
+plus the wall gaps.
+
+Geometry lives in `frontend/dist/split-geometry.js` — a **pure, framework-free
+module** (browser global *and* CommonJS) so it is unit-testable; it must run
+client-side because it recomputes per frame while dragging the crop. Tests:
+`frontend/__tests__/split-geometry.test.js` (50 cases), anchored on the
+handoff's worked example — 6528×4352 → six 13×19″ portrait as 3×2, gap 0.5″,
+window mode → 40″ × 38.5″, 113 dpi, 31% crop, 17,326 × 11,552 px for 300 dpi.
+
+Two invariants worth not breaking:
+
+- **`keep` (retained area) is scale-free** — it depends only on the two aspect
+  ratios, never the pixel count. Crop cost is a *shape* mismatch that no amount
+  of resolution fixes. This is what makes the crop-vs-resolution split in the
+  diagnostics meaningful.
+- **The binding axis comes from the `sa > ta` comparison**, never from comparing
+  the slacks. Letting those drift apart once told users their width was the
+  constraint when it was the height. (Note the handoff's "exactly one slack is
+  zero" is off by one case: when the aspects match exactly, *both* are zero.)
+
+**Upscaling is the payoff.** A wall piece spreads one file over many sheets, so
+dpi is the usual blocker, and `needPx` says precisely how much bigger the source
+must be. The diagnostic offers **"Upscale N× with Topaz"** using M30, where N is
+the smallest of 2/4/6 that reaches the requirement — and no button at all when
+even 6× falls short, rather than a fix that would not fix anything.
+
+Ranking is deliberate: **reach across the wall leads** (`reach*1000 -
+crop*600`), because the goal is filling a wall. Resolution is pass/fail against
+the floor and crop is a tolerance with the first 3% free — those are
+constraints, not objectives. The handoff's *prose* says "sorted by
+max(outerW,outerH)"; its *code* uses the weighted score, and the README says the
+code is the specification.
+
+**Print export is not built yet** — that is pass 2, and it belongs server-side
+(Pillow) rather than in a canvas: sources here are routinely 100 MP+ after an
+upscale, and the output should land in the export tree next to the upscales, not
+in the browser's Downloads.
+
+Design handoff (not in the repo): `Split_ Photo Diptych Planner.zip`. Its
+Organic cream/terracotta palette is mapped onto this app's dark tokens by role,
+as that README instructs, rather than transplanted.
+
 ## Deploy panel (Version / Build / Restart)
 
 `/status` has a Deployment card backed by `photosearch/admin_api.py`. It

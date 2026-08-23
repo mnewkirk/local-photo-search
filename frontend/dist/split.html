@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Split — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* The handoff is built on the Organic system (cream/terracotta). Per its
+       own guidance we map the ROLES onto this app's dark palette rather than
+       transplanting the hexes: terracotta accent -> --accent, sage second
+       accent -> --green, sand ground -> --surface. */
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --text-dim: #666;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --radius: 8px;
+    }
+
+    html, body, #root { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-inner {
+      max-width: 1600px; margin: 0 auto;
+      display: flex; align-items: center; gap: 16px; min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link { font-size: 13px; color: var(--accent); text-decoration: none; margin-left: 4px; }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .shell {
+      max-width: 1600px; margin: 0 auto; padding: 24px;
+      display: grid; grid-template-columns: 320px 1fr; gap: 24px; align-items: start;
+    }
+    @media (max-width: 1100px) { .shell { grid-template-columns: 1fr; } }
+
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px;
+    }
+    .card + .card { margin-top: 16px; }
+    .card h2 {
+      font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--text-muted); font-weight: 600; margin-bottom: 12px;
+    }
+
+    .field { margin-bottom: 16px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label {
+      display: flex; justify-content: space-between; align-items: baseline;
+      font-size: 13px; color: var(--text-muted); margin-bottom: 6px;
+    }
+    .field label b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    input[type=range] { width: 100%; accent-color: var(--accent); }
+
+    .seg { display: flex; gap: 4px; background: var(--surface2); padding: 3px; border-radius: 999px; }
+    .seg button {
+      flex: 1; border: 0; background: transparent; color: var(--text-muted);
+      font-size: 12px; padding: 6px 8px; border-radius: 999px; cursor: pointer;
+      font-family: inherit;
+    }
+    .seg button.on { background: var(--accent); color: #06121f; font-weight: 600; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      border: 1px solid var(--border); background: var(--surface2); color: var(--text-muted);
+      font-size: 12px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+      font-family: inherit;
+    }
+    .chip.on { border-color: var(--accent); color: var(--accent); }
+
+    .hint { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+
+    .stage {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 20px;
+      display: flex; flex-direction: column; align-items: center; gap: 14px;
+    }
+    .wallbox { position: relative; touch-action: none; user-select: none; cursor: grab; }
+    .wallbox.drag { cursor: grabbing; }
+    .panel { position: absolute; overflow: hidden; background: #000; }
+    .panel img { position: absolute; max-width: none; }
+    .ghost { position: absolute; inset: 0; pointer-events: none; }
+
+    .specs { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+    .spec {
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 999px;
+      padding: 4px 12px; font-size: 12px; color: var(--text-muted);
+    }
+    .spec b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .spec.warn b { color: var(--yellow); }
+    .spec.bad b { color: var(--red); }
+    .spec.good b { color: var(--green); }
+
+    .arrangements { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+    .arr {
+      background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 10px; cursor: pointer; text-align: left; color: var(--text);
+      font-family: inherit; font-size: 12px;
+    }
+    .arr:hover { border-color: var(--accent); }
+    .arr.on { border-color: var(--accent); background: #12243a; }
+    .arr .big { font-size: 14px; font-weight: 600; display: block; margin-bottom: 2px; }
+    .arr .sub { color: var(--text-muted); }
+
+    .diag { border-left: 3px solid var(--yellow); padding-left: 14px; }
+    .diag h3 { font-size: 16px; margin-bottom: 8px; }
+    .diag p { font-size: 13px; color: var(--text-muted); }
+    .diag .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+
+    button.primary {
+      background: var(--accent); color: #06121f; border: 0; border-radius: 999px;
+      padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+    }
+    button.primary:hover { background: var(--accent-hover); }
+    button.primary:disabled { opacity: 0.5; cursor: wait; }
+    button.ghostbtn {
+      background: transparent; color: var(--accent); border: 1px solid var(--border);
+      border-radius: 999px; padding: 8px 16px; font-size: 13px; cursor: pointer; font-family: inherit;
+    }
+    .empty { color: var(--text-dim); font-size: 13px; text-align: center; padding: 40px 0; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script src="/split-geometry.js"></script>
+
+  <script>
+    const e = React.createElement;
+    const { useState, useEffect, useCallback, useMemo, useRef } = React;
+    const G = window.SplitGeom;
+    const API = '';
+
+    function qs(k) { return new URLSearchParams(location.search).get(k); }
+
+    // --- sidebar ------------------------------------------------------------
+
+    function Sidebar(props) {
+      const s = props.s, set = props.set;
+      return e('div', null,
+        e('div', { className: 'card' },
+          e('h2', null, 'Wall'),
+          e('div', { className: 'field' },
+            e('label', null, 'Wall size', e('b', null, G.fmt(s.wall) + '″')),
+            e('input', { type: 'range', min: 24, max: 120, step: 1, value: s.wall,
+              onChange: (ev) => set({ wall: Number(ev.target.value) }) })),
+          e('div', { className: 'field' },
+            e('label', null, 'Gap between sheets', e('b', null, G.fmt(s.gutter) + '″')),
+            e('input', { type: 'range', min: 0, max: 3, step: 0.125, value: s.gutter,
+              onChange: (ev) => set({ gutter: Number(ev.target.value) }) })),
+          e('div', { className: 'field' },
+            e('label', null, 'Seam mode'),
+            e('div', { className: 'seg' },
+              ['window', 'continue'].map((m) => e('button', {
+                key: m, className: s.mode === m ? 'on' : '',
+                onClick: () => set({ mode: m }),
+              }, m === 'window' ? 'Window' : 'Continue'))),
+            e('p', { className: 'hint' }, s.mode === 'window'
+              ? 'The image continues behind the gaps, as if seen through a window.'
+              : 'The gaps are not part of the image; only the sheets carry it.')),
+          e('div', { className: 'field' },
+            e('label', null,
+              e('span', null,
+                e('input', { type: 'checkbox', checked: s.wallOnly,
+                  onChange: (ev) => set({ wallOnly: ev.target.checked }),
+                  style: { marginRight: 6 } }),
+                'Only what fits my wall')))),
+
+        e('div', { className: 'card' },
+          e('h2', null, 'Printing'),
+          e('div', { className: 'field' },
+            e('label', null, 'Resolution floor', e('b', null, s.minDpi + ' dpi')),
+            e('div', { className: 'chips' },
+              G.DPIS.map((d) => e('button', {
+                key: d, className: 'chip' + (s.minDpi === d ? ' on' : ''),
+                onClick: () => set({ minDpi: d }),
+              }, d)))),
+          // The tradeoff, before they hit a wall.
+          props.img && e('p', { className: 'hint' },
+            'At ' + s.minDpi + ' dpi this file reaches ' +
+            G.fmt(G.reachAtDpi(props.img, s.minDpi)) + '″ along its long edge. ' +
+            'Wall-scale pieces need a lower floor — 120 dpi reaches ' +
+            G.fmt(G.reachAtDpi(props.img, 120)) + '″.'),
+          e('div', { className: 'field', style: { marginTop: 16 } },
+            e('label', null, 'Crop allowance', e('b', null, G.pct(s.maxCrop))),
+            e('div', { className: 'chips' },
+              G.CROPS.map((c) => e('button', {
+                key: c, className: 'chip' + (s.maxCrop === c ? ' on' : ''),
+                onClick: () => set({ maxCrop: c }),
+              }, c === 1 ? 'Any' : G.pct(c)))))),
+
+        e('div', { className: 'card' },
+          e('h2', null, 'Sheet sizes in play'),
+          e('div', { className: 'chips' },
+            G.SIZES.map((p) => {
+              const lab = G.sizeLabel(p[0], p[1]);
+              const on = !s.sizes || s.sizes.indexOf(lab) >= 0;
+              return e('button', {
+                key: lab, className: 'chip' + (on ? ' on' : ''),
+                onClick: () => {
+                  const cur = s.sizes || G.SIZES.map((q) => G.sizeLabel(q[0], q[1]));
+                  set({ sizes: on ? cur.filter((x) => x !== lab) : cur.concat([lab]) });
+                },
+              }, lab + '″');
+            })),
+          e('div', { className: 'field', style: { marginTop: 16 } },
+            e('label', null, 'Panel count'),
+            e('div', { className: 'chips' },
+              ['any', 2, 3, 4, 5, 6, 8, 12].map((c) => e('button', {
+                key: c, className: 'chip' + (String(s.count) === String(c) ? ' on' : ''),
+                onClick: () => set({ count: c }),
+              }, c === 'any' ? 'Any' : c))))));
+    }
+
+    // --- preview ------------------------------------------------------------
+
+    function Preview(props) {
+      const { img, cand, s, maxPx } = props;
+      const box = useRef(null);
+      const [drag, setDrag] = useState(null);
+      const P = useMemo(() => G.plan(img, cand, s), [img, cand, s]);
+      const scale = maxPx / Math.max(P.outerW, P.outerH);
+      const W = P.outerW * scale, H = P.outerH * scale;
+
+      // Drag pans the crop, but only along the axis that actually has slack.
+      const onDown = (ev) => {
+        setDrag({ x: ev.clientX, y: ev.clientY, sx: s.sx, sy: s.sy });
+        ev.preventDefault();
+      };
+      useEffect(() => {
+        if (!drag) return;
+        const move = (ev) => {
+          const dx = (ev.clientX - drag.x) / W * 2;
+          const dy = (ev.clientY - drag.y) / H * 2;
+          props.onPan({
+            sx: Math.max(-1, Math.min(1, drag.sx - dx)),
+            sy: Math.max(-1, Math.min(1, drag.sy - dy)),
+          });
+        };
+        const up = () => setDrag(null);
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', up);
+        return () => {
+          window.removeEventListener('mousemove', move);
+          window.removeEventListener('mouseup', up);
+        };
+      }, [drag, W, H]);
+
+      const panels = [];
+      for (let r = 0; r < cand.rows; r++) {
+        for (let c = 0; c < cand.cols; c++) {
+          // Position on the wall.
+          const left = c * (cand.pw + s.gutter) * scale;
+          const top = r * (cand.ph + s.gutter) * scale;
+          // The image is laid out across the whole field; each panel is a
+          // window onto it, so the img is offset by this panel's origin.
+          const fieldW = P.cW * scale, fieldH = P.cH * scale;
+          const offX = s.mode === 'window' ? left : c * cand.pw * scale;
+          const offY = s.mode === 'window' ? top : r * cand.ph * scale;
+          panels.push(e('div', {
+            key: r + '-' + c,
+            className: 'panel',
+            style: { left: left, top: top, width: cand.pw * scale, height: cand.ph * scale },
+          }, e('img', {
+            src: props.src, draggable: false,
+            style: {
+              width: fieldW * (img.w / P.cw), height: fieldH * (img.h / P.ch),
+              left: -offX - (P.ox / P.cw) * fieldW,
+              top: -offY - (P.oy / P.ch) * fieldH,
+            },
+          })));
+        }
+      }
+
+      return e('div', {
+        ref: box, className: 'wallbox' + (drag ? ' drag' : ''),
+        style: { width: W, height: H }, onMouseDown: onDown,
+      }, panels);
+    }
+
+    // --- diagnostics --------------------------------------------------------
+
+    function Diagnostic(props) {
+      const { d, img, s, set, photoId } = props;
+      const [busy, setBusy] = useState(false);
+      const [msg, setMsg] = useState(null);
+      const scale = d.upscale ? G.upscaleFor(d.upscale) : null;
+
+      // The whole reason upscaling matters here: a wall piece spreads one file
+      // across many sheets, so dpi is the usual blocker and a bigger source is
+      // the only real fix. needPx says exactly how much bigger.
+      const upscale = () => {
+        setBusy(true); setMsg(null);
+        fetch(API + '/api/admin/upscale-photo', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_ids: [photoId], scale: scale, enhancements: ['upscale'] }),
+        }).then((r) => r.json()).then((data) => {
+          const err = (data.errors || [])[0];
+          const res = (data.results || [])[0];
+          if (err) setMsg({ kind: 'err', text: 'Upscale failed: ' + err.error });
+          else if (res) {
+            setMsg({ kind: 'ok', text: 'Upscaled to ' + scale + '×. Reloading with the larger file…' });
+            props.onUpscaled(res);
+          }
+          setBusy(false);
+        }).catch((ex) => { setMsg({ kind: 'err', text: String(ex) }); setBusy(false); });
+      };
+
+      return e('div', { className: 'card' },
+        e('div', { className: 'diag' },
+          e('h3', null, d.title),
+          e('p', null, d.body),
+          e('div', { className: 'actions' },
+            d.fix && e('button', {
+              className: 'primary',
+              onClick: () => {
+                if (d.fix.kind === 'minDpi') set({ minDpi: d.fix.minDpi });
+                else if (d.fix.kind === 'cropDpi') {
+                  const next = { maxCrop: d.fix.maxCrop };
+                  if (d.fix.minDpi != null) next.minDpi = d.fix.minDpi;
+                  set(next);
+                } else if (d.fix.kind === 'select') props.onSelectCand(d.fix.cand);
+              },
+            }, d.fix.label),
+            // Only offered when it would actually resolve the blocker.
+            photoId && scale && e('button', {
+              className: 'ghostbtn', disabled: busy, onClick: upscale,
+            }, busy ? 'Upscaling…' : 'Upscale ' + scale + '× with Topaz'),
+            photoId && d.upscale && !scale && e('span', { className: 'hint' },
+              'Even a 6× upscale would not reach ' + s.minDpi + ' dpi here.')),
+          msg && e('p', {
+            className: 'hint',
+            style: { color: msg.kind === 'err' ? 'var(--red)' : 'var(--green)' },
+          }, msg.text)));
+    }
+
+    // --- page ---------------------------------------------------------------
+
+    function SplitPage() {
+      const photoId = qs('photo') ? Number(qs('photo')) : null;
+      const [photo, setPhoto] = useState(null);
+      const [img, setImg] = useState(null);
+      const [src, setSrc] = useState(null);
+      const [sel, setSel] = useState(0);
+      const [s, setS] = useState(Object.assign({}, G.DEFAULTS));
+      const set = useCallback((patch) => setS((p) => Object.assign({}, p, patch)), []);
+
+      // Load the photo's real pixel dimensions — every number on this page
+      // depends on them, so we read them off the image rather than the DB.
+      useEffect(() => {
+        if (!photoId) return;
+        fetch(API + '/api/photos/' + photoId)
+          .then((r) => r.json()).then((p) => setPhoto(p)).catch(() => {});
+        const url = API + '/api/photos/' + photoId + '/preview';
+        const im = new Image();
+        im.onload = () => { setSrc(url); };
+        im.src = url;
+        // Full-resolution dims come from the detail record; the preview is only
+        // for display, so its own dimensions must not drive the math.
+        fetch(API + '/api/photos/' + photoId)
+          .then((r) => r.json())
+          .then((p) => {
+            if (p && p.image_width && p.image_height) {
+              setImg({ w: p.image_width, h: p.image_height });
+            }
+          }).catch(() => {});
+      }, [photoId]);
+
+      const cands = useMemo(() => (img ? G.candidates(img, s) : []), [img, s]);
+      const cand = cands.length ? cands[Math.min(sel, cands.length - 1)] : null;
+      const diag = useMemo(
+        () => (img && !cands.length ? G.diagnose(img, s) : null), [img, cands, s]);
+
+      useEffect(() => { setSel(0); }, [s.minDpi, s.maxCrop, s.count, s.wall, s.mode, s.gutter]);
+
+      if (!photoId) {
+        return e('div', null,
+          e(PS.SharedHeader, { activePage: 'split' }),
+          e('div', { className: 'shell' },
+            e('div', { className: 'card' },
+              e('p', { className: 'empty' },
+                'Open a photo and choose “Split print” to plan a multi-panel piece.'))));
+      }
+
+      const P = cand && img ? G.plan(img, cand.cand, s) : null;
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'split' }),
+        e('div', { className: 'shell' },
+          e(Sidebar, { s: s, set: set, img: img }),
+          e('div', null,
+            !img && e('div', { className: 'card' }, e('p', { className: 'empty' }, 'Loading photo…')),
+
+            img && P && e('div', { className: 'stage' },
+              e(Preview, {
+                img: img, cand: cand.cand, s: s, src: src, maxPx: 620,
+                onPan: (p) => set(p),
+              }),
+              e('div', { className: 'specs' },
+                e('div', { className: 'spec' }, 'Piece ',
+                  e('b', null, G.inches(P.outerW) + ' × ' + G.inches(P.outerH))),
+                e('div', { className: 'spec' }, cand.cand.cols + ' × ' + cand.cand.rows + ' of ',
+                  e('b', null, G.sizeLabel(P.pw, P.ph) + '″')),
+                e('div', {
+                  className: 'spec ' + (P.dpi >= 240 ? 'good' : P.dpi >= 150 ? 'warn' : 'bad'),
+                }, 'Resolution ', e('b', null, Math.round(P.dpi) + ' dpi')),
+                e('div', {
+                  className: 'spec ' + ((1 - P.keep) <= 0.15 ? 'good' : (1 - P.keep) <= 0.35 ? 'warn' : 'bad'),
+                }, 'Crop ', e('b', null, G.pct(1 - P.keep))),
+                e('div', { className: 'spec' }, 'Binds on ', e('b', null, P.bindingAxis))),
+              e('p', { className: 'hint' }, 'Drag the preview to reposition the crop.')),
+
+            img && diag && e(Diagnostic, {
+              d: diag, img: img, s: s, set: set, photoId: photoId,
+              onSelectCand: () => {},
+              onUpscaled: () => {
+                // The export is a new file, not a new library photo, so the
+                // planner just adopts the larger dimensions in place.
+                const k = G.upscaleFor(diag.upscale);
+                setImg({ w: img.w * k, h: img.h * k });
+              },
+            }),
+
+            img && cands.length > 0 && e('div', { className: 'card', style: { marginTop: 16 } },
+              e('h2', null, 'Other arrangements'),
+              e('div', { className: 'arrangements' },
+                cands.map((c, i) => {
+                  const cp = c.P;
+                  return e('button', {
+                    key: i, className: 'arr' + (i === Math.min(sel, cands.length - 1) ? ' on' : ''),
+                    onClick: () => setSel(i),
+                  },
+                    e('span', { className: 'big' },
+                      G.inches(cp.outerW) + ' × ' + G.inches(cp.outerH)),
+                    e('span', { className: 'sub' },
+                      c.cand.cols + '×' + c.cand.rows + ' · ' + G.sizeLabel(cp.pw, cp.ph) + '″'),
+                    e('br'),
+                    e('span', { className: 'sub' },
+                      Math.round(cp.dpi) + ' dpi · ' + G.pct(1 - cp.keep) + ' crop'));
+                }))))));
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(SplitPage));
+  </script>
+</body>
+</html>

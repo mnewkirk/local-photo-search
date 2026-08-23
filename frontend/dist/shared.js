@@ -1723,6 +1723,19 @@
             )
           ),
 
+          // Split print (M31) — plan this photo across several borderless
+          // sheets. Lives next to Upscale because the planner leans on it: a
+          // wall piece spreads one file over many sheets, so dpi is the usual
+          // blocker and a bigger source is the only real fix.
+          e('div', { className: 'detail-section' },
+            e('h3', null,
+              e('a', {
+                href: '/split?photo=' + photo.id,
+                style: { textDecoration: 'none' },
+                title: 'Plan this photo as a diptych, triptych, or panel grid',
+              }, '⊞ Split print →'))
+          ),
+
           // Upscale with Topaz (M30) — runs the local Topaz Photo AI CLI and
           // writes to the export tree. The library and DB are untouched, so
           // there is no mirror/refresh step as there is for re-run passes.
