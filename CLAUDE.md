@@ -960,6 +960,18 @@ or invalid key is rejected by name rather than silently dropped. The page holds
 rendering until the stored values arrive, or arrangements for the built-in
 defaults would flash past and be replaced. Tests: `tests/test_settings.py`.
 
+**The empty-state diagnostic names the actual constraint.** It used to say
+"No sheet size is selected" for *every* empty result — wrong in 25 of the
+26 ways the list can empty, and it told people to turn on sizes that were
+already on. The branches are now `empty-sizes` (genuinely none selected),
+`empty-count` (no grid makes that many panels), `empty-sizes-filter`, and
+`empty-wall` (they fit nowhere on your wall — quotes the smallest
+arrangement), each with a fix that actually produces results.
+
+`PANEL_COUNTS` is **derived from GRIDS**, not hand-written: the chip row
+offered **8**, which no grid produces, so choosing it was a guaranteed dead
+end. Use the cols × rows boxes for anything off that list.
+
 **Arrangement cards carry a live preview**, not just numbers — the panel
 breakdown *and* where the photo lands inside it. `PanelLayout` is shared by the
 card thumbnails and the main stage, so a thumbnail can never be a different

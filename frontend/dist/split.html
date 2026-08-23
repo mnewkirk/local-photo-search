@@ -278,7 +278,8 @@
           e('div', { className: 'field', style: { marginTop: 16 } },
             e('label', null, 'Panel count'),
             e('div', { className: 'chips' },
-              ['any', 2, 3, 4, 5, 6, 8, 12].map((c) => e('button', {
+              // Derived from GRIDS, so an impossible count is never offered.
+              ['any'].concat(G.PANEL_COUNTS).map((c) => e('button', {
                 key: c, className: 'chip' + (String(s.count) === String(c) ? ' on' : ''),
                 onClick: () => set({ count: c }),
               }, c === 'any' ? 'Any' : c))))),
@@ -431,6 +432,9 @@
               className: 'primary',
               onClick: () => {
                 if (d.fix.kind === 'minDpi') set({ minDpi: d.fix.minDpi });
+                else if (d.fix.kind === 'count') set({ count: d.fix.count });
+                else if (d.fix.kind === 'sizes') set({ sizes: d.fix.sizes });
+                else if (d.fix.kind === 'wallOnly') set({ wallOnly: d.fix.wallOnly });
                 else if (d.fix.kind === 'cropDpi') {
                   const next = { maxCrop: d.fix.maxCrop };
                   if (d.fix.minDpi != null) next.minDpi = d.fix.minDpi;

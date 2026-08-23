@@ -974,9 +974,15 @@ def admin_upscale_photo(req: UpscaleRequest):
 
     if not req.photo_ids:
         raise HTTPException(400, "photo_ids is required (explicit scoping)")
-    if req.scale is not None and req.scale not in upscale.SCALES:
+    # A RANGE, not membership in SCALES — those are only the UI presets. Topaz
+    # takes arbitrary decimals, and /split asks for the exact factor a plan
+    # needs (1.3, 2.1, ...). This check was left as a membership test when the
+    # rest moved to a range, which rejected every non-preset factor.
+    if req.scale is not None and not (
+            upscale.MIN_SCALE <= req.scale <= upscale.MAX_SCALE):
         raise HTTPException(
-            400, f"scale must be one of {list(upscale.SCALES)} or null for auto")
+            400, f"scale must be between {upscale.MIN_SCALE} and "
+                 f"{upscale.MAX_SCALE}, or null for auto")
     bad = [e for e in req.enhancements if e not in upscale.ENHANCEMENTS]
     if bad:
         raise HTTPException(400, f"unknown enhancement(s): {', '.join(bad)}")

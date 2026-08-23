@@ -334,9 +334,62 @@ describe('forGrid — trying an arbitrary grid', () => {
 describe('diagnose', () => {
   test('branch 1 — nothing selected at all', () => {
     const d = G.diagnose(IMG, { sizes: [] });
-    expect(d.branch).toBe('empty');
+    expect(d.branch).toBe('empty-sizes');
     expect(d.title).toBe('Nothing to arrange');
     expect(d.fix).toBeNull();
+  });
+
+  test('an unreachable panel count says so, not "no sheet size"', () => {
+    // The old copy blamed the sheet sizes for every empty result, telling
+    // people to turn on sizes that were already on.
+    const impossible = 7;   // no grid multiplies to it
+    expect(G.PANEL_COUNTS).not.toContain(impossible);
+    const d = G.diagnose(IMG, { count: impossible });
+    expect(d.branch).toBe('empty-count');
+    expect(d.body).not.toContain('No sheet size is selected');
+    expect(d.body).toContain(String(impossible));
+    expect(d.fix.kind).toBe('count');
+  });
+
+  test('a wall that nothing fits says THAT, and offers the right lever', () => {
+    // 5 panels of 13x19 cannot fit a 65" wall in any orientation.
+    const d = G.diagnose(IMG, { count: 5, sizes: ['13×19'], wall: 65,
+                                wallOnly: true });
+    expect(d.branch).toBe('empty-wall');
+    expect(d.body).not.toContain('No sheet size is selected');
+    expect(d.body).toContain('larger than your wall');
+    expect(d.fix.kind).toBe('wallOnly');
+  });
+
+  test('every empty-branch fix actually produces something', () => {
+    // The governing rule again: a button that yields nothing is worse than none.
+    const cases = [
+      { count: 7 },
+      { count: 5, sizes: ['13×19'], wall: 65, wallOnly: true },
+      { count: 12, sizes: ['13×19'], wall: 30, wallOnly: true },
+    ];
+    cases.forEach((o) => {
+      const opts = Object.assign({ minDpi: 100, maxCrop: 1 }, o);
+      const d = G.diagnose(IMG, opts);
+      expect(d.branch.startsWith('empty')).toBe(true);
+      expect(d.fix).toBeTruthy();
+      const next = Object.assign({}, opts);
+      if (d.fix.kind === 'count') next.count = d.fix.count;
+      if (d.fix.kind === 'sizes') next.sizes = d.fix.sizes;
+      if (d.fix.kind === 'wallOnly') next.wallOnly = d.fix.wallOnly;
+      expect(G.reachable(IMG, next).length).toBeGreaterThan(0);
+    });
+  });
+
+  test('PANEL_COUNTS is derived from GRIDS, so the UI cannot offer 8', () => {
+    // 8 was on the chip row while no grid produced it — a guaranteed dead end.
+    const products = [...new Set(G.GRIDS.map(([c, r]) => c * r))].sort((a, b) => a - b);
+    expect(G.PANEL_COUNTS).toEqual(products);
+    expect(G.PANEL_COUNTS).not.toContain(8);
+    G.PANEL_COUNTS.forEach((n) => {
+      expect(G.reachable(IMG, { count: n, wallOnly: false }).length)
+        .toBeGreaterThan(0);
+    });
   });
 
   test('branch 2 — crop passes, resolution blocks', () => {

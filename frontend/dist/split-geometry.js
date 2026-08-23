@@ -26,6 +26,13 @@
   var GRIDS = [[2, 1], [1, 2], [3, 1], [1, 3], [4, 1], [1, 4], [5, 1], [1, 5],
                [6, 1], [2, 2], [3, 2], [2, 3], [4, 3], [3, 4]];
 
+  // Panel counts the curated GRIDS list can actually produce. Derived, not
+  // hand-written: the UI used to offer 8, which NO grid makes, so picking it
+  // was a guaranteed dead end.
+  var PANEL_COUNTS = GRIDS.map(function (g) { return g[0] * g[1]; })
+    .filter(function (n, i, a) { return a.indexOf(n) === i; })
+    .sort(function (a, b) { return a - b; });
+
   var DPIS = [100, 120, 150, 200, 240, 300];
   var CROPS = [0.05, 0.15, 0.3, 0.5, 1];
 
@@ -300,12 +307,69 @@
     var reach = reachable(img, s);
 
     if (!reach.length) {
+      // Empty has several causes and they need different answers. Blaming the
+      // sheet sizes unconditionally was wrong in every case but the first —
+      // it told people to turn on sizes that were already on.
+      if (s.sizes && !s.sizes.length) {
+        return {
+          branch: 'empty-sizes',
+          title: 'Nothing to arrange',
+          body: 'No sheet size is selected, so there is nothing to arrange. ' +
+                'Turn at least one back on.',
+          fix: null,
+        };
+      }
+
+      // Is that panel count achievable by any grid at all?
+      if (s.count !== 'any' && PANEL_COUNTS.indexOf(Number(s.count)) < 0) {
+        return {
+          branch: 'empty-count',
+          title: 'No arrangement uses exactly ' + s.count + ' panels',
+          body: 'The grids on offer come to ' + PANEL_COUNTS.join(', ') +
+                ' panels. ' + s.count + ' is not among them, so nothing can ' +
+                'match. Clear the panel-count filter, or use the ' +
+                'cols × rows boxes to try that grid directly.',
+          fix: { kind: 'count', label: 'Clear the panel-count filter', count: 'any' },
+        };
+      }
+
+      // The count is buildable in principle, so the sheet/wall filters are
+      // what emptied it. Say which, and offer the one that actually helps.
+      var loose = enumerate(img, Object.assign({}, s, {
+        sizes: null, wallOnly: false }), function () { return true; });
+      if (loose.length) {
+        var withSizes = enumerate(img, Object.assign({}, s, { wallOnly: false }),
+                                  function () { return true; });
+        if (!withSizes.length) {
+          return {
+            branch: 'empty-sizes-filter',
+            title: 'Nothing to arrange',
+            body: 'No arrangement of ' + s.count + ' panels uses the sheet ' +
+                  'sizes you have left on. Turn more sizes back on.',
+            fix: { kind: 'sizes', label: 'Use every sheet size', sizes: null },
+          };
+        }
+        var biggest = withSizes.slice().sort(function (a, b) {
+          return Math.min(a.P.outerW, a.P.outerH) - Math.min(b.P.outerW, b.P.outerH);
+        })[0];
+        return {
+          branch: 'empty-wall',
+          title: 'Nothing fits your ' + fmt(s.wall) + '″ wall',
+          body: 'These sheets can make ' + s.count + ' panels, but the ' +
+                'smallest arrangement is ' + inches(biggest.P.outerW) + ' × ' +
+                inches(biggest.P.outerH) + ' — larger than your wall. Allow ' +
+                'pieces that overhang, or use smaller sheets.',
+          fix: { kind: 'wallOnly', label: 'Show pieces bigger than my wall',
+                 wallOnly: false },
+        };
+      }
+
       return {
-        branch: 'empty',
+        branch: 'empty-huge',
         title: 'Nothing to arrange',
-        body: 'No sheet size is selected, so there is nothing to arrange. ' +
-              'Turn at least one back on.',
-        fix: null,
+        body: 'No sheet size builds ' + s.count + ' panels under ' +
+              MAX_SPAN_IN + '″. Try a smaller panel count.',
+        fix: { kind: 'count', label: 'Clear the panel-count filter', count: 'any' },
       };
     }
 
@@ -436,6 +500,7 @@
 
   return {
     SIZES: SIZES, GRIDS: GRIDS, DPIS: DPIS, CROPS: CROPS,
+    PANEL_COUNTS: PANEL_COUNTS,
     MAX_SPAN_IN: MAX_SPAN_IN, MAX_UPSCALE: MAX_UPSCALE, DEFAULTS: DEFAULTS,
     plan: plan, panelRects: panelRects, needPx: needPx,
     candidates: candidates, reachable: reachable, bestAlternative: bestAlternative,
