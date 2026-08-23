@@ -863,8 +863,20 @@ of the original — `strength=1` full Topaz, `0` plain resize. Measured on the
 same centre window: 108.6 (0%) → 226.2 (25%) → 589.1 (50%) → 1042.4 (75%) →
 1453.1 (100%). Monotonic across the whole range, and the only strength control
 that exists. Done in horizontal strips, since a 130 MP pair would otherwise want
-over a gigabyte at once. Exposed as `--strength` / `strength` / a UI dropdown,
-and part of the variant filename (`-s50`).
+over a gigabyte at once. Part of the variant filename (`-s25`).
+
+**25% is the default** at every surface a person touches — the `--strength` CLI
+flag, the API model, the UI dropdown — chosen by eye off the ladder above on a
+real photo. `upscale_photo(strength=...)` itself still defaults to **1.0**: a
+library function named "upscale" should not blend behind the caller's back, and
+keeping it at 1.0 means the default can be retuned in one place without
+rewriting every test's expected filename. Full strength is still one dropdown
+change away when a subject wants it.
+
+Resolution is unaffected by strength — a 25% blend is still the full upscaled
+pixel dimensions (verified: 14016×9344 at both 25% and 100%), so `/split` panel
+exports get the same dpi either way. Strength only governs how much synthesized
+texture rides along.
 
 `UPSCALE_MODELS` was verified by running each name through the CLI and checking
 an output file appeared: **Standard, Standard V2, High Fidelity, High Fidelity

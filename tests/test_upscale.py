@@ -462,6 +462,19 @@ def test_blend_strength_is_monotonic(tmp_path):
     assert all(a < b for a, b in zip(means, means[1:]))   # monotonic
 
 
+def test_interfaces_default_to_quarter_strength(tmp_path, monkeypatch):
+    """25% is the chosen default at every surface a person touches. The library
+    primitive stays at 1.0 so `upscale_photo` does not blend behind your back."""
+    from photosearch.admin_api import UpscaleRequest
+    import inspect
+    import cli as cli_mod
+
+    assert UpscaleRequest(photo_ids=[1]).strength == 0.25
+    opt = next(p for p in cli_mod.upscale_cmd.params if p.name == "strength")
+    assert opt.default == 0.25
+    assert inspect.signature(U.upscale_photo).parameters["strength"].default == 1.0
+
+
 def test_blend_strength_rejects_out_of_range(tmp_path):
     from PIL import Image
     src = tmp_path / "s.jpg"; Image.new("RGB", (8, 8)).save(src)

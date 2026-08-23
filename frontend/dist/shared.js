@@ -224,7 +224,9 @@
     // Autopilot merges its own picks into every run — in practice a
     // "Sharpen Strong" pass that haloes an already-upscaled image. On by
     // default because that is usually what you want for a clean upscale.
-    var _upStrength = useState('100');   // percent; Topaz itself has no dial
+    // 25% is the default: full strength visibly over-synthesizes texture on
+    // detailed natural subjects. Topaz itself has no working dial.
+    var _upStrength = useState('25');
     var upStrength = _upStrength[0];     var setUpStrength = _upStrength[1];
     var _upOnly = useState(true);
     var upOnly = _upOnly[0];             var setUpOnly = _upOnly[1];

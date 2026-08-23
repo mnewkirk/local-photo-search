@@ -5308,10 +5308,11 @@ def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, bo
               help="--override replaces Autopilot's settings instead of "
                    "merging into them. Use it to stop Autopilot's Sharpen "
                    "from riding along, a common source of artifacts.")
-@click.option("--strength", type=float, default=1.0, show_default=True,
+@click.option("--strength", type=float, default=0.25, show_default=True,
               help="Dial the enhancement back by blending toward a plain "
-                   "resize. 1.0 = full Topaz, 0.5 = half. Topaz has no "
-                   "working strength control of its own.")
+                   "resize. 1.0 = full Topaz. Defaults to 0.25, which is "
+                   "where the house preference landed on a real photo; "
+                   "Topaz has no working strength control of its own.")
 @click.option("--overwrite", is_flag=True, default=False,
               help="Re-export photos that already have an output file.")
 def upscale_cmd(photo_ids, db, scale, enhancements, model, override, strength,

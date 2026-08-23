@@ -954,8 +954,10 @@ class UpscaleRequest(BaseModel):
     # is what stops its "Sharpen Strong" from riding along and adding halos.
     override: bool = False
     # Topaz has no working strength control, so this blends the result
-    # toward a plain resize afterward. 1.0 = full Topaz.
-    strength: float = 1.0
+    # toward a plain resize afterward. 1.0 = full Topaz. 0.25 is the
+    # default because full strength visibly over-synthesizes texture on
+    # detailed natural subjects (rock, scree, foliage).
+    strength: float = 0.25
     overwrite: bool = False
 
 
