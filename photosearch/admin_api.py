@@ -948,6 +948,11 @@ class UpscaleRequest(BaseModel):
     # None = let Topaz Autopilot choose (and never touch the user's settings).
     scale: Optional[int] = None
     enhancements: list[str] = ["upscale"]
+    # None = Autopilot's own pick (usually "High Fidelity V2").
+    model: Optional[str] = None
+    # True replaces Autopilot's settings rather than merging into them, which
+    # is what stops its "Sharpen Strong" from riding along and adding halos.
+    override: bool = False
     overwrite: bool = False
 
 
@@ -984,6 +989,7 @@ def admin_upscale_photo(req: UpscaleRequest):
                 results.append(upscale.upscale_photo(
                     db, pid, scale=req.scale,
                     enhancements=tuple(req.enhancements),
+                    model=req.model, override=req.override,
                     overwrite=req.overwrite))
             except Exception as e:
                 errors.append({"photo_id": pid, "error": str(e)})

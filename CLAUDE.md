@@ -801,6 +801,39 @@ Two upstream CLI bugs this works around:
    preference is global state shared with the Topaz GUI. **`--scale` omitted
    (the default) touches nothing** and just uses whatever Autopilot would pick.
 
+### Artifacts: Autopilot merges its own passes in
+
+**`--upscale` alone does not mean "only upscale".** Without `--override`, the
+requested settings are *merged into* Autopilot's rather than replacing them, so
+Topaz also runs whatever else Autopilot decided on. Confirmed with
+`--showSettings --skipProcessing`: on a plain `--upscale` run the enabled
+categories come back as **Enhance *and* Sharpen**, the latter with model
+`Sharpen Strong` — a sharpening pass on an already-upscaled image, and the usual
+explanation for halo/crunch artifacts. Autopilot's own upscale model is
+typically `High Fidelity V2`.
+
+So there are two levers, both now exposed on `upscale_photo` / `run_topaz`, the
+CLI (`--model`, `--override/--merge-autopilot`), the API, and the modal:
+
+- **`override=True`** → passes `--override`, so only the checked enhancements
+  run. This is the artifact fix; the UI defaults it **on**.
+- **`model=...`** → `--upscale model=<name>`. Unlike `scale`, the CLI serializes
+  this correctly, so it needs no registry workaround.
+
+`UPSCALE_MODELS` was verified by running each name through the CLI and checking
+an output file appeared: **Standard, Standard V2, High Fidelity, High Fidelity
+V2, Low Resolution, CGI**. `Redefine` and `Recovery` (the generative models)
+produce **no output until downloaded in the Topaz GUI**, so they are deliberately
+not offered. `Text Refine` is a separate enhancement, not an Enhance model.
+
+Both are part of the variant filename (`-topaz-upscale-standardv2-only-2x.JPG`)
+and round-trip back out via `_parse_variant`, so models can be compared
+side by side without overwriting each other.
+
+**Model installs need every `tpai.exe` closed** — including headless ones. A
+batch of CLI runs will block the GUI's model download with "tpai needs to be
+closed"; check with `Get-Process | Where ProcessName -match 'tpai|Topaz'`.
+
 **WSL note:** the replica server runs inside WSL2 but `tpai.exe` is a Windows
 binary, so paths are translated with `wslpath -w` before being handed over
 (`to_native_path`). Both a WSL-native and a `/mnt/c` export dir work; `/mnt/c`

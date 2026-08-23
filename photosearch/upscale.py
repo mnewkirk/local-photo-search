@@ -90,6 +90,21 @@ _CLI_CANDIDATES = (
 # these just force the enhancement enabled regardless of what Autopilot picked.
 ENHANCEMENTS = ("upscale", "noise", "sharpen", "lighting", "color")
 
+# Upscale ("Enhance") models, verified by running each one through the CLI.
+# Autopilot's own pick is usually "High Fidelity V2".
+#
+# Not listed because they are not installed by default and fail with no output
+# until downloaded in the Topaz GUI: "Redefine" and "Recovery" (the generative
+# ones). "Text Refine" is a separate enhancement, not an Enhance model.
+UPSCALE_MODELS = (
+    "Standard",           # safe general default, mild
+    "Standard V2",        # newer Standard; a little more detail reconstruction
+    "High Fidelity",      # preserves fine texture; Autopilot's usual choice
+    "High Fidelity V2",
+    "Low Resolution",     # for small/soft sources
+    "CGI",                # synthetic images, flat colour, line art
+)
+
 _REG_KEY = r"HKCU\Software\Topaz Labs LLC\Topaz Photo AI"
 _REG_TYPE = "autopilotUpscalingType"      # "auto" | "scale"
 _REG_FACTOR = "autopilotUpscalingFactor"  # REG_SZ holding the multiplier
@@ -276,10 +291,22 @@ class _scale_override:
 def run_topaz(src: str, out_dir: str, *,
               scale: Optional[int] = None,
               enhancements: tuple[str, ...] = ("upscale",),
+              model: Optional[str] = None,
+              override: bool = False,
               image_format: str = "preserve",
               quality: int = 95,
               timeout: int = 1800) -> str:
     """Upscale ``src`` into ``out_dir`` and return the produced file's path.
+
+    ``model`` picks the upscale ("Enhance") model — see ``UPSCALE_MODELS``.
+    Unlike ``scale``, this one the CLI serializes correctly, so it needs no
+    registry workaround.
+
+    ``override`` passes ``--override``, which makes the requested settings
+    *replace* Autopilot's rather than merge into them. Worth knowing: without
+    it, asking for ``--upscale`` alone still lets Autopilot run whatever else it
+    decided on — in practice "Sharpen Strong" — which is a common source of
+    halo/crunch artifacts on an already-upscaled image.
 
     Raises ``TopazError`` when the CLI is missing, reports a documented failure
     code, or exits without writing anything.
@@ -288,12 +315,22 @@ def run_topaz(src: str, out_dir: str, *,
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     before = {p.name for p in Path(out_dir).iterdir()}
 
+    if model is not None and model not in UPSCALE_MODELS:
+        raise ValueError(f"unknown upscale model: {model!r} "
+                         f"(known: {', '.join(UPSCALE_MODELS)})")
+
     cmd = [exe, "--output", to_native_path(out_dir),
            "--format", image_format, "--quality", str(quality)]
+    if override:
+        cmd.append("--override")
     for enh in enhancements:
         if enh not in ENHANCEMENTS:
             raise ValueError(f"unknown enhancement: {enh}")
-        cmd.append(f"--{enh}")
+        # The model belongs to the upscale enhancement only.
+        if enh == "upscale" and model:
+            cmd.extend(["--upscale", f"model={model}"])
+        else:
+            cmd.append(f"--{enh}")
     cmd.append(to_native_path(src))
 
     with _scale_override(scale):
@@ -320,8 +357,14 @@ def run_topaz(src: str, out_dir: str, *,
     return str(max(produced, key=lambda p: p.stat().st_mtime))
 
 
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
 def _variant_suffix(scale: Optional[int],
-                    enhancements: tuple[str, ...]) -> str:
+                    enhancements: tuple[str, ...],
+                    model: Optional[str] = None,
+                    override: bool = False) -> str:
     """Encode the chosen options into the filename.
 
     Two different option sets must not collide on one path — otherwise the
@@ -333,6 +376,10 @@ def _variant_suffix(scale: Optional[int],
     chosen = set(enhancements)
     parts = [x for x in ENHANCEMENTS if x in chosen]
     parts += sorted(chosen - set(ENHANCEMENTS))
+    if model:
+        parts.append(_slug(model))
+    if override:
+        parts.append("only")      # Autopilot's extras suppressed
     if scale:
         parts.append(f"{scale}x")
     return "".join("-" + p for p in parts)
@@ -344,15 +391,26 @@ def _parse_variant(name: str, stem: str) -> dict:
     body = os.path.splitext(name)[0]
     prefix = f"{stem}-topaz"
     tokens = [t for t in body[len(prefix):].split("-") if t]
-    scale, enh = None, []
+    models = {_slug(m): m for m in UPSCALE_MODELS}
+    scale, enh, model, override = None, [], None, False
     for t in tokens:
         if re.fullmatch(r"\d+x", t):
             scale = int(t[:-1])
+        elif t in models:
+            model = models[t]
+        elif t == "only":
+            override = True
         else:
             enh.append(t)
     label = ", ".join(enh) if enh else "autopilot"
+    if model:
+        label += f" · {model}"
+    if override:
+        label += " (no autopilot)"
+    if scale:
+        label += f" · {scale}x"
     return {"enhancements": enh, "scale": scale or "auto",
-            "label": label + (f" · {scale}x" if scale else "")}
+            "model": model, "override": override, "label": label}
 
 
 def list_exports(db, photo_id: int) -> list[dict]:
@@ -427,6 +485,8 @@ def fetch_source(row, dest_dir: str, *, server: Optional[str] = None) -> str:
 def upscale_photo(db, photo_id: int, *,
                   scale: Optional[int] = None,
                   enhancements: tuple[str, ...] = ("upscale",),
+                  model: Optional[str] = None,
+                  override: bool = False,
                   server: Optional[str] = None,
                   overwrite: bool = False) -> dict:
     """Upscale one library photo into the export tree.
@@ -445,12 +505,13 @@ def upscale_photo(db, photo_id: int, *,
     dest_dir = _dest_dir(row)
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem, ext = os.path.splitext(src_name)
-    variant = _variant_suffix(scale, enhancements)
+    variant = _variant_suffix(scale, enhancements, model, override)
     final = dest_dir / f"{stem}-topaz{variant}{ext}"
     if final.exists() and not overwrite:
         return {"photo_id": photo_id, "skipped": True,
                 "reason": "already exported", "scale": scale or "auto",
                 "enhancements": list(enhancements),
+                "model": model, "override": override,
                 "label": _parse_variant(final.name, stem)["label"],
                 **_describe_output(final)}
 
@@ -463,7 +524,8 @@ def upscale_photo(db, photo_id: int, *,
         src = fetch_source(row, str(staging), server=server)
 
         produced = run_topaz(src, str(staging / "out"), scale=scale,
-                             enhancements=enhancements)
+                             enhancements=enhancements, model=model,
+                             override=override)
         shutil.move(produced, final)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -471,5 +533,6 @@ def upscale_photo(db, photo_id: int, *,
     return {"photo_id": photo_id, "skipped": False,
             "bytes": final.stat().st_size, "scale": scale or "auto",
             "enhancements": list(enhancements),
+            "model": model, "override": override,
             "label": _parse_variant(final.name, stem)["label"],
             **_describe_output(final)}

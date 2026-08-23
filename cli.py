@@ -5301,9 +5301,16 @@ def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, bo
 @click.option("--enhancement", "enhancements", multiple=True, default=("upscale",),
               help="Topaz enhancement to enable (repeatable): "
                    "upscale, noise, sharpen, lighting, color.")
+@click.option("--model", default=None,
+              help="Upscale model (e.g. 'Standard', 'High Fidelity V2'). "
+                   "Default: let Autopilot pick.")
+@click.option("--override/--merge-autopilot", "override", default=False,
+              help="--override replaces Autopilot's settings instead of "
+                   "merging into them. Use it to stop Autopilot's Sharpen "
+                   "from riding along, a common source of artifacts.")
 @click.option("--overwrite", is_flag=True, default=False,
               help="Re-export photos that already have an output file.")
-def upscale_cmd(photo_ids, db, scale, enhancements, overwrite):
+def upscale_cmd(photo_ids, db, scale, enhancements, model, override, overwrite):
     """Upscale photos locally with Topaz Photo AI into the export tree.
 
     Runs the Topaz Photo AI CLI on THIS machine -- the Topaz cloud API is never
@@ -5319,6 +5326,9 @@ def upscale_cmd(photo_ids, db, scale, enhancements, overwrite):
 
     if scale is not None and scale not in U.SCALES:
         raise click.ClickException(f"--scale must be one of {list(U.SCALES)}")
+    if model is not None and model not in U.UPSCALE_MODELS:
+        raise click.ClickException(
+            "--model must be one of: " + ", ".join(U.UPSCALE_MODELS))
     try:
         click.echo(f"Topaz CLI: {U.cli_path()}")
     except U.TopazError as e:
@@ -5331,6 +5341,7 @@ def upscale_cmd(photo_ids, db, scale, enhancements, overwrite):
             try:
                 res = U.upscale_photo(pdb, pid, scale=scale,
                                       enhancements=tuple(enhancements),
+                                      model=model, override=override,
                                       overwrite=overwrite)
             except Exception as e:
                 failures += 1

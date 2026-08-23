@@ -205,6 +205,10 @@
     // re-run passes this touches neither the DB nor the library, so there is
     // nothing to mirror or refresh afterward.
     var UPSCALE_ENHANCEMENTS = ['upscale', 'noise', 'sharpen', 'lighting', 'color'];
+    // Verified against the CLI. Redefine/Recovery need downloading in the
+    // Topaz GUI first, so they are not offered until they exist.
+    var UPSCALE_MODELS = ['Standard', 'Standard V2', 'High Fidelity',
+                          'High Fidelity V2', 'Low Resolution', 'CGI'];
     var _upOpen = useState(false);
     var upOpen = _upOpen[0];             var setUpOpen = _upOpen[1];
     var _upScale = useState('auto');     // 'auto' | '2' | '4' | '6'
@@ -215,6 +219,13 @@
     var upBusy = _upBusy[0];             var setUpBusy = _upBusy[1];
     var _upMsg = useState(null);
     var upMsg = _upMsg[0];               var setUpMsg = _upMsg[1];
+    var _upModel = useState('');         // '' = let Autopilot pick
+    var upModel = _upModel[0];           var setUpModel = _upModel[1];
+    // Autopilot merges its own picks into every run — in practice a
+    // "Sharpen Strong" pass that haloes an already-upscaled image. On by
+    // default because that is usually what you want for a clean upscale.
+    var _upOnly = useState(true);
+    var upOnly = _upOnly[0];             var setUpOnly = _upOnly[1];
     var _upPrior = useState(null);       // null = not loaded yet, [] = none
     var upPrior = _upPrior[0];           var setUpPrior = _upPrior[1];
 
@@ -258,6 +269,8 @@
           photo_ids: [photo.id],
           scale: upScale === 'auto' ? null : parseInt(upScale, 10),
           enhancements: enh,
+          model: upModel || null,
+          override: upOnly,
         }),
       }).then(function (r) {
         return r.json().then(function (d) { return { ok: r.ok, d: d }; });
@@ -1759,7 +1772,34 @@
                   e('option', { value: '2' }, '2x'),
                   e('option', { value: '4' }, '4x'),
                   e('option', { value: '6' }, '6x')
+                ),
+                e('span', { style: { color: 'var(--text-muted)', marginLeft: 6 } }, 'Model'),
+                e('select', {
+                  value: upModel,
+                  onChange: function (ev) { setUpModel(ev.target.value); },
+                  style: { fontSize: 12 },
+                  title: 'Autopilot usually picks High Fidelity V2. Standard is '
+                       + 'milder if that looks over-processed.',
+                },
+                  e('option', { value: '' }, 'Auto'),
+                  UPSCALE_MODELS.map(function (m) {
+                    return e('option', { key: m, value: m }, m);
+                  })
                 )
+              ),
+              e('label', {
+                style: { display: 'flex', alignItems: 'center', gap: 6,
+                         fontSize: 12, marginBottom: 8 },
+                title: 'Without this, Topaz also applies whatever else Autopilot '
+                     + 'decided on — usually a Sharpen Strong pass, which haloes '
+                     + 'an already-upscaled image.',
+              },
+                e('input', {
+                  type: 'checkbox', checked: upOnly,
+                  onChange: function (ev) { setUpOnly(ev.target.checked); },
+                }),
+                e('span', { style: { color: 'var(--text-muted)' } },
+                  'Only the checked enhancements (ignore Autopilot extras)')
               ),
               e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', marginBottom: 8 } },
                 UPSCALE_ENHANCEMENTS.map(function (x) {

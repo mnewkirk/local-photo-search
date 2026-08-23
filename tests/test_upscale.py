@@ -347,6 +347,67 @@ def test_list_exports_empty_for_untouched_photo(tmp_path, monkeypatch):
         db.close()
 
 
+def test_model_is_passed_as_an_upscale_param(fake_cli, tmp_path, monkeypatch):
+    """Unlike scale, the CLI serializes model= correctly, so it goes in argv."""
+    cmds = []
+    monkeypatch.setattr(U.subprocess, "run", _runner(record=cmds))
+    src = tmp_path / "in.jpg"; src.write_bytes(b"x")
+    U.run_topaz(str(src), str(tmp_path / "out"), model="Standard V2")
+    assert "--upscale" in cmds[0]
+    assert "model=Standard V2" in cmds[0]
+
+
+def test_unknown_model_rejected(fake_cli, tmp_path, monkeypatch):
+    monkeypatch.setattr(U.subprocess, "run", _runner())
+    src = tmp_path / "in.jpg"; src.write_bytes(b"x")
+    with pytest.raises(ValueError, match="unknown upscale model"):
+        U.run_topaz(str(src), str(tmp_path / "out"), model="Nonsense")
+
+
+def test_override_suppresses_autopilot_extras(fake_cli, tmp_path, monkeypatch):
+    """--override is what stops Autopilot's Sharpen Strong riding along, which
+    is the usual source of halo artifacts on an upscale."""
+    cmds = []
+    monkeypatch.setattr(U.subprocess, "run", _runner(record=cmds))
+    src = tmp_path / "in.jpg"; src.write_bytes(b"x")
+    U.run_topaz(str(src), str(tmp_path / "out"), override=True)
+    assert "--override" in cmds[0]
+
+    cmds.clear()
+    U.run_topaz(str(src), str(tmp_path / "out2"), override=False)
+    assert "--override" not in cmds[0]
+
+
+def test_model_and_override_are_part_of_the_variant(fake_cli, tmp_path, monkeypatch):
+    """Two models must not collide on one filename, same as two option sets."""
+    orig = tmp_path / "lib" / "DSC2.JPG"
+    orig.parent.mkdir(parents=True)
+    orig.write_bytes(b"original")
+    db, pid = _db_with_photo(tmp_path, str(orig))
+    monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(tmp_path / "exports"))
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    monkeypatch.setattr(U.subprocess, "run", _runner(produce="DSC2.JPG"))
+    try:
+        a = U.upscale_photo(db, pid, model="Standard")
+        b = U.upscale_photo(db, pid, model="High Fidelity V2")
+        c = U.upscale_photo(db, pid, model="Standard", override=True)
+        listed = U.list_exports(db, pid)
+    finally:
+        db.close()
+
+    names = [os.path.basename(r["output"]) for r in (a, b, c)]
+    assert names == ["DSC2-topaz-upscale-standard.JPG",
+                     "DSC2-topaz-upscale-highfidelityv2.JPG",
+                     "DSC2-topaz-upscale-standard-only.JPG"]
+    assert len(listed) == 3
+    # The model round-trips out of the filename for the prior-exports list.
+    by_name = {os.path.basename(x["output"]): x for x in listed}
+    assert by_name[names[0]]["model"] == "Standard"
+    assert by_name[names[1]]["model"] == "High Fidelity V2"
+    assert by_name[names[2]]["override"] is True
+    assert "no autopilot" in by_name[names[2]]["label"]
+
+
 def test_upscale_photo_skips_existing(fake_cli, tmp_path, monkeypatch):
     orig = tmp_path / "lib" / "IMG_2.jpg"
     orig.parent.mkdir(parents=True)
