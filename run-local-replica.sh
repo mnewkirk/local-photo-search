@@ -17,6 +17,7 @@
 #   --nas           NAS web URL              (default: http://dxp4800-f976:8000, $PHOTOSEARCH_NAS_URL)
 #   --lm            LM Studio /v1 URL        (default: auto — WSL2 gateway / localhost, $PHOTOSEARCH_TEXT_LLM_URL)
 #   --model         agent model id loaded in LM Studio ($PHOTOSEARCH_LLM_AGENT_MODEL)
+#   --upscale-dir   Topaz export tree (M30)  (default: ./upscaled, $PHOTOSEARCH_UPSCALE_DIR)
 #
 # The --model must be a tool-calling-capable model loaded in LM Studio
 # (qwen2.5-instruct / qwen3 / llama-3.1+ with tool use on), or the ✨ Ask
@@ -31,6 +32,7 @@ REPLICA_DB="${PHOTOSEARCH_DB:-./photo_index.db.local}"
 NAS_URL="${PHOTOSEARCH_NAS_URL:-http://dxp4800-f976:8000}"
 LM_URL="${PHOTOSEARCH_TEXT_LLM_URL:-}"
 AGENT_MODEL="${PHOTOSEARCH_LLM_AGENT_MODEL:-qwen/qwen3.5-9b}"
+UPSCALE_DIR="${PHOTOSEARCH_UPSCALE_DIR:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +42,7 @@ while [ $# -gt 0 ]; do
     --nas) NAS_URL="$2"; shift 2 ;;
     --lm) LM_URL="$2"; shift 2 ;;
     --model) AGENT_MODEL="$2"; shift 2 ;;
+    --upscale-dir) UPSCALE_DIR="$2"; shift 2 ;;
     --reload) RELOAD=1; shift ;;   # uvicorn auto-reload on code edits (dev)
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -91,6 +94,11 @@ export PHOTOSEARCH_TEXT_LLM_URL="${LM_URL}"
 # Vision model for rerank_photos (VLM re-ranking). Override with VISUAL_MODEL=.
 export PHOTOSEARCH_LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-${VISUAL_MODEL:-qwen2.5-vl-7b-instruct}}"
 [ -n "${PHOTOSEARCH_AGENT_HINTS:-}" ] && export PHOTOSEARCH_AGENT_HINTS
+# Topaz upscale + Split print exports (M30/M31). These are NEW files, never
+# library photos, so the tree lives outside the library and nothing indexes it.
+# On WSL prefer a /mnt/c path: tpai.exe is a Windows binary, and a WSL-native
+# target costs a \wsl.localhost round trip on every read and write.
+[ -n "${UPSCALE_DIR}" ] && export PHOTOSEARCH_UPSCALE_DIR="${UPSCALE_DIR}"
 # No PHOTO_ROOT: originals aren't local, so image routes proxy from the NAS.
 
 echo "photosearch (local replica)"
@@ -98,6 +106,7 @@ echo "  DB:        ${REPLICA_DB}"
 echo "  NAS:       ${NAS_URL}   (image proxy + sync)"
 echo "  LM Studio: ${LM_URL}   (Ask agent${AGENT_MODEL:+, model=$AGENT_MODEL})"
 echo "  Hints:     ${PHOTOSEARCH_AGENT_HINTS:+loaded (${#PHOTOSEARCH_AGENT_HINTS} chars)}${PHOTOSEARCH_AGENT_HINTS:-none}"
+echo "  Upscale:   ${UPSCALE_DIR:-./upscaled}   (Topaz exports + /split)"
 echo "  Web:       http://localhost:${PORT}    (✨ Ask mode in the search bar)"
 echo
 exec "${PYBIN}" cli.py serve --db "${REPLICA_DB}" --host 0.0.0.0 --port "${PORT}" \
