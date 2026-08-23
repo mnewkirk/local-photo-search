@@ -943,6 +943,21 @@ Two invariants worth not breaking:
   constraint when it was the height. (Note the handoff's "exactly one slack is
   zero" is off by one case: when the aspects match exactly, *both* are zero.)
 
+**Arrangement cards carry a live preview**, not just numbers — the panel
+breakdown *and* where the photo lands inside it. `PanelLayout` is shared by the
+card thumbnails and the main stage, so a thumbnail can never be a different
+rendering of the geometry than the thing it previews.
+
+**Trying a grid** (the `cols × rows` boxes above the card grid) needs its own
+enumerator: `candidates`/`reachable` only walk the curated `GRIDS` list, which
+has **no 3×3**, so a grid that is not on that list is invisible to them —
+exactly the case worth trying. `G.forGrid(img, cols, rows, opts)` enumerates
+sheet sizes directly for one grid and applies **only** the physical caps; the
+dpi and crop floors are deliberately not enforced, because seeing *why* a grid
+does not work is the point of asking for it (such cards are marked "below your
+floors"). Tried grids persist in `localStorage` under `split.tried`, so clicking
+away or reloading keeps them, and they go only when the card's × is clicked.
+
 **The Source picker is a planning input, not an export detail.** It sits at the
 top of the sidebar and sets the resolution *everything else is judged against* —
 choosing a 2× upscale doubles the pixels, so arrangements that failed the dpi

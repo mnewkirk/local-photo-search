@@ -198,6 +198,42 @@
   }
 
   /**
+   * Every sheet size that can build ONE given grid, best first.
+   *
+   * `candidates`/`reachable` only walk the curated GRIDS list, so a grid that
+   * is not on it (3x3, say) is invisible to them. Trying an arbitrary grid is
+   * exactly the case that list cannot serve, so this enumerates sheet sizes
+   * directly for the cols/rows asked for.
+   *
+   * Only the physical caps apply — the dpi and crop floors are deliberately
+   * NOT enforced, because seeing *why* a grid does not work is the point of
+   * asking for it.
+   */
+  function forGrid(img, cols, rows, o) {
+    if (!img || cols < 1 || rows < 1) return [];
+    var s = opts(o), out = [];
+    SIZES.forEach(function (pair) {
+      var orients = pair[0] === pair[1]
+        ? [pair] : [[pair[0], pair[1]], [pair[1], pair[0]]];
+      orients.forEach(function (or) {
+        var cand = { pw: or[0], ph: or[1], cols: cols, rows: rows };
+        var P = plan(img, cand, s);
+        if (P.outerW > MAX_SPAN_IN || P.outerH > MAX_SPAN_IN) return;
+        out.push({ cand: cand, P: P, label: sizeLabel(pair[0], pair[1]),
+                   fits: P.outerW <= s.wall && P.outerH <= s.wall });
+      });
+    });
+    // Prefer something that fits the wall, then the least crop, then the
+    // largest piece — the same instincts as the main ranking.
+    out.sort(function (a, b) {
+      if (a.fits !== b.fits) return a.fits ? -1 : 1;
+      if (Math.abs(a.P.keep - b.P.keep) > 1e-9) return b.P.keep - a.P.keep;
+      return Math.max(b.P.outerW, b.P.outerH) - Math.max(a.P.outerW, a.P.outerH);
+    });
+    return out;
+  }
+
+  /**
    * Largest arrangement that genuinely clears the current floors, looking past
    * the panel-count and sheet-size filters — the "try this instead" answer.
    */
@@ -403,6 +439,7 @@
     MAX_SPAN_IN: MAX_SPAN_IN, MAX_UPSCALE: MAX_UPSCALE, DEFAULTS: DEFAULTS,
     plan: plan, panelRects: panelRects, needPx: needPx,
     candidates: candidates, reachable: reachable, bestAlternative: bestAlternative,
+    forGrid: forGrid,
     diagnose: diagnose, needSentence: needSentence, reachAtDpi: reachAtDpi,
     upscaleFor: upscaleFor, sizeLabel: sizeLabel, describe: describe,
     fmt: fmt, pct: pct, inches: inches, commas: commas, ratio: ratio,

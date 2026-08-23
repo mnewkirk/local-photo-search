@@ -125,6 +125,24 @@
     .arr.on { border-color: var(--accent); background: #12243a; }
     .arr .big { font-size: 14px; font-weight: 600; display: block; margin-bottom: 2px; }
     .arr .sub { color: var(--text-muted); }
+    .arr { position: relative; }
+    /* A grid the user asked to see, rather than one the ranker chose. */
+    .arr.tried { border-style: dashed; }
+    .arr .del {
+      position: absolute; top: 4px; right: 4px; width: 20px; height: 20px;
+      border: 0; border-radius: 50%; background: var(--surface);
+      color: var(--text-muted); font-size: 14px; line-height: 1;
+      cursor: pointer; font-family: inherit; opacity: 0;
+    }
+    .arr:hover .del { opacity: 1; }
+    .arr .del:hover { color: var(--red); }
+    /* Thumbnail: centre the wall inside a fixed square so cards align. */
+    .mini {
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 8px; overflow: hidden;
+    }
+    .mini .wallbox { cursor: inherit; }
+    .mini .panel { background: #111; }
 
     .diag { border-left: 3px solid var(--yellow); padding-left: 14px; }
     .diag h3 { font-size: 16px; margin-bottom: 8px; }
@@ -268,13 +286,54 @@
 
     // --- preview ------------------------------------------------------------
 
-    function Preview(props) {
-      const { img, cand, s, maxPx } = props;
-      const box = useRef(null);
-      const [drag, setDrag] = useState(null);
-      const P = useMemo(() => G.plan(img, cand, s), [img, cand, s]);
+    // Lays the photo across the sheets. Shared by the main stage and the little
+    // previews on the arrangement cards, so a thumbnail is never a different
+    // rendering of the geometry than the thing it previews.
+    function PanelLayout(props) {
+      const { img, cand, s, src, maxPx } = props;
+      const P = G.plan(img, cand, s);
       const scale = maxPx / Math.max(P.outerW, P.outerH);
       const W = P.outerW * scale, H = P.outerH * scale;
+
+      const panels = [];
+      for (let r = 0; r < cand.rows; r++) {
+        for (let c = 0; c < cand.cols; c++) {
+          // Position on the wall.
+          const left = c * (cand.pw + s.gutter) * scale;
+          const top = r * (cand.ph + s.gutter) * scale;
+          // The image is laid out across the whole field; each panel is a
+          // window onto it, so the img is offset by this panel's origin.
+          const fieldW = P.cW * scale, fieldH = P.cH * scale;
+          const offX = s.mode === 'window' ? left : c * cand.pw * scale;
+          const offY = s.mode === 'window' ? top : r * cand.ph * scale;
+          panels.push(e('div', {
+            key: r + '-' + c,
+            className: 'panel',
+            style: { left: left, top: top, width: cand.pw * scale, height: cand.ph * scale },
+          }, src && e('img', {
+            src: src, draggable: false,
+            style: {
+              width: fieldW * (img.w / P.cw), height: fieldH * (img.h / P.ch),
+              left: -offX - (P.ox / P.cw) * fieldW,
+              top: -offY - (P.oy / P.ch) * fieldH,
+            },
+          })));
+        }
+      }
+      return { node: panels, W: W, H: H };
+    }
+
+    /** Card-sized preview: the panel breakdown and where the photo lands. */
+    function MiniPreview(props) {
+      const { W, H, node } = PanelLayout(props);
+      return e('div', { className: 'mini', style: { width: props.maxPx, height: props.maxPx } },
+        e('div', { className: 'wallbox', style: { width: W, height: H } }, node));
+    }
+
+    function Preview(props) {
+      const { img, cand, s, maxPx } = props;
+      const [drag, setDrag] = useState(null);
+      const { node, W, H } = PanelLayout(props);
 
       // Drag pans the crop, but only along the axis that actually has slack.
       const onDown = (ev) => {
@@ -300,36 +359,10 @@
         };
       }, [drag, W, H]);
 
-      const panels = [];
-      for (let r = 0; r < cand.rows; r++) {
-        for (let c = 0; c < cand.cols; c++) {
-          // Position on the wall.
-          const left = c * (cand.pw + s.gutter) * scale;
-          const top = r * (cand.ph + s.gutter) * scale;
-          // The image is laid out across the whole field; each panel is a
-          // window onto it, so the img is offset by this panel's origin.
-          const fieldW = P.cW * scale, fieldH = P.cH * scale;
-          const offX = s.mode === 'window' ? left : c * cand.pw * scale;
-          const offY = s.mode === 'window' ? top : r * cand.ph * scale;
-          panels.push(e('div', {
-            key: r + '-' + c,
-            className: 'panel',
-            style: { left: left, top: top, width: cand.pw * scale, height: cand.ph * scale },
-          }, e('img', {
-            src: props.src, draggable: false,
-            style: {
-              width: fieldW * (img.w / P.cw), height: fieldH * (img.h / P.ch),
-              left: -offX - (P.ox / P.cw) * fieldW,
-              top: -offY - (P.oy / P.ch) * fieldH,
-            },
-          })));
-        }
-      }
-
       return e('div', {
-        ref: box, className: 'wallbox' + (drag ? ' drag' : ''),
+        className: 'wallbox' + (drag ? ' drag' : ''),
         style: { width: W, height: H }, onMouseDown: onDown,
-      }, panels);
+      }, node);
     }
 
     // --- diagnostics --------------------------------------------------------
@@ -444,6 +477,38 @@
             }, p.name.replace(/\.\w+$/, ''))))));
     }
 
+    /** Two boxes for trying a grid the ranker did not offer. */
+    function TryGrid(props) {
+      const [cols, setCols] = useState('3');
+      const [rows, setRows] = useState('2');
+      const box = {
+        width: 46, textAlign: 'center', background: 'var(--surface2)',
+        color: 'var(--text)', border: '1px solid var(--border)',
+        borderRadius: 6, padding: '4px 6px', fontSize: 13, fontFamily: 'inherit',
+      };
+      const [err, setErr] = useState(null);
+      const submit = () => {
+        const c = parseInt(cols, 10), r = parseInt(rows, 10);
+        // Say why nothing happened rather than swallowing the input.
+        if (!(c > 0 && r > 0)) return setErr('Enter whole numbers of 1 or more.');
+        if (c > 8 || r > 8) return setErr('8 is the most panels on a side.');
+        setErr(null);
+        props.onAdd(c, r);
+      };
+      return e('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+        e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'Try'),
+        e('input', { type: 'number', min: 1, max: 8, value: cols, style: box,
+          onChange: (ev) => setCols(ev.target.value),
+          onKeyDown: (ev) => { if (ev.key === 'Enter') submit(); } }),
+        e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, '×'),
+        e('input', { type: 'number', min: 1, max: 8, value: rows, style: box,
+          onChange: (ev) => setRows(ev.target.value),
+          onKeyDown: (ev) => { if (ev.key === 'Enter') submit(); } }),
+        e('button', { className: 'ghostbtn', style: { padding: '5px 12px', fontSize: 12 },
+          onClick: submit }, 'Add'),
+        err && e('span', { style: { fontSize: 11, color: 'var(--yellow)' } }, err));
+    }
+
     // --- page ---------------------------------------------------------------
 
     function SplitPage() {
@@ -454,6 +519,32 @@
       const [source, setSource] = useState('');       // '' = original
       const [src, setSrc] = useState(null);
       const [sel, setSel] = useState(0);
+      // Grids the user asked to see. Kept in localStorage so clicking away (or
+      // reloading) does not lose them; removed only by the card's x.
+      const TRIED_KEY = 'split.tried';
+      const [tried, setTried] = useState(() => {
+        try { return JSON.parse(localStorage.getItem(TRIED_KEY) || '[]'); }
+        catch (_) { return []; }
+      });
+      const saveTried = useCallback((next) => {
+        setTried(next);
+        try { localStorage.setItem(TRIED_KEY, JSON.stringify(next)); } catch (_) {}
+      }, []);
+      const addTried = useCallback((c, r) => {
+        setTried((prev) => {
+          if (prev.some((t) => t.cols === c && t.rows === r)) return prev;
+          const next = prev.concat([{ cols: c, rows: r }]);
+          try { localStorage.setItem(TRIED_KEY, JSON.stringify(next)); } catch (_) {}
+          return next;
+        });
+      }, []);
+      const removeTried = useCallback((key) => {
+        setTried((prev) => {
+          const next = prev.filter((t) => 'try-' + t.cols + 'x' + t.rows !== key);
+          try { localStorage.setItem(TRIED_KEY, JSON.stringify(next)); } catch (_) {}
+          return next;
+        });
+      }, []);
       const [s, setS] = useState(Object.assign({}, G.DEFAULTS));
       const set = useCallback((patch) => setS((p) => Object.assign({}, p, patch)), []);
 
@@ -494,7 +585,29 @@
       const img = chosen ? { w: chosen.width, h: chosen.height } : origImg;
 
       const cands = useMemo(() => (img ? G.candidates(img, s) : []), [img, s]);
-      const cand = cands.length ? cands[Math.min(sel, cands.length - 1)] : null;
+
+      // A tried grid is shown even when it fails the dpi/crop floors — seeing
+      // WHY it does not work is the whole point of trying it. Pick the best
+      // sheet size for that grid out of the physically-buildable set.
+      const triedRows = useMemo(() => {
+        if (!img) return [];
+        return tried.map((t) => {
+          // forGrid, not reachable(): the curated GRIDS list has no 3x3, and a
+          // grid it does not list is precisely the case worth trying.
+          const opts = G.forGrid(img, t.cols, t.rows, s);
+          const key = 'try-' + t.cols + 'x' + t.rows;
+          if (!opts.length) return { key: key, tried: true, impossible: true,
+                                     cand: { cols: t.cols, rows: t.rows } };
+          return Object.assign({}, opts[0], { tried: true, key: key });
+        });
+      }, [img, s, tried]);
+
+      // Tried grids first, so a just-added one is easy to find.
+      const shown = useMemo(
+        () => triedRows.concat(cands.map((c, i) => Object.assign({}, c, { key: 'c' + i }))),
+        [triedRows, cands]);
+      const selIdx = Math.min(sel, Math.max(0, shown.length - 1));
+      const cand = shown.length ? shown[selIdx] : null;
       const diag = useMemo(
         () => (img && !cands.length ? G.diagnose(img, s) : null), [img, cands, s]);
 
@@ -552,22 +665,60 @@
               },
             }),
 
-            img && cands.length > 0 && e('div', { className: 'card', style: { marginTop: 16 } },
-              e('h2', null, 'Other arrangements'),
-              e('div', { className: 'arrangements' },
-                cands.map((c, i) => {
+            img && shown.length > 0 && e('div', { className: 'card', style: { marginTop: 16 } },
+              e('div', { style: { display: 'flex', alignItems: 'baseline',
+                                  justifyContent: 'space-between', gap: 12 } },
+                e('h2', { style: { marginBottom: 0 } }, 'Other arrangements'),
+                e(TryGrid, { onAdd: addTried })),
+              e('p', { className: 'hint', style: { marginTop: 4 } },
+                'Every size shown is edge-to-edge.'),
+              e('div', { className: 'arrangements', style: { marginTop: 12 } },
+                shown.map((c, i) => {
+                  if (c.impossible) {
+                    return e('div', { key: c.key, className: 'arr tried' },
+                      e('button', {
+                        className: 'del', title: 'Remove this arrangement',
+                        onClick: (ev) => { ev.stopPropagation(); removeTried(c.key); },
+                      }, '×'),
+                      e('span', { className: 'big' },
+                        c.cand.cols + '×' + c.cand.rows),
+                      e('span', { className: 'sub' },
+                        'No sheet size builds this under ' + G.MAX_SPAN_IN + '″.'));
+                  }
                   const cp = c.P;
-                  return e('button', {
-                    key: i, className: 'arr' + (i === Math.min(sel, cands.length - 1) ? ' on' : ''),
+                  const failsDpi = cp.dpi < s.minDpi;
+                  const failsCrop = (1 - cp.keep) > s.maxCrop + 0.0001;
+                  return e('div', {
+                    key: c.key || i,
+                    className: 'arr' + (i === selIdx ? ' on' : '') + (c.tried ? ' tried' : ''),
                     onClick: () => setSel(i),
                   },
+                    // The point of the thumbnail: the panel breakdown AND where
+                    // the photo actually lands inside it.
+                    img && src && e(MiniPreview, {
+                      img: img, cand: c.cand, s: s, src: src, maxPx: 116 }),
+                    c.tried && e('button', {
+                      className: 'del', title: 'Remove this arrangement',
+                      onClick: (ev) => { ev.stopPropagation(); removeTried(c.key); },
+                    }, '×'),
                     e('span', { className: 'big' },
                       G.inches(cp.outerW) + ' × ' + G.inches(cp.outerH)),
                     e('span', { className: 'sub' },
                       c.cand.cols + '×' + c.cand.rows + ' · ' + G.sizeLabel(cp.pw, cp.ph) + '″'),
                     e('br'),
-                    e('span', { className: 'sub' },
-                      Math.round(cp.dpi) + ' dpi · ' + G.pct(1 - cp.keep) + ' crop'));
+                    e('span', {
+                      className: 'sub',
+                      style: { color: failsDpi ? 'var(--red)' : 'var(--text-muted)' },
+                    }, Math.round(cp.dpi) + ' dpi'),
+                    e('span', { className: 'sub' }, ' · '),
+                    e('span', {
+                      className: 'sub',
+                      style: { color: failsCrop ? 'var(--red)' : 'var(--text-muted)' },
+                    }, G.pct(1 - cp.keep) + ' crop'),
+                    c.tried && (failsDpi || failsCrop) && e('span', {
+                      className: 'sub',
+                      style: { display: 'block', color: 'var(--yellow)', marginTop: 2 },
+                    }, 'below your floors'));
                 }))))));
     }
 

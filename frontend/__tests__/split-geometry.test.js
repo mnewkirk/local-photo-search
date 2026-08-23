@@ -284,6 +284,53 @@ describe('reachable', () => {
   });
 });
 
+describe('forGrid — trying an arbitrary grid', () => {
+  test('serves grids the curated GRIDS list does not contain', () => {
+    // 3x3 is not in GRIDS, so candidates/reachable can never surface it —
+    // which is exactly why trying a grid needs its own enumerator.
+    expect(G.GRIDS.some(([c, r]) => c === 3 && r === 3)).toBe(false);
+    expect(G.reachable(IMG, { wallOnly: false }).some(
+      (x) => x.cand.cols === 3 && x.cand.rows === 3)).toBe(false);
+
+    const got = G.forGrid(IMG, 3, 3, { wallOnly: false });
+    expect(got.length).toBeGreaterThan(0);
+    got.forEach((x) => {
+      expect(x.cand.cols).toBe(3);
+      expect(x.cand.rows).toBe(3);
+    });
+  });
+
+  test('ignores the dpi and crop floors — seeing why is the point', () => {
+    const got = G.forGrid(IMG, 6, 6, { minDpi: 300, maxCrop: 0.01 });
+    // Any survivor is there on physical grounds alone.
+    got.forEach((x) => {
+      expect(x.P.outerW).toBeLessThanOrEqual(G.MAX_SPAN_IN);
+      expect(x.P.outerH).toBeLessThanOrEqual(G.MAX_SPAN_IN);
+    });
+  });
+
+  test('still honors the 10-foot ceiling, so absurd grids return nothing', () => {
+    expect(G.forGrid(IMG, 20, 20, {})).toEqual([]);
+  });
+
+  test('prefers a wall-fitting option, then the least crop', () => {
+    const got = G.forGrid(IMG, 2, 2, { wall: 65 });
+    expect(got.length).toBeGreaterThan(1);
+    const fits = got.map((x) => x.fits);
+    // All the fitting ones come first.
+    expect(fits.slice(0, fits.filter(Boolean).length).every(Boolean)).toBe(true);
+    const fitting = got.filter((x) => x.fits);
+    for (let i = 0; i < fitting.length - 1; i++) {
+      expect(fitting[i].P.keep).toBeGreaterThanOrEqual(fitting[i + 1].P.keep - 1e-9);
+    }
+  });
+
+  test('returns nothing for a nonsense grid or missing image', () => {
+    expect(G.forGrid(IMG, 0, 3, {})).toEqual([]);
+    expect(G.forGrid(null, 3, 3, {})).toEqual([]);
+  });
+});
+
 describe('diagnose', () => {
   test('branch 1 — nothing selected at all', () => {
     const d = G.diagnose(IMG, { sizes: [] });
