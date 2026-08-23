@@ -347,7 +347,10 @@
         setBusy(true); setMsg(null);
         fetch(API + '/api/admin/upscale-photo', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ photo_ids: [photoId], scale: scale, enhancements: ['upscale'] }),
+          // Exactly the factor the plan needs — Topaz takes decimals, so a
+          // 1.3x shortfall does not have to be paid for at 2x.
+          body: JSON.stringify({ photo_ids: [photoId], scale: scale,
+                                 enhancements: ['upscale'] }),
         }).then((r) => r.json()).then((data) => {
           const err = (data.errors || [])[0];
           const res = (data.results || [])[0];
@@ -379,9 +382,14 @@
             // Only offered when it would actually resolve the blocker.
             photoId && scale && e('button', {
               className: 'ghostbtn', disabled: busy, onClick: upscale,
-            }, busy ? 'Upscaling…' : 'Upscale ' + scale + '× with Topaz'),
+            }, busy ? 'Upscaling…' : 'Upscale ' + G.fmt(scale) + '× with Topaz'),
             photoId && d.upscale && !scale && e('span', { className: 'hint' },
-              'Even a 6× upscale would not reach ' + s.minDpi + ' dpi here.')),
+              'Even a ' + G.MAX_UPSCALE + '× upscale would not reach ' +
+              s.minDpi + ' dpi here.')),
+          scale && e('p', { className: 'hint' },
+            'That is the exact factor this plan needs — ' +
+            G.commas(d.upscale.w) + ' × ' + G.commas(d.upscale.h) + ' px. ' +
+            'Upscaling further only adds synthesized texture.'),
           msg && e('p', {
             className: 'hint',
             style: { color: msg.kind === 'err' ? 'var(--red)' : 'var(--green)' },

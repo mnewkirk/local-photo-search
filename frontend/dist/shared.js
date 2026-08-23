@@ -274,7 +274,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           photo_ids: [photo.id],
-          scale: upScale === 'auto' ? null : parseInt(upScale, 10),
+          scale: upScale === 'auto' ? null : parseFloat(upScale),
           enhancements: enh,
           model: upModel || null,
           override: upOnly,
@@ -1776,10 +1776,13 @@
                   title: 'Auto uses your Topaz Autopilot preference and leaves '
                        + 'your Topaz settings untouched',
                 },
+                  // Topaz takes arbitrary decimals, so modest factors are
+                  // offered too — a print that needs 1.3x should not pay
+                  // for 2x.
                   e('option', { value: 'auto' }, 'Auto'),
-                  e('option', { value: '2' }, '2x'),
-                  e('option', { value: '4' }, '4x'),
-                  e('option', { value: '6' }, '6x')
+                  ['1.25', '1.5', '2', '3', '4', '6'].map(function (v) {
+                    return e('option', { key: v, value: v }, v + 'x');
+                  })
                 ),
                 e('span', { style: { color: 'var(--text-muted)', marginLeft: 6 } }, 'Strength'),
                 e('select', {

@@ -5296,8 +5296,10 @@ def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, bo
 @click.argument("photo_ids", nargs=-1, type=int, required=True)
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
-@click.option("--scale", type=int, default=None,
-              help="Upscale factor (2/4/6). Default: let Topaz Autopilot decide.")
+@click.option("--scale", type=float, default=None,
+              help="Upscale factor. Any decimal in [1.05, 6] — ask for what "
+                   "the output needs (1.3) instead of over-upscaling to the "
+                   "next whole number. Default: let Topaz Autopilot decide.")
 @click.option("--enhancement", "enhancements", multiple=True, default=("upscale",),
               help="Topaz enhancement to enable (repeatable): "
                    "upscale, noise, sharpen, lighting, color.")
@@ -5330,8 +5332,9 @@ def upscale_cmd(photo_ids, db, scale, enhancements, model, override, strength,
     """
     from photosearch import upscale as U
 
-    if scale is not None and scale not in U.SCALES:
-        raise click.ClickException(f"--scale must be one of {list(U.SCALES)}")
+    if scale is not None and not (U.MIN_SCALE <= scale <= U.MAX_SCALE):
+        raise click.ClickException(
+            f"--scale must be between {U.MIN_SCALE} and {U.MAX_SCALE}")
     if not 0.0 <= strength <= 1.0:
         raise click.ClickException("--strength must be between 0 and 1")
     if model is not None and model not in U.UPSCALE_MODELS:

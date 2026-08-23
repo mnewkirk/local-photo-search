@@ -113,7 +113,12 @@ _REG_FACTOR = "autopilotUpscalingFactor"  # REG_SZ holding the multiplier
 # keys), so only one override may be in flight at a time.
 _REG_LOCK = threading.Lock()
 
-SCALES = (2, 4, 6)
+# Presets offered in the UI. The factor is NOT limited to these: the
+# Autopilot registry preference takes arbitrary decimals (verified —
+# 1.3 on a 3660x2997 source produced exactly 4758x3896), so a plan that
+# needs 1.3x can ask for 1.3x instead of over-upscaling to 2x.
+SCALES = (1.25, 1.5, 2, 3, 4, 6)
+MIN_SCALE, MAX_SCALE = 1.05, 6.0
 
 
 class TopazError(RuntimeError):
@@ -252,7 +257,7 @@ class _scale_override:
     the user's settings are never touched.
     """
 
-    def __init__(self, scale: Optional[int]):
+    def __init__(self, scale: Optional[float]):
         self.scale = scale
         self.prev: dict[str, Optional[str]] = {}
         self.active = False
@@ -289,7 +294,7 @@ class _scale_override:
 
 
 def run_topaz(src: str, out_dir: str, *,
-              scale: Optional[int] = None,
+              scale: Optional[float] = None,
               enhancements: tuple[str, ...] = ("upscale",),
               model: Optional[str] = None,
               override: bool = False,
@@ -326,6 +331,9 @@ def run_topaz(src: str, out_dir: str, *,
     if model is not None and model not in UPSCALE_MODELS:
         raise ValueError(f"unknown upscale model: {model!r} "
                          f"(known: {', '.join(UPSCALE_MODELS)})")
+    if scale is not None and not (MIN_SCALE <= scale <= MAX_SCALE):
+        raise ValueError(
+            f"scale must be between {MIN_SCALE} and {MAX_SCALE}, got {scale}")
 
     cmd = [exe, "--output", to_native_path(out_dir),
            "--format", image_format, "--quality", str(quality)]
@@ -372,11 +380,16 @@ def run_topaz(src: str, out_dir: str, *,
     return str(max(produced, key=lambda p: p.stat().st_mtime))
 
 
+def _fmt_scale(scale: float) -> str:
+    """2.0 -> "2", 1.30 -> "1.3". Keeps whole factors reading as integers."""
+    return f"{float(scale):g}"
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
 
 
-def _variant_suffix(scale: Optional[int],
+def _variant_suffix(scale: Optional[float],
                     enhancements: tuple[str, ...],
                     model: Optional[str] = None,
                     override: bool = False,
@@ -399,7 +412,7 @@ def _variant_suffix(scale: Optional[int],
     if strength < 1.0:
         parts.append(f"s{int(round(strength * 100))}")
     if scale:
-        parts.append(f"{scale}x")
+        parts.append(_fmt_scale(scale) + "x")
     return "".join("-" + p for p in parts)
 
 
@@ -412,8 +425,10 @@ def _parse_variant(name: str, stem: str) -> dict:
     models = {_slug(m): m for m in UPSCALE_MODELS}
     scale, enh, model, override, strength = None, [], None, False, 1.0
     for t in tokens:
-        if re.fullmatch(r"\d+x", t):
-            scale = int(t[:-1])
+        if re.fullmatch(r"\d+(\.\d+)?x", t):
+            scale = float(t[:-1])
+            if scale.is_integer():
+                scale = int(scale)
         elif re.fullmatch(r"s\d{1,3}", t):
             strength = int(t[1:]) / 100
         elif t in models:
@@ -430,7 +445,7 @@ def _parse_variant(name: str, stem: str) -> dict:
     if strength < 1.0:
         label += f" · {int(round(strength * 100))}% strength"
     if scale:
-        label += f" · {scale}x"
+        label += f" · {_fmt_scale(scale)}x"
     return {"enhancements": enh, "scale": scale or "auto",
             "model": model, "override": override,
             "strength": strength, "label": label}
@@ -571,7 +586,7 @@ def fetch_source(row, dest_dir: str, *, server: Optional[str] = None) -> str:
 
 
 def upscale_photo(db, photo_id: int, *,
-                  scale: Optional[int] = None,
+                  scale: Optional[float] = None,
                   enhancements: tuple[str, ...] = ("upscale",),
                   model: Optional[str] = None,
                   override: bool = False,

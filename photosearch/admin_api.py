@@ -946,7 +946,9 @@ def admin_rerun_passes(req: RerunRequest):
 class UpscaleRequest(BaseModel):
     photo_ids: list[int]
     # None = let Topaz Autopilot choose (and never touch the user's settings).
-    scale: Optional[int] = None
+    # Any decimal in [1.05, 6]: the planner asks for exactly the factor a
+    # plan needs rather than rounding up to a whole number.
+    scale: Optional[float] = None
     enhancements: list[str] = ["upscale"]
     # None = Autopilot's own pick (usually "High Fidelity V2").
     model: Optional[str] = None

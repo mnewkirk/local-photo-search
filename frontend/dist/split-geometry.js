@@ -31,6 +31,8 @@
 
   // A 10-foot ceiling. Past this the arrangement is not a wall piece.
   var MAX_SPAN_IN = 120;
+  // Topaz's ceiling for the Autopilot factor.
+  var MAX_UPSCALE = 6;
   // Float slop when comparing a computed crop against the user's allowance.
   var CROP_EPS = 0.0001;
 
@@ -378,21 +380,27 @@
   }
 
   /**
-   * Smallest Topaz scale (2/4/6) that reaches the required pixel dimensions.
-   * Returns null when even 6x falls short, so the UI can say so rather than
-   * offering an upscale that would not fix anything.
+   * The upscale factor this plan actually needs.
+   *
+   * Topaz takes arbitrary decimal factors (verified: 1.3 on a 3660x2997 source
+   * gives exactly 4758x3896), so ask for what is required rather than rounding
+   * up to the next rung of a 2/4/6 ladder. A plan that needs 1.3x should not
+   * pay for 2x — that is 2.4x the pixels, and every one of them carries
+   * synthesized texture the plan never asked for.
+   *
+   * Rounded UP to a tenth so the result clears the floor rather than landing
+   * a hair under it. Returns null past MAX_UPSCALE, so the UI can say a plan is
+   * out of reach instead of offering an upscale that would not fix it.
    */
   function upscaleFor(need) {
-    var options = [2, 4, 6];
-    for (var i = 0; i < options.length; i++) {
-      if (options[i] >= need.k) return options[i];
-    }
-    return null;
+    var k = Math.ceil(need.k * 10) / 10;
+    if (k <= 1) return null;              // already enough resolution
+    return k <= MAX_UPSCALE ? k : null;
   }
 
   return {
     SIZES: SIZES, GRIDS: GRIDS, DPIS: DPIS, CROPS: CROPS,
-    MAX_SPAN_IN: MAX_SPAN_IN, DEFAULTS: DEFAULTS,
+    MAX_SPAN_IN: MAX_SPAN_IN, MAX_UPSCALE: MAX_UPSCALE, DEFAULTS: DEFAULTS,
     plan: plan, panelRects: panelRects, needPx: needPx,
     candidates: candidates, reachable: reachable, bestAlternative: bestAlternative,
     diagnose: diagnose, needSentence: needSentence, reachAtDpi: reachAtDpi,

@@ -535,6 +535,52 @@ def test_strength_is_part_of_the_variant(fake_cli, tmp_path, monkeypatch):
     assert by["DSC3-topaz-upscale.JPG"]["strength"] == 1.0
 
 
+def test_fractional_scale_is_accepted_and_named(fake_cli, tmp_path, monkeypatch):
+    """Topaz's Autopilot factor takes decimals (verified: 1.3 on a 3660x2997
+    source gave exactly 4758x3896), so a plan needing 1.3x asks for 1.3x rather
+    than over-upscaling to 2x."""
+    orig = tmp_path / "lib" / "DSC8.JPG"
+    orig.parent.mkdir(parents=True)
+    orig.write_bytes(b"original")
+    db, pid = _db_with_photo(tmp_path, str(orig))
+    monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(tmp_path / "exports"))
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    monkeypatch.setattr(U.subprocess, "run", _runner(produce="DSC8.JPG"))
+    try:
+        a = U.upscale_photo(db, pid, scale=1.3)
+        b = U.upscale_photo(db, pid, scale=2)
+        listed = U.list_exports(db, pid)
+    finally:
+        db.close()
+
+    # Whole factors still read as integers; fractional ones keep their decimal.
+    assert os.path.basename(a["output"]) == "DSC8-topaz-upscale-1.3x.JPG"
+    assert os.path.basename(b["output"]) == "DSC8-topaz-upscale-2x.JPG"
+    by = {os.path.basename(x["output"]): x for x in listed}
+    assert by["DSC8-topaz-upscale-1.3x.JPG"]["scale"] == 1.3
+    assert by["DSC8-topaz-upscale-2x.JPG"]["scale"] == 2
+
+
+@pytest.mark.parametrize("bad", [0.5, 1.0, 6.5, 12])
+def test_scale_outside_the_supported_range_is_rejected(fake_cli, tmp_path,
+                                                       monkeypatch, bad):
+    monkeypatch.setattr(U.subprocess, "run", _runner())
+    src = tmp_path / "in.jpg"; src.write_bytes(b"x")
+    with pytest.raises(ValueError, match="scale must be between"):
+        U.run_topaz(str(src), str(tmp_path / "out"), scale=bad)
+
+
+def test_scale_override_writes_the_fractional_factor(monkeypatch):
+    """The registry value is a string, so a decimal must survive it intact."""
+    writes = []
+    monkeypatch.setattr(U, "is_wsl", lambda: True)
+    monkeypatch.setattr(U, "_reg_read", lambda n: "2")
+    monkeypatch.setattr(U, "_reg_write",
+                        lambda n, v: (writes.append((n, v)), True)[1])
+    with U._scale_override(1.3):
+        assert (U._REG_FACTOR, "1.3") in writes
+
+
 def test_upscale_photo_skips_existing(fake_cli, tmp_path, monkeypatch):
     orig = tmp_path / "lib" / "IMG_2.jpg"
     orig.parent.mkdir(parents=True)

@@ -409,20 +409,33 @@ describe('diagnose', () => {
 });
 
 describe('upscale integration', () => {
-  test('picks the smallest Topaz scale that reaches the requirement', () => {
-    expect(G.upscaleFor({ k: 1.4 })).toBe(2);
+  test('asks for the factor actually needed, not the next rung', () => {
+    // Topaz takes arbitrary decimals, so a plan needing 1.3x should ask for
+    // 1.3x rather than 2x — the latter is 2.4x the pixels, all of them
+    // carrying synthesized texture the plan never wanted.
+    expect(G.upscaleFor({ k: 1.3 })).toBe(1.3);
     expect(G.upscaleFor({ k: 2 })).toBe(2);
-    expect(G.upscaleFor({ k: 2.7 })).toBe(4);
-    expect(G.upscaleFor({ k: 4.1 })).toBe(6);
+    expect(G.upscaleFor({ k: 2.7 })).toBe(2.7);
   });
 
-  test('returns null when even 6x falls short, rather than a useless offer', () => {
+  test('rounds up to a tenth so the result clears the floor', () => {
+    expect(G.upscaleFor({ k: 1.21 })).toBe(1.3);
+    expect(G.upscaleFor({ k: 1.999 })).toBe(2);
+  });
+
+  test('returns null when the source is already big enough', () => {
+    expect(G.upscaleFor({ k: 1 })).toBeNull();
+    expect(G.upscaleFor({ k: 0.6 })).toBeNull();
+  });
+
+  test('returns null past the ceiling, rather than a useless offer', () => {
     expect(G.upscaleFor({ k: 9 })).toBeNull();
+    expect(G.upscaleFor({ k: G.MAX_UPSCALE })).toBe(G.MAX_UPSCALE);
   });
 
-  test('the worked example needs a 4x upscale to reach 300 dpi', () => {
+  test('the worked example needs 2.7x to reach 300 dpi', () => {
     const P = G.plan(IMG, CAND, OPTS);
-    expect(G.upscaleFor(G.needPx(IMG, P, 300))).toBe(4);
+    expect(G.upscaleFor(G.needPx(IMG, P, 300))).toBe(2.7);
   });
 
   test('an upscaled source actually clears the floor that blocked it', () => {
@@ -430,8 +443,12 @@ describe('upscale integration', () => {
     expect(G.candidates(IMG, o).length).toBe(0);
     const d = G.diagnose(IMG, o);
     const scale = G.upscaleFor(d.upscale);
-    const bigger = { w: IMG.w * scale, h: IMG.h * scale };
+    const bigger = { w: Math.round(IMG.w * scale), h: Math.round(IMG.h * scale) };
     expect(G.candidates(bigger, o).length).toBeGreaterThan(0);
+    // ...and not wastefully: one tenth less would not have been enough.
+    const short = { w: Math.round(IMG.w * (scale - 0.1)),
+                    h: Math.round(IMG.h * (scale - 0.1)) };
+    expect(G.candidates(short, o).length).toBe(0);
   });
 });
 

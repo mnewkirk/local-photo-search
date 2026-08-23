@@ -801,6 +801,20 @@ Two upstream CLI bugs this works around:
    preference is global state shared with the Topaz GUI. **`--scale` omitted
    (the default) touches nothing** and just uses whatever Autopilot would pick.
 
+   **The factor is not limited to whole numbers.** That registry preference
+   takes arbitrary decimals — verified: 1.3 on a 3660×2997 source produced
+   exactly 4758×3896, and 1.3 on a 6528×4352 photo produced 8486×5658. So
+   `scale` is a **float** in `[MIN_SCALE, MAX_SCALE]` = `[1.05, 6.0]`; `SCALES`
+   is only the list of UI presets, not a constraint.
+
+   This matters because print plans rarely need a whole factor. Sweeping every
+   blocked arrangement of one 28 MP photo, the required factors ran **1.1× to
+   1.9× — not one needed 2×**. Rounding those up to a 2/4/6 ladder means 2.4×
+   the pixels, every one carrying synthesized texture the plan never asked for
+   (and 2.4× the file). `/split`'s diagnostic therefore asks for the exact
+   factor; `upscaleFor` rounds up to a tenth so the result clears the floor
+   rather than landing a hair under it.
+
 ### Artifacts: Autopilot merges its own passes in
 
 **`--upscale` alone does not mean "only upscale".** Without `--override`, the
