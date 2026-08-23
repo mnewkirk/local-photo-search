@@ -5308,9 +5308,14 @@ def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, bo
               help="--override replaces Autopilot's settings instead of "
                    "merging into them. Use it to stop Autopilot's Sharpen "
                    "from riding along, a common source of artifacts.")
+@click.option("--strength", type=float, default=1.0, show_default=True,
+              help="Dial the enhancement back by blending toward a plain "
+                   "resize. 1.0 = full Topaz, 0.5 = half. Topaz has no "
+                   "working strength control of its own.")
 @click.option("--overwrite", is_flag=True, default=False,
               help="Re-export photos that already have an output file.")
-def upscale_cmd(photo_ids, db, scale, enhancements, model, override, overwrite):
+def upscale_cmd(photo_ids, db, scale, enhancements, model, override, strength,
+                overwrite):
     """Upscale photos locally with Topaz Photo AI into the export tree.
 
     Runs the Topaz Photo AI CLI on THIS machine -- the Topaz cloud API is never
@@ -5326,6 +5331,8 @@ def upscale_cmd(photo_ids, db, scale, enhancements, model, override, overwrite):
 
     if scale is not None and scale not in U.SCALES:
         raise click.ClickException(f"--scale must be one of {list(U.SCALES)}")
+    if not 0.0 <= strength <= 1.0:
+        raise click.ClickException("--strength must be between 0 and 1")
     if model is not None and model not in U.UPSCALE_MODELS:
         raise click.ClickException(
             "--model must be one of: " + ", ".join(U.UPSCALE_MODELS))
@@ -5342,6 +5349,7 @@ def upscale_cmd(photo_ids, db, scale, enhancements, model, override, overwrite):
                 res = U.upscale_photo(pdb, pid, scale=scale,
                                       enhancements=tuple(enhancements),
                                       model=model, override=override,
+                                      strength=strength,
                                       overwrite=overwrite)
             except Exception as e:
                 failures += 1

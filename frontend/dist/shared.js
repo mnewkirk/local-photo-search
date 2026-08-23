@@ -224,6 +224,8 @@
     // Autopilot merges its own picks into every run — in practice a
     // "Sharpen Strong" pass that haloes an already-upscaled image. On by
     // default because that is usually what you want for a clean upscale.
+    var _upStrength = useState('100');   // percent; Topaz itself has no dial
+    var upStrength = _upStrength[0];     var setUpStrength = _upStrength[1];
     var _upOnly = useState(true);
     var upOnly = _upOnly[0];             var setUpOnly = _upOnly[1];
     var _upPrior = useState(null);       // null = not loaded yet, [] = none
@@ -271,6 +273,7 @@
           enhancements: enh,
           model: upModel || null,
           override: upOnly,
+          strength: parseInt(upStrength, 10) / 100,
         }),
       }).then(function (r) {
         return r.json().then(function (d) { return { ok: r.ok, d: d }; });
@@ -1772,6 +1775,18 @@
                   e('option', { value: '2' }, '2x'),
                   e('option', { value: '4' }, '4x'),
                   e('option', { value: '6' }, '6x')
+                ),
+                e('span', { style: { color: 'var(--text-muted)', marginLeft: 6 } }, 'Strength'),
+                e('select', {
+                  value: upStrength,
+                  onChange: function (ev) { setUpStrength(ev.target.value); },
+                  style: { fontSize: 12 },
+                  title: 'Blends the result toward a plain resize. Topaz has no '
+                       + 'working strength control, so this is applied afterward.',
+                },
+                  ['100', '75', '50', '25'].map(function (v) {
+                    return e('option', { key: v, value: v }, v + '%');
+                  })
                 ),
                 e('span', { style: { color: 'var(--text-muted)', marginLeft: 6 } }, 'Model'),
                 e('select', {

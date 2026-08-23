@@ -439,6 +439,62 @@ def test_model_and_override_are_part_of_the_variant(fake_cli, tmp_path, monkeypa
     assert "no autopilot" in by_name[names[2]]["label"]
 
 
+def test_blend_strength_is_monotonic(tmp_path):
+    """The dial must actually span plain-resize to full-Topaz. Topaz has no
+    working strength control, so this is the only one there is."""
+    from PIL import Image
+    import numpy as np
+
+    src = tmp_path / "src.jpg"
+    Image.new("RGB", (64, 64), (0, 0, 0)).save(src)
+    topaz = tmp_path / "topaz.jpg"
+    Image.new("RGB", (128, 128), (255, 255, 255)).save(topaz)
+
+    means = []
+    for s in (0.0, 0.25, 0.5, 0.75, 1.0):
+        out = tmp_path / f"b{int(s * 100)}.jpg"
+        U.blend_strength(str(topaz), str(src), s, str(out))
+        with Image.open(out) as im:
+            assert im.size == (128, 128)      # keeps the Topaz dimensions
+            means.append(float(np.asarray(im.convert("L")).mean()))
+
+    assert means[0] < 5 and means[-1] > 250   # endpoints are the two sources
+    assert all(a < b for a, b in zip(means, means[1:]))   # monotonic
+
+
+def test_blend_strength_rejects_out_of_range(tmp_path):
+    from PIL import Image
+    src = tmp_path / "s.jpg"; Image.new("RGB", (8, 8)).save(src)
+    with pytest.raises(ValueError, match=r"strength must be in \[0, 1\]"):
+        U.blend_strength(str(src), str(src), 1.5, str(tmp_path / "o.jpg"))
+
+
+def test_strength_is_part_of_the_variant(fake_cli, tmp_path, monkeypatch):
+    orig = tmp_path / "lib" / "DSC3.JPG"
+    orig.parent.mkdir(parents=True)
+    orig.write_bytes(b"original")
+    db, pid = _db_with_photo(tmp_path, str(orig))
+    monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(tmp_path / "exports"))
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    monkeypatch.setattr(U.subprocess, "run", _runner(produce="DSC3.JPG"))
+    # Full strength short-circuits the blend, so no real images are needed.
+    monkeypatch.setattr(U, "blend_strength",
+                        lambda t, s, st, o, **k: (Path(o).write_bytes(b"x"), o)[1])
+    try:
+        full = U.upscale_photo(db, pid)
+        half = U.upscale_photo(db, pid, strength=0.5)
+        listed = U.list_exports(db, pid)
+    finally:
+        db.close()
+
+    assert os.path.basename(full["output"]) == "DSC3-topaz-upscale.JPG"
+    assert os.path.basename(half["output"]) == "DSC3-topaz-upscale-s50.JPG"
+    by = {os.path.basename(x["output"]): x for x in listed}
+    assert by["DSC3-topaz-upscale-s50.JPG"]["strength"] == 0.5
+    assert "50% strength" in by["DSC3-topaz-upscale-s50.JPG"]["label"]
+    assert by["DSC3-topaz-upscale.JPG"]["strength"] == 1.0
+
+
 def test_upscale_photo_skips_existing(fake_cli, tmp_path, monkeypatch):
     orig = tmp_path / "lib" / "IMG_2.jpg"
     orig.parent.mkdir(parents=True)

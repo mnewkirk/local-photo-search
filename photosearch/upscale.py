@@ -379,7 +379,8 @@ def _slug(text: str) -> str:
 def _variant_suffix(scale: Optional[int],
                     enhancements: tuple[str, ...],
                     model: Optional[str] = None,
-                    override: bool = False) -> str:
+                    override: bool = False,
+                    strength: float = 1.0) -> str:
     """Encode the chosen options into the filename.
 
     Two different option sets must not collide on one path — otherwise the
@@ -395,6 +396,8 @@ def _variant_suffix(scale: Optional[int],
         parts.append(_slug(model))
     if override:
         parts.append("only")      # Autopilot's extras suppressed
+    if strength < 1.0:
+        parts.append(f"s{int(round(strength * 100))}")
     if scale:
         parts.append(f"{scale}x")
     return "".join("-" + p for p in parts)
@@ -407,10 +410,12 @@ def _parse_variant(name: str, stem: str) -> dict:
     prefix = f"{stem}-topaz"
     tokens = [t for t in body[len(prefix):].split("-") if t]
     models = {_slug(m): m for m in UPSCALE_MODELS}
-    scale, enh, model, override = None, [], None, False
+    scale, enh, model, override, strength = None, [], None, False, 1.0
     for t in tokens:
         if re.fullmatch(r"\d+x", t):
             scale = int(t[:-1])
+        elif re.fullmatch(r"s\d{1,3}", t):
+            strength = int(t[1:]) / 100
         elif t in models:
             model = models[t]
         elif t == "only":
@@ -422,10 +427,13 @@ def _parse_variant(name: str, stem: str) -> dict:
         label += f" · {model}"
     if override:
         label += " (no autopilot)"
+    if strength < 1.0:
+        label += f" · {int(round(strength * 100))}% strength"
     if scale:
         label += f" · {scale}x"
     return {"enhancements": enh, "scale": scale or "auto",
-            "model": model, "override": override, "label": label}
+            "model": model, "override": override,
+            "strength": strength, "label": label}
 
 
 def list_exports(db, photo_id: int) -> list[dict]:
@@ -469,6 +477,49 @@ def _dest_dir(row) -> Path:
     return export_root() / (year or "undated")
 
 
+def blend_strength(topaz_path: str, src_path: str, strength: float,
+                   out_path: str, quality: int = 95) -> str:
+    """Dial the enhancement back by compositing toward a plain resize.
+
+    Topaz has no working strength control from the CLI — ``--upscale param1=``
+    is rejected as a string (the ``scale=N`` bug), and the Autopilot registry
+    preferences were measured to do nothing: ``autopilotOpacityValue=50``
+    produced output identical to 100, and the param-strength keys moved the
+    result 5%. Meanwhile the model *is* the artifact source on smooth,
+    detailed subjects — it synthesizes micro-texture at roughly 13x the
+    original's high-frequency energy.
+
+    So the dial lives here: resize the original to the Topaz result's size with
+    plain Lanczos and cross-fade. ``strength=1`` is pure Topaz, ``0`` is pure
+    resize, ``0.5`` is half. Done in horizontal strips because a 130 MP pair
+    would otherwise want well over a gigabyte at once.
+    """
+    from PIL import Image
+
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError(f"strength must be in [0, 1], got {strength}")
+
+    prev = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(topaz_path) as tp, Image.open(src_path) as orig:
+            tp = tp.convert("RGB")
+            w, h = tp.size
+            base = orig.convert("RGB").resize((w, h), Image.LANCZOS)
+            out = Image.new("RGB", (w, h))
+            strip = max(1, 8_000_000 // max(w, 1))     # ~8 MP per strip
+            for top in range(0, h, strip):
+                bot = min(h, top + strip)
+                box = (0, top, w, bot)
+                out.paste(
+                    Image.blend(base.crop(box), tp.crop(box), strength), box)
+            base.close()
+            out.save(out_path, quality=quality, subsampling=0)
+        return out_path
+    finally:
+        Image.MAX_IMAGE_PIXELS = prev
+
+
 def fetch_source(row, dest_dir: str, *, server: Optional[str] = None) -> str:
     """Get the full-resolution original onto this machine and return its path.
 
@@ -502,6 +553,7 @@ def upscale_photo(db, photo_id: int, *,
                   enhancements: tuple[str, ...] = ("upscale",),
                   model: Optional[str] = None,
                   override: bool = False,
+                  strength: float = 1.0,
                   server: Optional[str] = None,
                   overwrite: bool = False) -> dict:
     """Upscale one library photo into the export tree.
@@ -520,13 +572,13 @@ def upscale_photo(db, photo_id: int, *,
     dest_dir = _dest_dir(row)
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem, ext = os.path.splitext(src_name)
-    variant = _variant_suffix(scale, enhancements, model, override)
+    variant = _variant_suffix(scale, enhancements, model, override, strength)
     final = dest_dir / f"{stem}-topaz{variant}{ext}"
     if final.exists() and not overwrite:
         return {"photo_id": photo_id, "skipped": True,
                 "reason": "already exported", "scale": scale or "auto",
                 "enhancements": list(enhancements),
-                "model": model, "override": override,
+                "model": model, "override": override, "strength": strength,
                 "label": _parse_variant(final.name, stem)["label"],
                 **_describe_output(final)}
 
@@ -541,6 +593,10 @@ def upscale_photo(db, photo_id: int, *,
         produced = run_topaz(src, str(staging / "out"), scale=scale,
                              enhancements=enhancements, model=model,
                              override=override)
+        if strength < 1.0:
+            # Topaz has no working strength control, so dial it back here.
+            blended = str(staging / f"blend{Path(produced).suffix}")
+            produced = blend_strength(produced, src, strength, blended)
         shutil.move(produced, final)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -548,6 +604,6 @@ def upscale_photo(db, photo_id: int, *,
     return {"photo_id": photo_id, "skipped": False,
             "bytes": final.stat().st_size, "scale": scale or "auto",
             "enhancements": list(enhancements),
-            "model": model, "override": override,
+            "model": model, "override": override, "strength": strength,
             "label": _parse_variant(final.name, stem)["label"],
             **_describe_output(final)}

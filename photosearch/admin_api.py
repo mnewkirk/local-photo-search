@@ -953,6 +953,9 @@ class UpscaleRequest(BaseModel):
     # True replaces Autopilot's settings rather than merging into them, which
     # is what stops its "Sharpen Strong" from riding along and adding halos.
     override: bool = False
+    # Topaz has no working strength control, so this blends the result
+    # toward a plain resize afterward. 1.0 = full Topaz.
+    strength: float = 1.0
     overwrite: bool = False
 
 
@@ -990,6 +993,7 @@ def admin_upscale_photo(req: UpscaleRequest):
                     db, pid, scale=req.scale,
                     enhancements=tuple(req.enhancements),
                     model=req.model, override=req.override,
+                    strength=req.strength,
                     overwrite=req.overwrite))
             except Exception as e:
                 errors.append({"photo_id": pid, "error": str(e)})

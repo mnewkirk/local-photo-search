@@ -828,27 +828,43 @@ The two levers, on `upscale_photo` / `run_topaz`, the CLI (`--model`,
 - **`model=...`** → `--upscale model=<name>`. Unlike `scale`, the CLI serializes
   this correctly, so it needs no registry workaround.
 
-**Measured on a real 7008×4672 photo** (Laplacian variance of a 100% crop of the
-most detailed region — higher means more high-frequency energy, i.e. crunch):
+**Measured on a real 7008×4672 photo** — Laplacian variance of a 200% crop,
+higher meaning more high-frequency energy (crunch). **Where you measure decides
+the answer**, which is the trap here:
 
-| variant | lapvar | vs bicubic |
+| variant | high-detail corner | frame centre |
 |---|---|---|
-| original, plain bicubic | 35.8 | 1.0× |
-| Autopilot default (Sharpen on) | 135.8 | 3.8× |
-| **Sharpen off, High Fidelity V2** | **77.3** | **2.2×** |
-| Sharpen off, Standard | 120.3 | 3.4× |
-| Sharpen off, Standard V2 | 107.0 | 3.0× |
+| original, plain resize | 35.8 | 108.6 |
+| Autopilot default (Sharpen on) | 135.8 | 1448.8 |
+| Sharpen off, High Fidelity V2 | **77.3** | **1453.1** |
+| Sharpen off, Standard | 120.3 | 3299.0 |
+| Sharpen off, Standard V2 | 107.0 | 2737.4 |
 
-Turning Sharpen off cuts high-frequency energy **43%** (135.8 → 77.3) — that is
-the artifact fix. Note **`Standard` is *crunchier* than `High Fidelity V2`**,
-not milder as its name suggests, so the right default is Autopilot's own model
-choice with Sharpen disabled. Disabling noise/lighting/color as well changes
-nothing measurable (identical 77.3), so they are not worth turning off.
+On a high-contrast corner, disabling Sharpen cuts crunch 43%. **At the centre it
+changes nothing** (1448.8 → 1453.1) — there the artifacts come from the upscale
+*model itself*, synthesizing micro-texture at ~13× the original's
+high-frequency energy on rock and scree. Do not generalize from one crop; the
+first pass at this did, and was wrong.
 
-**Strength cannot be set from the CLI.** `--upscale param1=0.5` is serialized as
-a string and rejected with the same `type_error.302` as `scale=N`. The only
-levers are the model, the enabled/disabled set, and the Autopilot registry
-preferences (`autopilotUpscalingParam1Strength`, `autopilotOpacityValue`).
+Two things that stay true everywhere: **`Standard` is *crunchier* than `High
+Fidelity V2`** despite the name, so Autopilot's own model choice is the right
+default; and disabling noise/lighting/color changes nothing measurable.
+
+### Strength: Topaz has none, so we blend
+
+Every Topaz-side strength lever was measured and rejected:
+
+- `--upscale param1=0.5` → rejected as a string, same `type_error.302` as `scale=N`.
+- `autopilotOpacityValue=50` → output **identical** to 100. No effect.
+- `autopilotUpscalingParam1/2Strength` at minimum → 1377.3 vs 1453.1, a 5% move.
+
+So `blend_strength()` composites the Topaz result toward a plain Lanczos resize
+of the original — `strength=1` full Topaz, `0` plain resize. Measured on the
+same centre window: 108.6 (0%) → 226.2 (25%) → 589.1 (50%) → 1042.4 (75%) →
+1453.1 (100%). Monotonic across the whole range, and the only strength control
+that exists. Done in horizontal strips, since a 130 MP pair would otherwise want
+over a gigabyte at once. Exposed as `--strength` / `strength` / a UI dropdown,
+and part of the variant filename (`-s50`).
 
 `UPSCALE_MODELS` was verified by running each name through the CLI and checking
 an output file appeared: **Standard, Standard V2, High Fidelity, High Fidelity
