@@ -165,7 +165,33 @@
 
     function Sidebar(props) {
       const s = props.s, set = props.set;
+      const { ups, source, setSource, img, origImg } = props;
+      const mp = (o) => o ? (o.w * o.h / 1e6).toFixed(1) + ' MP' : '';
       return e('div', null,
+        // Source first: it sets the resolution everything below is judged
+        // against, so it is a planning input, not an export detail.
+        e('div', { className: 'card' },
+          e('h2', null, 'Source'),
+          e('select', {
+            value: source,
+            onChange: (ev) => setSource(ev.target.value),
+            style: { width: '100%', background: 'var(--surface2)',
+                     color: 'var(--text)', border: '1px solid var(--border)',
+                     borderRadius: 6, padding: '7px 8px', fontSize: 13,
+                     fontFamily: 'inherit' },
+          },
+            e('option', { value: '' },
+              'Original' + (origImg ? ' — ' + origImg.w + '×' + origImg.h : '')),
+            ups.map((u) => e('option', { key: u.output, value: u.output },
+              u.label + ' — ' + u.width + '×' + u.height))),
+          img && e('p', { className: 'hint' },
+            mp(img) + ' available' +
+            (origImg && img.w > origImg.w
+              ? ' · ' + G.fmt(img.w / origImg.w) + '× the original'
+              : '')),
+          ups.length === 0 && e('p', { className: 'hint' },
+            'No upscales yet. A wall piece usually needs one — upscale from the ' +
+            'photo view, or use the button in the diagnostic below.')),
         e('div', { className: 'card' },
           e('h2', null, 'Wall'),
           e('div', { className: 'field' },
@@ -365,21 +391,12 @@
     // --- export -------------------------------------------------------------
 
     function ExportBar(props) {
-      const { photoId, cand, s, P, img } = props;
+      // The source lives on the page, not here: it decides the resolution the
+      // whole plan is computed against, not merely what the export reads.
+      const { photoId, cand, s, source } = props;
       const [busy, setBusy] = useState(false);
       const [res, setRes] = useState(null);
       const [err, setErr] = useState(null);
-      const [ups, setUps] = useState([]);
-      const [source, setSource] = useState('');
-
-      // Offer any prior Topaz export as the source — a wall piece is usually
-      // short on resolution, and the upscale is what fixes it.
-      useEffect(() => {
-        fetch(API + '/api/admin/upscaled-list?photo_id=' + photoId)
-          .then((r) => (r.ok ? r.json() : { exports: [] }))
-          .then((d) => setUps(d.exports || []))
-          .catch(() => setUps([]));
-      }, [photoId]);
 
       const run = () => {
         setBusy(true); setErr(null); setRes(null);
@@ -400,15 +417,6 @@
       return e('div', { style: { width: '100%', marginTop: 4 } },
         e('div', { style: { display: 'flex', gap: 8, alignItems: 'center',
                             flexWrap: 'wrap', justifyContent: 'center' } },
-          ups.length > 0 && e('select', {
-            value: source, onChange: (ev) => setSource(ev.target.value),
-            style: { background: 'var(--surface2)', color: 'var(--text)',
-                     border: '1px solid var(--border)', borderRadius: 6,
-                     padding: '6px 8px', fontSize: 12, fontFamily: 'inherit' },
-          },
-            e('option', { value: '' }, 'Source: original'),
-            ups.map((u) => e('option', { key: u.output, value: u.output },
-              'Source: ' + u.label + ' (' + (u.bytes / 1e6).toFixed(0) + ' MB)'))),
           e('button', { className: 'primary', onClick: run, disabled: busy },
             busy ? 'Exporting…' : 'Export ' + (cand.cols * cand.rows) + ' panels')),
 
@@ -433,7 +441,9 @@
     function SplitPage() {
       const photoId = qs('photo') ? Number(qs('photo')) : null;
       const [photo, setPhoto] = useState(null);
-      const [img, setImg] = useState(null);
+      const [origImg, setOrigImg] = useState(null);   // the library original
+      const [ups, setUps] = useState([]);             // prior Topaz exports
+      const [source, setSource] = useState('');       // '' = original
       const [src, setSrc] = useState(null);
       const [sel, setSel] = useState(0);
       const [s, setS] = useState(Object.assign({}, G.DEFAULTS));
@@ -441,6 +451,18 @@
 
       // Load the photo's real pixel dimensions — every number on this page
       // depends on them, so we read them off the image rather than the DB.
+      // Prior upscales are planning inputs, not just export inputs: picking a
+      // 2x source doubles the resolution and changes which arrangements clear
+      // the dpi floor.
+      const loadUps = useCallback(() => {
+        if (!photoId) return;
+        fetch(API + '/api/admin/upscaled-list?photo_id=' + photoId)
+          .then((r) => (r.ok ? r.json() : { exports: [] }))
+          .then((d) => setUps((d.exports || []).filter((u) => u.width && u.height)))
+          .catch(() => setUps([]));
+      }, [photoId]);
+      useEffect(() => { loadUps(); }, [loadUps]);
+
       useEffect(() => {
         if (!photoId) return;
         fetch(API + '/api/photos/' + photoId)
@@ -455,10 +477,13 @@
           .then((r) => r.json())
           .then((p) => {
             if (p && p.image_width && p.image_height) {
-              setImg({ w: p.image_width, h: p.image_height });
+              setOrigImg({ w: p.image_width, h: p.image_height });
             }
           }).catch(() => {});
       }, [photoId]);
+
+      const chosen = ups.find((u) => u.output === source) || null;
+      const img = chosen ? { w: chosen.width, h: chosen.height } : origImg;
 
       const cands = useMemo(() => (img ? G.candidates(img, s) : []), [img, s]);
       const cand = cands.length ? cands[Math.min(sel, cands.length - 1)] : null;
@@ -481,7 +506,8 @@
       return e('div', null,
         e(PS.SharedHeader, { activePage: 'split' }),
         e('div', { className: 'shell' },
-          e(Sidebar, { s: s, set: set, img: img }),
+          e(Sidebar, { s: s, set: set, img: img, ups: ups, source: source,
+                       setSource: setSource, origImg: origImg }),
           e('div', null,
             !img && e('div', { className: 'card' }, e('p', { className: 'empty' }, 'Loading photo…')),
 
@@ -504,17 +530,17 @@
                 e('div', { className: 'spec' }, 'Binds on ', e('b', null, P.bindingAxis))),
               e('p', { className: 'hint' }, 'Drag the preview to reposition the crop.'),
               e(ExportBar, {
-                photoId: photoId, cand: cand.cand, s: s, P: P, img: img,
+                photoId: photoId, cand: cand.cand, s: s, source: source,
               })),
 
             img && diag && e(Diagnostic, {
               d: diag, img: img, s: s, set: set, photoId: photoId,
               onSelectCand: () => {},
-              onUpscaled: () => {
-                // The export is a new file, not a new library photo, so the
-                // planner just adopts the larger dimensions in place.
-                const k = G.upscaleFor(diag.upscale);
-                setImg({ w: img.w * k, h: img.h * k });
+              onUpscaled: (res) => {
+                // Adopt the file that was just written as the planning source,
+                // so its real dimensions drive the plan (not an assumed factor).
+                loadUps();
+                if (res && res.output) setSource(res.output);
               },
             }),
 

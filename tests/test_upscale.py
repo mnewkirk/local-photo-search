@@ -335,6 +335,33 @@ def test_different_options_do_not_collide(fake_cli, tmp_path, monkeypatch):
         "upscale", "upscale, lighting", "upscale · 2x"}
 
 
+def test_list_exports_reports_pixel_dimensions(tmp_path, monkeypatch):
+    """The Split planner computes against these: choosing a 2x export as its
+    source doubles the resolution and changes which arrangements are reachable,
+    so a listing without dimensions makes the picker inert."""
+    from PIL import Image
+
+    orig = tmp_path / "lib" / "DSC7.JPG"
+    orig.parent.mkdir(parents=True)
+    Image.new("RGB", (400, 300)).save(orig)
+    db, pid = _db_with_photo(tmp_path, str(orig))
+    export = tmp_path / "exports"
+    (export / "2024").mkdir(parents=True)
+    Image.new("RGB", (800, 600)).save(export / "2024" / "DSC7-topaz-upscale-2x.JPG")
+    # A non-image with the right name must not break the listing.
+    (export / "2024" / "DSC7-topaz-upscale-bogus.JPG").write_bytes(b"not an image")
+    monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(export))
+    try:
+        listed = {os.path.basename(x["output"]): x for x in U.list_exports(db, pid)}
+    finally:
+        db.close()
+
+    good = listed["DSC7-topaz-upscale-2x.JPG"]
+    assert (good["width"], good["height"]) == (800, 600)
+    bad = listed["DSC7-topaz-upscale-bogus.JPG"]
+    assert bad["width"] is None and bad["height"] is None
+
+
 def test_list_exports_empty_for_untouched_photo(tmp_path, monkeypatch):
     orig = tmp_path / "lib" / "DSC9.JPG"
     orig.parent.mkdir(parents=True)

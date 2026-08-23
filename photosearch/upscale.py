@@ -436,6 +436,27 @@ def _parse_variant(name: str, stem: str) -> dict:
             "strength": strength, "label": label}
 
 
+def _image_size(p: Path) -> dict:
+    """Pixel dimensions of an export, or Nones if unreadable.
+
+    The Split planner needs these: choosing a 2x upscale as its source doubles
+    the resolution available, which changes which arrangements clear the dpi
+    floor. Pillow parses the header lazily, so this does not decode the (often
+    100 MP+) image.
+    """
+    try:
+        from PIL import Image
+        prev = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = None
+        try:
+            with Image.open(p) as im:
+                return {"width": im.size[0], "height": im.size[1]}
+        finally:
+            Image.MAX_IMAGE_PIXELS = prev
+    except Exception:
+        return {"width": None, "height": None}
+
+
 def list_exports(db, photo_id: int) -> list[dict]:
     """Every prior export for one photo, newest first.
 
@@ -459,6 +480,7 @@ def list_exports(db, photo_id: int) -> list[dict]:
         out.append({"bytes": st.st_size,
                     "modified": datetime.fromtimestamp(st.st_mtime).isoformat(
                         timespec="seconds"),
+                    **_image_size(p),
                     **_parse_variant(p.name, stem), **_describe_output(p)})
     out.sort(key=lambda r: r["modified"], reverse=True)
     return out

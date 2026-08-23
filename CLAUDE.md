@@ -929,6 +929,15 @@ Two invariants worth not breaking:
   constraint when it was the height. (Note the handoff's "exactly one slack is
   zero" is off by one case: when the aspects match exactly, *both* are zero.)
 
+**The Source picker is a planning input, not an export detail.** It sits at the
+top of the sidebar and sets the resolution *everything else is judged against* —
+choosing a 2× upscale doubles the pixels, so arrangements that failed the dpi
+floor become reachable. Real example on a 7008×4672 photo: original → best is a
+26.5″ two-panel diptych; its 2× upscale → best is a **57.5″ × 34″ twelve-panel
+grid** at the same ~245 dpi. `list_exports` therefore returns `width`/`height`
+per export (Pillow parses the header lazily, so a 130 MP file is not decoded);
+without them the picker cannot drive the plan and is inert.
+
 **Upscaling is the payoff.** A wall piece spreads one file over many sheets, so
 dpi is the usual blocker, and `needPx` says precisely how much bigger the source
 must be. The diagnostic offers **"Upscale N× with Topaz"** using M30, where N is
