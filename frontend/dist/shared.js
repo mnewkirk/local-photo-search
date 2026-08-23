@@ -75,7 +75,7 @@
   // M15 — SharedHeader
   // =========================================================================
   // Props:
-  //   activePage  — 'search' | 'review' | 'faces' | 'merges' | 'collections' | 'map' | 'geotag' | 'status' | 'admin'
+  //   activePage  — 'search' | 'review' | 'faces' | 'merges' | 'collections' | 'book' | 'split' | 'map' | 'geotag' | 'status' | 'admin'
   //   children    — optional React nodes (search form, review controls, etc.)
   PS.SharedHeader = function SharedHeader(props) {
     var activePage = props.activePage || 'search';
@@ -88,6 +88,9 @@
       { href: '/merges',      label: 'Merges',      id: 'merges' },
       { href: '/collections', label: 'Collections', id: 'collections' },
       { href: '/book',        label: 'Books',       id: 'book' },
+      // Needs a photo, so a bare visit lands on its empty state — but it
+      // was otherwise reachable only from a photo's detail panel.
+      { href: '/split',       label: 'Split',       id: 'split' },
       { href: '/map',         label: 'Map',         id: 'map' },
       { href: '/geotag',      label: 'Geotag',      id: 'geotag' },
       { href: '/status',      label: 'Status',      id: 'status' },

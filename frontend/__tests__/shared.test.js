@@ -91,10 +91,11 @@ describe('PS.SharedHeader', () => {
   test('renders all nav links', () => {
     render(e(PS.SharedHeader, { activePage: 'search' }));
     const links = document.querySelectorAll('.nav-link');
-    expect(links.length).toBe(13);
+    expect(links.length).toBe(14);
     const labels = Array.from(links).map(l => l.textContent);
     expect(labels).toEqual(['Search', 'Review', 'Faces', 'Merges', 'Collections',
-      'Books', 'Map', 'Geotag', 'Status', 'Deploy', 'Maint', 'Vocab', 'Logs']);
+      'Books', 'Split', 'Map', 'Geotag', 'Status', 'Deploy', 'Maint', 'Vocab',
+      'Logs']);
   });
 
   test('marks active page with active class', () => {
@@ -112,8 +113,8 @@ describe('PS.SharedHeader', () => {
     const links = document.querySelectorAll('.nav-link');
     const hrefs = Array.from(links).map(l => l.getAttribute('href'));
     expect(hrefs).toEqual(['/', '/review', '/faces', '/merges', '/collections',
-      '/book', '/map', '/geotag', '/status', '/admin/deploy', '/admin/maintenance',
-      '/admin/vocab', '/logs']);
+      '/book', '/split', '/map', '/geotag', '/status', '/admin/deploy',
+      '/admin/maintenance', '/admin/vocab', '/logs']);
   });
 
   test('renders children inside header', () => {
