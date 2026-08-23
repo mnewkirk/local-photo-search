@@ -2647,6 +2647,81 @@ def _ask_available() -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# UI settings (server-side, so they survive a browser change)
+# ---------------------------------------------------------------------------
+
+# Namespaces a client may write, with a validator per key. An allowlist rather
+# than a free-for-all: these values drive geometry, and a bad one would render
+# the planner unusable in a way that is hard to back out of from the UI.
+_SETTING_VALIDATORS = {
+    "split": {
+        "wall":     lambda v: isinstance(v, (int, float)) and 6 <= v <= 240,
+        "gutter":   lambda v: isinstance(v, (int, float)) and 0 <= v <= 12,
+        "mode":     lambda v: v in ("window", "continue"),
+        "wallOnly": lambda v: isinstance(v, bool),
+        "minDpi":   lambda v: isinstance(v, (int, float)) and 30 <= v <= 1200,
+        "maxCrop":  lambda v: isinstance(v, (int, float)) and 0 <= v <= 1,
+        "sizes":    lambda v: v is None or (
+            isinstance(v, list) and all(isinstance(x, str) for x in v)),
+        "count":    lambda v: v == "any" or (
+            isinstance(v, int) and 1 <= v <= 64),
+    },
+}
+
+
+def _get_settings():
+    """Settings live in the SIDECAR file, not the replica DB — a replica sync
+    swaps the replica wholesale and would wipe them."""
+    from .settings import SettingsStore
+    return SettingsStore(_books_db_path)
+
+
+@app.get("/api/settings/{namespace}")
+def get_settings(namespace: str):
+    """Stored defaults for one page. Unknown namespaces return {} rather than
+    404 so a first visit is not an error case."""
+    if namespace not in _SETTING_VALIDATORS:
+        raise HTTPException(404, f"unknown settings namespace: {namespace}")
+    with _get_settings() as st:
+        return {"namespace": namespace, "values": st.get_all(namespace)}
+
+
+@app.put("/api/settings/{namespace}")
+async def put_settings(namespace: str, request: Request):
+    """Replace the stored defaults for one page.
+
+    Every key is validated; anything unknown or out of range is rejected with
+    the offending key named, rather than silently dropped.
+    """
+    if namespace not in _SETTING_VALIDATORS:
+        raise HTTPException(404, f"unknown settings namespace: {namespace}")
+    body = await request.json()
+    values = body.get("values", body)
+    if not isinstance(values, dict):
+        raise HTTPException(400, "expected an object of settings")
+
+    checks = _SETTING_VALIDATORS[namespace]
+    for k, v in values.items():
+        if k not in checks:
+            raise HTTPException(400, f"unknown setting: {k}")
+        if not checks[k](v):
+            raise HTTPException(400, f"invalid value for {k}: {v!r}")
+
+    with _get_settings() as st:
+        return {"namespace": namespace, "values": st.set_many(namespace, values)}
+
+
+@app.delete("/api/settings/{namespace}")
+def delete_settings(namespace: str):
+    """Forget the stored defaults so the page falls back to its built-ins."""
+    if namespace not in _SETTING_VALIDATORS:
+        raise HTTPException(404, f"unknown settings namespace: {namespace}")
+    with _get_settings() as st:
+        st.clear(namespace)
+    return {"namespace": namespace, "values": {}}
+
+
 @app.get("/api/stats")
 def api_stats():
     """Database statistics."""

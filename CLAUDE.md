@@ -943,6 +943,23 @@ Two invariants worth not breaking:
   constraint when it was the height. (Note the handoff's "exactly one slack is
   zero" is off by one case: when the aspects match exactly, *both* are zero.)
 
+**Planner defaults are stored server-side** — wall size, gap, seam mode,
+"only what fits my wall", resolution floor, crop allowance, sheet sizes, panel
+count. A **Defaults** card at the foot of the sidebar saves the current
+settings; Reset forgets them and falls back to `G.DEFAULTS`. Saving is explicit
+(the button only enables when something differs from what is stored), so
+fiddling with a control for one photo does not silently rewrite your defaults.
+
+They live in `photosearch/settings.py` (`app_settings`, namespaced key/JSON) in
+the **sidecar** file `PHOTOSEARCH_BOOKS_DB` — *not* the replica DB, because
+`sync-replica.sh` swaps `PHOTOSEARCH_DB` wholesale and would wipe them. Routes:
+`GET|PUT|DELETE /api/settings/{namespace}`. Writes are checked against a
+per-key **allowlist** in `web._SETTING_VALIDATORS`: these values drive geometry,
+and an out-of-range one would be hard to back out of from the UI, so an unknown
+or invalid key is rejected by name rather than silently dropped. The page holds
+rendering until the stored values arrive, or arrangements for the built-in
+defaults would flash past and be replaced. Tests: `tests/test_settings.py`.
+
 **Arrangement cards carry a live preview**, not just numbers — the panel
 breakdown *and* where the photo lands inside it. `PanelLayout` is shared by the
 card thumbnails and the main stage, so a thumbnail can never be a different

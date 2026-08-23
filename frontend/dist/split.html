@@ -281,7 +281,33 @@
               ['any', 2, 3, 4, 5, 6, 8, 12].map((c) => e('button', {
                 key: c, className: 'chip' + (String(s.count) === String(c) ? ' on' : ''),
                 onClick: () => set({ count: c }),
-              }, c === 'any' ? 'Any' : c))))));
+              }, c === 'any' ? 'Any' : c))))),
+
+        // Everything above is remembered server-side, so it follows you
+        // between browsers rather than living in this one's local storage.
+        e('div', { className: 'card' },
+          e('h2', null, 'Defaults'),
+          e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            e('button', {
+              className: 'primary', onClick: props.onSave,
+              disabled: !props.dirty,
+              style: props.dirty ? {} : { opacity: 0.5, cursor: 'default' },
+              title: props.dirty ? 'Remember these settings for next time'
+                                 : 'These already are your defaults',
+            }, props.dirty ? 'Save as defaults' : 'Saved'),
+            props.hasSaved && e('button', {
+              className: 'ghostbtn', onClick: props.onReset,
+              title: 'Forget the saved defaults and use the built-in ones',
+            }, 'Reset')),
+          props.msg && e('p', {
+            className: 'hint',
+            style: { color: props.msg.kind === 'err' ? 'var(--red)'
+                          : props.msg.kind === 'ok' ? 'var(--green)'
+                          : 'var(--text-muted)' },
+          }, props.msg.text),
+          !props.hasSaved && !props.msg && e('p', { className: 'hint' },
+            'Wall, gap, seam mode, floors, sheet sizes and panel count are '
+            + 'remembered on the server.')));
     }
 
     // --- preview ------------------------------------------------------------
@@ -546,6 +572,62 @@
         });
       }, []);
       const [s, setS] = useState(Object.assign({}, G.DEFAULTS));
+      // Stored defaults come from the server, so they follow you between
+      // browsers and machines. Until they arrive we hold off rendering the
+      // plan, or the user would see arrangements for the built-in defaults
+      // flash past and be replaced.
+      const [prefsLoaded, setPrefsLoaded] = useState(false);
+      const [savedPrefs, setSavedPrefs] = useState({});
+      const [prefsMsg, setPrefsMsg] = useState(null);
+
+      useEffect(() => {
+        fetch(API + '/api/settings/split')
+          .then((r) => (r.ok ? r.json() : { values: {} }))
+          .then((d) => {
+            const v = d.values || {};
+            setSavedPrefs(v);
+            if (Object.keys(v).length) setS((p) => Object.assign({}, p, v));
+          })
+          .catch(() => {})
+          .finally(() => setPrefsLoaded(true));
+      }, []);
+
+      // Only the eight controls that are worth remembering — the crop pan and
+      // the chosen arrangement are per-photo, not preferences.
+      const PREF_KEYS = ['wall', 'gutter', 'mode', 'wallOnly', 'minDpi',
+                         'maxCrop', 'sizes', 'count'];
+      const prefsDirty = PREF_KEYS.some((k) => {
+        const a = savedPrefs[k], b = s[k];
+        return JSON.stringify(a === undefined ? G.DEFAULTS[k] : a) !== JSON.stringify(b);
+      });
+
+      const savePrefs = useCallback(() => {
+        const values = {};
+        PREF_KEYS.forEach((k) => {
+          // count is 'any' or a number; the input hands back strings.
+          values[k] = k === 'count' && s[k] !== 'any' ? Number(s[k]) : s[k];
+        });
+        setPrefsMsg({ kind: 'info', text: 'Saving…' });
+        fetch(API + '/api/settings/split', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: values }),
+        }).then((r) => (r.ok ? r.json() : r.json().then((d) => {
+          throw new Error(d.detail || r.statusText);
+        }))).then((d) => {
+          setSavedPrefs(d.values || {});
+          setPrefsMsg({ kind: 'ok', text: 'Saved as your defaults.' });
+        }).catch((ex) => setPrefsMsg({ kind: 'err', text: String(ex.message || ex) }));
+      }, [s]);
+
+      const resetPrefs = useCallback(() => {
+        fetch(API + '/api/settings/split', { method: 'DELETE' })
+          .then(() => {
+            setSavedPrefs({});
+            setS((p) => Object.assign({}, p, G.DEFAULTS));
+            setPrefsMsg({ kind: 'ok', text: 'Back to the built-in defaults.' });
+          })
+          .catch((ex) => setPrefsMsg({ kind: 'err', text: String(ex) }));
+      }, []);
       const set = useCallback((patch) => setS((p) => Object.assign({}, p, patch)), []);
 
       // Load the photo's real pixel dimensions — every number on this page
@@ -628,11 +710,15 @@
         e(PS.SharedHeader, { activePage: 'split' }),
         e('div', { className: 'shell' },
           e(Sidebar, { s: s, set: set, img: img, ups: ups, source: source,
-                       setSource: setSource, origImg: origImg }),
+                       setSource: setSource, origImg: origImg,
+                       onSave: savePrefs, onReset: resetPrefs,
+                       dirty: prefsDirty, msg: prefsMsg,
+                       hasSaved: Object.keys(savedPrefs).length > 0 }),
           e('div', null,
-            !img && e('div', { className: 'card' }, e('p', { className: 'empty' }, 'Loading photo…')),
+            (!img || !prefsLoaded) && e('div', { className: 'card' },
+              e('p', { className: 'empty' }, 'Loading photo…')),
 
-            img && P && e('div', { className: 'stage' },
+            img && prefsLoaded && P && e('div', { className: 'stage' },
               e(Preview, {
                 img: img, cand: cand.cand, s: s, src: src, maxPx: 620,
                 onPan: (p) => set(p),
@@ -654,7 +740,7 @@
                 photoId: photoId, cand: cand.cand, s: s, source: source,
               })),
 
-            img && diag && e(Diagnostic, {
+            img && prefsLoaded && diag && e(Diagnostic, {
               d: diag, img: img, s: s, set: set, photoId: photoId,
               onSelectCand: () => {},
               onUpscaled: (res) => {
@@ -665,7 +751,7 @@
               },
             }),
 
-            img && shown.length > 0 && e('div', { className: 'card', style: { marginTop: 16 } },
+            img && prefsLoaded && shown.length > 0 && e('div', { className: 'card', style: { marginTop: 16 } },
               e('div', { style: { display: 'flex', alignItems: 'baseline',
                                   justifyContent: 'space-between', gap: 12 } },
                 e('h2', { style: { marginBottom: 0 } }, 'Other arrangements'),
