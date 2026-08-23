@@ -362,6 +362,72 @@
           }, msg.text)));
     }
 
+    // --- export -------------------------------------------------------------
+
+    function ExportBar(props) {
+      const { photoId, cand, s, P, img } = props;
+      const [busy, setBusy] = useState(false);
+      const [res, setRes] = useState(null);
+      const [err, setErr] = useState(null);
+      const [ups, setUps] = useState([]);
+      const [source, setSource] = useState('');
+
+      // Offer any prior Topaz export as the source — a wall piece is usually
+      // short on resolution, and the upscale is what fixes it.
+      useEffect(() => {
+        fetch(API + '/api/admin/upscaled-list?photo_id=' + photoId)
+          .then((r) => (r.ok ? r.json() : { exports: [] }))
+          .then((d) => setUps(d.exports || []))
+          .catch(() => setUps([]));
+      }, [photoId]);
+
+      const run = () => {
+        setBusy(true); setErr(null); setRes(null);
+        fetch(API + '/api/admin/split-export', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            photo_id: photoId, pw: cand.pw, ph: cand.ph,
+            cols: cand.cols, rows: cand.rows,
+            gutter: s.gutter, mode: s.mode, sx: s.sx, sy: s.sy,
+            source_path: source || null,
+          }),
+        }).then((r) => (r.ok ? r.json() : r.json().then((d) => {
+          throw new Error(d.detail || r.statusText);
+        }))).then((d) => { setRes(d); setBusy(false); })
+          .catch((ex) => { setErr(String(ex.message || ex)); setBusy(false); });
+      };
+
+      return e('div', { style: { width: '100%', marginTop: 4 } },
+        e('div', { style: { display: 'flex', gap: 8, alignItems: 'center',
+                            flexWrap: 'wrap', justifyContent: 'center' } },
+          ups.length > 0 && e('select', {
+            value: source, onChange: (ev) => setSource(ev.target.value),
+            style: { background: 'var(--surface2)', color: 'var(--text)',
+                     border: '1px solid var(--border)', borderRadius: 6,
+                     padding: '6px 8px', fontSize: 12, fontFamily: 'inherit' },
+          },
+            e('option', { value: '' }, 'Source: original'),
+            ups.map((u) => e('option', { key: u.output, value: u.output },
+              'Source: ' + u.label + ' (' + (u.bytes / 1e6).toFixed(0) + ' MB)'))),
+          e('button', { className: 'primary', onClick: run, disabled: busy },
+            busy ? 'Exporting…' : 'Export ' + (cand.cols * cand.rows) + ' panels')),
+
+        err && e('p', { className: 'hint', style: { color: 'var(--red)' } }, err),
+        res && e('div', { style: { marginTop: 10, fontSize: 12, textAlign: 'center' } },
+          e('p', { style: { color: 'var(--green)' } },
+            (res.skipped ? 'Already exported — ' : 'Wrote ') + res.panels.length +
+            ' panels at ' + res.dpi + ' dpi'),
+          e('code', { style: { color: 'var(--text-muted)', wordBreak: 'break-all',
+                               userSelect: 'all' } },
+            res.dest_windows || res.dest),
+          e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap',
+                              justifyContent: 'center', marginTop: 8 } },
+            res.panels.map((p) => e('a', {
+              key: p.output, target: '_blank', rel: 'noopener',
+              href: API + '/api/admin/upscaled-file?path=' + encodeURIComponent(p.output),
+            }, p.name.replace(/\.\w+$/, ''))))));
+    }
+
     // --- page ---------------------------------------------------------------
 
     function SplitPage() {
@@ -436,7 +502,10 @@
                   className: 'spec ' + ((1 - P.keep) <= 0.15 ? 'good' : (1 - P.keep) <= 0.35 ? 'warn' : 'bad'),
                 }, 'Crop ', e('b', null, G.pct(1 - P.keep))),
                 e('div', { className: 'spec' }, 'Binds on ', e('b', null, P.bindingAxis))),
-              e('p', { className: 'hint' }, 'Drag the preview to reposition the crop.')),
+              e('p', { className: 'hint' }, 'Drag the preview to reposition the crop.'),
+              e(ExportBar, {
+                photoId: photoId, cand: cand.cand, s: s, P: P, img: img,
+              })),
 
             img && diag && e(Diagnostic, {
               d: diag, img: img, s: s, set: set, photoId: photoId,

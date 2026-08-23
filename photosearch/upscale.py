@@ -396,6 +396,34 @@ def _dest_dir(row) -> Path:
     return export_root() / (year or "undated")
 
 
+def fetch_source(row, dest_dir: str, *, server: Optional[str] = None) -> str:
+    """Get the full-resolution original onto this machine and return its path.
+
+    The NAS holds the originals and the desktop does the compute (M28's split),
+    so this downloads unless we happen to be running where the files live.
+    Shared by upscaling and by the Split print export.
+    """
+    from . import rerun
+
+    base = server or rerun.nas_base()
+    if base:
+        from . import worker as W
+        client = W.WorkerClient(base, probe=False)
+        info = {"id": row["id"], "filepath": row["filepath"],
+                "filename": os.path.basename(row["filepath"])}
+        got = W._download_batch(client, [info], dest_dir)
+        if not got:
+            raise TopazError(
+                f"could not download photo {row['id']} from {base}")
+        return got[0][1]
+
+    # Running where the originals live — use the file directly.
+    src = row["filepath"]
+    if not os.path.exists(src):
+        raise TopazError(f"original not found on disk: {src}")
+    return src
+
+
 def upscale_photo(db, photo_id: int, *,
                   scale: Optional[int] = None,
                   enhancements: tuple[str, ...] = ("upscale",),
@@ -432,22 +460,7 @@ def upscale_photo(db, photo_id: int, *,
     staging = dest_dir / f".staging-{uuid.uuid4().hex[:8]}"
     staging.mkdir(parents=True, exist_ok=True)
     try:
-        base = server or rerun.nas_base()
-        if base:
-            from . import worker as W
-            client = W.WorkerClient(base, probe=False)
-            info = {"id": row["id"], "filepath": row["filepath"],
-                    "filename": src_name}
-            got = W._download_batch(client, [info], str(staging))
-            if not got:
-                raise TopazError(
-                    f"could not download photo {photo_id} from {base}")
-            src = got[0][1]
-        else:
-            # Running where the originals live - use the file directly.
-            src = row["filepath"]
-            if not os.path.exists(src):
-                raise TopazError(f"original not found on disk: {src}")
+        src = fetch_source(row, str(staging), server=server)
 
         produced = run_topaz(src, str(staging / "out"), scale=scale,
                              enhancements=enhancements)

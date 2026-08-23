@@ -851,10 +851,32 @@ constraints, not objectives. The handoff's *prose* says "sorted by
 max(outerW,outerH)"; its *code* uses the weighted score, and the README says the
 code is the specification.
 
-**Print export is not built yet** — that is pass 2, and it belongs server-side
-(Pillow) rather than in a canvas: sources here are routinely 100 MP+ after an
-upscale, and the output should land in the export tree next to the upscales, not
-in the browser's Downloads.
+**Print export is server-side** (`photosearch/split_export.py`, Pillow), not a
+browser canvas: sources here are routinely 100 MP+ after an upscale, and the
+output belongs in the export tree next to the upscales rather than in Downloads.
+
+```bash
+photosearch split-export 145820 --sheet 13x19 --grid 3x2 [--gutter 0.5] \
+    [--mode window|continue] [--source <a prior Topaz export>] [--format jpg]
+```
+
+- **`POST /api/admin/split-export`** — same export behind the page's button.
+- Panels land in `export_root()/split/<stem>-<cols>x<rows>-<pw>x<ph>-<mode>/`,
+  one folder **per arrangement**, so exporting a second plan of the same photo
+  cannot overwrite the first. Each folder carries a `manifest.json` with the
+  full plan, the source, and its pixel dimensions.
+- Output DPI metadata is stamped on every panel so the print dialog sizes the
+  sheet correctly without being told.
+- `--source` selects a prior Topaz export instead of the original — the usual
+  case, and the page's dropdown offers them. It is confined to `export_root()`
+  by the same resolved-path check as `/upscaled-file`, since it reads real files.
+- `Image.MAX_IMAGE_PIXELS` is raised for the duration: Pillow's
+  decompression-bomb guard rejects legitimately-enormous upscaled sources.
+
+**The geometry exists twice** — `split-geometry.js` (the planner must recompute
+per drag frame) and `split_export.py` (the export authority). Both are pinned to
+the *same* published worked example in their tests, which is what catches drift;
+change one and you must change the other.
 
 Design handoff (not in the repo): `Split_ Photo Diptych Planner.zip`. Its
 Organic cream/terracotta palette is mapped onto this app's dark tokens by role,

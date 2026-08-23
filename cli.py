@@ -5348,5 +5348,75 @@ def upscale_cmd(photo_ids, db, scale, enhancements, overwrite):
         raise click.ClickException(f"{failures} photo(s) failed")
 
 
+@cli.command("split-export")
+@click.argument("photo_id", type=int)
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--sheet", default="13x19", show_default=True,
+              help="Sheet size in inches, WxH (orientation matters).")
+@click.option("--grid", default="3x2", show_default=True,
+              help="Panel grid as COLSxROWS.")
+@click.option("--gutter", type=float, default=0.5, show_default=True,
+              help="Wall gap between sheets, inches.")
+@click.option("--mode", type=click.Choice(["window", "continue"]),
+              default="window", show_default=True,
+              help="window: the image continues behind the gaps. "
+                   "continue: it does not.")
+@click.option("--pan-x", "sx", type=float, default=0.0,
+              help="Crop pan across the slack axis, -1..1.")
+@click.option("--pan-y", "sy", type=float, default=0.0,
+              help="Crop pan down the slack axis, -1..1.")
+@click.option("--source", "source_path", default=None,
+              help="Use a prior Topaz export instead of the original "
+                   "(must be inside the export tree).")
+@click.option("--format", "fmt", default="jpg", show_default=True,
+              type=click.Choice(["jpg", "png", "tif", "tiff"]))
+@click.option("--overwrite", is_flag=True, default=False,
+              help="Re-export an arrangement that already has panel files.")
+def split_export_cmd(photo_id, db, sheet, grid, gutter, mode, sx, sy,
+                     source_path, fmt, overwrite):
+    """Slice a photo into borderless panel files for a multi-panel wall piece.
+
+    Every panel is one whole sheet -- nothing is trimmed -- so the piece's size
+    is whatever the sheets add up to plus the gaps. Plan it visually at /split;
+    this is the same export the page's button runs.
+
+    A wall piece spreads one file over many sheets, so the original is usually
+    short on resolution: upscale first, then pass the result with --source.
+    """
+    from photosearch import split_export as SX
+
+    def _pair(text, what):
+        try:
+            a, b = text.lower().split("x")
+            return float(a), float(b)
+        except ValueError:
+            raise click.ClickException(f"--{what} must look like AxB, got {text!r}")
+
+    pw, ph = _pair(sheet, "sheet")
+    cols, rows = _pair(grid, "grid")
+
+    with PhotoDB(db) as pdb:
+        try:
+            res = SX.export_panels(
+                pdb, photo_id, pw=pw, ph=ph, cols=int(cols), rows=int(rows),
+                gutter=gutter, mode=mode, sx=sx, sy=sy,
+                source_path=source_path, fmt=fmt, overwrite=overwrite)
+        except SX.SplitError as e:
+            raise click.ClickException(str(e))
+
+    piece = res["piece_inches"]
+    click.echo(f"{res['grid'][0]}x{res['grid'][1]} of "
+               f"{res['sheet_inches'][0]}x{res['sheet_inches'][1]}\" "
+               f"-> {piece[0]}\" x {piece[1]}\"")
+    click.echo(f"  {res['dpi']} dpi · {res['crop_pct']}% crop · "
+               f"binds on {res['binding_axis']}")
+    if res.get("skipped"):
+        click.echo(f"  skipped ({res['reason']})")
+    click.echo(f"  {res.get('dest_windows') or res['dest']}")
+    for p in res["panels"]:
+        click.echo(f"    {p['name']}  ({p['bytes'] / 1e6:.1f} MB)")
+
+
 if __name__ == "__main__":
     cli()

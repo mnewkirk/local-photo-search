@@ -993,6 +993,45 @@ def admin_upscale_photo(req: UpscaleRequest):
             "export_dir_windows": upscale.to_windows_path(str(root))}
 
 
+class SplitExportRequest(BaseModel):
+    photo_id: int
+    pw: float
+    ph: float
+    cols: int
+    rows: int
+    gutter: float = 0.5
+    mode: str = "window"
+    sx: float = 0.0
+    sy: float = 0.0
+    source_path: Optional[str] = None   # a prior Topaz export, when upscaled
+    fmt: str = "jpg"
+    quality: int = 95
+    overwrite: bool = False
+
+
+@router.post("/split-export")
+def admin_split_export(req: SplitExportRequest):
+    """Write one borderless panel file per sheet, plus a manifest.
+
+    Synchronous: a 6-panel export off a 200 MP source takes a few seconds, and
+    it is a deliberate one-at-a-time action rather than a batch job.
+    """
+    from . import split_export, web
+
+    with web._get_db() as db:
+        try:
+            return split_export.export_panels(
+                db, req.photo_id, pw=req.pw, ph=req.ph,
+                cols=req.cols, rows=req.rows, gutter=req.gutter,
+                mode=req.mode, sx=req.sx, sy=req.sy,
+                source_path=req.source_path, fmt=req.fmt,
+                quality=req.quality, overwrite=req.overwrite)
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+        except split_export.SplitError as e:
+            raise HTTPException(400, str(e))
+
+
 @router.get("/upscaled-list")
 def admin_upscaled_list(photo_id: int):
     """Prior exports for one photo, so the modal can show them on load instead
