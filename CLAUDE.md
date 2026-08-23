@@ -981,10 +981,13 @@ rendering of the geometry than the thing it previews.
 enumerator: `candidates`/`reachable` only walk the curated `GRIDS` list, which
 has **no 3×3**, so a grid that is not on that list is invisible to them —
 exactly the case worth trying. `G.forGrid(img, cols, rows, opts)` enumerates
-sheet sizes directly for one grid and applies **only** the physical caps; the
-dpi and crop floors are deliberately not enforced, because seeing *why* a grid
-does not work is the point of asking for it (such cards are marked "below your
-floors"). Tried grids persist in `localStorage` under `split.tried`, so clicking
+sheet sizes directly for one grid. The dpi and crop floors are deliberately
+not enforced — seeing *why* a grid falls short is the point of asking for it,
+and such cards are marked "below your floors". **The sheet-size selection IS
+enforced**: those are different kinds of constraint and conflating them once
+suggested a 4×2 on 8.5×11″ to someone with only 13×19″ switched on. A floor is
+a preference you might want to see violated; "sheet sizes in play" is a hard
+fact about which paper you own. Tried grids persist in `localStorage` under `split.tried`, so clicking
 away or reloading keeps them, and they go only when the card's × is clicked.
 
 **The Source picker is a planning input, not an export detail.** It sits at the

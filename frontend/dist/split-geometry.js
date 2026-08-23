@@ -212,14 +212,21 @@
    * exactly the case that list cannot serve, so this enumerates sheet sizes
    * directly for the cols/rows asked for.
    *
-   * Only the physical caps apply — the dpi and crop floors are deliberately
-   * NOT enforced, because seeing *why* a grid does not work is the point of
-   * asking for it.
+   * The dpi and crop floors are deliberately NOT enforced — seeing *why* a
+   * grid falls short is the point of asking for it, and such rows are labelled
+   * rather than hidden.
+   *
+   * **The sheet-size selection IS enforced.** Those two are different kinds of
+   * constraint and must not be conflated: a floor is a preference you might
+   * want to see violated, while "sheet sizes in play" is a hard fact about
+   * which paper you own. Ignoring it once produced a suggested 4x2 on 8.5x11"
+   * for someone who had only 13x19" switched on.
    */
   function forGrid(img, cols, rows, o) {
     if (!img || cols < 1 || rows < 1) return [];
     var s = opts(o), out = [];
     SIZES.forEach(function (pair) {
+      if (s.sizes && s.sizes.indexOf(sizeLabel(pair[0], pair[1])) < 0) return;
       var orients = pair[0] === pair[1]
         ? [pair] : [[pair[0], pair[1]], [pair[1], pair[0]]];
       orients.forEach(function (or) {

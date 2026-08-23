@@ -300,6 +300,26 @@ describe('forGrid — trying an arbitrary grid', () => {
     });
   });
 
+  test('HONORS the sheet-size selection', () => {
+    // The floors are preferences you might want to see violated; "sheet sizes
+    // in play" is a hard fact about which paper you own. Conflating them once
+    // suggested a 4x2 on 8.5x11" to someone who had only 13x19" enabled.
+    const got = G.forGrid(IMG, 4, 2, { sizes: ['13×19'], wallOnly: false });
+    expect(got.length).toBeGreaterThan(0);
+    got.forEach((x) => {
+      expect([x.P.pw, x.P.ph].sort((a, b) => a - b)).toEqual([13, 19]);
+    });
+  });
+
+  test('returns nothing when no ALLOWED sheet can build the grid', () => {
+    // 8x8 of 13x19 is 155.5" on its long side either way round, past the 120"
+    // ceiling — while 8x8 of 4x6 is a comfortable 35.5" x 51.5". So the grid is
+    // buildable, just not with the sheets left on: the case where the card has
+    // to say which constraint stopped it.
+    expect(G.forGrid(IMG, 8, 8, { sizes: ['13×19'] })).toEqual([]);
+    expect(G.forGrid(IMG, 8, 8, { sizes: null }).length).toBeGreaterThan(0);
+  });
+
   test('ignores the dpi and crop floors — seeing why is the point', () => {
     const got = G.forGrid(IMG, 6, 6, { minDpi: 300, maxCrop: 0.01 });
     // Any survivor is there on physical grounds alone.

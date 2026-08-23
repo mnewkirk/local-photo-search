@@ -682,8 +682,15 @@
           // grid it does not list is precisely the case worth trying.
           const opts = G.forGrid(img, t.cols, t.rows, s);
           const key = 'try-' + t.cols + 'x' + t.rows;
-          if (!opts.length) return { key: key, tried: true, impossible: true,
-                                     cand: { cols: t.cols, rows: t.rows } };
+          if (!opts.length) {
+            // Say WHICH constraint blocked it: the sheets they have on, or
+            // the physical ceiling that no sheet clears.
+            const anySheet = G.forGrid(img, t.cols, t.rows,
+                                       Object.assign({}, s, { sizes: null }));
+            return { key: key, tried: true, impossible: true,
+                     sheetsLimited: anySheet.length > 0,
+                     cand: { cols: t.cols, rows: t.rows } };
+          }
           return Object.assign({}, opts[0], { tried: true, key: key });
         });
       }, [img, s, tried]);
@@ -773,7 +780,9 @@
                       e('span', { className: 'big' },
                         c.cand.cols + '×' + c.cand.rows),
                       e('span', { className: 'sub' },
-                        'No sheet size builds this under ' + G.MAX_SPAN_IN + '″.'));
+                        c.sheetsLimited
+                          ? 'Not with the sheet sizes you have on.'
+                          : 'No sheet size builds this under ' + G.MAX_SPAN_IN + '″.'));
                   }
                   const cp = c.P;
                   const failsDpi = cp.dpi < s.minDpi;
