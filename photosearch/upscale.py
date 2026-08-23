@@ -302,11 +302,19 @@ def run_topaz(src: str, out_dir: str, *,
     Unlike ``scale``, this one the CLI serializes correctly, so it needs no
     registry workaround.
 
-    ``override`` passes ``--override``, which makes the requested settings
-    *replace* Autopilot's rather than merge into them. Worth knowing: without
-    it, asking for ``--upscale`` alone still lets Autopilot run whatever else it
-    decided on — in practice "Sharpen Strong" — which is a common source of
-    halo/crunch artifacts on an already-upscaled image.
+    ``override`` means "run ONLY the requested enhancements".
+
+    This is the artifact control. Asking for ``--upscale`` alone still lets
+    Autopilot run whatever else it chose — in practice a ``Sharpen Strong`` pass
+    over the already-upscaled image, which is the usual source of halo/crunch.
+    Verified with ``--showSettings``: a plain ``--upscale`` reports
+    ``Enhance -> true, Sharpen -> true``.
+
+    **``--override`` alone does NOT do this** — measured, Sharpen stays
+    ``enabled=true`` with or without it. The flag that actually works is the one
+    the help documents per enhancement: ``--sharpen enabled=false``. So this
+    emits an explicit ``enabled=false`` for every enhancement *not* asked for,
+    which does bring Sharpen down to ``false``.
 
     Raises ``TopazError`` when the CLI is missing, reports a documented failure
     code, or exits without writing anything.
@@ -331,6 +339,13 @@ def run_topaz(src: str, out_dir: str, *,
             cmd.extend(["--upscale", f"model={model}"])
         else:
             cmd.append(f"--{enh}")
+    if override:
+        # Explicitly switch off everything not asked for. Without this,
+        # Autopilot's own picks still run — `--override` on its own does not
+        # stop them (measured, not assumed).
+        for enh in ENHANCEMENTS:
+            if enh not in enhancements:
+                cmd.extend([f"--{enh}", "enabled=false"])
     cmd.append(to_native_path(src))
 
     with _scale_override(scale):

@@ -812,13 +812,43 @@ categories come back as **Enhance *and* Sharpen**, the latter with model
 explanation for halo/crunch artifacts. Autopilot's own upscale model is
 typically `High Fidelity V2`.
 
-So there are two levers, both now exposed on `upscale_photo` / `run_topaz`, the
-CLI (`--model`, `--override/--merge-autopilot`), the API, and the modal:
+**`--override` does NOT turn Autopilot's extras off.** Measured: with and
+without it, `--showSettings` reports `Enhance -> true, Sharpen -> true`. The
+flag that works is the per-enhancement one the help documents —
+**`--sharpen enabled=false`** — which does bring it to `false` and still
+processes. So `override=True` emits an explicit `enabled=false` for every
+enhancement *not* requested (and passes `--override` too). Do not "simplify"
+this back to a bare `--override`; it silently stops working.
 
-- **`override=True`** → passes `--override`, so only the checked enhancements
-  run. This is the artifact fix; the UI defaults it **on**.
+The two levers, on `upscale_photo` / `run_topaz`, the CLI (`--model`,
+`--override/--merge-autopilot`), the API, and the modal:
+
+- **`override=True`** → run only the checked enhancements. The artifact fix;
+  the UI defaults it **on**.
 - **`model=...`** → `--upscale model=<name>`. Unlike `scale`, the CLI serializes
   this correctly, so it needs no registry workaround.
+
+**Measured on a real 7008×4672 photo** (Laplacian variance of a 100% crop of the
+most detailed region — higher means more high-frequency energy, i.e. crunch):
+
+| variant | lapvar | vs bicubic |
+|---|---|---|
+| original, plain bicubic | 35.8 | 1.0× |
+| Autopilot default (Sharpen on) | 135.8 | 3.8× |
+| **Sharpen off, High Fidelity V2** | **77.3** | **2.2×** |
+| Sharpen off, Standard | 120.3 | 3.4× |
+| Sharpen off, Standard V2 | 107.0 | 3.0× |
+
+Turning Sharpen off cuts high-frequency energy **43%** (135.8 → 77.3) — that is
+the artifact fix. Note **`Standard` is *crunchier* than `High Fidelity V2`**,
+not milder as its name suggests, so the right default is Autopilot's own model
+choice with Sharpen disabled. Disabling noise/lighting/color as well changes
+nothing measurable (identical 77.3), so they are not worth turning off.
+
+**Strength cannot be set from the CLI.** `--upscale param1=0.5` is serialized as
+a string and rejected with the same `type_error.302` as `scale=N`. The only
+levers are the model, the enabled/disabled set, and the Autopilot registry
+preferences (`autopilotUpscalingParam1Strength`, `autopilotOpacityValue`).
 
 `UPSCALE_MODELS` was verified by running each name through the CLI and checking
 an output file appeared: **Standard, Standard V2, High Fidelity, High Fidelity

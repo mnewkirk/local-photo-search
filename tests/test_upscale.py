@@ -364,18 +364,49 @@ def test_unknown_model_rejected(fake_cli, tmp_path, monkeypatch):
         U.run_topaz(str(src), str(tmp_path / "out"), model="Nonsense")
 
 
-def test_override_suppresses_autopilot_extras(fake_cli, tmp_path, monkeypatch):
-    """--override is what stops Autopilot's Sharpen Strong riding along, which
-    is the usual source of halo artifacts on an upscale."""
+def test_override_disables_every_unrequested_enhancement(fake_cli, tmp_path,
+                                                        monkeypatch):
+    """The artifact fix. `--override` ALONE does not stop Autopilot's Sharpen
+    Strong — measured against the real CLI, it stays enabled=true. Only an
+    explicit `--sharpen enabled=false` brings it down, so override must emit
+    one for every enhancement not asked for."""
     cmds = []
     monkeypatch.setattr(U.subprocess, "run", _runner(record=cmds))
     src = tmp_path / "in.jpg"; src.write_bytes(b"x")
-    U.run_topaz(str(src), str(tmp_path / "out"), override=True)
-    assert "--override" in cmds[0]
+    U.run_topaz(str(src), str(tmp_path / "out"),
+                enhancements=("upscale",), override=True)
+    cmd = cmds[0]
 
-    cmds.clear()
-    U.run_topaz(str(src), str(tmp_path / "out2"), override=False)
+    assert "--upscale" in cmd
+    # Every other enhancement is explicitly switched off.
+    for enh in ("noise", "sharpen", "lighting", "color"):
+        i = cmd.index(f"--{enh}")
+        assert cmd[i + 1] == "enabled=false", f"{enh} not disabled"
+    # ...and the one we asked for is NOT.
+    assert "enabled=false" not in cmd[cmd.index("--upscale") + 1:
+                                     cmd.index("--upscale") + 2]
+
+
+def test_override_keeps_the_enhancements_you_asked_for(fake_cli, tmp_path,
+                                                       monkeypatch):
+    cmds = []
+    monkeypatch.setattr(U.subprocess, "run", _runner(record=cmds))
+    src = tmp_path / "in.jpg"; src.write_bytes(b"x")
+    U.run_topaz(str(src), str(tmp_path / "out"),
+                enhancements=("upscale", "sharpen"), override=True)
+    cmd = cmds[0]
+    # sharpen was requested, so it must not be turned off.
+    assert cmd[cmd.index("--sharpen") + 1] != "enabled=false"
+    assert cmd[cmd.index("--noise") + 1] == "enabled=false"
+
+
+def test_without_override_nothing_is_disabled(fake_cli, tmp_path, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(U.subprocess, "run", _runner(record=cmds))
+    src = tmp_path / "in.jpg"; src.write_bytes(b"x")
+    U.run_topaz(str(src), str(tmp_path / "out"), override=False)
     assert "--override" not in cmds[0]
+    assert "enabled=false" not in cmds[0]
 
 
 def test_model_and_override_are_part_of_the_variant(fake_cli, tmp_path, monkeypatch):
