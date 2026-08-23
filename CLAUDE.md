@@ -740,6 +740,73 @@ read-local / write-NAS / mirror-local model — don't wait for the nightly
 NAS images, so `mirrored:0` until the NAS is redeployed; the sync compute +
 authoritative write still work, and the local UI catches up on the next sync.
 
+## Local Topaz upscaling (M30)
+
+Upscale a photo from the image view using the **locally installed Topaz Photo
+AI**. Nothing leaves the machine — the Topaz *cloud* API (and the official
+`TopazLabs/topaz-mcp` server, which is just a wrapper around it and needs a paid
+key from developer.topazlabs.com) is deliberately unused.
+
+Same asymmetry as M28: the NAS holds the originals, the desktop does the
+compute. But unlike every other pass, the output is a new **file**, not DB
+columns — so this writes nothing to the DB, the NAS, or the library. Results go
+to a standalone export tree, dated `YYYY/` and suffixed `-topaz`. Module:
+`photosearch/upscale.py`; tests: `tests/test_upscale.py`.
+
+```bash
+photosearch upscale 145820 [--scale 2|4|6] [--enhancement upscale] [--overwrite]
+```
+
+- **UI** — `PS.PhotoModal` has an "Upscale (Topaz)" section (scale dropdown +
+  enhancement checkboxes) below "Re-run passes".
+- **`POST /api/admin/upscale-photo`** `{photo_ids, scale, enhancements, overwrite}`.
+  Synchronous (~20-30 s per photo at 2x), so it's sized for one photo at a time.
+  `503` when the Topaz CLI isn't installed — the service is fine, the install isn't.
+- **`GET /api/admin/upscaled-file?path=…`** serves one exported file. Confined to
+  `export_root()` by a resolved-path check (traversal → 403), because it reads
+  real files off disk.
+
+**Paths are reported Windows-style.** The server runs in WSL, so the raw
+`/mnt/c/...` result path is useless to a human on Windows. Every result carries
+`windows_path` (`C:\Users\...`, via `wslpath -w`) and `file_url`
+(`file:///C:/...`); the UI and CLI show those, not the POSIX path. The modal's
+**View** link goes through `/api/admin/upscaled-file` rather than the `file://`
+URL — **Chrome refuses to navigate to `file://` from an http page**, so a direct
+link would be silently inert. `file_url` exists for copy-paste into the address
+bar, which does work.
+- **`PHOTOSEARCH_UPSCALE_DIR`** — export root (default `./upscaled`).
+  **`PHOTOSEARCH_TOPAZ_CLI`** — explicit `tpai.exe` path, skips discovery.
+
+**Use Photo AI, not Gigapixel.** `gigapixel.exe` has the far nicer CLI (explicit
+`--model` / `--scale` / `--face-recovery` / `--skip-existing`) but hard-refuses
+below a Pro license: `Gigapixel CLI requires a Pro license`. `tpai.exe` from
+**Topaz Photo AI** has no such gate. Note the newer **"Topaz Photo" app ships
+its own broken `tpai.exe`** — it fails to load its QML entry point, exits −1 and
+writes nothing — so `_CLI_CANDIDATES` prefers the "Topaz Photo AI" install and
+only falls back to "Topaz Photo".
+
+Two upstream CLI bugs this works around:
+
+1. **The success exit code is wrong.** A successful run exits **9** under WSL
+   interop (127 under Git Bash), never 0. The *failure* codes are correct and
+   documented (255 no valid files, 254 stale login, 253 bad argument, 1 partial).
+   So success is decided by *"an output file appeared"*, never by the exit code —
+   don't "fix" this to a `check=True`, it will break every successful run.
+2. **`--upscale scale=N` is broken** — the CLI serializes the scale as a JSON
+   string and the engine rejects it (`type_error.302: type must be number, but
+   is string`). The only working lever is the Autopilot *preference* in the
+   registry (`HKCU\Software\Topaz Labs LLC\Topaz Photo AI` →
+   `autopilotUpscalingType` = `auto|scale`, `autopilotUpscalingFactor`).
+   `_scale_override` sets it, runs, and restores it under a lock, because that
+   preference is global state shared with the Topaz GUI. **`--scale` omitted
+   (the default) touches nothing** and just uses whatever Autopilot would pick.
+
+**WSL note:** the replica server runs inside WSL2 but `tpai.exe` is a Windows
+binary, so paths are translated with `wslpath -w` before being handed over
+(`to_native_path`). Both a WSL-native and a `/mnt/c` export dir work; `/mnt/c`
+avoids a `\\wsl.localhost` round trip per read/write and is measurably faster
+for large files.
+
 ## Deploy panel (Version / Build / Restart)
 
 `/status` has a Deployment card backed by `photosearch/admin_api.py`. It

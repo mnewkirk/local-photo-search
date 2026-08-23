@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -934,6 +934,107 @@ def admin_rerun_passes(req: RerunRequest):
                 except Exception as e:
                     errors.append({"photo_id": pid, "pass": pass_type, "error": str(e)})
     return {"mode": "sync", "results": results, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Local Topaz upscaling (M30) — image-view "upscale this photo". Runs the
+# Topaz Photo AI CLI on THIS machine (never the Topaz cloud API) and writes the
+# result to a standalone export tree. See photosearch/upscale.py.
+# ---------------------------------------------------------------------------
+
+
+class UpscaleRequest(BaseModel):
+    photo_ids: list[int]
+    # None = let Topaz Autopilot choose (and never touch the user's settings).
+    scale: Optional[int] = None
+    enhancements: list[str] = ["upscale"]
+    overwrite: bool = False
+
+
+@router.post("/upscale-photo")
+def admin_upscale_photo(req: UpscaleRequest):
+    """Upscale photos locally with Topaz Photo AI into the export tree.
+
+    Synchronous: a 2x upscale runs ~20-30s per photo, so this is sized for the
+    image view's one-photo-at-a-time use, not bulk work.
+    """
+    from . import upscale, web
+
+    if not req.photo_ids:
+        raise HTTPException(400, "photo_ids is required (explicit scoping)")
+    if req.scale is not None and req.scale not in upscale.SCALES:
+        raise HTTPException(
+            400, f"scale must be one of {list(upscale.SCALES)} or null for auto")
+    bad = [e for e in req.enhancements if e not in upscale.ENHANCEMENTS]
+    if bad:
+        raise HTTPException(400, f"unknown enhancement(s): {', '.join(bad)}")
+    if not req.enhancements:
+        raise HTTPException(400, "at least one enhancement is required")
+
+    try:
+        upscale.cli_path()
+    except upscale.TopazError as e:
+        # 503, not 500: the service is fine, the local Topaz install isn't.
+        raise HTTPException(503, str(e))
+
+    results, errors = [], []
+    with web._get_db() as db:
+        for pid in req.photo_ids:
+            try:
+                results.append(upscale.upscale_photo(
+                    db, pid, scale=req.scale,
+                    enhancements=tuple(req.enhancements),
+                    overwrite=req.overwrite))
+            except Exception as e:
+                errors.append({"photo_id": pid, "error": str(e)})
+    root = upscale.export_root()
+    return {"results": results, "errors": errors,
+            "export_dir": str(root),
+            "export_dir_windows": upscale.to_windows_path(str(root))}
+
+
+@router.get("/upscaled-list")
+def admin_upscaled_list(photo_id: int):
+    """Prior exports for one photo, so the modal can show them on load instead
+    of only after a fresh run."""
+    from . import upscale, web
+
+    with web._get_db() as db:
+        try:
+            return {"photo_id": photo_id, "exports": upscale.list_exports(db, photo_id)}
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+
+
+@router.get("/upscaled-file")
+def admin_upscaled_file(path: str):
+    """Serve one exported file so the UI can link to it.
+
+    Chrome refuses to navigate to a ``file://`` URL from an http page, so a
+    plain link to the Windows path is inert. Serving the bytes from this origin
+    is what actually makes "click to view the result" work.
+
+    Confined to the export tree: ``path`` is fully resolved and must land under
+    ``export_root()``, so symlinks and ``..`` cannot escape it.
+    """
+    from . import upscale
+
+    root = upscale.export_root().resolve()
+    try:
+        target = Path(path).resolve()
+    except OSError:
+        raise HTTPException(400, "invalid path")
+    if not (target == root or root in target.parents):
+        raise HTTPException(403, "path is outside the export directory")
+    if not target.is_file():
+        raise HTTPException(404, "file not found")
+
+    ext = target.suffix.lower()
+    media = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+             ".tif": "image/tiff", ".tiff": "image/tiff",
+             ".dng": "image/x-adobe-dng"}.get(ext, "application/octet-stream")
+    return FileResponse(str(target), media_type=media,
+                        headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/mirror-photos")

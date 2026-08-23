@@ -5292,5 +5292,61 @@ def shutterfly_gphotos_push(book_id, manifest_path, album_title, dry_run, db, bo
     click.echo(f"Uploaded {ok}/{len(results)} to album {album_id}")
 
 
+@cli.command("upscale")
+@click.argument("photo_ids", nargs=-1, type=int, required=True)
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--scale", type=int, default=None,
+              help="Upscale factor (2/4/6). Default: let Topaz Autopilot decide.")
+@click.option("--enhancement", "enhancements", multiple=True, default=("upscale",),
+              help="Topaz enhancement to enable (repeatable): "
+                   "upscale, noise, sharpen, lighting, color.")
+@click.option("--overwrite", is_flag=True, default=False,
+              help="Re-export photos that already have an output file.")
+def upscale_cmd(photo_ids, db, scale, enhancements, overwrite):
+    """Upscale photos locally with Topaz Photo AI into the export tree.
+
+    Runs the Topaz Photo AI CLI on THIS machine -- the Topaz cloud API is never
+    used. Originals are pulled from the NAS (PHOTOSEARCH_NAS_URL) when running
+    off a replica; results land under PHOTOSEARCH_UPSCALE_DIR and nothing is
+    written to the DB or the library.
+
+    Note --scale temporarily changes the Topaz Autopilot preference (the CLI's
+    own scale flag is broken), restoring it afterward. Omit it to leave your
+    Topaz settings untouched.
+    """
+    from photosearch import upscale as U
+
+    if scale is not None and scale not in U.SCALES:
+        raise click.ClickException(f"--scale must be one of {list(U.SCALES)}")
+    try:
+        click.echo(f"Topaz CLI: {U.cli_path()}")
+    except U.TopazError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"Export dir: {U.export_root()}")
+
+    failures = 0
+    with PhotoDB(db) as pdb:
+        for pid in photo_ids:
+            try:
+                res = U.upscale_photo(pdb, pid, scale=scale,
+                                      enhancements=tuple(enhancements),
+                                      overwrite=overwrite)
+            except Exception as e:
+                failures += 1
+                click.echo(f"  {pid}: FAILED — {e}", err=True)
+                continue
+            # Prefer the Windows path: on WSL the POSIX one can't be pasted
+            # into Explorer or a browser.
+            shown = res.get("windows_path") or res["output"]
+            if res.get("skipped"):
+                click.echo(f"  {pid}: skipped ({res['reason']}) -> {shown}")
+            else:
+                click.echo(f"  {pid}: {shown} "
+                           f"({res['bytes'] / 1e6:.1f} MB, scale={res['scale']})")
+    if failures:
+        raise click.ClickException(f"{failures} photo(s) failed")
+
+
 if __name__ == "__main__":
     cli()

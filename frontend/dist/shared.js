@@ -200,11 +200,98 @@
     var _rerunMsg = useState(null);
     var rerunMsg = _rerunMsg[0];          var setRerunMsg = _rerunMsg[1];
 
-    // Reset gen + re-run state when the focused photo changes
+    // ---- Topaz upscale state (M30) ----
+    // Runs the local Topaz Photo AI CLI and writes to the export tree; unlike
+    // re-run passes this touches neither the DB nor the library, so there is
+    // nothing to mirror or refresh afterward.
+    var UPSCALE_ENHANCEMENTS = ['upscale', 'noise', 'sharpen', 'lighting', 'color'];
+    var _upOpen = useState(false);
+    var upOpen = _upOpen[0];             var setUpOpen = _upOpen[1];
+    var _upScale = useState('auto');     // 'auto' | '2' | '4' | '6'
+    var upScale = _upScale[0];           var setUpScale = _upScale[1];
+    var _upEnh = useState({ upscale: true });
+    var upEnh = _upEnh[0];               var setUpEnh = _upEnh[1];
+    var _upBusy = useState(false);
+    var upBusy = _upBusy[0];             var setUpBusy = _upBusy[1];
+    var _upMsg = useState(null);
+    var upMsg = _upMsg[0];               var setUpMsg = _upMsg[1];
+    var _upPrior = useState(null);       // null = not loaded yet, [] = none
+    var upPrior = _upPrior[0];           var setUpPrior = _upPrior[1];
+
+    // Prior exports live only as files on disk, so re-read them whenever the
+    // section is opened or the photo changes — otherwise a page refresh loses
+    // every path until you upscale again.
+    var loadUpPrior = React.useCallback(function () {
+      if (!photo || !photo.id) return;
+      fetch(API + '/api/admin/upscaled-list?photo_id=' + photo.id)
+        .then(function (r) { return r.ok ? r.json() : { exports: [] }; })
+        .then(function (d) { setUpPrior(d.exports || []); })
+        .catch(function () { setUpPrior([]); });
+    }, [photo && photo.id]);
+
+    useEffect(function () {
+      setUpPrior(null);
+      setUpMsg(null);
+      if (upOpen) loadUpPrior();
+    }, [photo && photo.id]);
+
+    useEffect(function () {
+      if (upOpen && upPrior === null) loadUpPrior();
+    }, [upOpen]);
+
+    // Reset gen + re-run + upscale state when the focused photo changes
     useEffect(function () {
       setGens(null); setGensOpen(false); setGensLoading(false);
       setRerunSel({}); setRerunMsg(null); setRerunBusy(false);
+      setUpMsg(null); setUpBusy(false);
     }, [photo && photo.id]);
+
+    function submitUpscale() {
+      var enh = UPSCALE_ENHANCEMENTS.filter(function (x) { return upEnh[x]; });
+      if (!photo || enh.length === 0) return;
+      setUpBusy(true);
+      setUpMsg({ kind: 'info', text: 'Upscaling with Topaz… (~20-30s per photo)' });
+      fetch(API + '/api/admin/upscale-photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          photo_ids: [photo.id],
+          scale: upScale === 'auto' ? null : parseInt(upScale, 10),
+          enhancements: enh,
+        }),
+      }).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+      }).then(function (res) {
+        if (!res.ok) {
+          setUpMsg({ kind: 'err', text: (res.d && res.d.detail) || 'Upscale failed' });
+          setUpBusy(false);
+          return;
+        }
+        var errs = (res.d && res.d.errors) || [];
+        var done = (res.d && res.d.results) || [];
+        if (errs.length) {
+          setUpMsg({ kind: 'err', text: 'Upscale failed: ' + errs[0].error });
+        } else if (done.length) {
+          var r0 = done[0];
+          setUpMsg({
+            kind: 'ok',
+            text: r0.skipped
+              ? 'Already exported'
+              : 'Saved ' + (r0.bytes / 1e6).toFixed(1) + ' MB',
+            // Windows path for humans; the POSIX one is only meaningful to the
+            // server process. view is same-origin because Chrome refuses to
+            // follow a file:// link from an http page.
+            path: r0.windows_path || r0.output,
+            view: API + '/api/admin/upscaled-file?path=' + encodeURIComponent(r0.output),
+          });
+          loadUpPrior();   // the new variant joins the list
+        }
+        setUpBusy(false);
+      }).catch(function (e) {
+        setUpMsg({ kind: 'err', text: 'Upscale error: ' + e });
+        setUpBusy(false);
+      });
+    }
 
     // Toggle one pass. Selecting describe also selects the text passes derived
     // from the description (category-content + keywords) — re-describing alone
@@ -1633,6 +1720,121 @@
                   color: rerunMsg.kind === 'err' ? 'var(--danger, #c0392b)'
                        : rerunMsg.kind === 'ok' ? 'var(--success, #2e7d32)' : 'var(--text-muted)' },
               }, rerunMsg.text)
+            )
+          ),
+
+          // Upscale with Topaz (M30) — runs the local Topaz Photo AI CLI and
+          // writes to the export tree. The library and DB are untouched, so
+          // there is no mirror/refresh step as there is for re-run passes.
+          e('div', { className: 'detail-section' },
+            e('h3', {
+              onClick: function () { setUpOpen(!upOpen); },
+              style: { cursor: 'pointer', userSelect: 'none' },
+              title: 'Upscale this photo locally with Topaz Photo AI',
+            }, (upOpen ? '▾ ' : '▸ ') + 'Upscale (Topaz)'),
+            upOpen && e('div', null,
+              e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '6px 0 8px', fontSize: 12 } },
+                e('span', { style: { color: 'var(--text-muted)' } }, 'Scale'),
+                e('select', {
+                  value: upScale,
+                  onChange: function (ev) { setUpScale(ev.target.value); },
+                  style: { fontSize: 12 },
+                  title: 'Auto uses your Topaz Autopilot preference and leaves '
+                       + 'your Topaz settings untouched',
+                },
+                  e('option', { value: 'auto' }, 'Auto'),
+                  e('option', { value: '2' }, '2x'),
+                  e('option', { value: '4' }, '4x'),
+                  e('option', { value: '6' }, '6x')
+                )
+              ),
+              e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', marginBottom: 8 } },
+                UPSCALE_ENHANCEMENTS.map(function (x) {
+                  return e('label', { key: x, style: { fontSize: 12, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' } },
+                    e('input', { type: 'checkbox', checked: !!upEnh[x],
+                      onChange: function () {
+                        setUpEnh(function (prev) {
+                          var next = Object.assign({}, prev);
+                          if (next[x]) { delete next[x]; } else { next[x] = true; }
+                          return next;
+                        });
+                      } }),
+                    x);
+                })
+              ),
+              e('button', {
+                onClick: submitUpscale,
+                disabled: upBusy || UPSCALE_ENHANCEMENTS.filter(function (x) { return upEnh[x]; }).length === 0,
+                style: { fontSize: 12, padding: '4px 12px', cursor: upBusy ? 'wait' : 'pointer' },
+              }, upBusy ? 'Upscaling…' : 'Upscale'),
+              upMsg && e('div', { style: { fontSize: 12, marginTop: 8 } },
+                e('span', {
+                  style: { color: upMsg.kind === 'err' ? 'var(--danger, #c0392b)'
+                                : upMsg.kind === 'ok' ? 'var(--success, #2e7d32)'
+                                : 'var(--text-muted)' },
+                }, upMsg.text),
+                // Result path: shown Windows-style, one click to view it in a
+                // new tab, one click to copy the path for Explorer.
+                upMsg.path && e('div', { style: { marginTop: 6 } },
+                  e('code', {
+                    style: { wordBreak: 'break-all', userSelect: 'all',
+                             color: 'var(--text-muted)' },
+                  }, upMsg.path),
+                  e('div', { style: { display: 'flex', gap: 10, marginTop: 6 } },
+                    e('a', {
+                      href: upMsg.view, target: '_blank', rel: 'noopener',
+                      title: 'Open the upscaled image in a new tab',
+                    }, 'View'),
+                    e('a', {
+                      href: '#',
+                      title: 'Copy the Windows path to the clipboard',
+                      onClick: function (ev) {
+                        ev.preventDefault();
+                        navigator.clipboard.writeText(upMsg.path).then(function () {
+                          setUpMsg(function (m) {
+                            return Object.assign({}, m, { text: 'Path copied.' });
+                          });
+                        });
+                      },
+                    }, 'Copy path')
+                  )
+                )
+              ),
+              // Everything exported for this photo so far. Each option set is
+              // its own file, so re-running with different settings adds a row
+              // rather than being skipped as "already exported".
+              upPrior && upPrior.length > 0 && e('div',
+                { style: { marginTop: 12, borderTop: '1px solid var(--border)',
+                           paddingTop: 8 } },
+                e('div', { style: { fontSize: 11, color: 'var(--text-muted)',
+                                    marginBottom: 6 } },
+                  'Previous exports (' + upPrior.length + ')'),
+                upPrior.map(function (x) {
+                  return e('div', { key: x.output,
+                    style: { display: 'flex', alignItems: 'baseline', gap: 8,
+                             fontSize: 12, padding: '3px 0' } },
+                    e('a', { href: API + '/api/admin/upscaled-file?path=' +
+                                   encodeURIComponent(x.output),
+                             target: '_blank', rel: 'noopener',
+                             style: { flex: '0 0 auto' } }, x.label),
+                    e('span', { style: { color: 'var(--text-muted)', flex: '1 1 auto',
+                                         whiteSpace: 'nowrap' } },
+                      (x.bytes / 1e6).toFixed(1) + ' MB · ' +
+                      String(x.modified).replace('T', ' ').slice(0, 16)),
+                    e('a', {
+                      href: '#', style: { flex: '0 0 auto', fontSize: 11 },
+                      title: x.windows_path || x.output,
+                      onClick: function (ev) {
+                        ev.preventDefault();
+                        navigator.clipboard.writeText(x.windows_path || x.output);
+                      },
+                    }, 'copy')
+                  );
+                })
+              ),
+              upPrior && upPrior.length === 0 && e('div',
+                { style: { marginTop: 10, fontSize: 11, color: 'var(--text-muted)' } },
+                'No exports yet for this photo.')
             )
           ),
 
