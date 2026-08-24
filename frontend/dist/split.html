@@ -229,7 +229,16 @@
               }, m === 'window' ? 'Window' : 'Continue'))),
             e('p', { className: 'hint' }, s.mode === 'window'
               ? 'The image continues behind the gaps, as if seen through a window.'
-              : 'The gaps are not part of the image; only the sheets carry it.')),
+              : 'The gaps are not part of the image; only the sheets carry it.'),
+            // The mounting consequence, not just the concept — getting this
+            // wrong is invisible until the sheets are on the wall.
+            img && props.seam && e('p', {
+              className: 'hint',
+              style: props.seam.risky
+                ? { color: 'var(--yellow)', borderLeft: '2px solid var(--yellow)',
+                    paddingLeft: 8 }
+                : {},
+            }, props.seam.text)),
           e('div', { className: 'field' },
             e('label', null,
               e('span', null,
@@ -716,12 +725,14 @@
       }
 
       const P = cand && img ? G.plan(img, cand.cand, s) : null;
+      const seam = P ? G.seamNote(P) : null;
 
       return e('div', null,
         e(PS.SharedHeader, { activePage: 'split' }),
         e('div', { className: 'shell' },
           e(Sidebar, { s: s, set: set, img: img, ups: ups, source: source,
                        setSource: setSource, origImg: origImg,
+                       seam: seam,
                        onSave: savePrefs, onReset: resetPrefs,
                        dirty: prefsDirty, msg: prefsMsg,
                        hasSaved: Object.keys(savedPrefs).length > 0 }),
@@ -746,6 +757,11 @@
                   className: 'spec ' + ((1 - P.keep) <= 0.15 ? 'good' : (1 - P.keep) <= 0.35 ? 'warn' : 'bad'),
                 }, 'Crop ', e('b', null, G.pct(1 - P.keep))),
                 e('div', { className: 'spec' }, 'Binds on ', e('b', null, P.bindingAxis))),
+              seam && e('p', {
+                className: 'hint',
+                style: { maxWidth: 620, textAlign: 'center',
+                         color: seam.risky ? 'var(--yellow)' : 'var(--text-dim)' },
+              }, seam.text),
               e('p', { className: 'hint' }, 'Drag the preview to reposition the crop.'),
               e(ExportBar, {
                 photoId: photoId, cand: cand.cand, s: s, source: source,

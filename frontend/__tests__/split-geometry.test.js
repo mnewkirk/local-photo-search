@@ -572,6 +572,49 @@ describe('upscale integration', () => {
   });
 });
 
+describe('seamNote — what the mode means on the wall', () => {
+  const P = (mode, g) => G.plan(IMG, CAND, { mode, gutter: g });
+
+  test('window mode with a gap warns that image is left out at the seam', () => {
+    // A real print failed this way: exported in window mode with a 0.1" gap,
+    // then butt-joined, so a strip of mountain was simply missing at the join.
+    const n = G.seamNote(P('window', 0.5));
+    expect(n.risky).toBe(true);
+    expect(n.hiddenPx).toBeGreaterThan(0);
+    expect(n.text).toContain('Mount these 0.5″ apart');
+    expect(n.text).toContain('jump');
+  });
+
+  test('it quotes the hidden strip in pixels, at the plan\'s own dpi', () => {
+    const p = P('window', 0.5);
+    expect(G.seamNote(p).hiddenPx).toBe(Math.round(0.5 * p.dpi));
+  });
+
+  test('continue mode hides nothing and says the sheets can be butted', () => {
+    const n = G.seamNote(P('continue', 0.5));
+    expect(n.risky).toBe(false);
+    expect(n.hiddenPx).toBe(0);
+    expect(n.text).toContain('butted');
+  });
+
+  test('a zero gap is safe in either mode', () => {
+    ['window', 'continue'].forEach((mode) => {
+      const n = G.seamNote(P(mode, 0));
+      expect(n.risky).toBe(false);
+      expect(n.hiddenPx).toBe(0);
+    });
+  });
+
+  test('the hidden strip is exactly the step-minus-panel width', () => {
+    // This is the invariant the export relies on: in window mode the stride
+    // between panels exceeds the panel itself by the gap's worth of pixels.
+    const p = P('window', 0.5);
+    const { rects } = G.panelRects(IMG, CAND, { mode: 'window', gutter: 0.5 });
+    const skipped = (rects[1].sx - rects[0].sx) - rects[0].sw;
+    expect(Math.round(skipped)).toBe(G.seamNote(p).hiddenPx);
+  });
+});
+
 describe('reachAtDpi', () => {
   test('reports the long-edge reach, rounded down to the half inch', () => {
     expect(G.reachAtDpi(IMG, 240)).toBe(27);

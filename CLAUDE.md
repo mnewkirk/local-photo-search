@@ -960,6 +960,23 @@ or invalid key is rejected by name rather than silently dropped. The page holds
 rendering until the stored values arrive, or arrangements for the built-in
 defaults would flash past and be replaced. Tests: `tests/test_settings.py`.
 
+### Seam mode decides how the sheets must be MOUNTED
+
+In **window** mode the picture continues *behind* the wall gaps, so the
+export deliberately omits a gap's worth of image between panels. That is
+correct only if the sheets are hung that far apart. **Butt-joined, the
+missing strip reads as the image jumping at every seam** — a real print
+failed this way at a 0.1″ gap and 399 dpi, dropping **40 px** at each join.
+In **continue** mode nothing is omitted, so those sheets can be butted or
+spaced freely. At a zero gap the two modes are identical.
+
+`G.seamNote(P)` turns this into the mounting instruction shown in the
+sidebar and on the stage (highlighted when the combination is the risky
+one). `tests/test_split_export.py::test_adjacent_panels_join_exactly` pins
+the behaviour with a source whose every column is uniquely coloured, so a
+panel's edge column identifies its exact source column: continue mode must
+be perfectly contiguous, window mode must skip exactly `gap x dpi` pixels.
+
 **The empty-state diagnostic names the actual constraint.** It used to say
 "No sheet size is selected" for *every* empty result — wrong in 25 of the
 26 ways the list can empty, and it told people to turn on sizes that were

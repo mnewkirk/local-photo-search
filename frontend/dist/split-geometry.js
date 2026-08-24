@@ -481,6 +481,39 @@
     };
   }
 
+  /**
+   * What the seam mode means when the sheets go on the wall.
+   *
+   * In 'window' mode the picture continues *behind* the gap, so the export
+   * deliberately drops a gap's worth of image between panels. That is correct
+   * only if the sheets are actually mounted that far apart — butt-joined, the
+   * missing strip shows up as the image jumping at every seam. This is a real
+   * print that went wrong, not a hypothetical: 0.1" at 399 dpi is 40 px of
+   * mountain silently absent from the join.
+   */
+  function seamNote(P) {
+    var hiddenPx = P.mode === 'window' ? Math.round(P.g * P.dpi) : 0;
+    if (P.g <= 0) {
+      return { hiddenPx: 0, risky: false,
+               text: 'Sheets butt together with no gap. Both seam modes are '
+                   + 'identical at a zero gap.' };
+    }
+    if (P.mode === 'window') {
+      return {
+        hiddenPx: hiddenPx, risky: true,
+        text: 'Mount these ' + fmt(P.g) + '″ apart. The picture continues '
+            + 'behind each gap, so ' + fmt(P.g) + '″ (' + hiddenPx + ' px) is '
+            + 'left out at every seam — butt them together and the image will '
+            + 'jump there.',
+      };
+    }
+    return {
+      hiddenPx: 0, risky: false,
+      text: 'Nothing is left out at the seams, so these can be butted '
+          + 'together or spaced by any amount.',
+    };
+  }
+
   /** "At 240 dpi this file reaches 27 inches along its long edge." */
   function reachAtDpi(img, minDpi) {
     return Math.floor((Math.max(img.w, img.h) / minDpi) * 2) / 2;
@@ -513,6 +546,7 @@
     candidates: candidates, reachable: reachable, bestAlternative: bestAlternative,
     forGrid: forGrid,
     diagnose: diagnose, needSentence: needSentence, reachAtDpi: reachAtDpi,
+    seamNote: seamNote,
     upscaleFor: upscaleFor, sizeLabel: sizeLabel, describe: describe,
     fmt: fmt, pct: pct, inches: inches, commas: commas, ratio: ratio,
   };

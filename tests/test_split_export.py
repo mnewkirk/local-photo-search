@@ -175,6 +175,55 @@ def test_exported_panels_have_the_right_pixel_shape(tmp_path, monkeypatch):
         assert im.height > im.width
 
 
+def test_adjacent_panels_join_exactly(tmp_path, monkeypatch):
+    """The seam test, from a print that came out wrong.
+
+    Every source column gets a unique colour, so a panel's edge column says
+    exactly which source column it came from. In 'continue' mode adjacent
+    panels must be perfectly contiguous; in 'window' mode they must skip
+    exactly one gap's worth of pixels, because the picture continues *behind*
+    the gap. Butt-joining a window-mode print is what makes the image jump.
+    """
+    import numpy as np
+    from PIL import Image
+
+    W, H = 2600, 1000
+    src = tmp_path / "lib" / "ramp.png"
+    src.parent.mkdir(parents=True)
+    a = np.zeros((H, W, 3), dtype=np.uint8)
+    xs = np.arange(W)
+    a[:, :, 0] = (xs >> 8).astype(np.uint8)     # column index, high byte
+    a[:, :, 1] = (xs & 255).astype(np.uint8)    # ...and low byte
+    Image.fromarray(a).save(src)
+
+    db, pid = _db_with_photo(tmp_path, str(src))
+    monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(tmp_path / "exports"))
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+
+    def col_at(path, x):
+        with Image.open(path) as im:
+            px = np.asarray(im.convert("RGB"))[H // 2, x]
+        return int(px[0]) * 256 + int(px[1])
+
+    try:
+        for mode, gutter in (("continue", 0.5), ("continue", 0.0),
+                             ("window", 0.0), ("window", 0.5)):
+            res = SX.export_panels(db, pid, pw=10, ph=8, cols=2, rows=1,
+                                   gutter=gutter, mode=mode, fmt="png",
+                                   overwrite=True)
+            panels = sorted(res["panels"], key=lambda p: p["name"])
+            left_last = col_at(panels[0]["output"], -1)
+            right_first = col_at(panels[1]["output"], 0)
+            skipped = right_first - left_last - 1
+
+            p = SX.plan(W, H, 10, 8, 2, 1, gutter=gutter, mode=mode)
+            expected = round(gutter * p.dpi) if mode == "window" else 0
+            assert abs(skipped - expected) <= 1, (
+                f"{mode} gap={gutter}: skipped {skipped}px, expected {expected}")
+    finally:
+        db.close()
+
+
 def test_export_writes_a_manifest(tmp_path, monkeypatch):
     orig = _photo(tmp_path, 2400, 1600)
     db, pid = _db_with_photo(tmp_path, str(orig))
