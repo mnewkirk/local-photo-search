@@ -166,13 +166,50 @@ def test_exported_panels_have_the_right_pixel_shape(tmp_path, monkeypatch):
         db.close()
 
     p = SX.plan(2400, 1600, pw=13, ph=19, cols=3, rows=2)
-    rect = SX.panel_rects(p)[0]
     with Image.open(res["panels"][0]["output"]) as im:
-        # Each panel carries its share of the crop, within rounding.
-        assert abs(im.width - round(rect["sw"])) <= 1
-        assert abs(im.height - round(rect["sh"])) <= 1
+        # Panels are sized on an integer-dpi grid so pixels/dpi is exactly the
+        # sheet, so compare against that rather than the fractional ideal —
+        # which is at most one dpi's worth away.
+        assert im.width == round(13 * res["dpi"])
+        assert im.height == round(19 * res["dpi"])
+        assert abs(res["dpi"] - p.dpi) < 1
         # A 13:19 sheet must come out portrait.
         assert im.height > im.width
+
+
+def test_panels_are_exactly_sheet_sized(tmp_path, monkeypatch):
+    """pixels / dpi must be EXACTLY the sheet.
+
+    This is what makes printing with scaling turned off correct — "it should
+    already be fit". JPEG stores density as an integer, so sizing pixels from a
+    fractional dpi (240.5) and stamping the rounded one (240) declared
+    13.025" x 19.042" for a 13x19" sheet, and rounding each panel box
+    independently made neighbours 3126 and 3127 px wide. Both shipped, and both
+    push content off the edge of the paper.
+    """
+    from PIL import Image
+
+    orig = _photo(tmp_path, 13709, 9139, name="big.jpg")
+    db, pid = _db_with_photo(tmp_path, str(orig))
+    monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(tmp_path / "exports"))
+    monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
+    try:
+        res = SX.export_panels(db, pid, pw=13, ph=19, cols=4, rows=2,
+                               gutter=0.125, mode="continue")
+    finally:
+        db.close()
+
+    sizes = set()
+    for panel in res["panels"]:
+        with Image.open(panel["output"]) as im:
+            w, h = im.size
+            dpi = im.info["dpi"]
+        sizes.add((w, h))
+        assert dpi[0] == dpi[1] == int(dpi[0])          # integer density
+        assert w / dpi[0] == pytest.approx(13, abs=1e-9)
+        assert h / dpi[1] == pytest.approx(19, abs=1e-9)
+    # ...and every panel identical, not alternating by a pixel.
+    assert len(sizes) == 1, f"panels differ in size: {sizes}"
 
 
 def test_adjacent_panels_join_exactly(tmp_path, monkeypatch):
@@ -299,7 +336,8 @@ def test_export_uses_an_upscaled_source_when_given_one(tmp_path, monkeypatch):
         db.close()
 
     assert large["source_px"] == [4800, 3200]
-    assert large["dpi"] == pytest.approx(small["dpi"] * 4, rel=0.01)
+    # Quantised to an integer dpi, so allow a dpi's worth of slack.
+    assert large["dpi"] == pytest.approx(small["dpi"] * 4, rel=0.05)
     # Crop is a shape mismatch, so upscaling must not change it.
     assert large["crop_pct"] == pytest.approx(small["crop_pct"], abs=0.1)
 

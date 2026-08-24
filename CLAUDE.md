@@ -989,7 +989,22 @@ stride-minus-panel gap, and stitching `panel-r1c1` to `panel-r1c2` gives a seam
 step of 3.04 against 2.44 for a typical neighbouring column *inside* a panel —
 a 1.24× ratio, i.e. indistinguishable from any other column boundary.
 
-So the discontinuity is introduced **after** export, and the prime suspect is
+**One real defect was found on our side.** Panels were sized from the
+*fractional* dpi (240.5) while JPEG can only stamp an **integer** density (240),
+so each file declared **13.025″ × 19.042″ for a 13 × 19″ sheet** — and rounding
+each panel box independently made neighbours differ by a pixel (3126 vs 3127).
+Printing with scaling turned off ("it should already be fit") therefore laid out
+more than the sheet, unevenly, before borderless expansion was even considered.
+
+Panels are now laid out on an **integer-dpi grid**: `out_dpi` is the nearest
+integer dpi whose full run still fits inside the crop (rounding, not flooring —
+flooring throws away 1.3% at 41 dpi where rounding costs 0.2%), and each panel
+is exactly `pw × out_dpi` by `ph × out_dpi` pixels. `pixels / dpi` is now
+exactly the sheet, and every panel is identical.
+`test_panels_are_exactly_sheet_sized` pins it.
+
+That alone does not explain the whole misalignment — 25 mil is far less than
+what the print showed — so the prime remaining suspect is
 **borderless overspray**: an inkjet printing borderless enlarges the page
 (Epson calls it *Expansion*, roughly 2–3% at the Standard setting) so ink runs
 off all four edges and no white margin can appear. Every sheet therefore loses

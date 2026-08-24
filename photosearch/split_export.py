@@ -204,28 +204,63 @@ def export_panels(db, photo_id: int, *, pw: float, ph: float,
 
             ext = "jpg" if fmt in ("jpg", "jpeg") else fmt
             written = []
-            for rect in panel_rects(p):
-                box = (
-                    int(round(rect["sx"])), int(round(rect["sy"])),
-                    int(round(rect["sx"] + rect["sw"])),
-                    int(round(rect["sy"] + rect["sh"])),
-                )
-                # Clamp to the source: rounding at the far edge can overshoot
-                # by a pixel, which Pillow would silently pad with black.
-                box = (max(0, box[0]), max(0, box[1]),
-                       min(iw, box[2]), min(ih, box[3]))
-                tile = im.crop(box)
+            # Lay the panels out on an INTEGER dpi grid.
+            #
+            # A file is only "already the right size" — the thing that makes
+            # printing with scaling turned off correct — if pixels / dpi is
+            # exactly the sheet. JPEG stores density as an integer, so sizing
+            # pixels from a fractional dpi (240.5) and then stamping the
+            # rounded one (240) declares 13.025" x 19.042" for a 13x19" sheet,
+            # and rounding each panel box independently made neighbours differ
+            # by a pixel (3126 vs 3127). Both were real: they overflowed the
+            # sheet and made panels inconsistent widths.
+            #
+            # Use the NEAREST integer dpi that still fits inside the crop.
+            # Flooring unconditionally would be safe but wasteful: at 41.6 dpi
+            # it throws away 1.3% of the piece, where rounding costs ~0.2%.
+            ox, oy = int(round(p.ox)), int(round(p.oy))
+            gap_in = p.gutter if p.mode == "window" else 0.0
 
-                name = f"panel-r{rect['r'] + 1}c{rect['c'] + 1}.{ext}"
-                out = dest / name
-                save_kw = {"dpi": (round(p.dpi), round(p.dpi))}
-                if ext == "jpg":
-                    save_kw.update(quality=quality, subsampling=0)
-                tile.save(out, **save_kw)
-                written.append(out)
+            def _fits(d):
+                pwp, php = int(round(p.pw * d)), int(round(p.ph * d))
+                gx = int(round(gap_in * d))
+                return (ox + p.cols * pwp + (p.cols - 1) * gx <= iw
+                        and oy + p.rows * php + (p.rows - 1) * gx <= ih)
+
+            out_dpi = max(1, int(round(p.dpi)))
+            while out_dpi > 1 and not _fits(out_dpi):
+                out_dpi -= 1
+
+            pw_px = int(round(p.pw * out_dpi))
+            ph_px = int(round(p.ph * out_dpi))
+            # The gap is empty wall, not content, so a fractional pixel there
+            # is harmless — only the panels themselves must be exact.
+            gap_x = gap_y = int(round(gap_in * out_dpi))
+
+            for r in range(p.rows):
+                for c in range(p.cols):
+                    x0 = ox + c * (pw_px + gap_x)
+                    y0 = oy + r * (ph_px + gap_y)
+                    if x0 + pw_px > iw or y0 + ph_px > ih:
+                        raise SplitError(
+                            f"panel r{r + 1}c{c + 1} runs past the source "
+                            f"({x0 + pw_px}x{y0 + ph_px} vs {iw}x{ih})")
+                    tile = im.crop((x0, y0, x0 + pw_px, y0 + ph_px))
+
+                    name = f"panel-r{r + 1}c{c + 1}.{ext}"
+                    out = dest / name
+                    save_kw = {"dpi": (out_dpi, out_dpi)}
+                    if ext == "jpg":
+                        save_kw.update(quality=quality, subsampling=0)
+                    tile.save(out, **save_kw)
+                    written.append(out)
 
         manifest = dest / "manifest.json"
         summary = _summary(p, iw, ih, dest)
+        # The dpi the FILES carry, which is what a printer will honour.
+        summary["dpi"] = out_dpi
+        summary["panel_px"] = [pw_px, ph_px]
+        summary["sheet_exact"] = True
         manifest.write_text(json.dumps({
             "photo_id": photo_id,
             "source": src,
