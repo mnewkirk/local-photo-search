@@ -607,12 +607,17 @@ def test_upscale_photo_skips_existing(fake_cli, tmp_path, monkeypatch):
     (2, True), (2.1, True), (1.3, True), (1.05, True), (6, True),
     (1.0, False), (0.5, False), (6.5, False), (12, False),
 ])
-def test_upscale_route_accepts_any_factor_in_range(tmp_path, monkeypatch,
-                                                   scale, ok):
+def test_upscale_route_accepts_any_factor_in_range(fake_cli, tmp_path,
+                                                   monkeypatch, scale, ok):
     """The route validated MEMBERSHIP in SCALES long after everything else moved
     to a range, so /split's exact factors (1.3, 2.1) were rejected with
     "scale must be one of [...]" while 2 went through. SCALES is only the UI
-    preset list."""
+    preset list.
+
+    Takes `fake_cli` because the endpoint calls cli_path() and answers 503 when
+    Topaz is not installed. Without it this passed only on a machine that has
+    Topaz — which is why it went green locally and red on CI.
+    """
     from fastapi.testclient import TestClient
     from photosearch import web
 

@@ -740,6 +740,29 @@ read-local / write-NAS / mirror-local model — don't wait for the nightly
 NAS images, so `mirrored:0` until the NAS is redeployed; the sync compute +
 authoritative write still work, and the local UI catches up on the next sync.
 
+## Running the tests the way CI does
+
+`./scripts/test-like-ci.sh` — use this before pushing. A plain `pytest` run on a
+dev box diverges from GitHub Actions in three ways, and **each one has hidden a
+real failure**:
+
+1. **No Topaz CLI on CI.** With Topaz installed, `POST
+   /api/admin/upscale-photo` returns 200; on CI `cli_path()` raises and it
+   returns **503**. A test asserting 200 passed locally and failed on CI for
+   five commits. Tests that exercise that route must take the `fake_cli`
+   fixture.
+2. **Minimal dependencies.** CI installs no torch/cv2/insightface —
+   `tests/conftest.py` mocks them — so code paths differ from a dev venv that
+   has the real thing. The script builds a venv with CI's exact list.
+3. **Nothing ignored.** `--ignore=` is tempting when a file fails for local
+   reasons, and it silently stops testing that file. CI ignores nothing.
+
+Known local-only failure: `tests/test_admin_deploy_mode.py` reads HEAD through
+git, and a **git worktree created from Windows** has a `\wsl.localhost` UNC
+gitdir that git cannot resolve from inside WSL — so those two tests fail in a
+worktree and pass on CI. The script detects it and says so. Run from the main
+checkout for a clean result.
+
 ## Local Topaz upscaling (M30)
 
 Upscale a photo from the image view using the **locally installed Topaz Photo

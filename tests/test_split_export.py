@@ -189,7 +189,9 @@ def test_panels_are_exactly_sheet_sized(tmp_path, monkeypatch):
     """
     from PIL import Image
 
-    orig = _photo(tmp_path, 13709, 9139, name="big.jpg")
+    # Small enough for CI to encode quickly. 2603 is deliberate: it makes the
+    # dpi land fractional, which is the whole point of the test.
+    orig = _photo(tmp_path, 2603, 1740, name="big.jpg")
     db, pid = _db_with_photo(tmp_path, str(orig))
     monkeypatch.setenv("PHOTOSEARCH_UPSCALE_DIR", str(tmp_path / "exports"))
     monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
