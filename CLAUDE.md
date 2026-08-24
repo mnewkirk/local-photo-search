@@ -964,11 +964,15 @@ defaults would flash past and be replaced. Tests: `tests/test_settings.py`.
 
 In **window** mode the picture continues *behind* the wall gaps, so the
 export deliberately omits a gap's worth of image between panels. That is
-correct only if the sheets are hung that far apart. **Butt-joined, the
-missing strip reads as the image jumping at every seam** — a real print
-failed this way at a 0.1″ gap and 399 dpi, dropping **40 px** at each join.
+correct only if the sheets are hung that far apart; butt-joined, the missing
+strip would read as the image jumping at every seam (0.1″ at 399 dpi is 40 px).
 In **continue** mode nothing is omitted, so those sheets can be butted or
 spaced freely. At a zero gap the two modes are identical.
+
+**This was NOT the cause of the seam failure on the first real print** — that
+export was `continue` mode, verified contiguous. See "Seam misalignment in
+print" below. The guidance stands on its own; do not re-attribute that incident
+to it.
 
 `G.seamNote(P)` turns this into the mounting instruction shown in the
 sidebar and on the stage (highlighted when the combination is the risky
@@ -976,6 +980,26 @@ one). `tests/test_split_export.py::test_adjacent_panels_join_exactly` pins
 the behaviour with a source whose every column is uniquely coloured, so a
 panel's edge column identifies its exact source column: continue mode must
 be perfectly contiguous, window mode must skip exactly `gap x dpi` pixels.
+
+### Seam misalignment in print (files were fine)
+
+A printed 4×2 of 13×19″ showed the image jumping at the joins. The exported
+files were **correct**: the manifest confirms `continue` mode with a 0 px
+stride-minus-panel gap, and stitching `panel-r1c1` to `panel-r1c2` gives a seam
+step of 3.04 against 2.44 for a typical neighbouring column *inside* a panel —
+a 1.24× ratio, i.e. indistinguishable from any other column boundary.
+
+So the discontinuity is introduced **after** export, and the prime suspect is
+**borderless overspray**: an inkjet printing borderless enlarges the page
+(Epson calls it *Expansion*, roughly 2–3% at the Standard setting) so ink runs
+off all four edges and no white margin can appear. Every sheet therefore loses
+a sliver at *every* edge — including the two that meet at a seam — so ~0.2″ per
+edge goes missing and adjacent panels no longer line up. Set the driver's
+borderless **Expansion to Minimum**, or print one panel with borderless off to
+confirm before reprinting the set. A pre-compensating **bleed** option on the
+export (widen each panel rect by the expansion percentage so what survives the
+crop is exactly the intended panel) is the durable fix if Minimum is not
+enough — not built yet.
 
 **The empty-state diagnostic names the actual constraint.** It used to say
 "No sheet size is selected" for *every* empty result — wrong in 25 of the
