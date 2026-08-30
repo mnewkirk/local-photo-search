@@ -1416,8 +1416,36 @@ dimensionality) — ~230k faces takes tens of minutes even on a fast desktop.
 - **Big backlog**: clustering + matching are on-demand and fell far behind after
   the big imports (Google Takeout / phone ingest). At 2026-06-20: of 331k faces,
   only 51k (15%) matched to a person, 77k unmatched-but-clustered, and **202k
-  never clustered** (`person_id IS NULL AND cluster_id IS NULL`, shown as bare
-  "Unknown #" since the label is `"Unknown #" + cluster_id`).
+  never clustered** (`person_id IS NULL AND cluster_id IS NULL`). Those never-
+  clustered faces are **not** shown as bare "Unknown #" — the `/api/faces/groups`
+  cluster query requires `cluster_id IS NOT NULL`, so they were invisible on
+  `/faces` entirely. See "Reviewing never-clustered faces" below.
+### Reviewing never-clustered faces (the "Unclustered" bucket)
+
+Every face lands with `cluster_id = NULL` and only `recluster-faces` (global,
+~an hour on the desktop for 230k encodings) mints `Unknown #N`. Nothing
+schedules it, so **everything ingested since the last recluster is
+unreviewable** — the symptom is `/faces?filter=unknown` filtered to a recent
+day showing only named people and "0 unknowns" while the photos themselves
+clearly have faces.
+
+`/api/faces/groups` therefore emits one extra group, `type: "unclustered"`,
+covering `person_id IS NULL AND cluster_id IS NULL` — **but only when a content
+filter (date/place/query/camera) is active.** Unfiltered it would be a
+150k-face blob with no identity structure, so it is deliberately suppressed
+there. Open it via `GET /api/faces/group/unclustered/0/photos` with the *same*
+filters (the path id is ignored); an unfiltered call is a **400**, not a very
+slow full-library scan.
+
+Measured on the 259k-face replica: the group query is ~35 ms and the photo
+fetch ~70 ms on the busiest day in the library.
+
+On `/faces` the bucket has no Rename/Merge/Split/Ignore and is excluded from
+multi-select — every one of those reassigns *all* faces in a group, which is
+right for a cluster and catastrophic for a bucket holding many different
+people. Review it face-by-face in the photo grid. It is not a substitute for
+`recluster-faces`; it is how you review a day without running one.
+
 - **Babies don't auto-match**: infant faces ARE detected and cluster fine, but
   ArcFace can't bridge baby→child, so `match-faces` won't attach them to the
   grown person. Recover by reclustering then **manually assigning the baby

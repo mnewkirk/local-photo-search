@@ -255,6 +255,14 @@ def db(tmp_db_path):
         _make_embedding(512, seed=106), cluster_id=99,
     )
 
+    # A face that has never been clustered (person_id AND cluster_id both NULL).
+    # This is the state every newly-indexed face is in until recluster-faces
+    # runs, so /faces must be able to surface it under a content filter.
+    face8 = database.add_face(
+        photo_ids["DSC04880.JPG"], (310, 410, 390, 330),
+        _make_embedding(512, seed=107),
+    )
+
     # Create a collection
     coll_id = database.create_collection("Best of March", "Top picks from March trip")
     database.add_photos_to_collection(coll_id, [
@@ -270,6 +278,7 @@ def db(tmp_db_path):
         "jamie_907": face3, "alex_907": face4,
         "jamie_922": face5, "alex_922": face6,
         "unknown_878": face7,
+        "unclustered_880": face8,
     }
     database._test_collection_id = coll_id
 

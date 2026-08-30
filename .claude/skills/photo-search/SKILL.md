@@ -777,11 +777,20 @@ $DC photosearch recluster-faces          # group remaining unknowns via DBSCAN
 $DC photosearch stack --directory /photos/YEAR
 ```
 
-New faces land with `cluster_id = NULL` and are invisible on `/faces` until
-`recluster-faces` runs — it's the only thing that forms "Unknown #N" groups.
-Run it after each face-indexing pass (or batch thereof). Warning: every run
-renumbers every unknown cluster_id and clears `ignored_clusters`, so any
-"ignore" decisions on unknown clusters need to be reapplied afterward.
+New faces land with `cluster_id = NULL`, and `recluster-faces` is the only
+thing that forms "Unknown #N" groups. Run it after each face-indexing pass (or
+batch thereof). Warning: every run renumbers every unknown cluster_id and
+clears `ignored_clusters`, so any "ignore" decisions on unknown clusters need
+to be reapplied afterward.
+
+Until it runs, those faces are ungrouped — but they are **not** unreachable:
+`/api/faces/groups` surfaces them as a single `type: "unclustered"` group
+whenever a content filter (date / place / query / camera) is active, so "review
+the faces from that day" works without a global recluster. Unfiltered, the
+bucket is suppressed (it would be a six-figure blob) and
+`GET /api/faces/group/unclustered/0/photos` without filters returns 400. The
+bucket has no Rename/Merge/Split/Ignore and no multi-select — those reassign
+every face in a group, which is wrong when the group is many different people.
 
 ### Phone-photo ingest (Syncthing + `ingest-incoming`)
 

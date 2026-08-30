@@ -969,6 +969,12 @@
       const [splitError, setSplitError] = useState('');
       const editRef = useRef(null);
       const autoOpened = useRef(false);
+      // The unclustered bucket is scoped by the content filter, so its photo
+      // fetch needs the CURRENT cf. loadGroupPhotos/openGroupDirect are
+      // []-dep (the mount effect calls them), so read it through a ref rather
+      // than capturing a stale copy.
+      const cfRef = useRef(cf);
+      cfRef.current = cf;
 
       // Photo modal state
       const [modalPhoto, setModalPhoto] = useState(null);
@@ -1064,11 +1070,22 @@
       // the correct paginated slice. Keep the name to minimise downstream churn.
       const filteredGroups = groups;
 
-      const loadGroupPhotos = useCallback((group) => {
-        setLoadingPhotos(true);
+      // "unclustered" is the never-clustered bucket — it has no id, and the
+      // server requires the same content filter that produced it (otherwise it
+      // would return every unclustered face in the library).
+      const groupPhotosUrl = (group) => {
+        if (group.type === 'unclustered') {
+          return API + '/api/faces/group/unclustered/0/photos?limit=10000' +
+            cfParams(cfRef.current);
+        }
         const type = group.type === 'person' ? 'person' : 'cluster';
         const id = group.type === 'person' ? group.person_id : group.cluster_id;
-        fetch(API + '/api/faces/group/' + type + '/' + id + '/photos')
+        return API + '/api/faces/group/' + type + '/' + id + '/photos';
+      };
+
+      const loadGroupPhotos = useCallback((group) => {
+        setLoadingPhotos(true);
+        fetch(groupPhotosUrl(group))
           .then(r => r.json())
           .then(data => { setGroupPhotos(data.photos || []); setLoadingPhotos(false); })
           .catch(() => setLoadingPhotos(false));
@@ -1080,9 +1097,7 @@
         setMerging(false);
         setNameError('');
         setLoadingPhotos(true);
-        const type = group.type === 'person' ? 'person' : 'cluster';
-        const id = group.type === 'person' ? group.person_id : group.cluster_id;
-        fetch(API + '/api/faces/group/' + type + '/' + id + '/photos')
+        fetch(groupPhotosUrl(group))
           .then(r => r.json())
           .then(data => { setGroupPhotos(data.photos || []); setLoadingPhotos(false); })
           .catch(() => setLoadingPhotos(false));
@@ -1093,6 +1108,8 @@
         // Update URL
         if (group.type === 'person') {
           updateUrl({ name: group.label, filter });
+        } else if (group.type === 'unclustered') {
+          updateUrl({ filter });
         } else {
           updateUrl({ face_id: String(group.rep_face_id || group.cluster_id), filter });
         }
@@ -1286,10 +1303,15 @@
       const [multiWorking, setMultiWorking] = useState(false);
       const multiInputRef = useRef(null);
 
-      const groupKey = (g) => (g.type === 'person' ? 'p' : 'c') + (g.person_id || g.cluster_id);
+      const groupKey = (g) => (g.type === 'unclustered' ? 'u' :
+        (g.type === 'person' ? 'p' : 'c') + (g.person_id || g.cluster_id));
       const lastSelectedIdx = useRef(null); // index into filteredGroups
 
       const toggleSelect = useCallback((g, ev) => {
+        // The unclustered bucket has no cluster_id to send to bulk-collect,
+        // and it holds many different people — bulk actions on it are always
+        // wrong. Review it face-by-face in the photo grid instead.
+        if (g.type === 'unclustered') return;
         const key = groupKey(g);
         setSelected(prev => {
           const next = new Set(prev);
@@ -1774,9 +1796,13 @@
                   groupPhotos.length + ' photo' + (groupPhotos.length !== 1 ? 's' : '')),
               ),
               !editing && !merging && !splitting && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
-                e('button', { className: 'rename-btn', onClick: startRename },
+                selectedGroup.type !== 'unclustered' && e('button', { className: 'rename-btn', onClick: startRename },
                   selectedGroup.label.startsWith('Unknown') ? 'Set Name' : 'Rename'),
-                mergeTargets.length > 0 && e('button', { className: 'rename-btn', onClick: startMerge }, 'Merge'),
+                selectedGroup.type !== 'unclustered' && mergeTargets.length > 0 && e('button', { className: 'rename-btn', onClick: startMerge }, 'Merge'),
+                selectedGroup.type === 'unclustered' && e('span', {
+                  style: { fontSize: 12, color: 'var(--text-muted)' },
+                  title: 'These faces have never been through recluster-faces, so they have no identity grouping yet. Assign them individually from the photos below.',
+                }, 'Never clustered \u2014 assign faces individually below'),
                 selectedGroup.type === 'person' && e('button', {
                   className: 'rename-btn',
                   onClick: () => setInspectPerson({ id: selectedGroup.person_id, name: selectedGroup.label }),

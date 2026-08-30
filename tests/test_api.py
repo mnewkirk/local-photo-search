@@ -20,7 +20,7 @@ class TestStats:
         assert resp.status_code == 200
         data = resp.json()
         assert data["photos"] == 5
-        assert data["faces"] == 7  # 6 assigned + 1 unknown
+        assert data["faces"] == 8  # 6 assigned + 1 clustered unknown + 1 unclustered
         assert data["persons"] == 3
         assert data["described"] == 5
         assert data["quality_scored"] == 5
@@ -233,6 +233,56 @@ class TestFacesAPI:
         assert len(person_groups) == 3  # Alex, Jamie, Sam
         assert len(cluster_groups) >= 1  # at least the unknown cluster
         assert "total" in data and "counts" in data and "sort" in data
+
+    def test_unclustered_faces_hidden_without_filter(self, client):
+        """Unfiltered /faces must NOT surface the unclustered bucket.
+
+        Library-wide it is hundreds of thousands of faces — a useless blob.
+        It only earns a slot once a content filter narrows the set.
+        """
+        resp = client.get("/api/faces/groups", params={"include_singletons": "true"})
+        assert resp.status_code == 200
+        types = {g["type"] for g in resp.json()["groups"]}
+        assert "unclustered" not in types
+
+    def test_unclustered_faces_surface_under_filter(self, client, db):
+        """A never-clustered face appears as an 'unclustered' group when filtered."""
+        resp = client.get("/api/faces/groups",
+                          params={"filter": "unknown", "location": "Morro Bay"})
+        assert resp.status_code == 200
+        data = resp.json()
+        unclustered = [g for g in data["groups"] if g["type"] == "unclustered"]
+        assert len(unclustered) == 1
+        g = unclustered[0]
+        assert g["face_count"] == 1
+        assert g["photo_count"] == 1
+        assert g["rep_face_id"] == db._test_face_ids["unclustered_880"]
+        # The chip count must include it, or the UI reads "0 unknown" while
+        # showing a group.
+        assert data["counts"]["unknown"] >= 1
+
+    def test_unclustered_group_respects_the_filter(self, client):
+        """The bucket is scoped to the filtered photos, not the whole library."""
+        resp = client.get("/api/faces/groups",
+                          params={"filter": "unknown", "location": "Big Sur"})
+        assert resp.status_code == 200
+        types = {g["type"] for g in resp.json()["groups"]}
+        assert "unclustered" not in types
+
+    def test_unclustered_group_photos(self, client, db):
+        """Opening the bucket returns the filtered photos with their face ids."""
+        resp = client.get("/api/faces/group/unclustered/0/photos",
+                          params={"location": "Morro Bay"})
+        assert resp.status_code == 200
+        photos = resp.json()["photos"]
+        assert len(photos) == 1
+        assert photos[0]["filename"] == "DSC04880.JPG"
+        assert photos[0]["face_id"] == db._test_face_ids["unclustered_880"]
+
+    def test_unclustered_group_photos_requires_a_filter(self, client):
+        """Without a filter the bucket would dump every unclustered face."""
+        resp = client.get("/api/faces/group/unclustered/0/photos")
+        assert resp.status_code == 400
 
     def test_face_groups_sort_count(self, client):
         resp = client.get("/api/faces/groups", params={"sort": "count"})

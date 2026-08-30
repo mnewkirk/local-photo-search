@@ -919,7 +919,42 @@ def api_face_groups(
                     "ignored": is_ignored,
                 })
 
-        groups = named_groups + cluster_groups
+        # Faces that have never been clustered (person_id AND cluster_id both
+        # NULL) are the state EVERY newly-indexed face is in until the global
+        # recluster-faces runs — which nothing schedules. The cluster query
+        # above requires `cluster_id IS NOT NULL`, so without this they are
+        # invisible on /faces no matter how you filter.
+        #
+        # They are only surfaced when a content filter is active. Library-wide
+        # this bucket is hundreds of thousands of faces with no identity
+        # structure — useless as a single group, and expensive to render. Once
+        # a date/place/query narrows the set it is exactly what "review the
+        # faces from that day" means.
+        unclustered_groups: list[dict] = []
+        if filtering and filter in ("all", "unknown"):
+            r = db.conn.execute(
+                f"""SELECT COUNT(DISTINCT f.photo_id) AS photo_count,
+                          COUNT(f.id) AS face_count,
+                          (SELECT f2.id FROM faces f2
+                           WHERE f2.person_id IS NULL AND f2.cluster_id IS NULL
+                                 AND f2.bbox_top IS NOT NULL {ff_f2}
+                           ORDER BY (f2.bbox_bottom - f2.bbox_top) * (f2.bbox_right - f2.bbox_left) DESC
+                           LIMIT 1) AS rep_face_id
+                   FROM faces f
+                   WHERE f.person_id IS NULL AND f.cluster_id IS NULL {ff_f}"""
+            ).fetchone()
+            if r and r["face_count"]:
+                unclustered_groups.append({
+                    "type": "unclustered",
+                    "cluster_id": None,
+                    "label": "Unclustered (" + str(r["face_count"]) + " faces)",
+                    "photo_count": r["photo_count"],
+                    "face_count": r["face_count"],
+                    "rep_face_id": r["rep_face_id"],
+                    "ignored": False,
+                })
+
+        groups = named_groups + unclustered_groups + cluster_groups
         total = len(groups)
         t1 = time.time()
         logger.info("faces/groups: query took %.3fs (filter=%s, %d groups)",
@@ -944,7 +979,11 @@ def api_face_groups(
         ignored_qualifying = qualifying_cluster_ids & ignored_set
         counts = {
             "named": named_count,
-            "unknown": len(qualifying_cluster_ids) - len(ignored_qualifying),
+            # The unclustered bucket is one more group under the "Unknown" chip,
+            # so the chip count must include it or the UI reads "0 unknown"
+            # while rendering a group.
+            "unknown": (len(qualifying_cluster_ids) - len(ignored_qualifying)
+                        + len(unclustered_groups)),
             "ignored": len(ignored_qualifying),
         }
 
@@ -1096,7 +1135,17 @@ def api_face_group_info(
 
 
 @app.get("/api/faces/group/{group_type}/{group_id}/photos")
-def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(10000)):
+def api_face_group_photos(
+    group_type: str,
+    group_id: int,
+    limit: int = Query(10000),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    location: str | None = Query(None),
+    q: str | None = Query(None),
+    person: str | None = Query(None),
+    camera: str | None = Query(None),
+):
     """Get all photos for a specific face group (person or cluster).
 
     Returns up to `limit` photos ordered by date_taken DESC with NULL dates
@@ -1109,6 +1158,12 @@ def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(100
     with >10k indexed photos is rare; if that ceiling is ever hit, the real
     fix is offset-based pagination with a matching UI, not just bumping the
     cap. Callers can still pass `?limit=N` to override.
+
+    group_type "unclustered" is the never-clustered bucket (person_id AND
+    cluster_id both NULL); `group_id` is ignored for it. It REQUIRES the same
+    content filters that produced the group in /api/faces/groups — without
+    them the query would return every unclustered face in the library, so an
+    unfiltered request is a 400 rather than a very slow surprise.
 
     Each photo includes an `effective_date` field — `date_taken` when
     present, otherwise the date parsed from the parent folder name via
@@ -1152,8 +1207,41 @@ def api_face_group_photos(group_type: str, group_id: int, limit: int = Query(100
                    LIMIT ?""",
                 (group_id, limit),
             ).fetchall()
+        elif group_type == "unclustered":
+            filter_pids = _face_filter_photo_ids(
+                db, date_from, date_to, location, q, person, camera
+            )
+            if filter_pids is None:
+                raise HTTPException(
+                    400,
+                    "group_type 'unclustered' requires at least one content "
+                    "filter (date_from/date_to/location/q/person/camera)",
+                )
+            if not filter_pids:
+                return {"photos": []}
+            db.conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _facefilter (pid INTEGER PRIMARY KEY)"
+            )
+            db.conn.execute("DELETE FROM _facefilter")
+            db.conn.executemany(
+                "INSERT OR IGNORE INTO _facefilter(pid) VALUES (?)",
+                [(pid,) for pid in filter_pids],
+            )
+            rows = db.conn.execute(
+                f"""SELECT DISTINCT p.*, f.id as face_id,
+                          f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                          f.match_source,
+                          {effective_expr} AS effective_date
+                   FROM photos p
+                   JOIN faces f ON f.photo_id = p.id
+                   WHERE f.person_id IS NULL AND f.cluster_id IS NULL
+                         AND f.photo_id IN (SELECT pid FROM _facefilter)
+                   {order_clause}
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
         else:
-            raise HTTPException(400, "group_type must be 'person' or 'cluster'")
+            raise HTTPException(400, "group_type must be 'person', 'cluster', or 'unclustered'")
 
         return {"photos": [dict(r) for r in rows]}
 

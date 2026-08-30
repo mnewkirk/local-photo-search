@@ -93,8 +93,9 @@ def test_library_overview(db):
     ov = tools.call_tool(db, "get_library_overview", {})
     assert ov["total_photos"] == 5
     assert ov["registered_people"] == 3
-    # Faces exist on 894, 907, 922, 878 → 4 distinct photos.
-    assert ov["photos_with_faces"] == 4
+    # Faces exist on 894, 907, 922, 878, 880 → 5 distinct photos
+    # (880 carries the never-clustered face).
+    assert ov["photos_with_faces"] == 5
     assert ov["date_taken_min"] <= ov["date_taken_max"]
     # DSC04878 has GPS in the sample data.
     assert ov["with_gps"] >= 1
