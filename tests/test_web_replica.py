@@ -167,42 +167,41 @@ def _face_row(client, where):
         return db.conn.execute(f"SELECT * FROM faces WHERE {where}").fetchone()
 
 
-def test_assign_proxies_to_nas_and_does_not_write_locally(nas_spy):
+def test_assign_proxies_to_nas(nas_spy):
+    """The NAS is authoritative — a local-only write is wiped by the next sync.
+
+    The local row IS updated too, but as a MIRROR of what the NAS just applied,
+    in place. See test_assign_does_not_change_face_ids for why "in place"
+    matters.
+    """
     face = _face_row(nas_spy, "person_id IS NULL LIMIT 1")
-    fid, pid = face["id"], face["photo_id"]
+    fid = face["id"]
 
     r = nas_spy.post(f"/api/faces/{fid}/assign?name=Calvin")
     assert r.status_code == 200
     methods = [(m, p) for m, p, _ in nas_spy._nas_calls]
     assert ("POST", f"/api/faces/{fid}/assign?name=Calvin") in methods
-    assert ("MIRROR", [pid]) in [(m, p) for m, p, _ in nas_spy._nas_calls]
-    # the replica must NOT have applied the write itself
-    assert _face_row(nas_spy, f"id = {fid}")["person_id"] is None
 
 
 def test_clear_proxies_to_nas(nas_spy):
     face = _face_row(nas_spy, "person_id IS NOT NULL LIMIT 1")
-    fid, pid, person = face["id"], face["photo_id"], face["person_id"]
+    fid = face["id"]
 
     r = nas_spy.post(f"/api/faces/{fid}/clear")
     assert r.status_code == 200
     assert ("POST", f"/api/faces/{fid}/clear", None) in nas_spy._nas_calls
-    assert _face_row(nas_spy, f"id = {fid}")["person_id"] == person  # untouched locally
 
 
-def test_bulk_assign_proxies_and_mirrors_every_touched_photo(nas_spy):
+def test_bulk_assign_proxies_to_nas(nas_spy):
     from photosearch.db import PhotoDB
     with PhotoDB(web._db_path) as db:
-        rows = db.conn.execute("SELECT id, photo_id FROM faces LIMIT 3").fetchall()
-    fids = [r["id"] for r in rows]
-    want_photos = sorted({r["photo_id"] for r in rows})
+        fids = [r["id"] for r in db.conn.execute("SELECT id FROM faces LIMIT 3")]
 
     r = nas_spy.post("/api/faces/bulk-assign",
                      json={"face_ids": fids, "person_name": "Calvin"})
     assert r.status_code == 200
     posted = [b for m, p, b in nas_spy._nas_calls if p == "/api/faces/bulk-assign"]
     assert posted and posted[0]["face_ids"] == fids
-    assert ("MIRROR", want_photos) in [(m, p) for m, p, _ in nas_spy._nas_calls]
 
 
 def test_merge_proxies_and_resolves_photos_before_the_merge(nas_spy):
@@ -250,3 +249,57 @@ def test_non_replica_mode_still_writes_locally(client, monkeypatch):
     r = client.post(f"/api/faces/{face['id']}/assign?name=Calvin")
     assert r.status_code == 200
     assert _face_row(client, f"id = {face['id']}")["person_id"] is not None
+
+
+def test_assign_does_not_change_face_ids(nas_spy, monkeypatch):
+    """REGRESSION. Mirroring a label change must not rebuild the photo's face
+    rows.
+
+    _mirror_face_photos applies the NAS's face set DELETE-then-INSERT, which
+    mints new ids. Using it for assign meant the first assign silently
+    invalidated every face id on that photo, so the caller's next assign — the
+    modal keeps the ids it already rendered — hit a 404 and the label appeared
+    not to change. Labels must be applied in place.
+    """
+    from photosearch.db import PhotoDB
+    # let the real relabel helper run, not the mirror stub
+    monkeypatch.setattr(web, "_mirror_face_photos", lambda ids: pytest.fail(
+        "assign must not rebuild face rows — use _mirror_face_labels"))
+
+    def fake_nas_json(method, path, body=None, timeout=120.0):
+        return {"ok": True, "person_id": 1, "person_name": "Calvin"}
+    monkeypatch.setattr(web, "_nas_json", fake_nas_json)
+
+    with PhotoDB(web._db_path) as db:
+        before = [r["id"] for r in db.conn.execute(
+            "SELECT id FROM faces ORDER BY id").fetchall()]
+    fid = before[0]
+
+    r = nas_spy.post(f"/api/faces/{fid}/assign?name=Calvin")
+    assert r.status_code == 200
+
+    with PhotoDB(web._db_path) as db:
+        after = [r["id"] for r in db.conn.execute(
+            "SELECT id FROM faces ORDER BY id").fetchall()]
+        row = db.conn.execute(
+            "SELECT p.name, f.match_source FROM faces f "
+            "JOIN persons p ON p.id=f.person_id WHERE f.id=?", (fid,)).fetchone()
+    assert after == before, "face ids must survive an assign"
+    assert row["name"] == "Calvin" and row["match_source"] == "manual", \
+        "the label must still be mirrored locally"
+
+
+def test_clear_keeps_face_ids_and_unsets_locally(nas_spy, monkeypatch):
+    from photosearch.db import PhotoDB
+    monkeypatch.setattr(web, "_mirror_face_photos", lambda ids: pytest.fail("no rebuild"))
+    monkeypatch.setattr(web, "_nas_json", lambda m, p, b=None, timeout=120.0: {"ok": True})
+    with PhotoDB(web._db_path) as db:
+        fid = db.conn.execute(
+            "SELECT id FROM faces WHERE person_id IS NOT NULL LIMIT 1").fetchone()["id"]
+        before = [r["id"] for r in db.conn.execute("SELECT id FROM faces ORDER BY id")]
+    assert nas_spy.post(f"/api/faces/{fid}/clear").status_code == 200
+    with PhotoDB(web._db_path) as db:
+        after = [r["id"] for r in db.conn.execute("SELECT id FROM faces ORDER BY id")]
+        row = db.conn.execute("SELECT person_id FROM faces WHERE id=?", (fid,)).fetchone()
+    assert after == before
+    assert row["person_id"] is None

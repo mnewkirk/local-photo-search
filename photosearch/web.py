@@ -1556,12 +1556,11 @@ def api_assign_face(face_id: int, name: str = Query(..., description="Person nam
     sync-replica.sh, which REPLACES the replica DB rather than merging it."""
     if _nas_url:
         from urllib.parse import quote
-        photo_ids = _photo_ids_for_faces([face_id])
-        if not photo_ids:
+        if not _photo_ids_for_faces([face_id]):
             raise HTTPException(404, "Face not found")
         resp = _nas_json("POST",
                          f"/api/faces/{face_id}/assign?name={quote(name)}")
-        resp["mirror"] = _mirror_face_photos(photo_ids)
+        resp["mirror"] = _mirror_face_labels([face_id], resp.get("person_name", name))
         return resp
     with _get_db() as db:
         # Verify face exists
@@ -1589,11 +1588,10 @@ def api_clear_face(face_id: int):
 
     Replica mode: proxy to the NAS then mirror back (see api_assign_face)."""
     if _nas_url:
-        photo_ids = _photo_ids_for_faces([face_id])
-        if not photo_ids:
+        if not _photo_ids_for_faces([face_id]):
             raise HTTPException(404, "Face not found")
         resp = _nas_json("POST", f"/api/faces/{face_id}/clear")
-        resp["mirror"] = _mirror_face_photos(photo_ids)
+        resp["mirror"] = _mirror_face_labels([face_id], None)
         return resp
     with _get_db() as db:
         face = db.conn.execute("SELECT id FROM faces WHERE id = ?", (face_id,)).fetchone()
@@ -1629,6 +1627,39 @@ def _mirror_face_photos(photo_ids: list[int]) -> dict:
     from . import rerun
     with _get_db() as db:
         return rerun.mirror_photos(db, ids)
+
+
+def _mirror_face_labels(face_ids: list[int], person_name: Optional[str]) -> dict:
+    """Apply just a person-label change to the local replica rows, in place.
+
+    NOT _mirror_face_photos: that re-fetches the photo's whole face set and
+    applies it DELETE-then-INSERT, which mints NEW face ids. Fine for
+    delete-box / re-detect / add-box, where the face SET genuinely changed and
+    the modal calls syncFaces() afterwards. Fatal for assign/clear, which are
+    the common operations and whose callers keep using the ids they already
+    hold: the first assign silently invalidated every face id on that photo,
+    so the next assign 404'd and the label appeared not to change.
+
+    A label change is exactly person_id + match_source on known rows, so apply
+    that and leave the ids alone.
+    """
+    if not face_ids:
+        return {"relabelled": 0}
+    with _get_db() as db:
+        if person_name:
+            person = db.get_person_by_name(person_name)
+            pid = person["id"] if person else db.add_person(person_name)
+            src = "manual"
+        else:
+            pid, src = None, None
+        for i in range(0, len(face_ids), 500):
+            batch = face_ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            db.conn.execute(
+                f"UPDATE faces SET person_id = ?, match_source = ? WHERE id IN ({ph})",
+                [pid, src, *batch])
+        db.conn.commit()
+    return {"relabelled": len(face_ids)}
 
 
 def _photo_ids_for_faces(face_ids: list[int]) -> list[int]:
@@ -1844,9 +1875,8 @@ def api_bulk_assign_faces(data: dict):
     if not face_ids:
         return {"ok": True, "updated": 0}
     if _nas_url:
-        photo_ids = _photo_ids_for_faces(face_ids)
         resp = _nas_json("POST", "/api/faces/bulk-assign", data)
-        resp["mirror"] = _mirror_face_photos(photo_ids)
+        resp["mirror"] = _mirror_face_labels(face_ids, name or None)
         return resp
     with _get_db() as db:
         if name:
