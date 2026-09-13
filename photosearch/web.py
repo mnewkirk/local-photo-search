@@ -623,6 +623,215 @@ def api_preview_photo(photo_id: int):
         raise HTTPException(500, "Could not serve preview")
 
 
+def _preview_bytes(photo_id: int) -> bytes:
+    """Preview JPEG bytes for one photo, for in-process image work.
+
+    Goes through `_get_or_create_preview` rather than HTTP so the NAS doesn't
+    issue ~1,000 requests to itself (six workers hammering its own event loop
+    is a good way to make the box look wedged), and so the replica reuses its
+    on-disk preview cache — a second review pass over the same shoot is then
+    nearly free. Falls back to pulling from the NAS exactly like the
+    /preview route, which is what makes this work on the replica at all
+    (it holds no originals).
+    """
+    with _get_db() as db:
+        photo = db.get_photo(photo_id)
+        if not photo:
+            raise FileNotFoundError(f"photo {photo_id} not found")
+        photo = dict(photo)
+        photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
+    try:
+        with open(_get_or_create_preview(photo), "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        if not _nas_url:
+            raise
+        cache_path = os.path.join(_ensure_preview_dir(), f"{photo_id}_preview.jpg")
+        raw = _fetch_from_nas(photo_id, "preview")
+        _cache_bytes_atomic(cache_path, raw)
+        return raw
+
+
+@app.post("/api/faces/review-team")
+async def api_review_team(request: Request):
+    """SSE — group one shoot's unknown faces down to your team, for review.
+
+    The `review-faces` CLI, as an endpoint. Same pipeline, same module
+    (`photosearch.face_review`), so the two cannot drift: sample the jersey
+    colour below each face, keep the ones matching the team, DBSCAN the
+    survivors into a handful of groups you can name in one action.
+
+    The team colour is LEARNED from faces already named on the date, so it
+    follows the squad between kits. That is also the failure mode worth
+    knowing: if the named faces on the date are themselves wrong (e.g. a bad
+    temporal match pass), the learned hue is learned from garbage. Pass
+    `team_hue` to override.
+
+    Body (all optional except `date`):
+      {"date": "YYYY-MM-DD", "team_hue"?, "tolerance"?, "min_det"?, "min_edge"?,
+       "eps"?, "min_samples"?, "include_known"?, "workers"?}
+
+    Terminal events: done / cancelled / fatal.
+    """
+    import asyncio
+    import threading
+    import time
+    from . import face_review
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    data = data or {}
+
+    date_ = (data.get("date") or "").strip()
+    if not date_:
+        raise HTTPException(400, "date is required (YYYY-MM-DD)")
+    team_hue = data.get("team_hue")
+    team_hue = float(team_hue) if team_hue not in (None, "") else None
+    tolerance = float(data.get("tolerance", 25.0))
+    min_det = float(data.get("min_det", 0.65))
+    min_edge = int(data.get("min_edge", 110))
+    eps = float(data.get("eps", 0.80))
+    min_samples = int(data.get("min_samples", 2))
+    include_known = bool(data.get("include_known", True))
+    workers = max(1, min(int(data.get("workers", 6)), 16))
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    def run():
+        started = time.monotonic()
+        try:
+            with _get_db() as db:
+                rows = db.conn.execute("""
+                    SELECT f.id, f.photo_id, f.person_id, pe.name AS person_name,
+                           f.bbox_top, f.bbox_bottom, f.bbox_left, f.bbox_right,
+                           p.image_width
+                      FROM faces f
+                      JOIN photos p ON p.id = f.photo_id
+                      LEFT JOIN persons pe ON pe.id = f.person_id
+                     WHERE date(p.date_taken) = ?
+                       AND (f.det_score IS NULL OR f.det_score >= ?)
+                       AND MIN(f.bbox_bottom - f.bbox_top,
+                               f.bbox_right - f.bbox_left) >= ?
+                """, (date_, min_det, min_edge)).fetchall()
+                faces = [dict(r) for r in rows]
+                if not faces:
+                    _emit({"type": "fatal",
+                           "message": f"No faces on {date_} above the quality floor "
+                                      f"(det>={min_det}, edge>={min_edge}px)."})
+                    return
+                named = {f["id"] for f in faces if f["person_id"]}
+                n_photos = len({f["photo_id"] for f in faces})
+                _emit({"type": "start", "date": date_, "faces": len(faces),
+                       "named": len(named), "photos": n_photos})
+
+                def fetch(pid):
+                    if cancel_event.is_set():
+                        raise InterruptedError("cancelled")
+                    return _preview_bytes(pid)
+
+                def prog(done, total):
+                    if done % 10 == 0 or done == total:
+                        _emit({"type": "progress", "phase": "sampling",
+                               "done": done, "total": total})
+
+                samples = face_review.sample_faces(
+                    faces, fetch, workers=workers, on_progress=prog)
+                if cancel_event.is_set():
+                    _emit({"type": "cancelled", "message": "Review cancelled"})
+                    return
+
+                eff_hue = (team_hue if team_hue is not None
+                           else face_review.learn_team_hue(samples, named))
+                if eff_hue is None:
+                    _emit({"type": "fatal",
+                           "message": "Could not learn a team colour — too few named "
+                                      "faces with a readable torso on this date. Name "
+                                      "a few players first, or set the hue manually."})
+                    return
+                _emit({"type": "progress", "phase": "hue", "team_hue": round(eff_hue, 1),
+                       "source": "given" if team_hue is not None else "learned"})
+
+                classes = face_review.classify(
+                    samples, eff_hue, tolerance,
+                    always_include=named if include_known else set())
+                keep = [f for f in faces if classes.get(f["id"]) == "team"]
+                _emit({"type": "progress", "phase": "classify",
+                       "team": sum(1 for v in classes.values() if v == "team"),
+                       "other": sum(1 for v in classes.values() if v == "other"),
+                       "unreadable": sum(1 for v in classes.values() if v == "unknown")})
+
+                unknown_ids = [f["id"] for f in keep if not f["person_id"]]
+                encs = db.get_face_encodings_bulk(unknown_ids)
+                clusters = face_review.cluster_faces(
+                    encs, eps=eps, min_samples=min_samples)
+                stats = face_review.summarize(classes, clusters)
+
+            by_face = {f["id"]: f for f in keep}
+            grouped: dict = {}
+            for fid, c in clusters.items():
+                grouped.setdefault(c, []).append(by_face[fid])
+
+            def face_json(f):
+                return {"face_id": f["id"], "photo_id": f["photo_id"],
+                        "person_name": f.get("person_name")}
+
+            groups = [
+                {"group_id": c, "label": f"Group {c}", "size": len(v),
+                 "faces": [face_json(f) for f in sorted(v, key=lambda f: -f["id"])]}
+                for c, v in sorted(grouped.items(),
+                                   key=lambda kv: (kv[0] < 0, -len(kv[1])))
+                if c >= 0
+            ]
+            if grouped.get(-1):
+                groups.append({
+                    "group_id": -1, "label": "Ungrouped", "size": len(grouped[-1]),
+                    "faces": [face_json(f) for f in grouped[-1]],
+                })
+            # Already-named team faces aren't clustered (only unknowns are), but
+            # they're what the hue was learned from — surface them so a wrong
+            # name on the date is visible rather than silently shaping the run.
+            known_faces = [face_json(f) for f in keep if f["person_id"]]
+
+            _emit({"type": "done", "date": date_, "team_hue": round(eff_hue, 1),
+                   "tolerance": tolerance, "groups": groups, "stats": stats,
+                   "known_faces": known_faces,
+                   "duration_seconds": round(time.monotonic() - started, 1)})
+        except InterruptedError:
+            _emit({"type": "cancelled", "message": "Review cancelled"})
+        except Exception as exc:
+            logger.exception("review-team failed")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    threading.Thread(target=run, daemon=True).start()
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        break
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("done", "cancelled", "fatal"):
+                    break
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/api/faces/crop/{face_id}")
 def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     """Serve a square crop of the face from the original photo.

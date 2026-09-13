@@ -726,6 +726,189 @@
       );
     }
 
+    // -----------------------------------------------------------------------
+    // TeamReview — the `review-faces` CLI as a panel.
+    //
+    // One shoot's unknown faces, filtered to your team by jersey colour and
+    // grouped by DBSCAN, so you name a handful of groups instead of scrolling
+    // a thousand crops. Runs server-side over SSE (sampling ~800 previews
+    // takes minutes); the same photosearch.face_review module the CLI uses.
+    // -----------------------------------------------------------------------
+    function TeamReview({ date, persons, onClose, onChanged }) {
+      const [running, setRunning] = useState(false);
+      const [status, setStatus] = useState('');
+      const [prog, setProg] = useState(null);
+      const [result, setResult] = useState(null);
+      const [err, setErr] = useState('');
+      const [hue, setHue] = useState('');
+      const [names, setNames] = useState({});      // group_id -> typed name
+      const [busyGroup, setBusyGroup] = useState(null);
+      const abortRef = useRef(null);
+
+      const run = useCallback(() => {
+        if (running) return;
+        setRunning(true); setErr(''); setResult(null); setProg(null);
+        setStatus('starting…');
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const body = { date };
+        if (hue !== '') body.team_hue = parseFloat(hue);
+
+        fetch(API + '/api/faces/review-team', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body), signal: controller.signal,
+        }).then(async (resp) => {
+          if (!resp.ok) {
+            const b = await resp.json().catch(() => ({}));
+            throw new Error(b.detail || ('HTTP ' + resp.status));
+          }
+          const reader = resp.body.getReader();
+          const dec = new TextDecoder();
+          let buf = '';
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            buf += dec.decode(chunk.value, { stream: true });
+            let i;
+            while ((i = buf.indexOf('\n\n')) >= 0) {
+              const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+              const ev = parseSSEChunk(raw);
+              if (!ev) continue;
+              if (ev.type === 'start') {
+                setStatus(ev.faces.toLocaleString() + ' faces over ' +
+                          ev.photos.toLocaleString() + ' photos (' + ev.named + ' already named)');
+              } else if (ev.type === 'progress' && ev.phase === 'sampling') {
+                setProg({ done: ev.done, total: ev.total });
+              } else if (ev.type === 'progress' && ev.phase === 'hue') {
+                setStatus('team hue ' + ev.team_hue + '° (' + ev.source + ') — clustering…');
+              } else if (ev.type === 'done') {
+                setResult(ev); setProg(null); setStatus('');
+              } else if (ev.type === 'cancelled') {
+                setErr('Cancelled');
+              } else if (ev.type === 'fatal') {
+                setErr(ev.message || 'Failed');
+              }
+            }
+          }
+        }).catch((e2) => {
+          if (e2.name !== 'AbortError') setErr(e2.message || String(e2));
+        }).finally(() => { setRunning(false); abortRef.current = null; });
+      }, [date, hue, running]);
+
+      const assign = useCallback((group) => {
+        const name = (names[group.group_id] || '').trim();
+        if (!name) return;
+        const ids = group.faces.map(f => f.face_id);
+        if (!confirm('Assign ' + ids.length + ' face(s) to "' + name + '"? This writes to the database.')) return;
+        setBusyGroup(group.group_id);
+        fetch(API + '/api/faces/bulk-assign', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ face_ids: ids, person_name: name }),
+        }).then(r => r.json()).then(() => {
+          // Drop the group locally rather than re-running: a re-run re-samples
+          // ~800 previews, and the faces are no longer unknown anyway.
+          setResult(prev => prev && Object.assign({}, prev, {
+            groups: prev.groups.filter(g => g.group_id !== group.group_id),
+          }));
+          if (onChanged) onChanged();
+        }).catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setBusyGroup(null));
+      }, [names, onChanged]);
+
+      const crops = (faces, limit) => faces.slice(0, limit).map(f =>
+        e('img', {
+          key: f.face_id,
+          src: API + '/api/faces/crop/' + f.face_id + '?size=120',
+          loading: 'lazy',
+          title: 'face ' + f.face_id + (f.person_name ? ' · ' + f.person_name : ''),
+          style: { width: 72, height: 72, objectFit: 'cover', borderRadius: 6,
+                   border: '1px solid var(--border, #444)' },
+        }));
+
+      return e('div', { className: 'insp-overlay', onClick: (ev) => { if (ev.target === ev.currentTarget) onClose(); } },
+        e('div', { className: 'insp-panel' },
+          e('div', { className: 'insp-header' },
+            e('div', { style: { flex: 1 } },
+              e('div', { className: 'insp-title' }, 'Review team faces — ' + date),
+              e('div', { className: 'insp-sub' },
+                status || (result
+                  ? (result.stats.clusters + ' group(s), ' + result.stats.noise +
+                     ' ungrouped · team hue ' + result.team_hue + '° ±' + result.tolerance + '°')
+                  : 'Filters this day\u2019s faces to your team by jersey colour, then groups them.')),
+              result && e('div', { className: 'insp-sub', style: { color: 'var(--accent, #4a9)' } },
+                'Hue is learned from faces already named on this date — if those are '
+                + 'wrong, so is the filter. Override it above and re-run.'),
+            ),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 6, marginRight: 10 } },
+              'hue',
+              e('input', {
+                type: 'number', value: hue, placeholder: 'auto', min: 0, max: 360,
+                disabled: running,
+                onChange: ev => setHue(ev.target.value),
+                title: 'Team jersey hue in degrees. Blank = learn it from the faces already named on this date.',
+                style: { width: 70, background: 'var(--bg2, #222)', color: 'inherit',
+                         border: '1px solid var(--border, #444)', borderRadius: 4 },
+              })),
+            running
+              ? e('button', { className: 'insp-btn', onClick: () => abortRef.current && abortRef.current.abort() }, 'Cancel')
+              : e('button', { className: 'insp-btn', onClick: run }, result ? 'Re-run' : 'Run review'),
+            e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
+          ),
+
+          prog && e('div', { style: { padding: '10px 16px' } },
+            e('div', { className: 'insp-sub' },
+              'Sampling jersey colour: ' + prog.done.toLocaleString() + ' / ' +
+              prog.total.toLocaleString() + ' photos'),
+            e('div', { style: { height: 6, background: 'var(--bg2, #222)', borderRadius: 3, marginTop: 6 } },
+              e('div', { style: { height: '100%', borderRadius: 3, background: 'var(--accent, #4a9)',
+                                  width: Math.round(prog.done / Math.max(prog.total, 1) * 100) + '%' } }))),
+
+          err && e('div', { style: { padding: '10px 16px', color: 'var(--err, #e66)' } }, err),
+
+          !running && !result && !err && e('div', { style: { padding: '16px' }, className: 'insp-sub' },
+            'Sampling reads a preview per photo, so the first run on a shoot takes '
+            + 'a few minutes; previews are cached, so a re-run is fast.'),
+
+          result && e('div', { style: { padding: '10px 16px', overflowY: 'auto' } },
+            result.groups.length === 0 && e('div', { className: 'insp-sub' },
+              'No unknown team faces left to group.'),
+            result.groups.map(g => e('div', {
+              key: g.group_id,
+              style: { border: '1px solid var(--border, #444)', borderRadius: 8,
+                       padding: 10, marginBottom: 10 },
+            },
+              e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+                e('strong', null, g.group_id < 0 ? 'Ungrouped' : g.label),
+                e('span', { className: 'insp-sub' }, g.size + ' face' + (g.size === 1 ? '' : 's')),
+                e('span', { style: { flex: 1 } }),
+                e('input', {
+                  list: 'tr-persons', placeholder: 'who is this?',
+                  value: names[g.group_id] || '',
+                  onChange: ev => setNames(Object.assign({}, names, { [g.group_id]: ev.target.value })),
+                  style: { background: 'var(--bg2, #222)', color: 'inherit',
+                           border: '1px solid var(--border, #444)', borderRadius: 4, padding: '3px 6px' },
+                }),
+                e('button', {
+                  className: 'insp-btn',
+                  disabled: busyGroup === g.group_id || !(names[g.group_id] || '').trim(),
+                  onClick: () => assign(g),
+                }, busyGroup === g.group_id ? 'Assigning…' : 'Assign all'),
+              ),
+              // Ungrouped is a bag of different people — naming it wholesale
+              // would be wrong, so it is shown for context but not assignable.
+              g.group_id < 0 && e('div', { className: 'insp-sub', style: { marginBottom: 6 } },
+                'Different people — review these in the grid, not as one group.'),
+              e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+                crops(g.faces, 40),
+                g.faces.length > 40 && e('span', { className: 'insp-sub', style: { alignSelf: 'center' } },
+                  '+' + (g.faces.length - 40) + ' more')),
+            )),
+            e('datalist', { id: 'tr-persons' },
+              (persons || []).map(p => e('option', { key: p.id, value: p.name }))),
+          ),
+        ));
+    }
+
     function PersonInspector({ person, persons, dateFrom, dateTo, onClose, onChanged }) {
       const [data, setData] = useState(null);
       const [loading, setLoading] = useState(true);
@@ -1046,7 +1229,9 @@
       const [modalPhoto, setModalPhoto] = useState(null);
       const [modalIndex, setModalIndex] = useState(-1);
       const [persons, setPersons] = useState([]);
-      const [inspectPerson, setInspectPerson] = useState(null);  // {id, name} or null
+      const [inspectPerson, setInspectPerson] = useState(null);
+      // review-faces panel; only meaningful for a single shoot day.
+      const [teamReview, setTeamReview] = useState(false);  // {id, name} or null
 
       // Load persons list for face editing dropdown
       const loadPersons = useCallback(() => {
@@ -1645,6 +1830,15 @@
               }, 'Clear'),
               cfActive && e('span', { style: { fontSize: '12px', color: 'var(--accent, #4a9)', alignSelf: 'center' } },
                 total + ' matching group' + (total === 1 ? '' : 's')),
+              // review-faces needs ONE shoot: it learns a single team colour
+              // and clusters that day's faces. Offering it across a range
+              // would silently average two kits together.
+              cf.date_from && cf.date_from === cf.date_to && e('button', {
+                onClick: () => setTeamReview(true),
+                title: 'Filter this day\u2019s unknown faces to your team by jersey '
+                     + 'colour and group them, so you can name a few groups instead '
+                     + 'of a thousand crops.',
+              }, '⚽ Review team faces'),
             ),
             e('div', { className: 'shortcuts-row' },
               !multiSelect && e('span', { className: 'group' },
@@ -1990,6 +2184,13 @@
         ),
 
         // Photo modal
+        teamReview && e(TeamReview, {
+          date: cf.date_from,
+          persons,
+          onClose: () => setTeamReview(false),
+          onChanged: () => { loadGroups(); loadPersons(); },
+        }),
+
         inspectPerson && e(PersonInspector, {
           person: inspectPerson,
           persons,

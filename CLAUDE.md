@@ -1349,6 +1349,56 @@ cleanly at `eps=0.50` into one 75-face real-person sub-cluster plus
 cause; filtering them pre-DBSCAN prevents the attractor from forming
 in the first place.
 
+## Reviewing a shoot in the UI: person inspector + team review
+
+Two panels on `/faces`, both scoped to one day via the filter bar. `/faces`
+round-trips the content filters (`date_from`/`date_to`/`location`/`q`/`camera`)
+through the **URL**, so a shoot review survives a reload and can be bookmarked:
+
+```
+/faces?date_from=2026-09-12&date_to=2026-09-12
+```
+
+**Person inspector** — "X is tagged on other kids at Saturday's match". Opens
+from a person group; sub-clusters that person's faces, scores each by L2
+distance to their core, and bulk unassigns/reassigns. `GET
+/api/faces/person/{id}/inspect` takes `date_from`/`date_to`. Two things that
+are easy to get backwards:
+
+- DBSCAN runs on the **scoped** faces (the groups are "the different kids that
+  day"), but the reference core comes from the person's **full trusted set**.
+  Scope the core too and you measure the suspect faces against themselves —
+  when every trusted face is outside the window, the fallback makes the
+  impostors the core.
+- **The library's `eps=0.50` groups nothing on one day.** Measured on Calvin's
+  212 faces from 2026-09-12: 0.50 → 0 clusters/212 noise, 0.65 → 16, 0.80 → 21,
+  0.90 → 20 clusters/100 grouped, 1.00 → 14/148. A scoped call defaults to
+  **0.90 / min_samples=2**; unscoped stays 0.50/3. The panel exposes the radius.
+
+The panel states its scope ("showing 196 of 20,575") because it bulk-unassigns.
+
+**Team review** (`⚽ Review team faces`) — the `review-faces` CLI as a panel,
+offered only when `date_from == date_to`, since it learns **one** team colour
+and a range would average two kits. `POST /api/faces/review-team` (SSE) runs
+the same `photosearch/face_review.py` pipeline: sample the jersey colour below
+each face, keep the ones matching the team, DBSCAN the survivors. Name a group
+and "Assign all" → `POST /api/faces/bulk-assign`.
+
+Measured on the real 2026-09-12 shoot: 1,767 faces over 761 photos, **267 s**
+first run, learned hue 225°, 734 team / 490 other-team / 543 unreadable, **82
+groups** (top ones 32, 27, 26, 23, 23) + 237 ungrouped.
+
+- Previews are fetched via **`web._preview_bytes`**, NOT over HTTP. The NAS
+  would otherwise fire ~800 requests at itself with six workers; and going
+  through `_get_or_create_preview` means the replica reuses its on-disk preview
+  cache, so a re-run is fast. It falls back to pulling from the NAS, which is
+  the only reason this works on the replica at all (it holds no originals).
+- **The hue is learned from faces already named that day** — so if those are
+  wrong (a bad temporal pass), the filter is learned from garbage. Clean the
+  day's labels first, or set the hue manually in the panel.
+- **The "Ungrouped" bucket is not assignable.** It is DBSCAN noise — many
+  different people — and naming it wholesale would be catastrophic.
+
 ## Splitting attractor clusters (M18)
 
 Large muddled clusters (observed on the NAS: one cluster with 126 faces
