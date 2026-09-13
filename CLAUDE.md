@@ -167,6 +167,48 @@ git -c safe.directory=/volume1/docker/photosearch \
     -c credential.helper='!gh auth git-credential' push origin main
 ```
 
+### Watching a long job: never `pgrep -f` a bare string
+
+A watcher that polls `pgrep -f "<pattern>"` **matches itself**, because its own
+command line contains the pattern it is searching for. The loop then never
+terminates and — worse — anything else polling the same pattern believes the
+job is still running.
+
+This has bitten three separate times in one session:
+
+- `pkill -f "analyze.py"` killed the very shell running the command (the shell's
+  argv contained `analyze.py`), so a heredoc half-wrote its script.
+- A recluster watcher (`pgrep -f "cli.py recluster-faces"`) spun for its full
+  50-minute budget after the job had finished.
+- A Google Photos upload watcher matched itself, so a chained follow-up job sat
+  waiting on a process that had exited ~40 minutes earlier — and the status it
+  reported was its own liveness, not the upload's.
+
+Use a signal the watcher cannot be confused with:
+
+```bash
+# GOOD — the job writes a marker; the watcher polls the marker
+nohup sh -c 'long-job …; echo done > /tmp/job.done' &
+until [ -f /tmp/job.done ]; do sleep 10; done
+
+# GOOD — watch the PID you actually started
+nohup long-job & echo $! > /tmp/job.pid
+while kill -0 "$(cat /tmp/job.pid)" 2>/dev/null; do sleep 10; done
+
+# GOOD — completion is in the output; grep for it, not for the process
+until grep -q '"type": "done"' /tmp/job.log; do sleep 10; done
+
+# BAD — matches the watcher itself, forever
+until ! pgrep -f "long-job" >/dev/null; do sleep 10; done
+```
+
+If a pattern really is the only option, exclude self with `pgrep -f pat | grep -v $$`
+or bracket a character (`"[l]ong-job"`) — but a marker file or PID is safer and
+reads better. And when a job streams SSE, prefer its terminal event
+(`"type": "done"`) over process liveness: the client can stay open on the stream
+long after the work has finished, which is exactly how the upload watcher
+misreported a completed job as running.
+
 ## Distributed Indexing (Worker)
 
 Offload heavy indexing to a fast laptop while the NAS keeps the DB + photos.
