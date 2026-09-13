@@ -19,15 +19,32 @@ the same ``search(coords)`` contract the rest of the code expects —
 or ``None`` if the dataset hasn't been downloaded, in which case
 callers fall back to the stock ``reverse_geocoder`` module.
 
-Memory note: loading ~5M filtered rows into the KDTree takes ~1 GB
-at steady state. Kept as a module-level singleton after first access
-so the build cost (10-30s on an N100) is paid once per process.
+Memory note — measured 2026-09-13, and the reason for `_MIN_POPULATION`:
+``RGeocoder.load()`` keeps **one Python dict per row**, which costs ~745
+bytes/row, not the "~1 GB for the KDTree" this docstring used to claim. The
+original unfiltered build kept 6.58M rows = **4.9 GB**, plus 1.44 GB of
+transient text, against 4.5 GB free on the N100 — so the geocode maintenance
+stage OOM-killed the whole web container (SIGKILL, exit 137) every time it ran.
+
+Two changes keep it inside the budget, and both matter:
+
+- ``_MIN_POPULATION`` drops class-P rows GeoNames records as population 0.
+  That is **4.72M of 5.2M populated places** — overwhelmingly hamlets and
+  localities — while every named POI is kept regardless of population (parks
+  and peaks are always pop 0, and they are the whole point of this dataset).
+  6.58M rows -> 1.86M, 4.9 GB -> ~1.4 GB.
+- ``get_rich_geocoder`` streams the CSV instead of ``StringIO(f.read())``,
+  which used to hold it twice (UCS-2, because the file contains CJK
+  punctuation) for 1.44 GB of pure waste.
+
+Still a per-process cost, so it stays a module-level singleton. The durable
+fix is a SQLite R-tree instead of an in-memory KDTree — see
+``docs/plans/geocode-rtree.md``.
 """
 
 from __future__ import annotations
 
 import csv
-import io
 import os
 import sys
 import time
@@ -42,10 +59,22 @@ GEONAMES_ADMIN2_URL = "https://download.geonames.org/export/dump/admin2Codes.txt
 
 # Feature classes / codes we keep from allCountries.txt. The GeoNames
 # taxonomy has 9 top-level classes; photo geocoding only cares about a
-# few. Full class P (populated places) is always in; selected codes
-# from L (areas/parks), S (spots), H (water features), T (topographic)
-# add POI richness without bloating the dataset beyond workable size.
+# few. Class P (populated places) is in, subject to _MIN_POPULATION below;
+# selected codes from L (areas/parks), S (spots), H (water features), T
+# (topographic) add POI richness and are kept unconditionally.
 _KEEP_FEATURE_CLASSES = {"P"}
+
+# Class-P rows below this population are dropped. GeoNames records population 0
+# for 4.72M of its 5.2M populated places, and carrying them cost 3.5 GB of the
+# 4.9 GB that OOM-killed the NAS (see the module docstring).
+#
+# This threshold applies to class P ONLY. Named POIs — parks, peaks, beaches,
+# monuments — are matched by feature CODE and kept whatever their population,
+# which is always 0. Raising this to filter "small towns" would therefore not
+# touch the POIs; it would only trade away the long tail of real villages, and
+# the measured saving past 1 is small (pop>=1000 is 1.52M rows vs 1.86M, since
+# the 1.38M POIs are the floor).
+_MIN_POPULATION = 1
 _KEEP_FEATURE_CODES = {
     # L — protected areas and named regions
     "PRK",    # park
@@ -147,11 +176,19 @@ def _load_admin_codes(path: str) -> dict[str, str]:
 def build_rich_dataset(
     cache_dir: Optional[str] = None,
     force: bool = False,
+    refresh_source: bool = False,
 ) -> str:
     """Download + filter + transform GeoNames into a reverse_geocoder CSV.
 
-    Idempotent: skips any step whose output file already exists unless
-    ``force=True``. Returns the path to the final CSV.
+    Idempotent: skips any step whose output file already exists. Returns the
+    path to the final CSV.
+
+    ``force`` rebuilds the derived CSV from the source files already on disk —
+    which is what you want after changing ``_MIN_POPULATION`` or the feature
+    filter. It deliberately does NOT re-download: `force` used to imply a fresh
+    400 MB pull, so re-filtering an existing dataset cost a download that could
+    not change the answer. Pass ``refresh_source=True`` for that separately,
+    when the point is newer data from GeoNames.
 
     The CSV has six columns (``lat,lon,name,admin1,admin2,cc``) — the
     shape ``reverse_geocoder.RGeocoder`` consumes from a stream.
@@ -165,24 +202,24 @@ def build_rich_dataset(
     admin2_path = os.path.join(cache_dir, "admin2Codes.txt")
     output_csv = os.path.join(cache_dir, "rg_rich.csv")
 
-    if os.path.exists(output_csv) and not force:
+    if os.path.exists(output_csv) and not (force or refresh_source):
         print(f"Rich dataset already built at {output_csv}")
         return output_csv
 
-    if not os.path.exists(allcountries_zip) or force:
+    if not os.path.exists(allcountries_zip) or refresh_source:
         print("Downloading allCountries.zip (~400 MB)…")
         _download_with_progress(GEONAMES_ALLCOUNTRIES_URL, allcountries_zip)
 
-    if not os.path.exists(allcountries_txt) or force:
+    if not os.path.exists(allcountries_txt) or refresh_source:
         print("Unzipping allCountries.txt (~1.5 GB on disk)…")
         with zipfile.ZipFile(allcountries_zip) as z:
             z.extract("allCountries.txt", cache_dir)
 
-    if not os.path.exists(admin1_path) or force:
+    if not os.path.exists(admin1_path) or refresh_source:
         print("Downloading admin1CodesASCII.txt…")
         _download_with_progress(GEONAMES_ADMIN1_URL, admin1_path)
 
-    if not os.path.exists(admin2_path) or force:
+    if not os.path.exists(admin2_path) or refresh_source:
         print("Downloading admin2Codes.txt…")
         _download_with_progress(GEONAMES_ADMIN2_URL, admin2_path)
 
@@ -205,9 +242,21 @@ def build_rich_dataset(
                 continue
             feature_class = parts[6]
             feature_code = parts[7]
-            if (feature_class not in _KEEP_FEATURE_CLASSES
-                    and feature_code not in _KEEP_FEATURE_CODES):
+            is_poi = feature_code in _KEEP_FEATURE_CODES
+            if feature_class not in _KEEP_FEATURE_CLASSES and not is_poi:
                 continue
+            # Population gate on class P only — never on the named POIs, whose
+            # population is always 0. `is_poi` is checked FIRST so a feature
+            # that is both (e.g. a class-P row whose code is in the POI set)
+            # survives: dropping it would be a silent regression in exactly the
+            # labels this dataset exists to provide.
+            if not is_poi:
+                try:
+                    population = int(parts[14] or 0)
+                except ValueError:
+                    population = 0
+                if population < _MIN_POPULATION:
+                    continue
             try:
                 lat = float(parts[4])
                 lon = float(parts[5])
@@ -257,10 +306,14 @@ def get_rich_geocoder():
 
     import reverse_geocoder as rg
 
-    # reverse_geocoder's stream loader expects a file-like of the full
-    # CSV. Read it all — building a KDTree incrementally isn't
-    # supported. 300-400 MB of text in memory briefly, then the KDTree
-    # replaces it.
+    # Hand RGeocoder the FILE OBJECT, not StringIO(f.read()).
+    #
+    # Its load() is `csv.DictReader(stream)`, which iterates line by line, so a
+    # plain file object is all it ever needed. The old StringIO(f.read()) held
+    # the 370 MB CSV twice — and as a *Python str*, which is UCS-2 here because
+    # the file contains CJK punctuation (max codepoint U+FF1F), so 360M chars
+    # cost 2 bytes each: 0.72 GB per copy, 1.44 GB for the pair, all of it
+    # transient waste on a box with 4.5 GB free. Do not "simplify" this back.
     with open(rich_csv, encoding="utf-8") as f:
-        inst = rg.RGeocoder(mode=1, verbose=False, stream=io.StringIO(f.read()))
+        inst = rg.RGeocoder(mode=1, verbose=False, stream=f)
     return _RichWrapper(inst)

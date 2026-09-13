@@ -2563,8 +2563,13 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
                    "/data/geonames (container) or ~/.cache/photosearch/"
                    "geonames (host). Override via PHOTOSEARCH_GEONAMES_DIR.")
 @click.option("--force", is_flag=True, default=False,
-              help="Re-download + re-process even if files already exist.")
-def download_geonames_cmd(cache_dir, force):
+              help="Re-filter the CSV from the source files already on disk. "
+                   "Use after changing the population/feature filter. Does NOT "
+                   "re-download.")
+@click.option("--refresh-source", is_flag=True, default=False,
+              help="Re-download allCountries.zip + admin codes first (~400 MB), "
+                   "then rebuild. Use when you want newer GeoNames data.")
+def download_geonames_cmd(cache_dir, force, refresh_source):
     """Download + build the rich GeoNames dataset for reverse geocoding.
 
     One-time ~400 MB download. Produces a filtered CSV covering
@@ -2574,11 +2579,13 @@ def download_geonames_cmd(cache_dir, force):
     re-labels existing photos with the richer data.
 
     Disk cost: ~1.5 GB peak during processing, ~400 MB steady state.
-    RAM cost at lookup time: ~1 GB for the KDTree. Kept as a
-    module-level singleton so the cost is paid once per process.
+    RAM cost at lookup time: ~1.4 GB (one Python dict per row — see the
+    geonames_rich module docstring; it is NOT the KDTree that dominates).
+    Kept as a module-level singleton so the cost is paid once per process.
     """
     from photosearch.geonames_rich import build_rich_dataset
-    path = build_rich_dataset(cache_dir, force=force)
+    path = build_rich_dataset(cache_dir, force=force,
+                              refresh_source=refresh_source)
     click.echo(f"\nRich GeoNames dataset ready at: {path}")
     click.echo("Re-label existing photos with:")
     click.echo("  $DC run --rm photosearch normalize-places --force")

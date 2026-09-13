@@ -131,3 +131,112 @@ def test_get_rich_geocoder_returns_none_when_absent(tmp_path, monkeypatch):
     from photosearch import geonames_rich
     monkeypatch.setenv("PHOTOSEARCH_GEONAMES_DIR", str(tmp_path))
     assert geonames_rich.get_rich_geocoder() is None
+
+
+# ---------------------------------------------------------------------------
+# Population gate (_MIN_POPULATION) — added after the geocode OOM, 2026-09-13
+# ---------------------------------------------------------------------------
+
+def _row(geonameid, name, lat, lon, fclass, fcode, population):
+    """One allCountries.txt line; only columns 0-14 are read by the parser."""
+    return "\t".join([geonameid, name, name, "", lat, lon, fclass, fcode,
+                      "US", "", "CA", "041", "", "", population])
+
+
+_FIXTURE_POPULATION = "\n".join([
+    # Kept: populated place with a real population.
+    _row("1", "Real Town", "38.10", "-122.85", "P", "PPL", "1421"),
+    # Dropped: GeoNames records population 0 for 4.72M of its 5.2M class-P
+    # rows, and carrying them is what OOM-killed the NAS.
+    _row("2", "Pop Zero Hamlet", "38.11", "-122.86", "P", "PPL", "0"),
+    # Dropped: empty population field parses as 0.
+    _row("3", "Blank Pop Hamlet", "38.12", "-122.87", "P", "PPL", ""),
+    # Dropped: non-numeric population must not crash the build.
+    _row("4", "Junk Pop Hamlet", "38.13", "-122.88", "P", "PPL", "not-a-number"),
+    # KEPT despite population 0 — a named POI. This is the whole point of the
+    # rich dataset, and the gate must never reach it.
+    _row("5", "Big Sur Beach", "38.14", "-122.89", "H", "BCH", "0"),
+    _row("6", "Mount Tam", "38.15", "-122.90", "T", "MT", "0"),
+    # KEPT: class P *and* a POI code, population 0. The is_poi check runs
+    # first, so this survives; reversing that order silently drops it.
+    _row("7", "Park Village", "38.16", "-122.91", "P", "PRK", "0"),
+])
+
+
+def _build(tmp_path, monkeypatch, allcountries):
+    (tmp_path / "allCountries.txt").write_text(allcountries)
+    (tmp_path / "admin1CodesASCII.txt").write_text(_FIXTURE_ADMIN1)
+    (tmp_path / "admin2Codes.txt").write_text(_FIXTURE_ADMIN2)
+    (tmp_path / "allCountries.zip").write_bytes(b"stub")
+    from photosearch import geonames_rich
+    monkeypatch.setattr(geonames_rich, "_download_with_progress",
+                        lambda *a, **k: pytest.fail("must not download"))
+    out = geonames_rich.build_rich_dataset(cache_dir=str(tmp_path), force=True)
+    return {r[2] for r in list(csv.reader(open(out)))[1:]}
+
+
+def test_population_gate_drops_pop_zero_places_but_never_pois(tmp_path, monkeypatch):
+    names = _build(tmp_path, monkeypatch, _FIXTURE_POPULATION)
+    assert names == {"Real Town", "Big Sur Beach", "Mount Tam", "Park Village"}
+
+
+def test_population_gate_ignores_unparseable_population(tmp_path, monkeypatch):
+    """A junk population field must be treated as 0, not crash the build."""
+    names = _build(tmp_path, monkeypatch,
+                   _row("4", "Junk Pop", "38.1", "-122.8", "P", "PPL", "xyz"))
+    assert names == set()
+
+
+def test_poi_code_beats_the_population_gate(tmp_path, monkeypatch):
+    """A class-P row whose feature CODE is a POI is kept at population 0.
+
+    Pinned separately because it is the one ordering bug in this filter that
+    produces no error — just quietly missing park/village labels.
+    """
+    names = _build(tmp_path, monkeypatch,
+                   _row("7", "Park Village", "38.1", "-122.8", "P", "PRK", "0"))
+    assert names == {"Park Village"}
+
+
+def test_force_rebuilds_the_csv_without_redownloading(tmp_path, monkeypatch):
+    """`force` re-filters from the source on disk. It used to imply a fresh
+    400 MB pull, so re-filtering cost a download that could not change the
+    answer — `refresh_source` is now the flag for that."""
+    (tmp_path / "rg_rich.csv").write_text("lat,lon,name,admin1,admin2,cc\nstale\n")
+    names = _build(tmp_path, monkeypatch, _FIXTURE_POPULATION)
+    assert "Real Town" in names, "force must have rebuilt the stale CSV"
+
+
+def test_rich_geocoder_streams_the_file_rather_than_slurping_it(tmp_path, monkeypatch):
+    """get_rich_geocoder must hand RGeocoder the FILE OBJECT.
+
+    The old StringIO(f.read()) held the 370 MB CSV twice as UCS-2 text —
+    1.44 GB of transient waste that helped OOM-kill the NAS. csv.DictReader
+    iterates line by line, so nothing needed to be materialized at all.
+    """
+    csv_path = tmp_path / "rg_rich.csv"
+    csv_path.write_text(
+        "lat,lon,name,admin1,admin2,cc\n"
+        "38.05,-122.80,Point Reyes,California,Marin County,US\n")
+    monkeypatch.setenv("PHOTOSEARCH_GEONAMES_DIR", str(tmp_path))
+
+    import io as _io
+    from photosearch import geonames_rich
+
+    seen = {}
+    rg = pytest.importorskip("reverse_geocoder")
+    real = rg.RGeocoder
+
+    # A delegating wrapper, not a subclass: conftest mocks the heavy deps, so
+    # RGeocoder may not be a real class here.
+    def spy(*a, stream=None, **kw):
+        seen["type"] = type(stream)
+        return real(*a, stream=stream, **kw)
+
+    monkeypatch.setattr(rg, "RGeocoder", spy)
+    geo = geonames_rich.get_rich_geocoder()
+
+    assert geo is not None
+    assert not issubclass(seen["type"], _io.StringIO), \
+        "the whole CSV was slurped into memory again"
+    assert geo.search([(38.04, -122.79)])[0]["name"] == "Point Reyes"

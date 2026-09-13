@@ -75,16 +75,60 @@ re-label existing photos:
 $DC run --rm photosearch normalize-places --force
 ```
 
-Runtime cost: ~1 GB RAM at steady state (the KDTree), ~10-30 s
-build on first query each process. Fully falls back to stock
-`reverse_geocoder` if the dataset isn't present — nothing breaks if
-you skip this.
+Runtime cost: **~1.4 GB RAM** at steady state, ~10-30 s build on first query
+each process. Fully falls back to stock `reverse_geocoder` if the dataset isn't
+present — nothing breaks if you skip this.
 
-Feature-code filter covers populated places (class P) plus named
-POIs: parks (PRK, PRKN), reserves (RESN, RESW, RESF), monuments
-(MNMT), beaches (BCH), lakes (LK), waterfalls, historic sites,
+Feature-code filter covers populated places (class P, **subject to
+`_MIN_POPULATION`**) plus named POIs: parks (PRK, PRKN), reserves (RESN, RESW,
+RESF), monuments (MNMT), beaches (BCH), lakes (LK), waterfalls, historic sites,
 mountains, peaks, capes, forests. Tweak `_KEEP_FEATURE_CODES` in
 `photosearch/geonames_rich.py` to add more.
+
+### The memory cost is per-ROW, not the KDTree — and it OOM-killed the NAS
+
+This section used to claim "~1 GB (the KDTree)". **That was wrong by 5×**, and
+the error was load-bearing. Measured 2026-09-13: `RGeocoder.load()` keeps **one
+Python dict per row** at ~745 bytes, so the original unfiltered 6.58M-row build
+was **4.9 GB** — plus 1.44 GB of transient text, because
+`get_rich_geocoder` did `io.StringIO(f.read())`, holding the 370 MB CSV *twice*
+as UCS-2 (the file contains CJK punctuation, so Python can't use 1 byte/char).
+
+Peak ~6.3 GB against 4.5 GB free. The `geocode` maintenance stage therefore
+**SIGKILLed the whole photosearch container** (`exitCode=137`), reproducibly,
+~4-5 min in. Because a replica sweep defers every trigger stage to the push,
+this made **every** replica→NAS push report `partial` / `unreachable`, and it
+would have killed the web server nightly once the maintenance cron was
+installed. Symptom to recognise: `docker events` shows `container die …
+exitCode=137` while the SSE stream sits on `geocode scanning`.
+
+Two fixes, both needed:
+
+- **`_MIN_POPULATION = 1`** drops class-P rows GeoNames records as population
+  0 — **4.72M of 5.2M** populated places, overwhelmingly hamlets. Named POIs
+  are matched by feature *code* and kept whatever their population (parks and
+  peaks are always 0), so the labels this dataset exists for are untouched.
+  6.58M rows → 1.86M, 4.9 GB → ~1.4 GB. In `build_rich_dataset` the `is_poi`
+  check runs **before** the population gate, so a row that is both class P and
+  a POI code survives — reversing that order silently drops park/village labels.
+- **Stream the CSV.** `RGeocoder(stream=<file object>)` works —
+  its `load()` is a `csv.DictReader`, which iterates line by line. Don't
+  "simplify" it back to `StringIO(f.read())`.
+
+**Rebuilding after a filter change does NOT need a re-download.**
+`--force` now re-filters from the source files already on disk; the separate
+`--refresh-source` is the one that pulls a fresh 400 MB (it used to be
+conflated, so re-filtering cost a download that couldn't change the answer):
+
+```bash
+$DC run --rm photosearch download-geonames --force        # re-filter, no download
+$DC run --rm photosearch download-geonames --refresh-source   # newer GeoNames data
+```
+
+The durable fix is a **SQLite R-tree** instead of an in-memory KDTree — ~0
+resident memory, no per-process load, and all 6.58M rows retained (so the
+population gate could go away). `rtree` is already compiled into the SQLite on
+both machines. Plan: `docs/plans/geocode-rtree.md`.
 
 ## Debugging against the prod DB locally
 
