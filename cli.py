@@ -1217,8 +1217,10 @@ document.querySelectorAll('.apply').forEach(btn => btn.addEventListener('click',
               help="Skip face detections below this confidence.")
 @click.option("--min-edge", default=110, show_default=True, type=int,
               help="Skip faces whose shorter bbox edge is under this many pixels.")
-@click.option("--eps", default=0.45, show_default=True, type=float,
-              help="DBSCAN radius for grouping the surviving faces.")
+@click.option("--eps", default=0.80, show_default=True, type=float,
+              help="DBSCAN radius for grouping the surviving faces. Looser than the "
+                   "global recluster's 0.55 on purpose — one team on one day is a sparse "
+                   "space and a tight radius groups nothing (0.45 left 92%% as noise).")
 @click.option("--min-samples", default=2, show_default=True, type=int,
               help="DBSCAN min_samples.")
 @click.option("--include-known/--exclude-known", default=True, show_default=True,
