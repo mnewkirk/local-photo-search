@@ -75,8 +75,9 @@ re-label existing photos:
 $DC run --rm photosearch normalize-places --force
 ```
 
-Runtime cost: **~1.4 GB RAM** at steady state, ~10-30 s build on first query
-each process. Fully falls back to stock `reverse_geocoder` if the dataset isn't
+Runtime cost: **~1.47 GB RAM** at steady state (measured on the NAS after the
+fix below; it was ~6.3 GB peak before), **~7 s** build on first query each
+process. Fully falls back to stock `reverse_geocoder` if the dataset isn't
 present — nothing breaks if you skip this.
 
 Feature-code filter covers populated places (class P, **subject to
@@ -111,6 +112,10 @@ Two fixes, both needed:
   6.58M rows → 1.86M, 4.9 GB → ~1.4 GB. In `build_rich_dataset` the `is_poi`
   check runs **before** the population gate, so a row that is both class P and
   a POI code survives — reversing that order silently drops park/village labels.
+  **The rich labels are unaffected** — verified on the NAS after the rebuild:
+  Muir Woods still resolves to "Muir Woods National Monument" (not "Mill
+  Valley") and Point Reyes to "Mount Wittenberg" (not "Inverness"), which are
+  the two examples this whole section exists to justify.
 - **Stream the CSV.** `RGeocoder(stream=<file object>)` works —
   its `load()` is a `csv.DictReader`, which iterates line by line. Don't
   "simplify" it back to `StringIO(f.read())`.
@@ -124,6 +129,12 @@ conflated, so re-filtering cost a download that couldn't change the answer):
 $DC run --rm photosearch download-geonames --force        # re-filter, no download
 $DC run --rm photosearch download-geonames --refresh-source   # newer GeoNames data
 ```
+
+Verified on the NAS 2026-09-13 after the rebuild (`download-geonames --force`,
+1,856,756 rows): the `geocode` stage completes in **6.4 s** without restarting
+the container, and the whole deferred trigger set runs clean. Note the stage is
+gated missing-only, so a fully-enriched library **skips before loading the
+KDTree at all** and pays nothing.
 
 The durable fix is a **SQLite R-tree** instead of an in-memory KDTree — ~0
 resident memory, no per-process load, and all 6.58M rows retained (so the

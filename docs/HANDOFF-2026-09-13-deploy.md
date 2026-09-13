@@ -6,9 +6,10 @@ reach the NAS (Tailscale reported stopped), so the deploy moves to the desktop.
 
 > **STATUS: deployed and run, 2026-09-13.** Steps 1–3 below are complete and
 > verified; the 2026-09-12 shoot went from 1 named face to 197. A separate
-> pre-existing defect surfaced — `geocode` OOM-kills the NAS web container, so
-> every replica push's trigger leg fails. See **"Deploy result"** at the foot of
-> this file for what landed, what to distrust, and what is still open.
+> pre-existing defect surfaced — `geocode` OOM-killed the NAS web container —
+> and has since been **fixed and verified** (`53f167e`). See **"Deploy result"**
+> at the foot of this file for what landed, what to distrust, and what is still
+> open.
 
 Placeholders: `<nas>` is the NAS web address (`http://<nas>:8000`), `<replica>`
 is the desktop replica checkout. Use the IP, not the hostname, for HTTP.
@@ -293,3 +294,74 @@ Worth trying, in order:
   you were pointed at may itself be the newer commit.
 - The SSE keepalive comments (`: keepalive`) dominate a saved stream; filter
   with `grep -v keepalive` before reading it.
+
+
+---
+
+# Geocode OOM — FIXED and verified (`53f167e`, 2026-09-13)
+
+Root cause was **not** the KDTree the docs blamed. `RGeocoder.load()` keeps one
+Python dict per row at ~745 B, so the unfiltered 6.58M-row dataset was **4.9 GB**;
+`get_rich_geocoder` then did `io.StringIO(f.read())`, holding the 370 MB CSV
+*twice* as UCS-2 text (the file contains CJK punctuation, max codepoint U+FF1F,
+so Python can't use 1 byte/char) for another **1.44 GB**. Peak ~6.3 GB against
+4.5 GB free.
+
+That also **rules out the "run it out-of-process" suggestion** made earlier in
+this file: a separate container on the same host hits the same wall. Struck.
+
+## What changed
+
+- **`_MIN_POPULATION = 1`** — drops class-P rows GeoNames records as population
+  0: **4,724,495 of 5,203,624** populated places, overwhelmingly hamlets. Named
+  POIs are matched by feature *code* and kept whatever their population (parks
+  and peaks are always 0). In `build_rich_dataset` the `is_poi` test runs
+  **before** the population gate, so a row that is both survives — reversing
+  that order silently drops park/village labels, and has its own test.
+- **Stream the CSV** — `RGeocoder(stream=<file object>)`; its `load()` is a
+  `csv.DictReader`, which iterates line by line.
+- **`--force` no longer re-downloads.** It re-filters from the source already on
+  disk, which is what you want after a filter change; the new
+  `--refresh-source` is the 400 MB pull. They used to be conflated.
+
+## Verified on the NAS
+
+| | before | after |
+|---|---|---|
+| rows in `rg_rich.csv` | 6,581,251 | **1,856,756** |
+| peak RSS loading the geocoder | ~6,300 MB | **1,470 MB** |
+| load time | 10-30 s | **7.3 s** |
+| `geocode` stage | **SIGKILL, exit 137** | **done in 6.4 s, container survived** |
+| full deferred trigger set | all `unreachable` | **done, 225,519 applied, container survived** |
+
+Labels are still rich — the two examples CLAUDE.md uses to justify the dataset
+both still resolve correctly:
+
+```
+Point Reyes area   -> Mount Wittenberg, Marin County, US     (not "Inverness")
+Muir Woods area    -> Muir Woods National Monument, Marin County, US  (not "Mill Valley")
+Alps               -> Ils Chejels, Region Maloja, CH
+```
+
+Also worth knowing: the stage is gated missing-only, so a fully-enriched library
+**skips before loading the KDTree at all** and pays nothing.
+
+Stages run to completion on the NAS while fixing this: `geocode` 1,016,
+`infer` 14, `normalize_inferred` 14, `normalize` 1,016, `resolve_dups` 28,
+`normalize_aesthetics` 155,966, `normalize_subject_aesthetics` 69,553. The
+trigger leg of a replica push should now be clean.
+
+## Still open
+
+- **The durable fix is a SQLite R-tree** — ~0 resident memory, no per-process
+  load, and all 6.58M rows kept (so the population gate could go away). `rtree`
+  is already compiled into the SQLite on both machines (NAS 3.46.1, desktop
+  3.45.1). Plan with the traps written down (antimeridian, degrees-vs-distance,
+  haversine ranking): `docs/plans/geocode-rtree.md`.
+- **Existing photos still carry labels from the old dataset.** Nothing was
+  re-labelled — only the 1,016 photos that had no label got one. If you want the
+  whole library re-derived, that is `normalize-places --force`, and it is worth
+  diffing a sample first.
+- **`_MIN_POPULATION` dropped 4.72M rows.** If a place you care about starts
+  resolving to something coarser, that is the knob — and the R-tree work removes
+  the need for it entirely.
