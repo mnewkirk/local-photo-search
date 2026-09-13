@@ -137,3 +137,53 @@ def test_roundrobin_interleaves_by_default(monkeypatch, tmp_path):
     c = run({"clip": 3, "quality": 2}, monkeypatch, tmp_path)
     first_quality = c.calls.index("quality")
     assert c.calls[:first_quality].count("clip") == 1, c.calls
+
+
+# --- the /admin/maintenance fleet launcher must expose both flags too -------
+
+def test_workers_start_passes_flags_to_run_workers(monkeypatch):
+    """The UI launcher builds a run-workers.sh command line; the flags have to
+    reach it or the checkboxes are decorative."""
+    import photosearch.admin_api as A
+
+    seen = {}
+
+    class R:
+        returncode = 0; stdout = "ok"; stderr = ""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return R()
+
+    monkeypatch.setattr(A.subprocess, "run", fake_run)
+    monkeypatch.setattr(A, "_run_workers_script", lambda: __file__)  # any existing path
+    monkeypatch.setattr(A, "_fleet_server_url", lambda: "http://nas:8000")
+    monkeypatch.setattr(A, "_native_repo_dir", lambda: ".")
+    monkeypatch.setattr(A, "_fleet_env", lambda: {})
+
+    req = A.WorkersStartRequest(passes=["clip", "quality"], count=2,
+                                sequential=True, stay_alive=True)
+    out = A.admin_workers_start(req)
+    assert "--sequential" in seen["cmd"]
+    assert "--stay-alive" in seen["cmd"]
+    assert out["sequential"] is True and out["stay_alive"] is True
+
+
+def test_workers_start_defaults_omit_both_flags(monkeypatch):
+    """Default must be exit-when-drained, round-robin — i.e. neither flag."""
+    import photosearch.admin_api as A
+
+    seen = {}
+
+    class R:
+        returncode = 0; stdout = "ok"; stderr = ""
+
+    monkeypatch.setattr(A.subprocess, "run", lambda cmd, **kw: (seen.__setitem__("cmd", cmd), R())[1])
+    monkeypatch.setattr(A, "_run_workers_script", lambda: __file__)
+    monkeypatch.setattr(A, "_fleet_server_url", lambda: "http://nas:8000")
+    monkeypatch.setattr(A, "_native_repo_dir", lambda: ".")
+    monkeypatch.setattr(A, "_fleet_env", lambda: {})
+
+    A.admin_workers_start(A.WorkersStartRequest(passes=["clip"], count=1))
+    assert "--sequential" not in seen["cmd"]
+    assert "--stay-alive" not in seen["cmd"]

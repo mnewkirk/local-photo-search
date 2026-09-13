@@ -1127,6 +1127,13 @@ class WorkersStartRequest(BaseModel):
     # location, quality/aesthetic, camera, tags) — mutually exclusive with
     # `collection`. Resolved server-side to a photo-id set.
     filters: dict | None = None
+    # Keep polling when every queue runs dry. Default False matches the CLI:
+    # a pass retires when empty and the fleet exits, so it stops holding the
+    # NAS write lock once the backlog is gone.
+    stay_alive: bool = False
+    # Drain each pass fully before the next, in the order given, instead of
+    # round-robining a batch at a time.
+    sequential: bool = False
 
 
 # filters-dict key → run-workers.sh flag. `people` fans out to repeated
@@ -1211,6 +1218,10 @@ def admin_workers_start(req: WorkersStartRequest):
             raise HTTPException(400, "collection must be a positive id")
         cmd += ["-c", str(req.collection)]
     cmd += filter_flags
+    if req.stay_alive:
+        cmd.append("--stay-alive")
+    if req.sequential:
+        cmd.append("--sequential")
     try:
         r = subprocess.run(cmd, cwd=_native_repo_dir(), env=_fleet_env(),
                            capture_output=True, text=True, timeout=180)
@@ -1219,6 +1230,7 @@ def admin_workers_start(req: WorkersStartRequest):
     if r.returncode != 0:
         raise HTTPException(500, f"worker launch failed: {(r.stderr or r.stdout)[-500:]}")
     return {"ok": True, "count": n, "passes": req.passes, "collection": req.collection,
+            "stay_alive": req.stay_alive, "sequential": req.sequential,
             "server": _fleet_server_url(), "output": (r.stdout or "")[-2000:]}
 
 

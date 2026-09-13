@@ -1843,6 +1843,12 @@
       var _sel = useState({ describe: true, 'category-content': true, keywords: true });
       var sel = _sel[0]; var setSel = _sel[1];
       var _n = useState(2); var count = _n[0]; var setCount = _n[1];
+      // --sequential drains a pass fully before the next (no model thrash);
+      // --stay-alive keeps the fleet polling a dry queue. Default OFF so the
+      // fleet exits when the backlog is gone instead of holding the NAS
+      // write lock — idle polling has starved ingests and face writes.
+      var _seq = useState(false); var sequential = _seq[0]; var setSequential = _seq[1];
+      var _sa = useState(false); var stayAlive = _sa[0]; var setStayAlive = _sa[1];
       var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
       var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];
       var _status = useState(null); var status = _status[0]; var setStatus = _status[1];
@@ -1895,7 +1901,8 @@
         setBusy(true); setMsg({ kind: 'info', text: 'Launching ' + count + ' worker(s)…' });
         var filters = buildFilters();
         var hasFilter = Object.keys(filters).length > 0;
-        var body = { passes: passes, count: Number(count) };
+        var body = { passes: passes, count: Number(count),
+                     sequential: sequential, stay_alive: stayAlive };
         // Filters take precedence over the collection dropdown (the server
         // rejects both at once). A set filter scopes the whole fleet.
         if (hasFilter) body.filters = filters;
@@ -1951,6 +1958,21 @@
             e('input', { type: 'number', min: 1, max: 8, value: count,
               onChange: function (ev) { setCount(ev.target.value); },
               style: { width: 56, marginLeft: 6 } }),
+            e('label', { className: 'workers-title',
+                style: { marginLeft: 14, display: 'inline-flex', alignItems: 'center', gap: 4 },
+                title: 'Drain each pass completely before starting the next, in the order '
+                     + 'shown. Avoids swapping model weights in and out between batches.' },
+              e('input', { type: 'checkbox', checked: sequential,
+                onChange: function (ev) { setSequential(ev.target.checked); } }),
+              'Sequential'),
+            e('label', { className: 'workers-title',
+                style: { marginLeft: 10, display: 'inline-flex', alignItems: 'center', gap: 4 },
+                title: 'Keep workers polling after the queues run dry. Off (default) retires '
+                     + 'each pass when its queue empties and exits the fleet — idle workers '
+                     + 'hold the NAS write lock and have starved ingests and face writes.' },
+              e('input', { type: 'checkbox', checked: stayAlive,
+                onChange: function (ev) { setStayAlive(ev.target.checked); } }),
+              'Stay alive'),
             e('button', { className: 'btn', style: { marginLeft: 12 },
               onClick: start, disabled: busy }, busy ? 'Working…' : 'Start fleet'),
             e('button', { className: 'btn', style: { marginLeft: 8 },
