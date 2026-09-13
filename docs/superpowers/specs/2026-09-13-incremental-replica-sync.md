@@ -1,14 +1,461 @@
-# Incremental replica sync: make `sync-replica.sh` ship deltas, not the world
+# The photo database, evaluated — and incremental replica sync
 
-**Status:** Designed, not implemented. 2026-09-13.
+**Status:** Part II (incremental sync): designed, not implemented, 2026-09-13.
+Part I (holistic schema evaluation + forward recommendations): added in the
+2026-09-13 revision, after a read-only review of the v29 schema against
+everything the system has become.
 **Depends on:** M26a (`sync-replica.sh`, local read-replica), the maintenance-sync
 push model (schema v29, `photosearch/maintenance_sync.py`).
-**Schema:** Phase 2 bumps `SCHEMA_VERSION` 29 → 30. Phase 1 needs no schema change.
+**Schema:** one shared v29 → 30 bump carries everything in this document that
+needs a migration — Part I's S2/S4/R2 and, if the sync is built, Part II
+Phase 2's tracking columns. Sync Phase 1 needs no schema change.
 
 This lives in `docs/superpowers/specs/` (dated design specs — same shape as
 `2026-07-17-maintenance-push-up-design.md`), not `docs/plans/` (milestone
 plans/backlogs). It is a design for a specific mechanism, so the specs
-convention applies.
+convention applies. The 2026-09-13 revision widened the scope: the sync
+mechanism is now Part II of a document that also carries the forward design
+of the database itself, because the review kept finding that the sync
+design, the write-lock failures, and the schema's growth pains are one
+subject.
+
+# Part I — the v29 database, evaluated
+
+Reviewed 2026-09-13, read-only, against the Sep 13 replica
+(`photo_index.db.local`, 2,063,765,504 bytes = 503,849 × 4 KB pages, schema
+v29) plus the write paths in `db.py`, `worker_api.py`, `maintenance.py`,
+`faces.py`, `aesthetics.py`, `search.py`, `cli.py`. Every number below was
+measured in this pass unless it explicitly cites the briefing.
+
+## What this database is now
+
+One 2 GB file doing at least seven jobs that arrived years apart: (1) photo
+identity + EXIF (the original "photo search tool"), (2) two vector-search
+indexes (sqlite-vec, ~980 MB — half the file), (3) a face-recognition
+workbench (`faces`/`persons`/clusters/references/undo), (4) a VLM aesthetics
+store (32 columns bolted onto `photos`), (5) an LLM text store plus an
+append-only provenance log (`generations`, 847,062 rows), (6)
+distributed-fleet bookkeeping (`worker_processed` / `worker_claims`), and
+(7) operational logs (`index_activity`, `index_errors`,
+`maintenance_runs`). Its consumers now include the web UI, the MCP server,
+the Ask agent, the worker fleet, three cron jobs, and a second machine
+holding a wholesale-swapped copy of the whole file.
+
+The one-line summary: **the relational design has held up remarkably well;
+the physical layout and the write-concurrency behaviour have not.** Most of
+what follows is about the second half of that sentence.
+
+## What the design gets right — leave these alone
+
+- **AUTOINCREMENT everywhere; IDs never reused.** Quietly load-bearing for
+  at least four features: vec0 orphan safety, append-only delta extraction
+  (Part II), the face-crop caches, and tombstones. Never change this.
+- **The pragmas are already right.** `db.py:122–127` sets WAL,
+  `busy_timeout=60000`, `synchronous=NORMAL`, a 64 MB page cache, and
+  autocheckpoint. The briefing's remedy list opens with "WAL tuning /
+  `busy_timeout`" — that lever was pulled long ago. The lock failures happen
+  *despite* a 60-second retry, which is diagnostic: they are long-hold and
+  hot-acquirer problems, not configuration problems.
+- **FK cascades work where declared.** `generations` has **0 orphans**
+  against 847,062 rows and a library that has deleted tens of thousands of
+  photos. (Contrast `worker_processed`, which has no FK — §3.)
+- **Relative filepaths + `photo_root` indirection** — the single decision
+  that made the replica architecture possible at all.
+- **`generations` as append-only provenance** is the right shape. Its
+  problems are weight and indexing (§4), not design.
+- **The migration ladder** has survived real mess (the stray-v24 state, the
+  v23 tags split) and keeps every deployed DB upgradeable in place. Verbose
+  at v29, not broken (verdict in R3).
+- **Sidecar discipline** (`photobooks.db`, the split-planner settings DB) is
+  the correct response to swap-the-file sync. The pattern should be named
+  and kept — not unified away (R5).
+
+## What it is fighting — measured
+
+### 1. The write lock: the dominant failure, and it is three specific behaviours, not a platform limit
+
+SQLite allows one writer per database file. That is not going away, and no
+engine swap is warranted (Sequencing, do-nothing list). The failures traced
+to the one bad day each have a specific owner:
+
+- **Idle workers are writers.** `claim-batch` takes `BEGIN IMMEDIATE`
+  *unconditionally* (`worker_api.py:305`) — before knowing whether anything
+  is claimable — and the query it then runs while holding the writer lock
+  (`_unprocessed_scoped`, a NOT-EXISTS / NOT-IN scan) is the slow kind. An
+  idle fleet polling an empty queue therefore serializes every other writer
+  on the box through its polling loop. Two idle pollers were the measured
+  root cause of the face-assign 500s, the 30-minute collection insert, and
+  (by starving `ingest-incoming`) the 2,040-file zero-row ingest. Fix: S1 —
+  ~20 lines, no schema change.
+- **Long transactions blow past the 60 s retry.** `recluster-faces`
+  renumbers every unknown face in ONE transaction (`faces.py:800–813`:
+  `executemany` over ~181k UPDATEs plus the `ignored_clusters` wipe) — a
+  ~20-minute hold on the N100. No `busy_timeout` value survives a 20-minute
+  hold. Fix: S3.
+- **Whole-row rewrites amplify small writes ~100×.** `normalize-aesthetics`
+  writes ~20 B of floats per photo and dirties ~503 MB, because SQLite
+  rewrites the full 2,258 B row. Fix: S2 — the `photo_scores` split already
+  designed in Part II, Phase 1.5.
+
+The general levers, in the order they pay here: **hold the lock briefly**
+(S3), **acquire it less often** (S1), **write fewer bytes per acquisition**
+(S2). A fourth lever — a single-writer queue daemon in front of the file —
+is seductive and rejected: SQLite already *is* the write queue; the problem
+was never two well-behaved writers colliding, it was individual writers
+behaving badly, and a daemon adds an availability dependency to every CLI,
+cron, and ad-hoc container path that today needs only the file.
+
+### 2. `photos` is five tables wearing one rowid
+
+69 columns, 503 MB, 2,258 B/row, and at least five distinct mutability
+classes riding a single row: (a) immutable identity/EXIF (~24 columns), (b)
+write-once bulky LLM text (`description` 364 B/row, `aes_style` 336,
+`aes_subject` 308, `aesthetic_concepts` 293, `keywords` 135), (c) volatile
+scalars rewritten library-wide (~20 B/row — the percentiles and recomputed
+means), (d) occasionally-corrected location fields, and (e) dead columns
+(§6). Every UPDATE to any class rewrites all of them. There are **40
+`UPDATE photos SET` call sites across 6 modules** (db 9, maintenance 9,
+worker_api 8, cli 8, aesthetics 4, verify 2).
+
+The fix is the mutability split already designed in Part II ("Narrowing
+`photos`"): extract the ~6 volatile scalars to `photo_scores`. The *fuller*
+three-way split (identity / scores / text blobs) was evaluated and rejected
+(S6): the text columns are write-once, so they cause zero rewrite
+amplification; moving them buys only sequential-scan speed on a search path
+that is CLIP-KNN-first anyway, and costs a join in every result-hydration
+site. `description`, `keywords`, `categories`, `subject_boxes` stay where
+they are.
+
+### 3. `worker_processed`: bookkeeping that outgrew its design
+
+1,232,215 rows; 52.8 MB plus a **29.3 MB duplicate autoindex** (the table is
+keyed `(photo_id, pass_type)` but is a rowid table, so the PK is stored
+twice). Measured rot:
+
+- **228,194 rows (18.5%) are orphans** of deleted photos — no FK, so every
+  purge and dedup leaves rows forever. The briefing's "133% of photos have a
+  `faces` row" verified exactly (210,517 distinct vs 158,419 photos).
+- **78,812 rows (6.4%) belong to the removed `tags` pass.** Nothing will
+  ever read them.
+
+Is the table the right design at all? **In role, yes** — "which (photo,
+pass) pairs are done, with attempts" is exactly what a resumable fleet
+needs, and `processed_at` is already the delta key Part II relies on. **In
+physical form, no.** Rebuild once (S4): `WITHOUT ROWID` (the PK b-tree
+becomes the storage; the 29 MB autoindex disappears) + `REFERENCES
+photos(id) ON DELETE CASCADE` (orphans become impossible) + purge the
+orphans and the dead pass on the way through. ~82 MB → ~40–45 MB, and two
+whole rot classes designed out for the price of one migration step.
+
+### 4. `generations`: right log, wrong weight
+
+847,062 rows; 250 MB table + 30.4 MB of indexes = **~14% of the file** for
+data read from exactly two places: the per-photo modal
+(`web.py:1433,1494` — indexed by `photo_id`, fine) and rare admin backfills
+(`cli.py:4798–4931` — the only consumers of `WHERE text_type = …`). It
+grows ~5.3 rows/photo and never stops; every re-run appends more. Three
+observations with three different verdicts:
+
+- **`idx_generations_type` (19.8 MB) exists for one-off admin CLIs** that
+  can afford a 2–10 s scan of 847k rows. Drop it (S5): one statement,
+  −20 MB, and one fewer index-maintenance write per LLM artifact forever.
+- **Retention / compression: do nothing.** Average artifact is 216 B
+  (183 MB of text total). Deleting history surrenders the one thing the
+  table exists for — provenance across model re-runs; compressing it makes
+  every consumer decode to save ~100 MB that isn't hurting anything.
+- **Moving it to an ATTACHed `provenance.db` (S8)** is the honest
+  "eventually": −280 MB from the file every full dump copies, **zero effect
+  on the write lock** (inserts already flow through one chokepoint,
+  `log_generation`), small permanent tax (consumers must ATTACH; the FK
+  cascade is lost, so orphan cleanup moves to `cleanup-orphans`). Bundle it
+  with other work or skip it indefinitely; if Part II ships and full dumps
+  become weekly, the payoff halves.
+
+### 5. Index economics: one scan hiding in a hot path, several indexes of doubtful worth
+
+`photos` carries 18 secondary indexes (~55 MB). Two findings:
+
+- **`min_quality` is an unindexed full-table scan.** `search.py:1844–46`
+  filters *and orders* on `COALESCE(aes_overall, aesthetic_score)` — an
+  expression that neither `idx_photos_aes_overall` nor
+  `idx_photos_aesthetic` can serve. `EXPLAIN QUERY PLAN` confirms
+  `SCAN photos`: 503 MB per query using that filter, on the N100, from the
+  search page. The fix rides S2 — materialise the floor as a real column in
+  `photo_scores` and index it there. (A zero-migration interim exists — an
+  indexed generated column — but if `photo_scores` is happening, don't
+  build the floor twice.)
+- **Several aes indexes may be dead weight.** On the semantic path, ranking
+  and the `min_aesthetic` floor are applied *in Python* on the fetched
+  candidate set (`search.py:1182, 1347–1374`), so
+  `idx_photos_aes_technical` / `_composition` / `_impact` only pay on the
+  pure-structured path. `idx_photos_aesthetic` (legacy `aesthetic_score`,
+  3.2 MB) is very likely fully dead — its column now appears only inside
+  the COALESCE that cannot use it. Verify-then-drop (R4). The win is small
+  (~10–15 MB plus write overhead), which is why it batches with v30 rather
+  than shipping alone.
+
+### 6. Vestigial schema, measured
+
+| item | what | size | verdict |
+|---|---|---|---|
+| `aes_technical_iqa`, `aes_overall_iqa` | reserved for the rejected IQA anchor; **0 non-NULL values in 158,419 rows** | ~0 (NULLs) | drop at the v30 rebuild — they cost nothing but make the schema lie about capabilities |
+| `tags_v22_backup` | v23 migration snapshot — a **column**, not a table; 41,887 non-null | 2.8 MB | drop at v30; the re-tag it insured has long since run (192k category-pass rows) |
+| `tags` | pre-v23 column; 7,572 stragglers | 0.6 MB | drop at v30 after confirming the stragglers were re-tagged |
+| `aesthetic_critique` | **0 non-NULL** — yet still referenced by live code (`index.py:751,772`, `worker_api.py:760`, `rerun.py:278`) | 0 | delete the code paths first, *then* the column — a trap for a bare DROP |
+| `worker_processed` rows for pass `tags` | removed pass | 78,812 rows | purge (S4, or the interim cleanup-orphans extension) |
+| `photo_index.db.before-org-move-20260427` | stray file in NAS `/data` (briefed; not verifiable from the replica) | ~2 GB disk | delete after confirming its age — it predates four schema versions |
+| `photobooks.db.local.bak-*` × 7 | hand-named ad-hoc backups in the repo root | ~100 MB | superseded by D1's rotation; gitignore the pattern |
+
+Checked and **not** vestigial: `hallucination_flags` (84,473 rows, 9.0 MB —
+verify UI reads it) and `raw_filepath` (64,079 rows — the RAW badge and
+download path).
+
+### 7. Durability is currently an accident of the replica
+
+What the file holds that **no re-run can regenerate** — the human labour:
+5,212 manual + 1,341 merge-review face assignments, 54 persons, **60,517
+manually geotagged photos** (more than double the 28,597 with EXIF GPS),
+9,370 review selections, 56,223 collection memberships across 30
+collections, the ignored-clusters curation, and the whole `photobooks.db`
+sidecar. Second tier, regenerable only at real cost: 847k LLM artifacts,
+158k descriptions, 264k face encodings, and both vector indexes — call it
+**weeks of GPU time** to rebuild.
+
+The current safety net for all of that: a nightly replica pull whose target
+**overwrites itself** (so an upstream corruption or a bad migration
+propagates to the only copy within 24 h), one ad-hoc undo table
+(`face_dedupe_undo`), audit CSVs that some destructive CLIs write, and
+seven hand-named `.bak` files. There is no point-in-time recovery of any
+kind, while the destructive-operation inventory keeps growing:
+`dedup_photos` DELETEs, `purge-nonimage-photos` DELETEs, `recluster-faces`
+wipes `ignored_clusters` unconditionally, `apply-face-state
+--overwrite-persons` exists.
+
+And the Sep-12 ingest proved that writes can fail **silently at full
+scale**: 2,040 files moved, zero rows written, discovered a day later by
+absence. That is not a lock bug; it is a missing invariant — "files moved
+must equal rows written, or scream" (D4). A related operational hole:
+`index_activity`'s newest row on this replica is **2026-08-31**, a
+two-week silence over a period that included ingests — activity logging is
+evidently not reaching the log on some paths, which is exactly the
+condition D4 exists to make loud.
+
+## Corrections to the briefing
+
+Stated prominently, as asked:
+
+1. **"WAL tuning / busy_timeout / retry policy" is already done** —
+   `db.py:122–127` has had WAL + 60 s busy_timeout + NORMAL sync all along.
+   The lock problem is behavioural (S1/S2/S3), not configurational;
+   re-tuning pragmas would change nothing measurable.
+2. **Splitting the vec0 tables into a separate ATTACHed file would not help
+   the write lock at all.** Vectors are write-once at index time and
+   contend for nothing afterward. A separate file would only shrink the
+   full dump — which Part II achieves without file surgery. (A separate
+   *generations* file is a real but modest idea: S8.)
+3. `tags_v22_backup` is a **column on `photos`**, not a table.
+4. The `UPDATE photos SET` count is **40 sites across 6 modules** today —
+   the briefed 32/5 omitted `cli.py`'s 8. The argument it supports (that
+   convention-based change tracking is dead on arrival) only strengthens.
+5. Everything else verified exactly: the 133% `worker_processed` faces
+   ratio, the dbstat top sizes (±2% of this pass's numbers), the 2,258 B/row
+   `photos` payload, the aes column-group split, the 20 B of volatile
+   scalars.
+
+# Part I recommendations
+
+Organised by the axis they serve; each carries a cost/benefit. Conflicts
+between axes are called out afterward; build order — including the explicit
+do-nothings — is the Sequencing section.
+
+## Speed — meaning "stop losing to the write lock", then reads
+
+**S1. `claim-batch`: stop taking the write lock to learn there is no
+work.** Restructure to read-first: run `_unprocessed_scoped` *outside* any
+transaction (WAL readers never block or hold anything); if the result is
+empty — the overwhelmingly common case for an idle fleet — return without
+ever touching the writer lock. Only when candidates exist, `BEGIN
+IMMEDIATE` and **re-run the claim query inside the lock** before inserting
+claim rows, preserving the serialization the current comment defends. Add
+±25% jitter to the worker poll sleep while in the file. Cost: ~20 lines in
+`worker_api.py`, no schema change, one race test (two concurrent claims
+must not overlap). Benefit: removes the single highest-frequency
+`BEGIN IMMEDIATE` acquirer on the NAS — the measured root cause of the bad
+day. **Highest value-per-line change in this document.**
+
+**S2. The `photo_scores` split** — fully designed in Part II ("Narrowing
+`photos`", Phase 1.5) and unchanged; it is listed here because it is a
+Part-I-class fix that happens to have been designed there first: 503 MB →
+~7 MB for every normalize night, and the `min_quality` scan (§5) gets its
+index for free by materialising `COALESCE(aes_overall, aesthetic_score)` as
+a real column. It is the anchor tenant of the v30 migration.
+
+**S3. Cap every write transaction at roughly a second of hold.** The known
+offender: `recluster-faces`' single ~181k-row transaction → chunk to ~10k
+rows per commit (~18 commits; cluster IDs are ephemeral and the documented
+recovery for a failed recluster is "rerun", so whole-run atomicity buys
+nothing a rerun doesn't). Audit `maintenance.py` stage batch sizes while
+there — it commits per stage today, and a stage over a 40k backlog is the
+same shape of hold. Cost: ~30 lines + audit. Benefit: no writer can be
+starved past `busy_timeout` again — the 60 s retry becomes sufficient *by
+construction*. Trade-off noted under Conflicts.
+
+**S4. Rebuild `worker_processed` at v30**: `WITHOUT ROWID`, FK `ON DELETE
+CASCADE`, purge the 228k orphans and 79k dead-pass rows in the same
+migration step. Cost: one ~80 MB table rebuild, ~1 min on the N100, inside
+the existing ladder. Benefit: ~82 MB → ~40–45 MB, the orphan class extinct
+by construction, the duplicate autoindex gone. `processed_at` unchanged —
+zero Part II impact. Interim (ships this week, no migration): extend
+`cleanup-orphans` with `DELETE FROM worker_processed WHERE photo_id NOT IN
+(SELECT id FROM photos)` and `WHERE pass_type='tags'`.
+
+**S5. `DROP INDEX idx_generations_type`.** One statement, −19.8 MB, one
+fewer index write per artifact forever; its only consumers are one-off
+backfill CLIs that can afford a table scan. Can ship today.
+
+**S6. Do NOT split the bulky write-once text out of `photos`.** Evaluated
+(the maximal reading of the row-width question) and rejected — see §2.
+Revisit only if a profile shows `photos` scan time dominating a real query
+*after* S2 lands.
+
+**S7. Do NOT move vec0 to a separate file.** See Corrections #2. The
+1 GB of vectors is inert weight, not contention; Part II already stops
+shipping it nightly.
+
+**S8. `generations` → ATTACHed `provenance.db`** — real but optional;
+−280 MB of dump weight, zero lock effect, small permanent ATTACH tax.
+Bundle with a future migration or skip indefinitely (§4). If built, Part
+II's taxonomy is unaffected in kind — noted inline there.
+
+## Durability
+
+**D1 — SHIPPED 2026-09-13.** Implemented in `sync-replica.sh`: snapshots the
+OUTGOING replica before the swap, zstd -3, `KEEP_NIGHTLY=7` / `KEEP_WEEKLY=4`,
+`SNAPSHOTS=0` to disable. Measured on the real 2.06 GB file: **984 MB per
+snapshot (52%)**, matching the predicted ~53%; a decompressed snapshot passes
+`PRAGMA integrity_check` and carries all 60,517 manual geotags and 6,696
+manual/merge face assignments. Two corrections to the design below: the cull
+sorts by the **datestamp in the filename**, not `ls -t` — mtime ordering silently
+keeps the OLDEST N once a file is copied or restored (caught in test) — and the
+Sunday weekly is a **hardlink**, not a copy, so it costs nothing until the
+nightly is pruned out from under it.
+
+**D1. Rotate replica snapshots instead of overwriting the only copy.**
+`sync-replica.sh` currently `mv`s over the previous replica. Change the
+swap to rotate: keep ~7 nightly + 4 weekly, compressed (`zstd -3` at the
+measured ~53% ratio ≈ ~1 GB each, ~11 GB total on the desktop). Cost: ~15
+script lines + disk. Benefit: **point-in-time recovery exists for the first
+time**, covering both machines — including upstream corruption and
+bad-migration scenarios that today propagate into the only copy within
+24 h. Cheapest durability win available; needs no NAS changes at all.
+
+**D2. `export-curation` — a daily dump of the rows no re-run can
+regenerate.** The §7 human-labour set (persons, manual/merge face
+assignments, manual locations, collections, review selections, ignored
+clusters, settings) fits a ~10–30 MB sidecar SQLite file.
+`export-face-state` already proves the pattern; widen it, cron it on the
+NAS, rotate 30 deep. Cost: ~1 day. Benefit: months of eyeball work survives
+even a scenario that loses both full DBs; restore is ATTACH + set-based
+UPDATE, exactly like `apply-face-state`.
+
+**D3. One undo convention instead of N ad-hoc ones.** Generalise
+`face_dedupe_undo` into a single `op_undo` table — `(op_id, created_at,
+table_name, row_pk, column, old_value)` — plus `photosearch undo <op_id>`,
+adopted by each destructive CLI as it is next touched: dedup snapshots
+deleted rows, recluster snapshots `ignored_clusters` before wiping,
+`apply-face-state --overwrite-persons` snapshots what it overwrites. Cost:
+~150-line helper + incremental adoption. Benefit: "recluster ate my ignored
+clusters" becomes recoverable, and destructive ops stop needing bespoke
+undo design each time. Explicitly *not* an event-sourcing rewrite — just
+the existing in-tree pattern, named and reused.
+
+**D4. Make silent write failure structurally loud.** `ingest-incoming`
+must compare files-moved vs rows-written per run, and on divergence exit
+non-zero, log at ERROR, and surface on the `/status` ingest card. ~20
+lines. Same treatment for the `index_activity` silence (§7): if an ingest
+run logs no activity row, that is a failure, not a quiet night.
+
+**D5. Long jobs must not die with the browser.** The sweep killed by a
+phone lock-screen is an SSE-lifecycle bug, not a DB bug, but it destroys
+durability of *operations*: run sweeps detached with a reconnectable
+progress channel — the `on_progress` / `should_abort` machinery already
+exists; the abort must come from an explicit cancel, never from transport
+disconnect. Moderate cost; schedule with normal feature work.
+
+## Readability
+
+**R1. Generate a data dictionary; stop making the schema archaeology.**
+One page (`docs/db-schema.md`) generated from `PRAGMA table_info` plus a
+maintained one-liner per column (which pass writes it; when it went dead),
+with a CI test asserting the doc and a fresh `_init_schema()` agree on
+columns. Cost: half a day. Benefit: the next "is `hallucination_flags`
+dead?" takes ten seconds instead of a grep session — this review needed
+exactly that session.
+
+**R2. Retire the dead schema at v30** (the §6 table): drop `aes_*_iqa`,
+`tags_v22_backup`, `tags`; delete the `aesthetic_critique` *code paths*
+first, then the column. `photos` goes 69 → ~59 columns (→ ~53 after S2
+moves the volatile scalars out). Rides the v30 rebuild — do not run a
+standalone 503 MB table rewrite to reclaim 3 MB.
+
+**R3. Keep the migration ladder; add a canonical snapshot.** Verdict on
+"is `_init_schema()` still maintainable at v29": **yes** — linear,
+battle-tested against real deployed states, and every framework alternative
+adds a dependency for zero user-visible gain. The real gap is that nothing
+states the *current* schema in one place; that is R1, not Alembic.
+
+**R4. Verify-then-drop the doubtful indexes** (`idx_photos_aesthetic`; the
+per-dimension aes indexes if EXPLAIN shows the structured path never
+reaches them). Small (~10–15 MB); batch with v30.
+
+**R5. Do-nothing verdicts, for the record:** no column renames
+(`date_taken` / `date_created` / `indexed_at` confuse, but they are touched
+from 6 modules plus the frontend plus the MCP tool schemas — a rename buys
+aesthetics at real breakage risk); no table renames; no ORM; keep
+`photobooks.db` separate (its isolation from the sync swap is a feature,
+not a wart); keep the two-file NAS/replica model.
+
+## Where the axes conflict
+
+- **S2 vs readability:** every hot filter path gains a JOIN, and the shared
+  filter vocabulary (`search.py` + `tools._build_filter_sql`) must move in
+  lockstep — the exact risk Part II documents. Paid once, at migration
+  time, with tests; the alternative is paying 503 MB per normalize forever.
+- **S3 vs durability:** a crashed recluster now leaves a half-renumbered
+  state instead of rolling back. Acceptable *because* cluster IDs are
+  ephemeral and the recovery is "rerun"; D3's `ignored_clusters` snapshot
+  covers the one non-ephemeral casualty. This trade would be wrong for
+  `photos` content writes — do not generalise it blindly.
+- **S8 vs readability:** every `generations` consumer must ATTACH, and the
+  FK cascade is lost. That cost is why S8 is optional-bundle, not
+  recommended-now.
+- **S4 (`WITHOUT ROWID`) vs familiarity:** subtly different storage rules;
+  one comment in the DDL suffices.
+- **D1 vs disk:** ~11 GB on the desktop. Accepted without ceremony.
+
+## Sequencing
+
+| when | items | cost | benefit |
+|---|---|---|---|
+| **Now — no schema change, ship this week** | ✅ S1 claim-batch read-first (a935e5b, deployed) · ✅ S5 drop `idx_generations_type` · ✅ D1 snapshot rotation · D4 loud ingest · interim `cleanup-orphans` extension for `worker_processed` | ~2 days total | kills the measured #1 lock source; first-ever point-in-time recovery; the silent-failure class closed; −20 MB |
+| **v30 — ONE migration, one deploy** | S2 `photo_scores` (anchor) · S4 `worker_processed` rebuild · R2 column retirement · R4 index drops · **plus Part II Phase 2's tracking columns if the sync is being built** | ~1–2 weeks incl. search-path tests | normalize writes 503 MB → ~7 MB; `min_quality` indexed; file −~120 MB; two orphan classes extinct; schema stops lying |
+| **With normal feature work** | S3 transaction caps · D3 undo convention · D5 detached jobs · R1 data dictionary · D2 export-curation | ~1 week, spread out | lock holds bounded by construction; destructive ops reversible; curation backed up independently of both DBs |
+| **Only if bundled — maybe never** | S8 `provenance.db` split | ~2–3 days | −280 MB of dump weight; halves in value if Part II ships |
+| **Do nothing — deliberate verdicts** | vec0 file split (S7) · single-writer daemon · engine swap (nothing here exceeds SQLite used well) · three-way `photos` split (S6) · `generations` retention/compression · column renames · migration framework | 0 | churn avoided on a system in daily, successful use |
+
+The governing rule: **there should be exactly one more disruptive
+migration**, carrying everything above that needs one. On a two-machine,
+sync-coupled deployment, each schema bump costs a NAS redeploy + a replica
+redeploy + a full sync, in the right order, with the documented
+stale-image failure modes in between. Batching v30 is not tidiness; it is
+the deployment model.
+
+---
+
+# Part II — Incremental replica sync (the original design)
+
+*Kept intact from the original spec. Part I revisions are marked
+**[rev 2026-09-13]** where they change something; nothing else was reworded.*
 
 ## Problem
 
@@ -49,8 +496,11 @@ file the brief measured). Corrections and *useful additions* the brief missed:
   photos indexed in 7 days, 2,314 in 30, of 158,419.
 - `photos` has `indexed_at` and **no** `updated_at` — confirmed
   (`db.py:299-324`; the only `updated_at` in the schema is on `collections`).
-- `grep -c 'UPDATE photos SET'` finds **32 call sites across 5 modules**
-  (db.py, maintenance.py, verify.py, aesthetics.py, worker_api.py) — plus the
+- `grep -c 'UPDATE photos SET'` finds **40 call sites across 6 modules**
+  (db.py 9, maintenance.py 9, worker_api.py 8, cli.py 8, aesthetics.py 4,
+  verify.py 2; **[rev 2026-09-13]** the original count here — 32 across 5 —
+  missed cli.py and went stale within the week it was written, which is
+  itself the argument) — plus the
   documented ad-hoc `$DCPY` snippet culture. Any design that asks writers to
   remember anything is dead on arrival; this number is why.
 
@@ -130,6 +580,15 @@ tracking those tables (largest is `stack_members` at 48k tiny rows) and it
 reconciles their deletes and rewrites (stacking `clear`, collection edits,
 recluster's `ignored_clusters` wipe) for free, with zero new invariants.
 
+**[rev 2026-09-13]** Part I items adjust this table if built first, all
+benignly: `photo_scores` (S2 / Phase 1.5) joins the **full-copy** class — at
+~3–10 MB it is cheaper to ship whole than to track, so the split needs **no
+`updated_at` column and no trigger of its own**. A `provenance.db` split (S8)
+leaves `generations` in the delta-by-id class unchanged; `dump-delta` just
+ATTACHes one more file. The `worker_processed` v30 rebuild (S4) keeps
+`processed_at`, so its delta key is untouched. Nothing in Part I moves a
+table between classes.
+
 ### Narrowing `photos`: split the volatile scores into their own table
 
 **Proposed by Matt 2026-09-13, after the taxonomy above was drafted. It removes
@@ -200,6 +659,9 @@ not the wholesale aesthetics extraction: ~98% of the benefit for a fraction of
 the migration and search-path risk. Sequence it **before** Phase 2 if both are
 being built — it shrinks what Phase 2's triggers have to cover — but it is not
 a prerequisite, and it earns its keep on lock-contention grounds alone.
+**[rev 2026-09-13]** Sync bonus found in the Part I review: at ~3–10 MB the
+new table simply joins the full-copy class, so the split adds **zero**
+change-tracking machinery to this design — no `updated_at`, no trigger.
 
 ### Change tracking for `photos`/`faces`: trigger-maintained `updated_at`
 
@@ -541,7 +1003,10 @@ no mocks.
   `normalize-aesthetics` from a 503 MB write to ~7 MB is worth doing on its own,
   because that write holds the NAS's single SQLite write lock and lock
   contention has already cost a face-assignment session, a collection build and
-  an entire overnight ingest.
+  an entire overnight ingest. **[rev 2026-09-13]** And S1 (claim-batch
+  read-first, Part I) attacks the same lock with ~20 lines and no schema
+  change; it should ship before anything in this Part, whatever happens to
+  the sync.
 
 ## Phasing
 
@@ -562,6 +1027,11 @@ tombstones + `db_uuid`; `photos`/`faces` move to delta-by-timestamp; vec0
 gains the re-embed path via the chokepoint touch; mirror guard lands. This is
 the phase that carries all the correctness risk, which is why it rides on a
 Phase 1 skeleton that's already been syncing for a while.
+**[rev 2026-09-13]** If Phase 2 is built, its schema bump must be the *same*
+v30 migration that carries Part I's S2/S4/R2 (see Sequencing, Part I) — on a
+two-machine sync-coupled deployment every extra disruptive migration costs a
+NAS redeploy + a replica redeploy + a full sync; batching is the deployment
+model, not tidiness.
 
 **Phase 1.5 — `photo_scores` split (schema bump, independent).** See
 "Narrowing `photos`" above. Not a prerequisite for either phase, and it earns
