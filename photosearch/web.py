@@ -2143,6 +2143,77 @@ def api_face_suggestions():
     return payload
 
 
+@app.get("/api/faces/label-conflicts")
+def api_label_conflicts(
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    person: str | None = Query(None),
+    collection: int | None = Query(None),
+    eps: float = Query(0.80, ge=0.2, le=1.2),
+    min_samples: int = Query(2, ge=2, le=10),
+    min_det: float = Query(0.65, ge=0.0, le=1.0),
+    min_edge: int = Query(90, ge=0, le=2000),
+):
+    """Clusters that hold two or more DIFFERENT named people — suspected label
+    errors, most-lopsided first.
+
+    A cluster mixing two named people is usually a bad LABEL rather than a bad
+    cluster: on the 2026-08-29 shoot the single impurity across a full eps
+    sweep turned out to be two faces mistagged Carson Jones sitting inside
+    eleven Beckham Tinnel faces. Correcting the tags took the sweep to zero.
+
+    A SCOPE IS REQUIRED (date range, person, or collection). Clustering the
+    whole library takes ~20 minutes and holds the write lock — the same
+    contention that has cost this system an overnight ingest. Scoped to one
+    shoot it is seconds. An unscoped call is a 400, not a slow success.
+    """
+    if not (date_from or date_to or person or collection):
+        raise HTTPException(
+            400, "a scope is required (date_from/date_to, person, or collection) — "
+                 "clustering the whole library takes minutes and holds the write lock")
+    from . import face_review
+
+    where = ["(f.det_score IS NULL OR f.det_score >= :min_det)",
+             "MIN(f.bbox_bottom-f.bbox_top, f.bbox_right-f.bbox_left) >= :min_edge"]
+    params: dict = {"min_det": min_det, "min_edge": min_edge}
+    if date_from:
+        where.append("date(p.date_taken) >= :date_from"); params["date_from"] = date_from
+    if date_to:
+        where.append("date(p.date_taken) <= :date_to"); params["date_to"] = date_to
+    if collection:
+        where.append("p.id IN (SELECT photo_id FROM collection_photos WHERE collection_id = :coll)")
+        params["coll"] = collection
+    if person:
+        # every face in any photo where this person appears — the conflict is
+        # between them and whoever else got clustered with them
+        where.append("""p.id IN (SELECT f2.photo_id FROM faces f2
+                        JOIN persons pe2 ON pe2.id = f2.person_id
+                        WHERE pe2.name = :person)""")
+        params["person"] = person
+
+    with _get_db() as db:
+        rows = db.conn.execute(f"""
+            SELECT f.id, pe.name AS person_name
+              FROM faces f
+              JOIN photos p ON p.id = f.photo_id
+              LEFT JOIN persons pe ON pe.id = f.person_id
+             WHERE {' AND '.join(where)}
+        """, params).fetchall()
+        if not rows:
+            return {"scope_faces": 0, "conflicts": [], "eps": eps}
+        labels = {r["id"]: r["person_name"] for r in rows}
+        encs = db.get_face_encodings_bulk([r["id"] for r in rows])
+
+    clusters = face_review.cluster_faces(encs, eps=eps, min_samples=min_samples)
+    conflicts = face_review.find_label_conflicts(clusters, labels)
+    return {
+        "scope_faces": len(rows),
+        "clustered": sum(1 for v in clusters.values() if v >= 0),
+        "eps": eps, "min_samples": min_samples,
+        "conflicts": conflicts,
+    }
+
+
 @app.post("/api/faces/suggestions/regenerate")
 def api_regenerate_suggestions(data: dict = None):
     """Re-run the merge-suggestion engine and overwrite the cached JSON.

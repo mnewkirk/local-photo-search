@@ -863,7 +863,192 @@
       );
     }
 
+    // ---- Label conflicts -------------------------------------------------
+    // A cluster holding two or more DIFFERENT named people. On a same-uniform
+    // team shoot that is usually a bad LABEL rather than a bad cluster: the
+    // one impurity in a full eps sweep of 2026-08-29 was two faces mistagged
+    // Carson Jones sitting inside eleven Beckham Tinnel faces.
+    //
+    // Deliberately NOT offering a one-click "reassign minority to majority".
+    // That would have been wrong on the very case this was built for — both
+    // labels on those frames had been wrong earlier the same day and the right
+    // answer was a third person in neither group. You pick the name.
+    function ConflictCard({ conflict, persons, onPreview, onApplied }) {
+      const [checked, setChecked] = useState(() => {
+        // Pre-check the minority: the likeliest thing you're here to fix.
+        const m = {};
+        const groups = conflict.labels;
+        for (let i = 1; i < groups.length; i++) {
+          groups[i].face_ids.forEach((id) => { m[id] = true; });
+        }
+        return m;
+      });
+      const [name, setName] = useState('');
+      const [newName, setNewName] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [msg, setMsg] = useState(null);
+
+      const ids = Object.keys(checked).filter((k) => checked[k]).map(Number);
+      const effName = name === '__new__' ? newName.trim() : name;
+
+      function toggle(id) {
+        setChecked((c) => Object.assign({}, c, { [id]: !c[id] }));
+      }
+
+      async function apply() {
+        if (!effName) { setMsg({ kind: 'err', text: 'pick a name' }); return; }
+        if (!ids.length) { setMsg({ kind: 'err', text: 'nothing selected' }); return; }
+        setBusy(true); setMsg(null);
+        try {
+          // In replica mode this proxies to the NAS and mirrors back, so the
+          // write is authoritative rather than something the next sync wipes.
+          const r = await fetch(API + '/api/faces/bulk-assign', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ face_ids: ids, person_name: effName }),
+          });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const j = await r.json();
+          setMsg({ kind: 'ok', text: 'assigned ' + (j.updated || ids.length) + ' → ' + effName });
+          onApplied(conflict.cluster);
+        } catch (err) {
+          setMsg({ kind: 'err', text: 'failed: ' + err.message });
+        } finally { setBusy(false); }
+      }
+
+      const summary = conflict.labels
+        .map((l) => l.count + '× ' + l.name).join('  vs  ');
+
+      return e('div', { className: 'card', style: { marginBottom: 16 } },
+        e('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' } },
+          e('strong', null, summary),
+          e('span', { className: 'muted', style: { fontSize: 12 } },
+            'cluster ' + conflict.cluster + ' · ' + conflict.size + ' faces · '
+            + 'lopsided ' + conflict.lopsidedness.toFixed(2)),
+          conflict.lopsidedness >= 0.75
+            ? e('span', { className: 'pill', style: { background: '#4a3000', color: '#ffc46b' },
+                title: 'A heavily one-sided split is usually a mislabel. An even split is more likely two people genuinely clustered together.' },
+                'likely mislabel')
+            : e('span', { className: 'pill', title: 'An even split is more likely a genuine merge of two people than a bad label.' },
+                'possibly a real merge'),
+        ),
+        conflict.labels.map((grp) =>
+          e('div', { key: grp.name, style: { marginTop: 10 } },
+            e('div', { className: 'muted', style: { fontSize: 12, marginBottom: 4 } },
+              grp.name + ' — ' + grp.count + ' face(s)'),
+            e('div', { className: 'face-strip', style: { flexWrap: 'wrap' } },
+              grp.face_ids.map((id) =>
+                e('label', { key: id, style: { position: 'relative', display: 'inline-block' } },
+                  e('input', {
+                    type: 'checkbox', checked: !!checked[id],
+                    onChange: () => toggle(id),
+                    style: { position: 'absolute', top: 4, left: 4, zIndex: 2, width: 16, height: 16 },
+                  }),
+                  faceCrop(id, grp.name, () => onPreview(id),
+                           checked[id] ? 'primary' : ''),
+                )),
+            ),
+          )),
+        e('div', { style: { marginTop: 10, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+          e('select', { value: name, onChange: (ev) => setName(ev.target.value) },
+            e('option', { value: '' }, '— reassign selected to —'),
+            persons.map((p) => e('option', { key: p, value: p }, p)),
+            e('option', { value: '__new__' }, '+ new name…'),
+          ),
+          name === '__new__' && e('input', {
+            value: newName, placeholder: 'new name',
+            onChange: (ev) => setNewName(ev.target.value),
+          }),
+          e('button', { className: 'btn small', onClick: apply, disabled: busy },
+            busy ? 'Saving…' : 'Reassign ' + ids.length + ' selected'),
+          msg && e('span', {
+            className: msg.kind === 'ok' ? 'ok' : 'err',
+            style: { fontSize: 12, color: msg.kind === 'ok' ? '#5bd75b' : '#f28b82' },
+          }, msg.text),
+        ),
+      );
+    }
+
+    function ConflictsPanel({ onPreview }) {
+      const [from, setFrom] = useState('');
+      const [to, setTo] = useState('');
+      const [person, setPerson] = useState('');
+      const [eps, setEps] = useState('0.80');
+      const [data, setData] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [err, setErr] = useState('');
+      const [persons, setPersons] = useState([]);
+      const [resolved, setResolved] = useState({});
+
+      useEffect(() => {
+        fetch(API + '/api/persons').then((r) => r.json())
+          .then((d) => setPersons(((d && d.persons) || d || []).map((p) => p.name || p).filter(Boolean)))
+          .catch(() => {});
+      }, []);
+
+      async function scan() {
+        if (!from && !to && !person) {
+          setErr('Pick a date range or a person first — clustering the whole '
+               + 'library takes minutes and holds the NAS write lock.');
+          return;
+        }
+        setBusy(true); setErr(''); setData(null);
+        const q = new URLSearchParams();
+        if (from) q.set('date_from', from);
+        if (to) q.set('date_to', to);
+        if (person) q.set('person', person);
+        q.set('eps', eps);
+        try {
+          const r = await fetch(API + '/api/faces/label-conflicts?' + q.toString());
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+          setData(j);
+        } catch (e2) { setErr(String(e2.message || e2)); }
+        finally { setBusy(false); }
+      }
+
+      const pending = data ? data.conflicts.filter((c) => !resolved[c.cluster]) : [];
+
+      return e('div', null,
+        e('div', { className: 'info', style: { marginBottom: 12 } },
+          'Finds clusters containing two or more different named people. On a ',
+          'same-uniform team shoot that is usually a wrong label rather than a ',
+          'wrong cluster. A scope is required — clustering the whole library ',
+          'takes minutes and holds the write lock.'),
+        e('div', { className: 'toolbar', style: { marginBottom: 14 } },
+          e('span', { className: 'label' }, 'From'),
+          e('input', { type: 'date', value: from, onChange: (ev) => setFrom(ev.target.value) }),
+          e('span', { className: 'label' }, 'To'),
+          e('input', { type: 'date', value: to, onChange: (ev) => setTo(ev.target.value) }),
+          e('span', { className: 'label' }, 'or person'),
+          e('input', { value: person, placeholder: 'name',
+            onChange: (ev) => setPerson(ev.target.value), style: { width: 140 } }),
+          e('span', { className: 'label', title: 'DBSCAN radius. 0.80 is tuned for a single-team single-day scope; the global recluster uses 0.55.' }, 'eps'),
+          e('input', { type: 'number', step: '0.05', min: '0.2', max: '1.2', value: eps,
+            onChange: (ev) => setEps(ev.target.value), style: { width: 70 } }),
+          e('button', { className: 'btn', onClick: scan, disabled: busy },
+            busy ? 'Scanning…' : 'Scan'),
+        ),
+        err && e('div', { className: 'info', style: { color: '#f28b82' } }, err),
+        data && e('div', { className: 'muted', style: { fontSize: 12, marginBottom: 10 } },
+          data.scope_faces + ' faces in scope · ' + data.clustered + ' clustered · '
+          + data.conflicts.length + ' conflict(s) at eps ' + data.eps),
+        data && pending.length === 0
+          && e('div', { className: 'info' },
+              data.conflicts.length === 0
+                ? 'No conflicts — every cluster in this scope holds at most one named person.'
+                : 'All conflicts in this scope have been resolved.'),
+        pending.map((c) =>
+          e(ConflictCard, {
+            key: c.cluster, conflict: c, persons: persons, onPreview: onPreview,
+            onApplied: (cl) => setResolved((r) => Object.assign({}, r, { [cl]: true })),
+          })),
+      );
+    }
+
     function App() {
+      // 'merges' = the suggestion queue; 'conflicts' = clusters holding two
+      // different named people (suspected label errors).
+      const [mode, setMode] = useState('merges');
       const [payload, setPayload] = useState(null);
       const [loading, setLoading] = useState(true);
       const [loadError, setLoadError] = useState('');
@@ -1197,9 +1382,29 @@
 
           apiError && e('div', { className: 'error' }, apiError),
 
-          loading && e('div', { className: 'info' }, 'Loading suggestions…'),
+          // Mode toggle lives ABOVE the payload branches: label conflicts are
+          // computed live and need no suggestions file, so they have to stay
+          // reachable when there isn't one (which is the normal state — the
+          // JSON is only there right after a suggest-face-merges run).
+          e('div', { className: 'toolbar', style: { marginBottom: 14 } },
+            e('button', {
+              className: 'pill' + (mode === 'merges' ? ' active' : ''),
+              onClick: () => setMode('merges'),
+              title: 'Suggested merges: two groups that are probably one person',
+            }, 'Merge suggestions'),
+            e('button', {
+              className: 'pill' + (mode === 'conflicts' ? ' active' : ''),
+              onClick: () => setMode('conflicts'),
+              title: 'Label conflicts: one cluster that probably holds two people, '
+                   + 'meaning one of the names is wrong',
+            }, 'Label conflicts'),
+          ),
 
-          !loading && loadError && e('div', { className: 'info' },
+          mode === 'conflicts' && e(ConflictsPanel, { onPreview: setPreviewFaceId }),
+
+          mode === 'merges' && loading && e('div', { className: 'info' }, 'Loading suggestions…'),
+
+          mode === 'merges' && !loading && loadError && e('div', { className: 'info' },
             loadError,
             e('div', { style: { marginTop: 12 } },
               'Run ',
@@ -1209,7 +1414,7 @@
             ),
           ),
 
-          !loading && !loadError && payload && e(React.Fragment, null,
+          mode === 'merges' && !loading && !loadError && payload && e(React.Fragment, null,
             e('div', { className: 'stats-row' },
               e('div', { className: 'stat accent' },
                 e('span', { className: 'val' }, counts.toPerson + counts.toCluster),

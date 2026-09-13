@@ -238,3 +238,56 @@ def summarize(classes: dict[int, str], clusters: dict[int, int]) -> dict:
         "clusters": sum(1 for c in groups if c >= 0),
         "noise": groups.get(-1, 0),
     }
+
+
+def find_label_conflicts(clusters: dict[int, int], labels: dict[int, str],
+                         min_named: int = 2) -> list[dict]:
+    """Clusters holding two or more DIFFERENT named people — i.e. suspected
+    label errors, ranked most-lopsided first.
+
+    The premise, established on the 2026-08-29 shoot: within one team on one
+    day a cluster that mixes two named people is far more likely to be a bad
+    LABEL than a bad cluster. Two faces tagged Carson Jones sat inside eleven
+    Beckham Tinnel faces; the tags were wrong and the cluster was right. That
+    was the only impurity in a full eps sweep, and correcting it took the whole
+    sweep to zero.
+
+    Ranked by `lopsidedness` = majority / named-in-cluster. An 11-vs-2 split
+    (0.85) is a near-certain mislabel; a 6-vs-5 (0.55) is more likely a genuine
+    merge of two people and is worth looking at last.
+
+    Deliberately returns the FULL label breakdown rather than a
+    minority→majority suggestion. Auto-applying the majority name would have
+    been wrong on the very case that motivated this: both labels on those
+    frames had been wrong before, and the correct answer was a third person in
+    neither group.
+    """
+    by_cluster: dict[int, list[int]] = {}
+    for fid, cid in clusters.items():
+        if cid >= 0:
+            by_cluster.setdefault(cid, []).append(fid)
+
+    out: list[dict] = []
+    for cid, members in by_cluster.items():
+        named = [(f, labels[f]) for f in members if labels.get(f)]
+        if len(named) < min_named:
+            continue
+        counts: dict[str, list[int]] = {}
+        for f, n in named:
+            counts.setdefault(n, []).append(f)
+        if len(counts) < 2:
+            continue
+        ordered = sorted(counts.items(), key=lambda kv: -len(kv[1]))
+        majority = len(ordered[0][1])
+        out.append({
+            "cluster": cid,
+            "size": len(members),
+            "named_total": len(named),
+            "lopsidedness": round(majority / len(named), 3),
+            "minority_count": len(named) - majority,
+            "labels": [{"name": n, "count": len(fs), "face_ids": sorted(fs)}
+                       for n, fs in ordered],
+            "unnamed_face_ids": sorted(f for f in members if not labels.get(f)),
+        })
+    out.sort(key=lambda c: (-c["lopsidedness"], -c["named_total"]))
+    return out
