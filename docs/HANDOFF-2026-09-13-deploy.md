@@ -4,6 +4,12 @@ Continues `docs/HANDOFF-2026-09-13.md`. Its item 1 is **built and on main but
 not deployed** — the session that wrote it ran on the Mac, which could not
 reach the NAS (Tailscale reported stopped), so the deploy moves to the desktop.
 
+> **STATUS: deployed and run, 2026-09-13.** Steps 1–3 below are complete and
+> verified; the 2026-09-12 shoot went from 1 named face to 197. A separate
+> pre-existing defect surfaced — `geocode` OOM-kills the NAS web container, so
+> every replica push's trigger leg fails. See **"Deploy result"** at the foot of
+> this file for what landed, what to distrust, and what is still open.
+
 Placeholders: `<nas>` is the NAS web address (`http://<nas>:8000`), `<replica>`
 is the desktop replica checkout. Use the IP, not the hostname, for HTTP.
 
@@ -154,3 +160,136 @@ DB, so nothing half-applied lingers on the replica.
 Unchanged from `docs/HANDOFF-2026-09-13.md` items 2–6: D4 loud ingest
 write-failure, S2 + S4 as schema v30, ARW/video folder merge, intra-cluster
 congruence review, open questions.
+
+---
+
+# Deploy result — 2026-09-13, from the desktop
+
+Steps 1–3 are **done**. One new, unrelated defect found: the `geocode` stage
+OOM-kills the NAS web container, which breaks the trigger leg of *every*
+replica push.
+
+## Step 1 — NAS redeployed ✅
+
+`9e22b8b` → `47dee89` via the admin API (pull → build 21 s → restart helper).
+Verified: `/api/admin/version` reports `deployed_sha 47dee89`, and the probe
+returns **400 `bad_face_state_file`** (not 404), so the new endpoint is live.
+
+## Step 2 — replica updated ✅
+
+`git pull` + `systemctl --user restart photosearch-replica.service`.
+`push_mode('match_faces')` → `face_state`; `/api/admin/version` reports
+`native`, `deployed 47dee89`. Local test run: 88 passed.
+
+## Step 3 — first real run ✅ (the feature works)
+
+Driven by `curl -N` on the desktop rather than a browser tab, so no screen-lock
+risk; SSE written to a file, waited on a marker file (never `pgrep -f`).
+
+| | before | after |
+|---|---|---|
+| 2026-09-12 faces named | **1** | **197** (26 strict + 170 temporal, all Calvin; + 1 pre-existing manual) |
+| photos with a named face | 1 | 197 |
+| library faces named | 59,489 | 59,678 |
+| duplicate person-in-photo groups | 28 (post-match) | **0** |
+
+Sweep: trigger stages `deferred` as designed, `match_faces` ran locally in
+**55.6 s** and matched 6,556 faces. Push: face_state leg **applied**, and
+`match_faces` now reads **in sync** on the drift panel — nothing is "Replica
+ahead — unpushed".
+
+**Only 217 of the replica's 6,556 matches landed, and that is correct.** The
+other ~6,339 are faces whose NAS `match_source` is `dedupe_unmatched` — the
+June 2026 over-matching cleanup. The replica's temporal pass happily re-matches
+them; the additive apply refuses them. That guard is the whole reason this is
+safe behind a button, and this run is the first evidence it fires at scale. The
+replica's local re-matches are discarded by the next sync, as intended.
+
+> **Read the 170 temporal matches with suspicion.** The Calvin-temporal memory
+> note measured **4 % accuracy** on the 2026-08-29 soccer shoot (strict 14/14
+> correct, temporal 1/26). This is the same body (`ILCE-7RM6`) and the same kind
+> of shoot. The 26 **strict** matches are the trustworthy ones. Decide whether
+> to keep the temporal ones before leaning on them — and note `review-faces`
+> (step 4) learns the jersey colour from named faces on the date, so seeding it
+> with 170 probably-wrong matches would poison it. Reverse only via a pinned-id
+> script; never `restore-unmatched-faces`.
+
+## NEW DEFECT — `geocode` OOM-kills the NAS container
+
+**This is what made the push report `partial`, and it is not the new feature.**
+
+The trigger leg died with every stage `unreachable`. `docker events` shows the
+photosearch container **`die … exitCode=137`** (SIGKILL) twice, at
+`execDuration=291` and `264`, both while the stream sat on `geocode scanning`:
+
+```
+container die 920916e00344 … exitCode=137 … name=photosearch
+```
+
+Cause is memory. The NAS has the **rich GeoNames dataset installed**
+(`/data/geonames/rg_rich.csv`, 370 MB; `allCountries.txt`, 1.7 GB), and CLAUDE.md
+budgets ~1 GB steady-state for the KDTree plus a parse spike. The host has
+**7.7 GB total, ~3.2 GB already in use, 4.5 GB available**, and the container
+limit is 7 GiB — i.e. *above* host RAM, so the cgroup limit never engages and
+the kernel OOM-killer fires first. (No `dmesg` line to quote: UGOS restricts it.)
+
+Every other trigger stage was then run individually and **all succeeded**:
+
+| stage | result |
+|---|---|
+| `resolve_dups` | done, 28/28 — cleared every duplicate group |
+| `normalize` | done, 1,016 |
+| `normalize_aesthetics` | done, 155,966 (175 s) |
+| `normalize_subject_aesthetics` | done, 69,553 (32 s) |
+| `geocode` | **OOM-kills the container** (reproduced twice) |
+| `infer`, `normalize_inferred` | **untested** — both reverse-geocode on apply, so both are suspect. Not tested because a fleet had 3 live claims and another OOM kill is not a graceful shutdown. |
+
+**Why this matters beyond today:** a replica sweep defers *all* trigger stages
+to the push, and `geocode` is always among them. So **every** replica push will
+report `partial` with the server bouncing underneath it, until this is fixed.
+It also means the nightly NAS `maintenance-sweep` cron (when installed) would
+kill the web server every night.
+
+Worth trying, in order:
+1. Run `geocode` out-of-process — `docker compose run --rm photosearch
+   normalize-places` gets its own container and its own memory, instead of
+   loading the KDTree inside the long-lived web server.
+2. Cap the web container (`mem_limit` *below* host RAM) so it fails as a clean
+   Python `MemoryError` the SSE stream can report, instead of a silent SIGKILL
+   that looks like "NAS unreachable".
+3. Stream/chunk the `rg_rich.csv` load in `geonames_rich.py`, or drop back to
+   stock `reverse_geocoder` on the NAS and keep the rich labels for backfills
+   run from the desktop.
+
+## Decisions to review — answered
+
+- **Ignored-cluster remap rule.** The earlier handoff pointed at
+  `rollback_calvin.py` / the Calvin memory note. Both are on this desktop and
+  **neither is about cluster remapping** — `rollback_calvin.py` restores person
+  matches for 223 pinned face ids from `face_dedupe_undo`, and the memory note
+  only says to reverse that unmatch by pinned id rather than
+  `restore-unmatched-faces`. So there is **no prior art to reconcile with**: the
+  >50 %-face-membership rule in `face_state.apply_face_state` stands on its own,
+  and it is a clear improvement on the wipe (`ignored_clusters_backup.json` at
+  the repo root is a hand-taken 2026-09-10 backup — someone had already been
+  bitten by the wipe). Nothing to change. **Consider this item closed.**
+- **Writer-lock time on the N100.** Not observable on this run: the match apply
+  touched only 217 rows. It stays open for the first *recluster* push.
+
+## Step 4 — not done, deliberately
+
+- **Recluster from the replica** — untested end-to-end. Before the first one,
+  note `SELECT COUNT(*) FROM ignored_clusters` on the NAS (**31** as of now) and
+  compare against the push result's `ignored_before` / `ignored_after`.
+- **`review-faces` for 2026-09-12** — blocked on the judgement call above: it
+  learns from named faces on the date, and 170 of the 197 are suspect temporal.
+
+## Traps hit this session
+
+- **Fetch before trusting `git log`.** This session re-implemented the whole
+  `face_state` feature from `HANDOFF-2026-09-13.md` before fetching, because the
+  local checkout was two commits stale and `git log` looked authoritative. The
+  work was discarded. `git fetch` first when picking up a handoff — the handoff
+  you were pointed at may itself be the newer commit.
+- The SSE keepalive comments (`: keepalive`) dominate a saved stream; filter
+  with `grep -v keepalive` before reading it.
