@@ -132,3 +132,121 @@ def test_replica_status_endpoint_reflects_env(client, monkeypatch, tmp_path):
     assert body["nas_photos"] is None          # probe failed → None, not an error
     assert body["drift"] is None
     assert "last_sync" in body and "sync_script" in body
+
+
+# ---------------------------------------------------------------------------
+# Face WRITES must go to the NAS, never only to the replica.
+#
+# sync-replica.sh REPLACES the replica DB wholesale, so a face merge/assign
+# written only locally is silently destroyed on the next sync. These pin the
+# proxy-and-mirror behaviour for every face-mutating route.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def nas_spy(replica_client, monkeypatch):
+    """Record NAS calls instead of making them, and stub the mirror-back."""
+    calls = []
+
+    def fake_nas_json(method, path, body=None, timeout=120.0):
+        calls.append((method, path, body))
+        return {"ok": True, "proxied": True}
+
+    def fake_mirror(photo_ids):
+        calls.append(("MIRROR", sorted(photo_ids), None))
+        return {"mirrored": len(photo_ids), "errors": 0, "missing": 0}
+
+    monkeypatch.setattr(web, "_nas_json", fake_nas_json)
+    monkeypatch.setattr(web, "_mirror_face_photos", fake_mirror)
+    replica_client._nas_calls = calls
+    return replica_client
+
+
+def _face_row(client, where):
+    from photosearch.db import PhotoDB
+    with PhotoDB(web._db_path) as db:
+        return db.conn.execute(f"SELECT * FROM faces WHERE {where}").fetchone()
+
+
+def test_assign_proxies_to_nas_and_does_not_write_locally(nas_spy):
+    face = _face_row(nas_spy, "person_id IS NULL LIMIT 1")
+    fid, pid = face["id"], face["photo_id"]
+
+    r = nas_spy.post(f"/api/faces/{fid}/assign?name=Calvin")
+    assert r.status_code == 200
+    methods = [(m, p) for m, p, _ in nas_spy._nas_calls]
+    assert ("POST", f"/api/faces/{fid}/assign?name=Calvin") in methods
+    assert ("MIRROR", [pid]) in [(m, p) for m, p, _ in nas_spy._nas_calls]
+    # the replica must NOT have applied the write itself
+    assert _face_row(nas_spy, f"id = {fid}")["person_id"] is None
+
+
+def test_clear_proxies_to_nas(nas_spy):
+    face = _face_row(nas_spy, "person_id IS NOT NULL LIMIT 1")
+    fid, pid, person = face["id"], face["photo_id"], face["person_id"]
+
+    r = nas_spy.post(f"/api/faces/{fid}/clear")
+    assert r.status_code == 200
+    assert ("POST", f"/api/faces/{fid}/clear", None) in nas_spy._nas_calls
+    assert _face_row(nas_spy, f"id = {fid}")["person_id"] == person  # untouched locally
+
+
+def test_bulk_assign_proxies_and_mirrors_every_touched_photo(nas_spy):
+    from photosearch.db import PhotoDB
+    with PhotoDB(web._db_path) as db:
+        rows = db.conn.execute("SELECT id, photo_id FROM faces LIMIT 3").fetchall()
+    fids = [r["id"] for r in rows]
+    want_photos = sorted({r["photo_id"] for r in rows})
+
+    r = nas_spy.post("/api/faces/bulk-assign",
+                     json={"face_ids": fids, "person_name": "Calvin"})
+    assert r.status_code == 200
+    posted = [b for m, p, b in nas_spy._nas_calls if p == "/api/faces/bulk-assign"]
+    assert posted and posted[0]["face_ids"] == fids
+    assert ("MIRROR", want_photos) in [(m, p) for m, p, _ in nas_spy._nas_calls]
+
+
+def test_merge_proxies_and_resolves_photos_before_the_merge(nas_spy):
+    """The photo set must be read BEFORE proxying — the merge clears cluster_id,
+    so resolving afterwards would mirror nothing."""
+    from photosearch.db import PhotoDB
+    with PhotoDB(web._db_path) as db:
+        row = db.conn.execute(
+            "SELECT photo_id FROM faces WHERE cluster_id = 99").fetchone()
+        person = db.conn.execute("SELECT id FROM persons LIMIT 1").fetchone()["id"]
+
+    r = nas_spy.post("/api/faces/merges", json={
+        "source": {"type": "cluster", "id": 99},
+        "target": {"type": "person", "id": person}})
+    assert r.status_code == 200
+    assert any(p == "/api/faces/merges" for _, p, _ in nas_spy._nas_calls)
+    assert ("MIRROR", [row["photo_id"]]) in [(m, p) for m, p, _ in nas_spy._nas_calls]
+    # local cluster membership untouched — the NAS owns the change
+    with PhotoDB(web._db_path) as db:
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM faces WHERE cluster_id = 99").fetchone()[0] == 1
+
+
+def test_ignore_writes_nas_first_then_locally(nas_spy):
+    from photosearch.db import PhotoDB
+    r = nas_spy.post("/api/faces/ignore", json={"cluster_ids": [99]})
+    assert r.status_code == 200
+    assert ("POST", "/api/faces/ignore", {"cluster_ids": [99]}) in nas_spy._nas_calls
+    # cluster ids have no photo dimension, so this one DOES apply locally too
+    with PhotoDB(web._db_path) as db:
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ignored_clusters WHERE cluster_id = 99").fetchone()[0] == 1
+
+    nas_spy.post("/api/faces/unignore", json={"cluster_ids": [99]})
+    assert ("POST", "/api/faces/unignore", {"cluster_ids": [99]}) in nas_spy._nas_calls
+    with PhotoDB(web._db_path) as db:
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ignored_clusters WHERE cluster_id = 99").fetchone()[0] == 0
+
+
+def test_non_replica_mode_still_writes_locally(client, monkeypatch):
+    """Guard the other direction: with no NAS configured the NAS is us."""
+    monkeypatch.setattr(web, "_nas_url", None)
+    face = _face_row(client, "person_id IS NULL LIMIT 1")
+    r = client.post(f"/api/faces/{face['id']}/assign?name=Calvin")
+    assert r.status_code == 200
+    assert _face_row(client, f"id = {face['id']}")["person_id"] is not None

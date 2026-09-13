@@ -1549,7 +1549,20 @@ def api_cameras():
 
 @app.post("/api/faces/{face_id}/assign")
 def api_assign_face(face_id: int, name: str = Query(..., description="Person name")):
-    """Assign a face to a named person (creates the person if needed)."""
+    """Assign a face to a named person (creates the person if needed).
+
+    Replica mode: proxy to the NAS (authoritative) then mirror the photo's face
+    rows back. Writing locally would be silently destroyed by the next
+    sync-replica.sh, which REPLACES the replica DB rather than merging it."""
+    if _nas_url:
+        from urllib.parse import quote
+        photo_ids = _photo_ids_for_faces([face_id])
+        if not photo_ids:
+            raise HTTPException(404, "Face not found")
+        resp = _nas_json("POST",
+                         f"/api/faces/{face_id}/assign?name={quote(name)}")
+        resp["mirror"] = _mirror_face_photos(photo_ids)
+        return resp
     with _get_db() as db:
         # Verify face exists
         face = db.conn.execute("SELECT id FROM faces WHERE id = ?", (face_id,)).fetchone()
@@ -1572,7 +1585,16 @@ def api_assign_face(face_id: int, name: str = Query(..., description="Person nam
 
 @app.post("/api/faces/{face_id}/clear")
 def api_clear_face(face_id: int):
-    """Remove the person assignment from a face."""
+    """Remove the person assignment from a face.
+
+    Replica mode: proxy to the NAS then mirror back (see api_assign_face)."""
+    if _nas_url:
+        photo_ids = _photo_ids_for_faces([face_id])
+        if not photo_ids:
+            raise HTTPException(404, "Face not found")
+        resp = _nas_json("POST", f"/api/faces/{face_id}/clear")
+        resp["mirror"] = _mirror_face_photos(photo_ids)
+        return resp
     with _get_db() as db:
         face = db.conn.execute("SELECT id FROM faces WHERE id = ?", (face_id,)).fetchone()
         if not face:
@@ -1596,9 +1618,43 @@ def _abs_photo_path(db, photo: dict) -> str:
 def _mirror_face_photo(photo_id: int) -> dict:
     """Replica-mode helper: re-sync one photo's authoritative face rows from the
     NAS into the local DB after a NAS-side face mutation. Returns mirror stats."""
+    return _mirror_face_photos([photo_id])
+
+
+def _mirror_face_photos(photo_ids: list[int]) -> dict:
+    """Same as _mirror_face_photo for a set of photos (bulk face mutations)."""
+    ids = sorted({int(p) for p in photo_ids})
+    if not ids:
+        return {"mirrored": 0, "errors": 0, "missing": 0}
     from . import rerun
     with _get_db() as db:
-        return rerun.mirror_photos(db, [photo_id])
+        return rerun.mirror_photos(db, ids)
+
+
+def _photo_ids_for_faces(face_ids: list[int]) -> list[int]:
+    """Photos touched by these face ids, resolved from the LOCAL db.
+
+    Read before proxying the mutation: a merge or clear can null out the very
+    column we'd need to find them again afterwards.
+    """
+    ids = [int(f) for f in face_ids]
+    if not ids:
+        return []
+    out: set[int] = set()
+    with _get_db() as db:
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            out.update(r["photo_id"] for r in db.conn.execute(
+                f"SELECT DISTINCT photo_id FROM faces WHERE id IN ({ph})", batch))
+    return sorted(out)
+
+
+def _photo_ids_for_cluster(cluster_id: int) -> list[int]:
+    """Photos holding the (still-unassigned) faces of one cluster."""
+    with _get_db() as db:
+        return sorted({r["photo_id"] for r in db.conn.execute(
+            "SELECT DISTINCT photo_id FROM faces WHERE cluster_id = ?", (cluster_id,))})
 
 
 @app.delete("/api/faces/{face_id}")
@@ -1724,10 +1780,19 @@ def api_ignore_clusters(data: dict):
     """Mark clusters as ignored so they're hidden from the faces page.
 
     Accepts: {"cluster_ids": [42, 82, ...]}
+
+    Replica mode: write to the NAS first (authoritative — a local-only row is
+    wiped by the next sync), then apply the same row locally so the grid updates
+    immediately. ignored_clusters is keyed by cluster_id with no photo
+    dimension, so there is nothing for _mirror_face_photos to fetch; the ids are
+    valid on both sides as long as the replica is in sync (a recluster
+    renumbers them everywhere, which is why it clears the table).
     """
     cluster_ids = data.get("cluster_ids", [])
     if not cluster_ids:
         return {"ok": True, "ignored": 0}
+    if _nas_url:
+        _nas_json("POST", "/api/faces/ignore", data)
     with _get_db() as db:
         for cid in cluster_ids:
             db.conn.execute(
@@ -1743,10 +1808,14 @@ def api_unignore_clusters(data: dict):
     """Remove clusters from the ignored list.
 
     Accepts: {"cluster_ids": [42, 82, ...]}
+
+    Replica mode: NAS first, then locally (see api_ignore_clusters).
     """
     cluster_ids = data.get("cluster_ids", [])
     if not cluster_ids:
         return {"ok": True, "unignored": 0}
+    if _nas_url:
+        _nas_json("POST", "/api/faces/unignore", data)
     with _get_db() as db:
         placeholders = ",".join("?" * len(cluster_ids))
         db.conn.execute(
@@ -1766,11 +1835,19 @@ def api_bulk_assign_faces(data: dict):
     the faces are assigned to that person (created if needed) with
     match_source='manual'. Used by the per-person inspector to re-map / unset
     the wrong faces a person picked up via over-matching or duplicate imports.
+
+    Replica mode: proxy to the NAS then mirror the touched photos back (see
+    api_assign_face).
     """
     face_ids = [int(x) for x in (data.get("face_ids") or [])]
     name = (data.get("person_name") or "").strip()
     if not face_ids:
         return {"ok": True, "updated": 0}
+    if _nas_url:
+        photo_ids = _photo_ids_for_faces(face_ids)
+        resp = _nas_json("POST", "/api/faces/bulk-assign", data)
+        resp["mirror"] = _mirror_face_photos(photo_ids)
+        return resp
     with _get_db() as db:
         if name:
             person = db.get_person_by_name(name)
@@ -2252,6 +2329,15 @@ def api_apply_face_merge(data: dict):
 
     if source.get("type") == target.get("type") and source_id == target_id:
         raise HTTPException(400, "source and target must differ")
+
+    # Replica mode: the NAS is authoritative. Resolve the affected photos from
+    # the source cluster BEFORE proxying — the merge nulls out cluster_id, so
+    # afterwards there'd be nothing left to look them up by.
+    if _nas_url:
+        photo_ids = _photo_ids_for_cluster(source_id)
+        resp = _nas_json("POST", "/api/faces/merges", data)
+        resp["mirror"] = _mirror_face_photos(photo_ids)
+        return resp
 
     with _get_db() as db:
         # Verify the target exists — prevents accidental orphaning.
