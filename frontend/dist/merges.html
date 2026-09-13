@@ -1404,13 +1404,33 @@
 
           mode === 'merges' && loading && e('div', { className: 'info' }, 'Loading suggestions…'),
 
+          // No suggestions file is the NORMAL state, not an error — the JSON
+          // only exists just after a run. Offer the button that generates it
+          // rather than a shell command to copy onto another machine; the
+          // engine is the same one the toolbar's Regenerate already calls.
           mode === 'merges' && !loading && loadError && e('div', { className: 'info' },
-            loadError,
-            e('div', { style: { marginTop: 12 } },
-              'Run ',
-              e('code', null, 'docker compose -f docker-compose.nas.yml run --rm photosearch ' +
-                'suggest-face-merges --json-out /data/suggestions.json'),
-              ' on the NAS, then reload this page.',
+            e('div', null, 'No merge suggestions yet.'),
+            e('div', { className: 'muted', style: { marginTop: 6, fontSize: 13 } },
+              'Scores every pair of face groups and proposes the ones likely to be '
+              + 'the same person. Takes ~15-30s.'),
+            e('div', { style: { marginTop: 12, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+              e('button', {
+                className: 'btn', onClick: regenerate, disabled: regenWorking,
+              }, regenWorking ? 'Generating…' : 'Generate suggestions'),
+              e('button', {
+                className: 'btn small', onClick: () => setRegenOpen(true), disabled: regenWorking,
+                title: 'Change cutoffs before generating',
+              }, 'Options…'),
+              regenWorking && e('span', { className: 'muted', style: { fontSize: 12 } },
+                'loading every group\'s encodings, then scoring pairs…'),
+            ),
+            e('details', { style: { marginTop: 12 } },
+              e('summary', { className: 'muted', style: { fontSize: 12, cursor: 'pointer' } },
+                'or run it from the CLI'),
+              e('div', { style: { marginTop: 8 } },
+                e('code', null, 'photosearch suggest-face-merges --json-out <path>'),
+                e('div', { className: 'muted', style: { fontSize: 12, marginTop: 6 } }, loadError),
+              ),
             ),
           ),
 
