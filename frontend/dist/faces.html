@@ -647,26 +647,50 @@
     // -----------------------------------------------------------------------
     // URL parameter helpers
     // -----------------------------------------------------------------------
+    // The content filters (date / place / semantic / camera) round-trip through
+    // the URL as well as the selection params. They did not used to: a reload
+    // dropped you back to the unfiltered library, so reviewing one shoot meant
+    // re-entering the date after every refresh, and the address bar could not
+    // be shared or bookmarked to a shoot.
+    const CF_KEYS = ['date_from', 'date_to', 'location', 'q', 'camera'];
+    const EMPTY_CF = { date_from: '', date_to: '', location: '', q: '', camera: '' };
+
     function getUrlParams() {
       const p = new URLSearchParams(window.location.search);
-      return {
+      const out = {
         name: p.get('name') || '',
         face_id: p.get('face_id') || '',
         cluster_id: p.get('cluster_id') || '',
         person_id: p.get('person_id') || '',
         filter: p.get('filter') || 'all',
       };
+      CF_KEYS.forEach(k => { out[k] = p.get(k) || ''; });
+      return out;
     }
 
-    function updateUrl(params) {
+    function cfFromUrl() {
+      const u = getUrlParams();
+      const cf = {};
+      CF_KEYS.forEach(k => { cf[k] = u[k] || ''; });
+      return cf;
+    }
+
+    // `replace` avoids stacking a history entry per keystroke-ish filter change;
+    // the caller passes it for filter edits and omits it for navigation.
+    function updateUrl(params, cf, replace) {
       const p = new URLSearchParams();
       if (params.name) p.set('name', params.name);
       if (params.face_id) p.set('face_id', params.face_id);
       if (params.cluster_id) p.set('cluster_id', params.cluster_id);
       if (params.person_id) p.set('person_id', params.person_id);
       if (params.filter && params.filter !== 'all') p.set('filter', params.filter);
+      // Fall back to whatever is already in the URL so a navigation-only
+      // update (opening a cluster) can't silently drop the active shoot filter.
+      const c = cf || cfFromUrl();
+      CF_KEYS.forEach(k => { if (c[k]) p.set(k, c[k]); });
       const newUrl = window.location.pathname + (p.toString() ? '?' + p.toString() : '');
-      window.history.pushState(null, '', newUrl);
+      if (replace) window.history.replaceState(null, '', newUrl);
+      else window.history.pushState(null, '', newUrl);
     }
 
     // Build the content-filter query fragment (date / place / semantic search)
@@ -702,7 +726,7 @@
       );
     }
 
-    function PersonInspector({ person, persons, onClose, onChanged }) {
+    function PersonInspector({ person, persons, dateFrom, dateTo, onClose, onChanged }) {
       const [data, setData] = useState(null);
       const [loading, setLoading] = useState(true);
       const [err, setErr] = useState('');
@@ -712,14 +736,25 @@
       const [sel, setSel] = useState(() => new Set());
       const [reassignTo, setReassignTo] = useState('');
       const [working, setWorking] = useState(false);
+      // Grouping radius. Left blank so the server picks its scope-aware
+      // default (0.50 library-wide, 0.90 for a single shoot — a whole library
+      // and one team on one day need very different radii). Overridable
+      // because the useful value is shoot-dependent.
+      const [eps, setEps] = useState('');
 
       const load = useCallback(() => {
         setLoading(true); setErr('');
-        fetch(API + '/api/faces/person/' + person.id + '/inspect')
+        let url = API + '/api/faces/person/' + person.id + '/inspect';
+        const qp = [];
+        if (dateFrom) qp.push('date_from=' + encodeURIComponent(dateFrom));
+        if (dateTo) qp.push('date_to=' + encodeURIComponent(dateTo));
+        if (eps) qp.push('eps=' + encodeURIComponent(eps));
+        if (qp.length) url += '?' + qp.join('&');
+        fetch(url)
           .then(r => r.json())
           .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
           .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
-      }, [person.id]);
+      }, [person.id, dateFrom, dateTo, eps]);
       useEffect(() => { load(); }, [load]);
 
       // Face-grid selection (ranked / drilled-in views). lastFaceIdx is the
@@ -837,10 +872,40 @@
                 data.sub_clusters.filter(s => s.sub_id !== -1).length + ' sub-clusters · ' +
                 data.n_outliers.toLocaleString() + ' outliers · ' +
                 data.n_dup_faces.toLocaleString() + ' duplicates · core=' + data.params.ref_source),
+              // State the scope explicitly. The actions in this panel unassign
+              // in bulk, so "196 faces" must not be mistaken for the person's
+              // whole library when it is really one day's worth.
+              data && data.scope && (data.scope.date_from || data.scope.date_to) &&
+                e('div', { className: 'insp-sub', style: { color: 'var(--accent, #4a9)' } },
+                  'Scoped to ' + (data.scope.date_from || '…') + ' → ' + (data.scope.date_to || '…') +
+                  ' — showing ' + data.scope.in_scope.toLocaleString() + ' of ' +
+                  data.scope.total.toLocaleString() +
+                  ' faces. Distances are still measured against ' + person.name +
+                  "'s full trusted set."),
             ),
             e('div', { className: 'insp-toggle' },
               e('button', { className: view === 'subs' ? 'active' : '', onClick: () => switchView('subs') }, 'Sub-clusters'),
               e('button', { className: view === 'ranked' ? 'active' : '', onClick: () => switchView('ranked') }, 'Ranked by distance'),
+            ),
+            e('label', {
+              className: 'insp-sub',
+              style: { display: 'flex', alignItems: 'center', gap: '6px', marginRight: '10px' },
+              title: 'DBSCAN radius. Bigger = fewer, larger groups. Blank uses '
+                   + 'the scope-aware default (0.50 library-wide, 0.90 for one '
+                   + 'shoot). On a single day, 0.50 typically groups nothing.',
+            },
+              'radius',
+              e('select', {
+                value: eps,
+                onChange: ev => setEps(ev.target.value),
+                style: { background: 'var(--bg2, #222)', color: 'inherit',
+                         border: '1px solid var(--border, #444)', borderRadius: '4px' },
+              },
+                e('option', { value: '' }, 'auto'),
+                ['0.50', '0.65', '0.80', '0.90', '1.00', '1.10'].map(
+                  v => e('option', { key: v, value: v }, v))
+              ),
+              data && e('span', null, data.params.eps)
             ),
             e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
           ),
@@ -947,7 +1012,8 @@
       const [filter, setFilter] = useState(initParams.filter);
       // Content filters (date / place / semantic q). Applied on submit, not per
       // keystroke; restrict clusters/persons to those in matching photos.
-      const [cf, setCf] = useState({ date_from: '', date_to: '', location: '', q: '', camera: '' });
+      // Seeded from the URL so a reload / bookmark keeps the shoot you're reviewing.
+      const [cf, setCf] = useState(cfFromUrl);
       const PAGE_SIZE = 200;
       const [selectedGroup, setSelectedGroup] = useState(null);
       const [groupPhotos, setGroupPhotos] = useState([]);
@@ -1568,9 +1634,14 @@
               e(PS.CameraFilter, { value: cf.camera,
                 onChange: v => { const next = { ...cf, camera: v }; setCf(next); loadGroups(null, next); },
                 style: { maxWidth: '150px' } }),
-              e('button', { onClick: () => loadGroups(null, cf) }, 'Apply'),
+              e('button', {
+                onClick: () => { updateUrl(getUrlParams(), cf, true); loadGroups(null, cf); },
+              }, 'Apply'),
               cfActive && e('button', {
-                onClick: () => { const empty = { date_from: '', date_to: '', location: '', q: '', camera: '' }; setCf(empty); loadGroups(null, empty); },
+                onClick: () => {
+                  const empty = Object.assign({}, EMPTY_CF);
+                  setCf(empty); updateUrl(getUrlParams(), empty, true); loadGroups(null, empty);
+                },
               }, 'Clear'),
               cfActive && e('span', { style: { fontSize: '12px', color: 'var(--accent, #4a9)', alignSelf: 'center' } },
                 total + ' matching group' + (total === 1 ? '' : 's')),
@@ -1922,6 +1993,12 @@
         inspectPerson && e(PersonInspector, {
           person: inspectPerson,
           persons,
+          // Inherit the page's date filter: reviewing one shoot should
+          // sub-cluster THAT DAY's faces ("which kids are in here?"), not all
+          // 6,000 of a person's library faces. The inspector states the scope
+          // in its header, because you bulk-unassign from that view.
+          dateFrom: cf.date_from,
+          dateTo: cf.date_to,
           onClose: () => setInspectPerson(null),
           onChanged: () => { loadGroups(); loadPersons(); },
         }),

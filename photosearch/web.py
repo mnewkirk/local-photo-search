@@ -1902,8 +1902,10 @@ def api_bulk_assign_faces(data: dict):
 @app.get("/api/faces/person/{person_id}/inspect")
 def api_person_inspect(
     person_id: int,
-    eps: float = Query(0.50, ge=0.2, le=1.2),
-    min_samples: int = Query(3, ge=1, le=20),
+    eps: Optional[float] = Query(None, ge=0.2, le=1.2),
+    min_samples: Optional[int] = Query(None, ge=1, le=20),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
 ):
     """Sub-structure of one person's faces, for spotting/re-mapping wrong faces.
 
@@ -1917,10 +1919,46 @@ def api_person_inspect(
     even a 20k-face person is ~1MB) plus a ``sub_clusters`` summary. The frontend
     derives both views from the flat list (group by sub_id, or sort by distance)
     and paginates the crop rendering so the browser never draws 20k crops at once.
+
+    ``date_from`` / ``date_to`` scope the review to one shoot — the usual case
+    being "this person is tagged on other kids at Saturday's match", where
+    sub-clustering all 6,000 of their library faces is useless. Two deliberate
+    asymmetries in how the scope is applied:
+
+    - **DBSCAN runs on the SCOPED faces**, so the sub-groups are "the different
+      kids present that day" rather than a lifetime of the person's own looks.
+      That is the grouping you can act on.
+    - **The reference core is built from the person's FULL trusted set**, NOT
+      the scoped one. Scoping asks "which of these faces aren't really them?",
+      and the answer has to be measured against the real person — measuring
+      against one day's subset, when that subset is exactly what you suspect is
+      contaminated, would rank the impostors as core.
+
+    The DBSCAN defaults also depend on the scope, because the right radius for
+    a whole library is the wrong one for a single shoot. One team on one day is
+    a sparse space — the same finding `review-faces` records. Measured on
+    Calvin's 212 faces from the 2026-09-12 match:
+
+        eps=0.50 (the library default) ->   0 sub-clusters, 212/212 noise
+        eps=0.65                       ->  16 sub-clusters,  38 grouped
+        eps=0.80                       ->  21 sub-clusters,  62 grouped
+        eps=0.90                       ->  20 sub-clusters, 100 grouped
+        eps=1.00                       ->  14 sub-clusters, 148 grouped
+
+    So a scoped call with no explicit eps gets 0.90 / min_samples=2, which is
+    where distinct kids start separating into groups big enough to act on. An
+    unscoped call keeps 0.50 / 3 exactly as before. Both are overridable — the
+    inspector exposes them, since the useful value is shoot-dependent.
     """
     import hashlib
     import numpy as np
     from sklearn.cluster import DBSCAN
+
+    scoped = bool(date_from or date_to)
+    if eps is None:
+        eps = 0.90 if scoped else 0.50
+    if min_samples is None:
+        min_samples = 2 if scoped else 3
 
     with _get_db() as db:
         prow = db.conn.execute(
@@ -1946,31 +1984,70 @@ def api_person_inspect(
             return {"person": {"id": person_id, "name": prow["name"], "face_count": 0},
                     "faces": [], "sub_clusters": [], "params": {"eps": eps, "min_samples": min_samples}}
 
-        face_ids = [int(r["face_id"]) for r in rows]
-        X = np.stack([np.frombuffer(r["encoding"], dtype=np.float32) for r in rows]).astype(np.float32)
+        X_all = np.stack([np.frombuffer(r["encoding"], dtype=np.float32)
+                          for r in rows]).astype(np.float32)
         # Normalize defensively (stored encodings are unit-norm, but be safe).
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms = np.linalg.norm(X_all, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        X = X / norms
+        X_all = X_all / norms
 
-        # DBSCAN sub-clusters within this person.
+        # Reference set for "distance to core": trusted faces if we have enough.
+        # Computed over ALL of the person's faces BEFORE the date scope is
+        # applied — see the docstring; scoping the core to the day you are
+        # auditing is what would make the impostors look like the core.
+        trusted_idx = [i for i, r in enumerate(rows)
+                       if r["match_source"] in ("strict", "manual")]
+
+        # --- date scope -----------------------------------------------------
+        # ISO-8601 sorts lexicographically, so a 10-char prefix compare is the
+        # date comparison. A face with no date_taken can't satisfy a date
+        # filter, so it drops out of the scope rather than defaulting in.
+        if date_from or date_to:
+            scope = []
+            for i, r in enumerate(rows):
+                day = (r["date_taken"] or "")[:10]
+                if not day:
+                    continue
+                if date_from and day < date_from[:10]:
+                    continue
+                if date_to and day > date_to[:10]:
+                    continue
+                scope.append(i)
+        else:
+            scope = list(range(len(rows)))
+
+        if not scope:
+            return {"person": {"id": person_id, "name": prow["name"], "face_count": 0},
+                    "faces": [], "sub_clusters": [], "n_outliers": 0, "n_dup_faces": 0,
+                    "scope": {"date_from": date_from, "date_to": date_to,
+                              "in_scope": 0, "total": len(rows)},
+                    "params": {"eps": eps, "min_samples": min_samples,
+                               "ref_source": "trusted" if len(trusted_idx) >= 3
+                                             else "largest_subcluster"}}
+
+        rows = [rows[i] for i in scope]
+        face_ids = [int(r["face_id"]) for r in rows]
+        X = X_all[scope]
+
+        # DBSCAN sub-clusters over the SCOPED faces: on a one-day scope these
+        # are "the distinct kids in these photos", which is the thing you can
+        # select and reassign in one action.
         labels = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean",
                         algorithm="ball_tree", n_jobs=-1).fit_predict(X)
 
-        # Reference set for "distance to core": trusted faces if we have enough,
-        # else the largest sub-cluster. min-dist-to-refs tolerates aging / angles.
-        trusted_idx = [i for i, r in enumerate(rows)
-                       if r["match_source"] in ("strict", "manual")]
         ref_idx = trusted_idx if len(trusted_idx) >= 3 else None
         if ref_idx is None:
+            # No trusted anchor anywhere for this person — fall back to the
+            # largest sub-cluster of the SCOPE (indices into X, not X_all).
             from collections import Counter
             cnt = Counter(int(l) for l in labels if l != -1)
             if cnt:
                 core_label = cnt.most_common(1)[0][0]
-                ref_idx = [i for i, l in enumerate(labels) if int(l) == core_label]
+                R = X[[i for i, l in enumerate(labels) if int(l) == core_label]]
             else:
-                ref_idx = list(range(len(rows)))  # no structure — everything is "core"
-        R = X[ref_idx]
+                R = X  # no structure — everything is "core"
+        else:
+            R = X_all[ref_idx]
         if len(R) > 500:
             R = R[np.linspace(0, len(R) - 1, 500).astype(int)]
         maxsim = (X @ R.T).max(axis=1)
@@ -2026,6 +2103,11 @@ def api_person_inspect(
             "sub_clusters": sub_clusters,
             "n_outliers": sum(1 for l in labels if int(l) == -1),
             "n_dup_faces": len(dup_group),
+            # So the UI can say "196 of 6,013 faces" rather than implying the
+            # review covered everything — you are about to bulk-unassign from
+            # this view, and a silent scope would be the wrong thing to hide.
+            "scope": {"date_from": date_from, "date_to": date_to,
+                      "in_scope": len(rows), "total": len(X_all)},
             "params": {"eps": eps, "min_samples": min_samples,
                        "ref_source": "trusted" if len(trusted_idx) >= 3 else "largest_subcluster"},
         }
