@@ -108,3 +108,59 @@ def test_db_level_claim_flow_atomic(db):
     claimed = db.get_claimed_photo_ids("describe")
     assert pid in claimed, "claim row should be visible after commit"
     assert batch_id, "batch_id should be returned"
+
+
+def test_empty_queue_never_takes_the_writer_lock(client, monkeypatch):
+    """The whole point of the split: an idle fleet must not serialize writers.
+
+    claim-batch used to BEGIN IMMEDIATE unconditionally and run the unprocessed
+    scan while holding the writer lock, so workers polling an empty queue
+    starved every other writer on the NAS — measurably: face-assign 500s, a
+    30-minute collection insert, and an overnight ingest that wrote zero rows.
+
+    Observed via sqlite3's trace callback; Connection.execute can't be patched.
+    """
+    from photosearch import worker_api
+
+    # A prior test's TestClient teardown fires the app shutdown event, which
+    # leaves worker_api._shutting_down=True and 503s every /api/worker/* route.
+    # Same known leak that test_web_replica.py's replica_client guards against.
+    monkeypatch.setattr(worker_api, "_shutting_down", False)
+
+    statements: list[str] = []
+    orig_get_db = worker_api._get_db
+
+    def spy_db():
+        db = orig_get_db()
+        db.conn.set_trace_callback(statements.append)
+        return db
+
+    # Drain whatever the fixture has first, WITHOUT the spy, so the assertion
+    # is about a genuinely empty queue rather than "no work happened to exist".
+    for _ in range(50):
+        got = client.post("/api/worker/claim-batch", json={
+            "worker_id": "drain", "pass_type": "clip", "limit": 16}).json()
+        if not got.get("photos"):
+            break
+
+    monkeypatch.setattr(worker_api, "_get_db", spy_db)
+    r = client.post("/api/worker/claim-batch", json={
+        "worker_id": "w1", "pass_type": "clip", "limit": 16})
+    assert r.status_code == 200
+    assert r.json()["batch_id"] is None, "expected an empty queue after draining"
+    locks = [x for x in statements if "BEGIN IMMEDIATE" in x.upper()]
+    assert locks == [], f"empty queue acquired the writer lock: {locks}"
+
+
+def test_two_workers_never_claim_the_same_photo(client, monkeypatch):
+    """The invariant the original BEGIN IMMEDIATE existed for, preserved by the
+    in-lock re-check rather than by holding the lock across the scan."""
+    from photosearch import worker_api
+    monkeypatch.setattr(worker_api, "_shutting_down", False)
+    a = client.post("/api/worker/claim-batch", json={
+        "worker_id": "wa", "pass_type": "clip", "limit": 4}).json()
+    b = client.post("/api/worker/claim-batch", json={
+        "worker_id": "wb", "pass_type": "clip", "limit": 4}).json()
+    ids_a = {p["id"] for p in a.get("photos", [])}
+    ids_b = {p["id"] for p in b.get("photos", [])}
+    assert not (ids_a & ids_b), "two workers claimed the same photo"

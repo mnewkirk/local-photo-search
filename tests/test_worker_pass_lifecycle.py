@@ -187,3 +187,44 @@ def test_workers_start_defaults_omit_both_flags(monkeypatch):
     A.admin_workers_start(A.WorkersStartRequest(passes=["clip"], count=1))
     assert "--sequential" not in seen["cmd"]
     assert "--stay-alive" not in seen["cmd"]
+
+
+def test_contended_response_does_not_retire_a_pass(monkeypatch, tmp_path):
+    """claim-batch returns contended=True when it found work but lost the race.
+
+    That must not look like an empty queue: retiring on contention would shrink
+    a fleet exactly when it is busiest, and the two changes (unlocked scan +
+    drain-and-exit) would otherwise combine into that bug.
+    """
+    class Contending(FakeClient):
+        def __init__(self):
+            super().__init__({"clip": 1})
+            self.n = 0
+
+        def claim_batch(self, pass_type, **kw):
+            self.calls.append(pass_type)
+            self.n += 1
+            if self.n == 1:
+                return {"batch_id": None, "photos": [], "contended": True}
+            return super().claim_batch(pass_type, **kw)
+
+    client = Contending()
+    monkeypatch.setattr(W, "WorkerClient", lambda *a, **k: client)
+    monkeypatch.setattr(W, "_download_batch", lambda c, photos, d: {p["id"]: "x" for p in photos})
+    monkeypatch.setattr(W, "_process_clip", lambda d, **k: [{"photo_id": 1}])
+    monkeypatch.setattr(W, "_unload_pass_models", lambda p: None)
+    monkeypatch.setattr(W, "_flush_caches", lambda: None)
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    monkeypatch.setattr(W.tempfile, "mkdtemp", lambda **k: str(tmp_path))
+    monkeypatch.setattr(W.shutil, "rmtree", lambda *a, **k: None)
+
+    class _HB:
+        def __init__(self, *a, **k): pass
+        def start(self): pass
+        def stop(self): pass
+    monkeypatch.setattr(W, "_ClaimHeartbeat", _HB)
+
+    W.run_worker(server="http://fake", passes=["clip"])
+    # survived the contended reply, then did the real batch
+    assert client.remaining["clip"] == 0
+    assert client.calls.count("clip") >= 3

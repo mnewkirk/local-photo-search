@@ -283,6 +283,12 @@ def _resolve_scope_ids(db, collection_id, directory, filters):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# How many times claim-batch re-looks when another worker took the candidates
+# between the unlocked scan and the locked claim. Bounded so a pathological
+# fleet can't spin here; exceeding it reports contended=True, never "empty".
+_CLAIM_RACE_RETRIES = 3
+
+
 @router.post("/claim-batch")
 def claim_batch(req: ClaimRequest):
     """Claim a batch of unprocessed photos for a given pass type.
@@ -294,35 +300,67 @@ def claim_batch(req: ClaimRequest):
         scope_ids = _resolve_scope_ids(
             db, req.collection_id, req.directory, req.filters)
 
-        # BEGIN IMMEDIATE acquires the SQLite writer lock up front so concurrent
-        # claim-batch calls serialize here instead of racing through the
-        # read-then-insert window. Without this, N parallel workers could each
-        # SELECT the same unprocessed photos, then each INSERT a claim row
-        # containing the same photo_ids — every worker would download and
-        # re-describe the same images. Cleanup commits inside the read are
-        # suppressed via commit_cleanup/commit kwargs so they don't end our
-        # outer transaction early.
-        db.conn.execute("BEGIN IMMEDIATE")
-        try:
-            photos = _unprocessed_scoped(
-                db, req.pass_type, scope_ids, req.limit, commit_cleanup=False)
+        # Two phases, so the SQLite WRITER LOCK is never held across the scan.
+        #
+        # This used to be one BEGIN IMMEDIATE wrapped around the whole thing:
+        # take the writer lock, run the (slow, NOT-IN) unprocessed scan, claim,
+        # commit. That serialized every other writer on the box behind a scan
+        # — and a fleet polling an EMPTY queue paid the full price for nothing.
+        # Measured consequences on 2026-09-13: POST /api/faces/{id}/assign
+        # returning 500 "database is locked", 250 collection inserts taking
+        # ~30 minutes, and an overnight ingest moving 2,040 files while writing
+        # ZERO rows.
+        #
+        # Phase 1 (NO LOCK) finds candidates. The common case — nothing to do —
+        # now returns without ever acquiring the writer lock.
+        # Phase 2 takes the lock only when there is work, and re-checks just
+        # those few ids (an indexed lookup on <= limit rows, not a scan) before
+        # inserting the claim. That re-check is what preserves the invariant the
+        # original BEGIN IMMEDIATE existed for: two workers must never claim the
+        # same photo and both download it.
+        photos = None
+        batch_id = None
+        for _attempt in range(_CLAIM_RACE_RETRIES):
+            candidates = _unprocessed_scoped(
+                db, req.pass_type, scope_ids, req.limit, commit_cleanup=True)
+            if not candidates:
+                # Genuinely empty. This is the ONLY path that reports no work,
+                # which matters: the worker retires a pass on an empty queue,
+                # so a lost race must never look like one.
+                return JSONResponse({"batch_id": None, "pass_type": req.pass_type,
+                                     "photos": []})
 
-            if not photos:
+            cand_ids = [p["id"] for p in candidates]
+            db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-verify inside the lock, scoped to the candidates only.
+                confirmed = db.get_unprocessed_photos(
+                    pass_type=req.pass_type, photo_ids=cand_ids,
+                    limit=req.limit, commit_cleanup=False)
+                if not confirmed:
+                    # Another worker took them between the phases. NOT an empty
+                    # queue — loop and look again rather than reporting no work.
+                    db.conn.commit()
+                    continue
+                photos = confirmed
+                batch_id = db.claim_photos(
+                    worker_id=req.worker_id,
+                    pass_type=req.pass_type,
+                    photo_ids=[p["id"] for p in confirmed],
+                    ttl_minutes=req.ttl_minutes,
+                    commit=False,
+                )
                 db.conn.commit()
-                return JSONResponse({"batch_id": None, "pass_type": req.pass_type, "photos": []})
-
-            photo_ids = [p["id"] for p in photos]
-            batch_id = db.claim_photos(
-                worker_id=req.worker_id,
-                pass_type=req.pass_type,
-                photo_ids=photo_ids,
-                ttl_minutes=req.ttl_minutes,
-                commit=False,
-            )
-            db.conn.commit()
-        except Exception:
-            db.conn.rollback()
-            raise
+                break
+            except Exception:
+                db.conn.rollback()
+                raise
+        if photos is None:
+            # Lost the race every attempt — heavy contention, not an empty
+            # queue. Report "no batch" without the empty-queue semantics by
+            # telling the worker explicitly that it was contended.
+            return JSONResponse({"batch_id": None, "pass_type": req.pass_type,
+                                 "photos": [], "contended": True})
 
         # Count how many remain unclaimed after this batch. Uses a COUNT(*)
         # rather than materializing every unprocessed row — with N concurrent

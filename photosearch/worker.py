@@ -957,6 +957,13 @@ def run_worker(
                     continue
 
                 if not batch.get("batch_id") or not batch.get("photos"):
+                    if batch.get("contended"):
+                        # The server found work but lost the claim race to
+                        # another worker every retry. Emphatically NOT an empty
+                        # queue — retiring here would shrink a busy fleet
+                        # precisely when it is busiest.
+                        print(f"  {pass_type}: lost the claim race, retrying.")
+                        continue
                     # A genuinely EMPTY QUEUE — and only this — retires a pass.
                     # Transport failures take the _TRANSIENT path above and
                     # `continue` without touching `drained`, so a lock, a
