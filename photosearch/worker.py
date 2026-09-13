@@ -815,6 +815,8 @@ def run_worker(
     model_batch_size: int = 8,
     ttl_minutes: int = 30,
     one_shot: bool = False,
+    stay_alive: bool = False,
+    sequential: bool = False,
     force: bool = False,
     describe_model: str = "llama3.2-vision",
     tags_model: str = "llava",
@@ -838,6 +840,19 @@ def run_worker(
         model_batch_size: Batch size for model inference
         ttl_minutes: Claim TTL in minutes
         one_shot: If True, process one batch per pass and exit
+        stay_alive: If True, keep polling forever even when every queue is
+            empty (the old behaviour). By default a pass is RETIRED the first
+            time its queue comes back empty, and the worker exits once every
+            pass has been retired — so a fleet started for a specific backlog
+            shuts itself down instead of idling. Idle polling is not free: each
+            claim opens BEGIN IMMEDIATE on the NAS's SQLite file and takes the
+            single write lock, which has previously starved face assignments,
+            collection writes and an entire overnight ingest.
+        sequential: If True, drain one pass completely before starting the
+            next, in the order given. Default is round-robin, one batch per
+            pass per cycle. Sequential avoids thrashing model weights in and
+            out of memory between passes (-p clip,quality otherwise alternates
+            ViT-B/16 and ViT-L/14 every batch).
         force: If True, clear existing data and re-process from scratch
         describe_model: Ollama model for descriptions (default: llama3.2-vision)
         tags_model: Ollama model for the (removed) tags pass
@@ -897,11 +912,30 @@ def run_worker(
     # before loading a different pass's model (prevents both ViT-B/16 and
     # ViT-L/14 being held simultaneously when running -p clip,quality).
     loaded_pass: Optional[str] = None
+    # Passes still worth claiming. A pass is removed from here once its queue
+    # reports empty (unless --stay-alive); when the list empties, we're done.
+    active: list[str] = list(passes)
+    seq_idx = 0
+    mode = ("sequential" if sequential else "round-robin") + \
+           (", stay-alive" if stay_alive else ", exit when drained")
+    print(f"\nPass order: {' -> '.join(active)}  ({mode})")
+
     try:
         while True:
-            any_work = False
+            if not active:
+                print(f"\nEvery pass drained. Processed {total_processed} photos total.")
+                break
 
-            for pass_type in passes:
+            any_work = False
+            drained: list[str] = []
+
+            if sequential:
+                seq_idx %= len(active)
+                cycle = [active[seq_idx]]
+            else:
+                cycle = list(active)
+
+            for pass_type in cycle:
                 if loaded_pass is not None and loaded_pass != pass_type:
                     _unload_pass_models(loaded_pass)
                     loaded_pass = None
@@ -923,7 +957,13 @@ def run_worker(
                     continue
 
                 if not batch.get("batch_id") or not batch.get("photos"):
+                    # A genuinely EMPTY QUEUE — and only this — retires a pass.
+                    # Transport failures take the _TRANSIENT path above and
+                    # `continue` without touching `drained`, so a lock, a
+                    # timeout or a 503 mid-deploy can never silently kill the
+                    # fleet.
                     print(f"  No unprocessed {pass_type} photos in queue.")
+                    drained.append(pass_type)
                     continue
 
                 any_work = True
@@ -1056,6 +1096,19 @@ def run_worker(
                 # intermediate tensors/PIL buffers don't drift upward.
                 del downloaded, results
                 _flush_caches()
+
+            # Retire drained passes, or (stay-alive + sequential) move along so
+            # the head pass isn't polled forever while later ones have work.
+            for pt in drained:
+                if not stay_alive:
+                    if pt in active:
+                        active.remove(pt)
+                        left = ", ".join(active) if active else "none"
+                        print(f"  → retiring '{pt}' (queue empty). Remaining: {left}")
+                elif sequential:
+                    seq_idx += 1
+            if not active:
+                continue    # top of the loop reports completion and breaks
 
             if not any_work:
                 if one_shot:

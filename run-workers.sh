@@ -81,6 +81,8 @@ MODEL_BATCH_SIZE=8
 TTL=30
 MEM_LIMIT="3g"
 FORCE=""
+STAY_ALIVE=""
+SEQUENTIAL=""
 DESCRIBE_MODEL=""
 TAGS_MODEL=""
 VERIFY_MODEL=""
@@ -172,6 +174,11 @@ Start workers:
       --batch-size N      Photos per batch (default: 16)
       --model-batch-size N  Inference batch size (default: 8)
       --ttl MINUTES       Claim TTL (default: 30)
+      --stay-alive        Keep workers alive when queues run dry (default: a pass
+                          retires when its queue is empty and workers exit when
+                          all are done)
+      --sequential        Drain each pass fully before the next, in -p order
+                          (default: round-robin one batch per pass)
       --force             Clear existing data and reprocess
       --describe-model M  Ollama model for describe (default: llama3.2-vision)
       --tags-model M      (legacy — the tags pass was removed; ignored by the worker)
@@ -852,6 +859,8 @@ while [[ $# -gt 0 ]]; do
         --model-batch-size) MODEL_BATCH_SIZE="$2"; shift 2 ;;
         --ttl)              TTL="$2";              shift 2 ;;
         --force)            FORCE="1";             shift ;;
+        --stay-alive)       STAY_ALIVE="1";        shift ;;
+        --sequential)       SEQUENTIAL="1";        shift ;;
         --describe-model)   DESCRIBE_MODEL="$2";   shift 2 ;;
         --tags-model)       TAGS_MODEL="$2";       shift 2 ;;
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
@@ -1010,6 +1019,8 @@ for _p in "${PERSONS[@]}"; do WORKER_CMD+=(--person "$_p"); done
 [ -n "$KEYWORD" ]      && WORKER_CMD+=(--keyword "$KEYWORD")
 [ -n "$STYLE_TAG" ]    && WORKER_CMD+=(--style-tag "$STYLE_TAG")
 [ -n "$FORCE" ]        && WORKER_CMD+=(--force)
+[ -n "$STAY_ALIVE" ]   && WORKER_CMD+=(--stay-alive)
+[ -n "$SEQUENTIAL" ]   && WORKER_CMD+=(--sequential)
 [ -n "$DESCRIBE_MODEL" ]   && WORKER_CMD+=(--describe-model "$DESCRIBE_MODEL")
 [ -n "$TAGS_MODEL" ]       && WORKER_CMD+=(--tags-model "$TAGS_MODEL")
 [ -n "$VERIFY_MODEL" ]     && WORKER_CMD+=(--verify-model "$VERIFY_MODEL")

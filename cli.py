@@ -1099,6 +1099,232 @@ Catches non-sibling mis-tags well; sibling confusion stays close (embedder limit
         fh.write(doc)
 
 
+
+
+def _write_team_review_report(path, nas_url, date, team_hue, tolerance, groups,
+                              persons, stats, unknown_faces):
+    """Mobile-first review gallery: one card per cluster, tap a name, apply.
+
+    Crops are referenced by URL rather than inlined as base64 — the NAS already
+    disk-caches /api/faces/crop/{id}, and a 1,000-face base64 page is tens of
+    megabytes, which is exactly the thing you don't want to open on a phone.
+    """
+    import html as _html
+    import json as _json
+
+    def cell(f):
+        return (f'<label class="c"><input type=checkbox checked value="{f["id"]}">'
+                f'<img loading="lazy" src="{nas_url}/api/faces/crop/{f["id"]}?size=200">'
+                f'<span class="l">{f["id"]}</span></label>')
+
+    cards = []
+    for gi, (label, faces) in enumerate(groups):
+        cells = "".join(cell(f) for f in faces)
+        opts = "".join(f'<option value="{_html.escape(p)}">{_html.escape(p)}</option>'
+                       for p in persons)
+        cards.append(f"""<section class="g" data-g="{gi}">
+<h2>{_html.escape(label)} <small>{len(faces)} face(s)</small></h2>
+<div class="grid">{cells}</div>
+<div class="act">
+  <select class="who"><option value="">— choose person —</option>{opts}
+    <option value="__new__">+ new name…</option></select>
+  <input class="newname" placeholder="new name" hidden>
+  <button class="apply">Assign checked</button>
+  <span class="status"></span>
+</div></section>""")
+
+    doc = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Team face review — {date}</title><style>
+:root{{color-scheme:dark}}
+body{{font:15px system-ui;margin:0;padding:12px;background:#14161a;color:#e8eaed}}
+h1{{font-size:17px;margin:4px 0 2px}} h2{{font-size:15px;margin:14px 0 6px}}
+small{{color:#9aa0a6;font-weight:400}}
+.sum{{font:12px ui-monospace,monospace;color:#9aa0a6;margin-bottom:10px;line-height:1.5}}
+.swatch{{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;
+  border:1px solid #0006;margin-right:4px}}
+.grid{{display:flex;flex-wrap:wrap;gap:6px}}
+.c{{position:relative;width:88px;cursor:pointer}}
+.c img{{width:88px;height:88px;object-fit:cover;border-radius:8px;
+  border:3px solid #3a3f46;background:#222;display:block}}
+.c input{{position:absolute;top:4px;left:4px;z-index:2;width:18px;height:18px}}
+.c input:checked ~ img{{border-color:#5bd75b}}
+.l{{font:10px ui-monospace,monospace;color:#777;display:block;text-align:center}}
+.g{{border-top:1px solid #2a2e34;padding-top:6px}}
+.act{{margin:8px 0 14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
+select,input[type=text],.newname{{font:14px system-ui;padding:8px;border-radius:8px;
+  background:#1e2126;color:#e8eaed;border:1px solid #3a3f46;min-width:150px}}
+button{{font:14px system-ui;padding:9px 14px;border-radius:8px;border:0;
+  background:#3b82f6;color:#fff;font-weight:600}}
+button:disabled{{opacity:.5}}
+.status{{font:12px ui-monospace,monospace;color:#9aa0a6}}
+.ok{{color:#5bd75b}} .err{{color:#f28b82}}
+</style></head><body>
+<h1>Team face review — {date}</h1>
+<div class="sum">
+<span class="swatch" style="background:hsl({team_hue:.0f} 85% 50%)"></span>
+team hue {team_hue:.0f}&deg; &plusmn;{tolerance:.0f}&deg; (learned from named faces)<br>
+kept {stats['team']} team &middot; rejected {stats['other']} other-team &middot;
+{stats['unknown']} unreadable torso<br>
+{stats['clusters']} group(s) + {stats['noise']} ungrouped
+</div>
+{''.join(cards)}
+<script>
+const NAS = {_json.dumps(nas_url)};
+document.querySelectorAll('.who').forEach(s => s.addEventListener('change', e => {{
+  const nn = e.target.closest('.act').querySelector('.newname');
+  nn.hidden = e.target.value !== '__new__';
+}}));
+document.querySelectorAll('.apply').forEach(btn => btn.addEventListener('click', async e => {{
+  const act = e.target.closest('.act'), sec = e.target.closest('.g');
+  const sel = act.querySelector('.who'), nn = act.querySelector('.newname');
+  const status = act.querySelector('.status');
+  const name = sel.value === '__new__' ? nn.value.trim() : sel.value;
+  if (!name) {{ status.className='status err'; status.textContent='pick a name'; return; }}
+  const ids = [...sec.querySelectorAll('input[type=checkbox]:checked')].map(c => +c.value);
+  if (!ids.length) {{ status.className='status err'; status.textContent='nothing checked'; return; }}
+  btn.disabled = true; status.className='status'; status.textContent='saving…';
+  try {{
+    const r = await fetch(NAS + '/api/faces/bulk-assign', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{face_ids: ids, person_name: name}})}});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    status.className='status ok'; status.textContent = `assigned ${{j.updated ?? ids.length}} → ${{name}}`;
+    sec.style.opacity = .45;
+  }} catch (err) {{
+    status.className='status err'; status.textContent = 'failed: ' + err.message;
+  }} finally {{ btn.disabled = false; }}
+}}));
+</script></body></html>"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+
+
+@cli.command("review-faces")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--date", "date_", required=True, metavar="YYYY-MM-DD",
+              help="Shoot date to review.")
+@click.option("--base-url", default=None, envvar="PHOTOSEARCH_NAS_URL",
+              help="Server serving previews + face crops (the NAS).")
+@click.option("--team-hue", default=None, type=float,
+              help="Team jersey hue in degrees. Default: learn it from the faces "
+                   "you have already named on this date.")
+@click.option("--tolerance", default=25.0, show_default=True, type=float,
+              help="Degrees of hue either side of the team colour to keep.")
+@click.option("--min-det", default=0.65, show_default=True, type=float,
+              help="Skip face detections below this confidence.")
+@click.option("--min-edge", default=110, show_default=True, type=int,
+              help="Skip faces whose shorter bbox edge is under this many pixels.")
+@click.option("--eps", default=0.45, show_default=True, type=float,
+              help="DBSCAN radius for grouping the surviving faces.")
+@click.option("--min-samples", default=2, show_default=True, type=int,
+              help="DBSCAN min_samples.")
+@click.option("--include-known/--exclude-known", default=True, show_default=True,
+              help="Always surface already-named faces regardless of jersey colour "
+                   "(keeps coaches, who wear their own kit, reviewable).")
+@click.option("--workers", default=6, show_default=True, type=int)
+@click.option("--report", default=None, metavar="PATH",
+              help="Write the mobile review gallery here.")
+def review_faces(db, date_, base_url, team_hue, tolerance, min_det, min_edge,
+                 eps, min_samples, include_known, workers, report):
+    """Group one day's unknown faces down to your team, for review.
+
+    Samples the jersey colour below each face, keeps the ones matching your
+    team, and DBSCANs the survivors so you review a handful of groups instead
+    of a thousand individual crops.
+
+    The team colour is LEARNED from faces you have already named that day, so
+    it follows the squad between kits — fluorescent yellow one week, blue the
+    next — with no configuration. Override with --team-hue when a shoot has no
+    named faces yet.
+
+    \b
+    Example:
+      photosearch review-faces --date 2026-08-29 --report /tmp/review.html
+    """
+    import urllib.request
+    from photosearch import face_review
+
+    if not base_url:
+        raise click.ClickException(
+            "--base-url (or PHOTOSEARCH_NAS_URL) is required — previews and face "
+            "crops are served by the NAS.")
+    base_url = base_url.rstrip("/")
+
+    with PhotoDB(db) as photo_db:
+        rows = photo_db.conn.execute("""
+            SELECT f.id, f.photo_id, f.person_id, pe.name AS person_name,
+                   f.bbox_top, f.bbox_bottom, f.bbox_left, f.bbox_right,
+                   p.image_width
+              FROM faces f
+              JOIN photos p ON p.id = f.photo_id
+              LEFT JOIN persons pe ON pe.id = f.person_id
+             WHERE date(p.date_taken) = ?
+               AND (f.det_score IS NULL OR f.det_score >= ?)
+               AND MIN(f.bbox_bottom - f.bbox_top, f.bbox_right - f.bbox_left) >= ?
+        """, (date_, min_det, min_edge)).fetchall()
+        faces = [dict(r) for r in rows]
+        if not faces:
+            raise click.ClickException(f"No faces on {date_} above the quality floor.")
+        named = {f["id"] for f in faces if f["person_id"]}
+        click.echo(f"{date_}: {len(faces)} faces above the floor "
+                   f"({len(named)} already named, {len(faces) - len(named)} unknown)")
+
+        def fetch(pid):
+            with urllib.request.urlopen(f"{base_url}/api/photos/{pid}/preview",
+                                        timeout=120) as r:
+                return r.read()
+
+        def prog(done, total):
+            if done % 50 == 0 or done == total:
+                click.echo(f"  sampled {done}/{total} photos", nl=True)
+
+        click.echo("Sampling jersey colour below each face…")
+        samples = face_review.sample_faces(faces, fetch, workers=workers, on_progress=prog)
+
+        eff_hue = team_hue if team_hue is not None else face_review.learn_team_hue(samples, named)
+        if eff_hue is None:
+            raise click.ClickException(
+                "Could not learn a team colour — too few named faces with a readable "
+                "torso on this date. Name a few players first, or pass --team-hue.")
+        src = "given" if team_hue is not None else "learned from named faces"
+        click.echo(f"Team hue: {eff_hue:.0f}deg ({src}), tolerance +/-{tolerance:.0f}deg")
+
+        classes = face_review.classify(
+            samples, eff_hue, tolerance, always_include=named if include_known else set())
+        keep = [f for f in faces if classes.get(f["id"]) == "team"]
+        click.echo(f"  team {sum(1 for v in classes.values() if v=='team')} | "
+                   f"other-team {sum(1 for v in classes.values() if v=='other')} | "
+                   f"unreadable {sum(1 for v in classes.values() if v=='unknown')}")
+
+        unknown_ids = [f["id"] for f in keep if not f["person_id"]]
+        encs = photo_db.get_face_encodings_bulk(unknown_ids)
+        clusters = face_review.cluster_faces(encs, eps=eps, min_samples=min_samples)
+        stats = face_review.summarize(classes, clusters)
+        click.echo(f"  grouped into {stats['clusters']} cluster(s), "
+                   f"{stats['noise']} ungrouped")
+
+        by_face = {f["id"]: f for f in keep}
+        groups: dict[int, list] = {}
+        for fid, c in clusters.items():
+            groups.setdefault(c, []).append(by_face[fid])
+        ordered = [(f"Group {c}", sorted(v, key=lambda f: -f["id"]))
+                   for c, v in sorted(groups.items(), key=lambda kv: (kv[0] < 0, -len(kv[1])))
+                   if c >= 0]
+        if groups.get(-1):
+            ordered.append((f"Ungrouped ({len(groups[-1])})", groups[-1]))
+
+        if report:
+            persons = [r[0] for r in photo_db.conn.execute(
+                "SELECT name FROM persons ORDER BY name")]
+            _write_team_review_report(report, base_url, date_, eff_hue, tolerance,
+                                      ordered, persons, stats,
+                                      [f for f in faces if classes.get(f["id"]) == "unknown"])
+            click.echo(f"Wrote review gallery to {report}")
+
+
 @cli.command("verify-person-matches")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
@@ -4352,6 +4578,14 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Batch size for model inference (CLIP, quality).")
 @click.option("--ttl", default=30, show_default=True, help="Claim TTL in minutes.")
 @click.option("--one-shot", is_flag=True, help="Process one batch per pass and exit (don't loop).")
+@click.option("--stay-alive", is_flag=True,
+              help="Keep polling forever even when every queue is empty. By default a pass is "
+                   "retired once its queue comes back empty and the worker exits when all are "
+                   "done — idle polling holds the NAS write lock.")
+@click.option("--sequential", is_flag=True,
+              help="Drain each pass completely before starting the next, in the order given "
+                   "(default: round-robin one batch per pass). Avoids swapping model weights "
+                   "in and out between passes.")
 @click.option("--dry-run", is_flag=True, help="Resolve the scope and print per-pass queue depth, then exit (no claims).")
 @click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection, --directory, or a filter).")
 @click.option("--describe-model", default="llama3.2-vision", show_default=True,
@@ -4372,7 +4606,7 @@ def worker(server, passes, collection_id, directory,
            date_from, date_to, persons, location, min_quality, min_aesthetic,
            camera, category, visual_tag, keyword, style_tag,
            batch_size, model_batch_size, ttl,
-           one_shot, dry_run, force, describe_model, tags_model, verify_model,
+           one_shot, stay_alive, sequential, dry_run, force, describe_model, tags_model, verify_model,
            category_content_model, category_visual_model, keywords_model,
            aesthetics_model):
     """Run a remote indexing worker that processes photos from a NAS server.
@@ -4482,6 +4716,8 @@ def worker(server, passes, collection_id, directory,
         model_batch_size=model_batch_size,
         ttl_minutes=ttl,
         one_shot=one_shot,
+        stay_alive=stay_alive,
+        sequential=sequential,
         force=force,
         describe_model=describe_model,
         tags_model=tags_model,
