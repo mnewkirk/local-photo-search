@@ -28,6 +28,10 @@
 #   NAS_HOST           ssh target               (default: cantimatt@192.168.1.237)
 #   NAS_COMPOSE_FILE   compose file on the NAS  (default: /volume1/docker/photosearch/docker-compose.nas.yml)
 #   PHOTOSEARCH_DB     local replica path       (default: ./photo_index.db.local)
+#   SNAPSHOT_DIR       rotated snapshot dir     (default: <target dir>/replica-snapshots)
+#   KEEP_NIGHTLY       nightly snapshots kept   (default: 7)
+#   KEEP_WEEKLY        weekly snapshots kept    (default: 4; Sunday's is promoted)
+#   SNAPSHOTS=0        disable rotation entirely
 
 set -euo pipefail
 
@@ -35,6 +39,9 @@ NAS_HOST="${NAS_HOST:-cantimatt@192.168.1.237}"
 NAS_COMPOSE_FILE="${NAS_COMPOSE_FILE:-/volume1/docker/photosearch/docker-compose.nas.yml}"
 TARGET="${PHOTOSEARCH_DB:-./photo_index.db.local}"
 REMOTE_DUMP="/data/replica-dump.db"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-$(dirname "${TARGET}")/replica-snapshots}"
+KEEP_NIGHTLY="${KEEP_NIGHTLY:-7}"
+KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
 remote="docker compose -f '${NAS_COMPOSE_FILE}'"
 
 started=$(date +%s)
@@ -56,13 +63,54 @@ if [ "${size}" -lt 4096 ]; then
   exit 1
 fi
 
-echo "[3/4] atomic swap into place…"
+# Rotate BEFORE the swap. Until now this script `mv`'d straight over the only
+# copy that existed, so an upstream corruption or a bad migration reached the
+# last surviving replica within 24 h and there was no point-in-time recovery of
+# anything — including the ~60k manual geotags and ~6.5k manual/merge face
+# assignments that no re-run can regenerate.
+#
+# The snapshot is of the OUTGOING replica (the one about to be overwritten),
+# because that is the copy that would otherwise be lost. Compressed with zstd
+# -3: measured ~53% on this data, so ~1 GB each, ~11 GB for a full 7+4 set.
+if [ "${SNAPSHOTS:-1}" != "0" ] && [ -f "${TARGET}" ]; then
+  mkdir -p "${SNAPSHOT_DIR}"
+  stamp=$(date +%Y%m%d)
+  snap="${SNAPSHOT_DIR}/photo_index.${stamp}.db.zst"
+  if [ ! -f "${snap}" ]; then      # one per day; a same-day re-run keeps the first
+    echo "[3/5] snapshotting the outgoing replica → $(basename "${snap}")…"
+    if zstd -3 -q -T0 -o "${snap}" "${TARGET}" 2>/dev/null; then
+      # Sunday's is promoted to the weekly, which survives the nightly cull.
+      # HARDLINK, not copy: same filesystem, so the weekly costs zero extra
+      # bytes until the nightly is pruned out from under it, at which point the
+      # link keeps the data alive. A cp would double a ~1 GB snapshot every
+      # Sunday for nothing.
+      if [ "$(date +%u)" = "7" ]; then
+        ln -f "${snap}" "${SNAPSHOT_DIR}/weekly-${stamp}.db.zst" 2>/dev/null \
+          || cp -f "${snap}" "${SNAPSHOT_DIR}/weekly-${stamp}.db.zst"
+      fi
+    else
+      echo "[sync-replica]   (snapshot failed — continuing; the sync still proceeds)" >&2
+      rm -f "${snap}"
+    fi
+  fi
+  # Cull. Sort by the YYYYMMDD in the FILENAME (reverse = newest first), not by
+  # mtime: `ls -t` gets it wrong the moment a snapshot is copied, restored or
+  # touched, and silently keeps the oldest N instead of the newest. Nightly and
+  # weekly are culled independently so a quiet fortnight can't age out every
+  # weekly.
+  ls -1 "${SNAPSHOT_DIR}"/photo_index.*.db.zst 2>/dev/null | sort -r | tail -n +$((KEEP_NIGHTLY + 1)) \
+    | while read -r old; do echo "[sync-replica]   pruning $(basename "${old}")"; rm -f "${old}"; done
+  ls -1 "${SNAPSHOT_DIR}"/weekly-*.db.zst 2>/dev/null | sort -r | tail -n +$((KEEP_WEEKLY + 1)) \
+    | while read -r old; do echo "[sync-replica]   pruning $(basename "${old}")"; rm -f "${old}"; done
+fi
+
+echo "[4/6] atomic swap into place…"
 # Clear any stale WAL/SHM sidecars from a previous live copy — the streamed
 # snapshot is a self-contained single file.
 rm -f "${TARGET}-wal" "${TARGET}-shm"
 mv "${TARGET}.tmp" "${TARGET}"
 
-echo "[4/5] cleaning up snapshot on NAS…"
+echo "[5/6] cleaning up snapshot on NAS…"
 ssh "${NAS_HOST}" "${remote} run --rm --entrypoint rm photosearch ${REMOTE_DUMP}" \
   || echo "[sync-replica]   (remote cleanup failed; next sync overwrites it)"
 
@@ -72,7 +120,7 @@ ssh "${NAS_HOST}" "${remote} run --rm --entrypoint rm photosearch ${REMOTE_DUMP}
 # successful sync time as --since so only crops generated since then are tarred
 # (append-only + immutable per face_id → tiny delta after the first pull).
 if [ "${SYNC_FACE_CROPS:-1}" != "0" ]; then
-  echo "[5/5] mirroring face crops…"
+  echo "[6/6] mirroring face crops…"
   CROP_DIR="$(dirname "${TARGET}")/thumbnails/face_crops"
   mkdir -p "${CROP_DIR}"
   MARKER="${CROP_DIR}/.last_sync"

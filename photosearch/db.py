@@ -764,7 +764,18 @@ class PhotoDB:
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_generations_photo ON generations(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_generations_type ON generations(text_type)")
+        # idx_generations_type (text_type) was DROPPED — 20.8 MB of index, and
+        # one extra index write per LLM artifact forever (847k rows so far), to
+        # serve nothing on a hot path. Every real consumer filters
+        # `photo_id = ? AND text_type = ?`, which the planner satisfies with
+        # idx_generations_photo (verified with EXPLAIN QUERY PLAN: "SEARCH g
+        # USING INDEX idx_generations_photo"). Only type-ALONE predicates could
+        # use it, and those live in one-off backfills (backfill-generations, the
+        # v23 'tags' relabel below), which can afford the scan — measured 6.3 s
+        # over 847k rows on the desktop, so plan for ~20-30 s on the N100.
+        # DROP unconditionally rather than behind a SCHEMA_VERSION gate: it is
+        # idempotent, and it keeps v30 free for the photo_scores migration.
+        cur.execute("DROP INDEX IF EXISTS idx_generations_type")
 
         # Schema v23 deferred step: relabel legacy 'tags' generations rows now
         # that the table is guaranteed to exist (CREATE TABLE IF NOT EXISTS above).

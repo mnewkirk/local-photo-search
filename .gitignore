@@ -105,3 +105,8 @@ faces-state.db
 
 # Local LLM (LM Studio) per-machine config — keep .example tracked
 lmstudio.env
+
+# D1 rotated replica snapshots (GBs) and the ad-hoc .bak files they replace
+replica-snapshots/
+*.db.local.bak-*
+suggestions.json

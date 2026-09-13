@@ -1032,3 +1032,21 @@ class TestStaticServing:
         resp = client.get("/shared.js")
         # Depends on frontend dir; verify it doesn't crash
         assert resp.status_code in (200, 404)
+
+
+def test_generations_type_index_is_dropped(db):
+    """S5. idx_generations_type cost 20.8 MB plus an index write per LLM
+    artifact, and served nothing: every real consumer filters
+    `photo_id = ? AND text_type = ?`, which idx_generations_photo satisfies.
+    Pinned so a future schema edit doesn't reintroduce it by reflex."""
+    names = {r[0] for r in db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='generations'")}
+    assert "idx_generations_type" not in names
+    assert "idx_generations_photo" in names, "the index that IS used must remain"
+
+
+def test_generations_photo_index_serves_the_real_query(db):
+    plan = db.conn.execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM generations g "
+        "WHERE g.photo_id = 1 AND g.text_type = 'describe'").fetchall()
+    assert any("idx_generations_photo" in str(r[-1]) for r in plan), plan
