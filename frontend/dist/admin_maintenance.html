@@ -1257,10 +1257,11 @@
       var _rm = useState(false); var replicaMode = _rm[0]; var setReplicaMode = _rm[1];
       var abortRef = useRef(null);
 
-      // Colors/match-faces need the photo originals, which the replica
-      // doesn't have — the server already 400s on them in replica mode
-      // (Task 8), so grey the checkboxes out here rather than let the user
-      // hit an avoidable error. replicaMode is fed up from
+      // Colors needs the photo originals, which the replica doesn't have —
+      // the server 400s on it (and on dedup/requeue) in replica mode, so grey
+      // those checkboxes out here rather than let the user hit an avoidable
+      // error. Match/recluster DO run here: they push to the NAS as a
+      // face-state file. replicaMode is fed up from
       // MaintenanceSyncPanel below (the single /maintenance-fingerprint
       // fetcher) via its onReplicaMode callback — no separate fetch here.
 
@@ -1274,9 +1275,12 @@
 
       async function submit() {
         if (busy) return;
-        if (doApply && doRecluster && !confirm(
-          'Recluster renumbers every unknown face cluster and clears '
-          + 'ignored_clusters. Continue?'
+        if (doApply && doRecluster && !confirm(replicaMode
+          ? 'Recluster renumbers every unknown face cluster, here and then on '
+            + 'the NAS. Ignored clusters on the NAS are carried over to whichever '
+            + 'new cluster holds most of their faces. Continue?'
+          : 'Recluster renumbers every unknown face cluster and clears '
+            + 'ignored_clusters. Continue?'
         )) return;
         if (doApply && doDedup && !confirm(
           'Prune duplicate photos DELETES the redundant copies (the most-curated '
@@ -1459,16 +1463,16 @@
               e('input', { type: 'checkbox', checked: doStacking, disabled: busy,
                 onChange: function(ev) { setStacking(ev.target.checked); } }),
               'Stacking (heavy)'),
-            e('label', { title: replicaMode ? 'Already served by export-face-state / apply-face-state — run on the NAS.' : '' },
+            e('label', { title: replicaMode ? 'Computed here, then pushed to the NAS as a face-state file. Additive: only fills faces the NAS has unmatched, and the NAS re-runs duplicate-person resolution afterwards.' : '' },
               e('input', { type: 'checkbox', checked: doMatch,
-                disabled: busy || replicaMode,
+                disabled: busy,
                 onChange: function(ev) { setMatch(ev.target.checked); } }),
               'Match faces (heavy)'),
-            e('label', { title: replicaMode ? 'Already served by export-face-state / apply-face-state — run on the NAS.' : '' },
+            e('label', { title: replicaMode ? 'Computed here (minutes, vs hours on the N100), then pushed to the NAS. Renumbers unknown clusters there; ignored clusters follow their faces rather than being wiped.' : '' },
               e('input', { type: 'checkbox', checked: doRecluster,
-                disabled: busy || replicaMode,
+                disabled: busy,
                 onChange: function(ev) { setRecluster(ev.target.checked); } }),
-              'Recluster faces (clears ignored)'),
+              replicaMode ? 'Recluster faces' : 'Recluster faces (clears ignored)'),
             e('label', { title: replicaMode ? 'Deletes photos — destructive ops must not run on the replica, where the next sync would silently revert them. Run on the NAS.' : 'Deletes duplicate photos (same image imported twice), keeping the most-curated copy. Destructive; runs first.' },
               e('input', { type: 'checkbox', checked: doDedup,
                 disabled: busy || replicaMode,

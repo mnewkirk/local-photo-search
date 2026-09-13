@@ -20,7 +20,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
@@ -665,6 +665,136 @@ def admin_maintenance_apply(payload: dict):
             db.conn.rollback()
             raise
 
+    return {"applied": applied}
+
+
+# A face-state file is ~9 MB at 260k faces. The cap only exists so a
+# misdirected upload can't fill the NAS's /tmp.
+_FACE_STATE_MAX_BYTES = 512 * 1024 * 1024
+
+
+@router.post("/maintenance-apply-face-state")
+async def admin_maintenance_apply_face_state(request: Request):
+    """Receive a replica-computed face-state file (the face_state push mode).
+
+    The body is the raw SQLite file from face_state.export_face_state; its
+    face_state_meta table carries the photo fingerprint and the per-stage
+    watermarks. Streamed to a temp file, then applied in ONE transaction that
+    also stamps the watermarks, so a failure can't claim work that didn't land.
+    """
+    import tempfile
+    from starlette.concurrency import run_in_threadpool
+
+    fd, path = tempfile.mkstemp(suffix=".face-state.db")
+    try:
+        size = 0
+        with os.fdopen(fd, "wb") as fh:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > _FACE_STATE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail={
+                        "error": "face_state_too_large",
+                        "max_bytes": _FACE_STATE_MAX_BYTES,
+                    })
+                fh.write(chunk)
+        return await run_in_threadpool(_apply_face_state_file, path)
+    finally:
+        for suffix in ("", "-journal"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+
+
+def _apply_face_state_file(path: str) -> dict:
+    from .db import PhotoDB
+    from .face_state import apply_face_state, read_meta
+    from .maintenance_sync import fingerprints_match, photo_fingerprint, push_mode
+
+    try:
+        meta = read_meta(path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={
+            "error": "bad_face_state_file", "message": str(e)})
+    stages = meta.get("stages") or {}
+    if not stages:
+        raise HTTPException(status_code=400, detail={
+            "error": "no_stages", "message": "face-state file names no stages"})
+    for name in stages:
+        try:
+            mode = push_mode(name)
+        except ValueError:
+            raise HTTPException(status_code=400, detail={
+                "error": "unknown_stage", "stage": name,
+                "message": f"unknown maintenance stage: {name!r}"})
+        if mode != "face_state":
+            raise HTTPException(status_code=400, detail={
+                "error": "not_face_state_mode", "stage": name,
+                "message": f"{name!r} is a {mode} stage, not a face_state one"})
+
+    db_path = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
+    applied: dict = {}
+    with PhotoDB(db_path) as db:
+        local_fp = photo_fingerprint(db)
+        remote_fp = meta.get("fingerprint") or {}
+        if not fingerprints_match(local_fp, remote_fp):
+            raise HTTPException(status_code=409, detail={
+                "error": "fingerprint_mismatch",
+                "local": local_fp,
+                "remote": remote_fp,
+            })
+
+        runs = db.get_maintenance_runs()
+        fresh = {}
+        for name, info in stages.items():
+            incoming = (info or {}).get("last_run_at") or ""
+            existing = (runs.get(name) or {}).get("last_run_at") or ""
+            if existing and incoming <= existing:
+                # ISO8601 UTC strings sort lexicographically == chronologically.
+                applied[name] = {"status": "skipped", "reason": "nas_fresher"}
+            else:
+                fresh[name] = incoming
+        if not fresh:
+            return {"applied": applied}
+
+        # Only apply what the replica actually recomputed. A recluster-only run
+        # left persons as they were at sync time, so filling them would re-apply
+        # a label someone cleared on the NAS since. A match-only run didn't
+        # renumber, so copying its (sync-time) cluster ids would revert any
+        # split or merge made on the NAS since.
+        reclustered = "recluster" in fresh
+        matched = "match_faces" in fresh
+
+        def stamp(summary):
+            for name, ts in fresh.items():
+                db.record_maintenance_run(
+                    stage=name,
+                    last_run_at=ts,
+                    photo_count=local_fp["photo_count"],
+                    photo_max_id=local_fp["photo_max_id"],
+                    applied=summary["persons"] if name == "match_faces" else summary["clusters"],
+                    source="replica",
+                    commit=False,
+                )
+
+        summary = apply_face_state(
+            db, path,
+            apply_persons=matched,
+            apply_clusters=reclustered,
+            renumbered=reclustered,
+            before_commit=stamp,
+        )
+
+    for name in fresh:
+        entry = {"status": "applied"}
+        if name == "match_faces":
+            entry["persons"] = summary["persons"]
+        else:
+            entry.update(clusters=summary["clusters"],
+                         cleared_absent=summary["cleared_absent"],
+                         ignored_before=summary["ignored_before"],
+                         ignored_after=summary["ignored_after"])
+        applied[name] = entry
     return {"applied": applied}
 
 

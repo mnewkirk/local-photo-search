@@ -5,7 +5,7 @@ the local replica that's photo_index.db.local, which sync-replica.sh replaces
 wholesale (NAS -> replica, mv over the file). So a replica-side sweep is lost on
 the next sync unless its results are pushed up. This module is that push.
 
-Two modes, decided per stage:
+Four modes, decided per stage:
 
   trigger  — the NAS recomputes the stage itself over its own current data. No
              payload and no fingerprint guard: a stale-input mismatch is
@@ -15,6 +15,10 @@ Two modes, decided per stage:
              silently downgrade the NAS's labels.
   transfer — the replica ships computed rows, because recomputing on the N100 is
              precisely what we're avoiding. Only stacking earns this.
+  face_state — expensive on the N100 AND safe to compute remotely: the replica
+             ships a face-state file (photosearch.face_state, ~9 MB) and the NAS
+             applies it additively. Wraps the export-face-state /
+             apply-face-state CLI pair, which has moved ~230k faces for real.
   excluded — cannot run on the replica at all (see EXCLUDED_STAGES).
 
 Kept separate from maintenance.py so that module stays about RUNNING stages and
@@ -43,27 +47,31 @@ TRIGGER_STAGES = frozenset({
 # Expensive to recompute on the N100 -> ship the rows instead.
 TRANSFER_STAGES = frozenset({"stacking"})
 
+# Face work: computed here (hnswlib recluster in minutes, vs hours on the N100),
+# shipped as a face-state file, applied on the NAS. Person fills are additive,
+# so the NAS's curation can't be clobbered; a recluster renumbers clusters and
+# remaps ignored_clusters by face membership (see face_state.apply_face_state).
+FACE_STATE_STAGES = frozenset({"match_faces", "recluster"})
+
 # Must not run on the replica at all:
 #   colors       — reads pixels; the replica has no originals (PHOTO_ROOT unset,
 #                  images proxy from the NAS), so it cannot be correct locally.
 #   dedup_photos — DELETEs photos; destructive cross-machine ops are out of scope.
-#   match_faces,
-#   recluster    — already served by export-face-state / apply-face-state.
 #   requeue      — clears worker_processed markers, but the fleet claims from the
 #                  NAS, so a local run is a no-op with a misleading success.
 EXCLUDED_STAGES = frozenset({
     "colors",
     "dedup_photos",
-    "match_faces",
-    "recluster",
     "requeue",
 })
 
 
 def push_mode(stage: str) -> str:
-    """Return 'trigger' | 'transfer' | 'excluded' for a sweep stage name."""
+    """Return 'trigger' | 'transfer' | 'face_state' | 'excluded' for a stage."""
     if stage in TRANSFER_STAGES:
         return "transfer"
+    if stage in FACE_STATE_STAGES:
+        return "face_state"
     if stage in TRIGGER_STAGES:
         return "trigger"
     if stage in EXCLUDED_STAGES:
@@ -209,11 +217,12 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
     payload = collect_payload(db, stage_results)
     stages = payload["stages"]
     transfer = {n: i for n, i in stages.items() if i["mode"] == "transfer"}
+    face = {n: i for n, i in stages.items() if i["mode"] == "face_state"}
     if deferred_triggers is not None:
         trigger = sorted(set(deferred_triggers))
     else:
         trigger = sorted(n for n, i in stages.items() if i["mode"] == "trigger")
-    if not transfer and not trigger:
+    if not transfer and not face and not trigger:
         return {"ok": True, "partial": False, "error": None, "stages": {}}
 
     out: dict = {}
@@ -240,6 +249,18 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
             return _push_result("bad_response", out)
         out.update(applied)
 
+    # --- face_state -------------------------------------------------------
+    # Before the triggers, so the NAS's resolve_dups runs over the faces this
+    # just matched (temporal matching can put one person on two faces).
+    if face:
+        error = _push_face_state(db, nas_url, payload["fingerprint"], face, out,
+                                 timeout=timeout)
+        if error:
+            return _push_result(error, out)
+        if (out.get("match_faces") or {}).get("status") == "applied" \
+                and "resolve_dups" not in trigger:
+            trigger = sorted(set(trigger) | {"resolve_dups"})
+
     # --- trigger ----------------------------------------------------------
     if trigger:
         try:
@@ -261,6 +282,55 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
             out[name] = {"status": "triggered"}
 
     return _push_result(None, out)
+
+
+def _push_face_state(db, nas_url: str, fingerprint: dict, stages: dict,
+                     out: dict, *, timeout: int) -> "str | None":
+    """Export this DB's face state and POST it to the NAS. Fills ``out``.
+
+    Returns None on success, else an error string — every face stage is marked
+    failed first, so a transfer that already landed still reads as partial.
+    The file carries its own fingerprint + watermarks in face_state_meta, so the
+    request is one self-describing body rather than a multipart form.
+    """
+    import os
+    import tempfile
+    from .face_state import export_face_state
+
+    def fail(reason):
+        for name in stages:
+            out[name] = {"status": "failed", "reason": reason}
+        return reason
+
+    fd, path = tempfile.mkstemp(suffix=".face-state.db")
+    os.close(fd)
+    try:
+        export_face_state(db, path, meta={"fingerprint": fingerprint, "stages": stages})
+        with open(path, "rb") as fh:
+            r = requests.post(f"{nas_url}/api/admin/maintenance-apply-face-state",
+                              data=fh, timeout=timeout,
+                              headers={"Content-Type": "application/vnd.sqlite3"})
+    except requests.exceptions.RequestException as e:
+        logger.warning("maintenance push (face_state) failed: %s", e)
+        return fail("unreachable")
+    finally:
+        for suffix in ("", "-journal"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+    if r.status_code == 409:
+        return fail("fingerprint_mismatch")
+    if r.status_code != 200:
+        return fail(f"http_{r.status_code}")
+    try:
+        applied = r.json().get("applied") or {}
+    except (ValueError, TypeError) as e:
+        logger.warning("maintenance push (face_state) bad response body: %s", e)
+        return fail("bad_response")
+    for name in stages:
+        out[name] = applied.get(name) or {"status": "failed", "reason": "not_reported"}
+    return None
 
 
 # A stage outcome counts as landed if it applied, was triggered on the NAS, or

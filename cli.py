@@ -981,17 +981,9 @@ def export_face_state(db, out):
 
     (Distinct from export-face-assignments, which is JSON of MANUAL labels for
     rebuild preservation; this carries the full computed cluster+match state.)"""
-    import os as _os
-    if _os.path.exists(out):
-        _os.remove(out)
+    from photosearch.face_state import export_face_state as _export
     with PhotoDB(db) as pdb:
-        c = pdb.conn
-        c.execute("ATTACH DATABASE ? AS exp", (out,))
-        c.execute("CREATE TABLE exp.face_assignments AS "
-                  "SELECT id AS face_id, cluster_id, person_id, match_source FROM faces")
-        c.execute("CREATE UNIQUE INDEX exp.ix_fa ON face_assignments(face_id)")
-        n = c.execute("SELECT COUNT(*) FROM exp.face_assignments").fetchone()[0]
-        c.execute("DETACH DATABASE exp")
+        n = _export(pdb, out)
     click.echo(f"Exported {n} face assignments to {out}.")
 
 
@@ -1014,42 +1006,18 @@ def apply_face_state(db, from_file, overwrite_persons, apply):
     from the file (e.g. ingested after the replica sync) are left untouched.
     After applying matches, re-run resolve-duplicate-persons to re-enforce the
     one-person-per-photo invariant (temporal matching can create duplicates)."""
+    from photosearch.face_state import apply_face_state as _apply
     with PhotoDB(db) as pdb:
-        c = pdb.conn
-        c.execute("ATTACH DATABASE ? AS a", (from_file,))
-        if overwrite_persons:
-            newp = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
-                             "WHERE IFNULL(f.person_id,-1) <> IFNULL(x.person_id,-1)").fetchone()[0]
-        else:
-            newp = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
-                             "WHERE f.person_id IS NULL AND IFNULL(f.match_source,'') <> 'dedupe_unmatched' "
-                             "AND x.person_id IS NOT NULL").fetchone()[0]
-        clus = c.execute("SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id=f.id "
-                         "WHERE f.person_id IS NULL AND IFNULL(f.cluster_id,-1) <> IFNULL(x.cluster_id,-1)").fetchone()[0]
-        click.echo(f"{'Re-assign' if overwrite_persons else 'Add'} person on {newp} face(s); "
-                   f"update cluster on {clus} unmatched face(s).")
-        if not apply:
-            c.execute("DETACH DATABASE a")
-            click.echo("Dry run — no changes written. Re-run with --apply.")
-            return
-        # 1) persons first, so newly-matched faces don't keep a stale cluster_id
-        if overwrite_persons:
-            c.execute("UPDATE faces SET person_id=(SELECT person_id FROM a.face_assignments WHERE face_id=faces.id), "
-                      "match_source=(SELECT match_source FROM a.face_assignments WHERE face_id=faces.id) "
-                      "WHERE id IN (SELECT face_id FROM a.face_assignments)")
-        else:
-            c.execute("UPDATE faces SET person_id=(SELECT person_id FROM a.face_assignments WHERE face_id=faces.id), "
-                      "match_source=(SELECT match_source FROM a.face_assignments WHERE face_id=faces.id) "
-                      "WHERE person_id IS NULL "
-                      "AND IFNULL(match_source,'') <> 'dedupe_unmatched' "
-                      "AND (SELECT person_id FROM a.face_assignments WHERE face_id=faces.id) IS NOT NULL")
-        # 2) clusters for faces that are still unmatched here
-        c.execute("UPDATE faces SET cluster_id=(SELECT cluster_id FROM a.face_assignments WHERE face_id=faces.id) "
-                  "WHERE person_id IS NULL AND id IN (SELECT face_id FROM a.face_assignments)")
-        pdb.conn.commit()
-        c.execute("DETACH DATABASE a")
-        click.echo(f"Applied: persons on {newp}, clusters on {clus} face(s). "
-                   "Now run resolve-duplicate-persons to re-enforce the invariant.")
+        summary = _apply(pdb, from_file, overwrite_persons=overwrite_persons,
+                         apply=apply)
+    newp, clus = summary["persons"], summary["clusters"]
+    click.echo(f"{'Re-assign' if overwrite_persons else 'Add'} person on {newp} face(s); "
+               f"update cluster on {clus} unmatched face(s).")
+    if not apply:
+        click.echo("Dry run — no changes written. Re-run with --apply.")
+        return
+    click.echo(f"Applied: persons on {newp}, clusters on {clus} face(s). "
+               "Now run resolve-duplicate-persons to re-enforce the invariant.")
 
 
 def _write_verify_report(suspects, path, nas_url, top_n):

@@ -9,6 +9,7 @@ import requests
 
 from photosearch.maintenance_sync import (
     EXCLUDED_STAGES,
+    FACE_STATE_STAGES,
     TRANSFER_STAGES,
     TRIGGER_STAGES,
     fingerprints_match,
@@ -47,10 +48,17 @@ def test_stacking_is_the_only_transfer_stage():
     assert push_mode("stacking") == "transfer"
 
 
-@pytest.mark.parametrize("stage", ["colors", "dedup_photos", "match_faces",
-                                   "recluster", "requeue"])
+@pytest.mark.parametrize("stage", ["colors", "dedup_photos", "requeue"])
 def test_excluded_stages(stage):
     assert push_mode(stage) == "excluded"
+
+
+@pytest.mark.parametrize("stage", ["match_faces", "recluster"])
+def test_face_stages_push_as_face_state(stage):
+    """They used to be excluded — true of the CLI, false of the UI, which is
+    why the replica sweep 400'd on them. They now ship a face-state file."""
+    assert push_mode(stage) == "face_state"
+    assert stage not in EXCLUDED_STAGES
 
 
 def test_taxonomy_covers_every_sweep_stage_exactly_once():
@@ -60,11 +68,12 @@ def test_taxonomy_covers_every_sweep_stage_exactly_once():
     reconciliation decision — which would silently mean 'lost on next sync'.
     """
     from photosearch.maintenance import SWEEP_STAGE_ORDER
-    known = TRIGGER_STAGES | TRANSFER_STAGES | EXCLUDED_STAGES
+    known = TRIGGER_STAGES | TRANSFER_STAGES | FACE_STATE_STAGES | EXCLUDED_STAGES
     assert set(SWEEP_STAGE_ORDER) - known == set(), "sweep stage with no push mode"
     assert not (TRIGGER_STAGES & TRANSFER_STAGES)
     assert not (TRIGGER_STAGES & EXCLUDED_STAGES)
     assert not (TRANSFER_STAGES & EXCLUDED_STAGES)
+    assert not (FACE_STATE_STAGES & (TRIGGER_STAGES | TRANSFER_STAGES | EXCLUDED_STAGES))
 
 
 def test_push_mode_rejects_unknown_stage():
@@ -776,6 +785,23 @@ def test_excluded_stage_rejected_in_replica_mode(client, monkeypatch):
     assert "colors" in r.json()["detail"]["stages"]
 
 
+@pytest.mark.parametrize("flag", ["do_match", "do_recluster"])
+def test_face_stages_allowed_in_replica_mode(client, monkeypatch, flag):
+    """The live complaint: /admin/maintenance on the replica 400'd on these."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+    from photosearch import maintenance_sync, web
+
+    def fail_fast(*a, **kw):
+        raise OSError("connection refused")
+
+    # Reaching the NAS-reachability gate (503) proves the stage gate (400)
+    # let the request through.
+    monkeypatch.setattr(maintenance_sync.requests, "get", fail_fast)
+    r = client.post("/api/admin/maintenance-sweep", json={"apply": True, flag: True})
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "nas_unreachable"
+
+
 def test_excluded_stage_allowed_on_the_nas(client, monkeypatch):
     monkeypatch.delenv("PHOTOSEARCH_NAS_URL", raising=False)
     r = client.post("/api/admin/maintenance-sweep",
@@ -971,3 +997,195 @@ def test_maintenance_sweep_endpoint_reports_unknown_stage_as_fatal_not_500(clien
                     json={"apply": True, "stages": ["bogus_stage"]})
     assert r.status_code == 200
     assert '"type": "fatal"' in r.text or '"type":"fatal"' in r.text
+
+
+# ---------------------------------------------------------------------------
+# face_state push mode
+# ---------------------------------------------------------------------------
+
+def _stamp(db, stage, ts="2026-09-13T20:00:00+00:00"):
+    db.record_maintenance_run(stage=stage, last_run_at=ts, photo_count=1,
+                              photo_max_id=1, applied=1, source="replica")
+
+
+def test_push_ships_face_state_between_transfer_and_trigger(db, monkeypatch, tmp_path):
+    from photosearch import maintenance_sync
+    from photosearch.face_state import read_meta
+
+    calls, shipped = [], {}
+
+    def fake_post(url, json=None, data=None, timeout=None, **kw):
+        calls.append(url)
+        if url.endswith("/maintenance-apply"):
+            return _FakeResponse(200, {"applied": {"stacking": {"status": "applied"}}})
+        if url.endswith("/maintenance-apply-face-state"):
+            body = data.read()
+            path = tmp_path / "received.db"
+            path.write_bytes(body)
+            shipped["meta"] = read_meta(str(path))
+            shipped["trigger_later"] = True
+            return _FakeResponse(200, {"applied": {
+                "match_faces": {"status": "applied", "persons": 3}}})
+        shipped["triggers"] = (json or {}).get("stages")
+        return _FakeResponse(200, {})
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+    _stamp(db, "stacking")
+    _stamp(db, "match_faces")
+
+    result = maintenance_sync.push_to_nas(
+        db, "http://nas:8000",
+        [{"stage": "stacking", "status": "done"},
+         {"stage": "match_faces", "status": "done"}],
+        deferred_triggers=["geocode"])
+
+    assert [u.rsplit("/", 1)[-1] for u in calls] == [
+        "maintenance-apply", "maintenance-apply-face-state", "maintenance-sweep"]
+    assert set(shipped["meta"]["stages"]) == {"match_faces"}
+    assert shipped["meta"]["fingerprint"] == maintenance_sync.photo_fingerprint(db)
+    assert shipped["triggers"] == ["geocode", "resolve_dups"], \
+        "a landed match must be followed by duplicate-person resolution"
+    assert result["ok"] is True
+    assert result["stages"]["match_faces"]["status"] == "applied"
+
+
+def test_push_face_state_failure_is_partial_and_skips_triggers(db, monkeypatch):
+    from photosearch import maintenance_sync
+
+    calls = []
+
+    def fake_post(url, json=None, data=None, timeout=None, **kw):
+        calls.append(url)
+        if url.endswith("/maintenance-apply"):
+            return _FakeResponse(200, {"applied": {"stacking": {"status": "applied"}}})
+        return _FakeResponse(409, {"detail": {"error": "fingerprint_mismatch"}})
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+    _stamp(db, "stacking")
+    _stamp(db, "recluster")
+
+    result = maintenance_sync.push_to_nas(
+        db, "http://nas:8000",
+        [{"stage": "stacking", "status": "done"},
+         {"stage": "recluster", "status": "done"}],
+        deferred_triggers=["geocode"])
+
+    assert not any(u.endswith("/maintenance-sweep") for u in calls)
+    assert result["ok"] is False and result["partial"] is True
+    assert result["error"] == "fingerprint_mismatch"
+    assert result["stages"]["recluster"] == {"status": "failed",
+                                             "reason": "fingerprint_mismatch"}
+
+
+def test_push_face_state_unreachable(db, monkeypatch):
+    from photosearch import maintenance_sync
+
+    def fake_post(url, **kw):
+        raise requests.exceptions.ConnectionError("NAS restarting")
+
+    monkeypatch.setattr(maintenance_sync.requests, "post", fake_post)
+    _stamp(db, "match_faces")
+    result = maintenance_sync.push_to_nas(
+        db, "http://nas:8000", [{"stage": "match_faces", "status": "done"}])
+    assert result["ok"] is False and result["partial"] is False
+    assert result["stages"]["match_faces"]["reason"] == "unreachable"
+
+
+def _face_state_body(db, tmp_path, stages, fingerprint=None):
+    from photosearch.face_state import export_face_state
+    from photosearch.maintenance_sync import photo_fingerprint
+    path = tmp_path / "upload.db"
+    export_face_state(db, str(path), meta={
+        "fingerprint": fingerprint or photo_fingerprint(db), "stages": stages})
+    return path.read_bytes()
+
+
+def _first_face(db):
+    return db.conn.execute("SELECT id FROM faces ORDER BY id LIMIT 1").fetchone()[0]
+
+
+def test_apply_face_state_endpoint_fills_persons_and_stamps(client, db, monkeypatch, tmp_path):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    fid = _first_face(db)
+    pid = db.conn.execute("SELECT id FROM persons LIMIT 1").fetchone()[0]
+    db.conn.execute("UPDATE faces SET person_id = ?, match_source = 'temporal' WHERE id = ?",
+                    (pid, fid))
+    db.conn.commit()
+    body = _face_state_body(db, tmp_path, {
+        "match_faces": {"mode": "face_state", "last_run_at": "2026-09-13T20:00:00+00:00"}})
+    # The NAS side hasn't matched it yet.
+    db.conn.execute("UPDATE faces SET person_id = NULL, match_source = NULL WHERE id = ?", (fid,))
+    db.conn.commit()
+
+    r = client.post("/api/admin/maintenance-apply-face-state", content=body,
+                    headers={"Content-Type": "application/vnd.sqlite3"})
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"]["match_faces"]["status"] == "applied"
+    row = db.conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?",
+                          (fid,)).fetchone()
+    assert (row["person_id"], row["match_source"]) == (pid, "temporal")
+    assert db.get_maintenance_runs()["match_faces"]["last_run_at"] == \
+        "2026-09-13T20:00:00+00:00"
+
+
+def test_apply_face_state_endpoint_rejects_fingerprint_mismatch(client, db, monkeypatch, tmp_path):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    body = _face_state_body(db, tmp_path,
+                            {"recluster": {"mode": "face_state", "last_run_at": "t"}},
+                            fingerprint={"photo_count": -1, "photo_max_id": -1})
+    r = client.post("/api/admin/maintenance-apply-face-state", content=body)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "fingerprint_mismatch"
+    assert "recluster" not in db.get_maintenance_runs()
+
+
+def test_apply_face_state_endpoint_rejects_garbage(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    r = client.post("/api/admin/maintenance-apply-face-state", content=b"not sqlite" * 50)
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "bad_face_state_file"
+
+
+def test_apply_face_state_endpoint_rejects_non_face_stage(client, db, monkeypatch, tmp_path):
+    """A face-state file must not be able to stamp, e.g., stacking as done."""
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    body = _face_state_body(db, tmp_path,
+                            {"stacking": {"mode": "transfer", "last_run_at": "t"}})
+    r = client.post("/api/admin/maintenance-apply-face-state", content=body)
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "not_face_state_mode"
+
+
+def test_apply_face_state_endpoint_skips_when_nas_fresher(client, db, monkeypatch, tmp_path):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    db.record_maintenance_run(stage="recluster", last_run_at="2026-09-14T00:00:00+00:00",
+                              source="nas")
+    db.conn.execute("INSERT OR IGNORE INTO ignored_clusters (cluster_id) VALUES (42)")
+    db.conn.commit()
+    body = _face_state_body(db, tmp_path, {
+        "recluster": {"mode": "face_state", "last_run_at": "2026-09-13T00:00:00+00:00"}})
+    r = client.post("/api/admin/maintenance-apply-face-state", content=body)
+    assert r.status_code == 200
+    assert r.json()["applied"]["recluster"] == {"status": "skipped", "reason": "nas_fresher"}
+    assert db.conn.execute(
+        "SELECT 1 FROM ignored_clusters WHERE cluster_id = 42").fetchone(), \
+        "a skipped recluster must not touch ignored_clusters"
+
+
+def test_apply_face_state_recluster_only_does_not_refill_persons(client, db, monkeypatch, tmp_path):
+    """A recluster-only file carries sync-time persons. Filling them would
+    re-apply a label someone cleared on the NAS after the sync."""
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    fid = _first_face(db)
+    pid = db.conn.execute("SELECT id FROM persons LIMIT 1").fetchone()[0]
+    db.conn.execute("UPDATE faces SET person_id = ? WHERE id = ?", (pid, fid))
+    db.conn.commit()
+    body = _face_state_body(db, tmp_path, {
+        "recluster": {"mode": "face_state", "last_run_at": "2026-09-13T20:00:00+00:00"}})
+    db.conn.execute("UPDATE faces SET person_id = NULL, match_source = NULL WHERE id = ?", (fid,))
+    db.conn.commit()
+
+    r = client.post("/api/admin/maintenance-apply-face-state", content=body)
+    assert r.status_code == 200, r.text
+    assert db.conn.execute("SELECT person_id FROM faces WHERE id = ?",
+                           (fid,)).fetchone()[0] is None

@@ -903,13 +903,27 @@ points at, and `sync-replica.sh` replaces the replica's DB wholesale — so a
 replica-side apply used to be silently destroyed on the next sync. Now:
 
 - `apply=true` on the replica with the NAS unreachable → **503, refuses to run**.
-- `colors` / `match_faces` / `dedup_photos` / `recluster` / `requeue` → **400**
-  in replica mode (colors needs pixels the replica doesn't have; the rest must
-  not cross machines or already have `export-face-state`).
+- `colors` / `dedup_photos` / `requeue` → **400** in replica mode (colors needs
+  pixels the replica doesn't have; dedup DELETEs; requeue is a no-op because
+  the fleet claims from the NAS).
 - Everything else: pre-flight fingerprint → auto-sync if drifted → compute →
-  one push at the end. Cheap deterministic stages are **re-triggered** on the
-  NAS rather than transferred; only `stacking` ships rows (the one stage
-  expensive enough on the N100 to be worth avoiding).
+  one push at the end. Push modes (`maintenance_sync.push_mode`): cheap
+  deterministic stages are **re-triggered** on the NAS; `stacking` is
+  **transferred** as rows; `match_faces` / `recluster` are **face_state** —
+  the replica exports a face-state file (`photosearch/face_state.py`, the same
+  code as the `export-face-state` / `apply-face-state` CLI pair) and POSTs it
+  to `POST /api/admin/maintenance-apply-face-state`. The leg order is transfer
+  → face_state → trigger, and a landed match adds `resolve_dups` to the
+  triggers.
+- face_state apply on the NAS applies **only what the replica recomputed**:
+  match → additive person fill (skips `dedupe_unmatched`), no cluster copy (a
+  sync-time cluster id would revert a split made on the NAS since); recluster
+  → cluster ids for unmatched faces, stale ids cleared on named faces and on
+  faces absent from the file, and `ignored_clusters` **remapped** — a new
+  cluster stays ignored when >50% of its faces sat in an ignored cluster
+  before. Known window: a label cleared on the NAS between sync and push
+  (`/clear` sets `match_source=NULL`, indistinguishable) is re-filled by a
+  match push.
 
 `maintenance_runs` (schema v29) holds the per-stage watermark on both machines.
 The `/status` Replica card and `/admin_maintenance` show per-stage drift;
