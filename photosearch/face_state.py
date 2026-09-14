@@ -77,10 +77,11 @@ def read_meta(path: str) -> dict:
 
 # Faces the user deliberately unmatched stay unmatched: an additive fill that
 # re-applied a person to them would silently undo dedupe-person-faces /
-# resolve-duplicate-persons.
+# resolve-duplicate-persons ('dedupe_unmatched') or an explicit human rejection
+# ('rejected' — faces.REJECTED_MATCH_SOURCE).
 _ADDITIVE_PERSON_WHERE = (
     "person_id IS NULL "
-    "AND IFNULL(match_source, '') <> 'dedupe_unmatched' "
+    "AND IFNULL(match_source, '') NOT IN ('dedupe_unmatched', 'rejected') "
     "AND (SELECT person_id FROM a.face_assignments WHERE face_id = faces.id) IS NOT NULL"
 )
 

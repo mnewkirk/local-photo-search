@@ -1295,6 +1295,60 @@ def review_faces(db, date_, base_url, team_hue, tolerance, min_det, min_edge,
             click.echo(f"Wrote review gallery to {report}")
 
 
+@cli.command("verify-face-labels")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--date-from", default=None, metavar="YYYY-MM-DD")
+@click.option("--date-to", default=None, metavar="YYYY-MM-DD")
+@click.option("--person", default=None, help="Restrict to one person.")
+@click.option("--min-references", default=3, show_default=True, type=int,
+              help="Skip people with fewer trusted (manual/strict) faces.")
+@click.option("--decisive-only", is_flag=True, default=False,
+              help="Only faces closer to another person than the two ever get.")
+@click.option("--limit", default=40, show_default=True, type=int)
+def verify_face_labels(db, date_from, date_to, person, min_references,
+                       decisive_only, limit):
+    """Find labelled faces that look more like SOMEONE ELSE in the same scope.
+
+    Unlike verify-person-matches (global distance threshold) and
+    label-conflicts (needs the right eps), this needs neither: each face is
+    compared against every other person present and calibrated against how
+    close those two people genuinely get. A face closer to Q than P and Q ever
+    get to each other is flagged "DECISIVE".
+
+    Design + the Oliver/Franklin case it comes from:
+    docs/plans/face-label-verification.md
+    """
+    from photosearch import face_verify
+    with PhotoDB(db) as pdb:
+        try:
+            findings, skipped, stats = face_verify.verify_labels(
+                pdb, date_from=date_from, date_to=date_to, person=person,
+                min_references=min_references)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+
+    click.echo(f"{stats['faces']} labelled faces, {stats['people']} people "
+               f"with a usable reference set, {stats['pairs']} pairs calibrated")
+    for s in skipped:
+        click.echo(f"  skipped {s['person']}: {s['trusted']} trusted face(s) — "
+                   f"{s['reason']}")
+    if decisive_only:
+        findings = [f for f in findings if f["decisive"]]
+    if not findings:
+        click.echo("\nNo faces look more like someone else. ")
+        return
+    click.echo(f"\n{len(findings)} face(s) look more like someone else "
+               f"({sum(1 for f in findings if f['decisive'])} decisive):\n")
+    for f in findings[:limit]:
+        flag = "DECISIVE" if f["decisive"] else "suggest "
+        click.echo(
+            f"  [{flag}] face {f['face_id']} (photo {f['photo_id']}, "
+            f"{f['match_source']}): labelled {f['person']} but "
+            f"{f['d_other']} from {f['candidate']} vs {f['d_own']} from "
+            f"{f['person']} — the two are {f['separation']} apart at closest")
+
+
 @cli.command("verify-person-matches")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")

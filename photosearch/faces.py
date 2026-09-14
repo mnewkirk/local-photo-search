@@ -471,6 +471,26 @@ def cluster_encodings(
 # the DB (person-matching with MATCH_TOLERANCE=1.15 is forgiving enough
 # to find them anyway). NULL det_score is grandfathered — pre-v20 rows
 # pass the filter until re-indexed.
+# A human said "this face is NOT that person". Auto-matching must never
+# re-apply a person to it — otherwise every `match-faces` run silently undoes
+# the correction, which is exactly what happened on 2026-09-14: a sweep
+# re-applied 164 Calvin temporal matches that had been deliberately removed a
+# day earlier.
+#
+# Deliberately DISTINCT from 'dedupe_unmatched', which resolve-duplicate-persons
+# sets automatically when it keeps one face per (photo, person). Those are a
+# machine's tie-break, not a judgement about identity, and the losing face may
+# legitimately match a DIFFERENT person later — so it stays matchable.
+REJECTED_MATCH_SOURCE = "rejected"
+
+# SQL fragment for "this face may be auto-matched". Shared so the strict and
+# temporal matchers, and the face-state apply, cannot drift apart.
+MATCHABLE_SQL = (
+    "f.person_id IS NULL AND IFNULL(f.match_source, '') <> '"
+    + REJECTED_MATCH_SOURCE + "'"
+)
+
+
 CLUSTER_MIN_DET_SCORE = 0.65
 CLUSTER_MIN_BBOX_EDGE = 60
 
@@ -1044,13 +1064,14 @@ def match_faces_to_persons(
             placeholders = ",".join("?" * len(chunk))
             face_rows.extend(
                 db.conn.execute(
-                    f"SELECT id FROM faces WHERE person_id IS NULL AND photo_id IN ({placeholders})",
+                    f"SELECT f.id FROM faces f WHERE {MATCHABLE_SQL} "
+                    f"AND f.photo_id IN ({placeholders})",
                     chunk,
                 ).fetchall()
             )
     else:
         face_rows = db.conn.execute(
-            "SELECT id FROM faces WHERE person_id IS NULL"
+            f"SELECT f.id FROM faces f WHERE {MATCHABLE_SQL}"
         ).fetchall()
 
     if not face_rows:
@@ -1189,16 +1210,16 @@ def match_faces_temporal(
                     f"""SELECT f.id, ph.date_taken
                         FROM faces f
                         JOIN photos ph ON ph.id = f.photo_id
-                        WHERE f.person_id IS NULL AND f.photo_id IN ({placeholders})""",
+                        WHERE {MATCHABLE_SQL} AND f.photo_id IN ({placeholders})""",
                     chunk,
                 ).fetchall()
             )
     else:
         face_rows = db.conn.execute(
-            """SELECT f.id, ph.date_taken
-               FROM faces f
-               JOIN photos ph ON ph.id = f.photo_id
-               WHERE f.person_id IS NULL"""
+            f"""SELECT f.id, ph.date_taken
+                FROM faces f
+                JOIN photos ph ON ph.id = f.photo_id
+                WHERE {MATCHABLE_SQL}"""
         ).fetchall()
     if not face_rows:
         return 0

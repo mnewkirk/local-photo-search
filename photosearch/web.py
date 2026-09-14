@@ -1800,9 +1800,13 @@ def api_clear_face(face_id: int):
         face = db.conn.execute("SELECT id FROM faces WHERE id = ?", (face_id,)).fetchone()
         if not face:
             raise HTTPException(404, "Face not found")
+        # 'rejected', not NULL: NULL is indistinguishable from never-matched,
+        # so the next `match-faces` run re-applies the very person the user
+        # just removed. See faces.REJECTED_MATCH_SOURCE.
+        from .faces import REJECTED_MATCH_SOURCE
         db.conn.execute(
-            "UPDATE faces SET person_id = NULL, match_source = NULL WHERE id = ?",
-            (face_id,),
+            "UPDATE faces SET person_id = NULL, match_source = ? WHERE id = ?",
+            (REJECTED_MATCH_SOURCE, face_id),
         )
         db.conn.commit()
         return {"ok": True}
@@ -2090,13 +2094,16 @@ def api_bulk_assign_faces(data: dict):
             db.conn.commit()
             logger.info("FACE BULK-ASSIGN  %d faces -> %r (id=%d)", len(face_ids), name, pid)
             return {"ok": True, "updated": len(face_ids), "person_id": pid, "person_name": name}
-        # Clear
+        # Clear. Marked 'rejected' so auto-matching won't undo it — the
+        # inspector's whole purpose is removing faces a person should not have,
+        # and a NULL marker let the next match-faces sweep put them straight back.
+        from .faces import REJECTED_MATCH_SOURCE
         for i in range(0, len(face_ids), 500):
             batch = face_ids[i:i + 500]
             ph = ",".join("?" * len(batch))
             db.conn.execute(
-                f"UPDATE faces SET person_id = NULL, match_source = NULL "
-                f"WHERE id IN ({ph})", batch)
+                f"UPDATE faces SET person_id = NULL, match_source = ? "
+                f"WHERE id IN ({ph})", [REJECTED_MATCH_SOURCE, *batch])
         db.conn.commit()
         logger.info("FACE BULK-CLEAR  %d faces", len(face_ids))
         return {"ok": True, "updated": len(face_ids), "person_id": None}
