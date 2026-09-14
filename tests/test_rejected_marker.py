@@ -167,3 +167,45 @@ def test_people_with_too_few_references_are_reported_not_scored(db):
         db, date_from="2026-01-01", date_to="2027-01-01", min_references=3)
     assert any("too few trusted references" in s["reason"] for s in skipped)
     assert isinstance(findings, list)
+
+
+def test_alibi_excluded_is_never_negative(db):
+    """It counts same-burst references WITHHELD, so it cannot be negative.
+
+    The first version computed it as len(refs) - 1 - len(kept), which assumes
+    the face under test is itself in the reference set. A `temporal` face never
+    is (references are manual/strict only), so every temporal finding reported
+    -1 — visible nonsense in the UI and a wrong signal to the reviewer.
+    """
+    from photosearch import face_verify
+    findings, _, _ = face_verify.verify_labels(
+        db, date_from="2026-01-01", date_to="2027-01-01", min_references=2)
+    assert all(f["alibi_excluded"] >= 0 for f in findings)
+
+
+def test_findings_carry_what_the_review_ui_needs(db):
+    """The panel renders three strips and posts a reassignment without a
+    second round-trip, so each finding must carry both reference sets."""
+    from photosearch import face_verify
+    findings, _, _ = face_verify.verify_labels(
+        db, date_from="2026-01-01", date_to="2027-01-01", min_references=2)
+    for f in findings:
+        assert isinstance(f["own_refs"], list)
+        assert isinstance(f["candidate_refs"], list)
+        assert f["face_id"] not in f["own_refs"], "a face cannot be its own reference"
+
+
+def test_verify_labels_endpoint_requires_a_scope(client):
+    assert client.get("/api/faces/verify-labels").status_code == 400
+
+
+def test_verify_labels_endpoint_resolves_person_ids(client, db, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_DB", db.db_path)
+    r = client.get("/api/faces/verify-labels",
+                   params={"date_from": "2026-01-01", "date_to": "2027-01-01",
+                           "min_references": 2})
+    assert r.status_code == 200
+    d = r.json()
+    assert "findings" in d and "stats" in d and "decisive_count" in d
+    for f in d["findings"]:
+        assert f["person_id"] is not None

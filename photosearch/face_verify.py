@@ -30,6 +30,9 @@ SEPARATION_PERCENTILE = 5.0
 
 MIN_REFERENCES = 3
 
+# How many reference crops to hand the reviewer per identity.
+REF_PREVIEW = 4
+
 # A face must not be validated by a near-duplicate frame of ITSELF. Two
 # mislabelled faces from the same burst alibi each other perfectly: on the
 # 2026-09-12 ground-truth case, face 503089's nearest "Oliver" reference was
@@ -134,12 +137,15 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
         # LEAVE-ONE-BURST-OUT. Dropping only the face itself lets a second
         # mislabelled frame from the same burst vouch for it — see
         # BURST_WINDOW_SECONDS.
-        mask = [i for i, fid in enumerate(own["ids"])
-                if fid != r["face_id"]
-                and not (t is not None and own["ts"][i] is not None
-                         and abs((own["ts"][i] - t).total_seconds())
-                             <= burst_window)]
-        alibi_excluded = len(own["ids"]) - 1 - len(mask)
+        mask, alibi_excluded = [], 0
+        for i, fid in enumerate(own["ids"]):
+            if fid == r["face_id"]:
+                continue                      # never compare a face to itself
+            if (t is not None and own["ts"][i] is not None
+                    and abs((own["ts"][i] - t).total_seconds()) <= burst_window):
+                alibi_excluded += 1           # same burst — cannot vouch for it
+                continue
+            mask.append(i)
         if not mask:
             # Every reference is inside this face's own burst, so there is
             # nothing independent to compare against. Reported, not guessed at.
@@ -147,15 +153,22 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
                             "reason": f"all references fall inside face "
                                       f"{r['face_id']}'s own burst"})
             continue
-        d_own = float(_dists(x, own["X"][mask]).min())
+        own_d = _dists(x, own["X"][mask]).ravel()
+        d_own = float(own_d.min())
+        # Nearest references, for the reviewer. Showing the CLOSEST faces on
+        # each side puts the strongest case for both identities side by side —
+        # a random sample would make an obvious error look arguable.
+        own_refs = [own["ids"][mask[i]] for i in np.argsort(own_d)[:REF_PREVIEW]]
 
-        best_other, d_other = None, float("inf")
+        best_other, d_other, cand_refs = None, float("inf"), []
         for other in names:
             if other == name:
                 continue
-            d = float(_dists(x, refs[other]["X"]).min())
-            if d < d_other:
-                best_other, d_other = other, d
+            d = _dists(x, refs[other]["X"]).ravel()
+            if float(d.min()) < d_other:
+                best_other, d_other = other, float(d.min())
+                cand_refs = [refs[other]["ids"][i]
+                             for i in np.argsort(d)[:REF_PREVIEW]]
         if best_other is None:
             continue
 
@@ -171,6 +184,8 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
             # than one face wearing this label.
             "alibi_excluded": alibi_excluded,
             "separation": round(s, 3) if s is not None else None,
+            "own_refs": own_refs,
+            "candidate_refs": cand_refs,
             # The decisive test: closer to Q than P and Q ever get to each other.
             "decisive": bool(s is not None and d_other < s),
         })

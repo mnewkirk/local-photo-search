@@ -727,6 +727,156 @@
     }
 
     // -----------------------------------------------------------------------
+    // LabelVerify — "is this face actually that person?"
+    //
+    // One row per suspect: the disputed crop, the identity it CARRIES, and the
+    // identity it LOOKS LIKE, nearest references first so the strongest case
+    // for each is side by side. Needs no eps and no distance threshold — the
+    // server calibrates each pair against how close those two people genuinely
+    // get. See docs/plans/face-label-verification.md.
+    // -----------------------------------------------------------------------
+    function LabelVerify({ dateFrom, dateTo, onClose, onChanged }) {
+      const [data, setData] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [err, setErr] = useState('');
+      const [decisiveOnly, setDecisiveOnly] = useState(false);
+      const [busy, setBusy] = useState(null);
+      const [done, setDone] = useState({});     // face_id -> what we did
+
+      const load = useCallback(() => {
+        setLoading(true); setErr('');
+        let u = API + '/api/faces/verify-labels?limit=60';
+        if (dateFrom) u += '&date_from=' + encodeURIComponent(dateFrom);
+        if (dateTo) u += '&date_to=' + encodeURIComponent(dateTo);
+        if (decisiveOnly) u += '&decisive_only=1';
+        fetch(u).then(r => r.json())
+          .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
+          .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
+      }, [dateFrom, dateTo, decisiveOnly]);
+      useEffect(() => { load(); }, [load]);
+
+      // Reassign sends the candidate name; reject sends null, which the server
+      // records as match_source='rejected' so a later match-faces sweep cannot
+      // put the same wrong person back.
+      const act = useCallback((f, kind) => {
+        if (kind === 'keep') { setDone(d => Object.assign({}, d, { [f.face_id]: 'kept' })); return; }
+        const name = kind === 'reassign' ? f.candidate : null;
+        const verb = kind === 'reassign'
+          ? ('reassign this face to ' + f.candidate)
+          : ('remove the ' + f.person + ' label and mark it rejected');
+        if (!confirm('Confirm: ' + verb + '? This writes to the database.')) return;
+        setBusy(f.face_id);
+        fetch(API + '/api/faces/bulk-assign', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ face_ids: [f.face_id], person_name: name }),
+        }).then(r => r.json()).then(() => {
+          setDone(d => Object.assign({}, d, { [f.face_id]: kind === 'reassign' ? ('→ ' + f.candidate) : 'rejected' }));
+          if (onChanged) onChanged();
+        }).catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setBusy(null));
+      }, [onChanged]);
+
+      const strip = (ids, label, highlight) => e('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: 3 },
+      },
+        e('div', { className: 'insp-sub', style: highlight ? { color: 'var(--accent, #4a9)' } : null }, label),
+        e('div', { style: { display: 'flex', gap: 3 } },
+          (ids || []).map(id => e('img', {
+            key: id,
+            src: API + '/api/faces/crop/' + id + '?size=120',
+            loading: 'lazy', title: 'face ' + id,
+            style: { width: 64, height: 64, objectFit: 'cover', borderRadius: 4,
+                     border: '1px solid var(--border, #444)' },
+          }))));
+
+      const rows = (data && data.findings || []).map(f => {
+        const state = done[f.face_id];
+        return e('div', {
+          key: f.face_id,
+          style: { border: '1px solid var(--border, #444)', borderRadius: 8,
+                   padding: 10, marginBottom: 10, opacity: state ? 0.45 : 1 },
+        },
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' } },
+            e('span', {
+              style: { fontWeight: 600,
+                       color: f.decisive ? 'var(--err, #e66)' : 'var(--text-muted)' },
+            }, f.decisive ? 'DECISIVE' : 'suggestion'),
+            e('span', { className: 'insp-sub' },
+              'labelled ' + f.person + ' · ' + f.d_own +
+              ' from them, ' + f.d_other + ' from ' + f.candidate +
+              ' — the two are ' + f.separation + ' apart at closest'),
+            f.alibi_excluded > 0 && e('span', {
+              className: 'insp-sub', style: { color: 'var(--warn, #db4)' },
+              title: 'Other faces in this same burst also carry this label, so '
+                   + 'they were withheld — they cannot vouch for it.',
+            }, '· ' + f.alibi_excluded + ' same-burst ref withheld'),
+            e('span', { style: { flex: 1 } }),
+            state
+              ? e('span', { className: 'insp-sub' }, state)
+              : e(React.Fragment, null,
+                  e('button', { className: 'insp-btn', disabled: busy === f.face_id,
+                    onClick: () => act(f, 'reassign') }, 'Reassign to ' + f.candidate),
+                  e('button', { className: 'insp-btn', disabled: busy === f.face_id,
+                    onClick: () => act(f, 'reject'),
+                    title: 'Remove the label. Recorded as rejected, so auto-matching '
+                         + 'will not put it back.' }, 'Reject'),
+                  e('button', { className: 'insp-btn', disabled: busy === f.face_id,
+                    onClick: () => act(f, 'keep') }, 'Keep')),
+          ),
+          e('div', { style: { display: 'flex', gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' } },
+            e('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+              e('div', { className: 'insp-sub', style: { color: 'var(--err, #e66)' } }, 'this face'),
+              e('img', {
+                src: API + '/api/faces/crop/' + f.face_id + '?size=160',
+                onClick: () => window.open('/?photo=' + f.photo_id, '_blank'),
+                title: 'face ' + f.face_id + ' · photo ' + f.photo_id + ' (click to open)',
+                style: { width: 84, height: 84, objectFit: 'cover', borderRadius: 4,
+                         border: '3px solid var(--err, #e66)', cursor: 'pointer' } })),
+            strip(f.own_refs, 'labelled ' + f.person),
+            strip(f.candidate_refs, 'looks like ' + f.candidate, true),
+          ));
+      });
+
+      return e('div', { className: 'insp-overlay', onClick: (ev) => { if (ev.target === ev.currentTarget) onClose(); } },
+        e('div', { className: 'insp-panel' },
+          e('div', { className: 'insp-header' },
+            e('div', { style: { flex: 1 } },
+              e('div', { className: 'insp-title' }, 'Verify labels — ' + (dateFrom || '') +
+                (dateTo && dateTo !== dateFrom ? ' → ' + dateTo : '')),
+              e('div', { className: 'insp-sub' },
+                loading ? 'checking…'
+                  : data ? (data.stats.faces.toLocaleString() + ' labelled faces · ' +
+                            data.stats.people + ' people calibrated · ' +
+                            data.findings.length + ' flagged (' + data.decisive_count + ' decisive)')
+                  : ''),
+              data && e('div', { className: 'insp-sub' },
+                'DECISIVE = closer to the other person than those two ever get to '
+                + 'each other. Lookalikes calibrate to a smaller gap, so the check '
+                + 'goes quiet exactly where face recognition is unreliable.'),
+            ),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 5, marginRight: 10 } },
+              e('input', { type: 'checkbox', checked: decisiveOnly,
+                onChange: ev => setDecisiveOnly(ev.target.checked) }),
+              'decisive only'),
+            e('button', { className: 'insp-btn', onClick: load, disabled: loading },
+              loading ? 'Checking…' : 'Re-check'),
+            e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
+          ),
+          err && e('div', { style: { padding: '10px 16px', color: 'var(--err, #e66)' } }, err),
+          e('div', { style: { padding: '10px 16px', overflowY: 'auto' } },
+            !loading && data && data.findings.length === 0 &&
+              e('div', { className: 'insp-sub' },
+                'No labelled face looks more like someone else here.'),
+            rows,
+            data && (data.skipped || []).length > 0 && e('div', {
+              className: 'insp-sub', style: { marginTop: 12 },
+            }, 'Not checked: ' + data.skipped.map(s => s.person + ' (' + s.reason + ')')
+                 .filter((v, i, a) => a.indexOf(v) === i).join('; ')),
+          ),
+        ));
+    }
+
+    // -----------------------------------------------------------------------
     // TeamReview — the `review-faces` CLI as a panel.
     //
     // One shoot's unknown faces, filtered to your team by jersey colour and
@@ -1232,6 +1382,8 @@
       const [inspectPerson, setInspectPerson] = useState(null);  // {id, name} or null
       // review-faces panel; only meaningful for a single shoot day.
       const [teamReview, setTeamReview] = useState(false);
+      // Label verification; needs a date scope like the team review does.
+      const [labelVerify, setLabelVerify] = useState(false);
       // Photo-scope banner for the open group: is the list narrowed by the
       // page filter, and how many exist outside it.
       const [photoScope, setPhotoScope] = useState(null);
@@ -1859,6 +2011,13 @@
               // review-faces needs ONE shoot: it learns a single team colour
               // and clusters that day's faces. Offering it across a range
               // would silently average two kits together.
+              // Any date range works here — unlike the team review, which
+              // learns ONE jersey colour and so needs a single day.
+              cf.date_from && e('button', {
+                onClick: () => setLabelVerify(true),
+                title: 'Find labelled faces that look more like someone else in '
+                     + 'this range, calibrated per pair — no threshold to tune.',
+              }, '\ud83d\udd0d Verify labels'),
               cf.date_from && cf.date_from === cf.date_to && e('button', {
                 onClick: () => setTeamReview(true),
                 title: 'Filter this day\u2019s unknown faces to your team by jersey '
@@ -2237,6 +2396,13 @@
         ),
 
         // Photo modal
+        labelVerify && e(LabelVerify, {
+          dateFrom: cf.date_from,
+          dateTo: cf.date_to || cf.date_from,
+          onClose: () => setLabelVerify(false),
+          onChanged: () => { loadGroups(); loadPersons(); },
+        }),
+
         teamReview && e(TeamReview, {
           date: cf.date_from,
           persons,

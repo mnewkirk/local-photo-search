@@ -2109,6 +2109,51 @@ def api_bulk_assign_faces(data: dict):
         return {"ok": True, "updated": len(face_ids), "person_id": None}
 
 
+@app.get("/api/faces/verify-labels")
+def api_verify_labels(
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    person: Optional[str] = Query(None),
+    min_references: int = Query(3, ge=2, le=50),
+    decisive_only: bool = Query(False),
+    limit: int = Query(60, ge=1, le=500),
+):
+    """Labelled faces that look more like SOMEONE ELSE in the same scope.
+
+    Backs the review panel. Needs no eps and no distance threshold: each face
+    is compared against every other person present and calibrated against how
+    close those two people genuinely get (see photosearch/face_verify.py and
+    docs/plans/face-label-verification.md).
+
+    A SCOPE IS REQUIRED, for the same reason label-conflicts requires one —
+    the pairwise work is bounded by the people present, and "the whole library"
+    means every person against every other.
+    """
+    from . import face_verify
+
+    with _get_db() as db:
+        try:
+            findings, skipped, stats = face_verify.verify_labels(
+                db, date_from=date_from, date_to=date_to, person=person,
+                min_references=min_references)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+        if decisive_only:
+            findings = [f for f in findings if f["decisive"]]
+        findings = findings[:limit]
+
+        # Resolve the names the reviewer will act on, so the client can post a
+        # reassignment without a second round-trip per row.
+        names = {r["name"]: r["id"] for r in db.conn.execute(
+            "SELECT id, name FROM persons")}
+    for f in findings:
+        f["person_id"] = names.get(f["person"])
+        f["candidate_id"] = names.get(f["candidate"])
+    return {"findings": findings, "skipped": skipped, "stats": stats,
+            "decisive_count": sum(1 for f in findings if f["decisive"])}
+
+
 @app.get("/api/faces/person/{person_id}/inspect")
 def api_person_inspect(
     person_id: int,
