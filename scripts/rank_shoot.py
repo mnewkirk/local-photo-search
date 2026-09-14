@@ -1,0 +1,356 @@
+"""Rank one shoot's photos into a "best of" selection. Reusable per game.
+
+This reproduces the curation behind the Aug 29 2026 collections (ids 29/30/31),
+which was done ad-hoc and then lost. It recurs every match, so it lives here.
+
+    Best N   — sharp in-focus faces + real action, with per-person coverage
+    Next M   — no overlap, no two frames from the same burst
+    All N+M  — the union, for one upload
+
+WHY FACE-CROP LAPLACIAN AT NATIVE RESOLUTION IS THE PRIMARY SIGNAL
+
+Within a single shoot the usual rankers are inert or actively wrong:
+
+  - CLIP similarity is useless — every frame is the same kids on the same
+    pitch, so the embedding barely moves between a keeper and a dud.
+  - The MCP `rerank_photos` tool silently passes through on the NAS (no
+    PHOTOSEARCH_LLM_VISUAL_MODEL configured), and a local qwen2.5-vl
+    mode-collapses on Likert scoring.
+  - VLM aesthetics (`aes_overall`) is the right idea but is only scored on a
+    fraction of a fresh shoot, and a PARTIAL pass is worse than none here: it
+    covers whichever photos the fleet claimed first, so ranking on it would
+    systematically favour that arbitrary subset. This script refuses to use it
+    below --min-aes-coverage.
+
+What actually separates frames in a sports burst is whether the face is in
+focus, and that has to be measured on the ORIGINAL pixels — a downscaled
+preview or a cached 200px crop has already thrown the high-frequency detail
+away, which is precisely the signal. Hence one full-resolution decode per
+photo, which is the expensive part and is therefore cached.
+
+USAGE
+
+    # measure (slow, ~1 image decode per photo; cached, resumable)
+    python scripts/rank_shoot.py --date 2026-09-12 --measure
+
+    # select + preview, then create the collections
+    python scripts/rank_shoot.py --date 2026-09-12
+    python scripts/rank_shoot.py --date 2026-09-12 --apply
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — measure face sharpness at native resolution (the expensive part)
+# ---------------------------------------------------------------------------
+
+def measure(db, date_, cache_path, min_edge=60):
+    """Laplacian variance per face, from the ORIGINAL image. Cached + resumable.
+
+    One decode per PHOTO, not per face: a 60 MP JPEG costs seconds on the N100
+    and a frame can hold a dozen faces. Crops are taken from the EXIF-oriented
+    image because that is the space `faces.bbox_*` was computed in (see the
+    "EXIF-oriented image dimensions" note in CLAUDE.md) — using the raw
+    orientation would sample the wrong region on ~18% of the library.
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    Image.MAX_IMAGE_PIXELS = None
+
+    cache = {}
+    if os.path.exists(cache_path):
+        with open(cache_path) as fh:
+            cache = json.load(fh)
+        log(f"resuming from {cache_path}: {len(cache)} photos already measured")
+
+    rows = db.conn.execute(
+        """SELECT f.id AS face_id, f.photo_id, f.bbox_top, f.bbox_bottom,
+                  f.bbox_left, f.bbox_right, p.filepath
+             FROM faces f JOIN photos p ON p.id = f.photo_id
+            WHERE date(p.date_taken) = ?
+            ORDER BY f.photo_id, f.id""", (date_,)).fetchall()
+
+    by_photo = defaultdict(list)
+    for r in rows:
+        by_photo[r["photo_id"]].append(dict(r))
+    todo = [pid for pid in by_photo if str(pid) not in cache]
+    log(f"{len(by_photo)} photos with faces on {date_}; {len(todo)} left to measure")
+
+    for n, pid in enumerate(todo, 1):
+        faces = by_photo[pid]
+        path = db.resolve_filepath(faces[0]["filepath"])
+        out = {}
+        try:
+            with Image.open(path) as im0:
+                im = ImageOps.exif_transpose(im0)
+                W, H = im.size
+                for f in faces:
+                    t, b = int(f["bbox_top"] or 0), int(f["bbox_bottom"] or 0)
+                    l, r = int(f["bbox_left"] or 0), int(f["bbox_right"] or 0)
+                    if min(b - t, r - l) < min_edge:
+                        continue
+                    box = (max(0, l), max(0, t), min(W, r), min(H, b))
+                    if box[2] <= box[0] or box[3] <= box[1]:
+                        continue
+                    # Crop BEFORE converting: a 60 MP grayscale copy of the
+                    # whole frame would be ~60 MB per photo for no reason.
+                    g = np.asarray(im.crop(box).convert("L"))
+                    out[str(f["face_id"])] = {
+                        "lap": float(cv2.Laplacian(g, cv2.CV_64F).var()),
+                        "edge": int(min(b - t, r - l)),
+                        "area_frac": float(((b - t) * (r - l)) / max(1, W * H)),
+                    }
+        except Exception as exc:                      # unreadable → empty, not fatal
+            log(f"  ! photo {pid}: {exc}")
+        cache[str(pid)] = out
+        if n % 25 == 0 or n == len(todo):
+            with open(cache_path, "w") as fh:
+                json.dump(cache, fh)
+            log(f"  measured {n}/{len(todo)} photos")
+    with open(cache_path, "w") as fh:
+        json.dump(cache, fh)
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — score + select
+# ---------------------------------------------------------------------------
+
+def _pct_ranks(values):
+    """Map values -> percentile in [0,1]. Percentiles, not raw units, because
+    Laplacian variance, pixel edge and det_score share no scale and their
+    distributions differ per shoot; ranking makes the weights mean something.
+    """
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    out = [0.0] * len(values)
+    for rank, i in enumerate(order):
+        out[i] = rank / max(1, len(values) - 1)
+    return out
+
+
+def build_bursts(photos, gap_seconds):
+    """Group time-ordered photos into bursts; a gap > `gap_seconds` starts one.
+
+    Derived from timestamps rather than `photo_stacks` on purpose: a fresh
+    shoot has not been stacked (0 stacks on 2026-09-12), and running scoped
+    stacking to get them has twice wiped the whole library's stacks. This is
+    self-contained and has no global side effects.
+    """
+    ordered = sorted((p for p in photos if p["date_taken"]),
+                     key=lambda p: p["date_taken"])
+    bursts, cur, prev = [], [], None
+    for p in ordered:
+        t = datetime.fromisoformat(p["date_taken"][:19])
+        if prev is not None and (t - prev).total_seconds() > gap_seconds:
+            bursts.append(cur); cur = []
+        cur.append(p); prev = t
+    if cur:
+        bursts.append(cur)
+    for p in photos:
+        if not p["date_taken"]:
+            bursts.append([p])           # undated: its own burst
+    return bursts
+
+
+def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
+           min_aes_coverage=0.80):
+    rows = db.conn.execute(
+        """SELECT p.id, p.filename, p.date_taken, p.aesthetic_score, p.aes_overall
+             FROM photos p WHERE date(p.date_taken) = ? ORDER BY p.date_taken""",
+        (date_,)).fetchall()
+    photos = {r["id"]: dict(r) for r in rows}
+    if not photos:
+        raise SystemExit(f"no photos on {date_}")
+
+    face_rows = db.conn.execute(
+        """SELECT f.id AS face_id, f.photo_id, f.det_score, f.person_id,
+                  pe.name AS person_name
+             FROM faces f JOIN photos p ON p.id = f.photo_id
+             LEFT JOIN persons pe ON pe.id = f.person_id
+            WHERE date(p.date_taken) = ?""", (date_,)).fetchall()
+
+    # --- per-photo raw signals, taken from the photo's BEST face -----------
+    for p in photos.values():
+        p.update(lap=0.0, edge=0, area=0.0, det=0.0, people=set())
+    for fr in face_rows:
+        m = (cache.get(str(fr["photo_id"])) or {}).get(str(fr["face_id"]))
+        p = photos[fr["photo_id"]]
+        if fr["person_name"]:
+            p["people"].add(fr["person_name"])
+        if not m:
+            continue
+        # "Best face" = sharpest. A frame is worth keeping if ONE face is
+        # crisp; averaging would punish a good subject for a blurred bystander.
+        if m["lap"] > p["lap"]:
+            p.update(lap=m["lap"], edge=m["edge"], area=m["area_frac"],
+                     det=float(fr["det_score"] or 0.0))
+
+    import math
+    ids = [pid for pid, p in photos.items() if p["lap"] > 0]
+    if not ids:
+        raise SystemExit("no measured faces — run --measure first")
+
+    aes_cov = sum(1 for pid in ids if photos[pid]["aes_overall"] is not None) / len(ids)
+    use_aes = aes_cov >= min_aes_coverage
+    laion = [photos[i]["aesthetic_score"] for i in ids]
+    have_laion = [v for v in laion if v is not None]
+    med_laion = sorted(have_laion)[len(have_laion) // 2] if have_laion else 0.0
+
+    sharp = _pct_ranks([math.log1p(photos[i]["lap"]) for i in ids])
+    size = _pct_ranks([photos[i]["edge"] for i in ids])
+    det = _pct_ranks([photos[i]["det"] for i in ids])
+    aest = _pct_ranks([
+        (photos[i]["aes_overall"] if use_aes and photos[i]["aes_overall"] is not None
+         else (photos[i]["aesthetic_score"] if photos[i]["aesthetic_score"] is not None
+               else med_laion))
+        for i in ids])
+    # Multi-player frames stand in for "action": a contested ball has several
+    # kids in it, an isolated portrait does not. A PROXY, not a detector —
+    # capped and lightly weighted so it can't dominate.
+    crowd = _pct_ranks([min(len(photos[i]["people"]), 3) for i in ids])
+
+    for k, pid in enumerate(ids):
+        photos[pid]["score"] = (0.50 * sharp[k] + 0.22 * size[k] + 0.13 * det[k]
+                                + 0.10 * aest[k] + 0.05 * crowd[k])
+        photos[pid]["parts"] = {"sharp": round(sharp[k], 3), "size": round(size[k], 3),
+                                "det": round(det[k], 3), "aes": round(aest[k], 3),
+                                "crowd": round(crowd[k], 3)}
+
+    scored = [photos[i] for i in ids]
+    bursts = build_bursts(scored, burst_gap)
+    log(f"{len(scored)} scored photos in {len(bursts)} bursts "
+        f"(gap {burst_gap}s); aesthetics coverage {aes_cov:.0%} -> "
+        f"{'VLM aes_overall' if use_aes else 'LAION aesthetic_score'}")
+    if len(bursts) < best_n + next_n:
+        log(f"  ! only {len(bursts)} bursts for {best_n + next_n} slots — the "
+            f"one-per-burst rule cannot fill the request; lower --burst-gap")
+
+    # One representative per burst: the best frame of each press.
+    reps = sorted((max(b, key=lambda p: p["score"]) for b in bursts),
+                  key=lambda p: -p["score"])
+
+    best = reps[:best_n]
+    # Per-person coverage: swap the weakest picks for the strongest frames of
+    # anyone short of `min_per_person`. Applied AFTER ranking — it is a
+    # constraint on the set, not a term in the score.
+    have = defaultdict(int)
+    for p in best:
+        for n in p["people"]:
+            have[n] += 1
+    everyone = {n for p in scored for n in p["people"]}
+    chosen = {p["id"] for p in best}
+    for name in sorted(everyone, key=lambda n: have[n]):
+        pool = [p for p in reps if name in p["people"] and p["id"] not in chosen]
+        while have[name] < min_per_person and pool:
+            add = pool.pop(0)
+            # Drop the weakest pick that isn't itself propping someone up.
+            droppable = [p for p in reversed(best)
+                         if all(have[n] > min_per_person for n in p["people"])]
+            if not droppable:
+                break
+            drop = droppable[0]
+            best.remove(drop); chosen.discard(drop["id"])
+            for n in drop["people"]:
+                have[n] -= 1
+            best.append(add); chosen.add(add["id"])
+            for n in add["people"]:
+                have[n] += 1
+    best.sort(key=lambda p: -p["score"])
+    nxt = [p for p in reps if p["id"] not in chosen][:next_n]
+    return best, nxt, scored
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB", "photo_index.db"))
+    ap.add_argument("--date", required=True, metavar="YYYY-MM-DD")
+    ap.add_argument("--cache", default=None, help="Sharpness cache JSON.")
+    ap.add_argument("--measure", action="store_true",
+                    help="Run the native-resolution sharpness pass and exit.")
+    ap.add_argument("--best", type=int, default=50)
+    ap.add_argument("--next", dest="next_n", type=int, default=200)
+    ap.add_argument("--min-per-person", type=int, default=3)
+    ap.add_argument("--burst-gap", type=float, default=1.0,
+                    help="Seconds between frames that still counts as one burst.")
+    ap.add_argument("--label", default=None, help="Collection name prefix.")
+    ap.add_argument("--apply", action="store_true", help="Create the collections.")
+    args = ap.parse_args()
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from photosearch.db import PhotoDB
+
+    cache_path = args.cache or f"/data/rank_shoot_{args.date}.json"
+    with PhotoDB(args.db) as db:
+        if args.measure:
+            measure(db, args.date, cache_path)
+            log("measurement complete")
+            return
+        if not os.path.exists(cache_path):
+            raise SystemExit(f"no cache at {cache_path} — run --measure first")
+        with open(cache_path) as fh:
+            cache = json.load(fh)
+
+        best, nxt, scored = select(
+            db, args.date, cache, best_n=args.best, next_n=args.next_n,
+            min_per_person=args.min_per_person, burst_gap=args.burst_gap)
+
+        def coverage(sel):
+            c = defaultdict(int)
+            for p in sel:
+                for n in p["people"]:
+                    c[n] += 1
+            return dict(sorted(c.items(), key=lambda kv: -kv[1]))
+
+        log(f"\nBest {len(best)}  — person coverage:")
+        for n, k in coverage(best).items():
+            log(f"    {n:<22} {k}")
+        log(f"\nNext {len(nxt)} — person coverage:")
+        for n, k in coverage(nxt).items():
+            log(f"    {n:<22} {k}")
+        log(f"\ntop 10 of Best:")
+        for p in best[:10]:
+            log(f"    {p['filename']:<16} score={p['score']:.3f} {p['parts']} "
+                f"{sorted(p['people'])}")
+
+        if not args.apply:
+            log("\nDRY RUN — nothing written. Re-run with --apply.")
+            return
+
+        label = args.label or f"Soccer Game - {args.date}"
+        made = []
+        for name, sel, desc in (
+            (f"{label} - Best {len(best)}", best,
+             f"Top {len(best)} from {args.date}, ranked on native-resolution face "
+             f"sharpness, face size and detection confidence, with at least "
+             f"{args.min_per_person} frames of every face-matched person and no two "
+             f"frames from the same burst."),
+            (f"{label} - Next {len(nxt)}", nxt,
+             f"Second tier from {args.date}. No overlap with the Best {len(best)} "
+             f"and no two frames from the same burst. Same ranking."),
+            (f"{label} - All {len(best) + len(nxt)}", best + nxt,
+             f"Everything from the two tiers in one album: the full curated set "
+             f"from {args.date}."),
+        ):
+            cid = db.create_collection(name, desc)
+            db.add_photos_to_collection(cid, [p["id"] for p in sel])
+            made.append((cid, name, len(sel)))
+            log(f"  created collection {cid}: {name} ({len(sel)} photos)")
+        log("\ndone: " + ", ".join(f"{c} {n}" for c, n, _ in made))
+
+
+if __name__ == "__main__":
+    main()
