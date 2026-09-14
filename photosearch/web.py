@@ -1852,13 +1852,20 @@ def _mirror_face_labels(face_ids: list[int], person_name: Optional[str]) -> dict
     """
     if not face_ids:
         return {"relabelled": 0}
+    from .faces import REJECTED_MATCH_SOURCE
     with _get_db() as db:
         if person_name:
             person = db.get_person_by_name(person_name)
             pid = person["id"] if person else db.add_person(person_name)
             src = "manual"
         else:
-            pid, src = None, None
+            # Must match what the NAS wrote for a clear, not NULL. This mirror
+            # duplicates the authoritative write's semantics rather than reading
+            # them back, so a divergence here is silent: the NAS recorded the
+            # rejection and the replica showed a never-matched face, which a
+            # replica-side face-state export would then ship back up as "no
+            # opinion" and undo the rejection.
+            pid, src = None, REJECTED_MATCH_SOURCE
         for i in range(0, len(face_ids), 500):
             batch = face_ids[i:i + 500]
             ph = ",".join("?" * len(batch))

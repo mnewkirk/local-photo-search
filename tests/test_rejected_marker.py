@@ -209,3 +209,32 @@ def test_verify_labels_endpoint_resolves_person_ids(client, db, monkeypatch):
     assert "findings" in d and "stats" in d and "decisive_count" in d
     for f in d["findings"]:
         assert f["person_id"] is not None
+
+
+def test_mirror_writes_the_same_marker_the_nas_does(monkeypatch, db, tmp_path):
+    """The replica mirror must not invent its own semantics for a clear.
+
+    It duplicates the authoritative write rather than reading it back, so a
+    divergence is SILENT: the NAS recorded 'rejected' while the replica showed a
+    never-matched face — and a replica-side face-state export would then ship
+    that back up as "no opinion" and quietly undo the rejection.
+    """
+    from photosearch import web
+    monkeypatch.setattr(web, "_db_path", db.db_path)
+    fid = db._test_face_ids["alex_894"]
+    web._mirror_face_labels([fid], None)
+    row = db.conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?",
+                          (fid,)).fetchone()
+    assert row["person_id"] is None
+    assert row["match_source"] == REJECTED_MATCH_SOURCE
+
+
+def test_mirror_still_writes_manual_for_an_assignment(monkeypatch, db):
+    from photosearch import web
+    monkeypatch.setattr(web, "_db_path", db.db_path)
+    fid = db._test_face_ids["unknown_878"]
+    web._mirror_face_labels([fid], "Alex")
+    row = db.conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?",
+                          (fid,)).fetchone()
+    assert row["person_id"] == db._test_person_ids["Alex"]
+    assert row["match_source"] == "manual"
