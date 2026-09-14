@@ -166,7 +166,7 @@ def build_bursts(photos, gap_seconds):
 
 
 def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
-           min_aes_coverage=0.80):
+           max_per_person=None, min_aes_coverage=0.80):
     rows = db.conn.execute(
         """SELECT p.id, p.filename, p.date_taken, p.aesthetic_score, p.aes_overall
              FROM photos p WHERE date(p.date_taken) = ? ORDER BY p.date_taken""",
@@ -242,18 +242,54 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
     reps = sorted((max(b, key=lambda p: p["score"]) for b in bursts),
                   key=lambda p: -p["score"])
 
-    best = reps[:best_n]
+    # --- fill the Best tier ------------------------------------------------
+    # `max_per_person` stops one well-photographed kid owning the album. On
+    # 2026-09-12 the uncapped run gave Calvin 16 of 50 — everyone still cleared
+    # the >=3 floor, but it read as a Calvin album rather than a team one.
+    # A photo with no named player consumes nobody's quota, so it is never
+    # blocked by the cap.
+    have = defaultdict(int)
+    chosen = set()
+    best = []
+
+    def _fits(p):
+        return (max_per_person is None
+                or all(have[n] < max_per_person for n in p["people"]))
+
+    def _take(p):
+        best.append(p); chosen.add(p["id"])
+        for n in p["people"]:
+            have[n] += 1
+
+    for p in reps:
+        if len(best) >= best_n:
+            break
+        if _fits(p):
+            _take(p)
+    # If the cap is tight enough that the tier can't be filled, fall back to
+    # score order for the remainder rather than returning a short album —
+    # and say so, because a silently short set would look like a bug.
+    if len(best) < best_n:
+        short = best_n - len(best)
+        for p in reps:
+            if len(best) >= best_n:
+                break
+            if p["id"] not in chosen:
+                _take(p)
+        log(f"  ! cap {max_per_person} left the Best tier {short} short; "
+            f"filled the remainder by score, so some people exceed the cap")
+
     # Per-person coverage: swap the weakest picks for the strongest frames of
     # anyone short of `min_per_person`. Applied AFTER ranking — it is a
     # constraint on the set, not a term in the score.
-    have = defaultdict(int)
-    for p in best:
-        for n in p["people"]:
-            have[n] += 1
     everyone = {n for p in scored for n in p["people"]}
-    chosen = {p["id"] for p in best}
     for name in sorted(everyone, key=lambda n: have[n]):
-        pool = [p for p in reps if name in p["people"] and p["id"] not in chosen]
+        pool = [p for p in reps
+                if name in p["people"] and p["id"] not in chosen
+                # don't fix one person's shortfall by blowing another's cap
+                and (max_per_person is None
+                     or all(have[o] < max_per_person
+                            for o in p["people"] if o != name))]
         while have[name] < min_per_person and pool:
             add = pool.pop(0)
             # Drop the weakest pick that isn't itself propping someone up.
@@ -265,9 +301,7 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
             best.remove(drop); chosen.discard(drop["id"])
             for n in drop["people"]:
                 have[n] -= 1
-            best.append(add); chosen.add(add["id"])
-            for n in add["people"]:
-                have[n] += 1
+            _take(add)
     best.sort(key=lambda p: -p["score"])
     nxt = [p for p in reps if p["id"] not in chosen][:next_n]
     return best, nxt, scored
@@ -284,6 +318,10 @@ def main():
     ap.add_argument("--best", type=int, default=50)
     ap.add_argument("--next", dest="next_n", type=int, default=200)
     ap.add_argument("--min-per-person", type=int, default=3)
+    ap.add_argument("--max-per-person", type=int, default=None,
+                    help="Cap how many Best-tier frames any one person can take. "
+                         "Off by default. Stops one well-photographed kid owning "
+                         "the album (Calvin took 16 of 50 uncapped on 2026-09-12).")
     ap.add_argument("--burst-gap", type=float, default=1.0,
                     help="Seconds between frames that still counts as one burst.")
     ap.add_argument("--label", default=None, help="Collection name prefix.")
@@ -306,7 +344,8 @@ def main():
 
         best, nxt, scored = select(
             db, args.date, cache, best_n=args.best, next_n=args.next_n,
-            min_per_person=args.min_per_person, burst_gap=args.burst_gap)
+            min_per_person=args.min_per_person, burst_gap=args.burst_gap,
+            max_per_person=args.max_per_person)
 
         def coverage(sel):
             c = defaultdict(int)
@@ -336,8 +375,9 @@ def main():
             (f"{label} - Best {len(best)}", best,
              f"Top {len(best)} from {args.date}, ranked on native-resolution face "
              f"sharpness, face size and detection confidence, with at least "
-             f"{args.min_per_person} frames of every face-matched person and no two "
-             f"frames from the same burst."),
+             f"{args.min_per_person} frames of every face-matched person"
+             + (f" and at most {args.max_per_person}" if args.max_per_person else "")
+             + f", and no two frames from the same burst."),
             (f"{label} - Next {len(nxt)}", nxt,
              f"Second tier from {args.date}. No overlap with the Best {len(best)} "
              f"and no two frames from the same burst. Same ranking."),
