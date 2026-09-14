@@ -234,7 +234,19 @@ ArcFace produces L2-normalized 512-dimensional vectors. Matching uses L2 distanc
 
 - **Standard matching (tolerance 1.15):** Calibrated on sample photos where same-person distances ranged 0.88–1.11 and different-person distances started at 1.31+. The 1.15 threshold captures all confirmed matches with a 0.16+ gap before the first false positive.
 
-- **Temporal propagation (tolerance 1.45):** A second pass for faces that are too small or angled for confident auto-matching. Uses EXIF timestamps to check whether the best-matching person appears in a photo taken within 30 minutes. Requires both a clear distance gap to the second-best person AND temporal proximity — two constraints that prevent false positives in crowds.
+- **Temporal propagation (tolerance 1.45):** A second pass for faces that are too small or angled for confident auto-matching. Uses EXIF timestamps to check whether the best-matching person appears in a photo taken within 30 minutes. Requires both a clear distance gap to the second-best person AND temporal proximity.
+
+> **Temporal matching is unreliable when many similar-looking people share one event.** Hand-verified on a youth soccer shoot: the strict pass was **14/14 correct**, the temporal pass **1/26**. Both constraints are satisfied when a whole team of same-age children is on the same pitch within the same minute — proximity and a distance gap say nothing about identity there. Treat `match_source='temporal'` as a *lead*, not a label, on any group event, and verify before relying on it. A face a human clears is recorded as `match_source='rejected'` so a later matching run cannot silently re-apply it.
+
+### Verifying labels
+
+Distance to one person is not enough to catch a mislabel; what works is comparing a face against *everyone else present* and calibrating against how close those two people genuinely get:
+
+```bash
+photosearch verify-face-labels --date-from 2026-09-12 --date-to 2026-09-12
+```
+
+A face closer to person Q than P and Q ever get to each other is flagged **DECISIVE**. This needs no distance threshold and no clustering radius — which is why it finds errors the threshold-based tools miss. On one real shoot it reduced 397 hand-applied labels to 8 suspects, all genuine. Same thing in the browser via **🔍 Verify labels** on `/faces`, which shows the disputed crop beside both candidate identities so the call takes seconds.
 
 ### Workflow
 
@@ -252,6 +264,9 @@ python cli.py match-faces --temporal
 # 4. Review and correct mistakes
 python cli.py diagnose-photo DSC04922.JPG
 python cli.py correct-face DSC04907.JPG 2 "Alex"
+
+# 4b. Check for labels that look more like someone else
+python cli.py verify-face-labels --date-from 2026-09-12 --date-to 2026-09-12
 
 # 5. Search by person
 python cli.py search --person "Alex"

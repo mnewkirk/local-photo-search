@@ -22,7 +22,7 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 28. Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 29 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
 review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
 (v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
@@ -1398,6 +1398,151 @@ groups** (top ones 32, 27, 26, 23, 23) + 237 ungrouped.
   day's labels first, or set the hue manually in the panel.
 - **The "Ungrouped" bucket is not assignable.** It is DBSCAN noise — many
   different people — and naming it wholesale would be catastrophic.
+
+## Face-label integrity: is this face actually that person?
+
+Three tools, and the differences between them matter — they fail in different
+places and were each added because the previous one missed something real.
+
+| tool | question | needs tuning? |
+|---|---|---|
+| `label-conflicts` (`GET /api/faces/label-conflicts`) | does a cluster mix two names? | **yes** — eps |
+| person inspector (`/inspect`) | which of P's faces are unlike P? | **yes** — eps |
+| `verify-person-matches` | which of P's faces are far from P? | **yes** — `--min-dist` |
+| **`verify-face-labels`** | **is this face closer to someone else than P and they ever get?** | **no** |
+
+**`verify-face-labels` is the one to reach for first.** `photosearch/face_verify.py`,
+`GET /api/faces/verify-labels`, and the **🔍 Verify labels** panel on `/faces`
+(any date range). For each labelled face it measures the distance to its own
+person's references *and* to every other person in scope, then calibrates
+against how close those two people genuinely get:
+
+```
+margin   = d_own - d_other                  > 0  -> looks more like someone else
+decisive = d_other < separation(P, Q)       closer to Q than P and Q ever get
+```
+
+It exists because on 2026-09-12 two faces hand-labelled **Oliver Munoz** were
+really **Franklin Martinez**, and the other tools missed them:
+`verify-person-matches` compares against a global 1.30 while the faces sat at
+1.16, and `label-conflicts` reported **zero** at its default eps=0.80 (it only
+surfaced at 0.85/0.95). A single global threshold cannot be right for both a
+pair of lookalike 8-year-olds and two unrelated adults; the per-pair
+calibration can.
+
+Four implementation details that are load-bearing:
+
+- **Leave-one-BURST-out, not leave-one-face-out.** The first version failed its
+  own motivating case: the two mislabelled faces were 1s apart in one burst, so
+  each one's nearest "Oliver" reference was *the other impostor* at 0.579,
+  collapsing the margin below zero and hiding the error completely. Excluding
+  the burst gives 1.156 and it is decisive. `BURST_WINDOW_SECONDS = 3`.
+- **References are `manual` + `strict` only.** `temporal` is ~4% accurate on
+  these shoots and would poison the baseline the whole test rests on.
+- **`separation` is the 5th percentile, not `min()`.** One bad label on either
+  side drags a raw min to ~0 and silently disables the pair — surfacing as "no
+  conflicts found", the most dangerous possible failure.
+- **No VLM in the decision path.** `evals/vlm_face_compare.py` plus the
+  AdaFace/MagFace/QMagFace bake-offs already showed none of them separate the
+  hard cases. The calibration handles that regime by going quiet: lookalikes
+  have a small separation, so the bar to accuse rises automatically.
+
+Measured on 2026-09-12: 397 manual labels → **8 flagged (2%), all decisive**,
+the known ground-truth pair at #2 and #4. Design + the full case:
+`docs/plans/face-label-verification.md`.
+
+### `match_source='rejected'` — a human "no" that survives auto-matching
+
+`faces.REJECTED_MATCH_SOURCE`. Written whenever a person clears a face
+(`POST /api/faces/{id}/clear`, or `bulk-assign` with a null name, which is what
+the Verify-labels **Reject** button posts), and filtered out of **both** matcher
+candidate queries via the shared `faces.MATCHABLE_SQL`.
+
+This exists because on 2026-09-14 a routine `match_faces` sweep re-applied 164
+Calvin temporal matches that had been deliberately removed the day before. The
+only marker available then was `dedupe_unmatched`, which the matchers never
+consulted, and a plain `NULL` is indistinguishable from never-matched.
+
+**Deliberately distinct from `dedupe_unmatched`.** That is
+`resolve-duplicate-persons`' automatic tie-break when it keeps one face per
+(photo, person); the losing face may legitimately match a *different* person
+later, so it stays matchable. Filtering it instead was the tempting one-line fix
+and would have frozen ~9.6k faces from the June cleanup out of matching forever.
+
+`MATCHABLE_SQL` is shared **because the bug was one query, not both** — strict
+and temporal each had their own `person_id IS NULL`, and a fix applied to one
+would have looked complete. A test asserts both use the shared fragment.
+
+**Replica gotcha:** `web._mirror_face_labels` duplicates the authoritative
+write's semantics rather than reading them back, so it had to be taught
+`rejected` too. It silently wrote `NULL` locally while the NAS recorded the
+rejection — and a replica-side face-state export would then ship that back up as
+"no opinion" and undo the rejection by a longer route.
+
+## Per-shoot "best of" curation — `scripts/rank_shoot.py`
+
+Reusable ranking for one match/shoot, producing `Best N` / `Next M` / `All N+M`
+collections. The Aug 29 2026 version of this was ad-hoc and lost, so it had to
+be reverse-engineered from the collection descriptions; it is a script now.
+
+```bash
+# measure (slow: one full-res decode per photo; cached + resumable)
+python scripts/rank_shoot.py --date 2026-09-12 --measure
+# select, preview, then create
+python scripts/rank_shoot.py --date 2026-09-12 [--max-per-person 6]
+python scripts/rank_shoot.py --date 2026-09-12 --max-per-person 6 --apply
+```
+
+**Native-resolution face-crop Laplacian is the primary signal**, because within
+one shoot every other ranker is inert or wrong: CLIP barely moves between a
+keeper and a dud (same kids, same pitch); MCP `rerank_photos` silently passes
+through on the NAS (no visual model configured) and local qwen2.5-vl
+mode-collapses on Likert scoring. What separates frames in a sports burst is
+whether the face is in focus, and that must be measured on the **original**
+pixels — a preview or a cached 200px crop has already discarded the signal.
+919 photos ≈ 6 min on the N100.
+
+Things that will bite if changed carelessly:
+
+- **A partial VLM-aesthetics pass is worse than none.** It covers whichever
+  photos the fleet claimed first, so ranking on it favours that arbitrary
+  subset. The script refuses `aes_overall` below `--min-aes-coverage` (0.80)
+  and falls back to the LAION score.
+- **Bursts come from timestamps, not `photo_stacks`** — a fresh shoot has no
+  stacks, and scoped stacking has twice wiped the library's. `--burst-gap`
+  defaults to **1s** because the data forces it: on 2026-09-12 a 2s gap leaves
+  only 200 bursts, and "no two frames from one burst" then makes 250 photos
+  impossible (1s→341, 2s→200, 3s→156, 5s→105).
+- Signals are **percentile-ranked before weighting** — Laplacian variance,
+  pixel edge and det_score share no scale.
+- `--min-per-person` / `--max-per-person` are constraints applied **after**
+  ranking, not score terms. Uncapped on 2026-09-12 Calvin took 16 of 50.
+- The multi-player term is a lightly-weighted **proxy** for action, not a
+  detector. There is no real action signal without the LLM passes.
+
+## Frontend has no linter — `scripts/check-frontend-refs.js`
+
+The pages are plain React UMD with no build step, so a helper referenced from
+the wrong page is a `ReferenceError` that only appears when someone clicks the
+button. **A syntax check does not catch it** — `new Function(src)` happily
+accepts a call to an undefined name, which is exactly how a bare
+`parseSSEChunk` (defined only in `admin_maintenance.html`) shipped in
+`faces.html`.
+
+```bash
+node scripts/check-frontend-refs.js     # or: cd frontend && npm run check:refs
+```
+
+It flags bare `name(` calls nothing in that script binds, plus `PS.*` calls
+naming something `shared.js` never defines. Wired into CI in the jest job and
+into pytest (`tests/test_frontend_refs.py`). Two notes for anyone editing it:
+comments and strings are blanked in **one left-to-right scan**, not layered
+regexes (either order invents phantom names); and `shared.js` is an **IIFE**, so
+only `window.PS` escapes — the first version collected its inner names as
+globals and therefore *passed the very bug it was written for*.
+
+**Shared frontend helpers go on `PS.*` in `shared.js`**, never copied between
+pages.
 
 ## Splitting attractor clusters (M18)
 

@@ -93,12 +93,12 @@ local-photo-search/
 
 ---
 
-## Database Schema (v28)
+## Database Schema (v29)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
 > (v25), the VLM aesthetics `aes_*` columns (v26), and per-day aesthetic
-> percentile normalization (v28). `SCHEMA_VERSION` in `db.py` is the source of
+> percentile normalization (v28), `maintenance_runs` (v29). `SCHEMA_VERSION` in `db.py` is the source of
 > truth — currently **28**. See CLAUDE.md for the aesthetics + folder details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
@@ -246,17 +246,60 @@ need cross-recluster persistence.
   "Filter clusters:" bar — turns cluster triage into a searchable workflow.
 - `GET /api/faces/group-info?cluster_id=N | person_id=N` — Single group metadata
   (used by `/faces?cluster_id=N` auto-open; works for hidden singletons + unloaded pages)
-- `GET /api/faces/group/{type}/{id}/photos` — Photos for a person or cluster
+- `GET /api/faces/group/{type}/{id}/photos` — Photos for a person or cluster.
+  Takes the SAME content filters as `/api/faces/groups`
+  (`date_from`/`date_to`/`location`/`q`/`person`/`camera`) and applies them to
+  **every** group type. They used to be accepted and silently ignored for
+  person/cluster, so opening a name from a one-day `/faces` view loaded that
+  person's whole library (Calvin: 18,417 photos). The response carries
+  `filtered` + `total_unfiltered` so the UI can say "29 of 18,417" and offer to
+  widen — without the denominator, "narrowed to 29" and "this person only has
+  29 photos" look identical on screen. Capped at `limit` (default 10,000); the
+  UI labels a truncated widen rather than silently delivering less than the
+  button promised.
+- `GET /api/faces/verify-labels` — **labelled faces that look more like someone
+  else in the same scope** (M32). Scope required. Backs the 🔍 Verify labels
+  panel. Needs no eps and no distance threshold: each face is compared against
+  every other person present and calibrated against how close those two people
+  genuinely get. Returns `margin`, `separation`, `decisive`, `alibi_excluded`
+  and the nearest reference face-ids for both identities so the reviewer sees
+  the strongest case for each side by side. See
+  `docs/plans/face-label-verification.md`.
+- `POST /api/faces/review-team` — **SSE**; the `review-faces` CLI as an endpoint
+  (M32). Samples the jersey colour below each face, keeps the ones matching the
+  team, DBSCANs the survivors into nameable groups. Previews are fetched via
+  `web._preview_bytes` (in-process), NOT over HTTP — the NAS would otherwise
+  issue ~800 requests to itself, and going through `_get_or_create_preview`
+  lets the replica reuse its on-disk preview cache. Terminal events:
+  done/cancelled/fatal.
 - `GET /api/faces/crop/{face_id}` — Face crop image (disk-cached)
 - `GET /api/faces/face-detail/{face_id}` — Photo id + bbox + dimensions for
   overlays. `image_width`/`image_height` are stored EXIF-oriented (swapped for
   orientation 5-8), matching the bbox + preview space so overlays line up.
 - `POST /api/faces/{face_id}/assign` — Assign face to person
-- `POST /api/faces/{face_id}/clear` — Clear assignment
+- `POST /api/faces/{face_id}/clear` — Clear assignment. Writes
+  `match_source='rejected'` (`faces.REJECTED_MATCH_SOURCE`), **not NULL** —
+  NULL is indistinguishable from never-matched, so the next `match-faces` run
+  re-applies the very person just removed. Both matcher candidate queries
+  filter it out via the shared `faces.MATCHABLE_SQL`.
+- `POST /api/faces/bulk-assign` — `{face_ids, person_name}`; a null/empty name
+  CLEARS (and marks `rejected`, as above). The write primitive behind the
+  person inspector, team review and label verification.
 - `POST /api/faces/bulk-collect` — Bulk assign unassigned faces
 - `POST /api/faces/ignore` / `POST /api/faces/unignore` — Ignore/restore clusters
 - `POST /api/faces/clusters/{id}/split` — Re-run DBSCAN with tighter eps on
   one cluster (body `{eps, min_samples, dry_run}`)
+- `GET /api/faces/person/{id}/inspect` — sub-structure of ONE person's faces
+  for spotting wrong ones. Takes `date_from`/`date_to`: DBSCAN runs on the
+  **scoped** faces (so the groups are "the different kids that day") but the
+  reference core is built from the person's **full trusted set** — scope the
+  core too and you measure the suspect faces against themselves. A scoped call
+  with no explicit `eps` defaults to **0.90 / min_samples 2**; the library's
+  0.50 groups *nothing* on one day (measured on 212 real faces: 0.50 → 0
+  clusters/212 noise, 0.90 → 20 clusters/100 grouped).
+- `GET /api/faces/label-conflicts` — clusters holding two or more DIFFERENT
+  named people. Scope required. **Sweep the eps**: on 2026-09-12 the default
+  0.80 reported zero and the real mislabel only appeared at 0.85/0.95.
 - `GET /api/faces/manual-assignments` / `POST /api/faces/import-assignments`
   — Export/import manual face-to-person assignments
 
@@ -651,6 +694,52 @@ docker ps | grep photosearch
 curl -s http://localhost:8000/api/admin/version | python3 -m json.tool | head -15
 ```
 
+### /faces review panels (M32)
+
+`/faces` round-trips its content filters through the **URL**
+(`date_from`/`date_to`/`location`/`q`/`camera`), so a shoot review survives a
+reload and is shareable:
+
+```
+/faces?filter=named&date_from=2026-09-12&date_to=2026-09-12
+```
+
+They did not used to: a reload dropped you back to the unfiltered library, and
+reviewing one shoot meant re-typing the date every refresh. Apply/Clear use
+`replaceState` so the history does not fill up, and a navigation-only
+`updateUrl` falls back to the URL's existing filters so opening a cluster
+cannot silently drop the shoot.
+
+Three panels, all opened from the filter bar:
+
+- **Inspect** (on a person group) — sub-clusters that person's faces, scores
+  each by distance to their core, bulk unassign/reassign. Inherits the page's
+  date filter; states its scope ("showing 196 of 20,575") because it
+  bulk-unassigns and a hidden scope would be the wrong thing to hide. Radius
+  dropdown, since the useful eps is shoot-dependent.
+- **🔍 Verify labels** — any date range. One row per suspect: the disputed crop,
+  the identity it CARRIES, the identity it LOOKS LIKE, nearest references first
+  on each side. Reassign / Reject / Keep. Reject records `rejected`, so
+  auto-matching cannot put the label back.
+- **⚽ Review team faces** — single day only (it learns ONE jersey colour; a
+  range would average two kits). Groups the day's unknown team faces so you
+  name a handful of groups instead of a thousand crops. The hue is learned from
+  faces already named that day, so **clean the day's labels first** or it learns
+  from garbage; there is a manual hue override. The "Ungrouped" bucket is
+  rendered but deliberately NOT assignable — it is DBSCAN noise, many different
+  people.
+
+### Frontend has no linter — run `scripts/check-frontend-refs.js`
+
+No build step and no bundler, so a helper referenced from the wrong page is a
+runtime `ReferenceError` nothing catches. A syntax check does **not** find it:
+`new Function(src)` accepts calls to undefined names, which is how a bare
+`parseSSEChunk` (defined only in `admin_maintenance.html`) shipped in
+`faces.html`. `node scripts/check-frontend-refs.js` (also
+`cd frontend && npm run check:refs`) flags those plus `PS.*` calls naming
+something `shared.js` never defines. In CI via the jest job and pytest.
+**Shared helpers belong on `PS.*` in `shared.js`, never copied between pages.**
+
 ### /faces URL params (deep-linkable)
 
 - `?name=<Person>` — open named-person detail
@@ -689,6 +778,26 @@ with `--base-url` and they always resolve.
   (stable across reclusters). Accepts persist in the DB.
 
 ---
+
+## Per-shoot curation and label checking (CLI)
+
+```bash
+# Which labelled faces look more like someone ELSE? No eps, no threshold.
+photosearch verify-face-labels --date-from 2026-09-12 --date-to 2026-09-12 \
+    [--decisive-only] [--person NAME] [--min-references 3]
+
+# "Best of" a match: Best 50 / Next 200 / All 250 collections.
+python scripts/rank_shoot.py --date 2026-09-12 --measure        # slow, cached
+python scripts/rank_shoot.py --date 2026-09-12 --max-per-person 6
+python scripts/rank_shoot.py --date 2026-09-12 --max-per-person 6 --apply
+```
+
+`rank_shoot.py` ranks on **native-resolution face-crop Laplacian** because
+within one shoot CLIP is inert (same kids, same pitch), MCP `rerank_photos`
+passes through on the NAS, and a partial VLM-aesthetics pass is worse than none
+(it covers whichever photos the fleet claimed first). Bursts come from
+timestamps, not `photo_stacks` — a fresh shoot has none, and scoped stacking has
+twice wiped the library's. Full rationale in the script docstring and CLAUDE.md.
 
 ## NAS Operations
 
