@@ -784,13 +784,8 @@
       recluster: 'Recluster unknown faces',
     };
 
-    function parseSSEChunk(chunk) {
-      var trimmed = chunk.trim();
-      if (!trimmed || trimmed.startsWith(':')) return null;
-      var m = trimmed.match(/^data:\s*(.*)$/s);
-      if (!m) return null;
-      try { return JSON.parse(m[1]); } catch (_) { return null; }
-    }
+    // Canonical implementation lives in shared.js (three pages stream SSE).
+    var parseSSEChunk = PS.parseSSEChunk;
 
     // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
     // worker processes it; it would render a perpetual-0 pill).

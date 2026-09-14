@@ -772,7 +772,7 @@
             let i;
             while ((i = buf.indexOf('\n\n')) >= 0) {
               const raw = buf.slice(0, i); buf = buf.slice(i + 2);
-              const ev = parseSSEChunk(raw);
+              const ev = PS.parseSSEChunk(raw);
               if (!ev) continue;
               if (ev.type === 'start') {
                 setStatus(ev.faces.toLocaleString() + ' faces over ' +

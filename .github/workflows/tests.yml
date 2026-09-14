@@ -88,3 +88,8 @@ jobs:
       - run: npm ci
 
       - run: npm test
+
+      # No bundler or linter here, so a page calling a helper it doesn't have
+      # is a runtime ReferenceError nothing else catches — a syntax check
+      # accepts it. Cheap, and it has already caught a real shipped bug.
+      - run: npm run check:refs

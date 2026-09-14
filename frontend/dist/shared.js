@@ -2552,4 +2552,17 @@
         e('tbody', null, rows)));
   };
 
+  // Parse one SSE frame's `data:` payload. Returns null for keepalive comment
+  // frames (': keepalive') and unparseable lines, so callers can skip them.
+  // Lives here because three pages stream SSE; it used to be a private copy in
+  // admin_maintenance.html, and the faces page referencing it by bare name was
+  // a ReferenceError at runtime.
+  PS.parseSSEChunk = function parseSSEChunk(chunk) {
+    var trimmed = (chunk || '').trim();
+    if (!trimmed || trimmed.startsWith(':')) return null;
+    var m = trimmed.match(/^data:\s*(.*)$/s);
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch (_) { return null; }
+  };
+
 })();

@@ -5,7 +5,8 @@
   "description": "Frontend tests for local-photo-search shared components",
   "scripts": {
     "test": "jest --verbose",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "check:refs": "node ../scripts/check-frontend-refs.js"
   },
   "overrides": {
     "@tootallnate/once": ">=3.0.1",
