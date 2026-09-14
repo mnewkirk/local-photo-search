@@ -1229,9 +1229,13 @@
       const [modalPhoto, setModalPhoto] = useState(null);
       const [modalIndex, setModalIndex] = useState(-1);
       const [persons, setPersons] = useState([]);
-      const [inspectPerson, setInspectPerson] = useState(null);
+      const [inspectPerson, setInspectPerson] = useState(null);  // {id, name} or null
       // review-faces panel; only meaningful for a single shoot day.
-      const [teamReview, setTeamReview] = useState(false);  // {id, name} or null
+      const [teamReview, setTeamReview] = useState(false);
+      // Photo-scope banner for the open group: is the list narrowed by the
+      // page filter, and how many exist outside it.
+      const [photoScope, setPhotoScope] = useState(null);
+      const [widened, setWidened] = useState(false);
 
       // Load persons list for face editing dropdown
       const loadPersons = useCallback(() => {
@@ -1324,35 +1328,57 @@
       // "unclustered" is the never-clustered bucket — it has no id, and the
       // server requires the same content filter that produced it (otherwise it
       // would return every unclustered face in the library).
-      const groupPhotosUrl = (group) => {
-        if (group.type === 'unclustered') {
-          return API + '/api/faces/group/unclustered/0/photos?limit=10000' +
-            cfParams(cfRef.current);
-        }
-        const type = group.type === 'person' ? 'person' : 'cluster';
-        const id = group.type === 'person' ? group.person_id : group.cluster_id;
-        return API + '/api/faces/group/' + type + '/' + id + '/photos';
+      // A person's photos inherit the page's content filter by DEFAULT.
+      // Without that, clicking Calvin from a one-day view opened all 18,414 of
+      // his photos, which is unreviewable and is not what the filtered view
+      // implied. `widen` opts out for a single group (the "Show all" button);
+      // it resets whenever a different group is opened, so the wide scope
+      // can't silently persist into the next person you click.
+      // Mirrors the endpoint's default LIMIT. A person with more photos than
+      // this gets a truncated list, and the UI must say so rather than let
+      // "Show all 18,633" quietly deliver 10,000.
+      const PHOTO_LIMIT = 10000;
+
+      const groupPhotosUrl = (group, widen) => {
+        const base = group.type === 'unclustered'
+          ? API + '/api/faces/group/unclustered/0/photos'
+          : API + '/api/faces/group/'
+            + (group.type === 'person' ? 'person' : 'cluster') + '/'
+            + (group.type === 'person' ? group.person_id : group.cluster_id)
+            + '/photos';
+        // The unclustered bucket is DEFINED by the filter — the server 400s
+        // without one — so it can never be widened.
+        const useCf = !widen || group.type === 'unclustered';
+        return base + '?limit=' + PHOTO_LIMIT + (useCf ? cfParams(cfRef.current) : '');
       };
 
-      const loadGroupPhotos = useCallback((group) => {
+      const fetchGroupPhotos = useCallback((group, widen) => {
         setLoadingPhotos(true);
-        fetch(groupPhotosUrl(group))
+        return fetch(groupPhotosUrl(group, widen))
           .then(r => r.json())
-          .then(data => { setGroupPhotos(data.photos || []); setLoadingPhotos(false); })
+          .then(data => {
+            setGroupPhotos(data.photos || []);
+            setPhotoScope({ filtered: !!data.filtered,
+                            total: data.total_unfiltered,
+                            shown: (data.photos || []).length });
+            setLoadingPhotos(false);
+          })
           .catch(() => setLoadingPhotos(false));
       }, []);
+
+      const loadGroupPhotos = useCallback((group) => {
+        setWidened(false);
+        fetchGroupPhotos(group, false);
+      }, [fetchGroupPhotos]);
 
       const openGroupDirect = useCallback((group) => {
         setSelectedGroup(group);
         setEditing(false);
         setMerging(false);
         setNameError('');
-        setLoadingPhotos(true);
-        fetch(groupPhotosUrl(group))
-          .then(r => r.json())
-          .then(data => { setGroupPhotos(data.photos || []); setLoadingPhotos(false); })
-          .catch(() => setLoadingPhotos(false));
-      }, []);
+        setWidened(false);
+        fetchGroupPhotos(group, false);
+      }, [fetchGroupPhotos]);
 
       const openGroup = useCallback((group) => {
         openGroupDirect(group);
@@ -2157,9 +2183,36 @@
               ),
             ),
             loadingPhotos && e('div', { className: 'loading' }, 'Loading photos...'),
-            !loadingPhotos && e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 0' } },
+            !loadingPhotos && e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 0', flexWrap: 'wrap' } },
               e('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, sortedGroupPhotos.length + ' photos'),
               e(PS.SortControl, { value: sortBy, onChange: setSortBy, options: ['date_asc', 'date_desc', 'quality_desc'] }),
+              // Say plainly that this is a slice, and how big the whole is —
+              // otherwise a filtered detail view is indistinguishable from a
+              // person who simply has few photos.
+              photoScope && photoScope.filtered && photoScope.total > photoScope.shown &&
+                e('span', { style: { fontSize: 12, color: 'var(--accent, #4a9)' } },
+                  'filtered by the current view — ' + photoScope.total.toLocaleString()
+                  + ' in total'),
+              photoScope && photoScope.filtered && photoScope.total > photoScope.shown &&
+                selectedGroup && selectedGroup.type !== 'unclustered' &&
+                e('button', {
+                  onClick: () => { setWidened(true); fetchGroupPhotos(selectedGroup, true); },
+                  title: 'Load every photo of this person, ignoring the date/place '
+                       + 'filter above.',
+                }, photoScope.total > PHOTO_LIMIT
+                     ? ('Show all (' + PHOTO_LIMIT.toLocaleString() + ' max of '
+                        + photoScope.total.toLocaleString() + ')')
+                     : ('Show all ' + photoScope.total.toLocaleString())),
+              photoScope && !photoScope.filtered && widened && e(React.Fragment, null,
+                photoScope.shown >= PHOTO_LIMIT && e('span', {
+                  style: { fontSize: 12, color: 'var(--warn, #db4)' },
+                  title: 'The endpoint caps a single response. Narrow the filter '
+                       + 'to see the rest.',
+                }, 'capped at ' + PHOTO_LIMIT.toLocaleString() + ' of '
+                   + photoScope.total.toLocaleString()),
+                e('button', {
+                  onClick: () => { setWidened(false); fetchGroupPhotos(selectedGroup, false); },
+                }, '↺ Back to filtered')),
             ),
             !loadingPhotos && e('div', { className: 'detail-photos' },
               ...sortedGroupPhotos.map((p, i) =>

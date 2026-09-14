@@ -1368,11 +1368,17 @@ def api_face_group_photos(
     fix is offset-based pagination with a matching UI, not just bumping the
     cap. Callers can still pass `?limit=N` to override.
 
+    The content filters (date_from/date_to/location/q/person/camera) apply to
+    EVERY group type, not just "unclustered". They used to be accepted and then
+    silently ignored for person/cluster, which made a filtered /faces view
+    open Calvin's full 18,414 photos the moment you clicked his name — the
+    opposite of what a shoot review needs. The response carries `filtered` and
+    `total_unfiltered` so the UI can say "43 of 18,414" and offer to widen.
+
     group_type "unclustered" is the never-clustered bucket (person_id AND
-    cluster_id both NULL); `group_id` is ignored for it. It REQUIRES the same
-    content filters that produced the group in /api/faces/groups — without
-    them the query would return every unclustered face in the library, so an
-    unfiltered request is a 400 rather than a very slow surprise.
+    cluster_id both NULL); `group_id` is ignored for it. It REQUIRES a content
+    filter — without one the query would return every unclustered face in the
+    library, so an unfiltered request is a 400 rather than a very slow surprise.
 
     Each photo includes an `effective_date` field — `date_taken` when
     present, otherwise the date parsed from the parent folder name via
@@ -1389,70 +1395,58 @@ def api_face_group_photos(
     order_clause = (
         f"ORDER BY {effective_expr} IS NULL, {effective_expr} DESC"
     )
+    select_cols = f"""SELECT DISTINCT p.*, f.id as face_id,
+                      f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                      f.match_source,
+                      {effective_expr} AS effective_date
+               FROM photos p
+               JOIN faces f ON f.photo_id = p.id"""
+
     with _get_db() as db:
         if group_type == "person":
-            rows = db.conn.execute(
-                f"""SELECT DISTINCT p.*, f.id as face_id,
-                          f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                          f.match_source,
-                          {effective_expr} AS effective_date
-                   FROM photos p
-                   JOIN faces f ON f.photo_id = p.id
-                   WHERE f.person_id = ?
-                   {order_clause}
-                   LIMIT ?""",
-                (group_id, limit),
-            ).fetchall()
+            where, params = "f.person_id = ?", [group_id]
         elif group_type == "cluster":
-            rows = db.conn.execute(
-                f"""SELECT DISTINCT p.*, f.id as face_id,
-                          f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                          f.match_source,
-                          {effective_expr} AS effective_date
-                   FROM photos p
-                   JOIN faces f ON f.photo_id = p.id
-                   WHERE f.cluster_id = ? AND f.person_id IS NULL
-                   {order_clause}
-                   LIMIT ?""",
-                (group_id, limit),
-            ).fetchall()
+            where, params = "f.cluster_id = ? AND f.person_id IS NULL", [group_id]
         elif group_type == "unclustered":
-            filter_pids = _face_filter_photo_ids(
-                db, date_from, date_to, location, q, person, camera
+            where, params = "f.person_id IS NULL AND f.cluster_id IS NULL", []
+        else:
+            raise HTTPException(
+                400, "group_type must be 'person', 'cluster', or 'unclustered'")
+
+        filter_pids = _face_filter_photo_ids(
+            db, date_from, date_to, location, q, person, camera)
+        if group_type == "unclustered" and filter_pids is None:
+            raise HTTPException(
+                400,
+                "group_type 'unclustered' requires at least one content "
+                "filter (date_from/date_to/location/q/person/camera)",
             )
-            if filter_pids is None:
-                raise HTTPException(
-                    400,
-                    "group_type 'unclustered' requires at least one content "
-                    "filter (date_from/date_to/location/q/person/camera)",
-                )
+
+        # Unfiltered size of the group, so the UI can say "43 of 18,414" and
+        # offer to widen. Cheap: a COUNT over the person_id/cluster_id index.
+        total_unfiltered = db.conn.execute(
+            f"SELECT COUNT(DISTINCT f.photo_id) FROM faces f WHERE {where}",
+            params).fetchone()[0]
+
+        if filter_pids is not None:
             if not filter_pids:
-                return {"photos": []}
+                return {"photos": [], "filtered": True,
+                        "total_unfiltered": total_unfiltered}
             db.conn.execute(
-                "CREATE TEMP TABLE IF NOT EXISTS _facefilter (pid INTEGER PRIMARY KEY)"
-            )
+                "CREATE TEMP TABLE IF NOT EXISTS _facefilter (pid INTEGER PRIMARY KEY)")
             db.conn.execute("DELETE FROM _facefilter")
             db.conn.executemany(
                 "INSERT OR IGNORE INTO _facefilter(pid) VALUES (?)",
-                [(pid,) for pid in filter_pids],
-            )
-            rows = db.conn.execute(
-                f"""SELECT DISTINCT p.*, f.id as face_id,
-                          f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                          f.match_source,
-                          {effective_expr} AS effective_date
-                   FROM photos p
-                   JOIN faces f ON f.photo_id = p.id
-                   WHERE f.person_id IS NULL AND f.cluster_id IS NULL
-                         AND f.photo_id IN (SELECT pid FROM _facefilter)
-                   {order_clause}
-                   LIMIT ?""",
-                (limit,),
-            ).fetchall()
-        else:
-            raise HTTPException(400, "group_type must be 'person', 'cluster', or 'unclustered'")
+                [(pid,) for pid in filter_pids])
+            where += " AND f.photo_id IN (SELECT pid FROM _facefilter)"
 
-        return {"photos": [dict(r) for r in rows]}
+        rows = db.conn.execute(
+            f"{select_cols} WHERE {where} {order_clause} LIMIT ?",
+            (*params, limit)).fetchall()
+
+        return {"photos": [dict(r) for r in rows],
+                "filtered": filter_pids is not None,
+                "total_unfiltered": total_unfiltered}
 
 
 @app.get("/api/photos/geojson")

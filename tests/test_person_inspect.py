@@ -149,3 +149,78 @@ def test_scope_reports_the_denominator(client, two_day_person):
     d = _inspect(client, two_day_person["person_id"], date_from="2026-09-12")
     assert d["scope"]["total"] == 5
     assert d["scope"]["in_scope"] == 2
+
+
+# ---------------------------------------------------------------------------
+# /api/faces/group/{type}/{id}/photos — content filters apply to EVERY group
+# type, not just "unclustered" (added 2026-09-13)
+# ---------------------------------------------------------------------------
+
+def _photos(client, gtype, gid, **params):
+    r = client.get(f"/api/faces/group/{gtype}/{gid}/photos", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_person_photos_respect_the_date_filter(client, two_day_person):
+    """The whole point: clicking a name from a one-day /faces view must not
+    open that person's entire library. Calvin has 18,633 photos; before this
+    the filtered view opened all of them."""
+    pid = two_day_person["person_id"]
+    all_p = _photos(client, "person", pid)
+    day2 = _photos(client, "person", pid, date_from="2026-09-12", date_to="2026-09-12")
+
+    assert len(day2["photos"]) < len(all_p["photos"])
+    assert {p["id"] for p in day2["photos"]} < {p["id"] for p in all_p["photos"]}
+    for p in day2["photos"]:
+        assert (p["date_taken"] or "").startswith("2026-09-12")
+
+
+def test_response_reports_whether_it_is_filtered_and_the_whole_size(client, two_day_person):
+    """The UI needs both, or a narrowed list is indistinguishable from a person
+    who simply has few photos."""
+    pid = two_day_person["person_id"]
+    unfiltered = _photos(client, "person", pid)
+    filtered = _photos(client, "person", pid, date_from="2026-09-12")
+
+    assert unfiltered["filtered"] is False
+    assert filtered["filtered"] is True
+    # total_unfiltered is the WHOLE group either way — it's the denominator.
+    assert filtered["total_unfiltered"] == unfiltered["total_unfiltered"]
+    assert filtered["total_unfiltered"] >= len(filtered["photos"])
+
+
+def test_widening_returns_everything_again(client, two_day_person):
+    """The 'Show all' path is just the same call without the filter."""
+    pid = two_day_person["person_id"]
+    assert (len(_photos(client, "person", pid)["photos"])
+            == _photos(client, "person", pid)["total_unfiltered"])
+
+
+def test_cluster_photos_respect_the_date_filter_too(client, db):
+    """Unknown clusters get the same treatment — the filter used to be accepted
+    and silently ignored for both person AND cluster."""
+    fid = db._test_face_ids["unknown_878"]      # cluster_id = 99
+    row = db.conn.execute("SELECT cluster_id FROM faces WHERE id = ?", (fid,)).fetchone()
+    cid = row["cluster_id"]
+    wide = _photos(client, "cluster", cid)
+    narrow = _photos(client, "cluster", cid, date_from="2030-01-01")
+    assert wide["photos"] and narrow["photos"] == []
+    assert narrow["total_unfiltered"] == wide["total_unfiltered"]
+
+
+def test_unclustered_still_requires_a_filter(client):
+    """Unchanged: that bucket is DEFINED by the filter, and without one the
+    query would return every unclustered face in the library."""
+    r = client.get("/api/faces/group/unclustered/0/photos")
+    assert r.status_code == 400
+
+
+def test_a_filter_matching_nothing_returns_empty_not_everything(client, two_day_person):
+    """The dangerous failure mode: an over-narrow filter falling back to the
+    unfiltered set would silently re-open all 18k photos."""
+    d = _photos(client, "person", two_day_person["person_id"],
+                date_from="2030-01-01", date_to="2030-01-02")
+    assert d["photos"] == []
+    assert d["filtered"] is True
+    assert d["total_unfiltered"] == 5
