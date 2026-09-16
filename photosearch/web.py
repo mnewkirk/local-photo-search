@@ -2123,6 +2123,7 @@ def api_verify_labels(
     person: Optional[str] = Query(None),
     min_references: int = Query(3, ge=2, le=50),
     decisive_only: bool = Query(False),
+    rivals_only: bool = Query(False),
     limit: int = Query(60, ge=1, le=500),
 ):
     """Labelled faces that look more like SOMEONE ELSE in the same scope.
@@ -2131,6 +2132,11 @@ def api_verify_labels(
     is compared against every other person present and calibrated against how
     close those two people genuinely get (see photosearch/face_verify.py and
     docs/plans/face-label-verification.md).
+
+    `rivals_only` keeps just the findings where another face in the SAME photo
+    claims the label better. Those are rare and near-certain — 4 across two
+    919/976-photo shoots, all true — and unlike the rest they name the right
+    face, so the reviewer swaps instead of adjudicating.
 
     A SCOPE IS REQUIRED, for the same reason label-conflicts requires one —
     the pairwise work is bounded by the people present, and "the whole library"
@@ -2146,7 +2152,9 @@ def api_verify_labels(
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 
-        if decisive_only:
+        if rivals_only:
+            findings = [f for f in findings if f["rival"]]
+        elif decisive_only:
             findings = [f for f in findings if f["decisive"]]
         findings = findings[:limit]
 
@@ -2158,7 +2166,8 @@ def api_verify_labels(
         f["person_id"] = names.get(f["person"])
         f["candidate_id"] = names.get(f["candidate"])
     return {"findings": findings, "skipped": skipped, "stats": stats,
-            "decisive_count": sum(1 for f in findings if f["decisive"])}
+            "decisive_count": sum(1 for f in findings if f["decisive"]),
+            "rival_count": sum(1 for f in findings if f["rival"])}
 
 
 @app.get("/api/faces/person/{person_id}/inspect")

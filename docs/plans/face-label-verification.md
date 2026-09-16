@@ -1,7 +1,9 @@
 # Verifying that a matched face is actually that person
 
-**Status:** design + core implemented (`photosearch/face_verify.py`,
-`photosearch verify-face-labels`). UI not built.
+**Status:** SHIPPED. `photosearch/face_verify.py`, `photosearch
+verify-face-labels`, `GET /api/faces/verify-labels`, and the 🔍 Verify labels
+panel on `/faces`. A second, independent test — **the rival test** — was added
+2026-09-16; see the section at the foot of this doc.
 
 ## The case this is derived from
 
@@ -112,14 +114,126 @@ and — on the one case we have ground truth for — sufficient.
 | person inspector | which of P's faces are unlike P? | yes (eps) |
 | `verify-person-matches` | which of P's faces are far from P? | yes (min-dist) |
 | **`verify-face-labels`** | **is this face closer to someone else than P and they ever get?** | **no** |
+| **the rival test** | **does another face in this PHOTO claim the label better?** | **no** |
 
 They are complementary: clustering finds *groups* that mix, the margin finds
 *individual* faces that sit on the wrong side. Keep both.
 
+## The rival test (added 2026-09-16)
+
+### The case
+
+Photo 244260, found by eye, not by a tool: the left face was labelled
+**Franklin** (wrong) and the face two to the right was *clearly* Franklin and
+**untagged**. Replayed against the replica:
+
+| face | labelled | d → Franklin refs | d → Beckham refs |
+|---|---|---|---|
+| 505376 | Franklin | 1.301 | **1.010** |
+| 505377 | *(untagged)* | **0.949** | 1.273 |
+
+Franklin↔Beckham separation (p5) is 1.210, so both are decisive in opposite
+directions. The same mislabel was still live one frame later in photo 244261
+(505383 at 1.28, untagged 505381 at 0.944) and is what the shipped detector
+found first.
+
+### Why it is not just more of the margin test
+
+The margin test needs the true identity to already be a **registered person with
+references**. Here the right answer was an *unlabelled* face, so no comparison
+against named people could name it. The rival test needs nothing but the photo.
+
+It also produces a **repair** rather than a rejection: move the label from face A
+to face B, one click, both errors fixed.
+
+### The rule
+
+A person appears in a photo at most once. `resolve-duplicate-persons` already
+leans on that, but only across faces labelled the *same* person. Extending it to
+unlabelled faces is the new part.
+
+```
+d_self    = min L2 to P's trusted refs, leave-one-BURST-out
+d_rival   = the same, for each other face in the photo
+radius(P) = p90 of how far a GENUINE face of P lands from P's own refs
+```
+
+Four gates, all required:
+
+1. the rival is closer to P than the incumbent is
+2. `d_rival < radius(P)` — the rival is plausibly P at all
+3. `d_self > radius(P)` — the incumbent is not
+4. the rival is not better explained by some other person
+
+Gates 2+3 sandwich the radius between the two faces. That is why the answer is
+almost threshold-free: on 2026-09-12 the same single finding comes back at p75,
+p85, p90, p95 **and** p100. Gate 2 alone gets looser as the percentile rises and
+gate 3 gets tighter by exactly as much.
+
+`radius(P)` is the per-person analogue of `separation(P,Q)`. A person whose
+faces vary a lot demands a closer rival automatically — measured, Franklin 0.95
+against Calvin 0.76 — so there is no global number to tune, which is the
+property the whole module exists to preserve.
+
+### The assignment
+
+Gate 1 is decided by a one-to-one assignment, not a per-label argmin:
+`scipy.optimize.linear_sum_assignment` over a face × person cost matrix, with
+`n` appended zero-cost dummy columns as the "assign this face to nobody" option.
+
+- **Columns are the people already labelled in that photo.** The question is
+  only ever "is this label on the wrong face", never "who is that stranger" —
+  opening the columns to the whole roster would invent labels for unlabelled
+  faces, a different tool.
+- **Costs are normalized to `d - radius(P)`**, so zero means "as close as a
+  genuine face of them gets" and one uniform dummy price works for every column.
+  A raw-distance matrix would let a tight-radius person outbid a loose one for
+  every face in the photo.
+- Without the one-to-one constraint, two labels in one photo can both claim the
+  same rival, and applying both swaps writes two people onto one face — pinned
+  by `test_one_rival_cannot_satisfy_two_labels`.
+
+### Measured
+
+| shoot | photos | faces | raw rivals | strong | verdict |
+|---|---|---|---|---|---|
+| 2026-09-12 | 919 | 2,671 | 507 | **1** | true (photo 244261) |
+| 2026-08-29 | 976 | 2,920 | 419 | **3** | all true, confirmed by eye |
+
+For contrast, `verify-face-labels` on the same 2026-09-12 scope returns **108
+findings, 96 of them decisive** — 505383 is in there at #2, buried under
+Calvin-temporal noise. The rival gate narrows that to 1.
+
+Ranking the ungated list by `displaced = d_self - d_rival` is a strong signal on
+its own: the true positives sat at the top on both dates (0.335 against a next
+of 0.178; 0.357 / 0.314 / 0.251 against the rest).
+
+### Load-bearing details
+
+- **Leave-one-burst-out saved this case too.** Without it, 505376 measures
+  **0.716** from "Franklin" and looks correct, because 505383 — the other frame
+  of the same mislabel, one second away — is vouching for it. Franklin's
+  reference set was otherwise clean (all 19 audited by hand). This is the second
+  independent case where the burst alibi, not reference contamination, was the
+  thing that hid a mislabel.
+- **Swap is two `bulk-assign` calls from the client, clear-then-assign.**
+  Assigning first would briefly put one person on two faces in a photo. A
+  dedicated endpoint would have to re-implement `_mirror_face_labels`' replica
+  semantics — the duplication that already produced the `rejected` mirror bug.
+- **Burst siblings are independently gated, not copied.** Applying the group is
+  exactly as safe as applying each one alone.
+- **Reference pollution blunts it.** Enough wrong faces in P's reference set
+  inflates `radius(P)` until gate 3 stops firing. It degrades quietly toward
+  silence rather than toward false accusations, which is the right direction,
+  but it is the reason to keep reference sets `manual` + `strict` only.
+
 ## Still to build
 
-- The review UI described above (the scorer already emits everything it needs).
 - Iterative re-scoring after accepting a correction, so fixing one label
   re-calibrates the pair rather than requiring a full re-run.
 - A scope wider than one day. Calibration is per-pair and per-scope; whether
   `sep` is stable across shoots (different light, different kit) is untested.
+- The rival test currently only questions labels that already exist. The same
+  assignment could *propose* a name for an unlabelled face that is decisively
+  someone's — deliberately out of scope for now, since that is a matcher, not a
+  verifier.

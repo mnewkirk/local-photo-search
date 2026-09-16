@@ -1401,7 +1401,7 @@ groups** (top ones 32, 27, 26, 23, 23) + 237 ungrouped.
 
 ## Face-label integrity: is this face actually that person?
 
-Three tools, and the differences between them matter — they fail in different
+Four tools, and the differences between them matter — they fail in different
 places and were each added because the previous one missed something real.
 
 | tool | question | needs tuning? |
@@ -1410,6 +1410,7 @@ places and were each added because the previous one missed something real.
 | person inspector (`/inspect`) | which of P's faces are unlike P? | **yes** — eps |
 | `verify-person-matches` | which of P's faces are far from P? | **yes** — `--min-dist` |
 | **`verify-face-labels`** | **is this face closer to someone else than P and they ever get?** | **no** |
+| **`--rivals-only`** (same tool) | **does another face in this PHOTO claim the label better?** | **no** |
 
 **`verify-face-labels` is the one to reach for first.** `photosearch/face_verify.py`,
 `GET /api/faces/verify-labels`, and the **🔍 Verify labels** panel on `/faces`
@@ -1450,6 +1451,70 @@ Four implementation details that are load-bearing:
 Measured on 2026-09-12: 397 manual labels → **8 flagged (2%), all decisive**,
 the known ground-truth pair at #2 and #4. Design + the full case:
 `docs/plans/face-label-verification.md`.
+
+### The rival test — the right face is usually in the same photo
+
+`face_verify._photo_rivals`, `?rivals_only=1` on the API, `--rivals-only` on the
+CLI, **RIVAL IN PHOTO** + a one-click **Swap** in the panel.
+
+A person appears in a photo at most once. So if another face in the SAME photo
+is a better claimant to the label than the face carrying it, the label is on the
+wrong face — and the right face is right there. The invariant was already
+enforced across faces labelled the *same* person (`resolve-duplicate-persons`);
+this extends it to **unlabelled** faces, which is the whole point: the rival
+does not have to be a registered person, so this sees what the margin test
+structurally cannot.
+
+It comes from photo 244260 (2026-09-12), found by eye: "Franklin" was on the
+wrong boy and the real Franklin was **untagged** two faces to the right. Four
+gates, all required:
+
+1. the rival is closer to P than the incumbent is
+2. the rival is plausibly P at all — `d_rival < radius(P)`
+3. the incumbent is not — `d_self > radius(P)`
+4. the rival is not better explained by someone else
+
+**`radius(P)` is the per-person analogue of `separation(P,Q)`** — the p90 of how
+far a GENUINE face of P lands from P's own references, same leave-one-burst-out
+rule. That is what makes the test threshold-free across people with very
+different spreads (Franklin 0.95, Calvin 0.76). Gates 2+3 *sandwich* the radius
+between the two faces, which is why the result barely moves with the percentile:
+on 2026-09-12 it returns the same single finding at p75, p85, p90, p95 **and**
+p100.
+
+**Gate 1 comes from a one-to-one assignment** (`scipy.optimize.linear_sum_assignment`
+over a face × person cost matrix, `n` zero-cost dummy columns as the
+assign-to-nobody option), not a per-label argmin — otherwise two labels in one
+photo both claim the same rival and "Swap" writes two people onto one face.
+Costs are normalized as `d - radius(P)` so zero means "as close as a genuine
+face of them gets"; a raw-distance matrix would let a tight-radius person outbid
+a loose one for every face.
+
+Measured across both soccer shoots (1,895 photos, 5,591 faces): **4 findings,
+all true positives** — verified by eye against the crops. On 2026-09-12 that is
+108 verify-labels findings (96 "decisive", mostly Calvin-temporal noise) narrowed
+to **1**. The value is triage plus a repair: a rival names the right face, so it
+is the only finding a reviewer fixes in one click instead of adjudicating.
+
+**The burst-alibi rule earned its keep a second time here.** Without
+leave-one-burst-out, face 505376 measures **0.716** from "Franklin" and looks
+correct — because 505383, the other frame of the *same* mislabel one second
+away, is vouching for it. Franklin's reference set was otherwise clean (all 19
+audited). Any change to this path must keep the exclusion or it will confidently
+point at the wrong face.
+
+**Swap is two `bulk-assign` calls from the client, clear-then-assign**, not a new
+endpoint: assigning first would briefly put one person on two faces in a photo,
+and a dedicated endpoint would have to re-implement `_mirror_face_labels`'
+replica semantics — the exact duplication that already shipped the `rejected`
+mirror bug. **Burst siblings** (the same mistake in consecutive frames, which is
+how 244260 and 244261 both went wrong) are grouped for a single action, but each
+is an *independently gated* finding, not a blind copy — so applying the set is as
+safe as applying them one at a time.
+
+Tests: `tests/test_face_rivals.py` (7 cases — the unlabelled-claimant shape,
+ordering, the correct-label-beside-a-stranger false positive, gate 4, the
+one-rival-two-labels assignment invariant, burst linkage, and the off switch).
 
 ### `match_source='rejected'` — a human "no" that survives auto-matching
 

@@ -1305,9 +1305,11 @@ def review_faces(db, date_, base_url, team_hue, tolerance, min_det, min_edge,
               help="Skip people with fewer trusted (manual/strict) faces.")
 @click.option("--decisive-only", is_flag=True, default=False,
               help="Only faces closer to another person than the two ever get.")
+@click.option("--rivals-only", is_flag=True, default=False,
+              help="Only faces another face in the SAME photo claims better.")
 @click.option("--limit", default=40, show_default=True, type=int)
 def verify_face_labels(db, date_from, date_to, person, min_references,
-                       decisive_only, limit):
+                       decisive_only, rivals_only, limit):
     """Find labelled faces that look more like SOMEONE ELSE in the same scope.
 
     Unlike verify-person-matches (global distance threshold) and
@@ -1315,6 +1317,11 @@ def verify_face_labels(db, date_from, date_to, person, min_references,
     compared against every other person present and calibrated against how
     close those two people genuinely get. A face closer to Q than P and Q ever
     get to each other is flagged "DECISIVE".
+
+    A finding marked "RIVAL" additionally has the answer sitting in the same
+    photo: another face there is a better claimant to the label, and since a
+    person appears in a photo at most once, the label is simply on the wrong
+    face. Those are rare, near-certain, and fixable by a swap.
 
     Design + the Oliver/Franklin case it comes from:
     docs/plans/face-label-verification.md
@@ -1333,20 +1340,36 @@ def verify_face_labels(db, date_from, date_to, person, min_references,
     for s in skipped:
         click.echo(f"  skipped {s['person']}: {s['trusted']} trusted face(s) — "
                    f"{s['reason']}")
-    if decisive_only:
+    if rivals_only:
+        findings = [f for f in findings if f["rival"]]
+    elif decisive_only:
         findings = [f for f in findings if f["decisive"]]
     if not findings:
         click.echo("\nNo faces look more like someone else. ")
         return
     click.echo(f"\n{len(findings)} face(s) look more like someone else "
-               f"({sum(1 for f in findings if f['decisive'])} decisive):\n")
+               f"({sum(1 for f in findings if f['decisive'])} decisive, "
+               f"{sum(1 for f in findings if f['rival'])} with a rival in the "
+               f"same photo):\n")
     for f in findings[:limit]:
-        flag = "DECISIVE" if f["decisive"] else "suggest "
+        flag = "RIVAL   " if f["rival"] else ("DECISIVE" if f["decisive"] else "suggest ")
         click.echo(
             f"  [{flag}] face {f['face_id']} (photo {f['photo_id']}, "
             f"{f['match_source']}): labelled {f['person']} but "
             f"{f['d_other']} from {f['candidate']} vs {f['d_own']} from "
             f"{f['person']} — the two are {f['separation']} apart at closest")
+        r = f["rival"]
+        if r:
+            click.echo(
+                f"             swap: face {r['rival_face_id']} in the same photo is "
+                f"{r['d_rival']} from {f['person']} vs this face's {r['d_self']} "
+                f"(a real {f['person']} lands within {r['radius']})"
+                + (f" — currently labelled {r['rival_label']}" if r["rival_label"]
+                   else " — currently unlabelled"))
+            if r["burst_siblings"]:
+                click.echo(f"             same mistake in {len(r['burst_siblings'])} "
+                           f"other frame(s) of this burst: "
+                           + ", ".join(f"face {b['face_id']}" for b in r["burst_siblings"]))
 
 
 @cli.command("verify-person-matches")

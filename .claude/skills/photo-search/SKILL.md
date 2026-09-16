@@ -263,7 +263,12 @@ need cross-recluster persistence.
   every other person present and calibrated against how close those two people
   genuinely get. Returns `margin`, `separation`, `decisive`, `alibi_excluded`
   and the nearest reference face-ids for both identities so the reviewer sees
-  the strongest case for each side by side. See
+  the strongest case for each side by side. `?rivals_only=1` keeps only the
+  findings where **another face in the SAME photo claims the label better** —
+  a person appears in a photo at most once, so those are near-certain, and
+  unlike the rest they name the right face (`rival.rival_face_id`) so the
+  reviewer swaps instead of adjudicating. The rival may be **unlabelled**,
+  which is what the margin test structurally cannot see. See
   `docs/plans/face-label-verification.md`.
 - `POST /api/faces/review-team` — **SSE**; the `review-faces` CLI as an endpoint
   (M32). Samples the jersey colour below each face, keeps the ones matching the
@@ -720,7 +725,11 @@ Three panels, all opened from the filter bar:
 - **🔍 Verify labels** — any date range. One row per suspect: the disputed crop,
   the identity it CARRIES, the identity it LOOKS LIKE, nearest references first
   on each side. Reassign / Reject / Keep. Reject records `rejected`, so
-  auto-matching cannot put the label back.
+  auto-matching cannot put the label back. A **RIVAL IN PHOTO** row additionally
+  shows the face in the same photo that claims the label better, and offers
+  **Swap** (one click, fixes both faces) plus **Swap all N frames** when the
+  same mistake was independently flagged in neighbouring burst frames. Rivals
+  sort first; a "rivals only" toggle isolates them.
 - **⚽ Review team faces** — single day only (it learns ONE jersey colour; a
   range would average two kits). Groups the day's unknown team faces so you
   name a handful of groups instead of a thousand crops. The hue is learned from
@@ -785,6 +794,12 @@ with `--base-url` and they always resolve.
 # Which labelled faces look more like someone ELSE? No eps, no threshold.
 photosearch verify-face-labels --date-from 2026-09-12 --date-to 2026-09-12 \
     [--decisive-only] [--person NAME] [--min-references 3]
+
+# ...and which of those have the right face sitting in the SAME photo?
+# Rare, near-certain, and fixable by a swap. 4 findings across two ~950-photo
+# shoots, all true.
+photosearch verify-face-labels --date-from 2026-09-12 --date-to 2026-09-12 \
+    --rivals-only
 
 # "Best of" a match: Best 50 / Next 200 / All 250 collections.
 python scripts/rank_shoot.py --date 2026-09-12 --measure        # slow, cached

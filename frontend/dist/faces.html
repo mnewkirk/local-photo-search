@@ -740,6 +740,7 @@
       const [loading, setLoading] = useState(true);
       const [err, setErr] = useState('');
       const [decisiveOnly, setDecisiveOnly] = useState(false);
+      const [rivalsOnly, setRivalsOnly] = useState(false);
       const [busy, setBusy] = useState(null);
       const [done, setDone] = useState({});     // face_id -> what we did
 
@@ -748,11 +749,12 @@
         let u = API + '/api/faces/verify-labels?limit=60';
         if (dateFrom) u += '&date_from=' + encodeURIComponent(dateFrom);
         if (dateTo) u += '&date_to=' + encodeURIComponent(dateTo);
-        if (decisiveOnly) u += '&decisive_only=1';
+        if (rivalsOnly) u += '&rivals_only=1';
+        else if (decisiveOnly) u += '&decisive_only=1';
         fetch(u).then(r => r.json())
           .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
           .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
-      }, [dateFrom, dateTo, decisiveOnly]);
+      }, [dateFrom, dateTo, decisiveOnly, rivalsOnly]);
       useEffect(() => { load(); }, [load]);
 
       // Reassign sends the candidate name; reject sends null, which the server
@@ -773,6 +775,38 @@
           setDone(d => Object.assign({}, d, { [f.face_id]: kind === 'reassign' ? ('→ ' + f.candidate) : 'rejected' }));
           if (onChanged) onChanged();
         }).catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setBusy(null));
+      }, [onChanged]);
+
+      // Swap moves the label off this face and onto the rival. CLEAR FIRST:
+      // assigning first would briefly put the same person on two faces in one
+      // photo, the exact invariant resolve-duplicate-persons exists to enforce.
+      // Two bulk-assign calls rather than a new endpoint, so the replica's
+      // write-NAS-then-mirror path is reused instead of re-implemented.
+      const swap = useCallback((f, withBurst) => {
+        const r = f.rival;
+        if (!r) return;
+        const pairs = [{ from: f.face_id, to: r.rival_face_id }].concat(
+          withBurst ? (r.burst_siblings || []).map(b => ({ from: b.face_id, to: b.rival_face_id })) : []);
+        if (!confirm('Confirm: move the ' + f.person + ' label onto the rival face'
+              + (pairs.length > 1 ? ' in ' + pairs.length + ' frames' : '')
+              + '? This writes to the database.')) return;
+        setBusy(f.face_id);
+        const post = (ids, name) => fetch(API + '/api/faces/bulk-assign', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ face_ids: ids, person_name: name }),
+        }).then(r2 => r2.json());
+        post(pairs.map(p => p.from), null)
+          .then(() => post(pairs.map(p => p.to), f.person))
+          .then(() => {
+            setDone(d => {
+              const next = Object.assign({}, d);
+              pairs.forEach(p => { next[p.from] = 'swapped → face ' + p.to; });
+              return next;
+            });
+            if (onChanged) onChanged();
+          })
+          .catch(e2 => setErr(e2.message || String(e2)))
           .finally(() => setBusy(null));
       }, [onChanged]);
 
@@ -799,8 +833,8 @@
           e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' } },
             e('span', {
               style: { fontWeight: 600,
-                       color: f.decisive ? 'var(--err, #e66)' : 'var(--text-muted)' },
-            }, f.decisive ? 'DECISIVE' : 'suggestion'),
+                       color: (f.rival || f.decisive) ? 'var(--err, #e66)' : 'var(--text-muted)' },
+            }, f.rival ? 'RIVAL IN PHOTO' : (f.decisive ? 'DECISIVE' : 'suggestion')),
             e('span', { className: 'insp-sub' },
               'labelled ' + f.person + ' · ' + f.d_own +
               ' from them, ' + f.d_other + ' from ' + f.candidate +
@@ -814,6 +848,18 @@
             state
               ? e('span', { className: 'insp-sub' }, state)
               : e(React.Fragment, null,
+                  f.rival && e('button', {
+                    className: 'insp-btn', disabled: busy === f.face_id,
+                    style: { borderColor: 'var(--err, #e66)' },
+                    title: 'Move the ' + f.person + ' label onto face '
+                         + f.rival.rival_face_id + ', which claims it better.',
+                    onClick: () => swap(f, false) }, 'Swap onto face ' + f.rival.rival_face_id),
+                  f.rival && (f.rival.burst_siblings || []).length > 0 && e('button', {
+                    className: 'insp-btn', disabled: busy === f.face_id,
+                    title: 'The same mistake was flagged independently in '
+                         + f.rival.burst_siblings.length + ' other frame(s) of this burst.',
+                    onClick: () => swap(f, true) },
+                    'Swap all ' + (f.rival.burst_siblings.length + 1) + ' frames'),
                   e('button', { className: 'insp-btn', disabled: busy === f.face_id,
                     onClick: () => act(f, 'reassign') }, 'Reassign to ' + f.candidate),
                   e('button', { className: 'insp-btn', disabled: busy === f.face_id,
@@ -834,6 +880,26 @@
                          border: '3px solid var(--err, #e66)', cursor: 'pointer' } })),
             strip(f.own_refs, 'labelled ' + f.person),
             strip(f.candidate_refs, 'looks like ' + f.candidate, true),
+            f.rival && e('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+              e('div', { className: 'insp-sub', style: { color: 'var(--err, #e66)' } },
+                'this photo\u2019s real ' + f.person),
+              e('img', {
+                src: API + '/api/faces/crop/' + f.rival.rival_face_id + '?size=160',
+                onClick: () => window.open('/?photo=' + f.photo_id, '_blank'),
+                title: 'face ' + f.rival.rival_face_id + ' (click to open the photo)',
+                style: { width: 84, height: 84, objectFit: 'cover', borderRadius: 4,
+                         border: '3px solid var(--accent, #4a9)', cursor: 'pointer' } }),
+              e('div', { className: 'insp-sub', style: { maxWidth: 260 } },
+                f.rival.d_rival + ' from ' + f.person + ' vs this face\u2019s '
+                + f.rival.d_self + '; a real ' + f.person + ' lands within '
+                + f.rival.radius + '. '
+                + (f.rival.rival_label
+                    ? 'It is currently labelled ' + f.rival.rival_label + '.'
+                    : 'It is currently unlabelled.')
+                + ((f.rival.burst_siblings || []).length
+                    ? ' Same mistake in ' + f.rival.burst_siblings.length
+                      + ' other frame(s) of this burst.' : '')),
+            ),
           ));
       });
 
@@ -847,15 +913,25 @@
                 loading ? 'checking…'
                   : data ? (data.stats.faces.toLocaleString() + ' labelled faces · ' +
                             data.stats.people + ' people calibrated · ' +
-                            data.findings.length + ' flagged (' + data.decisive_count + ' decisive)')
+                            data.findings.length + ' flagged (' + data.decisive_count +
+                            ' decisive, ' + (data.rival_count || 0) + ' with a rival)')
                   : ''),
               data && e('div', { className: 'insp-sub' },
                 'DECISIVE = closer to the other person than those two ever get to '
                 + 'each other. Lookalikes calibrate to a smaller gap, so the check '
                 + 'goes quiet exactly where face recognition is unreliable.'),
+              data && e('div', { className: 'insp-sub' },
+                'RIVAL IN PHOTO = another face in the same photo claims this label '
+                + 'better, and a person appears in a photo at most once — so the '
+                + 'label is on the wrong face and the right one is right there. '
+                + 'Rare and near-certain; swap rather than adjudicate.'),
             ),
             e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 5, marginRight: 10 } },
-              e('input', { type: 'checkbox', checked: decisiveOnly,
+              e('input', { type: 'checkbox', checked: rivalsOnly,
+                onChange: ev => setRivalsOnly(ev.target.checked) }),
+              'rivals only'),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 5, marginRight: 10 } },
+              e('input', { type: 'checkbox', checked: decisiveOnly, disabled: rivalsOnly,
                 onChange: ev => setDecisiveOnly(ev.target.checked) }),
               'decisive only'),
             e('button', { className: 'insp-btn', onClick: load, disabled: loading },
