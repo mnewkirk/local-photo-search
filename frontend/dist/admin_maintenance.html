@@ -898,6 +898,117 @@
       );
     }
 
+    // Face crops are generated on first view — a full image decode per crop,
+    // ~2s on the N100 — so a review grid dribbles in over minutes when cold.
+    // This pre-generates them. Scope it to a shoot: --all over the library is
+    // hours here, one day is minutes.
+    function WarmFaceCrops() {
+      var _b = useState(false); var busy = _b[0];  var setBusy = _b[1];
+      var _f = useState('');    var from = _f[0];  var setFrom = _f[1];
+      var _t = useState('');    var to = _t[0];    var setTo = _t[1];
+      var _p = useState('');    var person = _p[0]; var setPerson = _p[1];
+      var _l = useState([]);    var log = _l[0];   var setLog = _l[1];
+
+      function appendLog(line) {
+        setLog(function(prev) {
+          var next = prev.concat([line]);
+          if (next.length > 500) next = next.slice(-500);
+          return next;
+        });
+      }
+
+      function run() {
+        if (busy) return;
+        var qs = [];
+        if (from) qs.push('date_from=' + encodeURIComponent(from));
+        if (to || from) qs.push('date_to=' + encodeURIComponent(to || from));
+        if (person) qs.push('person=' + encodeURIComponent(person));
+        setBusy(true);
+        appendLog('▸ warm-face-crops ' + (person ? '--person ' + person : '--all')
+          + (from ? ' --date-from ' + from + ' --date-to ' + (to || from) : ' (WHOLE LIBRARY — hours)')
+          + '…');
+        fetch('/api/admin/warm-face-crops' + (qs.length ? '?' + qs.join('&') : ''),
+              { method: 'POST' })
+          .then(function(response) {
+            if (!response.ok) {
+              return response.text().then(function(t) { throw new Error('HTTP ' + response.status + ': ' + t); });
+            }
+            var reader = response.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+            var resolved = false;
+            function pump() {
+              return reader.read().then(function(chunk) {
+                if (chunk.done) return;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var parts = buf.split('\n\n');
+                buf = parts.pop();
+                parts.forEach(function(evt) {
+                  var dataLine = evt.split('\n').filter(function(l) { return l.indexOf('data:') === 0; })[0];
+                  if (!dataLine) return;
+                  try {
+                    var payload = JSON.parse(dataLine.slice(5).trim());
+                    if (payload.line != null) appendLog(payload.line);
+                    if (payload.cmd) appendLog('$ ' + payload.cmd);
+                    if (payload.returncode != null) {
+                      appendLog(payload.returncode === 0
+                        ? '  ✓ crops warmed'
+                        : '  ✗ warm failed (rc=' + payload.returncode + ')');
+                      resolved = true; setBusy(false);
+                    }
+                    if (payload.error) { appendLog('  ✗ ' + payload.error); resolved = true; setBusy(false); }
+                  } catch (_) {}
+                });
+                return pump();
+              });
+            }
+            return pump().then(function() { if (!resolved) setBusy(false); });
+          })
+          .catch(function(err) { appendLog('  ✗ warm stream error: ' + err.message); setBusy(false); });
+      }
+
+      var inputStyle = {
+        background: 'var(--surface2)', color: 'var(--text)',
+        border: '1px solid var(--border)', borderRadius: 6, padding: '6px 8px',
+      };
+      return e('div', null,
+        e('h2', null, 'Warm face crops'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Pre-generate face-crop thumbnails so /faces, the person inspector and '
+            + 'the Bulk-unmatch grid are browsable immediately. Cold, each crop is a '
+            + 'full image decode (~2s here), so a 120-face grid dribbles in over '
+            + 'minutes. Scope it to a shoot — the whole library is hours.'),
+          e('div', { className: 'deploy-actions' },
+            e('input', { type: 'date', value: from, disabled: busy, style: inputStyle,
+              title: 'From date', onChange: function(ev) { setFrom(ev.target.value); } }),
+            e('input', { type: 'date', value: to, disabled: busy, style: inputStyle,
+              title: 'To date (defaults to the from date)',
+              onChange: function(ev) { setTo(ev.target.value); } }),
+            e('input', { type: 'text', value: person, disabled: busy, style: inputStyle,
+              placeholder: 'person (optional)',
+              title: 'Warm only this person\u2019s faces. Leave empty for every face '
+                   + 'in the range — the panels browse unknowns too.',
+              onChange: function(ev) { setPerson(ev.target.value); } }),
+            e('button', {
+              className: 'btn', disabled: busy, onClick: run,
+              title: 'docker compose run --rm photosearch warm-face-crops …',
+            }, busy ? 'Warming…' : 'Warm crops'),
+            !from && !person && e('span', {
+              className: 'deploy-meta', style: { color: 'var(--warn, #db4)' },
+            }, 'no scope = whole library (hours)'),
+            e('button', {
+              className: 'btn', disabled: busy, style: { marginLeft: 'auto' },
+              onClick: function() { setLog([]); }, title: 'Clear log',
+            }, 'Clear log')
+          ),
+          log.length > 0 && e('div', {
+            className: 'deploy-log' + (busy ? ' running' : ''),
+          }, log.join('\n'))
+        )
+      );
+    }
+
     function LightIndex() {
       var _b = useState(false);        var busy = _b[0]; var setBusy = _b[1];
       var _dir = useState('/photos');  var dir = _dir[0]; var setDir = _dir[1];
@@ -2164,6 +2275,7 @@
           e(FleetLauncher, null),
           e(LightIndex, null),
           e(IngestIncoming, null),
+          e(WarmFaceCrops, null),
           e(StackingForm, { onComplete: noop }),
           e(MaintenanceSweep, { onComplete: noop }),
           e(InferLocationForm, { onDone: noop })

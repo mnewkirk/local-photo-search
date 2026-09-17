@@ -5417,6 +5417,10 @@ def generation_history(photo_id, db):
 @click.option("--matched-only/--all", "matched_only", default=True,
               help="Default: only faces assigned to a person. --all warms every detected "
                    "face (includes unknown clusters; ~5x the work).")
+@click.option("--date-from", default=None, metavar="YYYY-MM-DD",
+              help="Only faces in photos on/after this date. Combines with the other "
+                   "scopes — warming one shoot is minutes, the library is hours.")
+@click.option("--date-to", default=None, metavar="YYYY-MM-DD")
 @click.option("--sizes", default="120,200",
               help="Comma-separated crop sizes to generate. Default: 120,200 (the grid + "
                    "rep-card sizes). All sizes come from one decode, so extra sizes are cheap.")
@@ -5427,7 +5431,8 @@ def generation_history(photo_id, db):
 @click.option("--nas-url", default=None, envvar="PHOTOSEARCH_NAS_URL",
               help="When an original isn't on local disk (replica mode), proxy the crop from "
                    "this NAS web URL instead. Defaults to $PHOTOSEARCH_NAS_URL.")
-def warm_face_crops(db, persons, matched_only, sizes, workers, force, nas_url):
+def warm_face_crops(db, persons, matched_only, date_from, date_to, sizes, workers,
+                    force, nas_url):
     """Pre-generate face-crop thumbnails so the cache is warm before browsing.
 
     The local read-replica generates face crops by proxying one cold round-trip
@@ -5446,6 +5451,11 @@ def warm_face_crops(db, persons, matched_only, sizes, workers, force, nas_url):
       photosearch warm-face-crops --person Nicole        # one person (fast)
       photosearch warm-face-crops                        # all matched persons
       photosearch warm-face-crops --all --workers 4      # every face (overnight)
+
+    \b
+      # One shoot, every face — what the review panels actually browse.
+      photosearch warm-face-crops --all \\
+          --date-from 2026-09-12 --date-to 2026-09-12
     """
     import time
     import urllib.request
@@ -5486,11 +5496,22 @@ def warm_face_crops(db, persons, matched_only, sizes, workers, force, nas_url):
             where = "1=1"
             scope_label = "ALL faces"
 
+        # Date scope ANDs onto whichever person scope was chosen: the review
+        # panels browse one shoot at a time, and warming a shoot is minutes
+        # where the library is hours.
+        date_sql = ""
+        if date_from:
+            date_sql += " AND date(ph.date_taken) >= ?"; params.append(date_from)
+        if date_to:
+            date_sql += " AND date(ph.date_taken) <= ?"; params.append(date_to)
+        if date_from or date_to:
+            scope_label += f" in {date_from or '…'} → {date_to or '…'}"
+
         rows = pdb.conn.execute(
             f"""SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
                        ph.filepath, ph.image_width, ph.image_height
                 FROM faces f JOIN photos ph ON ph.id = f.photo_id
-                WHERE f.bbox_top IS NOT NULL AND ({where})""",
+                WHERE f.bbox_top IS NOT NULL AND ({where}){date_sql}""",
             params,
         ).fetchall()
         # Resolve paths up front (DB access is single-threaded; workers are pure CPU/IO).

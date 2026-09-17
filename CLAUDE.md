@@ -1590,6 +1590,16 @@ and stop when you start recognising the person.
   rather than a second implementation of it.
 - **Undo in the panel is in-session only** (it re-assigns exactly the ids just
   cleared). For an undo that outlives the tab, use the CLI's `--snapshot`.
+- **Warm the crops first or the grid is unusable.** Face crops are generated on
+  first view — a full image decode, ~2 s on the N100 — so a cold 120-face grid
+  dribbles in over minutes. `photosearch warm-face-crops` now takes
+  `--date-from` / `--date-to`, which AND onto the person scope, and there is a
+  **Warm face crops** card on `/admin/maintenance`
+  (`POST /api/admin/warm-face-crops`, SSE, throwaway sibling container, shares
+  the long-job lock). It defaults to **every** face rather than matched-only,
+  because the panels that need warming browse unknown clusters too — so scope
+  it by date, or you are asking the N100 for hours of work. The card says so
+  when no scope is set.
 - `FaceTile` had to learn that `dist` can be null — a face whose every reference
   falls inside its own burst has no measurable distance, and `toFixed()` on it
   took out the whole grid. Unmeasured faces render `—` and **sort last**:

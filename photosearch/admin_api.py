@@ -362,6 +362,56 @@ async def admin_ingest_incoming(dry_run: bool = False):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+@router.post("/warm-face-crops")
+async def admin_warm_face_crops(
+    date_from: str = "",
+    date_to: str = "",
+    person: str = "",
+    all_faces: bool = True,
+    workers: int = 3,
+):
+    """`docker compose run --rm photosearch warm-face-crops …` — SSE.
+
+    Pre-generates face-crop thumbnails so a review panel is browsable
+    immediately. Without this, `/faces` and the Bulk-unmatch grid fetch each
+    crop cold — a full image decode on the N100, ~2s each — so a 120-face grid
+    dribbles in over minutes and a large person is unusable.
+
+    **Scope it.** `--all` over the whole library is hours on this box; one
+    shoot is minutes. The endpoint defaults to every face (not just matched
+    ones) because the panels that need warming browse unknowns too, but a date
+    range is what keeps that affordable.
+
+    Runs in a throwaway sibling container, like the other heavy jobs here, so a
+    long decode loop never sits inside the web server's process.
+    """
+    if not _ingest_lock.acquire(blocking=False):
+        raise HTTPException(409, "another long-running admin job is already active")
+
+    cmd = [
+        "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
+        "run", "--rm", "--no-deps", COMPOSE_SERVICE,
+        "warm-face-crops", "--workers", str(max(1, min(8, workers))),
+    ]
+    if person:
+        cmd += ["--person", person]
+    elif all_faces:
+        cmd.append("--all")
+    if date_from:
+        cmd += ["--date-from", date_from]
+    if date_to:
+        cmd += ["--date-to", date_to]
+
+    async def gen():
+        try:
+            async for chunk in _stream_subprocess(cmd, cwd=REPO_DIR, env=os.environ.copy()):
+                yield chunk
+        finally:
+            _ingest_lock.release()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 @router.post("/light-index")
 async def admin_light_index(directory: str = "/photos"):
     """`docker compose run --rm photosearch index <dir> --no-colors` — SSE.

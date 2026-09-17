@@ -748,6 +748,20 @@ Three panels, all opened from the filter bar:
   faces. Applies via `bulk-assign`, so cleared faces are `rejected` and
   auto-matching cannot put them back. Undo is in-session only; for a durable
   one use the CLI's `--snapshot`.
+
+Before browsing any of these panels on a cold shoot, warm the crops — each one
+is a full image decode on first view (~2 s on the N100), so a 120-face grid
+takes minutes to fill. `/admin/maintenance` → **Warm face crops** (date range +
+optional person), or:
+
+```bash
+$DC run --rm photosearch warm-face-crops --all \
+    --date-from 2026-09-12 --date-to 2026-09-12
+```
+
+It defaults to every face, not just matched ones — the panels browse unknown
+clusters too — so a date scope is what keeps it affordable.
+
 - **⚽ Review team faces** — single day only (it learns ONE jersey colour; a
   range would average two kits). Groups the day's unknown team faces so you
   name a handful of groups instead of a thousand crops. The hue is learned from
