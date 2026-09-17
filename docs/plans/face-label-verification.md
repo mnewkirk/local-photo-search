@@ -227,6 +227,38 @@ of 0.178; 0.357 / 0.314 / 0.251 against the rest).
   silence rather than toward false accusations, which is the right direction,
   but it is the reason to keep reference sets `manual` + `strict` only.
 
+## Which labels get adjudicated (added 2026-09-16)
+
+The panel gives each row Keep / Reject / Reassign / Swap — a per-face verdict.
+That is the right instrument for a hand-made label and the wrong one for a
+machine guess that is ~4% accurate. On 2026-09-12 the unfiltered list was
+**108 findings, 104 of them `temporal` Calvin** — the temporal matcher had
+tagged one boy onto most of the field, including the opposing team, so the
+panel was a wall of different kids' faces and the 4 real findings were buried
+26:1.
+
+`TRUSTED_LABEL_SOURCES = ("manual", "strict", "merge_review")` is now the
+default subject set. Filtered, the same scope gives **4 findings, all manual,
+all decisive, the rival first**. The temporal pile is a bulk clear of the
+person + date, not 104 verdicts.
+
+Two properties this must keep:
+
+- **Nothing is silently dropped.** `stats.hidden_by_source` /
+  `hidden_by_person` come back, and every surface prints them. A filter that
+  quietly shows less is indistinguishable from a detector that found less,
+  which is the failure mode this whole document exists to avoid.
+- **The filter is applied LAST** — after references, separations, radii and the
+  per-photo assignment. A hidden temporal face still competes for its photo's
+  labels. Filtering earlier would make the *numbers* depend on which rows you
+  asked to see.
+
+A corollary worth recognising rather than chasing: **a mislabel inflates the
+flag count around itself.** While 505383 was still wrongly "Franklin", face
+505376 — correctly relabelled Beckham — was flagged as looking like Franklin,
+because 505383 sat in Franklin's reference set. Fixing the rival makes the
+phantom finding disappear. Expect the list to shrink by more than one per fix.
+
 ## Still to build
 
 - Iterative re-scoring after accepting a correction, so fixing one label

@@ -741,6 +741,7 @@
       const [err, setErr] = useState('');
       const [decisiveOnly, setDecisiveOnly] = useState(false);
       const [rivalsOnly, setRivalsOnly] = useState(false);
+      const [sources, setSources] = useState('');   // '' = trusted (server default)
       const [busy, setBusy] = useState(null);
       const [done, setDone] = useState({});     // face_id -> what we did
 
@@ -751,10 +752,11 @@
         if (dateTo) u += '&date_to=' + encodeURIComponent(dateTo);
         if (rivalsOnly) u += '&rivals_only=1';
         else if (decisiveOnly) u += '&decisive_only=1';
+        if (sources) u += '&sources=' + encodeURIComponent(sources);
         fetch(u).then(r => r.json())
           .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
           .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
-      }, [dateFrom, dateTo, decisiveOnly, rivalsOnly]);
+      }, [dateFrom, dateTo, decisiveOnly, rivalsOnly, sources]);
       useEffect(() => { load(); }, [load]);
 
       // Reassign sends the candidate name; reject sends null, which the server
@@ -926,6 +928,14 @@
                 + 'label is on the wrong face and the right one is right there. '
                 + 'Rare and near-certain; swap rather than adjudicate.'),
             ),
+            e('select', {
+              className: 'insp-btn', value: sources, style: { marginRight: 10 },
+              title: 'Which labels you are asked about. Temporal matches are a '
+                   + 'bulk problem, not a per-face verdict.',
+              onChange: ev => setSources(ev.target.value) },
+              e('option', { value: '' }, 'trusted labels'),
+              e('option', { value: 'all' }, 'all labels'),
+              e('option', { value: 'temporal' }, 'temporal only')),
             e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 5, marginRight: 10 } },
               e('input', { type: 'checkbox', checked: rivalsOnly,
                 onChange: ev => setRivalsOnly(ev.target.checked) }),
@@ -939,6 +949,17 @@
             e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
           ),
           err && e('div', { style: { padding: '10px 16px', color: 'var(--err, #e66)' } }, err),
+          data && data.stats && Object.keys(data.stats.hidden_by_source || {}).length > 0 &&
+            e('div', { className: 'insp-sub',
+                       style: { padding: '0 16px 8px', color: 'var(--warn, #db4)' } },
+              'Not shown: '
+              + Object.entries(data.stats.hidden_by_source)
+                  .map(([src, n]) => n + ' ' + src).join(', ')
+              + ' — ' + Object.entries(data.stats.hidden_by_person).slice(0, 4)
+                  .map(([who, n]) => who + ' (' + n + ')').join(', ')
+              + '. Temporal matching over-tags one kid onto the whole field, so these '
+              + 'are a bulk clear of the person + date, not 76 individual verdicts. '
+              + 'Switch to "all labels" to see them anyway.'),
           e('div', { style: { padding: '10px 16px', overflowY: 'auto' } },
             !loading && data && data.findings.length === 0 &&
               e('div', { className: 'insp-sub' },

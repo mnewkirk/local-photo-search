@@ -2124,6 +2124,9 @@ def api_verify_labels(
     min_references: int = Query(3, ge=2, le=50),
     decisive_only: bool = Query(False),
     rivals_only: bool = Query(False),
+    sources: Optional[str] = Query(None, description=
+        "Comma-separated match_source values to REPORT on; 'all' for every "
+        "source. Default: manual,strict,merge_review."),
     limit: int = Query(60, ge=1, le=500),
 ):
     """Labelled faces that look more like SOMEONE ELSE in the same scope.
@@ -2132,6 +2135,13 @@ def api_verify_labels(
     is compared against every other person present and calibrated against how
     close those two people genuinely get (see photosearch/face_verify.py and
     docs/plans/face-label-verification.md).
+
+    `sources` decides which labels you are ASKED about. It defaults to the
+    trusted ones, because `temporal` is ~4% accurate on these shoots and buried
+    the real findings 76:1 on 2026-09-12 — a per-face verdict is the wrong
+    shape of work for a machine guess that wrong. The counts it hid come back
+    in `stats.hidden_by_source` / `stats.hidden_by_person`, so the panel can
+    say so rather than quietly show less.
 
     `rivals_only` keeps just the findings where another face in the SAME photo
     claims the label better. Those are rare and near-certain — 4 across two
@@ -2146,9 +2156,15 @@ def api_verify_labels(
 
     with _get_db() as db:
         try:
+            if sources and sources.strip().lower() == "all":
+                label_sources = None
+            elif sources:
+                label_sources = tuple(s.strip() for s in sources.split(",") if s.strip())
+            else:
+                label_sources = face_verify.TRUSTED_LABEL_SOURCES
             findings, skipped, stats = face_verify.verify_labels(
                 db, date_from=date_from, date_to=date_to, person=person,
-                min_references=min_references)
+                min_references=min_references, label_sources=label_sources)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 

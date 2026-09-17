@@ -186,3 +186,67 @@ def test_rivals_can_be_switched_off(rival_db):
 
     findings, _ = _findings(db, rivals=False)
     assert all(f["rival"] is None for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Which labels you are ASKED about (see TRUSTED_LABEL_SOURCES).
+# ---------------------------------------------------------------------------
+
+def test_temporal_labels_are_not_adjudicated_by_default(rival_db):
+    """A panel of per-face verdicts is the wrong shape for a ~4%-accurate
+    matcher: on 2026-09-12 temporal buried the real findings 76:1."""
+    db = rival_db
+    ph = db._mk_photo(3, 12, 0, 0)
+    t = db.add_face(ph, (10, 90, 90, 10), _near(db._ident["Quinn"], 55), det_score=0.9)
+    db.assign_face_to_person(t, db._person_id["Pat"], match_source="temporal")
+    db.conn.commit()
+
+    findings, stats = _findings(db)
+    assert all(f["face_id"] != t for f in findings)
+    assert stats["hidden_by_source"] == {"temporal": 1}
+    assert stats["hidden_by_person"] == {"Pat": 1}
+
+
+def test_hidden_labels_are_counted_not_silently_dropped(rival_db):
+    """The caller must be able to say what it is not showing."""
+    db = rival_db
+    for k in range(3):
+        ph = db._mk_photo(4, 12, k, 0)
+        t = db.add_face(ph, (10, 90, 90, 10), _near(db._ident["Quinn"], 200 + k), det_score=0.9)
+        db.assign_face_to_person(t, db._person_id["Pat"], match_source="temporal")
+    db.conn.commit()
+
+    _, stats = _findings(db)
+    assert stats["hidden_by_source"]["temporal"] == 3
+
+
+def test_sources_none_reports_everything(rival_db):
+    db = rival_db
+    ph = db._mk_photo(3, 12, 0, 0)
+    t = db.add_face(ph, (10, 90, 90, 10), _near(db._ident["Quinn"], 55), det_score=0.9)
+    db.assign_face_to_person(t, db._person_id["Pat"], match_source="temporal")
+    db.conn.commit()
+
+    findings, stats = _findings(db, label_sources=None)
+    assert any(f["face_id"] == t for f in findings)
+    assert stats["hidden_by_source"] == {}
+
+
+def test_hiding_a_source_does_not_change_the_numbers(rival_db):
+    """Filtering happens LAST. A hidden temporal face still competes in its
+    photo's assignment and still shapes the calibration — otherwise the answer
+    would depend on which rows you asked to see."""
+    db = rival_db
+    ph = db._mk_photo(2, 12, 0, 0)
+    wrong = db.add_face(ph, (10, 90, 90, 10), _near(db._ident["Quinn"], 77), det_score=0.9)
+    db.assign_face_to_person(wrong, db._person_id["Pat"], match_source="manual")
+    db.add_face(ph, (10, 190, 90, 110), _near(db._ident["Pat"], 88), det_score=0.9)
+    ph2 = db._mk_photo(5, 12, 0, 0)
+    t = db.add_face(ph2, (10, 90, 90, 10), _near(db._ident["Quinn"], 55), det_score=0.9)
+    db.assign_face_to_person(t, db._person_id["Pat"], match_source="temporal")
+    db.conn.commit()
+
+    trusted = {f["face_id"]: f for f in _findings(db)[0]}
+    every = {f["face_id"]: f for f in _findings(db, label_sources=None)[0]}
+    assert trusted[wrong]["d_own"] == every[wrong]["d_own"]
+    assert trusted[wrong]["rival"] == every[wrong]["rival"]

@@ -1307,9 +1307,13 @@ def review_faces(db, date_, base_url, team_hue, tolerance, min_det, min_edge,
               help="Only faces closer to another person than the two ever get.")
 @click.option("--rivals-only", is_flag=True, default=False,
               help="Only faces another face in the SAME photo claims better.")
+@click.option("--sources", default="manual,strict,merge_review", show_default=True,
+              help="Which match_source labels to report on; 'all' for every source. "
+                   "'temporal' is off by default — ~4% accurate on these shoots, "
+                   "and a bulk clear, not a per-face verdict, is the right fix.")
 @click.option("--limit", default=40, show_default=True, type=int)
 def verify_face_labels(db, date_from, date_to, person, min_references,
-                       decisive_only, rivals_only, limit):
+                       decisive_only, rivals_only, sources, limit):
     """Find labelled faces that look more like SOMEONE ELSE in the same scope.
 
     Unlike verify-person-matches (global distance threshold) and
@@ -1327,16 +1331,25 @@ def verify_face_labels(db, date_from, date_to, person, min_references,
     docs/plans/face-label-verification.md
     """
     from photosearch import face_verify
+    label_sources = (None if sources.strip().lower() == "all"
+                     else tuple(s.strip() for s in sources.split(",") if s.strip()))
     with PhotoDB(db) as pdb:
         try:
             findings, skipped, stats = face_verify.verify_labels(
                 pdb, date_from=date_from, date_to=date_to, person=person,
-                min_references=min_references)
+                min_references=min_references, label_sources=label_sources)
         except ValueError as e:
             raise click.ClickException(str(e))
 
     click.echo(f"{stats['faces']} labelled faces, {stats['people']} people "
                f"with a usable reference set, {stats['pairs']} pairs calibrated")
+    if stats.get("hidden_by_source"):
+        by_src = ", ".join(f"{n} {src}" for src, n in stats["hidden_by_source"].items())
+        by_who = ", ".join(f"{who} ({n})"
+                           for who, n in list(stats["hidden_by_person"].items())[:5])
+        click.echo(f"  not shown: {by_src} — {by_who}. These are a bulk problem "
+                   f"(clear the person+scope), not a per-face verdict. "
+                   f"--sources all to include them.")
     for s in skipped:
         click.echo(f"  skipped {s['person']}: {s['trusted']} trusted face(s) — "
                    f"{s['reason']}")

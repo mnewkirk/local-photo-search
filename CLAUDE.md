@@ -1512,9 +1512,39 @@ how 244260 and 244261 both went wrong) are grouped for a single action, but each
 is an *independently gated* finding, not a blind copy — so applying the set is as
 safe as applying them one at a time.
 
-Tests: `tests/test_face_rivals.py` (7 cases — the unlabelled-claimant shape,
+### The panel asks about TRUSTED labels only
+
+`face_verify.TRUSTED_LABEL_SOURCES = ("manual", "strict", "merge_review")` is
+the default for `verify_labels(label_sources=...)`, the API `?sources=`, the CLI
+`--sources`, and the panel's source dropdown. `'all'` includes everything;
+`'temporal'` isolates it.
+
+**`temporal` is off by default because the panel is per-face Keep / Reject /
+Swap, and that is the wrong shape of work for a ~4%-accurate matcher.** On
+2026-09-12 the unfiltered list was **108 findings, 104 of them temporal Calvin**
+— one kid over-matched across the whole field including the opposing team — and
+the 4 real ones were buried 26:1. Filtered: **4 findings, all manual, all
+decisive, the rival first.** The fix for the temporal pile is a bulk clear of
+the person + date, not 104 individual verdicts.
+
+**Nothing is silently dropped.** `stats.hidden_by_source` /
+`hidden_by_person` come back and the panel prints "Not shown: 104 temporal —
+Calvin (104)". **The filter is applied LAST**, after calibration and after the
+per-photo assignment, so a hidden temporal face still competes for its photo's
+labels and still shapes `separation`/`radius` — otherwise the numbers would
+depend on which rows you asked to see. `test_hiding_a_source_does_not_change_the_numbers`
+pins that.
+
+Corollary worth knowing: a mislabel *inflates the flag count around itself*.
+While 505383 was still wrongly "Franklin" on the replica, 505376 (correctly
+Beckham) was flagged as looking like Franklin — because 505383 was in Franklin's
+reference set. Fixing the rival makes the phantom finding go away; it is not a
+separate error to chase.
+
+Tests: `tests/test_face_rivals.py` (11 cases — the unlabelled-claimant shape,
 ordering, the correct-label-beside-a-stranger false positive, gate 4, the
-one-rival-two-labels assignment invariant, burst linkage, and the off switch).
+one-rival-two-labels assignment invariant, burst linkage, the off switch, and
+the source filter's don't-change-the-numbers guarantee).
 
 ### `match_source='rejected'` — a human "no" that survives auto-matching
 

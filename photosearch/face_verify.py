@@ -32,6 +32,18 @@ SEPARATION_PERCENTILE = 5.0
 
 MIN_REFERENCES = 3
 
+# Which labels are worth ADJUDICATING one at a time. Distinct from
+# REFERENCE_SOURCES above, which is about what may define a person.
+#
+# `temporal` is excluded by default because a panel with per-face Keep /
+# Reject / Swap buttons is the wrong shape of work for it: measured ~4%
+# accurate on these soccer shoots, it over-matches one kid onto the whole
+# field — including the opposing team — so the right action is a bulk clear of
+# the person+scope, not 76 individual verdicts. Leaving it in drowned the real
+# findings 76:1 on 2026-09-12. Nothing is silently dropped: the hidden counts
+# come back in `stats` so the caller can say what it is not showing.
+TRUSTED_LABEL_SOURCES = ("manual", "strict", "merge_review")
+
 # How many reference crops to hand the reviewer per identity.
 REF_PREVIEW = 4
 
@@ -105,7 +117,8 @@ def _assign(cost):
 
 def verify_labels(db, *, date_from=None, date_to=None, person=None,
                   min_references=MIN_REFERENCES, limit=None,
-                  burst_window=BURST_WINDOW_SECONDS, rivals=True):
+                  burst_window=BURST_WINDOW_SECONDS, rivals=True,
+                  label_sources=TRUSTED_LABEL_SOURCES):
     """Score every labelled face in scope. Returns (findings, skipped, stats).
 
     A finding carries both signals so a reviewer can tell a suggestion from a
@@ -117,6 +130,11 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
     the SAME photo that claims this label better. Those are returned even when
     `margin <= 0`, because the rival test does not need the true identity to be
     a registered person — which is the whole point of it.
+
+    `label_sources` limits which labels are REPORTED (None = every source).
+    Calibration is unaffected: references, separations, radii and the per-photo
+    assignment all still see every labelled face, so hiding a source changes
+    what you are asked about, never what the numbers mean.
     """
     where = ["f.person_id IS NOT NULL"]
     params: list = []
@@ -264,6 +282,22 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
     # person to be closer, which is the one thing the margin test cannot do
     # without.
     findings = [f for f in findings if f["margin"] > 0 or f["rival"]]
+    # Filter LAST, so a hidden source still shaped the calibration and the
+    # per-photo assignment it belongs to — a temporal face holding a label is
+    # still a rival's competitor even when you are not being asked about it.
+    hidden: dict[str, int] = {}
+    hidden_people: dict[str, int] = {}
+    if label_sources is not None:
+        allow = set(label_sources)
+        keep = []
+        for f in findings:
+            if f["match_source"] in allow:
+                keep.append(f)
+            else:
+                src = f["match_source"] or "none"
+                hidden[src] = hidden.get(src, 0) + 1
+                hidden_people[f["person"]] = hidden_people.get(f["person"], 0) + 1
+        findings = keep
     _attach_burst_siblings(findings, rows, burst_window)
     # Rivals first — they name the right face, so they are the only findings a
     # reviewer can fix in one click rather than adjudicate.
@@ -272,7 +306,10 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
         findings = findings[:limit]
     return findings, skipped, {"faces": len(rows), "people": len(refs),
                                "pairs": len(sep) // 2,
-                               "rivals": sum(1 for f in findings if f["rival"])}
+                               "rivals": sum(1 for f in findings if f["rival"]),
+                               "hidden_by_source": hidden,
+                               "hidden_by_person": dict(sorted(
+                                   hidden_people.items(), key=lambda kv: -kv[1]))}
 
 
 def _photo_rivals(db, labelled_rows, encs, refs, names, radius, d_to):

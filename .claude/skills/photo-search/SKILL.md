@@ -268,7 +268,11 @@ need cross-recluster persistence.
   a person appears in a photo at most once, so those are near-certain, and
   unlike the rest they name the right face (`rival.rival_face_id`) so the
   reviewer swaps instead of adjudicating. The rival may be **unlabelled**,
-  which is what the margin test structurally cannot see. See
+  which is what the margin test structurally cannot see. `?sources=` picks
+  which labels you are ASKED about and defaults to `manual,strict,merge_review`
+  — `temporal` is ~4% accurate on these shoots and buried the real findings
+  26:1 on 2026-09-12 (108 findings → 4). Use `sources=all` to include it; the
+  hidden counts come back in `stats.hidden_by_source`. See
   `docs/plans/face-label-verification.md`.
 - `POST /api/faces/review-team` — **SSE**; the `review-faces` CLI as an endpoint
   (M32). Samples the jersey colour below each face, keeps the ones matching the
@@ -729,7 +733,9 @@ Three panels, all opened from the filter bar:
   shows the face in the same photo that claims the label better, and offers
   **Swap** (one click, fixes both faces) plus **Swap all N frames** when the
   same mistake was independently flagged in neighbouring burst frames. Rivals
-  sort first; a "rivals only" toggle isolates them.
+  sort first; a "rivals only" toggle isolates them. A source dropdown
+  (trusted / all / temporal-only) decides which labels are adjudicated —
+  trusted by default, with a banner naming what it is not showing.
 - **⚽ Review team faces** — single day only (it learns ONE jersey colour; a
   range would average two kits). Groups the day's unknown team faces so you
   name a handful of groups instead of a thousand crops. The hue is learned from
