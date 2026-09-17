@@ -50,10 +50,13 @@ def rival_db(tmp_path):
     # and a photo per PERSON — sharing them would put both people in every
     # reference frame and quietly break the one-person-per-photo premise the
     # rival test rests on.
-    for n, base in ident.items():
+    # Seeds are positional, NOT hash(name): PYTHONHASHSEED is randomized per
+    # process, so a hash-derived seed makes the whole fixture — and therefore
+    # every distance in these tests — different on every run.
+    for pi, (n, base) in enumerate(sorted(ident.items())):
         for k in range(12):
             ph = photo(1, 10, k * 5, 0, tag="-" + n)
-            f = db.add_face(ph, (10, 90, 90, 10), _near(base, (hash(n) % 1000) + k),
+            f = db.add_face(ph, (10, 90, 90, 10), _near(base, 300 + pi * 100 + k),
                             det_score=0.9)
             db.assign_face_to_person(f, pid[n], match_source="manual")
     db.conn.commit()
@@ -216,8 +219,13 @@ def test_hidden_labels_are_counted_not_silently_dropped(rival_db):
         db.assign_face_to_person(t, db._person_id["Pat"], match_source="temporal")
     db.conn.commit()
 
+    # Anchored to the unfiltered call rather than a literal: the count must be
+    # exactly what the caller would have been shown, whatever that is.
+    every, _ = _findings(db, label_sources=None)
+    expected = sum(1 for f in every if f["match_source"] == "temporal")
     _, stats = _findings(db)
-    assert stats["hidden_by_source"]["temporal"] == 3
+    assert expected == 3, "fixture should produce a finding for each temporal face"
+    assert stats["hidden_by_source"]["temporal"] == expected
 
 
 def test_sources_none_reports_everything(rival_db):

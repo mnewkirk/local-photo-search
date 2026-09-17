@@ -801,6 +801,14 @@ with `--base-url` and they always resolve.
 photosearch verify-face-labels --date-from 2026-09-12 --date-to 2026-09-12 \
     [--decisive-only] [--person NAME] [--min-references 3]
 
+# A whole match_source is wrong for one person (Calvin: 6,331 temporal faces,
+# p50 1.248 from his manual refs vs strict's 1.053). Bulk, reversible, and
+# marked 'rejected' so match-faces cannot re-apply it. RUN ON THE NAS.
+photosearch unmatch-person --person Calvin                       # preview
+photosearch unmatch-person --person Calvin --min-dist 1.05 \
+    --snapshot /data/calvin-temporal.json --apply
+photosearch restore-unmatch --from /data/calvin-temporal.json --apply
+
 # ...and which of those have the right face sitting in the SAME photo?
 # Rare, near-certain, and fixable by a swap. 4 findings across two ~950-photo
 # shoots, all true.

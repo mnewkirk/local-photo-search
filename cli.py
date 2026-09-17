@@ -880,6 +880,127 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
                    "Reversible via: photosearch restore-unmatched-faces.")
 
 
+@cli.command("unmatch-person")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--person", required=True, help="Whose labels to remove.")
+@click.option("--source", "sources", multiple=True, default=("temporal",),
+              show_default=True,
+              help="match_source values to clear. Repeatable.")
+@click.option("--date-from", default=None, metavar="YYYY-MM-DD")
+@click.option("--date-to", default=None, metavar="YYYY-MM-DD")
+@click.option("--min-dist", default=None, type=float,
+              help="Only clear faces farther than this from the person's MANUAL "
+                   "references. Keeps the minority a bad source got right.")
+@click.option("--snapshot", default=None, metavar="PATH",
+              help="Write the exact cleared set to JSON so restore-unmatch can "
+                   "undo precisely this sweep. Required with --apply.")
+@click.option("--apply", "do_apply", is_flag=True, default=False,
+              help="Actually write. Without it this is a preview.")
+def unmatch_person(db, person, sources, date_from, date_to, min_dist,
+                   snapshot, do_apply):
+    """Bulk-remove one person's labels from a whole match_source.
+
+    The case: `temporal` matching over-tags one kid onto everyone at an event —
+    measured ~4% accurate on the soccer shoots — so a person accumulates
+    thousands of wrong faces that are not worth adjudicating one at a time.
+
+    Cleared faces are marked 'rejected', NOT NULL, so the next match-faces
+    sweep cannot put them straight back (which is exactly what happened on
+    2026-09-14). --snapshot makes it reversible by pinned id; prefer that over
+    restore-unmatched-faces, which restores every unmatch ever made.
+
+    Run this where the DB is authoritative — on the NAS.
+
+    \b
+    Examples:
+      photosearch unmatch-person --person Calvin                  # preview
+      photosearch unmatch-person --person Calvin --min-dist 1.05 \\
+          --snapshot /data/calvin-temporal.json --apply
+    """
+    import json
+    from photosearch import bulk_unmatch
+
+    if do_apply and not snapshot:
+        raise click.ClickException(
+            "--apply requires --snapshot: this clears thousands of labels and "
+            "the snapshot is the only precise undo.")
+
+    with PhotoDB(db) as pdb:
+        rows, stats = bulk_unmatch.select(
+            pdb, person=person, sources=tuple(sources), date_from=date_from,
+            date_to=date_to, min_dist=min_dist)
+
+        click.echo(f"{person}: {stats['candidates']} face(s) in "
+                   f"{'/'.join(sources)}, {stats['references']} manual "
+                   f"reference(s)")
+        if stats.get("percentiles"):
+            p = stats["percentiles"]
+            click.echo(f"  distance to the manual set — p10 {p[10]}, "
+                       f"p50 {p[50]}, p90 {p[90]}")
+        if min_dist is not None:
+            kept = stats["candidates"] - stats["selected"]
+            click.echo(f"  gate >{min_dist}: clears {stats['selected']}, "
+                       f"keeps {kept} as close enough to be real")
+        if not rows:
+            click.echo("Nothing to clear.")
+            return
+
+        for r in rows[:5]:
+            d = "n/a" if r["dist"] is None else f"{r['dist']:.3f}"
+            click.echo(f"    face {r['face_id']} (photo {r['photo_id']}, "
+                       f"{r['match_source']}, d={d})")
+        if len(rows) > 5:
+            click.echo(f"    … and {len(rows) - 5} more")
+
+        if not do_apply:
+            click.echo(f"\nDry run — would clear {len(rows)} face(s). "
+                       f"Re-run with --snapshot PATH --apply to write.")
+            return
+
+        with open(snapshot, "w") as fh:
+            json.dump({"person": person, "sources": list(sources),
+                       "min_dist": min_dist,
+                       "faces": [{"face_id": r["face_id"],
+                                  "person_id": r["person_id"],
+                                  "match_source": r["match_source"]}
+                                 for r in rows]}, fh)
+        n = bulk_unmatch.apply(pdb, rows)
+        click.echo(f"\nCleared {n} face(s), marked 'rejected'. "
+                   f"Snapshot: {snapshot}")
+        click.echo(f"Undo with: photosearch restore-unmatch --from {snapshot} --apply")
+
+
+@cli.command("restore-unmatch")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--from", "src", required=True, metavar="PATH",
+              help="Snapshot written by unmatch-person --snapshot.")
+@click.option("--apply", "do_apply", is_flag=True, default=False)
+def restore_unmatch(db, src, do_apply):
+    """Undo exactly one unmatch-person sweep, by pinned face id.
+
+    Deliberately narrower than restore-unmatched-faces, which re-applies every
+    unmatch ever recorded — including cleanups you meant to keep. Faces labelled
+    by hand since the sweep are skipped: this is an undo, not a replay.
+    """
+    import json
+    from photosearch import bulk_unmatch
+
+    with open(src) as fh:
+        snap = json.load(fh)
+    faces = snap.get("faces", [])
+    click.echo(f"Snapshot: {snap.get('person')} · {len(faces)} face(s) · "
+               f"sources {'/'.join(snap.get('sources') or [])}")
+    if not do_apply:
+        click.echo("Dry run — re-run with --apply to restore.")
+        return
+    with PhotoDB(db) as pdb:
+        restored, skipped = bulk_unmatch.restore(pdb, faces)
+    click.echo(f"Restored {restored}; skipped {skipped} "
+               f"(labelled since, or gone).")
+
+
 @cli.command("restore-unmatched-faces")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")

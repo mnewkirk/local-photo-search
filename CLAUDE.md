@@ -1546,6 +1546,50 @@ ordering, the correct-label-beside-a-stranger false positive, gate 4, the
 one-rival-two-labels assignment invariant, burst linkage, the off switch, and
 the source filter's don't-change-the-numbers guarantee).
 
+### Bulk-undoing one person's bad labels — `unmatch-person`
+
+When a whole `match_source` is wrong for a person, adjudicating is hopeless:
+Calvin carries **6,331 `temporal`** faces library-wide. Measured against his 745
+**manual** references (leave-one-burst-out), the populations do not overlap:
+
+| source | n | p10 | p50 | p90 | >1.15 |
+|---|---|---|---|---|---|
+| manual | 745 | 0.309 | 0.478 | 0.600 | 1% |
+| merge_review | 9 | 0.586 | 0.633 | 0.671 | 0% |
+| strict | 11,669 | 0.808 | **1.053** | 1.145 | 9% |
+| temporal | 6,331 | **1.123** | 1.248 | 1.313 | **85%** |
+
+temporal's *best decile* is worse than strict's median. Contact sheets confirm
+it: a strict sample is the same boy at every age; a temporal sample is a dozen
+different kids, both teams. **`strict` is fine — including its far tail**, which
+is hard poses (profiles, hats, low light), not other people. So the answer to
+"are they all temporal?" is effectively yes.
+
+```bash
+photosearch unmatch-person --person Calvin                       # preview
+photosearch unmatch-person --person Calvin --min-dist 1.05 \
+    --snapshot /data/calvin-temporal.json --apply
+photosearch restore-unmatch --from /data/calvin-temporal.json --apply
+```
+
+Module `photosearch/bulk_unmatch.py`; tests `tests/test_bulk_unmatch.py`.
+**Run it on the NAS** — it writes, and the NAS is the sole writer.
+
+Three things it does that a SQL `UPDATE ... SET person_id=NULL` does not:
+
+- **Writes `rejected`, not NULL.** A NULL is indistinguishable from
+  never-matched, so the next `match-faces` sweep re-applies the same wrong
+  labels — precisely what happened on 2026-09-14.
+- **`--apply` requires `--snapshot`**, and `restore-unmatch` re-applies *only*
+  those pinned ids, skipping any face hand-labelled since. Deliberately narrower
+  than `restore-unmatched-faces`, which restores every unmatch ever recorded.
+- **`--min-dist` keeps what the bad source got right.** temporal is ~4%
+  accurate, not 0%. On Calvin a 1.05 gate clears 6,187 and keeps 144 — the gate
+  costs almost nothing here because the populations are so separated, but on a
+  person with a better temporal record it is the difference between a cleanup
+  and a data loss. A face with **no usable reference is never cleared by a
+  gate**: "unknown" is not "far".
+
 ### `match_source='rejected'` — a human "no" that survives auto-matching
 
 `faces.REJECTED_MATCH_SOURCE`. Written whenever a person clears a face
