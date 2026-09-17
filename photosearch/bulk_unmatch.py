@@ -166,3 +166,129 @@ def restore(db, rows):
         restored += 1
     db.conn.commit()
     return restored, skipped
+
+
+# ---------------------------------------------------------------------------
+# The high-level view: who else needs this?
+# ---------------------------------------------------------------------------
+# Splitting this in two is deliberate. `label_health` is pure SQL over counts,
+# so the overview is instant and can be opened on a whim; `calibrate` costs a
+# distance pass over one person's whole face set, so it is per-person and
+# on demand. Doing both eagerly would make the overview a minute-long request
+# that nobody opens twice.
+
+MIN_CALIBRATION_REFS = 5
+MIN_CALIBRATION_STRICT = 20
+BAR_PERCENTILE = 90.0
+TOP_DAYS = 6
+
+
+def label_health(db, source="temporal"):
+    """Per person: how much of `source` they carry, and where it is concentrated.
+
+    Sorted by the count, because that is the review cost. Bundles the worst days
+    so the answer to "where do I start" is in the same payload — a person's
+    whole `source` population is usually not reviewable in one grid, but one of
+    their shoots is.
+    """
+    rows = db.conn.execute(
+        """SELECT pe.id AS person_id, pe.name AS person,
+                  f.match_source AS src, COUNT(*) AS n
+             FROM faces f JOIN persons pe ON pe.id = f.person_id
+            GROUP BY pe.id, f.match_source""").fetchall()
+    by_person: dict[int, dict] = {}
+    for r in rows:
+        p = by_person.setdefault(r["person_id"], {
+            "person_id": r["person_id"], "person": r["person"],
+            "total": 0, "by_source": {}})
+        p["by_source"][r["src"] or "none"] = r["n"]
+        p["total"] += r["n"]
+
+    days = db.conn.execute(
+        """SELECT f.person_id, date(p.date_taken) AS d, COUNT(*) AS n
+             FROM faces f JOIN photos p ON p.id = f.photo_id
+            WHERE f.match_source = ? AND p.date_taken IS NOT NULL
+            GROUP BY f.person_id, d ORDER BY n DESC""", (source,)).fetchall()
+    for r in days:
+        p = by_person.get(r["person_id"])
+        if p is None:
+            continue
+        p.setdefault("top_days", [])
+        if len(p["top_days"]) < TOP_DAYS:
+            p["top_days"].append({"date": r["d"], "count": r["n"]})
+
+    out = []
+    for p in by_person.values():
+        n = p["by_source"].get(source, 0)
+        manual = p["by_source"].get(REFERENCE_SOURCE, 0)
+        strict = p["by_source"].get("strict", 0)
+        out.append({**p, "source": source, "count": n,
+                    "top_days": p.get("top_days", []),
+                    # Why a person cannot be judged automatically is itself the
+                    # finding: "label a few by hand first" is the fix, and
+                    # silently omitting them would hide the work.
+                    "calibratable": bool(n and manual >= MIN_CALIBRATION_REFS
+                                         and strict >= MIN_CALIBRATION_STRICT),
+                    "blocker": (None if not n else
+                                "no faces in this source" if not n else
+                                f"only {manual} manual reference(s) — label a few "
+                                f"by hand first" if manual < MIN_CALIBRATION_REFS else
+                                f"only {strict} strict face(s) to calibrate against"
+                                if strict < MIN_CALIBRATION_STRICT else None)})
+    out.sort(key=lambda p: -p["count"])
+    return out
+
+
+def calibrate(db, *, person, source="temporal", burst_window=BURST_WINDOW_SECONDS):
+    """Is `source` a DIFFERENT population from this person's `strict` faces?
+
+    The bar is the p90 of the person's OWN strict distances — not of their
+    manual ones. Hand-made labels cluster in the sessions you happened to label,
+    so manual-to-manual distance is artificially tight: using its p90 as a bar
+    called **11,562 of Calvin's 11,669 strict faces suspect**, which the crops
+    flatly contradict. `strict` is the largest verified-looking population a
+    person has, so it is the honest yardstick for "how far does this person
+    legitimately land from their references".
+    """
+    rows = db.conn.execute(
+        """SELECT f.id, f.match_source, p.date_taken
+             FROM faces f JOIN persons pe ON pe.id = f.person_id
+             JOIN photos p ON p.id = f.photo_id
+            WHERE pe.name = ?""", (person,)).fetchall()
+    encs = db.get_face_encodings_bulk([r["id"] for r in rows])
+    rows = [r for r in rows if r["id"] in encs]
+    if not rows:
+        return None
+
+    src = np.array([r["match_source"] for r in rows])
+    ref = src == REFERENCE_SOURCE
+    if int(ref.sum()) < MIN_CALIBRATION_REFS:
+        return {"person": person, "calibratable": False,
+                "blocker": f"only {int(ref.sum())} manual reference(s)"}
+
+    ids = np.array([r["id"] for r in rows])
+    t = np.array([_epoch(r["date_taken"]) for r in rows])
+    X = _unit([encs[i] for i in ids])
+    R, Rt, Rid = X[ref], t[ref], ids[ref]
+    d = np.empty(len(ids))
+    for i in range(0, len(ids), CHUNK):
+        sl = slice(i, i + CHUNK)
+        D = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * (X[sl] @ R.T)))
+        D[(ids[sl][:, None] == Rid[None, :])
+          | np.nan_to_num(np.abs(t[sl][:, None] - Rt[None, :]) <= burst_window,
+                          nan=False)] = np.inf
+        d[sl] = D.min(axis=1)
+
+    ok = np.isfinite(d)
+    sm, tm = (src == "strict") & ok, (src == source) & ok
+    if int(sm.sum()) < MIN_CALIBRATION_STRICT or not tm.any():
+        return {"person": person, "calibratable": False,
+                "blocker": f"only {int(sm.sum())} strict face(s) to calibrate against"}
+    bar = float(np.percentile(d[sm], BAR_PERCENTILE))
+    return {"person": person, "source": source, "calibratable": True,
+            "strict_p50": round(float(np.median(d[sm])), 3),
+            "source_p50": round(float(np.median(d[tm])), 3),
+            "bar": round(bar, 3),
+            "count": int(tm.sum()),
+            "beyond": int((d[tm] > bar).sum()),
+            "pct_beyond": round(100.0 * float((d[tm] > bar).mean()), 1)}

@@ -2186,6 +2186,43 @@ def api_verify_labels(
             "rival_count": sum(1 for f in findings if f["rival"])}
 
 
+@app.get("/api/faces/label-health")
+def api_label_health(
+    source: str = Query("temporal", description="Which match_source to audit."),
+    person: Optional[str] = Query(None, description=
+        "Also run the (costlier) distance calibration for this one person."),
+):
+    """Who carries a suspect `match_source`, and where it is concentrated.
+
+    The high-level view the per-shoot panels do not give you: a whole library's
+    worth of over-matching is invisible one date at a time. Measured here, only
+    **four** people carry any `temporal` labels at all — so "which people should
+    I clean up?" has a short, checkable answer.
+
+    The overview is pure SQL over counts, so it opens instantly. The distance
+    calibration costs a pass over one person's whole face set, so it is opt-in
+    per person via `?person=`.
+
+    `calibratable: false` is a finding, not an omission — a person with no
+    hand-made labels (Matt: 794 temporal faces, 0 manual) cannot be judged
+    automatically at all, and "label a few by hand first" is the actual fix.
+    """
+    from . import bulk_unmatch
+
+    with _get_db() as db:
+        people = bulk_unmatch.label_health(db, source=source)
+        detail = None
+        if person:
+            if not db.get_person_by_name(person):
+                raise HTTPException(404, f"no person named {person!r}")
+            detail = bulk_unmatch.calibrate(db, person=person, source=source)
+    carrying = [p for p in people if p["count"]]
+    return {"source": source, "people": carrying,
+            "detail": detail,
+            "totals": {"people_carrying": len(carrying),
+                       "faces": sum(p["count"] for p in carrying)}}
+
+
 @app.get("/api/faces/unmatch-preview")
 def api_unmatch_preview(
     person: str = Query(..., description="Whose labels to preview removing."),

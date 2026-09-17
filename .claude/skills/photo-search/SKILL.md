@@ -257,6 +257,14 @@ need cross-recluster persistence.
   29 photos" look identical on screen. Capped at `limit` (default 10,000); the
   UI labels a truncated widen rather than silently delivering less than the
   button promised.
+- `GET /api/faces/label-health` — **who carries a suspect `match_source`,
+  library-wide**, ranked by count, with the days it is concentrated on. Pure SQL
+  (instant); `?person=` adds the distance calibration for one person. The bar is
+  the p90 of that person's own **strict** distances, not their manual ones —
+  manual labels cluster in the sessions you hand-labelled, so their spread is
+  artificially tight. `calibratable: false` + `blocker` is a finding (a person
+  with no manual labels can't be judged automatically). Backs the 📊 Label
+  health panel.
 - `GET /api/faces/unmatch-preview` — candidate faces for a bulk unmatch
   (`person`, `sources` default `temporal`, `min_dist`, date range), sorted
   farthest-from-the-person first; unmeasured faces sort last. **400 without a
@@ -740,6 +748,11 @@ Three panels, all opened from the filter bar:
   sort first; a "rivals only" toggle isolates them. A source dropdown
   (trusted / all / temporal-only) decides which labels are adjudicated —
   trusted by default, with a banner naming what it is not showing.
+- **📊 Label health** — the only panel NOT gated on a date filter, because
+  seeing it without picking a day first is the point. Ranks everyone by how many
+  temporal labels they carry, measures one person on click, and turns each of
+  their worst days into a button that opens the Bulk-unmatch grid scoped to that
+  person + day.
 - **✂ Bulk unmatch** — any date range. Remove a whole bad `match_source` from
   one person: pick the person, optionally `+strict` and a distance gate, then a
   farthest-first crop grid with the usual multi-select (click / shift-range /

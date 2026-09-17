@@ -1620,6 +1620,48 @@ Three things it does that a SQL `UPDATE ... SET person_id=NULL` does not:
   and a data loss. A face with **no usable reference is never cleared by a
   gate**: "unknown" is not "far".
 
+### The high-level view: `📊 Label health` on `/faces`
+
+Over-matching is invisible one date at a time — you only notice it when a grid
+you happened to open is full of other people. `GET /api/faces/label-health`
+ranks everyone by how much of a `match_source` they carry and names the days it
+is concentrated on; the panel turns each day into a button that opens the
+Bulk-unmatch grid for that person on that date. **Not gated on a date filter**,
+unlike the other panels — being able to see it without picking a day first is
+the entire point.
+
+Measured 2026-09-16: **only 4 people carry any `temporal` labels at all** —
+Calvin 6,331, Ellie 5,849, Nicole 1,829, Matt 794 (14,803 total). So "who else
+needs this?" has a short, checkable answer.
+
+| person | temporal | strict p50 | temporal p50 | bar | beyond |
+|---|---|---|---|---|---|
+| Calvin | 6,331 | 1.053 | 1.248 | 1.145 | 5,421 (86%) |
+| Ellie | 5,849 | 1.136 | 1.256 | 1.243 | 3,517 (60%) |
+| Nicole | 1,829 | 0.827 | 1.227 | 1.045 | 1,826 (99.8%) |
+| Matt | 794 | — | — | — | **cannot calibrate: 0 manual refs** |
+
+**The bar is the p90 of the person's own STRICT distances, not their manual
+ones.** This is the trap: hand-made labels cluster in the sessions you happened
+to label, so manual-to-manual distance is artificially tight, and the first
+version of this used its p90 — which called **11,562 of Calvin's 11,669 strict
+faces suspect**, flatly contradicting the crops. `strict` is the largest
+verified-looking population a person has, so it is the honest yardstick for
+"how far does this person legitimately land from their references".
+
+**`calibratable: false` is a finding, not an omission.** Matt has 794 temporal
+faces and zero manual labels, so nothing can judge him automatically; the fix is
+to hand-label a few, and the panel says so in amber rather than dropping him.
+
+Split by cost on purpose: the ranked list is **pure SQL over counts** so it
+opens instantly, and the distance pass is **per person, on click**. Doing both
+eagerly made it a minute-long request nobody opens twice.
+
+**Do not generalise Calvin's result to the others.** His temporal was ~uniformly
+wrong and a sweep was safe. Ellie's is 60% — the crops show several genuinely
+her — and Nicole's 99.8% rests on only **18** manual references, so the bar is
+weak. Those two want the per-face grid, not a blanket clear.
+
 ### `match_source='rejected'` — a human "no" that survives auto-matching
 
 `faces.REJECTED_MATCH_SOURCE`. Written whenever a person clears a face

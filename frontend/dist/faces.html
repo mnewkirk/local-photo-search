@@ -1162,6 +1162,110 @@
 
 
     // -----------------------------------------------------------------------
+    // LabelHealth — the view a per-shoot panel cannot give you.
+    //
+    // Over-matching is invisible one date at a time: you only notice it when a
+    // grid you happened to open is full of other people. This ranks everyone by
+    // how much of a bad match_source they carry, and names the days it is
+    // concentrated on, so "who else needs this?" has an answer you can check.
+    //
+    // The list is pure counts and opens instantly. The distance calibration is
+    // a pass over one person's whole face set, so it loads per person on click.
+    // -----------------------------------------------------------------------
+    function LabelHealth({ onPick, onClose }) {
+      const [data, setData] = useState(null);
+      const [err, setErr] = useState('');
+      const [detail, setDetail] = useState({});     // person -> calibration
+      const [busy, setBusy] = useState(null);
+
+      useEffect(() => {
+        fetch(API + '/api/faces/label-health')
+          .then(r => r.json())
+          .then(d => { if (d.detail && d.people === undefined) throw new Error(d.detail); setData(d); })
+          .catch(e2 => setErr(e2.message || String(e2)));
+      }, []);
+
+      const calibrate = useCallback((name) => {
+        if (detail[name] || busy) return;
+        setBusy(name);
+        fetch(API + '/api/faces/label-health?person=' + encodeURIComponent(name))
+          .then(r => r.json())
+          .then(d => setDetail(prev => Object.assign({}, prev, { [name]: d.detail || {} })))
+          .catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setBusy(null));
+      }, [detail, busy]);
+
+      const rows = ((data && data.people) || []).map(p => {
+        const cal = detail[p.person];
+        return e('div', { key: p.person_id,
+          style: { border: '1px solid var(--border, #444)', borderRadius: 8,
+                   padding: 10, marginBottom: 10 } },
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
+            e('strong', null, p.person),
+            e('span', { className: 'insp-sub' },
+              p.count.toLocaleString() + ' ' + p.source + ' · '
+              + (p.by_source.strict || 0).toLocaleString() + ' strict · '
+              + (p.by_source.manual || 0).toLocaleString() + ' manual'),
+            e('span', { style: { flex: 1 } }),
+            p.calibratable && !cal && e('button', {
+              className: 'insp-btn', disabled: busy === p.person,
+              onClick: () => calibrate(p.person),
+              title: 'Compare this source against the person\u2019s own strict faces. '
+                   + 'Costs a pass over all their encodings.',
+            }, busy === p.person ? 'Measuring…' : 'Measure'),
+          ),
+          // Why a person CANNOT be judged automatically is the finding — the
+          // fix is to hand-label a few, not to skip them.
+          p.blocker && e('div', { className: 'insp-sub',
+            style: { color: 'var(--warn, #db4)', marginTop: 4 } }, '⚠ ' + p.blocker),
+          cal && cal.calibratable && e('div', { className: 'insp-sub', style: { marginTop: 4 } },
+            'their strict faces sit ' + cal.strict_p50 + ' from their references; '
+            + 'these sit ' + cal.source_p50 + '. '
+            + e_pct(cal) + ' are beyond ' + cal.bar
+            + ' — where 10% of their strict faces legitimately land.'),
+          cal && cal.calibratable === false && e('div', { className: 'insp-sub',
+            style: { color: 'var(--warn, #db4)', marginTop: 4 } }, '⚠ ' + (cal.blocker || 'cannot calibrate')),
+          (p.top_days || []).length > 0 && e('div', {
+            style: { display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' } },
+            e('span', { className: 'insp-sub' }, 'worst days:'),
+            ...(p.top_days).map(dy => e('button', {
+              key: dy.date, className: 'insp-btn',
+              title: 'Open the bulk-unmatch grid for ' + p.person + ' on ' + dy.date,
+              onClick: () => onPick(p.person, dy.date),
+            }, dy.date + ' (' + dy.count + ')')),
+          ));
+      });
+
+      return e('div', { className: 'insp-overlay', onClick: (ev) => { if (ev.target === ev.currentTarget) onClose(); } },
+        e('div', { className: 'insp-panel' },
+          e('div', { className: 'insp-header' },
+            e('div', { style: { flex: 1 } },
+              e('div', { className: 'insp-title' }, 'Label health — temporal matches'),
+              e('div', { className: 'insp-sub' },
+                data ? (data.totals.people_carrying + ' people carry '
+                        + data.totals.faces.toLocaleString() + ' temporal labels')
+                     : 'counting…'),
+              e('div', { className: 'insp-sub' },
+                'Temporal matching over-tags one person onto everyone at an event. '
+                + 'Pick a day to open its grid — a whole person is rarely reviewable '
+                + 'in one pass, one of their shoots usually is.'),
+            ),
+            e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
+          ),
+          err && e('div', { style: { padding: '10px 16px', color: 'var(--err, #e66)' } }, err),
+          e('div', { style: { padding: '10px 16px', overflowY: 'auto' } },
+            data && rows.length === 0 && e('div', { className: 'insp-sub' },
+              'No temporal labels anywhere — nothing to clean up.'),
+            rows),
+        ));
+    }
+
+    function e_pct(cal) {
+      return cal.beyond.toLocaleString() + ' of ' + cal.count.toLocaleString()
+           + ' (' + cal.pct_beyond + '%)';
+    }
+
+    // -----------------------------------------------------------------------
     // BulkUnmatch — remove a whole bad match_source from one person, by hand.
     //
     // `temporal` matching over-tags one kid onto everyone at an event (~4%
@@ -1178,8 +1282,8 @@
     // cleared faces get match_source='rejected' and auto-matching cannot put
     // them back — and on the replica the write still goes NAS-first.
     // -----------------------------------------------------------------------
-    function BulkUnmatch({ persons, dateFrom, dateTo, onClose, onChanged }) {
-      const [person, setPerson] = useState('');
+    function BulkUnmatch({ persons, dateFrom, dateTo, initialPerson, onClose, onChanged }) {
+      const [person, setPerson] = useState(initialPerson || '');
       const [minDist, setMinDist] = useState('');
       const [includeStrict, setIncludeStrict] = useState(false);
       const [data, setData] = useState(null);
@@ -1203,6 +1307,14 @@
           .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
           .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
       }, [person, minDist, includeStrict, dateFrom, dateTo]);
+
+      // Arriving from Label health, the person and day are already chosen — so
+      // load straight away rather than making the user press Preview again on
+      // a selection they just made.
+      const auto = useRef(false);
+      useEffect(() => {
+        if (initialPerson && !auto.current) { auto.current = true; load(); }
+      }, [initialPerson, load]);
 
       const faces = (data && data.faces) || [];
       const nPages = Math.max(1, Math.ceil(faces.length / INSP_PAGE));
@@ -1668,7 +1780,8 @@
       const [teamReview, setTeamReview] = useState(false);
       // Label verification; needs a date scope like the team review does.
       const [labelVerify, setLabelVerify] = useState(false);
-      const [bulkUnmatch, setBulkUnmatch] = useState(false);
+      const [bulkUnmatch, setBulkUnmatch] = useState(null);   // true | {person, date}
+      const [labelHealth, setLabelHealth] = useState(false);
       // Photo-scope banner for the open group: is the list narrowed by the
       // page filter, and how many exist outside it.
       const [photoScope, setPhotoScope] = useState(null);
@@ -2303,6 +2416,11 @@
                 title: 'Find labelled faces that look more like someone else in '
                      + 'this range, calibrated per pair — no threshold to tune.',
               }, '\ud83d\udd0d Verify labels'),
+              e('button', {
+                onClick: () => setLabelHealth(true),
+                title: 'Who carries a suspect match_source, library-wide, and '
+                     + 'which days it is concentrated on.',
+              }, '\ud83d\udcca Label health'),
               cf.date_from && e('button', {
                 onClick: () => setBulkUnmatch(true),
                 title: 'Remove a whole bad match_source from one person in this '
@@ -2693,11 +2811,20 @@
           onChanged: () => { loadGroups(); loadPersons(); },
         }),
 
+        labelHealth && e(LabelHealth, {
+          onClose: () => setLabelHealth(false),
+          onPick: (name, date) => { setLabelHealth(false); setBulkUnmatch({ person: name, date }); },
+        }),
+
         bulkUnmatch && e(BulkUnmatch, {
           persons,
-          dateFrom: cf.date_from,
-          dateTo: cf.date_to || cf.date_from,
-          onClose: () => setBulkUnmatch(false),
+          // A pick from Label health overrides the page filter: you chose that
+          // person on that day, and silently intersecting it with whatever date
+          // the page happened to be showing would return nothing.
+          dateFrom: bulkUnmatch.date || cf.date_from,
+          dateTo: bulkUnmatch.date || cf.date_to || cf.date_from,
+          initialPerson: bulkUnmatch.person || '',
+          onClose: () => setBulkUnmatch(null),
           onChanged: () => { loadGroups(); loadPersons(); },
         }),
 

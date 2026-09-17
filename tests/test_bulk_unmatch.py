@@ -234,3 +234,71 @@ def test_preview_gate_excludes_close_faces(client):
     none = client.get(base + '&min_dist=2.0').json()
     assert len(wide['faces']) >= len(none['faces'])
     assert none['faces'] == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/faces/label-health — the high-level "who else?" view.
+# ---------------------------------------------------------------------------
+
+def test_label_health_lists_only_people_carrying_the_source(client):
+    """The point is a SHORT answer to 'who else needs this'. Padding it with
+    every person who has zero of the source would bury it."""
+    body = client.get('/api/faces/label-health').json()
+    assert body['source'] == 'temporal'
+    assert all(p['count'] > 0 for p in body['people'])
+    assert body['totals']['people_carrying'] == len(body['people'])
+    assert body['totals']['faces'] == sum(p['count'] for p in body['people'])
+
+
+def test_label_health_ranks_by_review_cost(client):
+    counts = [p['count'] for p in client.get('/api/faces/label-health').json()['people']]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_label_health_names_why_a_person_cannot_be_judged(client):
+    """`calibratable: false` is a finding, not an omission — a person with no
+    hand-made labels can't be judged automatically, and 'label a few by hand'
+    is the actual fix. Silently dropping them would hide the work."""
+    people = client.get('/api/faces/label-health').json()['people']
+    for p in people:
+        if not p['calibratable']:
+            assert p['blocker'], "an uncalibratable person must say why"
+
+
+def test_label_health_overview_runs_no_calibration(client):
+    """The overview is pure SQL so it opens instantly; the distance pass is
+    opt-in per person."""
+    body = client.get('/api/faces/label-health').json()
+    assert body['detail'] is None
+
+
+def test_label_health_person_detail_is_opt_in(client):
+    body = client.get('/api/faces/label-health?person=Alex').json()
+    assert body['detail'] is not None
+    assert body['detail']['person'] == 'Alex'
+    # The fixture is tiny, so it cannot calibrate — and must say so rather than
+    # inventing a bar from 2 faces.
+    assert body['detail']['calibratable'] is False
+    assert body['detail']['blocker']
+
+
+def test_label_health_unknown_person_is_404(client):
+    assert client.get('/api/faces/label-health?person=Nobody').status_code == 404
+
+
+def test_calibration_bar_comes_from_strict_not_manual(udb):
+    """Manual labels cluster in the sessions you happened to label by hand, so
+    their spread is artificially tight: using it as the bar called 11,562 of
+    Calvin's 11,669 strict faces suspect, which the crops contradict."""
+    db = udb
+    for k in range(25):
+        db._face(_near(db._base, 400 + k, spread=0.05), "strict", day=10)
+    far = [db._face(_vec(900 + k), "temporal", day=11) for k in range(5)]
+    db.conn.commit()
+
+    cal = bulk_unmatch.calibrate(db, person="Pat")
+    assert cal["calibratable"] is True
+    # strict sits further out than manual does, and the bar follows strict.
+    assert cal["bar"] > 0.5
+    assert cal["source_p50"] > cal["strict_p50"]
+    assert cal["beyond"] == len(far)
