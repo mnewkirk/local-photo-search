@@ -257,6 +257,10 @@ need cross-recluster persistence.
   29 photos" look identical on screen. Capped at `limit` (default 10,000); the
   UI labels a truncated widen rather than silently delivering less than the
   button promised.
+- `GET /api/faces/unmatch-preview` — candidate faces for a bulk unmatch
+  (`person`, `sources` default `temporal`, `min_dist`, date range), sorted
+  farthest-from-the-person first; unmeasured faces sort last. **400 without a
+  date scope.** Read-only — applying goes through `bulk-assign`.
 - `GET /api/faces/verify-labels` — **labelled faces that look more like someone
   else in the same scope** (M32). Scope required. Backs the 🔍 Verify labels
   panel. Needs no eps and no distance threshold: each face is compared against
@@ -736,6 +740,14 @@ Three panels, all opened from the filter bar:
   sort first; a "rivals only" toggle isolates them. A source dropdown
   (trusted / all / temporal-only) decides which labels are adjudicated —
   trusted by default, with a banner naming what it is not showing.
+- **✂ Bulk unmatch** — any date range. Remove a whole bad `match_source` from
+  one person: pick the person, optionally `+strict` and a distance gate, then a
+  farthest-first crop grid with the usual multi-select (click / shift-range /
+  Select all / > 1.15 / > 1.00). The grid IS the dry run and the selection is
+  the confirmation. A **date scope is required** — library-wide is thousands of
+  faces. Applies via `bulk-assign`, so cleared faces are `rejected` and
+  auto-matching cannot put them back. Undo is in-session only; for a durable
+  one use the CLI's `--snapshot`.
 - **⚽ Review team faces** — single day only (it learns ONE jersey colour; a
   range would average two kits). Groups the day's unknown team faces so you
   name a handful of groups instead of a thousand crops. The hue is learned from

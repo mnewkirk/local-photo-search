@@ -2186,6 +2186,52 @@ def api_verify_labels(
             "rival_count": sum(1 for f in findings if f["rival"])}
 
 
+@app.get("/api/faces/unmatch-preview")
+def api_unmatch_preview(
+    person: str = Query(..., description="Whose labels to preview removing."),
+    sources: str = Query("temporal", description="Comma-separated match_source values."),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    min_dist: Optional[float] = Query(None, ge=0.0, le=2.0),
+    limit: int = Query(2000, ge=1, le=5000),
+):
+    """Candidate faces for a bulk unmatch, farthest-from-the-person first.
+
+    Backs the Bulk-unmatch panel: this is the DRY RUN, and the selection in the
+    UI is the confirmation. Applying goes through the existing
+    `POST /api/faces/bulk-assign` with a null name, so the write is the audited
+    one — `match_source='rejected'`, plus the replica's write-NAS-then-mirror
+    path — rather than a second implementation of it.
+
+    **A DATE SCOPE IS REQUIRED.** Library-wide this is thousands of faces
+    (Calvin alone carries 6,331 temporal), which is neither reviewable in a
+    grid nor something to select-all by accident. Review it a shoot at a time.
+
+    Distances are to the person's MANUAL references only, leave-one-burst-out —
+    the same rule as face_verify, and for the same reason: the sources under
+    suspicion may not define the baseline they are judged against.
+    """
+    from . import bulk_unmatch
+
+    if not (date_from or date_to):
+        raise HTTPException(400, "a date scope is required — this is thousands "
+                                 "of faces library-wide; review one shoot at a time")
+    src = tuple(x.strip() for x in sources.split(",") if x.strip())
+    with _get_db() as db:
+        if not db.get_person_by_name(person):
+            raise HTTPException(404, f"no person named {person!r}")
+        rows, stats = bulk_unmatch.select(
+            db, person=person, sources=src, date_from=date_from,
+            date_to=date_to, min_dist=min_dist)
+    # Farthest first: the most likely wrong faces land at the top of the grid,
+    # so a reviewer can scan from the top and stop when they start recognising
+    # the person. Unmeasured faces sort last — "unknown" is not "far".
+    rows.sort(key=lambda r: (r["dist"] is None, -(r["dist"] or 0.0)))
+    return {"person": person, "sources": list(src),
+            "faces": rows[:limit], "truncated": len(rows) > limit,
+            "stats": stats}
+
+
 @app.get("/api/faces/person/{person_id}/inspect")
 def api_person_inspect(
     person_id: int,

@@ -1573,7 +1573,27 @@ photosearch restore-unmatch --from /data/calvin-temporal.json --apply
 ```
 
 Module `photosearch/bulk_unmatch.py`; tests `tests/test_bulk_unmatch.py`.
-**Run it on the NAS** — it writes, and the NAS is the sole writer.
+**Run the CLI on the NAS** — it writes, and the NAS is the sole writer.
+
+**Or review it by hand: the ✂ Bulk unmatch panel on `/faces`.** Person picker,
+optional `+strict` and a distance gate, then a farthest-first grid of crops with
+the page's existing multi-select (click, shift-click range, Select all / > 1.15 /
+> 1.00). **The grid is the dry run and the selection is the confirmation**, so
+there is no separate preview step. Farthest-first matters: you scan from the top
+and stop when you start recognising the person.
+
+- `GET /api/faces/unmatch-preview` — **a date scope is REQUIRED** (400 without
+  one). Library-wide is 6,331 faces for Calvin alone: not reviewable in a grid,
+  and not something to Select-all by accident.
+- Applying reuses `POST /api/faces/bulk-assign` with a null name, so the write
+  is the audited one — `rejected`, plus the replica's write-NAS-then-mirror —
+  rather than a second implementation of it.
+- **Undo in the panel is in-session only** (it re-assigns exactly the ids just
+  cleared). For an undo that outlives the tab, use the CLI's `--snapshot`.
+- `FaceTile` had to learn that `dist` can be null — a face whose every reference
+  falls inside its own burst has no measurable distance, and `toFixed()` on it
+  took out the whole grid. Unmeasured faces render `—` and **sort last**:
+  "unknown" is not "far", the same rule the gate follows.
 
 Three things it does that a SQL `UPDATE ... SET person_id=NULL` does not:
 

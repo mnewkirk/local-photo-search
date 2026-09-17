@@ -714,13 +714,17 @@
     // -----------------------------------------------------------------------
     const INSP_PAGE = 120;
     function FaceTile({ f, selected, idx, onToggle }) {
-      const far = f.dist > 1.0;
+      // `dist` may be null — a face whose every reference fell inside its own
+      // burst has no measurable distance. Render it as unknown rather than
+      // crashing the grid on toFixed().
+      const hasDist = typeof f.dist === 'number' && isFinite(f.dist);
+      const far = hasDist && f.dist > 1.0;
       return e('div', {
         className: 'face-tile' + (selected ? ' sel' : '') + (far ? ' far' : ''),
         onClick: (ev) => { if (ev.shiftKey) ev.preventDefault(); onToggle(f.face_id, idx, ev); },
       },
         e('img', { src: API + '/api/faces/crop/' + f.face_id + '?size=120', loading: 'lazy' }),
-        e('span', { className: 'dist-badge' }, f.dist.toFixed(2)),
+        e('span', { className: 'dist-badge' }, hasDist ? f.dist.toFixed(2) : '—'),
         f.dup_group != null && e('span', { className: 'dup-badge', title: 'duplicate of another face' }, 'dup'),
         e('span', { className: 'checkmark' }, '✓'),
       );
@@ -1156,6 +1160,189 @@
         ));
     }
 
+
+    // -----------------------------------------------------------------------
+    // BulkUnmatch — remove a whole bad match_source from one person, by hand.
+    //
+    // `temporal` matching over-tags one kid onto everyone at an event (~4%
+    // accurate on the soccer shoots), so a person picks up hundreds of wrong
+    // faces per shoot. The CLI can clear them wholesale; this panel is for when
+    // you want to LOOK first — the grid is the dry run and your selection is
+    // the confirmation.
+    //
+    // Scoped to a date range on purpose. Library-wide is thousands of faces
+    // (Calvin: 6,331 temporal), which is neither reviewable nor something to
+    // select-all by accident.
+    //
+    // Applying goes through the same bulk-assign the rest of the page uses, so
+    // cleared faces get match_source='rejected' and auto-matching cannot put
+    // them back — and on the replica the write still goes NAS-first.
+    // -----------------------------------------------------------------------
+    function BulkUnmatch({ persons, dateFrom, dateTo, onClose, onChanged }) {
+      const [person, setPerson] = useState('');
+      const [minDist, setMinDist] = useState('');
+      const [includeStrict, setIncludeStrict] = useState(false);
+      const [data, setData] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [err, setErr] = useState('');
+      const [sel, setSel] = useState(new Set());
+      const [page, setPage] = useState(0);
+      const [working, setWorking] = useState(false);
+      const [undo, setUndo] = useState(null);      // {person, face_ids} of the last apply
+      const lastIdx = useRef(null);
+
+      const load = useCallback(() => {
+        if (!person) return;
+        setLoading(true); setErr(''); setSel(new Set()); setPage(0); setUndo(null);
+        let u = API + '/api/faces/unmatch-preview?person=' + encodeURIComponent(person)
+              + '&sources=' + (includeStrict ? 'temporal,strict' : 'temporal');
+        if (dateFrom) u += '&date_from=' + encodeURIComponent(dateFrom);
+        if (dateTo || dateFrom) u += '&date_to=' + encodeURIComponent(dateTo || dateFrom);
+        if (minDist) u += '&min_dist=' + encodeURIComponent(minDist);
+        fetch(u).then(r => r.json())
+          .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
+          .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
+      }, [person, minDist, includeStrict, dateFrom, dateTo]);
+
+      const faces = (data && data.faces) || [];
+      const nPages = Math.max(1, Math.ceil(faces.length / INSP_PAGE));
+      const pageFaces = faces.slice(page * INSP_PAGE, (page + 1) * INSP_PAGE);
+
+      const toggle = useCallback((fid, idx, ev) => {
+        if (ev && ev.shiftKey && lastIdx.current != null) {
+          const lo = Math.min(lastIdx.current, idx), hi = Math.max(lastIdx.current, idx);
+          setSel(prev => {
+            const n = new Set(prev);
+            for (let i = lo; i <= hi; i++) { const f = faces[i]; if (f) n.add(f.face_id); }
+            return n;
+          });
+          lastIdx.current = idx;
+          return;
+        }
+        setSel(prev => { const n = new Set(prev); n.has(fid) ? n.delete(fid) : n.add(fid); return n; });
+        if (idx != null) lastIdx.current = idx;
+      }, [faces]);
+
+      // Nothing is pre-selected. The whole point of opening this instead of
+      // running the CLI is to look first, and a pre-ticked grid of 200 faces
+      // one click from Apply is the opposite of that.
+      const selectAll = useCallback(
+        () => setSel(new Set(faces.map(f => f.face_id))), [faces]);
+      const selectBeyond = useCallback((d) => setSel(new Set(
+        faces.filter(f => typeof f.dist === 'number' && f.dist > d).map(f => f.face_id))), [faces]);
+
+      const post = (ids, name) => fetch(API + '/api/faces/bulk-assign', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ face_ids: ids, person_name: name }),
+      }).then(r => r.json());
+
+      const apply = useCallback(() => {
+        const ids = Array.from(sel);
+        if (!ids.length) return;
+        if (!confirm('Unmatch ' + ids.length + ' face(s) from ' + person
+              + '? They are marked rejected, so auto-matching will not put them back.')) return;
+        setWorking(true);
+        post(ids, null)
+          .then(() => {
+            setUndo({ person, face_ids: ids });
+            setData(d => Object.assign({}, d, {
+              faces: d.faces.filter(f => !sel.has(f.face_id)) }));
+            setSel(new Set());
+            if (onChanged) onChanged();
+          })
+          .catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setWorking(false));
+      }, [sel, person, onChanged]);
+
+      // In-session undo only: it re-assigns exactly the ids just cleared. Use
+      // the CLI's --snapshot when you need an undo that outlives the tab.
+      const undoLast = useCallback(() => {
+        if (!undo) return;
+        setWorking(true);
+        post(undo.face_ids, undo.person)
+          .then(() => { setUndo(null); load(); if (onChanged) onChanged(); })
+          .catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setWorking(false));
+      }, [undo, load, onChanged]);
+
+      const st = data && data.stats;
+      return e('div', { className: 'insp-overlay', onClick: (ev) => { if (ev.target === ev.currentTarget) onClose(); } },
+        e('div', { className: 'insp-panel' },
+          e('div', { className: 'insp-header' },
+            e('div', { style: { flex: 1 } },
+              e('div', { className: 'insp-title' }, 'Bulk unmatch — ' + (dateFrom || '') +
+                (dateTo && dateTo !== dateFrom ? ' → ' + dateTo : '')),
+              e('div', { className: 'insp-sub' },
+                loading ? 'measuring…'
+                  : st ? (faces.length.toLocaleString() + ' candidate face(s) · '
+                          + st.references + ' manual reference(s)'
+                          + (st.percentiles ? ' · distance p10 ' + st.percentiles['10']
+                             + ', p50 ' + st.percentiles['50']
+                             + ', p90 ' + st.percentiles['90'] : ''))
+                  : 'Pick a person. Farthest-from-them first, so you can scan from '
+                    + 'the top and stop when you start recognising them.'),
+              data && data.truncated && e('div', { className: 'insp-sub', style: { color: 'var(--warn, #db4)' } },
+                'Showing the first ' + faces.length.toLocaleString()
+                + ' — narrow the date range to see the rest.'),
+            ),
+            e('select', { className: 'insp-btn', value: person, style: { marginRight: 8 },
+              onChange: ev => { setPerson(ev.target.value); setData(null); } },
+              e('option', { value: '' }, 'person…'),
+              ...(persons || []).map(p => e('option', { key: p.id, value: p.name }, p.name))),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 4, marginRight: 8 },
+              title: 'strict is reliable on this library — including its far tail, '
+                   + 'which is hard poses rather than other people. Only include it '
+                   + 'if you have reason to doubt it.' },
+              e('input', { type: 'checkbox', checked: includeStrict,
+                onChange: ev => setIncludeStrict(ev.target.checked) }),
+              '+strict'),
+            e('input', { type: 'number', step: '0.05', min: '0', max: '2',
+              placeholder: 'min dist', value: minDist, className: 'insp-btn',
+              style: { width: 90, marginRight: 8 },
+              title: 'Only show faces farther than this from the person. A face '
+                   + 'with no usable reference is never included by a gate.',
+              onChange: ev => setMinDist(ev.target.value) }),
+            e('button', { className: 'insp-btn', onClick: load, disabled: !person || loading },
+              loading ? 'Loading…' : (data ? 'Reload' : 'Preview')),
+            e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
+          ),
+          err && e('div', { style: { padding: '10px 16px', color: 'var(--err, #e66)' } }, err),
+          e('div', { style: { padding: '10px 16px', overflowY: 'auto', flex: 1 } },
+            data && faces.length === 0 && !loading &&
+              e('div', { className: 'insp-sub' }, 'No candidate faces in this scope.'),
+            faces.length > 0 && e('div', {
+              style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' } },
+              e('button', { className: 'insp-btn', onClick: selectAll }, 'Select all ' + faces.length),
+              e('button', { className: 'insp-btn', onClick: () => selectBeyond(1.15) }, 'Select > 1.15'),
+              e('button', { className: 'insp-btn', onClick: () => selectBeyond(1.0) }, 'Select > 1.00'),
+              e('span', { style: { flex: 1 } }),
+              e('button', { className: 'insp-btn', disabled: page <= 0, onClick: () => setPage(p => p - 1) }, '← Prev'),
+              e('span', { className: 'insp-sub' }, 'Page ' + (page + 1) + ' / ' + nPages),
+              e('button', { className: 'insp-btn', disabled: page >= nPages - 1, onClick: () => setPage(p => p + 1) }, 'Next →'),
+            ),
+            e('div', { className: 'insp-facegrid' },
+              ...pageFaces.map((f, j) => e(FaceTile, {
+                key: f.face_id, f, selected: sel.has(f.face_id),
+                idx: page * INSP_PAGE + j, onToggle: toggle })),
+            ),
+          ),
+          e('div', { className: 'insp-actionbar' },
+            e('strong', null, sel.size + ' selected'),
+            e('button', { className: 'insp-btn', disabled: sel.size === 0,
+              onClick: () => setSel(new Set()) }, 'Clear'),
+            e('span', { style: { flex: 1 } }),
+            undo && e('button', { className: 'insp-btn', disabled: working, onClick: undoLast,
+              title: 'Re-assign exactly the ' + undo.face_ids.length + ' face(s) just '
+                   + 'cleared. In-session only — use the CLI\u2019s --snapshot for an '
+                   + 'undo that outlives this tab.' },
+              'Undo last ' + undo.face_ids.length),
+            e('button', { className: 'insp-btn danger', disabled: sel.size === 0 || working || !person,
+              onClick: apply },
+              working ? 'Working…' : 'Unmatch ' + sel.size + ' from ' + (person || '…')),
+          ),
+        ));
+    }
+
     function PersonInspector({ person, persons, dateFrom, dateTo, onClose, onChanged }) {
       const [data, setData] = useState(null);
       const [loading, setLoading] = useState(true);
@@ -1481,6 +1668,7 @@
       const [teamReview, setTeamReview] = useState(false);
       // Label verification; needs a date scope like the team review does.
       const [labelVerify, setLabelVerify] = useState(false);
+      const [bulkUnmatch, setBulkUnmatch] = useState(false);
       // Photo-scope banner for the open group: is the list narrowed by the
       // page filter, and how many exist outside it.
       const [photoScope, setPhotoScope] = useState(null);
@@ -2115,6 +2303,11 @@
                 title: 'Find labelled faces that look more like someone else in '
                      + 'this range, calibrated per pair — no threshold to tune.',
               }, '\ud83d\udd0d Verify labels'),
+              cf.date_from && e('button', {
+                onClick: () => setBulkUnmatch(true),
+                title: 'Remove a whole bad match_source from one person in this '
+                     + 'range. Farthest-first grid, multi-select, then apply.',
+              }, '\u2702 Bulk unmatch'),
               cf.date_from && cf.date_from === cf.date_to && e('button', {
                 onClick: () => setTeamReview(true),
                 title: 'Filter this day\u2019s unknown faces to your team by jersey '
@@ -2497,6 +2690,14 @@
           dateFrom: cf.date_from,
           dateTo: cf.date_to || cf.date_from,
           onClose: () => setLabelVerify(false),
+          onChanged: () => { loadGroups(); loadPersons(); },
+        }),
+
+        bulkUnmatch && e(BulkUnmatch, {
+          persons,
+          dateFrom: cf.date_from,
+          dateTo: cf.date_to || cf.date_from,
+          onClose: () => setBulkUnmatch(false),
           onChanged: () => { loadGroups(); loadPersons(); },
         }),
 

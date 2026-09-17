@@ -177,3 +177,60 @@ def test_cli_roundtrip_writes_a_usable_snapshot(udb, tmp_path):
         "restore-unmatch", "--db", path, "--from", snap, "--apply"])
     assert r2.exit_code == 0, r2.output
     assert "Restored 1" in r2.output
+
+
+# ---------------------------------------------------------------------------
+# GET /api/faces/unmatch-preview — the dry run behind the panel.
+# ---------------------------------------------------------------------------
+
+def test_preview_requires_a_date_scope(client):
+    """Library-wide is thousands of faces — not reviewable in a grid, and not
+    something to select-all by accident."""
+    r = client.get('/api/faces/unmatch-preview?person=Alex')
+    assert r.status_code == 400
+    assert 'scope' in r.json()['detail'].lower()
+
+
+def test_preview_unknown_person_is_404(client):
+    r = client.get('/api/faces/unmatch-preview'
+                   '?person=Nobody+Here&date_from=2020-01-01&date_to=2030-01-01')
+    assert r.status_code == 404
+
+
+def test_preview_returns_farthest_first(client):
+    r = client.get('/api/faces/unmatch-preview'
+                   '?person=Alex&date_from=2020-01-01&date_to=2030-01-01')
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) >= {'person', 'sources', 'faces', 'truncated', 'stats'}
+    assert body['sources'] == ['temporal']
+    # Only the temporal face; Alex's strict one is not a candidate.
+    assert [f['match_source'] for f in body['faces']] == ['temporal']
+    measured = [f['dist'] for f in body['faces'] if f['dist'] is not None]
+    assert measured == sorted(measured, reverse=True)
+    # Unmeasured faces sort last: "unknown" is not "far".
+    seen_none = False
+    for f in body['faces']:
+        if f['dist'] is None:
+            seen_none = True
+        else:
+            assert not seen_none, "a measured face must not follow an unmeasured one"
+
+
+def test_preview_reports_the_reference_count_it_measured_against(client):
+    """The panel prints this: a gate means nothing without knowing how many
+    hand-made references are behind it."""
+    body = client.get('/api/faces/unmatch-preview'
+                      '?person=Alex&date_from=2020-01-01&date_to=2030-01-01').json()
+    assert body['stats']['references'] >= 1
+    assert body['stats']['candidates'] == len(body['faces'])
+
+
+def test_preview_gate_excludes_close_faces(client):
+    """An impossible gate empties the list; a permissive one does not. The gate
+    is a claim about distance, so it must act on the measured value."""
+    base = '/api/faces/unmatch-preview?person=Alex&date_from=2020-01-01&date_to=2030-01-01'
+    wide = client.get(base + '&min_dist=0.0').json()
+    none = client.get(base + '&min_dist=2.0').json()
+    assert len(wide['faces']) >= len(none['faces'])
+    assert none['faces'] == []
