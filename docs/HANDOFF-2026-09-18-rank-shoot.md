@@ -210,3 +210,73 @@ under "Face-label integrity".
 - **2026-08-29** has the same shape (223 Calvin temporal; crops warmed
   2026-09-16) and its collections 29–31 were built on the same bad labels —
   the same re-run applies there once its labels are cleaned.
+
+---
+
+## OUTCOME — run on 2026-09-18, collections 38–40 created
+
+Picked up and executed. Every number in this doc reproduced exactly, so nothing
+above needs re-verifying.
+
+| step | result |
+|---|---|
+| label state on the date | unchanged: 395 `manual` / 26 `strict` / 20 `temporal` / 136 `rejected` |
+| sharpness cache | intact — `0 left to measure` |
+| aesthetics coverage | 100% → VLM `aes_overall` (no LAION fallback) |
+| bursts | 330 at `--burst-gap 1.0` |
+
+```
+38  Soccer Game - 2026-09-12 (v2) - Best 50     50
+39  Soccer Game - 2026-09-12 (v2) - Next 200   200
+40  Soccer Game - 2026-09-12 (v2) - All 250    250
+```
+
+Collections 32–37 are untouched.
+
+### Decision 1 — the cap is retired, and the comparison inverted the argument
+
+The expectation above was that the cap had merely become *unnecessary*. Running
+both shows it is now actively **harmful**:
+
+| | uncapped (shipped as v2) | `--max-per-person 6` |
+|---|---|---|
+| spread over 15 players | **3 – 8** | 2 – 6 |
+| players below the `--min-per-person 3` floor | **none** | **Justin Tinnel at 2** |
+| Calvin | 7 | 6 |
+
+The cap is applied after ranking, so squeezing Calvin from 7 to 6 displaces
+frames that were carrying another player's only appearances — it spends
+Justin's third slot to buy back one of Calvin's. With honest labels the floor
+and the cap now pull against each other, and the floor is the one that encodes
+what the curation is for. **v2 is uncapped.**
+
+### Decision 2 — `--min-per-person 3` is doing real work now
+
+It binds on the thin end of the roster (Justin Tinnel has only 5 trusted faces
+on the date) and every one of the 15 players clears it. That is the guarantee it
+was always supposed to make, and on the old labels it was partly spending slots
+on faces that were not the named player at all.
+
+### How much actually changed
+
+| tier | shared | dropped | new |
+|---|---|---|---|
+| Best 50 | 41 | 9 | 9 |
+| Next 200 | 164 | 36 | 36 |
+| All 250 | 217 | 33 | 33 |
+
+**The telling number: v2-uncapped agrees with the old CAPPED Best 50 (46/50)
+more than with the old uncapped one (41/50).** The cap was a crude
+approximation of the label fix — it was suppressing Calvin's over-representation
+without knowing that the cause was ~162 faces that were not Calvin. Fixing the
+labels reaches the same place for the right reason, and without the collateral
+damage to Justin Tinnel.
+
+### Not done
+
+- **2026-08-29 (collections 29–31)** still sits on uncleaned labels (223 Calvin
+  `temporal`). Its crops are warmed, so it is only the label cleanup plus one
+  re-run away — but do that cleanup first or the re-run repeats the same error.
+- The `(capped)` variant was deliberately **not** rebuilt as v2. It exists to
+  answer a question that is now answered; rebuilding it would suggest the
+  comparison is still live. One command away if wanted.
