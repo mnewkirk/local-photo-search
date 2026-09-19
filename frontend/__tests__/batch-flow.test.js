@@ -352,6 +352,71 @@ describe('stepCaption', () => {
 });
 
 // =========================================================================
+// placeholder — what the diagram area shows when it is not a diagram
+// =========================================================================
+
+describe('placeholder', () => {
+  const view = (over) => Object.assign({
+    selected: 1, listLoaded: true, hasBatches: true,
+    state: null, err: null, computing: false,
+  }, over || {});
+
+  test('an error before any state has loaded is SHOWN, not swallowed', () => {
+    // The regression this function exists for: the error used to be rendered
+    // only inside the branch that already had a `state`, so a batch whose
+    // first fetch 404'd polled forever showing "Loading...", silently.
+    const out = BF.placeholder(view({ err: 'HTTP 404' }));
+    expect(out.kind).toBe('error');
+    expect(out.error).toContain('HTTP 404');
+  });
+
+  test('a hard error never shows a loading line beside it', () => {
+    const out = BF.placeholder(view({ err: 'HTTP 500', computing: true }));
+    expect(out.kind).toBe('error');
+    expect(out.text).toBe('');
+  });
+
+  test('an error alongside a good diagram still surfaces', () => {
+    // A poll that starts failing must not be hidden by the last good picture.
+    const out = BF.placeholder(view({ state: state(), err: 'NetworkError' }));
+    expect(out.kind).toBe('diagram');
+    expect(out.error).toContain('NetworkError');
+  });
+
+  test('a healthy diagram carries no error', () => {
+    const out = BF.placeholder(view({ state: state() }));
+    expect(out.kind).toBe('diagram');
+    expect(out.error).toBe('');
+    expect(out.text).toBe('');
+  });
+
+  test('mid-derivation with nothing cached says so', () => {
+    expect(BF.placeholder(view({ computing: true })).kind).toBe('computing');
+    expect(BF.placeholder(view({ computing: true })).text)
+      .toBe('Computing batch state…');
+  });
+
+  test('a selected batch with nothing yet is loading', () => {
+    expect(BF.placeholder(view()).kind).toBe('loading');
+  });
+
+  test('a loaded, empty library explains itself', () => {
+    const out = BF.placeholder(view({ selected: null, hasBatches: false }));
+    expect(out.kind).toBe('empty');
+    expect(out.text).toContain('No ingest batches yet');
+  });
+
+  test('no selection before the list arrives is still just loading', () => {
+    const out = BF.placeholder(view({ selected: null, listLoaded: false, hasBatches: false }));
+    expect(out.kind).toBe('loading');
+  });
+
+  test('no view at all is survivable', () => {
+    expect(BF.placeholder(null).kind).toBe('loading');
+  });
+});
+
+// =========================================================================
 // small helpers the page shares
 // =========================================================================
 

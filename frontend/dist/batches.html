@@ -95,6 +95,14 @@
 
     .muted { color: var(--text-muted); font-size: 13px; }
     .error { color: var(--red); font-size: 13px; margin-top: 10px; }
+    /* An error that stands in for (or sits above) the diagram — it has to be
+       visible at a glance, not a grey footnote. */
+    .error.notice {
+      margin-top: 0; margin-bottom: 12px; padding: 9px 12px;
+      background: rgba(248,113,113,0.1);
+      border: 1px solid rgba(248,113,113,0.45);
+      border-radius: 6px;
+    }
 
     /* ---------------------------------------------------------------- */
     /* Sweep banner                                                      */
@@ -474,14 +482,20 @@
       var updating = computing || !!(state && state.stale);
       var pct = sum.total ? Math.round(100 * sum.done / sum.total) : 0;
 
+      // What the diagram area shows is a pure function of what we know, so it
+      // is decided and unit-tested in batch-flow.js. In particular: an error
+      // is surfaced whether or not a diagram ever loaded, and a hard error
+      // never renders a "Loading…" line beside it.
+      var ph = BF.placeholder({
+        selected: sel, listLoaded: !!list, hasBatches: batches.length > 0,
+        state: state, err: err, computing: computing,
+      });
+
       var diagram;
-      if (!sel) {
-        diagram = e('div', { className: 'muted' },
-          list ? 'No ingest batches yet. They appear after an ingest sweep registers one.'
-               : 'Loading…');
-      } else if (!state) {
-        diagram = e('div', { className: 'muted' },
-          computing ? 'Computing batch state…' : 'Loading…');
+      if (ph.kind !== 'diagram') {
+        // For kind 'error' the text is empty — the error notice below the
+        // heading is the whole message.
+        diagram = ph.text ? e('div', { className: 'muted' }, ph.text) : null;
       } else {
         diagram = e('div', null,
           e('div', { className: 'headline-row' },
@@ -515,8 +529,7 @@
             e('a', { href: '/faces?date_from=' + day + '&date_to=' + day },
               'Review faces →'),
             e('a', { href: '/?date_from=' + day + '&date_to=' + day },
-              'Search this day →')) : null,
-          err ? e('div', { className: 'error' }, err) : null
+              'Search this day →')) : null
         );
       }
 
@@ -543,6 +556,11 @@
             e('div', { className: 'card-head' },
               e('h2', null, 'Flow'),
               batch ? e('span', { className: 'card-head-dir' }, batch.directory) : null),
+            // Above the diagram, and rendered whether or not there IS one: a
+            // poll that has started failing must never be hidden behind the
+            // last good picture, and a first fetch that fails must not leave
+            // the page saying "Loading…" forever.
+            ph.error ? e('div', { className: 'error notice' }, ph.error) : null,
             diagram)
         )
       );

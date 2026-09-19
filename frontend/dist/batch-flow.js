@@ -293,11 +293,56 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // placeholder — what the diagram area shows when it is not a diagram
+  // ---------------------------------------------------------------------
+
+  /**
+   * Decide what the diagram area should show, from everything the page knows:
+   * `{selected, listLoaded, hasBatches, state, err, computing}`.
+   *
+   * Returns `{kind, text, error}`:
+   *   kind   'diagram' | 'error' | 'empty' | 'loading' | 'computing'
+   *   text   the placeholder line for the non-diagram kinds, '' otherwise
+   *   error  the error sentence to show, or ''. Set whenever `err` is — INCLUDING
+   *          alongside a live diagram — so a failing poll is never silent.
+   *
+   * This is a pure function because getting it wrong is invisible: the first
+   * version rendered the error only inside the branch that already had a
+   * `state`, so a batch whose very first fetch 404'd sat on "Loading…"
+   * forever, polling, saying nothing. On a page whose whole job is to not
+   * under-report problems, that is the worst failure available — hence the
+   * two rules below, both pinned by tests:
+   *
+   *   - an error with nothing to show is its OWN kind, never "Loading…"
+   *     alongside it;
+   *   - an error with a good diagram still surfaces, over the diagram.
+   */
+  function placeholder(view) {
+    var v = view || {};
+    var error = v.err ? 'Couldn’t load this batch — ' + v.err : '';
+    function out(kind, text) { return { kind: kind, text: text, error: error }; }
+
+    if (error && !v.state) return out('error', '');
+    if (v.state) return out('diagram', '');
+    if (v.selected == null) {
+      if (v.listLoaded && !v.hasBatches) {
+        return out('empty', 'No ingest batches yet. They appear after an '
+          + 'ingest sweep registers one.');
+      }
+      return out('loading', 'Loading…');
+    }
+    return v.computing
+      ? out('computing', 'Computing batch state…')
+      : out('loading', 'Loading…');
+  }
+
   return {
     STATES: STATES,
     STATE_META: STATE_META,
     ROWS: ROWS,
     layout: layout,
+    placeholder: placeholder,
     summarize: summarize,
     sweepLine: sweepLine,
     stepCaption: stepCaption,
