@@ -100,18 +100,24 @@ def set_sweep_status(db, run_id: str, status: str, error: Optional[str] = None) 
     db.conn.commit()
 
 
-def get_active_sweep(db) -> Optional[dict]:
-    """The newest sweep still in progress (status 'moving' or 'indexing'),
-    with two computed fields the status page needs and the table doesn't
-    store: ``stalled`` and ``files_per_min``. None if nothing is running.
+def get_sweep(db, run_id: str) -> Optional[dict]:
+    """One sweep by run_id, whatever its status.
+
+    ``get_active_sweep`` only ever returns moving/indexing rows, so a caller
+    that needs to know a *specific* sweep reached 'failed' (batch_state's
+    ingest step does) has to look it up directly. The computed ``stalled`` /
+    ``files_per_min`` fields are added here too, so the two lookups return
+    the same shape.
     """
     row = db.conn.execute(
-        "SELECT * FROM ingest_sweeps WHERE status IN ('moving', 'indexing') "
-        "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        "SELECT * FROM ingest_sweeps WHERE run_id = ?", (run_id,)
     ).fetchone()
-    if row is None:
-        return None
+    return _enrich_sweep(row) if row else None
 
+
+def _enrich_sweep(row) -> dict:
+    """Add the two computed fields the status page needs and the table
+    doesn't store: ``stalled`` and ``files_per_min``."""
     sweep = dict(row)
     started = _parse_ts(sweep["started_at"])
     heartbeat = _parse_ts(sweep["heartbeat_at"])
@@ -123,6 +129,20 @@ def get_active_sweep(db) -> Optional[dict]:
     since_heartbeat = (now - heartbeat).total_seconds()
     sweep["stalled"] = sweep["status"] == "moving" and since_heartbeat > STALL_SECONDS
     return sweep
+
+
+def get_active_sweep(db) -> Optional[dict]:
+    """The newest sweep still in progress (status 'moving' or 'indexing'),
+    with two computed fields the status page needs and the table doesn't
+    store: ``stalled`` and ``files_per_min``. None if nothing is running.
+    """
+    row = db.conn.execute(
+        "SELECT * FROM ingest_sweeps WHERE status IN ('moving', 'indexing') "
+        "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    return _enrich_sweep(row)
 
 
 # ---------------------------------------------------------------------------
