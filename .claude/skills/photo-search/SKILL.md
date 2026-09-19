@@ -991,7 +991,7 @@ folder (CLIP + colors). Module `photosearch/ingest.py`; 15 tests in
 - **Folder suffix** (`_folder_suffix`): `phone-<source>` for human labels
   (`matt`, `wife`), bare `<source>` for camera-model labels (uppercase alnum
   with a digit, e.g. `ILCE-7RM6` → `2026-06-19_ILCE-7RM6/`). The SD-card
-  importer (`D:\Photos\import-photos-safe.ps1`) names `_incoming/<model>/` dirs
+  importer (`scripts/windows-import/import-photos-safe.ps1`, run from a repo checkout on the Windows box) names `_incoming/<model>/` dirs
   after the EXIF camera model, so camera bodies get clean per-model folders
   with zero config. Force either behavior with `--bare-source` /
   `--phone-source` (or `PHOTOSEARCH_INGEST_BARE_SOURCES` /

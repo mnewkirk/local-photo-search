@@ -110,3 +110,6 @@ lmstudio.env
 replica-snapshots/
 *.db.local.bak-*
 suggestions.json
+
+# Windows importer machine config — holds the NAS hostname/username
+scripts/windows-import/import-config.local.ps1

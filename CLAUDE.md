@@ -605,8 +605,9 @@ ILCE-7RM6 `.ARW` arrived as `unknown-camera` and was filed away from its JPEG.
 Only the fallback defers to EXIF — a person's label (`nicole`) or a named model
 dir is never overridden.
 
-The SD-card import path feeds this: `D:\Photos\import-photos-safe.ps1` (on the
-Windows workstation) reads each photo's/RAW's EXIF camera model and pushes all
+The SD-card import path feeds this: `scripts/windows-import/import-photos-safe.ps1`
+(run on the Windows workstation from a checkout of this repo; its NAS share +
+SSH target live in a git-ignored `import-config.local.ps1` — see the README there) reads each photo's/RAW's EXIF camera model and pushes all
 media (JPEG/HEIC + RAW + video) to `\\nas\Photos\_incoming\<CameraModel>\`,
 keeping its local `D:\Photos\Archive` backup, then ssh-triggers
 `ingest-incoming`. Video has no readable model, so it rides along with the
