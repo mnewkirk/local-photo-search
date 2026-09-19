@@ -297,6 +297,15 @@ python cli.py worker -s http://<NAS-IP>:8000 -p clip,faces,quality,describe,cate
 the photo_root prefix, leaving an empty prefix that matches no relative DB
 path. To process the whole library, **omit `-d` entirely.**
 
+`get_directory_photo_ids` is on the fleet's **per-claim** path, so it ranges over
+the indexed `photos.folder` column (`folder = p OR (folder >= 'p/' AND folder <
+'p0')` — `'0'` is the character after `'/'`) rather than `filepath LIKE 'p/%'`,
+which SQLite cannot index and was a full scan of `photos` per claimed batch. The
+range is exactly "in `p` or any subfolder", so year-level dirs work unchanged;
+a miss retries the LIKE only because LIKE is ASCII case-insensitive. Don't
+"simplify" it to `folder = ?` — that silently drops subfolders.
+`tests/test_directory_scope.py` asserts the query plan uses `idx_photos_folder`.
+
 Native mode launches `cli.py worker` processes from the project venv (GPU
 auto-detected via torch+rocm / cuda) with `HSA_ENABLE_DXG_DETECTION=1` and
 `OLLAMA_HOST` resolved to the Windows-host gateway on WSL2. Worker logs land
@@ -587,6 +596,14 @@ dedup** (same name + same hash already present → archive to `.processed`)
 since they have no `photos.file_hash` row. Companion folders are kept out of
 the returned `new_dirs`, so the follow-up CLIP index pass skips them. Video
 with no EXIF date routes by file mtime (photos still go to `_undated`).
+
+**`unknown-camera` is a fallback label, not a fact** — `ingest._file_suffix`
+overrides it per file with the file's own EXIF model when that passes the
+camera-model shape check. The Windows importer reads the model through the shell
+property store, which has no codec for a new body's RAWs: on 2026-09-19 every
+ILCE-7RM6 `.ARW` arrived as `unknown-camera` and was filed away from its JPEG.
+Only the fallback defers to EXIF — a person's label (`nicole`) or a named model
+dir is never overridden.
 
 The SD-card import path feeds this: `D:\Photos\import-photos-safe.ps1` (on the
 Windows workstation) reads each photo's/RAW's EXIF camera model and pushes all
@@ -1755,6 +1772,29 @@ globals and therefore *passed the very bug it was written for*.
 **Shared frontend helpers go on `PS.*` in `shared.js`**, never copied between
 pages.
 
+### Poll with `PS.poll`, never `setInterval`
+
+`setInterval` fires whether or not the previous request came back. On 2026-09-19
+the NAS's disks were saturated by an unrelated ~50 MB/s SMB bulk read (a desktop
+backup); each status poll then took *minutes*, and two open `/admin/maintenance`
+tabs kept issuing more until **all 40 request threads were stuck in disk wait**
+— 20+ minutes per request, 38 stacked `maintenance-fingerprint` calls in the
+log. The status page wedged the box it was reporting on, and ingest crawled at
+one file per ~3 minutes until the backup was stopped (then ~2 files/s, load
+44 → 5).
+
+`PS.poll(fn, ms)` re-arms only **after** `fn`'s promise settles, pauses while the
+tab is hidden, and returns `stop()` (which aborts the in-flight call). So a slow
+server is polled slower, never harder. `fn` must **return** its fetch chain
+(`Promise.all` for several) — a fire-and-forget fetch inside it defeats the
+point. A plain `setInterval` is still right for a pure UI clock tick. Tests:
+`frontend/__tests__/poll.test.js`.
+
+Symptom to recognise next time: `load average` far above the core count while
+every container shows near-zero CPU = threads in uninterruptible I/O wait.
+`vmstat 1` (`b` and `wa` columns) confirms it; `ss -tni` on port 445 names the
+SMB client doing the reading.
+
 ## Splitting attractor clusters (M18)
 
 Large muddled clusters (observed on the NAS: one cluster with 126 faces
@@ -2084,6 +2124,13 @@ Module: `photosearch/maintenance_sync.py`. Spec:
 `docs/superpowers/specs/2026-07-17-maintenance-push-up-design.md`.
 
 ## Planned milestones (see `docs/plans/`)
+
+- `docs/plans/ingest-batch-readiness.md` — **per-batch readiness + status flow.**
+  One dated folder = one batch; a `/batches` page with a per-step flow diagram
+  (needs queue / queued / running / completed, plus waiting + blocked) and a
+  one-click `batch-advance`. Shipped so far: `PS.poll` and the indexed directory
+  scope. Key trap it documents: `count_unprocessed == 0` is NOT "done" — it also
+  reads 0 for attempts-exhausted photos and for text passes before describe runs.
 
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
   surfaced on the 127k NAS library. Cap hop depth (cascade ran 776
