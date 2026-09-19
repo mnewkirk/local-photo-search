@@ -27,7 +27,12 @@ it has not started. So each pass carries four numbers instead of one:
   ``remaining``  ``worker_api._count_scoped`` — what a worker would claim
   ``failed``     eligible photos whose attempts are exhausted *and* whose
                  output column is still missing
-  ``done``       ``eligible - remaining - failed``, floored at 0
+  ``done``       ``eligible - remaining - failed``, floored at 0 — but only
+                 for the seven passes whose ``remaining`` excludes exhausted
+                 photos. For ``quality`` / ``verify`` / ``clip`` it doesn't,
+                 so ``failed`` is already inside ``remaining`` and ``done``
+                 is ``eligible - remaining``. See
+                 ``_REMAINING_FILTERS_ATTEMPTS``.
 
 and `completed` is ``done == total``, never ``remaining == 0``.
 
@@ -83,9 +88,12 @@ _ID_CHUNK = 20000
 #   keywords         keywords IS NULL    AND description IS NOT NULL
 #   verify           verified_at IS NULL AND description IS NOT NULL (no attempts filter)
 #
-# The description clause is kept on the three gated passes so that
-# `failed` is always a subset of `eligible`: a photo with no description has
-# not failed that pass, it has never been offered it.
+# The description clause is kept on the three gated passes because a photo
+# with no description has not *failed* that pass, it has never been offered
+# it. (That makes `failed` a subset of `eligible` in every case but one: a
+# photo whose description is the empty string is excluded from `eligible` by
+# the `!= ''` rule below while db.py's `IS NOT NULL` still counts it here.
+# `done` floors at 0, so the only effect is a conservative under-count.)
 _OUTPUT_MISSING = {
     "clip": None,
     "faces": "NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)",
@@ -96,6 +104,34 @@ _OUTPUT_MISSING = {
     "category-content": "p.categories IS NULL AND p.description IS NOT NULL",
     "keywords": "p.keywords IS NULL AND p.description IS NOT NULL",
     "verify": "p.verified_at IS NULL AND p.description IS NOT NULL",
+}
+
+# Does this pass's *claim* predicate (what `remaining` counts) exclude photos
+# whose attempts are exhausted? Seven do; `quality` (db.py:2235-2247),
+# `verify` (db.py:2304-2319) and `clip` (db.py:2202-2214) carry no attempts
+# filter at all. That single fact decides two things:
+#
+#   True  -> `failed` and `remaining` are DISJOINT sets.
+#            done    = eligible - remaining - failed
+#            blocked = remaining == 0 and failed > 0
+#   False -> `failed` is a SUBSET of `remaining` (an exhausted photo is still
+#            counted as claimable). Subtracting it as well would under-count
+#            `done` by exactly `failed`.
+#            done    = eligible - remaining
+#            blocked = remaining == failed and failed > 0   (every photo the
+#                      fleet would still claim is one it can never finish)
+#
+# `clip` is False but keeps no ledger, so `failed` is 0 and both rows agree.
+_REMAINING_FILTERS_ATTEMPTS = {
+    "clip": False,
+    "faces": True,
+    "quality": False,
+    "aesthetics": True,
+    "describe": True,
+    "category-visual": True,
+    "category-content": True,
+    "keywords": True,
+    "verify": False,
 }
 
 
@@ -186,7 +222,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
                  completed: set[str]) -> dict:
     from . import worker_api  # deferred: pulls in FastAPI
 
-    remaining = worker_api._count_scoped(db, pass_type, ids)
+    # The `if ids else 0` guard is load-bearing, not defensive tidiness:
+    # every branch of db.count_unprocessed_photos tests `if photo_ids:`, so an
+    # EMPTY list falls through to the whole-library query and the batch would
+    # report the entire backlog as its own. Membership is derived live from
+    # photos.folder, so a batch really can empty out later — a dedup prune,
+    # purge-nonimage-photos, or a clock retime that rewrites `folder`.
+    remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
     missing = _OUTPUT_MISSING[pass_type]
     if missing is None:
@@ -204,7 +246,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         )
 
     eligible = described if pass_type in _DESCRIPTION_GATED else total
-    done = max(0, eligible - remaining - failed)
+
+    # See _REMAINING_FILTERS_ATTEMPTS: for the passes whose claim predicate
+    # has no attempts filter, `failed` is already counted inside `remaining`,
+    # so subtracting it again would under-count `done` by exactly `failed`.
+    disjoint = _REMAINING_FILTERS_ATTEMPTS[pass_type]
+    done = max(0, eligible - remaining - failed if disjoint else eligible - remaining)
+    stuck = (remaining == 0) if disjoint else (remaining == failed)
 
     depends_on = DEPENDS_ON.get(pass_type)
     if pass_type in running:
@@ -216,8 +264,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     elif eligible < total and depends_on is not None and depends_on not in completed:
         # The count-zero trap: this pass hasn't become eligible yet.
         state, waiting_on = "waiting", depends_on
-    elif remaining == 0 and failed > 0:
-        # The other count-zero trap: every leftover photo is out of attempts.
+    elif stuck and failed > 0:
+        # The other trap: every photo the fleet would still claim for this
+        # pass is one it has already given up on.
         state, waiting_on = "blocked", None
     else:
         state, waiting_on = "needs_queue", None
@@ -304,8 +353,16 @@ def _job_only_step(step: str, kind: str, total: int, open_steps: set[str],
 # next_action
 # ---------------------------------------------------------------------------
 
-def _next_action(steps: dict[str, dict], ready: bool) -> str | None:
+def _next_action(steps: dict[str, dict], ready: bool, total: int) -> str | None:
     if ready:
+        return None
+    if total == 0:
+        # A batch whose photos are gone (deleted, re-foldered, pruned). The
+        # frozen `completed` rule is `total > 0 and done == total`, so an
+        # empty batch is deliberately never completed and never `ready` — but
+        # there is no action either: scoping a fleet run or a NAS stage to an
+        # empty directory does nothing (the worker API 404s on it). The steps
+        # still read `needs_queue`; this is what stops the UI acting on that.
         return None
     if steps["ingest"]["state"] == "running":
         return "wait_ingest"
@@ -374,6 +431,6 @@ def batch_state(db, batch_id: int) -> dict:
         "batch": batch,
         "sweep": sweep,
         "ready": ready,
-        "next_action": _next_action(steps, ready),
+        "next_action": _next_action(steps, ready, total),
         "steps": [steps[s] for s in STEP_ORDER],
     }

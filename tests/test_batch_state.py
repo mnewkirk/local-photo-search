@@ -364,6 +364,70 @@ class TestExhaustedAttemptsAreBlocked:
         assert step["done"] == 0
         assert step["state"] == "needs_queue"
 
+    # --- passes whose `remaining` does NOT filter exhausted attempts ------
+    #
+    # `quality` (db.py:2235-2247) and `verify` (db.py:2304-2319) have no
+    # attempts clause in their claim predicate, so an exhausted photo is
+    # still counted in `remaining`. Subtracting `failed` as well would
+    # under-count `done` by exactly `failed`, and `remaining == 0` can never
+    # coincide with `failed > 0` — so `blocked` needs the subset form
+    # `remaining == failed`.
+
+    def test_quality_done_does_not_subtract_failed_twice(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _do_quality(db, ids[:2])          # 2 genuinely scored
+        _exhaust(db, ids[2:], "quality")  # 2 given up on
+        step = _step(batch_state(db, batch_id), "quality")
+        assert step["remaining"] == 2
+        assert step["failed"] == 2
+        assert step["done"] == 2, "the 2 scored photos are done"
+
+    def test_quality_can_read_blocked(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _do_quality(db, ids[:2])
+        _exhaust(db, ids[2:], "quality")
+        step = _step(batch_state(db, batch_id), "quality")
+        assert step["state"] == "blocked"
+
+    def test_quality_stays_actionable_while_a_fresh_photo_remains(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _do_quality(db, ids[:2])
+        _exhaust(db, ids[2:3], "quality")   # 1 exhausted, 1 untried
+        step = _step(batch_state(db, batch_id), "quality")
+        assert step["remaining"] == 2
+        assert step["failed"] == 1
+        assert step["done"] == 2
+        assert step["state"] == "needs_queue"
+
+    def test_verify_done_does_not_subtract_failed_twice(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _complete_pass(db, ids, "describe")          # all eligible
+        _set_col(db, ids[:2], "verified_at", "2091-09-19 12:00:00")
+        _exhaust(db, ids[2:], "verify")
+        step = _step(batch_state(db, batch_id), "verify")
+        assert step["eligible"] == 4
+        assert step["remaining"] == 2
+        assert step["failed"] == 2
+        assert step["done"] == 2
+
+    def test_verify_can_read_blocked(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _complete_pass(db, ids, "describe")
+        _set_col(db, ids[:2], "verified_at", "2091-09-19 12:00:00")
+        _exhaust(db, ids[2:], "verify")
+        assert _step(batch_state(db, batch_id), "verify")["state"] == "blocked"
+
+    def test_quality_and_verify_still_complete_normally(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _complete_pass(db, ids, "describe")
+        _do_quality(db, ids)
+        _complete_pass(db, ids, "verify")
+        state = batch_state(db, batch_id)
+        for name in ("quality", "verify"):
+            step = _step(state, name)
+            assert step["state"] == "completed"
+            assert step["done"] == 4
+
     def test_clip_has_no_attempts_ledger(self, db):
         batch_id, ids = _make_batch(db)
         _exhaust(db, ids, "clip")
@@ -371,6 +435,54 @@ class TestExhaustedAttemptsAreBlocked:
         assert step["failed"] == 0
         assert step["remaining"] == len(ids)
         assert step["state"] == "needs_queue"
+
+
+# =========================================================================
+# A batch whose photos are gone
+# =========================================================================
+
+class TestEmptiedBatch:
+    """Membership is derived live from photos.folder, so a registered batch
+    can empty out later — a dedup prune, purge-nonimage-photos, or a clock
+    retime that rewrites `folder`. Every branch of
+    count_unprocessed_photos tests `if photo_ids:`, so an empty id list
+    falls through to the WHOLE-LIBRARY query: without a guard the batch
+    reports the entire backlog as its own and asks for a fleet run."""
+
+    def _emptied(self, db):
+        batch_id, ids = _make_batch(db)
+        ph = ",".join("?" * len(ids))
+        db.conn.execute(f"DELETE FROM photos WHERE id IN ({ph})", ids)
+        db.conn.commit()
+        return batch_id
+
+    def test_the_library_has_a_backlog_to_leak(self, db):
+        # Guards the test below against passing vacuously: at least one pass
+        # must have unprocessed photos outside the batch, or "remaining == 0"
+        # would prove nothing about the empty-list fall-through.
+        from photosearch import worker_api
+        leaky = [p for p in WORKER_PASSES
+                 if worker_api._count_scoped(db, p, []) > 0]
+        assert leaky, "fixture library has no backlog; the leak test is vacuous"
+
+    def test_no_step_reports_library_wide_numbers(self, db):
+        batch_id = self._emptied(db)
+        state = batch_state(db, batch_id)
+        for step in state["steps"]:
+            assert step["total"] == 0
+            assert step["remaining"] == 0, f"{step['step']} leaked the library"
+            assert step["eligible"] == 0
+            assert step["done"] == 0
+            assert step["failed"] == 0
+
+    def test_next_action_is_not_launch_fleet(self, db):
+        batch_id = self._emptied(db)
+        state = batch_state(db, batch_id)
+        # Documented choice: ready False (the frozen `completed` rule is
+        # `total > 0 and done == total`, so an empty batch is never
+        # completed) and next_action None (there is nothing to launch).
+        assert state["ready"] is False
+        assert state["next_action"] is None
 
 
 # =========================================================================
