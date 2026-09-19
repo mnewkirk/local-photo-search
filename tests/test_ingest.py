@@ -189,6 +189,65 @@ def test_companion_raw_moved_but_not_indexed(tmp_path, tmp_db_path, monkeypatch)
     assert result["sources"]["ILCE-7M4"]["new_dirs"] == []
 
 
+def _patch_exif_model(monkeypatch, date_taken, model):
+    """Like _patch_exif, but the file's own EXIF also names a camera model."""
+    def fake_extract(filepath):
+        return {"filepath": filepath, "filename": os.path.basename(filepath),
+                "date_taken": date_taken, "date_created": "2026-05-01 12:00:00",
+                "gps_lat": None, "gps_lon": None, "camera_model": model}
+    monkeypatch.setattr(ingest_mod, "extract_exif", fake_extract)
+
+
+def test_unknown_camera_raw_is_refiled_under_its_own_exif_model(tmp_path, tmp_db_path, monkeypatch):
+    """The importer's 'unknown-camera' label is a FALLBACK, not a fact.
+
+    The Windows importer reads the model through the shell property store, which
+    has no codec for a new body's RAWs — on 2026-09-19 every ILCE-7RM6 .ARW
+    arrived as 'unknown-camera' and was filed away from its own JPEG. The file
+    knows what took it; ingest reads EXIF anyway, so believe the file.
+    """
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "unknown-camera" / "102MSDCF" / "DSC00078.ARW", b"raw-bytes")
+    _patch_exif_model(monkeypatch, "2026-09-19 10:00:00", "ILCE-7RM6")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert (photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC00078.ARW").exists()
+    assert not (photos / "2026" / "2026-09-19_unknown-camera").exists()
+
+
+def test_unknown_camera_stays_when_the_file_has_no_usable_model(tmp_path, tmp_db_path, monkeypatch):
+    """Video has no model; a junk/odd Model string is not a folder name."""
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "unknown-camera" / "C0001.MP4", b"video-a")
+    _patch_exif_model(monkeypatch, "2026-09-19 10:00:00", None)
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+    ingest_incoming(str(incoming), str(photos), tmp_db_path)
+    assert (photos / "2026" / "2026-09-19_unknown-camera" / "C0001.MP4").exists()
+
+    _touch(incoming / "unknown-camera" / "C0002.MP4", b"video-b")
+    _patch_exif_model(monkeypatch, "2026-09-19 10:00:00", "../../etc")
+    ingest_incoming(str(incoming), str(photos), tmp_db_path)
+    assert (photos / "2026" / "2026-09-19_unknown-camera" / "C0002.MP4").exists()
+
+
+def test_a_real_source_label_is_never_overridden_by_exif(tmp_path, tmp_db_path, monkeypatch):
+    """Only the FALLBACK label defers to EXIF. 'nicole' is a person's camera
+    roll whatever body took the shot, and a named model dir was chosen on purpose."""
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "nicole" / "IMG_1.JPG", b"a")
+    _touch(incoming / "ILCE-7M4" / "DSC1.ARW", b"b")
+    _patch_exif_model(monkeypatch, "2026-09-19 10:00:00", "ILCE-7RM6")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+    ingest_incoming(str(incoming), str(photos), tmp_db_path)
+    assert (photos / "2026" / "2026-09-19_phone-nicole" / "IMG_1.JPG").exists()
+    assert (photos / "2026" / "2026-09-19_ILCE-7M4" / "DSC1.ARW").exists()
+
+
 def test_companion_video_uses_mtime_when_no_exif(tmp_path, tmp_db_path, monkeypatch):
     """A video with no EXIF date routes by file mtime, not into _undated."""
     incoming, photos = _setup_dirs(tmp_path)

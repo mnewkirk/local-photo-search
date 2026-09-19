@@ -162,6 +162,28 @@ def _folder_suffix(source: str,
     return f"phone-{source}"
 
 
+def _file_suffix(source: str, source_suffix: str, meta: dict) -> str:
+    """Folder suffix for ONE file: the source's, unless the source is only a fallback.
+
+    'unknown-camera' means the importer could not read a model, not that there
+    isn't one. The Windows importer asks the shell property store, which has no
+    codec for a new body's RAWs — so every ILCE-7RM6 .ARW arrived as
+    'unknown-camera' and was filed away from its own JPEG. The file's EXIF is
+    already in hand here, so believe it.
+
+    Only the fallback label defers to EXIF. A person's label ('nicole') is whose
+    camera roll it is whatever body took the shot, and a named model dir was
+    chosen deliberately. The model must pass the same camera-model shape check
+    as a source label, which also keeps path separators out of a folder name.
+    """
+    if source not in _DEFAULT_BARE_SOURCES:
+        return source_suffix
+    model = " ".join(str(meta.get("camera_model") or "").split())
+    if model and _looks_like_camera_model(model):
+        return model
+    return source_suffix
+
+
 def _iter_source_files(source_root: Path) -> list[Path]:
     """Yield every media file under one source dir, excluding the archive folder.
 
@@ -448,7 +470,7 @@ def ingest_incoming(
                     except OSError:
                         taken = None
 
-                tdir = _target_dir(photo_dir, suffix, taken)
+                tdir = _target_dir(photo_dir, _file_suffix(source, suffix, meta), taken)
 
                 if not is_photo:
                     # Companion (RAW/video): no DB row to dedup against, so

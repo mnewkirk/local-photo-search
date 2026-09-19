@@ -1386,6 +1386,29 @@ class PhotoDB:
         or a path already relative to photo_root ('2026'). Paths in the DB are
         stored relative to photo_root, so absolute inputs get re-rooted first.
         Ensures a trailing '/' so '2026' doesn't match '2026-extra'.
+
+        This is on the worker fleet's PER-CLAIM path (`worker -d`), so it ranges
+        over the indexed `folder` column instead of `filepath LIKE 'dir/%'`,
+        which SQLite cannot index — that was a full scan of `photos` on the N100
+        for every batch claimed. A miss retries the LIKE, which is ASCII
+        case-insensitive where the range is not.
+        """
+        sql, params = self._directory_scope_sql(directory)
+        rows = self.conn.execute(sql, params).fetchall()
+        if not rows:
+            rows = self.conn.execute(
+                "SELECT id FROM photos WHERE filepath LIKE ?",
+                (params[0] + "/%",),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def _directory_scope_sql(self, directory: str) -> tuple[str, tuple]:
+        """(sql, params) selecting photo ids in `directory` or any subfolder.
+
+        `folder` is dirname(filepath), so "in dir or below" is exactly
+        folder == dir, or folder starts with dir + '/'. The second half is
+        written as a half-open range — '0' is the character after '/' — because
+        a range uses idx_photos_folder and a LIKE does not.
         """
         prefix = directory.strip()
         while prefix.startswith("./"):
@@ -1395,12 +1418,11 @@ class PhotoDB:
                 prefix = str(Path(prefix).resolve().relative_to(self.photo_root))
             except ValueError:
                 pass
-        prefix = prefix.strip("/") + "/"
-        rows = self.conn.execute(
-            "SELECT id FROM photos WHERE filepath LIKE ?",
-            (prefix + "%",),
-        ).fetchall()
-        return [row[0] for row in rows]
+        prefix = prefix.strip("/")
+        return (
+            "SELECT id FROM photos WHERE folder = ? OR (folder >= ? AND folder < ?)",
+            (prefix, prefix + "/", prefix + "0"),
+        )
 
     def get_collection_photo_pairs(self, collection_id: int) -> list[tuple[int, str]]:
         """Get (photo_id, absolute_path) pairs for photos in a collection.
