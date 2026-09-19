@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Batches — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --violet: #a78bfa;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1000px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link { font-size: 13px; color: var(--accent); text-decoration: none; margin-left: 4px; }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container { max-width: 1000px; margin: 0 auto; padding: 28px 24px 60px; }
+
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+    .page-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 22px; }
+
+    h2 {
+      font-size: 13px; font-weight: 600; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px;
+    }
+    /* A card heading that carries a path. The path must NOT inherit the
+       heading's uppercase — a folder name is a literal string, and
+       `2091-09-14_phone-matt` shouted back as `PHONE-MATT` reads as a
+       different directory than the one in the list above. */
+    .card-head {
+      display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .card-head h2 { margin-bottom: 0; }
+    .card-head-dir {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px; color: var(--text); word-break: break-all;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      margin-bottom: 22px;
+    }
+
+    .btn {
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+      font-family: inherit;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+
+    .muted { color: var(--text-muted); font-size: 13px; }
+    .error { color: var(--red); font-size: 13px; margin-top: 10px; }
+
+    /* ---------------------------------------------------------------- */
+    /* Sweep banner                                                      */
+    /* ---------------------------------------------------------------- */
+    .sweep {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      background: rgba(74,158,255,0.08);
+      border: 1px solid rgba(74,158,255,0.35);
+      border-radius: var(--radius);
+      padding: 12px 16px; margin-bottom: 22px; font-size: 13px;
+    }
+    .sweep.stalled {
+      background: rgba(248,113,113,0.1);
+      border-color: rgba(248,113,113,0.5);
+    }
+    .sweep-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+      animation: pulse-dot 1.6s ease-in-out infinite; flex: none;
+    }
+    .sweep.stalled .sweep-dot { background: var(--red); animation: none; }
+    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+    .sweep-status { font-weight: 600; }
+    .sweep-meta { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .sweep-warn { color: var(--red); font-weight: 600; }
+
+    /* ---------------------------------------------------------------- */
+    /* Batch list                                                        */
+    /* ---------------------------------------------------------------- */
+    .batch-list { display: flex; flex-direction: column; gap: 6px; }
+    .batch-row {
+      display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-left: 3px solid var(--border);
+      border-radius: 6px; padding: 9px 12px; cursor: pointer; font-size: 13px;
+      text-align: left; width: 100%; color: inherit; font-family: inherit;
+    }
+    .batch-row:hover { border-color: var(--accent); }
+    .batch-row.active {
+      border-color: var(--accent); border-left-color: var(--accent);
+      background: rgba(74,158,255,0.1);
+    }
+    .batch-dir {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px; color: var(--text); flex: 1 1 260px; word-break: break-all;
+    }
+    .batch-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .batch-when { color: var(--text-muted); font-size: 12px; }
+    .pill {
+      font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+      text-transform: uppercase; letter-spacing: 0.04em; flex: none;
+    }
+    .pill.ready     { background: rgba(74,222,128,0.16); color: var(--green); }
+    .pill.dismissed { background: rgba(136,136,136,0.16); color: #aaa; }
+
+    /* ---------------------------------------------------------------- */
+    /* Headline + steps progress                                         */
+    /* ---------------------------------------------------------------- */
+    .headline-row {
+      display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+      margin-bottom: 6px;
+    }
+    .headline { font-size: 17px; font-weight: 600; }
+    .updating {
+      font-size: 11px; color: var(--text-muted); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1px 8px; flex: none;
+    }
+    .headline-sub { font-size: 12.5px; color: var(--text-muted); margin-bottom: 10px; }
+    .steps-bar { background: var(--surface2); border-radius: 4px; height: 6px; overflow: hidden; }
+    .steps-bar-fill { height: 100%; background: var(--accent); transition: width .4s ease; }
+    .steps-bar-fill.complete { background: var(--green); }
+
+    /* ---------------------------------------------------------------- */
+    /* The flow diagram                                                  */
+    /* ---------------------------------------------------------------- */
+    .flow { margin-top: 18px; }
+    .flow-row { display: flex; align-items: flex-start; gap: 14px; }
+    .flow-row-label {
+      flex: 0 0 116px; font-size: 10.5px; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.06em; padding-top: 10px;
+      text-align: right; line-height: 1.3;
+    }
+    .flow-nodes { display: flex; gap: 8px; flex-wrap: wrap; flex: 1 1 auto; }
+    .flow-arrow {
+      color: var(--border); font-size: 15px; line-height: 1;
+      margin: 5px 0 5px 168px;
+    }
+
+    .node {
+      flex: 1 1 148px; min-width: 132px; max-width: 220px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--border);
+      border-radius: 6px; padding: 8px 10px;
+    }
+    .node-head { display: flex; align-items: center; gap: 6px; }
+    .node-glyph { font-size: 12px; line-height: 1; flex: none; }
+    .node-name {
+      font-size: 13px; font-weight: 600; word-break: break-word; line-height: 1.25;
+    }
+    .node-state {
+      font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em;
+      margin-top: 3px; font-weight: 600;
+    }
+    .node-cap {
+      font-size: 11.5px; color: var(--text-muted); margin-top: 2px;
+      font-variant-numeric: tabular-nums; word-break: break-word;
+    }
+    .node-bar {
+      margin-top: 6px; height: 3px; border-radius: 2px;
+      background: rgba(255,255,255,0.07); overflow: hidden;
+    }
+    .node-bar-fill { height: 100%; background: currentColor; opacity: 0.55; }
+
+    /* One class per state — colour AND glyph AND the state's word, so the
+       diagram never depends on colour alone. */
+    .node.st-completed   { border-left-color: var(--green);  color: var(--green); }
+    .node.st-running     { border-left-color: var(--accent); color: var(--accent); }
+    .node.st-queued      { border-left-color: var(--violet); color: var(--violet); }
+    .node.st-needs-queue { border-left-color: var(--yellow); color: var(--yellow); }
+    .node.st-waiting     { border-left-color: #555;          color: var(--text-muted); }
+    .node.st-blocked     { border-left-color: var(--red);    color: var(--red); }
+    .node.st-unknown     { border-left-color: var(--violet); color: var(--violet); }
+    .node .node-name { color: var(--text); }
+    .node.st-running { background: rgba(74,158,255,0.09); }
+    .node.st-needs-queue { background: rgba(250,204,21,0.07); }
+    .node.st-blocked { background: rgba(248,113,113,0.09); }
+
+    .legend {
+      display: flex; gap: 6px 14px; flex-wrap: wrap; margin-top: 16px;
+      padding-top: 12px; border-top: 1px solid var(--border);
+      font-size: 11.5px; color: var(--text-muted);
+    }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-swatch {
+      width: 9px; height: 9px; border-radius: 2px; background: currentColor; flex: none;
+    }
+    .legend-item.st-completed   { color: var(--green); }
+    .legend-item.st-running     { color: var(--accent); }
+    .legend-item.st-queued      { color: var(--violet); }
+    .legend-item.st-needs-queue { color: var(--yellow); }
+    .legend-item.st-waiting     { color: var(--text-muted); }
+    .legend-item.st-blocked     { color: var(--red); }
+
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+    .links { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
+    .links a { color: var(--accent); text-decoration: none; }
+    .links a:hover { text-decoration: underline; }
+    .soon { font-size: 11px; color: var(--text-muted); align-self: center; }
+
+    @media (max-width: 720px) {
+      .container { padding: 20px 14px 50px; }
+      .flow-row { flex-direction: column; gap: 4px; }
+      .flow-row-label { text-align: left; padding-top: 0; flex: none; }
+      .flow-arrow { margin-left: 4px; }
+      .node { max-width: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script src="/batch-flow.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useRef = React.useRef;
+
+    // All the presentation decisions that can be made from data alone live in
+    // batch-flow.js, so they are unit-tested (frontend/__tests__/batch-flow.test.js).
+    var BF = PS.BatchFlow;
+
+    function qs(k) { return new URLSearchParams(location.search).get(k); }
+
+    function when(ts) {
+      if (!ts) return '';
+      return String(ts).replace('T', ' ').slice(0, 16);
+    }
+
+    // ---------------------------------------------------------------------
+    // Sweep banner — the move+index pass that creates batches in the first
+    // place. Red when stalled: STALL_SECONDS has elapsed with no file moved,
+    // which means the sweep is presumed dead, not merely slow.
+    // ---------------------------------------------------------------------
+    function SweepBanner(props) {
+      var s = props.sweep;
+      if (!s) return null;
+      return e('div', { className: 'sweep' + (s.stalled ? ' stalled' : '') },
+        e('span', { className: 'sweep-dot' }),
+        e('span', { className: 'sweep-status' }, 'Ingest sweep'),
+        e('span', { className: 'sweep-meta' },
+          s.status + ' · ' + BF.fmt(s.files_moved) + ' of '
+          + BF.fmt(s.files_seen) + ' files moved · '
+          + BF.rate(s.files_per_min) + '/min'),
+        s.stalled ? e('span', { className: 'sweep-warn' }, BF.sweepLine(s)) : null
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Batch list
+    // ---------------------------------------------------------------------
+    function BatchRow(props) {
+      var b = props.batch;
+      return e('button', {
+        className: 'batch-row' + (props.active ? ' active' : ''),
+        onClick: function () { props.onSelect(b.id); },
+      },
+        e('span', { className: 'batch-dir' }, b.directory),
+        e('span', { className: 'batch-count' }, BF.fmt(b.photo_count) + ' photos'),
+        e('span', { className: 'batch-when' }, when(b.created_at)),
+        b.dismissed_at ? e('span', { className: 'pill dismissed' }, 'Dismissed')
+          : (b.ready_at ? e('span', { className: 'pill ready' }, 'Ready') : null)
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // The diagram
+    // ---------------------------------------------------------------------
+    function Node(props) {
+      var s = props.step;
+      var meta = BF.STATE_META[s.state]
+        || { label: s.state || 'unknown', cls: 'st-unknown', glyph: '?' };
+      // The thin bar is a second, non-textual read of the same numbers. A
+      // completed step with nothing eligible (a shoot with no bursts to stack)
+      // still reads full — it IS finished.
+      var pct = s.eligible > 0
+        ? Math.max(0, Math.min(100, Math.round(100 * (s.done || 0) / s.eligible)))
+        : (s.state === 'completed' ? 100 : 0);
+      return e('div', {
+        className: 'node ' + meta.cls,
+        title: s.step + ' — ' + meta.label + ' — ' + BF.stepCaption(s),
+      },
+        e('div', { className: 'node-head' },
+          e('span', { className: 'node-glyph' }, meta.glyph),
+          e('span', { className: 'node-name' }, BF.stepLabel(s.step))),
+        e('div', { className: 'node-state' }, meta.label),
+        e('div', { className: 'node-cap' }, BF.stepCaption(s)),
+        e('div', { className: 'node-bar' },
+          e('div', { className: 'node-bar-fill', style: { width: pct + '%' } }))
+      );
+    }
+
+    function Flow(props) {
+      var rows = BF.layout(props.steps);
+      if (!rows.length) return e('div', { className: 'muted' }, 'No steps to show.');
+      return e('div', { className: 'flow' },
+        rows.map(function (row, i) {
+          return e('div', { key: row.key },
+            // Top-to-bottom arrows: crossing one always means "this cannot
+            // start until the row above is done".
+            i > 0 ? e('div', { className: 'flow-arrow' }, '↓') : null,
+            e('div', { className: 'flow-row' },
+              e('div', { className: 'flow-row-label' }, row.label),
+              e('div', { className: 'flow-nodes' },
+                row.steps.map(function (s) {
+                  return e(Node, { key: s.step, step: s });
+                })))
+          );
+        })
+      );
+    }
+
+    function Legend() {
+      return e('div', { className: 'legend' },
+        BF.STATES.map(function (st) {
+          var m = BF.STATE_META[st];
+          return e('span', { className: 'legend-item ' + m.cls, key: st },
+            e('span', { className: 'legend-swatch' }),
+            e('span', null, m.glyph + ' ' + m.label));
+        }));
+    }
+
+    // ---------------------------------------------------------------------
+    // Page
+    // ---------------------------------------------------------------------
+    function Page() {
+      var _l = useState(null);          var list = _l[0];       var setList = _l[1];
+      var _s = useState(null);          var sel = _s[0];        var setSel = _s[1];
+      var _st = useState(null);         var state = _st[0];     var setState = _st[1];
+      var _c = useState(false);         var computing = _c[0];  var setComputing = _c[1];
+      var _e = useState(null);          var err = _e[0];        var setErr = _e[1];
+      var _b = useState(false);         var busy = _b[0];       var setBusy = _b[1];
+      var selRef = useRef(null);
+
+      function loadList(signal) {
+        var opts = signal ? { signal: signal } : undefined;
+        return fetch('/api/batches?include_dismissed=1', opts)
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            setList(d);
+            // Default to the newest batch, unless ?batch= named one.
+            if (selRef.current == null && d && d.batches && d.batches.length) {
+              var wanted = parseInt(qs('batch'), 10);
+              var found = d.batches.filter(function (b) { return b.id === wanted; })[0];
+              var id = found ? found.id : d.batches[0].id;
+              selRef.current = id;
+              setSel(id);
+            }
+          })
+          .catch(function () {});
+      }
+
+      function loadDetail(signal) {
+        var id = selRef.current;
+        if (id == null) return Promise.resolve();
+        var opts = signal ? { signal: signal } : undefined;
+        return fetch('/api/batches/' + id, opts)
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function (d) {
+            if (selRef.current !== id) return;   // user switched mid-flight
+            // The detail endpoint answers with a MINIMAL body
+            // ({batch, steps: [], stale, computing}) when the server is
+            // mid-derivation and has nothing memoized: no `ready`, no
+            // `next_action`, no `steps`. Overwriting the diagram with it
+            // would blank a perfectly good picture every slow poll, and
+            // reading its missing `ready` as false would say "not ready"
+            // about a ready batch. So: keep the last good state, just say
+            // we are updating.
+            if (d && d.computing) { setComputing(true); setErr(null); return; }
+            setState(d);
+            setComputing(false);
+            setErr(null);
+          })
+          .catch(function (ex) {
+            if (ex && ex.name === 'AbortError') return;
+            setErr(String((ex && ex.message) || ex));
+          });
+      }
+
+      // PS.poll, never setInterval: one request in flight at a time, so a busy
+      // NAS gets polled slower rather than harder.
+      useEffect(function () { return PS.poll(loadList, 10000); }, []);
+
+      useEffect(function () {
+        if (sel == null) return undefined;
+        return PS.poll(loadDetail, 10000);
+      }, [sel]);
+
+      function select(id) {
+        if (id === sel) return;
+        selRef.current = id;
+        setState(null);            // don't show the old batch's diagram
+        setComputing(true);
+        setErr(null);
+        setSel(id);
+        try {
+          history.replaceState(null, '', location.pathname + '?batch=' + id);
+        } catch (_) {}
+      }
+
+      function act(verb) {
+        var id = selRef.current;
+        if (id == null) return;
+        setBusy(true);
+        fetch('/api/batches/' + id + '/' + verb, { method: 'POST' })
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function () { return Promise.all([loadList(), loadDetail()]); })
+          .catch(function (ex) { setErr(String((ex && ex.message) || ex)); })
+          .then(function () { setBusy(false); });
+      }
+
+      var batches = (list && list.batches) || [];
+      var sum = BF.summarize(state);
+      var batch = (state && state.batch)
+        || batches.filter(function (b) { return b.id === sel; })[0]
+        || null;
+      var day = batch ? BF.dayOf(batch.directory) : null;
+      var updating = computing || !!(state && state.stale);
+      var pct = sum.total ? Math.round(100 * sum.done / sum.total) : 0;
+
+      var diagram;
+      if (!sel) {
+        diagram = e('div', { className: 'muted' },
+          list ? 'No ingest batches yet. They appear after an ingest sweep registers one.'
+               : 'Loading…');
+      } else if (!state) {
+        diagram = e('div', { className: 'muted' },
+          computing ? 'Computing batch state…' : 'Loading…');
+      } else {
+        diagram = e('div', null,
+          e('div', { className: 'headline-row' },
+            e('div', { className: 'headline' }, sum.headline),
+            updating ? e('span', { className: 'updating' }, 'updating…') : null),
+          e('div', { className: 'headline-sub' },
+            sum.done + ' of ' + sum.total + ' steps complete'
+            + (batch ? ' · ' + BF.fmt(batch.photo_count) + ' photos' : '')),
+          e('div', { className: 'steps-bar' },
+            e('div', {
+              className: 'steps-bar-fill' + (pct === 100 ? ' complete' : ''),
+              style: { width: pct + '%' },
+            })),
+          e(Flow, { steps: state.steps }),
+          e(Legend, null),
+          e('div', { className: 'actions' },
+            e('button', {
+              className: 'btn',
+              disabled: busy || !!(batch && batch.ready_at),
+              onClick: function () { act('ready'); },
+            }, batch && batch.ready_at ? 'Marked ready' : 'Mark ready'),
+            e('button', {
+              className: 'btn',
+              disabled: busy || !!(batch && batch.dismissed_at),
+              onClick: function () { act('dismiss'); },
+            }, batch && batch.dismissed_at ? 'Dismissed' : 'Dismiss'),
+            // Task 6 wires this to the step the headline names.
+            e('button', { className: 'btn', disabled: true }, 'Advance batch'),
+            e('span', { className: 'soon' }, '(coming in the next step)')),
+          day ? e('div', { className: 'links' },
+            e('a', { href: '/faces?date_from=' + day + '&date_to=' + day },
+              'Review faces →'),
+            e('a', { href: '/?date_from=' + day + '&date_to=' + day },
+              'Search this day →')) : null,
+          err ? e('div', { className: 'error' }, err) : null
+        );
+      }
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'batches' }),
+        e('div', { className: 'container' },
+          e('h1', null, 'Ingest batches'),
+          e('div', { className: 'page-sub' },
+            'One dated folder per batch — what still has to happen to it, '
+            + 'and whether each step is running, queued, waiting or needs launching.'),
+          e(SweepBanner, { sweep: list && list.sweep }),
+          e('div', { className: 'card' },
+            e('h2', null, 'Batches'),
+            batches.length
+              ? e('div', { className: 'batch-list' },
+                  batches.map(function (b) {
+                    return e(BatchRow, {
+                      key: b.id, batch: b, active: b.id === sel, onSelect: select,
+                    });
+                  }))
+              : e('div', { className: 'muted' },
+                  list ? 'None registered yet.' : 'Loading…')),
+          e('div', { className: 'card' },
+            e('div', { className: 'card-head' },
+              e('h2', null, 'Flow'),
+              batch ? e('span', { className: 'card-head-dir' }, batch.directory) : null),
+            diagram)
+        )
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(Page, null));
+  </script>
+</body>
+</html>

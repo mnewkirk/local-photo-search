@@ -6284,6 +6284,20 @@ if _frontend_dir.exists():
             return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Book page not found</h1>")
 
+    @app.get("/batches")
+    def serve_batches():
+        """Serve the per-ingest-batch flow diagram (JS reads ?batch= from the URL).
+
+        no-cache like the other live pages: the diagram is a status display, so
+        a browser serving yesterday's HTML would quietly show a stale pipeline.
+        Its /batch-flow.js goes out through the static catch-all below, which
+        sets no-cache for .js too.
+        """
+        page = _frontend_dir / "batches.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Batches page not found</h1>")
+
     @app.get("/status")
     def serve_status():
         """Serve the indexing status page."""
