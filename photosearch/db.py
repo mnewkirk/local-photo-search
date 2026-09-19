@@ -79,7 +79,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -611,6 +611,36 @@ class PhotoDB:
                 source           TEXT
             )
         """)
+
+        # Ingest batches (schema v30) — one row per dated ingest folder
+        # (ingest_batches), the sweep that produced it (ingest_sweeps), and
+        # per-step job intent (ingest_batch_jobs). A batch's photo membership
+        # is never materialized here: it's derived live as
+        # `SELECT id FROM photos WHERE folder = ?` (see photosearch/ingest_batches.py),
+        # so a batch row is identity + lifecycle + progress only.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_sweeps (
+              run_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+              started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
+              heartbeat_at TEXT NOT NULL DEFAULT (datetime('now')),
+              files_seen INTEGER NOT NULL DEFAULT 0, files_moved INTEGER NOT NULL DEFAULT 0,
+              error TEXT)
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_batches (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, directory TEXT NOT NULL UNIQUE,
+              source TEXT, run_id TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              photo_count INTEGER NOT NULL DEFAULT 0, ready_at TEXT, dismissed_at TEXT)
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_batch_jobs (
+              batch_id INTEGER NOT NULL, step TEXT NOT NULL, job_kind TEXT NOT NULL,
+              opened_at TEXT NOT NULL DEFAULT (datetime('now')), expires_at TEXT NOT NULL,
+              closed_at TEXT, PRIMARY KEY (batch_id, step))
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ingest_batches_created ON ingest_batches(created_at)")
 
         # Photo stacks — burst/bracket groups of near-identical shots
         cur.execute("""
@@ -1402,13 +1432,14 @@ class PhotoDB:
             ).fetchall()
         return [row[0] for row in rows]
 
-    def _directory_scope_sql(self, directory: str) -> tuple[str, tuple]:
-        """(sql, params) selecting photo ids in `directory` or any subfolder.
+    def normalize_directory(self, directory: str) -> str:
+        """Normalize a directory to the form stored in `photos.folder`.
 
-        `folder` is dirname(filepath), so "in dir or below" is exactly
-        folder == dir, or folder starts with dir + '/'. The second half is
-        written as a half-open range — '0' is the character after '/' — because
-        a range uses idx_photos_folder and a LIKE does not.
+        Strips whitespace, drops a leading './', re-roots an absolute path
+        under `photo_root` (when one is set), and strips leading/trailing
+        '/'. Shared by `_directory_scope_sql` (worker-fleet directory
+        scoping) and `ingest_batches.register_batch` (M "ingest batch"
+        identity), so both agree on what "the same directory" means.
         """
         prefix = directory.strip()
         while prefix.startswith("./"):
@@ -1418,7 +1449,17 @@ class PhotoDB:
                 prefix = str(Path(prefix).resolve().relative_to(self.photo_root))
             except ValueError:
                 pass
-        prefix = prefix.strip("/")
+        return prefix.strip("/")
+
+    def _directory_scope_sql(self, directory: str) -> tuple[str, tuple]:
+        """(sql, params) selecting photo ids in `directory` or any subfolder.
+
+        `folder` is dirname(filepath), so "in dir or below" is exactly
+        folder == dir, or folder starts with dir + '/'. The second half is
+        written as a half-open range — '0' is the character after '/' — because
+        a range uses idx_photos_folder and a LIKE does not.
+        """
+        prefix = self.normalize_directory(directory)
         return (
             "SELECT id FROM photos WHERE folder = ? OR (folder >= ? AND folder < ?)",
             (prefix, prefix + "/", prefix + "0"),
