@@ -40,6 +40,7 @@ from .worker_api import (
     is_shutting_down as worker_is_shutting_down,
 )
 from .admin_api import router as admin_router
+from .batch_api import router as batches_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -47,6 +48,7 @@ from .admin_api import router as admin_router
 
 app = FastAPI(title="local-photo-search", version="0.1.0")
 app.include_router(worker_router)
+app.include_router(batches_router)
 app.include_router(admin_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)
