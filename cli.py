@@ -2680,6 +2680,7 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
     successfully are physically moved, not copied.
     """
     from photosearch.ingest import ingest_incoming, IngestAlreadyRunning
+    from photosearch.ingest_batches import register_batch, set_sweep_status
 
     def _csv_env(name):
         return [s.strip() for s in os.environ.get(name, "").split(",") if s.strip()]
@@ -2733,35 +2734,75 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
         click.echo("\nDry run — no files moved, no DB rows written.")
         return
 
-    if not index:
+    # run_id is None when the sweep moved/archived nothing (ingest_incoming
+    # creates no ingest_sweeps row in that case) — nothing below needs a
+    # status transition then.
+    run_id = result.get("run_id")
+
+    # (source, new_dir) pairs across all sources — feeds both the post-move
+    # index pass and the batch registration that follows it.
+    dir_sources: list[tuple[str, str]] = []
+    for source, stats in result["sources"].items():
+        for d in stats["new_dirs"]:
+            dir_sources.append((source, d))
+
+    if not dir_sources and run_id is None:
         return
 
-    # Collect every new dated folder across sources and index each one.
-    new_dirs: list[str] = []
-    for stats in result["sources"].values():
-        new_dirs.extend(stats["new_dirs"])
-    if not new_dirs:
-        return
-
-    passes = "CLIP only" if no_colors else "CLIP + colors"
-    click.echo(f"\nIndexing {len(new_dirs)} new folder(s) ({passes})...")
-    for d in new_dirs:
-        click.echo(f"  -> {d}")
+    with PhotoDB(db) as pdb:
         try:
-            index_directory(
-                photo_dir=d,
-                db_path=db,
-                enable_clip=True,
-                enable_colors=not no_colors,
-                enable_faces=False,
-                enable_describe=False,
-                enable_quality=False,
-                enable_category_content=False,
-                enable_category_visual=False,
-                enable_keywords=False,
-            )
+            if run_id is not None:
+                set_sweep_status(pdb, run_id, "indexing")
+
+            if index and dir_sources:
+                passes = "CLIP only" if no_colors else "CLIP + colors"
+                click.echo(f"\nIndexing {len(dir_sources)} new folder(s) ({passes})...")
+                for source, d in dir_sources:
+                    click.echo(f"  -> {d}")
+                    try:
+                        index_directory(
+                            photo_dir=d,
+                            db_path=db,
+                            enable_clip=True,
+                            enable_colors=not no_colors,
+                            enable_faces=False,
+                            enable_describe=False,
+                            enable_quality=False,
+                            enable_category_content=False,
+                            enable_category_visual=False,
+                            enable_keywords=False,
+                        )
+                    except Exception as exc:
+                        click.echo(f"     ERROR indexing {d}: {exc}", err=True)
+
+                    # Register (or widen) the batch for this folder now that
+                    # index_directory has had a chance to add its photo rows.
+                    # A folder register_batch can't find any rows for (the
+                    # index pass above failed, or found nothing new) is
+                    # skipped, never fatal to the rest of the sweep.
+                    try:
+                        register_batch(pdb, d, source=source, run_id=run_id)
+                    except ValueError as exc:
+                        click.echo(f"     WARNING: not registering {d}: {exc}", err=True)
+            elif dir_sources:
+                # --no-index: no fresh photo rows were created by this run,
+                # so only register folders that already have rows from an
+                # earlier, indexed sweep into the same dated folder today —
+                # register_batch's ValueError silently covers the rest.
+                for source, d in dir_sources:
+                    try:
+                        register_batch(pdb, d, source=source, run_id=run_id)
+                    except ValueError:
+                        pass
+
+            if run_id is not None:
+                set_sweep_status(pdb, run_id, "registered")
         except Exception as exc:
-            click.echo(f"     ERROR indexing {d}: {exc}", err=True)
+            # A crash here must never leave the sweep stuck 'indexing'
+            # forever — stamp it failed and re-raise.
+            if run_id is not None:
+                set_sweep_status(pdb, run_id, "failed", error=str(exc))
+            raise
 
 
 # ---------------------------------------------------------------------------
