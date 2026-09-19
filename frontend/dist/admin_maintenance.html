@@ -1925,18 +1925,20 @@
       // where the fleet pulls work + submits results. The local replica DB is a
       // fully-processed snapshot, so its own queue reads ~0. See
       // /api/admin/workers/queue-status.
-      function loadWorkers() {
-        fetch('/api/admin/workers/queue-status')
+      // Returns its promise so PS.poll can wait for it to settle.
+      function loadWorkers(signal) {
+        return fetch('/api/admin/workers/queue-status', signal ? { signal: signal } : undefined)
           .then(function(r) { return r.json(); })
           .then(function(d) { setData(d); })
           .catch(function() {});
       }
 
       useEffect(function() {
-        loadWorkers();
-        var pollId = setInterval(loadWorkers, 5000);
+        // PS.poll, not setInterval: queue-status is a heavy per-pass scan, and a
+        // fixed 5s timer stacked requests faster than a busy NAS could answer.
+        var stopPoll = PS.poll(loadWorkers, 5000);
         var tickId = setInterval(function() { setTick(function(t) { return t + 1; }); }, 1000);
-        return function() { clearInterval(pollId); clearInterval(tickId); };
+        return function() { stopPoll(); clearInterval(tickId); };
       }, []);
 
       return e(Workers, { data: data, onRefresh: loadWorkers });
@@ -2142,20 +2144,22 @@
       var _q = useState(null);   var q = _q[0];     var setQ = _q[1];
       var _ex = useState(false); var showSrc = _ex[0]; var setShowSrc = _ex[1];
 
-      function load() {
-        fetch('/api/admin/incoming-status')
-          .then(function (r) { return r.json(); })
-          .then(function (d) { setInc(d); }).catch(function () {});
-        fetch('/api/admin/workers/queue-status')
-          .then(function (r) { return r.json(); })
-          .then(function (d) { setQ(d); }).catch(function () {});
+      function load(signal) {
+        var opts = signal ? { signal: signal } : undefined;
+        return Promise.all([
+          fetch('/api/admin/incoming-status', opts)
+            .then(function (r) { return r.json(); })
+            .then(function (d) { setInc(d); }).catch(function () {}),
+          fetch('/api/admin/workers/queue-status', opts)
+            .then(function (r) { return r.json(); })
+            .then(function (d) { setQ(d); }).catch(function () {})
+        ]);
       }
       useEffect(function () {
-        load();
         // 20s — gentler than the Workers panel's 5s (queue-status is a heavy
-        // per-pass scan on the N100); _incoming scan is cheap either way.
-        var id = setInterval(load, 20000);
-        return function () { clearInterval(id); };
+        // per-pass scan on the N100). The _incoming scan is cheap on an idle box
+        // and NOT under disk contention, so PS.poll waits for both to settle.
+        return PS.poll(load, 20000);
       }, []);
 
       var totals = (inc && inc.totals) || {};

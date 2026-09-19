@@ -2467,29 +2467,33 @@
       if (onReplicaMode) onReplicaMode(!!m);
     }, [onReplicaMode]);
 
-    var load = useCallback(function () {
-      fetch('/api/admin/maintenance-fingerprint')
+    // Returns a promise covering ALL of its fetches (the nested one is returned,
+    // not fired-and-forgotten) — PS.poll re-arms on it, so a round is not over
+    // until every request in it has come back.
+    var load = useCallback(function (signal) {
+      var opts = signal ? { signal: signal } : undefined;
+      var fp = fetch('/api/admin/maintenance-fingerprint', opts)
         .then(function (r) { return r.json(); })
         .then(function (l) {
           reportMode(l.replica_mode);
           if (!l.replica_mode) { setData({ replica_mode: false }); return; }
-          fetch('/api/admin/maintenance-nas-fingerprint')
+          return fetch('/api/admin/maintenance-nas-fingerprint', opts)
             .then(function (r) { return r.json(); })
             .then(function (n) { setData({ replica_mode: true, local: l, nas: n }); })
             .catch(function () { setData({ replica_mode: true, local: l, nas: null }); });
         })
         .catch(function () {});  // endpoint absent (old build) → panel stays hidden
-      fetch('/api/admin/maintenance-push-status')
+      var ps = fetch('/api/admin/maintenance-push-status', opts)
         .then(function (r) { return r.json(); }).then(setPush).catch(function () {});
+      return Promise.all([fp, ps]);
     }, [reportMode]);
 
     // Poll so the panel reflects the current sync state after a sweep/push —
     // the whole point of the panel is to make drift visible, and a load-once
     // effect would freeze on the pre-sweep state until a manual page reload.
+    // PS.poll, not setInterval: see its comment for the 2026-09-19 pile-up.
     useEffect(function () {
-      load();
-      var id = setInterval(load, 5000);
-      return function () { clearInterval(id); };
+      return PS.poll(load, 5000);
     }, [load]);
 
     if (!data || !data.replica_mode) return null;
@@ -2563,6 +2567,55 @@
     var m = trimmed.match(/^data:\s*(.*)$/s);
     if (!m) return null;
     try { return JSON.parse(m[1]); } catch (_) { return null; }
+  };
+
+  // Poll `fn` every `ms` — but re-arm only AFTER the previous call settles.
+  // Use this instead of setInterval for anything that hits the server.
+  //
+  // setInterval fires whether or not the last request came back. On 2026-09-19
+  // the NAS's disks were saturated, each status poll took minutes, and two open
+  // tabs kept issuing more until all 40 request threads were stuck — the status
+  // page wedged the box it was reporting on. With this, a slow server is polled
+  // SLOWER, never harder: at most one call is in flight per poller.
+  //
+  // `fn(signal)` should return the promise for its work (return the fetch chain;
+  // use Promise.all for several). A non-promise return or a throw is tolerated.
+  // Polling pauses while the tab is hidden and fires at once when it is shown.
+  // Returns stop(), which also aborts the in-flight call via `signal`.
+  PS.poll = function poll(fn, ms) {
+    var stopped = false, inFlight = false, timer = null, controller = null;
+
+    function run() {
+      timer = null;
+      if (stopped || inFlight) return;
+      if (document.hidden) return;          // visibilitychange re-runs us
+      inFlight = true;
+      controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var result;
+      try { result = fn(controller ? controller.signal : undefined); }
+      catch (_) { result = null; }
+      Promise.resolve(result).catch(function () {}).then(function () {
+        inFlight = false;
+        controller = null;
+        if (!stopped) timer = setTimeout(run, ms);
+      });
+    }
+
+    function onVisible() {
+      if (stopped || document.hidden || inFlight) return;
+      if (timer) { clearTimeout(timer); timer = null; }
+      run();
+    }
+
+    document.addEventListener('visibilitychange', onVisible);
+    run();
+
+    return function stop() {
+      stopped = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (controller) controller.abort();
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   };
 
 })();

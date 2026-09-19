@@ -69,17 +69,19 @@
 
       const load = useCallback(() => {
         setLoading(true);
-        fetch(API + '/api/logs').then(r => r.json()).then(d => {
+        return fetch(API + '/api/logs').then(r => r.json()).then(d => {
           setData(d); setLoading(false);
           setUpdated(new Date().toLocaleTimeString());
         }).catch(() => setLoading(false));
       }, []);
 
-      useEffect(() => { load(); }, [load]);
+      // PS.poll re-arms only after the previous load settles (and runs at once),
+      // so auto-refresh can't stack requests; with auto off, load once.
       useEffect(() => {
-        if (timer.current) clearInterval(timer.current);
-        if (auto) timer.current = setInterval(load, REFRESH_MS);
-        return () => timer.current && clearInterval(timer.current);
+        if (timer.current) { timer.current(); timer.current = null; }
+        if (auto) timer.current = PS.poll(load, REFRESH_MS);
+        else load();
+        return () => { if (timer.current) { timer.current(); timer.current = null; } };
       }, [auto, load]);
 
       const days = (data && data.days) || [];
