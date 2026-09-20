@@ -22,10 +22,11 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 30 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
-persons, face_references, collections, collection_photos, photo_stacks, stack_members,
-review_selections, google_photos_uploads, ignored_clusters, generations, schema_info,
-ingest_sweeps, ingest_batches, ingest_batch_jobs.
+File is `photo_index.db` (not `photos.db`). Schema version 31 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
+persons, face_references, face_person_exclusions, collections, collection_photos,
+photo_stacks, stack_members, review_selections, google_photos_uploads,
+ignored_clusters, generations, schema_info, ingest_sweeps, ingest_batches,
+ingest_batch_jobs.
 (v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
 (v25 added `photos.folder` — indexed dirname of `filepath`, populated in
 `add_photo` + backfilled on migration — so the `/review` and `/geotag` folder
@@ -2091,15 +2092,72 @@ explicit opt-in: `maintenance-sweep --match-temporal`, `match_temporal=True` on
 `run_maintenance_sweep`, `"match_temporal": true` on the API. Hand-run
 `match-faces --temporal` is unchanged. Tests: `tests/test_maintenance_match_faces.py`.
 
-**Known, NOT fixed — a nightly match/unmatch churn loop.** The log shows the
-stage "applying" ~6,000 matches every night while the unmatched pool never
-shrinks (202k → 213k over eight runs), because `resolve_dups` strips
-~5,300–6,100 of them the *same night*. The ~5,500 `dedupe_unmatched` faces are
-deliberately still matchable (they may belong to a *different* person), so they
-are re-matched to the *same* person and re-stripped forever — on the sweep's
-heaviest CPU stage. Strict-only should shrink it; it has not been measured
-since. The durable fix is to remember *which person* a face was de-duplicated
-away from and skip only that pairing.
+**FIXED (2026-09-19) — the nightly match/unmatch churn loop.** The sweep's log
+showed `match_faces` and `resolve_dups` applying the *same* number night after
+night — 6134/6134, 6129/6129, 5262/5262, 5858/5327 — while the unmatched pool
+grew **202k → 213k over eight runs**. Unmatched by source at the time: NULL
+204,043 · `dedupe_unmatched` 5,531 · `rejected` 3,720.
+
+Mechanism: `resolve_dups` keeps one face per (photo, person) and unmatches the
+loser as `dedupe_unmatched`, which is **deliberately still matchable** (the
+loser may be a *different* person — filtering it wholesale was considered and
+rejected, it would freeze ~9.6k faces out of matching forever). But nothing
+remembered *which* person the face lost to, so the matcher re-applied the same
+label and the resolver stripped it again. Forever, on the sweep's heaviest CPU
+stage.
+
+The fix is **`face_person_exclusions(face_id, person_id, reason, created_at)`**
+(schema v31): remember the *pairing*, not the face. Load it once per run into
+`{face_id: {person_id}}` (`faces.load_match_exclusions`) — never a query per
+face; the matchers walk ~213k rows on a 4-core N100. Both matchers consult it,
+the same precedent as `MATCHABLE_SQL`, and a test asserts both do.
+
+Things not to simplify back:
+
+- **It is per (face, person), and the face falls through to the NEXT best
+  person inside the same tolerance** — not dropped. The strict matcher walks
+  `match_face`'s already-sorted in-tolerance list past a barred person; the
+  temporal one removes barred people from `ranked` *before* the gap and
+  session checks, so the face is judged on the remaining field exactly as if
+  that person were not registered. Dropping the face instead would lose real
+  labels; skipping *after* the gap check would make the runner-up unreachable.
+- **One write primitive**: `db.unmatch_faces_as_duplicates` does snapshot +
+  exclusion + null, and `cli.py`'s `resolve-duplicate-persons` /
+  `dedupe-person-faces` and `maintenance._stage_resolve_dups` all call it. They
+  each had their own copy of snapshot-then-null before; a fix to one would have
+  left the other churning. `test_the_duplicate_unmatch_write_lives_in_one_place`
+  fails if a copy comes back.
+- **A human overrules it.** `db.assign_face_to_person` clears the pairing
+  unless the source is `strict`/`temporal` (`AUTO_MATCH_SOURCES`) — so assign,
+  bulk-assign, `face_edit`, correct-face and the manual-assignment import all
+  get it from the one primitive. `correct-face` had to be *moved onto* that
+  primitive: it wrote a bare `UPDATE faces SET person_id`, so it neither
+  cleared the exclusion nor stamped a source, leaving a hand-corrected face
+  barred from the person the human had just named. Merge-accept and the
+  replica's `_mirror_face_labels` write their own UPDATE, so they clear it
+  explicitly. Restores
+  (`restore-unmatched-faces`, `bulk_unmatch.restore`) clear it too: the
+  restored pairing's exclusion is spent, and leaving it would make the face
+  permanently unmatchable to the person just restored.
+- **`face_state.apply_face_state` refuses excluded pairings on the TARGET** —
+  the replica recomputes off a synced copy, so its file can carry exactly the
+  pairing the NAS has since stripped, restarting the loop by the long route.
+  Guarded on the overwrite path too: one-person-per-photo is not something a
+  force flag should violate.
+- **Rows cascade** on both `face_id` and `person_id` (`PRAGMA foreign_keys` is
+  ON in `PhotoDB.__init__`), so they never outlive a deleted face or person.
+
+The ~5,531 already-stuck faces are backfilled from the `face_dedupe_undo`
+snapshots **inside the v31 migration** (idempotent, `INSERT OR IGNORE`, silently
+does nothing when that on-demand table was never created), so the fix takes
+effect on deploy with no operator step. Re-check or re-run by hand with
+`photosearch backfill-face-exclusions [--apply]`.
+
+Tests: `tests/test_face_person_exclusions.py` (20 cases, including the
+end-to-end `test_match_then_resolve_twice_is_stable` that reproduces the
+6134/6134 loop — verified to go red when the matchers stop consulting the
+table, along with the four per-matcher cases), plus
+`test_v30_db_migrates_to_v31_face_person_exclusions` in `tests/test_db.py`.
 
 **Replica mode is now gated.** A sweep writes to whatever `PHOTOSEARCH_DB`
 points at, and `sync-replica.sh` replaces the replica's DB wholesale — so a

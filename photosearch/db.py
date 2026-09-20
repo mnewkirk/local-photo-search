@@ -79,7 +79,18 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
+
+# The marker resolve-duplicate-persons / dedupe-person-faces leave on the
+# LOSING face of a (photo, person) duplicate. Deliberately still matchable —
+# see faces.REJECTED_MATCH_SOURCE for why filtering it wholesale was rejected.
+DEDUPE_UNMATCHED_SOURCE = "dedupe_unmatched"
+
+# match_source values written by the two automatic matchers. An assignment
+# carrying anything else (manual, merge_review, a bare None from an explicit
+# API write) is a human decision and CLEARS a face/person exclusion; a
+# matcher's own write must never clear the memory that is meant to stop it.
+AUTO_MATCH_SOURCES = ("strict", "temporal")
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -97,6 +108,127 @@ def _serialize_float_list(vec: list[float]) -> bytes:
 def _deserialize_float_list(data: bytes, dim: int) -> list[float]:
     """Deserialize binary float vector back to a list."""
     return list(struct.unpack(f"{dim}f", data))
+
+
+# ---------------------------------------------------------------------------
+# Face/person exclusions — "this face lost a duplicate to THAT person"
+# ---------------------------------------------------------------------------
+#
+# Everything that unmatches a face as a duplicate goes through
+# `unmatch_faces_as_duplicates`, and everything that matches consults
+# `load_face_person_exclusions`. Both live here rather than in faces.py so the
+# CLI and the maintenance sweep can use them without importing InsightFace.
+
+
+def record_face_person_exclusions(conn, pairs, reason: str = "resolve_dups") -> int:
+    """Remember that each (face_id, person_id) pair must not be re-matched.
+
+    Idempotent: the PK makes a repeat a no-op. Returns the number of NEW rows.
+    """
+    pairs = [(int(f), int(p)) for f, p in pairs if f is not None and p is not None]
+    if not pairs:
+        return 0
+    before = conn.execute("SELECT COUNT(*) FROM face_person_exclusions").fetchone()[0]
+    conn.executemany(
+        "INSERT OR IGNORE INTO face_person_exclusions (face_id, person_id, reason) "
+        "VALUES (?, ?, ?)",
+        [(f, p, reason) for f, p in pairs],
+    )
+    after = conn.execute("SELECT COUNT(*) FROM face_person_exclusions").fetchone()[0]
+    return after - before
+
+
+def clear_face_person_exclusion(conn, face_id: int, person_id: int) -> int:
+    """A human said this face IS that person — the exclusion is overruled."""
+    cur = conn.execute(
+        "DELETE FROM face_person_exclusions WHERE face_id = ? AND person_id = ?",
+        (int(face_id), int(person_id)),
+    )
+    return cur.rowcount or 0
+
+
+def load_face_person_exclusions(conn) -> dict[int, set[int]]:
+    """Every exclusion as {face_id: {person_id, ...}}, loaded ONCE per run.
+
+    The matchers walk ~213k unmatched faces on a 4-core N100, so this must be
+    a dict lookup per face, never a query per face. The table holds a few
+    thousand rows, so the whole thing is a few hundred KB.
+    """
+    out: dict[int, set[int]] = {}
+    for face_id, person_id in conn.execute(
+        "SELECT face_id, person_id FROM face_person_exclusions"
+    ):
+        out.setdefault(face_id, set()).add(person_id)
+    return out
+
+
+def unmatch_faces_as_duplicates(conn, face_ids, reason: str = "resolve_dups") -> int:
+    """THE shared write for "this face lost a (photo, person) duplicate".
+
+    Three things, in one place because they must never diverge:
+      1. snapshot (face_id, person_id, match_source) into the on-demand
+         `face_dedupe_undo` table, so the sweep stays reversible via
+         `restore-unmatched-faces`;
+      2. record the (face, person) exclusion, so the next matcher run does not
+         simply re-apply the label that is about to be removed;
+      3. null the person and stamp `dedupe_unmatched`.
+
+    cli.py's resolve-duplicate-persons / dedupe-person-faces and
+    maintenance._stage_resolve_dups each had their own copy of (1) + (3); a
+    fix applied to one would have left the other churning. Does NOT commit —
+    the caller owns the transaction. Returns the number of faces unmatched.
+    """
+    face_ids = [int(f) for f in face_ids]
+    if not face_ids:
+        return 0
+    conn.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
+                 "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
+                 "unmatched_at TEXT DEFAULT (datetime('now')))")
+    pairs = []
+    for fid in face_ids:
+        row = conn.execute(
+            "SELECT person_id, match_source FROM faces WHERE id = ?", (fid,)).fetchone()
+        if not row or row["person_id"] is None:
+            continue
+        pairs.append((fid, row["person_id"]))
+        conn.execute("INSERT OR REPLACE INTO face_dedupe_undo"
+                     "(face_id, person_id, match_source) VALUES (?, ?, ?)",
+                     (fid, row["person_id"], row["match_source"]))
+    record_face_person_exclusions(conn, pairs, reason=reason)
+    for fid in face_ids:
+        conn.execute("UPDATE faces SET person_id = NULL, match_source = ? WHERE id = ?",
+                     (DEDUPE_UNMATCHED_SOURCE, fid))
+    return len(face_ids)
+
+
+def backfill_exclusions_from_dedupe_undo(conn, apply: bool = False) -> int:
+    """Create an exclusion for every historically de-duplicated face.
+
+    `face_dedupe_undo` already holds (face_id, person_id) for the faces the
+    resolver has unmatched over the years; the ones still sitting at
+    `match_source='dedupe_unmatched'` and unmatched are precisely the set that
+    keeps flapping. Idempotent (INSERT OR IGNORE against the PK) and cheap, so
+    it also runs inside the v31 migration — the table may not exist at all,
+    since it is created on demand, in which case this does nothing.
+
+    Returns the number of exclusions that would be / were created.
+    """
+    if not conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'face_dedupe_undo'").fetchone():
+        return 0
+    rows = conn.execute(
+        "SELECT u.face_id, u.person_id FROM face_dedupe_undo u "
+        "JOIN faces f ON f.id = u.face_id "
+        "WHERE u.person_id IS NOT NULL AND f.person_id IS NULL "
+        "AND IFNULL(f.match_source, '') = ? "
+        "AND NOT EXISTS (SELECT 1 FROM face_person_exclusions e "
+        "                WHERE e.face_id = u.face_id AND e.person_id = u.person_id)",
+        (DEDUPE_UNMATCHED_SOURCE,),
+    ).fetchall()
+    if not apply:
+        return len(rows)
+    return record_face_person_exclusions(
+        conn, [(r["face_id"], r["person_id"]) for r in rows], reason="backfill")
 
 
 class PhotoDB:
@@ -642,6 +774,31 @@ class PhotoDB:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ingest_batches_created ON ingest_batches(created_at)")
 
+        # Face/person exclusions (schema v31) — "this face is not THAT person",
+        # written whenever the duplicate resolver unmatches the loser of a
+        # (photo, person) pair. Without it the nightly sweep re-applied the
+        # same label the resolver had just stripped, every night, forever
+        # (202k -> 213k unmatched over eight runs at ~6,000 flapping labels a
+        # night). Per (face, person) on purpose: the loser may legitimately be
+        # a DIFFERENT person, so the face stays matchable to everyone else —
+        # which is exactly why 'dedupe_unmatched' could not simply be filtered
+        # out of MATCHABLE_SQL.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS face_person_exclusions (
+                face_id    INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+                person_id  INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+                reason     TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (face_id, person_id)
+            )
+        """)
+        # Backfill the faces already stuck in the loop. face_dedupe_undo is an
+        # on-demand table (it may never have been created), the insert is
+        # INSERT OR IGNORE against a PK, and the whole thing is one indexed
+        # join — so it is safe to run inside the migration and the fix takes
+        # effect on deploy with no operator step.
+        backfill_exclusions_from_dedupe_undo(self.conn, apply=True)
+
         # Photo stacks — burst/bracket groups of near-identical shots
         cur.execute("""
             CREATE TABLE IF NOT EXISTS photo_stacks (
@@ -1175,11 +1332,20 @@ class PhotoDB:
         """Link a face to a named person.
 
         match_source: 'strict', 'temporal', or 'manual'.  Stored for filtering.
+
+        A NON-automatic source (manual, merge_review, an explicit None from an
+        API write) is a human overruling the duplicate resolver, so it also
+        clears any face/person exclusion for this pairing. This is the shared
+        primitive every manual-assign path goes through — /api/faces/{id}/assign,
+        bulk-assign, correct-face and the manual-assignment import — so the
+        clear lives here rather than being re-implemented at each call site.
         """
         self.conn.execute(
             "UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
             (person_id, match_source, face_id),
         )
+        if person_id is not None and match_source not in AUTO_MATCH_SOURCES:
+            clear_face_person_exclusion(self.conn, face_id, person_id)
         self._maybe_commit()
 
     # ------------------------------------------------------------------

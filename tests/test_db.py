@@ -1160,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 30
+        assert int(version) == SCHEMA_VERSION == 31
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1238,7 +1238,7 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 30
+        assert int(version) == SCHEMA_VERSION == 31
 
     # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
     # the tables intact (schema-version fast-path skips the DDL entirely).
@@ -1247,6 +1247,37 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
         assert {"ingest_sweeps", "ingest_batches", "ingest_batch_jobs"}.issubset(tables)
+
+
+# =========================================================================
+# Schema v31 — face_person_exclusions
+# =========================================================================
+
+def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
+    """A v30 DB gains the face/person exclusion table on open, additively,
+    and is stamped 31. The table is what stopped the nightly match/unmatch
+    churn loop — see tests/test_face_person_exclusions.py."""
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    db.conn.execute("DROP TABLE IF EXISTS face_person_exclusions")
+    db.conn.execute("UPDATE schema_info SET value = '30' WHERE key = 'version'")
+    db.conn.commit()
+    db.close()
+
+    with PhotoDB(tmp_db_path) as reopened:
+        cols = {r["name"] for r in reopened.conn.execute(
+            "PRAGMA table_info(face_person_exclusions)")}
+        assert cols == {"face_id", "person_id", "reason", "created_at"}
+        version = reopened.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 31
+
+    # Idempotent: the version fast-path skips the DDL and the table survives.
+    with PhotoDB(tmp_db_path) as again:
+        assert again.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='face_person_exclusions'").fetchone()
 
 
 class TestNormalizeDirectory:

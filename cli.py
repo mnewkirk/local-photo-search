@@ -691,20 +691,6 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 # split-cluster
 # ---------------------------------------------------------------------------
 
-def _record_unmatch_undo(conn, face_ids):
-    """Snapshot (face_id, person_id, match_source) for each face about to be
-    unmatched, so the bulk change is reversible via restore-unmatched-faces.
-    On-demand utility table (not part of the migrated schema)."""
-    conn.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
-                 "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
-                 "unmatched_at TEXT DEFAULT (datetime('now')))")
-    for fid in face_ids:
-        row = conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?", (fid,)).fetchone()
-        if row and row["person_id"] is not None:
-            conn.execute("INSERT OR REPLACE INTO face_dedupe_undo(face_id, person_id, match_source) "
-                         "VALUES (?, ?, ?)", (fid, row["person_id"], row["match_source"]))
-
-
 def _write_face_dedupe_report(decisions, path, nas_url, person, limit=120):
     """HTML gallery of keep-vs-remove FACE crops for the dedupe spot-check.
     Least-confident decisions first (smallest gap) so the riskiest calls are at
@@ -871,10 +857,8 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
-        _record_unmatch_undo(c, to_unmatch)
-        for fid in to_unmatch:
-            c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
-                      "WHERE id = ?", (fid,))
+        from photosearch.db import unmatch_faces_as_duplicates
+        unmatch_faces_as_duplicates(c, to_unmatch, reason="dedupe_person_faces")
         pdb.conn.commit()
         click.echo(f"Applied: unmatched {len(to_unmatch)} face(s) from {person}. "
                    "Reversible via: photosearch restore-unmatched-faces.")
@@ -1001,6 +985,30 @@ def restore_unmatch(db, src, do_apply):
                f"(labelled since, or gone).")
 
 
+@cli.command("backfill-face-exclusions")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", "do_apply", is_flag=True, default=False,
+              help="Write the exclusions. Default: dry-run.")
+def backfill_face_exclusions(db, do_apply):
+    """Stop the historically de-duplicated faces from churning.
+
+    Creates a face/person exclusion for every `face_dedupe_undo` snapshot whose
+    face is still unmatched with match_source='dedupe_unmatched' — the ~5,500
+    faces the nightly sweep re-matched and re-stripped every night before v31.
+    Idempotent. The v31 migration runs this automatically on first open, so
+    this command is for re-checking or for a DB that gained undo rows since.
+    """
+    from photosearch.db import backfill_exclusions_from_dedupe_undo
+    with PhotoDB(db) as pdb:
+        n = backfill_exclusions_from_dedupe_undo(pdb.conn, apply=do_apply)
+        if not do_apply:
+            click.echo(f"{n} exclusion(s) would be created. Re-run with --apply.")
+            return
+        pdb.conn.commit()
+        click.echo(f"Created {n} exclusion(s).")
+
+
 @cli.command("restore-unmatched-faces")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
@@ -1026,9 +1034,14 @@ def restore_unmatched_faces(db, apply):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
+        from photosearch.db import clear_face_person_exclusion
         for r in rows:
             c.execute("UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
                       (r["person_id"], r["match_source"], r["face_id"]))
+            # The restore puts this exact pairing back, so its exclusion is
+            # spent — leaving it would make the face permanently unmatchable
+            # to the person we just restored it to.
+            clear_face_person_exclusion(c, r["face_id"], r["person_id"])
             c.execute("DELETE FROM face_dedupe_undo WHERE face_id = ?", (r["face_id"],))
         pdb.conn.commit()
         click.echo(f"Restored {len(rows)} face(s).")
@@ -1078,10 +1091,8 @@ def resolve_duplicate_persons(db, apply):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
-        _record_unmatch_undo(c, to_unmatch)
-        for fid in to_unmatch:
-            c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
-                      "WHERE id = ?", (fid,))
+        from photosearch.db import unmatch_faces_as_duplicates
+        unmatch_faces_as_duplicates(c, to_unmatch, reason="resolve_duplicate_persons")
         pdb.conn.commit()
         click.echo(f"Applied: unmatched {len(to_unmatch)} duplicate face(s). "
                    "Every photo now has each person at most once. "
@@ -3169,9 +3180,13 @@ def correct_face(filename, face_number, correct_person, db):
             else:
                 person_id = person["id"]
 
-            photo_db.conn.execute(
-                "UPDATE faces SET person_id = ? WHERE id = ?", (person_id, target_face["id"])
-            )
+            # Through the shared manual-assign primitive, not a raw UPDATE: a
+            # human naming a face overrules the duplicate resolver, so this
+            # must clear any face/person exclusion for the pairing (and stamp
+            # the source, which the raw UPDATE left on whatever the matcher
+            # had written).
+            photo_db.assign_face_to_person(
+                target_face["id"], person_id, match_source="manual")
             photo_db.conn.commit()
             click.echo(f"✓ Face {face_number} in {filename} reassigned: {old_name} → {correct_person}.")
 

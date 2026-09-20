@@ -412,19 +412,12 @@ def _stage_resolve_dups(db, apply, emit, check_abort):
         return {"stage": "resolve_dups", "would": would, "applied": 0,
                 "status": "skipped" if would == 0 else "preview",
                 "groups": len(dups)}
-    # Reversible snapshot (same on-demand table the CLI dedup commands use).
-    c.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
-              "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
-              "unmatched_at TEXT DEFAULT (datetime('now')))")
-    for fid in to_unmatch:
-        row = c.execute("SELECT person_id, match_source FROM faces WHERE id = ?",
-                        (fid,)).fetchone()
-        if row and row["person_id"] is not None:
-            c.execute("INSERT OR REPLACE INTO face_dedupe_undo"
-                      "(face_id, person_id, match_source) VALUES (?, ?, ?)",
-                      (fid, row["person_id"], row["match_source"]))
-        c.execute("UPDATE faces SET person_id = NULL, "
-                  "match_source = 'dedupe_unmatched' WHERE id = ?", (fid,))
+    # Snapshot (reversible via restore-unmatched-faces) + record the (face,
+    # person) exclusion + null the label, in the ONE shared primitive the CLI
+    # dedup commands also use. Without the exclusion this stage and match_faces
+    # flapped ~6,000 labels a night forever; see photosearch/db.py.
+    from .db import unmatch_faces_as_duplicates
+    unmatch_faces_as_duplicates(c, to_unmatch, reason="maintenance_resolve_dups")
     db.conn.commit()
     return {"stage": "resolve_dups", "would": would, "applied": would,
             "status": "done", "groups": len(dups)}

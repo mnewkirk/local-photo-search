@@ -96,15 +96,16 @@ local-photo-search/
 
 ---
 
-## Database Schema (v30)
+## Database Schema (v31)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
 > (v25), the VLM aesthetics `aes_*` columns (v26), per-day aesthetic
 > percentile normalization (v28), `maintenance_runs` (v29), and
-> `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30). `SCHEMA_VERSION`
-> in `db.py` is the source of truth — currently **30**. See CLAUDE.md for the
-> aesthetics + folder + ingest-batch details.
+> `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30), and
+> `face_person_exclusions` (v31). `SCHEMA_VERSION` in `db.py` is the source of
+> truth — currently **31**. See CLAUDE.md for the aesthetics + folder +
+> ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -114,6 +115,7 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | faces | Detected faces per photo (bbox, encoding, quality) |
 | persons | Named persons for face matching |
 | face_references | Reference photos/encodings for each person |
+| face_person_exclusions | (face, person) pairs the duplicate resolver unmatched — both matchers skip that pairing only (v31) |
 | collections | Named photo collections/albums |
 | collection_photos | Junction table with sort_order for manual ordering |
 | photo_stacks | Burst/bracket groups detected by time + visual similarity |
@@ -1357,7 +1359,11 @@ verify-person-matches [--person NAME] [--min-dist 1.30] \
                                             # distance to their trusted (strict/manual)
                                             # refs; farthest = likely wrong person.
                                             # Report-only; catches non-sibling mis-tags.
-restore-unmatched-faces [--apply]           # Undo the two above (face_dedupe_undo table).
+restore-unmatched-faces [--apply]           # Undo the two above (face_dedupe_undo table);
+                                            # also clears the restored pairing's exclusion.
+backfill-face-exclusions [--apply]          # Seed face_person_exclusions from the existing
+                                            # face_dedupe_undo snapshots. Idempotent; the
+                                            # v31 migration runs it automatically.
 cleanup-orphan-faces [--apply]              # Delete faces whose photo was deleted.
 backfill-image-orientation [--apply] [--limit N]
                                             # Store EXIF-oriented image_width/height
@@ -1471,9 +1477,15 @@ Full narrative + rationale live in **CLAUDE.md** ("Face over-matching cleanup",
   each, spanning years). `--report` writes a keep-vs-remove **face-crop** gallery.
 - **`resolve-duplicate-persons`** enforces the one-person-per-photo invariant for
   everyone (priority manual > strict > temporal, tie-break det_score → bbox area).
+- **Both go through `db.unmatch_faces_as_duplicates`** (snapshot + record the
+  (face, person) exclusion + null the label) — one primitive, because each used
+  to carry its own copy and a fix to one left the other churning. The exclusion
+  is what stops the matcher re-applying the label the resolver just stripped;
+  see CLAUDE.md "FIXED (2026-09-19) — the nightly match/unmatch churn loop".
 - **`restore-unmatched-faces`** reverses both via the on-demand `face_dedupe_undo`
   snapshot (unmatch sets `match_source='dedupe_unmatched'`; `apply-face-state`
-  additive-fill skips those so a re-match can't undo the cleanup).
+  additive-fill skips those, and also refuses pairings excluded on the target,
+  so neither a re-match nor a replica push can undo the cleanup).
 - **`cleanup-orphan-faces`** deletes face rows whose photo was deleted (broken
   `/faces` thumbnails + phantom matches; ~12% of faces on the NAS were orphans).
 - **Desktop-as-client recompute**: the N100 can't do the ~230k-face DBSCAN, so
@@ -2372,7 +2384,7 @@ def my_command(db):
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py` (currently 30)
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 31)
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies

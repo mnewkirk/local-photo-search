@@ -491,6 +491,27 @@ MATCHABLE_SQL = (
 )
 
 
+def load_match_exclusions(db) -> dict[int, set[int]]:
+    """{face_id: {person_id, ...}} the matchers must not re-create.
+
+    Shared by BOTH matchers for the same reason MATCHABLE_SQL is: the
+    match/unmatch churn loop was one candidate path, not both, and a fix
+    applied to only the strict matcher would have looked complete while the
+    temporal one kept flapping.
+
+    Loaded ONCE per run and consulted as a dict lookup — the matchers walk
+    ~213k unmatched faces on a 4-core N100, so a query per face is not an
+    option. The table holds a few thousand rows.
+
+    An exclusion is per (face, person): a face excluded from its nearest
+    person is offered to the NEXT best person inside the same tolerance, not
+    dropped. The face genuinely is somebody; it just is not the person whose
+    duplicate it lost.
+    """
+    from .db import load_face_person_exclusions
+    return load_face_person_exclusions(db.conn)
+
+
 CLUSTER_MIN_DET_SCORE = 0.65
 CLUSTER_MIN_BBOX_EDGE = 60
 
@@ -1078,6 +1099,8 @@ def match_faces_to_persons(
         print("  All faces already matched.")
         return 0
 
+    exclusions = load_match_exclusions(db)
+
     matched = 0
     for face_row in face_rows:
         face_id = face_row["id"]
@@ -1090,10 +1113,17 @@ def match_faces_to_persons(
         face_enc = list(struct.unpack(f"{FACE_DIMENSIONS}f", enc_row["encoding"]))
         best_matches = match_face(face_enc, ref_encodings, tolerance=tolerance)
 
-        if best_matches:
-            best_idx, _ = best_matches[0]
-            db.assign_face_to_person(face_id, person_ids[best_idx], match_source="strict")
+        # match_face returns EVERY reference inside tolerance, closest first,
+        # so walking it past an excluded person is exactly "next best under the
+        # same tolerance" — no second pass, no widened radius.
+        barred = exclusions.get(face_id)
+        for best_idx, _ in best_matches:
+            pid = person_ids[best_idx]
+            if barred and pid in barred:
+                continue
+            db.assign_face_to_person(face_id, pid, match_source="strict")
             matched += 1
+            break
 
     return matched
 
@@ -1226,6 +1256,7 @@ def match_faces_temporal(
 
     window = timedelta(minutes=window_minutes)
     matched = 0
+    exclusions = load_match_exclusions(db)
 
     for face_row in face_rows:
         face_id = face_row["id"]
@@ -1242,8 +1273,17 @@ def match_faces_temporal(
         encs_np  = np.array(person_encs_u)
         dists = np.sqrt(((encs_np - query_np) ** 2).sum(axis=1)).tolist()
 
-        # Sort by distance
+        # Sort by distance, then drop the people this face is barred from.
+        # Dropping them BEFORE the gap check (rather than skipping at the end)
+        # is what makes "next best under the same tolerance" work: a face
+        # excluded from its nearest person is judged on the remaining field,
+        # exactly as if that person were not registered.
         ranked = sorted(zip(dists, person_ids_u), key=lambda x: x[0])
+        barred = exclusions.get(face_id)
+        if barred:
+            ranked = [r for r in ranked if r[1] not in barred]
+        if not ranked:
+            continue
         best_dist, best_pid = ranked[0]
 
         # Check 1: best distance within temporal tolerance

@@ -28,6 +28,7 @@ from datetime import datetime
 
 import numpy as np
 
+from .db import clear_face_person_exclusion
 from .faces import REJECTED_MATCH_SOURCE
 
 REFERENCE_SOURCE = "manual"
@@ -163,6 +164,9 @@ def restore(db, rows):
         db.conn.execute(
             "UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
             (r["person_id"], r["match_source"], r["face_id"]))
+        # Putting a label back also spends any duplicate-resolver exclusion for
+        # that pairing — same rule as restore-unmatched-faces.
+        clear_face_person_exclusion(db.conn, r["face_id"], r["person_id"])
         restored += 1
     db.conn.commit()
     return restored, skipped

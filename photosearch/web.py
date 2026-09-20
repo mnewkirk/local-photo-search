@@ -1874,6 +1874,13 @@ def _mirror_face_labels(face_ids: list[int], person_name: Optional[str]) -> dict
             db.conn.execute(
                 f"UPDATE faces SET person_id = ?, match_source = ? WHERE id IN ({ph})",
                 [pid, src, *batch])
+            if pid is not None:
+                # The NAS's assign cleared this pairing's exclusion (via
+                # db.assign_face_to_person); mirror that, or the replica would
+                # keep refusing to match a face the user just named.
+                db.conn.execute(
+                    f"DELETE FROM face_person_exclusions "
+                    f"WHERE person_id = ? AND face_id IN ({ph})", [pid, *batch])
         db.conn.commit()
     return {"relabelled": len(face_ids)}
 
@@ -2913,12 +2920,29 @@ def api_apply_face_merge(data: dict):
         cur = db.conn.cursor()
         try:
             if target["type"] == "person":
+                # Accepting a merge is a human saying these faces ARE that
+                # person, so it overrules any duplicate-resolver exclusion for
+                # the pairing — the same rule assign / bulk-assign get from
+                # db.assign_face_to_person. This path writes the label with its
+                # own UPDATE, so it clears the exclusions itself, scoped to the
+                # faces actually being moved (read BEFORE the update, which is
+                # what makes them identifiable).
+                moving = [r["id"] for r in db.conn.execute(
+                    "SELECT id FROM faces WHERE cluster_id = ? AND person_id IS NULL",
+                    (source_id,))]
                 cur.execute(
                     """UPDATE faces
                        SET person_id = ?, cluster_id = NULL, match_source = 'merge_review'
                        WHERE cluster_id = ? AND person_id IS NULL""",
                     (target_id, source_id),
                 )
+                for i in range(0, len(moving), 500):
+                    batch = moving[i:i + 500]
+                    ph = ",".join("?" * len(batch))
+                    db.conn.execute(
+                        f"DELETE FROM face_person_exclusions "
+                        f"WHERE person_id = ? AND face_id IN ({ph})",
+                        [target_id, *batch])
             else:
                 cur.execute(
                     """UPDATE faces
