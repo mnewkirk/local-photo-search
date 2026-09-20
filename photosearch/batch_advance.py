@@ -234,7 +234,11 @@ def _run_rank_measure(db, ctx) -> dict:
         db, day, cache_path,
         photo_ids=ctx["photo_ids"],
         log=lambda msg: ctx["emit"](_inner({"line": msg}, "rank_measure")),
-        on_progress=lambda ev: ctx["emit"](_inner(ev, "rank_measure")))
+        on_progress=lambda ev: ctx["emit"](_inner(ev, "rank_measure")),
+        # Checked per photo, not just between steps: this is the LAST step of
+        # an advance and the longest (~10 min for 1,260 photos on the N100),
+        # so a cancel that only landed between steps would do nothing at all.
+        should_abort=lambda: _abort_flag(ctx["check_abort"]))
 
 
 def default_runners() -> dict[str, Callable]:

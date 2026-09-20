@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import time
 from collections import defaultdict
 
 # The shorter bbox edge, in pixels, below which a face is not worth measuring:
@@ -71,6 +73,65 @@ def default_cache_path(db_path: str, date_: str) -> str:
     """
     return os.path.join(os.path.dirname(os.path.abspath(db_path)),
                         f"{_CACHE_PREFIX}{date_}.json")
+
+
+def _save_cache(cache: dict, cache_path: str) -> None:
+    """Write the cache **atomically**: temp file in the same directory, flush,
+    fsync, ``os.replace``.
+
+    A plain ``open(path, "w")`` + ``json.dump`` is torn for the whole duration
+    of the dump, and this now runs unattended on a box that has been
+    I/O-wedged (and OOM-killed) before. A kill mid-dump left truncated JSON,
+    and every later run for that date — including a manual `--measure` —
+    raised on load and never self-healed. ``os.replace`` is atomic on POSIX,
+    so the old file is either wholly there or wholly replaced.
+    """
+    directory = os.path.dirname(os.path.abspath(cache_path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory,
+                               prefix=os.path.basename(cache_path) + ".",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(cache, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, cache_path)
+    except BaseException:
+        # Leave no `.tmp` litter behind — and leave the previous good cache
+        # exactly where it was.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _load_cache(cache_path: str, log) -> dict:
+    """The existing cache, or an empty one — **never** an exception.
+
+    An unreadable cache is moved aside rather than overwritten: it may hold
+    hours of N100 decode time, and a truncated file is often still mostly
+    recoverable by hand. Silently discarding it, or raising forever, are both
+    worse than saying so and starting fresh.
+    """
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path) as fh:
+            cache = json.load(fh)
+        if not isinstance(cache, dict):
+            raise ValueError("cache is not an object")
+    except (ValueError, OSError, UnicodeDecodeError) as exc:
+        aside = f"{cache_path}.corrupt-{int(time.time())}"
+        try:
+            os.replace(cache_path, aside)
+        except OSError:
+            aside = "(could not be moved aside)"
+        log(f"  ! corrupt cache at {cache_path}: {exc} — moved to {aside}; "
+            f"starting from an empty cache")
+        return {}
+    log(f"resuming from {cache_path}: {len(cache)} photos already measured")
+    return cache
 
 
 def _chunks(ids: list):
@@ -145,13 +206,23 @@ def _measure_photo(path: str, faces: list[dict], min_edge: int) -> dict:
 
 
 def measure(db, date_, cache_path=None, min_edge=DEFAULT_MIN_EDGE, *,
-            photo_ids=None, log=_log, on_progress=None, measure_photo=None):
+            photo_ids=None, log=_log, on_progress=None, should_abort=None,
+            measure_photo=None):
     """Measure every unmeasured photo in scope. Cached, resumable, idempotent.
 
     ``date_`` picks the cache file and, when ``photo_ids`` is None, the scope.
     The batch runner passes ``photo_ids`` (one dated FOLDER — two folders can
     share a day) while still writing the DATE's cache, because that is the file
-    `rank_shoot.py --date D` reads next.
+    `rank_shoot.py --date D` reads next. Two batches on the same date MERGE
+    into that one cache; the second run never clobbers the first's entries.
+
+    ``should_abort`` is checked before every photo and raises
+    ``InterruptedError`` — the shape `stacking.py` uses. It is checked inside
+    the loop because `advance_nas_steps` only checks between steps, and this
+    is the last and longest step of an advance. The cache is SAVED before the
+    raise: the pass is resumable, so discarding it would make Cancel cost
+    minutes of N100 decode time. The script's CLI passes no callback and is
+    unaffected.
 
     Returns a small summary dict, not the cache: a runner's result is echoed
     onto the SSE stream, and a whole shoot's measurements do not belong there.
@@ -161,11 +232,7 @@ def measure(db, date_, cache_path=None, min_edge=DEFAULT_MIN_EDGE, *,
     if measure_photo is None:
         measure_photo = _measure_photo
 
-    cache = {}
-    if os.path.exists(cache_path):
-        with open(cache_path) as fh:
-            cache = json.load(fh)
-        log(f"resuming from {cache_path}: {len(cache)} photos already measured")
+    cache = _load_cache(cache_path, log)
 
     by_photo = defaultdict(list)
     for r in _face_rows(db, date_, photo_ids):
@@ -175,11 +242,17 @@ def measure(db, date_, cache_path=None, min_edge=DEFAULT_MIN_EDGE, *,
         f"{len(todo)} left to measure")
 
     def _save():
-        with open(cache_path, "w") as fh:
-            json.dump(cache, fh)
+        _save_cache(cache, cache_path)
 
     faces_measured = 0
     for n, pid in enumerate(todo, 1):
+        if should_abort is not None and should_abort():
+            # Keep what has been measured — this pass is resumable, and the
+            # caller (batch_advance) deletes the step's job row on the way
+            # out, so the step reads `needs_queue` and a retry resumes here.
+            _save()
+            log(f"  cancelled after {n - 1}/{len(todo)} photos")
+            raise InterruptedError("rank_measure cancelled")
         faces = by_photo[pid]
         path = db.resolve_filepath(faces[0]["filepath"])
         out = {}

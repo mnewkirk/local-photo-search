@@ -505,6 +505,45 @@ class TestDefaultRunners:
             db.db_path, "2090-03-01")
         assert out["measured"] == 3
 
+    def test_rank_measure_can_be_cancelled_mid_measurement(self, db):
+        """It is the LAST step of an advance and the longest (~10 min on the
+        N100), and `advance_nas_steps` only checks abort BETWEEN steps — so
+        without an abort callback threaded into the per-photo loop, Cancel
+        does nothing until the measurement finishes."""
+        batch_id, _ = _make_batch(db)
+        ctx = self._ctx(db, batch_id)
+        seen = {}
+
+        def fake_measure(db_, date_, cache_path, **kw):
+            seen.update(kw)
+            return {"measured": 0}
+
+        from photosearch import rank_measure
+        with patch.object(rank_measure, "measure", fake_measure):
+            batch_advance.default_runners()["rank_measure"](db, ctx)
+
+        assert callable(seen.get("should_abort"))
+        assert seen["should_abort"]() is False          # ctx says keep going
+
+    def test_a_cancelled_rank_measure_deletes_its_job_row(self, db):
+        batch_id, ids = _make_batch(db)
+        _finish_aesthetics(db, ids)
+        _finish_faces(db, ids)
+
+        def boom(db_, ctx):
+            raise InterruptedError("cancelled")
+
+        runners = dict(_fake_runners([]))
+        runners["rank_measure"] = boom
+        with pytest.raises(InterruptedError):
+            batch_advance.advance_nas_steps(db, batch_id, apply=True,
+                                            runners=runners)
+
+        assert "rank_measure" not in ingest_batches.closed_jobs(db, batch_id)
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs WHERE batch_id = ? AND step = ?",
+            (batch_id, "rank_measure")).fetchone()[0] == 0
+
     def test_rank_measure_skips_an_undated_batch_rather_than_guessing(self, db):
         """`_undated/...` has no day, and the selection phase reads the cache
         BY DATE — there is no file for it to write. Say so; never invent a

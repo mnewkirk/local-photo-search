@@ -2663,8 +2663,10 @@ def batch_advance_cmd(db, batch_id, apply):
     """Run the NAS-side steps one ingest batch still needs, in order.
 
     Stacking, aesthetic-percentile refresh, strict face matching,
-    duplicate-person resolution and face-crop warming — the steps that run
-    where the DB and the photo files live. Stops at the first step that is
+    duplicate-person resolution, face-crop warming and the optional
+    native-resolution sharpness measurement (`rank_measure`, which writes the
+    cache `scripts/rank_shoot.py --date D` reads) — the steps that run where
+    the DB and the photo files live. Stops at the first step that is
     waiting on something this command can't do (a worker pass, typically
     `faces`): launch the fleet for those from /status or /batches.
 

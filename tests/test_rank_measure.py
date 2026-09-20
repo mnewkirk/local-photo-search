@@ -175,12 +175,145 @@ class TestMeasure:
         assert cache[str(pid)] == {}
         assert out["measured"] == 2
 
+    def test_two_batches_sharing_a_date_merge_into_one_cache(self, db, tmp_path):
+        """Two folders can share a day (a phone sync and a card dump). The
+        second batch's run must ADD to the date's cache, never clobber the
+        first's — the selection phase reads the whole day."""
+        a = [_photo_with_faces(db, i) for i in range(2)]
+        b = [_photo_with_faces(db, 7, directory="2092/2092-04-02_phone-matt")]
+        cache_path = str(tmp_path / "cache.json")
+
+        rank_measure.measure(db, _DAY, cache_path, photo_ids=a,
+                             log=lambda m: None, measure_photo=_fake_measure([]))
+        rank_measure.measure(db, _DAY, cache_path, photo_ids=b,
+                             log=lambda m: None, measure_photo=_fake_measure([]))
+
+        assert sorted(json.loads(Path(cache_path).read_text())) == \
+            sorted(str(p) for p in a + b)
+
     def test_resolves_the_filepath_through_the_photo_root(self, db, tmp_path):
         _photo_with_faces(db, 0)
         calls = []
         rank_measure.measure(db, _DAY, str(tmp_path / "c.json"),
                              log=lambda m: None, measure_photo=_fake_measure(calls))
         assert calls == [f"/photos/{_DIR}/img000.jpg"]
+
+
+# =========================================================================
+# abort — it is the LAST and LONGEST step of a batch advance
+# =========================================================================
+
+class TestAbort:
+    """`advance_nas_steps` only checks abort BETWEEN steps, and this one runs
+    ~10 min on the N100. Without a check inside the loop, Cancel does nothing
+    until the whole measurement finishes."""
+
+    def test_aborting_raises_and_keeps_what_was_measured(self, db, tmp_path):
+        for i in range(5):
+            _photo_with_faces(db, i)
+        cache_path = str(tmp_path / "cache.json")
+        calls = []
+        # Abort once two photos are in the bag.
+        should_abort = lambda: len(calls) >= 2                  # noqa: E731
+
+        with pytest.raises(InterruptedError):
+            rank_measure.measure(db, _DAY, cache_path, log=lambda m: None,
+                                 should_abort=should_abort,
+                                 measure_photo=_fake_measure(calls))
+
+        # The work already done is SAVED — the pass is resumable, so throwing
+        # it away would make Cancel cost minutes of N100 time.
+        cache = json.loads(Path(cache_path).read_text())
+        assert len(cache) == 2
+
+    def test_a_rerun_after_an_abort_measures_only_the_remainder(self, db, tmp_path):
+        for i in range(5):
+            _photo_with_faces(db, i)
+        cache_path = str(tmp_path / "cache.json")
+        first = []
+
+        with pytest.raises(InterruptedError):
+            rank_measure.measure(db, _DAY, cache_path, log=lambda m: None,
+                                 should_abort=lambda: len(first) >= 2,
+                                 measure_photo=_fake_measure(first))
+        second = []
+        out = rank_measure.measure(db, _DAY, cache_path, log=lambda m: None,
+                                   measure_photo=_fake_measure(second))
+
+        assert len(second) == 3
+        assert out["measured"] == 3
+        assert len(json.loads(Path(cache_path).read_text())) == 5
+
+    def test_no_abort_callback_is_the_scripts_behaviour_unchanged(self, db, tmp_path):
+        for i in range(3):
+            _photo_with_faces(db, i)
+        out = rank_measure.measure(db, _DAY, str(tmp_path / "c.json"),
+                                   log=lambda m: None,
+                                   measure_photo=_fake_measure([]))
+        assert out["measured"] == 3
+
+
+# =========================================================================
+# the cache file — it now runs unattended on a box that has wedged twice
+# =========================================================================
+
+class TestCacheDurability:
+    def test_a_crash_mid_save_leaves_the_previous_good_cache_intact(self, db, tmp_path):
+        """A kill (OOM, container swap) part-way through `json.dump` used to
+        leave truncated JSON in place, and every later run for that date —
+        including a manual `--measure` — then raised. Writing to a temp file
+        and `os.replace`-ing means the old file is never in a torn state."""
+        _photo_with_faces(db, 0)
+        cache_path = str(tmp_path / "cache.json")
+        rank_measure.measure(db, _DAY, cache_path, log=lambda m: None,
+                             measure_photo=_fake_measure([]))
+        good = Path(cache_path).read_text()
+
+        _photo_with_faces(db, 1)
+        real_dump = json.dump
+
+        def exploding_dump(obj, fh, *a, **kw):
+            real_dump(obj, fh, *a, **kw)
+            fh.flush()
+            raise OSError("no space left on device")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(json, "dump", exploding_dump)
+            with pytest.raises(OSError):
+                rank_measure.measure(db, _DAY, cache_path, log=lambda m: None,
+                                     measure_photo=_fake_measure([]))
+
+        assert Path(cache_path).read_text() == good
+        assert json.loads(Path(cache_path).read_text())  # still parseable
+
+    def test_a_truncated_cache_is_moved_aside_not_silently_discarded(self, db, tmp_path):
+        _photo_with_faces(db, 0)
+        cache_path = tmp_path / "cache.json"
+        cache_path.write_text('{"1": {"2": {"lap": 1.0,')      # truncated
+        warnings = []
+
+        out = rank_measure.measure(db, _DAY, str(cache_path),
+                                   log=warnings.append,
+                                   measure_photo=_fake_measure([]))
+
+        # It proceeds rather than raising forever...
+        assert out["measured"] == 1
+        # ...it SAYS so...
+        assert any("corrupt" in w.lower() for w in warnings)
+        # ...and the unreadable file is kept, in case it held hours of work.
+        aside = list(tmp_path.glob("cache.json.corrupt-*"))
+        assert len(aside) == 1
+        assert aside[0].read_text().startswith('{"1"')
+
+    def test_a_successful_save_leaves_no_temp_file_behind(self, db, tmp_path):
+        for i in range(3):
+            _photo_with_faces(db, i)
+        rank_measure.measure(db, _DAY, str(tmp_path / "cache.json"),
+                             log=lambda m: None, measure_photo=_fake_measure([]))
+        # (the shared `db` fixture's own file lives here too, so look for the
+        # litter specifically rather than asserting on the whole directory)
+        assert list(tmp_path.glob("*.tmp")) == []
+        assert (tmp_path / "cache.json").exists()
 
 
 # =========================================================================

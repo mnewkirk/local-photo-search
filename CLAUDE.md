@@ -1819,7 +1819,23 @@ while off-NAS it no longer points at a `/data` that does not exist. `--cache`
 still overrides. The cache is keyed by **date** even when the runner scopes by
 folder, because the selection phase reads it by date; a batch folder with no
 `YYYY-MM-DD` prefix (`_undated/...`) is skipped with a message rather than
-given an invented date.
+given an invented date. Two batches sharing a date **merge** into that one
+cache — the second run adds to the first's entries, never clobbers them.
+
+**Two durability rules, because it now runs unattended** on a box that has
+been I/O-wedged and OOM-killed:
+
+- **`should_abort` is checked per PHOTO**, not per step. `advance_nas_steps`
+  only checks between steps and this is the last and longest one, so a Cancel
+  would otherwise do nothing for ten minutes. The cache is saved *before* the
+  `InterruptedError`, so the cancelled work is not lost (the pass is
+  resumable, and `batch_advance` deletes the job row on the way out).
+- **The cache is written atomically** — temp file in the same directory,
+  flush, `fsync`, `os.replace`. A kill mid-`json.dump` used to leave truncated
+  JSON that made every later run for that date raise, including a manual
+  `--measure`, with no self-healing. An unparseable cache is moved to
+  `<name>.corrupt-<ts>` and logged rather than silently discarded: it can hold
+  hours of N100 decode time.
 
 **Native-resolution face-crop Laplacian is the primary signal**, because within
 one shoot every other ranker is inert or wrong: CLIP barely moves between a
