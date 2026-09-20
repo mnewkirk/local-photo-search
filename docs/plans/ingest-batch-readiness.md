@@ -202,6 +202,20 @@ The full task-by-task ledger is
 `.superpowers/sdd/2026-09-19-ingest-batch-readiness/progress.md`; the entries
 below are the ones that changed what got built, not just how it was reviewed.
 
+- **`rank_measure` as a "desktop-only" step (steps 3/6) was a plan error,
+  corrected after it shipped.** Nothing ran it: no runner in `batch_advance`,
+  none in the fleet launcher, and its state derived from a job row nothing
+  wrote — so on the first real batch the box read "Needs to be queued
+  0 / 1,373" forever. It was called desktop-only because it is heavy, but it
+  decodes the ORIGINALS at full native resolution and **only the NAS has
+  them** (the desktop replica holds no files). Shipped: `rank_measure` is the
+  last entry in `NAS_STEPS` with a runner
+  (`batch_advance._run_rank_measure`), `DESKTOP_STEPS` and the `"desktop"`
+  kind are gone, and the measurement moved from `scripts/rank_shoot.py` into
+  `photosearch/rank_measure.py` because `scripts/` is not in the Docker
+  image. It stays OPTIONAL (`batch_state.OPTIONAL_STEPS`): it does not gate
+  `ready`, but `next_action` returns `advance_nas` while it is the only step
+  left, so the button can run it.
 - **`done`'s formula (step 4) was a controller-authored spec error, not an
   owner decision.** The brief said `done = eligible - remaining - failed`
   uniformly. `quality`, `verify` and `clip` carry no attempts filter on their

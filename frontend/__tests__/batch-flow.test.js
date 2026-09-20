@@ -22,7 +22,7 @@ const STATES = ['completed', 'running', 'queued', 'needs_queue', 'waiting', 'blo
 
 const KIND = {
   ingest: 'ingest', stacking: 'nas', normalize_aesthetics: 'nas', match_faces: 'nas',
-  resolve_dups: 'nas', warm_crops: 'nas', rank_measure: 'desktop',
+  resolve_dups: 'nas', warm_crops: 'nas', rank_measure: 'nas',
 };
 
 /** One step row in the shape batch_state emits. */
@@ -100,8 +100,8 @@ describe('layout', () => {
       ['clip'],
       ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'],
       ['category-content', 'keywords', 'verify'],
-      ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops'],
-      ['rank_measure'],
+      ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
+        'warm_crops', 'rank_measure'],
     ]);
   });
 
@@ -158,6 +158,21 @@ describe('summarize — headline per next_action', () => {
   test('ready to review', () => {
     const s = state({ ready: true, next_action: null }, 'completed');
     expect(BF.summarize(s).headline).toBe('Ready to review');
+  });
+
+  test('a ready batch names the optional step it has not run', () => {
+    // rank_measure does not gate `ready` (batch_state.OPTIONAL_STEPS), but it
+    // is still a box on the diagram reading "Needs to be queued". A bare
+    // "Ready to review" left nothing accounting for it — which is how it sat
+    // there, unrunnable, on the first real batch.
+    const s = state({
+      ready: true,
+      next_action: 'advance_nas',
+      steps: STEP_ORDER.map((n) => step(n, n === 'rank_measure' ? 'needs_queue'
+        : 'completed')),
+    });
+    expect(BF.summarize(s).headline)
+      .toBe('Ready to review — optional: measure sharpness for ranking');
   });
 
   test('ingest running quotes the sweep progress', () => {
@@ -492,10 +507,9 @@ describe('advanceButton', () => {
     const s = state({
       next_action: 'advance_nas',
       steps: [
-        step('clip', 'completed'),
+        step('clip', 'needs_queue'),          // worker — the fleet's job
         step('stacking', 'needs_queue'),
         step('match_faces', 'needs_queue'),
-        step('rank_measure', 'needs_queue'),  // desktop — a different job
       ],
     });
     const b = BF.advanceButton(s);
@@ -537,6 +551,22 @@ describe('advanceButton', () => {
     const b = BF.advanceButton(state({ ready: true, next_action: 'launch_fleet' }));
     expect(b.enabled).toBe(false);
     expect(b.reason).toMatch(/Ready to review/);
+  });
+
+  test('…except for the optional step, which is the one thing that runs it', () => {
+    // The server only says `advance_nas` on a ready batch when an OPTIONAL
+    // step is runnable. Disabling the button there is what made rank_measure
+    // a dead end: a box that needs queueing and nothing that queues it.
+    const s = state({
+      ready: true,
+      next_action: 'advance_nas',
+      steps: STEP_ORDER.map((n) => step(n, n === 'rank_measure' ? 'needs_queue'
+        : 'completed')),
+    });
+    const b = BF.advanceButton(s);
+    expect(b.enabled).toBe(true);
+    expect(b.action).toBe('advance_nas');
+    expect(b.label).toBe('Advance batch — 1 optional step');
   });
 
   test('busy disables without changing what the button claims to do', () => {

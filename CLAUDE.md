@@ -1801,6 +1801,42 @@ python scripts/rank_shoot.py --date 2026-09-12 [--max-per-person 6]
 python scripts/rank_shoot.py --date 2026-09-12 --max-per-person 6 --apply
 ```
 
+**The measurement pass lives in `photosearch/rank_measure.py`, not in the
+script** — the script imports `measure` from there, so there is one
+implementation and one cache format. It had to move because **`scripts/` is
+not copied into the Docker image** (the Dockerfile copies `photosearch/`,
+`frontend/`, `cli.py`, `requirements.txt`, `docker-entrypoint.sh` and nothing
+else); it only ever ran on the NAS because the repo is bind-mounted there.
+**`Advance batch` on `/batches` now runs it** for the batch's folder as the
+`rank_measure` NAS step, so the usual path is: advance the batch, then run the
+selection command above with no `--measure`.
+
+**Cache location: beside the DB** (`rank_measure.default_cache_path` —
+`dirname(PHOTOSEARCH_DB)/rank_shoot_<date>.json`). On the NAS the DB is
+`/data/photo_index.db`, so that is byte-identical to the `/data/rank_shoot_
+<date>.json` the script used to hardcode and existing caches keep working —
+while off-NAS it no longer points at a `/data` that does not exist. `--cache`
+still overrides. The cache is keyed by **date** even when the runner scopes by
+folder, because the selection phase reads it by date; a batch folder with no
+`YYYY-MM-DD` prefix (`_undated/...`) is skipped with a message rather than
+given an invented date. Two batches sharing a date **merge** into that one
+cache — the second run adds to the first's entries, never clobbers them.
+
+**Two durability rules, because it now runs unattended** on a box that has
+been I/O-wedged and OOM-killed:
+
+- **`should_abort` is checked per PHOTO**, not per step. `advance_nas_steps`
+  only checks between steps and this is the last and longest one, so a Cancel
+  would otherwise do nothing for ten minutes. The cache is saved *before* the
+  `InterruptedError`, so the cancelled work is not lost (the pass is
+  resumable, and `batch_advance` deletes the job row on the way out).
+- **The cache is written atomically** — temp file in the same directory,
+  flush, `fsync`, `os.replace`. A kill mid-`json.dump` used to leave truncated
+  JSON that made every later run for that date raise, including a manual
+  `--measure`, with no self-healing. An unparseable cache is moved to
+  `<name>.corrupt-<ts>` and logged rather than silently discarded: it can hold
+  hours of N100 decode time.
+
 **Native-resolution face-crop Laplacian is the primary signal**, because within
 one shoot every other ranker is inert or wrong: CLIP barely moves between a
 keeper and a dud (same kids, same pitch); MCP `rerank_photos` silently passes
@@ -2343,9 +2379,9 @@ becoming a phantom batch.
 `photosearch/batch_state.py` reports exactly one of `completed / running /
 queued / needs_queue / waiting / blocked` for every step — the 9 worker
 passes (`clip`, `faces`, `quality`, `aesthetics`, `describe`,
-`category-visual`, `category-content`, `keywords`, `verify`), the 5 NAS steps
-(`stacking`, `normalize_aesthetics`, `match_faces`, `resolve_dups`,
-`warm_crops`), and the desktop-only `rank_measure`. The module exists because
+`category-visual`, `category-content`, `keywords`, `verify`) and the 6 NAS
+steps (`stacking`, `normalize_aesthetics`, `match_faces`, `resolve_dups`,
+`warm_crops`, `rank_measure`). The module exists because
 `db.count_unprocessed_photos` — the fleet's **claim predicate**, not a
 progress bar — returns 0 in two situations that are not "done":
 
@@ -2384,8 +2420,8 @@ button, which force-completes a batch regardless of step state.
 
 Worker-pass precedence is **running > completed > blocked > queued > waiting
 > needs_queue** — `completed` deliberately outranks an open job row, because
-nothing ever *closes* a worker pass's job row (the job-only NAS/desktop steps
-are the mirror image: a *closed* row is their only proof of success).
+nothing ever *closes* a worker pass's job row (the job-only NAS steps are the
+mirror image: a *closed* row is their only proof of success).
 Precedence used to put `queued` first; a pass the fleet had already finished
 then read `queued` for the row's full 6h TTL, so the batch could never reach
 `ready` and the launch button's "already running" 409 stayed armed long after
@@ -2428,6 +2464,18 @@ closing it or leaving it open: closing it would falsely prove success, and
 leaving it open would read `queued` and block a retry for the full TTL with
 no recovery short of editing the table by hand.
 
+**A growing batch invalidates that evidence.** A closed row proves the step
+ran over *the photos that were in the batch at the time*. When a later sweep
+lands more files in today's folder, `register_batch` clears
+`ready_at`/`dismissed_at` and every **derived** step re-reads the new photos
+as unfinished by construction — but the job-only four would have kept reading
+`completed` although the arrivals have no matched faces, no warmed crops and
+no sharpness measurement. So growth now also deletes those steps' **closed**
+rows (`ingest_batches._clear_job_only_completion`, keyed on
+`batch_state.JOB_ONLY_STEPS`); open rows are left to whoever owns them. One
+more `Advance batch` fills the gap, cheaply — every one of those runners is
+missing-only or resumable.
+
 ### The non-blocking-lock cache — the incident it answers
 
 `GET /api/batches/{id}` (`photosearch/batch_api.py`) memoizes `batch_state`
@@ -2446,12 +2494,39 @@ generation counter, not a bare cache-pop — an in-flight recompute that
 started before the write must not resurrect the pre-write snapshot under a
 fresh timestamp once it finishes (race documented in the module docstring).
 
+### `rank_measure` is a NAS step, and it is OPTIONAL
+
+It was originally labelled **desktop-only**, on the theory that it is heavy.
+Heavy it is — `scripts/rank_shoot.py --measure` decodes every photo at **full
+native resolution** to take the Laplacian variance of each face crop (1,260
+photos with faces ≈ 10 min on the N100) — but it is heavy **where the pixels
+are**: only the NAS holds the originals, the desktop replica has the DB and
+the thumbnails and no files at all. As a desktop step it had **no runner
+anywhere** — not in `batch_advance`, not in the fleet launcher — and its state
+derived from an `ingest_batch_jobs` row nothing ever wrote, so the box read
+"Needs to be queued 0 / 1,373" forever. It is now the last entry in
+`NAS_STEPS` with a runner (`batch_advance._run_rank_measure`), so
+**`Advance batch` runs it**.
+
+Two things keep that from changing the rest of the flow:
+
+- **`OPTIONAL_STEPS`.** `ready` is "every step in `WORKER_PASSES +
+  NAS_STEPS`", so moving `rank_measure` in would silently have made it a
+  readiness gate; `ready` subtracts `OPTIONAL_STEPS` explicitly.
+- **`next_action` still offers it.** `if ready: return None` would have left
+  it exactly as dead as before — a box that needs queueing and no button that
+  queues it. So `advance_nas` *is* returned when a batch is otherwise ready
+  and only an optional step is runnable, and the page says "Ready to review —
+  optional: measure sharpness for ranking" with an enabled "Advance batch — 1
+  optional step". It is offered **only** from that state: a blocked batch, or
+  one with a pass still in flight, has something more important to say.
+
 ### What's deliberately not in "ready" — and why
 
-`ready` is `all(step == completed for step in WORKER_PASSES + NAS_STEPS)` —
-`rank_measure` (desktop-only) is excluded on purpose; it's a nicety, not a
-gate. `batch-advance` (`photosearch/batch_advance.py`) runs the five NAS
-steps in order and deliberately leaves two things out of "ready":
+`ready` is `all(step == completed for step in WORKER_PASSES + NAS_STEPS if
+step not in OPTIONAL_STEPS)`. `batch-advance`
+(`photosearch/batch_advance.py`) runs the six NAS steps in order and
+deliberately leaves two things out of "ready":
 
 - **Temporal face matching** (`match_faces_temporal`) — ~4% accurate on these
   shoots ("Bulk-undoing one person's bad labels" above); pouring it into a

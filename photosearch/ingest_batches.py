@@ -198,6 +198,7 @@ def register_batch(db, directory: str, *, source: Optional[str] = None,
             "WHERE id = ?",
             (photo_count, source, run_id, batch_id),
         )
+        _clear_job_only_completion(db, batch_id)
     else:
         db.conn.execute(
             "UPDATE ingest_batches SET photo_count = ?, updated_at = datetime('now'), "
@@ -207,6 +208,36 @@ def register_batch(db, directory: str, *, source: Optional[str] = None,
         )
     db.conn.commit()
     return batch_id
+
+
+def _clear_job_only_completion(db, batch_id: int) -> None:
+    """Drop the CLOSED job rows of the job-only steps when a batch grows.
+
+    The job-only steps (``batch_state.JOB_ONLY_STEPS`` — match_faces,
+    resolve_dups, warm_crops, rank_measure) write no per-photo column, so a
+    closed row is their ONLY evidence of completion. It is evidence about the
+    photos that were in the batch when the job ran. When a later sweep lands
+    more files in today's folder, ``ready_at`` is cleared and every *derived*
+    step (the worker passes, stacking, normalize_aesthetics) re-reads the new
+    photos as unfinished by construction — but the job-only steps would keep
+    reading `completed` although the new photos have no matched faces, no
+    warmed crops and no sharpness measurement. Deleting the closed rows puts
+    them back to `needs_queue`, which is the truth, and one more
+    ``batch-advance`` fills the gap (every runner is missing-only or
+    resumable, so it is cheap).
+
+    Only CLOSED rows: an open row belongs to a job that is running right now,
+    and whoever owns it will close or delete it.
+
+    Import is deferred because ``batch_state`` imports this module.
+    """
+    from .batch_state import JOB_ONLY_STEPS
+    placeholders = ",".join("?" * len(JOB_ONLY_STEPS))
+    db.conn.execute(
+        f"DELETE FROM ingest_batch_jobs WHERE batch_id = ? "
+        f"AND closed_at IS NOT NULL AND step IN ({placeholders})",
+        [batch_id, *JOB_ONLY_STEPS],
+    )
 
 
 def list_batches(db, include_dismissed: bool = False, limit: int = 50) -> list[dict]:

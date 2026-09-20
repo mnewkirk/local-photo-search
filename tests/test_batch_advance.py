@@ -154,7 +154,7 @@ class TestOrchestration:
 
         assert "match_faces" not in calls
         assert calls == ["stacking", "normalize_aesthetics",
-                         "resolve_dups", "warm_crops"]
+                         "resolve_dups", "warm_crops", "rank_measure"]
 
     def test_job_rows_are_opened_then_closed(self, db):
         batch_id, ids = _make_batch(db)
@@ -197,6 +197,24 @@ class TestOrchestration:
         # And it stops — a later step could depend on the one that failed.
         assert result["stopped_at"] == "normalize_aesthetics"
         assert calls == ["stacking", "normalize_aesthetics"]
+
+    def test_a_failing_rank_measure_leaves_no_job_row_either(self, db):
+        """`rank_measure` is optional, but it is still a job-only step: a
+        closed row is its only proof of success, so a failure must delete the
+        row rather than close it. Otherwise a crashed measurement would read
+        `completed` and the cache the selection phase needs would not exist."""
+        batch_id, ids = _make_batch(db)
+        _finish_aesthetics(db, ids)
+        _finish_faces(db, ids)
+
+        batch_advance.advance_nas_steps(
+            db, batch_id, apply=True,
+            runners=_fake_runners([], fail_on="rank_measure"))
+
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs WHERE batch_id = ? AND step = ?",
+            (batch_id, "rank_measure")).fetchone()[0] == 0
+        assert _step_state(db, batch_id, "rank_measure") == "needs_queue"
 
     def test_a_retry_after_a_failure_re_runs_the_failed_step(self, db):
         """The point of deleting the row: the operator's fix is to press the
@@ -464,6 +482,98 @@ class TestDefaultRunners:
                 db, self._ctx(db, batch_id))
 
         assert seen["photo_ids"] == ids
+
+    def test_rank_measure_is_scoped_to_the_batch_and_writes_the_day_s_cache(self, db):
+        """It measures ONE folder's photos but writes the cache file
+        `scripts/rank_shoot.py --date D` reads, so the owner's next step is
+        the selection run with no `--measure` and no extra flags."""
+        batch_id, ids = _make_batch(db)
+        seen = {}
+
+        def fake_measure(db_, date_, cache_path, **kw):
+            seen.update(kw, date=date_, cache_path=cache_path)
+            return {"photos": 3, "measured": 3, "cache_path": cache_path}
+
+        from photosearch import rank_measure
+        with patch.object(rank_measure, "measure", fake_measure):
+            out = batch_advance.default_runners()["rank_measure"](
+                db, self._ctx(db, batch_id))
+
+        assert seen["photo_ids"] == ids
+        assert seen["date"] == "2090-03-01"
+        assert seen["cache_path"] == rank_measure.default_cache_path(
+            db.db_path, "2090-03-01")
+        assert out["measured"] == 3
+
+    def test_rank_measure_can_be_cancelled_mid_measurement(self, db):
+        """It is the LAST step of an advance and the longest (~10 min on the
+        N100), and `advance_nas_steps` only checks abort BETWEEN steps — so
+        without an abort callback threaded into the per-photo loop, Cancel
+        does nothing until the measurement finishes."""
+        batch_id, _ = _make_batch(db)
+        ctx = self._ctx(db, batch_id)
+        seen = {}
+
+        def fake_measure(db_, date_, cache_path, **kw):
+            seen.update(kw)
+            return {"measured": 0}
+
+        from photosearch import rank_measure
+        with patch.object(rank_measure, "measure", fake_measure):
+            batch_advance.default_runners()["rank_measure"](db, ctx)
+
+        assert callable(seen.get("should_abort"))
+        assert seen["should_abort"]() is False          # ctx says keep going
+
+    def test_a_cancelled_rank_measure_deletes_its_job_row(self, db):
+        batch_id, ids = _make_batch(db)
+        _finish_aesthetics(db, ids)
+        _finish_faces(db, ids)
+
+        def boom(db_, ctx):
+            raise InterruptedError("cancelled")
+
+        runners = dict(_fake_runners([]))
+        runners["rank_measure"] = boom
+        with pytest.raises(InterruptedError):
+            batch_advance.advance_nas_steps(db, batch_id, apply=True,
+                                            runners=runners)
+
+        assert "rank_measure" not in ingest_batches.closed_jobs(db, batch_id)
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs WHERE batch_id = ? AND step = ?",
+            (batch_id, "rank_measure")).fetchone()[0] == 0
+
+    def test_rank_measure_skips_an_undated_batch_rather_than_guessing(self, db):
+        """`_undated/...` has no day, and the selection phase reads the cache
+        BY DATE — there is no file for it to write. Say so; never invent a
+        date, which would write a cache nothing will ever read."""
+        batch_id, _ = _make_batch(db)
+        ctx = self._ctx(db, batch_id)
+        ctx["day"] = None
+
+        def boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("must not measure an undated batch")
+
+        from photosearch import rank_measure
+        with patch.object(rank_measure, "measure", boom):
+            out = batch_advance.default_runners()["rank_measure"](db, ctx)
+
+        assert "undated" in out["skipped"]
+
+    def test_rank_measure_refuses_an_empty_batch(self, db):
+        batch_id, _ = _make_batch(db)
+        ctx = self._ctx(db, batch_id)
+        ctx["photo_ids"] = []
+
+        def boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("must not measure an empty batch")
+
+        from photosearch import rank_measure
+        with patch.object(rank_measure, "measure", boom):
+            out = batch_advance.default_runners()["rank_measure"](db, ctx)
+
+        assert out["skipped"] == "empty batch"
 
 
 # =========================================================================
