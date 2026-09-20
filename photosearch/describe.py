@@ -755,11 +755,12 @@ def critique_photo(
 # A focused visual-quality vocabulary (36 terms) assigned by Ollama vision.
 # Mood / light / composition only — content is handled by extract_categories.
 
-# Hard cap on PERCEIVED tags in one category-visual answer. The old prompt had
-# none — its only rule was "Include every tag that clearly applies". Five is
-# the cap the prompt states AND what the guard enforces: at most one tag per
-# axis, and there are six axes, so five already requires the model to leave
-# something out.
+# Hard cap on PERCEIVED tags in one category-visual answer. The first prompt
+# had none — its only rule was "Include every tag that clearly applies". Five
+# is the cap the prompt states AND what the guard enforces; the prompt also
+# tells the model that 1-3 is normal, which is what actually moves the average
+# (measured 1.8). The guard does NOT limit how many tags come from one section:
+# `backlit, silhouette` describe one photo honestly.
 _VISUAL_MAX_TAGS = 5
 
 # Over-selection / regurgitation threshold for the category-visual pass, as a
@@ -856,62 +857,70 @@ def extract_keywords_from_description(
 def _build_visual_prompt(vocab: list[str]) -> str:
     """Build the category-visual prompt from the PERCEIVED vocabulary.
 
-    Grouped by AXIS, one tag per axis, hard-capped, and explicitly permitted to
-    return nothing. The old flat checklist collapsed the output distribution:
-    1,373 photos of one shoot produced 163 distinct tag sets, the top 8 covering
-    56%, one verbatim 8-tag set repeated on 101 photos.
+    TWO failures shaped this, both measured on live output. DON'T UNDO EITHER
+    without re-running the A/B.
 
-    DON'T SIMPLIFY THIS BACK to a flat list of terms. The grouping, the cap and
-    the negative example are each load-bearing, and the capture-fact terms are
-    deliberately absent — see photosearch/visual_tags_derive.py.
+    1. A flat checklist whose only rule was "Include every tag that clearly
+       applies" collapsed the output: 1,373 photos of one shoot produced 163
+       distinct tag sets, one verbatim 8-tag set on 101 of them.
+    2. Its replacement grouped the terms into AXES and said "Pick at most ONE
+       tag from each group". The model read that as pick one FROM EACH group,
+       so every photo collected a viewpoint tag and a composition tag whether
+       or not one applied — `close-up, sunny, symmetrical` on a person walking
+       down stairs, `close-up ... wide-angle` on an artichoke.
 
-    Every demonstrated ANSWER is a bare tag line, because a small model copies
-    the shape it is shown. An earlier draft labelled the examples `WRONG:` /
-    `RIGHT:` and would have taught the model to emit a label — which the
-    comma-only parser of the day read as zero tags, persisted as '[]', and
-    silently retired the photo from the queue. Pinned by
-    tests/test_visual_parse_tolerance.py.
+    So there are NO axes to fill: the over-applied terms sit in a RARE section
+    that spells out the exact situation each one needs, including what it is
+    NOT. And there are NO worked examples — a variant carrying two of them
+    leaked `close-up` out of the example onto an unrelated baseball photo.
+
+    Measured on 11 hand-labelled photos (qwen2.5-vl-7b-instruct, temperature 0):
+    axes prompt 16 right / 5 wrong / 3.3 tags per photo; this one 14 right /
+    0 wrong / 1.8 tags; this one plus two examples 14 right / 1 wrong.
+
+    The capture-fact and frozen terms are deliberately absent — see
+    photosearch/visual_tags_derive.py.
     """
-    from .visual_tags_derive import PERCEIVED_AXES, PERCEIVED_GLOSS
+    from .visual_tags_derive import (PERCEIVED_GLOSS, PROMPT_SECTIONS,
+                                     _INLINE_SECTIONS)
 
     offered = set(vocab)
-    lines = []
-    for axis, terms in PERCEIVED_AXES.items():
-        shown = [t for t in terms if t in offered]
-        if not shown:
-            continue
-        rendered = ", ".join(
+
+    def _render(terms):
+        return ", ".join(
             f"{t} ({PERCEIVED_GLOSS[t]})" if t in PERCEIVED_GLOSS else t
-            for t in shown
+            for t in terms if t in offered
         )
-        lines.append(f"{axis.upper()}: {rendered}")
-    # Any term the caller offered that no axis claims (a regenerated vocabulary
-    # with a new word) still has to be reachable, or it could never be chosen.
-    claimed = {t for terms in PERCEIVED_AXES.values() for t in terms}
-    extra = [t for t in vocab if t not in claimed]
+
+    lines = []
+    listed = set()
+    for header, groups in PROMPT_SECTIONS:
+        rendered = [_render(g) for g in groups]
+        rendered = [r for r in rendered if r]
+        if not rendered:
+            continue
+        listed.update(t for g in groups for t in g)
+        if header in _INLINE_SECTIONS and len(rendered) == 1:
+            lines.append(f"{header} {rendered[0]}")
+        else:
+            lines.append(header)
+            lines.extend(f"  {r}" for r in rendered)
+    # A term the caller offered that no section claims (a regenerated
+    # vocabulary with a new word) still has to be reachable.
+    extra = _render([t for t in vocab if t not in listed])
     if extra:
-        lines.append("OTHER: " + ", ".join(extra))
+        lines.append("OTHER:")
+        lines.append(f"  {extra}")
 
     return (
-        "Describe how this photo LOOKS and FEELS, using only the tags below.\n\n"
+        "Tag how this photo LOOKS, using only tags from the list below.\n\n"
+        "Most photos deserve 1 to 3 tags, and many deserve only one. Do NOT "
+        "try to use every section: most photos have NO viewpoint tag and NO "
+        "composition tag at all.\n\n"
         + "\n".join(lines)
-        + "\n\nRules:\n"
-        f"- Pick at most ONE tag from each group, and never more than "
-        f"{_VISUAL_MAX_TAGS} tags in total.\n"
-        "- Omit a tag unless it is obviously and unmistakably true of THIS "
-        "image. Returning 2-3 tags is normal; returning none is acceptable.\n"
-        "- Judge only the look of the picture. Do not name what is in it.\n"
-        "- Return ONLY a comma-separated list of tags, exactly as spelled "
-        "above. No sentences, no labels, no bullets, no explanation.\n"
-        "- If nothing is unmistakably true, answer: none\n\n"
-        "Example — a backlit portrait at sunset, warm and calm:\n"
-        "golden-hour, peaceful\n\n"
-        "Example — a bright midday football match on grass:\n"
-        "sunny\n"
-        "One tag is the honest answer there. It would be a mistake to add "
-        "peaceful (it is a daytime action shot), or moody (nothing about it is "
-        "dark or night-like), or to pad the list with centered, dramatic and "
-        "vibrant because they are on the list.\n"
+        + "\n\nAnswer with ONLY a comma-separated list of tags spelled exactly "
+        f"as above, at most {_VISUAL_MAX_TAGS}. If nothing clearly applies, "
+        "answer: none\n"
     )
 
 

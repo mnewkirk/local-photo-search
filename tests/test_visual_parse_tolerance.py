@@ -163,29 +163,23 @@ def test_the_worker_sends_an_empty_list_for_a_legitimately_empty_answer(
 # The prompt must demonstrate only the format the parser wants
 # ---------------------------------------------------------------------------
 
-def test_the_prompts_example_answers_all_parse():
-    """Whatever the prompt shows, a model will copy. Every full-answer line in
-    the example block must round-trip through the parser."""
-    prompt = D._build_visual_prompt(PERCEIVED_VOCABULARY)
-    block = prompt.split("Example", 1)[1]
-    demonstrated = [ln.strip() for ln in block.splitlines()
-                    if ln.strip() and not ln.strip().endswith(":")
-                    and not ln.strip().startswith("Example")]
-    answers = [ln for ln in demonstrated
-               if D._parse_visual_response(ln, VOCAB)
-               or all(w.strip(",.") in VOCAB for w in ln.split())]
-    assert answers, "the example block demonstrates no answer at all"
-    for line in answers:
-        assert D._parse_visual_response(line, VOCAB), \
-            f"the prompt demonstrates an answer the parser cannot read: {line!r}"
-
-
-def test_the_prompt_shows_no_labelled_wrong_answer_line():
-    """A small model parrots the demonstrated shape. A `WRONG:`/`RIGHT:` label
-    in front of an answer teaches it to emit a label."""
+def test_the_prompt_demonstrates_no_answer_at_all():
+    """Whatever the prompt shows, a model copies. An earlier draft labelled its
+    examples `WRONG:` / `RIGHT:`, which the comma-only parser of the day read
+    as zero tags; a later one leaked `close-up` out of an example onto an
+    unrelated photo. So there are no examples, and no labels to parrot."""
     prompt = D._build_visual_prompt(PERCEIVED_VOCABULARY)
     assert "WRONG:" not in prompt
     assert "RIGHT:" not in prompt
+    assert "Example" not in prompt and "example" not in prompt
+
+
+def test_the_prompts_own_answer_format_parses():
+    """The one shape the prompt names must round-trip through the parser."""
+    prompt = D._build_visual_prompt(PERCEIVED_VOCABULARY)
+    assert "comma-separated list of tags" in prompt
+    assert D._parse_visual_response("sunny, peaceful", VOCAB) == ["sunny", "peaceful"]
+    assert D._is_explicit_empty_answer("none") is True
 
 
 def test_json_round_trip_of_an_empty_answer_is_still_a_list():
