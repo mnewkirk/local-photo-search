@@ -482,3 +482,16 @@ def test_report_command_side_by_side_with_stored_and_html(tmp_path, capsys):
         H.main(["report", "--variants", "stored,a"])
     with pytest.raises(SystemExit):
         H.main(["report", "--variants", "missing"])
+
+
+def test_vocab_override_lets_the_parser_accept_a_candidate_and_restores(monkeypatch):
+    import importlib
+    h = importlib.import_module("evals.visual_tags_eval") if False else None
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "evals"))
+    import visual_tags_eval as harness
+    from photosearch import visual_tags_derive as vtd
+    before = list(vtd.PERCEIVED_VOCABULARY)
+    with harness.vocab_override(["action"]):
+        assert "action" in vtd.PERCEIVED_VOCABULARY
+    assert vtd.PERCEIVED_VOCABULARY == before and "action" not in before

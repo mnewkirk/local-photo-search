@@ -35,7 +35,28 @@ from typing import Iterable, Optional
 
 from .visual_tags_derive import PERCEIVED_VOCABULARY
 
+#: Tags being TRIALLED: the owner labels them, but they are not in the shipped
+#: vocabulary or prompt. Collecting the label now is nearly free; collecting it
+#: later means re-opening every photo. A candidate is scored only for a variant
+#: that actually OFFERED it (`score(..., extra_tags=...)`) — otherwise every
+#: labelled `action` would count as a miss against a model never asked.
+#:
+#: `action` exists because the owner read a dribble and a keeper's save as
+#: `dramatic`. That is a fair reading of the word and the wrong tag: `dramatic`
+#: is about the LOOK (contrast, visual tension; it contradicts `peaceful`),
+#: and on a sports shoot it would go the way of `sunny` (98.7%) and stop
+#: discriminating. Action is about the MOMENT. Nothing in categories/keywords
+#: carries it either (1,251 of 1,373 frames say "soccer", none say what is
+#: happening), and it is the signal `rank_shoot` says it lacks.
+CANDIDATE_TAGS: dict[str, str] = {
+    "action": ("a moment of real motion caught mid-act: a kick, tackle, save, "
+               "leap, or a player driving the ball. Not players standing, "
+               "walking, watching or posed - a sports photo is not "
+               "automatically an action photo"),
+}
+
 _PERCEIVED = frozenset(PERCEIVED_VOCABULARY)
+_LABELLABLE = _PERCEIVED | frozenset(CANDIDATE_TAGS)
 
 
 def eval_dir() -> Path:
@@ -88,7 +109,7 @@ def load_labels() -> dict[int, dict]:
 
 def _check(tags: Iterable[str], field: str) -> list[str]:
     tags = sorted(set(tags))
-    bad = [t for t in tags if t not in _PERCEIVED]
+    bad = [t for t in tags if t not in _LABELLABLE]
     if bad:
         raise ValueError(f"{field}: not perceived visual tags: {bad}")
     return tags
@@ -116,7 +137,8 @@ def scoreable_labels() -> dict[int, dict]:
 
 
 def score(predicted: dict[int, Optional[Iterable[str]]],
-          labels: Optional[dict[int, dict]] = None) -> dict:
+          labels: Optional[dict[int, dict]] = None,
+          extra_tags: Iterable[str] = ()) -> dict:
     """Per-tag and overall precision/recall of `predicted` {photo_id: tags}.
 
     Debatable tags are neither a hit nor a miss, in either direction. A photo
@@ -124,9 +146,16 @@ def score(predicted: dict[int, Optional[Iterable[str]]],
     counted in `unanswered` and contributes misses for its `yes` tags, since
     that is what the library would actually hold. Non-perceived predicted tags
     are ignored: they never reach the column from the model.
+
+    `extra_tags` are the CANDIDATE_TAGS this variant offered the model; only
+    those are scored beyond the perceived vocabulary. A candidate the variant
+    never offered is invisible here in both directions.
     """
+    extra = [t for t in extra_tags if t in CANDIDATE_TAGS]
+    vocab = list(PERCEIVED_VOCABULARY) + extra
+    allowed = _PERCEIVED | frozenset(extra)
     labels = scoreable_labels() if labels is None else labels
-    per = {t: {"tp": 0, "fp": 0, "fn": 0, "debatable": 0} for t in PERCEIVED_VOCABULARY}
+    per = {t: {"tp": 0, "fp": 0, "fn": 0, "debatable": 0} for t in vocab}
     unanswered = scored = 0
     for pid, lab in labels.items():
         if pid not in predicted:
@@ -136,8 +165,8 @@ def score(predicted: dict[int, Optional[Iterable[str]]],
         if pred is None:
             unanswered += 1
             pred = ()
-        pred = set(pred) & _PERCEIVED
-        yes, deb = set(lab["yes"]), set(lab["debatable"])
+        pred = set(pred) & allowed
+        yes, deb = set(lab["yes"]) & allowed, set(lab["debatable"]) & allowed
         for t in pred:
             if t in deb:
                 per[t]["debatable"] += 1

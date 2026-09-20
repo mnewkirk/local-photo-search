@@ -75,6 +75,13 @@ def _vocabulary() -> dict:
                  "note": LABELLER_NOTES.get(t)}
                 for group in groups for t in group]
         sections.append({"title": title, "tags": tags})
+    if visual_tag_eval.CANDIDATE_TAGS:
+        # Trial tags: labelled here, absent from the shipped prompt.
+        sections.append({
+            "title": "MOMENT - candidate tag, not in the shipped prompt yet:",
+            "candidate": True,
+            "tags": [{"tag": t, "gloss": None, "note": g}
+                     for t, g in visual_tag_eval.CANDIDATE_TAGS.items()]})
     return {"sections": sections}
 
 

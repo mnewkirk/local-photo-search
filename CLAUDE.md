@@ -700,6 +700,24 @@ configured model under another's name. `--probe` answers "does this model see
 images" with one synthetic frame — 2026-09-20: `qwen2.5-vl-7b-instruct`,
 `gemma-4-e2b`, `qwen3.5-9b` and `gemma-4-26b-a4b` **all do**.
 
+**Candidate tags** (`visual_tag_eval.CANDIDATE_TAGS`) are labelled by the owner
+but are NOT in the shipped vocabulary or prompt — collecting the label now is
+nearly free, re-opening 60 photos later is not. A candidate is scored **only
+for a variant that offered it** (`run --extra-vocab action --prompt-file …`,
+which also lets the parser accept it); against any other variant it is
+invisible in both directions, so production is never charged a miss for a tag
+it was never asked about. First candidate: **`action`** — the owner read a
+dribble and a keeper's save as `dramatic`. Fair reading, wrong tag: `dramatic`
+is the LOOK (contrast / visual tension, contradicts `peaceful`) and on a sports
+shoot would saturate like `sunny` (98.7%); action is the MOMENT, nothing in
+categories/keywords carries it (1,251 of 1,373 frames say "soccer", none say
+what is happening), and it is the signal `rank_shoot` says it lacks.
+`eval_api.LABELLER_NOTES` likewise holds human-only definitions
+(`harsh-light`, `soft-light`, `overexposed`, `backlit` — judged on the
+CLEAREST SUBJECT, not the largest figure); a test asserts none of that text
+reaches the production prompt. Promote either into `visual_tags_derive` only
+after the A/B.
+
 Labels and run caches are **files** in `evals/visual-tags/` (git-ignored,
 `PHOTOSEARCH_VISUAL_EVAL_DIR`), not DB rows: `sync-replica.sh` swaps the
 replica DB wholesale and hand labels are the one artifact that cannot be

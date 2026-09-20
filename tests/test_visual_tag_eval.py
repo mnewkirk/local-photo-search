@@ -208,3 +208,44 @@ def test_per_tag_covers_exactly_the_perceived_vocabulary():
 def test_duplicate_predicted_tags_count_once():
     r = E.score({1: ["sunny", "sunny"]}, {1: _lab(["sunny"])})
     assert r["per_tag"]["sunny"]["tp"] == 1
+
+
+# --- candidate tags: labelled now, scored only for variants that offered them
+
+
+def _cand_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PHOTOSEARCH_VISUAL_EVAL_DIR", str(tmp_path))
+    from photosearch import visual_tag_eval as v
+    return v
+
+
+def test_candidate_label_round_trips(monkeypatch, tmp_path):
+    v = _cand_env(monkeypatch, tmp_path)
+    v.save_label(1, ["action", "sunny"], [])
+    assert v.load_labels()[1]["yes"] == ["action", "sunny"]
+
+
+def test_candidate_is_invisible_to_a_variant_that_never_offered_it(monkeypatch, tmp_path):
+    # Production never mentions `action`; a labelled `action` must not become
+    # a miss against it, and a stray prediction must not become a hit.
+    v = _cand_env(monkeypatch, tmp_path)
+    v.save_label(1, ["action", "sunny"], [])
+    res = v.score({1: ["sunny", "action"]})
+    assert "action" not in res["per_tag"]
+    assert res["overall"] == {**res["overall"], "tp": 1, "fp": 0, "fn": 0}
+
+
+def test_candidate_is_scored_for_a_variant_that_offered_it(monkeypatch, tmp_path):
+    v = _cand_env(monkeypatch, tmp_path)
+    v.save_label(1, ["action"], [])
+    v.save_label(2, [], [])
+    v.save_label(3, [], ["action"])
+    res = v.score({1: [], 2: ["action"], 3: ["action"]}, extra_tags=["action"])
+    c = res["per_tag"]["action"]
+    assert (c["tp"], c["fp"], c["fn"], c["debatable"]) == (0, 1, 1, 1)
+
+
+def test_extra_tags_outside_the_candidate_list_are_ignored(monkeypatch, tmp_path):
+    v = _cand_env(monkeypatch, tmp_path)
+    v.save_label(1, [], [])
+    assert "sharp" not in v.score({1: ["sharp"]}, extra_tags=["sharp"])["per_tag"]

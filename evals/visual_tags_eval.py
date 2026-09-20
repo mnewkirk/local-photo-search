@@ -303,6 +303,27 @@ def prompt_override(text):
         describe._build_visual_prompt = original
 
 
+@contextmanager
+def vocab_override(extra):
+    """Let the parser ACCEPT candidate tags, inside this process.
+
+    `tag_visual_photo` imports PERCEIVED_VOCABULARY from visual_tags_derive on
+    every call and builds its parser's allow-set from it, so a candidate the
+    prompt offers would otherwise be silently dropped as off-vocabulary. The
+    prompt text is a separate matter — pair this with --prompt-file.
+    """
+    from photosearch import visual_tags_derive as vtd
+    if not extra:
+        yield
+        return
+    original = vtd.PERCEIVED_VOCABULARY
+    vtd.PERCEIVED_VOCABULARY = list(original) + [t for t in extra if t not in original]
+    try:
+        yield
+    finally:
+        vtd.PERCEIVED_VOCABULARY = original
+
+
 class TransportError(RuntimeError):
     """The backend could not be reached / refused the request — says nothing
     about the photo, so it must not be cached as an "unanswered" result."""
@@ -360,7 +381,7 @@ def _pin_model(model):
 
 
 def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
-                server=DEFAULT_SERVER, pixels="full", limit=None, force=False,
+                extra_vocab=(), server=DEFAULT_SERVER, pixels="full", limit=None, force=False,
                 tagger=None, fetch=None, log=print):
     """Predict every `done`-labelled sample photo; cache as we go. Returns the
     run dict. `tagger` / `fetch` are injectable so tests need no model or
@@ -378,12 +399,24 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
     prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:12] \
         if prompt_text is not None else None
 
+    extra_vocab = sorted(set(extra_vocab))
+    unknown = [t for t in extra_vocab if t not in store.CANDIDATE_TAGS]
+    if unknown:
+        raise SystemExit(f"--extra-vocab: not candidate tags: {unknown} "
+                         f"(have: {sorted(store.CANDIDATE_TAGS)})")
+    if extra_vocab and prompt_text is None:
+        # The production prompt never mentions a candidate, so the model
+        # would never emit it and the run would score it at recall 0.
+        raise SystemExit("--extra-vocab needs --prompt-file: the shipped "
+                         "prompt does not offer candidate tags.")
+
     run = None if force else load_run(variant)
     if run is not None:
         # One variant = one (model, prompt). Resuming under a different one
         # would mix two experiments in a file that reports as one.
-        for key, now in (("effective_model", effective), ("prompt_sha", prompt_sha)):
-            if run.get(key) != now:
+        for key, now in (("effective_model", effective), ("prompt_sha", prompt_sha),
+                         ("extra_vocab", extra_vocab)):
+            if (run.get(key) or ([] if key == "extra_vocab" else None)) != now:
                 raise SystemExit(
                     f"variant {variant!r} was run with {key}={run.get(key)!r}, "
                     f"now {now!r}. Use a new --variant name, or --force to "
@@ -391,7 +424,7 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
     else:
         run = {"variant": variant, "model": nominal, "effective_model": effective,
                "prompt_file": prompt_file, "prompt_sha": prompt_sha,
-               "pixels": pixels, "server": server,
+               "extra_vocab": extra_vocab, "pixels": pixels, "server": server,
                "created": datetime.now(timezone.utc).isoformat(),
                "predictions": {}}
 
@@ -405,7 +438,8 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
         f"{len(run['predictions'])} cached, {len(labels)} labelled")
 
     errors = 0
-    with prompt_override(prompt_text), tempfile.TemporaryDirectory() as tmp:
+    with prompt_override(prompt_text), vocab_override(extra_vocab), \
+            tempfile.TemporaryDirectory() as tmp:
         for i, pid in enumerate(todo, 1):
             path = os.path.join(tmp, f"{pid}.jpg")
             try:
@@ -492,8 +526,9 @@ def cmd_run(args):
         with open(args.prompt_file, encoding="utf-8") as f:
             prompt_text = f.read()
     run_variant(args.variant, model=args.model, prompt_text=prompt_text,
-                prompt_file=args.prompt_file, server=args.server,
-                pixels=args.pixels, limit=args.limit, force=args.force)
+                prompt_file=args.prompt_file,
+                extra_vocab=[t.strip() for t in (args.extra_vocab or "").split(",") if t.strip()],
+                server=args.server, pixels=args.pixels, limit=args.limit, force=args.force)
 
 
 # --------------------------------------------------------------------------
@@ -517,10 +552,12 @@ def stored_predictions(conn, photo_ids):
     return out
 
 
-def _summarise(predicted, labels, sample):
-    """score() plus the things it does not carry: tags/photo and strata."""
-    res = store.score(predicted, labels)
-    answered = [set(t) & _PERCEIVED for pid, t in predicted.items()
+def _summarise(predicted, labels, sample, extra=()):
+    """score() plus the things it does not carry: tags/photo and strata.
+    `extra` = the candidate tags this variant offered (scored for it alone)."""
+    res = store.score(predicted, labels, extra_tags=extra)
+    allowed = _PERCEIVED | set(extra)
+    answered = [set(t) & allowed for pid, t in predicted.items()
                 if pid in labels and t is not None]
     res["avg_tags"] = (sum(len(t) for t in answered) / len(answered)) if answered else None
     res["strata"] = {}
@@ -530,19 +567,20 @@ def _summarise(predicted, labels, sample):
     for name, pids in by_stratum.items():
         sub_labels = {pid: labels[pid] for pid in pids if pid in labels}
         sub = store.score({pid: predicted[pid] for pid in sub_labels if pid in predicted},
-                          sub_labels)
+                          sub_labels, extra_tags=extra)
         res["strata"][name] = {"photos_scored": sub["photos_scored"],
                                "unanswered": sub["unanswered"], **sub["overall"]}
     return res
 
 
-def build_report(variant_predictions, labels=None, sample=None):
+def build_report(variant_predictions, labels=None, sample=None, extras=None):
     """{"variants": [names], "results": {name: summary}, "labelled": n}."""
     labels = store.scoreable_labels() if labels is None else labels
     sample = store.load_sample() if sample is None else sample
     return {"variants": list(variant_predictions), "labelled": len(labels),
             "sampled": len(sample["photos"]),
-            "results": {name: _summarise(pred, labels, sample)
+            "results": {name: _summarise(pred, labels, sample,
+                                         (extras or {}).get(name, ()))
                         for name, pred in variant_predictions.items()}}
 
 
@@ -565,10 +603,13 @@ def _recall(c):
 def _tag_order(report):
     """Tags by total false positives across variants (the failure this eval
     exists to find), dropping tags nobody predicted or labelled."""
-    res = report["results"].values()
-    totals = {t: [sum(r["per_tag"][t][k] for r in res)
+    res = list(report["results"].values())
+    # Union, not PERCEIVED_VOCABULARY: a candidate tag appears only in the
+    # variants that offered it.
+    tags = list(dict.fromkeys(t for r in res for t in r["per_tag"]))
+    totals = {t: [sum(r["per_tag"].get(t, {}).get(k, 0) for r in res)
                   for k in ("fp", "fn", "tp", "debatable")]
-              for t in PERCEIVED_VOCABULARY}
+              for t in tags}
     live = [t for t, v in totals.items() if any(v)]
     return sorted(live, key=lambda t: (-totals[t][0], -totals[t][1], t))
 
@@ -596,7 +637,10 @@ def report_tables(report):
     for t in _tag_order(report):
         row = [t]
         for n in names:
-            c = res[n]["per_tag"][t]
+            c = res[n]["per_tag"].get(t)
+            if c is None:          # a candidate this variant never offered
+                row += ["not offered", "—", "—"]
+                continue
             row += [f"{c['tp']}/{c['fp']}/{c['fn']}/{c['debatable']}",
                     _precision(c), _recall(c)]
         rows.append(row)
@@ -668,6 +712,7 @@ def cmd_report(args):
     wanted = [v.strip() for v in args.variants.split(",") if v.strip()] \
         if args.variants else [STORED] + list_variants()
     preds = {}
+    extras = {}
     for name in wanted:
         if name == STORED:
             if not args.db:
@@ -688,12 +733,13 @@ def cmd_report(args):
             raise SystemExit(f"No cached run for variant {name!r} "
                              f"(have: {', '.join(list_variants()) or 'none'}).")
         preds[name] = predictions_of(run)
+        extras[name] = run.get("extra_vocab") or []
         print(f"[report] {name}: model={run.get('effective_model')} "
               f"prompt={run.get('prompt_file') or 'production'} "
               f"({len(run['predictions'])} cached)")
     if not preds:
         raise SystemExit("Nothing to report — no runs cached and no --db.")
-    report = build_report(preds, labels)
+    report = build_report(preds, labels, extras=extras)
     print(render_text(report))
     if args.html:
         with open(args.html, "w", encoding="utf-8") as f:
@@ -728,6 +774,9 @@ def build_parser():
     rp.add_argument("--variant", default=DEFAULT_VARIANT)
     rp.add_argument("--model", help="Model id. On the LM Studio route this is "
                                     "pinned as the visual role model for this process.")
+    rp.add_argument("--extra-vocab", help="Comma-separated CANDIDATE tags (see "
+                    "photosearch/visual_tag_eval.py) the parser should accept and "
+                    "the report should score for this variant. Needs --prompt-file.")
     rp.add_argument("--prompt-file", help="Alternate prompt text (replaces only "
                                           "the prompt; parser and guard stay production).")
     rp.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER",

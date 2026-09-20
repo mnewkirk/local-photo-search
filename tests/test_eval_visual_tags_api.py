@@ -70,7 +70,14 @@ def test_get_shape(client, sample):
 def test_vocabulary_is_exactly_the_perceived_terms(client):
     sections = client.get(API).json()["vocabulary"]["sections"]
     assert len(sections) >= 2 and all(s["title"] for s in sections)
-    tags = [t["tag"] for s in sections for t in s["tags"]]
+    # Shipped sections are exactly the perceived vocabulary; trial tags sit in
+    # their own flagged section so the two can never blur together.
+    from photosearch.visual_tag_eval import CANDIDATE_TAGS
+    trial = [t["tag"] for s in sections if s.get("candidate") for t in s["tags"]]
+    assert set(trial) == set(CANDIDATE_TAGS)
+    assert all(t["gloss"] is None for s in sections if s.get("candidate")
+               for t in s["tags"])   # a candidate has no model-facing text
+    tags = [t["tag"] for s in sections if not s.get("candidate") for t in s["tags"]]
     assert len(tags) == len(set(tags))
     assert set(tags) == set(PERCEIVED_VOCABULARY)
     # Capture facts are EXIF's call; frozen/retired terms are never asked.
