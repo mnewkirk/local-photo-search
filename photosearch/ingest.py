@@ -427,7 +427,15 @@ def ingest_incoming(
         def _start_sweep_if_needed() -> None:
             nonlocal run_id
             if run_id is None and not dry_run:
-                run_id = start_sweep(db)
+                # Progress telemetry must never take the sweep down. If the
+                # sweep row can't be created (busy timeout, disk error),
+                # leave run_id None -- _heartbeat below is then a no-op for
+                # the rest of the run -- and let the move loop continue.
+                try:
+                    run_id = start_sweep(db)
+                except Exception as exc:
+                    print(f"  WARNING: start_sweep failed, continuing without "
+                          f"progress tracking: {exc}")
 
         def _heartbeat(force: bool = False) -> None:
             nonlocal last_heartbeat
@@ -436,8 +444,14 @@ def ingest_incoming(
             now = time.monotonic()
             if not force and (now - last_heartbeat) < _HEARTBEAT_INTERVAL_S:
                 return
-            heartbeat_sweep(db, run_id, files_seen=sweep_files_seen,
-                            files_moved=sweep_files_moved)
+            # Same swallow-and-log guard as _start_sweep_if_needed -- a
+            # heartbeat write failing (busy timeout, disk error) must not
+            # abort the move loop.
+            try:
+                heartbeat_sweep(db, run_id, files_seen=sweep_files_seen,
+                                files_moved=sweep_files_moved)
+            except Exception as exc:
+                print(f"  WARNING: heartbeat_sweep failed, continuing: {exc}")
             last_heartbeat = now
 
         try:
@@ -595,9 +609,17 @@ def ingest_incoming(
         except Exception as exc:
             # A crash must never leave a phantom 'moving' row — stamp it
             # failed (if a row was ever created) and re-raise so the caller
-            # (cron / the CLI) still sees the failure.
+            # (cron / the CLI) still sees the failure. The status update
+            # itself must not mask the ORIGINAL exception: if set_sweep_status
+            # also raises (e.g. the same DB error that caused exc in the
+            # first place), swallow that secondary failure and still surface
+            # exc — a masked root cause is far harder to debug than a stuck
+            # 'failed' status message.
             if run_id is not None:
-                set_sweep_status(db, run_id, "failed", error=str(exc))
+                try:
+                    set_sweep_status(db, run_id, "failed", error=str(exc))
+                except Exception as status_exc:
+                    print(f"  WARNING: set_sweep_status(failed) also failed: {status_exc}")
             raise
 
     return {"sources": per_source, "totals": totals, "dry_run": dry_run, "run_id": run_id}

@@ -382,14 +382,3 @@ def advance_nas_steps(db, batch_id: int, *, apply: bool = False,
     return result
 
 
-def needs_queue_passes(state: dict) -> list[str]:
-    """Deprecated alias for ``batch_state.fleet_launch_passes``.
-
-    It used to return only the `needs_queue` passes, which left the three
-    description-gated ones out of every launch — they are `waiting` at click
-    time, and a second launch mid-run is refused because it would kill the
-    running fleet. The launch set now includes a `waiting` pass whose
-    dependency this same launch will satisfy; see ``fleet_launch_passes``.
-    """
-    from .batch_state import fleet_launch_passes
-    return fleet_launch_passes(state)

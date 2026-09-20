@@ -1059,7 +1059,7 @@ def admin_restart():
 # mirror the touched rows into the local replica DB. See photosearch/rerun.py.
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel, model_validator  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
 
 
 class RerunRequest(BaseModel):
@@ -1321,20 +1321,15 @@ class WorkersStartRequest(BaseModel):
     # round-robining a batch at a time.
     sequential: bool = False
 
-    @model_validator(mode="after")
-    def _one_scope_only(self):
-        """The three scope kinds are mutually exclusive — `cli.py worker`
-        enforces the same rule. Sending two would silently pick whichever the
-        shell script happened to read last, which is the sort of thing that
-        runs a whole-library pass when a folder was meant."""
-        chosen = [name for name, val in (("collection", self.collection),
-                                         ("filters", self.filters),
-                                         ("directory", self.directory))
-                  if val not in (None, "", {})]
-        if len(chosen) > 1:
-            raise ValueError(
-                f"{' and '.join(chosen)} are mutually exclusive — pick one scope")
-        return self
+    # The three scope kinds (collection / filters / directory) are mutually
+    # exclusive — `cli.py worker` enforces the same rule, and sending two
+    # would silently pick whichever the shell script happened to read last,
+    # which is the sort of thing that runs a whole-library pass when a
+    # folder was meant. This used to be a `@model_validator`, but a pydantic
+    # validator raises before the handler ever runs (FastAPI turns it into a
+    # bare 422), which made `admin_workers_start`'s own explicit 400 check
+    # below dead code. Enforced in the handler instead, so callers get the
+    # clear 400 message.
 
 
 # filters-dict key → run-workers.sh flag. `people` fans out to repeated
@@ -1412,8 +1407,15 @@ def admin_workers_start(req: WorkersStartRequest):
     cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
            "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
     filter_flags = _filters_to_worker_flags(req.filters) if req.filters else []
+    # The three scope kinds are mutually exclusive (see WorkersStartRequest) —
+    # checked here, not in a pydantic validator, so the response is a clear
+    # 400 rather than a bare 422.
     if req.collection is not None and filter_flags:
         raise HTTPException(400, "collection and filters are mutually exclusive")
+    if req.directory and filter_flags:
+        raise HTTPException(400, "directory and filters are mutually exclusive")
+    if req.directory and req.collection is not None:
+        raise HTTPException(400, "directory and collection are mutually exclusive")
     if req.collection is not None:
         if req.collection <= 0:
             raise HTTPException(400, "collection must be a positive id")

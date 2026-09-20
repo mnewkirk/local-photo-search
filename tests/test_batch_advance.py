@@ -673,20 +673,60 @@ class TestLaunchFleetEndpoint:
         assert r.status_code == 404
 
 
-class TestWorkersStartRequestDirectory:
-    def test_rejects_directory_together_with_filters(self):
-        from pydantic import ValidationError
-        from photosearch.admin_api import WorkersStartRequest
-        with pytest.raises(ValidationError):
-            WorkersStartRequest(passes=["clip"], directory="/photos/2091/x",
-                                filters={"camera": "ILCE-7RM6"})
+def _workers_start(client, body):
+    """POST /api/admin/workers/start with subprocess.run patched out --
+    defensive even for the mutual-exclusion tests below, so a regression
+    that lets a bad request through can't shell out to the real
+    run-workers.sh (which exists for real in this repo checkout)."""
+    class R:
+        returncode = 0
+        stdout = "launched"
+        stderr = ""
 
-    def test_rejects_directory_together_with_collection(self):
-        from pydantic import ValidationError
-        from photosearch.admin_api import WorkersStartRequest
-        with pytest.raises(ValidationError):
-            WorkersStartRequest(passes=["clip"], directory="/photos/2091/x",
-                                collection=4)
+    def fake_run(cmd, **kw):
+        return R()
+
+    admin = batch_advance_admin()
+    with patch.object(admin.subprocess, "run", fake_run):
+        return client.post("/api/admin/workers/start", json=body)
+
+
+class TestWorkersStartRequestDirectory:
+    """The three scope kinds (collection / filters / directory) are mutually
+    exclusive. This used to be enforced by a `@model_validator` on
+    `WorkersStartRequest`, which raises before `admin_workers_start` ever
+    runs -- FastAPI turns that into a bare 422 and made the handler's own
+    explicit 400 checks dead code. Enforced in the handler now, so these hit
+    the real endpoint via the TestClient and assert on the 400 + message, not
+    a pydantic ValidationError."""
+
+    def test_rejects_directory_together_with_filters(self, client, db):
+        r = _workers_start(client, {
+            "passes": ["clip"], "directory": "/photos/2091/x",
+            "filters": {"camera": "ILCE-7RM6"},
+        })
+        assert r.status_code == 400
+        assert r.json()["detail"] == "directory and filters are mutually exclusive"
+
+    def test_rejects_directory_together_with_collection(self, client, db):
+        r = _workers_start(client, {
+            "passes": ["clip"], "directory": "/photos/2091/x", "collection": 4,
+        })
+        assert r.status_code == 400
+        assert r.json()["detail"] == "directory and collection are mutually exclusive"
+
+    def test_rejects_collection_together_with_filters_with_the_original_message(
+        self, client, db
+    ):
+        """This 400 (and its exact message) predates the ingest-batch work;
+        the validator made it unreachable. Restored verbatim so a caller
+        that matches on this message doesn't regress."""
+        r = _workers_start(client, {
+            "passes": ["clip"], "collection": 4,
+            "filters": {"camera": "ILCE-7RM6"},
+        })
+        assert r.status_code == 400
+        assert r.json()["detail"] == "collection and filters are mutually exclusive"
 
     def test_directory_alone_is_fine(self):
         from photosearch.admin_api import WorkersStartRequest

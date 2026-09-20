@@ -5,6 +5,7 @@ so the tests don't need real JPEG bytes.
 """
 
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -737,6 +738,103 @@ def test_heartbeat_throttled_and_always_fires_once_at_the_end(tmp_path, tmp_db_p
     assert calls[-1] == (3, 3)
 
 
+def test_heartbeat_failure_never_aborts_the_move_loop(tmp_path, tmp_db_path, monkeypatch):
+    """Progress telemetry must degrade, never take the sweep down: if
+    heartbeat_sweep raises on every call (busy timeout, disk error), the
+    files still move and the returned stats are still correct — no
+    exception escapes ingest_incoming."""
+    incoming, photos = _setup_dirs(tmp_path)
+    for i in range(3):
+        _touch(incoming / "matt" / f"IMG_000{i}.jpg", f"file-{i}".encode())
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    def raising_heartbeat(db, run_id, *, files_seen, files_moved):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ingest_mod, "heartbeat_sweep", raising_heartbeat)
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["imported"] == 3
+    assert result["totals"]["errors"] == 0
+    for i in range(3):
+        assert (photos / "2026" / "2026-04-12_phone-matt" / f"IMG_000{i}.jpg").exists()
+
+    with PhotoDB(tmp_db_path) as db:
+        row = db.conn.execute("SELECT status FROM ingest_sweeps").fetchone()
+    # The sweep row was created (start_sweep itself wasn't touched by this
+    # test) and still reaches a normal terminal-ish state -- it's the
+    # heartbeat writes, not the row's existence, that failed.
+    assert row["status"] == "moving"
+
+
+def test_start_sweep_failure_leaves_run_id_none_and_sweep_completes(
+    tmp_path, tmp_db_path, monkeypatch
+):
+    """If start_sweep itself raises, the sweep must not abort: run_id stays
+    None (heartbeats become no-ops) and the move loop runs to completion."""
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "IMG_0001.jpg", b"one")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    def raising_start_sweep(db):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ingest_mod, "start_sweep", raising_start_sweep)
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["imported"] == 1
+    assert result["run_id"] is None
+    assert (photos / "2026" / "2026-04-12_phone-matt" / "IMG_0001.jpg").exists()
+
+    with PhotoDB(tmp_db_path) as db:
+        count = db.conn.execute("SELECT COUNT(*) FROM ingest_sweeps").fetchone()[0]
+    # No sweep row was ever created -- start_sweep never succeeded.
+    assert count == 0
+
+
+def test_failing_set_sweep_status_does_not_mask_the_original_exception(
+    tmp_path, tmp_db_path, monkeypatch
+):
+    """A real crash mid-loop plus a set_sweep_status('failed') that ALSO
+    raises must still surface the ORIGINAL exception -- the secondary
+    failure (e.g. the same DB error that caused the crash) must be
+    swallowed-and-logged, not let to mask the real root cause."""
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "IMG_0001.jpg", b"one")
+    _touch(incoming / "matt" / "IMG_0002.jpg", b"two")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    calls = {"n": 0}
+    real_unique = ingest_mod._unique_target_path
+
+    def boom(target_dir, filename):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated crash")
+        return real_unique(target_dir, filename)
+
+    monkeypatch.setattr(ingest_mod, "_unique_target_path", boom)
+
+    def raising_set_sweep_status(db, run_id, status, error=None):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ingest_mod, "set_sweep_status", raising_set_sweep_status)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+
 def test_intra_run_dedup_also_covers_companions(tmp_path, tmp_db_path, monkeypatch):
     """RAW/video have no DB row at all, so the destination-path check is their
     only guard — and it misses a duplicate routed to a DIFFERENT dated folder."""
@@ -899,3 +997,135 @@ def test_cli_ingest_incoming_dry_run_touches_no_batch_or_sweep_tables(tmp_path, 
         batches = db.conn.execute("SELECT COUNT(*) FROM ingest_batches").fetchone()[0]
     assert sweeps == 0
     assert batches == 0
+
+
+def test_cli_ingest_incoming_register_batch_exception_does_not_abort_sweep(
+    tmp_path, tmp_db_path, monkeypatch
+):
+    """register_batch raising something other than ValueError (e.g. a
+    sqlite3.OperationalError "database is locked" from a real lock contest)
+    must not abort the rest of the sweep — bookkeeping failures are logged
+    as a WARNING and folders after the failing one still get indexed and
+    registered. The sweep must finish 'registered', not 'failed', and the
+    command must exit 0."""
+    import sqlite3
+
+    from click.testing import CliRunner
+
+    from cli import cli
+    from photosearch import ingest_batches as ingest_batches_mod
+    from photosearch.ingest_batches import list_batches
+
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "IMG_0001.jpg", b"one")
+    _touch(incoming / "wife" / "IMG_0002.jpg", b"two")
+
+    dates = {
+        str(incoming / "matt" / "IMG_0001.jpg"): "2026-04-12 09:30:15",
+        str(incoming / "wife" / "IMG_0002.jpg"): "2026-05-01 09:30:15",
+    }
+
+    def fake_extract(filepath):
+        return {
+            "filepath": filepath,
+            "filename": os.path.basename(filepath),
+            "date_taken": dates.get(filepath),
+            "date_created": "2026-05-01 12:00:00",
+            "gps_lat": None,
+            "gps_lon": None,
+        }
+
+    monkeypatch.setattr(ingest_mod, "extract_exif", fake_extract)
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    real_register_batch = ingest_batches_mod.register_batch
+    calls = []
+
+    def flaky_register_batch(pdb, directory, *, source=None, run_id=None):
+        calls.append(directory)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_register_batch(pdb, directory, source=source, run_id=run_id)
+
+    monkeypatch.setattr(ingest_batches_mod, "register_batch", flaky_register_batch)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "ingest-incoming",
+        "--incoming-root", str(incoming),
+        "--photo-root", str(photos),
+        "--db", tmp_db_path,
+    ])
+    assert result.exit_code == 0, result.output
+    assert "WARNING" in result.output
+    # Both dirs were attempted -- the first dir's failure did not stop the loop.
+    assert len(calls) == 2
+
+    with PhotoDB(tmp_db_path) as db:
+        batches = list_batches(db)
+        sweep = db.conn.execute("SELECT status FROM ingest_sweeps").fetchone()
+
+    # Only the second (wife) dir registered -- the first (matt) dir's
+    # register_batch call raised and was skipped.
+    assert len(batches) == 1
+    assert batches[0]["directory"] == "2026/2026-05-01_phone-wife"
+    assert sweep["status"] == "registered"
+
+
+def test_cli_ingest_incoming_no_index_register_batch_exception_warns_and_continues(
+    tmp_path, tmp_db_path, monkeypatch
+):
+    """Same guard on the --no-index registration branch: a non-ValueError
+    from register_batch must not abort the sweep, and (unlike the previous
+    silent-swallow behaviour) it must print a WARNING just like the --index
+    branch does."""
+    import sqlite3
+
+    from click.testing import CliRunner
+
+    from cli import cli
+    from photosearch import ingest_batches as ingest_batches_mod
+    from photosearch.ingest_batches import list_batches
+
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "IMG_0001.jpg", b"one")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    # First (indexed) sweep so the folder has photo rows and is eligible to
+    # be registered by the --no-index branch below.
+    runner = CliRunner()
+    first = runner.invoke(cli, [
+        "ingest-incoming",
+        "--incoming-root", str(incoming),
+        "--photo-root", str(photos),
+        "--db", tmp_db_path,
+    ])
+    assert first.exit_code == 0, first.output
+
+    _touch(incoming / "matt" / "IMG_0002.jpg", b"two")
+
+    def raising_register_batch(pdb, directory, *, source=None, run_id=None):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ingest_batches_mod, "register_batch", raising_register_batch)
+
+    second = runner.invoke(cli, [
+        "ingest-incoming",
+        "--incoming-root", str(incoming),
+        "--photo-root", str(photos),
+        "--db", tmp_db_path,
+        "--no-index",
+    ])
+    assert second.exit_code == 0, second.output
+    assert "WARNING" in second.output
+
+    with PhotoDB(tmp_db_path) as db:
+        sweep = db.conn.execute(
+            "SELECT status FROM ingest_sweeps ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    assert sweep["status"] == "registered"

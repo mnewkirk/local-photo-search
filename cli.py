@@ -2639,7 +2639,7 @@ def repair_data_cmd(db, apply):
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
 @click.option("--batch", "batch_id", type=int, required=True,
-              help="Ingest batch id (see /batches or `photosearch batch-list`).")
+              help="Ingest batch id (see the /batches page).")
 @click.option("--apply", is_flag=True, default=False,
               help="Run the steps. Default: dry-run (reports what WOULD run and "
                    "writes nothing — not even a job row).")
@@ -2837,21 +2837,26 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
                     # index_directory has had a chance to add its photo rows.
                     # A folder register_batch can't find any rows for (the
                     # index pass above failed, or found nothing new) is
-                    # skipped, never fatal to the rest of the sweep.
+                    # skipped, never fatal to the rest of the sweep. Bookkeeping
+                    # must never abort a file-moving sweep, so any exception
+                    # (not just ValueError — e.g. sqlite3.OperationalError
+                    # "database is locked") is caught here too, or the folders
+                    # after the failing one would never get indexed/registered.
                     try:
                         register_batch(pdb, d, source=source, run_id=run_id)
-                    except ValueError as exc:
+                    except Exception as exc:
                         click.echo(f"     WARNING: not registering {d}: {exc}", err=True)
             elif dir_sources:
                 # --no-index: no fresh photo rows were created by this run,
                 # so only register folders that already have rows from an
                 # earlier, indexed sweep into the same dated folder today —
-                # register_batch's ValueError silently covers the rest.
+                # register_batch's ValueError silently covers the rest. Same
+                # never-abort-the-sweep guard as the --index branch above.
                 for source, d in dir_sources:
                     try:
                         register_batch(pdb, d, source=source, run_id=run_id)
-                    except ValueError:
-                        pass
+                    except Exception as exc:
+                        click.echo(f"     WARNING: not registering {d}: {exc}", err=True)
 
             if run_id is not None:
                 set_sweep_status(pdb, run_id, "registered")
