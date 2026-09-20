@@ -161,7 +161,7 @@ def test_index_module_routes_visual_tags_through_the_merge():
         "index.py still writes the raw model answer; route it through merge_for_row"
     assert src.count("_merge_visual_tags(") >= 2, \
         "both index.py visual-tag writers must go through the shared merge"
-    assert "merge_for_row" in inspect.getsource(I._merge_visual_tags)
+    assert "merge_vlm_answer" in inspect.getsource(I._merge_visual_tags)
 
 
 def test_index_merge_helper_reads_the_photo_row(db):
