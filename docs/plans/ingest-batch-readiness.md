@@ -249,6 +249,21 @@ below are the ones that changed what got built, not just how it was reviewed.
   `PS.BatchFlow.fleetLaunchPasses` so the Advance button's pass count matches
   what actually launches.
 
+- **Step 4's claim that CLIP's unloadable rows "surface as `blocked` via a
+  no-progress rule" was NOT built — it does not hold for `clip`, only for
+  `quality`/`verify`.** `_OUTPUT_MISSING["clip"] is None` in
+  `batch_state.py` (clip keeps no attempts ledger at all — see CLAUDE.md
+  "Non-image rows"), so `_worker_step` hardcodes `failed = 0` for clip and
+  `blocked` requires `failed > 0`. A clip-unloadable photo therefore leaves
+  that batch's `clip` step at `remaining > 0` **indefinitely** — `needs_queue`
+  (or `queued` while a job row is open), never `blocked`. Found in the final
+  whole-branch review, not fixed here (out of scope for a docs-only
+  correction): the mitigations are `index.py:is_real_image()` gating row
+  creation at ingest (so new batches shouldn't hit this),
+  `purge-nonimage-photos` for old rows, and the `/batches` page's **Mark
+  ready** button as the manual escape. CLAUDE.md's "Ingest batches" section
+  has the corrected explanation.
+
 Every other task closed with a clean review (2026-09-19 ledger) or only
 deferred, non-blocking cleanups (dead code, a stray comment, an untested edge
 case) — see the ledger for the full list.

@@ -2178,10 +2178,23 @@ claim predicate carries **no attempts filter** (`db.py`
 `remaining` rather than disjoint from it — for those three, `done = eligible
 - remaining` (no second subtraction) and `blocked` is `remaining == failed >
 0`, not `remaining == 0 and failed > 0`. Get this backwards and `done`
-double-subtracts `failed` on every other pass. `clip` keeps no attempts
-ledger at all (see "Non-image rows" above), so its unloadable rows would sit
-in `needs_queue` forever without this — they surface as `blocked` via the
-same no-progress rule instead.
+double-subtracts `failed` on every other pass.
+
+**`clip` does NOT get the `blocked` escape hatch this reasoning gives
+`quality`/`verify`.** `_OUTPUT_MISSING["clip"] is None` in
+`photosearch/batch_state.py` (it keeps no attempts ledger at all — see
+"Non-image rows" above), so `_worker_step` hardcodes `failed = 0` for clip,
+and `blocked` requires `failed > 0`. A clip-unloadable photo (e.g. a
+ZIP-wrapped `.JPG` Live Photo saved with an image extension) therefore leaves
+that batch's `clip` step sitting at `remaining > 0` **indefinitely**:
+`next_action` stays `launch_fleet` and `ready` is never true — it does not
+surface as `blocked`. In practice this should be rare for new batches:
+`index.py:is_real_image()` gates row creation at ingest, so a photo that
+can't be decoded is reclassified as a move-only companion and never gets a
+`photos` row (and therefore never enters a batch) in the first place.
+`purge-nonimage-photos` is the remedy for old rows that predate that gate.
+Short of that, the manual escape is the `/batches` page's **Mark ready**
+button, which force-completes a batch regardless of step state.
 
 Worker-pass precedence is **running > completed > blocked > queued > waiting
 > needs_queue** — `completed` deliberately outranks an open job row, because
@@ -2256,7 +2269,11 @@ of a date scope while still belonging to the batch. `normalize_aesthetics`
 and `resolve_dups` have no scope parameter at all — they're library-wide
 maintenance stages reused as-is, so advancing one batch can touch
 duplicate-person rows or aesthetic percentiles elsewhere in the library (both
-reversible: `face_dedupe_undo` for the former, a re-run for the latter).
+reversible: `face_dedupe_undo` for the former, a re-run for the latter). In
+replica mode, `warm_crops` runs on the **NAS** (where the photo files live),
+so the desktop's own face-crop cache only warms on the next thumbnail sync —
+the step can read `completed` on the desktop's `/batches` page while the
+replica's face grids are still serving cold (slow, first-decode) crops.
 
 **One click launches the whole worker pipeline.** `POST
 /api/admin/batch-launch-fleet` doesn't just queue passes that are

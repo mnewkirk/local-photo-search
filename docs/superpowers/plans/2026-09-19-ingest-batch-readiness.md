@@ -10,8 +10,9 @@ task text below is the *what*. Already shipped (do not redo): `PS.poll` in
 - Read `CLAUDE.md` "Key Patterns" first. Python 3.11, FastAPI, SQLite. Frontend is plain
   React UMD with **no build step**: `React.createElement` only, never JSX.
 - **TDD.** Write the failing test first. Run Python tests with
-  `/Users/mattnewkirk/Documents/Claude/Projects/photo_organization/local-photo-search/venv/bin/python -m pytest <files> -q -p no:cacheprovider`
-  (the worktree has no venv of its own). Frontend: `cd frontend && npx jest` and
+  `venv/bin/python -m pytest <files> -q -p no:cacheprovider`
+  (run from a checkout that has a venv — a git worktree may not have its own). Frontend:
+  `cd frontend && npx jest` and
   `node scripts/check-frontend-refs.js` from the repo root. Never `source` an activate script.
 - The shared `db` pytest fixture is **pre-seeded** with photos under `2026/…`. Use years
   `2090`/`2091` in new fixtures so nothing collides.
