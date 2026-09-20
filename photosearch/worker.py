@@ -1094,6 +1094,22 @@ def run_worker(
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")
+                # The server defers a result blocked by a transient DB LOCK (a
+                # sweep holding the write lock) instead of spending one of the
+                # photo's MAX_PROCESS_ATTEMPTS on its own contention. Any other
+                # failure still counts the attempt, so the cap bounds it.
+                n_deferred = resp.get("deferred", 0)
+                if n_deferred:
+                    ids = resp.get("deferred_photo_ids") or []
+                    shown = ", ".join(str(i) for i in ids[:8])
+                    more = f", +{len(ids) - 8} more" if len(ids) > 8 else ""
+                    # Careful with the wording: on a failed batch commit only
+                    # the FINAL flush is known not to have landed — earlier
+                    # rows may be on disk, in which case the claim predicate
+                    # simply won't offer them again.
+                    print(f"  ⚠ Server deferred {n_deferred} result(s) it could not "
+                          f"commit ({shown}{more}) — no attempt was spent; any "
+                          f"that did not land will be reclaimed.")
                 total_processed += n_processed
 
                 # Cleanup temp files
