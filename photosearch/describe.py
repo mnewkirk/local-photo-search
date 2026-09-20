@@ -545,6 +545,50 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
     return os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL") or model
 
 
+# pass -> LLM role. The role, not the model name, is what selects the model on
+# the OpenAI-compatible (LM Studio) route, so it is also what provenance has to
+# resolve through. `rerun._PASS_LLM` carries the same roles alongside its Ollama
+# defaults; a test pins the two together.
+PASS_ROLES = {
+    "describe":         "describe",
+    "verify":           "verify",
+    "category-content": "text",
+    "keywords":         "text",
+    "category-visual":  "visual",
+    "aesthetics":       "aesthetics",
+}
+
+
+def effective_model(model: str, role: Optional[str] = None) -> str:
+    """The model id a call with (`model`, `role`) will ACTUALLY hit.
+
+    This is what belongs in `generations.model_used`. Logging the configured
+    name instead is why 159,647 of 159,650 `category-visual` rows on the live
+    library claim `llava`: on the LM Studio route the name is ignored and the
+    model is chosen by role, so the log recorded a model that never ran.
+
+    Deliberately the SAME function the request uses (`_resolve_openai_model`),
+    not a reimplementation — a second copy would drift and be undetectable,
+    since a wrong provenance string still looks like a string.
+    """
+    if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return _resolve_openai_model(model, role)
+    return model
+
+
+def effective_model_version(model: str) -> Optional[str]:
+    """Provenance digest for `generations.model_version`.
+
+    On the OpenAI-compatible route there is no Ollama to query and asking
+    anyway blocks ~80 s retrying localhost:11434, so use a static marker.
+    Otherwise it is the short Ollama digest.
+    """
+    if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return "lmstudio"
+    from .worker import _model_version  # lazy: worker imports describe
+    return _model_version(model)
+
+
 def _image_ref_to_b64(ref):
     """Normalize an Ollama image ref (file path OR base64) to bare base64."""
     try:

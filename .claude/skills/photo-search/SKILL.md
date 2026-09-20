@@ -1209,7 +1209,7 @@ Collection-only options:
 | Quality scoring | `--quality` | ViT-L/14 (768-dim) + MLP | ~1000 photos/hr | None |
 | Concept analysis | (auto with quality) | Same ViT-L/14 | Runs after scoring | Quality pass |
 | Descriptions | `--describe` | `llama3.2-vision` via Ollama (`--describe-model`) | 30-200s/photo CPU, ~4s GPU | Ollama running |
-| Category (visual) | `--category-visual` | `llava` via Ollama (`--category-visual-model`) — visual-quality tags from the image | 30-200s/photo CPU, ~1s GPU | Ollama running |
+| Category (visual) | `--category-visual` | `llava` via Ollama (`--category-visual-model`) — **perceived** visual qualities only (mood / colour / light / atmosphere / viewpoint / composition); the capture facts are derived from EXIF, not asked of the model | 30-200s/photo CPU, ~1s GPU | Ollama running |
 | Category (content) | `--category-content` | `llama3.2:3b` via Ollama (`--category-content-model`) — text-only, from description | ~text-only | Description exists |
 | Keywords | `--keywords` | `llama3.2:3b` via Ollama (`--keywords-model`) — text-only, from description | ~text-only | Description exists |
 | Critique | (auto) | Same as describe model | 30-200s/photo | Quality + describe |
@@ -1224,6 +1224,26 @@ strategy" under Distributed Indexing, and CLAUDE.md. `describe.py` has
 model-aware Ollama options + a degeneration detect-retry-fallback for
 `llama3.2-vision`, and a regurgitation guard on the visual-tag task.
 (`clean-garbage-tags` still exists to clear historical regurgitated tag sets.)
+
+**`category-visual` asks only about PERCEIVED qualities.** Five capture-fact
+terms — `long-exposure`, `low-light`, `panoramic`, `sharp`, `blurry` — are
+computed deterministically from EXIF (`photosearch/visual_tags_derive.py`) and
+override whatever the model said; `motion-blur` was retired from the
+vocabulary entirely. A VLM cannot read a shutter speed off the tile it is
+shown, and the measurements said it did not try (`long-exposure` was tagged on
+64% of a 1/125–1/800 s daytime soccer folder). The merge happens **server-side**
+in `worker_api.submit_results` and both `index.py` writers; storage is still
+the single `photos.visual_tags` JSON column, so `visual_tag=`, `list_vocab`
+and the Ask tools are unaffected. Full detail + thresholds in CLAUDE.md,
+"`category-visual`: derived capture facts vs perceived qualities".
+
+Backfill existing rows without any VLM work (dry run by default; never touches
+a NULL `visual_tags`, which is what drives the worker queue):
+
+```bash
+photosearch derive-visual-tags            # before/after frequency table
+photosearch derive-visual-tags --apply    # chunked, guarded, idempotent
+```
 
 ### Parallelization
 

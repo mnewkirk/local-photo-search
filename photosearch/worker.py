@@ -68,6 +68,56 @@ def _model_version(model: str) -> Optional[str]:
     return version
 
 
+# Passes whose provenance rides on the REQUEST rather than on each result row.
+# (`submit_results` reads `req.model` for these and `r.model` for the rest.)
+_BATCH_LEVEL_PROVENANCE = {"describe", "verify"}
+
+
+def _provenance_kwargs(pass_type: str, model: str, results: list,
+                       role: Optional[str] = None) -> dict:
+    """Stamp `model` / `model_version` for one submitted batch.
+
+    Reports the model that ACTUALLY ran, not the name this worker was
+    configured with: on the OpenAI-compatible (LM Studio) route the configured
+    name is ignored and the model is chosen by ROLE, so logging the CLI default
+    recorded a model that never executed — which is why 159,647 of 159,650
+    `category-visual` generations on the live library claim `llava`.
+
+    Shares `describe.effective_model` / `effective_model_version` with
+    `rerun.py`, which already resolved this correctly. Don't reintroduce a
+    second copy — a wrong provenance string still looks like a string, so
+    drift here is invisible until someone asks which model tagged a photo.
+
+    `role` overrides the pass's own role for the case where the logged artifact
+    was produced by a DIFFERENT call than the pass is named for: `verify` logs
+    the regenerated description, which the regen (describe-role) model wrote,
+    not the verifier.
+
+    Returns the kwargs to merge into the submit call; per-result passes are
+    stamped in place on `results`.
+    """
+    role = role or describe_module_roles().get(pass_type)
+    if role is None:
+        return {}
+    from .describe import effective_model, effective_model_version
+
+    resolved = effective_model(model, role)
+    version = effective_model_version(resolved)
+    if pass_type in _BATCH_LEVEL_PROVENANCE:
+        return {"model": resolved, "model_version": version}
+    for r in results:
+        r["model"] = resolved
+        r["model_version"] = version
+    return {}
+
+
+def describe_module_roles() -> dict:
+    """`describe.PASS_ROLES`, imported lazily (describe pulls in ollama)."""
+    from .describe import PASS_ROLES
+
+    return PASS_ROLES
+
+
 def _unload_pass_models(pass_type: str) -> None:
     """Release torch models owned by a pass so MPS/CUDA memory is reclaimed.
 
@@ -1021,44 +1071,32 @@ def run_worker(
                 elif pass_type == "describe":
                     results = _process_describe(downloaded, model=describe_model)
                     kwargs = {"describe_results": results,
-                              "model": describe_model,
-                              "model_version": _model_version(describe_model)}
+                              **_provenance_kwargs(pass_type, describe_model, results)}
                 elif pass_type == "verify":
                     results = _process_verify(
                         downloaded, client=client,
                         verify_model=verify_model, regen_model=describe_model,
                     )
-                    # regen_model == describe_model produces any regenerated text
+                    # regen_model == describe_model produces any regenerated
+                    # text, so the artifact's provenance is the DESCRIBE role.
                     kwargs = {"verify_results": results,
-                              "model": describe_model,
-                              "model_version": _model_version(describe_model)}
+                              **_provenance_kwargs(pass_type, describe_model,
+                                                   results, role="describe")}
                 elif pass_type == "category-content":
                     results = _process_category_content(photos, model=category_content_model)
-                    mv = _model_version(category_content_model)
-                    for r in results:
-                        r["model"] = category_content_model
-                        r["model_version"] = mv
+                    _provenance_kwargs(pass_type, category_content_model, results)
                     kwargs = {"category_content_results": results}
                 elif pass_type == "category-visual":
                     results = _process_category_visual(downloaded, model=category_visual_model)
-                    mv = _model_version(category_visual_model)
-                    for r in results:
-                        r["model"] = category_visual_model
-                        r["model_version"] = mv
+                    _provenance_kwargs(pass_type, category_visual_model, results)
                     kwargs = {"category_visual_results": results}
                 elif pass_type == "keywords":
                     results = _process_keywords(photos, model=keywords_model)
-                    mv = _model_version(keywords_model)
-                    for r in results:
-                        r["model"] = keywords_model
-                        r["model_version"] = mv
+                    _provenance_kwargs(pass_type, keywords_model, results)
                     kwargs = {"keywords_results": results}
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
-                    mv = _model_version(aesthetics_model)
-                    for r in results:
-                        r["model"] = aesthetics_model
-                        r["model_version"] = mv
+                    _provenance_kwargs(pass_type, aesthetics_model, results)
                     kwargs = {"aesthetics_results": results}
                 else:
                     print(f"  Pass type '{pass_type}' not yet implemented in worker.")
