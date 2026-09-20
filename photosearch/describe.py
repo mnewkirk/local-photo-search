@@ -795,14 +795,65 @@ def extract_keywords_from_description(
     return parse_keywords_response(raw)
 
 
+# Hard cap on PERCEIVED tags in one answer. The old prompt had none — its only
+# rule was "Include every tag that clearly applies" — and the guard sat at 12
+# while the observed maximum was 11 and the median 5, so it never fired on the
+# real failure. Five is the cap the prompt states AND the number the guard
+# enforces: one per axis, and there are six axes, so five already requires the
+# model to leave something out.
+_VISUAL_MAX_TAGS = 5
+
+
 def _build_visual_prompt(vocab: list[str]) -> str:
+    """Build the category-visual prompt from the PERCEIVED vocabulary.
+
+    Grouped by AXIS, one tag per axis, hard-capped, and explicitly permitted to
+    return nothing. The old flat checklist collapsed the output distribution:
+    1,373 photos of one shoot produced 163 distinct tag sets, the top 8 covering
+    56%, one verbatim 8-tag set repeated on 101 photos.
+
+    DON'T SIMPLIFY THIS BACK to a flat list of terms. The grouping, the cap and
+    the negative example are each load-bearing, and the capture-fact terms are
+    deliberately absent — see photosearch/visual_tags_derive.py.
+    """
+    from .visual_tags_derive import PERCEIVED_AXES, PERCEIVED_GLOSS
+
+    offered = set(vocab)
+    lines = []
+    for axis, terms in PERCEIVED_AXES.items():
+        shown = [t for t in terms if t in offered]
+        if not shown:
+            continue
+        rendered = ", ".join(
+            f"{t} ({PERCEIVED_GLOSS[t]})" if t in PERCEIVED_GLOSS else t
+            for t in shown
+        )
+        lines.append(f"{axis.upper()}: {rendered}")
+    # Any term the caller offered that no axis claims (a regenerated vocabulary
+    # with a new word) still has to be reachable, or it could never be chosen.
+    claimed = {t for terms in PERCEIVED_AXES.values() for t in terms}
+    extra = [t for t in vocab if t not in claimed]
+    if extra:
+        lines.append("OTHER: " + ", ".join(extra))
+
     return (
-        "Pick visual-quality tags for this photo from this list: "
-        + ", ".join(vocab)
+        "Describe how this photo LOOKS and FEELS, using only the tags below.\n\n"
+        + "\n".join(lines)
         + "\n\nRules:\n"
-        "- Return ONLY a comma-separated list of tags from the list above.\n"
-        "- Mood / light / composition only. Don't describe content.\n"
-        "- Include every tag that clearly applies.\n"
+        f"- Pick at most ONE tag from each group, and never more than "
+        f"{_VISUAL_MAX_TAGS} tags in total.\n"
+        "- Omit a tag unless it is obviously and unmistakably true of THIS "
+        "image. Returning 2-3 tags is normal; returning none is acceptable.\n"
+        "- Judge only the look of the picture. Do not name what is in it.\n"
+        "- Return ONLY a comma-separated list of tags, exactly as spelled "
+        "above. No sentences, no explanation.\n\n"
+        "Example (a backlit portrait at sunset, warm and calm):\n"
+        "golden-hour, peaceful\n\n"
+        "Example of what NOT to do (a bright midday football match on grass):\n"
+        "WRONG: sunny, peaceful, moody, centered, dramatic, vibrant\n"
+        "RIGHT: sunny\n"
+        "It is a bright daytime action shot, so it is not peaceful and nothing "
+        "about it is dark or night-like. One tag is the honest answer.\n"
     )
 
 
@@ -827,14 +878,17 @@ def tag_visual_photo(
     test surface is uniform — same mock point as extract_categories/keywords.
     Mirrors the regurgitation guard from the old `tag_photo` at threshold 12.
     """
-    from .vocab_visual import VISUAL_VOCABULARY
+    from .visual_tags_derive import PERCEIVED_VOCABULARY
     if not HAS_OLLAMA:
         return None
     path = Path(image_path)
     if not path.exists():
         return None
-    vocab_set = set(VISUAL_VOCABULARY)
-    prompt = _build_visual_prompt(VISUAL_VOCABULARY)
+    # PERCEIVED only — the capture facts are derived from EXIF server-side and
+    # would be stripped from this answer anyway. Asking for them just wastes
+    # tokens and invites the model to fill its quota with guesses.
+    vocab_set = set(PERCEIVED_VOCABULARY)
+    prompt = _build_visual_prompt(PERCEIVED_VOCABULARY)
     encoded = _encode_image_for_ollama(str(path))
     image_ref = encoded if encoded is not None else str(path)
     options = _options_for_model(model)
