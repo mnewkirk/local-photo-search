@@ -347,8 +347,18 @@ def _stage_stacking(db, apply, emit, check_abort):
             "photos_stacked": sum(len(s) for s in stacks)}
 
 
-def _stage_match_faces(db, apply, emit, check_abort):
-    """Match unassigned faces to known persons (strict + temporal)."""
+def _stage_match_faces(db, apply, emit, check_abort, temporal=False):
+    """Match unassigned faces to known persons — STRICT only, unless `temporal`.
+
+    Temporal matching is an explicit opt-in because this stage runs unattended
+    every night, over shoots nobody has reviewed yet. On 2026-09-19 it swept a
+    shoot ingested hours earlier and wrote 466 temporal labels (Calvin 382,
+    Ellie 149) beside 65 strict ones — on exactly the kind of shoot where
+    temporal is ~4% accurate and tags one kid across both teams (see "Label
+    health" in CLAUDE.md: 86% of Calvin's temporal faces sit beyond his own
+    strict bar). Recall is not worth polluting every new shoot by default; run
+    `match-faces --temporal` by hand when you want it.
+    """
     would = db.conn.execute(
         "SELECT COUNT(*) FROM faces WHERE person_id IS NULL"
     ).fetchone()[0]
@@ -372,7 +382,8 @@ def _stage_match_faces(db, apply, emit, check_abort):
     matched = match_faces_to_persons(db)
     emit({"phase": "sweep", "stage": "match_faces", "status": "running",
           "done": matched, "total": would})
-    matched += match_faces_temporal(db)
+    if temporal:
+        matched += match_faces_temporal(db)
     return {"stage": "match_faces", "would": would, "applied": matched, "status": "done"}
 
 
@@ -695,6 +706,7 @@ def run_maintenance_sweep(
     do_colors: bool = True,
     do_stacking: bool = True,
     do_match: bool = True,
+    match_temporal: bool = False,
     do_recluster: bool = False,
     do_dedup: bool = False,
     do_requeue: bool = False,
@@ -716,6 +728,9 @@ def run_maintenance_sweep(
         apply: When False (default) every stage reports how many rows it
             *would* touch and writes nothing. When True, stages run.
         do_colors / do_stacking: toggle those (heavier) stages.
+        match_temporal: opt-in — also run the TEMPORAL face matcher in the
+            match_faces stage. Off by default: it over-matches badly on
+            kids'-sport shoots and this sweep runs unattended on unreviewed ones.
         do_recluster: opt-in — clears ignored_clusters, so off by default.
         do_dedup: opt-in — DELETES duplicate photos (destructive), so off by
             default. Runs first so downstream stages work on the deduped set.
@@ -763,7 +778,8 @@ def run_maintenance_sweep(
     # unmatched face); gate it so the interactive/live sweep can skip it and
     # leave it to an off-hours cron or the worker fleet.
     if do_match:
-        plan.append(("match_faces", lambda: _stage_match_faces(db, apply, emit, check_abort)))
+        plan.append(("match_faces", lambda: _stage_match_faces(
+            db, apply, emit, check_abort, temporal=match_temporal)))
     plan.append(("resolve_dups", lambda: _stage_resolve_dups(db, apply, emit, check_abort)))
     plan.append(("normalize_aesthetics",
                  lambda: _stage_normalize_aesthetics(

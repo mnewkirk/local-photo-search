@@ -5200,6 +5200,7 @@ async def api_maintenance_sweep(request: Request):
     do_colors = bool(data.get("do_colors", False))
     do_stacking = bool(data.get("do_stacking", False))
     do_match = bool(data.get("do_match", False))
+    match_temporal = bool(data.get("match_temporal", False))
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
     do_requeue = bool(data.get("do_requeue", False))
@@ -5353,6 +5354,7 @@ async def api_maintenance_sweep(request: Request):
                     do_colors=do_colors,
                     do_stacking=do_stacking,
                     do_match=do_match,
+                    match_temporal=match_temporal,
                     do_recluster=do_recluster,
                     do_dedup=do_dedup,
                     do_requeue=do_requeue,

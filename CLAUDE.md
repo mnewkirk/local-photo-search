@@ -631,7 +631,7 @@ AppleDouble skip, hidden-source-dir skip).
 Cron entry on the NAS:
 
 ```cron
-0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
+0 4 * * * cd /volume1/docker/photosearch && flock -n /tmp/photo-ingest.lock docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
 ```
 
 `--no-colors` keeps the daily sweep CLIP-only: color extraction is the slow,
@@ -663,7 +663,7 @@ line-continuations → `"-":1: bad minute`):
 
 ```bash
 crontab -l 2>/dev/null > /tmp/mycron
-echo '0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1' >> /tmp/mycron
+echo '0 4 * * * cd /volume1/docker/photosearch && flock -n /tmp/photo-ingest.lock docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1' >> /tmp/mycron
 crontab /tmp/mycron && rm /tmp/mycron
 ```
 
@@ -2065,20 +2065,41 @@ dedup on therefore both deletes duplicates *and* writes inferred GPS
 
 ### Scheduling + replica-mode maintenance (2026-07-17)
 
-`maintenance-sweep` is intended to run nightly on the NAS from **root's
-crontab** at **01:00 UTC** (`CRON_TZ=UTC`, so it never drifts with DST). That
-is 18:00 America/Los_Angeles — chosen deliberately over the 03:00 Pacific
-ingest slot; accepted tradeoff is that it runs during California evening. Log:
-`/var/log/photo-maintenance.log`. `--recluster` / `--dedup-photos` stay OFF
-(recluster clears `ignored_clusters`; dedup DELETEs photos).
+`maintenance-sweep` **runs nightly on the NAS from the NAS user's own crontab**
+(not root's), at **18:30 host-local** (Pacific) — verified on the box
+2026-09-19 with `crontab -l`:
 
-**This cron entry is not yet installed** — it ships as an operator runbook
-step, not an automated change (installing it touches root's crontab and
-`/var/log` on the live NAS over SSH that UGOS auto-blocks on retry storms).
-`CRON_TZ` support on UGOS's cron is unverified; the runbook has the operator
-check it first, with a documented fallback (`0 18 * * *` host-local, which
-drifts to 02:00 UTC in Pacific winter) if it isn't supported. See the operator
-runbook at the bottom of `docs/superpowers/plans/2026-07-17-maintenance-sync.md`.
+```cron
+0 4 * * *   … flock -n /tmp/photo-ingest.lock      … ingest-incoming --no-colors …
+30 18 * * * … flock -n /tmp/photo-maintenance.lock … maintenance-sweep --apply --no-colors …
+```
+
+Both are `flock`-guarded, so a run that overlaps the previous one exits instead
+of stacking. Host-local time means it drifts an hour against UTC with DST
+(01:30 UTC in summer, 02:30 in winter); the `CRON_TZ=UTC` variant was never
+adopted. Log: `/var/log/photo-maintenance.log`. `--recluster` /
+`--dedup-photos` stay OFF (recluster clears `ignored_clusters`; dedup DELETEs
+photos). (This section used to say the entry was "not yet installed", in root's
+crontab, at 01:00 UTC, with ingest at 03:00 — all four were stale.)
+
+**The sweep's `match_faces` stage is STRICT-ONLY.** It used to run the temporal
+matcher too, every night, over shoots nobody had reviewed. On 2026-09-19 it
+swept a shoot ingested that afternoon and wrote **466 temporal labels (Calvin
+382, Ellie 149)** beside 65 strict ones — on exactly the kind of shoot where
+temporal is ~4% accurate and tags one kid across both teams. Temporal is now an
+explicit opt-in: `maintenance-sweep --match-temporal`, `match_temporal=True` on
+`run_maintenance_sweep`, `"match_temporal": true` on the API. Hand-run
+`match-faces --temporal` is unchanged. Tests: `tests/test_maintenance_match_faces.py`.
+
+**Known, NOT fixed — a nightly match/unmatch churn loop.** The log shows the
+stage "applying" ~6,000 matches every night while the unmatched pool never
+shrinks (202k → 213k over eight runs), because `resolve_dups` strips
+~5,300–6,100 of them the *same night*. The ~5,500 `dedupe_unmatched` faces are
+deliberately still matchable (they may belong to a *different* person), so they
+are re-matched to the *same* person and re-stripped forever — on the sweep's
+heaviest CPU stage. Strict-only should shrink it; it has not been measured
+since. The durable fix is to remember *which person* a face was de-duplicated
+away from and skip only that pairing.
 
 **Replica mode is now gated.** A sweep writes to whatever `PHOTOSEARCH_DB`
 points at, and `sync-replica.sh` replaces the replica's DB wholesale — so a

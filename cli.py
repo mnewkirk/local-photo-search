@@ -2516,6 +2516,10 @@ def normalize_subject_aesthetics(db, apply):
 @click.option("--no-stacking", is_flag=True, default=False, help="Skip the stacking stage.")
 @click.option("--no-match", is_flag=True, default=False,
               help="Skip face match-faces (the heaviest CPU stage).")
+@click.option("--match-temporal", is_flag=True, default=False,
+              help="Also run the TEMPORAL face matcher in the match stage. Off by "
+                   "default: it over-matches badly on kids'-sport shoots, and this "
+                   "sweep runs unattended over shoots nobody has reviewed yet.")
 @click.option("--light", is_flag=True, default=False,
               help="Only the fast stages (geocode/normalize/infer/resolve-dups) — skips "
                    "colors+stacking+match. Safe to run while the web UI is live (those "
@@ -2543,7 +2547,7 @@ def normalize_subject_aesthetics(db, apply):
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
-def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, recluster,
+def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_temporal, light, recluster,
                       dedup_photos, requeue, requeue_passes, normalize_aesthetics,
                       normalize_subject_aesthetics, window_minutes,
                       max_drift_km, min_confidence):
@@ -2579,7 +2583,8 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
         try:
             res = run_maintenance_sweep(
                 pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
-                do_match=not no_match, do_recluster=recluster, do_dedup=dedup_photos,
+                do_match=not no_match, match_temporal=match_temporal,
+                do_recluster=recluster, do_dedup=dedup_photos,
                 do_requeue=requeue, requeue_passes=rq_passes,
                 force_normalize_aesthetics=normalize_aesthetics,
                 force_normalize_subject_aesthetics=normalize_subject_aesthetics,
