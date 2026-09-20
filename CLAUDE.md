@@ -501,22 +501,43 @@ composition, and asked one model to answer both. Note `sunny` and `low-light`
 *do* track EXIF library-wide, so it was selectively broken, not useless —
 which is why the fix is a split, not a new model.
 
-**The split** (`photosearch/visual_tags_derive.py`):
+**The split** (`photosearch/visual_tags_derive.py`) is FOUR disjoint groups
+covering the compiled vocabulary exactly:
 
-- **DERIVED** (5) — `long-exposure`, `low-light`, `panoramic`, `sharp`,
-  `blurry`. Computed from EXIF / stored scalars, never asked of the model.
-- **RETIRED** (1) — `motion-blur`. Dropped from *both* halves: a scalar cannot
-  tell motion blur from defocus (a long exposure on a tripod is sharp), and the
-  VLM had zero signal. No rule was defensible, so there is none.
+- **DERIVED** (3) — `long-exposure`, `low-light`, `panoramic`. Computed from
+  EXIF, never asked of the model, authoritative over it.
+- **RETIRED** (1) — `motion-blur`. Dropped from *both* halves **and stripped
+  from existing rows**: a scalar cannot tell motion blur from defocus (a long
+  exposure on a tripod is sharp), and the VLM had zero signal. No rule was
+  defensible, so there is none and nothing replaces it.
+- **FROZEN** (2) — `sharp`, `blurry`. Not derived, not asked, **not deleted**.
+  See below.
 - **PERCEIVED** (30) — everything else, grouped into six axes (light, colour,
   mood, atmosphere, viewpoint, composition).
 
-**The merge rule is that derived wins.** `merge_tags(perceived, derived)`
-strips *every* capture-fact term the model emitted — including when nothing was
-derived, because an absent capture fact is a positive statement ("the EXIF says
-this is not a long exposure") — then adds the derived ones, passes perceived
-terms through, and returns a sorted, deduped list. **Missing EXIF derives
-nothing; it never guesses.**
+**The merge rule is that derived wins.** It strips *every* capture-fact term
+the model emitted — including when nothing was derived, because an absent
+capture fact is a positive statement ("the EXIF says this is not a long
+exposure") — then adds the derived ones, passes perceived terms through, and
+returns a sorted, deduped list. **Missing EXIF derives nothing; it never
+guesses.**
+
+**Frozen terms make the input's provenance part of the API**, because the two
+paths need opposite behaviour. Two named entry points, over one primitive:
+
+- **`merge_vlm_answer(perceived, row, existing=...)`** — the WRITE path
+  (`worker_api.submit_results`, both `index.py` writers). Fresh model output:
+  frozen terms the model volunteered are **dropped**, and any frozen term
+  already on the photo is **carried across** from `existing` (the current
+  `visual_tags`). So a re-tag replaces the perceived half — that is the point —
+  without deleting a `sharp`/`blurry` nothing has re-decided.
+- **`merge_stored_tags(stored, row)`** — the BACKFILL path. An array already in
+  the column: frozen terms **pass through** untouched.
+
+`merge_tags(..., source="vlm"|"stored")` and `merge_for_row(...)` are the
+primitive underneath; `source` is validated, so a new call site cannot silently
+pick the wrong semantics. Getting this backwards in either direction is a
+data-loss bug, which is why both directions are tested.
 
 Storage is unchanged: one `photos.visual_tags` JSON column, so the search blob,
 the `visual_tag=` filter, `list_vocab` and the Ask tools all keep working, and
@@ -530,12 +551,43 @@ library copy, 151,291 tagged rows):
 | `long-exposure` | shutter ≥ **1/4 s** | VLM agreement climbs monotonically as the bar tightens — ≥1/15 s: 6.9% of those photos were VLM-tagged, ≥1/8 s: 19.0%, ≥1/4 s: 25.1%. 1/4 s is 1.0% of the library (tripod/streaking territory); 1/15 s would be 4.3% and sweep in ordinary handheld indoor frames |
 | `low-light` | **EV100 < 5.0**, where EV100 = log2(N²/t) − log2(ISO/100) | cross-checked against clock time: fires on **44.9%** of photos shot 21:00–06:00 vs **3.6%** of 09:00–16:00 (12.5:1). EV100 < 6 halves that ratio to 6.6:1 for 11 more points of night recall |
 | `panoramic` | long/short edge ≥ **2.0** | 283 photos library-wide. The VLM claimed 4,290, of which **2.3%** had AR ≥ 2.0 |
-| `sharp` / `blurry` | `aes_sharpness` ≥ 9 / ≤ 2, **only when non-NULL** | cleanest separation in the dataset: **47.0%** of photos scoring ≤ 2 were VLM-tagged `blurry`, against **0.00%** of every bucket at 3 and above |
 
-`aes_sharpness` is the aesthetics VLM's 1–10 technical sub-score — a
-*different, better* model on a bigger image. Coverage is only 2.4% of tagged
-photos today, so `sharp`/`blurry` are rare by design; a photo the aesthetics
-pass has not scored gets **no opinion**, not a guess.
+#### `sharp` / `blurry` are FROZEN — and why that reversed a shipped decision
+
+They were briefly DERIVED from `aes_sharpness` (≥ 9 → `sharp`, ≤ 2 →
+`blurry`), on the cleanest-looking separation in the July validation copy:
+**47.0%** of photos scoring ≤ 2 carried the VLM's own `blurry` tag against
+**0.00%** of every bucket at 3 and above. **That was agreement between two
+models, which is not ground truth** — and the July copy had only **2.4%**
+coverage of `aes_sharpness`, so the rule barely fired there and the weakness
+did not show.
+
+On the live DB coverage is **98.9%** (158,111 rows) and the rule bites hard:
+`blurry` **1,284 → 10,103 (+8,819)**, `sharp` **3,410 → 15,076 (+11,666)**.
+Four photos scoring ≤ 2 were then inspected by hand: two were genuinely blurry
+(defocused / motion-blurred indoor sports) and **two were false positives** — a
+tack-sharp phone photo of construction formwork with the wood grain clearly
+resolved, and a dark, noisy GoPro night street scene that is not blurry at all.
+`aes_sharpness` evidently conflates sharpness with general technical quality;
+noise and low light drag it down. Four photos is a tiny sample, but a plausible
+~50% false-positive rate is disqualifying for a backfill that would stamp
+`blurry` on ten thousand photos.
+
+So the terms are **frozen in all three directions**: `derive_tags` never emits
+them, the prompt never offers them (and the parser drops them if a model
+volunteers one), and **nothing deletes the values already stored**. Deleting
+would be a second unvalidated decision on top of the first; they stay exactly
+as they are until a **hand-labelled eval** decides. The backfill's before/after
+table therefore shows both at **delta 0**.
+
+**The right long-term source is a native-resolution Laplacian, not a VLM
+score.** That signal already exists for photos WITH faces: `scripts/rank_shoot.py`
+ranks a shoot on native-resolution face-crop Laplacian variance precisely
+because "what separates frames in a sports burst is whether the face is in
+focus", and it insists on the ORIGINAL pixels — a preview or a cached 200 px
+crop has already discarded the signal. `photosearch/rank_measure.py` lifts that
+measurement out of the script. Wire `sharp`/`blurry` to it, with a hand-labelled
+eval, rather than to another model's opinion.
 
 **Deliberately NOT derived**, because the EXIF cannot decide them: `macro`
 (needs subject distance / magnification, which is not stored), `aerial` (no
@@ -642,11 +694,12 @@ concurrent fleet write is not clobbered. Idempotent. **It never touches a photo
 whose `visual_tags` is NULL** — NULL means "not yet tagged" and is what drives
 the category-visual worker queue.
 
-Simulated over the July copy: **106,480 of 151,291 rows change** (70.4%) —
-48,322 change tags, the other 58,158 are re-ordering into the new
+Dry run over the July copy: **106,120 of 151,291 rows change** (70.1%) —
+45,442 change tags, the other 60,678 are re-ordering into the new
 deterministic sort. `low-light` 33,951 → 15,173, `long-exposure` 7,885 →
-1,551, `panoramic` 4,290 → 283, `sharp` 3,247 → 787, `blurry` 1,001 → 115,
-`motion-blur` 2,378 → 0.
+1,551, `panoramic` 4,290 → 283, `motion-blur` 2,378 → 0, and — the point of
+freezing them — `sharp` 3,247 → 3,247 and `blurry` 1,001 → 1,001, **delta 0**.
+Only those four terms ever move.
 
 The 58,158 ordering-only rewrites are **intentional and a one-shot cost**:
 `merge_tags` sorts, which is what makes the stored JSON a deterministic

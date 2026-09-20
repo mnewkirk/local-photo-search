@@ -503,11 +503,12 @@ def _is_transient_db_error(exc: BaseException) -> bool:
 
 
 def _read_derive_row(db, photo_id: int):
-    """The EXIF columns `visual_tags_derive` needs, for one photo."""
+    """The EXIF columns `visual_tags_derive` needs, plus the photo's CURRENT
+    `visual_tags` — a re-tag has to carry its frozen terms across."""
     from .visual_tags_derive import DERIVE_COLUMNS
 
     return db.conn.execute(
-        f"SELECT {', '.join(DERIVE_COLUMNS)} FROM photos WHERE id=?",
+        f"SELECT {', '.join(DERIVE_COLUMNS)}, visual_tags FROM photos WHERE id=?",
         (photo_id,),
     ).fetchone()
 
@@ -527,7 +528,7 @@ def _merge_visual_tags(db, photo_id: int, perceived) -> list:
     A row that has vanished, or a genuinely broken read, degrades to
     strip-only: the bogus capture facts still go and nothing is invented.
     """
-    from .visual_tags_derive import merge_for_row, merge_tags
+    from .visual_tags_derive import merge_tags, merge_vlm_answer
 
     try:
         row = _read_derive_row(db, photo_id)
@@ -539,7 +540,7 @@ def _merge_visual_tags(db, photo_id: int, perceived) -> list:
         row = None
     if row is None:
         return merge_tags(perceived, [])
-    return merge_for_row(perceived, row)
+    return merge_vlm_answer(perceived, row, existing=row["visual_tags"])
 
 
 def _perceived_only(tags) -> list:

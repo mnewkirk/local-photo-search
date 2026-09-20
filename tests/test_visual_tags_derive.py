@@ -20,16 +20,19 @@ from photosearch import visual_tags_derive as V
 # ---------------------------------------------------------------------------
 
 def test_capture_fact_and_perceived_partition_the_vocabulary():
+    """Four disjoint groups covering the compiled vocabulary exactly. The
+    full four-way assertion lives in tests/test_visual_tags_frozen.py."""
     from photosearch.vocab_visual import VISUAL_VOCABULARY
 
     overlap = set(V.PERCEIVED_VOCABULARY) & set(V.CAPTURE_FACT_TAGS)
     assert overlap == set(), f"a term cannot be both derived and perceived: {overlap}"
-    assert set(V.PERCEIVED_VOCABULARY) | set(V.CAPTURE_FACT_TAGS) | set(V.RETIRED_TAGS) \
-        == set(VISUAL_VOCABULARY)
-    # Every capture-fact / retired term really is in the compiled vocabulary —
-    # a typo here would silently derive a tag nothing else knows about.
+    assert (set(V.PERCEIVED_VOCABULARY) | set(V.CAPTURE_FACT_TAGS)
+            | set(V.RETIRED_TAGS) | set(V.FROZEN_TAGS)) == set(VISUAL_VOCABULARY)
+    # Every capture-fact / retired / frozen term really is in the compiled
+    # vocabulary — a typo would silently name a tag nothing else knows about.
     assert set(V.CAPTURE_FACT_TAGS) <= set(VISUAL_VOCABULARY)
     assert set(V.RETIRED_TAGS) <= set(VISUAL_VOCABULARY)
+    assert set(V.FROZEN_TAGS) <= set(VISUAL_VOCABULARY)
 
 
 def test_motion_blur_is_retired_from_both_halves():
@@ -171,20 +174,12 @@ def test_panoramic_from_aspect_ratio_either_orientation():
     assert "panoramic" not in V.derive_tags(_row(image_width=0, image_height=4672))
 
 
-def test_sharp_and_blurry_come_only_from_aes_sharpness():
-    assert "sharp" in V.derive_tags(_row(aes_sharpness=9))
-    assert "blurry" in V.derive_tags(_row(aes_sharpness=2))
-    assert "blurry" in V.derive_tags(_row(aes_sharpness=1))
-    mid = V.derive_tags(_row(aes_sharpness=7))
-    assert "sharp" not in mid and "blurry" not in mid
-    # Not scored by the aesthetics VLM -> no opinion at all.
+def test_sharp_and_blurry_are_never_derived_from_aes_sharpness():
+    """FROZEN, not derived: `aes_sharpness` conflates sharpness with general
+    technical quality. See tests/test_visual_tags_frozen.py."""
+    for score in range(1, 11):
+        assert V.derive_tags(_row(aes_sharpness=score)) == []
     assert V.derive_tags(_row(aes_sharpness=None)) == []
-
-
-def test_sharp_and_blurry_are_never_both_derived():
-    for s in range(1, 11):
-        got = set(V.derive_tags(_row(aes_sharpness=s)))
-        assert not ({"sharp", "blurry"} <= got)
 
 
 def test_derive_tags_output_is_sorted_and_deduped():
@@ -193,7 +188,7 @@ def test_derive_tags_output_is_sorted_and_deduped():
     got = V.derive_tags(row)
     assert got == sorted(got)
     assert len(got) == len(set(got))
-    assert set(got) == {"long-exposure", "low-light", "panoramic", "sharp"}
+    assert set(got) == {"long-exposure", "low-light", "panoramic"}
 
 
 def test_derive_tags_accepts_a_sqlite_row(tmp_path):
@@ -220,7 +215,7 @@ def test_derive_tags_only_ever_returns_capture_fact_terms():
 def test_merge_strips_every_capture_fact_term_the_vlm_emitted():
     got = V.merge_tags(["long-exposure", "low-light", "sharp", "blurry",
                         "panoramic", "peaceful"], [])
-    assert got == ["peaceful"]
+    assert got == ["peaceful"]  # frozen terms go too on the `vlm` path
 
 
 def test_merge_strips_retired_terms():
@@ -287,8 +282,6 @@ def test_thresholds_are_the_validated_values():
     assert V.LONG_EXPOSURE_MIN_SECONDS == 0.25
     assert V.LOW_LIGHT_MAX_EV100 == 5.0
     assert V.PANORAMIC_MIN_ASPECT == 2.0
-    assert V.SHARP_MIN_AES_SHARPNESS == 9.0
-    assert V.BLURRY_MAX_AES_SHARPNESS == 2.0
 
 
 def test_json_round_trip_shape_is_a_plain_list_of_str():

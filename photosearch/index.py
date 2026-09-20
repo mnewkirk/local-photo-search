@@ -155,18 +155,21 @@ def _merge_visual_tags(db, photo_id: int, perceived) -> list:
     `panoramic` / `sharp` / `blurry`; EXIF does. See
     ``photosearch/visual_tags_derive.py``.
     """
-    from .visual_tags_derive import DERIVE_COLUMNS, merge_for_row, merge_tags
+    from .visual_tags_derive import DERIVE_COLUMNS, merge_tags, merge_vlm_answer
 
     try:
         row = db.conn.execute(
-            f"SELECT {', '.join(DERIVE_COLUMNS)} FROM photos WHERE id=?",
+            f"SELECT {', '.join(DERIVE_COLUMNS)}, visual_tags "
+            f"FROM photos WHERE id=?",
             (photo_id,),
         ).fetchone()
     except sqlite3.Error:
         row = None
     if row is None:
         return merge_tags(perceived, [])
-    return merge_for_row(perceived, row)
+    # `existing` carries a stored `sharp`/`blurry` across a re-tag — frozen
+    # terms are never re-decided here, only preserved.
+    return merge_vlm_answer(perceived, row, existing=row["visual_tags"])
 
 
 def _perceived_only(tags) -> list:

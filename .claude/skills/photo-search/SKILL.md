@@ -1225,11 +1225,12 @@ model-aware Ollama options + a degeneration detect-retry-fallback for
 `llama3.2-vision`, and a regurgitation guard on the visual-tag task.
 (`clean-garbage-tags` still exists to clear historical regurgitated tag sets.)
 
-**`category-visual` asks only about PERCEIVED qualities.** Five capture-fact
-terms — `long-exposure`, `low-light`, `panoramic`, `sharp`, `blurry` — are
-computed deterministically from EXIF (`photosearch/visual_tags_derive.py`) and
-override whatever the model said; `motion-blur` was retired from the
-vocabulary entirely. A VLM cannot read a shutter speed off the tile it is
+**`category-visual` asks only about PERCEIVED qualities.** Three capture-fact
+terms — `long-exposure`, `low-light`, `panoramic` — are computed
+deterministically from EXIF (`photosearch/visual_tags_derive.py`) and override
+whatever the model said; `motion-blur` was retired from the vocabulary
+entirely; `sharp` / `blurry` are **frozen** (never produced, never deleted)
+pending a hand-labelled eval. A VLM cannot read a shutter speed off the tile it is
 shown, and the measurements said it did not try (`long-exposure` was tagged on
 64% of a 1/125–1/800 s daytime soccer folder). The merge happens **server-side**
 in `worker_api.submit_results` and both `index.py` writers; storage is still
