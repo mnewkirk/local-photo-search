@@ -735,8 +735,11 @@ Collisions at the destination, the dangerous part — **nothing is ever
 overwritten, renamed, or deleted**: same name + identical hash → `duplicate_left`
 (source kept in place; clear those by hand); same name + different bytes →
 `conflict`, both paths in the audit, source kept. Hashing happens **only** on a
-name collision — whole-file reads across 9,600 RAWs on a spinning NAS disk are
-the thing this tool must not do. `extract_exif` reads the header only
+name collision **during an apply** — whole-file reads across 9,600 RAWs on a
+spinning NAS disk are the thing this tool must not do, and repeated Sony DSC
+names make collisions the expected case. A **dry run never hashes**: it reports
+`would_collide` with both sizes (differing sizes are certainly a conflict; equal
+sizes need a hash at apply time). `extract_exif` reads the header only
 (`exifread.process_file(..., details=False)`, `photosearch/exif.py:55`).
 
 **The move is `os.link` + `unlink`, and that is not a style choice.** Both
@@ -761,9 +764,30 @@ derived in `add_photo` but is **not maintained by every writer** —
 `UPDATE photos SET filepath = ?` and leave `folder` stale. A stale `folder` would
 hide the row, the file would look unindexed, get moved by default, and orphan
 the row where `_heal_folder` could not see it either. `_db_links` therefore does
-a prefix **range scan** on the UNIQUE `filepath` index (`>= 'dir/'` and
-`< 'dir0'`). (Those two writers leaving `folder` stale is a separate latent bug,
-not fixed here.)
+a prefix **range scan** on the UNIQUE `filepath` index (`>= 'dir/'`, `< 'dir0'`).
+(Those two writers leaving `folder` stale is a separate latent bug, not fixed
+here.)
+
+That moves the risk from the column to the **spelling**, so two more guards:
+
+- **A pre-flight refusal** (`_preflight_paths`, both dry run and apply, **no
+  override**). Any `filepath`/`raw_filepath` stored absolute, `./`-prefixed,
+  backslashed, or with a doubled slash is counted, sampled, and the run stops:
+  a string lookup that cannot be trusted is not a lookup. (Checked read-only on
+  the live DB 2026-09-19: **zero** such rows.)
+- **A per-file re-query** (`_resolve_link`) immediately before each move, on
+  both the relative and absolute spellings, against the UNIQUE index — so a row
+  inserted *since* the up-front scan still blocks the move. `raw_filepath` has
+  **no index** (confirmed in `db.py`), so it is scanned once up front and keyed
+  by absolute path; the per-file check hits that set instead.
+
+**One inode under two names is finished, not re-hashed.** A kill between
+`os.link` and `os.unlink` leaves exactly that. `_same_inode` (`st_dev` +
+`st_ino`, two stats, no hashing) proves identity rather than equal content, so
+the source is unlinked and the move recorded `moved` with
+`completed_interrupted_link`. Classifying it `duplicate_left` instead would
+strand the source forever, keep the folder undeletable, and whole-file hash
+both names on every future run.
 
 Other behaviour worth knowing:
 
@@ -811,10 +835,14 @@ the source gone means it completed and is undone.
 
 1. **Pause the nightly ingest cron and hold the SD-card importer** for the
    window. Today's-date folder genuinely contends; the lock enforces it too.
-2. Full **dry run** to a file, then check it: files ≈ 9,600; `skipped_indexed`
-   **non-zero** (a flat zero means the DB gate saw nothing — stop); conflicts and
-   errors 0; `no_model` small and explained; **both** bodies appear on the known
-   two-body dates, and never a model that isn't yours.
+2. Full **dry run** to a file, then check it: **the pre-flight passed** (it
+   refuses outright otherwise); files ≈ 9,600; `skipped_indexed` matches
+   expectation — on *this* library that is **0**, verified read-only on
+   2026-09-19: no `photos` rows and no `raw_filepath` refs live under any
+   `*_unknown-camera` folder, since the misfiled files are all RAW companions.
+   (It is the pre-flight, not a non-zero count, that proves the gate works.)
+   `would_collide` and errors 0; `no_model` small and explained; **both** bodies
+   appear on the known two-body dates, and never a model that isn't yours.
 3. **Smallest folder first** with `--apply --audit /data/…`.
 4. **Verify on disk**: listing, sizes, mtimes, an `exiftool`/`stat` spot-check.
 5. **Rehearse the undo** on that folder, confirm the tree is back, then redo it.
@@ -835,7 +863,15 @@ there — **size**, plus **hash for collision rows** (the only rows that carry o
 recording a digest for every move would mean reading ~576 GB) — and the source
 path is free. Anything else is `refused` and left alone. Any DB row the tool
 repointed is pointed back too, and the restore uses the same non-overwriting
-primitive as the forward move.
+primitive as the forward move. An undo **dry run** opens the DB read-only, like
+the forward one.
+
+Known and deliberately left alone: `EACCES`/`ENOSYS` are not in the hardlink
+fallback list, so they are a hard error and no move happens (fail-safe); the
+copy fallback preserves mode and mtime but **not owner/group** — irrelevant on
+the NAS, where `/photos` and `/data` share a device and the link path is always
+taken; and an `intent` row carries no hash, so undoing a crash-window move
+verifies size only.
 
 Cron entry on the NAS:
 

@@ -2930,10 +2930,14 @@ def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
     and the check-then-move window is real. A taken destination is hash-compared
     and reported as duplicate_left or conflict; the source is always left alone.
 
-    --apply takes ingest's sweep lock, so it refuses to run during a sweep.
+    A pre-flight refuses to run at all while any photos row stores a
+    non-canonical path (absolute / './' / backslash / '//'): the DB link lookup
+    matches paths as strings, so such a row could be missed and its file moved
+    out from under it. --apply also takes ingest's sweep lock.
 
-    Dry run by default (and read-only on the DB). --apply requires --audit; that
-    CSV, written intent-then-confirm per file, reverses the run:
+    Dry run by default (and read-only on the DB, and it never hashes). --apply
+    requires --audit; that CSV, written intent-then-confirm per file, reverses
+    the run:
 
         photosearch refile-unknown-camera --undo /data/refile.csv --apply
     """
