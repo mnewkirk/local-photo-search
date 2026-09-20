@@ -1237,6 +1237,162 @@ def test_interrupted_hardlink_is_only_reported_in_a_dry_run(tmp_path, tmp_db_pat
     assert stats["totals"]["would_collide"] == 0
 
 
+# ---------------------------------------------------------------------------
+# GUARD 1 — st_nlink proof before the interrupted-link unlink
+# ---------------------------------------------------------------------------
+
+def _two_name_state(photos: Path):
+    src = photos / "2026" / "2026-09-19_unknown-camera" / "DSC01.ARW"
+    _touch(src, b"raw")
+    dest_dir = photos / "2026" / "2026-09-19_ILCE-7RM6"
+    dest_dir.mkdir(parents=True)
+    os.link(str(src), str(dest_dir / "DSC01.ARW"))
+    return src, dest_dir / "DSC01.ARW"
+
+
+def test_interrupted_link_is_not_unlinked_when_nlink_is_one(
+        tmp_path, tmp_db_path, monkeypatch):
+    """A synthetic inode (SMB/NFS/FUSE) can match st_ino while nlink says 1."""
+    photos = _root(tmp_path)
+    src, dest = _two_name_state(photos)
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    real_lstat = os.lstat
+
+    class _Faked:
+        def __init__(self, st):
+            self._st = st
+        def __getattr__(self, n):
+            return getattr(self._st, n)
+        st_nlink = 1
+
+    def lying_lstat(p, *a, **k):
+        st = real_lstat(p, *a, **k)
+        return _Faked(st) if str(p) == str(src) else st
+    monkeypatch.setattr(refile_mod.os, "lstat", lying_lstat)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert src.exists(), "no unlink without proof another name holds the bytes"
+    assert dest.exists()
+    assert stats["totals"]["moved"] == 0
+    assert stats["totals"]["duplicate_left"] == 1
+    rows = list(csv.DictReader(open(tmp_path / "audit.csv")))
+    assert any("nlink" in r["reason"] for r in rows)
+
+
+def test_interrupted_link_is_not_unlinked_when_the_inode_changes_late(
+        tmp_path, tmp_db_path, monkeypatch):
+    """The destination is replaced between the check and the unlink."""
+    photos = _root(tmp_path)
+    src, dest = _two_name_state(photos)
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    real_same = refile_mod._same_inode
+    calls = []
+
+    def same_once(a, b):
+        calls.append(1)
+        return real_same(a, b) if len(calls) == 1 else False
+    monkeypatch.setattr(refile_mod, "_same_inode", same_once)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert src.exists()
+    assert stats["totals"]["moved"] == 0
+    assert stats["totals"]["duplicate_left"] + stats["totals"]["conflict"] == 1
+
+
+def test_genuine_two_name_state_still_completes(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src, dest = _two_name_state(photos)
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert not os.path.lexists(str(src))
+    assert dest.read_bytes().endswith(b"raw")
+    assert stats["totals"]["moved"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GUARD 2 — the DB's photo_root must map onto the root actually in use
+# ---------------------------------------------------------------------------
+
+def test_refuses_when_the_stored_photo_root_is_a_different_directory(
+        tmp_path, tmp_db_path, monkeypatch):
+    """relative_filepath silently returns ABSOLUTE paths, so every lookup misses."""
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-06-19_unknown-camera"
+    _touch(src / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(other))
+        db.add_photo(filepath="2026/2026-06-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1")
+
+    with pytest.raises(ValueError) as exc:
+        refile_unknown_camera(str(photos), tmp_db_path)
+    assert "photo root" in str(exc.value).lower()
+    assert str(other) in str(exc.value) and str(photos) in str(exc.value)
+    assert (src / "DSC01.JPG").exists()
+
+
+def test_refuses_when_the_stored_photo_root_is_a_symlink_to_elsewhere(
+        tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-06-19_unknown-camera" / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    link = tmp_path / "linked-root"
+    link.symlink_to(other)
+    with PhotoDB(tmp_db_path) as db:
+        db.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('photo_root', ?)",
+            (str(link),))
+        db.conn.commit()
+
+    with pytest.raises(ValueError, match="photo root"):
+        refile_unknown_camera(str(photos), tmp_db_path)
+
+
+def test_refuses_when_the_db_has_no_photo_root_at_all(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-06-19_unknown-camera" / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    monkeypatch.delenv("PHOTO_ROOT", raising=False)
+    with PhotoDB(tmp_db_path):
+        pass  # schema only — no photo_root row
+
+    with pytest.raises(ValueError, match="no photo_root"):
+        refile_unknown_camera(str(photos), tmp_db_path)
+
+
+def test_refuses_when_the_path_round_trip_is_broken(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-06-19_unknown-camera" / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        db.add_photo(filepath="2026/2026-06-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1")
+
+    monkeypatch.setattr(refile_mod._ReadOnlyDB, "relative_filepath",
+                        lambda self, p: "something/else.jpg")
+
+    with pytest.raises(ValueError, match="path mapping"):
+        refile_unknown_camera(str(photos), tmp_db_path)
+
+
 def test_audit_inside_the_photo_root_is_refused(tmp_path, tmp_db_path, monkeypatch):
     photos = _root(tmp_path)
     _touch(photos / "2026" / "2026-09-19_unknown-camera" / "A.ARW", b"a")

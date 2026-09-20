@@ -775,6 +775,23 @@ That moves the risk from the column to the **spelling**, so two more guards:
   backslashed, or with a doubled slash is counted, sampled, and the run stops:
   a string lookup that cannot be trusted is not a lookup. (Checked read-only on
   the live DB 2026-09-19: **zero** such rows.)
+- **A photo-root identity check** (`_preflight_root`) — the hole the spelling
+  pre-flight **cannot see**. `relative_filepath` swallows a mismatch: when the
+  path is not under `photo_root`, `Path.relative_to` raises and it returns the
+  **absolute** path instead. So a DB whose stored `photo_root` is a symlink,
+  another mount spelling, or simply a different directory leaves every stored
+  path looking perfectly canonical while **every** link lookup misses —
+  measured: stored `2026/2026-06-19_unknown-camera/DSC01.JPG`, pre-flight green,
+  `would_move=1 skipped_indexed=0`, an indexed file read as unindexed. The run
+  now refuses unless `Path(db_photo_root).resolve() == root`, and refuses a DB
+  with no `photo_root` at all (that branch **is** reachable — an earlier note
+  here wrongly called it unreachable). `_ReadOnlyDB` keeps the DB's own value
+  separately, because an explicit `--photo-root` would otherwise mask exactly
+  the mismatch being tested for.
+- **A round-trip positive control** (`_preflight_roundtrip`): one real stored
+  path must come back unchanged through the same helper the gate uses, or the
+  run stops with "path mapping between the DB and --photo-root is broken". It
+  makes the whole failure class loud instead of silent.
 - **A per-file re-query** (`_resolve_link`) immediately before each move, on
   both the relative and absolute spellings, against the UNIQUE index — so a row
   inserted *since* the up-front scan still blocks the move. `raw_filepath` has
@@ -788,6 +805,15 @@ the source is unlinked and the move recorded `moved` with
 `completed_interrupted_link`. Classifying it `duplicate_left` instead would
 strand the source forever, keep the folder undeletable, and whole-file hash
 both names on every future run.
+
+**That unlink requires `st_nlink >= 2`**, re-read immediately before it along
+with a second `_same_inode` confirmation. `nlink >= 2` is outright proof that
+another name still holds the bytes, so the unlink cannot destroy data; taking it
+late closes the check→unlink window; and it defeats a synthetic-inode false
+positive, since SMB/NFS/FUSE can repeat `st_ino` while reporting `nlink` 1. If
+either check fails the source is **not** unlinked — the file falls through to
+ordinary collision handling and the audit records `unlink_refused` with the
+reason.
 
 Other behaviour worth knowing:
 

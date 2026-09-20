@@ -296,18 +296,22 @@ class _ReadOnlyDB:
     def __init__(self, db_path: str, photo_root: Optional[str] = None):
         self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         self.conn.row_factory = sqlite3.Row
+        # The DB's OWN value, kept separately: `_preflight_root` has to compare
+        # the root the stored paths were written against with the one this run
+        # uses, and an explicit --photo-root would otherwise mask the mismatch.
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM schema_info WHERE key = 'photo_root'").fetchone()
+        except sqlite3.Error:
+            row = None
+        self.db_photo_root = row["value"] if row else None
         # Same precedence as PhotoDB.__init__: arg > PHOTO_ROOT env > DB value.
         if photo_root:
             self.photo_root = str(Path(photo_root).resolve())
         elif os.environ.get("PHOTO_ROOT"):
             self.photo_root = str(Path(os.environ["PHOTO_ROOT"]).resolve())
         else:
-            try:
-                row = self.conn.execute(
-                    "SELECT value FROM schema_info WHERE key = 'photo_root'").fetchone()
-            except sqlite3.Error:
-                row = None
-            self.photo_root = row["value"] if row else None
+            self.photo_root = self.db_photo_root
 
     def close(self) -> None:
         self.conn.close()
@@ -318,6 +322,68 @@ class _ReadOnlyDB:
     def __exit__(self, *a):
         self.close()
         return False
+
+
+def _preflight_root(db, root: Path) -> None:
+    """Refuse unless the DB's `photo_root` really maps onto the root in use.
+
+    This is the hole the spelling pre-flight CANNOT see. `relative_filepath`
+    swallows a mismatch: `Path.relative_to` raises and it returns the ABSOLUTE
+    path instead. So if the stored root is a symlink, a different mount spelling,
+    or simply another directory, every stored path looks canonical, the
+    pre-flight passes, and every single link lookup misses — an indexed file
+    reads as unindexed and gets moved out from under its row. Measured: stored
+    `2026/2026-06-19_unknown-camera/DSC01.JPG`, pre-flight green,
+    `would_move=1 skipped_indexed=0`.
+
+    A DB with no `photo_root` at all is refused for the same reason: nothing
+    then defines how a stored path relates to a file on disk. (That branch is
+    reachable — an earlier note here wrongly called it unreachable.)
+
+    `_preflight_roundtrip` is the cheap positive control that follows: it makes
+    this whole failure class loud instead of silent.
+    """
+    if not db.db_photo_root:
+        raise ValueError(
+            "the database has no photo_root configured, so a stored path cannot "
+            "be related to a file on disk and every DB link lookup would miss. "
+            "Set one (db.set_photo_root / PHOTO_ROOT) before refiling.")
+    stored = Path(db.db_photo_root)
+    if stored.resolve() != root:
+        raise ValueError(
+            f"the database's photo root does not match the one in use:\n"
+            f"    DB photo_root: {stored}  (resolves to {stored.resolve()})\n"
+            f"    running under: {root}\n"
+            f"Stored paths would not resolve against this root, so every DB link "
+            f"lookup would miss and indexed files would be moved out from under "
+            f"their rows. Point --photo-root at the DB's root (or fix the DB).")
+
+
+def _preflight_roundtrip(db, root: Path) -> None:
+    """Positive control: one real stored path must round-trip through the gate.
+
+    Runs after the spelling check, so a `//` or `./` row is reported by name
+    there rather than surfacing here as a vaguer mapping failure. What is left
+    for this to catch is any OTHER way the DB's paths and `root` fail to line
+    up — it turns that whole class from silent into loud. Pure string math
+    through the same helper the gate uses, so it needs no file on disk.
+    """
+    for year_dir in sorted(root.iterdir()):
+        if not year_dir.is_dir() or not _YEAR_RE.match(year_dir.name):
+            continue
+        row = db.conn.execute(
+            "SELECT filepath FROM photos WHERE filepath >= ? AND filepath < ? LIMIT 1",
+            (year_dir.name + "/", year_dir.name + "0")).fetchone()
+        if row is None:
+            continue
+        stored_fp = row["filepath"]
+        got = db.relative_filepath(str(root / stored_fp))
+        if got != stored_fp:
+            raise ValueError(
+                f"path mapping between the DB and --photo-root is broken: the "
+                f"stored path {stored_fp!r} does not round-trip under {root} "
+                f"(got {got!r}). Every DB link lookup would miss.")
+        return
 
 
 def _preflight_paths(db) -> None:
@@ -333,11 +399,12 @@ def _preflight_paths(db) -> None:
     When no `photo_root` is configured the indexer stores absolute paths
     legitimately, so that one check is dropped in that case.
     """
+    # `_preflight_root` has already guaranteed a photo_root, so an absolute
+    # stored path is unambiguously non-canonical here.
     checks = ["filepath LIKE './%'", "filepath LIKE '%\\%'", "filepath LIKE '%//%'",
               "raw_filepath LIKE './%'", "raw_filepath LIKE '%\\%'",
-              "raw_filepath LIKE '%//%'"]
-    if db.photo_root:
-        checks += ["filepath LIKE '/%'", "raw_filepath LIKE '/%'"]
+              "raw_filepath LIKE '%//%'",
+              "filepath LIKE '/%'", "raw_filepath LIKE '/%'"]
     rows = db.conn.execute(
         f"SELECT id, filepath, raw_filepath FROM photos WHERE {' OR '.join(checks)}"
     ).fetchall()
@@ -624,7 +691,9 @@ def refile_unknown_camera(
                     f"refusing to write the audit inside the photo root ({root}): "
                     f"it would count as a leftover and block an empty folder's "
                     f"removal. Use the /data volume.")
+        _preflight_root(ro, root)
         _preflight_paths(ro)
+        _preflight_roundtrip(ro, root)
         if not apply:
             # A dry run writes nothing, so it neither needs nor takes the mutex.
             with _no_lock():
@@ -819,9 +888,25 @@ def _run(db, root: Path, apply: bool, audit_path: Optional[str],
                           reason=";".join(intent_bits))
 
                 if interrupted:
-                    # Finish the move the kill interrupted. Unlinking the source
-                    # cannot lose data: it is literally the same inode as the
-                    # destination, already verified by identity, not by content.
+                    # Finish the move the kill interrupted. The unlink needs
+                    # PROOF that another name still holds the bytes, taken as
+                    # late as possible: st_nlink >= 2 says so outright, and
+                    # re-confirming the inode closes the check->unlink window.
+                    # nlink also defeats a synthetic-inode false positive —
+                    # SMB/NFS/FUSE can repeat st_ino while reporting nlink 1.
+                    try:
+                        nlink = os.lstat(abs_src).st_nlink
+                    except OSError:
+                        nlink = 1
+                    if nlink < 2 or not _same_inode(src, dest):
+                        counts["interrupted_link"] -= 1
+                        audit.row("unlink_refused", abs_src, abs_dest, suffix,
+                                  reason=f"st_nlink={nlink} or inode changed — no "
+                                         f"proof another name holds the bytes; "
+                                         f"treated as an ordinary collision")
+                        _collision(src, dest, abs_src, abs_dest, suffix,
+                                   counts, audit, _emit, rel_src)
+                        continue
                     try:
                         os.unlink(abs_src)
                     except OSError as exc:
