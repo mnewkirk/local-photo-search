@@ -164,6 +164,7 @@
     .chip:hover { border-color: var(--text-muted); }
     .chip .tag { font-weight: 600; white-space: nowrap; }
     .chip .gloss { color: var(--text-muted); font-size: 12px; line-height: 1.35; }
+    .chip .gloss.note { font-style: italic; }
     .chip .mark { width: 12px; flex: none; font-weight: 700; }
     .chip.yes { background: rgba(74,222,128,0.16); border-color: var(--green); }
     .chip.yes .tag, .chip.yes .mark { color: var(--green); }
@@ -234,13 +235,15 @@
         props.onSet(state === 'debatable' ? 'no' : 'debatable');
       }
       return e('button', {
-        type: 'button', className: 'chip ' + state + (props.gloss ? ' wide' : ''),
+        type: 'button', className: 'chip ' + state + ((props.gloss || props.note) ? ' wide' : ''),
         onClick: click, onContextMenu: context,
         title: 'click: no → yes → debatable → no · right-click / shift-click: debatable',
       },
         e('span', { className: 'mark' }, state === 'yes' ? '✓' : state === 'debatable' ? '?' : ''),
         e('span', { className: 'tag' }, props.tag),
-        props.gloss ? e('span', { className: 'gloss' }, props.gloss) : null);
+        props.gloss ? e('span', { className: 'gloss' }, props.gloss) : null,
+        // Labeller-only guidance; the model never sees this text.
+        props.note ? e('span', { className: 'gloss note' }, props.note) : null);
     }
 
     function Page() {
@@ -479,7 +482,7 @@
                   e('div', { className: 'chips' },
                     sec.tags.map(function (t) {
                       return e(Chip, {
-                        key: t.tag, tag: t.tag, gloss: t.gloss,
+                        key: t.tag, tag: t.tag, gloss: t.gloss, note: t.note,
                         state: draft[t.tag] || 'no',
                         onSet: function (s) { setTag(t.tag, s); },
                       });

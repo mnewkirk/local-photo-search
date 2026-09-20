@@ -162,3 +162,16 @@ def test_page_route_serves_html(client):
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "/api/eval/visual-tags" in resp.text
+
+
+def test_labeller_notes_never_leak_into_the_production_prompt():
+    # The notes define terms for the human only. Moving one into
+    # PERCEIVED_GLOSS changes the shipped prompt, which needs an A/B first.
+    from photosearch import eval_api
+    from photosearch.visual_tags_derive import PERCEIVED_GLOSS, PERCEIVED_VOCABULARY
+    from photosearch.describe import _build_visual_prompt
+    prompt = _build_visual_prompt(list(PERCEIVED_VOCABULARY))
+    for tag, note in eval_api.LABELLER_NOTES.items():
+        assert tag in PERCEIVED_VOCABULARY
+        assert note not in prompt
+        assert PERCEIVED_GLOSS.get(tag) != note

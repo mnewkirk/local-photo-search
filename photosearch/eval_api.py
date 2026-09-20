@@ -32,6 +32,27 @@ _SAMPLE_HINT = ("No sample yet. Draw one with: "
 _ID_CHUNK = 500
 
 
+# Definitions shown to the LABELLER only, for perceived terms the prompt leaves
+# un-glossed. Deliberately NOT in PERCEIVED_GLOSS: that text is the production
+# prompt, and the rule is not to change it without re-running the A/B. These
+# are the owner's calibrated readings (2026-09-20, on two midday soccer
+# frames); the same wording is what a `--prompt-file` variant should test.
+# The light on the CLEAREST SUBJECT decides — whoever the focus and the action
+# are on, which is not necessarily the largest figure in the frame.
+LABELLER_NOTES: dict[str, str] = {
+    "harsh-light": ("hard light that leaves the clearest subject's face or body "
+                    "mostly in shadow, or glaring; a sunlit scene with the "
+                    "subject evenly lit is just sunny"),
+    "soft-light": ("diffuse light on the subject, no hard shadow edges (open "
+                   "shade, window light, thin cloud); about the subject, not "
+                   "the sky"),
+    "overexposed": ("important areas blown to featureless white (skin, a jersey, "
+                    "most of the sky); not a bright photo, not a small highlight"),
+    "backlit": ("labeller note: judge the clearest subject, not a secondary "
+                "figure - its camera-facing side is in its own shadow"),
+}
+
+
 class LabelBody(BaseModel):
     yes: List[str] = []
     debatable: List[str] = []
@@ -50,7 +71,8 @@ def _vocabulary() -> dict:
     judged against one definition of each term, not two."""
     sections = []
     for title, groups in PROMPT_SECTIONS:
-        tags = [{"tag": t, "gloss": PERCEIVED_GLOSS.get(t)}
+        tags = [{"tag": t, "gloss": PERCEIVED_GLOSS.get(t),
+                 "note": LABELLER_NOTES.get(t)}
                 for group in groups for t in group]
         sections.append({"title": title, "tags": tags})
     return {"sections": sections}
