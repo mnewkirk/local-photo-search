@@ -29,7 +29,7 @@ skips those faces on an additive fill). NOTE it does NOT survive a direct
 `match-faces --temporal` run: that selects on `person_id IS NULL` with no
 marker filter, and would re-tag these faces.
 
-  cat unmatch_0912_calvin.py | ssh cantimatt@192.168.1.237 \\
+  cat unmatch_0912_calvin.py | ssh <nas-user>@<nas-host> \\
     'cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml \\
      run --rm -T -e APPLY=1 --entrypoint python photosearch -'
 """

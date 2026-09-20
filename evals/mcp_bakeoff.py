@@ -38,7 +38,7 @@ Env:
   PHOTOSEARCH_NAS_URL       for --thumbs
 
 Usage:
-  PHOTOSEARCH_TEXT_LLM_URL=http://172.20.176.1:1234/v1 \
+  PHOTOSEARCH_TEXT_LLM_URL=http://<lm-studio-host>:1234/v1 \
     ./venv/bin/python evals/mcp_bakeoff.py --paths mcp,agent
 """
 from __future__ import annotations

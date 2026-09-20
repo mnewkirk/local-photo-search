@@ -142,6 +142,32 @@ resident memory, no per-process load, and all 6.58M rows retained (so the
 population gate could go away). `rtree` is already compiled into the SQLite on
 both machines. Plan: `docs/plans/geocode-rtree.md`.
 
+## NAS host / login: never in tracked files (`nas.env`)
+
+This repo is **public**. The NAS's hostname, IP addresses and login name must
+not appear in any tracked file — code, comments, docs, or commit messages. Docs
+use the placeholders `<nas-host>` / `<nas-user>` (and `<windows-host-ip>` for
+the WSL2 gateway); scripts read the real values at runtime:
+
+- **`nas.env`** (git-ignored, repo root; copy `nas.env.example`) holds
+  `NAS_HOST=<nas-user>@<nas-host>` (ssh target) and
+  `PHOTOSEARCH_NAS_URL=http://<nas-host>:8000`. An exported env var wins over
+  the file. `NAS_ENV_FILE` points at a different file.
+- Shell scripts source **`scripts/nas-env.sh`** (`sync-replica.sh`,
+  `debug-db.sh`, `run-local-replica.sh`); Python uses
+  **`photosearch/nas_config.py`** (the evals). The file is *parsed*, never
+  `source`d. Keep the two loaders in step.
+- **There is no built-in default.** Unset → exit 2 with a message naming the
+  variable. A wrong default fails slowly (ssh timeout, UGOS auto-block); an
+  unset one fails at once.
+- Needed on the desktop replica checkout and any dev checkout. **Not on the
+  NAS** — `docker-compose.nas.yml` never contained these values outside
+  comments, so cron and the deploy panel need nothing new.
+- `tests/test_no_network_identifiers.py` fails if a device-name-shaped
+  hostname, a private/CGNAT IPv4 literal, a MAC address, or `user@<ip>` shows
+  up in a tracked file. It matches *shapes*, deliberately not the real values.
+  The real values still exist in **git history**; that was left as-is.
+
 ## Debugging against the prod DB locally
 
 `./debug-db.sh` pulls `/data/photo_index.db` from the NAS via rsync
@@ -158,7 +184,8 @@ multi-line-python-paste headache of running diagnostics through
 ./debug-db.sh clean                      # delete local copy
 ```
 
-Env overrides (`NAS_HOST`, `NAS_DATA_DIR`, `LOCAL_DB`) let you point
+`pull` needs `NAS_HOST` from `nas.env` (see above; no default). Env overrides
+(`NAS_HOST`, `NAS_COMPOSE_FILE`, `LOCAL_DB`) let you point
 it at a different NAS / path / local filename. The local copy goes
 under `.gitignore` as `photo_index.db.local*`.
 
@@ -644,8 +671,8 @@ so a killed index pass only leaves photos un-embedded — re-run
 ### Scheduling / crontab perms on the NAS
 
 The cron job lives in **root's crontab** (`sudo crontab -l`), not
-`/etc/cron.d` — a normal `crontab -l` as `cantimatt` is empty. The job needs no
-root (cantimatt is in the `docker` group; the container moves files as PUID
+`/etc/cron.d` — a normal `crontab -l` as `<nas-user>` is empty. The job needs no
+root (`<nas-user>` is in the `docker` group; the container moves files as PUID
 1000), so it can move to the user crontab — but UGOS ships the cron subsystem
 **without** the standard Debian setgid setup, so a non-root `crontab` fails with
 `/var/spool/cron: mkstemp: Permission denied`. Fix once as root (a firmware
@@ -654,7 +681,7 @@ update may revert it):
 ```bash
 sudo chown root:crontab /usr/bin/crontab && sudo chmod 2755 /usr/bin/crontab
 sudo chown root:crontab /var/spool/cron/crontabs && sudo chmod 1730 /var/spool/cron/crontabs
-sudo chown cantimatt:admin /var/log/photo-ingest.log   # so the non-root job can append
+sudo chown <nas-user>:admin /var/log/photo-ingest.log   # so the non-root job can append
 ```
 
 Then load the user crontab via a temp file — the
@@ -668,7 +695,7 @@ crontab /tmp/mycron && rm /tmp/mycron
 ```
 
 Firmware-update-proof fallback (keep it as root, just drop the password prompt):
-`echo 'cantimatt ALL=(ALL) NOPASSWD: /usr/bin/crontab' | sudo tee /etc/sudoers.d/crontab-nopasswd && sudo chmod 440 /etc/sudoers.d/crontab-nopasswd`.
+`echo '<nas-user> ALL=(ALL) NOPASSWD: /usr/bin/crontab' | sudo tee /etc/sudoers.d/crontab-nopasswd && sudo chmod 440 /etc/sudoers.d/crontab-nopasswd`.
 
 ### Syncthing receiver
 

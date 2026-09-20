@@ -9,7 +9,7 @@ Only restores faces that are STILL unmatched and still carry the
 'dedupe_unmatched' marker — if you have since named one of these faces
 correctly by hand, this leaves your label alone.
 
-  cat rollback_0912_calvin.py | ssh cantimatt@192.168.1.237 \\
+  cat rollback_0912_calvin.py | ssh <nas-user>@<nas-host> \\
     'cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml \\
      run --rm -T -e APPLY=1 --entrypoint python photosearch -'
 """

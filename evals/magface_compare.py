@@ -19,7 +19,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from photosearch.db import PhotoDB
 
-NAS = "http://dxp4800-f976:8000"
+from photosearch.nas_config import require_nas_url
+NAS = require_nas_url()  # $PHOTOSEARCH_NAS_URL or ./nas.env — never hard-coded
 REF_PHOTOS = [146137, 135481, 149139, 157832, 139946, 155880, 82681, 164190, 82672, 133981, 104266]
 WRONG = [63014, 57668, 60681, 4520, 21605, 60669]
 CORRECT = [21328, 127379, 114452, 46848, 87798, 34225, 87750, 16496]   # ones with originals on NAS

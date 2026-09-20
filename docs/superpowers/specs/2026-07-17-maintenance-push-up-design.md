@@ -286,10 +286,10 @@ CRON_TZ=UTC
 ```
 
 Goes in **root's crontab** (`sudo crontab -l`) alongside the existing ingest
-entry — a normal `crontab -l` as `cantimatt` is empty. Load it via a temp file;
+entry — a normal `crontab -l` as `<nas-user>` is empty. Load it via a temp file;
 the `( crontab -l; echo '...' ) | crontab -` one-liner is paste-fragile (mangled
 continuations → `"-":1: bad minute`). The log needs
-`sudo chown cantimatt:admin /var/log/photo-maintenance.log`, mirroring
+`sudo chown <nas-user>:admin /var/log/photo-maintenance.log`, mirroring
 `/var/log/photo-ingest.log`.
 
 ### Timing rationale

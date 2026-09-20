@@ -25,7 +25,10 @@
 # /status "Sync replica" button (POST /api/admin/replica-sync).
 #
 # Env overrides:
-#   NAS_HOST           ssh target               (default: cantimatt@192.168.1.237)
+# NAS_HOST has NO default — this repo is public, so the ssh target lives in the
+# git-ignored ./nas.env (copy nas.env.example) or the environment.
+#
+#   NAS_HOST           ssh target, REQUIRED     (<nas-user>@<nas-host>; from nas.env)
 #   NAS_COMPOSE_FILE   compose file on the NAS  (default: /volume1/docker/photosearch/docker-compose.nas.yml)
 #   PHOTOSEARCH_DB     local replica path       (default: ./photo_index.db.local)
 #   SNAPSHOT_DIR       rotated snapshot dir     (default: <target dir>/replica-snapshots)
@@ -35,7 +38,8 @@
 
 set -euo pipefail
 
-NAS_HOST="${NAS_HOST:-cantimatt@192.168.1.237}"
+. "$(dirname "${BASH_SOURCE[0]}")/scripts/nas-env.sh"
+nas_env_require NAS_HOST "the NAS ssh target, e.g. <nas-user>@<nas-host>"
 NAS_COMPOSE_FILE="${NAS_COMPOSE_FILE:-/volume1/docker/photosearch/docker-compose.nas.yml}"
 TARGET="${PHOTOSEARCH_DB:-./photo_index.db.local}"
 REMOTE_DUMP="/data/replica-dump.db"

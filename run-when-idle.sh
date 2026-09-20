@@ -18,8 +18,8 @@
 # include a --name so this controller can stop that fleet independently, e.g.:
 #
 #   ./run-when-idle.sh --idle 180 --poll 10 -- \
-#       -s http://192.168.1.237:8000 --name gpu \
-#       -p category-content,keywords --ollama-host http://172.20.176.1:11434 -n 2
+#       -s http://<nas-host>:8000 --name gpu \
+#       -p category-content,keywords --ollama-host http://<windows-host-ip>:11434 -n 2
 #
 # Run it in the foreground (Ctrl-C stops the controller AND the fleet) or
 # detached:  nohup ./run-when-idle.sh ... > /tmp/idle-gate.log 2>&1 &

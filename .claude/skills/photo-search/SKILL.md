@@ -977,7 +977,7 @@ $NOHUP photosearch index /photos/YEAR --clip --no-colors > /tmp/clip_YEAR.log 2>
 $NOHUP photosearch index /photos/YEAR --faces --no-colors > /tmp/faces_YEAR.log 2>&1 &
 $NOHUP photosearch index /photos/YEAR --quality --no-colors > /tmp/quality_YEAR.log 2>&1 &
 
-$DC -v /home/cantimatt/docker/photosearch/references:/references:ro \
+$DC -v /home/<nas-user>/docker/photosearch/references:/references:ro \
   photosearch add-persons --config /references/references.yml
 $DC photosearch match-faces --temporal
 $DC photosearch recluster-faces          # group remaining unknowns via DBSCAN
@@ -1063,7 +1063,7 @@ The ingest job runs from cron:
 ```
 
 It lives in **root's crontab** (`sudo crontab -l`), not `/etc/cron.d` — a normal
-`crontab -l` as `cantimatt` is empty. The job needs no root (cantimatt is in the
+`crontab -l` as `<nas-user>` is empty. The job needs no root (`<nas-user>` is in the
 `docker` group; the container writes as PUID 1000), so it can move to the user
 crontab — but UGOS ships cron **without** the standard Debian setgid setup, so a
 non-root `crontab` fails `/var/spool/cron: mkstemp: Permission denied`. One-time
@@ -1072,7 +1072,7 @@ fix as root (a firmware update may revert it):
 ```bash
 sudo chown root:crontab /usr/bin/crontab && sudo chmod 2755 /usr/bin/crontab
 sudo chown root:crontab /var/spool/cron/crontabs && sudo chmod 1730 /var/spool/cron/crontabs
-sudo chown cantimatt:admin /var/log/photo-ingest.log
+sudo chown <nas-user>:admin /var/log/photo-ingest.log
 ```
 
 Load the user crontab via a temp file — the `( crontab -l; echo '...' ) |
@@ -1086,7 +1086,7 @@ crontab /tmp/mycron && rm /tmp/mycron
 ```
 
 Firmware-proof fallback (keep it root-owned, just drop the password prompt):
-`echo 'cantimatt ALL=(ALL) NOPASSWD: /usr/bin/crontab' | sudo tee /etc/sudoers.d/crontab-nopasswd && sudo chmod 440 /etc/sudoers.d/crontab-nopasswd`.
+`echo '<nas-user> ALL=(ALL) NOPASSWD: /usr/bin/crontab' | sudo tee /etc/sudoers.d/crontab-nopasswd && sudo chmod 440 /etc/sudoers.d/crontab-nopasswd`.
 
 ### Scheduling + replica-mode maintenance (2026-07-17)
 
@@ -2196,14 +2196,23 @@ LM Studio endpoint):
 ./run-local-replica.sh --sync --model qwen/qwen2.5-7b-instruct
 ```
 
-Key flags: `-p PORT` (default 8001), `--db PATH`, `--nas URL` (default
-`http://dxp4800-f976:8000`), `--lm URL` (override the auto endpoint), `--model`.
+Key flags: `-p PORT` (default 8001), `--db PATH`, `--nas URL` (no default —
+`PHOTOSEARCH_NAS_URL` from `nas.env`), `--lm URL` (override the auto endpoint), `--model`.
+
+**NAS host/login come from `nas.env`, never from tracked files.** The repo is
+public: copy `nas.env.example` to the git-ignored `nas.env` and set
+`NAS_HOST=<nas-user>@<nas-host>` + `PHOTOSEARCH_NAS_URL=http://<nas-host>:8000`.
+`sync-replica.sh`, `debug-db.sh`, `run-local-replica.sh` (via
+`scripts/nas-env.sh`) and the evals (via `photosearch/nas_config.py`) read it;
+an exported env var wins; unset → immediate error naming the variable. Docs use
+the `<nas-host>` / `<nas-user>` placeholders — keep it that way
+(`tests/test_no_network_identifiers.py` enforces it).
 
 **Manual equivalent** (what the launcher exports):
 
 ```bash
 export PHOTOSEARCH_DB=./photo_index.db.local
-export PHOTOSEARCH_NAS_URL=http://dxp4800-f976:8000          # image proxy + drift
+export PHOTOSEARCH_NAS_URL=http://<nas-host>:8000          # image proxy + drift
 export PHOTOSEARCH_TEXT_LLM_URL=http://<lm-studio-host>:1234/v1   # WSL2: Windows-host gateway IP; Mac: localhost
 export PHOTOSEARCH_LLM_AGENT_MODEL=<tool-capable model loaded in LM Studio>
 ./.venv/bin/python cli.py serve --db "$PHOTOSEARCH_DB" --host 0.0.0.0 --port 8001
