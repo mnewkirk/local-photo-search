@@ -418,6 +418,39 @@ matches the 5.5 the modal displays (it used to floor on the legacy score alone).
 The `/status` "Aesthetics (VLM)" card + `PhotoModal` "Aesthetic
 Evaluation" breakdown + M28 re-run checkbox surface it in the UI.
 
+### The percentile refresh is chunked — and must stay that way
+
+`normalize_overall` / `normalize_subject_overall` / `_normalize_by_day` used
+to write every scored row through one `executemany` + one commit — 158,111
+rows. That holds SQLite's single writer lock for the whole rewrite, and on
+2026-09-20 the nightly sweep's `normalize_aesthetics` stage held it long
+enough for the GPU fleet's concurrent `submit-results` writes to exhaust
+their 60 s `busy_timeout` and fail with `database is locked` — which then
+burned those photos' retry attempts (see "A failed SERVER-side write must not
+burn a retry attempt"). Symptom: `index_errors` full of `database is locked`
+for one pass, timestamped inside a sweep.
+
+Writes now go in `aesthetics.PERCENTILE_CHUNK_ROWS` (2000) chunks with a
+commit between each. Three invariants:
+
+- **Every percentile comes from ONE snapshot read**, taken before the first
+  chunk. Chunking changes how the answer is written, never what it is — the
+  per-day variant likewise computes all days before writing anything. Do not
+  "simplify" this into a read-compute-write loop per chunk.
+- **The UPDATE is guarded on the score it was derived from**
+  (`WHERE id=? AND aes_overall IS ?`). A row rescored by the fleet between
+  the snapshot and its chunk is skipped, not given a stale percentile; it
+  corrects itself on the next run. Skips are counted and logged. (The float
+  `IS ?` round-trip was verified experimentally: 505/505 rows matched, 0
+  spurious rewrites on a second run.)
+- **Unchanged rows are not rewritten.** The nightly run rewrote all 158k rows
+  even when nothing had moved — most of the lock time for no change.
+
+Return values and the `apply=False` contract are unchanged, so the CLI and
+the sweep stages are unaffected. The stages pass `on_chunk(done, total)`,
+which checks abort and emits SSE progress in the between-chunk gaps. Tests:
+`tests/test_aesthetics_normalize_chunking.py`.
+
 ### Per-pass model strategy (Ollama defaults)
 
 No single vision model wins every pass, so each has its own default
@@ -508,6 +541,50 @@ OpenAI-compatible backend (LM Studio) via `PHOTOSEARCH_TEXT_LLM_URL` (see
 "Routing LLM passes to LM Studio" above). See the photo-search SKILL.md "GPU
 acceleration" section for per-machine setup (Mac Metal, WSL2 + AMD via
 librocdxg, WSL2 + NVIDIA).
+
+### A failed SERVER-side write must not burn a retry attempt
+
+`worker_api.submit_results` counted a photo as processed *before* attempting
+its write, and `mark_processed` UPSERT-increments `worker_processed.attempts`
+while the claim path stops claiming at `MAX_PROCESS_ATTEMPTS` (3). So a DB
+error on the NAS punished the PHOTO: two sharp, ordinary frames reached
+attempts=5 for `category-visual` with `visual_tags` still NULL, abandoned for
+good, one batch of GPU work thrown away per collision. Seven branches had the
+shape (`describe`, `tags`, `category-content`, `category-visual`, `keywords`,
+`aesthetics`, `faces`); all now route through `_SubmitOutcome`.
+
+An attempt is now spent only when the result was **persisted**, or when the
+**worker** reported a genuine per-photo outcome. The deliberate semantics are
+unchanged and must stay: a photo with no faces, no description, or an empty
+tag list is *done* in one pass (`'[]'` is written), and a worker-side timeout
+defers by being omitted from the payload entirely.
+
+Deferral is for a **transient lock only** — `_is_transient_db_error`: a
+`sqlite3.OperationalError` whose message mentions "locked" or "busy".
+**Do not widen this back to a bare `except Exception`.** Deferring every
+error uncaps the pass: a deterministically-failing photo never reaches
+MAX_PROCESS_ATTEMPTS, is re-claimed every TTL forever, and pays for a model
+run each cycle — the pathology documented below for the un-capped `clip`
+claim. (The first version of this fix did exactly that; review caught it.)
+`faces` is the worst case, because its predicate is
+`NOT EXISTS(faces) AND attempts < MAX` with no column to heal it and a
+malformed payload (short bbox, missing `encoding`, non-512 vector) raises
+*before* any INSERT. Every non-lock failure therefore still counts the
+attempt and logs the reason. One classifier serves the per-row,
+batch-commit and mark_processed paths so they cannot drift.
+
+`begin_batch` defers the commit, so SQLITE_BUSY usually surfaces at
+**COMMIT**. A transient commit failure defers the batch (200 with
+`status: "deferred"`, claim released — it used to be a 500 that left the claim
+held); a non-lock one (disk full, read-only FS) counts the attempt and logs at
+ERROR — re-claiming is unavoidable there, so only the cap bounds it. What is
+knowable is that the *final flush* did not land: `db.log_error` commits
+unconditionally, so earlier rows may be on disk. That is harmless — a
+landed-but-unmarked row is never offered again by a column-guarded predicate —
+but don't let the message claim "nothing landed". The response gained
+`deferred` / `deferred_photo_ids` (additive; older workers read only
+`written`/`processed`). Deferrals mean a long-running writer (the sweep), not a
+bad photo. Tests: `tests/test_worker_submit_resilience.py`.
 
 ## Vec0 orphan cleanup
 
