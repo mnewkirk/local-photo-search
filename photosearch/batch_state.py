@@ -36,6 +36,19 @@ it has not started. So each pass carries four numbers instead of one:
 
 and `completed` is ``done == total``, never ``remaining == 0``.
 
+**Worker-pass state precedence: running > completed > blocked > queued >
+waiting > needs_queue.** `completed` deliberately outranks an open job row,
+because a worker pass's job row is opened by a fleet launch and nothing ever
+closes one — completion is provable from the data instead. With `queued`
+first, a pass the fleet had finished kept reading `queued` for the row's full
+six-hour TTL, so the batch could never read `ready` and the launch button's
+"already running" refusal stayed armed after the fleet had exited. `blocked`
+outranks `queued` for the mirror-image reason: an open row must not hide a
+pass whose every remaining photo has exhausted its attempts. Job-only steps
+(``_job_only_step``) and the two computed NAS steps keep their own ordering —
+for them a *closed* row is the only evidence of success, so an open one still
+means queued.
+
 The per-pass "output missing" predicates in ``_OUTPUT_MISSING`` below are
 transcribed from ``db.count_unprocessed_photos`` (photosearch/db.py ~2199)
 so that ``done``/``failed``/``remaining`` stay mutually consistent — each
@@ -254,20 +267,40 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     done = max(0, eligible - remaining - failed if disjoint else eligible - remaining)
     stuck = (remaining == 0) if disjoint else (remaining == failed)
 
+    # Precedence: running > completed > blocked > queued > waiting > needs_queue.
+    #
+    # **`completed` outranks `queued`, and that is the whole point.** A worker
+    # pass's job row is opened by a fleet launch and nothing ever closes it —
+    # nothing should have to, because completion is provable from the data
+    # (`done == total`). When `queued` won, a pass the fleet had finished kept
+    # reading `queued` for the row's full six-hour TTL: the batch could never
+    # read `ready`, and `batch-launch-fleet`'s "a fleet is already running"
+    # refusal stayed armed long after the fleet had exited.
+    #
+    # `blocked` outranks `queued` for the same reason in the other direction:
+    # an open row must not hide a pass whose every remaining photo has
+    # exhausted its attempts. There is nothing queued about work that can
+    # never be claimed again.
+    #
+    # NOTE this also puts `blocked` above `waiting`, so a gated pass that has
+    # both un-described photos and exhausted described ones reports the
+    # exhaustion. That is deliberate: `waiting` reads as "nothing to do yet",
+    # which would bury a real failure behind a dependency that may itself
+    # never finish.
     depends_on = DEPENDS_ON.get(pass_type)
     if pass_type in running:
         state, waiting_on = "running", None
-    elif pass_type in open_steps:
-        state, waiting_on = "queued", None
     elif total > 0 and done == total:
         state, waiting_on = "completed", None
+    elif stuck and failed > 0:
+        # Every photo the fleet would still claim for this pass is one it has
+        # already given up on.
+        state, waiting_on = "blocked", None
+    elif pass_type in open_steps:
+        state, waiting_on = "queued", None
     elif eligible < total and depends_on is not None and depends_on not in completed:
         # The count-zero trap: this pass hasn't become eligible yet.
         state, waiting_on = "waiting", depends_on
-    elif stuck and failed > 0:
-        # The other trap: every photo the fleet would still claim for this
-        # pass is one it has already given up on.
-        state, waiting_on = "blocked", None
     else:
         state, waiting_on = "needs_queue", None
 
@@ -378,6 +411,55 @@ def _next_action(steps: dict[str, dict], ready: bool, total: int) -> str | None:
 # ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
+
+def fleet_launch_passes(state: dict) -> list[str]:
+    """The worker passes one fleet launch should cover, in WORKER_PASSES order.
+
+    **Not just the `needs_queue` ones.** The fleet is launched with
+    `sequential=True` and WORKER_PASSES is already a valid dependency order,
+    so one launch can drain the whole pipeline — and it has to, because the
+    three description-gated passes are `waiting` at click time and a second
+    launch mid-run is refused (it would kill the running fleet). Leaving them
+    out meant `category-content` / `keywords` / `verify` were never queued by
+    the button at all.
+
+    So the set is every worker pass that is `needs_queue`, plus every
+    `waiting` pass whose dependency is either already underway
+    (`completed`/`running`/`queued`) or is itself in this set. One forward
+    walk suffices because WORKER_PASSES is a topological order.
+
+    A `blocked` dependency does NOT admit its dependents: `describe` giving up
+    on every photo means there will be no descriptions for the text passes to
+    read, so queueing them would claim nothing.
+
+    Mirrored in JS as `PS.BatchFlow.fleetLaunchPasses` (frontend/dist/
+    batch-flow.js) so the button's "N passes" counts the same set this
+    launches. The two are pinned to the same cases — see the note there.
+    """
+    rows = {s["step"]: s for s in state.get("steps", []) if s.get("step")}
+    # States that mean "the dependency is or will be satisfied without another
+    # launch". `blocked` and `waiting` are deliberately absent.
+    underway = ("completed", "running", "queued")
+
+    chosen: list[str] = []
+    chosen_set: set[str] = set()
+    for pass_type in WORKER_PASSES:
+        row = rows.get(pass_type)
+        if row is None:
+            continue
+        pass_state = row.get("state")
+        if pass_state == "needs_queue":
+            chosen.append(pass_type)
+            chosen_set.add(pass_type)
+        elif pass_state == "waiting":
+            depends_on = row.get("waiting_on") or DEPENDS_ON.get(pass_type)
+            if depends_on is None:
+                continue
+            if depends_on in chosen_set or rows.get(depends_on, {}).get("state") in underway:
+                chosen.append(pass_type)
+                chosen_set.add(pass_type)
+    return chosen
+
 
 def batch_state(db, batch_id: int) -> dict:
     """Full derived state for one batch, one dict per step in STEP_ORDER.

@@ -1615,7 +1615,7 @@ def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
     cannot produce anything yet.
     """
     from . import batch_advance, web
-    from .batch_state import WORKER_PASSES
+    from .batch_state import WORKER_PASSES, fleet_launch_passes
 
     script = _run_workers_script()
     if not Path(script).exists():
@@ -1628,22 +1628,25 @@ def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
     state = _authoritative_batch_state(req.batch_id)   # 404/502/503 on failure
     batch = state["batch"]
 
-    # A pass with an open job row derives as `queued`, so this is how a fleet
-    # already launched for this batch shows up — the same signal in replica
-    # mode, where there is no other way to see the NAS's job rows. Refusing
-    # matters because a second `run-workers.sh --name ui` KILLS the running
-    # fleet and starts over, which a double-click or a second open tab would
-    # otherwise do silently.
+    # `queued` (an unfinished pass with an open job row) or `running` (a live
+    # claim) means a fleet is already on this batch. Refusing matters because
+    # a second `run-workers.sh --name ui` KILLS the running fleet and starts
+    # over, which a double-click or a second open tab would otherwise do
+    # silently. A pass that has FINISHED now outranks its own open row and
+    # reads `completed`, so a fleet that has exited no longer arms this.
     by_step = {s["step"]: s for s in state.get("steps", [])}
     already = [p for p in WORKER_PASSES
-               if by_step.get(p, {}).get("state") == "queued"]
+               if by_step.get(p, {}).get("state") in ("queued", "running")]
     if already:
         raise HTTPException(
             409, f"a fleet is already recorded as running for this batch "
                  f"({', '.join(already)}). Stop it first — relaunching would "
                  f"kill the running one.")
 
-    passes = batch_advance.needs_queue_passes(state)
+    # The whole worker pipeline in one click, not just what is actionable
+    # right now: `sequential=True` drains the passes in dependency order, so
+    # the description-gated ones ride along even though they are `waiting`.
+    passes = fleet_launch_passes(state)
     if not passes:
         raise HTTPException(
             400, "no worker pass needs queueing for this batch — "

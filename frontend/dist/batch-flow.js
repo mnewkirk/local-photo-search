@@ -200,6 +200,63 @@
     return (steps || []).filter(function (s) { return s && s.state === st; });
   }
 
+  // ---------------------------------------------------------------------
+  // fleetLaunchPasses — what ONE launch covers
+  // ---------------------------------------------------------------------
+
+  // Frozen in batch_state.py: WORKER_PASSES and DEPENDS_ON's worker half.
+  var WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
+    'category-visual', 'category-content', 'keywords', 'verify'];
+  var WORKER_DEPENDS_ON = {
+    'category-content': 'describe', keywords: 'describe', verify: 'describe',
+  };
+  // Dependency states that mean "satisfied without another launch".
+  var UNDERWAY = ['completed', 'running', 'queued'];
+
+  /**
+   * The worker passes one fleet launch covers, in WORKER_PASSES order.
+   *
+   * **This is a MIRROR of `batch_state.fleet_launch_passes` (Python).** The
+   * button says "N passes" and the server decides which N; if the two drift,
+   * the page lies about what the click will do. They are pinned to the same
+   * cases — `frontend/__tests__/batch-flow.test.js` and
+   * `tests/test_batch_state.py` carry the same five scenarios (fresh batch,
+   * dependency already completed, dependency blocked, dependency running,
+   * nothing to launch), so changing one without the other fails a test on
+   * both sides.
+   *
+   * Not just the `needs_queue` ones: the fleet runs sequentially through a
+   * dependency order, and a second launch mid-run is refused (it would kill
+   * the running fleet), so the description-gated passes have to ride along
+   * even though they are `waiting` at click time.
+   */
+  function fleetLaunchPasses(state) {
+    var rows = {};
+    ((state && state.steps) || []).forEach(function (s) {
+      if (s && s.step) rows[s.step] = s;
+    });
+    var chosen = [];
+    var chosenSet = {};
+    WORKER_PASSES.forEach(function (name) {
+      var row = rows[name];
+      if (!row) return;
+      if (row.state === 'needs_queue') {
+        chosen.push(name); chosenSet[name] = true;
+        return;
+      }
+      if (row.state !== 'waiting') return;
+      var dep = row.waiting_on || WORKER_DEPENDS_ON[name];
+      if (!dep) return;
+      var depState = rows[dep] ? rows[dep].state : null;
+      // A `blocked` dependency does NOT admit its dependents — there will be
+      // no output for them to read.
+      if (chosenSet[dep] || UNDERWAY.indexOf(depState) !== -1) {
+        chosen.push(name); chosenSet[name] = true;
+      }
+    });
+    return chosen;
+  }
+
   function sweepLine(sweep, now) {
     if (!sweep) return 'Ingest is running';
     if (sweep.stalled) {
@@ -242,12 +299,10 @@
         return out;
 
       case 'launch_fleet': {
-        // Worker passes only: a NAS stage in needs_queue is not something the
-        // fleet can pick up, and counting it would send the owner to the
-        // wrong button.
-        var n = byState(steps, 'needs_queue').filter(function (s) {
-          return s.kind === 'worker';
-        }).length;
+        // The count is the LAUNCH SET, not the `needs_queue` passes: one
+        // sequential fleet drains the description-gated passes too, and a
+        // headline that undercounted would promise less than the click does.
+        var n = fleetLaunchPasses(state).length;
         out.headline = n
           ? 'Launch the worker fleet for ' + n + ' ' + plural(n, 'pass', 'passes')
           : 'Launch the worker fleet';
@@ -336,9 +391,8 @@
 
     switch (state.next_action) {
       case 'launch_fleet': {
-        var n = byState(steps, 'needs_queue').filter(function (s) {
-          return s.kind === 'worker';
-        }).length;
+        // Same set the server will launch — see fleetLaunchPasses.
+        var n = fleetLaunchPasses(state).length;
         return out(n ? 'Launch fleet — ' + n + ' ' + plural(n, 'pass', 'passes')
           : 'Launch worker fleet', true, 'launch_fleet', '');
       }
@@ -454,8 +508,10 @@
     STATES: STATES,
     STATE_META: STATE_META,
     ROWS: ROWS,
+    WORKER_PASSES: WORKER_PASSES,
     advanceButton: advanceButton,
     advanceLogLine: advanceLogLine,
+    fleetLaunchPasses: fleetLaunchPasses,
     layout: layout,
     placeholder: placeholder,
     summarize: summarize,

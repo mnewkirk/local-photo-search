@@ -102,6 +102,11 @@ def _by_step(result):
     return {r["step"]: r for r in result["steps"]}
 
 
+def _step_state(db, batch_id, step):
+    return next(s["state"] for s in batch_state.batch_state(db, batch_id)["steps"]
+                if s["step"] == step)
+
+
 # =========================================================================
 # advance_nas_steps — orchestration
 # =========================================================================
@@ -596,19 +601,33 @@ def _fleet_cmd(client, body):
 
 
 class TestLaunchFleetEndpoint:
-    def test_picks_only_needs_queue_passes_in_worker_pass_order(self, client, db):
+    def test_one_click_launches_the_whole_pipeline_in_worker_pass_order(self, client, db):
         """The three description-gated passes are `waiting`, not
-        `needs_queue`, before `describe` has run — queueing them would have
-        the fleet claim zero photos and retire."""
+        `needs_queue`, before `describe` has run — but the fleet runs
+        `--sequential` through the dependency order, and a second launch
+        mid-run is refused (it would kill the running fleet). So they ride
+        along on this launch or they are never queued by the button at all."""
         batch_id, ids = _make_batch(db)
         seen = _fleet_cmd(client, {"batch_id": batch_id, "count": 2})
         assert seen["status"] == 200, seen
         cmd = seen["cmd"]
         passes = cmd[cmd.index("-p") + 1].split(",")
-        assert passes == ["clip", "faces", "quality", "aesthetics", "describe",
-                          "category-visual"]
+        assert passes == list(batch_state.WORKER_PASSES)
         assert cmd[cmd.index("-n") + 1] == "2"
         assert "--sequential" in cmd
+
+    def test_every_launched_pass_gets_a_fleet_job_row(self, client, db):
+        """Including the ones that were `waiting`: with the new precedence a
+        waiting pass with an open row reads `queued`, which is the truthful
+        display — the fleet really is going to run it."""
+        batch_id, _ = _make_batch(db)
+        _fleet_cmd(client, {"batch_id": batch_id})
+        assert set(ingest_batches.open_jobs(db, batch_id)) == set(
+            batch_state.WORKER_PASSES)
+        state = batch_state.batch_state(db, batch_id)
+        by = {s["step"]: s["state"] for s in state["steps"]}
+        assert by["keywords"] == "queued"
+        assert state["next_action"] != "launch_fleet"
 
     def test_scopes_the_fleet_to_the_batch_directory(self, client, db):
         batch_id, _ = _make_batch(db)
@@ -695,6 +714,36 @@ class TestLaunchFleetAlreadyRunning:
         batch_id, _ = _make_batch(db)
         assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 200
         assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 409
+
+    def test_409_on_a_live_claim_even_with_no_job_row(self, client, db):
+        """A fleet launched from the CLI leaves no job row, only claims."""
+        batch_id, ids = _make_batch(db)
+        db.conn.execute(
+            "INSERT INTO worker_claims (batch_id, worker_id, pass_type, "
+            "  photo_ids, claimed_at, expires_at) "
+            "VALUES ('c1', 'w1', 'clip', ?, datetime('now'), "
+            "        datetime('now', '+30 minutes'))",
+            (json.dumps(ids),))
+        db.conn.commit()
+        r = client.post("/api/admin/batch-launch-fleet", json={"batch_id": batch_id})
+        assert r.status_code == 409
+
+    def test_a_finished_fleet_no_longer_blocks_a_relaunch(self, client, db):
+        """The 409's whole failure mode before: nothing closes a fleet job
+        row, so with `queued` outranking `completed` the refusal stayed armed
+        for six hours after the fleet had exited."""
+        batch_id, ids = _make_batch(db)
+        assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 200
+        # clip finishes; its row is still open and nothing will ever close it.
+        for pid in ids:
+            db.add_clip_embedding(pid, [0.0] * 511 + [1.0])
+        db.conn.commit()
+        assert _step_state(db, batch_id, "clip") == "completed"
+        # Everything else is still queued, so this one is still refused —
+        # but for the right reason, naming only the unfinished passes.
+        r = client.post("/api/admin/batch-launch-fleet", json={"batch_id": batch_id})
+        assert r.status_code == 409
+        assert "clip" not in r.json()["detail"]
 
 
 # =========================================================================

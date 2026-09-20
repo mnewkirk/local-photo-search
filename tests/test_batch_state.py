@@ -29,6 +29,7 @@ from photosearch.batch_state import (
     DEPENDS_ON,
     STATES,
     batch_state,
+    fleet_launch_passes,
 )
 from photosearch.db import MAX_PROCESS_ATTEMPTS
 from photosearch.ingest_batches import (
@@ -715,3 +716,137 @@ class TestReadyAndNextAction:
         state = batch_state(db, batch_id)
         assert _step(state, "match_faces")["state"] == "needs_queue"
         assert state["next_action"] == "launch_fleet"
+
+
+# =========================================================================
+# Worker-pass precedence: running > completed > blocked > queued > waiting
+# =========================================================================
+#
+# A worker pass's job row is opened by a fleet launch and NOTHING ever closes
+# one — completion is provable from the data instead. So an open row must
+# never outrank what the data says. When it did, a pass the fleet had already
+# finished read `queued` for the row's full six-hour TTL: the batch could
+# never reach `ready`, and the launch button's "a fleet is already running"
+# refusal stayed armed long after the fleet had exited.
+
+class TestWorkerPrecedenceOverAnOpenJob:
+    def test_a_finished_pass_reads_completed_despite_an_open_fleet_job(self, db):
+        batch_id, ids = _make_batch(db)
+        open_job(db, batch_id, "describe", "fleet")
+        _complete_pass(db, ids, "describe")
+        step = _step(batch_state(db, batch_id), "describe")
+        assert step["state"] == "completed"
+        assert step["done"] == len(ids)
+
+    def test_ready_is_reachable_with_open_fleet_rows_still_present(self, db):
+        """The consequence that mattered: nothing closes a fleet row, so if
+        `queued` won the batch could never be reviewed."""
+        batch_id, ids = _make_batch(db)
+        for p in WORKER_PASSES:
+            open_job(db, batch_id, p, "fleet")
+        _complete_all_worker_passes(db, ids)
+        _complete_all_nas_steps(db, batch_id, ids)
+        state = batch_state(db, batch_id)
+        assert state["ready"] is True
+        assert state["next_action"] is None
+
+    def test_an_exhausted_pass_reads_blocked_despite_an_open_job(self, db):
+        """An open row must not hide a pass whose every remaining photo has
+        exhausted its attempts — there is nothing queued about work that can
+        never be claimed again."""
+        batch_id, ids = _make_batch(db)
+        open_job(db, batch_id, "describe", "fleet")
+        _exhaust(db, ids, "describe")
+        assert _step(batch_state(db, batch_id), "describe")["state"] == "blocked"
+
+    def test_an_unfinished_pass_with_an_open_job_still_reads_queued(self, db):
+        batch_id, ids = _make_batch(db)
+        open_job(db, batch_id, "describe", "fleet")
+        assert _step(batch_state(db, batch_id), "describe")["state"] == "queued"
+
+    def test_a_live_claim_still_outranks_everything(self, db):
+        batch_id, ids = _make_batch(db)
+        open_job(db, batch_id, "describe", "fleet")
+        _exhaust(db, ids, "describe")
+        _claim(db, "describe", ids[:1])
+        assert _step(batch_state(db, batch_id), "describe")["state"] == "running"
+
+    def test_job_only_steps_keep_the_old_ordering(self, db):
+        """For match_faces/resolve_dups/warm_crops a CLOSED row is the only
+        evidence of success, so an open one still means queued — the change
+        above is about worker passes only."""
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        open_job(db, batch_id, "match_faces", "nas")
+        assert _step(batch_state(db, batch_id), "match_faces")["state"] == "queued"
+
+
+# =========================================================================
+# fleet_launch_passes — what ONE launch covers
+# =========================================================================
+#
+# MIRRORED in JS as PS.BatchFlow.fleetLaunchPasses (frontend/dist/
+# batch-flow.js). The button says "N passes" and this decides which N, so the
+# two must not drift: the five scenarios below are duplicated case-for-case
+# in frontend/__tests__/batch-flow.test.js.
+
+def _fake_state(states: dict) -> dict:
+    """A batch_state-shaped response with the given worker-pass states."""
+    return {"steps": [
+        {"step": p, "kind": "worker", "state": states.get(p, "needs_queue"),
+         "total": 3, "eligible": 3, "done": 0, "remaining": 3, "failed": 0,
+         "waiting_on": DEPENDS_ON.get(p) if states.get(p) == "waiting" else None,
+         "detail": None}
+        for p in WORKER_PASSES]}
+
+
+class TestFleetLaunchPasses:
+    def test_fresh_batch_launches_the_whole_pipeline_in_order(self, db):
+        """Case 1. The gated passes are `waiting` at click time, and a second
+        launch mid-run is refused, so leaving them out meant they were never
+        queued by the button at all."""
+        batch_id, ids = _make_batch(db)
+        state = batch_state(db, batch_id)
+        assert fleet_launch_passes(state) == list(WORKER_PASSES)
+
+    def test_a_completed_dependency_admits_its_dependents(self, db):
+        """Case 2."""
+        got = fleet_launch_passes(_fake_state({
+            "describe": "completed", "category-content": "waiting",
+            "keywords": "waiting", "verify": "waiting"}))
+        assert got == ["clip", "faces", "quality", "aesthetics",
+                       "category-visual", "category-content", "keywords", "verify"]
+
+    def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
+        """Case 3. `describe` having given up on every photo means there will
+        be no descriptions for the text passes to read."""
+        got = fleet_launch_passes(_fake_state({
+            "describe": "blocked", "category-content": "waiting",
+            "keywords": "waiting", "verify": "waiting"}))
+        assert "category-content" not in got
+        assert "keywords" not in got
+        assert "verify" not in got
+        assert "describe" not in got
+
+    def test_a_running_or_queued_dependency_admits_its_dependents(self, db):
+        """Case 4. Another fleet is mid-describe; its dependents still need
+        queueing and will have input by the time they are claimed."""
+        for dep_state in ("running", "queued"):
+            got = fleet_launch_passes(_fake_state({
+                "describe": dep_state, "category-content": "waiting",
+                "keywords": "waiting", "verify": "waiting"}))
+            assert "category-content" in got, dep_state
+            assert "describe" not in got, dep_state
+
+    def test_nothing_to_launch_is_an_empty_list(self, db):
+        """Case 5."""
+        assert fleet_launch_passes(_fake_state(
+            {p: "completed" for p in WORKER_PASSES})) == []
+        assert fleet_launch_passes({"steps": []}) == []
+        assert fleet_launch_passes({}) == []
+
+    def test_only_worker_passes_are_ever_returned(self, db):
+        batch_id, ids = _make_batch(db)
+        got = fleet_launch_passes(batch_state(db, batch_id))
+        assert set(got) <= set(WORKER_PASSES)
+        assert not set(got) & set(NAS_STEPS)

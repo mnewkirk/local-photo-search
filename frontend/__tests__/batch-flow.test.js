@@ -197,7 +197,10 @@ describe('summarize — headline per next_action', () => {
     expect(BF.summarize(s).headline).toBe('Stalled: no file moved recently');
   });
 
-  test('launch the fleet counts the worker passes that need queueing', () => {
+  test('launch the fleet counts the passes ONE launch covers', () => {
+    // Not the `needs_queue` ones: `verify` is waiting on a `describe` this
+    // same sequential fleet will run, so it rides along and is counted. A
+    // NAS step in needs_queue must still NOT be counted as a fleet pass.
     const s = state({
       next_action: 'launch_fleet',
       steps: [
@@ -206,11 +209,10 @@ describe('summarize — headline per next_action', () => {
         step('quality', 'needs_queue'), step('aesthetics', 'needs_queue'),
         step('describe', 'needs_queue'),
         step('verify', 'waiting', { waiting_on: 'describe' }),
-        // A NAS step in needs_queue must NOT be counted as a fleet pass.
         step('stacking', 'needs_queue'),
       ],
     });
-    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 5 passes');
+    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 6 passes');
   });
 
   test('one pass is singular', () => {
@@ -599,5 +601,108 @@ describe('advanceLogLine', () => {
     expect(BF.advanceLogLine(null)).toBe(null);
     expect(BF.advanceLogLine(frame('ping', {}))).toBe(null);
     expect(BF.advanceLogLine({ event: 'x' })).toBe(null);
+  });
+});
+
+// =========================================================================
+// fleetLaunchPasses — MIRROR of batch_state.fleet_launch_passes
+// =========================================================================
+//
+// The button says "N passes" and the Python decides which N, so the two must
+// not drift. The five cases below are duplicated case-for-case in
+// tests/test_batch_state.py::TestFleetLaunchPasses — change one side and the
+// other's test fails.
+
+const WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
+  'category-visual', 'category-content', 'keywords', 'verify'];
+
+/** A state whose worker passes carry the given states (default needs_queue). */
+function workerState(over) {
+  const states = over || {};
+  const dep = { 'category-content': 'describe', keywords: 'describe', verify: 'describe' };
+  return {
+    batch: { id: 1, directory: '2091/2091-09-19_X', photo_count: 3 },
+    ready: false,
+    next_action: 'launch_fleet',
+    steps: WORKER_PASSES.map((p) => step(p, states[p] || 'needs_queue', {
+      waiting_on: states[p] === 'waiting' ? dep[p] || null : null,
+    })),
+  };
+}
+
+describe('fleetLaunchPasses', () => {
+  test('case 1 — a fresh batch launches the whole pipeline, in order', () => {
+    const gated = { 'category-content': 'waiting', keywords: 'waiting', verify: 'waiting' };
+    expect(BF.fleetLaunchPasses(workerState(gated))).toEqual(WORKER_PASSES);
+  });
+
+  test('case 2 — a completed dependency admits its dependents', () => {
+    expect(BF.fleetLaunchPasses(workerState({
+      describe: 'completed', 'category-content': 'waiting',
+      keywords: 'waiting', verify: 'waiting',
+    }))).toEqual(['clip', 'faces', 'quality', 'aesthetics', 'category-visual',
+      'category-content', 'keywords', 'verify']);
+  });
+
+  test('case 3 — a blocked dependency does NOT admit its dependents', () => {
+    const got = BF.fleetLaunchPasses(workerState({
+      describe: 'blocked', 'category-content': 'waiting',
+      keywords: 'waiting', verify: 'waiting',
+    }));
+    expect(got).not.toContain('describe');
+    expect(got).not.toContain('category-content');
+    expect(got).not.toContain('keywords');
+    expect(got).not.toContain('verify');
+  });
+
+  test('case 4 — a running or queued dependency admits its dependents', () => {
+    ['running', 'queued'].forEach((depState) => {
+      const got = BF.fleetLaunchPasses(workerState({
+        describe: depState, 'category-content': 'waiting',
+        keywords: 'waiting', verify: 'waiting',
+      }));
+      expect(got).toContain('category-content');
+      expect(got).not.toContain('describe');
+    });
+  });
+
+  test('case 5 — nothing to launch is an empty list', () => {
+    const done = {};
+    WORKER_PASSES.forEach((p) => { done[p] = 'completed'; });
+    expect(BF.fleetLaunchPasses(workerState(done))).toEqual([]);
+    expect(BF.fleetLaunchPasses({ steps: [] })).toEqual([]);
+    expect(BF.fleetLaunchPasses(null)).toEqual([]);
+  });
+
+  test('NAS steps are never in the launch set', () => {
+    const s = workerState();
+    s.steps = s.steps.concat([step('stacking', 'needs_queue'),
+      step('match_faces', 'needs_queue')]);
+    expect(BF.fleetLaunchPasses(s)).toEqual(WORKER_PASSES);
+  });
+});
+
+describe('the "N passes" copy counts the launch set', () => {
+  // Undercounting would promise less than the click actually does — the
+  // description-gated passes ride along on the same sequential fleet.
+  const gated = {
+    'category-content': 'waiting', keywords: 'waiting', verify: 'waiting',
+  };
+
+  test('the button label', () => {
+    expect(BF.advanceButton(workerState(gated)).label)
+      .toBe('Launch fleet — 9 passes');
+  });
+
+  test('the headline', () => {
+    expect(BF.summarize(workerState(gated)).headline)
+      .toBe('Launch the worker fleet for 9 passes');
+  });
+
+  test('a blocked describe drops its three dependents from both', () => {
+    const s = workerState(Object.assign({}, gated, { describe: 'blocked' }));
+    // 9 passes - describe - its 3 dependents = 5.
+    expect(BF.advanceButton(s).label).toBe('Launch fleet — 5 passes');
+    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 5 passes');
   });
 });
