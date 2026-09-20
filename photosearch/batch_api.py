@@ -131,6 +131,18 @@ class RegisterRequest(BaseModel):
     source: Optional[str] = None
 
 
+class OpenJobsRequest(BaseModel):
+    """Steps to record as launched for a batch.
+
+    Exists for the replica: the fleet launches on the desktop but the NAS is
+    the sole writer, so the desktop has to record the job intent *there* or
+    the NAS's own /batches page would keep showing those passes as
+    `needs_queue` while a fleet is already draining them.
+    """
+    steps: list[str]
+    job_kind: str = "fleet"
+
+
 # ---------------------------------------------------------------------------
 # GET /api/batches — pure SQL, no derivation
 # ---------------------------------------------------------------------------
@@ -217,6 +229,32 @@ def mark_ready_endpoint(batch_id: int):
         batch = ingest_batches.get_batch(db, batch_id)
     _invalidate(_key(batch_id))
     return {"batch": batch}
+
+
+@router.post("/{batch_id}/jobs")
+def open_jobs_endpoint(batch_id: int, body: OpenJobsRequest):
+    """Open a job row per step — the authoritative write behind a remote
+    fleet launch.
+
+    Steps are validated against ``STEP_ORDER`` **before anything is written**
+    (``batch_advance.open_step_job``): ``ingest_batch_jobs.step`` is bare TEXT
+    that nothing downstream checks, so a typo'd name would never match a
+    derived step and the real one would read `needs_queue` forever.
+    """
+    from . import batch_advance
+    with _get_db() as db:
+        if ingest_batches.get_batch(db, batch_id) is None:
+            raise HTTPException(404, f"no such batch: {batch_id}")
+        # Validate the whole list up front so a bad name in position 3 can't
+        # leave the first two half-applied.
+        from .batch_state import STEP_ORDER
+        bad = [s for s in body.steps if s not in STEP_ORDER]
+        if bad:
+            raise HTTPException(400, f"unknown step(s): {', '.join(bad)}")
+        for step in body.steps:
+            batch_advance.open_step_job(db, batch_id, step, body.job_kind)
+    _invalidate(_key(batch_id))
+    return {"batch_id": batch_id, "steps": body.steps, "job_kind": body.job_kind}
 
 
 @router.post("/register")

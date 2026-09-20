@@ -294,6 +294,79 @@
   }
 
   // ---------------------------------------------------------------------
+  // advanceButton — the ONE action
+  // ---------------------------------------------------------------------
+
+  /**
+   * What the "Advance batch" button should say and do, from the state alone.
+   *
+   * Returns `{label, enabled, action, reason}` where `action` is
+   * 'launch_fleet' | 'advance_nas' | null. The two live actions hit different
+   * endpoints on different machines — the fleet launches where the GPU is,
+   * the NAS steps run where the DB and files are — so the button has to name
+   * which one it means, not just say "Advance".
+   *
+   * Every disabled case carries a `reason`. A greyed button with no
+   * explanation is the failure mode this whole page exists to avoid: the
+   * owner is left guessing whether the pipeline is stuck or merely busy.
+   */
+  function advanceButton(state, opts) {
+    var o = opts || {};
+    var steps = (state && state.steps) || [];
+
+    function out(label, enabled, action, reason) {
+      return {
+        label: label,
+        // `busy` never changes the label — the button must not appear to
+        // offer a different action just because a request is in flight.
+        enabled: enabled && !o.busy,
+        action: action,
+        reason: o.busy && enabled ? 'Working…' : reason,
+      };
+    }
+
+    if (!state || !steps.length) {
+      return out('Advance batch', false, null,
+        'Still working out what this batch needs.');
+    }
+    if (state.ready) {
+      return out('Advance batch', false, null,
+        'Ready to review — nothing left to advance.');
+    }
+
+    switch (state.next_action) {
+      case 'launch_fleet': {
+        var n = byState(steps, 'needs_queue').filter(function (s) {
+          return s.kind === 'worker';
+        }).length;
+        return out(n ? 'Launch fleet — ' + n + ' ' + plural(n, 'pass', 'passes')
+          : 'Launch worker fleet', true, 'launch_fleet', '');
+      }
+      case 'advance_nas': {
+        var nas = byState(steps, 'needs_queue').filter(function (s) {
+          return s.kind === 'nas';
+        }).length;
+        return out(nas ? 'Advance batch — ' + nas + ' NAS '
+          + plural(nas, 'step', 'steps') : 'Advance batch',
+          true, 'advance_nas', '');
+      }
+      case 'wait_ingest':
+        return out('Advance batch', false, null,
+          'Ingest is still running — wait for it to finish.');
+      case 'wait':
+        return out('Advance batch', false, null,
+          'Everything is queued or running — nothing to launch.');
+      case 'review_blocked':
+        return out('Advance batch', false, null,
+          'A step is blocked — review it before advancing.');
+      default:
+        // next_action null with ready false: batch_state does that for a
+        // batch whose photos are gone. Nothing to launch, by design.
+        return out('Advance batch', false, null, 'Nothing to advance.');
+    }
+  }
+
+  // ---------------------------------------------------------------------
   // placeholder — what the diagram area shows when it is not a diagram
   // ---------------------------------------------------------------------
 
@@ -341,6 +414,7 @@
     STATES: STATES,
     STATE_META: STATE_META,
     ROWS: ROWS,
+    advanceButton: advanceButton,
     layout: layout,
     placeholder: placeholder,
     summarize: summarize,

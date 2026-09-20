@@ -2632,6 +2632,64 @@ def repair_data_cmd(db, apply):
 
 
 # ---------------------------------------------------------------------------
+# batch-advance (M "ingest batch" Task 6)
+# ---------------------------------------------------------------------------
+
+@cli.command("batch-advance")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--batch", "batch_id", type=int, required=True,
+              help="Ingest batch id (see /batches or `photosearch batch-list`).")
+@click.option("--apply", is_flag=True, default=False,
+              help="Run the steps. Default: dry-run (reports what WOULD run and "
+                   "writes nothing — not even a job row).")
+def batch_advance_cmd(db, batch_id, apply):
+    """Run the NAS-side steps one ingest batch still needs, in order.
+
+    Stacking, aesthetic-percentile refresh, strict face matching,
+    duplicate-person resolution and face-crop warming — the steps that run
+    where the DB and the photo files live. Stops at the first step that is
+    waiting on something this command can't do (a worker pass, typically
+    `faces`): launch the fleet for those from /status or /batches.
+
+    Run this on the NAS — it writes, and the NAS is the sole writer.
+    """
+    from photosearch.batch_advance import advance_nas_steps
+
+    def on_prog(ev):
+        if ev.get("status") in ("running", "scanning"):
+            return
+        bits = [f"{k}={v}" for k, v in ev.items()
+                if k not in ("phase", "step", "status", "reason", "error")
+                and not isinstance(v, (dict, list))]
+        extra = ev.get("reason") or ev.get("error") or ", ".join(bits)
+        click.echo(f"  [{ev.get('step')}] {ev.get('status')}"
+                   + (f": {extra}" if extra else ""))
+
+    with PhotoDB(db) as pdb:
+        try:
+            res = advance_nas_steps(pdb, batch_id, apply=apply, on_progress=on_prog)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+        except KeyboardInterrupt:
+            click.echo("Aborted."); return
+
+    planned = [s["step"] for s in res["steps"] if s["status"] == "would_run"]
+    if apply:
+        click.echo(f"Advanced batch {batch_id} ({res['directory']}): "
+                   + (f"ran {', '.join(res['ran'])}." if res["ran"]
+                      else "nothing to run."))
+    else:
+        click.echo(f"Batch {batch_id} ({res['directory']}) dry-run: "
+                   + (f"would run {', '.join(planned)}. Re-run with --apply."
+                      if planned else "nothing to run."))
+    if res["stopped_at"]:
+        click.echo(f"Stopped at {res['stopped_at']}: {res['stopped_reason']}")
+    if res["error"]:
+        raise click.ClickException(res["error"])
+
+
+# ---------------------------------------------------------------------------
 # ingest-incoming
 # ---------------------------------------------------------------------------
 
@@ -5498,24 +5556,15 @@ def warm_face_crops(db, persons, matched_only, date_from, date_to, sizes, worker
       photosearch warm-face-crops --all \\
           --date-from 2026-09-12 --date-to 2026-09-12
     """
-    import time
-    import urllib.request
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    from photosearch.face_crop import (
-        face_crop_cache_dir, crop_cache_path, render_face_crops, write_crop_atomic,
-    )
+    from photosearch.face_crop import warm_crops
 
     size_list = sorted({int(s) for s in sizes.split(",") if s.strip()})
     if not size_list:
         raise click.ClickException("--sizes must list at least one size.")
 
-    cache_dir = face_crop_cache_dir(db)
-    os.makedirs(cache_dir, exist_ok=True)
-
+    person_ids = None
+    scope_label = "all matched persons" if matched_only else "ALL faces"
     with PhotoDB(db) as pdb:
-        # Build the scope predicate.
-        params: list = []
         if persons:
             placeholders = ",".join("?" for _ in persons)
             rows = pdb.conn.execute(
@@ -5526,102 +5575,37 @@ def warm_face_crops(db, persons, matched_only, date_from, date_to, sizes, worker
             missing = [p for p in persons if p.lower() not in found]
             if missing:
                 raise click.ClickException(f"Unknown person(s): {', '.join(missing)}")
-            pid_ph = ",".join("?" for _ in found)
-            where = f"f.person_id IN ({pid_ph})"
-            params = list(found.values())
+            person_ids = list(found.values())
             scope_label = f"person(s) {', '.join(r['name'] for r in rows)}"
-        elif matched_only:
-            where = "f.person_id IS NOT NULL"
-            scope_label = "all matched persons"
-        else:
-            where = "1=1"
-            scope_label = "ALL faces"
-
-        # Date scope ANDs onto whichever person scope was chosen: the review
-        # panels browse one shoot at a time, and warming a shoot is minutes
-        # where the library is hours.
-        date_sql = ""
-        if date_from:
-            date_sql += " AND date(ph.date_taken) >= ?"; params.append(date_from)
-        if date_to:
-            date_sql += " AND date(ph.date_taken) <= ?"; params.append(date_to)
         if date_from or date_to:
             scope_label += f" in {date_from or '…'} → {date_to or '…'}"
 
-        rows = pdb.conn.execute(
-            f"""SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                       ph.filepath, ph.image_width, ph.image_height
-                FROM faces f JOIN photos ph ON ph.id = f.photo_id
-                WHERE f.bbox_top IS NOT NULL AND ({where}){date_sql}""",
-            params,
-        ).fetchall()
-        # Resolve paths up front (DB access is single-threaded; workers are pure CPU/IO).
-        tasks = [(r, pdb.resolve_filepath(r["filepath"])) for r in rows]
-
-    click.echo(f"Scope: {scope_label} — {len(tasks)} faces × sizes {size_list}")
-
-    # Skip faces already fully cached (unless --force).
-    if not force:
-        pending = []
-        for r, fp in tasks:
-            if not all(os.path.exists(crop_cache_path(cache_dir, r["id"], s)) for s in size_list):
-                pending.append((r, fp))
-        skipped = len(tasks) - len(pending)
-        tasks = pending
-        if skipped:
-            click.echo(f"  {skipped} already cached, {len(tasks)} to generate.")
-    if not tasks:
-        click.echo("Nothing to do — cache is warm.")
-        return
-
-    nas_url = nas_url.rstrip("/") if nas_url else None
-
-    def warm_one(item):
-        r, fp = item
-        try:
-            if fp and os.path.exists(fp):
-                bbox = (r["bbox_top"], r["bbox_right"], r["bbox_bottom"], r["bbox_left"])
-                crops = render_face_crops(fp, bbox, r["image_width"], r["image_height"], size_list)
-                for s in size_list:
-                    write_crop_atomic(crop_cache_path(cache_dir, r["id"], s), crops[s])
-            elif nas_url:
-                for s in size_list:
-                    url = f"{nas_url}/api/faces/crop/{r['id']}?size={s}"
-                    with urllib.request.urlopen(url, timeout=40) as resp:
-                        write_crop_atomic(crop_cache_path(cache_dir, r["id"], s), resp.read())
-            else:
-                return ("missing", r["id"])
-            return ("ok", r["id"])
-        except Exception as e:  # noqa: BLE001 — one bad photo shouldn't kill the run
-            return ("error", f"{r['id']}: {e}")
-
-    started = time.time()
-    ok = miss = err = done = 0
-    errors_shown = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(warm_one, t) for t in tasks]
-        for fut in as_completed(futures):
-            status, info = fut.result()
-            done += 1
-            if status == "ok":
-                ok += 1
-            elif status == "missing":
-                miss += 1
-            else:
-                err += 1
-                if errors_shown < 5:
-                    click.echo(f"  ! {info}", err=True)
-                    errors_shown += 1
-            if done % 500 == 0 or done == len(tasks):
-                elapsed = time.time() - started
-                rate = done / elapsed if elapsed else 0
-                eta = (len(tasks) - done) / rate if rate else 0
-                click.echo(f"  {done}/{len(tasks)}  ok={ok} miss={miss} err={err}  "
+        def on_prog(ev):
+            if ev.get("status") == "scanning":
+                click.echo(f"Scope: {scope_label} — {ev['found']} faces × sizes {size_list}")
+                if ev.get("cached"):
+                    click.echo(f"  {ev['cached']} already cached, {ev['total']} to generate.")
+            elif ev.get("status") == "running":
+                rate = ev.get("rate") or 0
+                eta = (ev["total"] - ev["done"]) / rate if rate else 0
+                click.echo(f"  {ev['done']}/{ev['total']}  ok={ev['ok']} "
+                           f"miss={ev['missing']} err={ev['errors']}  "
                            f"{rate:.1f}/s  eta {eta/60:.1f}m")
 
-    elapsed = time.time() - started
-    click.echo(f"Done in {elapsed/60:.1f}m — ok={ok} missing={miss} errors={err}")
-    if miss:
+        summary = warm_crops(
+            pdb, person_ids=person_ids, matched_only=matched_only and not persons,
+            date_from=date_from, date_to=date_to, sizes=size_list,
+            workers=workers, force=force, nas_url=nas_url, on_progress=on_prog,
+        )
+
+    for sample in summary["error_samples"]:
+        click.echo(f"  ! {sample}", err=True)
+    if not summary["total"]:
+        click.echo("Nothing to do — cache is warm.")
+        return
+    click.echo(f"Done in {summary['elapsed']/60:.1f}m — ok={summary['ok']} "
+               f"missing={summary['missing']} errors={summary['errors']}")
+    if summary["missing"]:
         click.echo("  (missing = original not on local disk; pass --nas-url to proxy in replica mode)")
 
 

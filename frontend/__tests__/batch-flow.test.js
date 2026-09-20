@@ -456,3 +456,93 @@ describe('module shape', () => {
     expect(window.PS.BatchFlow).toBe(BF);
   });
 });
+
+// =========================================================================
+// advanceButton — the ONE action
+// =========================================================================
+
+describe('advanceButton', () => {
+  test('offers the fleet, counting only worker passes', () => {
+    const s = state({
+      next_action: 'launch_fleet',
+      steps: [
+        step('clip', 'needs_queue'),
+        step('faces', 'needs_queue'),
+        step('stacking', 'needs_queue'),      // NAS — not the fleet's job
+        step('describe', 'completed'),
+      ],
+    });
+    const b = BF.advanceButton(s);
+    expect(b.action).toBe('launch_fleet');
+    expect(b.enabled).toBe(true);
+    expect(b.label).toBe('Launch fleet — 2 passes');
+  });
+
+  test('offers the NAS advance, counting only NAS steps', () => {
+    const s = state({
+      next_action: 'advance_nas',
+      steps: [
+        step('clip', 'completed'),
+        step('stacking', 'needs_queue'),
+        step('match_faces', 'needs_queue'),
+        step('rank_measure', 'needs_queue'),  // desktop — a different job
+      ],
+    });
+    const b = BF.advanceButton(s);
+    expect(b.action).toBe('advance_nas');
+    expect(b.enabled).toBe(true);
+    expect(b.label).toBe('Advance batch — 2 NAS steps');
+  });
+
+  test('singular reads as a pass / a step, not "1 passes"', () => {
+    expect(BF.advanceButton(state({
+      next_action: 'launch_fleet', steps: [step('clip', 'needs_queue')],
+    })).label).toBe('Launch fleet — 1 pass');
+    expect(BF.advanceButton(state({
+      next_action: 'advance_nas', steps: [step('stacking', 'needs_queue')],
+    })).label).toBe('Advance batch — 1 NAS step');
+  });
+
+  test('every disabled case explains itself', () => {
+    // A greyed button with no reason is the failure this page exists to
+    // avoid — the owner cannot tell "stuck" from "busy".
+    const cases = [
+      state({ next_action: 'wait_ingest' }),
+      state({ next_action: 'wait' }),
+      state({ next_action: 'review_blocked' }),
+      state({ next_action: null }),
+      state({ ready: true, next_action: null }),
+      null,
+      state({ steps: [] }),
+    ];
+    cases.forEach((s) => {
+      const b = BF.advanceButton(s);
+      expect(b.enabled).toBe(false);
+      expect(b.action).toBe(null);
+      expect(b.reason.length).toBeGreaterThan(0);
+    });
+  });
+
+  test('a ready batch is never advanceable, whatever next_action says', () => {
+    const b = BF.advanceButton(state({ ready: true, next_action: 'launch_fleet' }));
+    expect(b.enabled).toBe(false);
+    expect(b.reason).toMatch(/Ready to review/);
+  });
+
+  test('busy disables without changing what the button claims to do', () => {
+    const s = state({ next_action: 'advance_nas', steps: [step('stacking', 'needs_queue')] });
+    const idle = BF.advanceButton(s);
+    const busy = BF.advanceButton(s, { busy: true });
+    expect(busy.label).toBe(idle.label);
+    expect(busy.enabled).toBe(false);
+    expect(busy.reason).toBe('Working…');
+  });
+
+  test('a mid-derivation body never reads as "nothing to do"', () => {
+    // The detail endpoint answers {batch, steps: [], stale, computing} while
+    // it recomputes. Reading that as ready/idle would hide real work.
+    const b = BF.advanceButton({ batch: { id: 1 }, steps: [], stale: true, computing: true });
+    expect(b.enabled).toBe(false);
+    expect(b.reason).toMatch(/Still working out/);
+  });
+});

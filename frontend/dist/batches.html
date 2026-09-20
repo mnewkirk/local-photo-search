@@ -246,11 +246,30 @@
     .legend-item.st-waiting     { color: var(--text-muted); }
     .legend-item.st-blocked     { color: var(--red); }
 
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+    .btn.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+    .btn.primary:disabled { border-color: var(--border); color: var(--text); font-weight: 400; }
+    .action-reason { font-size: 12px; color: var(--text-muted); }
+
+    /* The advance log. Fixed height so a long stream can't push the diagram
+       off screen, monospace so the CLI's own aligned output stays aligned. */
+    .job-log {
+      margin-top: 12px; background: #000; border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px 12px; max-height: 260px; overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px; line-height: 1.45; white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .job-log .l-err { color: var(--red); }
+    .job-log .l-ok { color: var(--green); }
+    .job-log-head {
+      display: flex; align-items: baseline; gap: 10px; margin-top: 14px;
+      font-size: 12px; color: var(--text-muted);
+    }
+
     .links { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
     .links a { color: var(--accent); text-decoration: none; }
     .links a:hover { text-decoration: underline; }
-    .soon { font-size: 11px; color: var(--text-muted); align-self: center; }
 
     @media (max-width: 720px) {
       .container { padding: 20px 14px 50px; }
@@ -379,6 +398,85 @@
     }
 
     // ---------------------------------------------------------------------
+    // The advance actions
+    //
+    // Two endpoints, because the work happens on two different machines: the
+    // worker fleet launches where the GPU is (this host), the NAS steps run
+    // where the DB and the photo files are. `BF.advanceButton` decides which
+    // one this batch needs; these two just carry it out.
+    // ---------------------------------------------------------------------
+    function errText(ex) { return String((ex && ex.message) || ex); }
+
+    function jsonOrThrow(r) {
+      if (r.ok) return r.json();
+      // FastAPI puts the useful sentence in `detail`; losing it and showing a
+      // bare "HTTP 400" would hide the one thing that says what to do.
+      return r.text().then(function (t) {
+        var detail = t;
+        try { detail = JSON.parse(t).detail || t; } catch (_) {}
+        throw new Error('HTTP ' + r.status + ' — ' + String(detail).slice(0, 300));
+      });
+    }
+
+    function postJSON(url, body) {
+      return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).then(jsonOrThrow);
+    }
+
+    /**
+     * Stream POST /api/admin/batch-advance into `onLine`.
+     *
+     * Frames are split on the blank line SSE uses as a record separator and
+     * parsed with PS.parseSSEChunk (the shared helper — a private copy of
+     * this on one page is exactly how a bare parseSSEChunk once shipped as a
+     * ReferenceError). The server's events carry no discriminator field, so
+     * they are told apart by shape: `line`, `error`, `cmd`, `returncode`.
+     */
+    function streamAdvance(id, onLine) {
+      return fetch('/api/admin/batch-advance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_id: id, apply: true }),
+      }).then(function (r) {
+        if (!r.ok) return jsonOrThrow(r);
+        var reader = r.body.getReader();
+        var dec = new TextDecoder();
+        var buf = '';
+
+        function handle(frame) {
+          var d = PS.parseSSEChunk(frame);
+          if (!d) return;
+          if (d.line !== undefined) onLine(d.line, '');
+          else if (d.error) onLine('! ' + d.error, 'l-err');
+          else if (d.cmd) onLine('$ ' + d.cmd, '');
+          else if (d.returncode !== undefined) {
+            onLine(d.returncode === 0 ? '— finished —'
+              : '— exited ' + d.returncode + ' —',
+              d.returncode === 0 ? 'l-ok' : 'l-err');
+          }
+        }
+
+        function pump() {
+          return reader.read().then(function (res) {
+            if (res.done) {
+              if (buf.trim()) handle(buf);
+              return;
+            }
+            buf += dec.decode(res.value, { stream: true });
+            var parts = buf.split('\n\n');
+            buf = parts.pop();
+            parts.forEach(handle);
+            return pump();
+          });
+        }
+        return pump();
+      });
+    }
+
+    // ---------------------------------------------------------------------
     // Page
     // ---------------------------------------------------------------------
     function Page() {
@@ -388,7 +486,15 @@
       var _c = useState(false);         var computing = _c[0];  var setComputing = _c[1];
       var _e = useState(null);          var err = _e[0];        var setErr = _e[1];
       var _b = useState(false);         var busy = _b[0];       var setBusy = _b[1];
+      var _r = useState(false);         var running = _r[0];    var setRunning = _r[1];
+      var _lg = useState(null);         var log = _lg[0];       var setLog = _lg[1];
       var selRef = useRef(null);
+
+      function appendLog(text, cls) {
+        setLog(function (prev) {
+          return (prev || []).concat([{ t: text, cls: cls || '' }]);
+        });
+      }
 
       function loadList(signal) {
         var opts = signal ? { signal: signal } : undefined;
@@ -453,6 +559,7 @@
         setState(null);            // don't show the old batch's diagram
         setComputing(true);
         setErr(null);
+        setLog(null);              // nor the old batch's advance log
         setSel(id);
         try {
           history.replaceState(null, '', location.pathname + '?batch=' + id);
@@ -471,6 +578,45 @@
           .then(function () { return Promise.all([loadList(), loadDetail()]); })
           .catch(function (ex) { setErr(String((ex && ex.message) || ex)); })
           .then(function () { setBusy(false); });
+      }
+
+      // The one action. Which endpoint it means, and whether it is offerable
+      // at all, is decided in batch-flow.js so it can be unit-tested.
+      var adv = BF.advanceButton(state, { busy: busy || running });
+
+      function advance() {
+        var id = selRef.current;
+        if (id == null || !adv.action) return;
+        setRunning(true);
+        setLog([]);
+        var refresh = function () {
+          setRunning(false);
+          return Promise.all([loadList(), loadDetail()]);
+        };
+        if (adv.action === 'launch_fleet') {
+          appendLog('Launching the worker fleet…');
+          postJSON('/api/admin/batch-launch-fleet', { batch_id: id })
+            .then(function (d) {
+              appendLog('Started ' + d.count + ' worker(s) for: '
+                + (d.passes || []).join(', '), 'l-ok');
+              appendLog('Scope: ' + d.directory);
+              appendLog('Submitting to: ' + d.server);
+              // The fleet IS running even if the job rows didn't land — say
+              // so rather than letting the page imply nothing happened.
+              if (d.jobs && d.jobs.error) {
+                appendLog('! fleet started, but the job intent was not recorded: '
+                  + d.jobs.error, 'l-err');
+              }
+              if (d.output) appendLog(d.output);
+            })
+            .catch(function (ex) { appendLog('! ' + errText(ex), 'l-err'); })
+            .then(refresh);
+        } else {
+          appendLog('Running the NAS steps…');
+          streamAdvance(id, appendLog)
+            .catch(function (ex) { appendLog('! ' + errText(ex), 'l-err'); })
+            .then(refresh);
+        }
       }
 
       var batches = (list && list.batches) || [];
@@ -512,19 +658,36 @@
           e(Flow, { steps: state.steps }),
           e(Legend, null),
           e('div', { className: 'actions' },
+            // The one action leads — the other two are bookkeeping.
+            e('button', {
+              className: 'btn primary',
+              disabled: !adv.enabled,
+              title: adv.reason || '',
+              onClick: advance,
+            }, adv.label),
+            // Never a greyed button with no explanation.
+            adv.reason ? e('span', { className: 'action-reason' }, adv.reason) : null,
             e('button', {
               className: 'btn',
-              disabled: busy || !!(batch && batch.ready_at),
+              disabled: busy || running || !!(batch && batch.ready_at),
               onClick: function () { act('ready'); },
             }, batch && batch.ready_at ? 'Marked ready' : 'Mark ready'),
             e('button', {
               className: 'btn',
-              disabled: busy || !!(batch && batch.dismissed_at),
+              disabled: busy || running || !!(batch && batch.dismissed_at),
               onClick: function () { act('dismiss'); },
-            }, batch && batch.dismissed_at ? 'Dismissed' : 'Dismiss'),
-            // Task 6 wires this to the step the headline names.
-            e('button', { className: 'btn', disabled: true }, 'Advance batch'),
-            e('span', { className: 'soon' }, '(coming in the next step)')),
+            }, batch && batch.dismissed_at ? 'Dismissed' : 'Dismiss')),
+          log ? e('div', null,
+            e('div', { className: 'job-log-head' },
+              e('span', null, running ? 'Advance log — running…' : 'Advance log'),
+              e('button', {
+                className: 'btn', disabled: running,
+                onClick: function () { setLog(null); },
+              }, 'Clear')),
+            e('div', { className: 'job-log' },
+              log.map(function (l, i) {
+                return e('div', { key: i, className: l.cls }, l.t);
+              }))) : null,
           day ? e('div', { className: 'links' },
             e('a', { href: '/faces?date_from=' + day + '&date_to=' + day },
               'Review faces →'),
