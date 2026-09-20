@@ -5246,6 +5246,116 @@ def clean_garbage_tags(db, dry_run):
         click.echo(f"  deleted {gen_n} regurgitated 'tags' rows from generations")
 
 
+_DERIVE_VISUAL_CHUNK = 2000
+
+
+@cli.command("derive-visual-tags")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", "apply_", is_flag=True,
+              help="Write the merged arrays. Default is a dry run.")
+def derive_visual_tags(db, apply_):
+    """Recompute capture-fact visual tags from EXIF across the whole library.
+
+    Strips the terms the category-visual VLM cannot see (`long-exposure`,
+    `low-light`, `panoramic`, `sharp`, `blurry`, plus the retired
+    `motion-blur`) and re-adds the ones this photo's EXIF actually supports.
+    Same shared rule the worker submit path applies — photosearch/
+    visual_tags_derive.py.
+
+    DRY RUN by default: prints a per-term before/after frequency table and the
+    number of rows that would change. Nothing is logged to `generations` —
+    derived tags are not LLM artifacts.
+
+    Photos whose `visual_tags` is NULL are NEVER touched: NULL means "not yet
+    tagged" and is what drives the category-visual worker queue.
+    """
+    import json as _json
+    from collections import Counter
+
+    from photosearch.db import PhotoDB
+    from photosearch.visual_tags_derive import (
+        CAPTURE_FACT_TAGS, DERIVE_COLUMNS, RETIRED_TAGS, merge_for_row)
+
+    cols = ", ".join(DERIVE_COLUMNS)
+    before, after = Counter(), Counter()
+    pending = []          # (id, old_json, new_json)
+    scanned = reordered = unparseable = 0
+
+    with PhotoDB(db) as pdb:
+        # One read, then bounded writes — never hold a cursor open across a
+        # commit (the chunked-percentile-refresh discipline).
+        rows = pdb.conn.execute(
+            f"SELECT id, visual_tags, {cols} FROM photos "
+            f"WHERE visual_tags IS NOT NULL"
+        ).fetchall()
+
+        for row in rows:
+            scanned += 1
+            raw = row["visual_tags"]
+            try:
+                old = _json.loads(raw)
+            except (ValueError, TypeError):
+                unparseable += 1
+                continue
+            if not isinstance(old, list):
+                unparseable += 1
+                continue
+            before.update(t for t in old if isinstance(t, str))
+            new = merge_for_row(old, row)
+            after.update(new)
+            new_json = _json.dumps(new)
+            if new_json == raw:
+                continue
+            if sorted(set(old)) == new:
+                reordered += 1
+            pending.append((row["id"], raw, new_json))
+
+        click.echo(f"Scanned {scanned:,} photos with visual_tags "
+                   f"({unparseable:,} unparseable, skipped).")
+        # Always show every affected term, including ones whose net count
+        # happens to cancel out (a photo losing `long-exposure` while another
+        # gains it is still two real changes).
+        affected = (set(CAPTURE_FACT_TAGS) | set(RETIRED_TAGS)
+                    | {t for t in set(before) | set(after) if before[t] != after[t]})
+        click.echo(f"\n{'tag':20s} {'before':>10s} {'after':>10s} {'delta':>10s}")
+        for tag in sorted(affected):
+            b, a = before[tag], after[tag]
+            click.echo(f"{tag:20s} {b:10,d} {a:10,d} {a - b:+10,d}")
+
+        content_changes = len(pending) - reordered
+        click.echo(f"\n{len(pending):,} photo rows would change "
+                   f"({content_changes:,} change tags, "
+                   f"{reordered:,} are re-ordering only).")
+
+        if not apply_:
+            click.echo("Dry run — no rows written. Re-run with --apply.")
+            return
+
+        written = skipped = 0
+        for start in range(0, len(pending), _DERIVE_VISUAL_CHUNK):
+            chunk = pending[start:start + _DERIVE_VISUAL_CHUNK]
+            for photo_id, old_json, new_json in chunk:
+                # Guard on the old value: a worker that re-tagged this photo
+                # between the read above and now must win, not be clobbered.
+                cur = pdb.conn.execute(
+                    "UPDATE photos SET visual_tags = ? "
+                    "WHERE id = ? AND visual_tags IS ?",
+                    (new_json, photo_id, old_json),
+                )
+                if cur.rowcount:
+                    written += 1
+                else:
+                    skipped += 1
+            pdb.conn.commit()
+            click.echo(f"  ... {min(start + len(chunk), len(pending)):,}"
+                       f"/{len(pending):,}")
+
+        click.echo(f"Updated {written:,} photos"
+                   + (f" ({skipped:,} changed underneath us, left alone)"
+                      if skipped else "") + ".")
+
+
 @cli.command("bakeoff-keywords")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
 @click.option("--sample", default=30, show_default=True,

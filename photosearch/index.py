@@ -147,6 +147,28 @@ def find_photos(directory: str) -> list[str]:
     return photos
 
 
+def _merge_visual_tags(db, photo_id: int, perceived) -> list:
+    """Derived-capture-fact merge for the in-process category-visual writers.
+
+    Mirrors ``worker_api._merge_visual_tags`` — same shared rule, applied where
+    the write happens. The VLM never decides `long-exposure` / `low-light` /
+    `panoramic` / `sharp` / `blurry`; EXIF does. See
+    ``photosearch/visual_tags_derive.py``.
+    """
+    from .visual_tags_derive import DERIVE_COLUMNS, merge_for_row, merge_tags
+
+    try:
+        row = db.conn.execute(
+            f"SELECT {', '.join(DERIVE_COLUMNS)} FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return merge_tags(perceived, [])
+    return merge_for_row(perceived, row)
+
+
 def _write_geocode_results(db, ungeo) -> int:
     """Reverse-geocode the given rows and write place_name. Returns count filled.
 
@@ -523,12 +545,16 @@ def _index_collection(
                             vtags = tag_visual_photo(path, model=category_visual_model)
                             elapsed_photo = time.time() - t_photo
                             if vtags:
-                                db.update_photo(photo_id, visual_tags=_json.dumps(vtags))
+                                # Capture facts are decided from EXIF, not by
+                                # the VLM — see visual_tags_derive.py.
+                                merged = _merge_visual_tags(db, photo_id, vtags)
+                                merged_json = _json.dumps(merged)
+                                db.update_photo(photo_id, visual_tags=merged_json)
                                 db.conn.commit()
-                                db.log_generation(photo_id, "visual_tags", _json.dumps(vtags),
+                                db.log_generation(photo_id, "visual_tags", merged_json,
                                                   model_used=category_visual_model)
                                 db.mark_processed([photo_id], "category-visual")
-                                print(f" ({elapsed_photo:.1f}s) {', '.join(vtags)}{_eta(t0, idx, total)}")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(merged)}{_eta(t0, idx, total)}")
                                 visual_count += 1
                             else:
                                 print(f" ({elapsed_photo:.1f}s) no visual tags")
@@ -1305,12 +1331,16 @@ def index_directory(
                             vtags = tag_visual_photo(path, model=category_visual_model)
                             elapsed_photo = time.time() - t_photo
                             if vtags:
-                                db.update_photo(photo_id, visual_tags=_json.dumps(vtags))
+                                # Capture facts are decided from EXIF, not by
+                                # the VLM — see visual_tags_derive.py.
+                                merged = _merge_visual_tags(db, photo_id, vtags)
+                                merged_json = _json.dumps(merged)
+                                db.update_photo(photo_id, visual_tags=merged_json)
                                 db.conn.commit()  # release write lock immediately
-                                db.log_generation(photo_id, "visual_tags", _json.dumps(vtags),
+                                db.log_generation(photo_id, "visual_tags", merged_json,
                                                   model_used=category_visual_model)
                                 db.mark_processed([photo_id], "category-visual")
-                                print(f" ({elapsed_photo:.1f}s) {', '.join(vtags)}{_eta(t0, idx, total)}")
+                                print(f" ({elapsed_photo:.1f}s) {', '.join(merged)}{_eta(t0, idx, total)}")
                                 visual_count += 1
                             else:
                                 print(f" ({elapsed_photo:.1f}s) no visual tags")

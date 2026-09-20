@@ -497,6 +497,35 @@ def _is_transient_db_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _TRANSIENT_DB_MARKERS)
 
 
+def _merge_visual_tags(db, photo_id: int, perceived) -> list:
+    """Apply the derived capture-fact merge to one category-visual answer.
+
+    Reads the photo's EXIF here, on the authoritative writer, because that is
+    the only place it exists — the worker has the pixels and nothing else. A
+    row that has vanished (or a read that fails) degrades to strip-only: the
+    bogus capture facts still go, nothing wrong is invented.
+    """
+    from .visual_tags_derive import DERIVE_COLUMNS, merge_for_row, merge_tags
+
+    try:
+        row = db.conn.execute(
+            f"SELECT {', '.join(DERIVE_COLUMNS)} FROM photos WHERE id=?",
+            (photo_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return merge_tags(perceived, [])
+    return merge_for_row(perceived, row)
+
+
+def _has_perceived(tags) -> bool:
+    """True when at least one tag in the merged array came from the model."""
+    from .visual_tags_derive import PERCEIVED_VOCABULARY
+
+    return bool(set(tags or []) & set(PERCEIVED_VOCABULARY))
+
+
 def _record_write_failure(db, outcome: _SubmitOutcome, pass_type: str,
                           photo_id: int, exc: Exception):
     """Handle one photo whose DB write raised, and never lose the reason.
@@ -780,11 +809,22 @@ def submit_results(req: SubmitRequest):
             db.begin_batch(batch_size=100)
             for r in category_visual_results:
                 try:
+                    # The worker only ever saw the pixels, so its answer is the
+                    # PERCEIVED half. The capture facts (long-exposure /
+                    # low-light / panoramic / sharp / blurry) are decided HERE,
+                    # from the photo's EXIF, and override whatever the model
+                    # said — see photosearch/visual_tags_derive.py. The merge
+                    # lives server-side because this is where the EXIF is.
+                    merged = _merge_visual_tags(db, r.photo_id, r.visual_tags)
                     # Always persist the column ('[]' for empty) so a successful
                     # empty result marks done in one pass; only timeouts defer.
-                    vtags_json = json.dumps(r.visual_tags or [])
+                    # An empty merge IS a legitimate result.
+                    vtags_json = json.dumps(merged)
                     db.update_photo(r.photo_id, visual_tags=vtags_json)
-                    if r.visual_tags:
+                    # Provenance covers LLM artifacts only. A row whose only
+                    # surviving tags are derived was not produced by the model,
+                    # so it gets no `generations` entry.
+                    if _has_perceived(merged):
                         db.log_generation(r.photo_id, "category-visual", vtags_json,
                                           r.model, r.model_version)
                     outcome.written += 1
