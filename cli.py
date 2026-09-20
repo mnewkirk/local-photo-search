@@ -2892,7 +2892,8 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
 
 @cli.command("refile-unknown-camera")
 @click.option("--photo-root", default=None,
-              help="Library root. Default: the DB's stored photo_root (or PHOTO_ROOT).")
+              help="Library root. Precedence: this flag, then PHOTO_ROOT, then "
+                   "the DB's stored photo_root (the NAS stores none).")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
 @click.option("--apply", is_flag=True, default=False,

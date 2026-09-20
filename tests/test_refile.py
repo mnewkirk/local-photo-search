@@ -66,6 +66,20 @@ def _db(tmp_db_path: str, photos: Path) -> str:
     return tmp_db_path
 
 
+def _anchor(photos: Path, db_path: str) -> None:
+    """A real file with a real row, so the mapping self-check has something live.
+
+    The heal scenarios below deliberately leave their ONLY row pointing at a
+    missing file, which is indistinguishable from a broken path mapping when it
+    is the only row in the table. A production library has 160k rows and is
+    never in that state.
+    """
+    _touch(photos / "2019" / "2019-01-01_ILCE-7M4" / "ANCHOR.JPG", b"anchor")
+    with PhotoDB(db_path) as db:
+        db.add_photo(filepath="2019/2019-01-01_ILCE-7M4/ANCHOR.JPG",
+                     filename="ANCHOR.JPG", file_hash="anchor-hash")
+
+
 def _listing(root: Path) -> set:
     return {str(p.relative_to(root)) for p in root.rglob("*")}
 
@@ -346,6 +360,7 @@ def test_crash_between_move_and_db_write_heals_on_rerun(tmp_path, tmp_db_path, m
     with PhotoDB(tmp_db_path) as db:
         pid = db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
                            filename="DSC01.JPG", file_hash=h)
+    _anchor(photos, tmp_db_path)
     _patch_exif_by_name(monkeypatch, {})
 
     stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
@@ -959,6 +974,7 @@ def test_dry_run_heal_reports_without_hashing(tmp_path, tmp_db_path, monkeypatch
     with PhotoDB(tmp_db_path) as db:
         db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
                      filename="DSC01.JPG", file_hash=h)
+    _anchor(photos, tmp_db_path)
     _patch_exif_by_name(monkeypatch, {})
 
     def no_hashing(_p):
@@ -979,6 +995,7 @@ def test_heal_refuses_a_row_with_no_stored_hash(tmp_path, tmp_db_path, monkeypat
     with PhotoDB(tmp_db_path) as db:
         pid = db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
                            filename="DSC01.JPG")
+    _anchor(photos, tmp_db_path)
     _patch_exif_by_name(monkeypatch, {})
 
     stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
@@ -1002,6 +1019,7 @@ def test_stale_raw_filepath_is_reported_not_repointed(tmp_path, tmp_db_path, mon
         pid = db.add_photo(filepath="2026/2026-09-19_ILCE-7RM6/DSC01.JPG",
                            filename="DSC01.JPG", file_hash="h1",
                            raw_filepath="2026/2026-09-19_unknown-camera/DSC01.ARW")
+    _anchor(photos, tmp_db_path)
     _patch_exif_by_name(monkeypatch, {})
 
     stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
@@ -1127,6 +1145,7 @@ def test_preflight_passes_on_a_canonical_library(tmp_path, tmp_db_path, monkeypa
     photos = _root(tmp_path)
     _touch(photos / "2026" / "2026-09-19_unknown-camera" / "DSC01.ARW", b"raw")
     _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _touch(photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC01.JPG", b"jpeg")
     _db(tmp_db_path, photos)
     with PhotoDB(tmp_db_path) as db:
         db.add_photo(filepath="2026/2026-09-19_ILCE-7RM6/DSC01.JPG",
@@ -1135,6 +1154,7 @@ def test_preflight_passes_on_a_canonical_library(tmp_path, tmp_db_path, monkeypa
 
     stats = refile_unknown_camera(str(photos), tmp_db_path)
     assert stats["totals"]["would_move"] == 1
+    assert stats["mapping_checked"] == 1
 
 
 def test_a_row_appearing_after_the_scan_is_still_not_moved(tmp_path, tmp_db_path, monkeypatch):
@@ -1365,16 +1385,115 @@ def test_refuses_when_the_stored_photo_root_is_a_symlink_to_elsewhere(
         refile_unknown_camera(str(photos), tmp_db_path)
 
 
-def test_refuses_when_the_db_has_no_photo_root_at_all(tmp_path, tmp_db_path, monkeypatch):
+def _db_without_stored_root(tmp_db_path: str, photos: Path) -> None:
+    """The live NAS shape: schema_info holds only ('version', N) — no photo_root.
+
+    The container supplies it as PHOTO_ROOT=/photos and stored filepaths are
+    canonical relative paths.
+    """
+    with PhotoDB(tmp_db_path) as db:
+        db.conn.execute("DELETE FROM schema_info WHERE key = 'photo_root'")
+        db.conn.commit()
+
+
+def test_runs_when_the_root_comes_only_from_the_env(tmp_path, tmp_db_path, monkeypatch):
+    """The deployment this tool exists for stores no photo_root at all."""
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "DSC01.JPG", b"jpeg")
+    _touch(src / "DSC02.ARW", b"raw")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6", "DSC02.ARW": "ILCE-7RM6"})
+    with PhotoDB(tmp_db_path, photo_root=str(photos)) as db:
+        db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1")
+    _db_without_stored_root(tmp_db_path, photos)
+    monkeypatch.setenv("PHOTO_ROOT", str(photos))
+
+    stats = refile_unknown_camera(None, tmp_db_path)
+
+    assert stats["root_source"].startswith("PHOTO_ROOT")
+    assert stats["mapping_checked"] >= 1
+    # The lookup must relativise against the ENV root, or the indexed JPG
+    # would read as unindexed and be moved out from under its row.
+    assert stats["totals"]["skipped_indexed"] == 1
+    assert stats["totals"]["would_move"] == 1
+
+
+def test_refused_when_the_env_root_points_at_the_wrong_directory(
+        tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-09-19_unknown-camera" / "DSC01.JPG", b"jpeg")
+    wrong = tmp_path / "wrong-root"
+    (wrong / "2026").mkdir(parents=True)
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    with PhotoDB(tmp_db_path, photo_root=str(photos)) as db:
+        db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1")
+    _db_without_stored_root(tmp_db_path, photos)
+    monkeypatch.setenv("PHOTO_ROOT", str(wrong))
+
+    with pytest.raises(ValueError, match="path mapping"):
+        refile_unknown_camera(None, tmp_db_path)
+
+
+def test_refuses_when_no_root_is_available_anywhere(tmp_path, tmp_db_path, monkeypatch):
     photos = _root(tmp_path)
     _touch(photos / "2026" / "2026-06-19_unknown-camera" / "DSC01.JPG", b"jpeg")
     _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
     monkeypatch.delenv("PHOTO_ROOT", raising=False)
-    with PhotoDB(tmp_db_path):
-        pass  # schema only — no photo_root row
+    _db_without_stored_root(tmp_db_path, photos)
 
-    with pytest.raises(ValueError, match="no photo_root"):
+    with pytest.raises(ValueError, match="no photo root"):
+        refile_unknown_camera(None, tmp_db_path)
+
+
+def test_the_self_check_uses_the_production_lookup(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-09-19_unknown-camera" / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1")
+
+    seen = []
+    real = refile_mod._resolve_link
+
+    def spy(db, rel, abs_, by_path, raw_refs):
+        seen.append((rel, abs_))
+        return real(db, rel, abs_, by_path, raw_refs)
+    monkeypatch.setattr(refile_mod, "_resolve_link", spy)
+
+    refile_unknown_camera(str(photos), tmp_db_path)
+
+    assert seen, "the mapping proof must run through _resolve_link itself"
+    assert any(a.endswith("2026-09-19_unknown-camera/DSC01.JPG") for _r, a in seen)
+
+
+def test_refuses_when_no_sampled_row_has_a_file_on_disk(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-09-19_unknown-camera" / "DSC01.ARW", b"raw")
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        for i in range(3):
+            db.add_photo(filepath=f"2026/2026-01-0{i}_x/GONE{i}.JPG",
+                         filename=f"GONE{i}.JPG")
+
+    with pytest.raises(ValueError, match="path mapping"):
         refile_unknown_camera(str(photos), tmp_db_path)
+
+
+def test_an_empty_photos_table_needs_no_mapping_proof(tmp_path, tmp_db_path, monkeypatch):
+    """With no rows the gate cannot produce a false negative; there is nothing to map."""
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-09-19_unknown-camera" / "DSC01.ARW", b"raw")
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path)
+    assert stats["mapping_checked"] == 0
+    assert stats["totals"]["would_move"] == 1
 
 
 def test_refuses_when_the_path_round_trip_is_broken(tmp_path, tmp_db_path, monkeypatch):
