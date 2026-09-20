@@ -119,6 +119,21 @@ _OUTPUT_MISSING = {
     "verify": "p.verified_at IS NULL AND p.description IS NOT NULL",
 }
 
+# Passes for which "attempts exhausted and still no output" means the work is
+# DONE, not failed — because an empty result is a legitimate one.
+#
+# `faces` is the only one. A photo with nobody facing the camera has no `faces`
+# rows after a perfectly successful run; the claim path cannot tell that from a
+# failure, so the fleet re-tries it MAX_PROCESS_ATTEMPTS times and stops. On the
+# first real batch (2026-09-19, 1,373 photos) 113 photos sat at attempts=3 with
+# no face rows — every one a player facing away or a distant shot — while 3,696
+# faces were found in the other 1,260. Counting those as `failed` read the pass
+# as `blocked` and held match_faces / warm_crops / rank_measure in `waiting`
+# behind a pass that had finished. A genuinely corrupt file ends in the same
+# place and is indistinguishable here; it is rare, and the step's `detail`
+# reports the count so it is not hidden.
+_EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
+
 # Does this pass's *claim* predicate (what `remaining` counts) exclude photos
 # whose attempts are exhausted? Seven do; `quality` (db.py:2235-2247),
 # `verify` (db.py:2304-2319) and `clip` (db.py:2202-2214) carry no attempts
@@ -258,6 +273,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
             (pass_type,),
         )
 
+    # See _EMPTY_OUTPUT_IS_DONE: for `faces`, exhausted-with-no-rows is a
+    # finished photo that had nothing to find, so it counts toward `done`.
+    detail = None
+    if pass_type in _EMPTY_OUTPUT_IS_DONE and failed:
+        detail = f"{failed:,} with {_EMPTY_OUTPUT_IS_DONE[pass_type]}"
+        failed = 0
+
     eligible = described if pass_type in _DESCRIPTION_GATED else total
 
     # See _REMAINING_FILTERS_ATTEMPTS: for the passes whose claim predicate
@@ -306,7 +328,7 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
 
     return _step_row(pass_type, "worker", state, total=total, eligible=eligible,
                      done=done, remaining=remaining, failed=failed,
-                     waiting_on=waiting_on)
+                     waiting_on=waiting_on, detail=detail)
 
 
 # ---------------------------------------------------------------------------

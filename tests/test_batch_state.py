@@ -323,7 +323,7 @@ class TestTextPassesWaitForDescribe:
 
 class TestExhaustedAttemptsAreBlocked:
     @pytest.mark.parametrize(
-        "pass_type", ["faces", "describe", "category-visual", "aesthetics"])
+        "pass_type", ["describe", "category-visual", "aesthetics"])
     def test_blocked_not_completed(self, db, pass_type):
         batch_id, ids = _make_batch(db)
         _exhaust(db, ids, pass_type)
@@ -441,6 +441,52 @@ class TestExhaustedAttemptsAreBlocked:
 # =========================================================================
 # A batch whose photos are gone
 # =========================================================================
+
+class TestFacesWithNothingToFind:
+    """`faces` is the one pass where "no output" is a legitimate result.
+
+    A photo with nobody facing the camera has no `faces` rows after a perfectly
+    successful run. The claim path cannot tell that from a failure, so the fleet
+    re-tries it up to MAX_PROCESS_ATTEMPTS and then stops — and reading those as
+    `failed` is wrong. Measured on the first real batch (2026-09-19, 1,373
+    photos): 113 photos sat at attempts=3 with no face rows, every one a player
+    facing away or a distant shot, while 3,696 faces were found in the other
+    1,260. That read `blocked`, and held match_faces / warm_crops / rank_measure
+    in `waiting` behind a pass that had in fact finished.
+    """
+
+    def test_exhausted_no_face_photos_count_as_done(self, db):
+        batch_id, ids = _make_batch(db, count=4)
+        _do_faces(db, ids[:3])
+        _exhaust(db, ids[3:], "faces")          # detector ran 3x, found nobody
+        step = _step(batch_state(db, batch_id), "faces")
+        assert step["state"] == "completed", step
+        assert step["failed"] == 0
+        assert step["done"] == 4
+        assert "1" in (step["detail"] or "") and "no detectable face" in step["detail"]
+
+    def test_it_does_not_hold_the_face_steps_in_waiting(self, db):
+        batch_id, ids = _make_batch(db, count=2)
+        _do_faces(db, ids[:1])
+        _exhaust(db, ids[1:], "faces")
+        state = batch_state(db, batch_id)
+        assert _step(state, "match_faces")["state"] != "waiting"
+        assert _step(state, "warm_crops")["state"] != "waiting"
+
+    def test_a_photo_still_being_retried_is_not_done_yet(self, db):
+        batch_id, ids = _make_batch(db, count=2)
+        _do_faces(db, ids[:1])
+        _exhaust(db, ids[1:], "faces", attempts=MAX_PROCESS_ATTEMPTS - 1)
+        step = _step(batch_state(db, batch_id), "faces")
+        assert step["state"] == "needs_queue"    # the fleet will still claim it
+        assert step["remaining"] == 1
+        assert step["done"] == 1
+
+    def test_no_detail_when_every_photo_has_a_face(self, db):
+        batch_id, ids = _make_batch(db, count=2)
+        _do_faces(db, ids)
+        assert _step(batch_state(db, batch_id), "faces")["detail"] is None
+
 
 class TestEmptiedBatch:
     """Membership is derived live from photos.folder, so a registered batch

@@ -2205,6 +2205,28 @@ then read `queued` for the row's full 6h TTL, so the batch could never reach
 `ready` and the launch button's "already running" 409 stayed armed long after
 the fleet had exited.
 
+### `faces` is the one pass where "no output" means done
+
+A photo with nobody facing the camera has **no `faces` rows after a perfectly
+successful run**. The claim path can't tell that from a failure, so the fleet
+re-tries it `MAX_PROCESS_ATTEMPTS` times and stops (pre-existing, and 3× the
+work it should be). `batch_state._EMPTY_OUTPUT_IS_DONE` therefore counts an
+exhausted no-face photo toward `done`, not `failed`, and reports the count in the
+step's `detail` ("113 with no detectable face"), which the page shows on the
+completed box.
+
+This was found by the feature on its **first real batch**, within a minute of
+deploying it (2026-09-19, 1,373 photos): `faces` read `blocked — 113 failed` and
+held `match_faces` / `warm_crops` / `rank_measure` in `waiting`. Checked against
+the live DB: all 113 sat at exactly `attempts=3` with no face rows — players
+facing away, distant shots — while 3,696 faces had been found in the other 1,260.
+Every per-task review and the whole-branch review missed it, because nothing in
+the code says `worker_processed` for `faces` means *attempted*, not *failed*.
+A genuinely corrupt file ends in the same place and is indistinguishable here;
+it is rare, and the count is shown rather than hidden. Don't extend the rule to
+other passes without the same evidence: for `describe` or `aesthetics`, no output
+after three tries really is a failure.
+
 ### Where "queued" comes from — never `/workers/fleet-status`
 
 "Queued" is an open, unexpired `ingest_batch_jobs` row, full stop — never a

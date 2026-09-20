@@ -293,6 +293,14 @@ describe('summarize — headline per next_action', () => {
 // =========================================================================
 
 describe('stepCaption', () => {
+  test('a completed step still shows its detail note', () => {
+    // faces: photos the detector ran on and found nobody in are DONE, and the
+    // server says how many in `detail`. Hiding it would hide a real number.
+    const s = Object.assign(step('faces', 'completed', { done: 1373, total: 1373, eligible: 1373 }),
+      { detail: '113 with no detectable face' });
+    expect(BF.stepCaption(s)).toBe('1,373 done · 113 with no detectable face');
+  });
+
   test('completed says how many landed, with thousands separators', () => {
     expect(BF.stepCaption(step('describe', 'completed',
       { total: 1373, eligible: 1373, done: 1373, remaining: 0 }))).toBe('1,373 done');

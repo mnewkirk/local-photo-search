@@ -182,7 +182,9 @@
       return step.detail || 'blocked';
     }
     if (st === 'completed') {
-      return step.done > 0 ? fmt(step.done) + ' done' : 'done';
+      var doneText = step.done > 0 ? fmt(step.done) + ' done' : 'done';
+      // e.g. faces: "113 with no detectable face" — finished, but worth seeing.
+      return step.detail ? doneText + ' · ' + step.detail : doneText;
     }
 
     var base = fmt(step.done) + ' / ' + fmt(step.eligible);
