@@ -1497,12 +1497,49 @@ def _proxy_sse(url: str, payload: dict):
 
 
 def _load_batch(batch_id: int) -> dict:
-    from . import ingest_batches, web
+    """The batch row from the **authoritative** DB.
+
+    In replica mode that is the NAS: the desktop's DB is a periodically
+    synced copy, so a batch registered since the last sync is simply absent
+    and this would 404 on a batch that plainly exists. `batch_api` proxies
+    the same route, so going through the local endpoint's logic is not an
+    option — it would read the local file.
+    """
+    from . import batch_api, ingest_batches, web
+    if _nas_url():
+        return batch_api._proxy("GET", f"/api/batches/{batch_id}")["batch"]
     with web._get_db() as db:
         batch = ingest_batches.get_batch(db, batch_id)
     if batch is None:
         raise HTTPException(404, f"no such batch: {batch_id}")
     return batch
+
+
+def _authoritative_batch_state(batch_id: int) -> dict:
+    """Full derived state for a batch, read from whoever owns the DB.
+
+    Replica mode goes to the NAS — which is also what makes the fleet-launch
+    decision correct: the replica's worker-pass counts and job rows lag the
+    NAS by up to a full sync, so a local read would keep offering a launch
+    for passes the fleet is already draining.
+    """
+    from . import batch_api, web
+    from .batch_state import batch_state
+    if _nas_url():
+        state = batch_api._proxy("GET", f"/api/batches/{batch_id}")
+        if state.get("computing") or not state.get("steps"):
+            # The NAS's non-blocking cache had nothing memoized and someone
+            # else held its lock. Acting on an empty `steps` list would read
+            # as "no pass needs queueing" — a wrong answer, not a slow one.
+            raise HTTPException(
+                503, "the authoritative server is still computing this batch's "
+                     "state — try again in a moment")
+        return state
+    with web._get_db() as db:
+        try:
+            return batch_state(db, batch_id)
+        except ValueError:
+            raise HTTPException(404, f"no such batch: {batch_id}")
 
 
 @router.post("/batch-advance")
@@ -1577,8 +1614,8 @@ def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
     three others) and a round-robin fleet would burn claims on passes that
     cannot produce anything yet.
     """
-    from . import batch_advance, ingest_batches, web
-    from .batch_state import batch_state
+    from . import batch_advance, web
+    from .batch_state import WORKER_PASSES
 
     script = _run_workers_script()
     if not Path(script).exists():
@@ -1587,27 +1624,24 @@ def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
             f"this host cannot launch a worker fleet: run-workers.sh not found "
             f"at {script}. Launch it from the machine with the GPU.")
 
-    batch = _load_batch(req.batch_id)
-
-    # Prefer the authoritative view of progress: the replica's DB is a synced
-    # snapshot, so its worker-pass counts lag whatever the fleet has already
-    # done on the NAS.
     nas = _nas_url()
-    state = None
-    if nas:
-        import requests
-        try:
-            r = requests.get(f"{nas}/api/batches/{req.batch_id}", timeout=30)
-            r.raise_for_status()
-            candidate = r.json()
-            if candidate.get("steps"):
-                state = candidate
-        except requests.RequestException as exc:
-            logger.warning("batch %s: NAS state unavailable (%s) — using local",
-                           req.batch_id, exc)
-    if state is None:
-        with web._get_db() as db:
-            state = batch_state(db, req.batch_id)
+    state = _authoritative_batch_state(req.batch_id)   # 404/502/503 on failure
+    batch = state["batch"]
+
+    # A pass with an open job row derives as `queued`, so this is how a fleet
+    # already launched for this batch shows up — the same signal in replica
+    # mode, where there is no other way to see the NAS's job rows. Refusing
+    # matters because a second `run-workers.sh --name ui` KILLS the running
+    # fleet and starts over, which a double-click or a second open tab would
+    # otherwise do silently.
+    by_step = {s["step"]: s for s in state.get("steps", [])}
+    already = [p for p in WORKER_PASSES
+               if by_step.get(p, {}).get("state") == "queued"]
+    if already:
+        raise HTTPException(
+            409, f"a fleet is already recorded as running for this batch "
+                 f"({', '.join(already)}). Stop it first — relaunching would "
+                 f"kill the running one.")
 
     passes = batch_advance.needs_queue_passes(state)
     if not passes:
@@ -1634,14 +1668,14 @@ def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
     # Record intent on the authoritative DB. On the replica that is a POST to
     # the NAS; locally it is a direct write. Either way a failure here must
     # not read as "the fleet didn't start" — it did.
+    from . import batch_api
     jobs = {"recorded": False, "error": None}
     try:
         if nas:
-            import requests
-            r = requests.post(f"{nas}/api/batches/{req.batch_id}/jobs",
-                              json={"steps": passes, "job_kind": batch_advance.JOB_KIND_FLEET},
-                              timeout=30)
-            r.raise_for_status()
+            batch_api._proxy(
+                "POST", f"/api/batches/{req.batch_id}/jobs",
+                json_body={"steps": passes,
+                           "job_kind": batch_advance.JOB_KIND_FLEET})
         else:
             with web._get_db() as db:
                 for p in passes:
@@ -1649,11 +1683,10 @@ def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
                         db, req.batch_id, p, batch_advance.JOB_KIND_FLEET)
         jobs["recorded"] = True
     except Exception as exc:  # noqa: BLE001 — reported, not fatal
-        jobs["error"] = str(exc)
+        jobs["error"] = getattr(exc, "detail", None) or str(exc)
         logger.warning("batch %s: could not record fleet jobs: %s", req.batch_id, exc)
 
     try:
-        from . import batch_api
         batch_api._invalidate(batch_api._key(req.batch_id))
     except Exception:  # noqa: BLE001
         logger.debug("batch memo invalidation failed", exc_info=True)

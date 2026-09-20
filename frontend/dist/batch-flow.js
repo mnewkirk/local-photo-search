@@ -367,6 +367,46 @@
   }
 
   // ---------------------------------------------------------------------
+  // advanceLogLine — one SSE frame -> one log line
+  // ---------------------------------------------------------------------
+
+  /**
+   * Turn one parsed SSE frame (`{event, data}` from PS.parseSSEFrame) into
+   * `{text, cls}` for the advance log, or null when there is nothing to show.
+   *
+   * This is a pure function on purpose. The first version of it lived inline
+   * in batches.html and was **completely dead** — it fed frames to a parser
+   * that returned null for every `event:`-led frame, so the log rendered one
+   * client-side line and nothing else, including swallowing the terminal
+   * `fatal`. A dead log on the page whose job is to report what the pipeline
+   * is doing is invisible until someone needs it most, so it is tested.
+   *
+   * The server's payloads carry no discriminator field, so shape decides —
+   * but `event:` wins where it disagrees, because `fatal` is the one frame
+   * that must never be mistaken for progress.
+   */
+  function advanceLogLine(frame) {
+    if (!frame) return null;
+    var d = frame.data || {};
+    var name = frame.event;
+
+    if (name === 'fatal' || d.error) {
+      return { text: '! ' + (d.error || 'stream failed'), cls: 'l-err' };
+    }
+    if (name === 'cancelled') return { text: '— cancelled —', cls: 'l-err' };
+    if (d.line !== undefined && d.line !== null) {
+      return { text: String(d.line), cls: '' };
+    }
+    if (d.cmd) return { text: '$ ' + d.cmd, cls: '' };
+    if (d.returncode !== undefined && d.returncode !== null) {
+      return d.returncode === 0
+        ? { text: '— finished —', cls: 'l-ok' }
+        : { text: '— exited ' + d.returncode + ' —', cls: 'l-err' };
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------
   // placeholder — what the diagram area shows when it is not a diagram
   // ---------------------------------------------------------------------
 
@@ -415,6 +455,7 @@
     STATE_META: STATE_META,
     ROWS: ROWS,
     advanceButton: advanceButton,
+    advanceLogLine: advanceLogLine,
     layout: layout,
     placeholder: placeholder,
     summarize: summarize,

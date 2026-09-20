@@ -134,6 +134,14 @@ def _scoped_face_rows(db, *, photo_ids=None, person_ids=None, matched_only=False
     (a dedup prune, a retime), and falling through to the library there would
     warm every crop on the box.
     """
+    # An EMPTY id list is an empty SCOPE, not "no scope" — and `IN ()` is a
+    # SQLite syntax error anyway. Both list scopes are checked before any SQL
+    # is built, so neither can fall through to the whole library.
+    if person_ids is not None and not person_ids:
+        return []
+    if photo_ids is not None and not photo_ids:
+        return []
+
     select = ("SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
               "       ph.filepath, ph.image_width, ph.image_height "
               "FROM faces f JOIN photos ph ON ph.id = f.photo_id "

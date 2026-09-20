@@ -284,6 +284,24 @@ def open_job(db, batch_id: int, step: str, job_kind: str, ttl_seconds: int = 216
     db.conn.commit()
 
 
+def delete_job(db, batch_id: int, step: str) -> None:
+    """Remove a step's job row entirely — the failure/cancel path.
+
+    Deliberately NOT ``close_job``: a closed row is how a job-only step
+    (match_faces, resolve_dups, warm_crops) proves it *succeeded*, so closing
+    a failed one would mark it complete. And leaving it open is no better —
+    an open row reads `queued`, so a retry skips the step and stops at the
+    next thing depending on it, for the full six-hour TTL, with no recovery
+    short of editing the table by hand. Deleting puts the step back to
+    `needs_queue`, which is the truth: it did not run.
+    """
+    db.conn.execute(
+        "DELETE FROM ingest_batch_jobs WHERE batch_id = ? AND step = ?",
+        (batch_id, step),
+    )
+    db.conn.commit()
+
+
 def close_job(db, batch_id: int, step: str) -> None:
     db.conn.execute(
         "UPDATE ingest_batch_jobs SET closed_at = datetime('now') "

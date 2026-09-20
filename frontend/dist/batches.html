@@ -429,11 +429,11 @@
     /**
      * Stream POST /api/admin/batch-advance into `onLine`.
      *
-     * Frames are split on the blank line SSE uses as a record separator and
-     * parsed with PS.parseSSEChunk (the shared helper — a private copy of
-     * this on one page is exactly how a bare parseSSEChunk once shipped as a
-     * ReferenceError). The server's events carry no discriminator field, so
-     * they are told apart by shape: `line`, `error`, `cmd`, `returncode`.
+     * Frames are split on the blank line SSE uses as a record separator, read
+     * with the shared PS.parseSSEFrame (these frames lead with `event:`, so a
+     * data-only parser sees nothing at all) and turned into log lines by
+     * BF.advanceLogLine — a pure function, so the mapping is unit-tested
+     * rather than only discoverable by watching a real job.
      */
     function streamAdvance(id, onLine) {
       return fetch('/api/admin/batch-advance', {
@@ -447,16 +447,8 @@
         var buf = '';
 
         function handle(frame) {
-          var d = PS.parseSSEChunk(frame);
-          if (!d) return;
-          if (d.line !== undefined) onLine(d.line, '');
-          else if (d.error) onLine('! ' + d.error, 'l-err');
-          else if (d.cmd) onLine('$ ' + d.cmd, '');
-          else if (d.returncode !== undefined) {
-            onLine(d.returncode === 0 ? '— finished —'
-              : '— exited ' + d.returncode + ' —',
-              d.returncode === 0 ? 'l-ok' : 'l-err');
-          }
+          var line = BF.advanceLogLine(PS.parseSSEFrame(frame));
+          if (line) onLine(line.text, line.cls);
         }
 
         function pump() {
@@ -499,7 +491,7 @@
       function loadList(signal) {
         var opts = signal ? { signal: signal } : undefined;
         return fetch('/api/batches?include_dismissed=1', opts)
-          .then(function (r) { return r.json(); })
+          .then(jsonOrThrow)
           .then(function (d) {
             setList(d);
             // Default to the newest batch, unless ?batch= named one.
@@ -511,7 +503,13 @@
               setSel(id);
             }
           })
-          .catch(function () {});
+          .catch(function (ex) {
+            if (ex && ex.name === 'AbortError') return;
+            // In replica mode this route proxies to the NAS and 502s when it
+            // is unreachable. Swallowing that left the page on "Loading…"
+            // forever with no hint that the authoritative server was down.
+            setErr(errText(ex));
+          });
       }
 
       function loadDetail(signal) {

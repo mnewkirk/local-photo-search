@@ -2557,17 +2557,52 @@
         e('tbody', null, rows)));
   };
 
-  // Parse one SSE frame's `data:` payload. Returns null for keepalive comment
-  // frames (': keepalive') and unparseable lines, so callers can skip them.
-  // Lives here because three pages stream SSE; it used to be a private copy in
-  // admin_maintenance.html, and the faces page referencing it by bare name was
-  // a ReferenceError at runtime.
+  // Parse one SSE frame into {event, data, raw}, or null when there is
+  // nothing to act on (a keepalive comment, a blank frame, a frame with no
+  // `data:` line, or a payload that isn't JSON).
+  //
+  // **It must find the `data:` line ANYWHERE in the frame.** The first
+  // version anchored on `^data:` after trimming the whole chunk, so it
+  // returned null for every frame that led with an `event:` line — which is
+  // what the admin SSE endpoints emit (`_stream_subprocess` in
+  // photosearch/admin_api.py writes `event: line\ndata: {...}`). The result
+  // was a silently dead log: no output, and a terminal `fatal` swallowed.
+  // Two pages had already worked around it with their own `data:`-line
+  // filter, which is exactly the duplication this helper exists to prevent.
+  //
+  // Per the SSE spec, repeated `data:` lines in one frame join with "\n",
+  // and one optional space after the colon is part of the delimiter.
+  PS.parseSSEFrame = function parseSSEFrame(chunk) {
+    var text = String(chunk == null ? '' : chunk);
+    if (!text.trim()) return null;
+    var lines = text.split('\n');
+    var event = null, dataParts = [], sawData = false;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line || line.charAt(0) === ':') continue;   // blank / keepalive comment
+      var colon = line.indexOf(':');
+      var field = colon === -1 ? line : line.slice(0, colon);
+      var value = colon === -1 ? '' : line.slice(colon + 1);
+      if (value.charAt(0) === ' ') value = value.slice(1);
+      if (field === 'event') event = value;
+      else if (field === 'data') { sawData = true; dataParts.push(value); }
+    }
+    if (!sawData) return null;
+    var raw = dataParts.join('\n');
+    try {
+      return { event: event, data: JSON.parse(raw), raw: raw };
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // The payload alone — what most callers want. Kept as the original name and
+  // shape so the existing consumers (faces.html, admin_maintenance.html) need
+  // no change; reach for parseSSEFrame when you need the `event:` name to
+  // tell `done` from `fatal`.
   PS.parseSSEChunk = function parseSSEChunk(chunk) {
-    var trimmed = (chunk || '').trim();
-    if (!trimmed || trimmed.startsWith(':')) return null;
-    var m = trimmed.match(/^data:\s*(.*)$/s);
-    if (!m) return null;
-    try { return JSON.parse(m[1]); } catch (_) { return null; }
+    var frame = PS.parseSSEFrame(chunk);
+    return frame ? frame.data : null;
   };
 
   // Poll `fn` every `ms` — but re-arm only AFTER the previous call settles.

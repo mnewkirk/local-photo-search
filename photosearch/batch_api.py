@@ -126,6 +126,62 @@ def _invalidate(key: tuple[str, int]) -> None:
     _generation[key] = _generation.get(key, 0) + 1
 
 
+# ---------------------------------------------------------------------------
+# Replica mode — EVERY route here proxies to the NAS
+# ---------------------------------------------------------------------------
+#
+# Batches, sweeps and job rows are written on the NAS, which is the sole
+# writer; the desktop replica's DB is a periodically-synced COPY. Serving
+# these routes from that copy gets four things wrong at once: batches
+# registered since the last sync are missing entirely, sweep progress is
+# frozen, the job rows a fleet launch just POSTed to the NAS are invisible —
+# so the page keeps saying `next_action == "launch_fleet"` and a second click
+# makes run-workers.sh kill and restart a running fleet.
+#
+# So: when PHOTOSEARCH_NAS_URL is set, every route below forwards to the NAS
+# and **never falls back to local data**. A wrong batch view is worse than an
+# error — the page renders errors, and an operator who sees "could not reach
+# the NAS" knows what to do, where one shown a stale pipeline does not. Same
+# proxy shape as admin_api's `_incoming_status` / `_workers_queue_status`.
+
+_PROXY_TIMEOUT = 15
+
+
+def _nas_url() -> str:
+    import os
+    return (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+
+
+def _proxy(method: str, path: str, *, params=None, json_body=None):
+    """Forward one request to the NAS and return its JSON body.
+
+    Status codes the NAS meant (404 on an unknown batch, 400 on a bad step)
+    are re-raised as themselves so the caller sees the real answer; anything
+    that stops us reaching it at all becomes a 502 naming the host we tried.
+    """
+    import requests
+    nas = _nas_url()
+    url = f"{nas}{path}"
+    try:
+        resp = requests.request(method, url, params=params, json=json_body,
+                                timeout=_PROXY_TIMEOUT)
+    except requests.RequestException as exc:
+        raise HTTPException(
+            502, f"could not reach the authoritative server at {nas}: {exc}")
+    if resp.status_code >= 400:
+        detail = resp.text[:300]
+        try:
+            detail = resp.json().get("detail", detail)
+        except ValueError:
+            pass
+        raise HTTPException(resp.status_code, detail)
+    try:
+        return resp.json()
+    except ValueError:
+        raise HTTPException(
+            502, f"authoritative server returned a non-JSON body from {path}")
+
+
 class RegisterRequest(BaseModel):
     directory: str
     source: Optional[str] = None
@@ -149,6 +205,9 @@ class OpenJobsRequest(BaseModel):
 
 @router.get("")
 def list_batches_endpoint(include_dismissed: bool = Query(False)):
+    if _nas_url():
+        return _proxy("GET", "/api/batches",
+                      params={"include_dismissed": int(bool(include_dismissed))})
     with _get_db() as db:
         return {
             "sweep": ingest_batches.get_active_sweep(db),
@@ -164,6 +223,11 @@ def list_batches_endpoint(include_dismissed: bool = Query(False)):
 
 @router.get("/{batch_id}")
 def get_batch_status(batch_id: int):
+    if _nas_url():
+        # No local memo on this path: the NAS runs the same non-blocking
+        # cache one hop away, so memoizing its answer here would only add a
+        # second TTL to every change.
+        return _proxy("GET", f"/api/batches/{batch_id}")
     key = _key(batch_id)
     now = time.monotonic()
     cached = _memo.get(key)
@@ -211,6 +275,8 @@ def get_batch_status(batch_id: int):
 
 @router.post("/{batch_id}/dismiss")
 def dismiss_batch_endpoint(batch_id: int):
+    if _nas_url():
+        return _proxy("POST", f"/api/batches/{batch_id}/dismiss")
     with _get_db() as db:
         if ingest_batches.get_batch(db, batch_id) is None:
             raise HTTPException(404, f"no such batch: {batch_id}")
@@ -222,6 +288,8 @@ def dismiss_batch_endpoint(batch_id: int):
 
 @router.post("/{batch_id}/ready")
 def mark_ready_endpoint(batch_id: int):
+    if _nas_url():
+        return _proxy("POST", f"/api/batches/{batch_id}/ready")
     with _get_db() as db:
         if ingest_batches.get_batch(db, batch_id) is None:
             raise HTTPException(404, f"no such batch: {batch_id}")
@@ -242,6 +310,9 @@ def open_jobs_endpoint(batch_id: int, body: OpenJobsRequest):
     derived step and the real one would read `needs_queue` forever.
     """
     from . import batch_advance
+    if _nas_url():
+        return _proxy("POST", f"/api/batches/{batch_id}/jobs",
+                      json_body={"steps": body.steps, "job_kind": body.job_kind})
     with _get_db() as db:
         if ingest_batches.get_batch(db, batch_id) is None:
             raise HTTPException(404, f"no such batch: {batch_id}")
@@ -259,6 +330,9 @@ def open_jobs_endpoint(batch_id: int, body: OpenJobsRequest):
 
 @router.post("/register")
 def register_batch_endpoint(body: RegisterRequest):
+    if _nas_url():
+        return _proxy("POST", "/api/batches/register",
+                      json_body={"directory": body.directory, "source": body.source})
     with _get_db() as db:
         try:
             batch_id = ingest_batches.register_batch(

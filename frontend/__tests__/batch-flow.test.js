@@ -546,3 +546,58 @@ describe('advanceButton', () => {
     expect(b.reason).toMatch(/Still working out/);
   });
 });
+
+// =========================================================================
+// advanceLogLine — one SSE frame -> one log line
+// =========================================================================
+//
+// The regression this exists for: the page fed `event:`-led frames to a
+// data-only parser, so the advance log rendered nothing at all and the
+// terminal `fatal` was swallowed. Keeping the mapping pure means a change to
+// it fails here instead of silently on a real job.
+
+describe('advanceLogLine', () => {
+  const frame = (event, data) => ({ event, data });
+
+  test('renders the subprocess output lines', () => {
+    expect(BF.advanceLogLine(frame('line', { line: '  [stacking] done' })))
+      .toEqual({ text: '  [stacking] done', cls: '' });
+  });
+
+  test('renders the command the server is about to run', () => {
+    expect(BF.advanceLogLine(frame('start', { cmd: 'cli.py batch-advance' })))
+      .toEqual({ text: '$ cli.py batch-advance', cls: '' });
+  });
+
+  test('renders both terminal outcomes distinctly', () => {
+    expect(BF.advanceLogLine(frame('done', { returncode: 0 })))
+      .toEqual({ text: '— finished —', cls: 'l-ok' });
+    expect(BF.advanceLogLine(frame('done', { returncode: 2 })))
+      .toEqual({ text: '— exited 2 —', cls: 'l-err' });
+  });
+
+  test('a fatal is an error line — never mistaken for progress', () => {
+    // _proxy_sse emits this when the NAS is unreachable. Losing it leaves
+    // the log looking like a job that simply stopped saying anything.
+    const out = BF.advanceLogLine(frame('fatal', { error: 'could not reach NAS' }));
+    expect(out.cls).toBe('l-err');
+    expect(out.text).toContain('could not reach NAS');
+  });
+
+  test('an error payload is an error line whatever the event says', () => {
+    expect(BF.advanceLogLine(frame('line', { error: 'boom' })).cls).toBe('l-err');
+  });
+
+  test('rc=0 does not hide behind a falsy check', () => {
+    // `if (d.returncode)` would drop the success case entirely.
+    expect(BF.advanceLogLine(frame('done', { returncode: 0 }))).not.toBe(null);
+    expect(BF.advanceLogLine(frame('line', { line: '' })))
+      .toEqual({ text: '', cls: '' });
+  });
+
+  test('nothing to show is null, including a null frame', () => {
+    expect(BF.advanceLogLine(null)).toBe(null);
+    expect(BF.advanceLogLine(frame('ping', {}))).toBe(null);
+    expect(BF.advanceLogLine({ event: 'x' })).toBe(null);
+  });
+});

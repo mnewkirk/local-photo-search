@@ -130,6 +130,14 @@ def _run_stacking(db, ctx) -> dict:
     how the whole library's stacks have been wiped before.
     """
     from . import stacking
+    if not ctx["photo_ids"]:
+        # THE guard. `detect_stacks` treats `photo_ids=[]` as "no scope given"
+        # and falls through to the whole library — and `save_stacks` would
+        # then clear every stack in it. A batch really can empty out
+        # (membership is derived live from photos.folder: a dedup prune, a
+        # purge, a clock retime that rewrites the folder), so this is a state
+        # that happens, not a defensive nicety.
+        return {"stacks": 0, "photos_stacked": 0, "skipped": "empty batch"}
     stacks = stacking.run_stacking(
         db,
         photo_ids=ctx["photo_ids"],
@@ -242,8 +250,13 @@ def advance_nas_steps(db, batch_id: int, *, apply: bool = False,
     **no job row is written**. A job row that leaked out of a preview would
     read as `queued` for its whole TTL and keep the real run from starting.
 
+    A step that fails or is cancelled has its job row **deleted**, not closed
+    and not left open, so the step reads `needs_queue` again and the next
+    ``batch-advance`` retries it. The error is still reported in the result
+    and on the progress stream.
+
     ``should_abort`` is checked before each step; returning True raises
-    ``InterruptedError`` with the current step's job left open.
+    ``InterruptedError``.
     """
     runners = dict(default_runners() if runners is None else runners)
     unknown = [s for s in runners if s not in STEP_ORDER]
@@ -330,11 +343,17 @@ def advance_nas_steps(db, batch_id: int, *, apply: bool = False,
         try:
             out = runners[step](db, ctx)
         except InterruptedError:
-            # A cancel, not a failure: leave the job open so the step reads
-            # `queued` until its TTL rather than silently `needs_queue`.
+            # Cancelled mid-step: the step did not finish, so its job row is
+            # deleted. Leaving it open would read as `queued` and make the
+            # step unretryable for its whole TTL (see delete_job).
+            ingest_batches.delete_job(db, batch_id, step)
             emit({"step": step, "status": "cancelled"})
             raise
         except Exception as exc:  # noqa: BLE001 — reported, not swallowed
+            # Same rule as cancel — and NOT close_job, which is how a
+            # job-only step proves it succeeded. The error is still reported
+            # in the result and on the SSE stream; only the row goes.
+            ingest_batches.delete_job(db, batch_id, step)
             result["steps"].append({"step": step, "status": "failed",
                                     "state": row["state"], "reason": None,
                                     "waiting_on": waiting_on, "result": None,

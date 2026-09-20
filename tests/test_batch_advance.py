@@ -16,13 +16,19 @@ wrong work:
 - **Dry-run writes nothing** — no job rows, no runner calls. A job row that
   leaked out of a preview would read as `queued` for its whole TTL and stop
   the real run from ever starting.
-- **A failure leaves the job open**, so the step reads `queued` until the TTL
-  expires rather than `completed`.
+- **A failure DELETES the job row** — not closed (that reads `completed`) and
+  not left open (that reads `queued`, making the step unretryable for its
+  whole six-hour TTL). The step goes back to `needs_queue` and a retry
+  re-runs it.
+- **In replica mode every `/api/batches` route proxies to the NAS**, and an
+  unreachable NAS is an error rather than a silent fall back to the synced
+  copy. A stale pipeline view is worse than a visible failure.
 
 Per globals.md the shared `db` fixture is pre-seeded under `2026/`, so every
 fixture here builds photos under `2090/` and `2091/`.
 """
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -157,7 +163,14 @@ class TestOrchestration:
         assert set(batch_state.NAS_STEPS) <= closed
         assert ingest_batches.open_jobs(db, batch_id) == {}
 
-    def test_failure_leaves_the_job_open_and_reports_the_error(self, db):
+    def test_failure_deletes_the_job_row_and_reports_the_error(self, db):
+        """The row must go, not linger open and not be closed.
+
+        Closed would read `completed` (a job-only step's only evidence of
+        success). Open would read `queued`, so the retry skips the step and
+        stops at the next thing depending on it — for the full six-hour TTL,
+        with no recovery short of editing the table by hand.
+        """
         batch_id, ids = _make_batch(db)
         _finish_aesthetics(db, ids)
         _finish_faces(db, ids)
@@ -167,8 +180,11 @@ class TestOrchestration:
             db, batch_id, apply=True,
             runners=_fake_runners(calls, fail_on="normalize_aesthetics"))
 
-        assert "normalize_aesthetics" in ingest_batches.open_jobs(db, batch_id)
+        assert "normalize_aesthetics" not in ingest_batches.open_jobs(db, batch_id)
         assert "normalize_aesthetics" not in ingest_batches.closed_jobs(db, batch_id)
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs WHERE batch_id = ? AND step = ?",
+            (batch_id, "normalize_aesthetics")).fetchone()[0] == 0
         row = _by_step(result)["normalize_aesthetics"]
         assert row["status"] == "failed"
         assert "exploded" in row["error"]
@@ -176,6 +192,41 @@ class TestOrchestration:
         # And it stops — a later step could depend on the one that failed.
         assert result["stopped_at"] == "normalize_aesthetics"
         assert calls == ["stacking", "normalize_aesthetics"]
+
+    def test_a_retry_after_a_failure_re_runs_the_failed_step(self, db):
+        """The point of deleting the row: the operator's fix is to press the
+        button again, not to open sqlite3."""
+        batch_id, ids = _make_batch(db)
+        _finish_aesthetics(db, ids)
+        _finish_faces(db, ids)
+        first, second = [], []
+
+        batch_advance.advance_nas_steps(
+            db, batch_id, apply=True,
+            runners=_fake_runners(first, fail_on="normalize_aesthetics"))
+        result = batch_advance.advance_nas_steps(
+            db, batch_id, apply=True, runners=_fake_runners(second))
+
+        assert "normalize_aesthetics" in second
+        assert result["stopped_at"] is None
+        assert set(batch_state.NAS_STEPS) <= ingest_batches.closed_jobs(db, batch_id)
+
+    def test_an_abort_mid_step_deletes_that_step_s_job_row(self, db):
+        batch_id, ids = _make_batch(db)
+        _finish_aesthetics(db, ids)
+        _finish_faces(db, ids)
+
+        def boom(db_, ctx):
+            raise InterruptedError("cancelled")
+
+        runners = dict(_fake_runners([]))
+        runners["stacking"] = boom
+        with pytest.raises(InterruptedError):
+            batch_advance.advance_nas_steps(db, batch_id, apply=True, runners=runners)
+
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs WHERE batch_id = ?",
+            (batch_id,)).fetchone()[0] == 0
 
     def test_dry_run_writes_nothing_and_calls_no_runner(self, db):
         batch_id, ids = _make_batch(db)
@@ -324,6 +375,24 @@ class TestDefaultRunners:
         # `directory` would make run_stacking re-resolve its own clear scope.
         assert seen.get("directory") is None
         assert out["stacks"] == 1
+
+    def test_stacking_refuses_an_empty_batch_rather_than_going_library_wide(self, db):
+        """`detect_stacks` reads `photo_ids=[]` as "no scope given" and falls
+        through to the whole library — and `save_stacks` would then clear
+        every stack in it. A batch CAN empty out: membership is derived live
+        from photos.folder, so a prune, a purge or a clock retime does it."""
+        batch_id, _ = _make_batch(db)
+        ctx = self._ctx(db, batch_id)
+        ctx["photo_ids"] = []
+
+        from photosearch import stacking
+
+        def must_not_run(*a, **k):  # pragma: no cover - the whole point
+            raise AssertionError("run_stacking must not be called for an empty batch")
+
+        with patch.object(stacking, "run_stacking", must_not_run):
+            out = batch_advance.default_runners()["stacking"](db, ctx)
+        assert out["stacks"] == 0
 
     def test_match_faces_uses_the_strict_matcher_only(self, db):
         """`temporal` is ~4% accurate on these shoots — pouring it into a
@@ -609,6 +678,166 @@ class TestWorkersStartRequestDirectory:
 # =========================================================================
 # POST /api/batches/{id}/jobs — the replica's way to write on the NAS
 # =========================================================================
+
+class TestLaunchFleetAlreadyRunning:
+    def test_409_when_a_worker_pass_already_has_an_open_fleet_job(self, client, db):
+        """A second `run-workers.sh --name ui` KILLS the running fleet and
+        starts over, so a double-click or a second tab must be refused. An
+        open job row derives as `queued`, which is also the only way to see
+        the NAS's job rows from a replica."""
+        batch_id, _ = _make_batch(db)
+        ingest_batches.open_job(db, batch_id, "clip", "fleet")
+        r = client.post("/api/admin/batch-launch-fleet", json={"batch_id": batch_id})
+        assert r.status_code == 409
+        assert "already" in r.json()["detail"]
+
+    def test_a_launch_makes_the_next_one_409(self, client, db):
+        batch_id, _ = _make_batch(db)
+        assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 200
+        assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 409
+
+
+# =========================================================================
+# Replica mode — every /api/batches route proxies to the NAS
+# =========================================================================
+
+class FakeResponse:
+    def __init__(self, payload=None, status_code=200, text=""):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = text or (json.dumps(payload) if payload is not None else "")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+@pytest.fixture
+def nas(monkeypatch):
+    """Replica mode with a recording stand-in for `requests.request`."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas.example:8000/")
+    calls = []
+    box = {"response": FakeResponse({"ok": True}), "raise": None}
+
+    def fake_request(method, url, params=None, json=None, timeout=None):
+        calls.append({"method": method, "url": url, "params": params,
+                      "json": json, "timeout": timeout})
+        if box["raise"] is not None:
+            raise box["raise"]
+        resp = box["response"]
+        return resp(url) if callable(resp) else resp
+
+    import requests
+    monkeypatch.setattr(requests, "request", fake_request)
+    return {"calls": calls, "box": box}
+
+
+class TestReplicaProxy:
+    def test_list_comes_from_the_nas_not_the_local_copy(self, client, db, nas):
+        """The replica's DB is a periodically synced copy — a batch
+        registered since the last sync is simply missing from it."""
+        _make_batch(db)   # exists locally; must NOT be what we answer with
+        nas["box"]["response"] = FakeResponse(
+            {"sweep": None, "batches": [{"id": 77, "directory": "2091/x"}]})
+        data = client.get("/api/batches").json()
+        assert [b["id"] for b in data["batches"]] == [77]
+        assert nas["calls"][0]["url"] == "http://nas.example:8000/api/batches"
+
+    def test_detail_comes_from_the_nas(self, client, db, nas):
+        batch_id, _ = _make_batch(db)
+        nas["box"]["response"] = FakeResponse(
+            {"batch": {"id": batch_id}, "steps": [], "ready": True})
+        assert client.get(f"/api/batches/{batch_id}").json()["ready"] is True
+        assert nas["calls"][0]["url"].endswith(f"/api/batches/{batch_id}")
+
+    @pytest.mark.parametrize("method,path,body", [
+        ("post", "/api/batches/1/dismiss", None),
+        ("post", "/api/batches/1/ready", None),
+        ("post", "/api/batches/1/jobs", {"steps": ["clip"]}),
+        ("post", "/api/batches/register", {"directory": "2091/x"}),
+    ])
+    def test_writes_go_to_the_nas_and_never_touch_the_local_db(
+            self, client, db, nas, method, path, body):
+        """The NAS is the sole writer; a local write is destroyed by the next
+        sync-replica.sh, which swaps PHOTOSEARCH_DB wholesale."""
+        _make_batch(db)
+        getattr(client, method)(path, json=body)
+        assert nas["calls"], f"{path} did not proxy"
+        assert nas["calls"][0]["url"].startswith("http://nas.example:8000")
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs").fetchone()[0] == 0
+
+    def test_an_unreachable_nas_is_an_error_not_stale_local_data(
+            self, client, db, nas):
+        """A wrong batch view is worse than an error: the operator who sees
+        'could not reach' knows what to do, the one shown a stale pipeline
+        does not."""
+        import requests
+        _make_batch(db)
+        nas["box"]["raise"] = requests.ConnectionError("refused")
+        for path in ("/api/batches", "/api/batches/1"):
+            r = client.get(path)
+            assert r.status_code == 502, path
+            assert "could not reach" in r.json()["detail"]
+
+    def test_the_nas_s_own_status_codes_survive_the_hop(self, client, db, nas):
+        _make_batch(db)
+        nas["box"]["response"] = FakeResponse(
+            {"detail": "no such batch: 4242"}, status_code=404)
+        r = client.get("/api/batches/4242")
+        assert r.status_code == 404
+        assert r.json()["detail"] == "no such batch: 4242"
+
+
+class TestLaunchFleetInReplicaMode:
+    def _nas_state(self, batch_id, states):
+        return FakeResponse({
+            "batch": {"id": batch_id, "directory": _DIR},
+            "ready": False, "next_action": "launch_fleet",
+            "steps": [{"step": p, "kind": "worker", "state": st, "total": 3,
+                       "eligible": 3, "done": 0, "remaining": 3, "failed": 0,
+                       "waiting_on": None, "detail": None}
+                      for p, st in states.items()],
+        })
+
+    def test_passes_are_read_from_the_nas_not_the_replica(self, client, db, nas):
+        """The replica's worker-pass counts lag the NAS by up to a full sync,
+        so a local read keeps offering a launch for passes already draining."""
+        batch_id, _ = _make_batch(db)
+        nas["box"]["response"] = self._nas_state(batch_id, {
+            "clip": "completed", "faces": "needs_queue", "quality": "needs_queue"})
+        seen = _fleet_cmd(client, {"batch_id": batch_id})
+        assert seen["status"] == 200, seen
+        assert seen["cmd"][seen["cmd"].index("-p") + 1] == "faces,quality"
+        # And the job intent was POSTed to the NAS, not written locally.
+        assert any(c["url"].endswith(f"/api/batches/{batch_id}/jobs")
+                   for c in nas["calls"])
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ingest_batch_jobs").fetchone()[0] == 0
+
+    def test_409_from_the_nas_s_queued_passes(self, client, db, nas):
+        batch_id, _ = _make_batch(db)
+        nas["box"]["response"] = self._nas_state(batch_id, {
+            "clip": "queued", "faces": "needs_queue"})
+        assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 409
+
+    def test_503_while_the_nas_is_still_computing(self, client, db, nas):
+        """An empty `steps` list would read as 'no pass needs queueing' — a
+        wrong answer, not a slow one."""
+        batch_id, _ = _make_batch(db)
+        nas["box"]["response"] = FakeResponse(
+            {"batch": {"id": batch_id}, "steps": [], "computing": True})
+        assert _fleet_cmd(client, {"batch_id": batch_id})["status"] == 503
+
+    def test_unreachable_nas_is_502_not_a_local_launch(self, client, db, nas):
+        import requests
+        batch_id, _ = _make_batch(db)
+        nas["box"]["raise"] = requests.ConnectionError("refused")
+        seen = _fleet_cmd(client, {"batch_id": batch_id})
+        assert seen["status"] == 502
+        assert "cmd" not in seen
+
 
 class TestJobsEndpoint:
     def test_opens_the_named_steps(self, client, db):
