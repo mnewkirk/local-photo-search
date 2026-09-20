@@ -92,13 +92,15 @@ def _resolve_model(pass_type: str) -> str:
 
 
 def _model_version(model: str) -> Optional[str]:
-    """Provenance digest for the generations log. On an OpenAI-compatible
-    backend there is no Ollama to query, and ``worker._model_version`` would
-    block ~80s retrying localhost:11434 — so use a static marker instead."""
-    if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
-        return "lmstudio"
-    from .worker import _model_version as _wv
-    return _wv(model)
+    """Provenance digest for the generations log.
+
+    Thin alias for the shared ``describe.effective_model_version`` — the worker
+    fleet logs through the same helper, so a re-run and a fleet pass can never
+    disagree about how a model is identified.
+    """
+    from .describe import effective_model_version
+
+    return effective_model_version(model)
 
 
 # ---------------------------------------------------------------------------

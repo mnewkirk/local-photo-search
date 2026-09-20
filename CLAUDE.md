@@ -461,9 +461,11 @@ No single vision model wins every pass, so each has its own default
   on free-form description quality (esp. text/OCR-heavy photos).
 - **category-visual → `llava`** — the constrained tag task is a different shape;
   llama3.2-vision degenerates and over-selects on it. The
-  regurgitation guard (`_MAX_PLAUSIBLE_TAGS`) drops responses echoing the
-  vocabulary. `photosearch clean-garbage-tags` clears historical regurgitated
-  tag sets so they get re-tagged.
+  regurgitation guard (`_VISUAL_MAX_PLAUSIBLE_TAGS`) drops responses echoing
+  the vocabulary. `photosearch clean-garbage-tags` clears historical
+  regurgitated tag sets (from the legacy `tags` column, whose own threshold is
+  `_MAX_PLAUSIBLE_TAGS`) so they get re-tagged. See "derived capture facts vs
+  perceived qualities" below for what this pass is now allowed to decide.
 - **verify → `llava`** — must differ from the describe/regen model for an
   independent cross-check.
 
@@ -474,6 +476,199 @@ No single vision model wins every pass, so each has its own default
 These defaults apply when passes run through **Ollama**. When the fleet routes
 to an OpenAI-compatible backend (LM Studio — see below), per-pass models are
 selected by role env var instead.
+
+### `category-visual`: derived capture facts vs perceived qualities
+
+The visual vocabulary used to be one flat 36-word checklist, and the pass was
+measurably broken on half of it. On the live library (159,526 tagged photos)
+and one 1,373-frame daytime soccer folder (shutter 1/125–1/800, ISO median 160):
+
+| tag | how often | reality |
+|---|---|---|
+| `long-exposure` | 877/1,373 of that folder (64%) | slowest frame was 1/125 s → precision **0%**. Library-wide it is **anti-correlated**: on 10.1% of photos faster than 1/250 s but only 25.2% of genuine ≥1/4 s exposures (precision ≈3%, recall 25%) |
+| `motion-blur` | 48% | median `aes_sharpness` **7.0 tagged and untagged** — no signal at all |
+| `low-light` | 33% | 92% of those at ISO ≤ 400 in full sun |
+| `peaceful` | 24% | co-occurs with `dramatic` 216× |
+
+Contradictory pairs were routine (`long-exposure`+`sunny` 565,
+`low-light`+`golden-hour` 283, `low-light`+`vibrant` 302), and the model was
+largely ignoring the image: 1,373 photos produced only **163 distinct tag
+sets**, the top 8 covering 56%, with one verbatim 8-tag set on **101** photos.
+
+**Why: a VLM cannot read a shutter speed off a 336-px tile. EXIF can.** The
+vocabulary mixed physically measurable CAPTURE FACTS with mood and
+composition, and asked one model to answer both. Note `sunny` and `low-light`
+*do* track EXIF library-wide, so it was selectively broken, not useless —
+which is why the fix is a split, not a new model.
+
+**The split** (`photosearch/visual_tags_derive.py`):
+
+- **DERIVED** (5) — `long-exposure`, `low-light`, `panoramic`, `sharp`,
+  `blurry`. Computed from EXIF / stored scalars, never asked of the model.
+- **RETIRED** (1) — `motion-blur`. Dropped from *both* halves: a scalar cannot
+  tell motion blur from defocus (a long exposure on a tripod is sharp), and the
+  VLM had zero signal. No rule was defensible, so there is none.
+- **PERCEIVED** (30) — everything else, grouped into six axes (light, colour,
+  mood, atmosphere, viewpoint, composition).
+
+**The merge rule is that derived wins.** `merge_tags(perceived, derived)`
+strips *every* capture-fact term the model emitted — including when nothing was
+derived, because an absent capture fact is a positive statement ("the EXIF says
+this is not a long exposure") — then adds the derived ones, passes perceived
+terms through, and returns a sorted, deduped list. **Missing EXIF derives
+nothing; it never guesses.**
+
+Storage is unchanged: one `photos.visual_tags` JSON column, so the search blob,
+the `visual_tag=` filter, `list_vocab` and the Ask tools all keep working, and
+`list_vocab` lists the derived terms because it aggregates the column.
+
+**Thresholds, and the numbers behind them** (measured on the read-only July
+library copy, 151,291 tagged rows):
+
+| derived tag | rule | evidence |
+|---|---|---|
+| `long-exposure` | shutter ≥ **1/4 s** | VLM agreement climbs monotonically as the bar tightens — ≥1/15 s: 6.9% of those photos were VLM-tagged, ≥1/8 s: 19.0%, ≥1/4 s: 25.1%. 1/4 s is 1.0% of the library (tripod/streaking territory); 1/15 s would be 4.3% and sweep in ordinary handheld indoor frames |
+| `low-light` | **EV100 < 5.0**, where EV100 = log2(N²/t) − log2(ISO/100) | cross-checked against clock time: fires on **44.9%** of photos shot 21:00–06:00 vs **3.6%** of 09:00–16:00 (12.5:1). EV100 < 6 halves that ratio to 6.6:1 for 11 more points of night recall |
+| `panoramic` | long/short edge ≥ **2.0** | 283 photos library-wide. The VLM claimed 4,290, of which **2.3%** had AR ≥ 2.0 |
+| `sharp` / `blurry` | `aes_sharpness` ≥ 9 / ≤ 2, **only when non-NULL** | cleanest separation in the dataset: **47.0%** of photos scoring ≤ 2 were VLM-tagged `blurry`, against **0.00%** of every bucket at 3 and above |
+
+`aes_sharpness` is the aesthetics VLM's 1–10 technical sub-score — a
+*different, better* model on a bigger image. Coverage is only 2.4% of tagged
+photos today, so `sharp`/`blurry` are rare by design; a photo the aesthetics
+pass has not scored gets **no opinion**, not a guess.
+
+**Deliberately NOT derived**, because the EXIF cannot decide them: `macro`
+(needs subject distance / magnification, which is not stored), `aerial` (no
+altitude column), `wide-angle` (focal length is a mix of full-frame and phone
+actual mm with no 35 mm-equivalent column to normalise against), and any
+shallow-depth-of-field tag — the vocabulary has no `bokeh`-type term at all, so
+there was nothing to derive. These stay PERCEIVED.
+
+**The merge is applied SERVER-SIDE**, where the EXIF lives, through one shared
+call — the worker only ever sees pixels. Every write path routes through it:
+`worker_api.submit_results` (the fleet, **and** the M28 `rerun.run_pass_sync`
+path, which submits through that same endpoint), plus both in-process
+`index.py` writers (directory mode and collection mode). An emptied merge still
+persists `'[]'` so `_SubmitOutcome` marks the photo done in one pass. A row
+whose only survivors are derived logs **no `generations` entry** — derived tags
+are not LLM artifacts.
+
+`tools.set_photo_tags` / `POST /api/photos/bulk-set-tags` (the M26b agent/user
+write) deliberately **bypass** the merge — a human asking for a tag should get
+it. **But the next `derive-visual-tags --apply` will strip a hand-set
+capture-fact tag**, because the backfill treats EXIF as authoritative over
+every row. Hand-setting `long-exposure` on a 1/800 s frame does not survive a
+backfill; hand-setting `peaceful` does.
+
+**Two kinds of empty, and conflating them is what made the original bug
+permanent.** `tag_visual_photo` returns `[]` when the model *answered* "no
+tags" (that is a result: the server writes `'[]'` and the photo is done), and
+`None` when there is **no usable answer** — no response, unparseable prose,
+regurgitation, or a guard that removed everything. On `None` the server leaves
+`visual_tags` **NULL**, so the photo stays claimable, but still marks it
+processed so a *repeatable* failure is retired by `MAX_PROCESS_ATTEMPTS`
+instead of being re-claimed forever (the CLIP-style infinite re-claim). This is
+the same shape as the aesthetics pass's empty-scores row.
+`CategoryVisualResult.visual_tags` is therefore `Optional`; older workers
+always send a list, so `None` never arrives from one.
+
+**`_parse_visual_response` is deliberately tolerant.** It splits on commas,
+newlines and semicolons; strips bullets (`-`, `*`, `•`, `1.`, `1)`), a leading
+`Label:` prefix, code fences, quotes, brackets and emphasis; and reads a JSON
+array. The first version split on commas alone, so `RIGHT: sunny` parsed to
+`[]`, `Tags: sunny, peaceful` lost `sunny`, and a bullet list parsed to
+nothing — each of which then looked like "no visual qualities" and retired the
+photo. **Don't simplify it back to a comma split**: the prompt asks for one
+shape and small vision models supply six, and the cost of not reading one is a
+silently mistagged photo that never comes back. For the same reason every
+answer the prompt *demonstrates* is a bare tag line — a labelled `WRONG:` /
+`RIGHT:` example teaches the model to emit a label. Pinned by
+`tests/test_visual_parse_tolerance.py`.
+
+A transient `database is locked` on the server-side **EXIF read** is re-raised
+so `_record_write_failure` defers the photo. Swallowing it would write the row
+strip-only — derived tags silently absent — spend the attempt and mark the
+photo processed, leaving it permanently under-derived with no trace. Same rule
+as `50003c2`, applied to reads.
+
+**The prompt** now shows only the perceived terms, grouped by axis, with a
+3–6 word definition on each ambiguous one, **at most one tag per axis and a
+hard cap of 5**, an explicit "omit a tag unless it is obviously and
+unmistakably true of THIS image; returning 2–3 tags is normal; returning none
+is acceptable", one positive example and one negative one (a bright midday
+football frame gets `sunny` — not `peaceful`, nothing night-like).
+**Temperature stays at 0**: the collapse came from the checklist, not from
+greedy decoding, so the prompt is the fix and the pass stays reproducible.
+
+**The guard** (`describe._visual_answer_problem`) was at `>= 12` tags,
+inherited from the 78-term `tags` vocabulary — and the real failure's maximum
+was **11**, median 5, so **it never fired**. It is now `_VISUAL_MAX_TAGS + 1`,
+derived from the cap the prompt states so the two cannot drift. A second check
+covers `visual_tags_derive.CONTRADICTORY_PAIRS`; on a contradiction it retries
+once, then **drops both members of each bad pair** rather than rejecting the
+response — when a model calls one photo peaceful *and* dramatic, nothing says
+which half it meant, but the untouched tags are still good. Regurgitation
+behaviour is unchanged: a retry that still over-selects drops the whole
+response.
+
+**Because the guard deletes BOTH members, a pair that is merely unusual
+destroys correct tags.** The bar is therefore *could a competent
+photographer's single frame honestly be both?* — and it rules out more than it
+first looks like. The nine that survive contradict on the *same property*:
+dramatic×peaceful, joyful×melancholy, overcast×sunny, harsh-light×soft-light,
+muted×vibrant, colorful×muted, black-and-white×colorful,
+black-and-white×vibrant, aerial×macro. Rejected, with the reason:
+close-up×wide-angle (an environmental portrait is ordinary), foggy×sunny (sun
+through fog is a classic shot), joyful×moody (subject's emotion vs how the
+frame is lit), colorful×monochromatic (a blazing orange sunset reads as both),
+aerial×close-up (a tight drone crop is both), macro×wide-angle (close-focus
+wide-angle is a real technique), and peaceful×moody (the library's biggest
+co-occurrence at 19,056 — but a still, misty lake is honestly both). There is
+no sharp×blurry entry: both are derived now and cannot co-occur.
+
+**Backfill** (no VLM, no `generations` rows):
+
+```bash
+photosearch derive-visual-tags            # dry run: before/after frequency table
+photosearch derive-visual-tags --apply
+```
+
+The **dry run opens the DB read-only** (`mode=ro`), so it is safe against a
+live or write-protected copy — `PhotoDB` migrates on open and would write.
+`--apply` reads once, then writes in 2,000-row chunks with a commit and a
+progress line between, skips rows whose array would not change, and guards
+every UPDATE on the old value (`WHERE id=? AND visual_tags IS ?`) so a
+concurrent fleet write is not clobbered. Idempotent. **It never touches a photo
+whose `visual_tags` is NULL** — NULL means "not yet tagged" and is what drives
+the category-visual worker queue.
+
+Simulated over the July copy: **106,480 of 151,291 rows change** (70.4%) —
+48,322 change tags, the other 58,158 are re-ordering into the new
+deterministic sort. `low-light` 33,951 → 15,173, `long-exposure` 7,885 →
+1,551, `panoramic` 4,290 → 283, `sharp` 3,247 → 787, `blurry` 1,001 → 115,
+`motion-blur` 2,378 → 0.
+
+The 58,158 ordering-only rewrites are **intentional and a one-shot cost**:
+`merge_tags` sorts, which is what makes the stored JSON a deterministic
+function of (answer, row) — and that is what lets the backfill skip unchanged
+rows and lets the `WHERE visual_tags IS ?` guard mean anything. Don't "optimise"
+them away by preserving the model's emission order.
+
+Expect the `/status` **"visual tagged"** card to **drop** after the backfill:
+it counts `visual_tags IS NOT NULL AND != '[]'`, and a photo whose only tags
+were capture facts the EXIF refutes now legitimately holds `[]`. That is the
+fix working, not a regression.
+
+**A blanket VLM re-run is NOT recommended.** At the measured ~1 s/photo it is
+~44 h of GPU time for the whole library, and the backfill already fixes the
+half that was actually wrong without touching the model. Re-run
+`category-visual` only on a **targeted cohort** — the folders where the
+perceived tags are visibly collapsed (sports shoots: `centered` 88–94%) — via
+`clear-pass` + the fleet, or M28's per-photo re-run.
+
+**Don't simplify any of this back.** The prompt cannot fix the capture facts —
+the information is not in the image. The flat list, the missing cap and the
+12-tag guard each looked harmless and each was load-bearing in the failure.
 
 ### Routing LLM passes to LM Studio (OpenAI-compatible)
 
@@ -508,6 +703,38 @@ caveats: enable JIT loading + max-loaded-models ≥3 + TTL off, and **raise each
 model's context length above the 4096 JIT default** (LM Studio splits context
 across parallel slots, so a vision describe request 400s with `Context size has
 been exceeded`; qwen3.5-9b→16384, gemma→8192 worked).
+
+### Provenance: log the model that RAN, not the one configured
+
+`generations.model_used` said `llava` for **159,647 of 159,650**
+`category-visual` rows, and `model_version` was NULL for every Jun–Sep row — so
+nobody could tell which model tagged anything. The cause: `worker.py` stamped
+the **nominal CLI default** it was launched with. On the LM Studio route that
+name is *ignored* — `describe._resolve_openai_model(model, role)` picks the
+model by ROLE — so the log recorded a model that never executed.
+
+One shared helper pair in `describe.py`, used by the worker fleet and the M28
+re-run path alike:
+
+- **`effective_model(model, role)`** — on the OpenAI-compatible route, exactly
+  what `_resolve_openai_model(model, role)` returns (the *same* function the
+  request uses, not a reimplementation); on Ollama, the name as given.
+- **`effective_model_version(model)`** — `"lmstudio"` on the OpenAI route
+  (there is no Ollama to query, and asking blocks ~80 s retrying
+  localhost:11434 once per pass); otherwise the short Ollama digest.
+
+`describe.PASS_ROLES` is the pass→role map, pinned by a test against
+`rerun._PASS_LLM` so the two cannot disagree. `worker._provenance_kwargs`
+stamps every LLM pass through it — batch-level for `describe`/`verify`,
+per-result row for the rest. **`verify` passes `role="describe"` explicitly**:
+its logged artifact is the *regenerated description*, written by the regen
+model, not by the verifier. `rerun._model_version` is now a thin alias for the
+shared helper.
+
+Don't reintroduce a per-branch `_model_version(...)` call in the worker loop —
+a wrong provenance string still looks like a string, so drift here is invisible
+until someone asks which model tagged a photo. A test asserts the loop contains
+none.
 
 ### Ollama stall on the text passes — tight per-call timeout
 
