@@ -1094,6 +1094,17 @@ def run_worker(
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")
+                # The server defers a result it could not write (a DB lock
+                # held by e.g. the nightly maintenance sweep) instead of
+                # spending one of the photo's MAX_PROCESS_ATTEMPTS on its own
+                # failure. Those photos stay claimable and come back around.
+                n_deferred = resp.get("deferred", 0)
+                if n_deferred:
+                    ids = resp.get("deferred_photo_ids") or []
+                    shown = ", ".join(str(i) for i in ids[:8])
+                    more = f", +{len(ids) - 8} more" if len(ids) > 8 else ""
+                    print(f"  ⚠ Server deferred {n_deferred} result(s) it could not "
+                          f"write ({shown}{more}) — they will be reclaimed.")
                 total_processed += n_processed
 
                 # Cleanup temp files
