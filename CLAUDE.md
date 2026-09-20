@@ -739,6 +739,32 @@ name collision — whole-file reads across 9,600 RAWs on a spinning NAS disk are
 the thing this tool must not do. `extract_exif` reads the header only
 (`exifread.process_file(..., details=False)`, `photosearch/exif.py:55`).
 
+**The move is `os.link` + `unlink`, and that is not a style choice.** Both
+`os.rename` and `shutil.copy2` **silently overwrite** the destination, and the
+check-then-move window is real, not theoretical: today's date is one of the 25
+target folders, the nightly `ingest-incoming` cron and the SD-card importer
+write into `YYYY-MM-DD_<Model>/` while this runs, Sony DSC filenames repeat
+across cards, and `ingest._unique_target_path` has its own race on the other
+side. A hardlink fails with `EEXIST` instead of clobbering, and preserves
+mtime/permissions for free. `EXDEV`/`EPERM`/`EMLINK`/`ENOTSUP` (and only those)
+fall back to a copy that opens the destination `O_CREAT|O_EXCL|O_WRONLY` — never
+`copy2` onto a path — fsyncs the file *and* its directory before unlinking the
+source, and removes its own partial output on any failure so an ENOSPC can't
+leave a truncated file among real photos. An `EEXIST` at move time is handled
+exactly like a pre-detected collision, never retried under another name. A crash
+between link and unlink leaves both names on one inode, which the next run reads
+as an identical-hash `duplicate_left`.
+
+**The DB gate looks rows up by exact `filepath`, never by `folder`.** `folder` is
+derived in `add_photo` but is **not maintained by every writer** —
+`relocate-into-year-dirs` (cli.py) and `db.remap_paths` (db.py) both
+`UPDATE photos SET filepath = ?` and leave `folder` stale. A stale `folder` would
+hide the row, the file would look unindexed, get moved by default, and orphan
+the row where `_heal_folder` could not see it either. `_db_links` therefore does
+a prefix **range scan** on the UNIQUE `filepath` index (`>= 'dir/'` and
+`< 'dir0'`). (Those two writers leaving `folder` stale is a separate latent bug,
+not fixed here.)
+
 Other behaviour worth knowing:
 
 - **Only the top level** of each folder is processed. A nested subdirectory is
@@ -746,6 +772,9 @@ Other behaviour worth knowing:
   folder therefore never ends up empty and is never removed. Same for leftovers:
   the folder is `rmdir`'d (never `rmtree`) only when literally nothing remains,
   and the report names what is still there (`.DS_Store`, `@eaDir`, …).
+- **Symlinks are never moved or followed.** A source link is counted
+  `skipped_symlink`; the destination check uses `os.path.lexists`, because a
+  **dangling** symlink is a taken name that `exists()` reports as free.
 - **Indexed photos are skipped by default** (`skipped_indexed`). RAW/video
   companions have no `photos` row (`ingest.py` gates the DB path on `is_photo =
   ext in INGEST_EXTENSIONS`), but a JPEG in one of these folders may, and a RAW
@@ -755,30 +784,58 @@ Other behaviour worth knowing:
 - **Move first, write the row second.** They cannot be one transaction. This
   order leaves a row naming a gone file (recoverable) rather than a row naming a
   file that was never created. A re-run heals it: `_heal_folder` finds rows in
-  the folder whose file is missing, looks for the basename in that date's
-  sibling `YYYY-MM-DD_*` folders, and requires a `file_hash` match before
-  repointing. Anything ambiguous is left for a human.
+  the folder whose file is missing and repoints only on a **`file_hash` match**
+  against that date's sibling folders. No hash to check against — a row with a
+  NULL `file_hash`, or any stale `raw_filepath` (which stores no hash at all, so
+  "only one candidate" could attach the *other* body's identically-named RAW) —
+  is counted `heal_unverifiable` and printed for hand repair. A dry run never
+  hashes; it just reports how many rows would need healing.
 - `_undated/unknown-camera` is **skipped with a message** — no date, so no
   destination folder can be computed. Sort it by hand.
+- **A dry run opens the DB read-only** (`mode=ro`) and fails if the file is
+  missing, so a mistyped `--db` cannot create a stub or run migrations.
+- **`--apply` takes ingest's `_sweep_lock`** and aborts with
+  `IngestAlreadyRunning` if a sweep holds it. An `--audit` path resolving inside
+  the photo root is refused (it would count as a leftover and block `rmdir`) —
+  put it on `/data`.
 - Idempotent and resumable: a second run after a full apply does nothing.
 
-The audit CSV is the undo, so `--apply` refuses without `--audit`. It is written
-and flushed **per file**, so a crash mid-run still leaves an accurate record.
+The audit CSV is the undo, so `--apply` refuses without `--audit`. Each move
+writes **two** rows — an `intent` before the syscall and a `moved` after it —
+each `fsync`ed, so neither crash window loses the record. `--undo` resolves an
+unconfirmed `intent` by looking at the disk: source still present means the move
+never started (`never_started`); destination present at the recorded size with
+the source gone means it completed and is undone.
+
+**Operator procedure** (`/data` is the writable persistent volume):
+
+1. **Pause the nightly ingest cron and hold the SD-card importer** for the
+   window. Today's-date folder genuinely contends; the lock enforces it too.
+2. Full **dry run** to a file, then check it: files ≈ 9,600; `skipped_indexed`
+   **non-zero** (a flat zero means the DB gate saw nothing — stop); conflicts and
+   errors 0; `no_model` small and explained; **both** bodies appear on the known
+   two-body dates, and never a model that isn't yours.
+3. **Smallest folder first** with `--apply --audit /data/…`.
+4. **Verify on disk**: listing, sizes, mtimes, an `exiftool`/`stat` spot-check.
+5. **Rehearse the undo** on that folder, confirm the tree is back, then redo it.
+6. Then the rest, **one audit file per batch**.
+7. A final dry run should report nothing left.
+8. Leave `--include-indexed` and `--infer-from-sibling` **off** for the first pass.
 
 ```bash
-# On the NAS. /data is the writable persistent volume — the audit goes there.
-$DC run --rm photosearch refile-unknown-camera                    # 1. dry run, all folders
+$DC run --rm photosearch refile-unknown-camera > /data/refile-dryrun.txt     # 2
 $DC run --rm photosearch refile-unknown-camera \
-    --only 2026-06-28_unknown-camera --apply --audit /data/refile-0628.csv  # 2. one small folder
-#    3. inspect: ls the destination, read the CSV, confirm nothing unexpected
-$DC run --rm photosearch refile-unknown-camera --apply --audit /data/refile-all.csv  # 4. the rest
-$DC run --rm photosearch refile-unknown-camera --undo /data/refile-all.csv --apply   # reverse it
+    --only 2026-06-28_unknown-camera --apply --audit /data/refile-0628.csv   # 3
+$DC run --rm photosearch refile-unknown-camera --undo /data/refile-0628.csv --apply   # 5
+$DC run --rm photosearch refile-unknown-camera --apply --audit /data/refile-all.csv   # 6
 ```
 
-Undo restores a `moved` row only when the destination is still the file this
-tool put there (size, plus hash when one was recorded — `--verify-hash` hashes
-every destination) and the source path is free; anything else is `refused` and
-left alone. Any DB row the tool repointed is pointed back too.
+Undo restores a row only when the destination is still the file this tool put
+there — **size**, plus **hash for collision rows** (the only rows that carry one;
+recording a digest for every move would mean reading ~576 GB) — and the source
+path is free. Anything else is `refused` and left alone. Any DB row the tool
+repointed is pointed back too, and the restore uses the same non-overwriting
+primitive as the forward move.
 
 Cron entry on the NAS:
 

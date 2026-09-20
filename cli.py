@@ -2912,12 +2912,8 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
                    "sibling. Off by default — a wrong guess mixes two bodies.")
 @click.option("--undo", "undo_path", default=None, metavar="AUDIT.csv",
               help="Reverse the moves recorded in an audit CSV instead of refiling.")
-@click.option("--verify-hash", is_flag=True, default=False,
-              help="With --undo, hash every destination before restoring it "
-                   "(slow on spinning disks; catches a same-size edit).")
 def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
-                              include_indexed, infer_from_sibling, undo_path,
-                              verify_hash):
+                              include_indexed, infer_from_sibling, undo_path):
     """Re-file YYYY-MM-DD_unknown-camera/ onto the body each file's EXIF names.
 
     'unknown-camera' is the SD-card importer's fallback label, not a fact — it
@@ -2927,22 +2923,30 @@ def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
 
     The model comes ONLY from the file's own EXIF (never the date, never a
     sibling folder — two bodies were in use on several of these days). The date
-    comes ONLY from the source folder's name. Nothing is ever overwritten or
-    deleted: a name collision with identical bytes is left alone, and one with
-    different bytes is reported as a conflict.
+    comes ONLY from the source folder's name.
 
-    Dry run by default. --apply requires --audit, and that CSV reverses the run:
+    Nothing can be overwritten: the move is os.link + unlink (EEXIST instead of
+    clobbering), because the nightly ingest writes into these same dated folders
+    and the check-then-move window is real. A taken destination is hash-compared
+    and reported as duplicate_left or conflict; the source is always left alone.
+
+    --apply takes ingest's sweep lock, so it refuses to run during a sweep.
+
+    Dry run by default (and read-only on the DB). --apply requires --audit; that
+    CSV, written intent-then-confirm per file, reverses the run:
 
         photosearch refile-unknown-camera --undo /data/refile.csv --apply
     """
+    from photosearch.ingest import IngestAlreadyRunning
     from photosearch.refile import refile_unknown_camera, undo_refile, render_report
 
     if undo_path:
-        stats = undo_refile(undo_path, db, apply=apply, verify_hash=verify_hash)
-        click.echo(f"Undo from {undo_path}: {stats['candidates']:,} moved rows")
+        stats = undo_refile(undo_path, db, apply=apply)
+        click.echo(f"Undo from {undo_path}: {stats['candidates']:,} candidate rows")
         click.echo(f"  restored={stats['restored']:,}  "
                    f"would_restore={stats['would_restore']:,}  "
-                   f"refused={stats['refused']:,}  errors={stats['errors']:,}")
+                   f"refused={stats['refused']:,}  "
+                   f"never_started={stats['no_op']:,}  errors={stats['errors']:,}")
         for path, why in stats["refusals"]:
             click.echo(f"  REFUSED {path}: {why}")
         if not apply:
@@ -2964,6 +2968,10 @@ def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
             infer_from_sibling=infer_from_sibling,
             on_progress=_progress,
         )
+    except IngestAlreadyRunning as exc:
+        # An ingest sweep is moving files under _incoming/ right now; refiling
+        # the same tree concurrently would race it. Nothing is lost by waiting.
+        raise click.ClickException(str(exc)) from None
     except (ValueError, FileNotFoundError) as exc:
         raise click.ClickException(str(exc)) from None
 

@@ -18,16 +18,21 @@ files already on disk, and is built to be boring about it:
 * **The date comes only from the source folder's name.** Ingest already dated
   these files; re-deriving from EXIF could split a shoot across a midnight or
   timezone edge.
-* **Nothing is ever overwritten and nothing is ever deleted.** A name collision
-  at the destination is resolved by hashing: identical content leaves the source
-  alone (`duplicate_left`), different content leaves it alone too (`conflict`).
-* **Every move is recorded before the next one starts**, so `undo_refile` can
-  put the tree back from the audit CSV even after a crash.
+* **The move cannot overwrite, at the syscall level.** Not "we checked first" —
+  `os.rename` and `shutil.copy2` both clobber, and the check-then-move window is
+  real: `YYYY-MM-DD_<today>_unknown-camera` is one of the targets, the nightly
+  ingest cron and the SD-card importer write into the very folder we move into,
+  and Sony DSC names repeat across cards. See `_move_file`.
+* **Nothing is ever deleted.** A name collision at the destination is resolved by
+  hashing: identical content leaves the source alone (`duplicate_left`),
+  different content leaves it alone too (`conflict`).
+* **The audit is written before the move and confirmed after it**, so a kill at
+  any point leaves `undo_refile` enough to put the tree back.
 
 IO shape matters: this runs on a 4-core NAS with spinning disks. `extract_exif`
 reads the file header only (``exifread.process_file(..., details=False)``);
 hashing is whole-file and therefore happens ONLY on a name collision, never as
-part of the normal path.
+part of the normal path and never during a dry run.
 """
 
 from __future__ import annotations
@@ -37,6 +42,8 @@ import errno
 import os
 import re
 import shutil
+import sqlite3
+import stat as stat_mod
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -47,6 +54,8 @@ from .ingest import (
     ALL_MEDIA_EXTENSIONS,
     UNDATED_DIRNAME,
     _file_suffix,
+    _no_lock,
+    _sweep_lock,
 )
 
 # The fallback source label this tool repairs. Deliberately the literal ingest
@@ -62,7 +71,23 @@ _YEAR_RE = re.compile(r"^\d{4}$")
 # Audit CSV header. Ordering is part of the contract `undo_refile` reads back.
 AUDIT_FIELDS = ["action", "source", "destination", "model", "size", "hash", "reason"]
 
+# errno values that mean "hardlink is not available here", as opposed to "that
+# destination is taken". Only these fall through to the copy path.
+_LINK_UNSUPPORTED = {errno.EXDEV, errno.EPERM, errno.EMLINK}
+for _name in ("ENOTSUP", "EOPNOTSUPP"):
+    if hasattr(errno, _name):
+        _LINK_UNSUPPORTED.add(getattr(errno, _name))
+
 ProgressFn = Callable[[dict], None]
+
+
+class DestinationExists(OSError):
+    """The destination path was already taken at the moment of the move.
+
+    Raised instead of overwriting. The caller handles it exactly like a
+    collision detected up front — hash compare, then `duplicate_left` or
+    `conflict` — and never retries under another name.
+    """
 
 
 def _zero_counts() -> dict:
@@ -75,9 +100,11 @@ def _zero_counts() -> dict:
         "duplicate_left": 0,
         "conflict": 0,
         "skipped_indexed": 0,
+        "skipped_symlink": 0,
         "db_updated": 0,
         "healed": 0,
         "would_heal": 0,
+        "heal_unverifiable": 0,
         "errors": 0,
     }
 
@@ -87,12 +114,18 @@ def _zero_counts() -> dict:
 # ---------------------------------------------------------------------------
 
 class _Audit:
-    """Per-file CSV writer, flushed after every row.
+    """Per-file CSV writer, flushed AND fsynced after every row.
 
-    Flushing costs one small write per file and buys the thing that makes this
-    tool reversible: a crash mid-run still leaves a complete record of every
-    move that actually happened. Appends to an existing file (a resumed run
-    keeps the earlier run's record) rather than truncating it.
+    Two rows per move: an ``intent`` before the syscall and a ``moved`` after
+    it. That is what makes a kill survivable — a single row written after the
+    move would leave a completed move with no undo record, and a single row
+    written before it could not tell "moved" from "never started". `undo_refile`
+    resolves an unconfirmed intent by looking at the disk.
+
+    fsync (not just flush) because the failure this guards against includes
+    power loss, where buffered-but-unwritten rows are exactly the ones
+    describing the most recent moves. Appends to an existing file, so a resumed
+    run keeps the earlier run's record.
     """
 
     def __init__(self, path: Optional[str]):
@@ -106,14 +139,21 @@ class _Audit:
         self._w = csv.writer(self._fh)
         if not exists:
             self._w.writerow(AUDIT_FIELDS)
-            self._fh.flush()
+            self._sync()
+
+    def _sync(self) -> None:
+        self._fh.flush()
+        try:
+            os.fsync(self._fh.fileno())
+        except OSError:
+            pass  # a filesystem that cannot fsync must not abort the run
 
     def row(self, action: str, source: str = "", destination: str = "",
             model: str = "", size: str = "", digest: str = "", reason: str = "") -> None:
         if self._w is None:
             return
         self._w.writerow([action, source, destination, model, size, digest, reason])
-        self._fh.flush()
+        self._sync()
 
     def close(self) -> None:
         if self._fh is not None:
@@ -123,68 +163,176 @@ class _Audit:
 
 
 # ---------------------------------------------------------------------------
-# moving
+# the move primitive
 # ---------------------------------------------------------------------------
 
-def _move_file(src: Path, dst: Path) -> int:
-    """Move `src` onto `dst`, preserving mtime. Returns the destination size.
+def _fsync_dir(d: Path) -> None:
+    """Persist a directory entry, so the new name survives a power loss."""
+    try:
+        fd = os.open(str(d), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
-    Same-filesystem is the expected case (both folders live under the one photo
-    root), so this is a plain atomic `os.rename`. A cross-device layout (EXDEV)
-    falls back to copy + hash verify + only then remove the source — the source
-    is never unlinked until the copy has been proven byte-identical.
+
+def _unlink_quietly(p: Path) -> None:
+    try:
+        os.unlink(str(p))
+    except OSError:
+        pass
+
+
+def _move_file(src: Path, dst: Path) -> int:
+    """Move `src` to `dst` WITHOUT the ability to overwrite. Returns dst's size.
+
+    `os.link` is the whole point: it fails with EEXIST rather than clobbering,
+    so the check-then-move race cannot destroy an original. `os.rename` and
+    `shutil.copy2` both silently replace the destination, and the race is real —
+    the nightly ingest writes into these same dated folders while this runs.
+    A hardlink also preserves mtime and permissions for free (one inode), and a
+    crash between the link and the unlink leaves both names on that one inode,
+    which the next run reads as an identical-hash `duplicate_left`.
+
+    EXDEV/EPERM/EMLINK/ENOTSUP mean hardlinks are unavailable, not that the name
+    is taken; only those fall through to `_copy_exclusive`.
     """
     st = src.stat()
     try:
-        os.rename(str(src), str(dst))
+        os.link(str(src), str(dst))
+    except FileExistsError:
+        raise DestinationExists(errno.EEXIST, "destination exists", str(dst)) from None
     except OSError as exc:
-        if exc.errno != errno.EXDEV:
+        if exc.errno not in _LINK_UNSUPPORTED:
             raise
-        shutil.copy2(str(src), str(dst))
-        if file_hash(str(dst)) != file_hash(str(src)):
-            try:
-                dst.unlink()
-            except OSError:
-                pass
-            raise OSError(f"cross-device copy of {src} did not verify; source kept")
-        src.unlink()
-    out = dst.stat()
+        _copy_exclusive(src, dst, st)
+    else:
+        _fsync_dir(dst.parent)
+        os.unlink(str(src))
+    out = os.stat(str(dst))
     if out.st_size != st.st_size:
         raise OSError(f"destination {dst} is {out.st_size} bytes, expected {st.st_size}")
-    os.utime(str(dst), (st.st_atime, st.st_mtime))
     return out.st_size
 
 
+def _copy_exclusive(src: Path, dst: Path, st: os.stat_result) -> None:
+    """Cross-device fallback: copy into an O_EXCL fd, verify, fsync, then unlink.
+
+    O_EXCL gives the copy path the same non-overwriting guarantee the hardlink
+    has. Every failure removes the partial destination THIS call created (an
+    ENOSPC/EIO truncation left among real photos would read as a permanent
+    `conflict` on every later run) and leaves the source untouched. The
+    destination and its directory are fsynced BEFORE the source is unlinked, so
+    a power loss cannot leave the bytes only in page cache with the original
+    already gone.
+    """
+    try:
+        fd = os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise DestinationExists(errno.EEXIST, "destination exists", str(dst)) from None
+    try:
+        with open(str(src), "rb") as fsrc, os.fdopen(fd, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+    except BaseException:
+        _unlink_quietly(dst)
+        raise
+    try:
+        if os.stat(str(dst)).st_size != st.st_size:
+            raise OSError(f"cross-device copy of {src} is short; source kept")
+        if file_hash(str(dst)) != file_hash(str(src)):
+            raise OSError(f"cross-device copy of {src} did not verify; source kept")
+        os.chmod(str(dst), stat_mod.S_IMODE(st.st_mode))
+        os.utime(str(dst), (st.st_atime, st.st_mtime))
+        _fsync_dir(dst.parent)
+    except BaseException:
+        _unlink_quietly(dst)
+        raise
+    os.unlink(str(src))
+
+
 # ---------------------------------------------------------------------------
-# DB links
+# DB access
 # ---------------------------------------------------------------------------
 
-def _db_links(db: PhotoDB, rel_folders: list[str]) -> tuple[dict, dict]:
-    """Map the DB's view of the target folders.
+class _ReadOnlyDB:
+    """A read-only stand-in for PhotoDB, used by dry runs.
+
+    `PhotoDB(...)` opens read-write: on a mistyped `--db` it would CREATE an
+    empty stub and run migrations against it, and a dry run must write nothing
+    anywhere. The two path helpers are borrowed from PhotoDB itself rather than
+    re-derived, so relative/absolute handling cannot drift.
+    """
+
+    relative_filepath = PhotoDB.relative_filepath
+    resolve_filepath = PhotoDB.resolve_filepath
+
+    def __init__(self, db_path: str, photo_root: Optional[str] = None):
+        self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        self.conn.row_factory = sqlite3.Row
+        # Same precedence as PhotoDB.__init__: arg > PHOTO_ROOT env > DB value.
+        if photo_root:
+            self.photo_root = str(Path(photo_root).resolve())
+        elif os.environ.get("PHOTO_ROOT"):
+            self.photo_root = str(Path(os.environ["PHOTO_ROOT"]).resolve())
+        else:
+            try:
+                row = self.conn.execute(
+                    "SELECT value FROM schema_info WHERE key = 'photo_root'").fetchone()
+            except sqlite3.Error:
+                row = None
+            self.photo_root = row["value"] if row else None
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+        return False
+
+
+def _db_links(db, rel_folders: list[str]) -> tuple[dict, dict]:
+    """Map the DB's view of the target folders, keyed by EXACT filepath.
 
     Returns ``(by_path, raw_refs)``:
 
-    * ``by_path``  — ``rel filepath -> photo row`` for photos whose own row sits
-      in one of these folders. RAW/video companions have NO row (ingest gates
-      the DB path on ``is_photo = ext in INGEST_EXTENSIONS``), so this only ever
-      matches JPEG/HEIC.
-    * ``raw_refs`` — ``rel filepath -> [photo_id, ...]`` for files named by some
+    * ``by_path``  — ``filepath -> photo row`` for every row whose path lies in
+      one of these folders, found with a prefix RANGE scan on the UNIQUE
+      ``filepath`` index. Deliberately NOT ``WHERE folder IN (...)``: the
+      ``folder`` column is derived in ``add_photo`` but is not maintained by
+      every writer — ``relocate-into-year-dirs`` (cli.py) and
+      ``db.remap_paths`` both ``UPDATE photos SET filepath`` and leave ``folder``
+      stale. A stale ``folder`` would hide the row, the file would look
+      unindexed, and it would be moved by default, orphaning the row.
+    * ``raw_refs`` — ``filepath -> [photo_id, ...]`` for files named by some
       photo's ``raw_filepath``. ``index.py`` sets that from ``find_raw_pair``,
-      which looks in the photo's OWN directory, so this can only fire when a
-      JPEG and its RAW both landed in the unknown-camera folder. One sequential
-      scan of the non-null column, once per run.
+      which looks in the photo's OWN directory, so this fires when a JPEG and
+      its RAW both landed in the unknown-camera folder. One sequential scan of
+      the non-null column, once per run, matched by exact dirname.
+
+    RAW/video companions have no row of their own (``ingest.py`` gates the DB
+    path on ``is_photo = ext in INGEST_EXTENSIONS``), so ``by_path`` only ever
+    matches JPEG/HEIC.
     """
     by_path: dict[str, dict] = {}
     raw_refs: dict[str, list[int]] = {}
     if not rel_folders:
         return by_path, raw_refs
 
-    for chunk_start in range(0, len(rel_folders), 400):
-        chunk = rel_folders[chunk_start:chunk_start + 400]
-        ph = ",".join("?" * len(chunk))
+    for rel in rel_folders:
+        lo = rel + "/"
+        hi = rel + "0"  # '/' is 0x2F, '0' is 0x30 — the exact prefix range
         for r in db.conn.execute(
-            f"SELECT id, filepath, filename, file_hash, folder FROM photos "
-            f"WHERE folder IN ({ph})", chunk
+            "SELECT id, filepath, filename, file_hash FROM photos "
+            "WHERE filepath >= ? AND filepath < ?", (lo, hi)
         ).fetchall():
             by_path[r["filepath"]] = dict(r)
 
@@ -198,9 +346,9 @@ def _db_links(db: PhotoDB, rel_folders: list[str]) -> tuple[dict, dict]:
     return by_path, raw_refs
 
 
-def _heal_folder(db: PhotoDB, folder: Path, year_dir: Path, date: str,
-                 by_path: dict, raw_refs: dict,
-                 apply: bool, audit: _Audit, counts: dict) -> None:
+def _heal_folder(db, folder: Path, year_dir: Path, date: str,
+                 by_path: dict, raw_refs: dict, apply: bool,
+                 audit: _Audit, counts: dict, notes: list) -> None:
     """Repair rows left pointing into this folder at a file that has moved.
 
     This is the recovery half of the move-then-write ordering used by
@@ -209,41 +357,49 @@ def _heal_folder(db: PhotoDB, folder: Path, year_dir: Path, date: str,
     exists — recoverable, unlike the reverse order, which would point a row at
     a file that was never created.
 
-    A re-run heals it: for each row in this folder whose file is gone, look for
-    the same basename in the date's sibling `YYYY-MM-DD_*` folders and require
-    a ``file_hash`` match (for ``raw_filepath`` refs, which carry no hash,
-    require exactly one candidate). Anything ambiguous is left for a human.
+    A re-run heals it by CONTENT: the same basename in one of that date's
+    sibling `YYYY-MM-DD_*` folders, with a matching ``photos.file_hash``.
+    Anything that cannot be verified that way is counted ``heal_unverifiable``
+    and reported for a human — including every stale ``raw_filepath``, which
+    carries no hash at all, so an "only one candidate" repoint could silently
+    attach the OTHER body's same-named RAW.
+
+    A dry run never hashes: it reports how many rows would need healing.
     """
     siblings = [d for d in sorted(year_dir.iterdir())
                 if d.is_dir() and d.name.startswith(date + "_") and d != folder]
-    if not siblings:
-        return
+    prefix = db.relative_filepath(str(folder))
 
     def _candidates(name: str) -> list[Path]:
         return [d / name for d in siblings if (d / name).is_file()]
 
-    prefix = db.relative_filepath(str(folder))
     for rel, row in list(by_path.items()):
         if _folder_of(rel, os.path.basename(rel)) != prefix:
             continue
-        if os.path.exists(db.resolve_filepath(rel)):
+        if os.path.lexists(db.resolve_filepath(rel)):
             continue
-        name = os.path.basename(rel)
-        cands = _candidates(name)
-        if row.get("file_hash"):
-            cands = [c for c in cands if file_hash(str(c)) == row["file_hash"]]
-        elif len(cands) > 1:
-            cands = []
-        if len(cands) != 1:
-            continue
-        new_rel = db.relative_filepath(str(cands[0]))
         if not apply:
             counts["would_heal"] += 1
             continue
+        if not row.get("file_hash"):
+            counts["heal_unverifiable"] += 1
+            notes.append(f"{rel}: row has no file_hash — repair by hand")
+            audit.row("heal_unverifiable", rel,
+                      reason="photos row has no file_hash to verify against")
+            continue
+        cands = [c for c in _candidates(os.path.basename(rel))
+                 if file_hash(str(c)) == row["file_hash"]]
+        if len(cands) != 1:
+            counts["heal_unverifiable"] += 1
+            notes.append(f"{rel}: {len(cands)} content matches — repair by hand")
+            audit.row("heal_unverifiable", rel,
+                      reason=f"{len(cands)} hash-matching candidates")
+            continue
+        new_rel = db.relative_filepath(str(cands[0]))
         try:
             db.conn.execute(
                 "UPDATE photos SET filepath = ?, folder = ? WHERE id = ?",
-                (new_rel, _folder_of(new_rel, name), row["id"]))
+                (new_rel, _folder_of(new_rel, os.path.basename(new_rel)), row["id"]))
             db.conn.commit()
         except Exception as exc:
             counts["errors"] += 1
@@ -256,28 +412,18 @@ def _heal_folder(db: PhotoDB, folder: Path, year_dir: Path, date: str,
     for rel, ids in list(raw_refs.items()):
         if _folder_of(rel, os.path.basename(rel)) != prefix:
             continue
-        if os.path.exists(db.resolve_filepath(rel)):
+        if os.path.lexists(db.resolve_filepath(rel)):
             continue
-        cands = _candidates(os.path.basename(rel))
-        if len(cands) != 1:
-            continue
-        new_rel = db.relative_filepath(str(cands[0]))
         if not apply:
             counts["would_heal"] += 1
             continue
-        try:
-            for pid in ids:
-                db.conn.execute("UPDATE photos SET raw_filepath = ? WHERE id = ?",
-                                (new_rel, pid))
-            db.conn.commit()
-        except Exception as exc:
-            counts["errors"] += 1
-            audit.row("error", rel, new_rel, reason=f"heal failed: {exc}")
-            continue
-        raw_refs.pop(rel, None)
-        counts["healed"] += 1
-        audit.row("healed", rel, new_rel,
-                  reason="raw_refs=" + "|".join(str(i) for i in ids))
+        # Never auto-repoint: a raw_filepath has no stored hash, so "exactly one
+        # candidate" would happily attach another body's identically-named RAW.
+        counts["heal_unverifiable"] += 1
+        notes.append(f"{rel}: stale raw_filepath on photo(s) "
+                     f"{', '.join(str(i) for i in ids)} — repair by hand")
+        audit.row("heal_unverifiable", rel,
+                  reason="stale raw_filepath; no hash to verify a replacement")
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +442,7 @@ def _find_folders(photo_root: Path, only: Optional[Iterable[str]]) -> list[tuple
         if not year_dir.is_dir() or not _YEAR_RE.match(year_dir.name):
             continue
         for d in sorted(year_dir.iterdir()):
-            if not d.is_dir():
+            if not d.is_dir() or d.is_symlink():
                 continue
             m = _FOLDER_RE.match(d.name)
             if not m:
@@ -326,6 +472,13 @@ def _infer_from_sibling(year_dir: Path, date: str, stem: str) -> Optional[str]:
     return holder.name[len(date) + 1:]
 
 
+def _size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
@@ -345,19 +498,21 @@ def refile_unknown_camera(
     """Move `*_unknown-camera` files onto the folder their own EXIF names.
 
     Dry run is the default: nothing is moved, nothing is written, no audit file
-    is created. ``apply=True`` requires ``audit_path`` — the audit IS the undo.
+    is created, and the database is opened READ-ONLY. ``apply=True`` requires
+    ``audit_path`` — the audit IS the undo — and takes ingest's sweep lock, so
+    it cannot run against a library the nightly ingest is mid-sweep on.
 
     Only files at the TOP LEVEL of each folder are considered. A nested
     subdirectory is left untouched and reported: its layout carries meaning this
     tool cannot reproduce at the destination, and flattening it would invent
     collisions. That also means such a folder is never empty afterwards and is
-    therefore never removed.
+    therefore never removed. Symlinks are never followed and never moved.
 
     Returns a stats dict::
 
         {"dry_run": bool, "photo_root": str, "audit_path": str|None,
          "folders": [ {name, path, files, by_model, nested_dirs, remaining,
-                       removed, **counts}, ... ],
+                       removed, notes, **counts}, ... ],
          "totals": {...}, "samples": [(src, dst), ...],
          "skipped_undated": int}
     """
@@ -365,259 +520,315 @@ def refile_unknown_camera(
         raise ValueError(
             "refusing to --apply without --audit: the audit CSV is the only "
             "record that can reverse these moves")
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(
+            f"database not found: {db_path} — refusing to create one "
+            f"(check --db / PHOTOSEARCH_DB)")
 
-    with PhotoDB(db_path, photo_root=photo_root) as db:
-        root = Path(photo_root or db.photo_root or ".").resolve()
-        if not root.is_dir():
-            raise FileNotFoundError(f"photo root not found: {root}")
+    ro = _ReadOnlyDB(db_path, photo_root)
+    try:
+        root = Path(photo_root or ro.photo_root or ".").resolve()
+    finally:
+        if apply:
+            ro.close()
+    if not root.is_dir():
+        raise FileNotFoundError(f"photo root not found: {root}")
 
-        targets = _find_folders(root, only)
-        # DB keys go through the DB's own helper, never a hand-rolled
-        # relative_to(root): if no photo_root is configured the indexer stored
-        # ABSOLUTE paths, and a mismatch here would make every indexed photo
-        # look unindexed — the one failure mode that must not happen quietly.
-        rel_folders = [db.relative_filepath(str(f)) for _y, f, _d in targets]
-        by_path, raw_refs = _db_links(db, rel_folders)
+    if audit_path:
+        audit_abs = Path(audit_path).expanduser().resolve()
+        if audit_abs == root or root in audit_abs.parents:
+            raise ValueError(
+                f"refusing to write the audit inside the photo root ({root}): it "
+                f"would count as a leftover and block an empty folder's removal. "
+                f"Use the /data volume.")
 
-        audit = _Audit(audit_path if apply else None)
-        totals = _zero_counts()
-        folders: list[dict] = []
-        samples: list[tuple[str, str]] = []
-        budget = limit if limit is not None else None
-
-        # `_undated/unknown-camera` has no date to route by, so there is no
-        # destination folder to compute. Reported, never touched.
-        undated = root / UNDATED_DIRNAME / UNKNOWN_SUFFIX
-        skipped_undated = 1 if undated.is_dir() else 0
-
-        def _emit(payload: dict) -> None:
-            if on_progress is not None:
-                on_progress(payload)
-
+    # A dry run writes nothing, so it neither needs nor takes ingest's mutex.
+    lock = _sweep_lock(db_path) if apply else _no_lock()
+    with lock:
+        db = PhotoDB(db_path, photo_root=photo_root) if apply else ro
         try:
-            for fi, (year_dir, folder, date) in enumerate(targets):
-                rel_folder = db.relative_filepath(str(folder))
-                _emit({"event": "folder", "name": folder.name, "index": fi,
-                       "total": len(targets)})
-                counts = _zero_counts()
-                by_model: dict[str, int] = {}
-                nested_dirs: list[str] = []
+            return _run(db, root, apply, audit_path, only, limit, include_indexed,
+                        infer_from_sibling, on_progress, sample_limit)
+        finally:
+            db.close()
 
-                _heal_folder(db, folder, year_dir, date,
-                             by_path, raw_refs, apply, audit, counts)
 
-                # Names this run will NOT move, so a dry run can predict what
-                # would be left behind (and therefore whether the folder would
-                # be removed) instead of just listing everything still present.
-                leftovers: list[str] = []
-                entries = sorted(folder.iterdir())
-                candidates: list[Path] = []
-                for p in entries:
-                    if p.is_dir():
-                        nested_dirs.append(p.name)
-                        leftovers.append(p.name)
-                        continue
-                    if p.name.startswith("."):
-                        leftovers.append(p.name)  # .DS_Store / ._AppleDouble
-                        continue
-                    if p.suffix.lower() in ALL_MEDIA_EXTENSIONS:
-                        candidates.append(p)
-                    else:
-                        leftovers.append(p.name)  # sidecars, .aae edits, etc.
+def _run(db, root: Path, apply: bool, audit_path: Optional[str],
+         only, limit, include_indexed, infer_from_sibling,
+         on_progress, sample_limit) -> dict:
+    targets = _find_folders(root, only)
 
-                relocating: set[str] = set()
-                for src in candidates:
-                    if budget is not None and budget <= 0:
-                        break
-                    counts["files"] += 1
-                    # The audit records ABSOLUTE paths — it is a record of files
-                    # on disk, and must stay readable without knowing which
-                    # photo_root the run used. DB keys are the db-relative form.
-                    abs_src = str(src)
-                    rel_src = db.relative_filepath(abs_src)
+    # Classify every folder's top level FIRST, so the DB lookup can ask about
+    # the exact candidate paths rather than a folder column nothing maintains.
+    plan = []
+    for year_dir, folder, date in targets:
+        nested_dirs: list[str] = []
+        leftovers: list[str] = []
+        candidates: list[Path] = []
+        symlinks = 0
+        for p in sorted(folder.iterdir()):
+            if p.is_symlink():
+                # Never move a link: the move would relocate the link and leave
+                # its target, or (worse) act on a path outside this tree.
+                leftovers.append(p.name)
+                symlinks += 1
+                continue
+            if p.is_dir():
+                nested_dirs.append(p.name)
+                leftovers.append(p.name)
+                continue
+            if p.name.startswith("."):
+                leftovers.append(p.name)  # .DS_Store / ._AppleDouble droppings
+                continue
+            if p.suffix.lower() in ALL_MEDIA_EXTENSIONS:
+                candidates.append(p)
+            else:
+                leftovers.append(p.name)  # sidecars, .aae edits, etc.
+        plan.append({"year_dir": year_dir, "folder": folder, "date": date,
+                     "candidates": candidates, "nested_dirs": nested_dirs,
+                     "leftovers": leftovers, "symlinks": symlinks})
 
-                    try:
-                        meta = extract_exif(str(src))
-                    except Exception:
-                        meta = {}
-                    # The destination suffix must be EXACTLY what ingest would
-                    # produce today — imported, never re-implemented.
-                    suffix = _file_suffix(UNKNOWN_SUFFIX, UNKNOWN_SUFFIX, meta)
-                    inferred = False
-                    if suffix == UNKNOWN_SUFFIX and infer_from_sibling:
-                        guess = _infer_from_sibling(year_dir, date, src.stem)
-                        if guess:
-                            suffix, inferred = guess, True
+    rel_folders = [db.relative_filepath(str(f)) for _y, f, _d in targets]
+    by_path, raw_refs = _db_links(db, rel_folders)
 
-                    if suffix == UNKNOWN_SUFFIX:
-                        counts["no_model"] += 1
-                        audit.row("no_model", abs_src, model="",
-                                  size=str(_size(src)),
-                                  reason="EXIF names no usable camera model")
-                        _emit({"event": "file", "action": "no_model", "path": rel_src})
-                        continue
+    audit = _Audit(audit_path if apply else None)
+    totals = _zero_counts()
+    folders: list[dict] = []
+    samples: list[tuple[str, str]] = []
+    budget = limit if limit is not None else None
 
-                    by_model[suffix] = by_model.get(suffix, 0) + 1
-                    dest_dir = year_dir / f"{date}_{suffix}"
-                    dest = dest_dir / src.name
-                    abs_dest = str(dest)
-                    rel_dest = db.relative_filepath(abs_dest)
+    # `_undated/unknown-camera` has no date to route by, so there is no
+    # destination folder to compute. Reported, never touched.
+    skipped_undated = 1 if (root / UNDATED_DIRNAME / UNKNOWN_SUFFIX).is_dir() else 0
 
-                    # DB gate. A row (or a raw_filepath reference) makes the file
-                    # path-bearing state, not just bytes.
-                    linked_ids = list(raw_refs.get(rel_src, ()))
-                    row = by_path.get(rel_src)
-                    if (row or linked_ids) and not include_indexed:
-                        counts["skipped_indexed"] += 1
-                        audit.row("skipped_indexed", abs_src, abs_dest, suffix,
-                                  str(_size(src)),
-                                  reason="has a photos row (or is a raw_filepath "
-                                         "target); re-run with --include-indexed")
-                        _emit({"event": "file", "action": "skipped_indexed",
-                               "path": rel_src})
-                        continue
+    def _emit(payload: dict) -> None:
+        if on_progress is not None:
+            on_progress(payload)
 
-                    if dest.exists():
-                        # The ONLY place whole-file hashing happens. Doing it for
-                        # every file would mean reading the whole library off a
-                        # spinning disk; a name collision is rare and is exactly
-                        # the case where the bytes have to be compared.
-                        try:
-                            digest = file_hash(str(src))
-                            same = digest == file_hash(str(dest))
-                        except Exception as exc:
-                            counts["errors"] += 1
-                            audit.row("error", abs_src, abs_dest, suffix,
-                                      reason=f"hash failed: {exc}")
-                            continue
-                        if same:
-                            counts["duplicate_left"] += 1
-                            audit.row("duplicate_left", abs_src, abs_dest, suffix,
-                                      str(_size(src)), digest,
-                                      "identical copy already at destination; "
-                                      "source left in place, delete by hand")
-                        else:
-                            counts["conflict"] += 1
-                            audit.row("conflict", abs_src, abs_dest, suffix,
-                                      str(_size(src)), digest,
-                                      "different file already at destination; "
-                                      "nothing overwritten, nothing renamed")
-                        _emit({"event": "file",
-                               "action": "duplicate_left" if same else "conflict",
-                               "path": rel_src})
-                        continue
+    try:
+        for fi, step in enumerate(plan):
+            year_dir, folder, date = step["year_dir"], step["folder"], step["date"]
+            _emit({"event": "folder", "name": folder.name, "index": fi,
+                   "total": len(plan)})
+            counts = _zero_counts()
+            counts["skipped_symlink"] = step["symlinks"]
+            by_model: dict[str, int] = {}
+            notes: list[str] = []
 
-                    if len(samples) < sample_limit:
-                        samples.append((rel_src, rel_dest))
+            _heal_folder(db, folder, year_dir, date, by_path, raw_refs,
+                         apply, audit, counts, notes)
 
-                    if not apply:
-                        counts["would_move"] += 1
-                        relocating.add(src.name)
-                        if inferred:
-                            counts["inferred"] += 1
-                        if budget is not None:
-                            budget -= 1
-                        _emit({"event": "file", "action": "would_move",
-                               "path": rel_src, "destination": rel_dest})
-                        continue
-
-                    try:
-                        dest_dir.mkdir(parents=True, exist_ok=True)
-                        size = _move_file(src, dest)
-                    except Exception as exc:
-                        counts["errors"] += 1
-                        audit.row("error", abs_src, abs_dest, suffix,
-                                  reason=f"move failed: {exc}")
-                        _emit({"event": "file", "action": "error", "path": rel_src})
-                        continue
-
-                    # Move first, write the row second. See _heal_folder for why
-                    # this order is the recoverable one.
-                    reason_bits = []
-                    if row is not None:
-                        try:
-                            db.conn.execute(
-                                "UPDATE photos SET filepath = ?, folder = ? WHERE id = ?",
-                                (rel_dest, _folder_of(rel_dest, src.name), row["id"]))
-                            db.conn.commit()
-                            counts["db_updated"] += 1
-                            reason_bits.append(f"photo_id={row['id']}")
-                            by_path.pop(rel_src, None)
-                        except Exception as exc:
-                            counts["errors"] += 1
-                            reason_bits.append(f"db update FAILED: {exc}")
-                    if linked_ids:
-                        try:
-                            for pid in linked_ids:
-                                db.conn.execute(
-                                    "UPDATE photos SET raw_filepath = ? WHERE id = ?",
-                                    (rel_dest, pid))
-                            db.conn.commit()
-                            counts["db_updated"] += 1
-                            reason_bits.append(
-                                "raw_refs=" + "|".join(str(i) for i in linked_ids))
-                            raw_refs.pop(rel_src, None)
-                        except Exception as exc:
-                            counts["errors"] += 1
-                            reason_bits.append(f"raw_filepath update FAILED: {exc}")
-                    if inferred:
-                        counts["inferred"] += 1
-                        reason_bits.append("model inferred from same-stem sibling")
-
-                    counts["moved"] += 1
-                    relocating.add(src.name)
-                    if budget is not None:
-                        budget -= 1
-                    audit.row("moved", abs_src, abs_dest, suffix, str(size),
-                              reason=";".join(reason_bits))
-                    _emit({"event": "file", "action": "moved", "path": rel_src,
-                           "destination": rel_dest})
-
-                # On apply this is the real listing; on a dry run it is the
-                # prediction (everything that would NOT move), so the report
-                # can say whether the folder would survive the run.
-                leftovers += [c.name for c in candidates if c.name not in relocating]
-                remaining = (sorted(p.name for p in folder.iterdir())
-                             if (apply and folder.is_dir()) else sorted(leftovers))
-                removed = False
-                if apply and not remaining:
-                    try:
-                        folder.rmdir()  # rmdir only — fails safely if not empty
-                        removed = True
-                    except OSError as exc:
-                        audit.row("error", str(folder),
-                                  reason=f"rmdir failed: {exc}")
-
-                folders.append({
-                    "name": folder.name, "path": rel_folder,
-                    "by_model": by_model, "nested_dirs": nested_dirs,
-                    "remaining": remaining[:25], "removed": removed, **counts,
-                })
-                for k in totals:
-                    totals[k] += counts[k]
+            relocating: set[str] = set()
+            for src in step["candidates"]:
                 if budget is not None and budget <= 0:
                     break
-        finally:
-            audit.close()
+                counts["files"] += 1
+                # The audit records ABSOLUTE paths — it is a record of files on
+                # disk, and must stay readable without knowing which photo_root
+                # the run used. DB keys are the db-relative form.
+                abs_src = str(src)
+                rel_src = db.relative_filepath(abs_src)
 
-        _emit({"event": "done", "totals": totals})
-        return {
-            "dry_run": not apply,
-            "photo_root": str(root),
-            "audit_path": audit_path if apply else None,
-            "folders": folders,
-            "totals": totals,
-            "samples": samples,
-            "skipped_undated": skipped_undated,
-            "limit_reached": bool(budget is not None and budget <= 0),
-        }
+                try:
+                    meta = extract_exif(abs_src)
+                except Exception:
+                    meta = {}
+                # The destination suffix must be EXACTLY what ingest would
+                # produce today — imported, never re-implemented.
+                suffix = _file_suffix(UNKNOWN_SUFFIX, UNKNOWN_SUFFIX, meta)
+                inferred = False
+                if suffix == UNKNOWN_SUFFIX and infer_from_sibling:
+                    guess = _infer_from_sibling(year_dir, date, src.stem)
+                    if guess:
+                        suffix, inferred = guess, True
+
+                if suffix == UNKNOWN_SUFFIX:
+                    counts["no_model"] += 1
+                    audit.row("no_model", abs_src, model="", size=str(_size(src)),
+                              reason="EXIF names no usable camera model")
+                    _emit({"event": "file", "action": "no_model", "path": rel_src})
+                    continue
+
+                by_model[suffix] = by_model.get(suffix, 0) + 1
+                dest_dir = year_dir / f"{date}_{suffix}"
+                dest = dest_dir / src.name
+                abs_dest = str(dest)
+                rel_dest = db.relative_filepath(abs_dest)
+
+                # DB gate. A row (or a raw_filepath reference) makes the file
+                # path-bearing state, not just bytes.
+                linked_ids = list(raw_refs.get(rel_src, ()))
+                row = by_path.get(rel_src)
+                if (row or linked_ids) and not include_indexed:
+                    counts["skipped_indexed"] += 1
+                    audit.row("skipped_indexed", abs_src, abs_dest, suffix,
+                              str(_size(src)),
+                              reason="has a photos row (or is a raw_filepath "
+                                     "target); re-run with --include-indexed")
+                    _emit({"event": "file", "action": "skipped_indexed",
+                           "path": rel_src})
+                    continue
+
+                # lexists, not exists: a DANGLING symlink at the destination is
+                # taken, not free, and `exists()` would call it free.
+                if os.path.lexists(abs_dest):
+                    _collision(src, dest, abs_src, abs_dest, suffix,
+                               counts, audit, _emit, rel_src)
+                    continue
+
+                if len(samples) < sample_limit:
+                    samples.append((rel_src, rel_dest))
+
+                if not apply:
+                    counts["would_move"] += 1
+                    relocating.add(src.name)
+                    if inferred:
+                        counts["inferred"] += 1
+                    if budget is not None:
+                        budget -= 1
+                    _emit({"event": "file", "action": "would_move",
+                           "path": rel_src, "destination": rel_dest})
+                    continue
+
+                # Intent BEFORE the syscall, confirmation after it. A kill in
+                # between leaves an intent undo_refile resolves from the disk.
+                intent_bits = []
+                if row is not None:
+                    intent_bits.append(f"photo_id={row['id']}")
+                if linked_ids:
+                    intent_bits.append("raw_refs=" + "|".join(str(i) for i in linked_ids))
+                src_size = _size(src)
+                audit.row("intent", abs_src, abs_dest, suffix, str(src_size),
+                          reason=";".join(intent_bits))
+
+                try:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    size = _move_file(src, dest)
+                except DestinationExists:
+                    # Something landed there between our check and the move —
+                    # the nightly ingest, or another importer. Same handling as
+                    # a pre-detected collision; never retried under a new name.
+                    _collision(src, dest, abs_src, abs_dest, suffix,
+                               counts, audit, _emit, rel_src)
+                    continue
+                except Exception as exc:
+                    counts["errors"] += 1
+                    audit.row("error", abs_src, abs_dest, suffix,
+                              reason=f"move failed: {exc}")
+                    _emit({"event": "file", "action": "error", "path": rel_src})
+                    continue
+
+                # Move first, write the row second. See _heal_folder for why
+                # this order is the recoverable one.
+                reason_bits = []
+                if row is not None:
+                    try:
+                        db.conn.execute(
+                            "UPDATE photos SET filepath = ?, folder = ? WHERE id = ?",
+                            (rel_dest, _folder_of(rel_dest, src.name), row["id"]))
+                        db.conn.commit()
+                        counts["db_updated"] += 1
+                        reason_bits.append(f"photo_id={row['id']}")
+                        by_path.pop(rel_src, None)
+                    except Exception as exc:
+                        counts["errors"] += 1
+                        reason_bits.append(f"db update FAILED: {exc}")
+                if linked_ids:
+                    try:
+                        for pid in linked_ids:
+                            db.conn.execute(
+                                "UPDATE photos SET raw_filepath = ? WHERE id = ?",
+                                (rel_dest, pid))
+                        db.conn.commit()
+                        counts["db_updated"] += 1
+                        reason_bits.append(
+                            "raw_refs=" + "|".join(str(i) for i in linked_ids))
+                        raw_refs.pop(rel_src, None)
+                    except Exception as exc:
+                        counts["errors"] += 1
+                        reason_bits.append(f"raw_filepath update FAILED: {exc}")
+                if inferred:
+                    counts["inferred"] += 1
+                    reason_bits.append("model inferred from same-stem sibling")
+
+                counts["moved"] += 1
+                relocating.add(src.name)
+                if budget is not None:
+                    budget -= 1
+                audit.row("moved", abs_src, abs_dest, suffix, str(size),
+                          reason=";".join(reason_bits))
+                _emit({"event": "file", "action": "moved", "path": rel_src,
+                       "destination": rel_dest})
+
+            # On apply this is the real listing; on a dry run it is the
+            # prediction (everything that would NOT move), so the report can say
+            # whether the folder would survive the run.
+            leftovers = step["leftovers"] + [
+                c.name for c in step["candidates"] if c.name not in relocating]
+            remaining = (sorted(p.name for p in folder.iterdir())
+                         if (apply and folder.is_dir()) else sorted(leftovers))
+            removed = False
+            if apply and not remaining:
+                try:
+                    folder.rmdir()  # rmdir only — fails safely if not empty
+                    removed = True
+                except OSError as exc:
+                    audit.row("error", str(folder), reason=f"rmdir failed: {exc}")
+
+            folders.append({
+                "name": folder.name, "path": db.relative_filepath(str(folder)),
+                "by_model": by_model, "nested_dirs": step["nested_dirs"],
+                "remaining": remaining[:25], "removed": removed,
+                "notes": notes[:10], **counts,
+            })
+            for k in totals:
+                totals[k] += counts[k]
+            if budget is not None and budget <= 0:
+                break
+    finally:
+        audit.close()
+
+    _emit({"event": "done", "totals": totals})
+    return {
+        "dry_run": not apply,
+        "photo_root": str(root),
+        "audit_path": audit_path if apply else None,
+        "folders": folders,
+        "totals": totals,
+        "samples": samples,
+        "skipped_undated": skipped_undated,
+        "limit_reached": bool(budget is not None and budget <= 0),
+    }
 
 
-def _size(p: Path) -> int:
+def _collision(src: Path, dest: Path, abs_src: str, abs_dest: str, suffix: str,
+               counts: dict, audit: _Audit, emit, rel_src: str) -> None:
+    """Record a taken destination as duplicate_left or conflict. Never writes.
+
+    The ONLY place whole-file hashing happens. Hashing every file would mean
+    reading the whole library off a spinning disk; a name collision is rare and
+    is exactly the case where the bytes have to be compared.
+    """
     try:
-        return p.stat().st_size
-    except OSError:
-        return 0
+        digest = file_hash(str(src))
+        same = dest.is_file() and digest == file_hash(str(dest))
+    except Exception as exc:
+        counts["errors"] += 1
+        audit.row("error", abs_src, abs_dest, suffix, reason=f"hash failed: {exc}")
+        emit({"event": "file", "action": "error", "path": rel_src})
+        return
+    if same:
+        counts["duplicate_left"] += 1
+        audit.row("duplicate_left", abs_src, abs_dest, suffix, str(_size(src)),
+                  digest, "identical copy already at destination; source left "
+                          "in place, delete by hand")
+    else:
+        counts["conflict"] += 1
+        audit.row("conflict", abs_src, abs_dest, suffix, str(_size(src)), digest,
+                  "different file already at destination; nothing overwritten, "
+                  "nothing renamed")
+    emit({"event": "file", "action": "duplicate_left" if same else "conflict",
+          "path": rel_src})
 
 
 # ---------------------------------------------------------------------------
@@ -644,61 +855,81 @@ def _parse_reason(reason: str) -> tuple[Optional[int], list[int]]:
 
 
 def undo_refile(audit_path: str, db_path: str, apply: bool = False,
-                verify_hash: bool = False,
                 on_progress: Optional[ProgressFn] = None) -> dict:
-    """Reverse every `moved` row in an audit CSV, newest first.
+    """Reverse an audit CSV's moves, newest first.
 
-    A row is restored only when the destination is still the file this tool put
-    there — same size, and the same hash when one was recorded (a hash is only
-    recorded for rows that hit a name collision, because hashing every file on
-    the way out would mean reading the whole library). ``verify_hash=True``
-    hashes every destination instead: slow on spinning disks, but it catches a
-    same-size edit. The source path must also be free; anything else is
-    ``refused`` and left exactly as it is.
+    A `moved` row is restored only when the destination is still the file this
+    tool put there — same size, and the same hash when one was recorded (a hash
+    is recorded only for collision rows; hashing every move on the way out would
+    mean reading the whole library) — and the source path is free. Anything else
+    is `refused` and left exactly as it is.
+
+    An `intent` with no matching `moved` is a crash window, resolved by looking
+    at the disk rather than guessing: source still present means the move never
+    happened (`no_op`); destination present at the recorded size with the source
+    gone means it completed and is undoable.
 
     Any DB row this tool repointed (recorded in the audit's ``reason``) is
-    pointed back, after the file has been restored.
+    pointed back, after the file has been restored. Restoring uses the same
+    non-overwriting primitive as the forward move.
     """
     rows = []
     with open(audit_path, newline="") as fh:
         for r in csv.DictReader(fh):
-            if r.get("action") == "moved":
+            if r.get("action") in ("moved", "intent"):
                 rows.append(r)
-    rows.reverse()
+    confirmed = {(r["source"], r["destination"]) for r in rows if r["action"] == "moved"}
+    todo = [r for r in rows
+            if r["action"] == "moved"
+            or (r["source"], r["destination"]) not in confirmed]
+    todo.reverse()
 
-    stats = {"candidates": len(rows), "restored": 0, "would_restore": 0,
-             "refused": 0, "errors": 0, "refusals": [], "dry_run": not apply}
+    stats = {"candidates": len(todo), "restored": 0, "would_restore": 0,
+             "refused": 0, "no_op": 0, "errors": 0, "refusals": [],
+             "dry_run": not apply}
 
     def _emit(payload: dict) -> None:
         if on_progress is not None:
             on_progress(payload)
 
+    def _refuse(path: str, why: str) -> None:
+        stats["refused"] += 1
+        if len(stats["refusals"]) < 20:
+            stats["refusals"].append((path, why))
+        _emit({"event": "file", "action": "refused", "path": path, "reason": why})
+
     with PhotoDB(db_path) as db:
         root = Path(db.photo_root or ".").resolve()
-        for r in rows:
+        for r in todo:
             src = root / r["source"]
             dst = root / r["destination"]
+
+            if r["action"] == "intent":
+                if os.path.lexists(str(src)):
+                    stats["no_op"] += 1  # killed before the move — nothing to undo
+                    continue
+                if not dst.is_file():
+                    _refuse(r["destination"], "unconfirmed move: neither path holds the file")
+                    continue
+                if r.get("size") and str(_size(dst)) != r["size"]:
+                    _refuse(r["destination"], "unconfirmed move: destination size differs")
+                    continue
+
             why = None
             if not dst.is_file():
                 why = "destination no longer exists"
-            elif src.exists():
+            elif os.path.lexists(str(src)):
                 why = "source path is occupied"
             elif r.get("size") and str(_size(dst)) != r["size"]:
                 why = "destination size changed since the move"
-            elif (r.get("hash") or verify_hash) and dst.is_file():
+            elif r.get("hash"):
                 try:
-                    want = r.get("hash") or ""
-                    got = file_hash(str(dst))
-                    if want and got != want:
+                    if file_hash(str(dst)) != r["hash"]:
                         why = "destination content changed since the move"
                 except Exception as exc:
                     why = f"hash failed: {exc}"
             if why:
-                stats["refused"] += 1
-                if len(stats["refusals"]) < 20:
-                    stats["refusals"].append((r["destination"], why))
-                _emit({"event": "file", "action": "refused",
-                       "path": r["destination"], "reason": why})
+                _refuse(r["destination"], why)
                 continue
 
             if not apply:
@@ -723,8 +954,7 @@ def undo_refile(audit_path: str, db_path: str, apply: bool = False,
                         (back, _folder_of(back, src.name), photo_id))
                 for pid in raw_ids:
                     db.conn.execute(
-                        "UPDATE photos SET raw_filepath = ? WHERE id = ?",
-                        (back, pid))
+                        "UPDATE photos SET raw_filepath = ? WHERE id = ?", (back, pid))
                 if photo_id is not None or raw_ids:
                     db.conn.commit()
             except Exception as exc:
@@ -765,6 +995,11 @@ def render_report(stats: dict, sample_limit: int = 10) -> list[str]:
             if f["nested_dirs"]:
                 lines.append(f"    nested subfolders left untouched: "
                              f"{', '.join(f['nested_dirs'][:6])}")
+            if f["skipped_symlink"]:
+                lines.append(f"    {f['skipped_symlink']} symlink(s) skipped — "
+                             f"links are never moved")
+            for note in f.get("notes", []):
+                lines.append(f"    NEEDS MANUAL REPAIR: {note}")
             if f["remaining"] and not f["removed"]:
                 verb = "would remain" if stats["dry_run"] else "kept"
                 lines.append(f"    folder {verb}, holding: "
@@ -781,12 +1016,20 @@ def render_report(stats: dict, sample_limit: int = 10) -> list[str]:
             f"{t['skipped_indexed']:>6}{t['errors']:>5}")
     lines.append("")
     if t["inferred"]:
-        lines.append(f"  {t['inferred']} routed by same-stem sibling inference (--infer-from-sibling)")
+        lines.append(f"  {t['inferred']} routed by same-stem sibling inference "
+                     f"(--infer-from-sibling)")
+    if t["skipped_symlink"]:
+        lines.append(f"  {t['skipped_symlink']} symlink(s) skipped")
     if t["db_updated"]:
         lines.append(f"  {t['db_updated']} photos rows repointed")
-    if t["healed"] or t["would_heal"]:
-        lines.append(f"  {t['healed'] or t['would_heal']} stale rows healed "
-                     f"(file already at its destination)")
+    if t["healed"]:
+        lines.append(f"  {t['healed']} stale rows healed (file already at its destination)")
+    if t["would_heal"]:
+        lines.append(f"  {t['would_heal']} row(s) would need healing — their file "
+                     f"is already gone from the source folder")
+    if t["heal_unverifiable"]:
+        lines.append(f"  {t['heal_unverifiable']} stale row(s) could NOT be verified "
+                     f"— left alone, repair by hand (see above)")
     if stats.get("skipped_undated"):
         lines.append(f"  skipped {UNDATED_DIRNAME}/{UNKNOWN_SUFFIX} — no date to "
                      f"route by; sort it by hand")

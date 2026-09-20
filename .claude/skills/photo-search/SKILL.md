@@ -1058,11 +1058,15 @@ folder (CLIP + colors). Module `photosearch/ingest.py`; 15 tests in
   ```
 
   Moves `YYYY/YYYY-MM-DD_unknown-camera/*` onto the body each file's **own**
-  EXIF names, reusing `ingest._file_suffix` verbatim. Dry run by default;
-  `--apply` refuses without `--audit` (the CSV is the undo). Never overwrites,
-  never deletes, never guesses a model from the date or a sibling folder — two
-  bodies were in use on several of these days. Files with no readable model are
-  left in place. Module `photosearch/refile.py`; tests `tests/test_refile.py`.
+  EXIF names, reusing `ingest._file_suffix` verbatim. Dry run by default (and
+  read-only on the DB); `--apply` refuses without `--audit` (the CSV is the undo,
+  written intent-then-confirm and fsynced per file) and takes ingest's
+  `_sweep_lock`. The move is `os.link` + `unlink`, so it **cannot** overwrite —
+  the nightly ingest writes into these same dated folders. Never deletes, never
+  guesses a model from the date or a sibling folder (two bodies were in use on
+  several of these days); files with no readable model are left in place. The DB
+  gate matches on exact `filepath`, not the `folder` column, which some writers
+  leave stale. Module `photosearch/refile.py`; tests `tests/test_refile.py`.
   See the CLAUDE.md section for the full operator sequence.
 - **Stuck-phone gotcha:** because ingest *moves* files out, the receive-only
   Syncthing folder records them as local deletions and the **phone permanently

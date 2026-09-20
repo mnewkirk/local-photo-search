@@ -13,7 +13,12 @@ import pytest
 
 from photosearch import refile as refile_mod
 from photosearch.db import PhotoDB
-from photosearch.refile import refile_unknown_camera, undo_refile
+from photosearch.refile import (
+    DestinationExists,
+    refile_unknown_camera,
+    undo_refile,
+    _move_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -631,11 +636,20 @@ def test_audit_records_absolute_paths(tmp_path, tmp_db_path, monkeypatch):
     refile_unknown_camera(str(photos), tmp_db_path, apply=True,
                           audit_path=str(tmp_path / "audit.csv"))
 
-    row = list(csv.DictReader(open(tmp_path / "audit.csv")))[0]
-    assert row["action"] == "moved"
+    rows = list(csv.DictReader(open(tmp_path / "audit.csv")))
+    row = [r for r in rows if r["action"] == "moved"][0]
     assert os.path.isabs(row["source"]) and os.path.isabs(row["destination"])
     assert row["model"] == "ILCE-7RM6"
     assert int(row["size"]) > 0
+
+
+def _force_exdev(monkeypatch):
+    """Make the hardlink path unavailable so the copy fallback is exercised."""
+    import errno as _errno
+
+    def fake_link(a, b):
+        raise OSError(_errno.EXDEV, "Invalid cross-device link")
+    monkeypatch.setattr(refile_mod.os, "link", fake_link)
 
 
 def test_cross_device_move_copies_verifies_then_removes(tmp_path, tmp_db_path, monkeypatch):
@@ -644,21 +658,408 @@ def test_cross_device_move_copies_verifies_then_removes(tmp_path, tmp_db_path, m
     _touch(src / "A.ARW", b"a")
     _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
     _db(tmp_db_path, photos)
-
-    import errno as _errno
-    real_rename = os.rename
-
-    def fake_rename(a, b):
-        raise OSError(_errno.EXDEV, "Invalid cross-device link")
-    monkeypatch.setattr(refile_mod.os, "rename", fake_rename)
+    _force_exdev(monkeypatch)
 
     stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
                                   audit_path=str(tmp_path / "audit.csv"))
 
-    monkeypatch.setattr(refile_mod.os, "rename", real_rename)
     assert stats["totals"]["moved"] == 1
     assert (photos / "2026" / "2026-09-19_ILCE-7RM6" / "A.ARW").exists()
     assert not (src / "A.ARW").exists()
+
+
+# ---------------------------------------------------------------------------
+# C1 — the move primitive must never overwrite
+# ---------------------------------------------------------------------------
+
+def test_move_primitive_refuses_an_existing_destination(tmp_path):
+    src = tmp_path / "src.ARW"
+    dst = tmp_path / "dst.ARW"
+    src.write_bytes(b"source-bytes")
+    dst.write_bytes(b"destination-bytes")
+
+    with pytest.raises(DestinationExists):
+        _move_file(src, dst)
+
+    assert src.read_bytes() == b"source-bytes"
+    assert dst.read_bytes() == b"destination-bytes"
+
+
+def test_move_primitive_refuses_an_existing_destination_cross_device(tmp_path, monkeypatch):
+    _force_exdev(monkeypatch)
+    src = tmp_path / "src.ARW"
+    dst = tmp_path / "dst.ARW"
+    src.write_bytes(b"source-bytes")
+    dst.write_bytes(b"destination-bytes")
+
+    with pytest.raises(DestinationExists):
+        _move_file(src, dst)
+
+    assert src.read_bytes() == b"source-bytes"
+    assert dst.read_bytes() == b"destination-bytes"
+
+
+def test_move_primitive_refuses_a_dangling_symlink_destination(tmp_path):
+    src = tmp_path / "src.ARW"
+    src.write_bytes(b"source-bytes")
+    dst = tmp_path / "dst.ARW"
+    dst.symlink_to(tmp_path / "nowhere.ARW")
+
+    with pytest.raises(DestinationExists):
+        _move_file(src, dst)
+    assert src.exists()
+
+
+def test_a_file_appearing_at_the_destination_mid_run_is_not_overwritten(
+        tmp_path, tmp_db_path, monkeypatch):
+    """The nightly ingest can create the destination between our check and our move."""
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "DSC01.ARW", b"ours")
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    dest = photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC01.ARW"
+
+    real_move = refile_mod._move_file
+
+    def racing_move(s, d):
+        # Simulate ingest landing a DIFFERENT file at d after our lexists check.
+        if not os.path.lexists(str(d)):
+            _touch(d, b"theirs-from-the-nightly-ingest")
+        return real_move(s, d)
+    monkeypatch.setattr(refile_mod, "_move_file", racing_move)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert dest.read_bytes().endswith(b"theirs-from-the-nightly-ingest")
+    assert (src / "DSC01.ARW").exists(), "our original must survive"
+    assert stats["totals"]["conflict"] == 1
+    assert stats["totals"]["moved"] == 0
+
+
+def test_a_race_with_identical_bytes_becomes_duplicate_left(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "DSC01.ARW", b"same")
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    real_move = refile_mod._move_file
+
+    def racing_move(s, d):
+        if not os.path.lexists(str(d)):
+            _touch(d, b"same")
+        return real_move(s, d)
+    monkeypatch.setattr(refile_mod, "_move_file", racing_move)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert stats["totals"]["duplicate_left"] == 1
+    assert stats["totals"]["moved"] == 0
+    assert (src / "DSC01.ARW").exists()
+
+
+def test_source_symlinks_are_never_moved(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "REAL.ARW", b"real")
+    (src / "LINK.ARW").symlink_to(src / "REAL.ARW")
+    _patch_exif_by_name(monkeypatch, {"REAL.ARW": "ILCE-7RM6", "LINK.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert (src / "LINK.ARW").is_symlink()
+    assert stats["totals"]["skipped_symlink"] == 1
+    assert stats["totals"]["moved"] == 1
+
+
+# ---------------------------------------------------------------------------
+# I3 — a failed cross-device copy must leave no partial destination
+# ---------------------------------------------------------------------------
+
+def test_failed_copy_leaves_no_partial_destination(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "A.ARW", b"a" * 1000)
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    _force_exdev(monkeypatch)
+
+    def boom(fsrc, fdst, length=0):
+        fdst.write(b"partial")
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(refile_mod.shutil, "copyfileobj", boom)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    dest = photos / "2026" / "2026-09-19_ILCE-7RM6" / "A.ARW"
+    assert not os.path.lexists(str(dest)), "no truncated file may be left behind"
+    assert (src / "A.ARW").read_bytes().endswith(b"a" * 1000)
+    assert stats["totals"]["errors"] == 1
+    assert stats["totals"]["moved"] == 0
+
+
+# ---------------------------------------------------------------------------
+# C2 — the DB gate must not depend on the `folder` column
+# ---------------------------------------------------------------------------
+
+def test_indexed_photo_with_a_stale_folder_column_is_still_skipped(
+        tmp_path, tmp_db_path, monkeypatch):
+    """`relocate-into-year-dirs` / `db.remap_paths` rewrite filepath, not folder."""
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1",
+                     folder="1999/some-old-path")
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert (src / "DSC01.JPG").exists()
+    assert stats["totals"]["skipped_indexed"] == 1
+    assert stats["totals"]["moved"] == 0
+
+
+def test_indexed_photo_with_a_null_folder_column_is_still_skipped(
+        tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "DSC01.JPG", b"jpeg")
+    _patch_exif_by_name(monkeypatch, {"DSC01.JPG": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash="h1", folder=None)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert (src / "DSC01.JPG").exists()
+    assert stats["totals"]["skipped_indexed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# I5 — concurrency lock
+# ---------------------------------------------------------------------------
+
+def test_apply_refuses_while_an_ingest_sweep_holds_the_lock(tmp_path, tmp_db_path, monkeypatch):
+    from photosearch.ingest import IngestAlreadyRunning, _sweep_lock
+
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "A.ARW", b"a")
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    with _sweep_lock(tmp_db_path):
+        with pytest.raises(IngestAlreadyRunning):
+            refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+    assert (src / "A.ARW").exists()
+
+
+def test_dry_run_does_not_need_the_lock(tmp_path, tmp_db_path, monkeypatch):
+    from photosearch.ingest import _sweep_lock
+
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "A.ARW", b"a")
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    with _sweep_lock(tmp_db_path):
+        stats = refile_unknown_camera(str(photos), tmp_db_path)
+    assert stats["totals"]["would_move"] == 1
+
+
+# ---------------------------------------------------------------------------
+# I6 — intent-then-confirm audit
+# ---------------------------------------------------------------------------
+
+def test_audit_records_intent_before_the_move(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "A.ARW", b"a")
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    audit = tmp_path / "audit.csv"
+
+    refile_unknown_camera(str(photos), tmp_db_path, apply=True, audit_path=str(audit))
+
+    actions = [r["action"] for r in csv.DictReader(open(audit))]
+    assert actions == ["intent", "moved"]
+
+
+def test_undo_honours_an_intent_whose_move_completed_before_the_crash(
+        tmp_path, tmp_db_path, monkeypatch):
+    """Killed between the move and the confirm row: the file DID move, so undo it."""
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "A.ARW", b"a")
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+    audit = tmp_path / "audit.csv"
+
+    refile_unknown_camera(str(photos), tmp_db_path, apply=True, audit_path=str(audit))
+    # Rewrite the audit as the crash would have left it: intent, no confirm.
+    rows = [r for r in csv.DictReader(open(audit)) if r["action"] == "intent"]
+    with open(audit, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=refile_mod.AUDIT_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+
+    stats = undo_refile(str(audit), tmp_db_path, apply=True)
+
+    assert stats["restored"] == 1
+    assert (src / "A.ARW").exists()
+
+
+def test_undo_treats_an_intent_whose_move_never_started_as_a_no_op(
+        tmp_path, tmp_db_path, monkeypatch):
+    """Killed before the move: the source is still there, so there is nothing to undo."""
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera" / "A.ARW"
+    _touch(src, b"a")
+    _db(tmp_db_path, photos)
+    audit = tmp_path / "audit.csv"
+    dest = photos / "2026" / "2026-09-19_ILCE-7RM6" / "A.ARW"
+    with open(audit, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(refile_mod.AUDIT_FIELDS)
+        w.writerow(["intent", str(src), str(dest), "ILCE-7RM6",
+                    str(src.stat().st_size), "", ""])
+
+    stats = undo_refile(str(audit), tmp_db_path, apply=True)
+
+    assert stats["restored"] == 0
+    assert stats["no_op"] == 1
+    assert src.exists() and not os.path.lexists(str(dest))
+
+
+# ---------------------------------------------------------------------------
+# M7 / M8 — healing
+# ---------------------------------------------------------------------------
+
+def test_dry_run_heal_reports_without_hashing(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    (photos / "2026" / "2026-09-19_unknown-camera").mkdir(parents=True)
+    _touch(photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC01.JPG", b"jpeg")
+    from photosearch.index import file_hash as real_hash
+    h = real_hash(str(photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC01.JPG"))
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                     filename="DSC01.JPG", file_hash=h)
+    _patch_exif_by_name(monkeypatch, {})
+
+    def no_hashing(_p):
+        raise AssertionError("a dry run must not hash whole files")
+    monkeypatch.setattr(refile_mod, "file_hash", no_hashing)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path)
+
+    assert stats["totals"]["would_heal"] == 1
+    assert stats["totals"]["healed"] == 0
+
+
+def test_heal_refuses_a_row_with_no_stored_hash(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    (photos / "2026" / "2026-09-19_unknown-camera").mkdir(parents=True)
+    _touch(photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC01.JPG", b"jpeg")
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        pid = db.add_photo(filepath="2026/2026-09-19_unknown-camera/DSC01.JPG",
+                           filename="DSC01.JPG")
+    _patch_exif_by_name(monkeypatch, {})
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"),
+                                  include_indexed=True)
+
+    assert stats["totals"]["healed"] == 0
+    assert stats["totals"]["heal_unverifiable"] == 1
+    with PhotoDB(tmp_db_path) as db:
+        row = db.conn.execute("SELECT filepath FROM photos WHERE id = ?", (pid,)).fetchone()
+        assert row["filepath"] == "2026/2026-09-19_unknown-camera/DSC01.JPG"
+
+
+def test_stale_raw_filepath_is_reported_not_repointed(tmp_path, tmp_db_path, monkeypatch):
+    """A raw_filepath carries no hash, so an automatic repoint could pick another body's RAW."""
+    photos = _root(tmp_path)
+    (photos / "2026" / "2026-09-19_unknown-camera").mkdir(parents=True)
+    _touch(photos / "2026" / "2026-09-19_ILCE-7RM6" / "DSC01.ARW", b"someone-elses-raw")
+    _db(tmp_db_path, photos)
+    with PhotoDB(tmp_db_path) as db:
+        pid = db.add_photo(filepath="2026/2026-09-19_ILCE-7RM6/DSC01.JPG",
+                           filename="DSC01.JPG", file_hash="h1",
+                           raw_filepath="2026/2026-09-19_unknown-camera/DSC01.ARW")
+    _patch_exif_by_name(monkeypatch, {})
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"),
+                                  include_indexed=True)
+
+    assert stats["totals"]["healed"] == 0
+    assert stats["totals"]["heal_unverifiable"] == 1
+    with PhotoDB(tmp_db_path) as db:
+        row = db.conn.execute("SELECT raw_filepath FROM photos WHERE id = ?",
+                              (pid,)).fetchone()
+        assert row["raw_filepath"] == "2026/2026-09-19_unknown-camera/DSC01.ARW"
+
+
+# ---------------------------------------------------------------------------
+# M9 / M10 / M11 — misc hardening
+# ---------------------------------------------------------------------------
+
+def test_dangling_symlink_at_the_destination_is_a_conflict_not_free_space(
+        tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    src = photos / "2026" / "2026-09-19_unknown-camera"
+    _touch(src / "DSC01.ARW", b"ours")
+    dest_dir = photos / "2026" / "2026-09-19_ILCE-7RM6"
+    dest_dir.mkdir(parents=True)
+    (dest_dir / "DSC01.ARW").symlink_to(dest_dir / "gone.ARW")
+    _patch_exif_by_name(monkeypatch, {"DSC01.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    stats = refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                                  audit_path=str(tmp_path / "audit.csv"))
+
+    assert (src / "DSC01.ARW").exists()
+    assert (dest_dir / "DSC01.ARW").is_symlink()
+    assert stats["totals"]["moved"] == 0
+    assert stats["totals"]["conflict"] == 1
+
+
+def test_dry_run_never_creates_a_database(tmp_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-09-19_unknown-camera" / "A.ARW", b"a")
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    missing = str(tmp_path / "definitely-not-here.db")
+
+    with pytest.raises(FileNotFoundError, match="database"):
+        refile_unknown_camera(str(photos), missing)
+    assert not os.path.exists(missing)
+
+
+def test_audit_inside_the_photo_root_is_refused(tmp_path, tmp_db_path, monkeypatch):
+    photos = _root(tmp_path)
+    _touch(photos / "2026" / "2026-09-19_unknown-camera" / "A.ARW", b"a")
+    _patch_exif_by_name(monkeypatch, {"A.ARW": "ILCE-7RM6"})
+    _db(tmp_db_path, photos)
+
+    with pytest.raises(ValueError, match="photo root"):
+        refile_unknown_camera(str(photos), tmp_db_path, apply=True,
+                              audit_path=str(photos / "audit.csv"))
 
 
 def test_move_preserves_mtime(tmp_path, tmp_db_path, monkeypatch):
