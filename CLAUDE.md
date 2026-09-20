@@ -782,16 +782,36 @@ That moves the risk from the column to the **spelling**, so two more guards:
   another mount spelling, or simply a different directory leaves every stored
   path looking perfectly canonical while **every** link lookup misses —
   measured: stored `2026/2026-06-19_unknown-camera/DSC01.JPG`, pre-flight green,
-  `would_move=1 skipped_indexed=0`, an indexed file read as unindexed. The run
-  now refuses unless `Path(db_photo_root).resolve() == root`, and refuses a DB
-  with no `photo_root` at all (that branch **is** reachable — an earlier note
-  here wrongly called it unreachable). `_ReadOnlyDB` keeps the DB's own value
-  separately, because an explicit `--photo-root` would otherwise mask exactly
-  the mismatch being tested for.
-- **A round-trip positive control** (`_preflight_roundtrip`): one real stored
-  path must come back unchanged through the same helper the gate uses, or the
-  run stops with "path mapping between the DB and --photo-root is broken". It
-  makes the whole failure class loud instead of silent.
+  `would_move=1 skipped_indexed=0`, an indexed file read as unindexed. So when
+  the DB **does** store a root, the run refuses unless
+  `Path(stored).resolve() == root`. `_ReadOnlyDB` keeps the DB's own value
+  separately (`db_photo_root`), because an explicit `--photo-root` would
+  otherwise mask exactly the mismatch being tested for.
+- **A mandatory round-trip proof** (`_preflight_roundtrip`) — and *this*, not
+  where the root is configured, is what makes the gate trustworthy. Up to 25
+  rows spread across the id range (lowest, highest, middle — not the first row
+  alone; different eras of the indexer sit at different ends) are each fed to
+  the **production** lookup `_resolve_link`, the exact call the gate makes, and
+  must come back. At least one sampled row must also exist on disk, which is
+  what proves `root` is where the library actually lives. Any failure refuses
+  with "path mapping between the DB and the photo root is broken", naming the
+  root and where it came from. An **empty** `photos` table returns 0 instead of
+  refusing: with no rows the gate cannot produce a false negative.
+
+  "At least one of 25", not "all", is deliberate: `_heal_folder` exists
+  *because* rows whose file has moved are a normal state, so one stale row must
+  not lock the operator out.
+
+**The NAS stores no `photo_root` at all** — `schema_info` holds only
+`('version', N)` and the container supplies `PHOTO_ROOT=/photos`; stored paths
+are canonical relative ones like `2026/2026-09-19_ILCE-7RM6/DSC09999.JPG`. An
+earlier revision refused on a missing stored root and so **refused to run on
+the only system it exists for**. `_effective_root` now mirrors
+`PhotoDB.__init__`'s precedence — `--photo-root` > `PHOTO_ROOT` env > the DB's
+stored value — and refuses only when none of the three exists. The report
+header states which one was used, e.g.
+`photo root: /photos (from PHOTO_ROOT env; DB stores none) — mapping verified
+on 25 rows`.
 - **A per-file re-query** (`_resolve_link`) immediately before each move, on
   both the relative and absolute spellings, against the UNIQUE index — so a row
   inserted *since* the up-front scan still blocks the move. `raw_filepath` has
@@ -862,7 +882,9 @@ the source gone means it completed and is undone.
 1. **Pause the nightly ingest cron and hold the SD-card importer** for the
    window. Today's-date folder genuinely contends; the lock enforces it too.
 2. Full **dry run** to a file, then check it: **the pre-flight passed** (it
-   refuses outright otherwise); files ≈ 9,600; `skipped_indexed` matches
+   refuses outright otherwise) and the header names the expected root and
+   source (`/photos`, from `PHOTO_ROOT` env) with the mapping verified;
+   files ≈ 9,600; `skipped_indexed` matches
    expectation — on *this* library that is **0**, verified read-only on
    2026-09-19: no `photos` rows and no `raw_filepath` refs live under any
    `*_unknown-camera` folder, since the misfiled files are all RAW companions.

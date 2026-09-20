@@ -324,6 +324,32 @@ class _ReadOnlyDB:
         return False
 
 
+def _effective_root(db, photo_root_arg: Optional[str]) -> tuple[Path, str]:
+    """Resolve the root and say where it came from, mirroring `PhotoDB.__init__`.
+
+    Precedence is the one the rest of the CLI uses: the `--photo-root` argument,
+    then the `PHOTO_ROOT` env var, then the DB's stored value. **The deployment
+    this tool exists for stores none** — `schema_info` holds only
+    `('version', N)` and the container supplies `PHOTO_ROOT=/photos` — so
+    refusing on a missing stored root (which an earlier revision did) makes the
+    tool unusable on the one system it was written for. `_ReadOnlyDB` follows
+    the same precedence, so `relative_filepath` relativises against the
+    effective root and the link lookups match the canonical relative paths the
+    DB actually stores.
+    """
+    if photo_root_arg:
+        return Path(photo_root_arg).expanduser().resolve(), "--photo-root"
+    if os.environ.get("PHOTO_ROOT"):
+        return (Path(os.environ["PHOTO_ROOT"]).expanduser().resolve(),
+                "PHOTO_ROOT env")
+    if db.db_photo_root:
+        return Path(db.db_photo_root).resolve(), "the DB's stored photo_root"
+    raise ValueError(
+        "no photo root available: pass --photo-root, set PHOTO_ROOT, or store "
+        "one in the database. Without it a stored path cannot be related to a "
+        "file on disk and every DB link lookup would miss.")
+
+
 def _preflight_root(db, root: Path) -> None:
     """Refuse unless the DB's `photo_root` really maps onto the root in use.
 
@@ -336,18 +362,12 @@ def _preflight_root(db, root: Path) -> None:
     `2026/2026-06-19_unknown-camera/DSC01.JPG`, pre-flight green,
     `would_move=1 skipped_indexed=0`.
 
-    A DB with no `photo_root` at all is refused for the same reason: nothing
-    then defines how a stored path relates to a file on disk. (That branch is
-    reachable — an earlier note here wrongly called it unreachable.)
-
-    `_preflight_roundtrip` is the cheap positive control that follows: it makes
-    this whole failure class loud instead of silent.
+    A DB that stores NO root is not refused here — see `_effective_root`; the
+    NAS is exactly that case. `_preflight_roundtrip` carries the proof instead,
+    and it is mandatory.
     """
     if not db.db_photo_root:
-        raise ValueError(
-            "the database has no photo_root configured, so a stored path cannot "
-            "be related to a file on disk and every DB link lookup would miss. "
-            "Set one (db.set_photo_root / PHOTO_ROOT) before refiling.")
+        return
     stored = Path(db.db_photo_root)
     if stored.resolve() != root:
         raise ValueError(
@@ -359,31 +379,72 @@ def _preflight_root(db, root: Path) -> None:
             f"their rows. Point --photo-root at the DB's root (or fix the DB).")
 
 
-def _preflight_roundtrip(db, root: Path) -> None:
-    """Positive control: one real stored path must round-trip through the gate.
+def _sample_rows(db, n: int = 25) -> list[dict]:
+    """Up to `n` rows spread across the table: lowest ids, highest ids, middle.
 
-    Runs after the spelling check, so a `//` or `./` row is reported by name
-    there rather than surfacing here as a vaguer mapping failure. What is left
-    for this to catch is any OTHER way the DB's paths and `root` fail to line
-    up — it turns that whole class from silent into loud. Pure string math
-    through the same helper the gate uses, so it needs no file on disk.
+    Not `LIMIT 1` of the first row: paths written by different eras of the
+    indexer live at different ends of the id range, and a mapping that holds for
+    the oldest row can fail for the newest.
     """
-    for year_dir in sorted(root.iterdir()):
-        if not year_dir.is_dir() or not _YEAR_RE.match(year_dir.name):
-            continue
-        row = db.conn.execute(
-            "SELECT filepath FROM photos WHERE filepath >= ? AND filepath < ? LIMIT 1",
-            (year_dir.name + "/", year_dir.name + "0")).fetchone()
-        if row is None:
-            continue
-        stored_fp = row["filepath"]
-        got = db.relative_filepath(str(root / stored_fp))
-        if got != stored_fp:
-            raise ValueError(
-                f"path mapping between the DB and --photo-root is broken: the "
-                f"stored path {stored_fp!r} does not round-trip under {root} "
-                f"(got {got!r}). Every DB link lookup would miss.")
-        return
+    picks: dict[int, dict] = {}
+    for sql in (
+        "SELECT id, filepath FROM photos ORDER BY id LIMIT ?",
+        "SELECT id, filepath FROM photos ORDER BY id DESC LIMIT ?",
+        "SELECT id, filepath FROM photos ORDER BY id LIMIT ? "
+        "OFFSET (SELECT COUNT(*) / 2 FROM photos)",
+    ):
+        for r in db.conn.execute(sql, (max(1, n // 3),)).fetchall():
+            picks[r["id"]] = dict(r)
+    return list(picks.values())[:n]
+
+
+def _preflight_roundtrip(db, root: Path, root_source: str) -> int:
+    """MANDATORY proof that the DB's paths and the root in use line up.
+
+    This — not where the root happens to be configured — is what makes the link
+    gate trustworthy. For each sampled row it runs the PRODUCTION lookup
+    (`_resolve_link`, the exact call the gate makes, not a parallel
+    re-implementation) on the absolute on-disk path and requires it to find that
+    row back. A root that is a symlink, another mount spelling, or simply wrong
+    makes `relative_filepath` return an absolute path and every lookup miss;
+    this turns that from silent into a refusal.
+
+    At least one sampled row must also exist on disk, which is what proves
+    `root` is where the library actually lives. It is deliberately "at least
+    one of up to 25", not "all": `_heal_folder` exists precisely because rows
+    whose file has moved are a normal state, so a single stale row must not
+    lock the operator out.
+
+    An EMPTY photos table returns 0 rather than refusing — with no rows the gate
+    cannot produce a false negative, so there is nothing to prove.
+
+    Returns the number of rows verified (for the report header).
+    """
+    rows = _sample_rows(db)
+    if not rows:
+        return 0
+    def _broken(detail: str) -> ValueError:
+        return ValueError(
+            f"path mapping between the DB and the photo root is broken: {detail}\n"
+            f"    photo root in use: {root}  (from {root_source})\n"
+            f"Every DB link lookup would miss, so indexed files would be moved "
+            f"out from under their rows.")
+
+    any_on_disk = False
+    for r in rows:
+        stored_fp = r["filepath"]
+        abs_fp = str(root / stored_fp)
+        if os.path.lexists(abs_fp):
+            any_on_disk = True
+        found, _ids = _resolve_link(db, db.relative_filepath(abs_fp), abs_fp, {}, {})
+        if found is None or found["id"] != r["id"]:
+            raise _broken(f"the production lookup for row {r['id']} "
+                          f"({stored_fp!r}) does not find it back")
+    if not any_on_disk:
+        raise _broken(f"none of the {len(rows)} sampled photo rows has its file "
+                      f"on disk under this root (checked e.g. "
+                      f"{rows[0]['filepath']!r})")
+    return len(rows)
 
 
 def _preflight_paths(db) -> None:
@@ -681,7 +742,7 @@ def refile_unknown_camera(
     # and before any file is touched. The context manager matters: an early
     # raise here used to leak the connection.
     with _ReadOnlyDB(db_path, photo_root) as ro:
-        root = Path(photo_root or ro.photo_root or ".").resolve()
+        root, root_source = _effective_root(ro, photo_root)
         if not root.is_dir():
             raise FileNotFoundError(f"photo root not found: {root}")
         if audit_path:
@@ -693,21 +754,26 @@ def refile_unknown_camera(
                     f"removal. Use the /data volume.")
         _preflight_root(ro, root)
         _preflight_paths(ro)
-        _preflight_roundtrip(ro, root)
+        checked = _preflight_roundtrip(ro, root, root_source)
+        stored_note = ("DB stores none" if not ro.db_photo_root
+                       else f"DB stores {ro.db_photo_root}")
         if not apply:
             # A dry run writes nothing, so it neither needs nor takes the mutex.
             with _no_lock():
                 return _run(ro, root, False, None, only, limit, include_indexed,
-                            infer_from_sibling, on_progress, sample_limit)
+                            infer_from_sibling, on_progress, sample_limit,
+                            root_source, stored_note, checked)
 
-    with _sweep_lock(db_path), PhotoDB(db_path, photo_root=photo_root) as db:
+    with _sweep_lock(db_path), PhotoDB(db_path, photo_root=str(root)) as db:
         return _run(db, root, True, audit_path, only, limit, include_indexed,
-                    infer_from_sibling, on_progress, sample_limit)
+                    infer_from_sibling, on_progress, sample_limit,
+                    root_source, stored_note, checked)
 
 
 def _run(db, root: Path, apply: bool, audit_path: Optional[str],
          only, limit, include_indexed, infer_from_sibling,
-         on_progress, sample_limit) -> dict:
+         on_progress, sample_limit, root_source: str = "",
+         stored_note: str = "", mapping_checked: int = 0) -> dict:
     targets = _find_folders(root, only)
 
     # Classify every folder's top level FIRST, so the DB lookup can ask about
@@ -983,6 +1049,9 @@ def _run(db, root: Path, apply: bool, audit_path: Optional[str],
     return {
         "dry_run": not apply,
         "photo_root": str(root),
+        "root_source": root_source,
+        "root_note": stored_note,
+        "mapping_checked": mapping_checked,
         "audit_path": audit_path if apply else None,
         "folders": folders,
         "totals": totals,
@@ -1218,7 +1287,13 @@ def render_report(stats: dict, sample_limit: int = 10) -> list[str]:
     """Readable per-folder table + grand totals, sized for ~25 folders."""
     t = stats["totals"]
     mode = "DRY RUN" if stats["dry_run"] else "APPLIED"
-    lines = [f"Photo root: {stats['photo_root']}   [{mode}]", ""]
+    src = stats.get("root_source") or "?"
+    note = stats.get("root_note") or ""
+    checked = stats.get("mapping_checked", 0)
+    proof = (f"mapping verified on {checked} row{'s' if checked != 1 else ''}"
+             if checked else "no photo rows — nothing to map")
+    lines = [f"photo root: {stats['photo_root']} (from {src}; {note}) — {proof}",
+             f"[{mode}]", ""]
     if not stats["folders"]:
         lines.append("No *_unknown-camera folders to process.")
     else:
