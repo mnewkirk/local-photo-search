@@ -4,8 +4,11 @@ to review" (M "ingest batch" Task 6).
 ``batch_state`` says what each step of the pipeline *is*; this module is the
 half that makes it *become* something else. It only ever runs the **NAS
 steps** — stacking, normalize_aesthetics, match_faces, resolve_dups,
-warm_crops — because those are the ones that run where the DB and the photo
-files live. The worker passes are launched separately
+warm_crops, rank_measure — because those are the ones that run where the DB
+and the photo files live. (`rank_measure` was once labelled desktop-only and
+had no runner at all, so its box read "Needs to be queued" forever; it
+decodes the ORIGINALS at native resolution, which only the NAS has.) The
+worker passes are launched separately
 (``POST /api/admin/batch-launch-fleet``): the NAS has no GPU and cannot host
 a fleet, so that half has to run on the desktop.
 
@@ -201,6 +204,39 @@ def _run_warm_crops(db, ctx) -> dict:
     )
 
 
+def _run_rank_measure(db, ctx) -> dict:
+    """Native-resolution face-sharpness measurement for the batch's photos.
+
+    Runs HERE, on the NAS, because it decodes the originals at full
+    resolution and the desktop replica holds none of them. ~10 min for 1,260
+    photos on the N100, and resumable — a re-run after a late-arriving photo
+    only measures what is new.
+
+    Scoped by ``photo_ids`` (one dated FOLDER — two folders can share a day),
+    but it writes the cache file keyed by the folder's DATE, because the
+    selection phase (`scripts/rank_shoot.py --date D`, no `--measure`) reads
+    it by date. That is the whole point of the step: after an advance, the
+    owner's next command needs no extra flags.
+
+    A batch whose folder is not dated (``_undated/...``) is SKIPPED with a
+    message rather than guessed at: the cache is per-date, so there is no file
+    a selection run would ever read.
+    """
+    from . import rank_measure
+    day = ctx["day"]
+    if day is None:
+        return {"skipped": "undated batch — rank_shoot.py selects by date, so "
+                           "there is no dated cache to write"}
+    if not ctx["photo_ids"]:
+        return {"skipped": "empty batch"}
+    cache_path = rank_measure.default_cache_path(db.db_path, day)
+    return rank_measure.measure(
+        db, day, cache_path,
+        photo_ids=ctx["photo_ids"],
+        log=lambda msg: ctx["emit"](_inner({"line": msg}, "rank_measure")),
+        on_progress=lambda ev: ctx["emit"](_inner(ev, "rank_measure")))
+
+
 def default_runners() -> dict[str, Callable]:
     """step -> runner. Every NAS step has one; tests substitute fakes."""
     return {
@@ -209,6 +245,7 @@ def default_runners() -> dict[str, Callable]:
         "match_faces": _run_match_faces,
         "resolve_dups": _run_resolve_dups,
         "warm_crops": _run_warm_crops,
+        "rank_measure": _run_rank_measure,
     }
 
 

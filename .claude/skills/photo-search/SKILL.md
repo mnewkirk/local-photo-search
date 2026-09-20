@@ -76,6 +76,8 @@ local-photo-search/
 │   ├── colors.py           # Dominant color extraction
 │   ├── geocode.py          # Offline reverse geocoding
 │   ├── date_parse.py       # Natural language date parsing from queries
+│   ├── rank_measure.py     # Native-resolution face-sharpness pass (the
+│   │                       #   rank_measure NAS step + scripts/rank_shoot.py)
 │   └── cull.py             # Shoot review / culling logic
 └── frontend/dist/          # Static HTML/JS served by FastAPI
     ├── index.html          # Main search UI
@@ -394,9 +396,16 @@ need cross-recluster persistence.
   `batch_state.STEP_ORDER`.
 - `POST /api/batches/register` — `{directory, source}`, manual registration.
 - `POST /api/admin/batch-advance` — SSE; runs the batch's NAS steps (stacking,
-  normalize_aesthetics, strict match_faces, resolve_dups, warm_crops) in
-  order, id-scoped. `photosearch batch-advance --batch N [--apply]` is the
-  CLI equivalent (dry-run by default).
+  normalize_aesthetics, strict match_faces, resolve_dups, warm_crops,
+  rank_measure) in order, id-scoped. `photosearch batch-advance --batch N
+  [--apply]` is the CLI equivalent (dry-run by default). `rank_measure` is
+  `batch_state.OPTIONAL_STEPS` — it does NOT gate `ready`, but `next_action`
+  still offers `advance_nas` while it is the only step left, which is what
+  makes the button able to run it. It writes
+  `dirname(PHOTOSEARCH_DB)/rank_shoot_<date>.json`, the cache
+  `scripts/rank_shoot.py --date <date>` reads for its selection phase
+  (measurement itself is `photosearch/rank_measure.py` — `scripts/` is not in
+  the Docker image).
 - `POST /api/admin/batch-launch-fleet` — `{batch_id, count}`; launches
   `run-workers.sh --native` scoped to the batch's directory for exactly the
   worker passes it still needs (`batch_state.fleet_launch_passes`). 409 if a

@@ -65,10 +65,21 @@ from .db import MAX_PROCESS_ATTEMPTS
 
 WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
                  "category-visual", "category-content", "keywords", "verify")
+# `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
+# full native resolution to measure face sharpness, and only the NAS holds the
+# originals — the desktop replica has the DB and the thumbnails and no files at
+# all. The original plan labelled it "desktop-only" on the theory that it is
+# heavy; heavy it is (~10 min for 1,260 photos on the N100), but heavy where
+# the pixels are. As a desktop step it had no runner anywhere and read
+# "Needs to be queued" forever.
 NAS_STEPS = ("stacking", "normalize_aesthetics", "match_faces",
-             "resolve_dups", "warm_crops")
-DESKTOP_STEPS = ("rank_measure",)
-STEP_ORDER = ("ingest",) + WORKER_PASSES + NAS_STEPS + DESKTOP_STEPS
+             "resolve_dups", "warm_crops", "rank_measure")
+# NAS steps that do NOT gate `ready` — optional work the owner can run from
+# the same button, but a batch is reviewable without it. Subtracted from
+# `ready` explicitly: the rule is "every step in WORKER_PASSES + NAS_STEPS",
+# so moving a step into NAS_STEPS would otherwise silently make it a gate.
+OPTIONAL_STEPS = ("rank_measure",)
+STEP_ORDER = ("ingest",) + WORKER_PASSES + NAS_STEPS
 DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "verify": "describe", "normalize_aesthetics": "aesthetics",
               "match_faces": "faces", "resolve_dups": "match_faces",
@@ -76,8 +87,11 @@ DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
 STATES = ("completed", "running", "queued", "needs_queue", "waiting", "blocked")
 
 # Steps whose only completion evidence is a closed ingest_batch_jobs row —
-# they write no per-photo column this module could count.
-_JOB_ONLY_STEPS = ("match_faces", "resolve_dups", "warm_crops", "rank_measure")
+# they write no per-photo column this module could count. Public because
+# `ingest_batches.register_batch` has to drop exactly these rows when late
+# photos re-open a batch: their closed row would otherwise keep reading
+# `completed` for photos that have never been touched.
+JOB_ONLY_STEPS = ("match_faces", "resolve_dups", "warm_crops", "rank_measure")
 
 # Passes gated on an existing description. `eligible` is the count of batch
 # photos that have one; everything else is `total`.
@@ -408,8 +422,20 @@ def _job_only_step(step: str, kind: str, total: int, open_steps: set[str],
 # next_action
 # ---------------------------------------------------------------------------
 
+def _optional_runnable(steps: dict[str, dict]) -> bool:
+    """Is an OPTIONAL step sitting there waiting to be run?
+
+    This is what keeps `rank_measure` from being a dead end. It does not gate
+    `ready`, so a naive `if ready: return None` left the box reading "Needs to
+    be queued" with no action that would ever run it — which is exactly the
+    state the live batch was stuck in.
+    """
+    return any(steps[s]["state"] == "needs_queue"
+               for s in OPTIONAL_STEPS if s in steps)
+
+
 def _next_action(steps: dict[str, dict], ready: bool, total: int) -> str | None:
-    if ready:
+    if ready and not _optional_runnable(steps):
         return None
     if total == 0:
         # A batch whose photos are gone (deleted, re-foldered, pruned). The
@@ -423,7 +449,15 @@ def _next_action(steps: dict[str, dict], ready: bool, total: int) -> str | None:
         return "wait_ingest"
     if any(steps[p]["state"] == "needs_queue" for p in WORKER_PASSES):
         return "launch_fleet"
-    if any(steps[s]["state"] == "needs_queue" for s in NAS_STEPS):
+    if any(steps[s]["state"] == "needs_queue"
+           for s in NAS_STEPS if s not in OPTIONAL_STEPS):
+        return "advance_nas"
+    if ready:
+        # Every required step is done and an OPTIONAL one is still runnable —
+        # so the button offers it while the page already says "Ready to
+        # review". The optional step is deliberately offered ONLY from here:
+        # a batch that is blocked, or still has a pass in flight, has a more
+        # important thing to say than "you could also measure sharpness".
         return "advance_nas"
     if any(s["state"] == "blocked" for s in steps.values()):
         return "review_blocked"
@@ -521,15 +555,16 @@ def batch_state(db, batch_id: int) -> dict:
         elif step == "normalize_aesthetics":
             row = _normalize_aesthetics_step(db, ids, total, open_steps, completed)
         else:
-            kind = "nas" if step in NAS_STEPS else "desktop"
-            row = _job_only_step(step, kind, total, open_steps, closed, completed)
+            row = _job_only_step(step, "nas", total, open_steps, closed, completed)
         steps[step] = row
         if row["state"] == "completed":
             completed.add(step)
 
-    # rank_measure is optional — a desktop nicety, not a readiness gate.
+    # OPTIONAL_STEPS (rank_measure) are deliberately NOT part of `ready`: the
+    # batch is reviewable without the sharpness measurement. `next_action`
+    # still offers to run it — see `_optional_runnable`.
     ready = all(steps[s]["state"] == "completed"
-                for s in WORKER_PASSES + NAS_STEPS)
+                for s in WORKER_PASSES + NAS_STEPS if s not in OPTIONAL_STEPS)
 
     return {
         "batch": batch,

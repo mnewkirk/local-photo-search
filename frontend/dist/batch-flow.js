@@ -61,12 +61,23 @@
       steps: ['category-content', 'keywords', 'verify'] },
     { key: 'nas',     label: 'NAS stages',
       steps: ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
-              'warm_crops'] },
-    { key: 'desktop', label: 'Desktop',
-      steps: ['rank_measure'] },
+              'warm_crops', 'rank_measure'] },
   ];
 
   var OTHER_ROW_LABEL = 'Other steps';
+
+  // batch_state.OPTIONAL_STEPS — NAS steps that do NOT gate `ready`, and what
+  // to call them in the one sentence at the top. `rank_measure` used to sit in
+  // its own "Desktop" row with nothing anywhere that could run it, so its box
+  // read "Needs to be queued" forever; it runs on the NAS (it decodes the
+  // originals, which only the NAS holds) and the advance button runs it.
+  var OPTIONAL_STEPS = { rank_measure: 'measure sharpness for ranking' };
+
+  function optionalNeedingQueue(steps) {
+    return (steps || []).filter(function (s) {
+      return s && s.state === 'needs_queue' && OPTIONAL_STEPS[s.step];
+    });
+  }
 
   // ---------------------------------------------------------------------
   // formatting helpers
@@ -87,8 +98,8 @@
   function plural(n, one, many) { return n === 1 ? one : many; }
 
   /** Human form of a step name. The worker passes are the CLI's own pass
-   *  names and stay verbatim (they are what you would type); the NAS/desktop
-   *  steps are snake_case internals and read better as words. */
+   *  names and stay verbatim (they are what you would type); the NAS steps
+   *  are snake_case internals and read better as words. */
   function stepLabel(name) {
     return String(name || '').replace(/_/g, ' ');
   }
@@ -293,7 +304,17 @@
       return out;
     }
 
-    if (state.ready) { out.headline = 'Ready to review'; return out; }
+    if (state.ready) {
+      // `ready` never waits on an optional step — but the step is still there
+      // to run, so say so rather than leaving a box no sentence accounts for.
+      var opt = optionalNeedingQueue(steps);
+      out.headline = opt.length
+        ? 'Ready to review — optional: ' + opt.map(function (s) {
+          return OPTIONAL_STEPS[s.step];
+        }).join(', ')
+        : 'Ready to review';
+      return out;
+    }
 
     switch (state.next_action) {
       case 'wait_ingest':
@@ -386,7 +407,10 @@
       return out('Advance batch', false, null,
         'Still working out what this batch needs.');
     }
-    if (state.ready) {
+    // A ready batch is not advanceable — UNLESS the server is still offering
+    // `advance_nas`, which it does for exactly one reason: an OPTIONAL step
+    // (rank_measure) is runnable. That is the button that runs it.
+    if (state.ready && state.next_action !== 'advance_nas') {
       return out('Advance batch', false, null,
         'Ready to review — nothing left to advance.');
     }
@@ -402,6 +426,12 @@
         var nas = byState(steps, 'needs_queue').filter(function (s) {
           return s.kind === 'nas';
         }).length;
+        if (state.ready) {
+          // Only optional work is left. The label says so — a plain
+          // "1 NAS step" next to "Ready to review" reads as a contradiction.
+          return out('Advance batch — ' + nas + ' optional '
+            + plural(nas, 'step', 'steps'), true, 'advance_nas', '');
+        }
         return out(nas ? 'Advance batch — ' + nas + ' NAS '
           + plural(nas, 'step', 'steps') : 'Advance batch',
           true, 'advance_nas', '');
@@ -511,6 +541,7 @@
     STATE_META: STATE_META,
     ROWS: ROWS,
     WORKER_PASSES: WORKER_PASSES,
+    OPTIONAL_STEPS: OPTIONAL_STEPS,
     advanceButton: advanceButton,
     advanceLogLine: advanceLogLine,
     fleetLaunchPasses: fleetLaunchPasses,

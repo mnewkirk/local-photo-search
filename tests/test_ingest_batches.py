@@ -258,6 +258,45 @@ class TestRegisterBatch:
         assert batch["ready_at"] is None
         assert batch["dismissed_at"] is None
 
+    def test_reopen_with_growth_invalidates_job_only_completion(self, db):
+        """A closed job row is the ONLY completion evidence the job-only steps
+        have (match_faces / resolve_dups / warm_crops / rank_measure write no
+        per-photo column). When late photos re-open a batch, that row would
+        still read `completed` although the new photos have no matched faces,
+        no warmed crops and no measurement — so the page would say the batch
+        was finished when a third of it had never been touched. Growth
+        therefore drops those rows; the derived NAS steps (stacking,
+        normalize_aesthetics) need no help — they count photos.
+        """
+        from photosearch.batch_state import JOB_ONLY_STEPS
+
+        _add_photos(db, "2090/2090-01-09_ILCE-7RM6", 2)
+        batch_id = register_batch(db, "2090/2090-01-09_ILCE-7RM6")
+        for step in JOB_ONLY_STEPS:
+            open_job(db, batch_id, step, "nas")
+            close_job(db, batch_id, step)
+        open_job(db, batch_id, "stacking", "nas")   # still open: not touched
+        assert closed_jobs(db, batch_id) == set(JOB_ONLY_STEPS)
+
+        _add_photos(db, "2090/2090-01-09_ILCE-7RM6", 1, start=2)
+        register_batch(db, "2090/2090-01-09_ILCE-7RM6")
+
+        assert closed_jobs(db, batch_id) == set()
+        assert "stacking" in open_jobs(db, batch_id)
+
+    def test_reopen_without_growth_keeps_job_only_completion(self, db):
+        """A plain re-scan must not undo finished work — nothing changed."""
+        from photosearch.batch_state import JOB_ONLY_STEPS
+
+        _add_photos(db, "2090/2090-01-10_ILCE-7RM6", 2)
+        batch_id = register_batch(db, "2090/2090-01-10_ILCE-7RM6")
+        open_job(db, batch_id, JOB_ONLY_STEPS[0], "nas")
+        close_job(db, batch_id, JOB_ONLY_STEPS[0])
+
+        register_batch(db, "2090/2090-01-10_ILCE-7RM6")
+
+        assert closed_jobs(db, batch_id) == {JOB_ONLY_STEPS[0]}
+
     def test_reopen_without_growth_preserves_ready_and_dismissed(self, db):
         _add_photos(db, "2090/2090-01-05_ILCE-7RM6", 2)
         batch_id = register_batch(db, "2090/2090-01-05_ILCE-7RM6")

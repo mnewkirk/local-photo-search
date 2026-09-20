@@ -24,7 +24,7 @@ import pytest
 from photosearch.batch_state import (
     WORKER_PASSES,
     NAS_STEPS,
-    DESKTOP_STEPS,
+    OPTIONAL_STEPS,
     STEP_ORDER,
     DEPENDS_ON,
     STATES,
@@ -136,9 +136,14 @@ def _complete_all_worker_passes(db, ids):
             _complete_pass(db, ids, p)
 
 
-def _complete_all_nas_steps(db, batch_id, ids):
+def _complete_all_nas_steps(db, batch_id, ids, include_optional=False):
+    """Close every REQUIRED NAS step's job. The optional ones are left alone
+    by default — `ready` must not depend on them, and a helper that quietly
+    closed them would make that impossible to test."""
     _set_col(db, ids, "aes_overall_pct", 50.0)
     for step in NAS_STEPS:
+        if step in OPTIONAL_STEPS and not include_optional:
+            continue
         open_job(db, batch_id, step, "nas")
         close_job(db, batch_id, step)
 
@@ -174,7 +179,17 @@ class TestShape:
         assert [s["step"] for s in state["steps"]] == list(STEP_ORDER)
 
     def test_step_order_composition(self):
-        assert STEP_ORDER == ("ingest",) + WORKER_PASSES + NAS_STEPS + DESKTOP_STEPS
+        assert STEP_ORDER == ("ingest",) + WORKER_PASSES + NAS_STEPS
+
+    def test_rank_measure_is_a_nas_step_and_runs_last(self):
+        """It reads the ORIGINAL files at full resolution and only the NAS has
+        them (the replica holds no originals), so it is not a desktop step —
+        the plan's "desktop-only" label was simply wrong. Last, because it is
+        the optional one."""
+        assert NAS_STEPS[-1] == "rank_measure"
+        assert OPTIONAL_STEPS == ("rank_measure",)
+        assert set(OPTIONAL_STEPS) <= set(NAS_STEPS)
+        assert DEPENDS_ON["rank_measure"] == "faces"
 
     def test_kinds_match_the_step_family(self, db):
         batch_id, ids = _make_batch(db)
@@ -183,7 +198,7 @@ class TestShape:
         assert kinds["ingest"] == "ingest"
         assert all(kinds[p] == "worker" for p in WORKER_PASSES)
         assert all(kinds[p] == "nas" for p in NAS_STEPS)
-        assert all(kinds[p] == "desktop" for p in DESKTOP_STEPS)
+        assert "desktop" not in set(kinds.values())
 
     def test_every_step_carries_the_full_field_set(self, db):
         batch_id, ids = _make_batch(db)
@@ -721,18 +736,51 @@ class TestReadyAndNextAction:
     def test_ready_when_every_worker_and_nas_step_is_complete(self, db):
         batch_id, ids = _make_batch(db)
         _complete_all_worker_passes(db, ids)
-        _complete_all_nas_steps(db, batch_id, ids)
+        _complete_all_nas_steps(db, batch_id, ids, include_optional=True)
         state = batch_state(db, batch_id)
         assert state["ready"] is True
         assert state["next_action"] is None
 
     def test_rank_measure_does_not_gate_ready(self, db):
+        """Moving `rank_measure` into NAS_STEPS would silently make it gate
+        `ready` — `ready` is "every step in WORKER_PASSES + NAS_STEPS". It is
+        optional work (a ranking nicety), so OPTIONAL_STEPS is subtracted."""
         batch_id, ids = _make_batch(db)
         _complete_all_worker_passes(db, ids)
         _complete_all_nas_steps(db, batch_id, ids)
         state = batch_state(db, batch_id)
-        assert _step(state, "rank_measure")["state"] != "completed"
+        assert _step(state, "rank_measure")["state"] == "needs_queue"
         assert state["ready"] is True
+
+    def test_a_ready_batch_still_offers_to_run_the_optional_step(self, db):
+        """…and does NOT sit on `next_action: null`, which is what made
+        `rank_measure` a dead end: the box read "Needs to be queued 0 / 1,373"
+        forever with no button that would ever run it."""
+        batch_id, ids = _make_batch(db)
+        _complete_all_worker_passes(db, ids)
+        _complete_all_nas_steps(db, batch_id, ids)
+        state = batch_state(db, batch_id)
+        assert state["ready"] is True
+        assert state["next_action"] == "advance_nas"
+
+    def test_next_action_is_none_once_the_optional_step_has_run(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_all_worker_passes(db, ids)
+        _complete_all_nas_steps(db, batch_id, ids, include_optional=True)
+        state = batch_state(db, batch_id)
+        assert _step(state, "rank_measure")["state"] == "completed"
+        assert state["ready"] is True
+        assert state["next_action"] is None
+
+    def test_a_queued_optional_step_is_not_offered_again(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_all_worker_passes(db, ids)
+        _complete_all_nas_steps(db, batch_id, ids)
+        open_job(db, batch_id, "rank_measure", "nas")
+        state = batch_state(db, batch_id)
+        assert _step(state, "rank_measure")["state"] == "queued"
+        assert state["ready"] is True
+        assert state["next_action"] is None
 
     def test_review_blocked_when_nothing_is_actionable(self, db):
         batch_id, ids = _make_batch(db)
@@ -791,7 +839,7 @@ class TestWorkerPrecedenceOverAnOpenJob:
         for p in WORKER_PASSES:
             open_job(db, batch_id, p, "fleet")
         _complete_all_worker_passes(db, ids)
-        _complete_all_nas_steps(db, batch_id, ids)
+        _complete_all_nas_steps(db, batch_id, ids, include_optional=True)
         state = batch_state(db, batch_id)
         assert state["ready"] is True
         assert state["next_action"] is None
