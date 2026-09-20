@@ -289,6 +289,116 @@ def test_failed_batch_commit_logs_no_activity(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Deferral is for TRANSIENT locks only
+# ---------------------------------------------------------------------------
+
+def test_is_transient_db_error_classification():
+    """One named predicate, shared by the per-row and commit paths so they
+    cannot drift apart."""
+    from photosearch.worker_api import _is_transient_db_error as t
+    assert t(sqlite3.OperationalError("database is locked"))
+    assert t(sqlite3.OperationalError("DATABASE IS LOCKED"))
+    assert t(sqlite3.OperationalError("database table is locked: photos"))
+    assert t(sqlite3.OperationalError("database is busy"))
+    assert not t(sqlite3.OperationalError("disk I/O error"))
+    assert not t(sqlite3.OperationalError("database or disk is full"))
+    assert not t(sqlite3.OperationalError("no such column: aes_overall"))
+    assert not t(sqlite3.IntegrityError("UNIQUE constraint failed"))
+    assert not t(KeyError("encoding"))
+    assert not t(ValueError("bad"))
+
+
+def test_a_malformed_faces_payload_still_reaches_the_attempt_cap(client):
+    """`faces` has no column to heal it — its claim predicate is
+    NOT EXISTS(faces) AND attempts < MAX. A payload that raises BEFORE any
+    INSERT writes nothing, so deferring it would re-claim the photo every TTL
+    forever and pay for an InsightFace run each cycle: the exact pathology
+    CLAUDE.md documents for the un-capped clip pass."""
+    from photosearch.db import MAX_PROCESS_ATTEMPTS
+    for _ in range(MAX_PROCESS_ATTEMPTS):
+        body = client.post("/api/worker/submit-results", json={
+            "batch_id": "no-such-claim", "pass_type": "faces",
+            "face_results": [{"photo_id": 1, "faces": [{"bbox": [1, 2, 3, 4]}]}],
+        }).json()          # no "encoding" key -> KeyError, nothing written
+        assert body["deferred_photo_ids"] == []
+    assert _attempts("faces") == {1: MAX_PROCESS_ATTEMPTS}
+    with _open() as db:
+        claimable = {p["id"] for p in db.get_unprocessed_photos("faces", limit=50)}
+    assert 1 not in claimable, "a deterministically broken photo must stop being claimed"
+
+
+def test_a_short_bbox_is_a_counted_attempt_not_a_deferral(client):
+    client.post("/api/worker/submit-results", json={
+        "batch_id": "no-such-claim", "pass_type": "faces",
+        "face_results": [{"photo_id": 1, "faces": [
+            {"bbox": [1, 2], "encoding": [0.01] * 512}]}],
+    })
+    assert _attempts("faces") == {1: 1}
+
+
+@pytest.mark.parametrize("exc", [
+    sqlite3.IntegrityError("UNIQUE constraint failed: photos.id"),
+    sqlite3.OperationalError("database or disk is full"),
+    ValueError("not a json-serializable tag list"),
+])
+def test_a_non_lock_write_error_counts_the_attempt(client, monkeypatch, exc):
+    from photosearch.db import PhotoDB
+    real = PhotoDB.update_photo
+
+    def flaky(self, photo_id, *a, **kw):
+        if photo_id == 2:
+            raise exc
+        return real(self, photo_id, *a, **kw)
+
+    monkeypatch.setattr(PhotoDB, "update_photo", flaky)
+    body = client.post("/api/worker/submit-results", json={
+        "batch_id": "no-such-claim", "pass_type": "category-visual",
+        "category_visual_results": [
+            {"photo_id": 1, "visual_tags": ["a"]},
+            {"photo_id": 2, "visual_tags": ["b"]},
+        ],
+    }).json()
+    assert body["deferred_photo_ids"] == []
+    assert _attempts("category-visual") == {1: 1, 2: 1}, \
+        "only a transient lock may skip the attempt cap"
+
+
+def test_a_non_lock_commit_failure_counts_attempts(client, monkeypatch, caplog):
+    """The batch did not persist, so re-claiming is unavoidable for a
+    column-guarded pass — but the attempt is counted so the cap bounds it,
+    and the reason is logged loudly rather than looping in silence."""
+    from photosearch.db import PhotoDB
+    monkeypatch.setattr(PhotoDB, "end_batch",
+                        lambda self: (_ for _ in ()).throw(
+                            sqlite3.OperationalError("database or disk is full")))
+    with caplog.at_level("ERROR", logger="photosearch.worker_api"):
+        body = client.post("/api/worker/submit-results", json={
+            "batch_id": "no-such-claim", "pass_type": "category-visual",
+            "category_visual_results": [{"photo_id": 1, "visual_tags": ["a"]}],
+        }).json()
+    assert body["written"] == 0
+    assert _attempts("category-visual") == {1: 1}
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+def test_an_unwritable_db_cannot_record_the_attempt_but_says_so(client, monkeypatch, caplog):
+    """If mark_processed itself fails non-transiently the attempt cannot be
+    recorded at all — the one case that really can loop. It must be loud."""
+    from photosearch.db import PhotoDB
+    monkeypatch.setattr(PhotoDB, "mark_processed",
+                        lambda self, ids, pt: (_ for _ in ()).throw(
+                            sqlite3.OperationalError("attempt to write a readonly database")))
+    with caplog.at_level("ERROR", logger="photosearch.worker_api"):
+        body = client.post("/api/worker/submit-results", json={
+            "batch_id": "no-such-claim", "pass_type": "category-visual",
+            "category_visual_results": [{"photo_id": 1, "visual_tags": ["a"]}],
+        }).json()
+    assert body["deferred_photo_ids"] == [1]
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    assert "readonly" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Never swallow the reason
 # ---------------------------------------------------------------------------
 

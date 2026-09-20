@@ -11,6 +11,7 @@ The NAS remains the single source of truth (SQLite DB).
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -432,19 +433,38 @@ class _SubmitOutcome:
             self.processed.append(photo_id)
 
     def defer(self, photo_id: int):
-        """The server failed to write this one — do NOT spend an attempt."""
+        """A transient lock — do NOT spend an attempt; it comes back around."""
         if photo_id in self.processed:
             self.processed.remove(photo_id)
         if photo_id not in self.deferred:
             self.deferred.append(photo_id)
 
-    def commit_failed(self):
-        """The batch COMMIT raised: nothing in it landed, so nothing is done."""
-        for pid in self.processed:
-            if pid not in self.deferred:
-                self.deferred.append(pid)
-        self.processed = []
+    def failed(self, photo_id: int):
+        """A repeatable failure — spend the attempt so the cap bounds it.
+
+        Beats a deferral for the same photo (a photo whose payload is broken
+        will break again, and only the attempt cap can stop the loop).
+        """
+        if photo_id in self.deferred:
+            self.deferred.remove(photo_id)
+        if photo_id not in self.processed:
+            self.processed.append(photo_id)
+
+    def commit_failed(self, transient: bool):
+        """The batch COMMIT raised, so the final flush did not land.
+
+        A transient lock defers everything — the work is intact and comes
+        back. Anything else (disk full, read-only FS, corruption) is not
+        going to fix itself batch-over-batch, so the attempt is still spent:
+        the 3-attempt cap is the only thing that stops the fleet re-claiming
+        the same photos forever.
+        """
         self.written = 0
+        if transient:
+            for pid in self.processed:
+                if pid not in self.deferred:
+                    self.deferred.append(pid)
+            self.processed = []
 
     def status(self) -> str:
         if not self.deferred:
@@ -452,12 +472,48 @@ class _SubmitOutcome:
         return "partial" if self.processed or self.written else "deferred"
 
 
+# Only a TRANSIENT lock earns a free retry. Deferring anything else would
+# uncap the pass: a deterministically-failing photo would never reach
+# MAX_PROCESS_ATTEMPTS, be re-claimed every TTL forever, and pay for a model
+# run each cycle — exactly the pathology CLAUDE.md documents for the un-capped
+# `clip` pass ("workers churn at ~290% CPU and queue_depth.clip never reaches
+# 0"). `faces` is the worst case: its claim predicate is NOT EXISTS(faces) AND
+# attempts < MAX with no column to heal it, and a malformed payload (a short
+# bbox, a missing 'encoding', a non-512 vector) raises BEFORE any INSERT, so
+# nothing is written AND nothing is marked. DO NOT widen this back to a bare
+# `except Exception` defer.
+_TRANSIENT_DB_MARKERS = ("locked", "busy")
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True only for SQLite contention — a lock we should simply wait out.
+
+    Shared by the per-row, batch-commit and mark_processed paths so their
+    classifications cannot drift apart.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_DB_MARKERS)
+
+
 def _record_write_failure(db, outcome: _SubmitOutcome, pass_type: str,
                           photo_id: int, exc: Exception):
-    """Defer one photo whose DB write raised, and never lose the reason."""
-    logger.warning("Failed to store %s for photo %s — deferring for retry: %s",
-                   pass_type, photo_id, exc)
-    outcome.defer(photo_id)
+    """Handle one photo whose DB write raised, and never lose the reason.
+
+    A transient lock defers (no attempt spent). Any other error counts the
+    attempt, exactly as before this file learned to defer at all, so the
+    3-attempt cap still bounds a repeatable failure.
+    """
+    if _is_transient_db_error(exc):
+        logger.warning("Failed to store %s for photo %s — deferring for retry: %s",
+                       pass_type, photo_id, exc)
+        outcome.defer(photo_id)
+    else:
+        logger.warning("Failed to store %s for photo %s — counting the attempt "
+                       "(not a lock, so retrying would not help): %s",
+                       pass_type, photo_id, exc)
+        outcome.failed(photo_id)
     try:
         db.log_error(pass_type, str(photo_id), str(exc))
     except Exception as log_exc:
@@ -469,14 +525,22 @@ def _record_write_failure(db, outcome: _SubmitOutcome, pass_type: str,
 
 
 def _commit_batch(db, outcome: _SubmitOutcome, pass_type: str) -> bool:
-    """Commit the pending batch; return False when the COMMIT itself failed.
+    """Commit the pending batch; return True when the caller may mark its
+    processed set.
 
     begin_batch defers the commit, so under write contention SQLITE_BUSY
-    usually surfaces at COMMIT rather than at the UPDATE — and then none of
-    the batch landed. We cannot tell which rows an intermediate flush had
-    already committed, so the conservative answer is to mark nothing: every
-    pass rewrites the same columns idempotently, whereas over-marking retires
-    a good photo for good.
+    usually surfaces at COMMIT rather than at the UPDATE. What is knowable
+    then is only that the FINAL flush did not land: rows written before an
+    intermediate flush — or before a `db.log_error` call, which commits
+    unconditionally — may well be on disk. That is harmless either way, since
+    a landed-but-unmarked row is simply not re-claimed by a column-guarded
+    predicate.
+
+    A transient lock defers the whole batch (nothing marked — the work is
+    intact and comes back). Any OTHER commit failure (disk full, read-only
+    FS, corruption) is not going to resolve batch-over-batch, so the attempt
+    is still counted: re-claiming is unavoidable for a column-guarded pass,
+    but the 3-attempt cap is the only thing that bounds the loop.
     """
     try:
         db.end_batch()
@@ -485,28 +549,43 @@ def _commit_batch(db, outcome: _SubmitOutcome, pass_type: str) -> bool:
         # Leaves the connection usable rather than stuck in batch mode with an
         # open transaction (and stops close() re-raising the same error).
         db.abort_batch()
+        transient = _is_transient_db_error(e)
         n = len(outcome.processed) + len(outcome.deferred)
-        logger.warning("Batch commit failed for pass %s — nothing marked "
-                       "processed, %d result(s) deferred: %s", pass_type, n, e)
+        if transient:
+            logger.warning("Batch commit failed for pass %s under contention — "
+                           "nothing marked processed, %d result(s) deferred: %s",
+                           pass_type, n, e)
+        else:
+            logger.error("Batch commit failed for pass %s and it is NOT a lock — "
+                         "the final flush did not land for %d result(s); counting "
+                         "the attempt so the fleet cannot loop on it: %s",
+                         pass_type, n, e)
         try:
             db.log_error(pass_type, "batch", f"batch commit failed: {e}")
         except Exception as log_exc:
             logger.warning("Could not log the %s batch-commit failure (%s); "
                            "original error was: %s", pass_type, log_exc, e)
-        outcome.commit_failed()
-        return False
+        outcome.commit_failed(transient)
+        return not transient
 
 
 def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str):
-    """Spend one attempt per finished photo. A failure here is safe in the
-    other direction (the photo is simply reprocessed), so it defers too."""
+    """Spend one attempt per finished photo.
+
+    If this write itself fails the attempt cannot be recorded at all — the
+    one case that really can loop, since the photo comes back unmarked every
+    TTL. Nothing here can fix an unwritable DB, so say so loudly.
+    """
     if not outcome.processed:
         return
     try:
         db.mark_processed(outcome.processed, pass_type)
     except Exception as e:
-        logger.warning("Could not mark %d photo(s) processed for pass %s — they "
-                       "will be reclaimed: %s", len(outcome.processed), pass_type, e)
+        log = logger.warning if _is_transient_db_error(e) else logger.error
+        log("Could not mark %d photo(s) processed for pass %s — their attempt "
+            "was NOT recorded and they will be reclaimed; if this is not a "
+            "lock the DB is unwritable and the fleet will keep retrying: %s",
+            len(outcome.processed), pass_type, e)
         for pid in list(outcome.processed):
             outcome.defer(pid)
 
