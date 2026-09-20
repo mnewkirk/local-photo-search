@@ -280,8 +280,17 @@ def _stage_normalize_aesthetics(db, apply, emit, check_abort, force=False):
         return {"stage": "normalize_aesthetics", "would": would, "applied": 0,
                 "status": "skipped" if (would == 0 and not force) else "preview"}
     from .aesthetics import normalize_overall, normalize_overall_by_day
-    n = normalize_overall(db, apply=True)
-    normalize_overall_by_day(db, apply=True)  # per-day percentile (v28)
+
+    def on_chunk(done, total):
+        # The percentile write is chunked so the worker fleet can take the
+        # write lock between chunks (see aesthetics.PERCENTILE_CHUNK_ROWS);
+        # those gaps are also where an abort can land.
+        check_abort()
+        emit({"phase": "sweep", "stage": "normalize_aesthetics",
+              "status": "running", "done": done, "total": total})
+
+    n = normalize_overall(db, apply=True, on_chunk=on_chunk)
+    normalize_overall_by_day(db, apply=True, on_chunk=on_chunk)  # per-day (v28)
     emit({"phase": "sweep", "stage": "normalize_aesthetics", "status": "running",
           "done": n, "total": n})
     return {"stage": "normalize_aesthetics", "would": would, "applied": n,
@@ -303,8 +312,14 @@ def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort, force=Fals
         return {"stage": "normalize_subject_aesthetics", "would": would, "applied": 0,
                 "status": "skipped" if (would == 0 and not force) else "preview"}
     from .aesthetics import normalize_subject_overall, normalize_subject_overall_by_day
-    n = normalize_subject_overall(db, apply=True)
-    normalize_subject_overall_by_day(db, apply=True)  # per-day percentile (v28)
+
+    def on_chunk(done, total):
+        check_abort()
+        emit({"phase": "sweep", "stage": "normalize_subject_aesthetics",
+              "status": "running", "done": done, "total": total})
+
+    n = normalize_subject_overall(db, apply=True, on_chunk=on_chunk)
+    normalize_subject_overall_by_day(db, apply=True, on_chunk=on_chunk)  # per-day (v28)
     emit({"phase": "sweep", "stage": "normalize_subject_aesthetics", "status": "running",
           "done": n, "total": n})
     return {"stage": "normalize_subject_aesthetics", "would": would, "applied": n,

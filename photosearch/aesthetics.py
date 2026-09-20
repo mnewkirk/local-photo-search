@@ -27,9 +27,12 @@ Nothing here touches `quality.py`; the LAION score is kept as a cheap prior.
 """
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("photosearch.aesthetics")
 
 # The scoring taxonomy. Each dimension is the (equal-weight) mean of its
 # sub-attributes; the overall is the DIMENSION_WEIGHTS-weighted mean of the
@@ -415,55 +418,119 @@ def recompute_overall_scores(db, weights: Optional[dict[str, float]] = None,
     return len(rows)
 
 
-def normalize_overall(db, apply: bool = True) -> int:
+# A percentile refresh rewrites one column across the WHOLE library — 158,111
+# rows on the NAS. Doing that as one `executemany` + one commit holds SQLite's
+# single writer lock for the entire rewrite, and on 2026-09-20 the nightly
+# sweep's normalize_aesthetics stage held it long enough (>60 s) for the GPU
+# fleet's concurrent submit-results writes to exhaust their `busy_timeout` and
+# fail with `database is locked` — which then burned those photos' retry
+# attempts. A few thousand by-primary-key updates commit in well under a second
+# even on the N100's spinning disks, so this is small enough to leave frequent
+# windows for other writers and large enough not to pay per-transaction
+# overhead 158 times over.
+PERCENTILE_CHUNK_ROWS = 2000
+
+
+def _write_percentiles(db, pct_col: str, score_col: str, rows, on_chunk=None) -> int:
+    """Write percentiles in bounded, separately-committed chunks.
+
+    ``rows`` is a list of ``(photo_id, score, pct, current_pct)`` computed
+    from ONE consistent snapshot — chunking changes only how the answer is
+    written, never what it is. Two guards:
+
+    * a row whose stored percentile already equals the computed one is not
+      rewritten at all. The nightly run otherwise rewrote all 158k rows even
+      when nothing had moved, which was most of the lock time for no change.
+    * the UPDATE is guarded on the score the percentile was derived from
+      (``score_col IS ?``), so a row rescored between the snapshot read and
+      its chunk's write is SKIPPED rather than silently given a stale
+      percentile. It picks the correct value up on the next run.
+
+    Returns the number of rows actually written.
+    """
+    pending = [(pct, pid, score) for pid, score, pct, current in rows
+               if current != pct]
+    unchanged = len(rows) - len(pending)
+    total = len(pending)
+    sql = f"UPDATE photos SET {pct_col}=? WHERE id=? AND {score_col} IS ?"
+    written = 0
+    chunk_rows = max(1, PERCENTILE_CHUNK_ROWS)
+    for start in range(0, total, chunk_rows):
+        chunk = pending[start:start + chunk_rows]
+        cur = db.conn.executemany(sql, chunk)
+        written += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        db.conn.commit()
+        if on_chunk is not None:
+            on_chunk(min(start + chunk_rows, total), total)
+    stale = total - written
+    if stale or unchanged:
+        logger.info(
+            "%s: wrote %d row(s), skipped %d unchanged and %d rescored mid-run",
+            pct_col, written, unchanged, stale)
+    return written
+
+
+def normalize_overall(db, apply: bool = True, on_chunk=None) -> int:
     """Compute aes_overall_pct as the library-relative percentile (0–100) of
     aes_overall across every scored photo. This is the fix for the compressed
     raw scale — the UI/search rank on the percentile, so the best photo reads
-    ~100 regardless of the model's central tendency. Returns rows updated.
+    ~100 regardless of the model's central tendency. Returns rows normalized.
+
+    The write is chunked (see PERCENTILE_CHUNK_ROWS) so concurrent writers —
+    the worker fleet's submit-results, ingest — can take the lock between
+    chunks. ``on_chunk(done, total)`` is called after each chunk commits;
+    the maintenance sweep uses it to check for abort and emit progress.
     """
     rows = db.conn.execute(
-        "SELECT id, aes_overall FROM photos WHERE aes_overall IS NOT NULL"
+        "SELECT id, aes_overall, aes_overall_pct FROM photos "
+        "WHERE aes_overall IS NOT NULL"
     ).fetchall()
     if not rows or not apply:
         return len(rows)
-    ids = [r["id"] for r in rows]
     pcts = percentile_ranks([r["aes_overall"] for r in rows])
-    db.conn.executemany(
-        "UPDATE photos SET aes_overall_pct=? WHERE id=?",
-        [(p, i) for p, i in zip(pcts, ids)],
+    _write_percentiles(
+        db, "aes_overall_pct", "aes_overall",
+        [(r["id"], r["aes_overall"], p, r["aes_overall_pct"])
+         for r, p in zip(rows, pcts)],
+        on_chunk=on_chunk,
     )
-    db.conn.commit()
     return len(rows)
 
 
-def normalize_subject_overall(db, apply: bool = True) -> int:
+def normalize_subject_overall(db, apply: bool = True, on_chunk=None) -> int:
     """Compute aes_subject_overall_pct as the library-relative percentile (0–100)
     of aes_subject_overall across every subject-scored photo — the subject-crop
-    analogue of `normalize_overall`. Returns rows updated. See
+    analogue of `normalize_overall`. Returns rows normalized. See
     photosearch/subjects.py + docs/plans/subject-aware-quality.md.
     """
     rows = db.conn.execute(
-        "SELECT id, aes_subject_overall FROM photos WHERE aes_subject_overall IS NOT NULL"
+        "SELECT id, aes_subject_overall, aes_subject_overall_pct FROM photos "
+        "WHERE aes_subject_overall IS NOT NULL"
     ).fetchall()
     if not rows or not apply:
         return len(rows)
-    ids = [r["id"] for r in rows]
     pcts = percentile_ranks([r["aes_subject_overall"] for r in rows])
-    db.conn.executemany(
-        "UPDATE photos SET aes_subject_overall_pct=? WHERE id=?",
-        [(p, i) for p, i in zip(pcts, ids)],
+    _write_percentiles(
+        db, "aes_subject_overall_pct", "aes_subject_overall",
+        [(r["id"], r["aes_subject_overall"], p, r["aes_subject_overall_pct"])
+         for r, p in zip(rows, pcts)],
+        on_chunk=on_chunk,
     )
-    db.conn.commit()
     return len(rows)
 
 
-def _normalize_by_day(db, score_col: str, pct_col: str, apply: bool) -> int:
+def _normalize_by_day(db, score_col: str, pct_col: str, apply: bool,
+                      on_chunk=None) -> int:
     """Per-day percentile of ``score_col`` written to ``pct_col``: rank each
     photo against only the others taken on its capture day (YYYY-MM-DD of
     date_taken, else date_created). Photos with no determinable day are left
-    NULL. Returns rows updated. Shared by the two public wrappers below."""
+    NULL. Returns rows normalized. Shared by the two public wrappers below.
+
+    Every day's percentiles are computed before anything is written, so the
+    chunked write (see PERCENTILE_CHUNK_ROWS) cannot split a day's ranking
+    across two inconsistent snapshots."""
     rows = db.conn.execute(
-        f"SELECT id, {score_col} AS s, "
+        f"SELECT id, {score_col} AS s, {pct_col} AS cur, "
         "substr(COALESCE(date_taken, date_created), 1, 10) AS day "
         f"FROM photos WHERE {score_col} IS NOT NULL "
         "AND COALESCE(date_taken, date_created) IS NOT NULL"
@@ -477,25 +544,25 @@ def _normalize_by_day(db, score_col: str, pct_col: str, apply: bool) -> int:
     updates = []
     for group in by_day.values():
         pcts = percentile_ranks([g["s"] for g in group])
-        updates.extend((p, g["id"]) for g, p in zip(group, pcts))
-    db.conn.executemany(
-        f"UPDATE photos SET {pct_col}=? WHERE id=?", updates)
-    db.conn.commit()
+        updates.extend((g["id"], g["s"], p, g["cur"]) for g, p in zip(group, pcts))
+    _write_percentiles(db, pct_col, score_col, updates, on_chunk=on_chunk)
     return len(updates)
 
 
-def normalize_overall_by_day(db, apply: bool = True) -> int:
+def normalize_overall_by_day(db, apply: bool = True, on_chunk=None) -> int:
     """Per-day analogue of `normalize_overall`: aes_overall_day_pct is the
     percentile of aes_overall within the photo's own capture day, so 'best of
-    the day' is comparable across days. Returns rows updated."""
-    return _normalize_by_day(db, "aes_overall", "aes_overall_day_pct", apply)
+    the day' is comparable across days. Returns rows normalized."""
+    return _normalize_by_day(db, "aes_overall", "aes_overall_day_pct", apply,
+                             on_chunk=on_chunk)
 
 
-def normalize_subject_overall_by_day(db, apply: bool = True) -> int:
+def normalize_subject_overall_by_day(db, apply: bool = True, on_chunk=None) -> int:
     """Per-day analogue of `normalize_subject_overall` for the subject-crop
-    score (aes_subject_overall_day_pct). Returns rows updated."""
+    score (aes_subject_overall_day_pct). Returns rows normalized."""
     return _normalize_by_day(
-        db, "aes_subject_overall", "aes_subject_overall_day_pct", apply)
+        db, "aes_subject_overall", "aes_subject_overall_day_pct", apply,
+        on_chunk=on_chunk)
 
 
 def score_photo_aesthetics(
