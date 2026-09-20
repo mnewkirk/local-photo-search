@@ -43,12 +43,10 @@ def test_motion_blur_is_retired_from_both_halves():
     assert "motion-blur" not in V.CAPTURE_FACT_TAGS
 
 
-def test_perceived_axes_partition_the_perceived_vocabulary():
-    seen = []
-    for terms in V.PERCEIVED_AXES.values():
-        seen.extend(terms)
+def test_prompt_sections_partition_the_perceived_vocabulary():
+    seen = [t for _, groups in V.PROMPT_SECTIONS for g in groups for t in g]
     assert sorted(seen) == sorted(V.PERCEIVED_VOCABULARY)
-    assert len(seen) == len(set(seen)), "a term appears on two axes"
+    assert len(seen) == len(set(seen)), "a term appears in two sections"
 
 
 def test_contradictory_pairs_are_perceived_terms_only():

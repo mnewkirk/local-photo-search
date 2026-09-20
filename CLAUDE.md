@@ -512,8 +512,9 @@ covering the compiled vocabulary exactly:
   defensible, so there is none and nothing replaces it.
 - **FROZEN** (2) — `sharp`, `blurry`. Not derived, not asked, **not deleted**.
   See below.
-- **PERCEIVED** (30) — everything else, grouped into six axes (light, colour,
-  mood, atmosphere, viewpoint, composition).
+- **PERCEIVED** (30) — everything else, presented in four prompt sections
+  (light-and-weather, colour, mood, and a RARE section for the terms the model
+  over-applies). `PROMPT_SECTIONS` must partition this list exactly.
 
 **The merge rule is that derived wins.** It strips *every* capture-fact term
 the model emitted — including when nothing was derived, because an absent
@@ -643,14 +644,52 @@ strip-only — derived tags silently absent — spend the attempt and mark the
 photo processed, leaving it permanently under-derived with no trace. Same rule
 as `50003c2`, applied to reads.
 
-**The prompt** now shows only the perceived terms, grouped by axis, with a
-3–6 word definition on each ambiguous one, **at most one tag per axis and a
-hard cap of 5**, an explicit "omit a tag unless it is obviously and
-unmistakably true of THIS image; returning 2–3 tags is normal; returning none
-is acceptable", one positive example and one negative one (a bright midday
-football frame gets `sunny` — not `peaceful`, nothing night-like).
-**Temperature stays at 0**: the collapse came from the checklist, not from
-greedy decoding, so the prompt is the fix and the pass stays reproducible.
+#### The prompt: no axes to fill, no worked examples
+
+**"Pick at most ONE tag from each group" was read as "pick one FROM EACH
+group".** The first rewrite grouped the perceived terms into six AXES and said
+exactly that. Live, the cap held (3–5 tags) and 28 of 29 early tag sets were
+distinct — but nobody got fewer than 3 tags, and `close-up` / `symmetrical` /
+`wide-angle` turned up on photo after photo: a person walking down stairs got
+`close-up, sunny, symmetrical`; an artichoke close-up got `close-up …
+wide-angle`. The model was filling every section because the prompt implied
+there was one to fill.
+
+A/B on **11 photos the controller labelled by hand** (qwen2.5-vl-7b-instruct
+via the OpenAI route, 1024-px JPEG q85, temperature 0, the same parser;
+debatable tags scored as neither):
+
+| variant | right | wrong | tags | note |
+|---|---|---|---|---|
+| **A** axes prompt | 16 | **5** | 36 (avg 3.3) | called two defocused **indoor gym** photos `sunny`; `close-up, symmetrical` on the stairs photo |
+| **B** RARE section, no examples | 14 | **0** | 20 (avg 1.8) | answered `none` for both gym shots and a construction snapshot — correct: nothing notable about their look |
+| **C** = B + two examples | 14 | 1 | 18 | the example containing `close-up` leaked `close-up` onto a baseball photo |
+
+**B shipped.** What makes it work is the **RARE section**: instead of a 3–6
+word gloss, each over-applied term states the exact situation it needs *and
+what it is not* — "people seen full-length are never close-up", "candid photos
+of people are never symmetrical". Plus a standing instruction that "most photos
+have NO viewpoint tag and NO composition tag at all", and permission to answer
+`none`.
+
+**C is why there are no worked examples.** A small model parrots the shape and
+the content it is shown; the example's own `close-up` came back on an unrelated
+photo. That is the same example-leak the earlier review flagged when a
+`WRONG:` / `RIGHT:` label taught the model to emit a label.
+
+**Caveats, honestly:** 11 photos, labelled by the controller, and B was written
+after seeing A's failures on some of them — so it is partly overfitted to them.
+`centered` is still somewhat eager under B (3 of 11). The owner's labelled eval
+is what settles this.
+
+**Don't reintroduce axes-to-fill or worked examples without re-running the
+A/B.** Both looked like obvious improvements and both cost accuracy. The guard
+never enforced one-per-axis and must not start: `backlit, silhouette` describe
+one photo honestly.
+
+**Temperature stays at 0**: the collapse came from the prompt, not from greedy
+decoding, so the prompt is the fix and the pass stays reproducible. The hard
+cap of 5 stays in the guard.
 
 **The guard** (`describe._visual_answer_problem`) was at `>= 12` tags,
 inherited from the 78-term `tags` vocabulary — and the real failure's maximum

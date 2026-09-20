@@ -96,49 +96,59 @@ PERCEIVED_VOCABULARY: list[str] = [
     and t not in FROZEN_TAGS
 ]
 
-#: The perceived terms grouped by the axis they vary along. The prompt asks for
-#: at most ONE per axis: the old flat checklist invited the model to tick every
-#: line, which is how one verbatim 8-tag set landed on 101 photos in a row.
+#: How the prompt lays the perceived terms out: an ordered list of
+#: ``(header, groups)``, each group rendered as one indented line. A header
+#: ending in ':' with a single group whose terms are short enough sits on the
+#: header's own line; everything else goes underneath.
+#:
+#: The previous version grouped these as AXES and the prompt said "Pick at most
+#: ONE tag from each group". The model read that as "pick one FROM EACH group",
+#: so every photo collected a viewpoint tag and a composition tag whether or
+#: not one applied. The fix is a RARE section that describes the exact
+#: situation each over-applied term needs — see `describe._build_visual_prompt`.
 #: Must partition PERCEIVED_VOCABULARY exactly (pinned by a test).
-PERCEIVED_AXES: dict[str, list[str]] = {
-    "light": ["backlit", "golden-hour", "harsh-light", "overcast",
-              "overexposed", "silhouette", "soft-light", "sunny"],
-    "colour": ["black-and-white", "colorful", "monochromatic", "muted", "vibrant"],
-    "mood": ["dramatic", "joyful", "melancholy", "moody", "peaceful"],
-    "atmosphere": ["foggy", "hazy", "snowy"],
-    "viewpoint": ["aerial", "close-up", "macro", "wide-angle"],
-    "composition": ["centered", "composite", "reflection", "split-screen",
-                    "symmetrical"],
-}
+PROMPT_SECTIONS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
+    ("LIGHT AND WEATHER - use when it is the obvious character of the light:",
+     (("sunny", "overcast", "golden-hour", "backlit", "silhouette",
+       "harsh-light", "soft-light", "overexposed", "foggy", "hazy", "snowy"),)),
+    ("COLOUR:",
+     (("colorful", "vibrant", "muted", "monochromatic", "black-and-white"),)),
+    ("MOOD - only when unmistakable; ordinary snapshots and sports have none:",
+     (("dramatic", "joyful", "melancholy", "moody", "peaceful"),)),
+    ("RARE - use only in exactly the situation described, otherwise leave it out:",
+     (("close-up",), ("macro",), ("wide-angle",), ("aerial",), ("centered",),
+      ("symmetrical",), ("reflection", "composite", "split-screen"))),
+)
 
-#: Short definitions for the terms the model most often over-applies. Rendered
-#: into the prompt beside the term; absent terms are self-explanatory.
+#: Sections whose terms sit on the header line rather than underneath it.
+_INLINE_SECTIONS = frozenset({"COLOUR:"})
+
+#: Definitions rendered beside a term. These are NOT tidy 3-6 word glosses any
+#: more: the RARE ones spell out the exact situation the term needs, including
+#: what it is NOT ("people seen full-length are never close-up"), because a
+#: short definition was what let `close-up` and `symmetrical` land on photo
+#: after photo. Terms with no entry here are self-explanatory.
 PERCEIVED_GLOSS: dict[str, str] = {
-    "backlit": "light source behind the subject",
-    "golden-hour": "warm low sunrise or sunset",
-    "harsh-light": "hard-edged shadows from direct overhead sun",
-    "overcast": "flat grey sky, no visible shadows",
-    "overexposed": "highlights blown to featureless white",
-    "silhouette": "subject rendered as a dark shape",
-    "soft-light": "diffuse light, gentle shadow edges",
-    "sunny": "direct sunlight and blue sky visible",
+    "sunny": "direct sunlight, hard shadows on the ground",
+    "overcast": "flat grey sky, no shadows",
+    "golden-hour": "warm low orange sun at sunrise or sunset",
+    "backlit": "the main light is behind the subject, facing the camera",
+    "silhouette": "the subject is a black shape against a bright background",
     "monochromatic": "one hue family throughout",
-    "muted": "desaturated, low-contrast colour",
-    "vibrant": "intense saturated colour",
-    "dramatic": "strong contrast or visual tension",
-    "melancholy": "visibly sombre or sad subject",
-    "moody": "dark, brooding, low-key",
-    "peaceful": "calm, still, unhurried subject",
-    "hazy": "distant detail softened by atmosphere",
-    "aerial": "looking down from far above",
-    "close-up": "subject fills most of the frame",
-    "macro": "extreme magnification of a small object",
-    "wide-angle": "visibly stretched wide field of view",
-    "centered": "main subject squarely in the middle",
-    "composite": "several images combined into one",
-    "reflection": "mirrored image in water or glass",
-    "split-screen": "frame divided into separate panels",
-    "symmetrical": "mirror-image balance across an axis",
+    "moody": "dark, low-key, brooding",
+    "peaceful": "a still, quiet scene with no action in it",
+    "close-up": ("ONE small subject such as a face, a flower or a plate fills "
+                 "almost the whole frame; people seen full-length are never "
+                 "close-up"),
+    "macro": "extreme magnification of something tiny, like an insect",
+    "wide-angle": ("visibly distorted ultra-wide or fisheye view with curved "
+                   "straight lines"),
+    "aerial": "looking straight down from a drone, a plane or a summit",
+    "centered": ("a single isolated subject placed dead centre against a plain "
+                 "background"),
+    "symmetrical": ("left and right halves are near mirror images, as in "
+                    "architecture or a reflection; candid photos of people are "
+                    "never symmetrical"),
 }
 
 #: Perceived pairs that cannot both be true of one photo. Used by the guard in
