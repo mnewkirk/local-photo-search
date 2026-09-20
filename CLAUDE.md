@@ -706,6 +706,80 @@ sources kept for audit. Module: `photosearch/ingest.py`. Tests:
 mtime fallback, undated bucket, filename-collision suffix, HEIC,
 AppleDouble skip, hidden-source-dir skip).
 
+### Repairing the folders already misfiled — `refile-unknown-camera`
+
+`_file_suffix` only fixes files ingested *from now on*. The ones already on
+disk (25 folders `2026/2026-MM-DD_unknown-camera`, ~9,600 files, 2026-06-28 →
+2026-09-19, overwhelmingly `.ARW`) are moved onto the right body by
+`photosearch refile-unknown-camera`. Module `photosearch/refile.py`
+(`refile_unknown_camera`, `undo_refile`, `render_report`); tests
+`tests/test_refile.py`.
+
+**The model comes only from the file's OWN EXIF** — via
+`ingest._file_suffix("unknown-camera", "unknown-camera", meta)`, imported, never
+re-implemented, so the destination is exactly what ingest would choose today.
+Never from the date, never from a sibling folder, never from a same-stem JPEG:
+on several of these days **two bodies were in use** (`…_ILCE-7M4` *and*
+`…_ILCE-7RM6` folders exist for the same date), so a date-based guess silently
+mixes two cameras' files — an error nobody would notice afterwards. A file whose
+EXIF names no usable model (video, unreadable RAW) is **left exactly where it
+is** and counted `no_model`. `--infer-from-sibling` is the one opt-in exception
+and is gated hard: the same-stem sibling must sit in the ONLY non-unknown-camera
+folder for that date.
+
+**The date comes only from the source folder's name.** Ingest already dated
+these files; re-deriving it from EXIF could split a shoot across a
+midnight/timezone edge.
+
+Collisions at the destination, the dangerous part — **nothing is ever
+overwritten, renamed, or deleted**: same name + identical hash → `duplicate_left`
+(source kept in place; clear those by hand); same name + different bytes →
+`conflict`, both paths in the audit, source kept. Hashing happens **only** on a
+name collision — whole-file reads across 9,600 RAWs on a spinning NAS disk are
+the thing this tool must not do. `extract_exif` reads the header only
+(`exifread.process_file(..., details=False)`, `photosearch/exif.py:55`).
+
+Other behaviour worth knowing:
+
+- **Only the top level** of each folder is processed. A nested subdirectory is
+  left untouched and reported — flattening it would invent collisions. Such a
+  folder therefore never ends up empty and is never removed. Same for leftovers:
+  the folder is `rmdir`'d (never `rmtree`) only when literally nothing remains,
+  and the report names what is still there (`.DS_Store`, `@eaDir`, …).
+- **Indexed photos are skipped by default** (`skipped_indexed`). RAW/video
+  companions have no `photos` row (`ingest.py` gates the DB path on `is_photo =
+  ext in INGEST_EXTENSIONS`), but a JPEG in one of these folders may, and a RAW
+  may be some JPEG's `raw_filepath`. `--include-indexed` moves them and updates
+  `filepath` + `folder` (+ `raw_filepath` refs) — thumbnails/previews are keyed
+  by photo **id**, so they survive a path change untouched.
+- **Move first, write the row second.** They cannot be one transaction. This
+  order leaves a row naming a gone file (recoverable) rather than a row naming a
+  file that was never created. A re-run heals it: `_heal_folder` finds rows in
+  the folder whose file is missing, looks for the basename in that date's
+  sibling `YYYY-MM-DD_*` folders, and requires a `file_hash` match before
+  repointing. Anything ambiguous is left for a human.
+- `_undated/unknown-camera` is **skipped with a message** — no date, so no
+  destination folder can be computed. Sort it by hand.
+- Idempotent and resumable: a second run after a full apply does nothing.
+
+The audit CSV is the undo, so `--apply` refuses without `--audit`. It is written
+and flushed **per file**, so a crash mid-run still leaves an accurate record.
+
+```bash
+# On the NAS. /data is the writable persistent volume — the audit goes there.
+$DC run --rm photosearch refile-unknown-camera                    # 1. dry run, all folders
+$DC run --rm photosearch refile-unknown-camera \
+    --only 2026-06-28_unknown-camera --apply --audit /data/refile-0628.csv  # 2. one small folder
+#    3. inspect: ls the destination, read the CSV, confirm nothing unexpected
+$DC run --rm photosearch refile-unknown-camera --apply --audit /data/refile-all.csv  # 4. the rest
+$DC run --rm photosearch refile-unknown-camera --undo /data/refile-all.csv --apply   # reverse it
+```
+
+Undo restores a `moved` row only when the destination is still the file this
+tool put there (size, plus hash when one was recorded — `--verify-hash` hashes
+every destination) and the source path is free; anything else is `refused` and
+left alone. Any DB row the tool repointed is pointed back too.
+
 Cron entry on the NAS:
 
 ```cron

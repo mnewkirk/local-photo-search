@@ -2885,6 +2885,96 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
 
 
 # ---------------------------------------------------------------------------
+# refile-unknown-camera
+# ---------------------------------------------------------------------------
+
+@cli.command("refile-unknown-camera")
+@click.option("--photo-root", default=None,
+              help="Library root. Default: the DB's stored photo_root (or PHOTO_ROOT).")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Actually move files. Default is a DRY RUN that writes nothing.")
+@click.option("--audit", "audit_path", default=None,
+              help="CSV audit written per file (action,source,destination,model,"
+                   "size,hash,reason). REQUIRED with --apply — it is the undo.")
+@click.option("--only", "only", multiple=True, metavar="DIR",
+              help="Restrict to this *_unknown-camera folder (name or path). "
+                   "Repeatable — do one small folder first.")
+@click.option("--limit", default=None, type=int, help="Stop after N moves.")
+@click.option("--include-indexed", is_flag=True, default=False,
+              help="Also move files that have a photos row (or are some photo's "
+                   "raw_filepath), updating filepath/folder/raw_filepath after "
+                   "the move. Default skips them.")
+@click.option("--infer-from-sibling", is_flag=True, default=False,
+              help="For a file whose EXIF names no model, adopt the model of the "
+                   "ONLY other folder for that date when it holds a same-stem "
+                   "sibling. Off by default — a wrong guess mixes two bodies.")
+@click.option("--undo", "undo_path", default=None, metavar="AUDIT.csv",
+              help="Reverse the moves recorded in an audit CSV instead of refiling.")
+@click.option("--verify-hash", is_flag=True, default=False,
+              help="With --undo, hash every destination before restoring it "
+                   "(slow on spinning disks; catches a same-size edit).")
+def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
+                              include_indexed, infer_from_sibling, undo_path,
+                              verify_hash):
+    """Re-file YYYY-MM-DD_unknown-camera/ onto the body each file's EXIF names.
+
+    'unknown-camera' is the SD-card importer's fallback label, not a fact — it
+    could not read a new body's RAW model, so those .ARW files were filed away
+    from their own JPEGs. ingest._file_suffix self-corrects now; this repairs
+    the files already on disk.
+
+    The model comes ONLY from the file's own EXIF (never the date, never a
+    sibling folder — two bodies were in use on several of these days). The date
+    comes ONLY from the source folder's name. Nothing is ever overwritten or
+    deleted: a name collision with identical bytes is left alone, and one with
+    different bytes is reported as a conflict.
+
+    Dry run by default. --apply requires --audit, and that CSV reverses the run:
+
+        photosearch refile-unknown-camera --undo /data/refile.csv --apply
+    """
+    from photosearch.refile import refile_unknown_camera, undo_refile, render_report
+
+    if undo_path:
+        stats = undo_refile(undo_path, db, apply=apply, verify_hash=verify_hash)
+        click.echo(f"Undo from {undo_path}: {stats['candidates']:,} moved rows")
+        click.echo(f"  restored={stats['restored']:,}  "
+                   f"would_restore={stats['would_restore']:,}  "
+                   f"refused={stats['refused']:,}  errors={stats['errors']:,}")
+        for path, why in stats["refusals"]:
+            click.echo(f"  REFUSED {path}: {why}")
+        if not apply:
+            click.echo("\nDry run — nothing restored. Re-run with --apply.")
+        return
+
+    last = {"folder": None}
+
+    def _progress(ev):
+        if ev.get("event") == "folder" and ev["name"] != last["folder"]:
+            last["folder"] = ev["name"]
+            click.echo(f"  [{ev['index'] + 1}/{ev['total']}] {ev['name']}", err=True)
+
+    try:
+        stats = refile_unknown_camera(
+            photo_root, db, apply=apply, audit_path=audit_path,
+            only=list(only) or None, limit=limit,
+            include_indexed=include_indexed,
+            infer_from_sibling=infer_from_sibling,
+            on_progress=_progress,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+    for line in render_report(stats):
+        click.echo(line)
+    if apply and audit_path:
+        click.echo(f"\nAudit: {audit_path}  "
+                   f"(undo with --undo {audit_path} --apply)")
+
+
+# ---------------------------------------------------------------------------
 # face-clusters
 # ---------------------------------------------------------------------------
 
