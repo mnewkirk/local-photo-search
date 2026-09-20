@@ -1058,6 +1058,25 @@ folder (CLIP + colors). Module `photosearch/ingest.py`; 15 tests in
   /photos` (idempotent) backfills CLIP; colors are **not** a worker pass, so a
   plain `photosearch index <dir>` backfills those. Faces/quality/describe/tags
   are left to the worker fleet either way.
+- **Re-filing historical `unknown-camera` folders:**
+
+  ```bash
+  $DC photosearch refile-unknown-camera [--only DIR] [--limit N] \
+      [--include-indexed] [--infer-from-sibling] [--apply --audit /data/refile.csv]
+  $DC photosearch refile-unknown-camera --undo /data/refile.csv --apply
+  ```
+
+  Moves `YYYY/YYYY-MM-DD_unknown-camera/*` onto the body each file's **own**
+  EXIF names, reusing `ingest._file_suffix` verbatim. Dry run by default (and
+  read-only on the DB); `--apply` refuses without `--audit` (the CSV is the undo,
+  written intent-then-confirm and fsynced per file) and takes ingest's
+  `_sweep_lock`. The move is `os.link` + `unlink`, so it **cannot** overwrite —
+  the nightly ingest writes into these same dated folders. Never deletes, never
+  guesses a model from the date or a sibling folder (two bodies were in use on
+  several of these days); files with no readable model are left in place. The DB
+  gate matches on exact `filepath`, not the `folder` column, which some writers
+  leave stale. Module `photosearch/refile.py`; tests `tests/test_refile.py`.
+  See the CLAUDE.md section for the full operator sequence.
 - **Stuck-phone gotcha:** because ingest *moves* files out, the receive-only
   Syncthing folder records them as local deletions and the **phone permanently
   shows <100%** — expected, not a fault (all photos reach the NAS; the REST
