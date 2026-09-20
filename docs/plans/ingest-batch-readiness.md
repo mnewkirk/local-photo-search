@@ -1,8 +1,10 @@
 # Ingest-batch readiness — automation + per-batch status flow
 
-**Status:** planned (2026-09-19). Produced by a two-planner debate (two critique
+**Status:** ✅ **SHIPPED 2026-09-19.** Produced by a two-planner debate (two critique
 rounds); the `## Decisions` table records what the planners could not settle and what
-the owner chose.
+the owner chose. See "## What changed during the build" below for where the
+implementation amended this plan, and CLAUDE.md's "Ingest batches (`/batches`)"
+section for the shipped shape, the six states, and the traps.
 
 ## Goal
 
@@ -193,3 +195,60 @@ Settled in debate without the owner: dated-folder granularity (B conceded); the
 job-intent rows as the source of "queued" (A conceded); non-blocking-lock cache (A
 conceded); no persisted derived state (B conceded); strict-only matching in "ready"
 (A conceded); manual trigger with autopilot off (both).
+
+## What changed during the build
+
+The full task-by-task ledger is
+`.superpowers/sdd/2026-09-19-ingest-batch-readiness/progress.md`; the entries
+below are the ones that changed what got built, not just how it was reviewed.
+
+- **`done`'s formula (step 4) was a controller-authored spec error, not an
+  owner decision.** The brief said `done = eligible - remaining - failed`
+  uniformly. `quality`, `verify` and `clip` carry no attempts filter on their
+  claim predicate (`db.py:count_unprocessed_photos`), so for those three
+  `failed` is already counted *inside* `remaining` rather than disjoint from
+  it — subtracting it again double-counted. Shipped as a per-pass split
+  (`batch_state._REMAINING_FILTERS_ATTEMPTS`): seven passes use
+  `done = eligible - remaining - failed` and `blocked = remaining == 0 and
+  failed > 0`; the three use `done = eligible - remaining` and
+  `blocked = remaining == failed > 0`.
+- **Worker-pass state precedence (step 6) was a plan defect, caught in
+  review, not an owner call.** The plan implied `queued` alongside `running`/
+  `completed` without ordering them. Built as `queued` first initially, which
+  left a worker pass the fleet had *finished* reading `queued` for the job
+  row's full 6h TTL — the batch could never reach `ready`, and
+  `batch-launch-fleet`'s "already running" 409 stayed armed long after the
+  fleet had exited. Shipped precedence: **running > completed > blocked >
+  queued > waiting > needs_queue** (job-only NAS/desktop steps keep their own
+  ordering — a closed row is their only proof of success, so an open one
+  still reads `queued` for them).
+- **"Leave a failed job open to expire" (step 6) was a spec flaw the brief
+  wrote, not a design owner picked.** Leaving a failed/aborted NAS step's job
+  row open would have made that step unretryable for up to 6 hours with no
+  recovery short of editing the table. Shipped: a failed or cancelled step
+  **deletes** its job row (`ingest_batches.delete_job`), putting the step
+  back to `needs_queue` immediately — never `close_job`, which is how a
+  job-only step proves success.
+- **The plan had no replica-mode story for `batch_api` at all — a genuine
+  plan gap, not an ambiguity to resolve in review.** Batches and job rows are
+  written on the NAS, but the owner views `/batches` from the desktop
+  replica, whose DB is a periodically-synced copy. Amended: every
+  `/api/batches/*` route proxies to the NAS when `PHOTOSEARCH_NAS_URL` is
+  set, with no local fallback (a wrong batch view is worse than a visible
+  502); `batch-launch-fleet` reads the *authoritative* (NAS) state before
+  deciding whether a pass is already running, and refuses with 409 rather
+  than risk double-launching a fleet the replica doesn't know about yet.
+- **One click launches the whole worker pipeline, not just what is
+  `needs_queue` right now (step 6, found in review round 2).** The plan's
+  "launch the fleet for passes in needs queue" left `category-content` /
+  `keywords` / `verify` unqueued forever — they read `waiting` on `describe`
+  at click time, and a second launch mid-run is refused (it would kill the
+  running fleet). Shipped `batch_state.fleet_launch_passes`: the launch set
+  is every `needs_queue` pass plus every `waiting` pass whose dependency is
+  already underway or itself in the set, mirrored in JS as
+  `PS.BatchFlow.fleetLaunchPasses` so the Advance button's pass count matches
+  what actually launches.
+
+Every other task closed with a clean review (2026-09-19 ledger) or only
+deferred, non-blocking cleanups (dead code, a stray comment, an untested edge
+case) — see the ledger for the full list.

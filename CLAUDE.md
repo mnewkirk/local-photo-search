@@ -22,9 +22,10 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 29 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 30 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
 persons, face_references, collections, collection_photos, photo_stacks, stack_members,
-review_selections, google_photos_uploads, ignored_clusters, generations, schema_info.
+review_selections, google_photos_uploads, ignored_clusters, generations, schema_info,
+ingest_sweeps, ingest_batches, ingest_batch_jobs.
 (v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
 (v25 added `photos.folder` — indexed dirname of `filepath`, populated in
 `add_photo` + backfilled on migration — so the `/review` and `/geotag` folder
@@ -2124,14 +2125,204 @@ face work is overwritten by the next replica sync.
 Module: `photosearch/maintenance_sync.py`. Spec:
 `docs/superpowers/specs/2026-07-17-maintenance-push-up-design.md`.
 
+## Ingest batches (`/batches`)
+
+One-glance per-shoot readiness, replacing "SSH in and eyeball `/api/stats`"
+with a page that names the next action. Built after the 2026-09-19 incident
+where an unrelated ~50 MB/s SMB backup starved the NAS's disks and the
+**status page itself made it worse** — `PipelineFunnel`'s `setInterval`
+polling stacked requests faster than the starved server could answer them,
+filling all 40 request threads. `/batches` (`docs/plans/ingest-batch-readiness.md`)
+is built against a repeat: every read behind it is a fixed handful of indexed
+`COUNT` queries, behind a cache that never lets two requests wait on the same
+derivation.
+
+**A batch is one dated folder — `ingest_batches.directory == photos.folder`.**
+Membership is never materialized: `ingest_batches.batch_photo_ids` is always
+`SELECT id FROM photos WHERE folder = ?` (`photosearch/ingest_batches.py`), so
+a batch row holds only identity, lifecycle timestamps, sweep progress, and job
+*intent* — never derived state. `register_batch` upserts on `directory` and
+**re-opens an existing batch**: if a later sweep lands more photos in today's
+folder (the 03:00 phone cron, a second card dump), `photo_count` grows and
+`ready_at`/`dismissed_at` are cleared, so the newly-arrived photos' steps flip
+back to `needs_queue` while everything already `completed` (missing-only by
+construction) stays that way. `source`/`run_id` are only overwritten when the
+caller passes a non-`None` value, so a plain re-scan never clobbers who
+registered the batch. Registering a directory with zero matching `photos`
+rows raises `ValueError` — guards a typo'd or hand-made subfolder against
+becoming a phantom batch.
+
+### The six states, and the two ways `count_unprocessed == 0` lies
+
+`photosearch/batch_state.py` reports exactly one of `completed / running /
+queued / needs_queue / waiting / blocked` for every step — the 9 worker
+passes (`clip`, `faces`, `quality`, `aesthetics`, `describe`,
+`category-visual`, `category-content`, `keywords`, `verify`), the 5 NAS steps
+(`stacking`, `normalize_aesthetics`, `match_faces`, `resolve_dups`,
+`warm_crops`), and the desktop-only `rank_measure`. The module exists because
+`db.count_unprocessed_photos` — the fleet's **claim predicate**, not a
+progress bar — returns 0 in two situations that are not "done":
+
+1. every remaining photo has `worker_processed.attempts >=
+   MAX_PROCESS_ATTEMPTS` (3), so the claim path skips it forever — this reads
+   `blocked`, never `completed`.
+2. `category-content` / `keywords` / `verify` are gated on `description IS
+   NOT NULL`, so before `describe` has run they count 0 unprocessed **and** 0
+   eligible — this reads `waiting`, never `completed`.
+
+So every step carries `total / eligible / done / remaining / failed`, and
+`completed` is `done == total`, never `remaining == 0`. `quality`, `verify`
+and `clip` complicate `done` further: they are the only three passes whose
+claim predicate carries **no attempts filter** (`db.py`
+`count_unprocessed_photos`), so their `failed` count sits *inside*
+`remaining` rather than disjoint from it — for those three, `done = eligible
+- remaining` (no second subtraction) and `blocked` is `remaining == failed >
+0`, not `remaining == 0 and failed > 0`. Get this backwards and `done`
+double-subtracts `failed` on every other pass. `clip` keeps no attempts
+ledger at all (see "Non-image rows" above), so its unloadable rows would sit
+in `needs_queue` forever without this — they surface as `blocked` via the
+same no-progress rule instead.
+
+Worker-pass precedence is **running > completed > blocked > queued > waiting
+> needs_queue** — `completed` deliberately outranks an open job row, because
+nothing ever *closes* a worker pass's job row (the job-only NAS/desktop steps
+are the mirror image: a *closed* row is their only proof of success).
+Precedence used to put `queued` first; a pass the fleet had already finished
+then read `queued` for the row's full 6h TTL, so the batch could never reach
+`ready` and the launch button's "already running" 409 stayed armed long after
+the fleet had exited.
+
+### Where "queued" comes from — never `/workers/fleet-status`
+
+"Queued" is an open, unexpired `ingest_batch_jobs` row, full stop — never a
+parse of `GET /workers/fleet-status` (which shells `run-workers.sh --status`,
+which itself curls the heavier `/api/worker/status`, and is blind to a
+hand-launched fleet or one running on the other machine). A job row's 6h TTL
+is what reclaims it if a fleet dies mid-run. `warm_crops`, `match_faces`,
+`resolve_dups` and `rank_measure` write no per-photo column this module can
+count at all, so for them a **closed** job row is the *only* completion
+evidence there is (`_job_only_step`) — which is why a failed or aborted NAS
+step **deletes** its job row (`ingest_batches.delete_job`) rather than
+closing it or leaving it open: closing it would falsely prove success, and
+leaving it open would read `queued` and block a retry for the full TTL with
+no recovery short of editing the table by hand.
+
+### The non-blocking-lock cache — the incident it answers
+
+`GET /api/batches/{id}` (`photosearch/batch_api.py`) memoizes `batch_state`
+for 30s (`_TTL_SECONDS`) behind **one lock for the whole module**, acquired
+non-blocking. A poll past the TTL that can't get the lock never waits — it
+returns the existing memo with `stale: true`, or a `{computing: true}`
+placeholder if nothing is memoized yet. This is the direct fix for
+2026-09-19: one lock for every batch, not one per batch, mirrors the
+incident's actual shape on purpose — "all 40 threads wedged," not "one
+batch's derivation is slow." The memo key is `(db_path, batch_id)`, not a
+bare `batch_id` — `sync-replica.sh` swaps the replica's DB file wholesale,
+and every fresh test DB mints batch id 1, so a bare-id key could serve one
+DB's cached state against a different DB for up to 30s. Every write
+(`dismiss`/`ready`/`jobs`/`register`) invalidates its key through a
+generation counter, not a bare cache-pop — an in-flight recompute that
+started before the write must not resurrect the pre-write snapshot under a
+fresh timestamp once it finishes (race documented in the module docstring).
+
+### What's deliberately not in "ready" — and why
+
+`ready` is `all(step == completed for step in WORKER_PASSES + NAS_STEPS)` —
+`rank_measure` (desktop-only) is excluded on purpose; it's a nicety, not a
+gate. `batch-advance` (`photosearch/batch_advance.py`) runs the five NAS
+steps in order and deliberately leaves two things out of "ready":
+
+- **Temporal face matching** (`match_faces_temporal`) — ~4% accurate on these
+  shoots ("Bulk-undoing one person's bad labels" above); pouring it into a
+  fresh batch would manufacture Bulk-unmatch work instead of saving any. Only
+  `faces.match_faces_to_persons` (the **strict** matcher) runs, scoped to the
+  batch's photo ids — not `maintenance._stage_match_faces`, which runs both.
+  Unknown faces stay reviewable per day via the existing Unclustered bucket.
+- **`recluster-faces`** — clears `ignored_clusters` and takes on the order of
+  an hour; a per-batch action can't justify that cost or that blast radius.
+
+Also load-bearing: `run_stacking` has **no `clear` flag** — the clear scope
+is whatever restricted the run, so a call scoped by `photo_ids=<batch>` only
+clears stacks overlapping that batch. The real hazard is an **unscoped** call
+or an **empty** `photo_ids` list: `detect_stacks` treats `[]` as "no scope
+given" and falls through to the whole library, which is how the library's
+stacks have been wiped twice before. `_run_stacking` guards both — a batch
+that has emptied out (a dedup prune, a purge, a clock retime rewriting
+`folder`) short-circuits with `skipped: "empty batch"` before reaching
+`detect_stacks` at all. `warm_crops` is scoped by the batch's `photo_ids`,
+not its calendar day — two folders can share a date (a phone sync and a card
+dump landing the same day), and a photo with no `date_taken` would fall out
+of a date scope while still belonging to the batch. `normalize_aesthetics`
+and `resolve_dups` have no scope parameter at all — they're library-wide
+maintenance stages reused as-is, so advancing one batch can touch
+duplicate-person rows or aesthetic percentiles elsewhere in the library (both
+reversible: `face_dedupe_undo` for the former, a re-run for the latter).
+
+**One click launches the whole worker pipeline.** `POST
+/api/admin/batch-launch-fleet` doesn't just queue passes that are
+`needs_queue` right now — `batch_state.fleet_launch_passes` also includes
+every `waiting` pass whose dependency is already underway or itself in the
+launch set (one forward walk, since `WORKER_PASSES` is already a valid
+topological order). Without this, `category-content` / `keywords` / `verify`
+are `waiting` on `describe` at click time and a second launch mid-run is
+refused (409 — it would kill the running fleet), so they were never queued by
+the button at all. Mirrored in JS as `PS.BatchFlow.fleetLaunchPasses`
+(`frontend/dist/batch-flow.js`) so the Advance button's "N passes" count
+matches what the server will actually launch — keep the two pinned to the
+same cases, the way `split-geometry.js`'s worked example pins the JS and
+Python geometry together. Launch itself is refused (409) if any worker pass
+already reads `queued` or `running` for the batch, since a second
+`run-workers.sh --name ui` kills and restarts the fleet — exactly what a
+double click or a second open tab would otherwise trigger silently.
+
+### Endpoints and CLI
+
+- `GET /api/batches` — pure SQL: the active sweep (if any) + the batch list.
+- `GET /api/batches/{id}` — cached derived state (`batch_state`), carries
+  `computed_at`/`stale`.
+- `POST /api/batches/{id}/dismiss` / `POST /api/batches/{id}/ready` —
+  lifecycle writes.
+- `POST /api/batches/{id}/jobs` — record job intent from a *remote* launcher
+  (the desktop, launching a fleet against the NAS in replica mode). Steps are
+  validated against `STEP_ORDER` before anything is written
+  (`batch_advance.open_step_job`) — `ingest_batch_jobs.step` is unchecked
+  TEXT, so a typo'd write would read `needs_queue` forever with no error
+  anywhere.
+- `POST /api/batches/register` — manual registration; mirrors what
+  `ingest-incoming` does automatically per new dated folder.
+- `POST /api/admin/batch-advance` — SSE; runs the NAS steps. `photosearch
+  batch-advance --batch N [--apply]` is the same thing from the CLI
+  (`envvar="PHOTOSEARCH_DB"`); dry-run by default, writing nothing — not even
+  a job row.
+- `POST /api/admin/batch-launch-fleet` — launches `run-workers.sh --native`
+  scoped to the batch's directory for exactly the passes it still needs.
+- `/batches` (`frontend/dist/batches.html` + `batch-flow.js`) — sweep banner
+  (moving/stalled/indexing, files/min), batch picker, the flow diagram, one
+  Advance button. Polls both list and detail with `PS.poll`, never
+  `setInterval`. Linked from `/admin/maintenance`.
+
+### Deploy the NAS before the desktop
+
+Same shape as M28's `/mirror-fields` gotcha. In replica mode
+(`PHOTOSEARCH_NAS_URL` set) **every** `/api/batches` route proxies to the NAS
+with no local fallback — `batch_api._proxy` re-raises whatever status the NAS
+returns as-is (a 502 names the host when it's unreachable at all). An old NAS
+without this schema/code 404s every one of those calls, so the desktop
+`/batches` page and `batch-launch-fleet` fail loudly instead of silently
+reading a stale or absent local copy. That matters more here than in most
+M26b write paths: a stale local read would let `batch-launch-fleet`'s
+409-avoidance check pass on stale job rows and double-launch a fleet that's
+already running on the authoritative side.
+
 ## Planned milestones (see `docs/plans/`)
 
-- `docs/plans/ingest-batch-readiness.md` — **per-batch readiness + status flow.**
-  One dated folder = one batch; a `/batches` page with a per-step flow diagram
-  (needs queue / queued / running / completed, plus waiting + blocked) and a
-  one-click `batch-advance`. Shipped so far: `PS.poll` and the indexed directory
-  scope. Key trap it documents: `count_unprocessed == 0` is NOT "done" — it also
-  reads 0 for attempts-exhausted photos and for text passes before describe runs.
+- `docs/plans/ingest-batch-readiness.md` — **SHIPPED 2026-09-19.** Per-batch
+  readiness + status flow: one dated folder = one batch, a `/batches` page
+  with a per-step flow diagram (the six states above) and a one-click
+  `batch-advance` / fleet launch. See "## Ingest batches (`/batches`)" above
+  for the shape and the traps; `docs/plans/ingest-batch-readiness.md` itself
+  now carries a "What changed during the build" section for what the plan
+  got wrong along the way.
 
 - `docs/plans/infer-location-refinements.md` — post-M19 cascade fixes
   surfaced on the 127k NAS library. Cap hop depth (cascade ran 776

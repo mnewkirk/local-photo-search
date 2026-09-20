@@ -86,20 +86,25 @@ local-photo-search/
     ├── geotag.html         # Manual bulk geotag picker (folder-first UI)
     ├── review.html         # Shoot review / culling UI
     ├── status.html         # Indexing status + run commands
+    ├── batches.html        # /batches — per-ingest-batch flow diagram (M "ingest batch")
+    ├── batch-flow.js       # Pure module behind batches.html — layout/state/
+                            #   fleetLaunchPasses logic, unit-tested standalone
     └── shared.js           # Shared components: PS.SharedHeader (with /merges
                             #   link), PS.PhotoModal, PS.GooglePhotosButton,
-                            #   PS.formatFocalLength, etc.
+                            #   PS.formatFocalLength, PS.poll, etc.
 ```
 
 ---
 
-## Database Schema (v29)
+## Database Schema (v30)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
-> (v25), the VLM aesthetics `aes_*` columns (v26), and per-day aesthetic
-> percentile normalization (v28), `maintenance_runs` (v29). `SCHEMA_VERSION` in `db.py` is the source of
-> truth — currently **28**. See CLAUDE.md for the aesthetics + folder details.
+> (v25), the VLM aesthetics `aes_*` columns (v26), per-day aesthetic
+> percentile normalization (v28), `maintenance_runs` (v29), and
+> `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30). `SCHEMA_VERSION`
+> in `db.py` is the source of truth — currently **30**. See CLAUDE.md for the
+> aesthetics + folder + ingest-batch details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -117,6 +122,9 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | google_photos_uploads | Upload ledger (album_id, filepath, media_item_id) |
 | ignored_clusters | Face clusters marked to ignore |
 | generations | Provenance log for LLM text artifacts — describe / category-* / keywords / verify (v21) |
+| ingest_sweeps | One row per ingest-incoming move+index sweep run (v30) |
+| ingest_batches | One row per dated ingest folder — identity + lifecycle, membership derived live (v30) |
+| ingest_batch_jobs | Per-(batch, step) job intent (worker fleet / NAS stage), TTL-gated (v30) |
 | schema_info | Schema version + photo_root path |
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
@@ -371,6 +379,28 @@ need cross-recluster persistence.
 - `GET /api/review/run` — Run culling algorithm
 - `GET /api/review/load` — Load saved selections
 - `POST /api/review/toggle/{id}` — Toggle photo selection
+
+### Ingest batches (`/batches`, M "ingest batch" — see CLAUDE.md for the traps)
+- `GET /api/batches` — pure SQL: active sweep (if any) + the batch list
+  (`include_dismissed`).
+- `GET /api/batches/{id}` — derived readiness state (`batch_state.batch_state`),
+  memoized 30s behind a non-blocking lock; carries `computed_at`/`stale`, or
+  `computing: true` when nothing is memoized yet and the lock is held elsewhere.
+- `POST /api/batches/{id}/dismiss` / `POST /api/batches/{id}/ready` — lifecycle writes.
+- `POST /api/batches/{id}/jobs` — record job intent `{steps, job_kind}`
+  (used by a remote fleet launch in replica mode); steps validated against
+  `batch_state.STEP_ORDER`.
+- `POST /api/batches/register` — `{directory, source}`, manual registration.
+- `POST /api/admin/batch-advance` — SSE; runs the batch's NAS steps (stacking,
+  normalize_aesthetics, strict match_faces, resolve_dups, warm_crops) in
+  order, id-scoped. `photosearch batch-advance --batch N [--apply]` is the
+  CLI equivalent (dry-run by default).
+- `POST /api/admin/batch-launch-fleet` — `{batch_id, count}`; launches
+  `run-workers.sh --native` scoped to the batch's directory for exactly the
+  worker passes it still needs (`batch_state.fleet_launch_passes`). 409 if a
+  pass already reads `queued`/`running` for the batch.
+- In replica mode (`PHOTOSEARCH_NAS_URL` set), every `/api/batches/*` route
+  proxies to the NAS with no local fallback (502 if unreachable).
 
 ### Google Photos
 - `GET /api/google/status` — OAuth status (configured + authenticated)
@@ -2321,7 +2351,7 @@ def my_command(db):
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py` (currently 28)
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 30)
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies
