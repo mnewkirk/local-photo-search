@@ -553,8 +553,43 @@ persists `'[]'` so `_SubmitOutcome` marks the photo done in one pass. A row
 whose only survivors are derived logs **no `generations` entry** — derived tags
 are not LLM artifacts.
 
-`tools.set_photo_tags` (the M26b agent/user write) is deliberately *not*
-merged: a human asking for a tag should get it.
+`tools.set_photo_tags` / `POST /api/photos/bulk-set-tags` (the M26b agent/user
+write) deliberately **bypass** the merge — a human asking for a tag should get
+it. **But the next `derive-visual-tags --apply` will strip a hand-set
+capture-fact tag**, because the backfill treats EXIF as authoritative over
+every row. Hand-setting `long-exposure` on a 1/800 s frame does not survive a
+backfill; hand-setting `peaceful` does.
+
+**Two kinds of empty, and conflating them is what made the original bug
+permanent.** `tag_visual_photo` returns `[]` when the model *answered* "no
+tags" (that is a result: the server writes `'[]'` and the photo is done), and
+`None` when there is **no usable answer** — no response, unparseable prose,
+regurgitation, or a guard that removed everything. On `None` the server leaves
+`visual_tags` **NULL**, so the photo stays claimable, but still marks it
+processed so a *repeatable* failure is retired by `MAX_PROCESS_ATTEMPTS`
+instead of being re-claimed forever (the CLIP-style infinite re-claim). This is
+the same shape as the aesthetics pass's empty-scores row.
+`CategoryVisualResult.visual_tags` is therefore `Optional`; older workers
+always send a list, so `None` never arrives from one.
+
+**`_parse_visual_response` is deliberately tolerant.** It splits on commas,
+newlines and semicolons; strips bullets (`-`, `*`, `•`, `1.`, `1)`), a leading
+`Label:` prefix, code fences, quotes, brackets and emphasis; and reads a JSON
+array. The first version split on commas alone, so `RIGHT: sunny` parsed to
+`[]`, `Tags: sunny, peaceful` lost `sunny`, and a bullet list parsed to
+nothing — each of which then looked like "no visual qualities" and retired the
+photo. **Don't simplify it back to a comma split**: the prompt asks for one
+shape and small vision models supply six, and the cost of not reading one is a
+silently mistagged photo that never comes back. For the same reason every
+answer the prompt *demonstrates* is a bare tag line — a labelled `WRONG:` /
+`RIGHT:` example teaches the model to emit a label. Pinned by
+`tests/test_visual_parse_tolerance.py`.
+
+A transient `database is locked` on the server-side **EXIF read** is re-raised
+so `_record_write_failure` defers the photo. Swallowing it would write the row
+strip-only — derived tags silently absent — spend the attempt and mark the
+photo processed, leaving it permanently under-derived with no trace. Same rule
+as `50003c2`, applied to reads.
 
 **The prompt** now shows only the perceived terms, grouped by axis, with a
 3–6 word definition on each ambiguous one, **at most one tag per axis and a
@@ -572,10 +607,24 @@ derived from the cap the prompt states so the two cannot drift. A second check
 covers `visual_tags_derive.CONTRADICTORY_PAIRS`; on a contradiction it retries
 once, then **drops both members of each bad pair** rather than rejecting the
 response — when a model calls one photo peaceful *and* dramatic, nothing says
-which half it meant, but the untouched tags are still good.
-`peaceful`×`moody` is **not** in the table (19,056 co-occurrences, but a still
-misty lake is honestly both). Regurgitation behaviour is unchanged: a retry
-that still over-selects drops the whole response.
+which half it meant, but the untouched tags are still good. Regurgitation
+behaviour is unchanged: a retry that still over-selects drops the whole
+response.
+
+**Because the guard deletes BOTH members, a pair that is merely unusual
+destroys correct tags.** The bar is therefore *could a competent
+photographer's single frame honestly be both?* — and it rules out more than it
+first looks like. The nine that survive contradict on the *same property*:
+dramatic×peaceful, joyful×melancholy, overcast×sunny, harsh-light×soft-light,
+muted×vibrant, colorful×muted, black-and-white×colorful,
+black-and-white×vibrant, aerial×macro. Rejected, with the reason:
+close-up×wide-angle (an environmental portrait is ordinary), foggy×sunny (sun
+through fog is a classic shot), joyful×moody (subject's emotion vs how the
+frame is lit), colorful×monochromatic (a blazing orange sunset reads as both),
+aerial×close-up (a tight drone crop is both), macro×wide-angle (close-focus
+wide-angle is a real technique), and peaceful×moody (the library's biggest
+co-occurrence at 19,056 — but a still, misty lake is honestly both). There is
+no sharp×blurry entry: both are derived now and cannot co-occur.
 
 **Backfill** (no VLM, no `generations` rows):
 
@@ -584,18 +633,31 @@ photosearch derive-visual-tags            # dry run: before/after frequency tabl
 photosearch derive-visual-tags --apply
 ```
 
-Reads once, writes in 2,000-row chunks with a commit between, skips rows whose
-array would not change, and guards every UPDATE on the old value
-(`WHERE id=? AND visual_tags IS ?`) so a concurrent fleet write is not
-clobbered. Idempotent. **It never touches a photo whose `visual_tags` is
-NULL** — NULL means "not yet tagged" and is what drives the category-visual
-worker queue.
+The **dry run opens the DB read-only** (`mode=ro`), so it is safe against a
+live or write-protected copy — `PhotoDB` migrates on open and would write.
+`--apply` reads once, then writes in 2,000-row chunks with a commit and a
+progress line between, skips rows whose array would not change, and guards
+every UPDATE on the old value (`WHERE id=? AND visual_tags IS ?`) so a
+concurrent fleet write is not clobbered. Idempotent. **It never touches a photo
+whose `visual_tags` is NULL** — NULL means "not yet tagged" and is what drives
+the category-visual worker queue.
 
 Simulated over the July copy: **106,480 of 151,291 rows change** (70.4%) —
 48,322 change tags, the other 58,158 are re-ordering into the new
 deterministic sort. `low-light` 33,951 → 15,173, `long-exposure` 7,885 →
 1,551, `panoramic` 4,290 → 283, `sharp` 3,247 → 787, `blurry` 1,001 → 115,
 `motion-blur` 2,378 → 0.
+
+The 58,158 ordering-only rewrites are **intentional and a one-shot cost**:
+`merge_tags` sorts, which is what makes the stored JSON a deterministic
+function of (answer, row) — and that is what lets the backfill skip unchanged
+rows and lets the `WHERE visual_tags IS ?` guard mean anything. Don't "optimise"
+them away by preserving the model's emission order.
+
+Expect the `/status` **"visual tagged"** card to **drop** after the backfill:
+it counts `visual_tags IS NOT NULL AND != '[]'`, and a photo whose only tags
+were capture facts the EXIF refutes now legitimately holds `[]`. That is the
+fix working, not a regression.
 
 **A blanket VLM re-run is NOT recommended.** At the measured ~1 s/photo it is
 ~44 h of GPU time for the whole library, and the backfill already fixes the

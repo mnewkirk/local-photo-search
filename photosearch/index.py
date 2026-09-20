@@ -169,6 +169,14 @@ def _merge_visual_tags(db, photo_id: int, perceived) -> list:
     return merge_for_row(perceived, row)
 
 
+def _perceived_only(tags) -> list:
+    """The half of a merged array the VLM produced — what `generations` logs."""
+    from .visual_tags_derive import PERCEIVED_VOCABULARY
+
+    perceived = set(PERCEIVED_VOCABULARY)
+    return [t for t in (tags or []) if t in perceived]
+
+
 def _write_geocode_results(db, ungeo) -> int:
     """Reverse-geocode the given rows and write place_name. Returns count filled.
 
@@ -549,9 +557,14 @@ def _index_collection(
                                 # the VLM — see visual_tags_derive.py.
                                 merged = _merge_visual_tags(db, photo_id, vtags)
                                 merged_json = _json.dumps(merged)
+                                # Provenance records only what the VLM
+                                # produced; the derived capture facts came
+                                # from EXIF, not from this model.
+                                perceived_json = _json.dumps(
+                                    _perceived_only(merged))
                                 db.update_photo(photo_id, visual_tags=merged_json)
                                 db.conn.commit()
-                                db.log_generation(photo_id, "visual_tags", merged_json,
+                                db.log_generation(photo_id, "visual_tags", perceived_json,
                                                   model_used=category_visual_model)
                                 db.mark_processed([photo_id], "category-visual")
                                 print(f" ({elapsed_photo:.1f}s) {', '.join(merged)}{_eta(t0, idx, total)}")
@@ -1335,9 +1348,14 @@ def index_directory(
                                 # the VLM — see visual_tags_derive.py.
                                 merged = _merge_visual_tags(db, photo_id, vtags)
                                 merged_json = _json.dumps(merged)
+                                # Provenance records only what the VLM
+                                # produced; the derived capture facts came
+                                # from EXIF, not from this model.
+                                perceived_json = _json.dumps(
+                                    _perceived_only(merged))
                                 db.update_photo(photo_id, visual_tags=merged_json)
                                 db.conn.commit()  # release write lock immediately
-                                db.log_generation(photo_id, "visual_tags", merged_json,
+                                db.log_generation(photo_id, "visual_tags", perceived_json,
                                                   model_used=category_visual_model)
                                 db.mark_processed([photo_id], "category-visual")
                                 print(f" ({elapsed_photo:.1f}s) {', '.join(merged)}{_eta(t0, idx, total)}")

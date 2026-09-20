@@ -35,6 +35,7 @@ information is not in the image.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from typing import Any, Iterable, Optional
@@ -113,27 +114,38 @@ PERCEIVED_GLOSS: dict[str, str] = {
 }
 
 #: Perceived pairs that cannot both be true of one photo. Used by the guard in
-#: `describe.tag_visual_photo`. Deliberately CONSERVATIVE — only pairs that are
-#: genuinely exclusive. `peaceful` x `moody` is the single biggest co-occurrence
-#: in the library (19,056) and is NOT here: a still, misty lake is honestly
-#: both. Adding it would reject good answers.
+#: `describe.tag_visual_photo`, which drops BOTH members — so a pair that is
+#: merely unusual, rather than impossible, DESTROYS CORRECT TAGS. The bar is
+#: therefore: *could a competent photographer's single frame honestly be
+#: both?* If yes, it does not belong here, however often the model pairs them.
+#:
+#: Rejected on that test, with the reason:
+#:   close-up x wide-angle   an environmental portrait is ordinary
+#:   foggy x sunny           sun through fog is a classic shot
+#:   joyful x moody          subject's emotion vs how the frame is lit
+#:   colorful x monochromatic  a blazing orange sunset reads as both
+#:   aerial x close-up       a tight drone crop is both
+#:   macro x wide-angle      close-focus wide-angle is a real technique
+#:   peaceful x moody        a still, misty lake is honestly both — and it is
+#:                           the library's biggest co-occurrence (19,056)
+#:
+#: What survives contradicts on the SAME property: the sky is grey or it is
+#: sunny; shadow edges are hard or soft; the frame is desaturated or intense;
+#: black-and-white has no colour; `macro` needs to be close and `aerial` needs
+#: to be far; `dramatic` ("strong contrast or visual tension") and `peaceful`
+#: ("calm, still") are opposite readings of the same frame.
+#:
 #: Note there is no `sharp` x `blurry` entry: both are DERIVED now, and
 #: `derive_tags` cannot emit them together.
 CONTRADICTORY_PAIRS: tuple[tuple[str, str], ...] = (
     ("dramatic", "peaceful"),
     ("joyful", "melancholy"),
-    ("joyful", "moody"),
     ("overcast", "sunny"),
-    ("foggy", "sunny"),
     ("harsh-light", "soft-light"),
     ("muted", "vibrant"),
     ("colorful", "muted"),
-    ("colorful", "monochromatic"),
     ("black-and-white", "colorful"),
     ("black-and-white", "vibrant"),
-    ("close-up", "wide-angle"),
-    ("aerial", "close-up"),
-    ("macro", "wide-angle"),
     ("aerial", "macro"),
 )
 
@@ -275,6 +287,26 @@ def derive_tags(row: Any) -> list[str]:
     return sorted(out)
 
 
+def _as_tag_list(perceived: Any) -> Optional[Iterable[str]]:
+    """Normalise a tag argument that may arrive as a JSON-array string.
+
+    A bare `str` is NEVER a tag list: iterating it yields characters, none of
+    which is in the vocabulary, so the merge would quietly return [] and the
+    caller would store an empty array. Raise instead.
+    """
+    if not isinstance(perceived, str):
+        return perceived
+    try:
+        parsed = json.loads(perceived)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, list):
+        return parsed
+    raise TypeError(
+        "merge_tags expects a list of tags or a JSON-array string, got "
+        f"{perceived!r}")
+
+
 def merge_tags(perceived: Optional[Iterable[str]],
                derived: Optional[Iterable[str]]) -> list[str]:
     """Combine one VLM answer with the derived capture facts.
@@ -290,7 +322,12 @@ def merge_tags(perceived: Optional[Iterable[str]],
       4. The derived terms are added.
       5. Sorted + deduped, so the stored JSON is a deterministic function of
          (answer, row) and the backfill can skip rows that would not change.
+
+    `perceived` may be the raw JSON-array STRING straight out of the column, in
+    which case it is parsed. Any other string raises: iterating it would walk
+    it character by character, match nothing and return [] — a silent wipe.
     """
+    perceived = _as_tag_list(perceived)
     keep = {t.strip().lower() for t in (perceived or []) if isinstance(t, str)}
     keep &= set(PERCEIVED_VOCABULARY)
     keep |= {t for t in (derived or []) if t in CAPTURE_FACT_TAGS}

@@ -595,9 +595,20 @@ def _process_category_visual(
     downloaded: list[tuple[dict, str]],
     model: str = "llava",
 ) -> list[dict]:
-    """Vision pass: tag photos with visual-quality terms from VISUAL_VOCABULARY."""
-    from .describe import tag_visual_photo, check_available
-    check_available(model)
+    """Vision pass: PERCEIVED visual tags (the capture facts are derived from
+    EXIF server-side — see photosearch/visual_tags_derive.py).
+
+    `visual_tags: []` and `visual_tags: None` mean different things and must
+    not be conflated: `[]` is a real result ("the model looked and found
+    nothing"), which the server persists as '[]' so the photo is done in one
+    pass. `None` is "no usable answer" — the server leaves the column NULL so
+    the photo stays claimable, but still marks it processed so a repeatable
+    failure is bounded by MAX_PROCESS_ATTEMPTS. Same shape as the aesthetics
+    pass's empty-scores row, and the reason an unparseable response no longer
+    retires a photo from the queue forever.
+    """
+    from . import describe as _describe
+    _describe.check_available(model)
     results = []
     total = len(downloaded)
     for idx, (photo, path) in enumerate(downloaded, 1):
@@ -605,16 +616,19 @@ def _process_category_visual(
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
         try:
-            tags = tag_visual_photo(path, model=model)
-            elapsed = time.time() - t0
-            if tags:
-                print(f" ({elapsed:.1f}s) {', '.join(tags)}")
-            else:
-                print(f" ({elapsed:.1f}s) no visual tags")
-            results.append({"photo_id": photo["id"], "visual_tags": tags or []})
+            tags = _describe.tag_visual_photo(path, model=model)
         except Exception as e:
             print(f" ERROR: {e}")
-            results.append({"photo_id": photo["id"], "visual_tags": []})
+            results.append({"photo_id": photo["id"], "visual_tags": None})
+            continue
+        elapsed = time.time() - t0
+        if tags:
+            print(f" ({elapsed:.1f}s) {', '.join(tags)}")
+        elif tags is None:
+            print(f" ({elapsed:.1f}s) no usable answer (will retry)")
+        else:
+            print(f" ({elapsed:.1f}s) no visual tags")
+        results.append({"photo_id": photo["id"], "visual_tags": tags})
     return results
 
 

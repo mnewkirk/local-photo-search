@@ -116,15 +116,18 @@ def test_submit_persists_empty_list_when_the_merge_empties_it(client):
     assert n == 1, "an emptied merge must still mark the photo processed"
 
 
-def test_submit_logs_the_merged_array_to_generations(client):
+def test_submit_logs_only_what_the_vlm_produced(client):
+    """The column gets the merge; `generations` gets the perceived half. The
+    model did not produce `long-exposure` — EXIF did."""
     _submit(client, [{"photo_id": 2, "model": "llava", "model_version": "abc",
                       "visual_tags": ["peaceful"]}])
+    assert _stored(2) == ["long-exposure", "low-light", "peaceful"]
     from photosearch.db import PhotoDB
     with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
         row = db.conn.execute(
             "SELECT generated_text FROM generations "
             "WHERE photo_id=2 AND text_type='category-visual'").fetchone()
-    assert json.loads(row[0]) == ["long-exposure", "low-light", "peaceful"]
+    assert json.loads(row[0]) == ["peaceful"]
 
 
 def test_submit_writes_no_generation_when_the_merge_leaves_only_derived(client):

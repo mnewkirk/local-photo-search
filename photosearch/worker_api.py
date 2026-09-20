@@ -157,7 +157,12 @@ class CategoryContentResult(BaseModel):
 
 class CategoryVisualResult(BaseModel):
     photo_id: int
-    visual_tags: list[str]
+    # `[]` is a real result — the model looked and found nothing — and is
+    # persisted as '[]'. `None` is "no usable answer" (unparseable response,
+    # regurgitation, image error): the column stays NULL so the photo is
+    # re-claimed, but the attempt is still spent so a repeatable failure is
+    # bounded. Older workers always send a list, so None never arrives from one.
+    visual_tags: Optional[list[str]] = None
     model: Optional[str] = None
     model_version: Optional[str] = None
 
@@ -497,33 +502,52 @@ def _is_transient_db_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _TRANSIENT_DB_MARKERS)
 
 
+def _read_derive_row(db, photo_id: int):
+    """The EXIF columns `visual_tags_derive` needs, for one photo."""
+    from .visual_tags_derive import DERIVE_COLUMNS
+
+    return db.conn.execute(
+        f"SELECT {', '.join(DERIVE_COLUMNS)} FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+
+
 def _merge_visual_tags(db, photo_id: int, perceived) -> list:
     """Apply the derived capture-fact merge to one category-visual answer.
 
     Reads the photo's EXIF here, on the authoritative writer, because that is
-    the only place it exists — the worker has the pixels and nothing else. A
-    row that has vanished (or a read that fails) degrades to strip-only: the
-    bogus capture facts still go, nothing wrong is invented.
+    the only place it exists — the worker has the pixels and nothing else.
+
+    A TRANSIENT lock on that read is re-raised so `_record_write_failure`
+    defers the photo. Swallowing it would write the row strip-only — derived
+    tags silently absent — spend the attempt and mark the photo processed,
+    leaving it permanently under-derived with no trace. That is exactly the
+    failure 50003c2 fixed for writes; reads need the same rule.
+
+    A row that has vanished, or a genuinely broken read, degrades to
+    strip-only: the bogus capture facts still go and nothing is invented.
     """
-    from .visual_tags_derive import DERIVE_COLUMNS, merge_for_row, merge_tags
+    from .visual_tags_derive import merge_for_row, merge_tags
 
     try:
-        row = db.conn.execute(
-            f"SELECT {', '.join(DERIVE_COLUMNS)} FROM photos WHERE id=?",
-            (photo_id,),
-        ).fetchone()
-    except sqlite3.Error:
+        row = _read_derive_row(db, photo_id)
+    except sqlite3.Error as e:
+        if _is_transient_db_error(e):
+            raise
+        logger.error("Could not read EXIF for photo %s — writing visual_tags "
+                     "WITHOUT its derived capture facts: %s", photo_id, e)
         row = None
     if row is None:
         return merge_tags(perceived, [])
     return merge_for_row(perceived, row)
 
 
-def _has_perceived(tags) -> bool:
-    """True when at least one tag in the merged array came from the model."""
+def _perceived_only(tags) -> list:
+    """The half of a merged array that the VLM actually produced."""
     from .visual_tags_derive import PERCEIVED_VOCABULARY
 
-    return bool(set(tags or []) & set(PERCEIVED_VOCABULARY))
+    perceived = set(PERCEIVED_VOCABULARY)
+    return [t for t in (tags or []) if t in perceived]
 
 
 def _record_write_failure(db, outcome: _SubmitOutcome, pass_type: str,
@@ -808,6 +832,14 @@ def submit_results(req: SubmitRequest):
             category_visual_results = req.category_visual_results or []
             db.begin_batch(batch_size=100)
             for r in category_visual_results:
+                if r.visual_tags is None:
+                    # No usable answer. Leave the column NULL so the photo is
+                    # re-claimed, but spend the attempt so a REPEATABLE failure
+                    # is retired by MAX_PROCESS_ATTEMPTS rather than looping
+                    # forever (the CLIP-style infinite re-claim). Mirrors the
+                    # aesthetics pass's empty-scores row.
+                    outcome.persisted(r.photo_id)
+                    continue
                 try:
                     # The worker only ever saw the pixels, so its answer is the
                     # PERCEIVED half. The capture facts (long-exposure /
@@ -821,11 +853,14 @@ def submit_results(req: SubmitRequest):
                     # An empty merge IS a legitimate result.
                     vtags_json = json.dumps(merged)
                     db.update_photo(r.photo_id, visual_tags=vtags_json)
-                    # Provenance covers LLM artifacts only. A row whose only
-                    # surviving tags are derived was not produced by the model,
-                    # so it gets no `generations` entry.
-                    if _has_perceived(merged):
-                        db.log_generation(r.photo_id, "category-visual", vtags_json,
+                    # Provenance covers LLM artifacts only, so it records the
+                    # PERCEIVED tags — what this model actually produced — not
+                    # the merged array. Logging the merge would attribute
+                    # `long-exposure` to llava when EXIF decided it.
+                    perceived = _perceived_only(merged)
+                    if perceived:
+                        db.log_generation(r.photo_id, "category-visual",
+                                          json.dumps(perceived),
                                           r.model, r.model_version)
                     outcome.written += 1
                     outcome.persisted(r.photo_id)

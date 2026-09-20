@@ -120,9 +120,9 @@ def test_drop_contradictions_is_order_independent():
 
 
 def test_drop_contradictions_handles_a_chain():
-    # colorful contradicts both muted and monochromatic; all three go.
+    # muted contradicts both colorful and vibrant; all three go.
     assert D._drop_visual_contradictions(
-        ["colorful", "muted", "monochromatic", "sunny"]) == ["sunny"]
+        ["colorful", "muted", "vibrant", "sunny"]) == ["sunny"]
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -863,6 +864,13 @@ def _build_visual_prompt(vocab: list[str]) -> str:
     DON'T SIMPLIFY THIS BACK to a flat list of terms. The grouping, the cap and
     the negative example are each load-bearing, and the capture-fact terms are
     deliberately absent — see photosearch/visual_tags_derive.py.
+
+    Every demonstrated ANSWER is a bare tag line, because a small model copies
+    the shape it is shown. An earlier draft labelled the examples `WRONG:` /
+    `RIGHT:` and would have taught the model to emit a label — which the
+    comma-only parser of the day read as zero tags, persisted as '[]', and
+    silently retired the photo from the queue. Pinned by
+    tests/test_visual_parse_tolerance.py.
     """
     from .visual_tags_derive import PERCEIVED_AXES, PERCEIVED_GLOSS
 
@@ -894,30 +902,87 @@ def _build_visual_prompt(vocab: list[str]) -> str:
         "image. Returning 2-3 tags is normal; returning none is acceptable.\n"
         "- Judge only the look of the picture. Do not name what is in it.\n"
         "- Return ONLY a comma-separated list of tags, exactly as spelled "
-        "above. No sentences, no explanation.\n\n"
-        "Example (a backlit portrait at sunset, warm and calm):\n"
+        "above. No sentences, no labels, no bullets, no explanation.\n"
+        "- If nothing is unmistakably true, answer: none\n\n"
+        "Example — a backlit portrait at sunset, warm and calm:\n"
         "golden-hour, peaceful\n\n"
-        "Example of what NOT to do (a bright midday football match on grass):\n"
-        "WRONG: sunny, peaceful, moody, centered, dramatic, vibrant\n"
-        "RIGHT: sunny\n"
-        "It is a bright daytime action shot, so it is not peaceful and nothing "
-        "about it is dark or night-like. One tag is the honest answer.\n"
+        "Example — a bright midday football match on grass:\n"
+        "sunny\n"
+        "One tag is the honest answer there. It would be a mistake to add "
+        "peaceful (it is a daytime action shot), or moody (nothing about it is "
+        "dark or night-like), or to pad the list with centered, dramatic and "
+        "vibrant because they are on the list.\n"
     )
 
 
+# A leading "Tags:" / "RIGHT:" / "Answer:" style label on the answer line.
+_VISUAL_LABEL_RE = re.compile(r"^\w[\w \-]*:\s*")
+# A bullet or list-number at the start of a line.
+_VISUAL_BULLET_RE = re.compile(r"^\s*(?:[-*•–]|\d+[.)])\s+")
+# Everything a model wraps a token in: quotes, brackets, backticks, emphasis.
+_VISUAL_WRAPPERS = "\"'`*_[]{}()<> \t.,;:"
+# Answers that genuinely mean "no tags". Anything else that parses to nothing
+# is an unparseable FAILURE, not an empty result — see `tag_visual_photo`.
+_VISUAL_EMPTY_ANSWERS = {
+    "", "none", "no tags", "no tag", "n/a", "na", "nothing", "-", "[]",
+    "none of the above", "no visual tags",
+}
+
+
+def _is_explicit_empty_answer(raw: Optional[str]) -> bool:
+    """True when the model said "no tags" rather than saying nothing usable."""
+    s = (raw or "").strip().strip("`")
+    s = _VISUAL_BULLET_RE.sub("", s)
+    s = _VISUAL_LABEL_RE.sub("", s)
+    s = s.strip(_VISUAL_WRAPPERS).lower()
+    return s in _VISUAL_EMPTY_ANSWERS
+
+
 def _parse_visual_response(raw: str, vocab_set: set[str]) -> list[str]:
-    out = []
+    """Read a tag list out of whatever shape the model actually emitted.
+
+    The first version split on commas and nothing else, so `RIGHT: sunny` ->
+    `[]`, `Tags: sunny, peaceful` lost `sunny`, and a bullet list parsed to
+    nothing at all. An empty parse then looked exactly like "this photo has no
+    visual qualities" and was persisted as `'[]'` — NOT NULL, so the photo left
+    the queue permanently, un-retried, looking done.
+
+    DON'T SIMPLIFY THIS BACK to a comma split. The prompt asks for one shape;
+    small vision models supply six, and the cost of not reading one is a
+    silently mistagged photo that never comes back.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    # Strip a ``` fence, with or without a language tag.
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    # A JSON array is a common answer shape and the cleanest to read.
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            text = ", ".join(str(x) for x in parsed)
+
+    out: list[str] = []
     seen: set[str] = set()
-    for token in (raw or "").split(","):
-        t = token.strip().lower().rstrip(".")
-        if t in vocab_set and t not in seen:
-            seen.add(t)
-            out.append(t)
+    for line in re.split(r"[\r\n]+", text):
+        line = _VISUAL_BULLET_RE.sub("", line)
+        line = _VISUAL_LABEL_RE.sub("", line)
+        for token in re.split(r"[,;]", line):
+            t = token.strip().strip(_VISUAL_WRAPPERS).lower()
+            if t in vocab_set and t not in seen:
+                seen.add(t)
+                out.append(t)
     return out
 
 
 _OVER_SELECTION = "over-selection"
 _CONTRADICTION = "contradiction"
+_UNPARSEABLE = "unparseable"
 
 
 def _visual_contradictions(tags) -> list[tuple[str, str]]:
@@ -972,11 +1037,20 @@ def tag_visual_photo(
       * CONTRADICTION — both halves of a mutually exclusive pair. A retry that
         is still contradictory gets REPAIRED, not rejected: both members go and
         the untouched tags survive.
+      * UNPARSEABLE — a non-empty response that yields no tag at all. Retried
+        once, then treated as a FAILED GENERATION.
 
-    Returns None for "no usable answer". The caller
-    (`worker._process_category_visual`) turns that into `[]`, which the server
-    persists so the photo is marked done in one pass — an empty result is a
-    legitimate outcome, not a deferral.
+    Two different empties, and conflating them is what made the original bug
+    permanent:
+
+      ``[]``    the model answered, and the answer was "no tags". A real
+                result: the server writes '[]' and the photo is done.
+      ``None``  no usable answer (no response, unparseable prose,
+                regurgitation, or a guard that removed everything). The server
+                leaves `visual_tags` NULL — so the photo stays claimable — but
+                still marks it processed, so a repeatable failure is bounded by
+                MAX_PROCESS_ATTEMPTS instead of being re-claimed forever. Same
+                shape as the aesthetics pass's empty-scores row.
     """
     from .visual_tags_derive import PERCEIVED_VOCABULARY
     if not HAS_OLLAMA:
@@ -1003,9 +1077,11 @@ def tag_visual_photo(
     except Exception:
         return None
     if not raw:
-        return None
+        return None                       # no response at all — a failure
+    if _is_explicit_empty_answer(raw):
+        return []                         # the model answered: "no tags"
     tags = _parse_visual_response(raw, vocab_set)
-    problem = _visual_answer_problem(tags)
+    problem = _UNPARSEABLE if not tags else _visual_answer_problem(tags)
     if problem is not None:
         # One retry with a temperature bump — same shape as the old guard.
         retry_opts = dict(options)
@@ -1020,18 +1096,28 @@ def tag_visual_photo(
             )
         except Exception:
             raw2 = None
+        if raw2 and _is_explicit_empty_answer(raw2):
+            return []                     # the retry answered: "no tags"
         tags2 = _parse_visual_response(raw2, vocab_set) if raw2 else []
-        problem2 = _visual_answer_problem(tags2) if tags2 else None
+        if tags2:
+            problem2 = _visual_answer_problem(tags2)
+        else:
+            problem2 = _UNPARSEABLE if raw2 else None
 
         if tags2 and problem2 is None:
-            tags = tags2                      # the retry produced a clean answer
-        elif problem2 == _OVER_SELECTION or (problem == _OVER_SELECTION and not tags2):
-            # Regurgitation: reject the whole response, as before.
-            return None
+            tags = tags2                  # the retry produced a clean answer
+        elif problem2 == _CONTRADICTION:
+            # Repair rather than reject: both members of each bad pair go, the
+            # tags that were never in question survive.
+            tags = _drop_visual_contradictions(tags2)
+        elif problem2 is None and not tags2 and problem == _CONTRADICTION:
+            # The retry produced nothing at all — repair the first answer.
+            tags = _drop_visual_contradictions(tags)
         else:
-            # Contradictory (or the retry failed after a contradiction) —
-            # repair the best answer we have rather than throwing it away.
-            tags = _drop_visual_contradictions(tags2 or tags)
+            # Regurgitation, or still unparseable: no usable answer. None (not
+            # []) so the column stays NULL and the photo is re-claimed, bounded
+            # by MAX_PROCESS_ATTEMPTS.
+            return None
     return tags if tags else None
 
 

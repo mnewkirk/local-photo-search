@@ -5264,13 +5264,17 @@ def derive_visual_tags(db, apply_):
     visual_tags_derive.py.
 
     DRY RUN by default: prints a per-term before/after frequency table and the
-    number of rows that would change. Nothing is logged to `generations` —
-    derived tags are not LLM artifacts.
+    number of rows that would change. The dry run opens the database
+    READ-ONLY (`mode=ro`) so it can be pointed at a live or write-protected
+    copy without touching it — `PhotoDB` migrates on open and would write.
+    Nothing is logged to `generations` either way; derived tags are not LLM
+    artifacts.
 
     Photos whose `visual_tags` is NULL are NEVER touched: NULL means "not yet
     tagged" and is what drives the category-visual worker queue.
     """
     import json as _json
+    import sqlite3 as _sqlite3
     from collections import Counter
 
     from photosearch.db import PhotoDB
@@ -5278,19 +5282,25 @@ def derive_visual_tags(db, apply_):
         CAPTURE_FACT_TAGS, DERIVE_COLUMNS, RETIRED_TAGS, merge_for_row)
 
     cols = ", ".join(DERIVE_COLUMNS)
+    select = (f"SELECT id, visual_tags, {cols} FROM photos "
+              f"WHERE visual_tags IS NOT NULL")
     before, after = Counter(), Counter()
     pending = []          # (id, old_json, new_json)
     scanned = reordered = unparseable = 0
 
-    with PhotoDB(db) as pdb:
+    if apply_:
+        pdb = PhotoDB(db)
+        conn = pdb.conn
+    else:
+        pdb = None
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn.row_factory = _sqlite3.Row
+        click.echo("Opened the database read-only (dry run).")
+
+    try:
         # One read, then bounded writes — never hold a cursor open across a
         # commit (the chunked-percentile-refresh discipline).
-        rows = pdb.conn.execute(
-            f"SELECT id, visual_tags, {cols} FROM photos "
-            f"WHERE visual_tags IS NOT NULL"
-        ).fetchall()
-
-        for row in rows:
+        for row in conn.execute(select).fetchall():
             scanned += 1
             raw = row["visual_tags"]
             try:
@@ -5323,9 +5333,9 @@ def derive_visual_tags(db, apply_):
             b, a = before[tag], after[tag]
             click.echo(f"{tag:20s} {b:10,d} {a:10,d} {a - b:+10,d}")
 
-        content_changes = len(pending) - reordered
-        click.echo(f"\n{len(pending):,} photo rows would change "
-                   f"({content_changes:,} change tags, "
+        total = len(pending)
+        click.echo(f"\n{total:,} photo rows would change "
+                   f"({total - reordered:,} change tags, "
                    f"{reordered:,} are re-ordering only).")
 
         if not apply_:
@@ -5333,12 +5343,12 @@ def derive_visual_tags(db, apply_):
             return
 
         written = skipped = 0
-        for start in range(0, len(pending), _DERIVE_VISUAL_CHUNK):
+        for start in range(0, total, _DERIVE_VISUAL_CHUNK):
             chunk = pending[start:start + _DERIVE_VISUAL_CHUNK]
             for photo_id, old_json, new_json in chunk:
                 # Guard on the old value: a worker that re-tagged this photo
                 # between the read above and now must win, not be clobbered.
-                cur = pdb.conn.execute(
+                cur = conn.execute(
                     "UPDATE photos SET visual_tags = ? "
                     "WHERE id = ? AND visual_tags IS ?",
                     (new_json, photo_id, old_json),
@@ -5347,13 +5357,19 @@ def derive_visual_tags(db, apply_):
                     written += 1
                 else:
                     skipped += 1
-            pdb.conn.commit()
-            click.echo(f"  ... {min(start + len(chunk), len(pending)):,}"
-                       f"/{len(pending):,}")
+            conn.commit()
+            done = min(start + len(chunk), total)
+            click.echo(f"  ... committed {done:,}/{total:,} "
+                       f"({100 * done // total}%)")
 
         click.echo(f"Updated {written:,} photos"
                    + (f" ({skipped:,} changed underneath us, left alone)"
                       if skipped else "") + ".")
+    finally:
+        if pdb is not None:
+            pdb.close()
+        else:
+            conn.close()
 
 
 @cli.command("bakeoff-keywords")
