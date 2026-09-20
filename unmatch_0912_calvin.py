@@ -25,11 +25,13 @@ rollback_0912_calvin.py, which pins the same ids.
 
 match_source is set to 'dedupe_unmatched' rather than NULL. That is what makes
 the unmatch survive a replica face-state push (face_state.apply_face_state
-skips those faces on an additive fill). NOTE it does NOT survive a direct
-`match-faces --temporal` run: that selects on `person_id IS NULL` with no
-marker filter, and would re-tag these faces.
+skips those faces on an additive fill). As of schema v31 it ALSO survives a
+direct `match-faces --temporal` run: the shared primitive records a
+(face, person) exclusion, which both matchers honour, so these faces are no
+longer re-tagged as Calvin. (Before v31 they were, every night — the churn
+loop.) They remain matchable to anyone else.
 
-  cat unmatch_0912_calvin.py | ssh cantimatt@192.168.1.237 \\
+  cat unmatch_0912_calvin.py | ssh <nas-user>@<nas-host> \\
     'cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml \\
      run --rm -T -e APPLY=1 --entrypoint python photosearch -'
 """
@@ -91,17 +93,13 @@ with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
         print("DRY RUN - nothing written. Set APPLY=1 to write.")
         raise SystemExit(0)
 
-    c.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
-              "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
-              "unmatched_at TEXT DEFAULT (datetime('now')))")
-    for r in todo:
-        c.execute("INSERT OR REPLACE INTO face_dedupe_undo"
-                  "(face_id, person_id, match_source) VALUES (?, ?, ?)",
-                  (r["id"], r["person_id"], r["match_source"]))
-    ids = [r["id"] for r in todo]
-    ph2 = ",".join("?" * len(ids))
-    c.execute(f"UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
-              f"WHERE id IN ({ph2})", ids)
+    # Through the shared primitive (snapshot + (face, person) exclusion + null)
+    # rather than a raw UPDATE, so these faces do not rejoin the nightly
+    # match/unmatch churn loop the moment the next sweep runs.
+    from photosearch.db import unmatch_faces_as_duplicates
+
+    n = unmatch_faces_as_duplicates(c, [r["id"] for r in todo],
+                                    reason="unmatch_0912_calvin")
     db.conn.commit()
-    print(f"Applied: unmatched {len(ids)} face(s). Reversible via "
+    print(f"Applied: unmatched {n} face(s). Reversible via "
           f"rollback_0912_calvin.py (NOT restore-unmatched-faces).")

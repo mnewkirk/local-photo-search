@@ -2114,13 +2114,28 @@ the same precedent as `MATCHABLE_SQL`, and a test asserts both do.
 
 Things not to simplify back:
 
-- **It is per (face, person), and the face falls through to the NEXT best
-  person inside the same tolerance** — not dropped. The strict matcher walks
-  `match_face`'s already-sorted in-tolerance list past a barred person; the
-  temporal one removes barred people from `ranked` *before* the gap and
-  session checks, so the face is judged on the remaining field exactly as if
-  that person were not registered. Dropping the face instead would lose real
-  labels; skipping *after* the gap check would make the runner-up unreachable.
+- **The two matchers act on it differently, and unifying them is a bug.**
+  **Strict** falls through to the NEXT best person inside the same tolerance
+  (it walks `match_face`'s already-sorted in-tolerance list past a barred
+  person). It has no ambiguity rule, so the runner-up clears exactly the bar
+  the winner did — measured, 0 of 600 sampled excluded faces actually fell
+  through. **Temporal** ranks the UNFILTERED field and, if the winner is
+  barred, leaves the face unmatched. Its `min_gap` check (`TEMPORAL_MIN_GAP`
+  0.08) is a judgement about the *whole field*: filtering the barred person
+  out first hands the runner-up an unopposed win the real field never gave
+  them. A face 1.20 from Calvin and 1.25 from Ellie is a 0.05 gap this matcher
+  **refuses** as ambiguous; bar Calvin and Ellie has no one left to be
+  ambiguous against. Measured on the 260k-face replica: of 1,500 sampled
+  backfill-eligible faces, **34 gained a new label** under fall-through (30
+  where the old code chose a different person, 4 where the gap guard had
+  rejected outright) and **17 of the 34 were Calvin↔Ellie** — extrapolating to
+  the ~5,664 backfilled rows, ~128 new *persistent* temporal labels and ~64
+  sibling swaps. The old churn self-cancelled nightly; that terminates in a
+  wrong label, which is strictly worse. This is the ArcFace sibling limit the
+  face-integrity section describes, so **don't "simplify" temporal to match
+  strict.** Tests:
+  `test_temporal_exclusion_cannot_promote_an_ambiguous_sibling`,
+  `test_temporal_matcher_does_NOT_fall_through_to_the_next_best_person`.
 - **One write primitive**: `db.unmatch_faces_as_duplicates` does snapshot +
   exclusion + null, and `cli.py`'s `resolve-duplicate-persons` /
   `dedupe-person-faces` and `maintenance._stage_resolve_dups` all call it. They
@@ -2148,12 +2163,27 @@ Things not to simplify back:
   ON in `PhotoDB.__init__`), so they never outlive a deleted face or person.
 
 The ~5,531 already-stuck faces are backfilled from the `face_dedupe_undo`
-snapshots **inside the v31 migration** (idempotent, `INSERT OR IGNORE`, silently
-does nothing when that on-demand table was never created), so the fix takes
-effect on deploy with no operator step. Re-check or re-run by hand with
+snapshots **inside the v31 migration** (idempotent, `INSERT OR IGNORE`, does
+nothing when that on-demand table was never created), so the fix takes effect
+on deploy with no operator step. Re-check or re-run by hand with
 `photosearch backfill-face-exclusions [--apply]`.
 
-Tests: `tests/test_face_person_exclusions.py` (20 cases, including the
+**That backfill runs inside the PhotoDB constructor, so it is doubly guarded.**
+`INSERT OR IGNORE` does **not** suppress a FOREIGN KEY violation (`PRAGMA
+foreign_keys` is ON), and `face_dedupe_undo` rows go stale on both sides — a
+live snapshot had 2,940 of 8,919 orphaned `face_id`s. So the query joins
+**both** `faces` and `persons` to skip dangling ids, and the call is wrapped in
+a logged `try/except`: a failed backfill leaves some faces churning, which is
+the bug we already had, whereas an exception escaping `_init_schema` would stop
+the web server and every CLI container from starting, leave the schema at 30,
+and be retried forever. Never make it silent, and never let it raise.
+
+Similarly `unmatch_faces_as_duplicates` stamps only the faces that actually had
+a person (it iterates the collected pairs, not the caller's id list) — passing
+it an already-unmatched face must not overwrite a `rejected` marker with the
+matchable `dedupe_unmatched`, nor inflate the count the sweep reports.
+
+Tests: `tests/test_face_person_exclusions.py` (24 cases, including the
 end-to-end `test_match_then_resolve_twice_is_stable` that reproduces the
 6134/6134 loop — verified to go red when the matchers stop consulting the
 table, along with the four per-matcher cases), plus

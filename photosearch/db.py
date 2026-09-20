@@ -5,12 +5,15 @@ All photo annotations live here — original photos are never modified.
 """
 
 import json
+import logging
 import re
 import sqlite3
 import struct
 import time
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Throttle state for expire_worker_claims — see method docstring for the
@@ -195,10 +198,14 @@ def unmatch_faces_as_duplicates(conn, face_ids, reason: str = "resolve_dups") ->
                      "(face_id, person_id, match_source) VALUES (?, ?, ?)",
                      (fid, row["person_id"], row["match_source"]))
     record_face_person_exclusions(conn, pairs, reason=reason)
-    for fid in face_ids:
+    # Only the faces that actually HAD a person. Stamping every id passed in
+    # would overwrite a 'rejected' marker — a human "no" — with
+    # 'dedupe_unmatched', which is matchable again, and would over-count the
+    # return value (the sweep reports it as "applied").
+    for fid, _pid in pairs:
         conn.execute("UPDATE faces SET person_id = NULL, match_source = ? WHERE id = ?",
                      (DEDUPE_UNMATCHED_SOURCE, fid))
-    return len(face_ids)
+    return len(pairs)
 
 
 def backfill_exclusions_from_dedupe_undo(conn, apply: bool = False) -> int:
@@ -216,9 +223,15 @@ def backfill_exclusions_from_dedupe_undo(conn, apply: bool = False) -> int:
     if not conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
                         "AND name = 'face_dedupe_undo'").fetchone():
         return 0
+    # JOIN persons as well as faces: `INSERT OR IGNORE` does NOT suppress a
+    # FOREIGN KEY violation, and these snapshot rows go stale on both sides
+    # (a live snapshot had 2,940 of 8,919 face_ids already orphaned). One
+    # dangling person_id would otherwise raise inside _init_schema and stop
+    # the process from starting at all.
     rows = conn.execute(
         "SELECT u.face_id, u.person_id FROM face_dedupe_undo u "
         "JOIN faces f ON f.id = u.face_id "
+        "JOIN persons p ON p.id = u.person_id "
         "WHERE u.person_id IS NOT NULL AND f.person_id IS NULL "
         "AND IFNULL(f.match_source, '') = ? "
         "AND NOT EXISTS (SELECT 1 FROM face_person_exclusions e "
@@ -795,9 +808,23 @@ class PhotoDB:
         # Backfill the faces already stuck in the loop. face_dedupe_undo is an
         # on-demand table (it may never have been created), the insert is
         # INSERT OR IGNORE against a PK, and the whole thing is one indexed
-        # join — so it is safe to run inside the migration and the fix takes
-        # effect on deploy with no operator step.
-        backfill_exclusions_from_dedupe_undo(self.conn, apply=True)
+        # join — so the fix takes effect on deploy with no operator step.
+        #
+        # Guarded because this runs inside the CONSTRUCTOR: anything that
+        # escapes here stops the web server and every CLI container from
+        # starting, leaves the schema at 30, and is retried forever. A missed
+        # backfill only means some faces keep churning, which is the bug we
+        # already had — strictly better than a total outage. Logged, never
+        # silent; `photosearch backfill-face-exclusions --apply` is the retry.
+        try:
+            backfill_exclusions_from_dedupe_undo(self.conn, apply=True)
+        except Exception:
+            logger.warning(
+                "face-exclusion backfill failed during the v31 migration; "
+                "schema upgrade continues. Retry with "
+                "`photosearch backfill-face-exclusions --apply`.",
+                exc_info=True,
+            )
 
         # Photo stacks — burst/bracket groups of near-identical shots
         cur.execute("""

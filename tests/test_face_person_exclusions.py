@@ -135,6 +135,84 @@ def test_migration_backfills_from_face_dedupe_undo(db, tmp_db_path):
         assert _excl(reopened) == {(face_id, alex)}
 
 
+def test_backfill_skips_an_undo_row_whose_person_was_deleted(db, tmp_db_path):
+    """`INSERT OR IGNORE` does NOT suppress a FOREIGN KEY violation, and this
+    runs inside `_init_schema` — one stale person_id would make the PhotoDB
+    constructor throw, so the web server and every CLI container would fail to
+    start and the schema would never reach 31. The live snapshot has 2,940 of
+    8,919 orphan face_ids, proving these rows do go stale."""
+    from photosearch.db import backfill_exclusions_from_dedupe_undo
+
+    face_id = db._test_face_ids["alex_907"]
+    db.conn.execute(
+        "CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
+        "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
+        "unmatched_at TEXT DEFAULT (datetime('now')))")
+    db.conn.execute("INSERT INTO face_dedupe_undo(face_id, person_id, match_source) "
+                    "VALUES (?, 999999, 'strict')", (face_id,))
+    db.conn.execute("UPDATE faces SET person_id = NULL, "
+                    "match_source = 'dedupe_unmatched' WHERE id = ?", (face_id,))
+    db.conn.commit()
+
+    assert backfill_exclusions_from_dedupe_undo(db.conn, apply=True) == 0
+    assert _excl(db) == set()
+
+
+def test_a_failing_backfill_never_blocks_the_migration(db, tmp_db_path, caplog):
+    """A backfill that raises must not take the whole process down with it —
+    the schema upgrade completes and the CLI command remains the manual retry."""
+    import photosearch.db as dbmod
+
+    db.conn.execute("DROP TABLE IF EXISTS face_person_exclusions")
+    db.conn.execute("UPDATE schema_info SET value = '30' WHERE key = 'version'")
+    db.conn.commit()
+    db.close()
+
+    def boom(conn, apply=False):
+        raise RuntimeError("stale undo row")
+
+    original = dbmod.backfill_exclusions_from_dedupe_undo
+    dbmod.backfill_exclusions_from_dedupe_undo = boom
+    try:
+        with caplog.at_level("WARNING", logger="photosearch.db"):
+            with PhotoDB(tmp_db_path) as reopened:
+                assert reopened.conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='face_person_exclusions'").fetchone()
+                version = reopened.conn.execute(
+                    "SELECT value FROM schema_info WHERE key = 'version'"
+                ).fetchone()["value"]
+                assert int(version) == dbmod.SCHEMA_VERSION
+    finally:
+        dbmod.backfill_exclusions_from_dedupe_undo = original
+
+    assert any("exclusion" in r.message.lower() or "backfill" in r.message.lower()
+               for r in caplog.records), "the failure was swallowed silently"
+
+
+def test_unmatch_does_not_stamp_over_an_already_unmatched_face(mdb):
+    """The UPDATE loop ran over every id passed in, including ones skipped as
+    already unmatched — so a `rejected` marker (a human 'no') could be
+    overwritten with `dedupe_unmatched`, and the return value over-counted."""
+    from photosearch.db import unmatch_faces_as_duplicates
+    from photosearch.faces import REJECTED_MATCH_SOURCE
+
+    mdb.conn.execute("UPDATE faces SET person_id = ?, match_source = 'strict' "
+                     "WHERE id = ?", (mdb.ids["ann"], mdb.ids["dup_a"]))
+    mdb.conn.execute("UPDATE faces SET person_id = NULL, match_source = ? "
+                     "WHERE id = ?", (REJECTED_MATCH_SOURCE, mdb.ids["dup_b"]))
+    mdb.conn.commit()
+
+    n = unmatch_faces_as_duplicates(mdb.conn, [mdb.ids["dup_a"], mdb.ids["dup_b"]])
+    mdb.conn.commit()
+
+    assert n == 1, "an already-unmatched face was counted as unmatched"
+    assert mdb.conn.execute(
+        "SELECT match_source FROM faces WHERE id = ?",
+        (mdb.ids["dup_b"],)).fetchone()["match_source"] == REJECTED_MATCH_SOURCE
+    assert _excl(mdb) == {(mdb.ids["dup_a"], mdb.ids["ann"])}
+
+
 def test_exclusions_do_not_outlive_their_face_or_person(mdb):
     """PRAGMA foreign_keys is ON, so both sides cascade."""
     from photosearch.db import record_face_person_exclusions
@@ -208,11 +286,17 @@ def test_temporal_matcher_skips_the_excluded_pairing_only(mdb):
                             (mdb.ids["dup_b"],)).fetchone()["person_id"] is None
 
 
-def test_temporal_matcher_falls_through_to_the_next_best_person(mdb):
+def test_temporal_matcher_does_NOT_fall_through_to_the_next_best_person(mdb):
+    """The asymmetry with strict. Temporal's `min_gap` check is a judgement
+    about the WHOLE field, so removing the barred person from the ranking
+    before it would hand the runner-up an unopposed win the unfiltered field
+    never gave them. Temporal therefore ranks unfiltered and, if the top
+    choice is barred, leaves the face alone."""
     from photosearch.db import record_face_person_exclusions
     from photosearch.faces import match_faces_temporal
 
-    # Bea is confirmed in this session so the temporal presence check passes.
+    # Bea is confirmed in this session so the temporal presence check passes,
+    # and she is a clearly-separated second (0.632 Ann vs 1.0 Bea).
     mdb.conn.execute("UPDATE faces SET person_id = ?, match_source = 'strict' "
                      "WHERE id = ?", (mdb.ids["bea"], mdb.ids["dup_a"]))
     record_face_person_exclusions(
@@ -220,8 +304,59 @@ def test_temporal_matcher_falls_through_to_the_next_best_person(mdb):
     mdb.conn.commit()
 
     match_faces_temporal(mdb)
-    assert mdb.conn.execute("SELECT person_id FROM faces WHERE id = ?",
-                            (mdb.ids["near_both"],)).fetchone()["person_id"] == mdb.ids["bea"]
+    assert mdb.conn.execute(
+        "SELECT person_id FROM faces WHERE id = ?",
+        (mdb.ids["near_both"],)).fetchone()["person_id"] is None
+
+
+def test_temporal_exclusion_cannot_promote_an_ambiguous_sibling(tmp_path):
+    """THE finding. Two siblings 1.20 / 1.25 from a face is a 0.05 gap, under
+    TEMPORAL_MIN_GAP (0.08) — the old code REFUSED it as ambiguous. Barring
+    the nearer sibling must not turn the other into an unopposed top with a
+    wide gap: that converts self-cancelling nightly churn into a PERSISTENT
+    wrong label, and it is the Calvin<->Ellie case the docs call the ArcFace
+    limit. Measured on the 260k-face replica: of 1,500 sampled
+    backfill-eligible faces, 34 gained a new label under fall-through, 17 of
+    them sibling swaps.
+    """
+    from photosearch.db import record_face_person_exclusions
+    from photosearch.faces import match_faces_temporal
+
+    db = PhotoDB(str(tmp_path / "sib.db"))
+    db.set_photo_root("/photos")
+    p1 = db.add_photo(filepath="2026/s1.jpg", filename="s1.jpg",
+                      date_taken="2026-09-12 10:00:00")
+    p2 = db.add_photo(filepath="2026/s2.jpg", filename="s2.jpg",
+                      date_taken="2026-09-12 10:05:00")
+    cal = db.add_person("Cal")
+    elle = db.add_person("Elle")
+    _add_reference(db, cal, _vec(1))
+    _add_reference(db, elle, _vec(0, 1))
+
+    # 1.200 from Cal, 1.250 from Elle -> gap 0.050 < TEMPORAL_MIN_GAP.
+    ambiguous = db.add_face(p1, (10, 60, 60, 10), _vec(0.5, 0.43875, 0.99875),
+                            det_score=0.9)
+    # Both siblings confirmed in the session, so Check 3 passes either way.
+    anchor_c = db.add_face(p2, (10, 60, 60, 10), _vec(1), det_score=0.9)
+    anchor_e = db.add_face(p2, (10, 160, 60, 110), _vec(0, 1), det_score=0.9)
+    db.conn.execute("UPDATE faces SET person_id = ?, match_source = 'strict' "
+                    "WHERE id = ?", (cal, anchor_c))
+    db.conn.execute("UPDATE faces SET person_id = ?, match_source = 'strict' "
+                    "WHERE id = ?", (elle, anchor_e))
+    db.conn.commit()
+
+    # Sanity: without any exclusion the gap guard already refuses this face.
+    assert match_faces_temporal(db) == 0
+
+    record_face_person_exclusions(db.conn, [(ambiguous, cal)], reason="resolve_dups")
+    db.conn.commit()
+
+    match_faces_temporal(db)
+    got = db.conn.execute("SELECT person_id FROM faces WHERE id = ?",
+                          (ambiguous,)).fetchone()["person_id"]
+    assert got is None, (
+        "barring the nearer sibling promoted the other past the min_gap guard")
+    db.close()
 
 
 def test_both_matchers_use_the_shared_exclusion_loader():

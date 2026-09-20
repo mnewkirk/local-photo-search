@@ -503,10 +503,17 @@ def load_match_exclusions(db) -> dict[int, set[int]]:
     ~213k unmatched faces on a 4-core N100, so a query per face is not an
     option. The table holds a few thousand rows.
 
-    An exclusion is per (face, person): a face excluded from its nearest
-    person is offered to the NEXT best person inside the same tolerance, not
-    dropped. The face genuinely is somebody; it just is not the person whose
-    duplicate it lost.
+    An exclusion is per (face, person), but the two matchers act on it
+    DIFFERENTLY and must not be unified:
+
+    - **strict** offers the face to the NEXT best person inside the same
+      tolerance. It has no ambiguity rule, so the runner-up is judged by
+      exactly the bar the winner had to clear.
+    - **temporal** ranks the UNFILTERED field and simply leaves the face
+      unmatched when the winner is barred. Its `min_gap` check is a judgement
+      about the whole field, so filtering first would promote a runner-up the
+      real field had rejected as ambiguous — the sibling-mislabel case. See
+      `match_faces_temporal` for the measured numbers.
     """
     from .db import load_face_person_exclusions
     return load_face_person_exclusions(db.conn)
@@ -1273,18 +1280,27 @@ def match_faces_temporal(
         encs_np  = np.array(person_encs_u)
         dists = np.sqrt(((encs_np - query_np) ** 2).sum(axis=1)).tolist()
 
-        # Sort by distance, then drop the people this face is barred from.
-        # Dropping them BEFORE the gap check (rather than skipping at the end)
-        # is what makes "next best under the same tolerance" work: a face
-        # excluded from its nearest person is judged on the remaining field,
-        # exactly as if that person were not registered.
+        # Rank the FULL field, then refuse outright if the winner is barred.
+        #
+        # Deliberately NOT the strict matcher's fall-through, and the two must
+        # not be unified: Check 2 below (`min_gap`) is a judgement about the
+        # whole field, so removing the barred person BEFORE it would hand the
+        # runner-up an unopposed win the real field never gave them. A face
+        # 1.20 from Calvin and 1.25 from Ellie is a 0.05 gap that this matcher
+        # REFUSES as ambiguous; bar Calvin and Ellie becomes a lone candidate
+        # with no one to be ambiguous against. That converts self-cancelling
+        # nightly churn into a PERSISTENT sibling mislabel — measured on the
+        # 260k-face replica, 34 of 1,500 sampled faces gained a label that way,
+        # 17 of them Calvin<->Ellie.
+        #
+        # Strict keeps its fall-through because it has no gap rule and judges
+        # the runner-up by the identical tolerance (measured: 0 of 600 sampled
+        # excluded faces actually fell through).
         ranked = sorted(zip(dists, person_ids_u), key=lambda x: x[0])
-        barred = exclusions.get(face_id)
-        if barred:
-            ranked = [r for r in ranked if r[1] not in barred]
-        if not ranked:
-            continue
         best_dist, best_pid = ranked[0]
+        barred = exclusions.get(face_id)
+        if barred and best_pid in barred:
+            continue
 
         # Check 1: best distance within temporal tolerance
         if best_dist > temporal_tolerance:
