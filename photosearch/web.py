@@ -41,6 +41,7 @@ from .worker_api import (
 )
 from .admin_api import router as admin_router
 from .batch_api import router as batches_router
+from .eval_api import router as eval_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -49,6 +50,7 @@ from .batch_api import router as batches_router
 app = FastAPI(title="local-photo-search", version="0.1.0")
 app.include_router(worker_router)
 app.include_router(batches_router)
+app.include_router(eval_router)
 app.include_router(admin_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)
@@ -6323,6 +6325,14 @@ if _frontend_dir.exists():
         if page.exists():
             return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Batches page not found</h1>")
+
+    @app.get("/eval/visual-tags")
+    def serve_eval_visual_tags():
+        """Serve the visual-tag labelling page (local-only eval tool — see eval_api)."""
+        page = _frontend_dir / "eval_visual_tags.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Eval page not found</h1>")
 
     @app.get("/status")
     def serve_status():

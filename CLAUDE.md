@@ -682,6 +682,33 @@ after seeing A's failures on some of them — so it is partly overfitted to them
 `centered` is still somewhat eager under B (3 of 11). The owner's labelled eval
 is what settles this.
 
+**The labelled eval that settles it** — `evals/visual_tags_eval.py` +
+`/eval/visual-tags` (linked from `/admin/maintenance`). `sample` draws a
+stratified, seeded 60 (sports folders, each RARE term, `peaceful`/`moody`,
+EXIF low-light, indoor, landscape, travel, stored-`[]`, random) from a DB
+opened `mode=ro`; the page collects **three-state** labels (yes / debatable /
+no — debatable scores as neither, because forcing a verdict on `moody`
+manufactures disagreement that is not the model's fault); `run --variant`
+calls the **production** `tag_visual_photo` (real encode, parser, guard, retry)
+with pixels from `/api/photos/{id}/full`, the fleet's own endpoint;
+`report` gives per-tag precision/recall, per stratum, side by side, plus a
+`stored` pseudo-variant scoring what is in the column today with no model run.
+`--prompt-file` swaps only the prompt; `--model` pins
+`PHOTOSEARCH_LLM_VISUAL_MODEL` for the process, because on the LM Studio route
+the call-site name is ignored and the bake-off would otherwise score the
+configured model under another's name. `--probe` answers "does this model see
+images" with one synthetic frame — 2026-09-20: `qwen2.5-vl-7b-instruct`,
+`gemma-4-e2b`, `qwen3.5-9b` and `gemma-4-26b-a4b` **all do**.
+
+Labels and run caches are **files** in `evals/visual-tags/` (git-ignored,
+`PHOTOSEARCH_VISUAL_EVAL_DIR`), not DB rows: `sync-replica.sh` swaps the
+replica DB wholesale and hand labels are the one artifact that cannot be
+regenerated. The API is local-only — it must never proxy to the NAS. Shared
+contract: `photosearch/visual_tag_eval.py`. A photo that is not `done` has no
+opinion and is never scored; ratios under 3 observations print `n<3`. The
+page hides the model's stored tags by default (and skips `PS.PhotoModal`,
+whose sidebar shows them) so the labeller is not anchored.
+
 **Don't reintroduce axes-to-fill or worked examples without re-running the
 A/B.** Both looked like obvious improvements and both cost accuracy. The guard
 never enforced one-per-axis and must not start: `backlit, silhouette` describe

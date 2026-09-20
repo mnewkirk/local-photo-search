@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Visual-tag eval — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --violet: #a78bfa;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1500px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+      flex-wrap: wrap;
+    }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link { font-size: 13px; color: var(--accent); text-decoration: none; margin-left: 4px; }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+
+    .container { max-width: 1500px; margin: 0 auto; padding: 18px 24px 60px; }
+
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 2px; }
+    .page-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 14px; max-width: 1000px; }
+    .page-sub code, .hint code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      background: var(--surface2); padding: 1px 5px; border-radius: 4px; color: var(--text);
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+    }
+    .hint { font-size: 14px; }
+    .hint code { display: block; margin-top: 10px; padding: 8px 10px; font-size: 13px; }
+
+    .btn {
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+      font-family: inherit;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #07131f; font-weight: 600; }
+    .btn.primary:hover { background: var(--accent-hover); color: #07131f; }
+    /* "Nothing notable" is a first-class answer, not an afterthought: `[]` is
+       the correct label for a large share of ordinary snapshots. */
+    .btn.none {
+      border-color: var(--violet); color: var(--violet); font-weight: 600;
+      width: 100%; padding: 9px 14px; margin-bottom: 12px;
+    }
+    .btn.none:hover { background: rgba(167,139,250,0.12); color: var(--violet); }
+
+    .muted { color: var(--text-muted); font-size: 13px; }
+    .error {
+      color: var(--red); font-size: 13px; margin-bottom: 12px; padding: 9px 12px;
+      background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.45);
+      border-radius: 6px;
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Top bar: progress + position                                      */
+    /* ---------------------------------------------------------------- */
+    .topbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+    .progress-num { font-size: 15px; font-weight: 700; }
+    .progress-bar {
+      flex: 1; min-width: 160px; height: 6px; border-radius: 3px;
+      background: var(--surface2); overflow: hidden;
+    }
+    .progress-fill { height: 100%; background: var(--green); transition: width 0.2s; }
+    .pill {
+      font-size: 12px; padding: 2px 9px; border-radius: 999px;
+      border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap;
+    }
+    .pill.stratum { color: var(--accent); border-color: rgba(74,158,255,0.5); }
+    .pill.saved { color: var(--green); border-color: rgba(74,222,128,0.5); }
+    .pill.dirty { color: var(--yellow); border-color: rgba(250,204,21,0.6); font-weight: 600; }
+    .pill.draft { color: var(--violet); border-color: rgba(167,139,250,0.5); }
+
+    /* ---------------------------------------------------------------- */
+    /* Index strip                                                       */
+    /* ---------------------------------------------------------------- */
+    .strip { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px; }
+    .cell {
+      width: 30px; height: 24px; font-size: 11px; line-height: 22px; text-align: center;
+      border-radius: 4px; border: 1px solid var(--border); background: var(--surface);
+      color: var(--text-muted); cursor: pointer; font-family: inherit; padding: 0;
+    }
+    .cell:hover { border-color: var(--accent); }
+    .cell.done { background: rgba(74,222,128,0.18); border-color: rgba(74,222,128,0.5); color: var(--green); }
+    .cell.draft { background: rgba(167,139,250,0.15); border-color: rgba(167,139,250,0.5); color: var(--violet); }
+    .cell.current { outline: 2px solid var(--accent); outline-offset: 1px; color: var(--text); font-weight: 700; }
+
+    /* ---------------------------------------------------------------- */
+    /* Work area                                                         */
+    /* ---------------------------------------------------------------- */
+    .work { display: grid; grid-template-columns: minmax(0, 1fr) 470px; gap: 18px; align-items: start; }
+    @media (max-width: 1050px) { .work { grid-template-columns: 1fr; } }
+
+    .photo-pane { position: sticky; top: 86px; }
+    .photo-frame {
+      background: #000; border: 1px solid var(--border); border-radius: var(--radius);
+      display: flex; align-items: center; justify-content: center;
+      height: calc(100vh - 190px); min-height: 360px; overflow: hidden;
+    }
+    .photo-frame img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; display: block; }
+    .photo-meta { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+    .photo-meta .spacer { flex: 1; }
+
+    .section { margin-bottom: 14px; }
+    .section-title {
+      font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+      letter-spacing: 0.03em; margin-bottom: 6px;
+    }
+    /* A glossed term takes a full line so its definition is readable;
+       self-explanatory ones pack into rows to keep 30 terms on one screen. */
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip.wide { flex: 1 1 100%; }
+    .chip {
+      display: flex; align-items: baseline; gap: 8px; text-align: left;
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+      font-family: inherit; user-select: none;
+    }
+    .chip:hover { border-color: var(--text-muted); }
+    .chip .tag { font-weight: 600; white-space: nowrap; }
+    .chip .gloss { color: var(--text-muted); font-size: 12px; line-height: 1.35; }
+    .chip .mark { width: 12px; flex: none; font-weight: 700; }
+    .chip.yes { background: rgba(74,222,128,0.16); border-color: var(--green); }
+    .chip.yes .tag, .chip.yes .mark { color: var(--green); }
+    .chip.debatable { background: rgba(250,204,21,0.13); border-color: var(--yellow); border-style: dashed; }
+    .chip.debatable .tag, .chip.debatable .mark { color: var(--yellow); }
+
+    .legend { font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
+    .legend b.y { color: var(--green); } .legend b.d { color: var(--yellow); }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+    .keys { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+    kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    }
+    .reveal { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 12.5px; }
+    .reveal a { color: var(--text-muted); cursor: pointer; text-decoration: underline dotted; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useRef = React.useRef;
+
+    var API = '/api/eval/visual-tags';
+    // no -> yes -> debatable -> no
+    var NEXT_STATE = { no: 'yes', yes: 'debatable', debatable: 'no' };
+
+    // A label (or null) -> {tag: 'yes'|'debatable'}; absent = no.
+    function draftFromLabel(label) {
+      var d = {};
+      if (!label) return d;
+      (label.yes || []).forEach(function (t) { d[t] = 'yes'; });
+      (label.debatable || []).forEach(function (t) { d[t] = 'debatable'; });
+      return d;
+    }
+
+    function tagsIn(draft, state) {
+      return Object.keys(draft).filter(function (t) { return draft[t] === state; }).sort();
+    }
+
+    function isDone(photo) { return !!(photo.label && photo.label.done); }
+
+    // Next not-done photo strictly after `from`, wrapping; -1 when all done.
+    function nextUnlabelled(photos, from) {
+      for (var k = 1; k <= photos.length; k++) {
+        var i = (from + k) % photos.length;
+        if (!isDone(photos[i])) return i;
+      }
+      return -1;
+    }
+
+    function Chip(props) {
+      var state = props.state;
+      function click(ev) {
+        // shift-click jumps straight to debatable (or clears it), skipping yes
+        if (ev.shiftKey) props.onSet(state === 'debatable' ? 'no' : 'debatable');
+        else props.onSet(NEXT_STATE[state]);
+      }
+      function context(ev) {
+        ev.preventDefault();
+        props.onSet(state === 'debatable' ? 'no' : 'debatable');
+      }
+      return e('button', {
+        type: 'button', className: 'chip ' + state + (props.gloss ? ' wide' : ''),
+        onClick: click, onContextMenu: context,
+        title: 'click: no → yes → debatable → no · right-click / shift-click: debatable',
+      },
+        e('span', { className: 'mark' }, state === 'yes' ? '✓' : state === 'debatable' ? '?' : ''),
+        e('span', { className: 'tag' }, props.tag),
+        props.gloss ? e('span', { className: 'gloss' }, props.gloss) : null);
+    }
+
+    function Page() {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var draftS = useState({}); var draft = draftS[0]; var setDraft = draftS[1];
+      var dirtyS = useState(false); var dirty = dirtyS[0]; var setDirty = dirtyS[1];
+      var savingS = useState(false); var saving = savingS[0]; var setSaving = savingS[1];
+      var errS = useState(null); var error = errS[0]; var setError = errS[1];
+      var revealS = useState(false); var reveal = revealS[0]; var setReveal = revealS[1];
+
+      // The key handler is bound once; it reads the live values through here
+      // rather than a stale closure.
+      var live = useRef({});
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      useEffect(function () {
+        fetch(API).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }).then(function (d) {
+          setData(d);
+          var first = d.photos.findIndex(function (p) { return !isDone(p); });
+          var start = first < 0 ? 0 : first;
+          setIdx(start);
+          if (d.photos.length) setDraft(draftFromLabel(d.photos[start].label));
+        }).catch(function (ex) { setError('Could not load the eval sample: ' + ex.message); });
+      }, []);
+
+      var photos = data ? data.photos : [];
+      var photo = photos[idx] || null;
+
+      function goTo(i, force) {
+        if (i < 0 || i >= photos.length || i === idx) return;
+        if (dirty && !force
+            && !window.confirm('This photo has unsaved changes. Leave without saving?')) return;
+        setIdx(i);
+        setDraft(draftFromLabel(photos[i].label));
+        setDirty(false);
+        setError(null);
+        // Re-hide on every photo: the model's answer must never be on screen
+        // when a new photo appears, or it anchors the label.
+        setReveal(false);
+      }
+
+      function setTag(tag, state) {
+        var d = Object.assign({}, draft);
+        if (state === 'no') delete d[tag]; else d[tag] = state;
+        setDraft(d);
+        setDirty(true);
+      }
+
+      // Save `useDraft` for the current photo; on a done-save, advance to the
+      // next unlabelled photo.
+      function save(useDraft, done) {
+        if (!photo || saving) return;
+        setSaving(true);
+        setError(null);
+        var at = idx;
+        fetch(API + '/' + photo.photo_id, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            yes: tagsIn(useDraft, 'yes'), debatable: tagsIn(useDraft, 'debatable'), done: done,
+          }),
+        }).then(function (r) {
+          return r.json().then(function (body) {
+            if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+            return body;
+          });
+        }).then(function (body) {
+          var next = photos.map(function (p, i) {
+            return i === at ? Object.assign({}, p, { label: body.label }) : p;
+          });
+          setData(Object.assign({}, data, { photos: next, progress: body.progress }));
+          setDraft(draftFromLabel(body.label));
+          setDirty(false);
+          setSaving(false);
+          if (done) {
+            var n = nextUnlabelled(next, at);
+            if (n >= 0 && n !== at) {
+              setIdx(n);
+              setDraft(draftFromLabel(next[n].label));
+              setReveal(false);
+            }
+          }
+        }).catch(function (ex) {
+          setSaving(false);
+          setError('Save failed — nothing was written: ' + ex.message);
+        });
+      }
+
+      function saveNone() {
+        if (Object.keys(draft).length
+            && !window.confirm('Clear the selected tags and save this photo as "nothing notable"?')) return;
+        save({}, true);
+      }
+
+      function jumpUnlabelled() {
+        var n = nextUnlabelled(photos, idx);
+        if (n >= 0) goTo(n);
+      }
+
+      live.current = {
+        prev: function () { goTo(idx - 1); },
+        next: function () { goTo(idx + 1); },
+        // An empty label is a valid answer, so a bounced Enter would silently
+        // mark the photo that just appeared as "nothing notable". Ignore a
+        // keyboard save until the new photo has been on screen for a moment.
+        save: function () { if (Date.now() - shownAt.current > 600) save(draft, true); },
+        jump: jumpUnlabelled,
+        dirty: dirty,
+      };
+
+      useEffect(function () {
+        function onKey(ev) {
+          if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
+          var tn = ev.target && ev.target.tagName;
+          if (tn === 'INPUT' || tn === 'TEXTAREA' || tn === 'SELECT') return;
+          var L = live.current;
+          if (ev.key === 'ArrowLeft') { ev.preventDefault(); L.prev(); }
+          else if (ev.key === 'ArrowRight') { ev.preventDefault(); L.next(); }
+          // preventDefault matters for Enter: the last-clicked chip still has
+          // focus, and Enter would otherwise toggle it on the way to saving.
+          else if (ev.key === 'Enter' || ev.key === 's') { ev.preventDefault(); L.save(); }
+          else if (ev.key === 'u') { ev.preventDefault(); L.jump(); }
+        }
+        function onUnload(ev) {
+          if (!live.current.dirty) return;
+          ev.preventDefault();
+          ev.returnValue = '';
+        }
+        // capture: run before the focused button's own Enter activation
+        window.addEventListener('keydown', onKey, true);
+        window.addEventListener('beforeunload', onUnload);
+        return function () {
+          window.removeEventListener('keydown', onKey, true);
+          window.removeEventListener('beforeunload', onUnload);
+        };
+      }, []);
+
+      // Warm the next photo's preview so → / save feels instant.
+      useEffect(function () {
+        var n = photos[idx + 1];
+        if (n) { new Image().src = '/api/photos/' + n.photo_id + '/preview'; }
+      }, [idx, photos.length]);
+
+      var intro = e('div', { className: 'page-sub' },
+        'Hand-label each sample photo with the perceived visual tags that are genuinely right for it. '
+        + 'This is the ground truth the category-visual prompt is scored against. '
+        + 'Only PERCEIVED terms are asked: long-exposure, low-light and panoramic are decided by EXIF '
+        + '(a shutter speed cannot be read off pixels), sharp / blurry are frozen pending a real '
+        + 'sharpness measurement, and motion-blur is retired. '
+        + 'Most photos deserve few tags or none.');
+
+      var body;
+      if (!data) {
+        body = error ? null : e('div', { className: 'muted' }, 'Loading…');
+      } else if (!photos.length) {
+        var hint = data.hint || '';
+        var cut = hint.indexOf('python ');
+        body = e('div', { className: 'card hint' },
+          cut >= 0 ? hint.slice(0, cut) : hint,
+          cut >= 0 ? e('code', null, hint.slice(cut)) : null,
+          e('div', { className: 'muted', style: { marginTop: 10 } },
+            'Sample and labels are files in ', e('code', { style: { display: 'inline' } }, data.eval_dir),
+            ' on this machine — never the DB, which a replica sync replaces wholesale.'));
+      } else {
+        var prog = data.progress;
+        var label = photo.label;
+        var statePill = dirty
+          ? e('span', { className: 'pill dirty' }, '● unsaved changes')
+          : isDone(photo)
+            ? e('span', { className: 'pill saved' }, '✓ saved')
+            : label
+              ? e('span', { className: 'pill draft' }, 'saved as draft — not done')
+              : e('span', { className: 'pill' }, 'not labelled');
+
+        var nYes = tagsIn(draft, 'yes').length;
+        var nDeb = tagsIn(draft, 'debatable').length;
+
+        body = e('div', null,
+          e('div', { className: 'topbar' },
+            e('span', { className: 'progress-num' }, prog.done + ' / ' + prog.total + ' done'),
+            e('div', { className: 'progress-bar' },
+              e('div', { className: 'progress-fill',
+                         style: { width: (prog.total ? 100 * prog.done / prog.total : 0) + '%' } })),
+            prog.done === prog.total
+              ? e('span', { className: 'pill saved' }, 'All labelled — run the harness')
+              : e('button', { className: 'btn', type: 'button', onClick: jumpUnlabelled }, 'Next unlabelled (u)')),
+          e('div', { className: 'strip' },
+            photos.map(function (p, i) {
+              var cls = 'cell' + (isDone(p) ? ' done' : p.label ? ' draft' : '')
+                + (i === idx ? ' current' : '');
+              return e('button', {
+                key: p.photo_id, type: 'button', className: cls,
+                title: '#' + p.photo_id + ' · ' + (p.stratum || ''),
+                onClick: function () { goTo(i); },
+              }, i + 1);
+            })),
+          e('div', { className: 'work' },
+            e('div', { className: 'photo-pane' },
+              e('div', { className: 'photo-frame' },
+                e('img', {
+                  // key: drop the old <img> so the previous photo never
+                  // lingers under the new photo's chips while loading
+                  key: photo.photo_id,
+                  src: '/api/photos/' + photo.photo_id + '/preview',
+                  alt: 'photo ' + photo.photo_id,
+                  title: 'Open full size',
+                  onClick: function () { window.open('/api/photos/' + photo.photo_id + '/full', '_blank'); },
+                })),
+              e('div', { className: 'photo-meta' },
+                e('button', { className: 'btn', type: 'button', disabled: idx === 0,
+                              onClick: function () { goTo(idx - 1); } }, '← Prev'),
+                e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length),
+                e('button', { className: 'btn', type: 'button', disabled: idx >= photos.length - 1,
+                              onClick: function () { goTo(idx + 1); } }, 'Next →'),
+                e('span', { className: 'pill stratum' }, photo.stratum || 'no stratum'),
+                e('span', { className: 'muted' },
+                  '#' + photo.photo_id + (photo.filename ? ' · ' + photo.filename : '')),
+                photo.in_db ? null : e('span', { className: 'pill dirty' }, 'not in this DB'),
+                e('span', { className: 'spacer' }),
+                statePill)),
+            e('div', { className: 'card' },
+              e('button', { className: 'btn none', type: 'button', disabled: saving, onClick: saveNone },
+                'None of these — nothing notable  (save empty & next)'),
+              e('div', { className: 'legend' },
+                'Click: ', e('b', { className: 'y' }, '✓ yes'), ' → ',
+                e('b', { className: 'd' }, '? debatable'), ' → no.  Right-click or shift-click = debatable. ',
+                'Debatable is scored as neither right nor wrong — use it instead of forcing a call.'),
+              data.vocabulary.sections.map(function (sec) {
+                return e('div', { className: 'section', key: sec.title },
+                  e('div', { className: 'section-title' }, sec.title),
+                  e('div', { className: 'chips' },
+                    sec.tags.map(function (t) {
+                      return e(Chip, {
+                        key: t.tag, tag: t.tag, gloss: t.gloss,
+                        state: draft[t.tag] || 'no',
+                        onSet: function (s) { setTag(t.tag, s); },
+                      });
+                    })));
+              }),
+              e('div', { className: 'actions' },
+                e('button', { className: 'btn primary', type: 'button', disabled: saving,
+                              onClick: function () { save(draft, true); } },
+                  saving ? 'Saving…' : 'Save & next (Enter)'),
+                e('button', { className: 'btn', type: 'button', disabled: saving || !dirty,
+                              title: 'Keep these toggles but leave the photo unscored',
+                              onClick: function () { save(draft, false); } }, 'Save draft (not done)'),
+                e('button', { className: 'btn', type: 'button', disabled: !dirty,
+                              onClick: function () { setDraft(draftFromLabel(label)); setDirty(false); } },
+                  'Revert'),
+                e('span', { className: 'muted' }, nYes + ' yes · ' + nDeb + ' debatable')),
+              e('div', { className: 'keys' },
+                e('kbd', null, '←'), ' ', e('kbd', null, '→'), ' prev / next · ',
+                e('kbd', null, 'Enter'), ' or ', e('kbd', null, 's'), ' save as done + next unlabelled · ',
+                e('kbd', null, 'u'), ' next unlabelled'),
+              // Hidden by default and re-hidden per photo, so the model's
+              // answer cannot anchor the label. Look only AFTER deciding.
+              e('div', { className: 'reveal' },
+                reveal
+                  ? e('span', null,
+                      e('span', { className: 'muted' }, 'Model stored: '),
+                      photo.stored_tags == null ? 'not tagged'
+                        : photo.stored_tags.length ? photo.stored_tags.join(', ') : '[] (none)',
+                      '  ', e('a', { onClick: function () { setReveal(false); } }, 'hide'))
+                  : e('a', { onClick: function () { setReveal(true); } },
+                      'Show what the model said (decide first — it will bias you)')))));
+      }
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'eval-visual-tags' }),
+        e('div', { className: 'container' },
+          e('h1', null, 'Visual-tag eval — labelling'),
+          intro,
+          error ? e('div', { className: 'error' }, error) : null,
+          body));
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(Page, null));
+  </script>
+</body>
+</html>

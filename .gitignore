@@ -113,3 +113,6 @@ suggestions.json
 
 # Windows importer machine config — holds the NAS hostname/username
 scripts/windows-import/import-config.local.ps1
+
+# Visual-tag eval: hand labels + run caches stay on the owner's machine
+evals/visual-tags/
