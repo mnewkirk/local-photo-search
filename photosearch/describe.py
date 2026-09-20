@@ -710,7 +710,20 @@ def critique_photo(
 # A focused visual-quality vocabulary (36 terms) assigned by Ollama vision.
 # Mood / light / composition only — content is handled by extract_categories.
 
-_VISUAL_MAX_PLAUSIBLE_TAGS = 12  # tighter than the old 16; smaller vocab.
+# Hard cap on PERCEIVED tags in one category-visual answer. The old prompt had
+# none — its only rule was "Include every tag that clearly applies". Five is
+# the cap the prompt states AND what the guard enforces: at most one tag per
+# axis, and there are six axes, so five already requires the model to leave
+# something out.
+_VISUAL_MAX_TAGS = 5
+
+# Over-selection / regurgitation threshold for the category-visual pass, as a
+# `>=` bound — i.e. reject at MORE than the cap the prompt states. It was 12,
+# inherited from the 78-term `tags` vocabulary, and the real failure never came
+# near it: the observed maximum was 11 tags and the median 5, so the guard
+# never fired on the thing that was actually wrong. Defined from
+# `_VISUAL_MAX_TAGS` so the prompt and the guard cannot drift apart.
+_VISUAL_MAX_PLAUSIBLE_TAGS = _VISUAL_MAX_TAGS + 1
 
 
 def _build_category_prompt(description: str, vocab: list[str]) -> str:
@@ -795,15 +808,6 @@ def extract_keywords_from_description(
     return parse_keywords_response(raw)
 
 
-# Hard cap on PERCEIVED tags in one answer. The old prompt had none — its only
-# rule was "Include every tag that clearly applies" — and the guard sat at 12
-# while the observed maximum was 11 and the median 5, so it never fired on the
-# real failure. Five is the cap the prompt states AND the number the guard
-# enforces: one per axis, and there are six axes, so five already requires the
-# model to leave something out.
-_VISUAL_MAX_TAGS = 5
-
-
 def _build_visual_prompt(vocab: list[str]) -> str:
     """Build the category-visual prompt from the PERCEIVED vocabulary.
 
@@ -868,15 +872,67 @@ def _parse_visual_response(raw: str, vocab_set: set[str]) -> list[str]:
     return out
 
 
+_OVER_SELECTION = "over-selection"
+_CONTRADICTION = "contradiction"
+
+
+def _visual_contradictions(tags) -> list[tuple[str, str]]:
+    """The mutually-exclusive pairs both present in `tags`."""
+    from .visual_tags_derive import CONTRADICTORY_PAIRS
+
+    have = set(tags)
+    return [p for p in CONTRADICTORY_PAIRS if p[0] in have and p[1] in have]
+
+
+def _visual_answer_problem(tags) -> Optional[str]:
+    """Why this answer is not believable, or None if it is fine."""
+    if len(tags) >= _VISUAL_MAX_PLAUSIBLE_TAGS:
+        return _OVER_SELECTION
+    if _visual_contradictions(tags):
+        return _CONTRADICTION
+    return None
+
+
+def _drop_visual_contradictions(tags) -> list[str]:
+    """Remove BOTH members of every contradictory pair, keeping the rest.
+
+    Both go, not the "better" one: when a model says a photo is at once
+    peaceful and dramatic, nothing in the answer tells you which half it meant,
+    so neither is evidence. The tags that were never in question are still
+    good, which is why this repairs rather than rejecting the whole response.
+    """
+    doomed: set[str] = set()
+    for a, b in _visual_contradictions(tags):
+        doomed.add(a)
+        doomed.add(b)
+    return [t for t in tags if t not in doomed]
+
+
 def tag_visual_photo(
     image_path: str,
     model: str = TAGS_MODEL,
 ) -> Optional[list[str]]:
-    """Generate visual-quality tags for a single photo via Ollama (vision).
+    """Generate PERCEIVED visual tags for a single photo via Ollama (vision).
 
     Calls `_ollama_chat_with_retry` directly (not via describe_photo) so the
     test surface is uniform — same mock point as extract_categories/keywords.
-    Mirrors the regurgitation guard from the old `tag_photo` at threshold 12.
+
+    Two guards on the answer, both resolved with at most one retry:
+
+      * OVER-SELECTION (>= `_VISUAL_MAX_PLAUSIBLE_TAGS`) — a retry that still
+        over-selects is the regurgitation signature (the model is reciting the
+        vocabulary, not looking at the photo) and the whole response is
+        dropped. Unchanged in shape from the old guard; only the threshold
+        moved, from 12 — which the real failure never reached, its maximum
+        being 11 — down to the cap the prompt now states.
+      * CONTRADICTION — both halves of a mutually exclusive pair. A retry that
+        is still contradictory gets REPAIRED, not rejected: both members go and
+        the untouched tags survive.
+
+    Returns None for "no usable answer". The caller
+    (`worker._process_category_visual`) turns that into `[]`, which the server
+    persists so the photo is marked done in one pass — an empty result is a
+    legitimate outcome, not a deferral.
     """
     from .visual_tags_derive import PERCEIVED_VOCABULARY
     if not HAS_OLLAMA:
@@ -905,8 +961,9 @@ def tag_visual_photo(
     if not raw:
         return None
     tags = _parse_visual_response(raw, vocab_set)
-    if len(tags) >= _VISUAL_MAX_PLAUSIBLE_TAGS:
-        # Retry with temp bump (regurgitation guard — same shape as old tag_photo).
+    problem = _visual_answer_problem(tags)
+    if problem is not None:
+        # One retry with a temperature bump — same shape as the old guard.
         retry_opts = dict(options)
         retry_opts["temperature"] = 0.4
         retry_opts.setdefault("repeat_penalty", 1.3)
@@ -919,12 +976,18 @@ def tag_visual_photo(
             )
         except Exception:
             raw2 = None
-        if not raw2:
+        tags2 = _parse_visual_response(raw2, vocab_set) if raw2 else []
+        problem2 = _visual_answer_problem(tags2) if tags2 else None
+
+        if tags2 and problem2 is None:
+            tags = tags2                      # the retry produced a clean answer
+        elif problem2 == _OVER_SELECTION or (problem == _OVER_SELECTION and not tags2):
+            # Regurgitation: reject the whole response, as before.
             return None
-        tags2 = _parse_visual_response(raw2, vocab_set)
-        if len(tags2) >= _VISUAL_MAX_PLAUSIBLE_TAGS or not tags2:
-            return None
-        tags = tags2
+        else:
+            # Contradictory (or the retry failed after a contradiction) —
+            # repair the best answer we have rather than throwing it away.
+            tags = _drop_visual_contradictions(tags2 or tags)
     return tags if tags else None
 
 
