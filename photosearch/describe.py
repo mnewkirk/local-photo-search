@@ -450,13 +450,24 @@ def _openai_chat_with_retry(
     if timeout is None:
         timeout = _DEFAULT_OLLAMA_TIMEOUT_S
     url = base_url.rstrip("/") + "/chat/completions"
-    payload = json.dumps({
+    body = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
-    }).encode("utf-8")
+    }
+    # Reasoning models (gemma-4, qwen3.x) think by default and, on a short
+    # tag/JSON task, spend the ENTIRE max_tokens budget on hidden reasoning
+    # and return an empty content string — measured on gemma-4-26b: 765 of 768
+    # tokens reasoning, '' back, ~80 s/photo, every photo UNANSWERED.
+    # `reasoning_effort: "none"` is the OpenAI-style switch LM Studio honours
+    # (3.6 s and a real answer); `chat_template_kwargs.enable_thinking` did
+    # nothing. Opt-in via env so non-reasoning backends never see the field.
+    effort = os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
+    if effort:
+        body["reasoning_effort"] = effort
+    payload = json.dumps(body).encode("utf-8")
     for attempt in range(1, retries + 1):
         t0 = time.time()
         wd_stop = _threading.Event()

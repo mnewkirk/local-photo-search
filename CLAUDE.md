@@ -834,6 +834,15 @@ export PHOTOSEARCH_LLM_TEXT_MODEL=llama-3.2-3b-instruct
     -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -n 2
 ```
 
+**Reasoning models need `PHOTOSEARCH_LLM_REASONING_EFFORT=none`.** gemma-4 and
+qwen3.x think by default, and on a short tag/JSON task they spend the ENTIRE
+`max_tokens` budget on hidden reasoning and return `''` — measured on
+gemma-4-26b-a4b (2026-09-21): 765 of 768 tokens reasoning, empty content,
+~80 s/photo, every photo UNANSWERED. With the env set, `describe.
+_openai_chat_with_retry` adds `reasoning_effort` to the request (3.6 s, real
+answer). `chat_template_kwargs.enable_thinking=false` did nothing on LM
+Studio. Unset by default so backends that reject unknown fields never see it.
+
 This was adopted because Ollama proved unstable on a single 24 GB AMD GPU
 (`model runner has unexpectedly stopped` under VRAM contention). LM Studio
 caveats: enable JIT loading + max-loaded-models ≥3 + TTL off, and **raise each
