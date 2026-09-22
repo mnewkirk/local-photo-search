@@ -182,3 +182,20 @@ def test_labeller_notes_never_leak_into_the_production_prompt():
         assert tag in PERCEIVED_VOCABULARY
         assert note not in prompt
         assert PERCEIVED_GLOSS.get(tag) != note
+
+
+def test_recheck_set_withholds_the_first_answer_and_writes_its_own_file(client, sample, monkeypatch):
+    from photosearch import visual_tag_eval as v
+    ids = [p["photo_id"] for p in v.load_sample()["photos"]]
+    v.save_label(ids[0], ["sunny"], [])                      # first answer, main set
+    monkeypatch.setattr(v, "recheck_ids", lambda *a, **k: [ids[0]])
+    r = client.get(API + "?set=recheck").json()
+    assert r["set"] == "recheck" and [p["photo_id"] for p in r["photos"]] == [ids[0]]
+    assert r["photos"][0]["label"] is None                   # blind
+    assert client.put(f"{API}/{ids[0]}?set=recheck", json={"yes": [], "debatable": [], "done": True}).status_code == 200
+    assert v.load_labels("main")[ids[0]]["yes"] == ["sunny"]  # untouched
+    assert v.load_labels("recheck")[ids[0]]["yes"] == []
+    assert client.get(API + "?set=bogus").status_code == 400
+    # a photo outside the recheck subset is refused for that set
+    if len(ids) > 1:
+        assert client.put(f"{API}/{ids[1]}?set=recheck", json={"yes": [], "debatable": []}).status_code == 404

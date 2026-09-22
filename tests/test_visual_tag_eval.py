@@ -249,3 +249,36 @@ def test_extra_tags_outside_the_candidate_list_are_ignored(monkeypatch, tmp_path
     v = _cand_env(monkeypatch, tmp_path)
     v.save_label(1, [], [])
     assert "sharp" not in v.score({1: ["sharp"]}, extra_tags=["sharp"])["per_tag"]
+
+
+# --- recheck set + self-agreement
+
+
+def test_recheck_labels_live_in_their_own_file_and_ids_are_stable(monkeypatch, tmp_path):
+    v = _cand_env(monkeypatch, tmp_path)
+    v.save_sample([{"photo_id": i, "stratum": "x"} for i in range(1, 41)], 1)
+    ids = v.recheck_ids(n=15)
+    assert len(ids) == 15 and ids == v.recheck_ids(n=99)   # persisted, not redrawn
+    v.save_label(ids[0], ["sunny"], [], label_set="recheck")
+    assert ids[0] not in v.load_labels("main")
+    assert v.load_labels("recheck")[ids[0]]["yes"] == ["sunny"]
+    import pytest
+    with pytest.raises(ValueError):
+        v.load_labels("nope")
+
+
+def test_self_agreement_math(monkeypatch, tmp_path):
+    v = _cand_env(monkeypatch, tmp_path)
+    # 4 photos: sunny agree-yes ×2, agree-no ×1, yes→no ×1; muted debatable once.
+    for pid, m, r in ((1, ["sunny"], ["sunny"]), (2, ["sunny"], ["sunny"]),
+                      (3, [], []), (4, ["sunny", "muted"], [])):
+        v.save_label(pid, m, [], label_set="main")
+        v.save_label(pid, r, ["muted"] if pid == 4 else [], label_set="recheck")
+    v.save_label(5, ["sunny"], [], label_set="main")          # not rechecked
+    res = v.self_agreement()
+    assert res["photos"] == 4
+    s = res["per_tag"]["sunny"]
+    assert (s["n"], s["agree_yes"], s["agree_no"], s["yes_then_no"], s["no_then_yes"]) == (4, 2, 1, 1, 0)
+    assert abs(s["agreement"] - 0.75) < 1e-9
+    assert res["per_tag"]["muted"]["debatable"] == 1 and res["per_tag"]["muted"]["n"] == 3
+    assert "peaceful" not in res["per_tag"]   # never used on either side

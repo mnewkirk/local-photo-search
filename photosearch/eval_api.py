@@ -16,13 +16,14 @@ from __future__ import annotations
 import json
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from . import visual_tag_eval
 from .visual_tags_derive import PERCEIVED_GLOSS, PROMPT_SECTIONS
 
 router = APIRouter(prefix="/api/eval/visual-tags", tags=["eval"])
+set_ = set  # the handlers take a `set=` query param, which shadows the builtin
 
 _SAMPLE_HINT = ("No sample yet. Draw one with: "
                 "python evals/visual_tags_eval.py sample --db <db>")
@@ -112,11 +113,23 @@ def _stored_tags(photo_ids: list[int]) -> dict[int, dict]:
     return out
 
 
+def _label_set(name: str) -> str:
+    if name not in visual_tag_eval.LABEL_SETS:
+        raise HTTPException(400, f"unknown label set {name!r}")
+    return name
+
+
 @router.get("")
-def get_eval():
+def get_eval(set: str = Query("main")):
+    """`set=recheck` serves the blind-relabel subset: the same photos, the
+    recheck file's labels only — the first answer is deliberately withheld."""
+    label_set = _label_set(set)
     sample = visual_tag_eval.load_sample()
-    labels = visual_tag_eval.load_labels()
+    labels = visual_tag_eval.load_labels(label_set)
     entries = sample.get("photos") or []
+    if label_set == "recheck":
+        keep = set_(visual_tag_eval.recheck_ids())
+        entries = [p for p in entries if int(p["photo_id"]) in keep]
     ids = [int(p["photo_id"]) for p in entries]
     info = _stored_tags(ids)
 
@@ -140,25 +153,29 @@ def get_eval():
         "photos": photos,
         "vocabulary": _vocabulary(),
         "progress": {"done": done, "total": len(photos)},
+        "set": label_set,
         "hint": None if photos else _SAMPLE_HINT,
         "eval_dir": str(visual_tag_eval.eval_dir()),
     }
 
 
 @router.put("/{photo_id}")
-def put_label(photo_id: int, body: LabelBody):
+def put_label(photo_id: int, body: LabelBody, set: str = Query("main")):
+    label_set = _label_set(set)
     sample_ids = {int(p["photo_id"])
                   for p in visual_tag_eval.load_sample().get("photos") or []}
+    if label_set == "recheck":
+        sample_ids &= set_(visual_tag_eval.recheck_ids())
     # Only sampled photos: a label outside the sample would sit in labels.json
     # and be scored by the harness against a stratum it was never drawn for.
     if photo_id not in sample_ids:
         raise HTTPException(404, f"photo {photo_id} is not in the eval sample")
     try:
         label = visual_tag_eval.save_label(
-            photo_id, body.yes, body.debatable, done=body.done)
+            photo_id, body.yes, body.debatable, done=body.done, label_set=label_set)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    labels = visual_tag_eval.load_labels()
+    labels = visual_tag_eval.load_labels(label_set)
     done = sum(1 for pid in sample_ids if (labels.get(pid) or {}).get("done"))
     return {"photo_id": photo_id, "label": label,
             "progress": {"done": done, "total": len(sample_ids)}}

@@ -197,7 +197,12 @@
     var useEffect = React.useEffect;
     var useRef = React.useRef;
 
+    // ?set=recheck re-labels a blind subset into a second file; the first
+    // answers are never shown, so the eval can measure the labeller's own
+    // consistency per tag (`visual_tags_eval.py agreement`).
+    var LABEL_SET = new URLSearchParams(window.location.search).get('set') === 'recheck' ? 'recheck' : 'main';
     var API = '/api/eval/visual-tags';
+    var SETQ = '?set=' + LABEL_SET;
     // no -> yes -> debatable -> no
     var NEXT_STATE = { no: 'yes', yes: 'debatable', debatable: 'no' };
 
@@ -264,7 +269,7 @@
       useEffect(function () { shownAt.current = Date.now(); }, [idx]);
 
       useEffect(function () {
-        fetch(API).then(function (r) {
+        fetch(API + SETQ).then(function (r) {
           if (!r.ok) throw new Error('HTTP ' + r.status);
           return r.json();
         }).then(function (d) {
@@ -306,7 +311,7 @@
         setSaving(true);
         setError(null);
         var at = idx;
-        fetch(API + '/' + photo.photo_id, {
+        fetch(API + '/' + photo.photo_id + SETQ, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -521,7 +526,11 @@
       return e('div', null,
         e(PS.SharedHeader, { activePage: 'eval-visual-tags' }),
         e('div', { className: 'container' },
-          e('h1', null, 'Visual-tag eval — labelling'),
+          e('h1', null, LABEL_SET === 'recheck' ? 'Visual-tag eval — RECHECK (blind re-label)' : 'Visual-tag eval — labelling'),
+          LABEL_SET === 'recheck'
+            ? e('div', { className: 'gloss note', style: { marginBottom: '12px' } },
+                'These photos were labelled once already. Label them again without trying to remember the first answer — the point is to measure how consistently the definitions are being applied.')
+            : null,
           intro,
           error ? e('div', { className: 'error' }, error) : null,
           body));

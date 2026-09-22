@@ -718,6 +718,28 @@ CLEAREST SUBJECT, not the largest figure); a test asserts none of that text
 reaches the production prompt. Promote either into `visual_tags_derive` only
 after the A/B.
 
+**The labeller is measured too.** `/eval/visual-tags?set=recheck` re-serves a
+seeded 15-photo subset (`recheck.json`) with the first answer withheld; labels
+go to `labels-recheck.json`; `visual_tags_eval.py agreement` prints per-tag
+self-agreement and Cohen's kappa. A tag the owner disagrees with themself on
+(kappa < ~0.4) is not tightly enough defined to score a model against — fix
+the definition (`eval_api.LABELLER_NOTES`), not the prompt.
+
+**Second set — Unsplash recall** (`evals/visual_tags_unsplash.py`): the
+Unsplash Research Dataset Lite's PHOTOGRAPHER-supplied keywords as positives
+(up to 40 photos per tag from the 25k local thumbs in
+`~/unsplash-quality-eval/thumbs/`, 400 px — not fleet resolution). Keywords are
+positive-only, so it reports **recall and contradictions only, never
+precision**; `sheet --tag X` writes a contact sheet of what photographers mean
+by X. `centered` / `harsh-light` / `overexposed` have ≤2 photos there and
+cannot be measured on it.
+
+**Model bake-off 2026-09-21** (production prompt, 60 owner labels):
+qwen2.5-vl-7b 0.51/0.40 precision/recall, **gemma-4-26b-a4b 0.70/0.41** (fp
+65 → 30, `soft-light` recall 0.18 → 0.57, `centered`/`joyful` fp gone; only
+`close-up` regresses; needs `PHOTOSEARCH_LLM_REASONING_EFFORT=none` and is 5×
+slower at 3.5 s/photo), qwen3.5-9b 0.55/0.44, gemma-4-e2b unusable.
+
 Labels and run caches are **files** in `evals/visual-tags/` (git-ignored,
 `PHOTOSEARCH_VISUAL_EVAL_DIR`), not DB rows: `sync-replica.sh` swaps the
 replica DB wholesale and hand labels are the one artifact that cannot be

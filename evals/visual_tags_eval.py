@@ -751,6 +751,28 @@ def cmd_report(args):
 # CLI
 # --------------------------------------------------------------------------
 
+def cmd_agreement(args):
+    """Labeller self-consistency: main vs the blind recheck set, per tag."""
+    res = store.self_agreement()
+    if not res["photos"]:
+        raise SystemExit("No photos labelled done in BOTH sets — label the "
+                         "recheck subset at /eval/visual-tags?set=recheck first.")
+    print(f"{res['photos']} photos labelled twice. Agreement is on yes/no calls; "
+          f"a debatable on either side is set aside. kappa < 0.4 = the tag is "
+          f"not tightly defined enough to score a model on.")
+    rows = []
+    for t, c in sorted(res["per_tag"].items(),
+                       key=lambda kv: (kv[1]["kappa"] is None, kv[1]["kappa"] or 0)):
+        k = "—" if c["kappa"] is None else f"{c['kappa']:.2f}"
+        rows.append([t, str(c["n"]), fmt_ratio(c["agree_yes"] + c["agree_no"], c["n"]),
+                     str(c["agree_yes"]), str(c["yes_then_no"]), str(c["no_then_yes"]),
+                     str(c["debatable"]), k])
+    head = ["tag", "n", "agreement", "yes both", "yes→no", "no→yes", "debatable", "kappa"]
+    widths = [max(len(r[i]) for r in [head] + rows) for i in range(len(head))]
+    for r in [head] + rows:
+        print("  ".join(x.ljust(w) for x, w in zip(r, widths)))
+
+
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -800,7 +822,14 @@ def build_parser():
                     help=f"For the `{STORED}` pseudo-variant — opened READ-ONLY.")
     tp.add_argument("--html", help="Also write an HTML report here.")
     tp.set_defaults(func=cmd_report)
+    _add_agreement(sub)
     return ap
+
+
+def _add_agreement(sub):
+    ap = sub.add_parser("agreement", help="Labeller self-consistency (main vs "
+                        "the blind recheck set).")
+    ap.set_defaults(func=cmd_agreement)
 
 
 def main(argv=None):

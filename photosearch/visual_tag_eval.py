@@ -102,9 +102,40 @@ def save_sample(photos: list[dict], seed: int) -> dict:
     return data
 
 
-def load_labels() -> dict[int, dict]:
-    raw = _read("labels.json", {"labels": {}})["labels"]
+#: Label SETS. "main" is the eval's ground truth. "recheck" is the same
+#: labeller re-labelling a blind subset of the same photos, later, without
+#: seeing the first answer — the only way to measure how tightly the labeller
+#: holds the definitions. A tag the owner disagrees with themself on cannot
+#: be one the model is fairly scored against.
+LABEL_SETS = {"main": "labels.json", "recheck": "labels-recheck.json"}
+RECHECK_N = 15
+
+
+def _labels_file(label_set: str) -> str:
+    try:
+        return LABEL_SETS[label_set]
+    except KeyError:
+        raise ValueError(f"unknown label set {label_set!r}; have {sorted(LABEL_SETS)}")
+
+
+def load_labels(label_set: str = "main") -> dict[int, dict]:
+    raw = _read(_labels_file(label_set), {"labels": {}})["labels"]
     return {int(k): v for k, v in raw.items()}
+
+
+def recheck_ids(n: int = RECHECK_N, seed: int = 1) -> list[int]:
+    """The blind-relabel subset: a seeded draw from the sample, persisted in
+    recheck.json so it cannot drift under the owner between sessions."""
+    existing = _read("recheck.json", None)
+    if existing is not None:
+        return [int(i) for i in existing["photo_ids"]]
+    import random
+    ids = [int(p["photo_id"]) for p in load_sample()["photos"]]
+    if not ids:
+        return []
+    chosen = sorted(random.Random(f"{seed}:recheck").sample(ids, min(n, len(ids))))
+    _write_atomic("recheck.json", {"seed": seed, "photo_ids": chosen})
+    return chosen
 
 
 def _check(tags: Iterable[str], field: str) -> list[str]:
@@ -116,7 +147,7 @@ def _check(tags: Iterable[str], field: str) -> list[str]:
 
 
 def save_label(photo_id: int, yes: Iterable[str], debatable: Iterable[str],
-               done: bool = True) -> dict:
+               done: bool = True, label_set: str = "main") -> dict:
     """Replace one photo's label. Raises ValueError on a non-perceived tag or
     a tag listed as both yes and debatable."""
     yes, debatable = _check(yes, "yes"), _check(debatable, "debatable")
@@ -125,15 +156,51 @@ def save_label(photo_id: int, yes: Iterable[str], debatable: Iterable[str],
         raise ValueError(f"tags cannot be both yes and debatable: {both}")
     entry = {"yes": yes, "debatable": debatable, "done": bool(done),
              "updated_at": datetime.now(timezone.utc).isoformat()}
-    labels = {str(k): v for k, v in load_labels().items()}
+    labels = {str(k): v for k, v in load_labels(label_set).items()}
     labels[str(int(photo_id))] = entry
-    _write_atomic("labels.json", {"labels": labels})
+    _write_atomic(_labels_file(label_set), {"labels": labels})
     return entry
 
 
-def scoreable_labels() -> dict[int, dict]:
+def scoreable_labels(label_set: str = "main") -> dict[int, dict]:
     """Only `done` photos — the only ones whose absent tags mean "no"."""
-    return {pid: lab for pid, lab in load_labels().items() if lab.get("done")}
+    return {pid: lab for pid, lab in load_labels(label_set).items() if lab.get("done")}
+
+
+def self_agreement() -> dict:
+    """How consistently the labeller applies each tag: main vs recheck on the
+    photos labelled `done` in both. Per tag: `n` photos, `agree`, and the
+    disagreements split by direction; a debatable on either side is neither.
+    `kappa` is Cohen's kappa on the yes/no calls (None when undefined)."""
+    a, b = scoreable_labels("main"), scoreable_labels("recheck")
+    both = sorted(set(a) & set(b))
+    tags = list(PERCEIVED_VOCABULARY) + list(CANDIDATE_TAGS)
+    per = {}
+    for t in tags:
+        c = {"n": 0, "agree_yes": 0, "agree_no": 0, "yes_then_no": 0,
+             "no_then_yes": 0, "debatable": 0}
+        for pid in both:
+            ya, da = t in a[pid]["yes"], t in a[pid]["debatable"]
+            yb, db = t in b[pid]["yes"], t in b[pid]["debatable"]
+            if da or db:
+                c["debatable"] += 1
+                continue
+            c["n"] += 1
+            if ya and yb: c["agree_yes"] += 1
+            elif not ya and not yb: c["agree_no"] += 1
+            elif ya: c["yes_then_no"] += 1
+            else: c["no_then_yes"] += 1
+        n = c["n"]
+        po = (c["agree_yes"] + c["agree_no"]) / n if n else None
+        pa = (c["agree_yes"] + c["yes_then_no"]) / n if n else 0
+        pb = (c["agree_yes"] + c["no_then_yes"]) / n if n else 0
+        pe = pa * pb + (1 - pa) * (1 - pb)
+        c["agreement"] = po
+        c["kappa"] = None if n == 0 or pe == 1 else (po - pe) / (1 - pe)
+        per[t] = c
+    used = {t: c for t, c in per.items()
+            if c["agree_yes"] + c["yes_then_no"] + c["no_then_yes"] + c["debatable"]}
+    return {"photos": len(both), "per_tag": used}
 
 
 def score(predicted: dict[int, Optional[Iterable[str]]],
