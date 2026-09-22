@@ -1051,9 +1051,16 @@ def match_faces_to_persons(
         photo_ids: If set, only match faces belonging to these photo IDs
             (e.g. from a collection).
 
+    Matching needs NO model: it is SQL + struct + numpy over encodings that
+    are already stored, exactly like match_faces_temporal below. So there is
+    deliberately no check_available() here -- the guard it used to carry was
+    inherited from when this module only did detection, and it made the whole
+    pass (and its tests) fail on a machine with no insightface installed.
+    detect_faces keeps its own guard; maintenance._stage_match_faces guards
+    the sweep, which may also run the detector.
+
     Returns the number of faces matched.
     """
-    check_available()
     import struct
     from .db import FACE_DIMENSIONS
 
