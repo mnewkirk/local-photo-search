@@ -27,11 +27,9 @@ it has not started. So each pass carries four numbers instead of one:
   ``remaining``  ``worker_api._count_scoped`` — what a worker would claim
   ``failed``     eligible photos whose attempts are exhausted *and* whose
                  output column is still missing
-  ``done``       ``eligible - remaining - failed``, floored at 0 — but only
-                 for the seven passes whose ``remaining`` excludes exhausted
-                 photos. For ``quality`` / ``verify`` / ``clip`` it doesn't,
-                 so ``failed`` is already inside ``remaining`` and ``done``
-                 is ``eligible - remaining``. See
+  ``done``       ``eligible - remaining - failed``, floored at 0. Every
+                 pass's ``remaining`` now excludes exhausted photos, so
+                 ``failed`` and ``remaining`` are disjoint. See
                  ``_REMAINING_FILTERS_ATTEMPTS``.
 
 and `completed` is ``done == total``, never ``remaining == 0``.
@@ -102,18 +100,17 @@ _DESCRIPTION_GATED = ("category-content", "keywords", "verify")
 _ID_CHUNK = 20000
 
 # Per-pass "the output is still missing" column test, transcribed from
-# db.count_unprocessed_photos. `p` is the photos alias. `None` means the pass
-# keeps no attempts ledger, so it can never contribute a `failed` count.
+# db.count_unprocessed_photos. `p` is the photos alias.
 #
-#   clip             photos.id NOT IN clip_embeddings      (no attempts filter)
+#   clip             photos.id NOT IN clip_embeddings
 #   faces            no faces row for the photo
-#   quality          aesthetic_score OR aesthetic_concepts NULL (no attempts filter)
+#   quality          aesthetic_score OR aesthetic_concepts NULL
 #   aesthetics       aes_overall IS NULL
 #   describe         description IS NULL
 #   category-visual  visual_tags IS NULL
 #   category-content categories IS NULL  AND description IS NOT NULL
 #   keywords         keywords IS NULL    AND description IS NOT NULL
-#   verify           verified_at IS NULL AND description IS NOT NULL (no attempts filter)
+#   verify           verified_at IS NULL AND description IS NOT NULL
 #
 # The description clause is kept on the three gated passes because a photo
 # with no description has not *failed* that pass, it has never been offered
@@ -122,7 +119,7 @@ _ID_CHUNK = 20000
 # the `!= ''` rule below while db.py's `IS NOT NULL` still counts it here.
 # `done` floors at 0, so the only effect is a conservative under-count.)
 _OUTPUT_MISSING = {
-    "clip": None,
+    "clip": "p.id NOT IN (SELECT photo_id FROM clip_embeddings)",
     "faces": "NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)",
     "quality": "(p.aesthetic_score IS NULL OR p.aesthetic_concepts IS NULL)",
     "aesthetics": "p.aes_overall IS NULL",
@@ -137,21 +134,27 @@ _OUTPUT_MISSING = {
 # DONE, not failed — because an empty result is a legitimate one.
 #
 # `faces` is the only one. A photo with nobody facing the camera has no `faces`
-# rows after a perfectly successful run; the claim path cannot tell that from a
-# failure, so the fleet re-tries it MAX_PROCESS_ATTEMPTS times and stops. On the
-# first real batch (2026-09-19, 1,373 photos) 113 photos sat at attempts=3 with
-# no face rows — every one a player facing away or a distant shot — while 3,696
-# faces were found in the other 1,260. Counting those as `failed` read the pass
-# as `blocked` and held match_faces / warm_crops / rank_measure in `waiting`
-# behind a pass that had finished. A genuinely corrupt file ends in the same
-# place and is indistinguishable here; it is rare, and the step's `detail`
+# rows after a perfectly successful run. The server now records that as
+# TERMINAL — `worker_processed.attempts` set straight to MAX_PROCESS_ATTEMPTS on
+# the first clean empty result (db.mark_processed(terminal=True)) — so it is
+# detected once, not three times. Either way it ends exhausted with no rows, and
+# this rule is what reads it as done. On the first real batch (2026-09-19, 1,373
+# photos) 113 photos sat at attempts=3 with no face rows — every one a player
+# facing away or a distant shot — while 3,696 faces were found in the other
+# 1,260. Counting those as `failed` read the pass as `blocked` and held
+# match_faces / warm_crops / rank_measure in `waiting` behind a pass that had
+# finished. A genuinely corrupt file (detection raising three times) ends in the
+# same place and is indistinguishable here; it is rare, and the step's `detail`
 # reports the count so it is not hidden.
 _EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
 
 # Does this pass's *claim* predicate (what `remaining` counts) exclude photos
-# whose attempts are exhausted? Seven do; `quality` (db.py:2235-2247),
-# `verify` (db.py:2304-2319) and `clip` (db.py:2202-2214) carry no attempts
-# filter at all. That single fact decides two things:
+# whose attempts are exhausted? Every pass does now. `clip`, `quality` and
+# `verify` used to carry no attempts filter — a photo that failed them every
+# time was re-claimed forever and could never read `blocked` — until they
+# joined the ledger. The table stays because the arithmetic below is only
+# right for the True shape; a pass added without the cap must say False here.
+# That single fact decides two things:
 #
 #   True  -> `failed` and `remaining` are DISJOINT sets.
 #            done    = eligible - remaining - failed
@@ -162,18 +165,16 @@ _EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
 #            done    = eligible - remaining
 #            blocked = remaining == failed and failed > 0   (every photo the
 #                      fleet would still claim is one it can never finish)
-#
-# `clip` is False but keeps no ledger, so `failed` is 0 and both rows agree.
 _REMAINING_FILTERS_ATTEMPTS = {
-    "clip": False,
+    "clip": True,
     "faces": True,
-    "quality": False,
+    "quality": True,
     "aesthetics": True,
     "describe": True,
     "category-visual": True,
     "category-content": True,
     "keywords": True,
-    "verify": False,
+    "verify": True,
 }
 
 
@@ -273,19 +274,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
     missing = _OUTPUT_MISSING[pass_type]
-    if missing is None:
-        # clip keeps no attempts ledger — its claim predicate is purely
-        # "no embedding row", so a photo can never be permanently skipped
-        # (which is the non-image re-claim loop documented in CLAUDE.md).
-        failed = 0
-    else:
-        failed = _count_where(
-            db, ids,
-            f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
-            f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
-            f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
-            (pass_type,),
-        )
+    failed = _count_where(
+        db, ids,
+        f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
+        f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
+        f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
+        (pass_type,),
+    )
 
     # See _EMPTY_OUTPUT_IS_DONE: for `faces`, exhausted-with-no-rows is a
     # finished photo that had nothing to find, so it counts toward `done`.

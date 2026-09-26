@@ -189,13 +189,13 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
 
         if pass_type == "clip":
             results = W._process_clip(downloaded, batch_size=model_batch_size)
-            kwargs = {"clip_results": results}
+            kwargs = W._submit_kwargs("clip_results", results)
         elif pass_type == "quality":
             results = W._process_quality(downloaded, batch_size=model_batch_size)
-            kwargs = {"quality_results": results}
+            kwargs = W._submit_kwargs("quality_results", results)
         elif pass_type == "faces":
             results = W._process_faces(downloaded)
-            kwargs = {"face_results": results}
+            kwargs = W._submit_kwargs("face_results", results)
         elif pass_type == "describe":
             model = _resolve_model("describe")
             results = W._process_describe(downloaded, model=model)
@@ -206,8 +206,8 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             results = W._process_verify(downloaded, client=client,
                                         verify_model=_resolve_model("verify"),
                                         regen_model=regen)
-            kwargs = {"verify_results": results, "model": regen,
-                      "model_version": _model_version(regen)}
+            kwargs = {**W._submit_kwargs("verify_results", results),
+                      "model": regen, "model_version": _model_version(regen)}
         elif pass_type == "category-content":
             model = _resolve_model("category-content")
             results = W._process_category_content([info], model=model)

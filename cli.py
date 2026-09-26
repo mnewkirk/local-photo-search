@@ -2118,9 +2118,10 @@ def purge_nonimage_photos(db, apply, scan_all, audit_path, sample):
     """Delete photos rows whose file content is not a decodable image.
 
     Targets ZIP-wrapped iOS Live Photo bundles saved as IMG_xxxx(1).JPG (PK
-    magic, a .mov inside) that PIL can't open: they never get a CLIP embedding
-    and, because the clip claim path has no attempts cap, the worker fleet
-    re-claims them on every TTL cycle forever — the clip queue never reaches 0.
+    magic, a .mov inside) that PIL can't open: they never get a CLIP embedding.
+    The clip claim path is attempts-capped now, so the fleet gives up after
+    MAX_PROCESS_ATTEMPTS failures (it used to re-claim them forever), but each
+    one still leaves its batch's clip step `blocked` until it is purged.
 
     Default scans only photos with no CLIP embedding (the stuck set). Cascades
     via FK to faces/stack_members/collection_photos/review_selections; run

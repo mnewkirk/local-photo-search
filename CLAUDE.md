@@ -987,17 +987,56 @@ shape (`describe`, `tags`, `category-content`, `category-visual`, `keywords`,
 
 An attempt is now spent only when the result was **persisted**, or when the
 **worker** reported a genuine per-photo outcome. The deliberate semantics are
-unchanged and must stay: a photo with no faces, no description, or an empty
-tag list is *done* in one pass (`'[]'` is written), and a worker-side timeout
-defers by being omitted from the payload entirely.
+unchanged and must stay: a photo with no description or an empty tag list is
+*done* in one pass (`'[]'` is written), and a worker-side timeout defers by
+being omitted from the payload entirely.
+
+**Worker-reported failures are a separate `failures` list** on the submit
+payload (`FailedResult{photo_id, error}`), built by `worker._submit_kwargs`
+from `_failure_row`s. Each spends ONE attempt, writes no column, and is logged
+to `index_errors` — so a poison photo (an unloadable image, a detection or
+verification that raises every time) is retired by the cap instead of being
+re-claimed forever. It is deliberately NOT folded into the per-pass rows: an
+older server ignores the unknown field and behaves as before, whereas
+`aesthetic_score=None` would 422 an old `QualityResult` and a verify
+`status="error"` row would be written as a real verification. Timeouts /
+network errors (`worker._TRANSIENT`) are still omitted, never reported.
+
+**`quality` and `verify` are on the ledger now.** Their claim/count
+predicates carry the same `attempts >= MAX_PROCESS_ATTEMPTS` exclusion as the
+other passes (`db._QUALITY_NOT_EXHAUSTED` / `_VERIFY_NOT_EXHAUSTED`; quality
+keeps its either-column self-heal), `submit_results` marks both processed, and
+`clear-pass` deletes their ledger rows. Before, the worker silently dropped a
+photo it could not score or verify and nothing recorded it; a quality photo
+whose concept analysis failed rewrote its score and stayed claimable — both
+infinite re-claims. Existing libraries have no quality/verify ledger rows, so
+deploying changes nothing until a photo actually fails.
+
+**A clean empty `faces` result is TERMINAL.** `submit_results` marks it with
+`db.mark_processed(..., terminal=True)`, which sets `attempts` straight to
+`MAX_PROCESS_ATTEMPTS` (never lowering a higher count; no schema change). It
+used to be `+1`, so every photo with nobody in frame was detected three times —
+67,853 such photos, ~136k wasted InsightFace runs. This is only safe because
+the worker no longer sends `faces: []` for a detection **exception**: that is
+now a failure row (one attempt, still retried). A non-empty result is
+unchanged. The in-process `index.py` faces writers (directory + collection
+mode) follow the same contract — terminal on empty, one attempt on an error,
+skip exhausted photos, and `--force-faces` clears the ledger.
+
+**Deploy the server and the workers together.** A worker older than this
+change still sends `faces: []` on a detection error, which the new server
+reads as "nobody here" and retires in one shot — a transiently-failing photo
+would lose its two retries (recover with `clear-pass faces` on the affected
+scope). The reverse (new worker, old server) is safe but uncapped: the old
+server ignores `failures`, so a failing photo is re-claimed as it always was.
 
 Deferral is for a **transient lock only** — `_is_transient_db_error`: a
 `sqlite3.OperationalError` whose message mentions "locked" or "busy".
 **Do not widen this back to a bare `except Exception`.** Deferring every
 error uncaps the pass: a deterministically-failing photo never reaches
 MAX_PROCESS_ATTEMPTS, is re-claimed every TTL forever, and pays for a model
-run each cycle — the pathology documented below for the un-capped `clip`
-claim. (The first version of this fix did exactly that; review caught it.)
+run each cycle — the pathology documented below for the formerly un-capped
+`clip` claim. (The first version of this fix did exactly that; review caught it.)
 `faces` is the worst case, because its predicate is
 `NOT EXISTS(faces) AND attempts < MAX` with no column to heal it and a
 malformed payload (short bbox, missing `encoding`, non-512 vector) raises
@@ -1039,15 +1078,29 @@ $DC photosearch cleanup-orphans [--dry-run]
 
 ## Non-image rows & the clip-claim infinite re-claim
 
-CLIP is the **only** worker pass with no `worker_processed.attempts >=
-MAX_PROCESS_ATTEMPTS` cap — the claim/count predicates (`db.py
-get_unprocessed_photos`/`count_unprocessed_photos`) just check
-`id NOT IN (SELECT photo_id FROM clip_embeddings)`, and the clip branch of
-`worker_api.submit_results` never calls `mark_processed`. So a photo that can't
-be loaded leaves *no trace* (no embedding, no attempts row) and is re-claimed
-every TTL forever. SQLite returns the claim set in rowid order, so the same
-unloadable rows sit at the front of every claim — workers churn at ~290% CPU
-and `queue_depth.clip` never reaches 0 ("workers won't drain").
+**FIXED — clip is on the attempts ledger now.** It used to be the only worker
+pass with no `worker_processed.attempts >= MAX_PROCESS_ATTEMPTS` cap: the
+claim/count predicates just checked `id NOT IN (SELECT photo_id FROM
+clip_embeddings)`, the clip branch of `worker_api.submit_results` never called
+`mark_processed`, and the worker silently skipped an image it could not load.
+So such a photo left *no trace* and was re-claimed every TTL forever. SQLite
+returns the claim set in rowid order, so the same unloadable rows sat at the
+front of every claim — workers churned at ~290% CPU and `queue_depth.clip`
+never reached 0 ("workers won't drain").
+
+Now: both predicates carry `db._CLIP_NOT_EXHAUSTED`; `worker._process_clip`
+reports a photo `embed_images_stream` skipped as a failure row (the shared
+`failures` list); the server spends one attempt per failure (and per non-lock
+write error — a malformed vector), defers only a transient lock, and after
+three tries the photo stops being claimed and its batch reads `blocked`. A
+**successful** embedding is still its own marker and writes no ledger row
+(clip is the highest-volume pass; a row per photo on the N100 buys nothing).
+`clear-pass clip` deletes the clip ledger rows along with the embeddings, so a
+re-embed starts clean. Same deploy note as the other passes: an old worker
+never sends `failures`, so against it clip stays uncapped until the fleet is
+updated. Tests: `tests/test_worker_attempts_cap.py`.
+
+The rows are still worth removing rather than leaving capped:
 
 The usual culprit: files whose extension lies about their content — iOS Live
 Photo / motion bundles saved as `IMG_xxxx(1).JPG` that are actually **ZIP
@@ -3088,30 +3141,26 @@ progress bar — returns 0 in two situations that are not "done":
    eligible — this reads `waiting`, never `completed`.
 
 So every step carries `total / eligible / done / remaining / failed`, and
-`completed` is `done == total`, never `remaining == 0`. `quality`, `verify`
-and `clip` complicate `done` further: they are the only three passes whose
-claim predicate carries **no attempts filter** (`db.py`
-`count_unprocessed_photos`), so their `failed` count sits *inside*
-`remaining` rather than disjoint from it — for those three, `done = eligible
-- remaining` (no second subtraction) and `blocked` is `remaining == failed >
-0`, not `remaining == 0 and failed > 0`. Get this backwards and `done`
-double-subtracts `failed` on every other pass.
+`completed` is `done == total`, never `remaining == 0`. Every worker pass's
+claim predicate now excludes exhausted photos, so `failed` and `remaining` are
+disjoint: `done = eligible - remaining - failed` and `blocked` is `remaining
+== 0 and failed > 0` (`_REMAINING_FILTERS_ATTEMPTS`, all `True`). `clip`,
+`quality` and `verify` used to carry **no attempts filter** — `failed` sat
+inside `remaining`, so they needed `done = eligible - remaining` and `blocked =
+remaining == failed > 0` — until they joined the ledger (see "A failed
+SERVER-side write must not burn a retry attempt" and "Non-image rows"). The
+table stays: a future pass added without the cap must say `False` there, or
+`done` double-subtracts `failed`.
 
-**`clip` does NOT get the `blocked` escape hatch this reasoning gives
-`quality`/`verify`.** `_OUTPUT_MISSING["clip"] is None` in
-`photosearch/batch_state.py` (it keeps no attempts ledger at all — see
-"Non-image rows" above), so `_worker_step` hardcodes `failed = 0` for clip,
-and `blocked` requires `failed > 0`. A clip-unloadable photo (e.g. a
-ZIP-wrapped `.JPG` Live Photo saved with an image extension) therefore leaves
-that batch's `clip` step sitting at `remaining > 0` **indefinitely**:
-`next_action` stays `launch_fleet` and `ready` is never true — it does not
-surface as `blocked`. In practice this should be rare for new batches:
-`index.py:is_real_image()` gates row creation at ingest, so a photo that
-can't be decoded is reclassified as a move-only companion and never gets a
-`photos` row (and therefore never enters a batch) in the first place.
-`purge-nonimage-photos` is the remedy for old rows that predate that gate.
-Short of that, the manual escape is the `/batches` page's **Mark ready**
-button, which force-completes a batch regardless of step state.
+**A poison `clip` photo now reads `blocked`.** It used to be the exception:
+clip kept no ledger, so `_worker_step` hardcoded `failed = 0` and a
+clip-unloadable photo (a ZIP-wrapped `.JPG` Live Photo) left the batch's `clip`
+step at `remaining > 0` **indefinitely** — `next_action` stuck on
+`launch_fleet`, never `ready`, never `blocked`. `_OUTPUT_MISSING["clip"]` is
+now the embedding test and the step counts exhausted photos like any other.
+Such rows should still be rare for new batches (`index.py:is_real_image()`
+gates row creation at ingest); `purge-nonimage-photos` removes old ones, and
+**Mark ready** remains the manual escape.
 
 Worker-pass precedence is **running > completed > blocked > queued > waiting
 > needs_queue** — `completed` deliberately outranks an open job row, because
@@ -3125,9 +3174,10 @@ the fleet had exited.
 ### `faces` is the one pass where "no output" means done
 
 A photo with nobody facing the camera has **no `faces` rows after a perfectly
-successful run**. The claim path can't tell that from a failure, so the fleet
-re-tries it `MAX_PROCESS_ATTEMPTS` times and stops (pre-existing, and 3× the
-work it should be). `batch_state._EMPTY_OUTPUT_IS_DONE` therefore counts an
+successful run**. The server now records that as terminal — attempts set
+straight to `MAX_PROCESS_ATTEMPTS` on the first clean empty result (it used to
+re-try it three times). Either way it ends exhausted with no rows, which the
+claim predicate cannot tell from three failures. `batch_state._EMPTY_OUTPUT_IS_DONE` therefore counts an
 exhausted no-face photo toward `done`, not `failed`, and reports the count in the
 step's `detail` ("113 with no detectable face"), which the page shows on the
 completed box.

@@ -427,15 +427,55 @@ def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> 
     return downloaded
 
 
+def _failure_row(photo_id: int, error) -> dict:
+    """A photo this worker tried and could NOT process (unloadable image,
+    detection/verification raised). Split out of the result list by
+    `_submit_kwargs` and sent as `failures`, which spends one of the photo's
+    MAX_PROCESS_ATTEMPTS on the server without writing anything — so a poison
+    photo is retired by the cap instead of re-claimed forever.
+
+    NOT for timeouts or network errors: those are the worker's problem, not
+    the photo's, and are omitted from the payload so they cost nothing.
+    """
+    return {"photo_id": photo_id, "error": (str(error) or type(error).__name__)[:500]}
+
+
+def _is_failure_row(row: dict) -> bool:
+    return "error" in row
+
+
+def _submit_kwargs(results_key: str, results: list[dict]) -> dict:
+    """Build submit kwargs, moving failure rows into the separate `failures`
+    list. Kept out of the per-pass result rows on purpose: an older server
+    ignores the unknown `failures` field, whereas a failure folded into a
+    result row would 422 (QualityResult.aesthetic_score is required there) or
+    be written as a real verification."""
+    ok = [r for r in results if not _is_failure_row(r)]
+    failed = [r for r in results if _is_failure_row(r)]
+    kwargs = {results_key: ok}
+    if failed:
+        kwargs["failures"] = failed
+    return kwargs
+
+
 def _process_clip(downloaded: list[tuple[dict, str]], batch_size: int = 8) -> list[dict]:
     """Run CLIP embedding on downloaded photos. Returns list of {photo_id, embedding}."""
     from .clip_embed import embed_images_stream
 
     paths = [path for _, path in downloaded]
     results = []
+    embedded = set()
     for idx, emb in embed_images_stream(paths, batch_size=batch_size):
         photo_info = downloaded[idx][0]
         results.append({"photo_id": photo_info["id"], "embedding": emb})
+        embedded.add(idx)
+    # embed_images_stream skips an image it cannot open. Report it, so the
+    # attempts cap retires it — before this it left no trace and headed every
+    # clip claim forever (a ZIP-wrapped Live Photo saved as .JPG).
+    for idx, (photo_info, _) in enumerate(downloaded):
+        if idx not in embedded:
+            results.append(_failure_row(
+                photo_info["id"], "CLIP embedding failed (image could not be loaded)"))
     return results
 
 
@@ -466,6 +506,11 @@ def _process_quality(downloaded: list[tuple[dict, str]], batch_size: int = 8) ->
                 "aesthetic_score": scores[pid],
                 "aesthetic_concepts": concepts.get(pid),
             })
+        else:
+            # score_photos_stream skips an image it cannot open. That used to
+            # drop the photo silently, so it was re-claimed every TTL forever;
+            # report it so the attempts cap can retire it.
+            results.append(_failure_row(pid, "quality scoring failed (image could not be loaded)"))
     return results
 
 
@@ -490,8 +535,12 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
                 "faces": face_data,
             })
         except Exception as e:
+            # NEVER `faces: []` here: the server now treats an empty list as a
+            # clean "nobody in frame" and retires the photo in one submit. An
+            # error is a failure row — it spends ONE attempt, so a transient
+            # detection failure still gets retried.
             print(f"    Face detection failed for {photo_info['filename']}: {e}")
-            results.append({"photo_id": photo_info["id"], "faces": []})
+            results.append(_failure_row(photo_info["id"], e))
     return results
 
 
@@ -864,8 +913,14 @@ def _process_verify(
                 result["tags"] = new_tags
             results.append(result)
 
+        except _TRANSIENT as e:
+            # Network / LLM-backend timeout — the worker's problem, not the
+            # photo's. Omit it so the photo comes back without spending an
+            # attempt.
+            print(f" deferring ({e.__class__.__name__}: {e})")
         except Exception as e:
             print(f" ERROR: {e}")
+            results.append(_failure_row(pid, e))
     return results
 
 
@@ -1075,13 +1130,13 @@ def run_worker(
 
                 if pass_type == "clip":
                     results = _process_clip(downloaded, batch_size=model_batch_size)
-                    kwargs = {"clip_results": results}
+                    kwargs = _submit_kwargs("clip_results", results)
                 elif pass_type == "quality":
                     results = _process_quality(downloaded, batch_size=model_batch_size)
-                    kwargs = {"quality_results": results}
+                    kwargs = _submit_kwargs("quality_results", results)
                 elif pass_type == "faces":
                     results = _process_faces(downloaded)
-                    kwargs = {"face_results": results}
+                    kwargs = _submit_kwargs("face_results", results)
                 elif pass_type == "describe":
                     results = _process_describe(downloaded, model=describe_model)
                     kwargs = {"describe_results": results,
@@ -1093,7 +1148,7 @@ def run_worker(
                     )
                     # regen_model == describe_model produces any regenerated
                     # text, so the artifact's provenance is the DESCRIBE role.
-                    kwargs = {"verify_results": results,
+                    kwargs = {**_submit_kwargs("verify_results", results),
                               **_provenance_kwargs(pass_type, describe_model,
                                                    results, role="describe")}
                 elif pass_type == "category-content":

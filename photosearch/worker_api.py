@@ -193,6 +193,17 @@ class AestheticsResult(BaseModel):
     model_version: Optional[str] = None
 
 
+class FailedResult(BaseModel):
+    """A photo the WORKER tried and could not process — an unloadable image, a
+    detection or verification that raised. Spends one attempt on the server
+    (so the MAX_PROCESS_ATTEMPTS cap retires a poison photo) and writes no
+    output column. Worker-side TIMEOUTS are not failures: the worker omits
+    those from the payload entirely so they are retried at no cost.
+    """
+    photo_id: int
+    error: Optional[str] = None
+
+
 class SubmitRequest(BaseModel):
     batch_id: str
     pass_type: str
@@ -206,6 +217,14 @@ class SubmitRequest(BaseModel):
     category_visual_results: Optional[list[CategoryVisualResult]] = None
     keywords_results: Optional[list[KeywordsResult]] = None
     aesthetics_results: Optional[list[AestheticsResult]] = None
+    # Genuine per-photo failures, separate from the per-pass result lists so
+    # the payload stays backward compatible in BOTH directions: an older
+    # server ignores the unknown field (pydantic's default) and behaves as it
+    # always did, and an older worker simply never sends it. Folding failures
+    # into the result rows instead (aesthetic_score=None, a verify
+    # status="error") would 422 against an old QualityResult, or be written as
+    # a real verification by an old verify branch.
+    failures: Optional[list[FailedResult]] = None
     # Model provenance for describe/tags/verify — logged to the generations
     # table. Optional so older workers still submit cleanly.
     model: Optional[str] = None
@@ -431,11 +450,21 @@ class _SubmitOutcome:
         self.written = 0
         self.processed: list[int] = []
         self.deferred: list[int] = []
+        # Subset of `processed` whose outcome is FINAL on the first try — a
+        # clean faces run that found nobody. Marked straight to the attempts
+        # cap instead of +1 (see db.mark_processed(terminal=True)).
+        self.terminal: set[int] = set()
 
     def persisted(self, photo_id: int):
         """This photo's outcome is final — spend an attempt on it."""
         if photo_id not in self.deferred and photo_id not in self.processed:
             self.processed.append(photo_id)
+
+    def finished_empty(self, photo_id: int):
+        """A clean run with nothing to record — retire it in ONE submit."""
+        self.persisted(photo_id)
+        if photo_id in self.processed:
+            self.terminal.add(photo_id)
 
     def defer(self, photo_id: int):
         """A transient lock — do NOT spend an attempt; it comes back around."""
@@ -452,6 +481,7 @@ class _SubmitOutcome:
         """
         if photo_id in self.deferred:
             self.deferred.remove(photo_id)
+        self.terminal.discard(photo_id)
         if photo_id not in self.processed:
             self.processed.append(photo_id)
 
@@ -480,8 +510,8 @@ class _SubmitOutcome:
 # Only a TRANSIENT lock earns a free retry. Deferring anything else would
 # uncap the pass: a deterministically-failing photo would never reach
 # MAX_PROCESS_ATTEMPTS, be re-claimed every TTL forever, and pay for a model
-# run each cycle — exactly the pathology CLAUDE.md documents for the un-capped
-# `clip` pass ("workers churn at ~290% CPU and queue_depth.clip never reaches
+# run each cycle — exactly the pathology CLAUDE.md documents for the formerly
+# un-capped `clip` pass ("workers churn at ~290% CPU and queue_depth.clip never reaches
 # 0"). `faces` is the worst case: its claim predicate is NOT EXISTS(faces) AND
 # attempts < MAX with no column to heal it, and a malformed payload (a short
 # bbox, a missing 'encoding', a non-512 vector) raises BEFORE any INSERT, so
@@ -623,25 +653,58 @@ def _commit_batch(db, outcome: _SubmitOutcome, pass_type: str) -> bool:
         return not transient
 
 
-def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str):
+def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str,
+                    skip: set[int] | None = None):
     """Spend one attempt per finished photo.
+
+    `skip` names finished photos whose output row is its own marker and so
+    need no ledger write (clip's stored embeddings). They still count as
+    processed in the response.
 
     If this write itself fails the attempt cannot be recorded at all — the
     one case that really can loop, since the photo comes back unmarked every
     TTL. Nothing here can fix an unwritable DB, so say so loudly.
     """
-    if not outcome.processed:
+    skip = skip or set()
+    marks = [p for p in outcome.processed if p not in skip]
+    if not marks:
         return
+    terminal = [p for p in marks if p in outcome.terminal]
+    counted = [p for p in marks if p not in outcome.terminal]
     try:
-        db.mark_processed(outcome.processed, pass_type)
+        if counted:
+            db.mark_processed(counted, pass_type)
+        if terminal:
+            db.mark_processed(terminal, pass_type, terminal=True)
     except Exception as e:
         log = logger.warning if _is_transient_db_error(e) else logger.error
         log("Could not mark %d photo(s) processed for pass %s — their attempt "
             "was NOT recorded and they will be reclaimed; if this is not a "
             "lock the DB is unwritable and the fleet will keep retrying: %s",
-            len(outcome.processed), pass_type, e)
-        for pid in list(outcome.processed):
+            len(marks), pass_type, e)
+        for pid in marks:
             outcome.defer(pid)
+
+
+def _record_worker_failures(db, outcome: _SubmitOutcome, pass_type: str,
+                            failures: list[FailedResult]):
+    """Spend one attempt per photo the WORKER could not process.
+
+    This is a real per-photo outcome, not a server-side write failure, so it
+    is never deferred — deferring would uncap the pass (see
+    `_TRANSIENT_DB_MARKERS`). Runs BEFORE `begin_batch`, because `log_error`
+    commits unconditionally.
+    """
+    for f in failures:
+        logger.warning("Worker reported %s failure for photo %s: %s",
+                       pass_type, f.photo_id, f.error)
+        outcome.failed(f.photo_id)
+        try:
+            db.log_error(pass_type, str(f.photo_id),
+                         f"worker: {f.error or 'failed'}")
+        except Exception as log_exc:
+            logger.warning("Could not log the worker-reported %s failure for "
+                           "photo %s (%s)", pass_type, f.photo_id, log_exc)
 
 
 @router.post("/submit-results")
@@ -676,25 +739,45 @@ def submit_results(req: SubmitRequest):
 
         outcome = _SubmitOutcome()
 
-        if req.pass_type == "clip" and req.clip_results:
+        if req.failures:
+            _record_worker_failures(db, outcome, req.pass_type, req.failures)
+
+        if req.pass_type == "clip":
+            embedded: set[int] = set()
             db.begin_batch(batch_size=100)
-            for r in req.clip_results:
+            for r in req.clip_results or []:
                 try:
                     db.add_clip_embedding(r.photo_id, r.embedding)
                     outcome.written += 1
                     outcome.persisted(r.photo_id)
+                    embedded.add(r.photo_id)
                 except Exception as e:
                     _record_write_failure(db, outcome, "clip", r.photo_id, e)
-            _commit_batch(db, outcome, "clip")
-            # NOTE: clip deliberately never calls mark_processed — the
-            # embedding row itself is the marker (see CLAUDE.md, "Non-image
-            # rows & the clip-claim infinite re-claim").
+            committed = _commit_batch(db, outcome, "clip")
+            # A stored embedding is its own marker, so success is NOT written
+            # to the ledger (clip is the highest-volume pass; that would be a
+            # row per photo on the N100 for nothing). Only a FAILURE spends an
+            # attempt — a worker-reported one (unloadable image) or a
+            # non-lock write error — so an unloadable file is retired by
+            # MAX_PROCESS_ATTEMPTS instead of heading every claim forever.
+            # clear-pass deletes clip ledger rows, so a re-embed starts clean.
+            if committed:
+                _mark_processed(db, outcome, "clip", skip=embedded)
 
         elif req.pass_type == "faces":
             face_results = req.face_results or []
             db.begin_batch(batch_size=50)
             for r in face_results:
                 failed = False
+                if not r.faces:
+                    # A clean detection run that found nobody. There is no
+                    # output row to prove it, so it is marked straight to the
+                    # attempts cap: re-detecting the same empty photo twice
+                    # more wasted ~136k InsightFace runs library-wide. The
+                    # worker reports a detection ERROR via `failures`, never as
+                    # an empty list (see worker._process_faces).
+                    outcome.finished_empty(r.photo_id)
+                    continue
                 for face in r.faces:
                     try:
                         db.add_face(
@@ -708,8 +791,6 @@ def submit_results(req: SubmitRequest):
                         failed = True
                         _record_write_failure(db, outcome, "faces", r.photo_id, e)
                 if not failed:
-                    # A photo with NO faces found is done, not failed — its
-                    # attempt is spent here because nothing else records it.
                     outcome.persisted(r.photo_id)
             committed = _commit_batch(db, outcome, "faces")
 
@@ -718,13 +799,14 @@ def submit_results(req: SubmitRequest):
             # per-batch clustering would collide IDs across batches and
             # fragment the same person across many pseudo-clusters.
 
-            # Mark every photo whose faces landed (including those with none).
+            # Mark every photo whose faces landed; photos with none go
+            # straight to the cap (terminal), worker failures spend one.
             if committed:
                 _mark_processed(db, outcome, "faces")
 
-        elif req.pass_type == "quality" and req.quality_results:
+        elif req.pass_type == "quality":
             db.begin_batch(batch_size=100)
-            for r in req.quality_results:
+            for r in req.quality_results or []:
                 try:
                     updates = {"aesthetic_score": r.aesthetic_score}
                     if r.aesthetic_concepts:
@@ -734,7 +816,13 @@ def submit_results(req: SubmitRequest):
                     outcome.persisted(r.photo_id)
                 except Exception as e:
                     _record_write_failure(db, outcome, "quality", r.photo_id, e)
-            _commit_batch(db, outcome, "quality")
+            committed = _commit_batch(db, outcome, "quality")
+            # Every persisted row spends an attempt. A full success leaves
+            # both columns set, so the column test retires it regardless; the
+            # attempt only matters for a concepts-only failure (score written,
+            # aesthetic_concepts still NULL), which used to re-claim forever.
+            if committed:
+                _mark_processed(db, outcome, "quality")
 
         elif req.pass_type == "describe":
             describe_results = req.describe_results or []
@@ -779,9 +867,9 @@ def submit_results(req: SubmitRequest):
             if committed:
                 _mark_processed(db, outcome, "tags")
 
-        elif req.pass_type == "verify" and req.verify_results:
+        elif req.pass_type == "verify":
             db.begin_batch(batch_size=100)
-            for r in req.verify_results:
+            for r in req.verify_results or []:
                 try:
                     updates = {
                         "verified_at": r.verified_at,
@@ -804,7 +892,9 @@ def submit_results(req: SubmitRequest):
                     outcome.persisted(r.photo_id)
                 except Exception as e:
                     _record_write_failure(db, outcome, "verify", r.photo_id, e)
-            _commit_batch(db, outcome, "verify")
+            committed = _commit_batch(db, outcome, "verify")
+            if committed:
+                _mark_processed(db, outcome, "verify")
 
         elif req.pass_type == "category-content":
             category_content_results = req.category_content_results or []
@@ -1050,12 +1140,20 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM clip_embeddings WHERE photo_id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'clip' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "quality":
             cur = db.conn.execute(
                 f"UPDATE photos SET aesthetic_score = NULL, aesthetic_concepts = NULL, aesthetic_critique = NULL "
                 f"WHERE id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'quality' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "describe":
             cur = db.conn.execute(
                 f"UPDATE photos SET description = NULL WHERE id IN ({placeholders})", photo_ids
@@ -1082,6 +1180,10 @@ def clear_pass(req: ClearPassRequest):
                 f"hallucination_flags = NULL WHERE id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'verify' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "category-content":
             cur = db.conn.execute(
                 f"UPDATE photos SET categories = NULL WHERE id IN ({placeholders})", photo_ids
