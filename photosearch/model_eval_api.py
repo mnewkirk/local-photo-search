@@ -377,3 +377,33 @@ def put_keyword(photo_id: int, body: KeywordBody, inputs: str = Query("main")):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"photo_id": photo_id, "label": label}
+
+
+# --------------------------------------------------------------------------
+# Verify: confirm each planted claim really is false for the photo
+# --------------------------------------------------------------------------
+
+class PlantedBody(BaseModel):
+    confirmed: bool
+
+
+@router.get("/verify/planted")
+def get_planted():
+    sets = me.load_verify_sets()
+    if sets is None:
+        return {"items": [], "progress": {"done": 0, "total": 0},
+                "hint": "No verify sets yet — run: python evals/verify_eval.py plant --source <variant>"}
+    items = [{"id": it["id"], "photo_id": it["photo_id"], "type": it["type"],
+              "text": it["text"], "spans": it["spans"], "confirmed": it.get("confirmed")}
+             for it in sets["items"] if it["kind"] == "planted"]
+    done = sum(1 for it in items if it["confirmed"] is not None)
+    return {"items": items, "progress": {"done": done, "total": len(items)}, "hint": None}
+
+
+@router.put("/verify/planted/{item_id}")
+def put_planted(item_id: str, body: PlantedBody):
+    try:
+        it = me.confirm_planted(item_id, body.confirmed)
+    except KeyError:
+        raise HTTPException(404, "no such planted item")
+    return {"id": item_id, "confirmed": it["confirmed"]}

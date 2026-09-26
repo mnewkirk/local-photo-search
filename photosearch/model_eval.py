@@ -690,3 +690,36 @@ def save_keyword_label(key: str, judged: Iterable[str], wrong: Iterable[str],
     data[key] = {"judged": judged, "wrong": wrong, "done": bool(done), "updated_at": now_iso()}
     write_pass_file("text", "keyword_labels.json", data)
     return data[key]
+
+
+# --------------------------------------------------------------------------
+# Verify sets
+# --------------------------------------------------------------------------
+#
+#   verify/sets.json  {"source_variant", "source_effective_model", "created",
+#                      "items": [{"id", "photo_id", "kind": clean|planted|real,
+#                                 "type": object|colour|count|None, "text",
+#                                 "spans": [str], "confirmed": bool|None}]}
+#
+# A planted error counts only once the owner has confirmed it really is false
+# for the photo (`confirmed` true) — a templated plant can be accidentally true.
+
+def load_verify_sets() -> Optional[dict]:
+    return read_pass_file("verify", "sets.json", None)
+
+
+def save_verify_sets(data: dict) -> None:
+    write_pass_file("verify", "sets.json", data)
+
+
+def confirm_planted(item_id: str, confirmed: bool) -> dict:
+    data = load_verify_sets()
+    if data is None:
+        raise KeyError("no verify sets")
+    for it in data["items"]:
+        if it["id"] == item_id and it["kind"] == "planted":
+            it["confirmed"] = bool(confirmed)
+            it["confirmed_at"] = now_iso()
+            save_verify_sets(data)
+            return it
+    raise KeyError(item_id)

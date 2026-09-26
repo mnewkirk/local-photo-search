@@ -144,6 +144,7 @@
       { id: 'truth', label: 'Visible text' },
       { id: 'categories', label: 'Categories' },
       { id: 'keywords', label: 'Keywords' },
+      { id: 'planted', label: 'Planted' },
     ];
 
     function jsonOrThrow(r) {
@@ -648,6 +649,85 @@
               e('button', { className: 'btn primary', type: 'button', onClick: save }, 'Save & next (Enter)')))));
     }
 
+    // ------------------------------------------------------------------
+    // Planted: a templated false claim was added to a description you marked
+    // all-correct. Confirm it really is false for this photo (a plant can be
+    // accidentally true — "a kite" in a sky full of kites).
+    // ------------------------------------------------------------------
+    function PlantedTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      useEffect(function () {
+        fetch(API + '/verify/planted').then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.items.findIndex(function (it) { return it.confirmed == null; });
+          setIdx(first < 0 ? 0 : first);
+        }).catch(function (ex) { props.onError('Could not load: ' + ex.message); });
+      }, []);
+
+      var items = data ? data.items : [];
+      var item = items[idx];
+
+      function answer(ok) {
+        if (!item) return;
+        var at = idx;
+        fetch(API + '/verify/planted/' + encodeURIComponent(item.id), {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmed: ok }),
+        }).then(jsonOrThrow).then(function () {
+          var next = items.map(function (it, i) { return i === at ? Object.assign({}, it, { confirmed: ok }) : it; });
+          var done = next.filter(function (it) { return it.confirmed != null; }).length;
+          setData(Object.assign({}, data, { items: next, progress: { done: done, total: next.length } }));
+          var n = nextOpen(next, at, function (it) { return it.confirmed != null; });
+          if (n >= 0 && n !== at) setIdx(n);
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+
+      live.current = {
+        move: function (d) { var i = idx + d; if (i >= 0 && i < items.length) setIdx(i); },
+        digit: function (k) { if (k === 1) answer(true); else if (k === 3) answer(false); },
+        shownAt: shownAt,
+      };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!items.length) return e(Hint, { text: data.hint });
+
+      // Highlight the planted span inside the text.
+      var text = item.text;
+      var span = (item.spans && item.spans[0]) || '';
+      var at = span ? text.toLowerCase().lastIndexOf(span.toLowerCase()) : -1;
+      var shown = at < 0 ? text : [text.slice(0, at),
+        e('mark', { key: 'm', style: { background: 'rgba(250,204,21,0.3)', color: 'var(--text)' } },
+          text.slice(at, at + span.length)),
+        text.slice(at + span.length)];
+
+      return e('div', null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: items, idx: idx, onPick: setIdx,
+                   isDone: function (it) { return it.confirmed != null; },
+                   title: function (it) { return it.id + ' · ' + it.type; } }),
+        e('div', { className: 'work' },
+          e(PhotoPane, { photoId: item.photo_id },
+            e('span', { className: 'pill stratum' }, 'planted ' + item.type),
+            e('span', { className: 'spacer' }),
+            item.confirmed == null ? null
+              : e('span', { className: 'pill saved' }, item.confirmed ? '✓ false — scored' : '✗ excluded')),
+          e('div', { className: 'card' },
+            e('div', { className: 'muted', style: { marginBottom: 8 } },
+              'Is the highlighted claim FALSE for this photo? Only confirmed plants are scored.'),
+            e('div', { className: 'desc' }, shown),
+            e('div', { className: 'actions' },
+              e('button', { className: 'btn choice' + (item.confirmed === true ? ' on' : ''), type: 'button',
+                            onClick: function () { answer(true); } }, 'Yes, it is false (1)'),
+              e('button', { className: 'btn choice' + (item.confirmed === false ? ' on' : ''), type: 'button',
+                            onClick: function () { answer(false); } }, 'No — it is actually true (3)')))));
+    }
+
     function Page() {
       var initial = PARAMS.get('tab');
       var tabS = useState(TABS.some(function (t) { return t.id === initial; }) ? initial : 'claims');
@@ -664,6 +744,7 @@
       var body = tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })
         : tab === 'pairs' ? e(PairsTab, { key: 'p', onError: setError })
         : tab === 'truth' ? e(TruthTab, { key: 't', onError: setError })
+        : tab === 'planted' ? e(PlantedTab, { key: 'pl', onError: setError })
         : e(TextTab, { key: tab, mode: tab, onError: setError });
 
       return e('div', null,
