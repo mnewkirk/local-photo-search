@@ -68,28 +68,29 @@ def test_extract_keywords_returns_empty_on_none(monkeypatch):
     assert d.extract_keywords_from_description("") == []
 
 
-def test_tag_visual_photo_uses_visual_vocab(monkeypatch, tmp_path):
+def test_tag_visual_photo_uses_the_perceived_vocab(monkeypatch, tmp_path):
+    """Only PERCEIVED terms are offered or accepted — the capture facts are
+    derived from EXIF server-side (photosearch/visual_tags_derive.py)."""
     from photosearch import describe as d
     img = tmp_path / "x.jpg"
     img.write_bytes(b"\xff\xd8\xff\xd9")  # minimal jpeg stub
-    monkeypatch.setattr("photosearch.vocab_visual.VISUAL_VOCABULARY",
-                        ["dramatic", "peaceful", "foggy"])
     monkeypatch.setattr(d, "_ollama_chat_with_retry",
-                        lambda **kw: "dramatic, peaceful, nope")
+                        lambda **kw: "dramatic, foggy, nope, long-exposure")
     monkeypatch.setattr(d, "_encode_image_for_ollama", lambda p: "encoded")
     out = d.tag_visual_photo(str(img))
-    assert out == ["dramatic", "peaceful"]
+    assert out == ["dramatic", "foggy"]
 
 
-def test_tag_visual_photo_regurgitation_guard_at_12(monkeypatch, tmp_path):
+def test_tag_visual_photo_regurgitation_guard(monkeypatch, tmp_path):
+    """A response at/above the guard threshold, twice, is dropped whole. The
+    threshold now tracks the cap the prompt states (see test_visual_guard.py)."""
     from photosearch import describe as d
+    from photosearch.visual_tags_derive import PERCEIVED_VOCABULARY
     img = tmp_path / "x.jpg"
     img.write_bytes(b"\xff\xd8\xff\xd9")
-    big_vocab = [f"v{i}" for i in range(25)]
-    monkeypatch.setattr("photosearch.vocab_visual.VISUAL_VOCABULARY", big_vocab)
-    # First call returns 12 (regurgitation); retry returns the same 12 → guard returns None.
+    too_many = PERCEIVED_VOCABULARY[:d._VISUAL_MAX_PLAUSIBLE_TAGS]
     monkeypatch.setattr(d, "_ollama_chat_with_retry",
-                        lambda **kw: ", ".join(big_vocab[:12]))
+                        lambda **kw: ", ".join(too_many))
     monkeypatch.setattr(d, "_encode_image_for_ollama", lambda p: "encoded")
     out = d.tag_visual_photo(str(img))
     assert out is None

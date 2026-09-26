@@ -5,12 +5,15 @@ All photo annotations live here — original photos are never modified.
 """
 
 import json
+import logging
 import re
 import sqlite3
 import struct
 import time
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Throttle state for expire_worker_claims — see method docstring for the
@@ -68,6 +71,38 @@ def _folder_of(filepath: Optional[str], filename: Optional[str]) -> str:
     idx = filepath.rfind("/")
     return filepath[:idx] if idx > 0 else ""
 
+
+def folder_for_path(filepath: Optional[str]) -> str:
+    """``photos.folder`` for a filepath — ``_folder_of`` with the basename."""
+    if not filepath:
+        return ""
+    return _folder_of(filepath, filepath.rsplit("/", 1)[-1])
+
+
+_KEEP = object()
+
+
+def set_photo_filepath(conn, photo_id: int, filepath: str,
+                       raw_filepath=_KEEP) -> None:
+    """THE write primitive for changing ``photos.filepath``.
+
+    ``photos.folder`` is derived from ``filepath`` (schema v25) and is what
+    ingest batches (``WHERE folder = ?``), /review, /geotag and worker
+    directory scoping read. A bare ``UPDATE photos SET filepath = ?`` leaves
+    it stale and silently drops the photo from all of those — which is what
+    ``relocate-into-year-dirs`` and ``remap_paths`` used to do. Every writer
+    that moves a photo goes through here so the two cannot drift.
+
+    ``raw_filepath`` is left untouched unless passed (``None`` clears it).
+    Does NOT commit — callers batch their own transaction.
+    """
+    cols = {"filepath": filepath, "folder": folder_for_path(filepath)}
+    if raw_filepath is not _KEEP:
+        cols["raw_filepath"] = raw_filepath
+    set_clause = ", ".join(f"{k} = ?" for k in cols)
+    conn.execute(f"UPDATE photos SET {set_clause} WHERE id = ?",
+                 list(cols.values()) + [photo_id])
+
 # sqlite-vec will be imported at init time so we can fail gracefully
 try:
     import sqlite_vec
@@ -79,7 +114,18 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 32
+
+# The marker resolve-duplicate-persons / dedupe-person-faces leave on the
+# LOSING face of a (photo, person) duplicate. Deliberately still matchable —
+# see faces.REJECTED_MATCH_SOURCE for why filtering it wholesale was rejected.
+DEDUPE_UNMATCHED_SOURCE = "dedupe_unmatched"
+
+# match_source values written by the two automatic matchers. An assignment
+# carrying anything else (manual, merge_review, a bare None from an explicit
+# API write) is a human decision and CLEARS a face/person exclusion; a
+# matcher's own write must never clear the memory that is meant to stop it.
+AUTO_MATCH_SOURCES = ("strict", "temporal")
 
 # Maximum times a worker will attempt a pass on a single photo before giving
 # up. The worker_processed table tracks attempts; the claim path filters
@@ -97,6 +143,137 @@ def _serialize_float_list(vec: list[float]) -> bytes:
 def _deserialize_float_list(data: bytes, dim: int) -> list[float]:
     """Deserialize binary float vector back to a list."""
     return list(struct.unpack(f"{dim}f", data))
+
+
+# ---------------------------------------------------------------------------
+# Face/person exclusions — "this face lost a duplicate to THAT person"
+# ---------------------------------------------------------------------------
+#
+# Everything that unmatches a face as a duplicate goes through
+# `unmatch_faces_as_duplicates`, and everything that matches consults
+# `load_face_person_exclusions`. Both live here rather than in faces.py so the
+# CLI and the maintenance sweep can use them without importing InsightFace.
+
+
+def record_face_person_exclusions(conn, pairs, reason: str = "resolve_dups") -> int:
+    """Remember that each (face_id, person_id) pair must not be re-matched.
+
+    Idempotent: the PK makes a repeat a no-op. Returns the number of NEW rows.
+    """
+    pairs = [(int(f), int(p)) for f, p in pairs if f is not None and p is not None]
+    if not pairs:
+        return 0
+    before = conn.execute("SELECT COUNT(*) FROM face_person_exclusions").fetchone()[0]
+    conn.executemany(
+        "INSERT OR IGNORE INTO face_person_exclusions (face_id, person_id, reason) "
+        "VALUES (?, ?, ?)",
+        [(f, p, reason) for f, p in pairs],
+    )
+    after = conn.execute("SELECT COUNT(*) FROM face_person_exclusions").fetchone()[0]
+    return after - before
+
+
+def clear_face_person_exclusion(conn, face_id: int, person_id: int) -> int:
+    """A human said this face IS that person — the exclusion is overruled."""
+    cur = conn.execute(
+        "DELETE FROM face_person_exclusions WHERE face_id = ? AND person_id = ?",
+        (int(face_id), int(person_id)),
+    )
+    return cur.rowcount or 0
+
+
+def load_face_person_exclusions(conn) -> dict[int, set[int]]:
+    """Every exclusion as {face_id: {person_id, ...}}, loaded ONCE per run.
+
+    The matchers walk ~213k unmatched faces on a 4-core N100, so this must be
+    a dict lookup per face, never a query per face. The table holds a few
+    thousand rows, so the whole thing is a few hundred KB.
+    """
+    out: dict[int, set[int]] = {}
+    for face_id, person_id in conn.execute(
+        "SELECT face_id, person_id FROM face_person_exclusions"
+    ):
+        out.setdefault(face_id, set()).add(person_id)
+    return out
+
+
+def unmatch_faces_as_duplicates(conn, face_ids, reason: str = "resolve_dups") -> int:
+    """THE shared write for "this face lost a (photo, person) duplicate".
+
+    Three things, in one place because they must never diverge:
+      1. snapshot (face_id, person_id, match_source) into the on-demand
+         `face_dedupe_undo` table, so the sweep stays reversible via
+         `restore-unmatched-faces`;
+      2. record the (face, person) exclusion, so the next matcher run does not
+         simply re-apply the label that is about to be removed;
+      3. null the person and stamp `dedupe_unmatched`.
+
+    cli.py's resolve-duplicate-persons / dedupe-person-faces and
+    maintenance._stage_resolve_dups each had their own copy of (1) + (3); a
+    fix applied to one would have left the other churning. Does NOT commit —
+    the caller owns the transaction. Returns the number of faces unmatched.
+    """
+    face_ids = [int(f) for f in face_ids]
+    if not face_ids:
+        return 0
+    conn.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
+                 "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
+                 "unmatched_at TEXT DEFAULT (datetime('now')))")
+    pairs = []
+    for fid in face_ids:
+        row = conn.execute(
+            "SELECT person_id, match_source FROM faces WHERE id = ?", (fid,)).fetchone()
+        if not row or row["person_id"] is None:
+            continue
+        pairs.append((fid, row["person_id"]))
+        conn.execute("INSERT OR REPLACE INTO face_dedupe_undo"
+                     "(face_id, person_id, match_source) VALUES (?, ?, ?)",
+                     (fid, row["person_id"], row["match_source"]))
+    record_face_person_exclusions(conn, pairs, reason=reason)
+    # Only the faces that actually HAD a person. Stamping every id passed in
+    # would overwrite a 'rejected' marker — a human "no" — with
+    # 'dedupe_unmatched', which is matchable again, and would over-count the
+    # return value (the sweep reports it as "applied").
+    for fid, _pid in pairs:
+        conn.execute("UPDATE faces SET person_id = NULL, match_source = ? WHERE id = ?",
+                     (DEDUPE_UNMATCHED_SOURCE, fid))
+    return len(pairs)
+
+
+def backfill_exclusions_from_dedupe_undo(conn, apply: bool = False) -> int:
+    """Create an exclusion for every historically de-duplicated face.
+
+    `face_dedupe_undo` already holds (face_id, person_id) for the faces the
+    resolver has unmatched over the years; the ones still sitting at
+    `match_source='dedupe_unmatched'` and unmatched are precisely the set that
+    keeps flapping. Idempotent (INSERT OR IGNORE against the PK) and cheap, so
+    it also runs inside the v31 migration — the table may not exist at all,
+    since it is created on demand, in which case this does nothing.
+
+    Returns the number of exclusions that would be / were created.
+    """
+    if not conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'face_dedupe_undo'").fetchone():
+        return 0
+    # JOIN persons as well as faces: `INSERT OR IGNORE` does NOT suppress a
+    # FOREIGN KEY violation, and these snapshot rows go stale on both sides
+    # (a live snapshot had 2,940 of 8,919 face_ids already orphaned). One
+    # dangling person_id would otherwise raise inside _init_schema and stop
+    # the process from starting at all.
+    rows = conn.execute(
+        "SELECT u.face_id, u.person_id FROM face_dedupe_undo u "
+        "JOIN faces f ON f.id = u.face_id "
+        "JOIN persons p ON p.id = u.person_id "
+        "WHERE u.person_id IS NOT NULL AND f.person_id IS NULL "
+        "AND IFNULL(f.match_source, '') = ? "
+        "AND NOT EXISTS (SELECT 1 FROM face_person_exclusions e "
+        "                WHERE e.face_id = u.face_id AND e.person_id = u.person_id)",
+        (DEDUPE_UNMATCHED_SOURCE,),
+    ).fetchall()
+    if not apply:
+        return len(rows)
+    return record_face_person_exclusions(
+        conn, [(r["face_id"], r["person_id"]) for r in rows], reason="backfill")
 
 
 class PhotoDB:
@@ -255,14 +432,11 @@ class PhotoDB:
         count = 0
         for row in rows:
             new_path = new_prefix + row["filepath"][len(old_prefix):]
-            updates = {"filepath": new_path}
+            raw = _KEEP
             if row["raw_filepath"] and row["raw_filepath"].startswith(old_prefix):
-                updates["raw_filepath"] = new_prefix + row["raw_filepath"][len(old_prefix):]
-            set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
-            self.conn.execute(
-                f"UPDATE photos SET {set_clause} WHERE id = ?",
-                list(updates.values()) + [row["id"]],
-            )
+                raw = new_prefix + row["raw_filepath"][len(old_prefix):]
+            # Through the shared primitive so photos.folder follows the path.
+            set_photo_filepath(self.conn, row["id"], new_path, raw_filepath=raw)
             count += 1
         self.conn.commit()
         return count
@@ -612,6 +786,75 @@ class PhotoDB:
             )
         """)
 
+        # Ingest batches (schema v30) — one row per dated ingest folder
+        # (ingest_batches), the sweep that produced it (ingest_sweeps), and
+        # per-step job intent (ingest_batch_jobs). A batch's photo membership
+        # is never materialized here: it's derived live as
+        # `SELECT id FROM photos WHERE folder = ?` (see photosearch/ingest_batches.py),
+        # so a batch row is identity + lifecycle + progress only.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_sweeps (
+              run_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+              started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
+              heartbeat_at TEXT NOT NULL DEFAULT (datetime('now')),
+              files_seen INTEGER NOT NULL DEFAULT 0, files_moved INTEGER NOT NULL DEFAULT 0,
+              error TEXT)
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_batches (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, directory TEXT NOT NULL UNIQUE,
+              source TEXT, run_id TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+              photo_count INTEGER NOT NULL DEFAULT 0, ready_at TEXT, dismissed_at TEXT)
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_batch_jobs (
+              batch_id INTEGER NOT NULL, step TEXT NOT NULL, job_kind TEXT NOT NULL,
+              opened_at TEXT NOT NULL DEFAULT (datetime('now')), expires_at TEXT NOT NULL,
+              closed_at TEXT, PRIMARY KEY (batch_id, step))
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ingest_batches_created ON ingest_batches(created_at)")
+
+        # Face/person exclusions (schema v31) — "this face is not THAT person",
+        # written whenever the duplicate resolver unmatches the loser of a
+        # (photo, person) pair. Without it the nightly sweep re-applied the
+        # same label the resolver had just stripped, every night, forever
+        # (202k -> 213k unmatched over eight runs at ~6,000 flapping labels a
+        # night). Per (face, person) on purpose: the loser may legitimately be
+        # a DIFFERENT person, so the face stays matchable to everyone else —
+        # which is exactly why 'dedupe_unmatched' could not simply be filtered
+        # out of MATCHABLE_SQL.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS face_person_exclusions (
+                face_id    INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+                person_id  INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+                reason     TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (face_id, person_id)
+            )
+        """)
+        # Backfill the faces already stuck in the loop. face_dedupe_undo is an
+        # on-demand table (it may never have been created), the insert is
+        # INSERT OR IGNORE against a PK, and the whole thing is one indexed
+        # join — so the fix takes effect on deploy with no operator step.
+        #
+        # Guarded because this runs inside the CONSTRUCTOR: anything that
+        # escapes here stops the web server and every CLI container from
+        # starting, leaves the schema at 30, and is retried forever. A missed
+        # backfill only means some faces keep churning, which is the bug we
+        # already had — strictly better than a total outage. Logged, never
+        # silent; `photosearch backfill-face-exclusions --apply` is the retry.
+        try:
+            backfill_exclusions_from_dedupe_undo(self.conn, apply=True)
+        except Exception:
+            logger.warning(
+                "face-exclusion backfill failed during the v31 migration; "
+                "schema upgrade continues. Retry with "
+                "`photosearch backfill-face-exclusions --apply`.",
+                exc_info=True,
+            )
+
         # Photo stacks — burst/bracket groups of near-identical shots
         cur.execute("""
             CREATE TABLE IF NOT EXISTS photo_stacks (
@@ -627,6 +870,21 @@ class PhotoDB:
                 is_top INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (stack_id, photo_id),
                 UNIQUE(photo_id)
+            )
+        """)
+
+        # Stacking ledger (schema v32) — which photos stack detection has
+        # already considered, and at which date_taken. The nightly
+        # maintenance sweep used to re-detect the WHOLE library and rewrite
+        # every stack (27,165 of them) every night on an unchanged library;
+        # with this it re-detects only the burst sessions around photos that
+        # are new, re-timed, or whose stack lost a member. See
+        # stacking.run_incremental_stacking.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stacking_seen (
+                photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                date_taken TEXT,
+                seen_at    TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
 
@@ -886,7 +1144,13 @@ class PhotoDB:
         return dict(row) if row else None
 
     def update_photo(self, photo_id: int, **kwargs):
-        """Update fields on a photo record."""
+        """Update fields on a photo record.
+
+        A ``filepath`` change also re-derives ``folder`` (unless the caller
+        passes one), mirroring ``add_photo`` — see ``set_photo_filepath``.
+        """
+        if "filepath" in kwargs and "folder" not in kwargs:
+            kwargs["folder"] = folder_for_path(kwargs["filepath"])
         set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
         self.conn.execute(
             f"UPDATE photos SET {set_clause} WHERE id = ?",
@@ -1145,11 +1409,20 @@ class PhotoDB:
         """Link a face to a named person.
 
         match_source: 'strict', 'temporal', or 'manual'.  Stored for filtering.
+
+        A NON-automatic source (manual, merge_review, an explicit None from an
+        API write) is a human overruling the duplicate resolver, so it also
+        clears any face/person exclusion for this pairing. This is the shared
+        primitive every manual-assign path goes through — /api/faces/{id}/assign,
+        bulk-assign, correct-face and the manual-assignment import — so the
+        clear lives here rather than being re-implemented at each call site.
         """
         self.conn.execute(
             "UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
             (person_id, match_source, face_id),
         )
+        if person_id is not None and match_source not in AUTO_MATCH_SOURCES:
+            clear_face_person_exclusion(self.conn, face_id, person_id)
         self._maybe_commit()
 
     # ------------------------------------------------------------------
@@ -1402,13 +1675,14 @@ class PhotoDB:
             ).fetchall()
         return [row[0] for row in rows]
 
-    def _directory_scope_sql(self, directory: str) -> tuple[str, tuple]:
-        """(sql, params) selecting photo ids in `directory` or any subfolder.
+    def normalize_directory(self, directory: str) -> str:
+        """Normalize a directory to the form stored in `photos.folder`.
 
-        `folder` is dirname(filepath), so "in dir or below" is exactly
-        folder == dir, or folder starts with dir + '/'. The second half is
-        written as a half-open range — '0' is the character after '/' — because
-        a range uses idx_photos_folder and a LIKE does not.
+        Strips whitespace, drops a leading './', re-roots an absolute path
+        under `photo_root` (when one is set), and strips leading/trailing
+        '/'. Shared by `_directory_scope_sql` (worker-fleet directory
+        scoping) and `ingest_batches.register_batch` (M "ingest batch"
+        identity), so both agree on what "the same directory" means.
         """
         prefix = directory.strip()
         while prefix.startswith("./"):
@@ -1418,7 +1692,17 @@ class PhotoDB:
                 prefix = str(Path(prefix).resolve().relative_to(self.photo_root))
             except ValueError:
                 pass
-        prefix = prefix.strip("/")
+        return prefix.strip("/")
+
+    def _directory_scope_sql(self, directory: str) -> tuple[str, tuple]:
+        """(sql, params) selecting photo ids in `directory` or any subfolder.
+
+        `folder` is dirname(filepath), so "in dir or below" is exactly
+        folder == dir, or folder starts with dir + '/'. The second half is
+        written as a half-open range — '0' is the character after '/' — because
+        a range uses idx_photos_folder and a LIKE does not.
+        """
+        prefix = self.normalize_directory(directory)
         return (
             "SELECT id FROM photos WHERE folder = ? OR (folder >= ? AND folder < ?)",
             (prefix, prefix + "/", prefix + "0"),

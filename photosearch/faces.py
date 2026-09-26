@@ -491,6 +491,34 @@ MATCHABLE_SQL = (
 )
 
 
+def load_match_exclusions(db) -> dict[int, set[int]]:
+    """{face_id: {person_id, ...}} the matchers must not re-create.
+
+    Shared by BOTH matchers for the same reason MATCHABLE_SQL is: the
+    match/unmatch churn loop was one candidate path, not both, and a fix
+    applied to only the strict matcher would have looked complete while the
+    temporal one kept flapping.
+
+    Loaded ONCE per run and consulted as a dict lookup — the matchers walk
+    ~213k unmatched faces on a 4-core N100, so a query per face is not an
+    option. The table holds a few thousand rows.
+
+    An exclusion is per (face, person), but the two matchers act on it
+    DIFFERENTLY and must not be unified:
+
+    - **strict** offers the face to the NEXT best person inside the same
+      tolerance. It has no ambiguity rule, so the runner-up is judged by
+      exactly the bar the winner had to clear.
+    - **temporal** ranks the UNFILTERED field and simply leaves the face
+      unmatched when the winner is barred. Its `min_gap` check is a judgement
+      about the whole field, so filtering first would promote a runner-up the
+      real field had rejected as ambiguous — the sibling-mislabel case. See
+      `match_faces_temporal` for the measured numbers.
+    """
+    from .db import load_face_person_exclusions
+    return load_face_person_exclusions(db.conn)
+
+
 CLUSTER_MIN_DET_SCORE = 0.65
 CLUSTER_MIN_BBOX_EDGE = 60
 
@@ -1023,9 +1051,16 @@ def match_faces_to_persons(
         photo_ids: If set, only match faces belonging to these photo IDs
             (e.g. from a collection).
 
+    Matching needs NO model: it is SQL + struct + numpy over encodings that
+    are already stored, exactly like match_faces_temporal below. So there is
+    deliberately no check_available() here -- the guard it used to carry was
+    inherited from when this module only did detection, and it made the whole
+    pass (and its tests) fail on a machine with no insightface installed.
+    detect_faces keeps its own guard; maintenance._stage_match_faces guards
+    the sweep, which may also run the detector.
+
     Returns the number of faces matched.
     """
-    check_available()
     import struct
     from .db import FACE_DIMENSIONS
 
@@ -1078,6 +1113,8 @@ def match_faces_to_persons(
         print("  All faces already matched.")
         return 0
 
+    exclusions = load_match_exclusions(db)
+
     matched = 0
     for face_row in face_rows:
         face_id = face_row["id"]
@@ -1090,10 +1127,17 @@ def match_faces_to_persons(
         face_enc = list(struct.unpack(f"{FACE_DIMENSIONS}f", enc_row["encoding"]))
         best_matches = match_face(face_enc, ref_encodings, tolerance=tolerance)
 
-        if best_matches:
-            best_idx, _ = best_matches[0]
-            db.assign_face_to_person(face_id, person_ids[best_idx], match_source="strict")
+        # match_face returns EVERY reference inside tolerance, closest first,
+        # so walking it past an excluded person is exactly "next best under the
+        # same tolerance" — no second pass, no widened radius.
+        barred = exclusions.get(face_id)
+        for best_idx, _ in best_matches:
+            pid = person_ids[best_idx]
+            if barred and pid in barred:
+                continue
+            db.assign_face_to_person(face_id, pid, match_source="strict")
             matched += 1
+            break
 
     return matched
 
@@ -1226,6 +1270,7 @@ def match_faces_temporal(
 
     window = timedelta(minutes=window_minutes)
     matched = 0
+    exclusions = load_match_exclusions(db)
 
     for face_row in face_rows:
         face_id = face_row["id"]
@@ -1242,9 +1287,27 @@ def match_faces_temporal(
         encs_np  = np.array(person_encs_u)
         dists = np.sqrt(((encs_np - query_np) ** 2).sum(axis=1)).tolist()
 
-        # Sort by distance
+        # Rank the FULL field, then refuse outright if the winner is barred.
+        #
+        # Deliberately NOT the strict matcher's fall-through, and the two must
+        # not be unified: Check 2 below (`min_gap`) is a judgement about the
+        # whole field, so removing the barred person BEFORE it would hand the
+        # runner-up an unopposed win the real field never gave them. A face
+        # 1.20 from Calvin and 1.25 from Ellie is a 0.05 gap that this matcher
+        # REFUSES as ambiguous; bar Calvin and Ellie becomes a lone candidate
+        # with no one to be ambiguous against. That converts self-cancelling
+        # nightly churn into a PERSISTENT sibling mislabel — measured on the
+        # 260k-face replica, 34 of 1,500 sampled faces gained a label that way,
+        # 17 of them Calvin<->Ellie.
+        #
+        # Strict keeps its fall-through because it has no gap rule and judges
+        # the runner-up by the identical tolerance (measured: 0 of 600 sampled
+        # excluded faces actually fell through).
         ranked = sorted(zip(dists, person_ids_u), key=lambda x: x[0])
         best_dist, best_pid = ranked[0]
+        barred = exclusions.get(face_id)
+        if barred and best_pid in barred:
+            continue
 
         # Check 1: best distance within temporal tolerance
         if best_dist > temporal_tolerance:

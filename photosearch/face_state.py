@@ -85,6 +85,20 @@ _ADDITIVE_PERSON_WHERE = (
     "AND (SELECT person_id FROM a.face_assignments WHERE face_id = faces.id) IS NOT NULL"
 )
 
+# A (face, person) pairing the TARGET de-duplicated away must not come back by
+# the long route. The replica recomputes matches off a synced copy, so its
+# file can carry exactly the pairing the NAS has since stripped — applying it
+# would restart the nightly match/unmatch churn loop through the push instead
+# of through the matcher. Checked against the target's own exclusions (the
+# file has none), and applied to the overwrite path too: the one-person-per-
+# photo invariant is not something a force flag should be able to violate.
+_NOT_EXCLUDED = (
+    "AND NOT EXISTS (SELECT 1 FROM face_person_exclusions e "
+    "                WHERE e.face_id = faces.id AND e.person_id = "
+    "                  (SELECT person_id FROM a.face_assignments WHERE face_id = faces.id))"
+)
+_ADDITIVE_PERSON_WHERE += " " + _NOT_EXCLUDED
+
 
 def apply_face_state(
     db,
@@ -127,7 +141,10 @@ def apply_face_state(
             if overwrite_persons:
                 summary["persons"] = c.execute(
                     "SELECT COUNT(*) FROM faces f JOIN a.face_assignments x ON x.face_id = f.id "
-                    "WHERE IFNULL(f.person_id, -1) <> IFNULL(x.person_id, -1)").fetchone()[0]
+                    "WHERE IFNULL(f.person_id, -1) <> IFNULL(x.person_id, -1) "
+                    "AND NOT EXISTS (SELECT 1 FROM face_person_exclusions e "
+                    "                WHERE e.face_id = f.id AND e.person_id = x.person_id)"
+                ).fetchone()[0]
             else:
                 summary["persons"] = c.execute(
                     f"SELECT COUNT(*) FROM faces WHERE {_ADDITIVE_PERSON_WHERE}").fetchone()[0]
@@ -159,7 +176,8 @@ def apply_face_state(
             if apply_persons:
                 src = "(SELECT {col} FROM a.face_assignments WHERE face_id = faces.id)"
                 if overwrite_persons:
-                    where = "id IN (SELECT face_id FROM a.face_assignments)"
+                    where = ("id IN (SELECT face_id FROM a.face_assignments) "
+                             + _NOT_EXCLUDED)
                 else:
                     where = _ADDITIVE_PERSON_WHERE
                 c.execute(f"UPDATE faces SET person_id = {src.format(col='person_id')}, "

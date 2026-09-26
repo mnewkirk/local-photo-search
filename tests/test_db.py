@@ -1141,7 +1141,8 @@ def test_mark_processed_blocks_after_max_attempts_category_content(tmp_path):
 
 
 def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
-    """A v28 DB gains maintenance_runs on open, and the version is stamped 29."""
+    """A v28 DB gains maintenance_runs on open, and the version is stamped
+    to the current SCHEMA_VERSION (a single-shot init, not stepped)."""
     import sqlite3
     from photosearch.db import PhotoDB, SCHEMA_VERSION
 
@@ -1159,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 29
+        assert int(version) == SCHEMA_VERSION == 32
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1198,3 +1199,131 @@ def test_record_maintenance_run_commit_false_is_rollback_able(db):
     )
     db.conn.rollback()
     assert db.get_maintenance_runs() == {}
+
+
+# =========================================================================
+# Schema v30 — ingest_batches / ingest_sweeps / ingest_batch_jobs
+# =========================================================================
+
+def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
+    """A v29 DB (missing the three ingest-batch tables) gains them on open,
+    additively and idempotently, and the version is stamped 30."""
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    db.conn.execute("DROP TABLE ingest_sweeps")
+    db.conn.execute("DROP TABLE ingest_batches")
+    db.conn.execute("DROP TABLE ingest_batch_jobs")
+    db.conn.execute("UPDATE schema_info SET value = '29' WHERE key = 'version'")
+    db.conn.commit()
+    db.close()
+
+    with PhotoDB(tmp_db_path) as reopened:
+        tables = {r[0] for r in reopened.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert {"ingest_sweeps", "ingest_batches", "ingest_batch_jobs"}.issubset(tables)
+
+        sweep_cols = {r["name"] for r in reopened.conn.execute("PRAGMA table_info(ingest_sweeps)")}
+        assert sweep_cols == {"run_id", "status", "started_at", "finished_at",
+                               "heartbeat_at", "files_seen", "files_moved", "error"}
+
+        batch_cols = {r["name"] for r in reopened.conn.execute("PRAGMA table_info(ingest_batches)")}
+        assert batch_cols == {"id", "directory", "source", "run_id", "created_at",
+                               "updated_at", "photo_count", "ready_at", "dismissed_at"}
+
+        job_cols = {r["name"] for r in reopened.conn.execute("PRAGMA table_info(ingest_batch_jobs)")}
+        assert job_cols == {"batch_id", "step", "job_kind", "opened_at",
+                             "expires_at", "closed_at"}
+
+        version = reopened.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 32
+
+    # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
+    # the tables intact (schema-version fast-path skips the DDL entirely).
+    with PhotoDB(tmp_db_path) as reopened_again:
+        tables = {r[0] for r in reopened_again.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert {"ingest_sweeps", "ingest_batches", "ingest_batch_jobs"}.issubset(tables)
+
+
+# =========================================================================
+# Schema v31 — face_person_exclusions
+# =========================================================================
+
+def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
+    """A v30 DB gains the face/person exclusion table on open, additively,
+    and is stamped 31. The table is what stopped the nightly match/unmatch
+    churn loop — see tests/test_face_person_exclusions.py."""
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    db.conn.execute("DROP TABLE IF EXISTS face_person_exclusions")
+    db.conn.execute("UPDATE schema_info SET value = '30' WHERE key = 'version'")
+    db.conn.commit()
+    db.close()
+
+    with PhotoDB(tmp_db_path) as reopened:
+        cols = {r["name"] for r in reopened.conn.execute(
+            "PRAGMA table_info(face_person_exclusions)")}
+        assert cols == {"face_id", "person_id", "reason", "created_at"}
+        version = reopened.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 32
+
+    # Idempotent: the version fast-path skips the DDL and the table survives.
+    with PhotoDB(tmp_db_path) as again:
+        assert again.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='face_person_exclusions'").fetchone()
+
+
+# =========================================================================
+# Schema v32 — stacking_seen (incremental stacking ledger)
+# =========================================================================
+
+def test_v31_db_migrates_to_v32_stacking_seen(db, tmp_db_path):
+    """A v31 DB gains the stacking ledger on open, additively, and is stamped
+    32. Existing stacks are untouched — the ledger starts empty, which makes
+    the first incremental run treat every photo as dirty (one full detection,
+    diff-written) and then fill it."""
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    a = db.add_photo(filepath="a.jpg", filename="a.jpg")
+    b = db.add_photo(filepath="b.jpg", filename="b.jpg")
+    db.create_stack([a, b], top_photo_id=a)
+    db.conn.execute("DROP TABLE IF EXISTS stacking_seen")
+    db.conn.execute("UPDATE schema_info SET value = '31' WHERE key = 'version'")
+    db.conn.commit()
+    db.close()
+
+    with PhotoDB(tmp_db_path) as reopened:
+        cols = {r["name"] for r in reopened.conn.execute(
+            "PRAGMA table_info(stacking_seen)")}
+        assert cols == {"photo_id", "date_taken", "seen_at"}
+        version = reopened.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 32
+        assert reopened.conn.execute(
+            "SELECT COUNT(*) FROM stack_members").fetchone()[0] == 2
+
+
+class TestNormalizeDirectory:
+    """`normalize_directory` is the shared helper `_directory_scope_sql` and
+    `ingest_batches.register_batch` both use to agree on directory identity."""
+
+    def test_strips_leading_dot_slash(self, db):
+        assert db.normalize_directory("./2091/2091-09-19_ILCE-7RM6") == "2091/2091-09-19_ILCE-7RM6"
+
+    def test_strips_surrounding_slashes_and_whitespace(self, db):
+        assert db.normalize_directory("  /2091/2091-09-19_ILCE-7RM6/  ") == "2091/2091-09-19_ILCE-7RM6"
+
+    def test_reroots_absolute_path_under_photo_root(self, db):
+        # The `db` fixture sets photo_root to "/photos".
+        assert db.normalize_directory("/photos/2091/2091-09-19_ILCE-7RM6") == "2091/2091-09-19_ILCE-7RM6"
+
+    def test_already_relative_path_unchanged(self, db):
+        assert db.normalize_directory("2091/2091-09-19_ILCE-7RM6") == "2091/2091-09-19_ILCE-7RM6"

@@ -691,20 +691,6 @@ def recluster_faces(db, eps, min_samples, no_session_stacking, session_eps,
 # split-cluster
 # ---------------------------------------------------------------------------
 
-def _record_unmatch_undo(conn, face_ids):
-    """Snapshot (face_id, person_id, match_source) for each face about to be
-    unmatched, so the bulk change is reversible via restore-unmatched-faces.
-    On-demand utility table (not part of the migrated schema)."""
-    conn.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
-                 "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
-                 "unmatched_at TEXT DEFAULT (datetime('now')))")
-    for fid in face_ids:
-        row = conn.execute("SELECT person_id, match_source FROM faces WHERE id = ?", (fid,)).fetchone()
-        if row and row["person_id"] is not None:
-            conn.execute("INSERT OR REPLACE INTO face_dedupe_undo(face_id, person_id, match_source) "
-                         "VALUES (?, ?, ?)", (fid, row["person_id"], row["match_source"]))
-
-
 def _write_face_dedupe_report(decisions, path, nas_url, person, limit=120):
     """HTML gallery of keep-vs-remove FACE crops for the dedupe spot-check.
     Least-confident decisions first (smallest gap) so the riskiest calls are at
@@ -871,10 +857,8 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
-        _record_unmatch_undo(c, to_unmatch)
-        for fid in to_unmatch:
-            c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
-                      "WHERE id = ?", (fid,))
+        from photosearch.db import unmatch_faces_as_duplicates
+        unmatch_faces_as_duplicates(c, to_unmatch, reason="dedupe_person_faces")
         pdb.conn.commit()
         click.echo(f"Applied: unmatched {len(to_unmatch)} face(s) from {person}. "
                    "Reversible via: photosearch restore-unmatched-faces.")
@@ -1001,6 +985,30 @@ def restore_unmatch(db, src, do_apply):
                f"(labelled since, or gone).")
 
 
+@cli.command("backfill-face-exclusions")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", "do_apply", is_flag=True, default=False,
+              help="Write the exclusions. Default: dry-run.")
+def backfill_face_exclusions(db, do_apply):
+    """Stop the historically de-duplicated faces from churning.
+
+    Creates a face/person exclusion for every `face_dedupe_undo` snapshot whose
+    face is still unmatched with match_source='dedupe_unmatched' — the ~5,500
+    faces the nightly sweep re-matched and re-stripped every night before v31.
+    Idempotent. The v31 migration runs this automatically on first open, so
+    this command is for re-checking or for a DB that gained undo rows since.
+    """
+    from photosearch.db import backfill_exclusions_from_dedupe_undo
+    with PhotoDB(db) as pdb:
+        n = backfill_exclusions_from_dedupe_undo(pdb.conn, apply=do_apply)
+        if not do_apply:
+            click.echo(f"{n} exclusion(s) would be created. Re-run with --apply.")
+            return
+        pdb.conn.commit()
+        click.echo(f"Created {n} exclusion(s).")
+
+
 @cli.command("restore-unmatched-faces")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
@@ -1026,9 +1034,14 @@ def restore_unmatched_faces(db, apply):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
+        from photosearch.db import clear_face_person_exclusion
         for r in rows:
             c.execute("UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
                       (r["person_id"], r["match_source"], r["face_id"]))
+            # The restore puts this exact pairing back, so its exclusion is
+            # spent — leaving it would make the face permanently unmatchable
+            # to the person we just restored it to.
+            clear_face_person_exclusion(c, r["face_id"], r["person_id"])
             c.execute("DELETE FROM face_dedupe_undo WHERE face_id = ?", (r["face_id"],))
         pdb.conn.commit()
         click.echo(f"Restored {len(rows)} face(s).")
@@ -1078,10 +1091,8 @@ def resolve_duplicate_persons(db, apply):
         if not apply:
             click.echo("Dry run — no changes written. Re-run with --apply.")
             return
-        _record_unmatch_undo(c, to_unmatch)
-        for fid in to_unmatch:
-            c.execute("UPDATE faces SET person_id = NULL, match_source = 'dedupe_unmatched' "
-                      "WHERE id = ?", (fid,))
+        from photosearch.db import unmatch_faces_as_duplicates
+        unmatch_faces_as_duplicates(c, to_unmatch, reason="resolve_duplicate_persons")
         pdb.conn.commit()
         click.echo(f"Applied: unmatched {len(to_unmatch)} duplicate face(s). "
                    "Every photo now has each person at most once. "
@@ -2516,6 +2527,10 @@ def normalize_subject_aesthetics(db, apply):
 @click.option("--no-stacking", is_flag=True, default=False, help="Skip the stacking stage.")
 @click.option("--no-match", is_flag=True, default=False,
               help="Skip face match-faces (the heaviest CPU stage).")
+@click.option("--match-temporal", is_flag=True, default=False,
+              help="Also run the TEMPORAL face matcher in the match stage. Off by "
+                   "default: it over-matches badly on kids'-sport shoots, and this "
+                   "sweep runs unattended over shoots nobody has reviewed yet.")
 @click.option("--light", is_flag=True, default=False,
               help="Only the fast stages (geocode/normalize/infer/resolve-dups) — skips "
                    "colors+stacking+match. Safe to run while the web UI is live (those "
@@ -2543,7 +2558,7 @@ def normalize_subject_aesthetics(db, apply):
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
-def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, recluster,
+def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_temporal, light, recluster,
                       dedup_photos, requeue, requeue_passes, normalize_aesthetics,
                       normalize_subject_aesthetics, window_minutes,
                       max_drift_km, min_confidence):
@@ -2568,8 +2583,10 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
         bits = []
         if ev.get("would"):
             bits.append(f"would {ev['would']}")
-        if ev.get("applied"):
-            bits.append(f"applied {ev['applied']}")
+        # A finished stage always states its applied count, even 0: "done:
+        # would 1373" with no applied reads as if the count were missing.
+        if ev.get("applied") or (ev.get("status") == "done" and "applied" in ev):
+            bits.append(f"applied {ev.get('applied') or 0}")
         if ev.get("message"):
             bits.append(ev["message"])
         click.echo(f"  [{ev.get('stage')}] {ev.get('status')}"
@@ -2579,7 +2596,8 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, light, reclus
         try:
             res = run_maintenance_sweep(
                 pdb, apply=apply, do_colors=not no_colors, do_stacking=not no_stacking,
-                do_match=not no_match, do_recluster=recluster, do_dedup=dedup_photos,
+                do_match=not no_match, match_temporal=match_temporal,
+                do_recluster=recluster, do_dedup=dedup_photos,
                 do_requeue=requeue, requeue_passes=rq_passes,
                 force_normalize_aesthetics=normalize_aesthetics,
                 force_normalize_subject_aesthetics=normalize_subject_aesthetics,
@@ -2629,6 +2647,66 @@ def repair_data_cmd(db, apply):
         click.echo(f"{cat}: {info}")
     if not apply:
         click.echo("Dry run — no changes written. Re-run with --apply.")
+
+
+# ---------------------------------------------------------------------------
+# batch-advance (M "ingest batch" Task 6)
+# ---------------------------------------------------------------------------
+
+@cli.command("batch-advance")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--batch", "batch_id", type=int, required=True,
+              help="Ingest batch id (see the /batches page).")
+@click.option("--apply", is_flag=True, default=False,
+              help="Run the steps. Default: dry-run (reports what WOULD run and "
+                   "writes nothing — not even a job row).")
+def batch_advance_cmd(db, batch_id, apply):
+    """Run the NAS-side steps one ingest batch still needs, in order.
+
+    Stacking, aesthetic-percentile refresh, strict face matching,
+    duplicate-person resolution, face-crop warming and the optional
+    native-resolution sharpness measurement (`rank_measure`, which writes the
+    cache `scripts/rank_shoot.py --date D` reads) — the steps that run where
+    the DB and the photo files live. Stops at the first step that is
+    waiting on something this command can't do (a worker pass, typically
+    `faces`): launch the fleet for those from /status or /batches.
+
+    Run this on the NAS — it writes, and the NAS is the sole writer.
+    """
+    from photosearch.batch_advance import advance_nas_steps
+
+    def on_prog(ev):
+        if ev.get("status") in ("running", "scanning"):
+            return
+        bits = [f"{k}={v}" for k, v in ev.items()
+                if k not in ("phase", "step", "status", "reason", "error")
+                and not isinstance(v, (dict, list))]
+        extra = ev.get("reason") or ev.get("error") or ", ".join(bits)
+        click.echo(f"  [{ev.get('step')}] {ev.get('status')}"
+                   + (f": {extra}" if extra else ""))
+
+    with PhotoDB(db) as pdb:
+        try:
+            res = advance_nas_steps(pdb, batch_id, apply=apply, on_progress=on_prog)
+        except ValueError as e:
+            raise click.ClickException(str(e))
+        except KeyboardInterrupt:
+            click.echo("Aborted."); return
+
+    planned = [s["step"] for s in res["steps"] if s["status"] == "would_run"]
+    if apply:
+        click.echo(f"Advanced batch {batch_id} ({res['directory']}): "
+                   + (f"ran {', '.join(res['ran'])}." if res["ran"]
+                      else "nothing to run."))
+    else:
+        click.echo(f"Batch {batch_id} ({res['directory']}) dry-run: "
+                   + (f"would run {', '.join(planned)}. Re-run with --apply."
+                      if planned else "nothing to run."))
+    if res["stopped_at"]:
+        click.echo(f"Stopped at {res['stopped_at']}: {res['stopped_reason']}")
+    if res["error"]:
+        raise click.ClickException(res["error"])
 
 
 # ---------------------------------------------------------------------------
@@ -2687,6 +2765,7 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
     successfully are physically moved, not copied.
     """
     from photosearch.ingest import ingest_incoming, IngestAlreadyRunning
+    from photosearch.ingest_batches import register_batch, set_sweep_status
 
     def _csv_env(name):
         return [s.strip() for s in os.environ.get(name, "").split(",") if s.strip()]
@@ -2740,38 +2819,186 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
         click.echo("\nDry run — no files moved, no DB rows written.")
         return
 
-    if not index:
+    # run_id is None when the sweep moved/archived nothing (ingest_incoming
+    # creates no ingest_sweeps row in that case) — nothing below needs a
+    # status transition then.
+    run_id = result.get("run_id")
+
+    # (source, new_dir) pairs across all sources — feeds both the post-move
+    # index pass and the batch registration that follows it.
+    dir_sources: list[tuple[str, str]] = []
+    for source, stats in result["sources"].items():
+        for d in stats["new_dirs"]:
+            dir_sources.append((source, d))
+
+    if not dir_sources and run_id is None:
         return
 
-    # Collect every new dated folder across sources and index each one.
-    new_dirs: list[str] = []
-    for stats in result["sources"].values():
-        new_dirs.extend(stats["new_dirs"])
-    if not new_dirs:
-        return
-
-    if no_clip:
-        passes = "register only; CLIP left to the worker fleet"
-    else:
-        passes = "CLIP only" if no_colors else "CLIP + colors"
-    click.echo(f"\nIndexing {len(new_dirs)} new folder(s) ({passes})...")
-    for d in new_dirs:
-        click.echo(f"  -> {d}")
+    with PhotoDB(db) as pdb:
         try:
-            index_directory(
-                photo_dir=d,
-                db_path=db,
-                enable_clip=not no_clip,
-                enable_colors=not (no_colors or no_clip),
-                enable_faces=False,
-                enable_describe=False,
-                enable_quality=False,
-                enable_category_content=False,
-                enable_category_visual=False,
-                enable_keywords=False,
-            )
+            if run_id is not None:
+                set_sweep_status(pdb, run_id, "indexing")
+
+            if index and dir_sources:
+                if no_clip:
+                    passes = "register only; CLIP left to the worker fleet"
+                else:
+                    passes = "CLIP only" if no_colors else "CLIP + colors"
+                click.echo(f"\nIndexing {len(dir_sources)} new folder(s) ({passes})...")
+                for source, d in dir_sources:
+                    click.echo(f"  -> {d}")
+                    try:
+                        index_directory(
+                            photo_dir=d,
+                            db_path=db,
+                            enable_clip=not no_clip,
+                            enable_colors=not (no_colors or no_clip),
+                            enable_faces=False,
+                            enable_describe=False,
+                            enable_quality=False,
+                            enable_category_content=False,
+                            enable_category_visual=False,
+                            enable_keywords=False,
+                        )
+                    except Exception as exc:
+                        click.echo(f"     ERROR indexing {d}: {exc}", err=True)
+
+                    # Register (or widen) the batch for this folder now that
+                    # index_directory has had a chance to add its photo rows.
+                    # A folder register_batch can't find any rows for (the
+                    # index pass above failed, or found nothing new) is
+                    # skipped, never fatal to the rest of the sweep. Bookkeeping
+                    # must never abort a file-moving sweep, so any exception
+                    # (not just ValueError — e.g. sqlite3.OperationalError
+                    # "database is locked") is caught here too, or the folders
+                    # after the failing one would never get indexed/registered.
+                    try:
+                        register_batch(pdb, d, source=source, run_id=run_id)
+                    except Exception as exc:
+                        click.echo(f"     WARNING: not registering {d}: {exc}", err=True)
+            elif dir_sources:
+                # --no-index: no fresh photo rows were created by this run,
+                # so only register folders that already have rows from an
+                # earlier, indexed sweep into the same dated folder today —
+                # register_batch's ValueError silently covers the rest. Same
+                # never-abort-the-sweep guard as the --index branch above.
+                for source, d in dir_sources:
+                    try:
+                        register_batch(pdb, d, source=source, run_id=run_id)
+                    except Exception as exc:
+                        click.echo(f"     WARNING: not registering {d}: {exc}", err=True)
+
+            if run_id is not None:
+                set_sweep_status(pdb, run_id, "registered")
         except Exception as exc:
-            click.echo(f"     ERROR indexing {d}: {exc}", err=True)
+            # A crash here must never leave the sweep stuck 'indexing'
+            # forever — stamp it failed and re-raise.
+            if run_id is not None:
+                set_sweep_status(pdb, run_id, "failed", error=str(exc))
+            raise
+
+
+# ---------------------------------------------------------------------------
+# refile-unknown-camera
+# ---------------------------------------------------------------------------
+
+@cli.command("refile-unknown-camera")
+@click.option("--photo-root", default=None,
+              help="Library root. Precedence: this flag, then PHOTO_ROOT, then "
+                   "the DB's stored photo_root (the NAS stores none).")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Actually move files. Default is a DRY RUN that writes nothing.")
+@click.option("--audit", "audit_path", default=None,
+              help="CSV audit written per file (action,source,destination,model,"
+                   "size,hash,reason). REQUIRED with --apply — it is the undo.")
+@click.option("--only", "only", multiple=True, metavar="DIR",
+              help="Restrict to this *_unknown-camera folder (name or path). "
+                   "Repeatable — do one small folder first.")
+@click.option("--limit", default=None, type=int, help="Stop after N moves.")
+@click.option("--include-indexed", is_flag=True, default=False,
+              help="Also move files that have a photos row (or are some photo's "
+                   "raw_filepath), updating filepath/folder/raw_filepath after "
+                   "the move. Default skips them.")
+@click.option("--infer-from-sibling", is_flag=True, default=False,
+              help="For a file whose EXIF names no model, adopt the model of the "
+                   "ONLY other folder for that date when it holds a same-stem "
+                   "sibling. Off by default — a wrong guess mixes two bodies.")
+@click.option("--undo", "undo_path", default=None, metavar="AUDIT.csv",
+              help="Reverse the moves recorded in an audit CSV instead of refiling.")
+def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
+                              include_indexed, infer_from_sibling, undo_path):
+    """Re-file YYYY-MM-DD_unknown-camera/ onto the body each file's EXIF names.
+
+    'unknown-camera' is the SD-card importer's fallback label, not a fact — it
+    could not read a new body's RAW model, so those .ARW files were filed away
+    from their own JPEGs. ingest._file_suffix self-corrects now; this repairs
+    the files already on disk.
+
+    The model comes ONLY from the file's own EXIF (never the date, never a
+    sibling folder — two bodies were in use on several of these days). The date
+    comes ONLY from the source folder's name.
+
+    Nothing can be overwritten: the move is os.link + unlink (EEXIST instead of
+    clobbering), because the nightly ingest writes into these same dated folders
+    and the check-then-move window is real. A taken destination is hash-compared
+    and reported as duplicate_left or conflict; the source is always left alone.
+
+    A pre-flight refuses to run at all while any photos row stores a
+    non-canonical path (absolute / './' / backslash / '//'): the DB link lookup
+    matches paths as strings, so such a row could be missed and its file moved
+    out from under it. --apply also takes ingest's sweep lock.
+
+    Dry run by default (and read-only on the DB, and it never hashes). --apply
+    requires --audit; that CSV, written intent-then-confirm per file, reverses
+    the run:
+
+        photosearch refile-unknown-camera --undo /data/refile.csv --apply
+    """
+    from photosearch.ingest import IngestAlreadyRunning
+    from photosearch.refile import refile_unknown_camera, undo_refile, render_report
+
+    if undo_path:
+        stats = undo_refile(undo_path, db, apply=apply)
+        click.echo(f"Undo from {undo_path}: {stats['candidates']:,} candidate rows")
+        click.echo(f"  restored={stats['restored']:,}  "
+                   f"would_restore={stats['would_restore']:,}  "
+                   f"refused={stats['refused']:,}  "
+                   f"never_started={stats['no_op']:,}  errors={stats['errors']:,}")
+        for path, why in stats["refusals"]:
+            click.echo(f"  REFUSED {path}: {why}")
+        if not apply:
+            click.echo("\nDry run — nothing restored. Re-run with --apply.")
+        return
+
+    last = {"folder": None}
+
+    def _progress(ev):
+        if ev.get("event") == "folder" and ev["name"] != last["folder"]:
+            last["folder"] = ev["name"]
+            click.echo(f"  [{ev['index'] + 1}/{ev['total']}] {ev['name']}", err=True)
+
+    try:
+        stats = refile_unknown_camera(
+            photo_root, db, apply=apply, audit_path=audit_path,
+            only=list(only) or None, limit=limit,
+            include_indexed=include_indexed,
+            infer_from_sibling=infer_from_sibling,
+            on_progress=_progress,
+        )
+    except IngestAlreadyRunning as exc:
+        # An ingest sweep is moving files under _incoming/ right now; refiling
+        # the same tree concurrently would race it. Nothing is lost by waiting.
+        raise click.ClickException(str(exc)) from None
+    except (ValueError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+    for line in render_report(stats):
+        click.echo(line)
+    if apply and audit_path:
+        click.echo(f"\nAudit: {audit_path}  "
+                   f"(undo with --undo {audit_path} --apply)")
 
 
 # ---------------------------------------------------------------------------
@@ -3070,9 +3297,13 @@ def correct_face(filename, face_number, correct_person, db):
             else:
                 person_id = person["id"]
 
-            photo_db.conn.execute(
-                "UPDATE faces SET person_id = ? WHERE id = ?", (person_id, target_face["id"])
-            )
+            # Through the shared manual-assign primitive, not a raw UPDATE: a
+            # human naming a face overrules the duplicate resolver, so this
+            # must clear any face/person exclusion for the pairing (and stamp
+            # the source, which the raw UPDATE left on whatever the matcher
+            # had written).
+            photo_db.assign_face_to_person(
+                target_face["id"], person_id, match_source="manual")
             photo_db.conn.commit()
             click.echo(f"✓ Face {face_number} in {filename} reassigned: {old_name} → {correct_person}.")
 
@@ -4043,17 +4274,14 @@ def relocate_into_year_dirs(db, dry_run, conflicts_file):
             click.echo("\nNo changes made (dry run).")
             return
 
+        from photosearch.db import set_photo_filepath, _KEEP
         for pid, _old, new_fp, _raw, new_raw in planned:
-            if new_raw is not None:
-                photo_db.conn.execute(
-                    "UPDATE photos SET filepath = ?, raw_filepath = ? WHERE id = ?",
-                    (new_fp, new_raw, pid),
-                )
-            else:
-                photo_db.conn.execute(
-                    "UPDATE photos SET filepath = ? WHERE id = ?",
-                    (new_fp, pid),
-                )
+            # Shared primitive: also re-derives photos.folder, which a bare
+            # UPDATE of filepath used to leave stale.
+            set_photo_filepath(
+                photo_db.conn, pid, new_fp,
+                raw_filepath=new_raw if new_raw is not None else _KEEP,
+            )
         photo_db.conn.commit()
         click.echo(f"Updated {len(planned)} filepath(s).")
 
@@ -5132,6 +5360,140 @@ def clean_garbage_tags(db, dry_run):
         click.echo(f"  deleted {gen_n} regurgitated 'tags' rows from generations")
 
 
+_DERIVE_VISUAL_CHUNK = 2000
+
+
+@cli.command("derive-visual-tags")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", "apply_", is_flag=True,
+              help="Write the merged arrays. Default is a dry run.")
+def derive_visual_tags(db, apply_):
+    """Recompute capture-fact visual tags from EXIF across the whole library.
+
+    Strips the terms the category-visual VLM cannot see (`long-exposure`,
+    `low-light`, `panoramic`, plus the retired `motion-blur`) and re-adds the
+    ones this photo's EXIF actually supports. Same shared rule the worker
+    submit path applies — photosearch/visual_tags_derive.py.
+
+    `sharp` / `blurry` are FROZEN and pass through untouched — their delta in
+    the table below is always 0. They are imperfect, but deleting them would
+    be a second unvalidated decision; see FROZEN_TAGS.
+
+    DRY RUN by default: prints a per-term before/after frequency table and the
+    number of rows that would change. The dry run opens the database
+    READ-ONLY (`mode=ro`) so it can be pointed at a live or write-protected
+    copy without touching it — `PhotoDB` migrates on open and would write.
+    Nothing is logged to `generations` either way; derived tags are not LLM
+    artifacts.
+
+    Photos whose `visual_tags` is NULL are NEVER touched: NULL means "not yet
+    tagged" and is what drives the category-visual worker queue.
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+    from collections import Counter
+
+    from photosearch.db import PhotoDB
+    from photosearch.visual_tags_derive import (
+        CAPTURE_FACT_TAGS, DERIVE_COLUMNS, FROZEN_TAGS, RETIRED_TAGS,
+        merge_stored_tags)
+
+    cols = ", ".join(DERIVE_COLUMNS)
+    select = (f"SELECT id, visual_tags, {cols} FROM photos "
+              f"WHERE visual_tags IS NOT NULL")
+    before, after = Counter(), Counter()
+    pending = []          # (id, old_json, new_json)
+    scanned = reordered = unparseable = 0
+
+    if apply_:
+        pdb = PhotoDB(db)
+        conn = pdb.conn
+    else:
+        pdb = None
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn.row_factory = _sqlite3.Row
+        click.echo("Opened the database read-only (dry run).")
+
+    try:
+        # One read, then bounded writes — never hold a cursor open across a
+        # commit (the chunked-percentile-refresh discipline).
+        for row in conn.execute(select).fetchall():
+            scanned += 1
+            raw = row["visual_tags"]
+            try:
+                old = _json.loads(raw)
+            except (ValueError, TypeError):
+                unparseable += 1
+                continue
+            if not isinstance(old, list):
+                unparseable += 1
+                continue
+            before.update(t for t in old if isinstance(t, str))
+            # `stored`, not `vlm`: this array is already in the column, so
+            # FROZEN terms (`sharp` / `blurry`) pass through untouched.
+            new = merge_stored_tags(old, row)
+            after.update(new)
+            new_json = _json.dumps(new)
+            if new_json == raw:
+                continue
+            if sorted(set(old)) == new:
+                reordered += 1
+            pending.append((row["id"], raw, new_json))
+
+        click.echo(f"Scanned {scanned:,} photos with visual_tags "
+                   f"({unparseable:,} unparseable, skipped).")
+        # Always show every affected term, including ones whose net count
+        # happens to cancel out (a photo losing `long-exposure` while another
+        # gains it is still two real changes).
+        # FROZEN_TAGS are listed so their delta is visibly 0 — they are the
+        # terms this command deliberately does NOT touch.
+        affected = (set(CAPTURE_FACT_TAGS) | set(RETIRED_TAGS) | set(FROZEN_TAGS)
+                    | {t for t in set(before) | set(after) if before[t] != after[t]})
+        click.echo(f"\n{'tag':20s} {'before':>10s} {'after':>10s} {'delta':>10s}")
+        for tag in sorted(affected):
+            b, a = before[tag], after[tag]
+            click.echo(f"{tag:20s} {b:10,d} {a:10,d} {a - b:+10,d}")
+
+        total = len(pending)
+        click.echo(f"\n{total:,} photo rows would change "
+                   f"({total - reordered:,} change tags, "
+                   f"{reordered:,} are re-ordering only).")
+
+        if not apply_:
+            click.echo("Dry run — no rows written. Re-run with --apply.")
+            return
+
+        written = skipped = 0
+        for start in range(0, total, _DERIVE_VISUAL_CHUNK):
+            chunk = pending[start:start + _DERIVE_VISUAL_CHUNK]
+            for photo_id, old_json, new_json in chunk:
+                # Guard on the old value: a worker that re-tagged this photo
+                # between the read above and now must win, not be clobbered.
+                cur = conn.execute(
+                    "UPDATE photos SET visual_tags = ? "
+                    "WHERE id = ? AND visual_tags IS ?",
+                    (new_json, photo_id, old_json),
+                )
+                if cur.rowcount:
+                    written += 1
+                else:
+                    skipped += 1
+            conn.commit()
+            done = min(start + len(chunk), total)
+            click.echo(f"  ... committed {done:,}/{total:,} "
+                       f"({100 * done // total}%)")
+
+        click.echo(f"Updated {written:,} photos"
+                   + (f" ({skipped:,} changed underneath us, left alone)"
+                      if skipped else "") + ".")
+    finally:
+        if pdb is not None:
+            pdb.close()
+        else:
+            conn.close()
+
+
 @cli.command("bakeoff-keywords")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")
 @click.option("--sample", default=30, show_default=True,
@@ -5467,24 +5829,15 @@ def warm_face_crops(db, persons, matched_only, date_from, date_to, sizes, worker
       photosearch warm-face-crops --all \\
           --date-from 2026-09-12 --date-to 2026-09-12
     """
-    import time
-    import urllib.request
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    from photosearch.face_crop import (
-        face_crop_cache_dir, crop_cache_path, render_face_crops, write_crop_atomic,
-    )
+    from photosearch.face_crop import warm_crops
 
     size_list = sorted({int(s) for s in sizes.split(",") if s.strip()})
     if not size_list:
         raise click.ClickException("--sizes must list at least one size.")
 
-    cache_dir = face_crop_cache_dir(db)
-    os.makedirs(cache_dir, exist_ok=True)
-
+    person_ids = None
+    scope_label = "all matched persons" if matched_only else "ALL faces"
     with PhotoDB(db) as pdb:
-        # Build the scope predicate.
-        params: list = []
         if persons:
             placeholders = ",".join("?" for _ in persons)
             rows = pdb.conn.execute(
@@ -5495,102 +5848,37 @@ def warm_face_crops(db, persons, matched_only, date_from, date_to, sizes, worker
             missing = [p for p in persons if p.lower() not in found]
             if missing:
                 raise click.ClickException(f"Unknown person(s): {', '.join(missing)}")
-            pid_ph = ",".join("?" for _ in found)
-            where = f"f.person_id IN ({pid_ph})"
-            params = list(found.values())
+            person_ids = list(found.values())
             scope_label = f"person(s) {', '.join(r['name'] for r in rows)}"
-        elif matched_only:
-            where = "f.person_id IS NOT NULL"
-            scope_label = "all matched persons"
-        else:
-            where = "1=1"
-            scope_label = "ALL faces"
-
-        # Date scope ANDs onto whichever person scope was chosen: the review
-        # panels browse one shoot at a time, and warming a shoot is minutes
-        # where the library is hours.
-        date_sql = ""
-        if date_from:
-            date_sql += " AND date(ph.date_taken) >= ?"; params.append(date_from)
-        if date_to:
-            date_sql += " AND date(ph.date_taken) <= ?"; params.append(date_to)
         if date_from or date_to:
             scope_label += f" in {date_from or '…'} → {date_to or '…'}"
 
-        rows = pdb.conn.execute(
-            f"""SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                       ph.filepath, ph.image_width, ph.image_height
-                FROM faces f JOIN photos ph ON ph.id = f.photo_id
-                WHERE f.bbox_top IS NOT NULL AND ({where}){date_sql}""",
-            params,
-        ).fetchall()
-        # Resolve paths up front (DB access is single-threaded; workers are pure CPU/IO).
-        tasks = [(r, pdb.resolve_filepath(r["filepath"])) for r in rows]
-
-    click.echo(f"Scope: {scope_label} — {len(tasks)} faces × sizes {size_list}")
-
-    # Skip faces already fully cached (unless --force).
-    if not force:
-        pending = []
-        for r, fp in tasks:
-            if not all(os.path.exists(crop_cache_path(cache_dir, r["id"], s)) for s in size_list):
-                pending.append((r, fp))
-        skipped = len(tasks) - len(pending)
-        tasks = pending
-        if skipped:
-            click.echo(f"  {skipped} already cached, {len(tasks)} to generate.")
-    if not tasks:
-        click.echo("Nothing to do — cache is warm.")
-        return
-
-    nas_url = nas_url.rstrip("/") if nas_url else None
-
-    def warm_one(item):
-        r, fp = item
-        try:
-            if fp and os.path.exists(fp):
-                bbox = (r["bbox_top"], r["bbox_right"], r["bbox_bottom"], r["bbox_left"])
-                crops = render_face_crops(fp, bbox, r["image_width"], r["image_height"], size_list)
-                for s in size_list:
-                    write_crop_atomic(crop_cache_path(cache_dir, r["id"], s), crops[s])
-            elif nas_url:
-                for s in size_list:
-                    url = f"{nas_url}/api/faces/crop/{r['id']}?size={s}"
-                    with urllib.request.urlopen(url, timeout=40) as resp:
-                        write_crop_atomic(crop_cache_path(cache_dir, r["id"], s), resp.read())
-            else:
-                return ("missing", r["id"])
-            return ("ok", r["id"])
-        except Exception as e:  # noqa: BLE001 — one bad photo shouldn't kill the run
-            return ("error", f"{r['id']}: {e}")
-
-    started = time.time()
-    ok = miss = err = done = 0
-    errors_shown = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(warm_one, t) for t in tasks]
-        for fut in as_completed(futures):
-            status, info = fut.result()
-            done += 1
-            if status == "ok":
-                ok += 1
-            elif status == "missing":
-                miss += 1
-            else:
-                err += 1
-                if errors_shown < 5:
-                    click.echo(f"  ! {info}", err=True)
-                    errors_shown += 1
-            if done % 500 == 0 or done == len(tasks):
-                elapsed = time.time() - started
-                rate = done / elapsed if elapsed else 0
-                eta = (len(tasks) - done) / rate if rate else 0
-                click.echo(f"  {done}/{len(tasks)}  ok={ok} miss={miss} err={err}  "
+        def on_prog(ev):
+            if ev.get("status") == "scanning":
+                click.echo(f"Scope: {scope_label} — {ev['found']} faces × sizes {size_list}")
+                if ev.get("cached"):
+                    click.echo(f"  {ev['cached']} already cached, {ev['total']} to generate.")
+            elif ev.get("status") == "running":
+                rate = ev.get("rate") or 0
+                eta = (ev["total"] - ev["done"]) / rate if rate else 0
+                click.echo(f"  {ev['done']}/{ev['total']}  ok={ev['ok']} "
+                           f"miss={ev['missing']} err={ev['errors']}  "
                            f"{rate:.1f}/s  eta {eta/60:.1f}m")
 
-    elapsed = time.time() - started
-    click.echo(f"Done in {elapsed/60:.1f}m — ok={ok} missing={miss} errors={err}")
-    if miss:
+        summary = warm_crops(
+            pdb, person_ids=person_ids, matched_only=matched_only and not persons,
+            date_from=date_from, date_to=date_to, sizes=size_list,
+            workers=workers, force=force, nas_url=nas_url, on_progress=on_prog,
+        )
+
+    for sample in summary["error_samples"]:
+        click.echo(f"  ! {sample}", err=True)
+    if not summary["total"]:
+        click.echo("Nothing to do — cache is warm.")
+        return
+    click.echo(f"Done in {summary['elapsed']/60:.1f}m — ok={summary['ok']} "
+               f"missing={summary['missing']} errors={summary['errors']}")
+    if summary["missing"]:
         click.echo("  (missing = original not on local disk; pass --nas-url to proxy in replica mode)")
 
 

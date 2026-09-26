@@ -28,9 +28,15 @@ preview or a cached 200px crop has already thrown the high-frequency detail
 away, which is precisely the signal. Hence one full-resolution decode per
 photo, which is the expensive part and is therefore cached.
 
+That measurement pass lives in **`photosearch/rank_measure.py`**, not here:
+`scripts/` is not copied into the Docker image, and the `rank_measure` step of
+a batch advance has to be able to run it on the NAS. This script imports it,
+so there is one implementation and one cache format.
+
 USAGE
 
     # measure (slow, ~1 image decode per photo; cached, resumable)
+    # — or let `Advance batch` on /batches do it for the batch's folder
     python scripts/rank_shoot.py --date 2026-09-12 --measure
 
     # select + preview, then create the collections
@@ -46,83 +52,15 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 
+# Before the package import below: this runs as a script, so the project root
+# is not on sys.path by virtue of anything else.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from photosearch.rank_measure import default_cache_path, measure  # noqa: E402
+
 
 def log(msg):
     print(msg, flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 — measure face sharpness at native resolution (the expensive part)
-# ---------------------------------------------------------------------------
-
-def measure(db, date_, cache_path, min_edge=60):
-    """Laplacian variance per face, from the ORIGINAL image. Cached + resumable.
-
-    One decode per PHOTO, not per face: a 60 MP JPEG costs seconds on the N100
-    and a frame can hold a dozen faces. Crops are taken from the EXIF-oriented
-    image because that is the space `faces.bbox_*` was computed in (see the
-    "EXIF-oriented image dimensions" note in CLAUDE.md) — using the raw
-    orientation would sample the wrong region on ~18% of the library.
-    """
-    import cv2
-    import numpy as np
-    from PIL import Image, ImageOps
-
-    Image.MAX_IMAGE_PIXELS = None
-
-    cache = {}
-    if os.path.exists(cache_path):
-        with open(cache_path) as fh:
-            cache = json.load(fh)
-        log(f"resuming from {cache_path}: {len(cache)} photos already measured")
-
-    rows = db.conn.execute(
-        """SELECT f.id AS face_id, f.photo_id, f.bbox_top, f.bbox_bottom,
-                  f.bbox_left, f.bbox_right, p.filepath
-             FROM faces f JOIN photos p ON p.id = f.photo_id
-            WHERE date(p.date_taken) = ?
-            ORDER BY f.photo_id, f.id""", (date_,)).fetchall()
-
-    by_photo = defaultdict(list)
-    for r in rows:
-        by_photo[r["photo_id"]].append(dict(r))
-    todo = [pid for pid in by_photo if str(pid) not in cache]
-    log(f"{len(by_photo)} photos with faces on {date_}; {len(todo)} left to measure")
-
-    for n, pid in enumerate(todo, 1):
-        faces = by_photo[pid]
-        path = db.resolve_filepath(faces[0]["filepath"])
-        out = {}
-        try:
-            with Image.open(path) as im0:
-                im = ImageOps.exif_transpose(im0)
-                W, H = im.size
-                for f in faces:
-                    t, b = int(f["bbox_top"] or 0), int(f["bbox_bottom"] or 0)
-                    l, r = int(f["bbox_left"] or 0), int(f["bbox_right"] or 0)
-                    if min(b - t, r - l) < min_edge:
-                        continue
-                    box = (max(0, l), max(0, t), min(W, r), min(H, b))
-                    if box[2] <= box[0] or box[3] <= box[1]:
-                        continue
-                    # Crop BEFORE converting: a 60 MP grayscale copy of the
-                    # whole frame would be ~60 MB per photo for no reason.
-                    g = np.asarray(im.crop(box).convert("L"))
-                    out[str(f["face_id"])] = {
-                        "lap": float(cv2.Laplacian(g, cv2.CV_64F).var()),
-                        "edge": int(min(b - t, r - l)),
-                        "area_frac": float(((b - t) * (r - l)) / max(1, W * H)),
-                    }
-        except Exception as exc:                      # unreadable → empty, not fatal
-            log(f"  ! photo {pid}: {exc}")
-        cache[str(pid)] = out
-        if n % 25 == 0 or n == len(todo):
-            with open(cache_path, "w") as fh:
-                json.dump(cache, fh)
-            log(f"  measured {n}/{len(todo)} photos")
-    with open(cache_path, "w") as fh:
-        json.dump(cache, fh)
-    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +245,7 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
     return best, nxt, scored
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB", "photo_index.db"))
@@ -326,12 +264,25 @@ def main():
                     help="Seconds between frames that still counts as one burst.")
     ap.add_argument("--label", default=None, help="Collection name prefix.")
     ap.add_argument("--apply", action="store_true", help="Create the collections.")
-    args = ap.parse_args()
+    return ap
 
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def cache_path_for(args, db_path):
+    """`--cache` wins; otherwise the cache sits beside the DB.
+
+    On the NAS the DB is `/data/photo_index.db`, so the default is
+    `/data/rank_shoot_<date>.json` — byte-identical to the path this script
+    used to hardcode, which is what keeps existing caches usable.
+    """
+    return args.cache or default_cache_path(db_path, args.date)
+
+
+def main():
+    args = build_parser().parse_args()
+
     from photosearch.db import PhotoDB
 
-    cache_path = args.cache or f"/data/rank_shoot_{args.date}.json"
+    cache_path = cache_path_for(args, args.db)
     with PhotoDB(args.db) as db:
         if args.measure:
             measure(db, args.date, cache_path)

@@ -9,7 +9,7 @@ Only restores faces that are STILL unmatched and still carry the
 'dedupe_unmatched' marker — if you have since named one of these faces
 correctly by hand, this leaves your label alone.
 
-  cat rollback_0912_calvin.py | ssh cantimatt@192.168.1.237 \\
+  cat rollback_0912_calvin.py | ssh <nas-user>@<nas-host> \\
     'cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml \\
      run --rm -T -e APPLY=1 --entrypoint python photosearch -'
 """
@@ -57,8 +57,14 @@ with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
     if not APPLY:
         print("DRY RUN - nothing written. Set APPLY=1 to write.")
         raise SystemExit(0)
+    from photosearch.db import clear_face_person_exclusion
+
     for r in todo:
         c.execute("UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
                   (r["person_id"], r["match_source"], r["face_id"]))
+        # Same rule as restore-unmatched-faces: putting the pairing back spends
+        # its exclusion, or the face would be permanently unmatchable to the
+        # person we just restored it to.
+        clear_face_person_exclusion(c, r["face_id"], r["person_id"])
     db.conn.commit()
     print(f"Restored {len(todo)} face(s).")

@@ -1307,6 +1307,12 @@ class WorkersStartRequest(BaseModel):
     # location, quality/aesthetic, camera, tags) — mutually exclusive with
     # `collection`. Resolved server-side to a photo-id set.
     filters: dict | None = None
+    # optional: scope the fleet to one directory, passed straight through as
+    # run-workers.sh's `-d`. This is the batch case (M "ingest batch" Task 6).
+    # It must be the absolute /photos/... form and never the photo root —
+    # `-d /photos` 404s, because get_directory_photo_ids strips the root
+    # prefix and the empty remainder matches no relative DB path.
+    directory: str | None = None
     # Keep polling when every queue runs dry. Default False matches the CLI:
     # a pass retires when empty and the fleet exits, so it stops holding the
     # NAS write lock once the backlog is gone.
@@ -1314,6 +1320,16 @@ class WorkersStartRequest(BaseModel):
     # Drain each pass fully before the next, in the order given, instead of
     # round-robining a batch at a time.
     sequential: bool = False
+
+    # The three scope kinds (collection / filters / directory) are mutually
+    # exclusive — `cli.py worker` enforces the same rule, and sending two
+    # would silently pick whichever the shell script happened to read last,
+    # which is the sort of thing that runs a whole-library pass when a
+    # folder was meant. This used to be a `@model_validator`, but a pydantic
+    # validator raises before the handler ever runs (FastAPI turns it into a
+    # bare 422), which made `admin_workers_start`'s own explicit 400 check
+    # below dead code. Enforced in the handler instead, so callers get the
+    # clear 400 message.
 
 
 # filters-dict key → run-workers.sh flag. `people` fans out to repeated
@@ -1391,12 +1407,21 @@ def admin_workers_start(req: WorkersStartRequest):
     cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
            "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
     filter_flags = _filters_to_worker_flags(req.filters) if req.filters else []
+    # The three scope kinds are mutually exclusive (see WorkersStartRequest) —
+    # checked here, not in a pydantic validator, so the response is a clear
+    # 400 rather than a bare 422.
     if req.collection is not None and filter_flags:
         raise HTTPException(400, "collection and filters are mutually exclusive")
+    if req.directory and filter_flags:
+        raise HTTPException(400, "directory and filters are mutually exclusive")
+    if req.directory and req.collection is not None:
+        raise HTTPException(400, "directory and collection are mutually exclusive")
     if req.collection is not None:
         if req.collection <= 0:
             raise HTTPException(400, "collection must be a positive id")
         cmd += ["-c", str(req.collection)]
+    if req.directory:
+        cmd += ["-d", req.directory]
     cmd += filter_flags
     if req.stay_alive:
         cmd.append("--stay-alive")
@@ -1410,8 +1435,269 @@ def admin_workers_start(req: WorkersStartRequest):
     if r.returncode != 0:
         raise HTTPException(500, f"worker launch failed: {(r.stderr or r.stdout)[-500:]}")
     return {"ok": True, "count": n, "passes": req.passes, "collection": req.collection,
+            "directory": req.directory,
             "stay_alive": req.stay_alive, "sequential": req.sequential,
             "server": _fleet_server_url(), "output": (r.stdout or "")[-2000:]}
+
+
+# ---------------------------------------------------------------------------
+# Batch advance (M "ingest batch" Task 6) — the ONE action on /batches
+# ---------------------------------------------------------------------------
+#
+# The system is asymmetric and both endpoints below are shaped by it: the NAS
+# holds the DB and the photo files and is the sole writer, but has no GPU and
+# cannot host a worker fleet. So:
+#
+#   /batch-advance       runs the NAS-side steps -> must execute against the
+#                        NAS's DB. In replica mode it proxies the whole SSE
+#                        stream to the NAS rather than writing locally (a
+#                        replica write is destroyed by the next
+#                        sync-replica.sh, which swaps PHOTOSEARCH_DB whole).
+#   /batch-launch-fleet  launches run-workers.sh -> must execute on THIS host
+#                        (the one with the GPU), but records its job intent on
+#                        the authoritative DB.
+
+class BatchAdvanceRequest(BaseModel):
+    batch_id: int
+    apply: bool = False
+
+
+class BatchLaunchFleetRequest(BaseModel):
+    batch_id: int
+    count: int = 2
+
+
+def _nas_url() -> str:
+    return (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/")
+
+
+def _proxy_sse(url: str, payload: dict):
+    """Forward a remote SSE stream verbatim.
+
+    A plain (sync) generator: Starlette iterates those in a threadpool, which
+    is what we want for a blocking `requests` stream. Terminal events come
+    from the NAS; a transport failure emits our own `fatal` so the client is
+    never left waiting on a stream that has already died.
+    """
+    import requests
+    try:
+        with requests.post(url, json=payload, stream=True,
+                           timeout=(10, 3600)) as resp:
+            if resp.status_code >= 400:
+                body = resp.text[:500]
+                yield ("event: fatal\ndata: "
+                       + json.dumps({"error": f"NAS returned {resp.status_code}: {body}"})
+                       + "\n\n")
+                return
+            for chunk in resp.iter_content(chunk_size=None):
+                if chunk:
+                    yield chunk.decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 — surfaced as a terminal event
+        yield ("event: fatal\ndata: "
+               + json.dumps({"error": f"could not reach authoritative server: {exc}"})
+               + "\n\n")
+
+
+def _load_batch(batch_id: int) -> dict:
+    """The batch row from the **authoritative** DB.
+
+    In replica mode that is the NAS: the desktop's DB is a periodically
+    synced copy, so a batch registered since the last sync is simply absent
+    and this would 404 on a batch that plainly exists. `batch_api` proxies
+    the same route, so going through the local endpoint's logic is not an
+    option — it would read the local file.
+    """
+    from . import batch_api, ingest_batches, web
+    if _nas_url():
+        return batch_api._proxy("GET", f"/api/batches/{batch_id}")["batch"]
+    with web._get_db() as db:
+        batch = ingest_batches.get_batch(db, batch_id)
+    if batch is None:
+        raise HTTPException(404, f"no such batch: {batch_id}")
+    return batch
+
+
+def _authoritative_batch_state(batch_id: int) -> dict:
+    """Full derived state for a batch, read from whoever owns the DB.
+
+    Replica mode goes to the NAS — which is also what makes the fleet-launch
+    decision correct: the replica's worker-pass counts and job rows lag the
+    NAS by up to a full sync, so a local read would keep offering a launch
+    for passes the fleet is already draining.
+    """
+    from . import batch_api, web
+    from .batch_state import batch_state
+    if _nas_url():
+        state = batch_api._proxy("GET", f"/api/batches/{batch_id}")
+        if state.get("computing") or not state.get("steps"):
+            # The NAS's non-blocking cache had nothing memoized and someone
+            # else held its lock. Acting on an empty `steps` list would read
+            # as "no pass needs queueing" — a wrong answer, not a slow one.
+            raise HTTPException(
+                503, "the authoritative server is still computing this batch's "
+                     "state — try again in a moment")
+        return state
+    with web._get_db() as db:
+        try:
+            return batch_state(db, batch_id)
+        except ValueError:
+            raise HTTPException(404, f"no such batch: {batch_id}")
+
+
+@router.post("/batch-advance")
+async def admin_batch_advance(req: BatchAdvanceRequest):
+    """`photosearch batch-advance --batch N [--apply]` — SSE.
+
+    Runs in a throwaway sibling container on the NAS (like ingest-incoming and
+    warm-face-crops), because the face-crop warming and stacking passes are
+    exactly the kind of long decode loop that must not sit inside the web
+    server's process. In native mode with no NAS configured (a dev box) the
+    CLI runs as a plain subprocess instead.
+
+    Shares `_ingest_lock` with the other long jobs: two advances of the same
+    batch would fight over the same job rows and the same crop cache files.
+    """
+    nas = _nas_url()
+    if nas:
+        # Replica mode: the NAS is the sole writer, and sync-replica.sh swaps
+        # PHOTOSEARCH_DB wholesale — a local apply would simply vanish.
+        return StreamingResponse(
+            _proxy_sse(f"{nas}/api/admin/batch-advance",
+                       {"batch_id": req.batch_id, "apply": req.apply}),
+            media_type="text/event-stream")
+
+    _load_batch(req.batch_id)   # 404 before we take the lock
+
+    if not _ingest_lock.acquire(blocking=False):
+        raise HTTPException(409, "another long-running admin job is already active")
+
+    if _deploy_mode() == "docker":
+        cmd = [
+            "docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE,
+            "run", "--rm", "--no-deps", COMPOSE_SERVICE,
+            "batch-advance", "--batch", str(req.batch_id),
+        ]
+        cwd = REPO_DIR
+    else:
+        import sys
+        from . import web
+        cmd = [sys.executable, "cli.py", "batch-advance",
+               "--batch", str(req.batch_id), "--db", web._db_path]
+        cwd = _native_repo_dir()
+    if req.apply:
+        cmd.append("--apply")
+
+    async def gen():
+        try:
+            async for chunk in _stream_subprocess(cmd, cwd=cwd, env=os.environ.copy()):
+                yield chunk
+        finally:
+            _ingest_lock.release()
+            # The run wrote job rows, so the cached /api/batches/{id} body is
+            # now wrong for up to its full TTL unless we say so.
+            try:
+                from . import batch_api
+                batch_api._invalidate(batch_api._key(req.batch_id))
+            except Exception:  # noqa: BLE001 — never fail a finished stream
+                logger.debug("batch memo invalidation failed", exc_info=True)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/batch-launch-fleet")
+def admin_batch_launch_fleet(req: BatchLaunchFleetRequest):
+    """Launch a worker fleet for exactly the passes this batch still needs.
+
+    Runs where the GPU is — this host — but records the job intent on the
+    **authoritative** DB, so the NAS's own /batches page stops showing those
+    passes as `needs_queue` the moment the fleet starts.
+
+    `sequential=True`: the passes have a dependency order (`describe` gates
+    three others) and a round-robin fleet would burn claims on passes that
+    cannot produce anything yet.
+    """
+    from . import batch_advance, web
+    from .batch_state import WORKER_PASSES, fleet_launch_passes
+
+    script = _run_workers_script()
+    if not Path(script).exists():
+        raise HTTPException(
+            400,
+            f"this host cannot launch a worker fleet: run-workers.sh not found "
+            f"at {script}. Launch it from the machine with the GPU.")
+
+    nas = _nas_url()
+    state = _authoritative_batch_state(req.batch_id)   # 404/502/503 on failure
+    batch = state["batch"]
+
+    # `queued` (an unfinished pass with an open job row) or `running` (a live
+    # claim) means a fleet is already on this batch. Refusing matters because
+    # a second `run-workers.sh --name ui` KILLS the running fleet and starts
+    # over, which a double-click or a second open tab would otherwise do
+    # silently. A pass that has FINISHED now outranks its own open row and
+    # reads `completed`, so a fleet that has exited no longer arms this.
+    by_step = {s["step"]: s for s in state.get("steps", [])}
+    already = [p for p in WORKER_PASSES
+               if by_step.get(p, {}).get("state") in ("queued", "running")]
+    if already:
+        raise HTTPException(
+            409, f"a fleet is already recorded as running for this batch "
+                 f"({', '.join(already)}). Stop it first — relaunching would "
+                 f"kill the running one.")
+
+    # The whole worker pipeline in one click, not just what is actionable
+    # right now: `sequential=True` drains the passes in dependency order, so
+    # the description-gated ones ride along even though they are `waiting`.
+    passes = fleet_launch_passes(state)
+    if not passes:
+        raise HTTPException(
+            400, "no worker pass needs queueing for this batch — "
+                 "the remaining work is NAS-side (use Advance batch) or it is done")
+
+    # `-d` is resolved by the AUTHORITATIVE server's get_directory_photo_ids,
+    # so in replica mode the local DB's photo_root is the wrong one to build
+    # from (the desktop holds no photos and may have no root at all). Fall
+    # back to $PHOTO_ROOT / the container's /photos mount there.
+    photo_root = None
+    if not nas:
+        with web._get_db() as db:
+            photo_root = db.photo_root
+    try:
+        directory = batch_advance.fleet_directory(photo_root, batch["directory"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    started = admin_workers_start(WorkersStartRequest(
+        passes=passes, count=req.count, directory=directory, sequential=True))
+
+    # Record intent on the authoritative DB. On the replica that is a POST to
+    # the NAS; locally it is a direct write. Either way a failure here must
+    # not read as "the fleet didn't start" — it did.
+    from . import batch_api
+    jobs = {"recorded": False, "error": None}
+    try:
+        if nas:
+            batch_api._proxy(
+                "POST", f"/api/batches/{req.batch_id}/jobs",
+                json_body={"steps": passes,
+                           "job_kind": batch_advance.JOB_KIND_FLEET})
+        else:
+            with web._get_db() as db:
+                for p in passes:
+                    batch_advance.open_step_job(
+                        db, req.batch_id, p, batch_advance.JOB_KIND_FLEET)
+        jobs["recorded"] = True
+    except Exception as exc:  # noqa: BLE001 — reported, not fatal
+        jobs["error"] = getattr(exc, "detail", None) or str(exc)
+        logger.warning("batch %s: could not record fleet jobs: %s", req.batch_id, exc)
+
+    try:
+        batch_api._invalidate(batch_api._key(req.batch_id))
+    except Exception:  # noqa: BLE001
+        logger.debug("batch memo invalidation failed", exc_info=True)
+
+    return {**started, "batch_id": req.batch_id, "passes": passes,
+            "directory": directory, "jobs": jobs}
 
 
 @router.post("/workers/stop")

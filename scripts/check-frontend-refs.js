@@ -101,8 +101,16 @@ function boundNames(src) {
 // this script pass the very bug it was written for: `parseSSEChunk` is a named
 // function EXPRESSION inside the IIFE, so it looked defined while a page
 // calling it bare would still throw.
-const shared = decomment(fs.readFileSync(path.join(DIR, 'shared.js'), 'utf8'));
-const psMembers = new Set([...shared.matchAll(/\bPS\.([A-Za-z_$][\w$]*)\s*=/g)].map(m => m[1]));
+//
+// PS members are collected from EVERY dist/*.js, not just shared.js: a pure
+// module a page loads alongside it (batch-flow.js publishes PS.BatchFlow) is
+// just as real a definition. Only the `PS.x =` assignments are taken, so a
+// module's inner names still do not resolve a page's bare call.
+const psMembers = new Set();
+for (const js of fs.readdirSync(DIR).filter(x => x.endsWith('.js')).sort()) {
+  const src = decomment(fs.readFileSync(path.join(DIR, js), 'utf8'));
+  for (const m of src.matchAll(/\bPS\.([A-Za-z_$][\w$]*)\s*=/g)) psMembers.add(m[1]);
+}
 
 let bad = 0;
 for (const f of fs.readdirSync(DIR).filter(x => x.endsWith('.html')).sort()) {

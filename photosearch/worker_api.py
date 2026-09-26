@@ -11,6 +11,7 @@ The NAS remains the single source of truth (SQLite DB).
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -156,7 +157,12 @@ class CategoryContentResult(BaseModel):
 
 class CategoryVisualResult(BaseModel):
     photo_id: int
-    visual_tags: list[str]
+    # `[]` is a real result — the model looked and found nothing — and is
+    # persisted as '[]'. `None` is "no usable answer" (unparseable response,
+    # regurgitation, image error): the column stays NULL so the photo is
+    # re-claimed, but the attempt is still spent so a repeatable failure is
+    # bounded. Older workers always send a list, so None never arrives from one.
+    visual_tags: Optional[list[str]] = None
     model: Optional[str] = None
     model_version: Optional[str] = None
 
@@ -397,12 +403,258 @@ def claim_batch(req: ClaimRequest):
         )
 
 
+# ---------------------------------------------------------------------------
+# Submit bookkeeping — an attempt is only spent when the result was PERSISTED
+# ---------------------------------------------------------------------------
+
+class _SubmitOutcome:
+    """Separates "this photo is done" from "the SERVER could not write it".
+
+    `mark_processed` UPSERT-increments `worker_processed.attempts`, and the
+    claim path stops claiming a photo at MAX_PROCESS_ATTEMPTS. So counting a
+    server-side write failure as an attempt punishes the PHOTO for the
+    server's problem: a handful of unlucky lock collisions permanently
+    abandons a perfectly good photo and throws away the GPU work each time.
+    Observed 2026-09-20 — two sharp, ordinary photos reached attempts=5 for
+    'category-visual' with `visual_tags` still NULL, while the errors table
+    logged `database is locked` for their batch-mates at the same second
+    (the nightly maintenance sweep held the write lock past the 60 s
+    busy_timeout).
+
+    An attempt is spent only when the result was actually persisted, or when
+    the WORKER reported a genuine per-photo outcome (no description, no
+    faces, an empty tag list). A DB write that raised defers instead: the
+    photo keeps its attempt count and is reclaimed on a later pass.
+    """
+
+    def __init__(self):
+        self.written = 0
+        self.processed: list[int] = []
+        self.deferred: list[int] = []
+
+    def persisted(self, photo_id: int):
+        """This photo's outcome is final — spend an attempt on it."""
+        if photo_id not in self.deferred and photo_id not in self.processed:
+            self.processed.append(photo_id)
+
+    def defer(self, photo_id: int):
+        """A transient lock — do NOT spend an attempt; it comes back around."""
+        if photo_id in self.processed:
+            self.processed.remove(photo_id)
+        if photo_id not in self.deferred:
+            self.deferred.append(photo_id)
+
+    def failed(self, photo_id: int):
+        """A repeatable failure — spend the attempt so the cap bounds it.
+
+        Beats a deferral for the same photo (a photo whose payload is broken
+        will break again, and only the attempt cap can stop the loop).
+        """
+        if photo_id in self.deferred:
+            self.deferred.remove(photo_id)
+        if photo_id not in self.processed:
+            self.processed.append(photo_id)
+
+    def commit_failed(self, transient: bool):
+        """The batch COMMIT raised, so the final flush did not land.
+
+        A transient lock defers everything — the work is intact and comes
+        back. Anything else (disk full, read-only FS, corruption) is not
+        going to fix itself batch-over-batch, so the attempt is still spent:
+        the 3-attempt cap is the only thing that stops the fleet re-claiming
+        the same photos forever.
+        """
+        self.written = 0
+        if transient:
+            for pid in self.processed:
+                if pid not in self.deferred:
+                    self.deferred.append(pid)
+            self.processed = []
+
+    def status(self) -> str:
+        if not self.deferred:
+            return "ok"
+        return "partial" if self.processed or self.written else "deferred"
+
+
+# Only a TRANSIENT lock earns a free retry. Deferring anything else would
+# uncap the pass: a deterministically-failing photo would never reach
+# MAX_PROCESS_ATTEMPTS, be re-claimed every TTL forever, and pay for a model
+# run each cycle — exactly the pathology CLAUDE.md documents for the un-capped
+# `clip` pass ("workers churn at ~290% CPU and queue_depth.clip never reaches
+# 0"). `faces` is the worst case: its claim predicate is NOT EXISTS(faces) AND
+# attempts < MAX with no column to heal it, and a malformed payload (a short
+# bbox, a missing 'encoding', a non-512 vector) raises BEFORE any INSERT, so
+# nothing is written AND nothing is marked. DO NOT widen this back to a bare
+# `except Exception` defer.
+_TRANSIENT_DB_MARKERS = ("locked", "busy")
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True only for SQLite contention — a lock we should simply wait out.
+
+    Shared by the per-row, batch-commit and mark_processed paths so their
+    classifications cannot drift apart.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_DB_MARKERS)
+
+
+def _read_derive_row(db, photo_id: int):
+    """The EXIF columns `visual_tags_derive` needs, plus the photo's CURRENT
+    `visual_tags` — a re-tag has to carry its frozen terms across."""
+    from .visual_tags_derive import DERIVE_COLUMNS
+
+    return db.conn.execute(
+        f"SELECT {', '.join(DERIVE_COLUMNS)}, visual_tags FROM photos WHERE id=?",
+        (photo_id,),
+    ).fetchone()
+
+
+def _merge_visual_tags(db, photo_id: int, perceived) -> list:
+    """Apply the derived capture-fact merge to one category-visual answer.
+
+    Reads the photo's EXIF here, on the authoritative writer, because that is
+    the only place it exists — the worker has the pixels and nothing else.
+
+    A TRANSIENT lock on that read is re-raised so `_record_write_failure`
+    defers the photo. Swallowing it would write the row strip-only — derived
+    tags silently absent — spend the attempt and mark the photo processed,
+    leaving it permanently under-derived with no trace. That is exactly the
+    failure 50003c2 fixed for writes; reads need the same rule.
+
+    A row that has vanished, or a genuinely broken read, degrades to
+    strip-only: the bogus capture facts still go and nothing is invented.
+    """
+    from .visual_tags_derive import merge_tags, merge_vlm_answer
+
+    try:
+        row = _read_derive_row(db, photo_id)
+    except sqlite3.Error as e:
+        if _is_transient_db_error(e):
+            raise
+        logger.error("Could not read EXIF for photo %s — writing visual_tags "
+                     "WITHOUT its derived capture facts: %s", photo_id, e)
+        row = None
+    if row is None:
+        return merge_tags(perceived, [])
+    return merge_vlm_answer(perceived, row, existing=row["visual_tags"])
+
+
+def _perceived_only(tags) -> list:
+    """The half of a merged array that the VLM actually produced."""
+    from .visual_tags_derive import PERCEIVED_VOCABULARY
+
+    perceived = set(PERCEIVED_VOCABULARY)
+    return [t for t in (tags or []) if t in perceived]
+
+
+def _record_write_failure(db, outcome: _SubmitOutcome, pass_type: str,
+                          photo_id: int, exc: Exception):
+    """Handle one photo whose DB write raised, and never lose the reason.
+
+    A transient lock defers (no attempt spent). Any other error counts the
+    attempt, exactly as before this file learned to defer at all, so the
+    3-attempt cap still bounds a repeatable failure.
+    """
+    if _is_transient_db_error(exc):
+        logger.warning("Failed to store %s for photo %s — deferring for retry: %s",
+                       pass_type, photo_id, exc)
+        outcome.defer(photo_id)
+    else:
+        logger.warning("Failed to store %s for photo %s — counting the attempt "
+                       "(not a lock, so retrying would not help): %s",
+                       pass_type, photo_id, exc)
+        outcome.failed(photo_id)
+    try:
+        db.log_error(pass_type, str(photo_id), str(exc))
+    except Exception as log_exc:
+        # The conditions that break the write (a locked DB) are exactly the
+        # ones that break logging it, so a bare `except: pass` here made the
+        # reason vanish precisely when it mattered.
+        logger.warning("Could not log the %s error for photo %s (%s); "
+                       "original error was: %s", pass_type, photo_id, log_exc, exc)
+
+
+def _commit_batch(db, outcome: _SubmitOutcome, pass_type: str) -> bool:
+    """Commit the pending batch; return True when the caller may mark its
+    processed set.
+
+    begin_batch defers the commit, so under write contention SQLITE_BUSY
+    usually surfaces at COMMIT rather than at the UPDATE. What is knowable
+    then is only that the FINAL flush did not land: rows written before an
+    intermediate flush — or before a `db.log_error` call, which commits
+    unconditionally — may well be on disk. That is harmless either way, since
+    a landed-but-unmarked row is simply not re-claimed by a column-guarded
+    predicate.
+
+    A transient lock defers the whole batch (nothing marked — the work is
+    intact and comes back). Any OTHER commit failure (disk full, read-only
+    FS, corruption) is not going to resolve batch-over-batch, so the attempt
+    is still counted: re-claiming is unavoidable for a column-guarded pass,
+    but the 3-attempt cap is the only thing that bounds the loop.
+    """
+    try:
+        db.end_batch()
+        return True
+    except Exception as e:
+        # Leaves the connection usable rather than stuck in batch mode with an
+        # open transaction (and stops close() re-raising the same error).
+        db.abort_batch()
+        transient = _is_transient_db_error(e)
+        n = len(outcome.processed) + len(outcome.deferred)
+        if transient:
+            logger.warning("Batch commit failed for pass %s under contention — "
+                           "nothing marked processed, %d result(s) deferred: %s",
+                           pass_type, n, e)
+        else:
+            logger.error("Batch commit failed for pass %s and it is NOT a lock — "
+                         "the final flush did not land for %d result(s); counting "
+                         "the attempt so the fleet cannot loop on it: %s",
+                         pass_type, n, e)
+        try:
+            db.log_error(pass_type, "batch", f"batch commit failed: {e}")
+        except Exception as log_exc:
+            logger.warning("Could not log the %s batch-commit failure (%s); "
+                           "original error was: %s", pass_type, log_exc, e)
+        outcome.commit_failed(transient)
+        return not transient
+
+
+def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str):
+    """Spend one attempt per finished photo.
+
+    If this write itself fails the attempt cannot be recorded at all — the
+    one case that really can loop, since the photo comes back unmarked every
+    TTL. Nothing here can fix an unwritable DB, so say so loudly.
+    """
+    if not outcome.processed:
+        return
+    try:
+        db.mark_processed(outcome.processed, pass_type)
+    except Exception as e:
+        log = logger.warning if _is_transient_db_error(e) else logger.error
+        log("Could not mark %d photo(s) processed for pass %s — their attempt "
+            "was NOT recorded and they will be reclaimed; if this is not a "
+            "lock the DB is unwritable and the fleet will keep retrying: %s",
+            len(outcome.processed), pass_type, e)
+        for pid in list(outcome.processed):
+            outcome.defer(pid)
+
+
 @router.post("/submit-results")
 def submit_results(req: SubmitRequest):
     """Submit processing results for a claimed batch.
 
     Results are written directly to the main DB.
     The claim is released after successful write.
+
+    A photo is only marked processed (which spends one of its
+    MAX_PROCESS_ATTEMPTS) when its result was persisted or the worker
+    reported a genuine per-photo outcome. Server-side write failures come
+    back in `deferred` / `deferred_photo_ids` and the photo stays claimable.
     """
     with _get_db() as db:
         # Check if the claim exists — accept results even if expired, since the
@@ -422,29 +674,27 @@ def submit_results(req: SubmitRequest):
             else:
                 logger.warning(f"Claim {req.batch_id} expired and was cleaned up, but accepting results anyway")
 
-        written = 0
-        processed_photo_ids = []
+        outcome = _SubmitOutcome()
 
         if req.pass_type == "clip" and req.clip_results:
             db.begin_batch(batch_size=100)
             for r in req.clip_results:
                 try:
                     db.add_clip_embedding(r.photo_id, r.embedding)
-                    written += 1
-                    processed_photo_ids.append(r.photo_id)
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store CLIP for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("clip", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
+                    _record_write_failure(db, outcome, "clip", r.photo_id, e)
+            _commit_batch(db, outcome, "clip")
+            # NOTE: clip deliberately never calls mark_processed — the
+            # embedding row itself is the marker (see CLAUDE.md, "Non-image
+            # rows & the clip-claim infinite re-claim").
 
         elif req.pass_type == "faces":
             face_results = req.face_results or []
             db.begin_batch(batch_size=50)
             for r in face_results:
-                processed_photo_ids.append(r.photo_id)
+                failed = False
                 for face in r.faces:
                     try:
                         db.add_face(
@@ -453,23 +703,24 @@ def submit_results(req: SubmitRequest):
                             encoding=face["encoding"],
                             det_score=face.get("det_score"),
                         )
-                        written += 1
+                        outcome.written += 1
                     except Exception as e:
-                        logger.warning(f"Failed to store face for photo {r.photo_id}: {e}")
-                        try:
-                            db.log_error("faces", str(r.photo_id), str(e))
-                        except Exception:
-                            pass
-            db.end_batch()
+                        failed = True
+                        _record_write_failure(db, outcome, "faces", r.photo_id, e)
+                if not failed:
+                    # A photo with NO faces found is done, not failed — its
+                    # attempt is spent here because nothing else records it.
+                    outcome.persisted(r.photo_id)
+            committed = _commit_batch(db, outcome, "faces")
 
             # New faces land with cluster_id=NULL. Global clustering is a
             # separate, on-demand step via `photosearch recluster-faces` —
             # per-batch clustering would collide IDs across batches and
             # fragment the same person across many pseudo-clusters.
 
-            # Mark all submitted photos as processed (including those with no faces)
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "faces")
+            # Mark every photo whose faces landed (including those with none).
+            if committed:
+                _mark_processed(db, outcome, "faces")
 
         elif req.pass_type == "quality" and req.quality_results:
             db.begin_batch(batch_size=100)
@@ -479,60 +730,54 @@ def submit_results(req: SubmitRequest):
                     if r.aesthetic_concepts:
                         updates["aesthetic_concepts"] = r.aesthetic_concepts
                     db.update_photo(r.photo_id, **updates)
-                    written += 1
-                    processed_photo_ids.append(r.photo_id)
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store quality for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("quality", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
+                    _record_write_failure(db, outcome, "quality", r.photo_id, e)
+            _commit_batch(db, outcome, "quality")
 
         elif req.pass_type == "describe":
             describe_results = req.describe_results or []
             db.begin_batch(batch_size=100)
             for r in describe_results:
-                processed_photo_ids.append(r.photo_id)
-                if r.description:
-                    try:
-                        db.update_photo(r.photo_id, description=r.description)
-                        db.log_generation(r.photo_id, "describe", r.description,
-                                          req.model, req.model_version)
-                        written += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to store description for photo {r.photo_id}: {e}")
-                        try:
-                            db.log_error("describe", str(r.photo_id), str(e))
-                        except Exception:
-                            pass
-            db.end_batch()
+                if not r.description:
+                    # The model returned nothing — a completed attempt. The
+                    # worker omits true deferrals (timeouts) from the payload.
+                    outcome.persisted(r.photo_id)
+                    continue
+                try:
+                    db.update_photo(r.photo_id, description=r.description)
+                    db.log_generation(r.photo_id, "describe", r.description,
+                                      req.model, req.model_version)
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                except Exception as e:
+                    _record_write_failure(db, outcome, "describe", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "describe")
             # Mark all submitted photos as processed (including those with no description)
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "describe")
+            if committed:
+                _mark_processed(db, outcome, "describe")
 
         elif req.pass_type == "tags":
             tags_results = req.tags_results or []
             db.begin_batch(batch_size=100)
             for r in tags_results:
-                processed_photo_ids.append(r.photo_id)
-                if r.tags:
-                    try:
-                        tags_json = json.dumps(r.tags)
-                        db.update_photo(r.photo_id, tags=tags_json)
-                        db.log_generation(r.photo_id, "tags", tags_json,
-                                          req.model, req.model_version)
-                        written += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to store tags for photo {r.photo_id}: {e}")
-                        try:
-                            db.log_error("tags", str(r.photo_id), str(e))
-                        except Exception:
-                            pass
-            db.end_batch()
+                if not r.tags:
+                    outcome.persisted(r.photo_id)
+                    continue
+                try:
+                    tags_json = json.dumps(r.tags)
+                    db.update_photo(r.photo_id, tags=tags_json)
+                    db.log_generation(r.photo_id, "tags", tags_json,
+                                      req.model, req.model_version)
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                except Exception as e:
+                    _record_write_failure(db, outcome, "tags", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "tags")
             # Mark all submitted photos as processed (including those with no tags)
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "tags")
+            if committed:
+                _mark_processed(db, outcome, "tags")
 
         elif req.pass_type == "verify" and req.verify_results:
             db.begin_batch(batch_size=100)
@@ -555,21 +800,16 @@ def submit_results(req: SubmitRequest):
                     if r.description:
                         db.log_generation(r.photo_id, "verify", r.description,
                                           req.model, req.model_version)
-                    written += 1
-                    processed_photo_ids.append(r.photo_id)
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store verify for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("verify", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
+                    _record_write_failure(db, outcome, "verify", r.photo_id, e)
+            _commit_batch(db, outcome, "verify")
 
         elif req.pass_type == "category-content":
             category_content_results = req.category_content_results or []
             db.begin_batch(batch_size=100)
             for r in category_content_results:
-                processed_photo_ids.append(r.photo_id)
                 try:
                     # Always persist the column. A successful-but-empty result
                     # writes '[]' so the photo is marked done in ONE pass (column
@@ -580,48 +820,62 @@ def submit_results(req: SubmitRequest):
                     if r.categories:
                         db.log_generation(r.photo_id, "category-content", cats_json,
                                           r.model, r.model_version)
-                    written += 1
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store category-content for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("category-content", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
+                    _record_write_failure(db, outcome, "category-content", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "category-content")
             # Mark all submitted photos as processed (including those with no categories)
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "category-content")
+            if committed:
+                _mark_processed(db, outcome, "category-content")
 
         elif req.pass_type == "category-visual":
             category_visual_results = req.category_visual_results or []
             db.begin_batch(batch_size=100)
             for r in category_visual_results:
-                processed_photo_ids.append(r.photo_id)
+                if r.visual_tags is None:
+                    # No usable answer. Leave the column NULL so the photo is
+                    # re-claimed, but spend the attempt so a REPEATABLE failure
+                    # is retired by MAX_PROCESS_ATTEMPTS rather than looping
+                    # forever (the CLIP-style infinite re-claim). Mirrors the
+                    # aesthetics pass's empty-scores row.
+                    outcome.persisted(r.photo_id)
+                    continue
                 try:
+                    # The worker only ever saw the pixels, so its answer is the
+                    # PERCEIVED half. The capture facts (long-exposure /
+                    # low-light / panoramic / sharp / blurry) are decided HERE,
+                    # from the photo's EXIF, and override whatever the model
+                    # said — see photosearch/visual_tags_derive.py. The merge
+                    # lives server-side because this is where the EXIF is.
+                    merged = _merge_visual_tags(db, r.photo_id, r.visual_tags)
                     # Always persist the column ('[]' for empty) so a successful
                     # empty result marks done in one pass; only timeouts defer.
-                    vtags_json = json.dumps(r.visual_tags or [])
+                    # An empty merge IS a legitimate result.
+                    vtags_json = json.dumps(merged)
                     db.update_photo(r.photo_id, visual_tags=vtags_json)
-                    if r.visual_tags:
-                        db.log_generation(r.photo_id, "category-visual", vtags_json,
+                    # Provenance covers LLM artifacts only, so it records the
+                    # PERCEIVED tags — what this model actually produced — not
+                    # the merged array. Logging the merge would attribute
+                    # `long-exposure` to llava when EXIF decided it.
+                    perceived = _perceived_only(merged)
+                    if perceived:
+                        db.log_generation(r.photo_id, "category-visual",
+                                          json.dumps(perceived),
                                           r.model, r.model_version)
-                    written += 1
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store category-visual for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("category-visual", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
+                    _record_write_failure(db, outcome, "category-visual", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "category-visual")
             # Mark all submitted photos as processed (including those with no visual tags)
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "category-visual")
+            if committed:
+                _mark_processed(db, outcome, "category-visual")
 
         elif req.pass_type == "keywords":
             keywords_results = req.keywords_results or []
             db.begin_batch(batch_size=100)
             for r in keywords_results:
-                processed_photo_ids.append(r.photo_id)
                 try:
                     # Always persist the column ('[]' for empty) so a successful
                     # empty result marks done in one pass; only timeouts defer.
@@ -630,17 +884,14 @@ def submit_results(req: SubmitRequest):
                     if r.keywords:
                         db.log_generation(r.photo_id, "keywords", kw_json,
                                           r.model, r.model_version)
-                    written += 1
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store keywords for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("keywords", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
+                    _record_write_failure(db, outcome, "keywords", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "keywords")
             # Mark all submitted photos as processed (including those with no keywords)
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "keywords")
+            if committed:
+                _mark_processed(db, outcome, "keywords")
 
         elif req.pass_type == "aesthetics":
             from .aesthetics import ALL_SUBATTRS, DIMENSIONS
@@ -655,13 +906,14 @@ def submit_results(req: SubmitRequest):
             now = db.conn.execute("SELECT datetime('now')").fetchone()[0]
             db.begin_batch(batch_size=100)
             for r in aesthetics_results:
-                processed_photo_ids.append(r.photo_id)
                 try:
                     fields = {k: v for k, v in (r.scores or {}).items()
                               if k in allowed_score_cols and v is not None}
                     if not fields or "aes_overall" not in fields:
-                        # Nothing usable — skip (worker already omits deferrals,
-                        # so this is a defensive guard, not the normal path).
+                        # Nothing usable — a completed attempt, not a write
+                        # failure (worker already omits deferrals, so this is a
+                        # defensive guard, not the normal path).
+                        outcome.persisted(r.photo_id)
                         continue
                     fields["aes_style"] = r.aes_style
                     fields["aes_style_tags"] = r.aes_style_tags
@@ -683,29 +935,34 @@ def submit_results(req: SubmitRequest):
                                     "style": r.aes_style,
                                     "tags": r.aes_style_tags}),
                         r.model, r.model_version)
-                    written += 1
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
                 except Exception as e:
-                    logger.warning(f"Failed to store aesthetics for photo {r.photo_id}: {e}")
-                    try:
-                        db.log_error("aesthetics", str(r.photo_id), str(e))
-                    except Exception:
-                        pass
-            db.end_batch()
-            if processed_photo_ids:
-                db.mark_processed(processed_photo_ids, "aesthetics")
+                    _record_write_failure(db, outcome, "aesthetics", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "aesthetics")
+            if committed:
+                _mark_processed(db, outcome, "aesthetics")
 
         # Log activity for the chart
-        if written > 0:
-            db.log_activity(req.pass_type, "index", written)
+        if outcome.written > 0:
+            try:
+                db.log_activity(req.pass_type, "index", outcome.written)
+            except Exception as e:
+                # Telemetry must never fail a submit that already landed.
+                logger.warning("Could not log %s activity: %s", req.pass_type, e)
 
-        # Release the claim
+        # Release the claim — deferred photos must become claimable again.
         db.release_claim(req.batch_id)
 
         return {
-            "status": "ok",
-            "written": written,
-            "processed": len(processed_photo_ids),
+            # `status` / `written` / `processed` / `batch_id` are what older
+            # workers read; `deferred*` is additive.
+            "status": outcome.status(),
+            "written": outcome.written,
+            "processed": len(outcome.processed),
             "batch_id": req.batch_id,
+            "deferred": len(outcome.deferred),
+            "deferred_photo_ids": outcome.deferred,
         }
 
 

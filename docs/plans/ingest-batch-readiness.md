@@ -1,8 +1,10 @@
 # Ingest-batch readiness — automation + per-batch status flow
 
-**Status:** planned (2026-09-19). Produced by a two-planner debate (two critique
+**Status:** ✅ **SHIPPED 2026-09-19.** Produced by a two-planner debate (two critique
 rounds); the `## Decisions` table records what the planners could not settle and what
-the owner chose.
+the owner chose. See "## What changed during the build" below for where the
+implementation amended this plan, and CLAUDE.md's "Ingest batches (`/batches`)"
+section for the shipped shape, the six states, and the traps.
 
 ## Goal
 
@@ -193,3 +195,89 @@ Settled in debate without the owner: dated-folder granularity (B conceded); the
 job-intent rows as the source of "queued" (A conceded); non-blocking-lock cache (A
 conceded); no persisted derived state (B conceded); strict-only matching in "ready"
 (A conceded); manual trigger with autopilot off (both).
+
+## What changed during the build
+
+The full task-by-task ledger is
+`.superpowers/sdd/2026-09-19-ingest-batch-readiness/progress.md`; the entries
+below are the ones that changed what got built, not just how it was reviewed.
+
+- **`rank_measure` as a "desktop-only" step (steps 3/6) was a plan error,
+  corrected after it shipped.** Nothing ran it: no runner in `batch_advance`,
+  none in the fleet launcher, and its state derived from a job row nothing
+  wrote — so on the first real batch the box read "Needs to be queued
+  0 / 1,373" forever. It was called desktop-only because it is heavy, but it
+  decodes the ORIGINALS at full native resolution and **only the NAS has
+  them** (the desktop replica holds no files). Shipped: `rank_measure` is the
+  last entry in `NAS_STEPS` with a runner
+  (`batch_advance._run_rank_measure`), `DESKTOP_STEPS` and the `"desktop"`
+  kind are gone, and the measurement moved from `scripts/rank_shoot.py` into
+  `photosearch/rank_measure.py` because `scripts/` is not in the Docker
+  image. It stays OPTIONAL (`batch_state.OPTIONAL_STEPS`): it does not gate
+  `ready`, but `next_action` returns `advance_nas` while it is the only step
+  left, so the button can run it.
+- **`done`'s formula (step 4) was a controller-authored spec error, not an
+  owner decision.** The brief said `done = eligible - remaining - failed`
+  uniformly. `quality`, `verify` and `clip` carry no attempts filter on their
+  claim predicate (`db.py:count_unprocessed_photos`), so for those three
+  `failed` is already counted *inside* `remaining` rather than disjoint from
+  it — subtracting it again double-counted. Shipped as a per-pass split
+  (`batch_state._REMAINING_FILTERS_ATTEMPTS`): seven passes use
+  `done = eligible - remaining - failed` and `blocked = remaining == 0 and
+  failed > 0`; the three use `done = eligible - remaining` and
+  `blocked = remaining == failed > 0`.
+- **Worker-pass state precedence (step 6) was a plan defect, caught in
+  review, not an owner call.** The plan implied `queued` alongside `running`/
+  `completed` without ordering them. Built as `queued` first initially, which
+  left a worker pass the fleet had *finished* reading `queued` for the job
+  row's full 6h TTL — the batch could never reach `ready`, and
+  `batch-launch-fleet`'s "already running" 409 stayed armed long after the
+  fleet had exited. Shipped precedence: **running > completed > blocked >
+  queued > waiting > needs_queue** (job-only NAS/desktop steps keep their own
+  ordering — a closed row is their only proof of success, so an open one
+  still reads `queued` for them).
+- **"Leave a failed job open to expire" (step 6) was a spec flaw the brief
+  wrote, not a design owner picked.** Leaving a failed/aborted NAS step's job
+  row open would have made that step unretryable for up to 6 hours with no
+  recovery short of editing the table. Shipped: a failed or cancelled step
+  **deletes** its job row (`ingest_batches.delete_job`), putting the step
+  back to `needs_queue` immediately — never `close_job`, which is how a
+  job-only step proves success.
+- **The plan had no replica-mode story for `batch_api` at all — a genuine
+  plan gap, not an ambiguity to resolve in review.** Batches and job rows are
+  written on the NAS, but the owner views `/batches` from the desktop
+  replica, whose DB is a periodically-synced copy. Amended: every
+  `/api/batches/*` route proxies to the NAS when `PHOTOSEARCH_NAS_URL` is
+  set, with no local fallback (a wrong batch view is worse than a visible
+  502); `batch-launch-fleet` reads the *authoritative* (NAS) state before
+  deciding whether a pass is already running, and refuses with 409 rather
+  than risk double-launching a fleet the replica doesn't know about yet.
+- **One click launches the whole worker pipeline, not just what is
+  `needs_queue` right now (step 6, found in review round 2).** The plan's
+  "launch the fleet for passes in needs queue" left `category-content` /
+  `keywords` / `verify` unqueued forever — they read `waiting` on `describe`
+  at click time, and a second launch mid-run is refused (it would kill the
+  running fleet). Shipped `batch_state.fleet_launch_passes`: the launch set
+  is every `needs_queue` pass plus every `waiting` pass whose dependency is
+  already underway or itself in the set, mirrored in JS as
+  `PS.BatchFlow.fleetLaunchPasses` so the Advance button's pass count matches
+  what actually launches.
+
+- **Step 4's claim that CLIP's unloadable rows "surface as `blocked` via a
+  no-progress rule" was NOT built — it does not hold for `clip`, only for
+  `quality`/`verify`.** `_OUTPUT_MISSING["clip"] is None` in
+  `batch_state.py` (clip keeps no attempts ledger at all — see CLAUDE.md
+  "Non-image rows"), so `_worker_step` hardcodes `failed = 0` for clip and
+  `blocked` requires `failed > 0`. A clip-unloadable photo therefore leaves
+  that batch's `clip` step at `remaining > 0` **indefinitely** — `needs_queue`
+  (or `queued` while a job row is open), never `blocked`. Found in the final
+  whole-branch review, not fixed here (out of scope for a docs-only
+  correction): the mitigations are `index.py:is_real_image()` gating row
+  creation at ingest (so new batches shouldn't hit this),
+  `purge-nonimage-photos` for old rows, and the `/batches` page's **Mark
+  ready** button as the manual escape. CLAUDE.md's "Ingest batches" section
+  has the corrected explanation.
+
+Every other task closed with a clean review (2026-09-19 ledger) or only
+deferred, non-blocking cleanups (dead code, a stray comment, an untested edge
+case) — see the ledger for the full list.

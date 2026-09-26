@@ -17,6 +17,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -449,13 +450,24 @@ def _openai_chat_with_retry(
     if timeout is None:
         timeout = _DEFAULT_OLLAMA_TIMEOUT_S
     url = base_url.rstrip("/") + "/chat/completions"
-    payload = json.dumps({
+    body = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
-    }).encode("utf-8")
+    }
+    # Reasoning models (gemma-4, qwen3.x) think by default and, on a short
+    # tag/JSON task, spend the ENTIRE max_tokens budget on hidden reasoning
+    # and return an empty content string — measured on gemma-4-26b: 765 of 768
+    # tokens reasoning, '' back, ~80 s/photo, every photo UNANSWERED.
+    # `reasoning_effort: "none"` is the OpenAI-style switch LM Studio honours
+    # (3.6 s and a real answer); `chat_template_kwargs.enable_thinking` did
+    # nothing. Opt-in via env so non-reasoning backends never see the field.
+    effort = os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
+    if effort:
+        body["reasoning_effort"] = effort
+    payload = json.dumps(body).encode("utf-8")
     for attempt in range(1, retries + 1):
         t0 = time.time()
         wd_stop = _threading.Event()
@@ -543,6 +555,50 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
             if visual:
                 return visual
     return os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL") or model
+
+
+# pass -> LLM role. The role, not the model name, is what selects the model on
+# the OpenAI-compatible (LM Studio) route, so it is also what provenance has to
+# resolve through. `rerun._PASS_LLM` carries the same roles alongside its Ollama
+# defaults; a test pins the two together.
+PASS_ROLES = {
+    "describe":         "describe",
+    "verify":           "verify",
+    "category-content": "text",
+    "keywords":         "text",
+    "category-visual":  "visual",
+    "aesthetics":       "aesthetics",
+}
+
+
+def effective_model(model: str, role: Optional[str] = None) -> str:
+    """The model id a call with (`model`, `role`) will ACTUALLY hit.
+
+    This is what belongs in `generations.model_used`. Logging the configured
+    name instead is why 159,647 of 159,650 `category-visual` rows on the live
+    library claim `llava`: on the LM Studio route the name is ignored and the
+    model is chosen by role, so the log recorded a model that never ran.
+
+    Deliberately the SAME function the request uses (`_resolve_openai_model`),
+    not a reimplementation — a second copy would drift and be undetectable,
+    since a wrong provenance string still looks like a string.
+    """
+    if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return _resolve_openai_model(model, role)
+    return model
+
+
+def effective_model_version(model: str) -> Optional[str]:
+    """Provenance digest for `generations.model_version`.
+
+    On the OpenAI-compatible route there is no Ollama to query and asking
+    anyway blocks ~80 s retrying localhost:11434, so use a static marker.
+    Otherwise it is the short Ollama digest.
+    """
+    if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return "lmstudio"
+    from .worker import _model_version  # lazy: worker imports describe
+    return _model_version(model)
 
 
 def _image_ref_to_b64(ref):
@@ -710,7 +766,21 @@ def critique_photo(
 # A focused visual-quality vocabulary (36 terms) assigned by Ollama vision.
 # Mood / light / composition only — content is handled by extract_categories.
 
-_VISUAL_MAX_PLAUSIBLE_TAGS = 12  # tighter than the old 16; smaller vocab.
+# Hard cap on PERCEIVED tags in one category-visual answer. The first prompt
+# had none — its only rule was "Include every tag that clearly applies". Five
+# is the cap the prompt states AND what the guard enforces; the prompt also
+# tells the model that 1-3 is normal, which is what actually moves the average
+# (measured 1.8). The guard does NOT limit how many tags come from one section:
+# `backlit, silhouette` describe one photo honestly.
+_VISUAL_MAX_TAGS = 5
+
+# Over-selection / regurgitation threshold for the category-visual pass, as a
+# `>=` bound — i.e. reject at MORE than the cap the prompt states. It was 12,
+# inherited from the 78-term `tags` vocabulary, and the real failure never came
+# near it: the observed maximum was 11 tags and the median 5, so the guard
+# never fired on the thing that was actually wrong. Defined from
+# `_VISUAL_MAX_TAGS` so the prompt and the guard cannot drift apart.
+_VISUAL_MAX_PLAUSIBLE_TAGS = _VISUAL_MAX_TAGS + 1
 
 
 def _build_category_prompt(description: str, vocab: list[str]) -> str:
@@ -796,45 +866,235 @@ def extract_keywords_from_description(
 
 
 def _build_visual_prompt(vocab: list[str]) -> str:
+    """Build the category-visual prompt from the PERCEIVED vocabulary.
+
+    TWO failures shaped this, both measured on live output. DON'T UNDO EITHER
+    without re-running the A/B.
+
+    1. A flat checklist whose only rule was "Include every tag that clearly
+       applies" collapsed the output: 1,373 photos of one shoot produced 163
+       distinct tag sets, one verbatim 8-tag set on 101 of them.
+    2. Its replacement grouped the terms into AXES and said "Pick at most ONE
+       tag from each group". The model read that as pick one FROM EACH group,
+       so every photo collected a viewpoint tag and a composition tag whether
+       or not one applied — `close-up, sunny, symmetrical` on a person walking
+       down stairs, `close-up ... wide-angle` on an artichoke.
+
+    So there are NO axes to fill: the over-applied terms sit in a RARE section
+    that spells out the exact situation each one needs, including what it is
+    NOT. And there are NO worked examples — a variant carrying two of them
+    leaked `close-up` out of the example onto an unrelated baseball photo.
+
+    Measured on 11 hand-labelled photos (qwen2.5-vl-7b-instruct, temperature 0):
+    axes prompt 16 right / 5 wrong / 3.3 tags per photo; this one 14 right /
+    0 wrong / 1.8 tags; this one plus two examples 14 right / 1 wrong.
+
+    The capture-fact and frozen terms are deliberately absent — see
+    photosearch/visual_tags_derive.py.
+    """
+    from .visual_tags_derive import (PERCEIVED_GLOSS, PROMPT_SECTIONS,
+                                     _INLINE_SECTIONS)
+
+    offered = set(vocab)
+
+    def _render(terms):
+        return ", ".join(
+            f"{t} ({PERCEIVED_GLOSS[t]})" if t in PERCEIVED_GLOSS else t
+            for t in terms if t in offered
+        )
+
+    lines = []
+    listed = set()
+    for header, groups in PROMPT_SECTIONS:
+        rendered = [_render(g) for g in groups]
+        rendered = [r for r in rendered if r]
+        if not rendered:
+            continue
+        listed.update(t for g in groups for t in g)
+        if header in _INLINE_SECTIONS and len(rendered) == 1:
+            lines.append(f"{header} {rendered[0]}")
+        else:
+            lines.append(header)
+            lines.extend(f"  {r}" for r in rendered)
+    # A term the caller offered that no section claims (a regenerated
+    # vocabulary with a new word) still has to be reachable.
+    extra = _render([t for t in vocab if t not in listed])
+    if extra:
+        lines.append("OTHER:")
+        lines.append(f"  {extra}")
+
     return (
-        "Pick visual-quality tags for this photo from this list: "
-        + ", ".join(vocab)
-        + "\n\nRules:\n"
-        "- Return ONLY a comma-separated list of tags from the list above.\n"
-        "- Mood / light / composition only. Don't describe content.\n"
-        "- Include every tag that clearly applies.\n"
+        "Tag how this photo LOOKS, using only tags from the list below.\n\n"
+        "Most photos deserve 1 to 3 tags, and many deserve only one. Do NOT "
+        "try to use every section: most photos have NO viewpoint tag and NO "
+        "composition tag at all.\n\n"
+        + "\n".join(lines)
+        + "\n\nAnswer with ONLY a comma-separated list of tags spelled exactly "
+        f"as above, at most {_VISUAL_MAX_TAGS}. If nothing clearly applies, "
+        "answer: none\n"
     )
 
 
+# A leading "Tags:" / "RIGHT:" / "Answer:" style label on the answer line.
+_VISUAL_LABEL_RE = re.compile(r"^\w[\w \-]*:\s*")
+# A bullet or list-number at the start of a line.
+_VISUAL_BULLET_RE = re.compile(r"^\s*(?:[-*•–]|\d+[.)])\s+")
+# Everything a model wraps a token in: quotes, brackets, backticks, emphasis.
+_VISUAL_WRAPPERS = "\"'`*_[]{}()<> \t.,;:"
+# Answers that genuinely mean "no tags". Anything else that parses to nothing
+# is an unparseable FAILURE, not an empty result — see `tag_visual_photo`.
+_VISUAL_EMPTY_ANSWERS = {
+    "", "none", "no tags", "no tag", "n/a", "na", "nothing", "-", "[]",
+    "none of the above", "no visual tags",
+}
+
+
+# Off-vocabulary words a model uses for an on-vocabulary tag. Applied only when
+# the target is in the vocabulary being parsed. gemma-4 answered `misty` on a
+# photographer-keyworded fog shot and the tag was silently dropped (Unsplash
+# 26-lAP0XprM, 2026-09-26). Keep this to true synonyms: a near-miss mapping
+# (say `cloudy` -> `overcast`) would manufacture a tag the model did not mean.
+_VISUAL_SYNONYMS = {
+    "misty": "foggy",
+}
+
+
+def _is_explicit_empty_answer(raw: Optional[str]) -> bool:
+    """True when the model said "no tags" rather than saying nothing usable."""
+    s = (raw or "").strip().strip("`")
+    s = _VISUAL_BULLET_RE.sub("", s)
+    s = _VISUAL_LABEL_RE.sub("", s)
+    s = s.strip(_VISUAL_WRAPPERS).lower()
+    return s in _VISUAL_EMPTY_ANSWERS
+
+
 def _parse_visual_response(raw: str, vocab_set: set[str]) -> list[str]:
-    out = []
+    """Read a tag list out of whatever shape the model actually emitted.
+
+    The first version split on commas and nothing else, so `RIGHT: sunny` ->
+    `[]`, `Tags: sunny, peaceful` lost `sunny`, and a bullet list parsed to
+    nothing at all. An empty parse then looked exactly like "this photo has no
+    visual qualities" and was persisted as `'[]'` — NOT NULL, so the photo left
+    the queue permanently, un-retried, looking done.
+
+    DON'T SIMPLIFY THIS BACK to a comma split. The prompt asks for one shape;
+    small vision models supply six, and the cost of not reading one is a
+    silently mistagged photo that never comes back.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    # Strip a ``` fence, with or without a language tag.
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    # A JSON array is a common answer shape and the cleanest to read.
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text.replace("'", '"'))
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            text = ", ".join(str(x) for x in parsed)
+
+    out: list[str] = []
     seen: set[str] = set()
-    for token in (raw or "").split(","):
-        t = token.strip().lower().rstrip(".")
-        if t in vocab_set and t not in seen:
-            seen.add(t)
-            out.append(t)
+    for line in re.split(r"[\r\n]+", text):
+        line = _VISUAL_BULLET_RE.sub("", line)
+        line = _VISUAL_LABEL_RE.sub("", line)
+        for token in re.split(r"[,;]", line):
+            t = token.strip().strip(_VISUAL_WRAPPERS).lower()
+            if t not in vocab_set and _VISUAL_SYNONYMS.get(t) in vocab_set:
+                t = _VISUAL_SYNONYMS[t]
+            if t in vocab_set and t not in seen:
+                seen.add(t)
+                out.append(t)
     return out
+
+
+_OVER_SELECTION = "over-selection"
+_CONTRADICTION = "contradiction"
+_UNPARSEABLE = "unparseable"
+
+
+def _visual_contradictions(tags) -> list[tuple[str, str]]:
+    """The mutually-exclusive pairs both present in `tags`."""
+    from .visual_tags_derive import CONTRADICTORY_PAIRS
+
+    have = set(tags)
+    return [p for p in CONTRADICTORY_PAIRS if p[0] in have and p[1] in have]
+
+
+def _visual_answer_problem(tags) -> Optional[str]:
+    """Why this answer is not believable, or None if it is fine."""
+    if len(tags) >= _VISUAL_MAX_PLAUSIBLE_TAGS:
+        return _OVER_SELECTION
+    if _visual_contradictions(tags):
+        return _CONTRADICTION
+    return None
+
+
+def _drop_visual_contradictions(tags) -> list[str]:
+    """Remove BOTH members of every contradictory pair, keeping the rest.
+
+    Both go, not the "better" one: when a model says a photo is at once
+    peaceful and dramatic, nothing in the answer tells you which half it meant,
+    so neither is evidence. The tags that were never in question are still
+    good, which is why this repairs rather than rejecting the whole response.
+    """
+    doomed: set[str] = set()
+    for a, b in _visual_contradictions(tags):
+        doomed.add(a)
+        doomed.add(b)
+    return [t for t in tags if t not in doomed]
 
 
 def tag_visual_photo(
     image_path: str,
     model: str = TAGS_MODEL,
 ) -> Optional[list[str]]:
-    """Generate visual-quality tags for a single photo via Ollama (vision).
+    """Generate PERCEIVED visual tags for a single photo via Ollama (vision).
 
     Calls `_ollama_chat_with_retry` directly (not via describe_photo) so the
     test surface is uniform — same mock point as extract_categories/keywords.
-    Mirrors the regurgitation guard from the old `tag_photo` at threshold 12.
+
+    Two guards on the answer, both resolved with at most one retry:
+
+      * OVER-SELECTION (>= `_VISUAL_MAX_PLAUSIBLE_TAGS`) — a retry that still
+        over-selects is the regurgitation signature (the model is reciting the
+        vocabulary, not looking at the photo) and the whole response is
+        dropped. Unchanged in shape from the old guard; only the threshold
+        moved, from 12 — which the real failure never reached, its maximum
+        being 11 — down to the cap the prompt now states.
+      * CONTRADICTION — both halves of a mutually exclusive pair. A retry that
+        is still contradictory gets REPAIRED, not rejected: both members go and
+        the untouched tags survive.
+      * UNPARSEABLE — a non-empty response that yields no tag at all. Retried
+        once, then treated as a FAILED GENERATION.
+
+    Two different empties, and conflating them is what made the original bug
+    permanent:
+
+      ``[]``    the model answered, and the answer was "no tags". A real
+                result: the server writes '[]' and the photo is done.
+      ``None``  no usable answer (no response, unparseable prose,
+                regurgitation, or a guard that removed everything). The server
+                leaves `visual_tags` NULL — so the photo stays claimable — but
+                still marks it processed, so a repeatable failure is bounded by
+                MAX_PROCESS_ATTEMPTS instead of being re-claimed forever. Same
+                shape as the aesthetics pass's empty-scores row.
     """
-    from .vocab_visual import VISUAL_VOCABULARY
+    from .visual_tags_derive import PERCEIVED_VOCABULARY
     if not HAS_OLLAMA:
         return None
     path = Path(image_path)
     if not path.exists():
         return None
-    vocab_set = set(VISUAL_VOCABULARY)
-    prompt = _build_visual_prompt(VISUAL_VOCABULARY)
+    # PERCEIVED only — the capture facts are derived from EXIF server-side and
+    # would be stripped from this answer anyway. Asking for them just wastes
+    # tokens and invites the model to fill its quota with guesses.
+    vocab_set = set(PERCEIVED_VOCABULARY)
+    prompt = _build_visual_prompt(PERCEIVED_VOCABULARY)
     encoded = _encode_image_for_ollama(str(path))
     image_ref = encoded if encoded is not None else str(path)
     options = _options_for_model(model)
@@ -849,10 +1109,13 @@ def tag_visual_photo(
     except Exception:
         return None
     if not raw:
-        return None
+        return None                       # no response at all — a failure
+    if _is_explicit_empty_answer(raw):
+        return []                         # the model answered: "no tags"
     tags = _parse_visual_response(raw, vocab_set)
-    if len(tags) >= _VISUAL_MAX_PLAUSIBLE_TAGS:
-        # Retry with temp bump (regurgitation guard — same shape as old tag_photo).
+    problem = _UNPARSEABLE if not tags else _visual_answer_problem(tags)
+    if problem is not None:
+        # One retry with a temperature bump — same shape as the old guard.
         retry_opts = dict(options)
         retry_opts["temperature"] = 0.4
         retry_opts.setdefault("repeat_penalty", 1.3)
@@ -865,12 +1128,28 @@ def tag_visual_photo(
             )
         except Exception:
             raw2 = None
-        if not raw2:
+        if raw2 and _is_explicit_empty_answer(raw2):
+            return []                     # the retry answered: "no tags"
+        tags2 = _parse_visual_response(raw2, vocab_set) if raw2 else []
+        if tags2:
+            problem2 = _visual_answer_problem(tags2)
+        else:
+            problem2 = _UNPARSEABLE if raw2 else None
+
+        if tags2 and problem2 is None:
+            tags = tags2                  # the retry produced a clean answer
+        elif problem2 == _CONTRADICTION:
+            # Repair rather than reject: both members of each bad pair go, the
+            # tags that were never in question survive.
+            tags = _drop_visual_contradictions(tags2)
+        elif problem2 is None and not tags2 and problem == _CONTRADICTION:
+            # The retry produced nothing at all — repair the first answer.
+            tags = _drop_visual_contradictions(tags)
+        else:
+            # Regurgitation, or still unparseable: no usable answer. None (not
+            # []) so the column stays NULL and the photo is re-claimed, bounded
+            # by MAX_PROCESS_ATTEMPTS.
             return None
-        tags2 = _parse_visual_response(raw2, vocab_set)
-        if len(tags2) >= _VISUAL_MAX_PLAUSIBLE_TAGS or not tags2:
-            return None
-        tags = tags2
     return tags if tags else None
 
 

@@ -91,11 +91,11 @@ describe('PS.SharedHeader', () => {
   test('renders all nav links', () => {
     render(e(PS.SharedHeader, { activePage: 'search' }));
     const links = document.querySelectorAll('.nav-link');
-    expect(links.length).toBe(14);
+    expect(links.length).toBe(15);
     const labels = Array.from(links).map(l => l.textContent);
     expect(labels).toEqual(['Search', 'Review', 'Faces', 'Merges', 'Collections',
-      'Books', 'Split', 'Map', 'Geotag', 'Status', 'Deploy', 'Maint', 'Vocab',
-      'Logs']);
+      'Books', 'Split', 'Map', 'Geotag', 'Batches', 'Status', 'Deploy', 'Maint',
+      'Vocab', 'Logs']);
   });
 
   test('marks active page with active class', () => {
@@ -113,7 +113,7 @@ describe('PS.SharedHeader', () => {
     const links = document.querySelectorAll('.nav-link');
     const hrefs = Array.from(links).map(l => l.getAttribute('href'));
     expect(hrefs).toEqual(['/', '/review', '/faces', '/merges', '/collections',
-      '/book', '/split', '/map', '/geotag', '/status', '/admin/deploy',
+      '/book', '/split', '/map', '/geotag', '/batches', '/status', '/admin/deploy',
       '/admin/maintenance', '/admin/vocab', '/logs']);
   });
 
@@ -525,5 +525,97 @@ describe('PS.PhotoModal — collections', () => {
 
     const fetchCalls = fetch.mock.calls.map(c => c[0]);
     expect(fetchCalls.some(url => url.includes('/collections'))).toBe(false);
+  });
+});
+
+// =========================================================================
+// PS.parseSSEFrame / PS.parseSSEChunk
+// =========================================================================
+//
+// These parse the frames three pages stream. The bug they are written for:
+// the first version anchored on `^data:` after trimming the whole frame, so
+// every frame that leads with an `event:` line — which is what
+// _stream_subprocess emits for the admin endpoints — parsed as null. The
+// /batches advance log was therefore completely dead, terminal `fatal`
+// included. Two other pages had already worked around it with their own
+// `data:`-line filter.
+
+describe('PS.parseSSEFrame', () => {
+  test('reads a frame that leads with an event: line', () => {
+    const f = PS.parseSSEFrame('event: line\ndata: {"line": "hello"}');
+    expect(f.event).toBe('line');
+    expect(f.data).toEqual({ line: 'hello' });
+  });
+
+  test('reads a data-only frame — the two existing callers still work', () => {
+    const f = PS.parseSSEFrame('data: {"type": "done"}');
+    expect(f.event).toBe(null);
+    expect(f.data).toEqual({ type: 'done' });
+  });
+
+  test('surfaces the terminal event names', () => {
+    expect(PS.parseSSEFrame('event: fatal\ndata: {"error": "boom"}').event).toBe('fatal');
+    expect(PS.parseSSEFrame('event: done\ndata: {"returncode": 0}').data.returncode).toBe(0);
+  });
+
+  test('is null for a keepalive comment, a blank frame and garbage', () => {
+    expect(PS.parseSSEFrame(': keepalive')).toBe(null);
+    expect(PS.parseSSEFrame('')).toBe(null);
+    expect(PS.parseSSEFrame('   ')).toBe(null);
+    expect(PS.parseSSEFrame(null)).toBe(null);
+    expect(PS.parseSSEFrame('not an sse frame at all')).toBe(null);
+    expect(PS.parseSSEFrame('event: line')).toBe(null);          // no data:
+    expect(PS.parseSSEFrame('data: {not json}')).toBe(null);
+  });
+
+  test('joins repeated data: lines with a newline, per the SSE spec', () => {
+    const f = PS.parseSSEFrame('event: x\ndata: {"a":\ndata: 1}');
+    expect(f.data).toEqual({ a: 1 });
+  });
+
+  test('tolerates CRLF, trailing blank lines and a missing space after the colon', () => {
+    expect(PS.parseSSEFrame('event: line\r\ndata: {"line":"x"}\r\n').data).toEqual({ line: 'x' });
+    expect(PS.parseSSEFrame('data:{"line":"x"}').data).toEqual({ line: 'x' });
+  });
+});
+
+describe('PS.parseSSEChunk', () => {
+  test('returns the payload alone, for the callers that predate the frame form', () => {
+    expect(PS.parseSSEChunk('data: {"type": "start"}')).toEqual({ type: 'start' });
+    expect(PS.parseSSEChunk('event: line\ndata: {"line": "x"}')).toEqual({ line: 'x' });
+  });
+
+  test('still returns null where it always did', () => {
+    expect(PS.parseSSEChunk(': keepalive')).toBe(null);
+    expect(PS.parseSSEChunk('')).toBe(null);
+    expect(PS.parseSSEChunk('data: nope')).toBe(null);
+  });
+});
+
+describe('parseSSEFrame + BatchFlow.advanceLogLine, composed', () => {
+  // The regression in one test: real frames as photosearch/admin_api.py's
+  // _stream_subprocess writes them, through both halves, to a log line.
+  const BF = require('../dist/batch-flow.js');
+  const render = (frame) => BF.advanceLogLine(PS.parseSSEFrame(frame));
+
+  test('a real subprocess stream produces a real log', () => {
+    const frames = [
+      'event: start\ndata: {"cmd": "python cli.py batch-advance --batch 7"}',
+      'event: line\ndata: {"line": "  [stacking] done: stacks=3"}',
+      'event: line\ndata: {"line": "  [warm_crops] done: ok=812"}',
+      'event: done\ndata: {"returncode": 0}',
+    ];
+    expect(frames.map(render).map((l) => l && l.text)).toEqual([
+      '$ python cli.py batch-advance --batch 7',
+      '  [stacking] done: stacks=3',
+      '  [warm_crops] done: ok=812',
+      '— finished —',
+    ]);
+  });
+
+  test('the fatal a replica emits when the NAS is unreachable is not lost', () => {
+    const out = render('event: fatal\ndata: {"error": "could not reach authoritative server"}');
+    expect(out.cls).toBe('l-err');
+    expect(out.text).toContain('could not reach');
   });
 });

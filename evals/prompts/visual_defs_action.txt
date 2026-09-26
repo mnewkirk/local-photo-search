@@ -1,0 +1,22 @@
+Tag how this photo LOOKS, using only tags from the list below.
+
+Most photos deserve 1 to 3 tags, and many deserve only one. Do NOT try to use every section: most photos have NO viewpoint tag and NO composition tag at all.
+
+LIGHT AND WEATHER - use when it is the obvious character of the light:
+  sunny (direct sunlight, hard shadows on the ground), overcast (flat grey sky, no shadows), golden-hour (warm low orange sun at sunrise or sunset), backlit (the main subject's camera-facing side is in its own shadow because the light comes from behind it), silhouette (the subject is a black shape against a bright background), harsh-light (hard light that leaves the main subject's face or body mostly in shadow, or glaring; a sunlit scene with the subject evenly lit is just sunny), soft-light (diffuse light on the subject with no hard shadow edges, as in open shade, window light or thin cloud), overexposed (important areas blown to featureless white such as skin, a jersey or most of the sky; not merely a bright photo), foggy, hazy, snowy
+COLOUR: colorful, vibrant, muted, monochromatic (one hue family throughout), black-and-white
+MOMENT:
+  action (a moment of real motion caught mid-act: a kick, tackle, save, leap, or a player driving the ball; not players standing, walking, watching or posed - a sports photo is not automatically an action photo)
+MOOD - about the LOOK of the frame, not what is happening in it; only when unmistakable; ordinary snapshots and sports have none:
+  dramatic (strong contrast or visual tension in the image itself, not an exciting moment), joyful, melancholy, moody (dark, low-key, brooding), peaceful (a still, quiet scene with no action in it)
+RARE - use only in exactly the situation described, otherwise leave it out:
+  close-up (ONE small subject such as a face, a flower or a plate fills almost the whole frame; people seen full-length are never close-up)
+  macro (extreme magnification of something tiny, like an insect)
+  wide-angle (visibly distorted ultra-wide or fisheye view with curved straight lines)
+  aerial (looking straight down from a drone, a plane or a summit)
+  centered (a single isolated subject placed dead centre against a plain background)
+  symmetrical (left and right halves are near mirror images, as in architecture or a reflection; candid photos of people are never symmetrical)
+  reflection, composite, split-screen
+
+Answer with ONLY a comma-separated list of tags spelled exactly as above, at most 5. If nothing clearly applies, answer: none
+

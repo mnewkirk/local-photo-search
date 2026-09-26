@@ -260,6 +260,64 @@ def _stage_colors(db, apply, emit, check_abort, batch_size=100):
     return {"stage": "colors", "would": would, "applied": applied, "status": "done"}
 
 
+# The per-day percentile can only exist for a photo with a capture day
+# (``aesthetics._normalize_by_day`` skips rows where
+# COALESCE(date_taken, date_created) IS NULL). The gate must ask the same
+# question, or an undated scored photo reads "missing" forever: on the NAS
+# 1,373 such photos (Facebook takeout, old scans — no EXIF date, no
+# date_created) held this stage's gate open every night, so it re-ranked all
+# 158,111 scored photos nightly on an unchanged library.
+_HAS_CAPTURE_DAY_SQL = "COALESCE(date_taken, date_created) IS NOT NULL"
+
+
+def _aesthetics_missing_sql(score_col: str, pct_col: str, day_pct_col: str) -> str:
+    """COUNT of rows that CAN still receive a percentile and don't have one."""
+    return (
+        f"SELECT COUNT(*) FROM photos WHERE {score_col} IS NOT NULL "
+        f"AND ({pct_col} IS NULL "
+        f"OR ({day_pct_col} IS NULL AND {_HAS_CAPTURE_DAY_SQL}))"
+    )
+
+
+def _run_percentile_stage(db, apply, emit, check_abort, force, *, stage,
+                          score_col, pct_col, day_pct_col,
+                          library_fn, by_day_fn):
+    """Shared body of the two aesthetics-percentile stages.
+
+    ``would`` = scored rows that can still get a percentile and lack one
+    (the gate). ``applied`` = rows whose percentile was actually WRITTEN
+    across both passes — not the number of scored rows considered, which is
+    what this used to report (``applied 158,111`` on a night that changed
+    nothing, which hid the skip-unchanged logic). ``considered`` keeps that
+    number for anyone who wants it.
+    """
+    would = db.conn.execute(
+        _aesthetics_missing_sql(score_col, pct_col, day_pct_col)
+    ).fetchone()[0]
+    if (would == 0 and not force) or not apply:
+        return {"stage": stage, "would": would, "applied": 0,
+                "status": "skipped" if (would == 0 and not force) else "preview"}
+
+    def on_chunk(done, total):
+        # The percentile write is chunked so the worker fleet can take the
+        # write lock between chunks (see aesthetics.PERCENTILE_CHUNK_ROWS);
+        # those gaps are also where an abort can land.
+        check_abort()
+        emit({"phase": "sweep", "stage": stage,
+              "status": "running", "done": done, "total": total})
+
+    stats: dict = {}
+    n = library_fn(db, apply=True, on_chunk=on_chunk, stats=stats)
+    by_day_fn(db, apply=True, on_chunk=on_chunk, stats=stats)  # per-day (v28)
+    written = stats.get("written", 0)
+    emit({"phase": "sweep", "stage": stage, "status": "running",
+          "done": written, "total": written})
+    return {"stage": stage, "would": would, "applied": written,
+            "status": "done", "considered": n,
+            "unchanged": stats.get("unchanged", 0),
+            "rescored_mid_run": stats.get("stale", 0)}
+
+
 def _stage_normalize_aesthetics(db, apply, emit, check_abort, force=False):
     """Refresh aes_overall_pct (library-relative percentile) when new photos
     have been scored by the fleet's aesthetics pass. The VLM scoring itself is
@@ -272,20 +330,12 @@ def _stage_normalize_aesthetics(db, apply, emit, check_abort, force=False):
     percentile from the missing-only trigger, but the DISTRIBUTION shifted, so
     existing rows must be re-ranked) or after retuning the dimension weights.
     """
-    would = db.conn.execute(
-        "SELECT COUNT(*) FROM photos WHERE aes_overall IS NOT NULL "
-        "AND (aes_overall_pct IS NULL OR aes_overall_day_pct IS NULL)"
-    ).fetchone()[0]
-    if (would == 0 and not force) or not apply:
-        return {"stage": "normalize_aesthetics", "would": would, "applied": 0,
-                "status": "skipped" if (would == 0 and not force) else "preview"}
     from .aesthetics import normalize_overall, normalize_overall_by_day
-    n = normalize_overall(db, apply=True)
-    normalize_overall_by_day(db, apply=True)  # per-day percentile (v28)
-    emit({"phase": "sweep", "stage": "normalize_aesthetics", "status": "running",
-          "done": n, "total": n})
-    return {"stage": "normalize_aesthetics", "would": would, "applied": n,
-            "status": "done"}
+    return _run_percentile_stage(
+        db, apply, emit, check_abort, force,
+        stage="normalize_aesthetics", score_col="aes_overall",
+        pct_col="aes_overall_pct", day_pct_col="aes_overall_day_pct",
+        library_fn=normalize_overall, by_day_fn=normalize_overall_by_day)
 
 
 def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort, force=False):
@@ -295,20 +345,14 @@ def _stage_normalize_subject_aesthetics(db, apply, emit, check_abort, force=Fals
     ``force`` re-ranks the whole library even with nothing missing (post-batch
     distribution shift / weight retune). See photosearch/subjects.py +
     docs/plans/subject-aware-quality.md."""
-    would = db.conn.execute(
-        "SELECT COUNT(*) FROM photos WHERE aes_subject_overall IS NOT NULL "
-        "AND (aes_subject_overall_pct IS NULL OR aes_subject_overall_day_pct IS NULL)"
-    ).fetchone()[0]
-    if (would == 0 and not force) or not apply:
-        return {"stage": "normalize_subject_aesthetics", "would": would, "applied": 0,
-                "status": "skipped" if (would == 0 and not force) else "preview"}
     from .aesthetics import normalize_subject_overall, normalize_subject_overall_by_day
-    n = normalize_subject_overall(db, apply=True)
-    normalize_subject_overall_by_day(db, apply=True)  # per-day percentile (v28)
-    emit({"phase": "sweep", "stage": "normalize_subject_aesthetics", "status": "running",
-          "done": n, "total": n})
-    return {"stage": "normalize_subject_aesthetics", "would": would, "applied": n,
-            "status": "done"}
+    return _run_percentile_stage(
+        db, apply, emit, check_abort, force,
+        stage="normalize_subject_aesthetics", score_col="aes_subject_overall",
+        pct_col="aes_subject_overall_pct",
+        day_pct_col="aes_subject_overall_day_pct",
+        library_fn=normalize_subject_overall,
+        by_day_fn=normalize_subject_overall_by_day)
 
 
 def _abort_flag(check_abort) -> bool:
@@ -321,15 +365,26 @@ def _abort_flag(check_abort) -> bool:
 
 
 def _stage_stacking(db, apply, emit, check_abort):
-    """Library-wide burst/bracket stack detection (idempotent re-detect)."""
-    from .stacking import run_stacking
-    # "would" here is the count of timestamped photos eligible for detection;
-    # stacking is a full re-detect rather than a missing-only backfill.
-    would = db.conn.execute(
-        "SELECT COUNT(*) FROM photos WHERE date_taken IS NOT NULL"
-    ).fetchone()[0]
-    if not apply:
-        return {"stage": "stacking", "would": would, "applied": 0, "status": "preview"}
+    """Missing-only burst/bracket stack detection.
+
+    ``would`` is the number of photos stacking has not yet considered (new,
+    re-timed, or in a stack that lost a member — see
+    ``stacking.run_incremental_stacking``); ``applied`` is the number of
+    stacks actually created + removed. This used to be an unscoped
+    ``run_stacking``: a full-library re-detect that cleared and re-created
+    every stack nightly (``would 157815, applied 27165`` on an unchanged
+    library, where applied was just the total stack count).
+    """
+    from .stacking import run_incremental_stacking
+    should_abort = lambda: _abort_flag(check_abort)  # noqa: E731
+    preview = run_incremental_stacking(db, dry_run=True)
+    would = preview["dirty"]
+    if would == 0 or not apply:
+        # A dry run still reports what is dirty; nothing dirty is a skip.
+        # (Stale ledger rows for photos that lost their date are harmless and
+        # are pruned by the next run that has real work.)
+        return {"stage": "stacking", "would": would, "applied": 0,
+                "status": "skipped" if would == 0 else "preview"}
 
     def _on_prog(ev):
         ev = dict(ev)
@@ -338,17 +393,30 @@ def _stage_stacking(db, apply, emit, check_abort):
         ev["status"] = "running"
         emit(ev)
 
-    stacks = run_stacking(
-        db, dry_run=False,
-        on_progress=_on_prog, should_abort=lambda: _abort_flag(check_abort),
+    res = run_incremental_stacking(
+        db, on_progress=_on_prog, should_abort=should_abort,
     )
-    return {"stage": "stacking", "would": would,
-            "applied": len(stacks), "status": "done",
-            "photos_stacked": sum(len(s) for s in stacks)}
+    return {"stage": "stacking", "would": res["dirty"],
+            "applied": res["applied"], "status": "done",
+            "scope_photos": res["scope_photos"],
+            "stacks_detected": res["stacks_detected"],
+            "stacks_created": res["stacks_created"],
+            "stacks_removed": res["stacks_removed"],
+            "stacks_unchanged": res["stacks_unchanged"]}
 
 
-def _stage_match_faces(db, apply, emit, check_abort):
-    """Match unassigned faces to known persons (strict + temporal)."""
+def _stage_match_faces(db, apply, emit, check_abort, temporal=False):
+    """Match unassigned faces to known persons — STRICT only, unless `temporal`.
+
+    Temporal matching is an explicit opt-in because this stage runs unattended
+    every night, over shoots nobody has reviewed yet. On 2026-09-19 it swept a
+    shoot ingested hours earlier and wrote 466 temporal labels (Calvin 382,
+    Ellie 149) beside 65 strict ones — on exactly the kind of shoot where
+    temporal is ~4% accurate and tags one kid across both teams (see "Label
+    health" in CLAUDE.md: 86% of Calvin's temporal faces sit beyond his own
+    strict bar). Recall is not worth polluting every new shoot by default; run
+    `match-faces --temporal` by hand when you want it.
+    """
     would = db.conn.execute(
         "SELECT COUNT(*) FROM faces WHERE person_id IS NULL"
     ).fetchone()[0]
@@ -372,7 +440,8 @@ def _stage_match_faces(db, apply, emit, check_abort):
     matched = match_faces_to_persons(db)
     emit({"phase": "sweep", "stage": "match_faces", "status": "running",
           "done": matched, "total": would})
-    matched += match_faces_temporal(db)
+    if temporal:
+        matched += match_faces_temporal(db)
     return {"stage": "match_faces", "would": would, "applied": matched, "status": "done"}
 
 
@@ -401,19 +470,12 @@ def _stage_resolve_dups(db, apply, emit, check_abort):
         return {"stage": "resolve_dups", "would": would, "applied": 0,
                 "status": "skipped" if would == 0 else "preview",
                 "groups": len(dups)}
-    # Reversible snapshot (same on-demand table the CLI dedup commands use).
-    c.execute("CREATE TABLE IF NOT EXISTS face_dedupe_undo ("
-              "face_id INTEGER PRIMARY KEY, person_id INTEGER, match_source TEXT, "
-              "unmatched_at TEXT DEFAULT (datetime('now')))")
-    for fid in to_unmatch:
-        row = c.execute("SELECT person_id, match_source FROM faces WHERE id = ?",
-                        (fid,)).fetchone()
-        if row and row["person_id"] is not None:
-            c.execute("INSERT OR REPLACE INTO face_dedupe_undo"
-                      "(face_id, person_id, match_source) VALUES (?, ?, ?)",
-                      (fid, row["person_id"], row["match_source"]))
-        c.execute("UPDATE faces SET person_id = NULL, "
-                  "match_source = 'dedupe_unmatched' WHERE id = ?", (fid,))
+    # Snapshot (reversible via restore-unmatched-faces) + record the (face,
+    # person) exclusion + null the label, in the ONE shared primitive the CLI
+    # dedup commands also use. Without the exclusion this stage and match_faces
+    # flapped ~6,000 labels a night forever; see photosearch/db.py.
+    from .db import unmatch_faces_as_duplicates
+    unmatch_faces_as_duplicates(c, to_unmatch, reason="maintenance_resolve_dups")
     db.conn.commit()
     return {"stage": "resolve_dups", "would": would, "applied": would,
             "status": "done", "groups": len(dups)}
@@ -695,6 +757,7 @@ def run_maintenance_sweep(
     do_colors: bool = True,
     do_stacking: bool = True,
     do_match: bool = True,
+    match_temporal: bool = False,
     do_recluster: bool = False,
     do_dedup: bool = False,
     do_requeue: bool = False,
@@ -716,6 +779,9 @@ def run_maintenance_sweep(
         apply: When False (default) every stage reports how many rows it
             *would* touch and writes nothing. When True, stages run.
         do_colors / do_stacking: toggle those (heavier) stages.
+        match_temporal: opt-in — also run the TEMPORAL face matcher in the
+            match_faces stage. Off by default: it over-matches badly on
+            kids'-sport shoots and this sweep runs unattended on unreviewed ones.
         do_recluster: opt-in — clears ignored_clusters, so off by default.
         do_dedup: opt-in — DELETES duplicate photos (destructive), so off by
             default. Runs first so downstream stages work on the deduped set.
@@ -763,7 +829,8 @@ def run_maintenance_sweep(
     # unmatched face); gate it so the interactive/live sweep can skip it and
     # leave it to an off-hours cron or the worker fleet.
     if do_match:
-        plan.append(("match_faces", lambda: _stage_match_faces(db, apply, emit, check_abort)))
+        plan.append(("match_faces", lambda: _stage_match_faces(
+            db, apply, emit, check_abort, temporal=match_temporal)))
     plan.append(("resolve_dups", lambda: _stage_resolve_dups(db, apply, emit, check_abort)))
     plan.append(("normalize_aesthetics",
                  lambda: _stage_normalize_aesthetics(

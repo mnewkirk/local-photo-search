@@ -249,6 +249,18 @@
       margin-bottom: 14px;
       margin-top: 8px;
     }
+    /* A sibling-page link inside an h2 — the heading is uppercase/tracked, the
+       link should not inherit that. */
+    h2 .h2-link {
+      margin-left: 10px;
+      font-size: 12px;
+      font-weight: 500;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--accent);
+      text-decoration: none;
+    }
+    h2 .h2-link:hover { text-decoration: underline; }
 
     .cmd-table {
       width: 100%;
@@ -2243,7 +2255,12 @@
         ? inc.source.replace(/^https?:\/\//, '') : null;
 
       return e('div', null,
-        e('h2', null, 'Pipeline' + (srcLabel ? ' — ' + srcLabel : '')),
+        e('h2', null, 'Pipeline' + (srcLabel ? ' — ' + srcLabel : ''),
+          // This funnel is library-wide; /batches is the same pipeline for one
+          // dated ingest folder, which is the view you want after a card dump.
+          e('a', { className: 'h2-link', href: '/batches' }, 'Per-batch view →'),
+          // Owner-only labelling tool for the category-visual eval; not in the nav.
+          e('a', { className: 'h2-link', href: '/eval/visual-tags' }, 'Visual-tag eval →')),
         e('div', { className: 'workers-wrap' },
           inc && inc.error && e('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, inc.error),
           e('div', { className: 'funnel-groups' },

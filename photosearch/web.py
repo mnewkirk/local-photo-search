@@ -40,6 +40,9 @@ from .worker_api import (
     is_shutting_down as worker_is_shutting_down,
 )
 from .admin_api import router as admin_router
+from .batch_api import router as batches_router
+from .eval_api import router as eval_router
+from .eval_api import sheet_router as eval_sheet_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -47,6 +50,9 @@ from .admin_api import router as admin_router
 
 app = FastAPI(title="local-photo-search", version="0.1.0")
 app.include_router(worker_router)
+app.include_router(batches_router)
+app.include_router(eval_router)
+app.include_router(eval_sheet_router)
 app.include_router(admin_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)
@@ -1872,6 +1878,13 @@ def _mirror_face_labels(face_ids: list[int], person_name: Optional[str]) -> dict
             db.conn.execute(
                 f"UPDATE faces SET person_id = ?, match_source = ? WHERE id IN ({ph})",
                 [pid, src, *batch])
+            if pid is not None:
+                # The NAS's assign cleared this pairing's exclusion (via
+                # db.assign_face_to_person); mirror that, or the replica would
+                # keep refusing to match a face the user just named.
+                db.conn.execute(
+                    f"DELETE FROM face_person_exclusions "
+                    f"WHERE person_id = ? AND face_id IN ({ph})", [pid, *batch])
         db.conn.commit()
     return {"relabelled": len(face_ids)}
 
@@ -2911,12 +2924,29 @@ def api_apply_face_merge(data: dict):
         cur = db.conn.cursor()
         try:
             if target["type"] == "person":
+                # Accepting a merge is a human saying these faces ARE that
+                # person, so it overrules any duplicate-resolver exclusion for
+                # the pairing — the same rule assign / bulk-assign get from
+                # db.assign_face_to_person. This path writes the label with its
+                # own UPDATE, so it clears the exclusions itself, scoped to the
+                # faces actually being moved (read BEFORE the update, which is
+                # what makes them identifiable).
+                moving = [r["id"] for r in db.conn.execute(
+                    "SELECT id FROM faces WHERE cluster_id = ? AND person_id IS NULL",
+                    (source_id,))]
                 cur.execute(
                     """UPDATE faces
                        SET person_id = ?, cluster_id = NULL, match_source = 'merge_review'
                        WHERE cluster_id = ? AND person_id IS NULL""",
                     (target_id, source_id),
                 )
+                for i in range(0, len(moving), 500):
+                    batch = moving[i:i + 500]
+                    ph = ",".join("?" * len(batch))
+                    db.conn.execute(
+                        f"DELETE FROM face_person_exclusions "
+                        f"WHERE person_id = ? AND face_id IN ({ph})",
+                        [target_id, *batch])
             else:
                 cur.execute(
                     """UPDATE faces
@@ -5198,6 +5228,7 @@ async def api_maintenance_sweep(request: Request):
     do_colors = bool(data.get("do_colors", False))
     do_stacking = bool(data.get("do_stacking", False))
     do_match = bool(data.get("do_match", False))
+    match_temporal = bool(data.get("match_temporal", False))
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
     do_requeue = bool(data.get("do_requeue", False))
@@ -5351,6 +5382,7 @@ async def api_maintenance_sweep(request: Request):
                     do_colors=do_colors,
                     do_stacking=do_stacking,
                     do_match=do_match,
+                    match_temporal=match_temporal,
                     do_recluster=do_recluster,
                     do_dedup=do_dedup,
                     do_requeue=do_requeue,
@@ -6281,6 +6313,28 @@ if _frontend_dir.exists():
         if page.exists():
             return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Book page not found</h1>")
+
+    @app.get("/batches")
+    def serve_batches():
+        """Serve the per-ingest-batch flow diagram (JS reads ?batch= from the URL).
+
+        no-cache like the other live pages: the diagram is a status display, so
+        a browser serving yesterday's HTML would quietly show a stale pipeline.
+        Its /batch-flow.js goes out through the static catch-all below, which
+        sets no-cache for .js too.
+        """
+        page = _frontend_dir / "batches.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Batches page not found</h1>")
+
+    @app.get("/eval/visual-tags")
+    def serve_eval_visual_tags():
+        """Serve the visual-tag labelling page (local-only eval tool — see eval_api)."""
+        page = _frontend_dir / "eval_visual_tags.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Eval page not found</h1>")
 
     @app.get("/status")
     def serve_status():

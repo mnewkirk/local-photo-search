@@ -359,6 +359,228 @@ def _resolve_directory_photo_ids(db: PhotoDB, directory: str) -> list[int]:
     return ids
 
 
+# ---------------------------------------------------------------------------
+# Incremental (missing-only) stacking — the maintenance-sweep path
+# ---------------------------------------------------------------------------
+
+# Chunk size for IN (...) lists — well under SQLITE_MAX_VARIABLE_NUMBER.
+_SQL_CHUNK = 900
+
+
+def _chunks(seq, n=_SQL_CHUNK):
+    seq = list(seq)
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def run_incremental_stacking(
+    db: PhotoDB,
+    time_window_sec: float = 5.0,
+    clip_threshold: float = 0.05,
+    max_stack_span_sec: float = 10.0,
+    dry_run: bool = False,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
+) -> dict:
+    """Re-detect stacks only where something changed, and write only the diff.
+
+    The nightly maintenance sweep used to call ``run_stacking`` unscoped: a
+    full-library re-detect that cleared and re-created every stack (27,165 on
+    the NAS) every night on an unchanged library. This is the missing-only
+    replacement.
+
+    **What is "dirty".** ``stacking_seen`` records every photo detection has
+    already considered, with the ``date_taken`` it had then. A photo is dirty
+    when it is eligible (``date_taken`` set + a CLIP embedding) and either has
+    no ledger row or its ``date_taken`` has changed (a clock retime). Also
+    dirty: the members of any stack that lost a member to a deleted/undated
+    photo, or that is down to fewer than two members.
+
+    **Why the scope is exact, not a heuristic.** detect_stacks only ever
+    unions two photos whose timestamps are within ``time_window_sec``. So the
+    library splits into *sessions* — maximal runs of eligible photos whose
+    consecutive gaps are all <= ``time_window_sec`` — and no stack can span two
+    sessions. Re-detecting just the sessions that contain a dirty photo
+    therefore reproduces exactly what a full-library run would produce for
+    them. Existing stacks overlapping that scope are pulled in whole (and their
+    sessions with them, to a fixpoint), so a stale stack can never be half
+    inside the scope.
+
+    **Why it writes a diff.** Detected stacks are compared to the affected
+    existing stacks by *membership*: an identical stack is left untouched
+    (same id, and a user's hand-picked top survives), a vanished one is
+    deleted, a new one is created. ``applied`` is the number of stacks
+    actually created + removed, so the log can show "nothing changed".
+
+    **It never clears the library.** There is no ``clear_stacks()`` call and
+    no unscoped ``detect_stacks``: deletions are by explicit stack id, drawn
+    only from stacks overlapping the scope, and an empty scope skips
+    detection entirely (``detect_stacks`` treats ``photo_ids=[]`` as "no
+    scope" and would fall through to the whole library — the bug that wiped
+    the library's stacks twice).
+
+    The first run after deploy has an empty ledger, so every eligible photo is
+    dirty: it costs one full detection (what every night used to cost) but
+    still writes only the diff, then fills the ledger.
+
+    ``dry_run`` computes the dirty set only (cheap: no embeddings, no
+    detection) and writes nothing.
+
+    Returns a dict: ``dirty``, ``scope_photos``, ``stacks_detected``,
+    ``stacks_created``, ``stacks_removed``, ``stacks_unchanged``, ``applied``.
+    """
+    def _emit(event: dict):
+        if on_progress:
+            on_progress(event)
+
+    def _check_abort():
+        if should_abort and should_abort():
+            raise InterruptedError("stacking cancelled")
+
+    conn = db.conn
+    eligible_rows = conn.execute(
+        "SELECT p.id, p.date_taken, s.photo_id AS seen_id, s.date_taken AS seen_date "
+        "FROM photos p LEFT JOIN stacking_seen s ON s.photo_id = p.id "
+        "WHERE p.date_taken IS NOT NULL "
+        "AND p.id IN (SELECT photo_id FROM clip_embeddings)"
+    ).fetchall()
+    eligible = {r["id"]: r["date_taken"] for r in eligible_rows}
+    dirty = {r["id"] for r in eligible_rows
+             if r["seen_id"] is None or r["seen_date"] != r["date_taken"]}
+
+    # Ledger rows for photos that are no longer eligible (deleted rows cascade
+    # away on their own; this is the date cleared / embedding removed case).
+    gone = {r[0] for r in conn.execute("SELECT photo_id FROM stacking_seen")
+            if r[0] not in eligible}
+
+    # Existing stacks, in memory (~76k member rows on the NAS — cheap).
+    stack_members: dict[int, set[int]] = {}
+    photo_stack: dict[int, int] = {}
+    for r in conn.execute("SELECT stack_id, photo_id FROM stack_members"):
+        stack_members.setdefault(r[0], set()).add(r[1])
+        photo_stack[r[1]] = r[0]
+
+    # A stack that lost members (a photo deleted, undated, or un-embedded) or
+    # is down to one member is stale: re-detect its session.
+    for sid, members in stack_members.items():
+        if len(members) < 2 or any(m not in eligible for m in members):
+            dirty.update(members)
+
+    result = {
+        "dirty": len(dirty), "scope_photos": 0, "stacks_detected": 0,
+        "stacks_created": 0, "stacks_removed": 0, "stacks_unchanged": 0,
+        "applied": 0,
+    }
+    if dry_run or (not dirty and not gone):
+        return result
+
+    # Sessions over eligible photos with a parseable date.
+    parsed = []
+    for pid, ds in eligible.items():
+        dt = _parse_date(ds)
+        if dt is not None:
+            parsed.append((dt, pid))
+    parsed.sort()
+    session_of: dict[int, int] = {}
+    sessions: list[list[int]] = []
+    window = timedelta(seconds=time_window_sec)
+    prev = None
+    for dt, pid in parsed:
+        if prev is None or dt - prev > window:
+            sessions.append([])
+        sessions[-1].append(pid)
+        session_of[pid] = len(sessions) - 1
+        prev = dt
+
+    # Scope = sessions containing a dirty photo, closed over existing stacks.
+    scope: set[int] = set()
+    affected: set[int] = set()   # existing stack ids the diff may remove
+    frontier = set(dirty)
+    while frontier:
+        new_sessions = {session_of[p] for p in frontier if p in session_of}
+        added = set()
+        for si in new_sessions:
+            for p in sessions[si]:
+                if p not in scope:
+                    scope.add(p)
+                    added.add(p)
+        # Photos that are dirty but have no session (unparseable date, or a
+        # member of a stale stack that is no longer eligible) still pull their
+        # stack into the affected set.
+        touched = added | {p for p in frontier if p not in session_of}
+        frontier = set()
+        for p in touched:
+            sid = photo_stack.get(p)
+            if sid is not None and sid not in affected:
+                affected.add(sid)
+                frontier.update(m for m in stack_members[sid]
+                                if m in session_of and m not in scope)
+    result["scope_photos"] = len(scope)
+    _check_abort()
+
+    detected: list[list[int]] = []
+    if scope:
+        # Non-empty by construction here. NEVER pass an empty list:
+        # detect_stacks reads photo_ids=[] as "no scope" -> whole library.
+        detected = detect_stacks(
+            db, time_window_sec, clip_threshold, None, max_stack_span_sec,
+            photo_ids=sorted(scope), on_progress=on_progress,
+            should_abort=should_abort,
+        )
+    result["stacks_detected"] = len(detected)
+
+    existing_by_key = {frozenset(stack_members[sid]): sid for sid in affected}
+    detected_keys = {frozenset(s) for s in detected}
+    to_remove = [sid for key, sid in existing_by_key.items() if key not in detected_keys]
+    to_create = [s for s in detected if frozenset(s) not in existing_by_key]
+    result["stacks_unchanged"] = len(affected) - len(to_remove)
+
+    _check_abort()
+    _emit({"phase": "save", "saved": 0, "total": len(to_create) + len(to_remove)})
+    # Removals first: stack_members.photo_id is UNIQUE.
+    for chunk in _chunks(to_remove):
+        ph = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM stack_members WHERE stack_id IN ({ph})", chunk)
+        conn.execute(f"DELETE FROM photo_stacks WHERE id IN ({ph})", chunk)
+        conn.commit()
+    last_emit = time.monotonic()
+    for idx, stack_ids in enumerate(to_create, 1):
+        if idx % 200 == 0:
+            _check_abort()
+        db.create_stack(stack_ids, top_photo_id=stack_ids[0])
+        now = time.monotonic()
+        if on_progress and now - last_emit >= _PROGRESS_INTERVAL:
+            on_progress({"phase": "save", "saved": len(to_remove) + idx,
+                         "total": len(to_create) + len(to_remove)})
+            last_emit = now
+    result["stacks_removed"] = len(to_remove)
+    result["stacks_created"] = len(to_create)
+    result["applied"] = len(to_remove) + len(to_create)
+
+    # Ledger last: an abort anywhere above leaves these photos dirty, so the
+    # next run redoes their sessions and converges.
+    seen_rows = [(pid, eligible[pid]) for pid in (scope | dirty) if pid in eligible]
+    for chunk in _chunks(seen_rows):
+        conn.executemany(
+            "INSERT INTO stacking_seen (photo_id, date_taken) VALUES (?, ?) "
+            "ON CONFLICT(photo_id) DO UPDATE SET date_taken = excluded.date_taken, "
+            "seen_at = datetime('now')",
+            chunk,
+        )
+    for chunk in _chunks(gone):
+        ph = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM stacking_seen WHERE photo_id IN ({ph})", chunk)
+    conn.commit()
+    _emit({"phase": "save", "saved": result["applied"], "total": result["applied"]})
+    logger.info(
+        "Incremental stacking: %d dirty, %d in scope, %d detected, "
+        "%d created, %d removed, %d unchanged",
+        result["dirty"], result["scope_photos"], result["stacks_detected"],
+        result["stacks_created"], result["stacks_removed"],
+        result["stacks_unchanged"])
+    return result
+
+
 def run_stacking(
     db: PhotoDB,
     time_window_sec: float = 5.0,

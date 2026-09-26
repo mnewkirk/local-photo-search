@@ -76,6 +76,8 @@ local-photo-search/
 │   ├── colors.py           # Dominant color extraction
 │   ├── geocode.py          # Offline reverse geocoding
 │   ├── date_parse.py       # Natural language date parsing from queries
+│   ├── rank_measure.py     # Native-resolution face-sharpness pass (the
+│   │                       #   rank_measure NAS step + scripts/rank_shoot.py)
 │   └── cull.py             # Shoot review / culling logic
 └── frontend/dist/          # Static HTML/JS served by FastAPI
     ├── index.html          # Main search UI
@@ -86,20 +88,26 @@ local-photo-search/
     ├── geotag.html         # Manual bulk geotag picker (folder-first UI)
     ├── review.html         # Shoot review / culling UI
     ├── status.html         # Indexing status + run commands
+    ├── batches.html        # /batches — per-ingest-batch flow diagram (M "ingest batch")
+    ├── batch-flow.js       # Pure module behind batches.html — layout/state/
+                            #   fleetLaunchPasses logic, unit-tested standalone
     └── shared.js           # Shared components: PS.SharedHeader (with /merges
                             #   link), PS.PhotoModal, PS.GooglePhotosButton,
-                            #   PS.formatFocalLength, etc.
+                            #   PS.formatFocalLength, PS.poll, etc.
 ```
 
 ---
 
-## Database Schema (v29)
+## Database Schema (v31)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
-> (v25), the VLM aesthetics `aes_*` columns (v26), and per-day aesthetic
-> percentile normalization (v28), `maintenance_runs` (v29). `SCHEMA_VERSION` in `db.py` is the source of
-> truth — currently **28**. See CLAUDE.md for the aesthetics + folder details.
+> (v25), the VLM aesthetics `aes_*` columns (v26), per-day aesthetic
+> percentile normalization (v28), `maintenance_runs` (v29), and
+> `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30), and
+> `face_person_exclusions` (v31). `SCHEMA_VERSION` in `db.py` is the source of
+> truth — currently **31**. See CLAUDE.md for the aesthetics + folder +
+> ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -109,6 +117,7 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | faces | Detected faces per photo (bbox, encoding, quality) |
 | persons | Named persons for face matching |
 | face_references | Reference photos/encodings for each person |
+| face_person_exclusions | (face, person) pairs the duplicate resolver unmatched — both matchers skip that pairing only (v31) |
 | collections | Named photo collections/albums |
 | collection_photos | Junction table with sort_order for manual ordering |
 | photo_stacks | Burst/bracket groups detected by time + visual similarity |
@@ -117,6 +126,9 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | google_photos_uploads | Upload ledger (album_id, filepath, media_item_id) |
 | ignored_clusters | Face clusters marked to ignore |
 | generations | Provenance log for LLM text artifacts — describe / category-* / keywords / verify (v21) |
+| ingest_sweeps | One row per ingest-incoming move+index sweep run (v30) |
+| ingest_batches | One row per dated ingest folder — identity + lifecycle, membership derived live (v30) |
+| ingest_batch_jobs | Per-(batch, step) job intent (worker fleet / NAS stage), TTL-gated (v30) |
 | schema_info | Schema version + photo_root path |
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
@@ -371,6 +383,35 @@ need cross-recluster persistence.
 - `GET /api/review/run` — Run culling algorithm
 - `GET /api/review/load` — Load saved selections
 - `POST /api/review/toggle/{id}` — Toggle photo selection
+
+### Ingest batches (`/batches`, M "ingest batch" — see CLAUDE.md for the traps)
+- `GET /api/batches` — pure SQL: active sweep (if any) + the batch list
+  (`include_dismissed`).
+- `GET /api/batches/{id}` — derived readiness state (`batch_state.batch_state`),
+  memoized 30s behind a non-blocking lock; carries `computed_at`/`stale`, or
+  `computing: true` when nothing is memoized yet and the lock is held elsewhere.
+- `POST /api/batches/{id}/dismiss` / `POST /api/batches/{id}/ready` — lifecycle writes.
+- `POST /api/batches/{id}/jobs` — record job intent `{steps, job_kind}`
+  (used by a remote fleet launch in replica mode); steps validated against
+  `batch_state.STEP_ORDER`.
+- `POST /api/batches/register` — `{directory, source}`, manual registration.
+- `POST /api/admin/batch-advance` — SSE; runs the batch's NAS steps (stacking,
+  normalize_aesthetics, strict match_faces, resolve_dups, warm_crops,
+  rank_measure) in order, id-scoped. `photosearch batch-advance --batch N
+  [--apply]` is the CLI equivalent (dry-run by default). `rank_measure` is
+  `batch_state.OPTIONAL_STEPS` — it does NOT gate `ready`, but `next_action`
+  still offers `advance_nas` while it is the only step left, which is what
+  makes the button able to run it. It writes
+  `dirname(PHOTOSEARCH_DB)/rank_shoot_<date>.json`, the cache
+  `scripts/rank_shoot.py --date <date>` reads for its selection phase
+  (measurement itself is `photosearch/rank_measure.py` — `scripts/` is not in
+  the Docker image).
+- `POST /api/admin/batch-launch-fleet` — `{batch_id, count}`; launches
+  `run-workers.sh --native` scoped to the batch's directory for exactly the
+  worker passes it still needs (`batch_state.fleet_launch_passes`). 409 if a
+  pass already reads `queued`/`running` for the batch.
+- In replica mode (`PHOTOSEARCH_NAS_URL` set), every `/api/batches/*` route
+  proxies to the NAS with no local fallback (502 if unreachable).
 
 ### Google Photos
 - `GET /api/google/status` — OAuth status (configured + authenticated)
@@ -1017,6 +1058,25 @@ folder (CLIP + colors). Module `photosearch/ingest.py`; 15 tests in
   /photos` (idempotent) backfills CLIP; colors are **not** a worker pass, so a
   plain `photosearch index <dir>` backfills those. Faces/quality/describe/tags
   are left to the worker fleet either way.
+- **Re-filing historical `unknown-camera` folders:**
+
+  ```bash
+  $DC photosearch refile-unknown-camera [--only DIR] [--limit N] \
+      [--include-indexed] [--infer-from-sibling] [--apply --audit /data/refile.csv]
+  $DC photosearch refile-unknown-camera --undo /data/refile.csv --apply
+  ```
+
+  Moves `YYYY/YYYY-MM-DD_unknown-camera/*` onto the body each file's **own**
+  EXIF names, reusing `ingest._file_suffix` verbatim. Dry run by default (and
+  read-only on the DB); `--apply` refuses without `--audit` (the CSV is the undo,
+  written intent-then-confirm and fsynced per file) and takes ingest's
+  `_sweep_lock`. The move is `os.link` + `unlink`, so it **cannot** overwrite —
+  the nightly ingest writes into these same dated folders. Never deletes, never
+  guesses a model from the date or a sibling folder (two bodies were in use on
+  several of these days); files with no readable model are left in place. The DB
+  gate matches on exact `filepath`, not the `folder` column, which some writers
+  leave stale. Module `photosearch/refile.py`; tests `tests/test_refile.py`.
+  See the CLAUDE.md section for the full operator sequence.
 - **Stuck-phone gotcha:** because ingest *moves* files out, the receive-only
   Syncthing folder records them as local deletions and the **phone permanently
   shows <100%** — expected, not a fault (all photos reach the NAS; the REST
@@ -1029,7 +1089,7 @@ folder (CLIP + colors). Module `photosearch/ingest.py`; 15 tests in
 The ingest job runs from cron:
 
 ```cron
-0 3 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
+0 4 * * * cd /volume1/docker/photosearch && flock -n /tmp/photo-ingest.lock docker compose -f docker-compose.nas.yml run --rm photosearch ingest-incoming --no-colors >> /var/log/photo-ingest.log 2>&1
 ```
 
 It lives in **root's crontab** (`sudo crontab -l`), not `/etc/cron.d` — a normal
@@ -1060,20 +1120,41 @@ Firmware-proof fallback (keep it root-owned, just drop the password prompt):
 
 ### Scheduling + replica-mode maintenance (2026-07-17)
 
-`maintenance-sweep` is intended to run nightly on the NAS from **root's
-crontab** at **01:00 UTC** (`CRON_TZ=UTC`, so it never drifts with DST). That
-is 18:00 America/Los_Angeles — chosen deliberately over the 03:00 Pacific
-ingest slot; accepted tradeoff is that it runs during California evening. Log:
-`/var/log/photo-maintenance.log`. `--recluster` / `--dedup-photos` stay OFF
-(recluster clears `ignored_clusters`; dedup DELETEs photos).
+`maintenance-sweep` **runs nightly on the NAS from the NAS user's own crontab**
+(not root's), at **18:30 host-local** (Pacific) — verified on the box
+2026-09-19 with `crontab -l`:
 
-**This cron entry is not yet installed** — it ships as an operator runbook
-step, not an automated change (installing it touches root's crontab and
-`/var/log` on the live NAS over SSH that UGOS auto-blocks on retry storms).
-`CRON_TZ` support on UGOS's cron is unverified; the runbook has the operator
-check it first, with a documented fallback (`0 18 * * *` host-local, which
-drifts to 02:00 UTC in Pacific winter) if it isn't supported. See the operator
-runbook at the bottom of `docs/superpowers/plans/2026-07-17-maintenance-sync.md`.
+```cron
+0 4 * * *   … flock -n /tmp/photo-ingest.lock      … ingest-incoming --no-colors …
+30 18 * * * … flock -n /tmp/photo-maintenance.lock … maintenance-sweep --apply --no-colors …
+```
+
+Both are `flock`-guarded, so a run that overlaps the previous one exits instead
+of stacking. Host-local time means it drifts an hour against UTC with DST
+(01:30 UTC in summer, 02:30 in winter); the `CRON_TZ=UTC` variant was never
+adopted. Log: `/var/log/photo-maintenance.log`. `--recluster` /
+`--dedup-photos` stay OFF (recluster clears `ignored_clusters`; dedup DELETEs
+photos). (This section used to say the entry was "not yet installed", in root's
+crontab, at 01:00 UTC, with ingest at 03:00 — all four were stale.)
+
+**The sweep's `match_faces` stage is STRICT-ONLY.** It used to run the temporal
+matcher too, every night, over shoots nobody had reviewed. On 2026-09-19 it
+swept a shoot ingested that afternoon and wrote **466 temporal labels (Calvin
+382, Ellie 149)** beside 65 strict ones — on exactly the kind of shoot where
+temporal is ~4% accurate and tags one kid across both teams. Temporal is now an
+explicit opt-in: `maintenance-sweep --match-temporal`, `match_temporal=True` on
+`run_maintenance_sweep`, `"match_temporal": true` on the API. Hand-run
+`match-faces --temporal` is unchanged. Tests: `tests/test_maintenance_match_faces.py`.
+
+**Known, NOT fixed — a nightly match/unmatch churn loop.** The log shows the
+stage "applying" ~6,000 matches every night while the unmatched pool never
+shrinks (202k → 213k over eight runs), because `resolve_dups` strips
+~5,300–6,100 of them the *same night*. The ~5,500 `dedupe_unmatched` faces are
+deliberately still matchable (they may belong to a *different* person), so they
+are re-matched to the *same* person and re-stripped forever — on the sweep's
+heaviest CPU stage. Strict-only should shrink it; it has not been measured
+since. The durable fix is to remember *which person* a face was de-duplicated
+away from and skip only that pairing.
 
 **Replica mode is now gated.** A sweep writes to whatever `PHOTOSEARCH_DB`
 points at, and `sync-replica.sh` replaces the replica's DB wholesale — so a
@@ -1156,7 +1237,7 @@ Collection-only options:
 | Quality scoring | `--quality` | ViT-L/14 (768-dim) + MLP | ~1000 photos/hr | None |
 | Concept analysis | (auto with quality) | Same ViT-L/14 | Runs after scoring | Quality pass |
 | Descriptions | `--describe` | `llama3.2-vision` via Ollama (`--describe-model`) | 30-200s/photo CPU, ~4s GPU | Ollama running |
-| Category (visual) | `--category-visual` | `llava` via Ollama (`--category-visual-model`) — visual-quality tags from the image | 30-200s/photo CPU, ~1s GPU | Ollama running |
+| Category (visual) | `--category-visual` | `llava` via Ollama (`--category-visual-model`) — **perceived** visual qualities only (mood / colour / light / atmosphere / viewpoint / composition); the capture facts are derived from EXIF, not asked of the model | 30-200s/photo CPU, ~1s GPU | Ollama running |
 | Category (content) | `--category-content` | `llama3.2:3b` via Ollama (`--category-content-model`) — text-only, from description | ~text-only | Description exists |
 | Keywords | `--keywords` | `llama3.2:3b` via Ollama (`--keywords-model`) — text-only, from description | ~text-only | Description exists |
 | Critique | (auto) | Same as describe model | 30-200s/photo | Quality + describe |
@@ -1171,6 +1252,27 @@ strategy" under Distributed Indexing, and CLAUDE.md. `describe.py` has
 model-aware Ollama options + a degeneration detect-retry-fallback for
 `llama3.2-vision`, and a regurgitation guard on the visual-tag task.
 (`clean-garbage-tags` still exists to clear historical regurgitated tag sets.)
+
+**`category-visual` asks only about PERCEIVED qualities.** Three capture-fact
+terms — `long-exposure`, `low-light`, `panoramic` — are computed
+deterministically from EXIF (`photosearch/visual_tags_derive.py`) and override
+whatever the model said; `motion-blur` was retired from the vocabulary
+entirely; `sharp` / `blurry` are **frozen** (never produced, never deleted)
+pending a hand-labelled eval. A VLM cannot read a shutter speed off the tile it is
+shown, and the measurements said it did not try (`long-exposure` was tagged on
+64% of a 1/125–1/800 s daytime soccer folder). The merge happens **server-side**
+in `worker_api.submit_results` and both `index.py` writers; storage is still
+the single `photos.visual_tags` JSON column, so `visual_tag=`, `list_vocab`
+and the Ask tools are unaffected. Full detail + thresholds in CLAUDE.md,
+"`category-visual`: derived capture facts vs perceived qualities".
+
+Backfill existing rows without any VLM work (dry run by default; never touches
+a NULL `visual_tags`, which is what drives the worker queue):
+
+```bash
+photosearch derive-visual-tags            # before/after frequency table
+photosearch derive-visual-tags --apply    # chunked, guarded, idempotent
+```
 
 ### Parallelization
 
@@ -1306,7 +1408,11 @@ verify-person-matches [--person NAME] [--min-dist 1.30] \
                                             # distance to their trusted (strict/manual)
                                             # refs; farthest = likely wrong person.
                                             # Report-only; catches non-sibling mis-tags.
-restore-unmatched-faces [--apply]           # Undo the two above (face_dedupe_undo table).
+restore-unmatched-faces [--apply]           # Undo the two above (face_dedupe_undo table);
+                                            # also clears the restored pairing's exclusion.
+backfill-face-exclusions [--apply]          # Seed face_person_exclusions from the existing
+                                            # face_dedupe_undo snapshots. Idempotent; the
+                                            # v31 migration runs it automatically.
 cleanup-orphan-faces [--apply]              # Delete faces whose photo was deleted.
 backfill-image-orientation [--apply] [--limit N]
                                             # Store EXIF-oriented image_width/height
@@ -1420,9 +1526,15 @@ Full narrative + rationale live in **CLAUDE.md** ("Face over-matching cleanup",
   each, spanning years). `--report` writes a keep-vs-remove **face-crop** gallery.
 - **`resolve-duplicate-persons`** enforces the one-person-per-photo invariant for
   everyone (priority manual > strict > temporal, tie-break det_score → bbox area).
+- **Both go through `db.unmatch_faces_as_duplicates`** (snapshot + record the
+  (face, person) exclusion + null the label) — one primitive, because each used
+  to carry its own copy and a fix to one left the other churning. The exclusion
+  is what stops the matcher re-applying the label the resolver just stripped;
+  see CLAUDE.md "FIXED (2026-09-19) — the nightly match/unmatch churn loop".
 - **`restore-unmatched-faces`** reverses both via the on-demand `face_dedupe_undo`
   snapshot (unmatch sets `match_source='dedupe_unmatched'`; `apply-face-state`
-  additive-fill skips those so a re-match can't undo the cleanup).
+  additive-fill skips those, and also refuses pairings excluded on the target,
+  so neither a re-match nor a replica push can undo the cleanup).
 - **`cleanup-orphan-faces`** deletes face rows whose photo was deleted (broken
   `/faces` thumbnails + phantom matches; ~12% of faces on the NAS were orphans).
 - **Desktop-as-client recompute**: the N100 can't do the ~230k-face DBSCAN, so
@@ -2321,7 +2433,7 @@ def my_command(db):
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py` (currently 28)
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 31)
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies

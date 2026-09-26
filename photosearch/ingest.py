@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,11 @@ except ImportError:  # pragma: no cover - non-POSIX
 from .db import PhotoDB
 from .exif import extract_exif
 from .index import file_hash, is_real_image, JPEG_EXTENSIONS, HEIC_EXTENSIONS
+from .ingest_batches import heartbeat_sweep, set_sweep_status, start_sweep
+
+# Minimum spacing between DB heartbeat writes during the move loop, so the
+# extra UPDATE stays negligible against the per-file work (hashing + move).
+_HEARTBEAT_INTERVAL_S = 1.0
 
 # Phones produce JPEG (Android default) and HEIC (iPhone default). These are
 # the types we CLIP-index. Camera SD cards also bring RAW + video — we relocate
@@ -363,11 +369,23 @@ def ingest_incoming(
           "totals": {"scanned", "imported", "deduped", "companions_moved",
                      "companions_deduped", "vanished", "errors"},
           "dry_run": bool,
+          "run_id": str | None,
         }
 
     `vanished` counts files that disappeared between the directory walk and the
     move — the importer or a phone sync still writing into _incoming/. They are
     skipped, never fatal, and picked up by the next sweep if they reappear.
+
+    `run_id` identifies the `ingest_sweeps` row this call created (see
+    `photosearch/ingest_batches.py`), so a status page can tell running /
+    stalled / done without walking the filesystem. A sweep row is created
+    lazily — only once a file is actually moved or archived, and never on a
+    `dry_run` — so a no-op sweep (empty `_incoming/`, or a preview) leaves
+    `run_id` as None and writes no row. The row is left in status 'moving' on
+    a normal return; the caller (`cli.py:ingest_incoming_cmd`) advances it
+    through 'indexing' / 'registered' once it has run the post-move index
+    pass. A crash partway through re-raises after stamping the row 'failed'
+    so it never sits as a phantom 'moving' row.
     """
     incoming = Path(incoming_root).resolve()
     photo_dir = Path(photo_root).resolve()
@@ -394,140 +412,217 @@ def ingest_incoming(
     # alongside their 'ILCE-7RM6' originals. First source wins (sorted order).
     seen_hashes: dict[str, Path] = {}
 
+    # Sweep-progress bookkeeping (schema v30 `ingest_sweeps`). The row is
+    # created lazily — see the `run_id` docstring above — and heartbeats are
+    # throttled so this adds negligible cost to the move loop.
+    run_id: Optional[str] = None
+    sweep_files_seen = 0
+    sweep_files_moved = 0
+    last_heartbeat = 0.0
+
     # A dry run touches nothing, so it doesn't need (or take) the mutex.
     lock = _sweep_lock(db_path) if not dry_run else _no_lock()
     with lock, PhotoDB(db_path) as db:
-        for source_root in sources:
-            source = source_root.name
-            suffix = _folder_suffix(source, bare_sources, phone_sources)
-            stats = _zero()
-            stats["new_dirs"] = []
-            new_dirs: set[Path] = set()
 
-            for src_file in _iter_source_files(source_root):
-                stats["scanned"] += 1
-                # The listing is a snapshot; the SD-card importer / phone sync
-                # may still be writing (and moving) files under _incoming/. A
-                # file that's gone by the time we reach it is skipped, not an
-                # error, and certainly not fatal to the rest of the sweep.
-                if not src_file.exists():
-                    stats["vanished"] += 1
-                    continue
-                is_photo = src_file.suffix.lower() in INGEST_EXTENSIONS
-                # An image-extension file whose content isn't a decodable image
-                # (e.g. a ZIP-wrapped iOS Live Photo saved as .JPG) is moved into
-                # the library like a companion but never gets a DB row / CLIP pass
-                # — those rows can't be embedded and re-cycle the clip queue forever.
-                if is_photo and not is_real_image(str(src_file)):
-                    is_photo = False
-                    stats["non_image_reclassified"] += 1
+        def _start_sweep_if_needed() -> None:
+            nonlocal run_id
+            if run_id is None and not dry_run:
+                # Progress telemetry must never take the sweep down. If the
+                # sweep row can't be created (busy timeout, disk error),
+                # leave run_id None -- _heartbeat below is then a no-op for
+                # the rest of the run -- and let the move loop continue.
                 try:
-                    h = file_hash(str(src_file))
+                    run_id = start_sweep(db)
                 except Exception as exc:
-                    stats["errors"] += 1
-                    print(f"  [{source}] HASH FAIL {src_file.name}: {exc}")
-                    continue
+                    print(f"  WARNING: start_sweep failed, continuing without "
+                          f"progress tracking: {exc}")
 
-                # Same bytes already relocated earlier in this sweep (usually a
-                # second source label for the same camera). Archive the copy
-                # instead of landing it in the library a second time.
-                if h in seen_hashes:
-                    stats["deduped" if is_photo else "companions_deduped"] += 1
-                    if not dry_run:
-                        _archive(source_root, src_file, source, stats)
-                    continue
+        def _heartbeat(force: bool = False) -> None:
+            nonlocal last_heartbeat
+            if run_id is None:
+                return
+            now = time.monotonic()
+            if not force and (now - last_heartbeat) < _HEARTBEAT_INTERVAL_S:
+                return
+            # Same swallow-and-log guard as _start_sweep_if_needed -- a
+            # heartbeat write failing (busy timeout, disk error) must not
+            # abort the move loop.
+            try:
+                heartbeat_sweep(db, run_id, files_seen=sweep_files_seen,
+                                files_moved=sweep_files_moved)
+            except Exception as exc:
+                print(f"  WARNING: heartbeat_sweep failed, continuing: {exc}")
+            last_heartbeat = now
 
-                if is_photo:
-                    # Dedup by content hash against the photos table. The
-                    # file_hash column has been populated on every newly-indexed
-                    # photo for a long time; an older un-hashed match would just
-                    # route as a new import, which is safe but slightly redundant.
-                    existing = db.conn.execute(
-                        "SELECT id, filepath FROM photos WHERE file_hash = ? LIMIT 1",
-                        (h,),
-                    ).fetchone()
-                    if existing is not None:
-                        stats["deduped"] += 1
-                        if not dry_run:
-                            _archive(source_root, src_file, source, stats)
+        try:
+            for source_root in sources:
+                source = source_root.name
+                suffix = _folder_suffix(source, bare_sources, phone_sources)
+                stats = _zero()
+                stats["new_dirs"] = []
+                new_dirs: set[Path] = set()
+
+                for src_file in _iter_source_files(source_root):
+                    stats["scanned"] += 1
+                    sweep_files_seen += 1
+                    # The listing is a snapshot; the SD-card importer / phone sync
+                    # may still be writing (and moving) files under _incoming/. A
+                    # file that's gone by the time we reach it is skipped, not an
+                    # error, and certainly not fatal to the rest of the sweep.
+                    if not src_file.exists():
+                        stats["vanished"] += 1
+                        _heartbeat()
+                        continue
+                    is_photo = src_file.suffix.lower() in INGEST_EXTENSIONS
+                    # An image-extension file whose content isn't a decodable image
+                    # (e.g. a ZIP-wrapped iOS Live Photo saved as .JPG) is moved into
+                    # the library like a companion but never gets a DB row / CLIP pass
+                    # — those rows can't be embedded and re-cycle the clip queue forever.
+                    if is_photo and not is_real_image(str(src_file)):
+                        is_photo = False
+                        stats["non_image_reclassified"] += 1
+                    try:
+                        h = file_hash(str(src_file))
+                    except Exception as exc:
+                        stats["errors"] += 1
+                        print(f"  [{source}] HASH FAIL {src_file.name}: {exc}")
+                        _heartbeat()
                         continue
 
-                # Date routing. extract_exif is photo-oriented and may not read
-                # a date from video — fall back to file mtime so videos still
-                # land in a dated folder instead of _undated.
-                try:
-                    meta = extract_exif(str(src_file))
-                except Exception:
-                    meta = {}
-                taken = (_parse_date_taken(meta.get("date_taken"))
-                         or _parse_date_taken(meta.get("date_created")))
-                if taken is None and not is_photo:
-                    # Video rarely carries EXIF — use file mtime so it still
-                    # lands in a dated folder. Photos keep the original behavior
-                    # (no date → _undated) so a truly-dateless photo is visible.
-                    try:
-                        taken = datetime.fromtimestamp(src_file.stat().st_mtime)
-                    except OSError:
-                        taken = None
+                    # Same bytes already relocated earlier in this sweep (usually a
+                    # second source label for the same camera). Archive the copy
+                    # instead of landing it in the library a second time.
+                    if h in seen_hashes:
+                        stats["deduped" if is_photo else "companions_deduped"] += 1
+                        if not dry_run:
+                            _start_sweep_if_needed()
+                            _archive(source_root, src_file, source, stats)
+                        _heartbeat()
+                        continue
 
-                tdir = _target_dir(photo_dir, _file_suffix(source, suffix, meta), taken)
-
-                if not is_photo:
-                    # Companion (RAW/video): no DB row to dedup against, so
-                    # dedup at the destination — same filename + identical bytes
-                    # already there means we've moved this exact file before.
-                    cand = tdir / src_file.name
-                    if cand.exists():
-                        try:
-                            same = file_hash(str(cand)) == h
-                        except Exception:
-                            same = False
-                        if same:
-                            stats["companions_deduped"] += 1
+                    if is_photo:
+                        # Dedup by content hash against the photos table. The
+                        # file_hash column has been populated on every newly-indexed
+                        # photo for a long time; an older un-hashed match would just
+                        # route as a new import, which is safe but slightly redundant.
+                        existing = db.conn.execute(
+                            "SELECT id, filepath FROM photos WHERE file_hash = ? LIMIT 1",
+                            (h,),
+                        ).fetchone()
+                        if existing is not None:
+                            stats["deduped"] += 1
                             if not dry_run:
+                                _start_sweep_if_needed()
                                 _archive(source_root, src_file, source, stats)
+                            _heartbeat()
                             continue
 
-                target = _unique_target_path(tdir, src_file.name)
+                    # Date routing. extract_exif is photo-oriented and may not read
+                    # a date from video — fall back to file mtime so videos still
+                    # land in a dated folder instead of _undated.
+                    try:
+                        meta = extract_exif(str(src_file))
+                    except Exception:
+                        meta = {}
+                    taken = (_parse_date_taken(meta.get("date_taken"))
+                             or _parse_date_taken(meta.get("date_created")))
+                    if taken is None and not is_photo:
+                        # Video rarely carries EXIF — use file mtime so it still
+                        # lands in a dated folder. Photos keep the original behavior
+                        # (no date → _undated) so a truly-dateless photo is visible.
+                        try:
+                            taken = datetime.fromtimestamp(src_file.stat().st_mtime)
+                        except OSError:
+                            taken = None
 
-                if dry_run:
-                    # Record even on a dry run so the preview counts a
-                    # duplicate pair the same way a real sweep would.
+                    tdir = _target_dir(photo_dir, _file_suffix(source, suffix, meta), taken)
+
+                    if not is_photo:
+                        # Companion (RAW/video): no DB row to dedup against, so
+                        # dedup at the destination — same filename + identical bytes
+                        # already there means we've moved this exact file before.
+                        cand = tdir / src_file.name
+                        if cand.exists():
+                            try:
+                                same = file_hash(str(cand)) == h
+                            except Exception:
+                                same = False
+                            if same:
+                                stats["companions_deduped"] += 1
+                                if not dry_run:
+                                    _start_sweep_if_needed()
+                                    _archive(source_root, src_file, source, stats)
+                                _heartbeat()
+                                continue
+
+                    target = _unique_target_path(tdir, src_file.name)
+
+                    if dry_run:
+                        # Record even on a dry run so the preview counts a
+                        # duplicate pair the same way a real sweep would.
+                        seen_hashes[h] = target
+                        if is_photo:
+                            stats["imported"] += 1
+                            new_dirs.add(tdir)
+                        else:
+                            stats["companions_moved"] += 1
+                        continue
+
+                    try:
+                        tdir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(src_file), str(target))
+                    except FileNotFoundError:
+                        stats["vanished"] += 1
+                        _heartbeat()
+                        continue
+                    except Exception as exc:
+                        stats["errors"] += 1
+                        print(f"  [{source}] MOVE FAIL {src_file.name} -> {target}: {exc}")
+                        _heartbeat()
+                        continue
+
+                    # A file actually moved — this is what starts the sweep row
+                    # (see the run_id docstring above): a sweep that only ever
+                    # deduped-and-archived still counts (handled above), but a
+                    # sweep that found nothing at all never gets here.
+                    _start_sweep_if_needed()
                     seen_hashes[h] = target
                     if is_photo:
-                        stats["imported"] += 1
+                        # new_dirs drives the follow-up CLIP index pass. Companion
+                        # folders are deliberately left out — RAW/video are never
+                        # indexed (a photo from the same shoot adds the dir anyway).
                         new_dirs.add(tdir)
+                        stats["imported"] += 1
                     else:
                         stats["companions_moved"] += 1
-                    continue
+                    sweep_files_moved += 1
+                    _heartbeat()
 
+                stats["new_dirs"] = sorted(str(p) for p in new_dirs)
+                per_source[source] = stats
+                for k in totals:
+                    totals[k] += stats[k]
+
+            # Always emit a final heartbeat so the last few files aren't lost
+            # to the throttle window.
+            _heartbeat(force=True)
+        except Exception as exc:
+            # A crash must never leave a phantom 'moving' row — stamp it
+            # failed (if a row was ever created) and re-raise so the caller
+            # (cron / the CLI) still sees the failure. The status update
+            # itself must not mask the ORIGINAL exception: if set_sweep_status
+            # also raises (e.g. the same DB error that caused exc in the
+            # first place), swallow that secondary failure and still surface
+            # exc — a masked root cause is far harder to debug than a stuck
+            # 'failed' status message.
+            if run_id is not None:
                 try:
-                    tdir.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(src_file), str(target))
-                except FileNotFoundError:
-                    stats["vanished"] += 1
-                    continue
-                except Exception as exc:
-                    stats["errors"] += 1
-                    print(f"  [{source}] MOVE FAIL {src_file.name} -> {target}: {exc}")
-                    continue
+                    set_sweep_status(db, run_id, "failed", error=str(exc))
+                except Exception as status_exc:
+                    print(f"  WARNING: set_sweep_status(failed) also failed: {status_exc}")
+            raise
 
-                seen_hashes[h] = target
-                if is_photo:
-                    # new_dirs drives the follow-up CLIP index pass. Companion
-                    # folders are deliberately left out — RAW/video are never
-                    # indexed (a photo from the same shoot adds the dir anyway).
-                    new_dirs.add(tdir)
-                    stats["imported"] += 1
-                else:
-                    stats["companions_moved"] += 1
-
-            stats["new_dirs"] = sorted(str(p) for p in new_dirs)
-            per_source[source] = stats
-            for k in totals:
-                totals[k] += stats[k]
-
-    return {"sources": per_source, "totals": totals, "dry_run": dry_run}
+    return {"sources": per_source, "totals": totals, "dry_run": dry_run, "run_id": run_id}
 
 
 def _archive(source_root: Path, src_file: Path, source: str, stats: dict) -> None:
