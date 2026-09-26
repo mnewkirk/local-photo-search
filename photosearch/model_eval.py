@@ -257,8 +257,9 @@ def pin_role_model(role: str, model: Optional[str]) -> None:
     env var picks the model, and the vision roles fall back to
     PHOTOSEARCH_LLM_VISUAL_MODEL when their own var is unset
     (`describe._resolve_openai_model`). So a bake-off passing `--model X` while
-    the shell exports VISUAL=qwen would score qwen under X's name — which is
-    exactly what may have happened to the 2026-07-09 aesthetics ρ 0.70.
+    the shell exports VISUAL=qwen would score qwen under X's name. (The
+    aesthetics fallback arrived in 4cfc202, 2026-07-10 — after the 07-09
+    bake-off, whose qwen ρ 0.70 is therefore genuinely qwen's.)
 
     --model values are LM Studio ids, so pinning without the LM Studio route
     is refused rather than quietly handed to Ollama as a model name."""

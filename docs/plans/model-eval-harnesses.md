@@ -15,15 +15,21 @@ model only has to fit on its own.
 
 ## What the code shows (read this before building)
 
-1. **The aesthetics bake-off may have scored the wrong model.**
-   `describe._resolve_openai_model` (describe.py:544-557) falls back from the
+1. **The aesthetics bake-off's `--vlm` stopped meaning what it says on
+   2026-07-10.** `describe._resolve_openai_model` now falls back from the
    `aesthetics` role to `PHOTOSEARCH_LLM_VISUAL_MODEL` when
-   `PHOTOSEARCH_LLM_AESTHETICS_MODEL` is unset.
-   - The advice in `aesthetics_bakeoff.py:15-16` ("DO NOT set …AESTHETICS_MODEL")
-     is wrong whenever the fleet env exports VISUAL.
-   - `scores.json` records no effective model.
-   - So the old **ρ 0.70 cannot be trusted as qwen2.5-vl's score**. Re-run it as a
-     new baseline, not as a regression check.
+   `PHOTOSEARCH_LLM_AESTHETICS_MODEL` is unset (`4cfc202`, 2026-07-10 16:59).
+   From then on, the harness's "DO NOT set …AESTHETICS_MODEL — the per-call id
+   wins" advice was wrong for any shell that exported VISUAL. The fix is to pin
+   the role variable and record `effective_model`.
+   - **The 2026-07-09 ρ 0.70 IS qwen2.5-vl-7b-instruct's score** — corrected
+     after the plan was written, from git history. `scores.json` was written
+     2026-07-09 09:00 and recorded in `7d1b7c6` at 09:16, ~32 h before the
+     fallback existed. The resolver then was: AESTHETICS_MODEL env → the
+     legacy `PHOTOSEARCH_TEXT_LLM_MODEL` → the call-site id. So the per-call
+     `qwen2.5-vl-7b-instruct` ran unless one of those two was exported, and
+     nothing suggests either was. Re-running qwen is still worthwhile to get the
+     new columns (parse failures, spread, s/photo), not to fix attribution.
 2. **The ground truth is `evals/aesthetics-bakeoff/ranked.csv`**: 28 rows that
    match `sample/`. The directory is untracked but not in `.gitignore`, so check
    that no personal photos get committed.
@@ -388,7 +394,7 @@ python evals/describe_eval.py sample --db $DB          # --list to see text cand
 python evals/describe_eval.py fetch-originals
 python evals/text_passes_eval.py freeze --db $DB       # production descriptions
 
-# 1. aesthetics (re-run the qwen baseline first: the old rho 0.70 is 'legacy')
+# 1. aesthetics (re-run qwen once for the new columns; its 0.70 is attributable, see item 1)
 python evals/aesthetics_bakeoff.py --photos-dir evals/aesthetics-bakeoff/sample --vlm <id>
 
 # 2. describe, per model, then screen

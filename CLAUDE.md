@@ -930,8 +930,10 @@ Traps these exist to catch — don't undo them:
 
 - **`--model` must PIN the role env var** (`model_eval.pin_role_model`). On the
   LM Studio route the call-site name is ignored and the vision roles fall back
-  to `PHOTOSEARCH_LLM_VISUAL_MODEL` — so the 2026-07-09 aesthetics "qwen ρ 0.70"
-  may not be qwen at all (reported as `legacy:` until re-run).
+  to `PHOTOSEARCH_LLM_VISUAL_MODEL` (since `4cfc202`, 2026-07-10). The
+  2026-07-09 aesthetics "qwen ρ 0.70" predates that fallback and IS qwen's —
+  verified from file times vs git history; it reports as `legacy:` only because
+  scores.json records no effective model.
 - **Production turns transport failures into answers**: `describe_photo` →
   None, `llm_verify_description` → `[]` (== ALL CORRECT), the text extractors →
   None. Every harness wraps the call in `model_eval.Recorder`, which raises

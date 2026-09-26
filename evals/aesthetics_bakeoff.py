@@ -21,8 +21,10 @@ Two families of candidate, run side by side:
         python evals/aesthetics_bakeoff.py --photos-dir evals/aesthetics-bakeoff/sample \\
             --vlm qwen2.5-vl-7b-instruct
     (This docstring used to say "DO NOT set …AESTHETICS_MODEL — the per-call
-    id wins". It never did; the 2026-07-09 qwen result may be whatever VISUAL
-    pointed at, so its scores.json entry is reported as `legacy:`.)
+    id wins". That was TRUE when the 2026-07-09 run was made — scores.json was
+    written 07-09 09:00, and the VISUAL fallback arrived in 4cfc202 on 07-10 —
+    so that run's qwen2.5-vl-7b-instruct entry really is qwen. It stopped
+    being true afterwards, hence the pin.)
 
   * IQA   — purpose-built No-Reference metrics via `pyiqa` (optional; pip install
     pyiqa). Fast, objective, and (for MUSIQ/TOPIQ) run at native resolution — a
@@ -671,8 +673,9 @@ def main():
         print(f"{s:<34} {st['n']:>4} {_fmt(st['mean'], 2):>7} "
               f"{_fmt(st['std']):>7} {_fmt(rho):>9}")
     if any(r[0].startswith("legacy:") for r in rows):
-        print("  legacy: = cached before v2. For a VLM entry the model that "
-              "actually ran was not recorded (see the docstring) — re-run it.")
+        print("  legacy: = cached in scores.json before v2 (no effective model "
+              "recorded). The 2026-07-09 VLM entry predates the VISUAL fallback "
+              "(4cfc202), so it is the model it is named after.")
 
     if v2:
         print("\n=== VLM runs (scores-v2.json) ===")
