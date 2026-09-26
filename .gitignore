@@ -117,3 +117,5 @@ scripts/windows-import/import-config.local.ps1
 # Visual-tag eval: hand labels + run caches stay on the owner's machine
 evals/visual-tags/
 evals/model-evals/
+# The 2026-07-09 hand-ranked sample (personal photos) + its score caches.
+evals/aesthetics-bakeoff/

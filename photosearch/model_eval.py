@@ -368,13 +368,15 @@ class Recorder:
         return any("error" not in c for c in self.calls)
 
     def check(self, result_is_empty: bool, what: str = "the production call") -> None:
-        """Raise TransportError if the result is empty-ish AND no call answered."""
+        """Raise TransportError if the result is empty-ish AND the LAST call
+        errored (or none was made). An earlier answered-but-unparseable call
+        followed by a dead retry is still unknown, not a parse failure."""
         if not result_is_empty:
             return
         if not self.calls:
             raise TransportError(f"{what} made no model call "
                                  "(is the `ollama` package installed? unreadable file?)")
-        if not self.answered():
+        if "error" in self.calls[-1]:
             raise TransportError(self.calls[-1]["error"])
 
     # ---- per-attempt summaries -------------------------------------------

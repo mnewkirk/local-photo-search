@@ -12,11 +12,17 @@ Two families of candidate, run side by side:
     OpenAI-compatible LM Studio endpoint). Each candidate is just a model id
     passed to photosearch.aesthetics.score_photo_aesthetics; the rubric-anchored
     prompt + JSON parse are reused verbatim, so the bakeoff measures the real
-    pass. Point at LM Studio and DO NOT set PHOTOSEARCH_LLM_AESTHETICS_MODEL —
-    the per-call model id wins:
+    pass. On LM Studio the per-call model id is IGNORED — the `aesthetics`
+    role env var picks the model, and falls back to
+    PHOTOSEARCH_LLM_VISUAL_MODEL when unset — so `--vlm M` PINS
+    PHOTOSEARCH_LLM_AESTHETICS_MODEL=M for this process and records the model
+    that actually ran. One --vlm per process (the pin is process-global):
         export PHOTOSEARCH_TEXT_LLM_URL=http://localhost:1234/v1
-        python evals/aesthetics_bakeoff.py --photos-dir /path/to/sample \\
-            --vlm qwen2.5-vl-7b-instruct --vlm qwen3.5-9b
+        python evals/aesthetics_bakeoff.py --photos-dir evals/aesthetics-bakeoff/sample \\
+            --vlm qwen2.5-vl-7b-instruct
+    (This docstring used to say "DO NOT set …AESTHETICS_MODEL — the per-call
+    id wins". It never did; the 2026-07-09 qwen result may be whatever VISUAL
+    pointed at, so its scores.json entry is reported as `legacy:`.)
 
   * IQA   — purpose-built No-Reference metrics via `pyiqa` (optional; pip install
     pyiqa). Fast, objective, and (for MUSIQ/TOPIQ) run at native resolution — a
@@ -31,18 +37,40 @@ scorer's Spearman rank-correlation with your judgment — the number that actual
 decides the winner.
 
 Outputs (under --out, default ./aesthetics-bakeoff):
-  scores.json   — {scorer: {filename: score}}  (resumable cache; re-run adds models)
+  scores-v2.json — VLM runs, one per --variant (default: the model id), with
+                   the effective model, what LM Studio had loaded, and per
+                   photo {overall, first_parse_ok, calls, latency_s}.
+                   Resumable; a transport error is never cached.
+  scores.json   — {scorer: {filename: score}}: IQA metrics, plus the legacy
+                  pre-v2 VLM entries (read-only, effective model unknown)
   report.html   — per-scorer ranked galleries + a metrics table
   console       — score spread (discrimination), pairwise agreement, GT Spearman
 
-Nothing here touches photo_index.db.
+The console summary adds what decides a model swap besides ρ: parse-failure
+rate (first attempt and final), spread (std, IQR, distinct values, share
+within ±0.5 of the median — the "squashed scores" failure), s/photo (labelled
+solo/shared by what LM Studio had loaded), and ρ with a 95% CI. On 28 photos a
+ρ gap under ~0.1 is a tie.
+
+`--selections-gt --db <replica>` adds a second, owner-free ground truth: within
+each /review cluster, does the scorer rank the photos the owner KEPT above the
+ones they didn't? Culling picks mix sharpness and moment with aesthetics, so
+read it as a sanity check, not the verdict.
+
+photo_index.db is only ever opened read-only (mode=ro).
 """
 import argparse
 import csv
 import html
 import json
+import math
 import os
+import random
+import re
+import sqlite3
 import sys
+import time
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -87,24 +115,46 @@ def gather_photos(photos_dir=None, list_file=None):
 # Scorers
 # --------------------------------------------------------------------------
 
-def score_vlm(model, photos, cache, verbose=True):
-    """Score every photo with one VLM model. Returns {name: overall}. Resumable:
-    photos already in `cache` are skipped."""
+def _production_scorer(path, model):
     from photosearch.aesthetics import score_photo_aesthetics
-    out = dict(cache)
-    for i, (name, path) in enumerate(photos, 1):
-        if name in out and out[name] is not None:
-            continue
+    return score_photo_aesthetics(path, model=model)
+
+
+def score_vlm(model, photos, entry, *, scorer=None, save=None, log=print):
+    """Score every photo not yet in `entry["items"]` with the PRODUCTION
+    `score_photo_aesthetics`, through a Recorder so a dead backend is not
+    cached as a parse failure. Mutates and returns `entry`; `save()` is called
+    after every photo (resumable)."""
+    from photosearch import model_eval as me
+    from photosearch.aesthetics import parse_aesthetics_response
+    scorer = scorer or _production_scorer
+    items = entry.setdefault("items", {})
+    todo = [(n, p) for n, p in photos if n not in items]
+    fc = me.FailureCounter(log)
+    for i, (name, path) in enumerate(todo, 1):
+        rec = me.Recorder()
+        t0 = time.time()
         try:
-            res = score_photo_aesthetics(path, model=model)
-            out[name] = res["overall"] if res else None
+            with rec.active():
+                res = scorer(path, model)
+            rec.check(res is None, "score_photo_aesthetics")
         except Exception as e:
-            if verbose:
-                print(f"    ! {name}: {e}")
-            out[name] = None
-        if verbose and i % 10 == 0:
-            print(f"    [{i}/{len(photos)}] {model}")
-    return out
+            fc.fail(name, e)
+            continue
+        fc.ok()
+        first_raw = rec.calls[0].get("raw") if rec.calls else None
+        items[name] = {
+            "overall": res["overall"] if res else None,
+            "first_parse_ok": parse_aesthetics_response(first_raw or "") is not None,
+            "calls": len(rec.calls),
+            "latency_s": round(time.time() - t0, 3),
+        }
+        if save:
+            save()
+        if i % 10 == 0 or i == len(todo):
+            log(f"    [{i}/{len(todo)}] {entry.get('effective_model')}")
+    fc.summary()
+    return entry
 
 
 def _load_capped_tensor(path, max_edge):
@@ -212,6 +262,99 @@ def stats_for(values):
     std = (sum((v - mean) ** 2 for v in vals) / n) ** 0.5
     return {"n": n, "min": min(vals), "max": max(vals),
             "mean": mean, "std": std}
+
+
+def spread_for(values):
+    """How discriminative a scorer is. std alone hides the failure this pass
+    exists to fix (a VLM that answers 7 for everything), so also: IQR, how many
+    distinct values it used, and the share within ±0.5 of its own median."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return {"std": None, "iqr": None, "distinct": 0, "near_median": None}
+    from photosearch.model_eval import median, percentile
+    med = median(vals)
+    return {"std": stats_for(vals)["std"],
+            "iqr": percentile(vals, 0.75) - percentile(vals, 0.25),
+            "distinct": len(set(round(v, 2) for v in vals)),
+            "near_median": sum(1 for v in vals if abs(v - med) <= 0.5) / len(vals)}
+
+
+def spearman_ci(rho, n, z=1.96):
+    """95% CI for Spearman's ρ via Fisher z with the Bonett-Wright standard
+    error, sqrt((1 + ρ²/2) / (n - 3)). On 28 photos it is wide — which is the
+    point of printing it."""
+    if n is None or n < 4 or rho != rho or abs(rho) >= 1:
+        return (float("nan"), float("nan"))
+    se = math.sqrt((1 + rho * rho / 2) / (n - 3))
+    zr = math.atanh(rho)
+    return (math.tanh(zr - z * se), math.tanh(zr + z * se))
+
+
+def vlm_summary(entry, gt):
+    """The per-VLM row for the console table."""
+    from photosearch import model_eval as me
+    items = {k: v for k, v in entry.get("items", {}).items() if not k.startswith("pid:")}
+    n = len(items)
+    overall = {k: v["overall"] for k, v in items.items()}
+    first_fail = sum(1 for v in items.values() if not v.get("first_parse_ok"))
+    final_fail = sum(1 for v in overall.values() if v is None)
+    lat = me.latencies(items)
+    rho = n_gt = None
+    if gt:
+        names = [k for k in gt if overall.get(k) is not None]
+        n_gt = len(names)
+        rho = spearman([overall[k] for k in names], [gt[k] for k in names])
+    return {"n": n, "first_fail": first_fail, "final_fail": final_fail,
+            "spread": spread_for(overall.values()),
+            "lat_median": me.median(lat), "lat_p90": me.percentile(lat, 0.9),
+            "latency_label": entry.get("latency_label", "unknown"),
+            "rho": rho, "n_gt": n_gt,
+            "rho_ci": spearman_ci(rho, n_gt) if rho is not None else None}
+
+
+# --------------------------------------------------------------------------
+# Second ground truth: the owner's /review culling picks
+# --------------------------------------------------------------------------
+
+def open_db_readonly(path):
+    if not path:
+        raise SystemExit("--selections-gt needs --db (or PHOTOSEARCH_DB).")
+    uri = "file:" + quote(os.path.abspath(path)) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.execute("SELECT 1 FROM review_selections LIMIT 1")
+    except sqlite3.OperationalError as e:
+        raise SystemExit(f"Cannot open {path} read-only: {e}")
+    return conn
+
+
+def selection_groups(conn, n_groups=150, seed=7):
+    """Seeded sample of /review clusters holding at least one KEPT and one
+    not-kept photo: [(kept_ids, other_ids)]."""
+    groups = {}
+    for directory, cluster, pid, selected in conn.execute(
+            "SELECT directory, cluster_id, photo_id, selected FROM review_selections "
+            "WHERE cluster_id IS NOT NULL ORDER BY directory, cluster_id, photo_id"):
+        g = groups.setdefault((directory, cluster), ([], []))
+        g[0 if selected else 1].append(int(pid))
+    usable = [g for _, g in sorted(groups.items()) if g[0] and g[1]]
+    rnd = random.Random(seed)
+    return usable if len(usable) <= n_groups else rnd.sample(usable, n_groups)
+
+
+def selection_agreement(groups, score_by_id):
+    """(agreeing pairs, scored pairs) — a kept photo scored above a not-kept
+    one from the same cluster agrees; a tie counts half."""
+    agree = total = 0.0
+    for kept, other in groups:
+        for k in kept:
+            for o in other:
+                a, b = score_by_id.get(k), score_by_id.get(o)
+                if a is None or b is None:
+                    continue
+                total += 1
+                agree += 1 if a > b else 0.5 if a == b else 0
+    return agree, total
 
 
 def load_ground_truth(path):
@@ -384,16 +527,74 @@ compression). <b>Spearman vs you</b> = agreement with your hand-ranking (the tie
     return out_html, rows
 
 
+def _slug(model):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-") or "vlm"
+
+
+def _fmt(v, d=3):
+    return "—" if v is None or (isinstance(v, float) and v != v) else f"{v:.{d}f}"
+
+
+def run_vlm(model, photos, v2_path, *, variant=None, force=False, solo=False,
+            selection_photos=(), scorer=None, log=print):
+    """Pin, score (sample + any selection photos), and persist one VLM run."""
+    from photosearch import describe, model_eval as me
+    me.pin_role_model("aesthetics", model)
+    effective = describe.effective_model(model, "aesthetics")
+    variant = variant or _slug(model)
+    me.check_variant(variant)
+    store = me.read_json(v2_path, {})
+    entry = None if force else store.get(variant)
+    if entry is not None and entry.get("effective_model") != effective:
+        raise SystemExit(f"variant {variant!r} was scored by "
+                         f"{entry.get('effective_model')!r}, now {effective!r}. "
+                         "Use a new --variant, or --force.")
+    if entry is None:
+        entry = {"model": model, "effective_model": effective,
+                 "created": me.now_iso(), "items": {}}
+    store[variant] = entry
+    loaded_start = me.lmstudio_loaded()
+    log(f"[vlm] {variant}: model={effective}  loaded={loaded_start}")
+
+    def save():
+        me.write_json_atomic(v2_path, store)
+
+    score_vlm(model, list(photos) + list(selection_photos), entry,
+              scorer=scorer, save=save, log=log)
+    loaded_end = me.lmstudio_loaded()
+    entry["loaded_models_start"], entry["loaded_models_end"] = loaded_start, loaded_end
+    entry["latency_label"] = me.latency_label(effective, loaded_start, loaded_end, solo)
+    save()
+    return variant, entry
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--photos-dir", help="Directory of sample photos (recursed).")
     ap.add_argument("--list-file", help="Newline-delimited file of photo paths.")
     ap.add_argument("--vlm", action="append", default=[],
-                    help="VLM model id (repeatable). Routed via PHOTOSEARCH_TEXT_LLM_URL.")
+                    help="VLM model id. Pinned via PHOTOSEARCH_LLM_AESTHETICS_MODEL; "
+                         "one per process on the LM Studio route.")
+    ap.add_argument("--variant", help="Name for this VLM run (default: the model id).")
+    ap.add_argument("--force", action="store_true",
+                    help="Discard the cached VLM run for this variant.")
+    ap.add_argument("--solo", action="store_true",
+                    help="Assert only this model was loaded, when LM Studio "
+                         "can't report it.")
     ap.add_argument("--iqa", action="append", default=[],
                     help="pyiqa metric name, e.g. musiq / topiq_nr (repeatable).")
-    ap.add_argument("--ground-truth", help="CSV filename,rank|score for correlation.")
+    default_gt = os.path.join(HERE, "aesthetics-bakeoff", "ranked.csv")
+    ap.add_argument("--ground-truth",
+                    default=default_gt if os.path.exists(default_gt) else None,
+                    help="CSV filename,rank|score (default: the 2026-07-09 "
+                         "ranked.csv when present).")
+    ap.add_argument("--selections-gt", action="store_true",
+                    help="Also score /review culling clusters (needs --db).")
+    ap.add_argument("--selections-n", type=int, default=150)
+    ap.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"))
+    ap.add_argument("--server", default="http://localhost:8001",
+                    help="Server the selection photos are fetched from (once).")
     ap.add_argument("--out", default=os.path.join(HERE, "aesthetics-bakeoff"))
     ap.add_argument("--top-n", type=int, default=60)
     ap.add_argument("--device", default=None, help="torch device for pyiqa.")
@@ -401,52 +602,102 @@ def main():
                     help="Downscale images to this longer-edge px before IQA "
                          "scoring (0 = native resolution — will OOM MUSIQ on "
                          "large photos). Default 1536.")
+    ap.add_argument("--report-only", action="store_true",
+                    help="Score nothing; report what is cached.")
     args = ap.parse_args()
 
-    if not args.vlm and not args.iqa:
-        raise SystemExit("Provide at least one --vlm or --iqa scorer.")
+    if not (args.vlm or args.iqa or args.report_only):
+        raise SystemExit("Provide --vlm, --iqa, or --report-only.")
+    if len(args.vlm) > 1 and os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        raise SystemExit("One --vlm per process: the model is pinned through a "
+                         "process-global env var. Run the command once per model.")
+    if args.variant and len(args.vlm) != 1:
+        raise SystemExit("--variant names exactly one --vlm run.")
 
+    from photosearch import model_eval as me
     os.makedirs(args.out, exist_ok=True)
     cache_path = os.path.join(args.out, "scores.json")
-    scores = {}
-    if os.path.exists(cache_path):
-        with open(cache_path) as f:
-            scores = json.load(f)
-        print(f"[cache] loaded {len(scores)} scorer(s) from {cache_path}")
+    v2_path = os.path.join(args.out, "scores-v2.json")
+    legacy = me.read_json(cache_path, {})
 
     photos = gather_photos(args.photos_dir, args.list_file)
     print(f"[sample] {len(photos)} photos")
 
+    groups, sel_photos = [], []
+    if args.selections_gt:
+        groups = selection_groups(open_db_readonly(args.db), args.selections_n)
+        ids = sorted({i for k, o in groups for i in k + o})
+        print(f"[selections] {len(groups)} clusters, {len(ids)} photos")
+        for pid in ids:
+            try:
+                sel_photos.append((f"pid:{pid}", str(me.original_path(pid, args.server))))
+            except Exception as e:
+                print(f"  ! {pid}: {e} (skipped)")
+
     for model in args.vlm:
-        print(f"[vlm] {model}")
-        scores[model] = score_vlm(model, photos, scores.get(model, {}))
-        with open(cache_path, "w") as f:
-            json.dump(scores, f)
+        run_vlm(model, photos, v2_path, variant=args.variant, force=args.force,
+                solo=args.solo, selection_photos=sel_photos)
 
     for metric in args.iqa:
         print(f"[iqa] {metric}")
         try:
-            scores[metric] = score_iqa(metric, photos, scores.get(metric, {}),
+            legacy[metric] = score_iqa(metric, photos, legacy.get(metric, {}),
                                        device=args.device, max_edge=args.max_edge)
         except ImportError:
             print("  ! pyiqa not installed — `pip install pyiqa`; skipping.")
             continue
-        with open(cache_path, "w") as f:
-            json.dump(scores, f)
+        me.write_json_atomic(cache_path, legacy)
 
     gt = load_ground_truth(args.ground_truth) if args.ground_truth else {}
     if args.ground_truth:
-        print(f"[gt] {len(gt)} ranked photos loaded")
+        print(f"[gt] {len(gt)} ranked photos loaded from {args.ground_truth}")
+
+    v2 = me.read_json(v2_path, {})
+    iqa_names = set(args.iqa)
+    scores = {}
+    for name, vals in legacy.items():
+        scores[name if name in iqa_names else f"legacy:{name}"] = vals
+    for variant, entry in v2.items():
+        scores[variant] = {k: v["overall"] for k, v in entry["items"].items()
+                           if not k.startswith("pid:")}
 
     out_html, rows = write_report(args.out, photos, scores, gt, top_n=args.top_n)
 
-    print("\n=== Summary (higher std = more discriminative) ===")
-    print(f"{'scorer':<28} {'n':>4} {'mean':>7} {'std':>7} {'ρ vs you':>9}")
+    print("\n=== Legacy / IQA scorers (scores.json) ===")
+    print(f"{'scorer':<34} {'n':>4} {'mean':>7} {'std':>7} {'ρ vs you':>9}")
     for s, st, rho in rows:
-        mean = f"{st['mean']:.2f}" if st['mean'] is not None else "—"
-        std = f"{st['std']:.3f}" if st['std'] is not None else "—"
-        r = f"{rho:.3f}" if rho == rho else "—"
-        print(f"{s:<28} {st['n']:>4} {mean:>7} {std:>7} {r:>9}")
+        if s in v2:
+            continue
+        print(f"{s:<34} {st['n']:>4} {_fmt(st['mean'], 2):>7} "
+              f"{_fmt(st['std']):>7} {_fmt(rho):>9}")
+    if any(r[0].startswith("legacy:") for r in rows):
+        print("  legacy: = cached before v2. For a VLM entry the model that "
+              "actually ran was not recorded (see the docstring) — re-run it.")
+
+    if v2:
+        print("\n=== VLM runs (scores-v2.json) ===")
+        print(f"{'variant':<26} {'effective model':<28} {'n':>3} {'parse✗1st':>9} "
+              f"{'parse✗fin':>9} {'std':>6} {'IQR':>6} {'dist':>5} {'±.5med':>6} "
+              f"{'s/ph p50':>8} {'p90':>6} {'ρ [95% CI]':>22}  latency")
+        for variant, entry in v2.items():
+            r = vlm_summary(entry, gt)
+            sp = r["spread"]
+            ci = r["rho_ci"]
+            rho = (f"{_fmt(r['rho'])} [{_fmt(ci[0], 2)},{_fmt(ci[1], 2)}]"
+                   if r["rho"] is not None else "—")
+            print(f"{variant:<26} {str(entry.get('effective_model')):<28} {r['n']:>3} "
+                  f"{me.fmt_ratio(r['first_fail'], r['n']):>9} "
+                  f"{me.fmt_ratio(r['final_fail'], r['n']):>9} "
+                  f"{_fmt(sp['std'], 2):>6} {_fmt(sp['iqr'], 2):>6} {sp['distinct']:>5} "
+                  f"{_fmt(sp['near_median'], 2):>6} {_fmt(r['lat_median'], 1):>8} "
+                  f"{_fmt(r['lat_p90'], 1):>6} {rho:>22}  {r['latency_label']}")
+            if groups:
+                by_id = {int(k[4:]): v["overall"] for k, v in entry["items"].items()
+                         if k.startswith("pid:")}
+                agree, total = selection_agreement(groups, by_id)
+                print(f"{'':<26} culling agreement: {me.fmt_ratio(agree, total)} "
+                      f"of {int(total)} kept-vs-other pairs (0.50 = chance)")
+        print("On 28 photos a ρ gap under ~0.1 is a tie.")
     print(f"\n[report] {out_html}")
 
 
