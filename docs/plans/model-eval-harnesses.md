@@ -1,6 +1,7 @@
 # Eval harnesses for aesthetics, describe, category-content, keywords, verify
 
-Status: **planned, not started** (2026-09-26). Picks up from
+Status: **built** (2026-09-26, commits `6856e4a`..step 7). Not yet run against
+the new models — see "Runbook" at the end. Picks up from
 `docs/HANDOFF-2026-09-26-model-evals.md` (Phases 1–4). Built by plan-debate
 (two planners, two critique rounds). The three points they still disagreed on
 went to the owner; see "Decisions" at the end.
@@ -372,3 +373,45 @@ time. Watch jobs with a marker file or the log's final line, never
 | Review of planted errors | The owner approves each full planted description for naturalness (~90 s each, ~1 h) | Templated plants with a recorded span; the owner gives a yes/no that each claim is false (~5 s each) | **B: quick yes/no per claim** | 2026-09-26 |
 | Inputs for the text passes | Freeze the chosen describe model's descriptions after Phase 2 (text work waits on describe) | Freeze the stored production descriptions now; run the describe→text chain on the winner later as a check | **B: freeze from production now** | 2026-09-26 |
 | Loading models in production | All role models loaded at once in 24 GB (the handoff's goal), verified by a final all-loaded run | One model loaded at a time with the passes run in sequence; winners chosen per role, each only has to fit alone | **One at a time, sequential passes** (raised by the owner after the debate) | 2026-09-26 |
+
+## Runbook (build done — this is the order to run it)
+
+With the worker fleet stopped, and ONE model loaded in LM Studio at a time
+(`--solo` if LM Studio's `/api/v0/models` isn't available):
+
+```bash
+export PHOTOSEARCH_TEXT_LLM_URL=http://localhost:1234/v1 PHOTOSEARCH_LLM_REASONING_EFFORT=none
+DB=photo_index.db.local
+
+# 0. sample + pixels, once, while the NAS is up
+python evals/describe_eval.py sample --db $DB          # --list to see text candidates
+python evals/describe_eval.py fetch-originals
+python evals/text_passes_eval.py freeze --db $DB       # production descriptions
+
+# 1. aesthetics (re-run the qwen baseline first: the old rho 0.70 is 'legacy')
+python evals/aesthetics_bakeoff.py --photos-dir evals/aesthetics-bakeoff/sample --vlm <id>
+
+# 2. describe, per model, then screen
+python evals/describe_eval.py run --variant <short> --model <id>
+python evals/describe_eval.py report --db $DB
+
+# 3. text passes, per model (no GPU contention with describe needed — inputs are frozen)
+python evals/text_passes_eval.py run --pass category-content --variant <short> --model <id>
+python evals/text_passes_eval.py run --pass keywords         --variant <short> --model <id>
+
+# 4. owner: /eval/models — Visible text, Claims, then Categories / Keywords
+python evals/describe_eval.py pairs --baseline <prod> --variants <finalist>[,<finalist>]
+#    then the Pairwise tab
+
+# 5. verify, from one describe variant's labelled descriptions
+python evals/verify_eval.py plant --source <describe variant>   # then the Planted tab
+python evals/verify_eval.py run --variant <short> --model <id> [--mode pipeline --db $DB]
+
+# 6. summary
+python evals/model_eval_summary.py init-models          # fill in vram_gb + swap_s
+python evals/model_eval_summary.py report --db $DB [--assign role=model,...]
+```
+
+Re-run any `run` without `--force` after a failure line: only the gaps are
+filled.
+

@@ -440,6 +440,8 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
         f"{prompt_file or 'production'} — {len(todo)} to do, "
         f"{len(run['predictions'])} cached, {len(labels)} labelled")
 
+    from photosearch import model_eval
+    loaded_start = model_eval.lmstudio_loaded()
     errors = 0
     with prompt_override(prompt_text), vocab_override(extra_vocab), \
             tempfile.TemporaryDirectory() as tmp:
@@ -470,6 +472,12 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
             log(f"  [{i}/{len(todo)}] {pid}: {shown}  ({latency:.1f}s)")
     if errors:
         log(f"[run] {errors} photo(s) failed and were NOT cached — re-run to retry")
+    # Speed depends on what else is loaded (gemma-4-26b: 0.45 s alone, 3.1 s
+    # beside qwen); record it so the model-eval summary can say which.
+    loaded_end = model_eval.lmstudio_loaded()
+    if loaded_start is not None or loaded_end is not None or "latency_label" not in run:
+        run["latency_label"] = model_eval.latency_label(effective, loaded_start, loaded_end)
+        save_run(variant, run)
     return run
 
 

@@ -39,6 +39,9 @@ def eval_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("PHOTOSEARCH_TEXT_LLM_MODEL", raising=False)
     # `--db` defaults to it; a dev shell that exports it must not leak in.
     monkeypatch.delenv("PHOTOSEARCH_DB", raising=False)
+    # run_variant asks LM Studio what is loaded; never reach the network here.
+    from photosearch import model_eval
+    monkeypatch.setattr(model_eval, "lmstudio_loaded", lambda *a, **kw: None)
     return d
 
 
