@@ -629,3 +629,61 @@ def test_intra_run_dedup_also_covers_companions(tmp_path, tmp_db_path, monkeypat
     assert result["totals"]["companions_deduped"] == 1
     assert (photos / "2026" / "2026-08-05_ILCE-7RM6" / "DSC06192.ARW").exists()
     assert not (photos / "2026" / "2026-08-05_LCE-7RM6").exists()
+
+
+# --- CLI: --no-clip registers rows without CLIP -------------------------------
+
+def _ingest_cli(tmp_path, tmp_db_path, monkeypatch, *flags):
+    """Run `ingest-incoming` on one photo; returns (result, photos_root)."""
+    from click.testing import CliRunner
+    from cli import cli
+
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "ILCE-7RM6" / "DSC00001.jpg", b"cli-no-clip")
+    _patch_exif(monkeypatch, "2026-09-20 10:00:00")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    result = CliRunner().invoke(cli, [
+        "ingest-incoming", "--incoming-root", str(incoming),
+        "--photo-root", str(photos), "--db", tmp_db_path, *flags,
+    ])
+    assert result.exit_code == 0, result.output
+    return result, photos
+
+
+def test_no_clip_passes_clip_and_colors_off(tmp_path, tmp_db_path, monkeypatch):
+    import cli as cli_mod
+    calls = []
+    monkeypatch.setattr(cli_mod, "index_directory", lambda **kw: calls.append(kw))
+
+    _ingest_cli(tmp_path, tmp_db_path, monkeypatch, "--no-clip")
+
+    assert len(calls) == 1
+    assert calls[0]["enable_clip"] is False
+    assert calls[0]["enable_colors"] is False
+
+
+def test_default_still_clips(tmp_path, tmp_db_path, monkeypatch):
+    import cli as cli_mod
+    calls = []
+    monkeypatch.setattr(cli_mod, "index_directory", lambda **kw: calls.append(kw))
+
+    _ingest_cli(tmp_path, tmp_db_path, monkeypatch, "--no-colors")
+
+    assert calls[0]["enable_clip"] is True
+    assert calls[0]["enable_colors"] is False
+
+
+def test_no_clip_still_registers_the_photo(tmp_path, tmp_db_path, monkeypatch):
+    """The point of --no-clip over --no-index: the moved photo gets a DB row
+    (with its hash), so the fleet can claim it and the next sweep dedups
+    against it — but no embedding is computed here."""
+    _, photos = _ingest_cli(tmp_path, tmp_db_path, monkeypatch, "--no-clip")
+
+    with PhotoDB(tmp_db_path) as db:
+        rows = db.conn.execute("SELECT id, file_hash FROM photos").fetchall()
+        assert len(rows) == 1
+        assert rows[0][1]  # hash populated -> future dedup works
+        n_emb = db.conn.execute("SELECT COUNT(*) FROM clip_embeddings").fetchone()[0]
+        assert n_emb == 0

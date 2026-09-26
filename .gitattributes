@@ -1,0 +1,5 @@
+# Keep LF in the working tree no matter which git (WSL or Windows) checks the
+# repo out. Without this a Windows-side checkout/editor rewrote every file to
+# CRLF, which shows up as a whole-repo diff and breaks the shell scripts
+# (`$'\r': command not found`). PowerShell reads LF scripts fine.
+* text=auto eol=lf
