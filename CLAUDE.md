@@ -770,6 +770,17 @@ self-agreement and Cohen's kappa. A tag the owner disagrees with themself on
 (kappa < ~0.4) is not tightly enough defined to score a model against — fix
 the definition (`eval_api.LABELLER_NOTES`), not the prompt.
 
+**Sharpness labels ride on the same page** (`docs/plans/sharpness-measurement.md`
+step 1). `sharp`/`blurry` are `visual_tag_eval.MEASURED_TAGS`: labellable on
+every set, outside `CANDIDATE_TAGS`, and never scored against a VLM variant in
+either direction. They are judged in `PS.Loupe` — the original from `/full` at
+one image pixel per device pixel — never from `/preview`. A separate
+blurry-weighted sample lives in `<eval_dir>/sharpness/` (`sample-sharpness`,
+`?set=sharpness`, `?set=sharpness-recheck`, `agreement --set all`) so drawing
+it never orphans the visual sample. Labels carry `measured: true` once the
+chips were shown; the first visual labels do not, and `measured_labels()`
+skips them — a missing `blurry` there means "never asked".
+
 **Second set — Unsplash recall** (`evals/visual_tags_unsplash.py`): the
 Unsplash Research Dataset Lite's PHOTOGRAPHER-supplied keywords as positives
 (up to 40 photos per tag from the 25k local thumbs in

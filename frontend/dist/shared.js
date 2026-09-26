@@ -95,6 +95,148 @@
   };
 
   // =========================================================================
+  // Loupe — the ORIGINAL at actual pixels, pannable
+  // =========================================================================
+  // Sharpness has to be judged at native resolution: a 1920 px /preview has
+  // already averaged away the focus error it would reveal (the same mistake
+  // that made a 336 px VLM tile useless as a blur judge). So the loupe loads
+  // /api/photos/{id}/full and draws it at 1 image pixel = 1 DEVICE pixel —
+  // CSS size divided by devicePixelRatio, or a HiDPI screen would upsample it
+  // 2x and fake a softness that is not in the file.
+  //
+  // Pure geometry, exported for tests: the scroll offset that puts the
+  // fraction `focus` ({x, y} in 0..1 of the image) at the viewport centre,
+  // clamped to the scrollable range.
+  PS.loupeScroll = function loupeScroll(focus, imgW, imgH, viewW, viewH) {
+    var fx = focus && focus.x != null ? focus.x : 0.5;
+    var fy = focus && focus.y != null ? focus.y : 0.5;
+    function clamp(v, max) { return Math.max(0, Math.min(Math.round(v), Math.max(0, max))); }
+    return { left: clamp(fx * imgW - viewW / 2, imgW - viewW),
+             top: clamp(fy * imgH - viewH / 2, imgH - viewH) };
+  };
+
+  // The CSS size that shows `natural` image pixels at `zoom` x actual pixels.
+  PS.loupeCssSize = function loupeCssSize(naturalW, naturalH, zoom, dpr) {
+    var s = (zoom || 1) / (dpr || 1);
+    return { width: Math.round(naturalW * s), height: Math.round(naturalH * s) };
+  };
+
+  // Props: src (the original's URL), focus ({x, y} fractions — where the user
+  //        clicked on the fitted image; default the centre), onClose().
+  // Drag or scroll to pan, arrow keys pan, `z` toggles 100% / 200%, Esc or the
+  // × closes. While open it owns the keyboard (capture phase + stopPropagation),
+  // so a page's own arrow-key navigation does not fire underneath it.
+  PS.Loupe = function Loupe(props) {
+    var h = React.createElement;
+    var zoomS = useState(1); var zoom = zoomS[0]; var setZoom = zoomS[1];
+    var natS = useState(null); var nat = natS[0]; var setNat = natS[1];
+    var errS = useState(null); var err = errS[0]; var setErr = errS[1];
+    var boxRef = useRef(null);
+    var drag = useRef(null);
+    var focusRef = useRef(props.focus || { x: 0.5, y: 0.5 });
+    var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    var size = nat ? PS.loupeCssSize(nat.w, nat.h, zoom, dpr) : null;
+
+    // Re-centre on the focus point whenever the drawn size changes (load,
+    // zoom). On a zoom toggle, the focus is the current view centre.
+    useEffect(function () {
+      var box = boxRef.current;
+      if (!box || !size) return;
+      var p = PS.loupeScroll(focusRef.current, size.width, size.height,
+                             box.clientWidth, box.clientHeight);
+      box.scrollLeft = p.left; box.scrollTop = p.top;
+    }, [size && size.width, size && size.height]);
+
+    function viewCentre() {
+      var box = boxRef.current;
+      if (!box || !size || !size.width || !size.height) return focusRef.current;
+      return { x: (box.scrollLeft + box.clientWidth / 2) / size.width,
+               y: (box.scrollTop + box.clientHeight / 2) / size.height };
+    }
+
+    function toggleZoom() {
+      focusRef.current = viewCentre();
+      setZoom(function (z) { return z === 1 ? 2 : 1; });
+    }
+
+    useEffect(function () {
+      function onKey(ev) {
+        var box = boxRef.current;
+        var step = 200;
+        var handled = true;
+        if (ev.key === 'Escape') props.onClose();
+        else if (ev.key === 'z') toggleZoom();
+        else if (box && ev.key === 'ArrowLeft') box.scrollLeft -= step;
+        else if (box && ev.key === 'ArrowRight') box.scrollLeft += step;
+        else if (box && ev.key === 'ArrowUp') box.scrollTop -= step;
+        else if (box && ev.key === 'ArrowDown') box.scrollTop += step;
+        else handled = false;
+        if (handled) { ev.preventDefault(); ev.stopPropagation(); }
+        else if (ev.key === 'Enter' || ev.key === 's' || ev.key === 'u') {
+          // Never let a save / jump fire on a photo the labeller cannot see.
+          ev.preventDefault(); ev.stopPropagation();
+        }
+      }
+      window.addEventListener('keydown', onKey, true);
+      return function () { window.removeEventListener('keydown', onKey, true); };
+    }, [size && size.width]);
+
+    function down(ev) {
+      var box = boxRef.current;
+      if (!box || ev.button !== 0) return;
+      drag.current = { x: ev.clientX, y: ev.clientY, l: box.scrollLeft, t: box.scrollTop };
+      if (ev.currentTarget.setPointerCapture) ev.currentTarget.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    }
+    function move(ev) {
+      var d = drag.current; var box = boxRef.current;
+      if (!d || !box) return;
+      box.scrollLeft = d.l - (ev.clientX - d.x);
+      box.scrollTop = d.t - (ev.clientY - d.y);
+    }
+    function up() { drag.current = null; }
+
+    var overlay = { position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(0,0,0,0.94)',
+                    display: 'flex', flexDirection: 'column' };
+    var bar = { display: 'flex', gap: 12, alignItems: 'center', padding: '8px 14px',
+                color: '#ccc', fontSize: 13, borderBottom: '1px solid #333' };
+    var btn = { background: '#242424', border: '1px solid #444', color: '#eee',
+                borderRadius: 6, padding: '4px 12px', cursor: 'pointer', fontFamily: 'inherit' };
+
+    return h('div', { style: overlay, role: 'dialog', 'aria-label': 'Loupe: original at actual pixels' },
+      h('div', { style: bar },
+        h('b', null, zoom === 1 ? '100% — actual pixels' : '200%'),
+        h('span', null, nat ? nat.w + ' × ' + nat.h + ' px original' : err ? '' : 'loading the original…'),
+        h('span', { style: { color: '#888' } }, 'drag / scroll / arrow keys to pan · z zoom · Esc close'),
+        h('span', { style: { flex: 1 } }),
+        h('button', { type: 'button', style: btn, onClick: toggleZoom }, zoom === 1 ? '200%' : '100%'),
+        h('button', { type: 'button', style: btn, onClick: props.onClose, 'aria-label': 'Close loupe' }, '× Close')),
+      err ? h('div', { style: { color: '#f87171', padding: 20 } }, err) : null,
+      h('div', {
+        ref: boxRef,
+        style: { flex: 1, overflow: 'auto', cursor: drag.current ? 'grabbing' : 'grab',
+                 touchAction: 'none', userSelect: 'none' },
+        onPointerDown: down, onPointerMove: move, onPointerUp: up, onPointerCancel: up,
+      },
+        h('img', {
+          src: props.src, alt: 'original', draggable: false,
+          // Until the natural size is known, keep it off-screen at its natural
+          // size so the browser decodes it once; never CSS-scaled to fit.
+          style: size
+            ? { display: 'block', width: size.width, height: size.height, maxWidth: 'none',
+                imageRendering: zoom > 1 ? 'pixelated' : 'auto' }
+            : { position: 'absolute', visibility: 'hidden', maxWidth: 'none' },
+          onLoad: function (ev) {
+            setNat({ w: ev.target.naturalWidth, h: ev.target.naturalHeight });
+          },
+          onError: function () {
+            setErr('The browser could not display this original (HEIC or RAW, or the '
+                   + 'NAS is unreachable). Judge it in another viewer at 100%.');
+          },
+        })));
+  };
+
+  // =========================================================================
   // M15 — SharedHeader
   // =========================================================================
   // Props:

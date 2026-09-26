@@ -1,6 +1,21 @@
 # Measured sharpness → derived `blurry`
 
-Status: **planned, not started.** Follows `docs/HANDOFF-2026-09-26-sharp-blurry.md`.
+Status: **step 1 built (labelling tools), awaiting owner labels.** Follows
+`docs/HANDOFF-2026-09-26-sharp-blurry.md`.
+
+Step 1 as built: `visual_tag_eval.MEASURED_TAGS` (never scored against a
+model, both directions); `eval_api.LABELLER_NOTES` for `sharp`/`blurry`;
+`PS.Loupe` on `/eval/visual-tags` (click the photo or press `l`: the original
+from `/full` at 1 image px = 1 device px, drag/arrows to pan, `z` for 200%);
+a separate sample under `<eval_dir>/sharpness/` drawn by
+`python evals/visual_tags_eval.py sample-sharpness --db photo_index.db.local`
+(read-only, excludes the visual 60 and HEIC/RAW, which the loupe cannot draw)
+and labelled at `/eval/visual-tags?set=sharpness`; blind recheck at
+`?set=sharpness-recheck` (20 photos) and
+`visual_tags_eval.py agreement --set all`. Every label now records
+`measured` (the chips were shown), because the first 60 visual labels predate
+them — their missing `blurry` is "never asked", not "no", and
+`visual_tag_eval.measured_labels()` skips them until re-saved.
 Produced by a two-planner debate (2026-09-26); both planners converged on every
 point, so there were no owner tie-breaks. The four "decisions to make" from the
 handoff are answered below as **recommendations** — the owner can still overrule
