@@ -71,6 +71,38 @@ def _folder_of(filepath: Optional[str], filename: Optional[str]) -> str:
     idx = filepath.rfind("/")
     return filepath[:idx] if idx > 0 else ""
 
+
+def folder_for_path(filepath: Optional[str]) -> str:
+    """``photos.folder`` for a filepath — ``_folder_of`` with the basename."""
+    if not filepath:
+        return ""
+    return _folder_of(filepath, filepath.rsplit("/", 1)[-1])
+
+
+_KEEP = object()
+
+
+def set_photo_filepath(conn, photo_id: int, filepath: str,
+                       raw_filepath=_KEEP) -> None:
+    """THE write primitive for changing ``photos.filepath``.
+
+    ``photos.folder`` is derived from ``filepath`` (schema v25) and is what
+    ingest batches (``WHERE folder = ?``), /review, /geotag and worker
+    directory scoping read. A bare ``UPDATE photos SET filepath = ?`` leaves
+    it stale and silently drops the photo from all of those — which is what
+    ``relocate-into-year-dirs`` and ``remap_paths`` used to do. Every writer
+    that moves a photo goes through here so the two cannot drift.
+
+    ``raw_filepath`` is left untouched unless passed (``None`` clears it).
+    Does NOT commit — callers batch their own transaction.
+    """
+    cols = {"filepath": filepath, "folder": folder_for_path(filepath)}
+    if raw_filepath is not _KEEP:
+        cols["raw_filepath"] = raw_filepath
+    set_clause = ", ".join(f"{k} = ?" for k in cols)
+    conn.execute(f"UPDATE photos SET {set_clause} WHERE id = ?",
+                 list(cols.values()) + [photo_id])
+
 # sqlite-vec will be imported at init time so we can fail gracefully
 try:
     import sqlite_vec
@@ -400,14 +432,11 @@ class PhotoDB:
         count = 0
         for row in rows:
             new_path = new_prefix + row["filepath"][len(old_prefix):]
-            updates = {"filepath": new_path}
+            raw = _KEEP
             if row["raw_filepath"] and row["raw_filepath"].startswith(old_prefix):
-                updates["raw_filepath"] = new_prefix + row["raw_filepath"][len(old_prefix):]
-            set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
-            self.conn.execute(
-                f"UPDATE photos SET {set_clause} WHERE id = ?",
-                list(updates.values()) + [row["id"]],
-            )
+                raw = new_prefix + row["raw_filepath"][len(old_prefix):]
+            # Through the shared primitive so photos.folder follows the path.
+            set_photo_filepath(self.conn, row["id"], new_path, raw_filepath=raw)
             count += 1
         self.conn.commit()
         return count
@@ -1100,7 +1129,13 @@ class PhotoDB:
         return dict(row) if row else None
 
     def update_photo(self, photo_id: int, **kwargs):
-        """Update fields on a photo record."""
+        """Update fields on a photo record.
+
+        A ``filepath`` change also re-derives ``folder`` (unless the caller
+        passes one), mirroring ``add_photo`` — see ``set_photo_filepath``.
+        """
+        if "filepath" in kwargs and "folder" not in kwargs:
+            kwargs["folder"] = folder_for_path(kwargs["filepath"])
         set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
         self.conn.execute(
             f"UPDATE photos SET {set_clause} WHERE id = ?",

@@ -4262,17 +4262,14 @@ def relocate_into_year_dirs(db, dry_run, conflicts_file):
             click.echo("\nNo changes made (dry run).")
             return
 
+        from photosearch.db import set_photo_filepath, _KEEP
         for pid, _old, new_fp, _raw, new_raw in planned:
-            if new_raw is not None:
-                photo_db.conn.execute(
-                    "UPDATE photos SET filepath = ?, raw_filepath = ? WHERE id = ?",
-                    (new_fp, new_raw, pid),
-                )
-            else:
-                photo_db.conn.execute(
-                    "UPDATE photos SET filepath = ? WHERE id = ?",
-                    (new_fp, pid),
-                )
+            # Shared primitive: also re-derives photos.folder, which a bare
+            # UPDATE of filepath used to leave stale.
+            set_photo_filepath(
+                photo_db.conn, pid, new_fp,
+                raw_filepath=new_raw if new_raw is not None else _KEEP,
+            )
         photo_db.conn.commit()
         click.echo(f"Updated {len(planned)} filepath(s).")
 

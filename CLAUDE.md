@@ -1170,14 +1170,17 @@ between link and unlink leaves both names on one inode, which the next run reads
 as an identical-hash `duplicate_left`.
 
 **The DB gate looks rows up by exact `filepath`, never by `folder`.** `folder` is
-derived in `add_photo` but is **not maintained by every writer** —
-`relocate-into-year-dirs` (cli.py) and `db.remap_paths` (db.py) both
-`UPDATE photos SET filepath = ?` and leave `folder` stale. A stale `folder` would
-hide the row, the file would look unindexed, get moved by default, and orphan
-the row where `_heal_folder` could not see it either. `_db_links` therefore does
-a prefix **range scan** on the UNIQUE `filepath` index (`>= 'dir/'`, `< 'dir0'`).
-(Those two writers leaving `folder` stale is a separate latent bug, not fixed
-here.)
+derived, and `relocate-into-year-dirs` (cli.py) and `db.remap_paths` (db.py)
+used to `UPDATE photos SET filepath = ?` and leave it stale. **Fixed:** every
+filepath writer now goes through **`db.set_photo_filepath(conn, id, path,
+raw_filepath=...)`**, which re-derives `folder` in the same UPDATE, and
+`PhotoDB.update_photo(filepath=...)` does the same — so never write a bare
+`UPDATE photos SET filepath`. But a DB that ran the old writers can still hold
+stale values (heal with `photosearch backfill-folders --force --apply`), so the
+gate keeps trusting only `filepath`: a stale `folder` would hide the row, the
+file would look unindexed, get moved by default, and orphan the row where
+`_heal_folder` could not see it either. `_db_links` therefore does a prefix
+**range scan** on the UNIQUE `filepath` index (`>= 'dir/'`, `< 'dir0'`).
 
 That moves the risk from the column to the **spelling**, so two more guards:
 

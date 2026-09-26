@@ -47,7 +47,7 @@ import stat as stat_mod
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .db import PhotoDB, _folder_of
+from .db import PhotoDB, _folder_of, set_photo_filepath
 from .exif import extract_exif
 from .index import file_hash
 from .ingest import (
@@ -492,11 +492,13 @@ def _db_links(db, rel_folders: list[str]) -> tuple[dict, dict]:
     * ``by_path``  — ``filepath -> photo row`` for every row whose path lies in
       one of these folders, found with a prefix RANGE scan on the UNIQUE
       ``filepath`` index. Deliberately NOT ``WHERE folder IN (...)``: the
-      ``folder`` column is derived in ``add_photo`` but is not maintained by
-      every writer — ``relocate-into-year-dirs`` (cli.py) and
-      ``db.remap_paths`` both ``UPDATE photos SET filepath`` and leave ``folder``
-      stale. A stale ``folder`` would hide the row, the file would look
-      unindexed, and it would be moved by default, orphaning the row.
+      ``folder`` column is derived, and ``relocate-into-year-dirs`` (cli.py)
+      and ``db.remap_paths`` used to ``UPDATE photos SET filepath`` and leave
+      it stale. Every writer now goes through ``db.set_photo_filepath``, but
+      a DB that ran those older versions can still carry stale values (until
+      ``backfill-folders --force``). A stale ``folder`` would hide the row,
+      the file would look unindexed, and it would be moved by default,
+      orphaning the row — so the gate keeps trusting only ``filepath``.
     * ``raw_refs`` — ``filepath -> [photo_id, ...]`` for files named by some
       photo's ``raw_filepath``. ``index.py`` sets that from ``find_raw_pair``,
       which looks in the photo's OWN directory, so this fires when a JPEG and
@@ -610,9 +612,7 @@ def _heal_folder(db, folder: Path, year_dir: Path, date: str,
             continue
         new_rel = db.relative_filepath(str(cands[0]))
         try:
-            db.conn.execute(
-                "UPDATE photos SET filepath = ?, folder = ? WHERE id = ?",
-                (new_rel, _folder_of(new_rel, os.path.basename(new_rel)), row["id"]))
+            set_photo_filepath(db.conn, row["id"], new_rel)
             db.conn.commit()
         except Exception as exc:
             counts["errors"] += 1
@@ -1076,9 +1076,7 @@ def _after_move(db, counts: dict, audit: _Audit, by_path: dict, raw_refs: dict,
     reason_bits = list(extra)
     if row is not None:
         try:
-            db.conn.execute(
-                "UPDATE photos SET filepath = ?, folder = ? WHERE id = ?",
-                (rel_dest, _folder_of(rel_dest, name), row["id"]))
+            set_photo_filepath(db.conn, row["id"], rel_dest)
             db.conn.commit()
             counts["db_updated"] += 1
             reason_bits.append(f"photo_id={row['id']}")
@@ -1259,9 +1257,7 @@ def undo_refile(audit_path: str, db_path: str, apply: bool = False,
             back = db.relative_filepath(str(src))
             try:
                 if photo_id is not None:
-                    db.conn.execute(
-                        "UPDATE photos SET filepath = ?, folder = ? WHERE id = ?",
-                        (back, _folder_of(back, src.name), photo_id))
+                    set_photo_filepath(db.conn, photo_id, back)
                 for pid in raw_ids:
                     db.conn.execute(
                         "UPDATE photos SET raw_filepath = ? WHERE id = ?", (back, pid))
