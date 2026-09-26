@@ -19,7 +19,8 @@ def eval_dir(tmp_path, monkeypatch):
     for var in ("PHOTOSEARCH_TEXT_LLM_URL", "PHOTOSEARCH_LLM_VISUAL_MODEL",
                 "PHOTOSEARCH_LLM_AESTHETICS_MODEL", "PHOTOSEARCH_LLM_DESCRIBE_MODEL",
                 "PHOTOSEARCH_TEXT_LLM_MODEL"):
-        monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv(var, "x")  # recorded, so teardown removes a pin
+        monkeypatch.delenv(var)
     return d
 
 

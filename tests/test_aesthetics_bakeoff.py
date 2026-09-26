@@ -31,7 +31,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("PHOTOSEARCH_MODEL_EVAL_DIR", str(tmp_path / "me"))
     monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
     for v in ("PHOTOSEARCH_LLM_AESTHETICS_MODEL", "PHOTOSEARCH_TEXT_LLM_MODEL"):
-        monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv(v, "x")  # recorded, so teardown removes a pin
+        monkeypatch.delenv(v)
     # The trap: the shell exports the VISUAL model.
     monkeypatch.setenv("PHOTOSEARCH_LLM_VISUAL_MODEL", "qwen-visual")
     import urllib.request

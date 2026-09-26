@@ -38,7 +38,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
     for v in ("PHOTOSEARCH_LLM_DESCRIBE_MODEL", "PHOTOSEARCH_LLM_VISUAL_MODEL",
               "PHOTOSEARCH_TEXT_LLM_MODEL"):
-        monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv(v, "x")  # recorded, so teardown removes a pin
+        monkeypatch.delenv(v)
     monkeypatch.setattr(describe, "HAS_OLLAMA", True)
     monkeypatch.setattr(describe, "_encode_image_for_ollama", lambda p: "b64")
     monkeypatch.setattr(me, "lmstudio_loaded", lambda *a, **kw: None)
