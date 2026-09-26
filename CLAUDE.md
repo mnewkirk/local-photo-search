@@ -2473,6 +2473,27 @@ Three things it does that a SQL `UPDATE ... SET person_id=NULL` does not:
   and a data loss. A face with **no usable reference is never cleared by a
   gate**: "unknown" is not "far".
 
+### Finding more of one person: `➕ More of this kid` on `/faces`
+
+**Hand labels do not teach the strict matcher anything.** `match_faces_to_persons`
+compares only against `face_references` (from `add-person --photo`); assigning
+faces in `/faces` adds none. On 2026-09-26, after six kids were hand-labelled,
+re-running `match_faces` matched **0** — correctly, as far as its inputs went.
+
+Feeding the hand labels to the matcher's global 1.15 tolerance was measured and
+rejected: on that shoot it would have written 793 labels, with a kid who had
+**one** label absorbing 220. So `photosearch/face_suggest.py` +
+`GET /api/faces/suggest-person` (date scope REQUIRED) + the panel rank the
+scope's unmatched faces by distance to the person's trusted labels
+(`manual`/`merge_review`, **library-wide** — Beckham had 94 from earlier shoots,
+not today's 6) and **never write**: a cutoff slider dims tiles beyond it,
+"Select ≤ cutoff" takes the rest, Assign goes through `bulk-assign`. Two flags,
+both excluded from the cutoff selection: **nearer another kid** (distance to
+every other person's trusted labels, library-wide) and **in photo** (the person
+is already tagged in that photo). On the replica copy, 0.8–0.9 was the clean
+band (Beckham 56→109, 0–2 rival flags); 1.0 starts collecting rival flags.
+Tests: `tests/test_face_suggest.py`.
+
 ### The high-level view: `📊 Label health` on `/faces`
 
 Over-matching is invisible one date at a time — you only notice it when a grid

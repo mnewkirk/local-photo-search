@@ -2284,6 +2284,40 @@ def api_unmatch_preview(
             "stats": stats}
 
 
+@app.get("/api/faces/suggest-person")
+def api_suggest_person(
+    person: str = Query(..., description="Who to find more of."),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    max_dist: Optional[float] = Query(None, ge=0.0, le=2.0),
+    exclude_closer_to_other: bool = Query(False),
+    limit: int = Query(2000, ge=1, le=5000),
+):
+    """"More of this kid": the scope's unmatched faces, nearest to `person` first.
+
+    Backs the More-of-this-kid panel on /faces. Never writes — the grid is the
+    review and the selection is the confirmation; applying goes through
+    `POST /api/faces/bulk-assign`. See `photosearch/face_suggest.py` for why a
+    matcher run from hand labels was rejected (one label absorbed 220 faces).
+
+    **A DATE SCOPE IS REQUIRED**, for the same reason as unmatch-preview: this
+    is a per-shoot review, not a library-wide select-all.
+    """
+    from . import face_suggest
+
+    if not (date_from or date_to):
+        raise HTTPException(400, "a date scope is required — review one shoot at a time")
+    with _get_db() as db:
+        try:
+            rows, stats = face_suggest.suggest(
+                db, person=person, date_from=date_from, date_to=date_to,
+                max_dist=max_dist, exclude_closer_to_other=exclude_closer_to_other)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+    return {"person": person, "faces": rows[:limit],
+            "truncated": len(rows) > limit, "stats": stats}
+
+
 @app.get("/api/faces/person/{person_id}/inspect")
 def api_person_inspect(
     person_id: int,

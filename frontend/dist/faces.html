@@ -610,6 +610,13 @@
       border-radius: 3px; background: rgba(245,158,11,0.9); color: #000;
     }
     .face-tile.far .dist-badge { background: rgba(239,68,68,0.9); }
+    .face-tile.beyond { opacity: 0.4; }
+    .face-tile .rival-badge {
+      position: absolute; bottom: 2px; left: 2px; max-width: calc(100% - 26px);
+      font-size: 10px; padding: 1px 4px; border-radius: 3px; overflow: hidden;
+      white-space: nowrap; text-overflow: ellipsis;
+      background: rgba(245,158,11,0.9); color: #000;
+    }
     .face-tile .checkmark {
       position: absolute; bottom: 2px; right: 2px; width: 18px; height: 18px;
       border-radius: 50%; background: var(--accent); color: #fff; font-size: 12px;
@@ -1455,6 +1462,190 @@
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // MoreOfKid — "find more of this person" in one shoot.
+    //
+    // The strict matcher only knows add-person reference photos, so faces you
+    // label here never teach it anything. This ranks the scope's UNMATCHED
+    // faces by distance to the person's hand labels (library-wide) and lets
+    // you pick the cutoff by eye: tiles beyond it are dimmed, "Select ≤ cutoff"
+    // takes the rest. Never writes on its own — Assign goes through bulk-assign.
+    // Faces nearer ANOTHER labelled kid, or in a photo that person is already
+    // tagged in, are badged and never included by the cutoff selection.
+    // -----------------------------------------------------------------------
+    function MoreOfKid({ persons, dateFrom, dateTo, onClose, onChanged }) {
+      const [person, setPerson] = useState('');
+      const [cutoff, setCutoff] = useState(0.8);
+      const [hideRivals, setHideRivals] = useState(false);
+      const [data, setData] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [err, setErr] = useState('');
+      const [sel, setSel] = useState(new Set());
+      const [page, setPage] = useState(0);
+      const [working, setWorking] = useState(false);
+      const [undo, setUndo] = useState(null);
+      const lastIdx = useRef(null);
+
+      const load = useCallback((who) => {
+        const name = who || person;
+        if (!name) return;
+        setLoading(true); setErr(''); setSel(new Set()); setPage(0);
+        let u = API + '/api/faces/suggest-person?person=' + encodeURIComponent(name);
+        if (dateFrom) u += '&date_from=' + encodeURIComponent(dateFrom);
+        u += '&date_to=' + encodeURIComponent(dateTo || dateFrom || '');
+        fetch(u).then(r => r.json())
+          .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
+          .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
+      }, [person, dateFrom, dateTo]);
+
+      const all = (data && data.faces) || [];
+      const faces = hideRivals ? all.filter(f => !f.closer_to_other) : all;
+      const nPages = Math.max(1, Math.ceil(faces.length / INSP_PAGE));
+      const pageFaces = faces.slice(page * INSP_PAGE, (page + 1) * INSP_PAGE);
+      const safe = f => f.dist <= cutoff && !f.closer_to_other && !f.in_photo;
+      const nWithin = faces.filter(f => f.dist <= cutoff).length;
+      const nSafe = faces.filter(safe).length;
+
+      const toggle = useCallback((fid, idx, ev) => {
+        if (ev && ev.shiftKey && lastIdx.current != null) {
+          const lo = Math.min(lastIdx.current, idx), hi = Math.max(lastIdx.current, idx);
+          setSel(prev => {
+            const n = new Set(prev);
+            for (let i = lo; i <= hi; i++) { const f = faces[i]; if (f) n.add(f.face_id); }
+            return n;
+          });
+          lastIdx.current = idx;
+          return;
+        }
+        setSel(prev => { const n = new Set(prev); n.has(fid) ? n.delete(fid) : n.add(fid); return n; });
+        if (idx != null) lastIdx.current = idx;
+      }, [faces]);
+
+      const post = (ids, name) => fetch(API + '/api/faces/bulk-assign', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ face_ids: ids, person_name: name }),
+      }).then(r => r.json());
+
+      const apply = useCallback(() => {
+        const ids = Array.from(sel);
+        if (!ids.length || !person) return;
+        if (!confirm('Assign ' + ids.length + ' face(s) to ' + person + '?')) return;
+        setWorking(true);
+        post(ids, person)
+          .then(() => {
+            setUndo({ person, face_ids: ids });
+            setData(d => Object.assign({}, d, { faces: d.faces.filter(f => !sel.has(f.face_id)) }));
+            setSel(new Set());
+            if (onChanged) onChanged();
+          })
+          .catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setWorking(false));
+      }, [sel, person, onChanged]);
+
+      // Undo clears exactly the faces just assigned. The server records a
+      // cleared label as match_source='rejected', which also keeps these faces
+      // out of auto-matching and out of this panel — right for "those weren't him".
+      const undoLast = useCallback(() => {
+        if (!undo) return;
+        setWorking(true);
+        post(undo.face_ids, null)
+          .then(() => { setUndo(null); load(); if (onChanged) onChanged(); })
+          .catch(e2 => setErr(e2.message || String(e2)))
+          .finally(() => setWorking(false));
+      }, [undo, load, onChanged]);
+
+      const st = data && data.stats;
+      const tile = (f, j) => {
+        const idx = page * INSP_PAGE + j;
+        const warn = f.in_photo ? (person + ' is already tagged in this photo')
+          : f.closer_to_other ? ('closer to ' + f.rival + ' (' + f.rival_dist.toFixed(2) + ')') : null;
+        return e('div', {
+          key: f.face_id,
+          className: 'face-tile' + (sel.has(f.face_id) ? ' sel' : '') + (f.dist > cutoff ? ' beyond' : ''),
+          title: 'distance to ' + person + ': ' + f.dist.toFixed(3)
+               + (f.rival ? '\nnearest other labelled: ' + f.rival + ' ' + f.rival_dist.toFixed(3) : '')
+               + (warn ? '\n⚠ ' + warn : ''),
+          onClick: (ev) => { if (ev.shiftKey) ev.preventDefault(); toggle(f.face_id, idx, ev); },
+        },
+          e('img', { src: API + '/api/faces/crop/' + f.face_id + '?size=120', loading: 'lazy' }),
+          e('span', { className: 'dist-badge' }, f.dist.toFixed(2)),
+          warn && e('span', { className: 'rival-badge' },
+            f.in_photo ? 'in photo' : '≈ ' + f.rival),
+          e('span', { className: 'checkmark' }, '✓'),
+        );
+      };
+
+      return e('div', { className: 'insp-overlay', onClick: (ev) => { if (ev.target === ev.currentTarget) onClose(); } },
+        e('div', { className: 'insp-panel' },
+          e('div', { className: 'insp-header' },
+            e('div', { style: { flex: 1 } },
+              e('div', { className: 'insp-title' }, 'More of this kid — ' + (dateFrom || '') +
+                (dateTo && dateTo !== dateFrom ? ' → ' + dateTo : '')),
+              e('div', { className: 'insp-sub' },
+                loading ? 'measuring…'
+                  : st ? (all.length.toLocaleString() + ' unmatched face(s) · '
+                          + st.references + ' labelled reference(s) of ' + person
+                          + (st.within ? ' · within 0.8: ' + st.within['0.8']
+                             + ', 0.9: ' + st.within['0.9'] + ', 1.0: ' + st.within['1.0'] : ''))
+                  : 'Pick a person. Nearest first — slide the cutoff to where the '
+                    + 'crops stop being them.'),
+              st && st.references < 3 && e('div', { className: 'insp-sub', style: { color: 'var(--warn, #db4)' } },
+                'Only ' + st.references + ' labelled face(s) — keep the cutoff tight; '
+                + 'a single label matches every similar-looking child. Label a few more and Reload.'),
+            ),
+            e('select', { className: 'insp-btn', value: person, style: { marginRight: 8 },
+              onChange: ev => { setPerson(ev.target.value); setData(null); setUndo(null);
+                                if (ev.target.value) load(ev.target.value); } },
+              e('option', { value: '' }, 'person…'),
+              ...(persons || []).map(p => e('option', { key: p.id, value: p.name }, p.name))),
+            e('button', { className: 'insp-btn', onClick: () => load(), disabled: !person || loading },
+              loading ? 'Loading…' : 'Reload'),
+            e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
+          ),
+          data && e('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 16px', flexWrap: 'wrap' } },
+            e('span', { className: 'insp-sub' }, 'Cutoff'),
+            e('input', { type: 'range', min: 0.4, max: 1.3, step: 0.01, value: cutoff,
+              style: { width: 220 }, onChange: ev => setCutoff(parseFloat(ev.target.value)) }),
+            e('input', { type: 'number', min: 0.4, max: 1.3, step: 0.01, value: cutoff,
+              className: 'insp-btn', style: { width: 70 },
+              onChange: ev => { const v = parseFloat(ev.target.value); if (isFinite(v)) setCutoff(v); } }),
+            e('span', { className: 'insp-sub' }, nWithin + ' within · ' + nSafe + ' without warnings'),
+            e('button', { className: 'insp-btn', disabled: !nSafe,
+              title: 'Selects faces at or under the cutoff, skipping any nearer another labelled '
+                   + 'kid or in a photo this person is already tagged in.',
+              onClick: () => setSel(new Set(faces.filter(safe).map(f => f.face_id))) },
+              'Select ≤ ' + cutoff.toFixed(2)),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 4 } },
+              e('input', { type: 'checkbox', checked: hideRivals, onChange: ev => { setHideRivals(ev.target.checked); setPage(0); } }),
+              'hide faces nearer another kid'),
+            e('span', { style: { flex: 1 } }),
+            e('button', { className: 'insp-btn', disabled: page <= 0, onClick: () => setPage(p => p - 1) }, '← Prev'),
+            e('span', { className: 'insp-sub' }, 'Page ' + (page + 1) + ' / ' + nPages),
+            e('button', { className: 'insp-btn', disabled: page >= nPages - 1, onClick: () => setPage(p => p + 1) }, 'Next →'),
+          ),
+          err && e('div', { style: { padding: '10px 16px', color: 'var(--err, #e66)' } }, err),
+          e('div', { style: { padding: '10px 16px', overflowY: 'auto', flex: 1 } },
+            data && faces.length === 0 && !loading &&
+              e('div', { className: 'insp-sub' }, st && st.references === 0
+                ? person + ' has no hand-labelled faces yet — label one or two first.'
+                : 'No unmatched faces in this scope.'),
+            e('div', { className: 'insp-facegrid' }, ...pageFaces.map(tile)),
+          ),
+          e('div', { className: 'insp-actionbar' },
+            e('strong', null, sel.size + ' selected'),
+            e('button', { className: 'insp-btn', disabled: sel.size === 0, onClick: () => setSel(new Set()) }, 'Clear'),
+            e('span', { style: { flex: 1 } }),
+            undo && e('button', { className: 'insp-btn', disabled: working, onClick: undoLast,
+              title: 'Clear the ' + undo.face_ids.length + ' face(s) just assigned (recorded as '
+                   + 'rejected, so auto-matching will not re-add them).' },
+              'Undo last ' + undo.face_ids.length),
+            e('button', { className: 'insp-btn primary', disabled: sel.size === 0 || working || !person,
+              onClick: apply },
+              working ? 'Working…' : 'Assign ' + sel.size + ' to ' + (person || '…')),
+          ),
+        ));
+    }
+
     function PersonInspector({ person, persons, dateFrom, dateTo, onClose, onChanged }) {
       const [data, setData] = useState(null);
       const [loading, setLoading] = useState(true);
@@ -1781,6 +1972,7 @@
       // Label verification; needs a date scope like the team review does.
       const [labelVerify, setLabelVerify] = useState(false);
       const [bulkUnmatch, setBulkUnmatch] = useState(null);   // true | {person, date}
+      const [moreOfKid, setMoreOfKid] = useState(false);
       const [labelHealth, setLabelHealth] = useState(false);
       // Photo-scope banner for the open group: is the list narrowed by the
       // page filter, and how many exist outside it.
@@ -2426,6 +2618,11 @@
                 title: 'Remove a whole bad match_source from one person in this '
                      + 'range. Farthest-first grid, multi-select, then apply.',
               }, '\u2702 Bulk unmatch'),
+              cf.date_from && e('button', {
+                onClick: () => setMoreOfKid(true),
+                title: 'Find more of one person in this range: unmatched faces ranked by '
+                     + 'closeness to their labelled faces, with a cutoff you tune by eye.',
+              }, '\u2795 More of this kid'),
               cf.date_from && cf.date_from === cf.date_to && e('button', {
                 onClick: () => setTeamReview(true),
                 title: 'Filter this day\u2019s unknown faces to your team by jersey '
@@ -2814,6 +3011,14 @@
         labelHealth && e(LabelHealth, {
           onClose: () => setLabelHealth(false),
           onPick: (name, date) => { setLabelHealth(false); setBulkUnmatch({ person: name, date }); },
+        }),
+
+        moreOfKid && e(MoreOfKid, {
+          persons,
+          dateFrom: cf.date_from,
+          dateTo: cf.date_to || cf.date_from,
+          onClose: () => setMoreOfKid(false),
+          onChanged: () => { loadGroups(); loadPersons(); },
         }),
 
         bulkUnmatch && e(BulkUnmatch, {
