@@ -992,13 +992,39 @@
     // a thousand crops. Runs server-side over SSE (sampling ~800 previews
     // takes minutes); the same photosearch.face_review module the CLI uses.
     // -----------------------------------------------------------------------
+    // Jersey hue helpers for TeamReview. The review filters faces by the colour
+    // of the shirt just below them, as a hue angle (0-360°) on the colour
+    // wheel; these make that number visible as a colour and a name.
+    const JERSEY_PRESETS = [
+      [0, 'red'], [30, 'orange'], [55, 'yellow'], [120, 'green'],
+      [175, 'teal'], [220, 'blue'], [270, 'purple'], [320, 'pink'],
+    ];
+    function hueName(h) {
+      h = ((Number(h) % 360) + 360) % 360;
+      if (h < 15 || h >= 345) return 'red';
+      if (h < 45) return 'orange';
+      if (h < 75) return 'yellow';
+      if (h < 160) return 'green';
+      if (h < 195) return 'teal';
+      if (h < 255) return 'blue';
+      if (h < 290) return 'purple';
+      return 'pink';
+    }
+    function hueSwatch(h, size) {
+      return e('span', { style: {
+        display: 'inline-block', width: size || 14, height: size || 14, borderRadius: 3,
+        verticalAlign: 'middle', border: '1px solid rgba(255,255,255,0.35)',
+        background: 'hsl(' + h + ', 80%, 50%)' } });
+    }
+
     function TeamReview({ date, persons, onClose, onChanged }) {
       const [running, setRunning] = useState(false);
       const [status, setStatus] = useState('');
       const [prog, setProg] = useState(null);
       const [result, setResult] = useState(null);
       const [err, setErr] = useState('');
-      const [hue, setHue] = useState('');
+      const [hue, setHue] = useState('');          // '' = learn it from named faces
+      const [tol, setTol] = useState('25');
       const [names, setNames] = useState({});      // group_id -> typed name
       const [busyGroup, setBusyGroup] = useState(null);
       const abortRef = useRef(null);
@@ -1011,6 +1037,7 @@
         abortRef.current = controller;
         const body = { date };
         if (hue !== '') body.team_hue = parseFloat(hue);
+        if (tol !== '' && isFinite(parseFloat(tol))) body.tolerance = parseFloat(tol);
 
         fetch(API + '/api/faces/review-team', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1038,7 +1065,8 @@
               } else if (ev.type === 'progress' && ev.phase === 'sampling') {
                 setProg({ done: ev.done, total: ev.total });
               } else if (ev.type === 'progress' && ev.phase === 'hue') {
-                setStatus('team hue ' + ev.team_hue + '° (' + ev.source + ') — clustering…');
+                setStatus('jersey colour ' + hueName(ev.team_hue) + ' ' + Math.round(ev.team_hue)
+                          + '° (' + ev.source + ') — clustering…');
               } else if (ev.type === 'done') {
                 setResult(ev); setProg(null); setStatus('');
               } else if (ev.type === 'cancelled') {
@@ -1051,7 +1079,7 @@
         }).catch((e2) => {
           if (e2.name !== 'AbortError') setErr(e2.message || String(e2));
         }).finally(() => { setRunning(false); abortRef.current = null; });
-      }, [date, hue, running]);
+      }, [date, hue, tol, running]);
 
       const assign = useCallback((group) => {
         const name = (names[group.group_id] || '').trim();
@@ -1090,27 +1118,54 @@
               e('div', { className: 'insp-title' }, 'Review team faces — ' + date),
               e('div', { className: 'insp-sub' },
                 status || (result
-                  ? (result.stats.clusters + ' group(s), ' + result.stats.noise +
-                     ' ungrouped · team hue ' + result.team_hue + '° ±' + result.tolerance + '°')
-                  : 'Filters this day\u2019s faces to your team by jersey colour, then groups them.')),
-              result && e('div', { className: 'insp-sub', style: { color: 'var(--accent, #4a9)' } },
-                'Hue is learned from faces already named on this date — if those are '
-                + 'wrong, so is the filter. Override it above and re-run.'),
+                  ? e('span', null, result.stats.clusters + ' group(s), ' + result.stats.noise
+                      + ' ungrouped · jersey colour ', hueSwatch(result.team_hue), ' '
+                      + hueName(result.team_hue) + ' ' + Math.round(result.team_hue) + '° ±'
+                      + result.tolerance + '°')
+                  : 'Keeps only faces whose shirt matches your team\u2019s jersey colour, then groups them.')),
+              result && hue === '' && e('div', { className: 'insp-sub', style: { color: 'var(--accent, #4a9)' } },
+                'The colour was learned from faces already named on this date — if those '
+                + 'are wrong, so is the filter. Pick the colour below and re-run.'),
             ),
-            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 6, marginRight: 10 } },
-              'hue',
-              e('input', {
-                type: 'number', value: hue, placeholder: 'auto', min: 0, max: 360,
-                disabled: running,
-                onChange: ev => setHue(ev.target.value),
-                title: 'Team jersey hue in degrees. Blank = learn it from the faces already named on this date.',
-                style: { width: 70, background: 'var(--bg2, #222)', color: 'inherit',
-                         border: '1px solid var(--border, #444)', borderRadius: 4 },
-              })),
             running
               ? e('button', { className: 'insp-btn', onClick: () => abortRef.current && abortRef.current.abort() }, 'Cancel')
               : e('button', { className: 'insp-btn', onClick: run }, result ? 'Re-run' : 'Run review'),
             e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
+          ),
+
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 16px',
+                              flexWrap: 'wrap', borderBottom: '1px solid var(--border, #333)' } },
+            e('span', { className: 'insp-sub', style: { fontWeight: 600 },
+              title: 'Faces are kept when the shirt just below them is this colour. '
+                   + 'Measured as a hue angle on the colour wheel (0-360°).' }, 'Jersey colour'),
+            e('button', {
+              className: 'insp-btn' + (hue === '' ? ' primary' : ''), disabled: running,
+              onClick: () => setHue(''),
+              title: 'Learn the colour from the faces already named on this date.' }, 'Auto'),
+            ...JERSEY_PRESETS.map(([h, name]) => e('button', {
+              key: h, disabled: running, onClick: () => setHue(String(h)), title: name + ' (' + h + '°)',
+              style: { width: 26, height: 26, padding: 0, borderRadius: 5, cursor: 'pointer',
+                       background: 'hsl(' + h + ', 80%, 50%)',
+                       border: hue !== '' && hueName(hue) === name
+                         ? '3px solid var(--text, #fff)' : '1px solid rgba(255,255,255,0.3)' } })),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 4 },
+              title: 'Fine-tune: the exact hue angle in degrees (0 red, 120 green, 220 blue).' },
+              hue !== '' && hueSwatch(hue),
+              e('input', {
+                type: 'number', value: hue, placeholder: 'auto', min: 0, max: 360, disabled: running,
+                onChange: ev => setHue(ev.target.value),
+                style: { width: 62, background: 'var(--bg2, #222)', color: 'inherit',
+                         border: '1px solid var(--border, #444)', borderRadius: 4 } }), '°'),
+            e('label', { className: 'insp-sub', style: { display: 'flex', alignItems: 'center', gap: 4, marginLeft: 8 },
+              title: 'How far a shirt may be from the jersey colour and still count as your team. '
+                   + 'Widen it for faded or shadowed kits; narrow it if the other team\u2019s '
+                   + 'colour is close to yours.' },
+              'match within ±',
+              e('input', {
+                type: 'number', value: tol, min: 5, max: 90, disabled: running,
+                onChange: ev => setTol(ev.target.value),
+                style: { width: 52, background: 'var(--bg2, #222)', color: 'inherit',
+                         border: '1px solid var(--border, #444)', borderRadius: 4 } }), '°'),
           ),
 
           prog && e('div', { style: { padding: '10px 16px' } },
