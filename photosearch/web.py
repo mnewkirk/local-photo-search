@@ -43,6 +43,7 @@ from .admin_api import router as admin_router
 from .batch_api import router as batches_router
 from .eval_api import router as eval_router
 from .eval_api import sheet_router as eval_sheet_router
+from .model_eval_api import router as model_eval_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -53,6 +54,7 @@ app.include_router(worker_router)
 app.include_router(batches_router)
 app.include_router(eval_router)
 app.include_router(eval_sheet_router)
+app.include_router(model_eval_router)
 app.include_router(admin_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)
@@ -6332,6 +6334,14 @@ if _frontend_dir.exists():
     def serve_eval_visual_tags():
         """Serve the visual-tag labelling page (local-only eval tool — see eval_api)."""
         page = _frontend_dir / "eval_visual_tags.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Eval page not found</h1>")
+
+    @app.get("/eval/models")
+    def serve_eval_models():
+        """Serve the model-eval labelling page (local-only — see model_eval_api)."""
+        page = _frontend_dir / "eval_models.html"
         if page.exists():
             return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Eval page not found</h1>")

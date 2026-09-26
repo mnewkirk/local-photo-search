@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Model eval — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f0f0f; --surface: #1a1a1a; --surface2: #242424; --border: #333;
+      --text: #e8e8e8; --text-muted: #888; --accent: #4a9eff; --accent-hover: #6bb3ff;
+      --green: #4ade80; --yellow: #facc15; --red: #f87171; --violet: #a78bfa;
+      --radius: 8px;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh;
+    }
+    .header { background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 16px 24px; position: sticky; top: 0; z-index: 100; }
+    .header-inner { max-width: 1500px; margin: 0 auto; display: flex; align-items: center;
+      gap: 16px; min-height: 42px; flex-wrap: wrap; }
+    .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: var(--accent); }
+    .nav-link { font-size: 13px; color: var(--accent); text-decoration: none; margin-left: 4px; }
+    .nav-link:hover { text-decoration: underline; }
+    .nav-link.active { color: var(--text); font-weight: 600; }
+    .container { max-width: 1500px; margin: 0 auto; padding: 18px 24px 60px; }
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 2px; }
+    .page-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 14px; max-width: 1000px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      background: var(--surface2); padding: 1px 5px; border-radius: 4px; color: var(--text); }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 14px 16px; }
+    .btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; font-family: inherit; }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #07131f; font-weight: 600; }
+    .btn.primary:hover { background: var(--accent-hover); color: #07131f; }
+    .btn.choice { flex: 1; padding: 10px 14px; font-weight: 600; }
+    .btn.choice.on { background: rgba(74,222,128,0.16); border-color: var(--green); color: var(--green); }
+    .muted { color: var(--text-muted); font-size: 13px; }
+    .error { color: var(--red); font-size: 13px; margin-bottom: 12px; padding: 9px 12px;
+      background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.45); border-radius: 6px; }
+
+    .tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--text-muted);
+      padding: 8px 14px; font-size: 14px; cursor: pointer; font-family: inherit; }
+    .tab:hover { color: var(--text); }
+    .tab.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+
+    .topbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+    .progress-num { font-size: 15px; font-weight: 700; }
+    .progress-bar { flex: 1; min-width: 160px; height: 6px; border-radius: 3px;
+      background: var(--surface2); overflow: hidden; }
+    .progress-fill { height: 100%; background: var(--green); transition: width 0.2s; }
+    .pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border);
+      color: var(--text-muted); white-space: nowrap; }
+    .pill.stratum { color: var(--accent); border-color: rgba(74,158,255,0.5); }
+    .pill.saved { color: var(--green); border-color: rgba(74,222,128,0.5); }
+    .pill.dirty { color: var(--yellow); border-color: rgba(250,204,21,0.6); font-weight: 600; }
+
+    .strip { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px; }
+    .cell { width: 30px; height: 24px; font-size: 11px; line-height: 22px; text-align: center;
+      border-radius: 4px; border: 1px solid var(--border); background: var(--surface);
+      color: var(--text-muted); cursor: pointer; font-family: inherit; padding: 0; }
+    .cell:hover { border-color: var(--accent); }
+    .cell.done { background: rgba(74,222,128,0.18); border-color: rgba(74,222,128,0.5); color: var(--green); }
+    .cell.current { outline: 2px solid var(--accent); outline-offset: 1px; color: var(--text); font-weight: 700; }
+
+    .work { display: grid; grid-template-columns: minmax(0, 1fr) 560px; gap: 18px; align-items: start; }
+    @media (max-width: 1100px) { .work { grid-template-columns: 1fr; } }
+    .photo-pane { position: sticky; top: 86px; }
+    .photo-frame { background: #000; border: 1px solid var(--border); border-radius: var(--radius);
+      display: flex; align-items: center; justify-content: center;
+      height: calc(100vh - 200px); min-height: 360px; overflow: hidden; }
+    .photo-frame img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; cursor: zoom-in; }
+    @media (max-width: 1100px) {
+      .photo-pane { position: static; }
+      .photo-frame { height: auto; min-height: 0; max-height: 65vh; }
+      .photo-frame img { max-height: 65vh; }
+    }
+    .photo-meta { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+    .photo-meta .spacer { flex: 1; }
+
+    /* A description rendered exactly as written, each claim chunk clickable. */
+    .desc { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; margin-bottom: 10px; font-size: 14px; line-height: 1.65; }
+    .desc-head { display: flex; justify-content: space-between; align-items: center;
+      font-size: 11.5px; color: var(--text-muted); margin-bottom: 4px; }
+    .seg { cursor: pointer; border-radius: 3px; padding: 1px 0; }
+    .seg:hover { background: rgba(248,113,113,0.12); }
+    .seg.wrong { background: rgba(248,113,113,0.22); color: var(--red);
+      text-decoration: line-through; text-decoration-color: rgba(248,113,113,0.7); }
+    .other { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--text-muted);
+      margin-top: 6px; cursor: pointer; user-select: none; }
+    .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+    .pair .desc { margin-bottom: 0; cursor: default; }
+    .pair .desc.won { border-color: var(--green); }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+    textarea { width: 100%; min-height: 120px; background: var(--surface2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 14px; }
+    .keys { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+    kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useRef = React.useRef;
+
+    var API = '/api/eval/models';
+    var PARAMS = new URLSearchParams(window.location.search);
+    // ?variants=a,b limits which runs' descriptions are labelled. Names only
+    // ever appear in the URL the owner typed, never next to a description.
+    var VQ = PARAMS.get('variants') ? '?variants=' + encodeURIComponent(PARAMS.get('variants')) : '';
+    var TABS = [
+      { id: 'claims', label: 'Claims' },
+      { id: 'pairs', label: 'Pairwise' },
+      { id: 'truth', label: 'Visible text' },
+    ];
+
+    function jsonOrThrow(r) {
+      return r.json().then(function (body) {
+        if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+        return body;
+      });
+    }
+
+    // The local originals cache first — labelling must keep working while the
+    // NAS is down — then the normal preview.
+    function PhotoPane(props) {
+      var failedS = useState(false); var failed = failedS[0]; var setFailed = failedS[1];
+      useEffect(function () { setFailed(false); }, [props.photoId]);
+      var src = failed ? '/api/photos/' + props.photoId + '/preview'
+                       : API + '/original/' + props.photoId;
+      return e('div', { className: 'photo-pane' },
+        e('div', { className: 'photo-frame' },
+          e('img', {
+            key: props.photoId + (failed ? 'p' : 'o'), src: src, alt: 'photo ' + props.photoId,
+            title: 'Open full size', onError: function () { if (!failed) setFailed(true); },
+            onClick: function () { window.open(API + '/original/' + props.photoId + '?max_px=8000', '_blank'); },
+          })),
+        e('div', { className: 'photo-meta' }, props.children));
+    }
+
+    function Progress(props) {
+      var p = props.progress;
+      return e('div', { className: 'topbar' },
+        e('span', { className: 'progress-num' }, p.done + ' / ' + p.total + ' done'),
+        e('div', { className: 'progress-bar' },
+          e('div', { className: 'progress-fill', style: { width: (p.total ? 100 * p.done / p.total : 0) + '%' } })),
+        props.children);
+    }
+
+    function Strip(props) {
+      return e('div', { className: 'strip' },
+        props.items.map(function (it, i) {
+          return e('button', {
+            key: i, type: 'button', title: props.title(it),
+            className: 'cell' + (props.isDone(it) ? ' done' : '') + (i === props.idx ? ' current' : ''),
+            onClick: function () { props.onPick(i); },
+          }, i + 1);
+        }));
+    }
+
+    function Hint(props) {
+      return e('div', { className: 'card' }, props.text || 'Nothing to label yet.');
+    }
+
+    // Next not-done index strictly after `from`, wrapping; -1 when all done.
+    function nextOpen(items, from, isDone) {
+      for (var k = 1; k <= items.length; k++) {
+        var i = (from + k) % items.length;
+        if (!isDone(items[i])) return i;
+      }
+      return -1;
+    }
+
+    // Shared key handling: arrows move, Enter saves, digits pick. Ignored in
+    // inputs, and a save is ignored for 600 ms after a new item appears so a
+    // bounced Enter cannot label the photo that just loaded.
+    function useKeys(live) {
+      useEffect(function () {
+        function onKey(ev) {
+          if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
+          var tn = ev.target && ev.target.tagName;
+          if (tn === 'INPUT' || tn === 'TEXTAREA' || tn === 'SELECT') return;
+          var L = live.current;
+          if (!L) return;
+          if (ev.key === 'ArrowLeft') { ev.preventDefault(); L.move(-1); }
+          else if (ev.key === 'ArrowRight') { ev.preventDefault(); L.move(1); }
+          else if (ev.key === 'Enter' && L.save) {
+            ev.preventDefault();
+            if (Date.now() - L.shownAt.current > 600) L.save();
+          } else if (L.digit && /^[1-3]$/.test(ev.key)) {
+            ev.preventDefault();
+            if (Date.now() - L.shownAt.current > 600) L.digit(Number(ev.key));
+          }
+        }
+        window.addEventListener('keydown', onKey, true);
+        return function () { window.removeEventListener('keydown', onKey, true); };
+      }, []);
+    }
+
+    // ------------------------------------------------------------------
+    // Claims: every distinct description of a photo, click the wrong parts
+    // ------------------------------------------------------------------
+    function draftFrom(photo) {
+      var d = {};
+      photo.texts.forEach(function (t) {
+        var l = t.label || {};
+        d[t.sha] = { wrong: (l.wrong || []).slice(), other: !!l.other_wrong };
+      });
+      return d;
+    }
+
+    function ClaimsTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var draftS = useState({}); var draft = draftS[0]; var setDraft = draftS[1];
+      var dirtyS = useState(false); var dirty = dirtyS[0]; var setDirty = dirtyS[1];
+      var savingS = useState(false); var saving = savingS[0]; var setSaving = savingS[1];
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      useEffect(function () {
+        fetch(API + '/describe/claims' + VQ).then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.photos.findIndex(function (p) { return !p.done && p.texts.length; });
+          var start = first < 0 ? 0 : first;
+          setIdx(start);
+          if (d.photos.length) setDraft(draftFrom(d.photos[start]));
+        }).catch(function (ex) { props.onError('Could not load claims: ' + ex.message); });
+      }, []);
+
+      var photos = data ? data.photos : [];
+      var photo = photos[idx];
+
+      function goTo(i) {
+        if (i < 0 || i >= photos.length || i === idx) return;
+        if (dirty && !window.confirm('Unsaved marks on this photo. Leave without saving?')) return;
+        setIdx(i); setDraft(draftFrom(photos[i])); setDirty(false);
+      }
+
+      function toggle(sha, i) {
+        var d = Object.assign({}, draft);
+        var cur = Object.assign({}, d[sha]);
+        var w = cur.wrong.slice();
+        var at = w.indexOf(i);
+        if (at >= 0) w.splice(at, 1); else w.push(i);
+        cur.wrong = w; d[sha] = cur; setDraft(d); setDirty(true);
+      }
+
+      function toggleOther(sha) {
+        var d = Object.assign({}, draft);
+        d[sha] = Object.assign({}, d[sha], { other: !d[sha].other });
+        setDraft(d); setDirty(true);
+      }
+
+      // One save marks every description of the photo done: a description
+      // with nothing clicked is "all correct".
+      function save() {
+        if (!photo || saving || !photo.texts.length) return;
+        setSaving(true);
+        var at = idx;
+        Promise.all(photo.texts.map(function (t) {
+          return fetch(API + '/describe/claims/' + t.sha + VQ, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ photo_id: photo.photo_id, wrong: draft[t.sha].wrong,
+                                   other_wrong: draft[t.sha].other, done: true }),
+          }).then(jsonOrThrow);
+        })).then(function (results) {
+          var byS = {};
+          results.forEach(function (r) { byS[r.sha] = r.label; });
+          var next = photos.map(function (p, i) {
+            if (i !== at) return p;
+            return Object.assign({}, p, { done: true, texts: p.texts.map(function (t) {
+              return Object.assign({}, t, { label: byS[t.sha] || t.label });
+            }) });
+          });
+          var done = next.filter(function (p) { return p.done; }).length;
+          setData(Object.assign({}, data, { photos: next, progress: { done: done, total: next.length } }));
+          setSaving(false); setDirty(false);
+          var n = nextOpen(next, at, function (p) { return p.done || !p.texts.length; });
+          if (n >= 0 && n !== at) { setIdx(n); setDraft(draftFrom(next[n])); }
+        }).catch(function (ex) {
+          setSaving(false);
+          props.onError('Save failed: ' + ex.message);
+        });
+      }
+
+      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!photos.length) return e(Hint, { text: data.hint });
+
+      return e('div', null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: photos, idx: idx, onPick: goTo,
+                   isDone: function (p) { return p.done; },
+                   title: function (p) { return '#' + p.photo_id + ' · ' + (p.stratum || ''); } }),
+        e('div', { className: 'work' },
+          e(PhotoPane, { photoId: photo.photo_id },
+            e('button', { className: 'btn', type: 'button', disabled: idx === 0,
+                          onClick: function () { goTo(idx - 1); } }, '← Prev'),
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length),
+            e('button', { className: 'btn', type: 'button', disabled: idx >= photos.length - 1,
+                          onClick: function () { goTo(idx + 1); } }, 'Next →'),
+            e('span', { className: 'pill stratum' }, photo.stratum || ''),
+            e('span', { className: 'spacer' }),
+            dirty ? e('span', { className: 'pill dirty' }, '● unsaved')
+                  : photo.done ? e('span', { className: 'pill saved' }, '✓ saved') : null),
+          e('div', { className: 'card' },
+            e('div', { className: 'muted', style: { marginBottom: 10 } },
+              'Click every part that is WRONG about this photo — an object that is not there, a wrong colour, ',
+              'count, action or reading of text. Leave a description untouched if it is all correct. ',
+              photo.texts.length + ' distinct description' + (photo.texts.length === 1 ? '' : 's') +
+              ', shown in a fixed shuffled order.'),
+            photo.texts.length ? null : e('div', { className: 'muted' }, 'No model answered for this photo.'),
+            photo.texts.map(function (t, n) {
+              var d = draft[t.sha] || { wrong: [], other: false };
+              var bad = d.wrong.length + (d.other ? 1 : 0);
+              return e('div', { className: 'desc', key: t.sha },
+                e('div', { className: 'desc-head' },
+                  e('span', null, 'Description ' + String.fromCharCode(65 + n)),
+                  e('span', { style: { color: bad ? 'var(--red)' : 'var(--green)' } },
+                    bad ? bad + ' wrong' : 'all correct')),
+                t.segments.map(function (s, i) {
+                  return e('span', {
+                    key: i, className: 'seg' + (d.wrong.indexOf(i) >= 0 ? ' wrong' : ''),
+                    onClick: function () { toggle(t.sha, i); },
+                  }, s);
+                }),
+                e('label', { className: 'other', onClick: function (ev) { ev.preventDefault(); toggleOther(t.sha); } },
+                  e('input', { type: 'checkbox', readOnly: true, checked: d.other }),
+                  'Something else is wrong that I cannot click'));
+            }),
+            e('div', { className: 'actions' },
+              e('button', { className: 'btn primary', type: 'button', disabled: saving || !photo.texts.length,
+                            onClick: save }, saving ? 'Saving…' : 'Save & next (Enter)'),
+              e('button', { className: 'btn', type: 'button', disabled: !dirty,
+                            onClick: function () { setDraft(draftFrom(photo)); setDirty(false); } }, 'Revert')),
+            e('div', { className: 'keys' },
+              e('kbd', null, '←'), ' ', e('kbd', null, '→'), ' prev / next · ',
+              e('kbd', null, 'Enter'), ' save all descriptions of this photo + next'))));
+    }
+
+    // ------------------------------------------------------------------
+    // Pairwise: which of two descriptions is better?
+    // ------------------------------------------------------------------
+    function PairsTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      useEffect(function () {
+        fetch(API + '/describe/pairs').then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.pairs.findIndex(function (p) { return !p.choice; });
+          setIdx(first < 0 ? 0 : first);
+        }).catch(function (ex) { props.onError('Could not load pairs: ' + ex.message); });
+      }, []);
+
+      var pairs = data ? data.pairs : [];
+      var pair = pairs[idx];
+
+      function choose(choice) {
+        if (!pair) return;
+        var at = idx;
+        fetch(API + '/describe/pairs/' + encodeURIComponent(pair.key), {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ choice: choice }),
+        }).then(jsonOrThrow).then(function () {
+          var next = pairs.map(function (p, i) { return i === at ? Object.assign({}, p, { choice: choice }) : p; });
+          var done = next.filter(function (p) { return p.choice; }).length;
+          setData(Object.assign({}, data, { pairs: next, progress: { done: done, total: next.length } }));
+          var n = nextOpen(next, at, function (p) { return !!p.choice; });
+          if (n >= 0 && n !== at) setIdx(n);
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+
+      live.current = {
+        move: function (d) { var i = idx + d; if (i >= 0 && i < pairs.length) setIdx(i); },
+        digit: function (k) { choose(k === 1 ? 'a' : k === 2 ? 'tie' : 'b'); },
+        shownAt: shownAt,
+      };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!pairs.length) return e(Hint, { text: data.hint });
+
+      function side(key, label) {
+        return e('div', { className: 'desc' + (pair.choice === key ? ' won' : '') },
+          e('div', { className: 'desc-head' }, e('span', null, label)), pair[key].text);
+      }
+
+      return e('div', null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: pairs, idx: idx, onPick: setIdx,
+                   isDone: function (p) { return !!p.choice; },
+                   title: function (p) { return '#' + p.photo_id; } }),
+        e('div', { className: 'work' },
+          e(PhotoPane, { photoId: pair.photo_id },
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + pairs.length),
+            e('span', { className: 'spacer' }),
+            pair.choice ? e('span', { className: 'pill saved' }, '✓ ' + pair.choice) : null),
+          e('div', { className: 'card' },
+            e('div', { className: 'muted', style: { marginBottom: 10 } },
+              'Which description would you rather have for this photo? Accuracy first, then what it ',
+              'notices that matters. Call it a tie when neither is better.'),
+            e('div', { className: 'pair' }, side('a', 'Left'), side('b', 'Right')),
+            e('div', { className: 'actions' },
+              [['a', '← Left better (1)'], ['tie', 'Tie (2)'], ['b', 'Right better (3) →']].map(function (c) {
+                return e('button', { key: c[0], type: 'button',
+                  className: 'btn choice' + (pair.choice === c[0] ? ' on' : ''),
+                  onClick: function () { choose(c[0]); } }, c[1]);
+              })),
+            e('div', { className: 'keys' },
+              e('kbd', null, '1'), ' ', e('kbd', null, '2'), ' ', e('kbd', null, '3'), ' left / tie / right · ',
+              e('kbd', null, '←'), ' ', e('kbd', null, '→'), ' prev / next'))));
+    }
+
+    // ------------------------------------------------------------------
+    // Visible text: type what the photo actually says, once
+    // ------------------------------------------------------------------
+    function TruthTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var textS = useState(''); var text = textS[0]; var setText = textS[1];
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      useEffect(function () {
+        fetch(API + '/describe/text-truth').then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.photos.findIndex(function (p) { return !(p.truth && p.truth.done); });
+          var start = first < 0 ? 0 : first;
+          setIdx(start);
+          if (d.photos.length) setText((d.photos[start].truth || {}).text || '');
+        }).catch(function (ex) { props.onError('Could not load: ' + ex.message); });
+      }, []);
+
+      var photos = data ? data.photos : [];
+      var photo = photos[idx];
+
+      function goTo(i) {
+        if (i < 0 || i >= photos.length) return;
+        setIdx(i); setText((photos[i].truth || {}).text || '');
+      }
+
+      function save(value) {
+        if (!photo) return;
+        var at = idx;
+        fetch(API + '/describe/text-truth/' + photo.photo_id, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: value, done: true }),
+        }).then(jsonOrThrow).then(function (body) {
+          var next = photos.map(function (p, i) { return i === at ? Object.assign({}, p, { truth: body.truth }) : p; });
+          var done = next.filter(function (p) { return p.truth && p.truth.done; }).length;
+          setData(Object.assign({}, data, { photos: next, progress: { done: done, total: next.length } }));
+          var n = nextOpen(next, at, function (p) { return !!(p.truth && p.truth.done); });
+          if (n >= 0 && n !== at) { setIdx(n); setText((next[n].truth || {}).text || ''); }
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+
+      live.current = { move: function (d) { goTo(idx + d); }, shownAt: shownAt };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!photos.length) return e(Hint, { text: 'The describe sample has no photos in the text stratum.' });
+
+      return e('div', null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: photos, idx: idx, onPick: goTo,
+                   isDone: function (p) { return !!(p.truth && p.truth.done); },
+                   title: function (p) { return '#' + p.photo_id; } }),
+        e('div', { className: 'work' },
+          e(PhotoPane, { photoId: photo.photo_id },
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length + ' · #' + photo.photo_id)),
+          e('div', { className: 'card' },
+            e('div', { className: 'muted', style: { marginBottom: 10 } },
+              'Type the text you can actually read in the photo — signs, labels, shirts — exactly as ',
+              'written. Leave out anything you cannot read. This is what descriptions are checked against.'),
+            e('textarea', { value: text, onChange: function (ev) { setText(ev.target.value); },
+                            placeholder: 'e.g. MILLER CREEK SOCCER LEAGUE' }),
+            e('div', { className: 'actions', style: { marginTop: 10 } },
+              e('button', { className: 'btn primary', type: 'button',
+                            onClick: function () { save(text); } }, 'Save & next'),
+              e('button', { className: 'btn', type: 'button',
+                            onClick: function () { setText(''); save(''); } },
+                'No readable text — skip this photo')))));
+    }
+
+    function Page() {
+      var initial = PARAMS.get('tab');
+      var tabS = useState(TABS.some(function (t) { return t.id === initial; }) ? initial : 'claims');
+      var tab = tabS[0]; var setTab = tabS[1];
+      var errS = useState(null); var error = errS[0]; var setError = errS[1];
+
+      function pick(id) {
+        setTab(id); setError(null);
+        var u = new URL(window.location.href);
+        u.searchParams.set('tab', id);
+        window.history.replaceState(null, '', u.toString());
+      }
+
+      var body = tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })
+        : tab === 'pairs' ? e(PairsTab, { key: 'p', onError: setError })
+        : e(TruthTab, { key: 't', onError: setError });
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'eval-models' }),
+        e('div', { className: 'container' },
+          e('h1', null, 'Model eval — labelling'),
+          e('div', { className: 'page-sub' },
+            'Ground truth for the describe / text / verify model evals ',
+            '(', e('code', null, 'docs/plans/model-eval-harnesses.md'), '). ',
+            'Model names are never shown. Labels are files on this machine, not DB rows.'),
+          e('div', { className: 'tabs' },
+            TABS.map(function (t) {
+              return e('button', { key: t.id, type: 'button', className: 'tab' + (tab === t.id ? ' on' : ''),
+                                   onClick: function () { pick(t.id); } }, t.label);
+            })),
+          error ? e('div', { className: 'error' }, error) : null,
+          body));
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(Page, null));
+  </script>
+</body>
+</html>

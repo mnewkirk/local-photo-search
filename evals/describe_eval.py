@@ -290,6 +290,15 @@ def summarize(run, *, strata=None, truth=None, conn=None, clip_cache=None, use_c
     bad = (n - row["answered"]) + row["degenerate_final"] + row["truncated"]
     row["screen_out"] = n >= me.MIN_N and bad / n > SCREEN_MAX_BAD
 
+    claims = me.load_claims()
+    errs = [me.claim_errors(claims.get(it.get("text_sha") or me.text_sha(t)))
+            for (pid, t), it in zip(texts.items(), items.values()) if t]
+    errs = [x for x in errs if x is not None]
+    row["claims_n"] = len(errs)
+    row["clean"] = sum(1 for x in errs if x == 0)
+    row["wrong_per_desc"] = sum(errs) / len(errs) if errs else None
+    row["wrong_ci"] = bootstrap_mean_ci(errs) if errs else None
+
     if use_clip and conn is not None:
         per = [clip_flags(conn, pid, t, clip_cache if clip_cache is not None else {})
                for pid, t in texts.items() if t]
@@ -311,6 +320,88 @@ def summarize(run, *, strata=None, truth=None, conn=None, clip_cache=None, use_c
         row["text_recall"] = sum(recs) / len(recs) if recs else None
         row["text_invented"] = invented
     return row
+
+
+def bootstrap_mean_ci(xs, n_boot=2000, seed=3):
+    """95% percentile-bootstrap CI of a mean (seeded, so reports are stable)."""
+    if not xs:
+        return None
+    rnd = random.Random(seed)
+    k = len(xs)
+    means = sorted(sum(rnd.choice(xs) for _ in range(k)) / k for _ in range(n_boot))
+    return (means[int(0.025 * n_boot)], means[int(0.975 * n_boot) - 1])
+
+
+def sign_test_p(wins, losses):
+    """Two-sided exact binomial sign test, ties excluded."""
+    from math import comb
+    n = wins + losses
+    if n == 0:
+        return None
+    k = min(wins, losses)
+    tail = sum(comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
+def build_pairs(baseline, variants, *, n=40, seed=5):
+    """Blind side-by-side pairs: `baseline` against each other variant, on n
+    photos where every compared variant answered and the texts differ.
+    Only finalists belong here — this is the expensive owner task."""
+    runs = {v: me.load_run(PASS, v) for v in [baseline] + list(variants)}
+    missing = [v for v, r in runs.items() if r is None]
+    if missing:
+        raise SystemExit(f"no cached run for: {missing}")
+    others = [v for v in variants if v != baseline]
+    if not others:
+        raise SystemExit("--variants must name at least one variant besides the baseline")
+    eligible = []
+    for pid in me.sample_ids(PASS):
+        texts = {v: (r["items"].get(str(pid)) or {}).get("text") for v, r in runs.items()}
+        if all(texts.values()):
+            eligible.append(pid)
+    rnd = random.Random(seed)
+    chosen = eligible if len(eligible) <= n else sorted(rnd.sample(eligible, n))
+    pairs = []
+    for pid in chosen:
+        a = runs[baseline]["items"][str(pid)]
+        for v in others:
+            b = runs[v]["items"][str(pid)]
+            a_sha = a.get("text_sha") or me.text_sha(a["text"])
+            b_sha = b.get("text_sha") or me.text_sha(b["text"])
+            if a_sha == b_sha:
+                continue            # identical text: nothing to prefer
+            pairs.append({"key": me.pair_key(a_sha, b_sha), "photo_id": pid,
+                          "a_sha": a_sha, "b_sha": b_sha,
+                          "a_variant": baseline, "b_variant": v})
+    data = {"created": me.now_iso(), "seed": seed, "baseline": baseline, "pairs": pairs}
+    me.write_pass_file(PASS, "pairs.json", data)
+    return data
+
+
+def pairwise_table():
+    """[(challenger, baseline, wins, ties, losses, win_rate, p)] from the
+    owner's preferences; ties count half toward the win rate."""
+    prefs = me.load_prefs()
+    agg = {}
+    for p in me.load_pairs()["pairs"]:
+        pref = prefs.get(p["key"])
+        if pref is None:
+            continue
+        key = (p["b_variant"], p["a_variant"])
+        w, t, l = agg.get(key, (0, 0, 0))
+        winner = pref.get("winner_sha")
+        if winner is None:
+            t += 1
+        elif winner == p["b_sha"]:
+            w += 1
+        else:
+            l += 1
+        agg[key] = (w, t, l)
+    rows = []
+    for (b, a), (w, t, l) in sorted(agg.items()):
+        n = w + t + l
+        rows.append((b, a, w, t, l, (w + t / 2) / n if n else None, sign_test_p(w, l)))
+    return rows
 
 
 def build_report(*, db=None, use_clip=True):
@@ -354,6 +445,26 @@ def render(rows):
             f"{_f(r['words_p50'], 0) + '/' + _f(r['words_p90'], 0):>9} "
             f"{_f(r['lat_p50']) + '/' + _f(r['lat_p90']):>11} {clip:>10} {tr:>8}  "
             f"{r['latency_label']}{'   ✗ SCREEN OUT' if r['screen_out'] else ''}")
+    labelled = [r for r in rows if r.get("claims_n")]
+    if labelled:
+        out.append("")
+        out.append(f"{'variant':<18} {'labelled':>8} {'clean':>6} {'wrong/desc':>10} {'95% CI':>13}")
+        for r in labelled:
+            ci = r["wrong_ci"]
+            out.append(f"{str(r['variant']):<18} {r['claims_n']:>8} "
+                       f"{me.fmt_ratio(r['clean'], r['claims_n']):>6} "
+                       f"{_f(r['wrong_per_desc'], 2):>10} "
+                       f"{('[' + _f(ci[0], 2) + ',' + _f(ci[1], 2) + ']') if ci else '—':>13}")
+        out.append("clean = share of labelled descriptions with no wrong claim.")
+    pw = pairwise_table()
+    if pw:
+        out.append("")
+        out.append(f"{'challenger':<18} {'vs':<18} {'win':>4} {'tie':>4} {'loss':>4} "
+                   f"{'win rate':>8} {'sign p':>7}")
+        for b, a, w, t, l, rate, p in pw:
+            out.append(f"{b:<18} {a:<18} {w:>4} {t:>4} {l:>4} {_f(rate, 2):>8} {_f(p, 3):>7}")
+        out.append("win rate counts a tie as half; sign test excludes ties.")
+    out.append("")
     out.append(f"ratios are shares of n; words and s/photo are p50/p90; 'n<3' = too few. "
                f"SCREEN OUT = more than {SCREEN_MAX_BAD:.0%} unanswered/degenerate/truncated.")
     return "\n".join(out)
@@ -391,6 +502,12 @@ def main(argv=None):
     r.add_argument("--force", action="store_true")
     r.add_argument("--solo", action="store_true")
 
+    pr = sub.add_parser("pairs", help="build blind pairwise comparisons (finalists only)")
+    pr.add_argument("--baseline", required=True)
+    pr.add_argument("--variants", required=True, help="comma-separated challengers")
+    pr.add_argument("--n", type=int, default=40)
+    pr.add_argument("--seed", type=int, default=5)
+
     p = sub.add_parser("report")
     p.add_argument("--db", default=db_default)
     p.add_argument("--no-clip", action="store_true")
@@ -418,6 +535,10 @@ def main(argv=None):
         run_variant(args.variant, model=args.model, prompt_file=args.prompt_file,
                     server=args.server, limit=args.limit, force=args.force,
                     solo=args.solo)
+    elif args.cmd == "pairs":
+        data = build_pairs(args.baseline, [v.strip() for v in args.variants.split(",") if v.strip()],
+                           n=args.n, seed=args.seed)
+        print(f"[pairs] {len(data['pairs'])} pairs written — label them on /eval/models?tab=pairs")
     elif args.cmd == "report":
         print(render(build_report(db=args.db, use_clip=not args.no_clip)))
 

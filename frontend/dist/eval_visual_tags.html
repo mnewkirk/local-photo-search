@@ -238,6 +238,7 @@
       return -1;
     }
 
+    // The three-state cycle lives here; the chip itself is PS.Chip.
     function Chip(props) {
       var state = props.state;
       function click(ev) {
@@ -249,16 +250,14 @@
         ev.preventDefault();
         props.onSet(state === 'debatable' ? 'no' : 'debatable');
       }
-      return e('button', {
-        type: 'button', className: 'chip ' + state + ((props.gloss || props.note) ? ' wide' : ''),
+      return e(PS.Chip, {
+        label: props.tag, state: state, gloss: props.gloss,
+        // Labeller-only guidance; the model never sees this text.
+        note: props.note,
+        mark: state === 'yes' ? '✓' : state === 'debatable' ? '?' : '',
         onClick: click, onContextMenu: context,
         title: 'click: no → yes → debatable → no · right-click / shift-click: debatable',
-      },
-        e('span', { className: 'mark' }, state === 'yes' ? '✓' : state === 'debatable' ? '?' : ''),
-        e('span', { className: 'tag' }, props.tag),
-        props.gloss ? e('span', { className: 'gloss' }, props.gloss) : null,
-        // Labeller-only guidance; the model never sees this text.
-        props.note ? e('span', { className: 'gloss note' }, props.note) : null);
+      });
     }
 
     function Page() {

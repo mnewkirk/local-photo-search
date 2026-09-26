@@ -502,3 +502,108 @@ def latencies(items: dict, skip_first: bool = True) -> list[float]:
     so it is dropped by default."""
     xs = [it.get("latency_s") for it in items.values() if it.get("latency_s") is not None]
     return xs[1:] if skip_first and len(xs) > 1 else xs
+
+
+# --------------------------------------------------------------------------
+# Describe labels: wrong claims, pairwise preference, visible text
+# --------------------------------------------------------------------------
+#
+#   describe/claims.json  {"labels": {<text_sha>: {"photo_id", "n_segments",
+#                          "wrong": [segment idx], "other_wrong": bool,
+#                          "done": bool, "updated_at"}}}
+#   describe/pairs.json   {"created", "seed", "baseline",
+#                          "pairs": [{"key", "photo_id", "a_sha", "b_sha",
+#                                     "a_variant", "b_variant"}]}
+#   describe/prefs.json   {"prefs": {<key>: {"winner_sha": sha | None (tie),
+#                          "updated_at"}}}
+#   describe/text_truth.json {<photo_id>: {"text", "done", "updated_at"}}
+#
+# Claims and prefs are keyed by TEXT, never by variant — see text_sha().
+
+_SENTENCE = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][\"”)]))\s+(?=[A-Z\"“(])")
+# Clause joins that almost always start a new factual claim. Deliberately
+# narrow: splitting on a bare "and" would cut "salt and pepper" in half.
+_ABBREV = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|St|Mt|Jr|Sr|vs|etc|e\.g|i\.e)\.\s*$")
+_CLAUSE = re.compile(r"(?:;\s+|,\s+(?=(?:and|while|with|where|which|but)\s))")
+
+
+def segment_claims(text: Optional[str]) -> list[str]:
+    """Split a description into clickable claim chunks. Deterministic, and
+    lossless: "".join(segment_claims(t)) == t, so the page can render the
+    description exactly as written with each chunk clickable."""
+    if not text:
+        return []
+    sents: list[str] = []
+    for sent in _split_keep(text, _SENTENCE):
+        if sents and _ABBREV.search(sents[-1]):
+            sents[-1] += sent          # "Mr. " is not the end of a sentence
+        else:
+            sents.append(sent)
+    out: list[str] = []
+    for sent in sents:
+        out.extend(_split_keep(sent, _CLAUSE))
+    return [s for s in out if s]
+
+
+def _split_keep(text: str, pattern) -> list[str]:
+    """Split at `pattern`, keeping each separator on the chunk before it."""
+    parts, last = [], 0
+    for m in pattern.finditer(text):
+        parts.append(text[last:m.end()])
+        last = m.end()
+    parts.append(text[last:])
+    return parts
+
+
+def load_claims() -> dict:
+    return read_pass_file("describe", "claims.json", {"labels": {}})["labels"]
+
+
+def save_claim(sha: str, photo_id: int, n_segments: int, wrong: Iterable[int],
+               other_wrong: bool = False, done: bool = True) -> dict:
+    wrong = sorted(set(int(i) for i in wrong))
+    if any(i < 0 or i >= n_segments for i in wrong):
+        raise ValueError(f"segment index out of range 0..{n_segments - 1}")
+    data = read_pass_file("describe", "claims.json", {"labels": {}})
+    label = {"photo_id": int(photo_id), "n_segments": int(n_segments), "wrong": wrong,
+             "other_wrong": bool(other_wrong), "done": bool(done), "updated_at": now_iso()}
+    data["labels"][sha] = label
+    write_pass_file("describe", "claims.json", data)
+    return label
+
+
+def claim_errors(label: Optional[dict]) -> Optional[int]:
+    """Wrong claims in one labelled description, or None if not done."""
+    if not label or not label.get("done"):
+        return None
+    return len(label.get("wrong") or []) + (1 if label.get("other_wrong") else 0)
+
+
+def pair_key(a_sha: str, b_sha: str) -> str:
+    return "~".join(sorted((a_sha, b_sha)))
+
+
+def load_pairs() -> dict:
+    return read_pass_file("describe", "pairs.json", {"pairs": []})
+
+
+def load_prefs() -> dict:
+    return read_pass_file("describe", "prefs.json", {"prefs": {}})["prefs"]
+
+
+def save_pref(key: str, winner_sha: Optional[str]) -> dict:
+    data = read_pass_file("describe", "prefs.json", {"prefs": {}})
+    data["prefs"][key] = {"winner_sha": winner_sha, "updated_at": now_iso()}
+    write_pass_file("describe", "prefs.json", data)
+    return data["prefs"][key]
+
+
+def load_text_truth() -> dict:
+    return read_pass_file("describe", "text_truth.json", {})
+
+
+def save_text_truth(photo_id: int, text: str, done: bool = True) -> dict:
+    data = load_text_truth()
+    data[str(int(photo_id))] = {"text": text, "done": bool(done), "updated_at": now_iso()}
+    write_pass_file("describe", "text_truth.json", data)
+    return data[str(int(photo_id))]

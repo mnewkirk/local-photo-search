@@ -72,6 +72,29 @@
   };
 
   // =========================================================================
+  // Label chip — the one toggle the eval labelling pages share
+  // =========================================================================
+  // Presentational only: the page decides what a click means (the visual-tag
+  // page cycles no → yes → debatable; /eval/models toggles a claim wrong).
+  // Styling stays with each page's `.chip` / `.chip.<state>` CSS.
+  // Props: label, state (CSS class, e.g. 'no'|'yes'|'debatable'|'wrong'),
+  //        mark (glyph), gloss, note, wide, title, disabled,
+  //        onClick(ev), onContextMenu(ev).
+  PS.Chip = function Chip(props) {
+    var h = React.createElement;
+    var wide = props.wide != null ? props.wide : !!(props.gloss || props.note);
+    return h('button', {
+      type: 'button', className: 'chip ' + (props.state || 'no') + (wide ? ' wide' : ''),
+      onClick: props.onClick, onContextMenu: props.onContextMenu,
+      title: props.title, disabled: props.disabled,
+    },
+      h('span', { className: 'mark' }, props.mark || ''),
+      h('span', { className: 'tag' }, props.label),
+      props.gloss ? h('span', { className: 'gloss' }, props.gloss) : null,
+      props.note ? h('span', { className: 'gloss note' }, props.note) : null);
+  };
+
+  // =========================================================================
   // M15 — SharedHeader
   // =========================================================================
   // Props:
