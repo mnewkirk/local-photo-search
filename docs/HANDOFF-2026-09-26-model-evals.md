@@ -203,14 +203,36 @@ qwen2.5-vl-7b, production prompt → sky prompt:
   - `foggy` 0.38 → 0.55
   - `moody` 0.40 → 0.65
   - `blue-sky` 0.70
-  - `cloudy` **0.10** (qwen seems to use `overcast` for clouds; not verified)
+  - `cloudy` **0.10**. Checked: on the 40 cloudy photos qwen mostly said
+    `sunny` (17) and `blue-sky` (15), not `overcast` (9)
   - `hazy` still ≈ 0
   - `peaceful` 0.53 → 0.30
   - `monochromatic` 0.47 → 0.28
 
-Gemma results: _filled in when the runs finish_ (`python
-evals/visual_tags_eval.py report`, `python evals/visual_tags_unsplash.py
-report`).
+gemma-4-26b-a4b, production → sky prompt (all runs complete; the failed
+photos were re-run):
+- Owner-labelled 60 photos: production 0.69 precision / 0.39 recall; sky 0.61 /
+  0.39. But 12 of sky's false positives are `blue-sky` (9) and `cloudy` (3),
+  tags the owner hasn't labelled yet. Without those, sky's precision is
+  **0.68**, level with production.
+- Unsplash recall: production 0.40, sky **0.43**, the best of the four runs.
+  Notable per-tag changes:
+  - `hazy` 0.10 → **0.42**: the definition works for gemma, not for qwen
+  - `foggy` 0.53 → 0.62
+  - `cloudy` 0.35
+  - `blue-sky` 0.72
+  - `peaceful` 0.78
+  - `soft-light` 0.92
+  - `action` 0.39
+  - costs: `colorful` recall on the owner set 0.53 → 0.18, `sunny` 0.28 → 0.35
+    (still weak), `monochromatic` and `snowy` ≤ 0.17
+- The same gemma model ran at 0.4 s/photo once the LM Studio restart left it
+  loaded alone.
+
+**So for category-visual:** gemma with the sky prompt is the best result so
+far: same precision as production gemma and the highest recall. qwen stays
+behind on precision (0.51). Label `blue-sky` / `cloudy` on the owner set
+before deciding whether they ship.
 
 **The owner's 60 labels predate `blue-sky` and `cloudy`.** So the report
 counts any `blue-sky` a model emits as a false positive, even when it's right.
