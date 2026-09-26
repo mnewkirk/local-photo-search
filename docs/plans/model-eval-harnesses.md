@@ -6,8 +6,11 @@ Status: **planned, not started** (2026-09-26). Picks up from
 went to the owner; see "Decisions" at the end.
 
 Goal: compare `google/gemma-4-12b-qat`, `minicpm-v-4_5` and `google/gemma-4-e4b`
-against the production role models on every LLM pass, and end with **one
-role→model configuration that fits in 24 GB of VRAM together**.
+against the production role models on every LLM pass, and pick the best model
+**per role**. The owner accepts running **one model loaded at a time**, with the
+passes run in sequence (decided 2026-09-26, see Decisions), so the handoff's
+"all role models fit in 24 GB together" constraint no longer applies. Each
+model only has to fit on its own.
 
 ## What the code shows (read this before building)
 
@@ -277,16 +280,31 @@ refusal, the matching rules, `[]`-on-error counted as a transport error).
 
 **New: `evals/model_eval_summary.py`.**
 - Reads `<dir>/models.json`, which the owner fills in during Phase 0: VRAM when
-  loaded, context length, parallel slots, reasoning setting, whether the model
-  sees images. Measure all of these at production settings.
+  loaded on its own, context length, reasoning setting, whether the model sees
+  images, and **swap time** (seconds to load it cold in LM Studio).
 - Calls each harness's `build_report()`.
 - Prints one table per role with the headline metric, screen flags and solo
   s/photo.
-- Lists every role→model assignment. VRAM is summed over *distinct* models, the
-  budget is 24 GB minus `--headroom 1.5`, and verify≠describe is enforced.
-- Marks the Pareto-dominant assignments and doesn't pick a winner.
-- **Final step:** run every pass with the whole chosen set loaded
-  (`--variant final-*`).
+- Picks per role **independently**. The constraints are that each model fits
+  in 24 GB on its own and that verify ≠ describe. It marks the Pareto-dominant
+  choices per role and doesn't pick a winner.
+- **Sequential-schedule estimate:** for a typical batch (default 1,373 photos,
+  the 2026-09-19 shoot), fleet wall-clock = Σ over passes (photos × solo
+  s/photo) + one swap per model change. Two roles sharing one model save a
+  swap, so shared models show up as a cost saving rather than a requirement.
+- There is **no all-models-loaded final run**, because production won't load
+  them together.
+
+**Production follow-up (outside the harness, not built here).** The fleet
+currently runs every pass concurrently, with LM Studio keeping several models
+resident (max-loaded ≥3, TTL off). Switching to one model at a time means:
+- launching the passes in dependency order: describe → category-content +
+  keywords (one text model) → verify → category-visual → aesthetics
+- setting LM Studio to one loaded model with JIT loading, or unloading
+  explicitly between passes
+
+`/batches`' one-click fleet launch would need to learn that sequence. Plan it
+once the winners are known.
 
 ## Ordering
 
@@ -294,7 +312,7 @@ refusal, the matching rules, `[]`-on-error counted as a transport error).
 1 infra ─┬─ 2 aesthetics
          ├─ fetch-originals (NAS up) ─ 3 describe runs ─ 4 labels (owner) ─ 6 verify
          └─ 5 text (freeze from stored) ─────────────── chain check after 4
-                                              all ─ 7 summary ─ final all-loaded run
+                                              all ─ 7 summary
 ```
 
 Run GPU jobs only with the worker fleet stopped, and with one model loaded at a
@@ -353,3 +371,4 @@ time. Watch jobs with a marker file or the log's final line, never
 | Code/page structure | Per-pass modules, routers and pages (`describe_eval`, `category_eval`, `verify_eval`; `eval_describe.html`, `eval_categories.html`) over a thin `eval_common` | One shared `photosearch/model_eval.py`, one `/api/eval/models` router, one `/eval/models` page with tabs; the CLIs stay per pass | **B: one shared module + one page** | 2026-09-26 |
 | Review of planted errors | The owner approves each full planted description for naturalness (~90 s each, ~1 h) | Templated plants with a recorded span; the owner gives a yes/no that each claim is false (~5 s each) | **B: quick yes/no per claim** | 2026-09-26 |
 | Inputs for the text passes | Freeze the chosen describe model's descriptions after Phase 2 (text work waits on describe) | Freeze the stored production descriptions now; run the describe→text chain on the winner later as a check | **B: freeze from production now** | 2026-09-26 |
+| Loading models in production | All role models loaded at once in 24 GB (the handoff's goal), verified by a final all-loaded run | One model loaded at a time with the passes run in sequence; winners chosen per role, each only has to fit alone | **One at a time, sequential passes** (raised by the owner after the debate) | 2026-09-26 |
