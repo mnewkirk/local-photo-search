@@ -116,7 +116,7 @@ there. `scripts/` is **not** in the Docker image — the repo is bind-mounted at
 to the container's `PHOTOSEARCH_DB`.)
 
 ```bash
-ssh cantimatt@192.168.1.237
+ssh <nas-user>@<nas-host>
 cd /volume1/docker/photosearch
 DC="docker compose -f docker-compose.nas.yml run --rm --entrypoint python photosearch"
 

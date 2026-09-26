@@ -15,7 +15,7 @@
 # `ollama-models` volume is left on disk — `docker volume rm
 # photosearch_ollama-models` to reclaim ~8.4 GB once you're happy.
 #
-# Remote access is via **host-level Tailscale on the NAS** (node DXP4800-F976).
+# Remote access is via **host-level Tailscale on the NAS**.
 # The old in-compose `tailscale` sidecar was removed 2026-07-03 — it shared the
 # photosearch netns and could only expose :8000, not host ssh/smb, and its netns
 # coupling made restarts fragile. The host tailnet IP serves the published :8000.
@@ -60,7 +60,7 @@ services:
       - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photos:rw
       # _incoming is the natural ${PHOTO_DIR}/_incoming subdir of the /photos
       # mount above — the SAME place the SD-card importer writes (via the
-      # personal_folder SMB share, Samba path=%H = /home/cantimatt) and where
+      # personal_folder SMB share, Samba path=%H = /home/<nas-user>) and where
       # Syncthing lands phone rolls (see the syncthing service below).
       # Do NOT re-add a `./photos/_incoming:/photos/_incoming` overlay: that
       # relative bind (a) put staging in the repo dir, diverging from where the
@@ -154,7 +154,7 @@ services:
     # Receives phone camera-roll uploads into /photos/_incoming/<source>/.
     # The daily `ingest-incoming` cron evacuates those files into the
     # year/date library tree — see CLAUDE.md "Phone-photo daily ingest".
-    # PUID/PGID = cantimatt (1000) / admin (10) — must match the host
+    # PUID/PGID = <nas-user> (1000) / admin (10) — must match the host
     # owner of ${PHOTO_DIR}/_incoming so ingest-incoming can move files.
     image: lscr.io/linuxserver/syncthing:latest
     container_name: photosearch-syncthing
@@ -181,7 +181,7 @@ services:
   # NOTE: the photosearch-tailscale sidecar was removed 2026-07-03. It ran in
   # this compose's network namespace (network_mode: service:photosearch), so it
   # could only expose the app's :8000 over Tailscale — never the host's ssh/smb.
-  # The NAS host now runs Tailscale natively (node DXP4800-F976), which serves
+  # The NAS host now runs Tailscale natively, which serves
   # the published :8000 plus host ssh/smb, so the sidecar was redundant and its
   # netns coupling made restarts fragile (a --force-recreate cut off all remote
   # ssh/smb). Re-add ONLY as a properly-scoped subnet router if ever needed.

@@ -189,7 +189,7 @@ Start workers:
   per-pass model is chosen by role. (Sets PHOTOSEARCH_TEXT_LLM_URL / PHOTOSEARCH_LLM_*
   for the workers, so no manual export needed. Defaults read from those env vars if
   already exported.) Base URL must end in /v1.
-      --text-llm-url URL       e.g. http://172.20.176.1:1234/v1
+      --text-llm-url URL       e.g. http://<windows-host-ip>:1234/v1
       --llm-describe-model M   describe + regen   (role: describe)
       --llm-verify-model M     verify             (role: verify)
       --llm-visual-model M     category-visual    (role: visual)
@@ -228,7 +228,7 @@ Examples:
   ./run-workers.sh -s http://nas:8000 --name cpu -p category-content,keywords \
       --ollama-host http://localhost:11434 -n 2 -d /photos/2026
   ./run-workers.sh -s http://nas:8000 --name gpu -p category-visual \
-      --ollama-host http://172.20.176.1:11434 -n 3 -d /photos/2026
+      --ollama-host http://<windows-host-ip>:11434 -n 3 -d /photos/2026
   ./run-workers.sh --name cpu --status   # manage each fleet by name
   ./run-workers.sh --name gpu --stop
 

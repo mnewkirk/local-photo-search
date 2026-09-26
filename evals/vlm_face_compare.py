@@ -12,7 +12,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from photosearch.db import PhotoDB
 
-NAS = os.environ.get("PHOTOSEARCH_NAS_URL", "http://dxp4800-f976:8000")
+from photosearch.nas_config import require_nas_url
+NAS = require_nas_url()  # $PHOTOSEARCH_NAS_URL or ./nas.env — never hard-coded
 LM = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL", "http://localhost:1234/v1")
 VMODEL = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL", "qwen2.5-vl-7b-instruct")
 

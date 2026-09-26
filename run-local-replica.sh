@@ -14,7 +14,7 @@
 #   --sync          pull a fresh replica (sync-replica.sh) before starting
 #   -p, --port      web port                 (default: 8001)
 #   --db            replica DB path          (default: ./photo_index.db.local, $PHOTOSEARCH_DB)
-#   --nas           NAS web URL              (default: http://dxp4800-f976:8000, $PHOTOSEARCH_NAS_URL)
+#   --nas           NAS web URL              (REQUIRED: $PHOTOSEARCH_NAS_URL, from ./nas.env — see nas.env.example)
 #   --lm            LM Studio /v1 URL        (default: auto — WSL2 gateway / localhost, $PHOTOSEARCH_TEXT_LLM_URL)
 #   --model         agent model id loaded in LM Studio ($PHOTOSEARCH_LLM_AGENT_MODEL)
 #   --upscale-dir   Topaz export tree (M30)  (default: ./upscaled, $PHOTOSEARCH_UPSCALE_DIR)
@@ -29,7 +29,9 @@ cd "$(dirname "$0")"
 DO_SYNC=0
 PORT="${PORT:-8001}"
 REPLICA_DB="${PHOTOSEARCH_DB:-./photo_index.db.local}"
-NAS_URL="${PHOTOSEARCH_NAS_URL:-http://dxp4800-f976:8000}"
+# NAS host/login are never hard-coded (public repo): ./nas.env or the env.
+. ./scripts/nas-env.sh
+NAS_URL="${PHOTOSEARCH_NAS_URL:-}"
 LM_URL="${PHOTOSEARCH_TEXT_LLM_URL:-}"
 AGENT_MODEL="${PHOTOSEARCH_LLM_AGENT_MODEL:-qwen/qwen3.5-9b}"
 UPSCALE_DIR="${PHOTOSEARCH_UPSCALE_DIR:-}"
@@ -48,6 +50,11 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -z "${NAS_URL}" ]; then
+  PHOTOSEARCH_NAS_URL=""
+  nas_env_require PHOTOSEARCH_NAS_URL "the NAS web URL, e.g. http://<nas-host>:8000 (or pass --nas URL)"
+fi
 
 # Auto-resolve the LM Studio endpoint if not given.
 if [ -z "${LM_URL}" ]; then
@@ -70,7 +77,7 @@ PYBIN="./.venv/bin/python"
 
 if [ "${DO_SYNC}" = "1" ]; then
   echo "→ syncing replica first…"
-  PHOTOSEARCH_DB="${REPLICA_DB}" NAS_HOST="${NAS_HOST:-cantimatt@192.168.1.237}" ./sync-replica.sh
+  PHOTOSEARCH_DB="${REPLICA_DB}" ./sync-replica.sh   # requires NAS_HOST (nas.env)
 fi
 
 if [ ! -f "${REPLICA_DB}" ]; then
