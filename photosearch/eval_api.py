@@ -58,6 +58,12 @@ LABELLER_NOTES: dict[str, str] = {
                     "most of the sky); not a bright photo, not a small highlight"),
     "backlit": ("labeller note: judge the clearest subject, not a secondary "
                 "figure - its camera-facing side is in its own shadow"),
+    # 2026-09-26: the owner's own recheck disagreed with itself on `muted`
+    # (kappa 0.06). Their reading: the SHADES are subdued, not the light and
+    # not the number of hues.
+    "muted": ("the colours are subdued: darker, greyer shades with little "
+              "contrast between them. About the shades, not the light or the "
+              "number of hues - a photo can be muted and colorful"),
     # 2026-09-26: gemma picked `hazy` on a foggy sunrise and the owner read a
     # photographer's "fog" shot as not foggy — the boundary was undefined.
     "foggy": ("fog or mist in the scene: the air itself is visible and nearby "

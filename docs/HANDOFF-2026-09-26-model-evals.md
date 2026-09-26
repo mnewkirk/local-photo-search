@@ -262,3 +262,18 @@ set. The blind recheck set (`?set=recheck`) is still 0/15.
   goal above).
 - **Watching a job:** use a marker file or the log's final line, never
   `pgrep -f` (CLAUDE.md, "Watching a long job").
+
+## Labeller self-agreement (recheck, 15 photos, 2026-09-26)
+
+- **Consistent** (kappa ≥ 0.6): `soft-light` 0.86, `close-up` 0.84,
+  `overcast` 0.76, `dramatic` 0.63; `golden-hour` and `action` 15/15.
+  Borderline: `sunny` 0.59, `colorful` 0.57, `vibrant` 0.44.
+- **`muted` failed: kappa 0.06.** It had no definition. The owner's reading is
+  the SHADES: darker, greyer colours with little contrast between them, not
+  the light and not the number of hues. That's now the labeller note and part
+  of `visual_defs_sky.txt`, which has changed since the sky runs above:
+  re-run the sky variants before comparing them to anything new, and re-label
+  `muted` on the 60 photos before scoring it.
+- The rare tags (`backlit`, `centered`, `harsh-light`, `joyful`, …) had ≤ 2
+  yes calls across 15 photos, so their kappa means nothing. `blue-sky` and
+  `cloudy` weren't in the first labelling pass.
