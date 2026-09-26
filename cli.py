@@ -2583,8 +2583,10 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_tempora
         bits = []
         if ev.get("would"):
             bits.append(f"would {ev['would']}")
-        if ev.get("applied"):
-            bits.append(f"applied {ev['applied']}")
+        # A finished stage always states its applied count, even 0: "done:
+        # would 1373" with no applied reads as if the count were missing.
+        if ev.get("applied") or (ev.get("status") == "done" and "applied" in ev):
+            bits.append(f"applied {ev.get('applied') or 0}")
         if ev.get("message"):
             bits.append(ev["message"])
         click.echo(f"  [{ev.get('stage')}] {ev.get('status')}"

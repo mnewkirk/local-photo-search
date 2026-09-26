@@ -22,9 +22,9 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 31 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 32 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
 persons, face_references, face_person_exclusions, collections, collection_photos,
-photo_stacks, stack_members, review_selections, google_photos_uploads,
+photo_stacks, stack_members, stacking_seen, review_selections, google_photos_uploads,
 ignored_clusters, generations, schema_info, ingest_sweeps, ingest_batches,
 ingest_batch_jobs.
 (v23 split `tags` into `categories`/`visual_tags`/`keywords` + `tags_v22_backup`.)
@@ -450,6 +450,27 @@ Return values and the `apply=False` contract are unchanged, so the CLI and
 the sweep stages are unaffected. The stages pass `on_chunk(done, total)`,
 which checks abort and emits SSE progress in the between-chunk gaps. Tests:
 `tests/test_aesthetics_normalize_chunking.py`.
+
+**The stage's gate excludes rows that can never be filled.** The nightly log
+read `normalize_aesthetics done: would 1373, applied 158111` every night on an
+unchanged library. `would 1373` was **1,373 scored photos with no capture day
+at all** — `date_taken` AND `date_created` both NULL (Facebook takeout, old
+scans; verified read-only on the replica 2026-09-26: 1,373 of 1,373 missing a
+day pct, 0 missing a library pct, none from the 2026-09-19 1,373-photo batch —
+the equal count is a coincidence). `_normalize_by_day` can never give such a
+photo a per-day percentile, but the gate asked `aes_overall_day_pct IS NULL`,
+so it stayed true forever and re-ranked the library nightly. The gate
+(`maintenance._aesthetics_missing_sql`) now counts a missing day pct only when
+`COALESCE(date_taken, date_created) IS NOT NULL` — the same predicate the
+writer uses. Same for `normalize_subject_aesthetics` (399 such photos).
+
+**`applied` is rows WRITTEN**, summed across the library and per-day passes
+(the `stats=` dict the `normalize_*` functions fill; their int return is
+unchanged). It used to be the scored-row count, which is why the log could not
+show the skip-unchanged logic working — measured on a replica copy, that
+nightly `applied 158111` was really **0 rows written**. The stage result also
+carries `considered` (the old number), `unchanged` and `rescored_mid_run`.
+Tests: `tests/test_maintenance_incremental.py`.
 
 ### Per-pass model strategy (Ollama defaults)
 
@@ -2779,8 +2800,53 @@ over many stages**, not a menu of independent jobs. Dry-run is the default
 
 Default stage order (each gated by a "what's still missing" SQL predicate, so a
 fully-enriched library is nearly free): `geocode` → `normalize` → `infer` →
-`normalize_inferred` → `colors` → `stacking` → `match_faces` → `resolve_dups`.
+`normalize_inferred` → `colors` → `stacking` → `match_faces` → `resolve_dups`
+→ `normalize_aesthetics` → `normalize_subject_aesthetics`.
 Opt-in extras flip a single stage on but **do not narrow the sweep**:
+
+**`stacking` is missing-only (2026-09-26) — it used to rewrite every stack
+nightly.** The log read `stacking done: would 157815, applied 27165` every
+night: the stage called an **unscoped** `run_stacking`, i.e. `db.clear_stacks()`
++ a full-library re-detect + 27,165 `create_stack`s, on an unchanged library.
+`would` was the count of dated photos and `applied` the total stack count, not
+a change count. (Side effect: every hand-picked stack top was reset nightly.)
+
+It now calls `stacking.run_incremental_stacking`:
+
+- **Ledger** `stacking_seen(photo_id, date_taken, seen_at)` (schema v32) —
+  which photos detection has considered, and at which `date_taken`. Dirty =
+  eligible (dated + CLIP embedding) and no ledger row or a changed
+  `date_taken` (retime), plus members of any stack that lost a member or is
+  down to one. `would` = dirty photos; nothing dirty → `skipped`.
+- **Scope is exact, not a margin.** `detect_stacks` only unions photos within
+  `time_window_sec` of each other, so the library splits into *sessions*
+  (maximal runs with every consecutive gap ≤ the window) and no stack crosses
+  one. Re-detecting only sessions containing a dirty photo, closed over the
+  existing stacks they touch, reproduces the full-run answer for them —
+  `test_incremental_batches_converge_to_the_full_detect_answer` pins that.
+  A new 1,373-photo shoot has a scope of ~1,373.
+- **Writes a diff.** Detected vs affected existing stacks compared by
+  membership: identical stacks are untouched (same id, hand-set top kept),
+  vanished ones deleted **by id**, new ones created. `applied` = created +
+  removed.
+- **It can never wipe the library.** No `clear_stacks()`, no unscoped
+  `detect_stacks`; an empty scope skips detection entirely (never
+  `photo_ids=[]`, which `detect_stacks` reads as "whole library").
+  `test_never_clears_the_library_or_runs_unscoped` spies on both.
+- The ledger is written **last**, so an abort leaves those photos dirty and
+  the next run converges.
+- **First run after deploy** has an empty ledger: every photo is dirty, one
+  full detection (~15 s on the desktop, what every night used to cost) — and,
+  measured on a replica copy, **0 created / 0 removed / 27,165 unchanged**,
+  then the second run is `skipped` in 0.3 s.
+
+Known limits: a stack that lost a member but still has ≥ 2 eligible members is
+not re-detected (only matters if the deleted photo bridged a chain), and a
+re-embedded photo (CLIP re-run) is not dirty. A full re-detect is still the
+`/status` stacking form / `photosearch stack` CLI. Other stack writers
+(ingest's scoped run, `batch-advance`, the replica's full-replace transfer)
+don't touch the ledger; the worst case is the sweep redoing a session.
+Tests: `tests/test_maintenance_incremental.py`.
 
 - `do_dedup` ("Prune duplicate photos") — prepends the destructive
   `dedup_photos` stage (DELETEs redundant copies, runs *first* so later stages
