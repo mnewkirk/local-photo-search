@@ -252,3 +252,128 @@ def get_original(photo_id: int, max_px: int = Query(1920, ge=200, le=8000)):
         raise HTTPException(500, f"could not decode cached original: {exc}")
     return Response(buf.getvalue(), media_type="image/jpeg",
                     headers={"Cache-Control": "max-age=3600"})
+
+
+# --------------------------------------------------------------------------
+# Text passes: pooled category checklist + keyword wrong-marking
+# --------------------------------------------------------------------------
+
+class CategoryBody(BaseModel):
+    yes: List[str] = []
+    done: bool = True
+
+
+class KeywordBody(BaseModel):
+    wrong: List[str] = []
+    done: bool = True
+
+
+def _inputs(name: str) -> dict:
+    inputs = me.load_inputs(name)
+    if inputs is None:
+        raise HTTPException(404, f"no frozen inputs {name!r} — run "
+                                 "`python evals/text_passes_eval.py freeze`")
+    return inputs
+
+
+def _stored_column(col: str, ids: list[int]) -> dict[int, list[str]]:
+    import json as _json
+    out: dict[int, list[str]] = {}
+    if not ids:
+        return out
+    try:
+        with _get_db() as db:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                for pid, raw in db.conn.execute(
+                        f"SELECT id, {col} FROM photos WHERE id IN ({marks})", chunk):
+                    try:
+                        val = _json.loads(raw) if raw else None
+                    except (TypeError, ValueError):
+                        val = None
+                    if isinstance(val, list):
+                        out[int(pid)] = [str(t) for t in val]
+    except Exception:
+        pass
+    return out
+
+
+def text_pool(pass_: str, inputs: dict) -> dict[str, list[str]]:
+    """{pid: sorted union of every run's tags (for these inputs) plus the
+    stored column} — unattributed, so the owner judges terms, not models."""
+    ident = me.inputs_identity(inputs)
+    pool: dict[str, set] = {pid: set() for pid in inputs["items"]}
+    for v in me.list_variants(pass_):
+        run = me.load_run(pass_, v) or {}
+        if run.get("input_source") != ident:
+            continue
+        for pid, item in run.get("items", {}).items():
+            if pid in pool and item.get("tags"):
+                pool[pid].update(item["tags"])
+    if inputs.get("source") == me.STORED:
+        col = "categories" if pass_ == "category-content" else "keywords"
+        for pid, tags in _stored_column(col, [int(p) for p in pool]).items():
+            pool[str(pid)].update(tags)
+    return {pid: sorted(tags) for pid, tags in pool.items()}
+
+
+@router.get("/text/categories")
+def get_categories(inputs: str = Query("main")):
+    from .vocab_content import CONTENT_VOCABULARY
+    inp = _inputs(inputs)
+    labels = me.load_category_labels()
+    pool = text_pool("category-content", inp)
+    photos = []
+    for pid, item in inp["items"].items():
+        key = me.label_key(pid, item["text_sha"])
+        lab = labels.get(key)
+        terms = sorted(set(pool.get(pid, [])) | set((lab or {}).get("yes", [])))
+        photos.append({"photo_id": int(pid), "description": item["text"],
+                       "pool": terms, "label": lab})
+    done = sum(1 for p in photos if (p["label"] or {}).get("done"))
+    return {"photos": photos, "vocabulary": sorted(CONTENT_VOCABULARY),
+            "progress": {"done": done, "total": len(photos)}}
+
+
+@router.put("/text/categories/{photo_id}")
+def put_category(photo_id: int, body: CategoryBody, inputs: str = Query("main")):
+    inp = _inputs(inputs)
+    item = inp["items"].get(str(photo_id))
+    if item is None:
+        raise HTTPException(404, f"photo {photo_id} is not in inputs {inputs!r}")
+    try:
+        label = me.save_category_label(me.label_key(photo_id, item["text_sha"]),
+                                       body.yes, body.done)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"photo_id": photo_id, "label": label}
+
+
+@router.get("/text/keywords")
+def get_keywords(inputs: str = Query("main")):
+    inp = _inputs(inputs)
+    labels = me.load_keyword_labels()
+    pool = text_pool("keywords", inp)
+    photos = []
+    for pid, item in inp["items"].items():
+        lab = labels.get(me.label_key(pid, item["text_sha"]))
+        photos.append({"photo_id": int(pid), "description": item["text"],
+                       "pool": pool.get(pid, []), "label": lab})
+    done = sum(1 for p in photos if (p["label"] or {}).get("done"))
+    return {"photos": photos, "progress": {"done": done, "total": len(photos)}}
+
+
+@router.put("/text/keywords/{photo_id}")
+def put_keyword(photo_id: int, body: KeywordBody, inputs: str = Query("main")):
+    inp = _inputs(inputs)
+    item = inp["items"].get(str(photo_id))
+    if item is None:
+        raise HTTPException(404, f"photo {photo_id} is not in inputs {inputs!r}")
+    judged = text_pool("keywords", inp).get(str(photo_id), [])
+    try:
+        label = me.save_keyword_label(me.label_key(photo_id, item["text_sha"]),
+                                      judged, body.wrong, body.done)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"photo_id": photo_id, "label": label}

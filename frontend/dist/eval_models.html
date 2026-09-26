@@ -101,6 +101,21 @@
     .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
     textarea { width: 100%; min-height: 120px; background: var(--surface2); color: var(--text);
       border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 14px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
+    .chip { display: flex; align-items: baseline; gap: 8px; text-align: left;
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+      font-family: inherit; user-select: none; }
+    .chip:hover { border-color: var(--text-muted); }
+    .chip .tag { font-weight: 600; white-space: nowrap; }
+    .chip .mark { width: 12px; flex: none; font-weight: 700; }
+    .chip.yes { background: rgba(74,222,128,0.16); border-color: var(--green); }
+    .chip.yes .tag, .chip.yes .mark { color: var(--green); }
+    .chip.wrong { background: rgba(248,113,113,0.16); border-color: var(--red); }
+    .chip.wrong .tag, .chip.wrong .mark { color: var(--red); text-decoration: line-through; }
+    .add { display: flex; gap: 6px; margin-bottom: 12px; }
+    .add input { flex: 1; background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px; }
     .keys { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
     kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
       background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
@@ -127,6 +142,8 @@
       { id: 'claims', label: 'Claims' },
       { id: 'pairs', label: 'Pairwise' },
       { id: 'truth', label: 'Visible text' },
+      { id: 'categories', label: 'Categories' },
+      { id: 'keywords', label: 'Keywords' },
     ];
 
     function jsonOrThrow(r) {
@@ -506,6 +523,131 @@
                 'No readable text — skip this photo')))));
     }
 
+    // ------------------------------------------------------------------
+    // Text passes. Judged against the PHOTO, with the frozen description
+    // shown. Categories: the pooled terms every model proposed (unattributed)
+    // — click the ones that are right, add any missing term. Keywords: click
+    // the ones that are wrong.
+    // ------------------------------------------------------------------
+    function TextTab(props) {
+      var isCat = props.mode === 'categories';
+      var url = API + '/text/' + props.mode;
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var pickS = useState({}); var picked = pickS[0]; var setPicked = pickS[1];
+      var addS = useState(''); var add = addS[0]; var setAdd = addS[1];
+      var dirtyS = useState(false); var dirty = dirtyS[0]; var setDirty = dirtyS[1];
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      function pickedFrom(photo) {
+        var d = {};
+        var l = photo.label || {};
+        (isCat ? (l.yes || []) : (l.wrong || [])).forEach(function (t) { d[t] = true; });
+        return d;
+      }
+
+      useEffect(function () {
+        fetch(url).then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.photos.findIndex(function (p) { return !(p.label && p.label.done); });
+          var start = first < 0 ? 0 : first;
+          setIdx(start);
+          if (d.photos.length) setPicked(pickedFrom(d.photos[start]));
+        }).catch(function (ex) { props.onError('Could not load: ' + ex.message); });
+      }, []);
+
+      var photos = data ? data.photos : [];
+      var photo = photos[idx];
+
+      function goTo(i) {
+        if (i < 0 || i >= photos.length || i === idx) return;
+        if (dirty && !window.confirm('Unsaved changes on this photo. Leave without saving?')) return;
+        setIdx(i); setPicked(pickedFrom(photos[i])); setDirty(false); setAdd('');
+      }
+
+      function toggle(t) {
+        var d = Object.assign({}, picked);
+        if (d[t]) delete d[t]; else d[t] = true;
+        setPicked(d); setDirty(true);
+      }
+
+      function addTerm() {
+        var t = add.trim().toLowerCase();
+        if (!t) return;
+        if (data.vocabulary.indexOf(t) < 0) { props.onError('"' + t + '" is not in the content vocabulary'); return; }
+        var d = Object.assign({}, picked); d[t] = true;
+        setPicked(d); setDirty(true); setAdd('');
+      }
+
+      function save() {
+        if (!photo) return;
+        var at = idx;
+        var chosen = Object.keys(picked).sort();
+        fetch(url + '/' + photo.photo_id, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(isCat ? { yes: chosen, done: true } : { wrong: chosen, done: true }),
+        }).then(jsonOrThrow).then(function (body) {
+          var next = photos.map(function (p, i) {
+            if (i !== at) return p;
+            var pool = isCat ? Array.from(new Set(p.pool.concat(body.label.yes))).sort() : p.pool;
+            return Object.assign({}, p, { label: body.label, pool: pool });
+          });
+          var done = next.filter(function (p) { return p.label && p.label.done; }).length;
+          setData(Object.assign({}, data, { photos: next, progress: { done: done, total: next.length } }));
+          setDirty(false);
+          var n = nextOpen(next, at, function (p) { return !!(p.label && p.label.done); });
+          if (n >= 0 && n !== at) { setIdx(n); setPicked(pickedFrom(next[n])); setAdd(''); }
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+
+      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!photos.length) return e(Hint, { text: 'No frozen inputs yet — run python evals/text_passes_eval.py freeze' });
+
+      var shown = Array.from(new Set(photo.pool.concat(Object.keys(picked)))).sort();
+      return e('div', null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: photos, idx: idx, onPick: goTo,
+                   isDone: function (p) { return !!(p.label && p.label.done); },
+                   title: function (p) { return '#' + p.photo_id; } }),
+        e('div', { className: 'work' },
+          e(PhotoPane, { photoId: photo.photo_id },
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length + ' · #' + photo.photo_id),
+            e('span', { className: 'spacer' }),
+            dirty ? e('span', { className: 'pill dirty' }, '● unsaved')
+                  : (photo.label && photo.label.done) ? e('span', { className: 'pill saved' }, '✓ saved') : null),
+          e('div', { className: 'card' },
+            e('div', { className: 'desc' }, photo.description),
+            e('div', { className: 'muted', style: { marginBottom: 8 } },
+              isCat ? 'Click every category that is RIGHT for the photo (untouched = not right). '
+                      + 'Add anything that is missing.'
+                    : 'Click every keyword that is WRONG for the photo. Untouched keywords count as right.'),
+            shown.length ? null : e('div', { className: 'muted', style: { marginBottom: 8 } },
+              'No model has proposed anything for this photo yet.'),
+            e('div', { className: 'chips' },
+              shown.map(function (t) {
+                var on = !!picked[t];
+                return e(PS.Chip, {
+                  key: t, label: t, wide: false,
+                  state: on ? (isCat ? 'yes' : 'wrong') : 'no',
+                  mark: on ? (isCat ? '✓' : '✗') : '',
+                  onClick: function () { toggle(t); },
+                });
+              })),
+            isCat ? e('div', { className: 'add' },
+              e('input', { list: 'vocab', value: add, placeholder: 'Add a missing category…',
+                           onChange: function (ev) { setAdd(ev.target.value); },
+                           onKeyDown: function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addTerm(); } } }),
+              e('datalist', { id: 'vocab' }, data.vocabulary.map(function (v) { return e('option', { key: v, value: v }); })),
+              e('button', { className: 'btn', type: 'button', onClick: addTerm }, 'Add')) : null,
+            e('div', { className: 'actions' },
+              e('button', { className: 'btn primary', type: 'button', onClick: save }, 'Save & next (Enter)')))));
+    }
+
     function Page() {
       var initial = PARAMS.get('tab');
       var tabS = useState(TABS.some(function (t) { return t.id === initial; }) ? initial : 'claims');
@@ -521,7 +663,8 @@
 
       var body = tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })
         : tab === 'pairs' ? e(PairsTab, { key: 'p', onError: setError })
-        : e(TruthTab, { key: 't', onError: setError });
+        : tab === 'truth' ? e(TruthTab, { key: 't', onError: setError })
+        : e(TextTab, { key: tab, mode: tab, onError: setError });
 
       return e('div', null,
         e(PS.SharedHeader, { activePage: 'eval-models' }),

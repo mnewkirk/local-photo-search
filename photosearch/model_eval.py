@@ -607,3 +607,86 @@ def save_text_truth(photo_id: int, text: str, done: bool = True) -> dict:
     data[str(int(photo_id))] = {"text": text, "done": bool(done), "updated_at": now_iso()}
     write_pass_file("describe", "text_truth.json", data)
     return data[str(int(photo_id))]
+
+
+# --------------------------------------------------------------------------
+# Text-pass inputs + labels (category-content, keywords)
+# --------------------------------------------------------------------------
+#
+#   text/inputs-<name>.json   {"name", "source", "source_effective_model",
+#                              "created", "items": {<pid>: {"text", "text_sha"}}}
+#   text/category_labels.json {<pid>:<text_sha>: {"yes": [term], "done", "updated_at"}}
+#   text/keyword_labels.json  {<pid>:<text_sha>: {"wrong": [kw], "judged": [kw],
+#                              "done", "updated_at"}}
+#
+# Labels are keyed to the frozen TEXT, so refreezing orphans them rather than
+# scoring a new description against a judgement of the old one.
+
+TEXT_PASSES = ("category-content", "keywords")
+
+
+def load_inputs(name: str = "main") -> Optional[dict]:
+    return read_pass_file("text", f"inputs-{name}.json", None)
+
+
+def save_inputs(name: str, source: str, source_effective_model: Optional[str],
+                items: dict, force: bool = False) -> dict:
+    if not VARIANT_RE.match(name):
+        raise ValueError(f"bad inputs name {name!r}")
+    if load_inputs(name) is not None and not force:
+        raise SystemExit(f"inputs {name!r} already frozen; labels are keyed to it. "
+                         "--force to refreeze (orphans those labels).")
+    data = {"name": name, "source": source, "source_effective_model": source_effective_model,
+            "created": now_iso(),
+            "items": {str(int(k)): {"text": v, "text_sha": text_sha(v)}
+                      for k, v in items.items() if v}}
+    write_pass_file("text", f"inputs-{name}.json", data)
+    return data
+
+
+def inputs_identity(inputs: dict) -> str:
+    """What a text run is keyed to: the input set's name + a hash of its texts."""
+    import hashlib
+    h = hashlib.sha256()
+    for pid in sorted(inputs["items"], key=int):
+        h.update(f"{pid}:{inputs['items'][pid]['text_sha']};".encode())
+    return f"{inputs['name']}@{h.hexdigest()[:12]}"
+
+
+def label_key(photo_id, sha: str) -> str:
+    return f"{int(photo_id)}:{sha}"
+
+
+def load_category_labels() -> dict:
+    return read_pass_file("text", "category_labels.json", {})
+
+
+def save_category_label(key: str, yes: Iterable[str], done: bool = True) -> dict:
+    from .vocab_content import CONTENT_VOCABULARY
+    vocab = set(CONTENT_VOCABULARY)
+    yes = sorted(set(yes))
+    bad = [t for t in yes if t not in vocab]
+    if bad:
+        raise ValueError(f"not in the content vocabulary: {bad}")
+    data = load_category_labels()
+    data[key] = {"yes": yes, "done": bool(done), "updated_at": now_iso()}
+    write_pass_file("text", "category_labels.json", data)
+    return data[key]
+
+
+def load_keyword_labels() -> dict:
+    return read_pass_file("text", "keyword_labels.json", {})
+
+
+def save_keyword_label(key: str, judged: Iterable[str], wrong: Iterable[str],
+                       done: bool = True) -> dict:
+    """`judged` is the pool the owner saw; a keyword in it and not in `wrong`
+    is judged right. A keyword a later run adds is simply unjudged."""
+    judged = sorted(set(judged))
+    wrong = sorted(set(wrong))
+    if not set(wrong) <= set(judged):
+        raise ValueError("wrong keywords must come from the judged pool")
+    data = load_keyword_labels()
+    data[key] = {"judged": judged, "wrong": wrong, "done": bool(done), "updated_at": now_iso()}
+    write_pass_file("text", "keyword_labels.json", data)
+    return data[key]
