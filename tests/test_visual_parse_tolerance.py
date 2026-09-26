@@ -184,3 +184,15 @@ def test_the_prompts_own_answer_format_parses():
 
 def test_json_round_trip_of_an_empty_answer_is_still_a_list():
     assert json.loads(json.dumps([])) == []
+
+
+def test_misty_reads_as_foggy():
+    # gemma-4 answered `peaceful, misty, muted` on a fog shot (Unsplash
+    # 26-lAP0XprM) and `misty` was dropped as off-vocabulary.
+    assert D._parse_visual_response("peaceful, misty, muted", VOCAB) == [
+        "peaceful", "foggy", "muted"]
+    assert D._parse_visual_response("foggy, misty", VOCAB) == ["foggy"]
+
+
+def test_a_synonym_never_adds_a_tag_outside_the_vocabulary():
+    assert D._parse_visual_response("misty", {"sunny"}) == []

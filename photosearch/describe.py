@@ -949,6 +949,16 @@ _VISUAL_EMPTY_ANSWERS = {
 }
 
 
+# Off-vocabulary words a model uses for an on-vocabulary tag. Applied only when
+# the target is in the vocabulary being parsed. gemma-4 answered `misty` on a
+# photographer-keyworded fog shot and the tag was silently dropped (Unsplash
+# 26-lAP0XprM, 2026-09-26). Keep this to true synonyms: a near-miss mapping
+# (say `cloudy` -> `overcast`) would manufacture a tag the model did not mean.
+_VISUAL_SYNONYMS = {
+    "misty": "foggy",
+}
+
+
 def _is_explicit_empty_answer(raw: Optional[str]) -> bool:
     """True when the model said "no tags" rather than saying nothing usable."""
     s = (raw or "").strip().strip("`")
@@ -994,6 +1004,8 @@ def _parse_visual_response(raw: str, vocab_set: set[str]) -> list[str]:
         line = _VISUAL_LABEL_RE.sub("", line)
         for token in re.split(r"[,;]", line):
             t = token.strip().strip(_VISUAL_WRAPPERS).lower()
+            if t not in vocab_set and _VISUAL_SYNONYMS.get(t) in vocab_set:
+                t = _VISUAL_SYNONYMS[t]
             if t in vocab_set and t not in seen:
                 seen.add(t)
                 out.append(t)

@@ -168,6 +168,8 @@ def test_index_logs_only_the_perceived_tags():
     ("colorful", "monochromatic"),  # a blazing orange sunset is both
     ("aerial", "close-up"),         # a tight drone crop is both
     ("macro", "wide-angle"),        # close-focus wide-angle is a real technique
+    ("dramatic", "peaceful"),       # a still sunset over the sea is both
+    ("colorful", "muted"),          # muted is the light, colorful the hue count
 ])
 def test_pairs_that_are_not_genuinely_exclusive_are_gone(pair):
     normalised = {tuple(sorted(p)) for p in V.CONTRADICTORY_PAIRS}
@@ -175,12 +177,10 @@ def test_pairs_that_are_not_genuinely_exclusive_are_gone(pair):
 
 
 @pytest.mark.parametrize("pair", [
-    ("dramatic", "peaceful"),
     ("joyful", "melancholy"),
     ("overcast", "sunny"),
     ("harsh-light", "soft-light"),
     ("muted", "vibrant"),
-    ("colorful", "muted"),
     ("black-and-white", "colorful"),
     ("black-and-white", "vibrant"),
     ("aerial", "macro"),
@@ -191,7 +191,7 @@ def test_the_genuinely_exclusive_pairs_remain(pair):
 
 
 def test_the_table_is_exactly_those_pairs():
-    assert len(V.CONTRADICTORY_PAIRS) == 9
+    assert len(V.CONTRADICTORY_PAIRS) == 7
 
 
 # ---------------------------------------------------------------------------

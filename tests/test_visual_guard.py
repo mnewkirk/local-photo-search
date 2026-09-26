@@ -74,7 +74,7 @@ def test_a_failed_retry_after_over_selection_is_rejected(monkeypatch, img):
 # ---------------------------------------------------------------------------
 
 def test_contradiction_triggers_a_retry_and_the_clean_retry_wins(monkeypatch, img):
-    calls = _answers(monkeypatch, "peaceful, dramatic, sunny", "sunny, peaceful")
+    calls = _answers(monkeypatch, "overcast, sunny, peaceful", "sunny, peaceful")
     assert D.tag_visual_photo(img) == ["sunny", "peaceful"]
     assert len(calls) == 2
 
@@ -83,18 +83,18 @@ def test_a_still_contradictory_retry_drops_both_members_not_the_answer(
         monkeypatch, img):
     """Drop BOTH sides of each bad pair — neither is trustworthy — but keep the
     tags that were never in question."""
-    _answers(monkeypatch, "peaceful, dramatic, sunny", "peaceful, dramatic, sunny")
-    assert D.tag_visual_photo(img) == ["sunny"]
+    _answers(monkeypatch, "overcast, sunny, peaceful", "overcast, sunny, peaceful")
+    assert D.tag_visual_photo(img) == ["peaceful"]
 
 
 def test_a_failed_retry_after_a_contradiction_repairs_the_first_answer(
         monkeypatch, img):
-    _answers(monkeypatch, "peaceful, dramatic, sunny", None)
-    assert D.tag_visual_photo(img) == ["sunny"]
+    _answers(monkeypatch, "overcast, sunny, peaceful", None)
+    assert D.tag_visual_photo(img) == ["peaceful"]
 
 
 def test_dropping_a_pair_may_empty_the_answer(monkeypatch, img):
-    _answers(monkeypatch, "peaceful, dramatic", "peaceful, dramatic")
+    _answers(monkeypatch, "overcast, sunny", "overcast, sunny")
     # None here; _process_category_visual turns it into [] so the photo is
     # still persisted and marked done in one pass.
     assert D.tag_visual_photo(img) is None
@@ -114,15 +114,24 @@ def test_a_non_contradictory_pair_is_left_alone(monkeypatch, img):
     assert len(calls) == 1, "a legitimate answer must not cost a retry"
 
 
+@pytest.mark.parametrize("answer", ["dramatic, peaceful", "muted, colorful"])
+def test_pairs_the_owner_ruled_compatible_survive(monkeypatch, img, answer):
+    # Removed 2026-09-26: a still sunset is both dramatic and peaceful; muted
+    # (the light) and colorful (how many hues) are different properties.
+    calls = _answers(monkeypatch, answer)
+    assert D.tag_visual_photo(img) == answer.split(", ")
+    assert len(calls) == 1
+
+
 def test_drop_contradictions_is_order_independent():
-    assert D._drop_visual_contradictions(["dramatic", "peaceful", "sunny"]) == ["sunny"]
-    assert D._drop_visual_contradictions(["sunny", "peaceful", "dramatic"]) == ["sunny"]
+    assert D._drop_visual_contradictions(["overcast", "sunny", "peaceful"]) == ["peaceful"]
+    assert D._drop_visual_contradictions(["peaceful", "sunny", "overcast"]) == ["peaceful"]
 
 
 def test_drop_contradictions_handles_a_chain():
-    # muted contradicts both colorful and vibrant; all three go.
+    # black-and-white contradicts both colorful and vibrant; all three go.
     assert D._drop_visual_contradictions(
-        ["colorful", "muted", "vibrant", "sunny"]) == ["sunny"]
+        ["colorful", "black-and-white", "vibrant", "sunny"]) == ["sunny"]
 
 
 # ---------------------------------------------------------------------------

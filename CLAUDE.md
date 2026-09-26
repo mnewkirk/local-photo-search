@@ -718,6 +718,17 @@ CLEAREST SUBJECT, not the largest figure); a test asserts none of that text
 reaches the production prompt. Promote either into `visual_tags_derive` only
 after the A/B.
 
+Also candidates since 2026-09-26: **`blue-sky`** and **`cloudy`** — not
+exclusive with each other or with `sunny`/`overcast` (no pair). qwen already
+volunteered `blue-sky, fluffy-clouds` unprompted, which the parser dropped.
+`foggy`/`hazy` got labeller definitions (fog = the air itself visible, near
+things fade; haze = only the distance washes out). The variant that offers all
+of it is `evals/prompts/visual_defs_sky.txt` (`--extra-vocab
+action,blue-sky,cloudy`). The parser maps **`misty` → `foggy`**
+(`describe._VISUAL_SYNONYMS`, true synonyms only). The Unsplash sample predates
+the two new mappings, so it has no positives for them until re-drawn with
+`sample --force` — which orphans the cached runs.
+
 **The labeller is measured too.** `/eval/visual-tags?set=recheck` re-serves a
 seeded 15-photo subset (`recheck.json`) with the first answer withheld; labels
 go to `labels-recheck.json`; `visual_tags_eval.py agreement` prints per-tag
@@ -772,16 +783,21 @@ response.
 **Because the guard deletes BOTH members, a pair that is merely unusual
 destroys correct tags.** The bar is therefore *could a competent
 photographer's single frame honestly be both?* — and it rules out more than it
-first looks like. The nine that survive contradict on the *same property*:
-dramatic×peaceful, joyful×melancholy, overcast×sunny, harsh-light×soft-light,
-muted×vibrant, colorful×muted, black-and-white×colorful,
-black-and-white×vibrant, aerial×macro. Rejected, with the reason:
+first looks like. The seven that survive contradict on the *same property*:
+joyful×melancholy, overcast×sunny, harsh-light×soft-light, muted×vibrant,
+black-and-white×colorful, black-and-white×vibrant, aerial×macro. Rejected,
+with the reason:
 close-up×wide-angle (an environmental portrait is ordinary), foggy×sunny (sun
 through fog is a classic shot), joyful×moody (subject's emotion vs how the
 frame is lit), colorful×monochromatic (a blazing orange sunset reads as both),
 aerial×close-up (a tight drone crop is both), macro×wide-angle (close-focus
 wide-angle is a real technique), and peaceful×moody (the library's biggest
-co-occurrence at 19,056 — but a still, misty lake is honestly both). There is
+co-occurrence at 19,056 — but a still, misty lake is honestly both),
+and — removed by the owner 2026-09-26 off the Unsplash sheets —
+dramatic×peaceful (a still sunset over the sea is both) and colorful×muted
+(muted is the *light*, colorful the *number of hues*; the pair turned gemma's
+`muted, colorful` on a rose photo into no answer at all, because deleting both
+members left nothing). There is
 no sharp×blurry entry: both are derived now and cannot co-occur.
 
 **Backfill** (no VLM, no `generations` rows):

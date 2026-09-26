@@ -53,6 +53,14 @@ CANDIDATE_TAGS: dict[str, str] = {
                "leap, or a player driving the ball. Not players standing, "
                "walking, watching or posed - a sports photo is not "
                "automatically an action photo"),
+    # 2026-09-26, from the Unsplash `peaceful` sheet: the owner expected "blue
+    # sky" and "clouds" on two sky photos, and qwen volunteered `blue-sky,
+    # fluffy-clouds` unprompted. Deliberately NOT mutually exclusive with each
+    # other, nor with sunny / overcast — no CONTRADICTORY_PAIRS entry.
+    "blue-sky": ("clear blue sky is a visible part of the frame, with or "
+                 "without clouds in it"),
+    "cloudy": ("clouds with visible shape or texture are part of the sky; can "
+               "go with blue-sky, sunny or overcast"),
 }
 
 _PERCEIVED = frozenset(PERCEIVED_VOCABULARY)

@@ -166,22 +166,26 @@ PERCEIVED_GLOSS: dict[str, str] = {
 #:   macro x wide-angle      close-focus wide-angle is a real technique
 #:   peaceful x moody        a still, misty lake is honestly both — and it is
 #:                           the library's biggest co-occurrence (19,056)
+#:   dramatic x peaceful     (2026-09-26, owner) a still sunset over the sea
+#:                           is honestly both; the pair was deleting correct
+#:                           tags on the Unsplash `peaceful` sheet
+#:   colorful x muted        (2026-09-26, owner) different properties: muted
+#:                           is about the light, colorful about how many hues
+#:                           there are. The pair turned a rose photo's
+#:                           `muted, colorful` into no answer at all
 #:
 #: What survives contradicts on the SAME property: the sky is grey or it is
 #: sunny; shadow edges are hard or soft; the frame is desaturated or intense;
 #: black-and-white has no colour; `macro` needs to be close and `aerial` needs
-#: to be far; `dramatic` ("strong contrast or visual tension") and `peaceful`
-#: ("calm, still") are opposite readings of the same frame.
+#: to be far.
 #:
 #: Note there is no `sharp` x `blurry` entry: both are DERIVED now, and
 #: `derive_tags` cannot emit them together.
 CONTRADICTORY_PAIRS: tuple[tuple[str, str], ...] = (
-    ("dramatic", "peaceful"),
     ("joyful", "melancholy"),
     ("overcast", "sunny"),
     ("harsh-light", "soft-light"),
     ("muted", "vibrant"),
-    ("colorful", "muted"),
     ("black-and-white", "colorful"),
     ("black-and-white", "vibrant"),
     ("aerial", "macro"),

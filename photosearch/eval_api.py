@@ -58,6 +58,13 @@ LABELLER_NOTES: dict[str, str] = {
                     "most of the sky); not a bright photo, not a small highlight"),
     "backlit": ("labeller note: judge the clearest subject, not a secondary "
                 "figure - its camera-facing side is in its own shadow"),
+    # 2026-09-26: gemma picked `hazy` on a foggy sunrise and the owner read a
+    # photographer's "fog" shot as not foggy — the boundary was undefined.
+    "foggy": ("fog or mist in the scene: the air itself is visible and nearby "
+              "things fade into white or grey"),
+    "hazy": ("distance is washed out - far hills or skyline pale and "
+             "low-contrast from haze, smog, smoke or dust - while the near "
+             "scene stays clear"),
 }
 
 

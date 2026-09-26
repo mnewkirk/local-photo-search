@@ -85,7 +85,7 @@ MAPPING = {
     "harsh-light": ("harsh light", "hard light"),
     "soft-light": ("soft light",),
     "overexposed": ("overexposed",),
-    "foggy": ("foggy", "fog"),
+    "foggy": ("foggy", "fog", "mist", "misty"),
     "hazy": ("hazy", "haze"),
     "snowy": ("snowy", "snow"),
     "colorful": ("colorful", "colourful"),
@@ -108,6 +108,8 @@ MAPPING = {
     # Candidate tag (visual_tag_eval.CANDIDATE_TAGS): sampled and reported,
     # but scored only for a variant that offered it via --extra-vocab.
     "action": ("action",),
+    "blue-sky": ("blue sky", "clear sky"),
+    "cloudy": ("cloudy", "clouds", "cloud", "cloudy sky", "cloudscape"),
 }
 
 _PERCEIVED = frozenset(PERCEIVED_VOCABULARY)
