@@ -175,6 +175,78 @@ class FailureCounter:
 
 
 # --------------------------------------------------------------------------
+# Samples + text identity
+# --------------------------------------------------------------------------
+
+def load_sample(pass_: str) -> dict:
+    return read_pass_file(pass_, "sample.json", {"created": None, "photos": []})
+
+
+def save_sample(pass_: str, photos: list[dict], **meta) -> dict:
+    """`photos` is [{"photo_id": int, "stratum": str}, ...]."""
+    data = {"created": now_iso(), **meta,
+            "photos": [{"photo_id": int(p["photo_id"]), "stratum": str(p["stratum"])}
+                       for p in photos]}
+    write_pass_file(pass_, "sample.json", data)
+    return data
+
+
+def sample_ids(pass_: str) -> list[int]:
+    return [p["photo_id"] for p in load_sample(pass_)["photos"]]
+
+
+def text_sha(text: Optional[str]) -> Optional[str]:
+    """Identity of a generated text, whitespace-normalised. Labels on
+    generated text are keyed by this, not by variant: the labelling page never
+    needs a model name (blind by construction), two models that wrote the same
+    words share one label, and a re-run that changes the words orphans the old
+    label instead of being scored with it."""
+    if text is None:
+        return None
+    import hashlib
+    norm = " ".join(text.split())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
+def open_db_readonly(path: Optional[str]):
+    """sqlite3 connection with mode=ro. A missing file is an error, not a new
+    stub DB — and never PhotoDB, which migrates on open. sqlite-vec is loaded
+    when available so `clip_embeddings` can be read."""
+    import sqlite3
+    from urllib.parse import quote
+    if not path:
+        raise SystemExit("No DB given — pass --db (or set PHOTOSEARCH_DB).")
+    uri = "file:" + quote(os.path.abspath(path)) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.execute("SELECT 1 FROM photos LIMIT 1")
+    except sqlite3.OperationalError as e:
+        raise SystemExit(f"Cannot open {path} read-only: {e}")
+    conn.row_factory = sqlite3.Row
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except Exception:
+        pass
+    return conn
+
+
+def clip_embedding(conn, photo_id: int) -> Optional[list[float]]:
+    import struct
+    try:
+        row = conn.execute("SELECT embedding FROM clip_embeddings WHERE photo_id = ?",
+                           (int(photo_id),)).fetchone()
+    except Exception:
+        return None
+    if not row or row[0] is None:
+        return None
+    blob = row[0]
+    return list(struct.unpack(f"{len(blob) // 4}f", blob))
+
+
+# --------------------------------------------------------------------------
 # Model pinning
 # --------------------------------------------------------------------------
 
