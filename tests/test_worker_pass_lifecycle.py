@@ -10,9 +10,10 @@ Two behaviours, both about NOT idling:
   writes (30 min for 250 rows) and an entire overnight camera ingest (2,040
   files moved, zero rows written).
 
-- `--sequential` drains one pass fully before starting the next instead of
-  round-robining a batch at a time, so model weights aren't swapped in and out
-  between every batch.
+- Sequential (the default since 2026-09-26) drains one pass fully before
+  starting the next instead of round-robining a batch at a time, so every
+  photo gets CLIP before the slow LLM passes start and model weights aren't
+  swapped in and out between every batch. `--round-robin` opts back in.
 
 The claim call is stubbed: these pin the LOOP's control flow, which is where
 the subtle bugs live, without needing torch or a NAS.
@@ -132,11 +133,27 @@ def test_sequential_drains_in_order(monkeypatch, tmp_path):
     assert c.remaining == {"clip": 0, "quality": 0}
 
 
-def test_roundrobin_interleaves_by_default(monkeypatch, tmp_path):
-    """Default stays round-robin: quality is claimed before clip is drained."""
+def test_sequential_is_the_default(monkeypatch, tmp_path):
+    """With no flag, clip drains completely before quality is ever claimed."""
     c = run({"clip": 3, "quality": 2}, monkeypatch, tmp_path)
     first_quality = c.calls.index("quality")
+    assert set(c.calls[:first_quality]) == {"clip"}, c.calls
+    assert c.remaining == {"clip": 0, "quality": 0}
+
+
+def test_roundrobin_interleaves_when_asked(monkeypatch, tmp_path):
+    """sequential=False: quality is claimed before clip is drained."""
+    c = run({"clip": 3, "quality": 2}, monkeypatch, tmp_path, sequential=False)
+    first_quality = c.calls.index("quality")
     assert c.calls[:first_quality].count("clip") == 1, c.calls
+
+
+def test_cli_worker_defaults_to_sequential():
+    """`cli.py worker` with neither flag must pass sequential=True."""
+    import cli
+    opt = {o.name: o for o in cli.worker.params}["sequential"]
+    assert opt.default is True
+    assert "--round-robin" in opt.secondary_opts
 
 
 # --- the /admin/maintenance fleet launcher must expose both flags too -------
@@ -169,8 +186,8 @@ def test_workers_start_passes_flags_to_run_workers(monkeypatch):
     assert out["sequential"] is True and out["stay_alive"] is True
 
 
-def test_workers_start_defaults_omit_both_flags(monkeypatch):
-    """Default must be exit-when-drained, round-robin — i.e. neither flag."""
+def test_workers_start_defaults_sequential_exit_when_drained(monkeypatch):
+    """Default must be exit-when-drained and sequential."""
     import photosearch.admin_api as A
 
     seen = {}
@@ -185,8 +202,13 @@ def test_workers_start_defaults_omit_both_flags(monkeypatch):
     monkeypatch.setattr(A, "_fleet_env", lambda: {})
 
     A.admin_workers_start(A.WorkersStartRequest(passes=["clip"], count=1))
-    assert "--sequential" not in seen["cmd"]
+    assert "--sequential" in seen["cmd"]
+    assert "--round-robin" not in seen["cmd"]
     assert "--stay-alive" not in seen["cmd"]
+
+    A.admin_workers_start(A.WorkersStartRequest(passes=["clip"], count=1, sequential=False))
+    assert "--round-robin" in seen["cmd"]
+    assert "--sequential" not in seen["cmd"]
 
 
 def test_contended_response_does_not_retire_a_pass(monkeypatch, tmp_path):

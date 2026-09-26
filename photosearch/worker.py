@@ -935,7 +935,7 @@ def run_worker(
     ttl_minutes: int = 30,
     one_shot: bool = False,
     stay_alive: bool = False,
-    sequential: bool = False,
+    sequential: bool = True,
     force: bool = False,
     describe_model: str = "llama3.2-vision",
     tags_model: str = "llava",
@@ -967,9 +967,9 @@ def run_worker(
             claim opens BEGIN IMMEDIATE on the NAS's SQLite file and takes the
             single write lock, which has previously starved face assignments,
             collection writes and an entire overnight ingest.
-        sequential: If True, drain one pass completely before starting the
-            next, in the order given. Default is round-robin, one batch per
-            pass per cycle. Sequential avoids thrashing model weights in and
+        sequential: If True (the default), drain one pass completely before
+            starting the next, in the order given. False is round-robin, one
+            batch per pass per cycle. Sequential avoids thrashing model weights in and
             out of memory between passes (-p clip,quality otherwise alternates
             ViT-B/16 and ViT-L/14 every batch).
         force: If True, clear existing data and re-process from scratch

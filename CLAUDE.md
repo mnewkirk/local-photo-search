@@ -278,6 +278,13 @@ Worker claims batches via HTTP, downloads photos, processes locally, POSTs resul
 ./run-workers.sh --logs      # tail all workers live
 ./run-workers.sh --stop      # stop all workers
 ```
+**Workers drain passes sequentially by default** (since 2026-09-26): each pass
+in `-p` order is drained completely before the next starts, so a new shoot is
+CLIP-searchable before the slow LLM passes begin and model weights aren't
+reloaded every batch. `--round-robin` (cli.py worker, run-workers.sh) restores
+the old one-batch-per-pass-per-cycle interleave; the `/admin/maintenance`
+Sequential checkbox now defaults on.
+
 Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
 (not hostname) — Docker containers can't resolve local DNS names.
 

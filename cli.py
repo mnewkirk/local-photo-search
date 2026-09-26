@@ -5009,10 +5009,11 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Keep polling forever even when every queue is empty. By default a pass is "
                    "retired once its queue comes back empty and the worker exits when all are "
                    "done — idle polling holds the NAS write lock.")
-@click.option("--sequential", is_flag=True,
-              help="Drain each pass completely before starting the next, in the order given "
-                   "(default: round-robin one batch per pass). Avoids swapping model weights "
-                   "in and out between passes.")
+@click.option("--sequential/--round-robin", default=True, show_default=True,
+              help="--sequential (default) drains each pass completely before starting the "
+                   "next, in the order given, so every photo is CLIP-searchable before the "
+                   "slow LLM passes start and model weights aren't swapped every batch. "
+                   "--round-robin claims one batch per pass per cycle instead.")
 @click.option("--dry-run", is_flag=True, help="Resolve the scope and print per-pass queue depth, then exit (no claims).")
 @click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection, --directory, or a filter).")
 @click.option("--describe-model", default="llama3.2-vision", show_default=True,

@@ -1967,11 +1967,12 @@
       var _sel = useState({ describe: true, 'category-content': true, keywords: true });
       var sel = _sel[0]; var setSel = _sel[1];
       var _n = useState(2); var count = _n[0]; var setCount = _n[1];
-      // --sequential drains a pass fully before the next (no model thrash);
-      // --stay-alive keeps the fleet polling a dry queue. Default OFF so the
+      // --sequential (default ON) drains a pass fully before the next (no model
+      // thrash; CLIP first); --stay-alive keeps the fleet polling a dry queue.
+      // Stay-alive defaults OFF so the
       // fleet exits when the backlog is gone instead of holding the NAS
       // write lock — idle polling has starved ingests and face writes.
-      var _seq = useState(false); var sequential = _seq[0]; var setSequential = _seq[1];
+      var _seq = useState(true); var sequential = _seq[0]; var setSequential = _seq[1];
       var _sa = useState(false); var stayAlive = _sa[0]; var setStayAlive = _sa[1];
       var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
       var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];

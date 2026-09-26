@@ -1317,9 +1317,9 @@ class WorkersStartRequest(BaseModel):
     # a pass retires when empty and the fleet exits, so it stops holding the
     # NAS write lock once the backlog is gone.
     stay_alive: bool = False
-    # Drain each pass fully before the next, in the order given, instead of
-    # round-robining a batch at a time.
-    sequential: bool = False
+    # Drain each pass fully before the next, in the order given (the default),
+    # instead of round-robining a batch at a time.
+    sequential: bool = True
 
     # The three scope kinds (collection / filters / directory) are mutually
     # exclusive — `cli.py worker` enforces the same rule, and sending two
@@ -1425,8 +1425,7 @@ def admin_workers_start(req: WorkersStartRequest):
     cmd += filter_flags
     if req.stay_alive:
         cmd.append("--stay-alive")
-    if req.sequential:
-        cmd.append("--sequential")
+    cmd.append("--sequential" if req.sequential else "--round-robin")
     try:
         r = subprocess.run(cmd, cwd=_native_repo_dir(), env=_fleet_env(),
                            capture_output=True, text=True, timeout=180)
