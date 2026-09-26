@@ -276,10 +276,13 @@ def fetch_image(server, photo_id, kind="full", timeout=120):
     LANCZOS / JPEG q85 re-encode it does in the fleet. `preview` (1920 px,
     q82) is ~10x lighter but adds a JPEG generation the fleet never sees.
     """
-    import urllib.request
-    url = f"{server.rstrip('/')}/api/photos/{int(photo_id)}/{kind}"
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
+    from photosearch import model_eval
+    if kind == "full":
+        # Read once through the shared originals cache: every variant x model
+        # otherwise re-pulls the same photos from the NAS via the replica, and
+        # a NAS restart 502'd 28 of them mid-run on 2026-09-26.
+        return model_eval.original_path(photo_id, server).read_bytes()
+    return model_eval.fetch_from_server(server, photo_id, kind, timeout)
 
 
 @contextmanager

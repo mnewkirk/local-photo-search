@@ -116,3 +116,4 @@ scripts/windows-import/import-config.local.ps1
 
 # Visual-tag eval: hand labels + run caches stay on the owner's machine
 evals/visual-tags/
+evals/model-evals/

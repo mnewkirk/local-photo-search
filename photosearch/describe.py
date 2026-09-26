@@ -242,6 +242,26 @@ _LLM_SLOW_WARN_S = float(os.environ.get("PHOTOSEARCH_LLM_SLOW_WARN_S", "60"))
 _LLM_WATCHDOG_S = float(os.environ.get("PHOTOSEARCH_LLM_WATCHDOG_S", "30"))
 
 
+# Per-ATTEMPT observer for the eval harnesses (photosearch/model_eval.py).
+# The retry loop below hides what an eval needs to count: a timeout that
+# recovered on attempt 2 never surfaces, and `finish_reason` (truncation at
+# max_tokens) is dropped. When set, it is called once per attempt as
+# hook(role=, model=, attempt=, outcome="ok"|"timeout"|"error", elapsed=,
+# completion_tokens=, finish_reason=). None in production; its own exceptions
+# are swallowed so an observer can never change a call's result.
+_ATTEMPT_HOOK = None
+
+
+def _notify_attempt(**kw):
+    hook = _ATTEMPT_HOOK
+    if hook is None:
+        return
+    try:
+        hook(**kw)
+    except Exception:
+        pass
+
+
 def _llm_trace(role, model, elapsed, completion_tokens=None, prompt_tokens=None):
     """Emit a per-call timing line. Always fires for slow calls (>=
     _LLM_SLOW_WARN_S); fires for every call when PHOTOSEARCH_LLM_TRACE is set.
@@ -508,11 +528,21 @@ def _openai_chat_with_retry(
             usage = data.get("usage") or {}
             _llm_trace(role, model, time.time() - t0,
                        usage.get("completion_tokens"), usage.get("prompt_tokens"))
-            text = (data["choices"][0]["message"]["content"] or "").strip()
+            choice = data["choices"][0]
+            _notify_attempt(role=role, model=model, attempt=attempt, outcome="ok",
+                            elapsed=time.time() - t0,
+                            completion_tokens=usage.get("completion_tokens"),
+                            finish_reason=choice.get("finish_reason"))
+            text = (choice["message"]["content"] or "").strip()
             return text if text else None
 
         e = val
         es = str(e).lower()
+        _notify_attempt(role=role, model=model, attempt=attempt,
+                        outcome="timeout" if isinstance(e, TimeoutError)
+                        or "timed out" in es or "timeout" in es else "error",
+                        elapsed=time.time() - t0, completion_tokens=None,
+                        finish_reason=None)
         transient = any(k in es for k in [
             "timeout", "timed out", "exceeded", "connection", "refused", "reset",
             "broken pipe", "502", "503", "500", "unavailable",
