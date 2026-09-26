@@ -42,6 +42,7 @@ from .worker_api import (
 from .admin_api import router as admin_router
 from .batch_api import router as batches_router
 from .eval_api import router as eval_router
+from .eval_api import sheet_router as eval_sheet_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -51,6 +52,7 @@ app = FastAPI(title="local-photo-search", version="0.1.0")
 app.include_router(worker_router)
 app.include_router(batches_router)
 app.include_router(eval_router)
+app.include_router(eval_sheet_router)
 app.include_router(admin_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)

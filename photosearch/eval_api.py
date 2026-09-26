@@ -14,15 +14,22 @@ for the optional "what the model said" reveal.
 from __future__ import annotations
 
 import json
+import os
+import re
 from typing import List
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from . import visual_tag_eval
 from .visual_tags_derive import PERCEIVED_GLOSS, PROMPT_SECTIONS
 
 router = APIRouter(prefix="/api/eval/visual-tags", tags=["eval"])
+# Serves the Unsplash contact sheets (`evals/visual_tags_unsplash.py sheet`)
+# to a browser that is not this machine. The sheets embed thumbs as file://
+# paths so they open locally; here those are rewritten to the thumbs route.
+sheet_router = APIRouter(prefix="/eval/unsplash", tags=["eval"])
 set_ = set  # the handlers take a `set=` query param, which shadows the builtin
 
 _SAMPLE_HINT = ("No sample yet. Draw one with: "
@@ -179,3 +186,36 @@ def put_label(photo_id: int, body: LabelBody, set: str = Query("main")):
     done = sum(1 for pid in sample_ids if (labels.get(pid) or {}).get("done"))
     return {"photo_id": photo_id, "label": label,
             "progress": {"done": done, "total": len(sample_ids)}}
+
+
+# Same env var + default as evals/visual_tags_unsplash.py's THUMBS.
+def _unsplash_thumbs() -> str:
+    return os.environ.get("PHOTOSEARCH_UNSPLASH_THUMBS",
+                          os.path.expanduser("~/unsplash-quality-eval/thumbs"))
+
+
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+@sheet_router.get("/sheet/{tag}")
+def get_unsplash_sheet(tag: str):
+    if not _SAFE_NAME.match(tag):
+        raise HTTPException(400, "bad tag")
+    path = visual_tag_eval.eval_dir() / "unsplash" / f"sheet-{tag}.html"
+    if not path.exists():
+        raise HTTPException(404, f"No sheet for {tag!r}. Make one with: "
+                            f"python evals/visual_tags_unsplash.py sheet --tag {tag}")
+    page = path.read_text(encoding="utf-8").replace(
+        "file://" + _unsplash_thumbs().rstrip("/") + "/", "/eval/unsplash/thumbs/")
+    return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
+
+
+@sheet_router.get("/thumbs/{name}")
+def get_unsplash_thumb(name: str):
+    stem, ext = os.path.splitext(name)
+    if ext != ".jpg" or not _SAFE_NAME.match(stem):
+        raise HTTPException(400, "bad thumb name")
+    path = os.path.join(_unsplash_thumbs(), name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "no such thumb")
+    return FileResponse(path, media_type="image/jpeg")
