@@ -143,6 +143,14 @@
       height: calc(100vh - 190px); min-height: 360px; overflow: hidden;
     }
     .photo-frame img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; display: block; }
+    /* Single column (phones): a sticky, near-viewport-tall photo covers the
+       label panel as it scrolls up beneath it. Let the photo scroll away and
+       size to the image instead of the viewport. */
+    @media (max-width: 1050px) {
+      .photo-pane { position: static; }
+      .photo-frame { height: auto; min-height: 0; max-height: 65vh; }
+      .photo-frame img { max-height: 65vh; }
+    }
     .photo-meta { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
     .photo-meta .spacer { flex: 1; }
 
