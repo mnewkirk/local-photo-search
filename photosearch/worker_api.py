@@ -510,8 +510,8 @@ class _SubmitOutcome:
 # Only a TRANSIENT lock earns a free retry. Deferring anything else would
 # uncap the pass: a deterministically-failing photo would never reach
 # MAX_PROCESS_ATTEMPTS, be re-claimed every TTL forever, and pay for a model
-# run each cycle — exactly the pathology CLAUDE.md documents for the un-capped
-# `clip` pass ("workers churn at ~290% CPU and queue_depth.clip never reaches
+# run each cycle — exactly the pathology CLAUDE.md documents for the formerly
+# un-capped `clip` pass ("workers churn at ~290% CPU and queue_depth.clip never reaches
 # 0"). `faces` is the worst case: its claim predicate is NOT EXISTS(faces) AND
 # attempts < MAX with no column to heal it, and a malformed payload (a short
 # bbox, a missing 'encoding', a non-512 vector) raises BEFORE any INSERT, so
@@ -653,17 +653,24 @@ def _commit_batch(db, outcome: _SubmitOutcome, pass_type: str) -> bool:
         return not transient
 
 
-def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str):
+def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str,
+                    skip: set[int] | None = None):
     """Spend one attempt per finished photo.
+
+    `skip` names finished photos whose output row is its own marker and so
+    need no ledger write (clip's stored embeddings). They still count as
+    processed in the response.
 
     If this write itself fails the attempt cannot be recorded at all — the
     one case that really can loop, since the photo comes back unmarked every
     TTL. Nothing here can fix an unwritable DB, so say so loudly.
     """
-    if not outcome.processed:
+    skip = skip or set()
+    marks = [p for p in outcome.processed if p not in skip]
+    if not marks:
         return
-    terminal = [p for p in outcome.processed if p in outcome.terminal]
-    counted = [p for p in outcome.processed if p not in outcome.terminal]
+    terminal = [p for p in marks if p in outcome.terminal]
+    counted = [p for p in marks if p not in outcome.terminal]
     try:
         if counted:
             db.mark_processed(counted, pass_type)
@@ -674,15 +681,9 @@ def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str):
         log("Could not mark %d photo(s) processed for pass %s — their attempt "
             "was NOT recorded and they will be reclaimed; if this is not a "
             "lock the DB is unwritable and the fleet will keep retrying: %s",
-            len(outcome.processed), pass_type, e)
-        for pid in list(outcome.processed):
+            len(marks), pass_type, e)
+        for pid in marks:
             outcome.defer(pid)
-
-
-# Passes whose claim predicate has no attempts ledger. A worker-reported
-# failure there can only be logged — see CLAUDE.md "Non-image rows & the
-# clip-claim infinite re-claim".
-_NO_LEDGER_PASSES = ("clip",)
 
 
 def _record_worker_failures(db, outcome: _SubmitOutcome, pass_type: str,
@@ -697,8 +698,7 @@ def _record_worker_failures(db, outcome: _SubmitOutcome, pass_type: str,
     for f in failures:
         logger.warning("Worker reported %s failure for photo %s: %s",
                        pass_type, f.photo_id, f.error)
-        if pass_type not in _NO_LEDGER_PASSES:
-            outcome.failed(f.photo_id)
+        outcome.failed(f.photo_id)
         try:
             db.log_error(pass_type, str(f.photo_id),
                          f"worker: {f.error or 'failed'}")
@@ -742,19 +742,27 @@ def submit_results(req: SubmitRequest):
         if req.failures:
             _record_worker_failures(db, outcome, req.pass_type, req.failures)
 
-        if req.pass_type == "clip" and req.clip_results:
+        if req.pass_type == "clip":
+            embedded: set[int] = set()
             db.begin_batch(batch_size=100)
-            for r in req.clip_results:
+            for r in req.clip_results or []:
                 try:
                     db.add_clip_embedding(r.photo_id, r.embedding)
                     outcome.written += 1
                     outcome.persisted(r.photo_id)
+                    embedded.add(r.photo_id)
                 except Exception as e:
                     _record_write_failure(db, outcome, "clip", r.photo_id, e)
-            _commit_batch(db, outcome, "clip")
-            # NOTE: clip deliberately never calls mark_processed — the
-            # embedding row itself is the marker (see CLAUDE.md, "Non-image
-            # rows & the clip-claim infinite re-claim").
+            committed = _commit_batch(db, outcome, "clip")
+            # A stored embedding is its own marker, so success is NOT written
+            # to the ledger (clip is the highest-volume pass; that would be a
+            # row per photo on the N100 for nothing). Only a FAILURE spends an
+            # attempt — a worker-reported one (unloadable image) or a
+            # non-lock write error — so an unloadable file is retired by
+            # MAX_PROCESS_ATTEMPTS instead of heading every claim forever.
+            # clear-pass deletes clip ledger rows, so a re-embed starts clean.
+            if committed:
+                _mark_processed(db, outcome, "clip", skip=embedded)
 
         elif req.pass_type == "faces":
             face_results = req.face_results or []
@@ -1132,6 +1140,10 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM clip_embeddings WHERE photo_id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'clip' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "quality":
             cur = db.conn.execute(
                 f"UPDATE photos SET aesthetic_score = NULL, aesthetic_concepts = NULL, aesthetic_critique = NULL "

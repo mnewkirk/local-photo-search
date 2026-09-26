@@ -72,8 +72,9 @@ def is_real_image(filepath: str) -> bool:
     Guards against files whose extension lies about their content — most
     importantly ZIP-wrapped iOS Live Photo bundles saved as ``IMG_xxxx(1).JPG``
     (PK magic, a ``.mov`` inside) that PIL can't open. Such files must never get
-    a ``photos`` row: they can't be CLIP-embedded, and the clip claim path has no
-    attempts cap, so the workers would re-claim them on every TTL cycle forever.
+    a ``photos`` row: they can't be CLIP-embedded, and even with the clip
+    attempts cap every such row costs the fleet MAX_PROCESS_ATTEMPTS failed
+    claims and leaves its batch reading ``blocked``.
     """
     try:
         with open(filepath, "rb") as f:

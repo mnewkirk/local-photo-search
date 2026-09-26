@@ -382,7 +382,7 @@ class TestExhaustedAttemptsAreBlocked:
 
     # --- quality / verify joined the attempts ledger ------------------------
     #
-    # They used to be the two passes (besides clip) whose claim predicate had
+    # They used to be, with clip, the passes whose claim predicate had
     # no attempts clause, so an exhausted photo stayed inside `remaining` and
     # needed the subset arithmetic (`done = eligible - remaining`,
     # `blocked = remaining == failed`). They now filter exhausted photos like
@@ -467,9 +467,30 @@ class TestExhaustedAttemptsAreBlocked:
             assert step["state"] == "completed"
             assert step["done"] == 4
 
-    def test_clip_has_no_attempts_ledger(self, db):
+    def test_poison_clip_photo_reads_blocked(self, db):
+        """clip used to keep no ledger: an unloadable photo sat at
+        `remaining > 0` forever and the batch could never be `blocked` or
+        `ready`. Now it is capped like every other pass."""
+        batch_id, ids = _make_batch(db, count=3)
+        _do_clip(db, ids[:2])
+        _exhaust(db, ids[2:], "clip")
+        step = _step(batch_state(db, batch_id), "clip")
+        assert step["remaining"] == 0
+        assert step["failed"] == 1
+        assert step["done"] == 2
+        assert step["state"] == "blocked"
+
+    def test_clip_exhausted_but_embedded_is_done(self, db):
         batch_id, ids = _make_batch(db)
         _exhaust(db, ids, "clip")
+        _do_clip(db, ids)
+        step = _step(batch_state(db, batch_id), "clip")
+        assert step["failed"] == 0
+        assert step["state"] == "completed"
+
+    def test_clip_below_the_cap_stays_actionable(self, db):
+        batch_id, ids = _make_batch(db)
+        _exhaust(db, ids, "clip", attempts=MAX_PROCESS_ATTEMPTS - 1)
         step = _step(batch_state(db, batch_id), "clip")
         assert step["failed"] == 0
         assert step["remaining"] == len(ids)

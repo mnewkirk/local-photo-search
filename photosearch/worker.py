@@ -464,9 +464,18 @@ def _process_clip(downloaded: list[tuple[dict, str]], batch_size: int = 8) -> li
 
     paths = [path for _, path in downloaded]
     results = []
+    embedded = set()
     for idx, emb in embed_images_stream(paths, batch_size=batch_size):
         photo_info = downloaded[idx][0]
         results.append({"photo_id": photo_info["id"], "embedding": emb})
+        embedded.add(idx)
+    # embed_images_stream skips an image it cannot open. Report it, so the
+    # attempts cap retires it — before this it left no trace and headed every
+    # clip claim forever (a ZIP-wrapped Live Photo saved as .JPG).
+    for idx, (photo_info, _) in enumerate(downloaded):
+        if idx not in embedded:
+            results.append(_failure_row(
+                photo_info["id"], "CLIP embedding failed (image could not be loaded)"))
     return results
 
 
@@ -1121,7 +1130,7 @@ def run_worker(
 
                 if pass_type == "clip":
                     results = _process_clip(downloaded, batch_size=model_batch_size)
-                    kwargs = {"clip_results": results}
+                    kwargs = _submit_kwargs("clip_results", results)
                 elif pass_type == "quality":
                     results = _process_quality(downloaded, batch_size=model_batch_size)
                     kwargs = _submit_kwargs("quality_results", results)

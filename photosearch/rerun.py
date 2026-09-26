@@ -189,7 +189,7 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
 
         if pass_type == "clip":
             results = W._process_clip(downloaded, batch_size=model_batch_size)
-            kwargs = {"clip_results": results}
+            kwargs = W._submit_kwargs("clip_results", results)
         elif pass_type == "quality":
             results = W._process_quality(downloaded, batch_size=model_batch_size)
             kwargs = W._submit_kwargs("quality_results", results)

@@ -315,8 +315,13 @@ def test_worker_detection_error_is_a_failure_row_not_an_empty_list(monkeypatch):
 
 
 def test_worker_quality_reports_an_unloadable_image(monkeypatch):
-    from photosearch import quality as Q
+    # A stub module, not the real one: photosearch.quality imports torch.nn at
+    # module level, which the CI venv's torch mock cannot provide.
+    import sys
+    import types
     from photosearch import worker as W
+    Q = types.ModuleType("photosearch.quality")
+    monkeypatch.setitem(sys.modules, "photosearch.quality", Q)
 
     def score(paths, batch_size=8):
         for i, p in enumerate(paths):
@@ -328,8 +333,8 @@ def test_worker_quality_reports_an_unloadable_image(monkeypatch):
             if not p.endswith("bad.jpg"):
                 yield i, {"sharp": 0.3}
 
-    monkeypatch.setattr(Q, "score_photos_stream", score)
-    monkeypatch.setattr(Q, "analyze_photos_stream", analyze)
+    Q.score_photos_stream = score
+    Q.analyze_photos_stream = analyze
     results = W._process_quality([
         ({"id": 1, "filename": "ok.jpg"}, "/x/ok.jpg"),
         ({"id": 2, "filename": "bad.jpg"}, "/x/bad.jpg"),
@@ -383,3 +388,124 @@ def test_in_process_faces_marks_match_the_server(client):
         _clear_faces_ledger(db, [1])
         db.conn.commit()
     assert _attempts("faces") == {2: 1}
+
+
+# ---------------------------------------------------------------------------
+# clip joins the ledger (it used to be the one uncapped pass)
+# ---------------------------------------------------------------------------
+
+def _emb(seed=0):
+    v = [0.0] * 512
+    v[seed] = 1.0
+    return v
+
+
+def test_clip_exhausted_photo_is_neither_claimed_nor_counted(client):
+    assert 1 in _claimable("clip")
+    before = _count("clip")
+    _exhaust("clip", [1])
+    assert 1 not in _claimable("clip")
+    assert _count("clip") == before - 1
+    assert _count("clip", [1, 2]) == 1
+
+
+def test_clip_success_is_its_own_marker(client):
+    """A stored embedding needs no ledger row — the highest-volume pass should
+    not write one per photo on the N100."""
+    body = _submit(client, "clip", clip_results=[{"photo_id": 1, "embedding": _emb()}])
+    assert body["written"] == 1
+    assert body["processed"] == 1
+    assert _attempts("clip") == {}
+    assert 1 not in _claimable("clip")
+
+
+def test_clip_failure_row_spends_one_attempt(client):
+    body = _submit(client, "clip", failures=[{"photo_id": 2, "error": "cannot identify"}])
+    assert _attempts("clip") == {2: 1}
+    assert body["deferred"] == 0
+    assert 2 in _claimable("clip"), "one failure must still be retried"
+
+
+def test_clip_transient_lock_defers_without_spending(client, monkeypatch):
+    from photosearch.db import PhotoDB
+    real = PhotoDB.add_clip_embedding
+
+    def flaky(self, photo_id, *a, **kw):
+        if photo_id == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real(self, photo_id, *a, **kw)
+
+    monkeypatch.setattr(PhotoDB, "add_clip_embedding", flaky)
+    with _open() as db:
+        for _ in range(MAX_PROCESS_ATTEMPTS - 1):
+            db.mark_processed([2], "clip")
+    body = _submit(client, "clip", clip_results=[
+        {"photo_id": 1, "embedding": _emb(1)}, {"photo_id": 2, "embedding": _emb(2)}])
+    assert body["deferred_photo_ids"] == [2]
+    assert _attempts("clip") == {2: MAX_PROCESS_ATTEMPTS - 1}
+    assert 2 in _claimable("clip")
+
+
+def test_clip_non_lock_write_error_spends_an_attempt(client):
+    """A malformed vector is a repeatable failure — capped, not deferred."""
+    _submit(client, "clip", clip_results=[{"photo_id": 2, "embedding": [0.1] * 7}])
+    assert _attempts("clip") == {2: 1}
+
+
+def test_poison_clip_photo_stops_being_claimed_and_batch_reads_blocked(client):
+    from photosearch.batch_state import batch_state
+    from photosearch.ingest_batches import register_batch
+
+    offered = 0
+    for _ in range(MAX_PROCESS_ATTEMPTS + 2):
+        claim = client.post("/api/worker/claim-batch", json={
+            "worker_id": "w1", "pass_type": "clip", "limit": 10,
+            "directory": "2091"}).json()
+        ids = [p["id"] for p in claim["photos"]]
+        if not ids:
+            break
+        if 2 in ids:
+            offered += 1
+        client.post("/api/worker/submit-results", json={
+            "batch_id": claim["batch_id"], "pass_type": "clip",
+            "clip_results": [{"photo_id": i, "embedding": _emb(i)}
+                             for i in ids if i != 2],
+            "failures": [{"photo_id": 2, "error": "PK zip, not a JPEG"}]})
+    assert offered == MAX_PROCESS_ATTEMPTS
+    assert 2 not in _claimable("clip")
+
+    with _open() as db:
+        db.conn.execute("UPDATE photos SET folder='2091' WHERE id IN (2,3)")
+        db.conn.commit()
+        batch_id = register_batch(db, "2091")
+        step = next(s for s in batch_state(db, batch_id)["steps"] if s["step"] == "clip")
+    assert step["failed"] == 1
+    assert step["done"] == 1
+    assert step["state"] == "blocked"
+
+
+def test_clear_pass_resets_the_clip_ledger(client):
+    _exhaust("clip", [1, 2])
+    r = client.post("/api/worker/clear-pass", json={"pass_type": "clip", "photo_ids": [1]})
+    assert r.status_code == 200, r.text
+    assert _attempts("clip") == {2: MAX_PROCESS_ATTEMPTS}
+    assert 1 in _claimable("clip")
+
+
+def test_worker_clip_reports_an_unloadable_image(monkeypatch):
+    from photosearch import clip_embed as C
+    from photosearch import worker as W
+
+    def stream(paths, batch_size=8):
+        for i, p in enumerate(paths):
+            if not p.endswith("bad.jpg"):
+                yield i, _emb(i)
+
+    monkeypatch.setattr(C, "embed_images_stream", stream)
+    results = W._process_clip([
+        ({"id": 1, "filename": "ok.jpg"}, "/x/ok.jpg"),
+        ({"id": 2, "filename": "bad.jpg"}, "/x/bad.jpg"),
+    ])
+    kwargs = W._submit_kwargs("clip_results", results)
+    assert [r["photo_id"] for r in kwargs["clip_results"]] == [1]
+    assert [f["photo_id"] for f in kwargs["failures"]] == [2]

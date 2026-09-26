@@ -27,10 +27,9 @@ it has not started. So each pass carries four numbers instead of one:
   ``remaining``  ``worker_api._count_scoped`` — what a worker would claim
   ``failed``     eligible photos whose attempts are exhausted *and* whose
                  output column is still missing
-  ``done``       ``eligible - remaining - failed``, floored at 0 — for
-                 every pass whose ``remaining`` excludes exhausted photos.
-                 Only ``clip`` has no attempts filter, so for it ``done`` is
-                 ``eligible - remaining`` (and ``failed`` is always 0). See
+  ``done``       ``eligible - remaining - failed``, floored at 0. Every
+                 pass's ``remaining`` now excludes exhausted photos, so
+                 ``failed`` and ``remaining`` are disjoint. See
                  ``_REMAINING_FILTERS_ATTEMPTS``.
 
 and `completed` is ``done == total``, never ``remaining == 0``.
@@ -101,10 +100,9 @@ _DESCRIPTION_GATED = ("category-content", "keywords", "verify")
 _ID_CHUNK = 20000
 
 # Per-pass "the output is still missing" column test, transcribed from
-# db.count_unprocessed_photos. `p` is the photos alias. `None` means the pass
-# keeps no attempts ledger, so it can never contribute a `failed` count.
+# db.count_unprocessed_photos. `p` is the photos alias.
 #
-#   clip             photos.id NOT IN clip_embeddings      (no attempts filter)
+#   clip             photos.id NOT IN clip_embeddings
 #   faces            no faces row for the photo
 #   quality          aesthetic_score OR aesthetic_concepts NULL
 #   aesthetics       aes_overall IS NULL
@@ -121,7 +119,7 @@ _ID_CHUNK = 20000
 # the `!= ''` rule below while db.py's `IS NOT NULL` still counts it here.
 # `done` floors at 0, so the only effect is a conservative under-count.)
 _OUTPUT_MISSING = {
-    "clip": None,
+    "clip": "p.id NOT IN (SELECT photo_id FROM clip_embeddings)",
     "faces": "NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)",
     "quality": "(p.aesthetic_score IS NULL OR p.aesthetic_concepts IS NULL)",
     "aesthetics": "p.aes_overall IS NULL",
@@ -151,10 +149,12 @@ _OUTPUT_MISSING = {
 _EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
 
 # Does this pass's *claim* predicate (what `remaining` counts) exclude photos
-# whose attempts are exhausted? Every pass but `clip` does. (`quality` and
-# `verify` used to carry no attempts filter either — a photo that failed them
-# every time was re-claimed forever — until they joined the ledger.) That single
-# fact decides two things:
+# whose attempts are exhausted? Every pass does now. `clip`, `quality` and
+# `verify` used to carry no attempts filter — a photo that failed them every
+# time was re-claimed forever and could never read `blocked` — until they
+# joined the ledger. The table stays because the arithmetic below is only
+# right for the True shape; a pass added without the cap must say False here.
+# That single fact decides two things:
 #
 #   True  -> `failed` and `remaining` are DISJOINT sets.
 #            done    = eligible - remaining - failed
@@ -165,10 +165,8 @@ _EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
 #            done    = eligible - remaining
 #            blocked = remaining == failed and failed > 0   (every photo the
 #                      fleet would still claim is one it can never finish)
-#
-# `clip` is False but keeps no ledger, so `failed` is 0 and both rows agree.
 _REMAINING_FILTERS_ATTEMPTS = {
-    "clip": False,
+    "clip": True,
     "faces": True,
     "quality": True,
     "aesthetics": True,
@@ -276,19 +274,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
     missing = _OUTPUT_MISSING[pass_type]
-    if missing is None:
-        # clip keeps no attempts ledger — its claim predicate is purely
-        # "no embedding row", so a photo can never be permanently skipped
-        # (which is the non-image re-claim loop documented in CLAUDE.md).
-        failed = 0
-    else:
-        failed = _count_where(
-            db, ids,
-            f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
-            f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
-            f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
-            (pass_type,),
-        )
+    failed = _count_where(
+        db, ids,
+        f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
+        f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
+        f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
+        (pass_type,),
+    )
 
     # See _EMPTY_OUTPUT_IS_DONE: for `faces`, exhausted-with-no-rows is a
     # finished photo that had nothing to find, so it counts toward `done`.

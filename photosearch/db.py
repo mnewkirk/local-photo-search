@@ -110,6 +110,15 @@ _QUALITY_NOT_EXHAUSTED = (
     "WHERE wp.photo_id = photos.id AND wp.pass_type = 'quality' "
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
+# clip's predicates alias photos as `p`. clip keeps its own output test (an
+# embedding row) and, like every other pass, stops being offered a photo once
+# the worker has failed on it MAX_PROCESS_ATTEMPTS times — see CLAUDE.md
+# "Non-image rows & the clip-claim infinite re-claim".
+_CLIP_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'clip' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
 _VERIFY_NOT_EXHAUSTED = (
     "NOT EXISTS (SELECT 1 FROM worker_processed wp "
     "WHERE wp.photo_id = photos.id AND wp.pass_type = 'verify' "
@@ -2245,20 +2254,24 @@ class PhotoDB:
         # from processed-with-no-results). Other passes store NULL → value
         # in photos columns, so we can check IS NULL directly.
         if pass_type == "clip":
-            # Photos with no CLIP embedding
+            # Photos with no CLIP embedding whose attempts aren't exhausted.
+            # Without the cap an unloadable file (a ZIP-wrapped Live Photo
+            # saved as .JPG) sat at the front of every claim forever.
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"""SELECT p.id, p.filepath FROM photos p
                         WHERE p.id IN ({placeholders})
                         AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                        AND {_CLIP_NOT_EXHAUSTED}
                         LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    """SELECT p.id, p.filepath FROM photos p
+                    f"""SELECT p.id, p.filepath FROM photos p
                        WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                       AND {_CLIP_NOT_EXHAUSTED}
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
@@ -2438,12 +2451,15 @@ class PhotoDB:
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
                         WHERE p.id IN ({placeholders})
-                        AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)""",
+                        AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                        AND {_CLIP_NOT_EXHAUSTED}""",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    "SELECT COUNT(*) FROM photos p WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)"
+                    "SELECT COUNT(*) FROM photos p "
+                    "WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings) "
+                    f"AND {_CLIP_NOT_EXHAUSTED}"
                 ).fetchone()
         elif pass_type == "faces":
             if photo_ids:
