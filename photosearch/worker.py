@@ -806,37 +806,18 @@ def _process_verify(
                 })
                 continue
 
-            # Pass 1: CLIP scoring
-            clip_flags = []
-            if clip_embedding:
-                from .verify import clip_score_description, clip_score_tags, _flag_by_clip
-                desc_scores = clip_score_description(clip_embedding, description) if description else []
-                tag_scores = clip_score_tags(clip_embedding, tags) if tags else []
-                desc_flagged, tag_flagged, all_clip_items = _flag_by_clip(
-                    desc_scores, tag_scores, clip_threshold=0.18
-                )
-                clip_flags = [item for item in all_clip_items
-                              if any(f.get("noun") == item.get("noun") for f in desc_flagged)
-                              or any(f.get("tag") == item.get("tag") for f in tag_flagged)]
-
-                if not desc_flagged and not tag_flagged:
-                    elapsed = time.time() - t0
-                    print(f" ({elapsed:.1f}s) pass (CLIP clean)")
-                    results.append({
-                        "photo_id": pid,
-                        "status": "pass",
-                        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
-                    })
-                    continue
-
-            # Pass 2: LLM verification
-            from .verify import llm_verify_description
-            confirmed = llm_verify_description(path, description, tags, model=verify_model)
-
-            if not confirmed:
+            # Passes 1-3 (CLIP gate, LLM, CLIP override) live in
+            # verify.check_description so the model eval measures this exact
+            # pipeline (evals/verify_eval.py --mode pipeline).
+            from .verify import check_description
+            chk = check_description(path, description, tags, clip_embedding,
+                                    verify_model=verify_model)
+            clip_flags = chk["clip_flags"]
+            if chk["stage"] != "confirmed":
                 elapsed = time.time() - t0
-                print(f" ({elapsed:.1f}s) pass (LLM cleared)")
+                label = {"clip_clean": "CLIP clean", "llm_cleared": "LLM cleared",
+                         "clip_override": "CLIP override"}[chk["stage"]]
+                print(f" ({elapsed:.1f}s) pass ({label})")
                 results.append({
                     "photo_id": pid,
                     "status": "pass",
@@ -844,36 +825,7 @@ def _process_verify(
                     "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
                 })
                 continue
-
-            # Pass 3: CLIP cross-check on LLM findings
-            import numpy as np
-            verified_confirmed = confirmed
-            if clip_embedding:
-                from .clip_embed import embed_text
-                photo_vec = np.array(clip_embedding, dtype=np.float32)
-                desc_scores_sims = [s["similarity"] for s in desc_scores] + [s["similarity"] for s in tag_scores]
-                median_sim = float(np.median(desc_scores_sims)) if desc_scores_sims else 0.0
-
-                verified_confirmed = []
-                for item in confirmed:
-                    text_emb = embed_text(f"a photo of {item['noun']}")
-                    if text_emb is not None:
-                        text_vec = np.array(text_emb, dtype=np.float32)
-                        sim = float(np.dot(photo_vec, text_vec))
-                        if sim >= median_sim:
-                            continue  # CLIP overrides LLM
-                    verified_confirmed.append(item)
-
-            if not verified_confirmed:
-                elapsed = time.time() - t0
-                print(f" ({elapsed:.1f}s) pass (CLIP override)")
-                results.append({
-                    "photo_id": pid,
-                    "status": "pass",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
-                })
-                continue
+            verified_confirmed = chk["confirmed"]
 
             # Hallucinations confirmed — regenerate
             confirmed_nouns = {c["noun"] for c in verified_confirmed}

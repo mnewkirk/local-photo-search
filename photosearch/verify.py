@@ -352,6 +352,73 @@ def llm_verify_description(
     return confirmed
 
 
+def check_description(
+    image_path: str,
+    description: str,
+    tags: list[str],
+    clip_embedding: Optional[list[float]],
+    verify_model: str = "llava",
+    *,
+    llm_all: bool = False,
+    clip_threshold: float = 0.18,
+) -> dict:
+    """The worker's three-stage check, with no DB write and no regeneration:
+
+      1. CLIP gate — nouns/tags the photo's embedding does not support. If
+         none are flagged the description passes without asking the LLM.
+      2. LLM — the verify model lists WRONG: claims (`llm_verify_description`).
+      3. CLIP override — an LLM finding CLIP scores at or above the median
+         similarity is dropped.
+
+    Returns {"stage": "clip_clean" | "llm_cleared" | "clip_override" |
+    "confirmed", "clip_flags": [...], "llm_items": [...], "confirmed": [...]}.
+
+    `llm_all=True` skips stages 1 and 3: the verify model's own answer, which
+    is what a model comparison needs (the eval harness, evals/verify_eval.py).
+    The default is exactly what `worker._process_verify` ships.
+    """
+    clip_flags: list = []
+    desc_scores: list = []
+    tag_scores: list = []
+    if clip_embedding and not llm_all:
+        desc_scores = clip_score_description(clip_embedding, description) if description else []
+        tag_scores = clip_score_tags(clip_embedding, tags) if tags else []
+        desc_flagged, tag_flagged, all_clip_items = _flag_by_clip(
+            desc_scores, tag_scores, clip_threshold=clip_threshold)
+        clip_flags = [item for item in all_clip_items
+                      if any(f.get("noun") == item.get("noun") for f in desc_flagged)
+                      or any(f.get("tag") == item.get("tag") for f in tag_flagged)]
+        if not desc_flagged and not tag_flagged:
+            return {"stage": "clip_clean", "clip_flags": clip_flags,
+                    "llm_items": [], "confirmed": []}
+
+    confirmed = llm_verify_description(image_path, description, tags, model=verify_model)
+    if not confirmed:
+        return {"stage": "llm_cleared", "clip_flags": clip_flags,
+                "llm_items": [], "confirmed": []}
+
+    verified = confirmed
+    if clip_embedding and not llm_all:
+        import numpy as np
+        from .clip_embed import embed_text
+        photo_vec = np.array(clip_embedding, dtype=np.float32)
+        sims = [x["similarity"] for x in desc_scores] + [x["similarity"] for x in tag_scores]
+        median_sim = float(np.median(sims)) if sims else 0.0
+        verified = []
+        for item in confirmed:
+            text_emb = embed_text(f"a photo of {item['noun']}")
+            if text_emb is not None:
+                text_vec = np.array(text_emb, dtype=np.float32)
+                if float(np.dot(photo_vec, text_vec)) >= median_sim:
+                    continue  # CLIP overrides LLM
+            verified.append(item)
+    if not verified:
+        return {"stage": "clip_override", "clip_flags": clip_flags,
+                "llm_items": confirmed, "confirmed": []}
+    return {"stage": "confirmed", "clip_flags": clip_flags,
+            "llm_items": confirmed, "confirmed": verified}
+
+
 # ---------------------------------------------------------------------------
 # Full verification pipeline
 # ---------------------------------------------------------------------------
