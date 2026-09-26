@@ -77,7 +77,12 @@ def test_vocabulary_is_exactly_the_perceived_terms(client):
     assert set(trial) == set(CANDIDATE_TAGS)
     assert all(t["gloss"] is None for s in sections if s.get("candidate")
                for t in s["tags"])   # a candidate has no model-facing text
-    tags = [t["tag"] for s in sections if not s.get("candidate") for t in s["tags"]]
+    # sharp / blurry: their own flagged section, labelled for the sharpness
+    # measurement, never a model's vocabulary.
+    measured = [t["tag"] for s in sections if s.get("measured") for t in s["tags"]]
+    assert measured == list(visual_tag_eval.MEASURED_TAGS)
+    tags = [t["tag"] for s in sections
+            if not s.get("candidate") and not s.get("measured") for t in s["tags"]]
     assert len(tags) == len(set(tags))
     assert set(tags) == set(PERCEIVED_VOCABULARY)
     # Capture facts are EXIF's call; frozen/retired terms are never asked.
@@ -132,7 +137,7 @@ def test_empty_label_is_a_valid_done_answer(client, sample):
     assert visual_tag_eval.scoreable_labels()[pid]["yes"] == []
 
 
-@pytest.mark.parametrize("tag", ["long-exposure", "sharp", "motion-blur", "not-a-tag"])
+@pytest.mark.parametrize("tag", ["long-exposure", "panoramic", "motion-blur", "not-a-tag"])
 def test_non_perceived_tag_is_400(client, sample, tag):
     resp = client.put(f"{API}/{sample[0]}", json={"yes": [tag], "debatable": []})
     assert resp.status_code == 400
@@ -178,8 +183,10 @@ def test_labeller_notes_never_leak_into_the_production_prompt():
     from photosearch.visual_tags_derive import PERCEIVED_GLOSS, PERCEIVED_VOCABULARY
     from photosearch.describe import _build_visual_prompt
     prompt = _build_visual_prompt(list(PERCEIVED_VOCABULARY))
+    from photosearch.visual_tag_eval import MEASURED_TAGS
     for tag, note in eval_api.LABELLER_NOTES.items():
-        assert tag in PERCEIVED_VOCABULARY
+        # sharp / blurry notes are for the MEASURED labels, never the model.
+        assert tag in PERCEIVED_VOCABULARY or tag in MEASURED_TAGS
         assert note not in prompt
         assert PERCEIVED_GLOSS.get(tag) != note
 
