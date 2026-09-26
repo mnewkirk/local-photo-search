@@ -1,8 +1,9 @@
 # import-photos-safe.ps1   (lives in the repo: scripts/windows-import/ — see README.md)
 # Imports SD-card media to D:\Photos\Archive\YYYY\YYYY-MM-DD\ (local backup),
 # then pushes everything to the NAS _incoming\<CameraModel>\ staging area so the
-# NAS `ingest-incoming` job dates, dedups, and (for photos) indexes them —
-# replacing the old per-year robocopy + ssh-index dance.
+# NAS `ingest-incoming --no-clip` job dates, dedups, and (for photos) registers
+# them — replacing the old per-year robocopy + ssh-index dance. CLIP is left to
+# the worker fleet's `clip` pass.
 #
 # Flow:
 #   1. Copy new files from SD cards into the staging folder.
@@ -12,11 +13,11 @@
 #      or 'unknown-camera').
 #   3. organize.ps1 moves staging -> D:\Photos\Archive\YYYY\YYYY-MM-DD\ (local backup kept).
 #   4. (Drift) push any local Archive date that has no folder on the NAS yet.
-#   5. ssh-trigger `ingest-incoming` on the NAS (unless -NoIngest).
+#   5. ssh-trigger `ingest-incoming --no-clip` on the NAS (unless -NoIngest).
 #
 # NOTE: ingest-incoming moves RAW + video into the dated library folders too
 # (so every file reaches the NAS) but does NOT index them — only JPEG/HEIC get
-# CLIP/colors. Sony db sidecars (.XML/.BIN/etc.) are not media and stay local.
+# DB rows (and CLIP, from the fleet). Sony db sidecars (.XML/.BIN/etc.) are not media and stay local.
 
 param(
     [switch]$NoIngest,       # skip the remote ingest-incoming trigger
@@ -60,8 +61,8 @@ $nasIncoming     = Join-Path $nasPath "_incoming"
 $nasUser         = $NasSshTarget
 $touchedYearsFile = Join-Path $env:TEMP "photo-touched-years-$PID.txt"
 
-# Media types pushed to the NAS. Photos (JPEG/HEIC) get CLIP-indexed by
-# ingest-incoming; RAW + video are moved into the library but not indexed.
+# Media types pushed to the NAS. Photos (JPEG/HEIC) get registered by
+# ingest-incoming (CLIP comes from the fleet); RAW + video are moved into the library but not indexed.
 # Photos + RAW expose an EXIF camera model; video usually doesn't.
 $photoExts     = @('.jpg', '.jpeg', '.heic', '.heif')
 $rawExts       = @('.arw', '.cr2', '.cr3', '.nef', '.nrw', '.dng', '.raf', '.rw2', '.orf', '.pef', '.srw', '.raw', '.rwl', '.sr2')
@@ -72,7 +73,7 @@ $allMediaExts  = $photoExts + $rawExts + $videoExts
 Write-Host "=== Photo Import Starting ===" -ForegroundColor Cyan
 Write-Host "Staging:  $stagingPath"
 Write-Host "Archive:  $localArchive  (YYYY\YYYY-MM-DD\)"
-Write-Host "NAS push: $nasIncoming\<CameraModel>\  (ingest-incoming dates + indexes)"
+Write-Host "NAS push: $nasIncoming\<CameraModel>\  (ingest-incoming dates + registers; CLIP via fleet)"
 Write-Host ""
 
 # COM shell used to read EXIF 'Camera model' from each photo.
@@ -382,16 +383,17 @@ if ($driftDates.Count -gt 0) {
     Write-Host "No drift detected." -ForegroundColor Green
 }
 
-# Step 5: Trigger the NAS ingest-incoming sweep (dates, dedups, CLIP-indexes
-# everything we just pushed). Skippable -- the daily cron and the /status
-# "Ingest incoming" button run the same job.
+# Step 5: Trigger the NAS ingest-incoming sweep (dates, dedups, and registers
+# everything we just pushed). --no-clip: photos get DB rows but CLIP is left to
+# the worker fleet's `clip` pass rather than the N100. Skippable -- the daily
+# cron and the /status "Ingest incoming" button run the same sweep (with CLIP).
 if ($NoIngest) {
     Write-Host "`n-NoIngest set -- not triggering the NAS sweep." -ForegroundColor DarkGray
     Write-Host "Run it later from /status (Ingest incoming) or wait for the daily cron." -ForegroundColor DarkGray
 } else {
     $dryFlag = if ($DryRunIngest) { " --dry-run" } else { "" }
     Write-Host "`n=== Triggering NAS ingest-incoming$dryFlag ===" -ForegroundColor Cyan
-    $remoteCmd = "cd $nasComposeDir && nohup docker compose -f docker-compose.nas.yml run --rm -e PYTHONUNBUFFERED=1 photosearch ingest-incoming --no-colors$dryFlag > /tmp/ingest-incoming.log 2>&1 < /dev/null &"
+    $remoteCmd = "cd $nasComposeDir && nohup docker compose -f docker-compose.nas.yml run --rm -e PYTHONUNBUFFERED=1 photosearch ingest-incoming --no-clip$dryFlag > /tmp/ingest-incoming.log 2>&1 < /dev/null &"
     ssh $nasUser $remoteCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  WARN: ssh exited $LASTEXITCODE -- trigger may not have started." -ForegroundColor Yellow

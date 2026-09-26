@@ -1182,7 +1182,12 @@ shoot's body (the batch's single camera model) or lands under `unknown-camera`
    CLIP + colors at the end. `--no-colors` drops the color pass (CLIP only)
    — lighter/faster for the daily cron and avoids the memory-heavy color
    extraction; colors are *not* a worker pass, so backfill them later with
-   `photosearch index <dir>`. Faces / quality / describe / tags get picked
+   `photosearch index <dir>`. `--no-clip` goes further: the index pass only
+   **registers** rows (hash/EXIF/geocode) and leaves CLIP to the fleet's `clip`
+   pass — the SD-card importer uses it. **Never `--no-index` for that**:
+   ingest itself inserts no rows, so `--no-index` leaves moved photos with no
+   DB row at all — unclaimable by the fleet, unsearchable, and invisible to the
+   next sweep's hash dedup. Faces / quality / describe / tags get picked
    up by the existing worker fleet on its next claim — no special wiring.
 
 `.processed/` is safe to `rm -rf` at any time; it only holds deduped

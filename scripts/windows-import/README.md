@@ -3,7 +3,10 @@
 `import-photos-safe.ps1` copies new media off the SD cards into a local staging
 folder, pushes it to the NAS `_incoming\<CameraModel>\` staging area, files the
 local copy into a dated archive (via your own `organize.ps1`), and ssh-triggers
-`ingest-incoming` on the NAS. See the header of the script for the full flow,
+`ingest-incoming --no-clip` on the NAS — photos are dated, deduped and get DB
+rows there, but CLIP is left to the worker fleet's `clip` pass rather than the
+N100 (**the NAS must be running code with `--no-clip`**, or the trigger fails
+on an unknown option). See the header of the script for the full flow,
 and "Phone-photo daily ingest" in the repo's `CLAUDE.md` for the NAS side.
 
 ## Setup (once per machine)

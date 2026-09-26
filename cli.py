@@ -2732,6 +2732,13 @@ def batch_advance_cmd(db, batch_id, apply):
                    "pass (CLIP only). Lighter + faster for the daily cron; "
                    "colors are not a worker pass, so backfill them later with "
                    "`photosearch index <dir>`.")
+@click.option("--no-clip", is_flag=True, default=False,
+              help="Register new photos (hash, EXIF, geocode) in the post-move "
+                   "index pass but skip CLIP and colors, leaving CLIP to the "
+                   "worker fleet's `clip` pass. Unlike --no-index, the photos "
+                   "still get DB rows, so the fleet can claim them and later "
+                   "sweeps can dedup against them. Stacking is skipped too "
+                   "(it needs embeddings); maintenance-sweep picks it up.")
 @click.option("--bare-source", "bare_sources", multiple=True, metavar="LABEL",
               help="Source label that should land in YYYY-MM-DD_<label>/ with "
                    "NO 'phone-' prefix (e.g. a camera model like ILCE-7RM6). "
@@ -2743,7 +2750,7 @@ def batch_advance_cmd(db, batch_id, apply):
                    "like a camera model. Repeatable. Also via "
                    "PHOTOSEARCH_INGEST_PHONE_SOURCES (comma-separated).")
 def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors,
-                        bare_sources, phone_sources):
+                        no_clip, bare_sources, phone_sources):
     """Sweep synced media out of _incoming/<source>/ into the library.
 
     Designed to run daily from cron. Each direct subdir of --incoming-root is
@@ -2834,7 +2841,10 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
                 set_sweep_status(pdb, run_id, "indexing")
 
             if index and dir_sources:
-                passes = "CLIP only" if no_colors else "CLIP + colors"
+                if no_clip:
+                    passes = "register only; CLIP left to the worker fleet"
+                else:
+                    passes = "CLIP only" if no_colors else "CLIP + colors"
                 click.echo(f"\nIndexing {len(dir_sources)} new folder(s) ({passes})...")
                 for source, d in dir_sources:
                     click.echo(f"  -> {d}")
@@ -2842,8 +2852,8 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
                         index_directory(
                             photo_dir=d,
                             db_path=db,
-                            enable_clip=True,
-                            enable_colors=not no_colors,
+                            enable_clip=not no_clip,
+                            enable_colors=not (no_colors or no_clip),
                             enable_faces=False,
                             enable_describe=False,
                             enable_quality=False,
