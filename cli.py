@@ -2704,8 +2704,10 @@ def batch_advance_cmd(db, batch_id, apply):
         click.echo(f"Batch {batch_id} ({res['directory']}) dry-run: "
                    + (f"would run {', '.join(planned)}. Re-run with --apply."
                       if planned else "nothing to run."))
-    if res["stopped_at"]:
-        click.echo(f"Stopped at {res['stopped_at']}: {res['stopped_reason']}")
+    deferred = [s for s in res["steps"] if s["status"] == "deferred"]
+    if deferred:
+        click.echo("Deferred (run batch-advance again once these finish): "
+                   + "; ".join(f"{s['step']} ({s['reason']})" for s in deferred))
     if res["error"]:
         raise click.ClickException(res["error"])
 
@@ -5134,6 +5136,8 @@ def worker(server, passes, collection_id, directory,
             click.echo(f"  {p}: {status['queue_depth'].get(p, 0)}")
         return
 
+    from photosearch.worker import install_log_timestamps
+    install_log_timestamps()
     run_worker(
         server=server,
         passes=pass_list,

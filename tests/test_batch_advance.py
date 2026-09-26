@@ -125,9 +125,10 @@ class TestOrchestration:
         assert result["ran"] == list(batch_state.NAS_STEPS)
         assert result["stopped_at"] is None
 
-    def test_stops_at_the_first_waiting_step(self, db):
-        """`faces` has not run, so `match_faces` is waiting on it — and
-        everything after it must be left alone, not skipped past."""
+    def test_defers_steps_waiting_on_an_unfinished_pass(self, db):
+        """`faces` has not run: `match_faces` waits on it, and its dependents
+        (`resolve_dups`) and the other faces-gated steps are deferred with it
+        — never run."""
         batch_id, ids = _make_batch(db)
         _finish_aesthetics(db, ids)
         calls = []
@@ -137,8 +138,37 @@ class TestOrchestration:
 
         assert calls == ["stacking", "normalize_aesthetics"]
         assert result["stopped_at"] == "match_faces"
-        assert _by_step(result)["match_faces"]["waiting_on"] == "faces"
-        assert "warm_crops" not in _by_step(result)
+        steps = _by_step(result)
+        assert steps["match_faces"]["waiting_on"] == "faces"
+        for s in ("match_faces", "resolve_dups", "warm_crops", "rank_measure"):
+            assert steps[s]["status"] == "deferred", s
+
+    def test_face_steps_do_not_wait_on_the_aesthetics_pass(self, db):
+        """faces done, aesthetics not: only `normalize_aesthetics` is deferred;
+        face matching and everything else that needs only faces still runs."""
+        batch_id, ids = _make_batch(db)
+        _finish_faces(db, ids)
+        calls = []
+
+        result = batch_advance.advance_nas_steps(
+            db, batch_id, apply=True, runners=_fake_runners(calls))
+
+        assert calls == ["stacking", "match_faces", "resolve_dups",
+                         "warm_crops", "rank_measure"]
+        assert result["stopped_at"] == "normalize_aesthetics"
+        assert _by_step(result)["normalize_aesthetics"]["status"] == "deferred"
+        assert "normalize_aesthetics" not in ingest_batches.closed_jobs(db, batch_id)
+
+    def test_dry_run_plans_past_a_deferred_step(self, db):
+        batch_id, ids = _make_batch(db)
+        _finish_faces(db, ids)
+
+        result = batch_advance.advance_nas_steps(db, batch_id, apply=False)
+
+        would = [r["step"] for r in result["steps"] if r["status"] == "would_run"]
+        assert would == ["stacking", "match_faces", "resolve_dups",
+                         "warm_crops", "rank_measure"]
+        assert ingest_batches.open_jobs(db, batch_id) == {}
 
     def test_completed_steps_are_skipped_not_rerun(self, db):
         batch_id, ids = _make_batch(db)

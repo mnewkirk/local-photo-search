@@ -38,8 +38,10 @@ evidence is a closed job row, so on a fresh batch it *always* derives as
 the plan naively would therefore stop two steps early every single time. So a
 step whose `waiting_on` is a step this run has already run (or, in a dry-run,
 would run) is promoted to runnable. A step waiting on anything else — a
-worker pass, typically `faces` — still stops the run, which is correct: this
-module cannot make that happen.
+worker pass, typically `faces` or `aesthetics` — is DEFERRED: skipped, with
+its dependents, while independent later steps still run (since 2026-09-26 —
+it used to stop the run, which held face matching hostage to the slow VLM
+aesthetics pass).
 """
 
 from __future__ import annotations
@@ -282,10 +284,13 @@ def advance_nas_steps(db, batch_id: int, *, apply: bool = False,
     """Run (or preview) every NAS step this batch still needs, in order.
 
     Walks ``NAS_STEPS``: `completed` steps are skipped, `queued`/`running`
-    ones are left to whoever owns them, and the run **stops** at the first
-    `waiting` or `blocked` step — nothing after it can be trusted to be
-    meaningful. See the module docstring for why a step waiting on another
-    step of this same run is promoted instead of stopping it.
+    ones are left to whoever owns them, and a `waiting` or `blocked` step is
+    **deferred** — recorded, not run — while later steps whose own dependency
+    is satisfied still run (face matching needs only `faces`, not the
+    aesthetics pass `normalize_aesthetics` waits on). Dependents of a deferred
+    step derive as waiting on it and are deferred too. A step that FAILS still
+    stops the run. See the module docstring for why a step waiting on another
+    step of this same run is promoted instead of deferred.
 
     ``apply=False`` (the default) is a true dry run: no runner is called and
     **no job row is written**. A job row that leaked out of a preview would
@@ -349,16 +354,24 @@ def advance_nas_steps(db, batch_id: int, *, apply: bool = False,
             state_name = "needs_queue"
 
         if state_name in ("waiting", "blocked"):
+            # DEFERRED, not a stop: a later step with its own, satisfied
+            # dependency still runs. `match_faces` needs only `faces`, so it
+            # must not sit behind `normalize_aesthetics` waiting on the slow
+            # VLM aesthetics pass. Safe because nothing is added to
+            # `satisfied`: every step that depends on this one derives as
+            # waiting on it and is deferred in turn. `stopped_at` keeps
+            # naming the FIRST deferred step (the CLI/API contract).
             reason = (f"waiting on {waiting_on}" if state_name == "waiting" and waiting_on
                       else state_name)
-            result["steps"].append({"step": step, "status": "stopped",
+            result["steps"].append({"step": step, "status": "deferred",
                                     "state": row["state"], "reason": reason,
                                     "waiting_on": waiting_on, "result": None,
                                     "error": None})
-            result["stopped_at"] = step
-            result["stopped_reason"] = reason
-            emit({"step": step, "status": "stopped", "reason": reason})
-            break
+            if result["stopped_at"] is None:
+                result["stopped_at"] = step
+                result["stopped_reason"] = reason
+            emit({"step": step, "status": "deferred", "reason": reason})
+            continue
 
         if state_name != "needs_queue":
             # queued / running — someone else owns it. Anything that depends

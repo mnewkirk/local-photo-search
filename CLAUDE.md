@@ -278,6 +278,12 @@ Worker claims batches via HTTP, downloads photos, processes locally, POSTs resul
 ./run-workers.sh --logs      # tail all workers live
 ./run-workers.sh --stop      # stop all workers
 ```
+Worker log lines are **timestamped** (`worker.install_log_timestamps`, applied
+by `cli.py worker`). The OpenAI-route reachability check
+(`describe.check_available`) now retries ~2.5 min: LM Studio stops answering
+while it JIT-loads a model, and that single un-retried check used to kill a
+worker whose pass started right after its model was ejected.
+
 **Workers drain passes sequentially by default** (since 2026-09-26): each pass
 in `-p` order is drained completely before the next starts, so a new shoot is
 CLIP-searchable before the slow LLM passes begin and model weights aren't
@@ -3314,6 +3320,16 @@ Two things keep that from changing the rest of the flow:
   one with a pass still in flight, has something more important to say.
 
 ### What's deliberately not in "ready" — and why
+
+**A waiting step is deferred, not a stop** (2026-09-26). `batch-advance` used
+to halt at the first `waiting` step — and `normalize_aesthetics` (waiting on the
+slow VLM `aesthetics` pass) sits before `match_faces`, so face matching could
+not run until aesthetics finished even though it needs only `faces`. Now a
+waiting/blocked step is recorded `deferred` and later steps whose own
+dependency is satisfied still run; dependents of a deferred step derive as
+waiting on it and are deferred too. A step that FAILS still stops the run.
+`stopped_at` still names the first deferred step. Run `Advance batch` once
+after clip+faces (stacking, face matching, crops) and again after aesthetics.
 
 `ready` is `all(step == completed for step in WORKER_PASSES + NAS_STEPS if
 step not in OPTIONAL_STEPS)`. `batch-advance`

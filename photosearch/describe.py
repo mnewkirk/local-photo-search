@@ -162,6 +162,9 @@ def _encode_image_for_ollama(image_path: str) -> Optional[str]:
         return None
 
 
+_REACHABILITY_BACKOFF_S = (5, 10, 20, 40, 60)
+
+
 def check_available(model: str = MODEL) -> None:
     """Raise a clear error if the LLM backend isn't reachable or the model isn't pulled."""
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
@@ -169,15 +172,25 @@ def check_available(model: str = MODEL) -> None:
         # OpenAI-compatible backend (LM Studio / llama-server) for the text
         # passes — verify it instead of Ollama. Scoped to text-pass workers;
         # don't set PHOTOSEARCH_TEXT_LLM_URL on a worker running vision passes.
+        # Retried with backoff (~2.5 min in all): LM Studio stops answering
+        # while it JIT-loads a model, and a pass that starts right after its
+        # model was ejected hits exactly that window. This check runs once per
+        # batch OUTSIDE the per-photo retry wrapper, so a single timeout here
+        # used to kill the whole worker process mid-fleet (2026-09-26).
         import urllib.request
-        try:
-            urllib.request.urlopen(base.rstrip("/") + "/models", timeout=10).read()
-        except Exception as e:
-            raise RuntimeError(
-                f"Cannot reach OpenAI-compatible LLM at {base} "
-                f"(PHOTOSEARCH_TEXT_LLM_URL):\n  {e}"
-            ) from e
-        return
+        last: Exception | None = None
+        for delay in (0,) + _REACHABILITY_BACKOFF_S:
+            if delay:
+                time.sleep(delay)
+            try:
+                urllib.request.urlopen(base.rstrip("/") + "/models", timeout=10).read()
+                return
+            except Exception as e:  # noqa: BLE001 — retried, then re-raised
+                last = e
+        raise RuntimeError(
+            f"Cannot reach OpenAI-compatible LLM at {base} "
+            f"(PHOTOSEARCH_TEXT_LLM_URL):\n  {last}"
+        ) from last
     if not HAS_OLLAMA:
         raise RuntimeError(
             "ollama Python package is not installed.\n"

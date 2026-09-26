@@ -876,6 +876,43 @@ def _process_verify(
     return results
 
 
+class _TimestampedStream:
+    """Prefix every output line with a local timestamp.
+
+    Worker logs had none, so "how long did describe take" or "how long does a
+    submit sit on the NAS" could only be guessed. Stamps at the START of a
+    line only: the worker writes a line in pieces ("Downloading X..." then
+    "19.0MB (0.5s)" on the same line), and those must not be split.
+    """
+
+    def __init__(self, stream):
+        self._s = stream
+        self._at_line_start = True
+
+    def write(self, text):
+        if not text:
+            return 0
+        out = []
+        for piece in text.splitlines(keepends=True):
+            if self._at_line_start and piece not in ("\n", "\r\n"):
+                out.append(time.strftime("[%Y-%m-%d %H:%M:%S] "))
+            out.append(piece)
+            self._at_line_start = piece.endswith("\n")
+        self._s.write("".join(out))
+        return len(text)
+
+    def __getattr__(self, name):          # flush, fileno, isatty, encoding …
+        return getattr(self._s, name)
+
+
+def install_log_timestamps() -> None:
+    """Wrap stdout/stderr so every worker log line carries a timestamp."""
+    if not isinstance(sys.stdout, _TimestampedStream):
+        sys.stdout = _TimestampedStream(sys.stdout)
+    if not isinstance(sys.stderr, _TimestampedStream):
+        sys.stderr = _TimestampedStream(sys.stderr)
+
+
 def run_worker(
     server: str,
     passes: list[str],

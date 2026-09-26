@@ -250,3 +250,24 @@ def test_contended_response_does_not_retire_a_pass(monkeypatch, tmp_path):
     # survived the contended reply, then did the real batch
     assert client.remaining["clip"] == 0
     assert client.calls.count("clip") >= 3
+
+
+# --- worker log timestamps ---------------------------------------------------
+
+def test_log_lines_are_timestamped_once_at_line_start():
+    """Every line gets a stamp; a line written in pieces ("Downloading X..."
+    then "19.0MB (0.5s)") gets exactly one, at its start."""
+    import io, re
+    buf = io.StringIO()
+    s = W._TimestampedStream(buf)
+    s.write("Claiming clip batch\n")
+    s.write("    Downloading A.JPG...")
+    s.write(" 19.0MB (0.5s)\n")
+    s.write("\n")
+    s.write("two\nlines\n")
+    lines = buf.getvalue().split("\n")
+    stamp = r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] "
+    assert re.match(stamp + "Claiming clip batch$", lines[0])
+    assert re.match(stamp + r"    Downloading A\.JPG\.\.\. 19\.0MB \(0\.5s\)$", lines[1])
+    assert lines[2] == ""                      # blank lines stay blank
+    assert re.match(stamp + "two$", lines[3]) and re.match(stamp + "lines$", lines[4])
