@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .colors import colors_to_json, extract_dominant_colors
 from .clip_embed import embed_image, embed_images_batch, embed_images_stream, unload_model as unload_clip
-from .db import PhotoDB
+from .db import MAX_PROCESS_ATTEMPTS, PhotoDB
 from .exif import extract_exif, find_raw_pair
 
 # File extensions we index. HEIC is iPhone/iPad's default container
@@ -81,6 +81,52 @@ def is_real_image(filepath: str) -> bool:
     except OSError:
         return False
     return _image_header_ok(head)
+
+
+# ── faces attempts ledger for the in-process writers ─────────────────────
+# Same contract as worker_api.submit_results so the fleet and `index --faces`
+# agree: a clean run that found nobody is FINAL (marked straight to the
+# attempts cap — there is no output row to prove it, and re-detecting the same
+# empty frame twice more is pure waste); a detection error spends ONE attempt,
+# so a transient failure is retried but a poison file is eventually retired.
+
+def _faces_exhausted(db, photo_ids) -> set:
+    """Photo ids whose faces attempts are exhausted (includes no-face photos)."""
+    ids = list(photo_ids)
+    out: set = set()
+    for i in range(0, len(ids), 20000):
+        chunk = ids[i:i + 20000]
+        placeholders = ",".join("?" * len(chunk))
+        out.update(r[0] for r in db.conn.execute(
+            f"SELECT photo_id FROM worker_processed WHERE pass_type = 'faces' "
+            f"AND attempts >= {MAX_PROCESS_ATTEMPTS} AND photo_id IN ({placeholders})",
+            chunk,
+        ).fetchall())
+    return out
+
+
+def _clear_faces_ledger(db, photo_ids) -> None:
+    """--force-faces re-detects, so it must also forget the attempts."""
+    ids = list(photo_ids)
+    for i in range(0, len(ids), 20000):
+        chunk = ids[i:i + 20000]
+        placeholders = ",".join("?" * len(chunk))
+        db.conn.execute(
+            f"DELETE FROM worker_processed WHERE pass_type = 'faces' "
+            f"AND photo_id IN ({placeholders})", chunk)
+
+
+def _mark_faces_outcomes(db, no_face_ids, failed_ids) -> None:
+    """Record the run's outcomes AFTER end_batch (mark_processed commits)."""
+    try:
+        if no_face_ids:
+            db.mark_processed(no_face_ids, "faces", terminal=True)
+        if failed_ids:
+            db.mark_processed(failed_ids, "faces")
+    except sqlite3.Error as e:
+        # Bookkeeping only — the faces themselves already landed. A missed
+        # mark just means the photo is looked at again next run.
+        print(f"  Warning: could not record faces attempts: {e}")
 
 
 # Subfolder names that are excluded from indexing.
@@ -415,6 +461,7 @@ def _index_collection(
                     for pid in photo_id_set:
                         cur = db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
                         cleared_faces += cur.rowcount
+                    _clear_faces_ledger(db, photo_id_set)
                     db.conn.commit()
                     db.log_activity("faces", "clear", cleared_faces)
                     face_candidates = list(photo_pairs)
@@ -427,7 +474,7 @@ def _index_collection(
                             f"SELECT DISTINCT photo_id FROM faces WHERE photo_id IN ({placeholders})",
                             ids,
                         ).fetchall()
-                    )
+                    ) | _faces_exhausted(db, ids)
                     face_candidates = [(pid, path) for pid, path in photo_pairs if pid not in already_processed]
 
                 total = len(face_candidates)
@@ -436,6 +483,7 @@ def _index_collection(
                     t0 = time.time()
                     db.begin_batch(batch_size=50)
                     face_count = 0
+                    no_face_ids, failed_ids = [], []
                     for idx, (photo_id, path) in enumerate(face_candidates, 1):
                         fname = os.path.basename(path)
                         print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
@@ -447,6 +495,7 @@ def _index_collection(
                                 print(f" {len(faces)} face(s) ({elapsed_photo:.1f}s){_eta(t0, idx, total)}")
                             else:
                                 print(f" no faces ({elapsed_photo:.1f}s)")
+                                no_face_ids.append(photo_id)
                             for face in faces:
                                 db.add_face(
                                     photo_id=photo_id,
@@ -456,8 +505,10 @@ def _index_collection(
                                 )
                                 face_count += 1
                         except Exception as e:
+                            failed_ids.append(photo_id)
                             _report_error("faces", path, e)
                     db.end_batch()
+                    _mark_faces_outcomes(db, no_face_ids, failed_ids)
                     elapsed = time.time() - t0
                     print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
                     db.log_activity("faces", "index", face_count)
@@ -1204,14 +1255,20 @@ def index_directory(
                     for pid in dir_ids:
                         cur = db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (pid,))
                         cleared_faces += cur.rowcount
+                    _clear_faces_ledger(db, dir_ids)
                     db.conn.commit()
                     db.log_activity("faces", "clear", cleared_faces)
                     all_face_candidates = list(_get_dir_photos())
                 else:
                     unprocessed_rows = db.conn.execute(
-                        """SELECT p.id, p.filepath FROM photos p
+                        f"""SELECT p.id, p.filepath FROM photos p
                            WHERE NOT EXISTS (
                                SELECT 1 FROM faces f WHERE f.photo_id = p.id
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM worker_processed wp
+                               WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
+                                 AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}
                            )"""
                     ).fetchall()
                     new_ids = {pid for pid, _ in new_photos}
@@ -1227,6 +1284,7 @@ def index_directory(
 
                 db.begin_batch(batch_size=50)
                 face_count = 0
+                no_face_ids, failed_ids = [], []
                 for idx, (photo_id, path) in enumerate(all_face_candidates, 1):
                     fname = os.path.basename(path)
                     print(f"  [{idx}/{total}] {fname} ...", end="", flush=True)
@@ -1238,6 +1296,7 @@ def index_directory(
                             print(f" {len(faces)} face(s) ({elapsed_photo:.1f}s){_eta(t0, idx, total)}")
                         else:
                             print(f" no faces ({elapsed_photo:.1f}s)")
+                            no_face_ids.append(photo_id)
                         for face in faces:
                             db.add_face(
                                 photo_id=photo_id,
@@ -1247,9 +1306,11 @@ def index_directory(
                             )
                             face_count += 1
                     except Exception as e:
+                        failed_ids.append(photo_id)
                         _report_error("faces", path, e)
 
                 db.end_batch()
+                _mark_faces_outcomes(db, no_face_ids, failed_ids)
                 elapsed = time.time() - t0
                 print(f"  Found {face_count} face(s) across {total} photos in {elapsed:.1f}s")
                 db.log_activity("faces", "index", face_count)

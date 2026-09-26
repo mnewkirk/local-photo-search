@@ -102,6 +102,20 @@ AUTO_MATCH_SOURCES = ("strict", "temporal")
 # retry-failed-* CLI.
 MAX_PROCESS_ATTEMPTS = 3
 
+# Attempts-cap clauses for the two passes whose output columns alone used to
+# decide claimability (see get_unprocessed_photos / count_unprocessed_photos).
+# `photos` is the unaliased table in both queries.
+_QUALITY_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = photos.id AND wp.pass_type = 'quality' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+_VERIFY_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = photos.id AND wp.pass_type = 'verify' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+
 
 def _serialize_float_list(vec: list[float]) -> bytes:
     """Serialize a list of floats to a compact binary format for sqlite-vec."""
@@ -2162,7 +2176,8 @@ class PhotoDB:
         self._maybe_commit()
         return final
 
-    def mark_processed(self, photo_ids: list[int], pass_type: str):
+    def mark_processed(self, photo_ids: list[int], pass_type: str,
+                       terminal: bool = False):
         """Record an attempt at processing these photos for the given pass.
 
         Used for passes (faces, describe, tags) where a no-result outcome produces
@@ -2170,16 +2185,29 @@ class PhotoDB:
         increments `attempts` so the claim path can skip after MAX_PROCESS_ATTEMPTS
         — transient failures (HEIC pre-decoder, runner-OOM blips) auto-retry on
         the next pass; truly broken files stop being claimed after N tries.
+
+        ``terminal=True`` records a FINISHED outcome that leaves no output row —
+        today only a clean faces run that found nobody. It sets `attempts`
+        straight to MAX_PROCESS_ATTEMPTS (never lowers a higher count), so the
+        claim path stops at once instead of re-detecting the same empty photo
+        MAX_PROCESS_ATTEMPTS times. A detection *error* must NOT use this: it
+        spends one ordinary attempt so a transient failure still gets retried.
+        No schema change — it is the same column the cap already reads.
         """
+        if terminal:
+            sql = f"""INSERT INTO worker_processed (photo_id, pass_type, attempts)
+                      VALUES (?, ?, {MAX_PROCESS_ATTEMPTS})
+                      ON CONFLICT(photo_id, pass_type) DO UPDATE SET
+                        attempts = MAX(attempts, {MAX_PROCESS_ATTEMPTS}),
+                        processed_at = datetime('now')"""
+        else:
+            sql = """INSERT INTO worker_processed (photo_id, pass_type, attempts)
+                     VALUES (?, ?, 1)
+                     ON CONFLICT(photo_id, pass_type) DO UPDATE SET
+                       attempts = attempts + 1,
+                       processed_at = datetime('now')"""
         for pid in photo_ids:
-            self.conn.execute(
-                """INSERT INTO worker_processed (photo_id, pass_type, attempts)
-                   VALUES (?, ?, 1)
-                   ON CONFLICT(photo_id, pass_type) DO UPDATE SET
-                     attempts = attempts + 1,
-                     processed_at = datetime('now')""",
-                (pid, pass_type),
-            )
+            self.conn.execute(sql, (pid, pass_type))
         self.conn.commit()
 
     def get_claimed_photo_ids(self, pass_type: str, commit_cleanup: bool = True) -> set[int]:
@@ -2262,17 +2290,24 @@ class PhotoDB:
             # Either column missing is enough to claim — worker re-runs both
             # phases and submit-results writes both. Heals interrupted runs
             # where scoring committed but concept analysis didn't.
+            #
+            # Capped by the attempts ledger like every other pass except clip:
+            # without it a photo whose concept analysis fails every time (score
+            # written, concepts NULL) or that cannot be decoded was re-claimed
+            # forever. submit_results marks quality photos processed.
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
-                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) LIMIT ?",
+                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED} LIMIT ?",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
                     "SELECT id, filepath FROM photos "
-                    "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL LIMIT ?",
+                    "WHERE (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED} LIMIT ?",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type in ("describe", "tags", "category-content", "keywords"):
@@ -2337,7 +2372,10 @@ class PhotoDB:
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "verify":
-            # Photos that have a description but haven't been verified yet
+            # Photos that have a description but haven't been verified yet,
+            # capped by the attempts ledger (a photo whose verification raises
+            # every time is retired after MAX_PROCESS_ATTEMPTS, not re-claimed
+            # forever).
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
@@ -2345,14 +2383,16 @@ class PhotoDB:
                         WHERE id IN ({placeholders})
                         AND description IS NOT NULL
                         AND verified_at IS NULL
+                        AND {_VERIFY_NOT_EXHAUSTED}
                         LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    """SELECT id, filepath FROM photos
+                    f"""SELECT id, filepath FROM photos
                        WHERE description IS NOT NULL
                        AND verified_at IS NULL
+                       AND {_VERIFY_NOT_EXHAUSTED}
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
@@ -2430,13 +2470,15 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"SELECT COUNT(*) FROM photos WHERE id IN ({placeholders}) "
-                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL)",
+                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED}",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
                     "SELECT COUNT(*) FROM photos "
-                    "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL"
+                    "WHERE (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED}"
                 ).fetchone()
         elif pass_type in ("describe", "tags", "category-content", "keywords"):
             # All four passes gate on the same condition: photos.<col> IS NULL
@@ -2501,14 +2543,16 @@ class PhotoDB:
                     f"""SELECT COUNT(*) FROM photos
                         WHERE id IN ({placeholders})
                         AND description IS NOT NULL
-                        AND verified_at IS NULL""",
+                        AND verified_at IS NULL
+                        AND {_VERIFY_NOT_EXHAUSTED}""",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    """SELECT COUNT(*) FROM photos
+                    f"""SELECT COUNT(*) FROM photos
                        WHERE description IS NOT NULL
-                       AND verified_at IS NULL"""
+                       AND verified_at IS NULL
+                       AND {_VERIFY_NOT_EXHAUSTED}"""
                 ).fetchone()
         elif pass_type == "aesthetics":
             if photo_ids:

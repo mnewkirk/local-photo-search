@@ -380,21 +380,21 @@ class TestExhaustedAttemptsAreBlocked:
         assert step["done"] == 0
         assert step["state"] == "needs_queue"
 
-    # --- passes whose `remaining` does NOT filter exhausted attempts ------
+    # --- quality / verify joined the attempts ledger ------------------------
     #
-    # `quality` (db.py:2235-2247) and `verify` (db.py:2304-2319) have no
-    # attempts clause in their claim predicate, so an exhausted photo is
-    # still counted in `remaining`. Subtracting `failed` as well would
-    # under-count `done` by exactly `failed`, and `remaining == 0` can never
-    # coincide with `failed > 0` — so `blocked` needs the subset form
-    # `remaining == failed`.
+    # They used to be the two passes (besides clip) whose claim predicate had
+    # no attempts clause, so an exhausted photo stayed inside `remaining` and
+    # needed the subset arithmetic (`done = eligible - remaining`,
+    # `blocked = remaining == failed`). They now filter exhausted photos like
+    # every other ledgered pass, so `failed` and `remaining` are DISJOINT and
+    # the ordinary `done = eligible - remaining - failed` applies.
 
-    def test_quality_done_does_not_subtract_failed_twice(self, db):
+    def test_quality_failed_is_disjoint_from_remaining(self, db):
         batch_id, ids = _make_batch(db, count=4)
         _do_quality(db, ids[:2])          # 2 genuinely scored
         _exhaust(db, ids[2:], "quality")  # 2 given up on
         step = _step(batch_state(db, batch_id), "quality")
-        assert step["remaining"] == 2
+        assert step["remaining"] == 0, "exhausted photos are no longer claimable"
         assert step["failed"] == 2
         assert step["done"] == 2, "the 2 scored photos are done"
 
@@ -410,19 +410,33 @@ class TestExhaustedAttemptsAreBlocked:
         _do_quality(db, ids[:2])
         _exhaust(db, ids[2:3], "quality")   # 1 exhausted, 1 untried
         step = _step(batch_state(db, batch_id), "quality")
-        assert step["remaining"] == 2
+        assert step["remaining"] == 1
         assert step["failed"] == 1
         assert step["done"] == 2
         assert step["state"] == "needs_queue"
 
-    def test_verify_done_does_not_subtract_failed_twice(self, db):
+    def test_quality_concepts_only_failure_counts_as_failed(self, db):
+        """Score written, concepts NULL, attempts exhausted: that is the
+        infinite re-claim the cap exists to stop — it reads failed, not
+        remaining."""
+        batch_id, ids = _make_batch(db, count=2)
+        _do_quality(db, ids[:1])
+        _set_col(db, ids[1:], "aesthetic_score", 5.0)
+        _exhaust(db, ids[1:], "quality")
+        step = _step(batch_state(db, batch_id), "quality")
+        assert step["remaining"] == 0
+        assert step["failed"] == 1
+        assert step["done"] == 1
+        assert step["state"] == "blocked"
+
+    def test_verify_failed_is_disjoint_from_remaining(self, db):
         batch_id, ids = _make_batch(db, count=4)
         _complete_pass(db, ids, "describe")          # all eligible
         _set_col(db, ids[:2], "verified_at", "2091-09-19 12:00:00")
         _exhaust(db, ids[2:], "verify")
         step = _step(batch_state(db, batch_id), "verify")
         assert step["eligible"] == 4
-        assert step["remaining"] == 2
+        assert step["remaining"] == 0
         assert step["failed"] == 2
         assert step["done"] == 2
 
@@ -432,6 +446,15 @@ class TestExhaustedAttemptsAreBlocked:
         _set_col(db, ids[:2], "verified_at", "2091-09-19 12:00:00")
         _exhaust(db, ids[2:], "verify")
         assert _step(batch_state(db, batch_id), "verify")["state"] == "blocked"
+
+    def test_verify_below_the_cap_is_still_remaining(self, db):
+        batch_id, ids = _make_batch(db, count=2)
+        _complete_pass(db, ids, "describe")
+        _exhaust(db, ids, "verify", attempts=MAX_PROCESS_ATTEMPTS - 1)
+        step = _step(batch_state(db, batch_id), "verify")
+        assert step["remaining"] == 2
+        assert step["failed"] == 0
+        assert step["state"] == "needs_queue"
 
     def test_quality_and_verify_still_complete_normally(self, db):
         batch_id, ids = _make_batch(db, count=4)
