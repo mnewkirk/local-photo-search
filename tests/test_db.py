@@ -1160,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 31
+        assert int(version) == SCHEMA_VERSION == 32
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1238,7 +1238,7 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 31
+        assert int(version) == SCHEMA_VERSION == 32
 
     # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
     # the tables intact (schema-version fast-path skips the DDL entirely).
@@ -1271,13 +1271,44 @@ def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 31
+        assert int(version) == SCHEMA_VERSION == 32
 
     # Idempotent: the version fast-path skips the DDL and the table survives.
     with PhotoDB(tmp_db_path) as again:
         assert again.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='face_person_exclusions'").fetchone()
+
+
+# =========================================================================
+# Schema v32 — stacking_seen (incremental stacking ledger)
+# =========================================================================
+
+def test_v31_db_migrates_to_v32_stacking_seen(db, tmp_db_path):
+    """A v31 DB gains the stacking ledger on open, additively, and is stamped
+    32. Existing stacks are untouched — the ledger starts empty, which makes
+    the first incremental run treat every photo as dirty (one full detection,
+    diff-written) and then fill it."""
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    a = db.add_photo(filepath="a.jpg", filename="a.jpg")
+    b = db.add_photo(filepath="b.jpg", filename="b.jpg")
+    db.create_stack([a, b], top_photo_id=a)
+    db.conn.execute("DROP TABLE IF EXISTS stacking_seen")
+    db.conn.execute("UPDATE schema_info SET value = '31' WHERE key = 'version'")
+    db.conn.commit()
+    db.close()
+
+    with PhotoDB(tmp_db_path) as reopened:
+        cols = {r["name"] for r in reopened.conn.execute(
+            "PRAGMA table_info(stacking_seen)")}
+        assert cols == {"photo_id", "date_taken", "seen_at"}
+        version = reopened.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 32
+        assert reopened.conn.execute(
+            "SELECT COUNT(*) FROM stack_members").fetchone()[0] == 2
 
 
 class TestNormalizeDirectory:

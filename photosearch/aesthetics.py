@@ -431,7 +431,8 @@ def recompute_overall_scores(db, weights: Optional[dict[str, float]] = None,
 PERCENTILE_CHUNK_ROWS = 2000
 
 
-def _write_percentiles(db, pct_col: str, score_col: str, rows, on_chunk=None) -> int:
+def _write_percentiles(db, pct_col: str, score_col: str, rows, on_chunk=None,
+                       stats: dict | None = None) -> int:
     """Write percentiles in bounded, separately-committed chunks.
 
     ``rows`` is a list of ``(photo_id, score, pct, current_pct)`` computed
@@ -446,7 +447,9 @@ def _write_percentiles(db, pct_col: str, score_col: str, rows, on_chunk=None) ->
       its chunk's write is SKIPPED rather than silently given a stale
       percentile. It picks the correct value up on the next run.
 
-    Returns the number of rows actually written.
+    Returns the number of rows actually written. When ``stats`` (a dict) is
+    passed, ``written`` / ``unchanged`` / ``stale`` are ADDED into it, so one
+    dict can total several calls (the maintenance stage reports the sum).
     """
     pending = [(pct, pid, score) for pid, score, pct, current in rows
                if current != pct]
@@ -463,6 +466,9 @@ def _write_percentiles(db, pct_col: str, score_col: str, rows, on_chunk=None) ->
         if on_chunk is not None:
             on_chunk(min(start + chunk_rows, total), total)
     stale = total - written
+    if stats is not None:
+        for k, v in (("written", written), ("unchanged", unchanged), ("stale", stale)):
+            stats[k] = stats.get(k, 0) + v
     if stale or unchanged:
         logger.info(
             "%s: wrote %d row(s), skipped %d unchanged and %d rescored mid-run",
@@ -470,7 +476,8 @@ def _write_percentiles(db, pct_col: str, score_col: str, rows, on_chunk=None) ->
     return written
 
 
-def normalize_overall(db, apply: bool = True, on_chunk=None) -> int:
+def normalize_overall(db, apply: bool = True, on_chunk=None,
+                      stats: dict | None = None) -> int:
     """Compute aes_overall_pct as the library-relative percentile (0–100) of
     aes_overall across every scored photo. This is the fix for the compressed
     raw scale — the UI/search rank on the percentile, so the best photo reads
@@ -492,12 +499,13 @@ def normalize_overall(db, apply: bool = True, on_chunk=None) -> int:
         db, "aes_overall_pct", "aes_overall",
         [(r["id"], r["aes_overall"], p, r["aes_overall_pct"])
          for r, p in zip(rows, pcts)],
-        on_chunk=on_chunk,
+        on_chunk=on_chunk, stats=stats,
     )
     return len(rows)
 
 
-def normalize_subject_overall(db, apply: bool = True, on_chunk=None) -> int:
+def normalize_subject_overall(db, apply: bool = True, on_chunk=None,
+                              stats: dict | None = None) -> int:
     """Compute aes_subject_overall_pct as the library-relative percentile (0–100)
     of aes_subject_overall across every subject-scored photo — the subject-crop
     analogue of `normalize_overall`. Returns rows normalized. See
@@ -514,13 +522,13 @@ def normalize_subject_overall(db, apply: bool = True, on_chunk=None) -> int:
         db, "aes_subject_overall_pct", "aes_subject_overall",
         [(r["id"], r["aes_subject_overall"], p, r["aes_subject_overall_pct"])
          for r, p in zip(rows, pcts)],
-        on_chunk=on_chunk,
+        on_chunk=on_chunk, stats=stats,
     )
     return len(rows)
 
 
 def _normalize_by_day(db, score_col: str, pct_col: str, apply: bool,
-                      on_chunk=None) -> int:
+                      on_chunk=None, stats: dict | None = None) -> int:
     """Per-day percentile of ``score_col`` written to ``pct_col``: rank each
     photo against only the others taken on its capture day (YYYY-MM-DD of
     date_taken, else date_created). Photos with no determinable day are left
@@ -545,24 +553,27 @@ def _normalize_by_day(db, score_col: str, pct_col: str, apply: bool,
     for group in by_day.values():
         pcts = percentile_ranks([g["s"] for g in group])
         updates.extend((g["id"], g["s"], p, g["cur"]) for g, p in zip(group, pcts))
-    _write_percentiles(db, pct_col, score_col, updates, on_chunk=on_chunk)
+    _write_percentiles(db, pct_col, score_col, updates, on_chunk=on_chunk,
+                       stats=stats)
     return len(updates)
 
 
-def normalize_overall_by_day(db, apply: bool = True, on_chunk=None) -> int:
+def normalize_overall_by_day(db, apply: bool = True, on_chunk=None,
+                             stats: dict | None = None) -> int:
     """Per-day analogue of `normalize_overall`: aes_overall_day_pct is the
     percentile of aes_overall within the photo's own capture day, so 'best of
     the day' is comparable across days. Returns rows normalized."""
     return _normalize_by_day(db, "aes_overall", "aes_overall_day_pct", apply,
-                             on_chunk=on_chunk)
+                             on_chunk=on_chunk, stats=stats)
 
 
-def normalize_subject_overall_by_day(db, apply: bool = True, on_chunk=None) -> int:
+def normalize_subject_overall_by_day(db, apply: bool = True, on_chunk=None,
+                                     stats: dict | None = None) -> int:
     """Per-day analogue of `normalize_subject_overall` for the subject-crop
     score (aes_subject_overall_day_pct). Returns rows normalized."""
     return _normalize_by_day(
         db, "aes_subject_overall", "aes_subject_overall_day_pct", apply,
-        on_chunk=on_chunk)
+        on_chunk=on_chunk, stats=stats)
 
 
 def score_photo_aesthetics(

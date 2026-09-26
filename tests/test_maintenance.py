@@ -79,7 +79,11 @@ def test_force_normalize_aesthetics_reranks_when_nothing_missing(seeded_db):
 
     forced = maintenance._stage_normalize_aesthetics(
         seeded_db, True, lambda e: None, lambda: None, force=True)
-    assert forced["status"] == "done" and forced["applied"] == 2
+    # applied = percentile rows actually WRITTEN: both library pcts (50/50 ->
+    # apart) and both per-day pcts (same day, 50/50 -> apart). considered is
+    # the scored-row count the stage used to (mis)report as applied.
+    assert forced["status"] == "done" and forced["applied"] == 4
+    assert forced["considered"] == 2
     pcts = dict(c.execute(
         "SELECT id, aes_overall_pct FROM photos WHERE id IN (?,?)", (ids[0], ids[1])).fetchall())
     assert pcts[ids[0]] != pcts[ids[1]]  # re-ranked apart

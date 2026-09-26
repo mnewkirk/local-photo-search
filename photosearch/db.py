@@ -82,7 +82,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 # The marker resolve-duplicate-persons / dedupe-person-faces leave on the
 # LOSING face of a (photo, person) duplicate. Deliberately still matchable —
@@ -841,6 +841,21 @@ class PhotoDB:
                 is_top INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (stack_id, photo_id),
                 UNIQUE(photo_id)
+            )
+        """)
+
+        # Stacking ledger (schema v32) — which photos stack detection has
+        # already considered, and at which date_taken. The nightly
+        # maintenance sweep used to re-detect the WHOLE library and rewrite
+        # every stack (27,165 of them) every night on an unchanged library;
+        # with this it re-detects only the burst sessions around photos that
+        # are new, re-timed, or whose stack lost a member. See
+        # stacking.run_incremental_stacking.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stacking_seen (
+                photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                date_taken TEXT,
+                seen_at    TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
 
