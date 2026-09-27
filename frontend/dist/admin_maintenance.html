@@ -1365,6 +1365,7 @@
       var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
       var _dd = useState(false); var doDedup = _dd[0]; var setDedup = _dd[1];
       var _rq = useState(false); var doRequeue = _rq[0]; var setRequeue = _rq[1];
+      var _sh = useState(false); var doSharpness = _sh[0]; var setSharpness = _sh[1];
       var _na = useState(false); var doNormAes = _na[0]; var setNormAes = _na[1];
       var _nsa = useState(false); var doNormSubjAes = _nsa[0]; var setNormSubjAes = _nsa[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
@@ -1433,6 +1434,7 @@
               do_recluster: doRecluster,
               do_dedup: doDedup,
               do_requeue: doRequeue,
+              sharpness: doSharpness,
               force_normalize_aesthetics: doNormAes,
               force_normalize_subject_aesthetics: doNormSubjAes,
             }),
@@ -1601,6 +1603,11 @@
                 disabled: busy || replicaMode,
                 onChange: function(ev) { setRequeue(ev.target.checked); } }),
               'Re-queue stuck passes'),
+            e('label', { title: replicaMode ? 'Needs the photo originals — run on the NAS, not the replica.' : 'Measure photos.sharpness from the ORIGINAL pixels (full-res decode, ~0.5 s/photo on the N100). Missing-only, capped at ~5,000 per run, paced and niced; refuses to start while an ingest sweep or batch advance is running.' },
+              e('input', { type: 'checkbox', checked: doSharpness,
+                disabled: busy || replicaMode,
+                onChange: function(ev) { setSharpness(ev.target.checked); } }),
+              'Sharpness (heavy)'),
             e('label', { title: 'Force a full re-rank of the full-frame aesthetic percentile (aes_overall_pct) — both library-wide AND per-day (aes_overall_day_pct) — across the whole library. Normally only new rows get one; run this after a scoring batch shifts the distribution or after retuning the dimension weights.' },
               e('input', { type: 'checkbox', checked: doNormAes, disabled: busy,
                 onChange: function(ev) { setNormAes(ev.target.checked); } }),

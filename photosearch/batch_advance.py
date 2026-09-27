@@ -4,7 +4,7 @@ to review" (M "ingest batch" Task 6).
 ``batch_state`` says what each step of the pipeline *is*; this module is the
 half that makes it *become* something else. It only ever runs the **NAS
 steps** — stacking, normalize_aesthetics, match_faces, resolve_dups,
-warm_crops, rank_measure — because those are the ones that run where the DB
+warm_crops, rank_measure, sharpness — because those are the ones that run where the DB
 and the photo files live. (`rank_measure` was once labelled desktop-only and
 had no runner at all, so its box read "Needs to be queued" forever; it
 decodes the ORIGINALS at native resolution, which only the NAS has.) The
@@ -243,6 +243,32 @@ def _run_rank_measure(db, ctx) -> dict:
         should_abort=lambda: _abort_flag(ctx["check_abort"]))
 
 
+def _run_sharpness(db, ctx) -> dict:
+    """Measured sharpness (schema v33) for the batch's photos, from the
+    originals — so HERE, on the NAS, like rank_measure.
+
+    Scoped by ``photo_ids``; an EMPTY batch returns before the backfill is
+    called, because ``photo_ids=[]`` must never be confused with "no scope"
+    (sharpness_backfill guards it too). Ignores its own open ``sharpness``
+    job row in the busy check, but still refuses while an ingest sweep holds
+    its lock. A refused or yielded run raises, so the step reports failed,
+    its job row is deleted, and the next Advance retries — the column says
+    which photos are left, so nothing is lost.
+    """
+    from . import sharpness_backfill
+    if not ctx["photo_ids"]:
+        return {"skipped": "empty batch"}
+    res = sharpness_backfill.run_sharpness_backfill(
+        db, photo_ids=ctx["photo_ids"], apply=True,
+        ignore_batch_steps=("sharpness",),
+        on_progress=lambda ev: ctx["emit"](_inner(
+            {k: v for k, v in ev.items() if k != "event"}, "sharpness")),
+        should_abort=lambda: _abort_flag(ctx["check_abort"]))
+    if res.get("status") in ("refused", "yielded"):
+        raise RuntimeError(res.get("message") or res["status"])
+    return res
+
+
 def default_runners() -> dict[str, Callable]:
     """step -> runner. Every NAS step has one; tests substitute fakes."""
     return {
@@ -252,6 +278,7 @@ def default_runners() -> dict[str, Callable]:
         "resolve_dups": _run_resolve_dups,
         "warm_crops": _run_warm_crops,
         "rank_measure": _run_rank_measure,
+        "sharpness": _run_sharpness,
     }
 
 

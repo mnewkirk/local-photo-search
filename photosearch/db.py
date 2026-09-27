@@ -114,7 +114,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # The marker resolve-duplicate-persons / dedupe-person-faces leave on the
 # LOSING face of a (photo, person) duplicate. Deliberately still matchable —
@@ -756,6 +756,30 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_overall_day_pct REAL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_overall_day_pct ON photos(aes_overall_day_pct)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall_day_pct ON photos(aes_subject_overall_day_pct)")
+
+        # v33: measured sharpness from the ORIGINAL pixels (photosearch/
+        # sharpness.py; docs/plans/sharpness-measurement.md). sharpness is the
+        # headline score (NULL when unmeasurable), sharpness_json every
+        # candidate feature or {"error": ...}, sharpness_version the
+        # SHARPNESS_VERSION that produced the row (set even on a decode error,
+        # so a bad file is never retried forever), sharpness_scored_at when.
+        # Written only by photosearch/sharpness_backfill.py.
+        try:
+            cur.execute("SELECT sharpness_version FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness REAL")
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness_json TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness_version INTEGER")
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness_scored_at TEXT")
+            # Serves the backfill's missing-only predicate
+            # (`sharpness_version IS NULL OR sharpness_version < ?`) as a
+            # MULTI-INDEX OR. Measured on a 161k-row replica copy with 2% of
+            # rows missing: the candidate query drops from a 0.21 s full table
+            # scan to 0.002 s, and the "nothing left" nightly check from 0.17 s
+            # to ~0 — the scan reads the whole (wide) photos table, which is
+            # exactly the disk traffic a starved N100 cannot afford.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_sharpness_version "
+                        "ON photos(sharpness_version)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.

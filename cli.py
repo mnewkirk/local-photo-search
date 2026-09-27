@@ -2556,13 +2556,19 @@ def normalize_subject_aesthetics(db, apply):
 @click.option("--normalize-subject-aesthetics", is_flag=True, default=False,
               help="Force a full re-rank of the subject-crop aesthetic percentile "
                    "(aes_subject_overall_pct) across the whole library.")
+@click.option("--sharpness", "do_sharpness", is_flag=True, default=False,
+              help="Opt-in: measure photos.sharpness from the ORIGINAL pixels "
+                   "(heavy full-res decode; missing-only, paced, niced; skipped "
+                   "while an ingest sweep or batch advance is running).")
+@click.option("--sharpness-limit", default=5000, show_default=True, type=int,
+              help="Per-run cap for --sharpness.")
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
 def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_temporal, light, recluster,
                       dedup_photos, requeue, requeue_passes, normalize_aesthetics,
-                      normalize_subject_aesthetics, window_minutes,
-                      max_drift_km, min_confidence):
+                      normalize_subject_aesthetics, do_sharpness, sharpness_limit,
+                      window_minutes, max_drift_km, min_confidence):
     """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
 
     Backfills nothing else schedules: structured locations, inferred GPS, colors,
@@ -2600,6 +2606,7 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_tempora
                 do_match=not no_match, match_temporal=match_temporal,
                 do_recluster=recluster, do_dedup=dedup_photos,
                 do_requeue=requeue, requeue_passes=rq_passes,
+                do_sharpness=do_sharpness, sharpness_limit=sharpness_limit,
                 force_normalize_aesthetics=normalize_aesthetics,
                 force_normalize_subject_aesthetics=normalize_subject_aesthetics,
                 window_minutes=window_minutes,
@@ -2613,6 +2620,84 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_tempora
                f"{len(res['stages'])} stages, "
                + (f"{total_applied} rows changed." if apply
                   else f"{total_would} rows would change. Re-run with --apply."))
+
+
+@cli.command("sharpness")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--limit", default=None, type=int,
+              help="Measure at most N photos this run (newest first).")
+@click.option("--apply", "apply_", is_flag=True, default=False,
+              help="Measure and write. Default: dry run (counts, writes nothing, "
+                   "opens the DB read-only).")
+@click.option("--pause", default=0.2, show_default=True, type=float,
+              help="Seconds to sleep between photos (disk courtesy on the NAS).")
+@click.option("--folder", default=None,
+              help="Only photos in this folder (or below), e.g. 2026/2026-09-19_ILCE-7RM6.")
+def sharpness_cmd(db, limit, apply_, pause, folder):
+    """Backfill photos.sharpness from the ORIGINAL pixels (schema v33).
+
+    Missing-only (sharpness_version NULL or older than the code's
+    SHARPNESS_VERSION), and only for photos whose faces pass is done. A decode
+    error is stored with the version so it is never retried; a file that is not
+    on this machine (the replica) is skipped and counted `not_local`.
+
+    Runs where the originals are: the NAS. Niced + idle I/O class, pauses
+    between photos, commits every 25, and refuses to start while an
+    ingest-incoming sweep or a batch-advance NAS step is running. Ctrl-C stops
+    after committing what was measured. See photosearch/sharpness_backfill.py.
+    """
+    import sqlite3 as _sqlite3
+    from photosearch import sharpness_backfill as sb
+
+    if limit is not None and limit <= 0:
+        raise click.BadParameter("must be positive", param_hint="--limit")
+
+    def on_prog(ev):
+        click.echo(f"  {ev['done']}/{ev['total']}  measured {ev['measured']}  "
+                   f"errors {ev['errors']}  not_local {ev['not_local']}"
+                   + (f"  raced {ev['raced']}" if ev.get("raced") else ""))
+
+    try:
+        if apply_:
+            pdb = PhotoDB(db)
+        else:
+            pdb = sb.open_readonly(db)
+            click.echo("Opened the database read-only (dry run).")
+    except FileNotFoundError:
+        raise click.ClickException(f"no such database: {db}")
+    try:
+        try:
+            res = sb.run_sharpness_backfill(
+                pdb, limit=limit, folder=folder, apply=apply_, pause_s=pause,
+                on_progress=on_prog)
+        except _sqlite3.OperationalError as exc:
+            if "sharpness" in str(exc):
+                raise click.ClickException(
+                    f"{exc} -- this database predates schema v33. Open it once "
+                    "read-write (restart the web server, or run any read-write "
+                    "command such as `photosearch stats`) to migrate.")
+            raise
+        except (KeyboardInterrupt, InterruptedError):
+            click.echo("Stopped; everything measured so far is committed.")
+            return
+    finally:
+        pdb.close()
+
+    status = res.get("status")
+    if res.get("busy"):
+        if status == "preview":
+            click.echo(f"Note: {res['busy']} -- an --apply now would refuse to start.")
+        else:
+            click.echo(f"Not running: {res['busy']}.")
+    if not apply_:
+        click.echo(f"Dry run: {res.get('would', 0)} photo(s) would be measured "
+                   f"(sharpness v{res.get('version')}). Re-run with --apply.")
+        return
+    click.echo(f"sharpness {status}: measured {res.get('measured', 0)}, "
+               f"errors stored {res.get('errors', 0)}, "
+               f"not_local {res.get('not_local', 0)}, raced {res.get('raced', 0)}"
+               + (f" -- {res['message']}" if res.get("message") else ""))
 
 
 @cli.command("validate-data")
