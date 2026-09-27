@@ -385,7 +385,8 @@ def choose_sharpness_sample(conn, n=60, seed=1, exclude=()):
 EXTEND_STRATA = ("stored-blurry", "aes-sharpness<=2")
 
 
-def extend_sharpness_sample(conn, existing, n, seed=1, exclude=()):
+def extend_sharpness_sample(conn, existing, n, seed=1, exclude=(),
+                            strata=EXTEND_STRATA):
     """`existing` + n NEW photos split evenly over EXTEND_STRATA, never
     repeating an existing or excluded id, so labels already keyed to the
     sample stay valid (appending never orphans them)."""
@@ -393,8 +394,8 @@ def extend_sharpness_sample(conn, existing, n, seed=1, exclude=()):
     rows = [r for r in _load_sharpness_candidates(conn) if r["id"] not in taken]
     preds = {name: pred for name, _q, pred in build_sharpness_strata()}
     out = list(existing)
-    for i, name in enumerate(EXTEND_STRATA):
-        k = n // len(EXTEND_STRATA) + (1 if i < n % len(EXTEND_STRATA) else 0)
+    for i, name in enumerate(strata):
+        k = n // len(strata) + (1 if i < n % len(strata) else 0)
         pool = [r for r in rows if preds[name](r) and r["id"] not in taken]
         rng = random.Random(f"{seed}:sharpness-extend:{name}:{len(existing)}")
         for r in rng.sample(pool, min(k, len(pool))):
@@ -414,7 +415,8 @@ def cmd_sample_sharpness(args):
         try:
             photos = extend_sharpness_sample(conn, existing["photos"], args.extend,
                                              seed=existing.get("seed") or args.seed,
-                                             exclude=exclude)
+                                             exclude=exclude,
+                                             strata=tuple(args.extend_from.split(",")))
         finally:
             conn.close()
         store.save_sample(photos, existing.get("seed") or args.seed, sample="sharpness")
@@ -1047,6 +1049,9 @@ def build_parser():
     ss.add_argument("--extend", type=int, default=0, metavar="N",
                     help="APPEND N photos from the blurry-rich strata "
                          "(EXTEND_STRATA); existing labels stay valid.")
+    ss.add_argument("--extend-from", default=",".join(EXTEND_STRATA),
+                    help="comma-separated strata --extend draws from "
+                         "(default: %(default)s)")
     ss.set_defaults(func=cmd_sample_sharpness)
 
     rp = sub.add_parser("run", help="Predict the labelled photos for one variant.")
