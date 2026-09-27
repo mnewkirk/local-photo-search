@@ -385,3 +385,28 @@ def test_page_has_the_loupe_on_the_original():
                 encoding="utf-8").read()
     assert "PS.Loupe" in page and "/full'" in page
     assert "'sharpness'" in page and "'sharpness-recheck'" in page
+
+
+def test_extend_appends_without_touching_existing_entries():
+    """--extend must never reorder or drop a labelled photo: labels are keyed
+    to the sample, and re-drawing it is what orphans them."""
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location(
+        "vte_ext", pathlib.Path(__file__).parents[1] / "evals" / "visual_tags_eval.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    rows = [{"id": i, "tags": ["blurry"] if i % 2 else [], "aes_sharpness": 1 if i % 3 == 0 else 7}
+            for i in range(1, 200)]
+    mod._load_sharpness_candidates = lambda conn: rows
+    mod.build_sharpness_strata = lambda: [
+        ("stored-blurry", 1, lambda r: "blurry" in r["tags"]),
+        ("aes-sharpness<=2", 1, lambda r: r["aes_sharpness"] <= 2)]
+    existing = [{"photo_id": 1, "stratum": "stored-blurry"},
+                {"photo_id": 3, "stratum": "aes-sharpness<=2"}]
+    out = mod.extend_sharpness_sample(None, existing, 10, exclude=[5])
+    assert out[:2] == existing
+    new = out[2:]
+    assert len(new) == 10
+    ids = [p["photo_id"] for p in new]
+    assert len(set(ids)) == 10 and not ({1, 3, 5} & set(ids))
+    assert {p["stratum"] for p in new} == {"stored-blurry+ext", "aes-sharpness<=2+ext"}

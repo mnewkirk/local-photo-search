@@ -379,9 +379,48 @@ def choose_sharpness_sample(conn, n=60, seed=1, exclude=()):
     return chosen
 
 
+#: `sample-sharpness --extend N` draws only from these: on the first 120
+#: labels they held 9 of 21 blurry photos at a ~50% hit rate, against ~5%
+#: everywhere else. Suffixed so the report can tell the draws apart.
+EXTEND_STRATA = ("stored-blurry", "aes-sharpness<=2")
+
+
+def extend_sharpness_sample(conn, existing, n, seed=1, exclude=()):
+    """`existing` + n NEW photos split evenly over EXTEND_STRATA, never
+    repeating an existing or excluded id, so labels already keyed to the
+    sample stay valid (appending never orphans them)."""
+    taken = {int(p["photo_id"]) for p in existing} | {int(i) for i in exclude}
+    rows = [r for r in _load_sharpness_candidates(conn) if r["id"] not in taken]
+    preds = {name: pred for name, _q, pred in build_sharpness_strata()}
+    out = list(existing)
+    for i, name in enumerate(EXTEND_STRATA):
+        k = n // len(EXTEND_STRATA) + (1 if i < n % len(EXTEND_STRATA) else 0)
+        pool = [r for r in rows if preds[name](r) and r["id"] not in taken]
+        rng = random.Random(f"{seed}:sharpness-extend:{name}:{len(existing)}")
+        for r in rng.sample(pool, min(k, len(pool))):
+            taken.add(r["id"])
+            out.append({"photo_id": r["id"], "stratum": f"{name}+ext"})
+    return out
+
+
 def cmd_sample_sharpness(args):
     existing = store.load_sample("sharpness")
     path = store.eval_dir() / store.SAMPLE_FILES["sharpness"]
+    if args.extend:
+        if not existing["photos"]:
+            raise SystemExit("nothing to extend: draw the sample first")
+        exclude = [p["photo_id"] for p in store.load_sample("visual")["photos"]]
+        conn = open_db_readonly(args.db)
+        try:
+            photos = extend_sharpness_sample(conn, existing["photos"], args.extend,
+                                             seed=existing.get("seed") or args.seed,
+                                             exclude=exclude)
+        finally:
+            conn.close()
+        store.save_sample(photos, existing.get("seed") or args.seed, sample="sharpness")
+        print(f"[sample-sharpness] extended {len(existing['photos'])} -> {len(photos)} "
+              f"photos -> {path}")
+        return
     if existing["photos"] and not args.force:
         raise SystemExit(
             f"{path} already holds {len(existing['photos'])} photos. Labels are "
@@ -1005,6 +1044,9 @@ def build_parser():
     ss.add_argument("--seed", type=int, default=1)
     ss.add_argument("--force", action="store_true",
                     help="Overwrite an existing sharpness sample (orphans its labels).")
+    ss.add_argument("--extend", type=int, default=0, metavar="N",
+                    help="APPEND N photos from the blurry-rich strata "
+                         "(EXTEND_STRATA); existing labels stay valid.")
     ss.set_defaults(func=cmd_sample_sharpness)
 
     rp = sub.add_parser("run", help="Predict the labelled photos for one variant.")
