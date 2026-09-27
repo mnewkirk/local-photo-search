@@ -1,6 +1,6 @@
 # Measured sharpness → derived `blurry`
 
-Status: **step 1 built (labelling tools), awaiting owner labels.** Follows
+Status: **steps 1, 2, 4 and 5 built** (labelling tools; `sharpness.py`; schema v33; the throttled opt-in backfill — CLI `photosearch sharpness`, maintenance stage `--sharpness`, optional batch step `sharpness`). Step 1 labels still awaited; nothing derives `blurry` until step 3. Follows
 `docs/HANDOFF-2026-09-26-sharp-blurry.md`.
 
 Step 1 as built: `visual_tag_eval.MEASURED_TAGS` (never scored against a

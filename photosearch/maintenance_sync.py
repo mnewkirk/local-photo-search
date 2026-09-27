@@ -56,11 +56,13 @@ FACE_STATE_STAGES = frozenset({"match_faces", "recluster"})
 # Must not run on the replica at all:
 #   colors       — reads pixels; the replica has no originals (PHOTO_ROOT unset,
 #                  images proxy from the NAS), so it cannot be correct locally.
+#   sharpness    — same as colors: decodes the originals the replica lacks.
 #   dedup_photos — DELETEs photos; destructive cross-machine ops are out of scope.
 #   requeue      — clears worker_processed markers, but the fleet claims from the
 #                  NAS, so a local run is a no-op with a misleading success.
 EXCLUDED_STAGES = frozenset({
     "colors",
+    "sharpness",
     "dedup_photos",
     "requeue",
 })

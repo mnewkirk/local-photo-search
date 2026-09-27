@@ -32,6 +32,7 @@ from photosearch.batch_state import (
     fleet_launch_passes,
 )
 from photosearch.db import MAX_PROCESS_ATTEMPTS
+from photosearch.sharpness import SHARPNESS_VERSION
 from photosearch.ingest_batches import (
     STALL_SECONDS,
     register_batch,
@@ -144,6 +145,10 @@ def _complete_all_nas_steps(db, batch_id, ids, include_optional=False):
     for step in NAS_STEPS:
         if step in OPTIONAL_STEPS and not include_optional:
             continue
+        if step == "sharpness":
+            # Column-derived, not job-derived: a closed row proves nothing.
+            _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+            continue
         open_job(db, batch_id, step, "nas")
         close_job(db, batch_id, step)
 
@@ -184,12 +189,13 @@ class TestShape:
     def test_rank_measure_is_a_nas_step_and_runs_last(self):
         """It reads the ORIGINAL files at full resolution and only the NAS has
         them (the replica holds no originals), so it is not a desktop step —
-        the plan's "desktop-only" label was simply wrong. Last, because it is
-        the optional one."""
-        assert NAS_STEPS[-1] == "rank_measure"
-        assert OPTIONAL_STEPS == ("rank_measure",)
+        the plan's "desktop-only" label was simply wrong. The two optional
+        measurement steps run last: rank_measure, then sharpness."""
+        assert NAS_STEPS[-2:] == ("rank_measure", "sharpness")
+        assert OPTIONAL_STEPS == ("rank_measure", "sharpness")
         assert set(OPTIONAL_STEPS) <= set(NAS_STEPS)
         assert DEPENDS_ON["rank_measure"] == "faces"
+        assert DEPENDS_ON["sharpness"] == "faces"
 
     def test_kinds_match_the_step_family(self, db):
         batch_id, ids = _make_batch(db)
@@ -753,6 +759,77 @@ class TestJobOnlyNasSteps:
         assert _step(batch_state(db, batch_id), "resolve_dups")["state"] == "needs_queue"
 
 
+class TestSharpnessStep:
+    """Schema v33. Derived from the COLUMN, not a job row: a photo is done
+    once its sharpness_version is current. Optional — never gates `ready`."""
+
+    def test_waits_on_faces(self, db):
+        batch_id, ids = _make_batch(db)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "waiting" and step["waiting_on"] == "faces"
+        assert step["kind"] == "nas"
+        assert step["remaining"] == len(ids)
+
+    def test_needs_queue_then_queued_then_completed_from_the_column(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "needs_queue"
+        open_job(db, batch_id, "sharpness", "nas")
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "queued"
+        # A closed job row is NOT completion evidence for a derived step...
+        close_job(db, batch_id, "sharpness")
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "needs_queue"
+        # ...the column is.
+        _set_col(db, ids[:2], "sharpness_version", SHARPNESS_VERSION)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "needs_queue"
+        assert (step["done"], step["remaining"]) == (2, 1)
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "completed" and step["done"] == len(ids)
+
+    def test_an_older_version_reads_as_remaining(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION - 1)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["remaining"] == len(ids) and step["state"] == "needs_queue"
+
+    def test_a_stored_decode_error_is_done_and_named(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+        _set_col(db, ids[:1], "sharpness_json",
+                 json.dumps({"error": "UnidentifiedImageError: x"}))
+        _set_col(db, ids[1:], "sharpness", 50.0)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "completed"
+        assert step["failed"] == 0
+        assert step["detail"] == "1 unreadable"
+
+    def test_does_not_gate_ready_and_is_offered_as_optional(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_all_worker_passes(db, ids)
+        _complete_all_nas_steps(db, batch_id, ids)
+        open_job(db, batch_id, "rank_measure", "nas")
+        close_job(db, batch_id, "rank_measure")
+        state = batch_state(db, batch_id)
+        assert _step(state, "sharpness")["state"] == "needs_queue"
+        assert state["ready"] is True
+        assert state["next_action"] == "advance_nas"
+
+    def test_late_arrivals_reopen_it(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "completed"
+        late = db.add_photo(filepath=f"{_DIR}/late.jpg", filename="late.jpg")
+        _complete_pass(db, [late], "faces")
+        register_batch(db, _DIR)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "needs_queue" and step["remaining"] == 1
+
+
 # =========================================================================
 # ready + next_action
 # =========================================================================
@@ -821,8 +898,10 @@ class TestReadyAndNextAction:
         _complete_all_worker_passes(db, ids)
         _complete_all_nas_steps(db, batch_id, ids)
         open_job(db, batch_id, "rank_measure", "nas")
+        open_job(db, batch_id, "sharpness", "nas")
         state = batch_state(db, batch_id)
         assert _step(state, "rank_measure")["state"] == "queued"
+        assert _step(state, "sharpness")["state"] == "queued"
         assert state["ready"] is True
         assert state["next_action"] is None
 

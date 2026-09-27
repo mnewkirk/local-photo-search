@@ -1515,7 +1515,9 @@ def api_photo_mirror_fields(photo_id: int):
             f"""SELECT description, categories, visual_tags, keywords, tags,
                       verified_at, verification_status, hallucination_flags,
                       aesthetic_score, aesthetic_concepts, aesthetic_critique,
-                      {', '.join(_aes_cols)}
+                      {', '.join(_aes_cols)},
+                      sharpness, sharpness_json, sharpness_version,
+                      sharpness_scored_at
                  FROM photos WHERE id = ?""",
             (photo_id,),
         ).fetchone()
@@ -5228,6 +5230,7 @@ async def api_maintenance_sweep(request: Request):
     Body (all optional; defaults match the CLI, ``apply`` defaults False):
       {"apply"?, "do_colors"?, "do_stacking"?, "do_recluster"?, "do_dedup"?,
        "do_requeue"?, "requeue_passes"?, "stages"?,
+       "sharpness"? (alias "do_sharpness"), "sharpness_limit"?,
        "window_minutes"?, "max_drift_km"?, "min_confidence"?}
 
     ``stages``, when present, restricts the run to that subset of stage names
@@ -5268,6 +5271,17 @@ async def api_maintenance_sweep(request: Request):
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
     do_requeue = bool(data.get("do_requeue", False))
+    # Measured sharpness (heavy full-res decode). Opt-in; accepts the plain
+    # `sharpness` field and the `do_*` spelling the other toggles use.
+    do_sharpness = bool(data.get("sharpness", data.get("do_sharpness", False)))
+    sharpness_limit = data.get("sharpness_limit")
+    if sharpness_limit is not None:
+        try:
+            sharpness_limit = int(sharpness_limit)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "sharpness_limit must be an integer")
+        if sharpness_limit <= 0 or sharpness_limit > 200000:
+            raise HTTPException(400, "sharpness_limit must be in (0, 200000]")
 
     # --- replica-mode gating ------------------------------------------------
     # A sweep on the replica writes to photo_index.db.local, which the next
@@ -5284,6 +5298,7 @@ async def api_maintenance_sweep(request: Request):
         requested_excluded = [
             name for name, on in (
                 ("colors", do_colors),
+                ("sharpness", do_sharpness),
                 ("match_faces", do_match),
                 ("recluster", do_recluster),
                 ("dedup_photos", do_dedup),
@@ -5376,6 +5391,7 @@ async def api_maintenance_sweep(request: Request):
                 "do_recluster": do_recluster,
                 "do_dedup": do_dedup,
                 "do_requeue": do_requeue,
+                "do_sharpness": do_sharpness,
             })
             # Pre-flight BEFORE compute: a sync replaces the whole local DB, so
             # discovering drift after a local stacking run would destroy the very
@@ -5422,6 +5438,8 @@ async def api_maintenance_sweep(request: Request):
                     do_recluster=do_recluster,
                     do_dedup=do_dedup,
                     do_requeue=do_requeue,
+                    do_sharpness=do_sharpness,
+                    sharpness_limit=sharpness_limit,
                     force_normalize_aesthetics=force_normalize_aesthetics,
                     force_normalize_subject_aesthetics=force_normalize_subject_aesthetics,
                     requeue_passes=tuple(requeue_passes) if requeue_passes else None,

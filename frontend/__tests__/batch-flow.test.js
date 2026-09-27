@@ -16,13 +16,13 @@ const BF = require('../dist/batch-flow.js');
 const STEP_ORDER = ['ingest', 'clip', 'faces', 'quality', 'aesthetics', 'describe',
   'category-visual', 'category-content', 'keywords', 'verify',
   'stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops',
-  'rank_measure'];
+  'rank_measure', 'sharpness'];
 
 const STATES = ['completed', 'running', 'queued', 'needs_queue', 'waiting', 'blocked'];
 
 const KIND = {
   ingest: 'ingest', stacking: 'nas', normalize_aesthetics: 'nas', match_faces: 'nas',
-  resolve_dups: 'nas', warm_crops: 'nas', rank_measure: 'nas',
+  resolve_dups: 'nas', warm_crops: 'nas', rank_measure: 'nas', sharpness: 'nas',
 };
 
 /** One step row in the shape batch_state emits. */
@@ -101,7 +101,7 @@ describe('layout', () => {
       ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'],
       ['category-content', 'keywords', 'verify'],
       ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
-        'warm_crops', 'rank_measure'],
+        'warm_crops', 'rank_measure', 'sharpness'],
     ]);
   });
 
@@ -173,6 +173,20 @@ describe('summarize — headline per next_action', () => {
     });
     expect(BF.summarize(s).headline)
       .toBe('Ready to review — optional: measure sharpness for ranking');
+  });
+
+  test('both optional NAS steps are named when both are runnable', () => {
+    // batch_state.OPTIONAL_STEPS == ("rank_measure", "sharpness"): neither
+    // gates `ready`, and the headline accounts for every box left to queue.
+    const s = state({
+      ready: true,
+      next_action: 'advance_nas',
+      steps: STEP_ORDER.map((n) => step(n,
+        (n === 'rank_measure' || n === 'sharpness') ? 'needs_queue' : 'completed')),
+    });
+    expect(BF.summarize(s).headline).toBe('Ready to review — optional: '
+      + 'measure sharpness for ranking, measure library sharpness');
+    expect(Object.keys(BF.OPTIONAL_STEPS).sort()).toEqual(['rank_measure', 'sharpness']);
   });
 
   test('ingest running quotes the sweep progress', () => {

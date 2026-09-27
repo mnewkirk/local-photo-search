@@ -279,6 +279,10 @@ _MIRROR_COLUMNS = (
     "verified_at", "verification_status", "hallucination_flags",
     "aesthetic_score", "aesthetic_concepts", "aesthetic_critique",
     *_aes_mirror_columns(),
+    # schema v33 — measured on the NAS (sharpness_backfill), carried so a
+    # targeted mirror doesn't leave the replica's copy staler than the rest.
+    # An older NAS omits them, and `if c in fields` below skips the absent.
+    "sharpness", "sharpness_json", "sharpness_version", "sharpness_scored_at",
 )
 
 

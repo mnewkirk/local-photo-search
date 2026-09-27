@@ -70,18 +70,24 @@ WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
 # heavy; heavy it is (~10 min for 1,260 photos on the N100), but heavy where
 # the pixels are. As a desktop step it had no runner anywhere and read
 # "Needs to be queued" forever.
+#
+# `sharpness` (schema v33, photosearch/sharpness_backfill.py) comes after it:
+# the library-comparable measured sharpness, from the same originals. Like
+# rank_measure it is OPTIONAL — nothing derives a tag from it until the
+# labelled eval passes (docs/plans/sharpness-measurement.md step 3).
 NAS_STEPS = ("stacking", "normalize_aesthetics", "match_faces",
-             "resolve_dups", "warm_crops", "rank_measure")
+             "resolve_dups", "warm_crops", "rank_measure", "sharpness")
 # NAS steps that do NOT gate `ready` — optional work the owner can run from
 # the same button, but a batch is reviewable without it. Subtracted from
 # `ready` explicitly: the rule is "every step in WORKER_PASSES + NAS_STEPS",
 # so moving a step into NAS_STEPS would otherwise silently make it a gate.
-OPTIONAL_STEPS = ("rank_measure",)
+OPTIONAL_STEPS = ("rank_measure", "sharpness")
 STEP_ORDER = ("ingest",) + WORKER_PASSES + NAS_STEPS
 DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "verify": "describe", "normalize_aesthetics": "aesthetics",
               "match_faces": "faces", "resolve_dups": "match_faces",
-              "warm_crops": "faces", "rank_measure": "faces"}
+              "warm_crops": "faces", "rank_measure": "faces",
+              "sharpness": "faces"}
 STATES = ("completed", "running", "queued", "needs_queue", "waiting", "blocked")
 
 # Steps whose only completion evidence is a closed ingest_batch_jobs row —
@@ -393,6 +399,39 @@ def _normalize_aesthetics_step(db, ids: list[int], total: int,
                      waiting_on=waiting_on)
 
 
+def _sharpness_step(db, ids: list[int], total: int, open_steps: set[str],
+                    completed: set[str]) -> dict:
+    """Derived from the column, like stacking: a photo is done once its
+    ``sharpness_version`` is current. A stored decode error counts as done
+    (it is never retried — sharpness_backfill's rule) and is named in
+    ``detail``. Waits on `faces` because the backfill only measures photos
+    whose faces pass is done (face boxes are the headline region)."""
+    from .sharpness import SHARPNESS_VERSION
+    from .sharpness_backfill import missing_sql
+    remaining = _count_where(db, ids, missing_sql("p"), (SHARPNESS_VERSION,))
+    done = max(0, total - remaining)
+    unreadable = _count_where(
+        db, ids,
+        "p.sharpness IS NULL AND p.sharpness_version >= ? "
+        "AND p.sharpness_json LIKE '{\"error\"%'",
+        (SHARPNESS_VERSION,))
+    detail = f"{unreadable:,} unreadable" if unreadable else None
+
+    depends_on = DEPENDS_ON["sharpness"]
+    waiting_on = None
+    if total > 0 and remaining == 0:
+        state = "completed"
+    elif depends_on not in completed:
+        state, waiting_on = "waiting", depends_on
+    elif "sharpness" in open_steps:
+        state = "queued"
+    else:
+        state = "needs_queue"
+    return _step_row("sharpness", "nas", state, total=total, eligible=total,
+                     done=done, remaining=remaining, waiting_on=waiting_on,
+                     detail=detail)
+
+
 def _job_only_step(step: str, kind: str, total: int, open_steps: set[str],
                    closed: set[str], completed: set[str]) -> dict:
     """match_faces / resolve_dups / warm_crops / rank_measure — these write no
@@ -549,14 +588,16 @@ def batch_state(db, batch_id: int) -> dict:
             row = _stacking_step(db, ids, total, open_steps, closed)
         elif step == "normalize_aesthetics":
             row = _normalize_aesthetics_step(db, ids, total, open_steps, completed)
+        elif step == "sharpness":
+            row = _sharpness_step(db, ids, total, open_steps, completed)
         else:
             row = _job_only_step(step, "nas", total, open_steps, closed, completed)
         steps[step] = row
         if row["state"] == "completed":
             completed.add(step)
 
-    # OPTIONAL_STEPS (rank_measure) are deliberately NOT part of `ready`: the
-    # batch is reviewable without the sharpness measurement. `next_action`
+    # OPTIONAL_STEPS (rank_measure, sharpness) are deliberately NOT part of
+    # `ready`: the batch is reviewable without either measurement. `next_action`
     # still offers to run it — see `_optional_runnable`.
     ready = all(steps[s]["state"] == "completed"
                 for s in WORKER_PASSES + NAS_STEPS if s not in OPTIONAL_STEPS)
