@@ -615,14 +615,20 @@ would be a second unvalidated decision on top of the first; they stay exactly
 as they are until a **hand-labelled eval** decides. The backfill's before/after
 table therefore shows both at **delta 0**.
 
-**The right long-term source is a native-resolution Laplacian, not a VLM
-score.** That signal already exists for photos WITH faces: `scripts/rank_shoot.py`
-ranks a shoot on native-resolution face-crop Laplacian variance precisely
-because "what separates frames in a sports burst is whether the face is in
-focus", and it insists on the ORIGINAL pixels — a preview or a cached 200 px
-crop has already discarded the signal. `photosearch/rank_measure.py` lifts that
-measurement out of the script. Wire `sharp`/`blurry` to it, with a hand-labelled
-eval, rather than to another model's opinion.
+**A native-resolution Laplacian was tried as the source, and it FAILED**
+(2026-09-26, `docs/plans/sharpness-measurement.md`). The eval used 208
+owner-labelled photos, 80 of them blurry, judged at 100%. It tested
+face-, subject- and frame-tiled Laplacian and Tenengrad, noise-corrected, at
+several scales. No measured feature reached P ≥ 0.8 at R ≥ 0.5. Gradient energy
+cannot tell a soft *scene* from soft *focus*.
+
+The best idea looked good only in-sample: `aes_sharpness ≤ 2 AND
+frame.ten_max ≤ 4000` scored 0.86, but fell to **0.55** on a 40-photo random
+holdout. The labels and the measurement cache are kept in `evals/visual-tags/`,
+so a new signal can be scored with `evals/sharpness_eval.py` without
+relabelling anything. Face-crop Laplacian is still the right *within-shoot
+ranking* signal (`rank_shoot`): comparing frames of one burst cancels the
+scene. It is not a library-wide tag.
 
 **Deliberately NOT derived**, because the EXIF cannot decide them: `macro`
 (needs subject distance / magnification, which is not stored), `aerial` (no
