@@ -421,3 +421,77 @@ python evals/model_eval_summary.py report --db $DB [--assign role=model,...]
 Re-run any `run` without `--force` after a failure line: only the gaps are
 filled.
 
+
+## Results 2026-09-26 — automated (owner labels still to come)
+
+One driver run, **each model loaded alone** in LM Studio (`lms load -c 16384 --gpu
+max`), `PHOTOSEARCH_LLM_REASONING_EFFORT=none`, replica on :8001. 35 min wall-clock,
+**0 uncached failures** (every run re-ran once to fill gaps and found none), and every
+latency below is labelled `solo`. All three new models passed the Phase-0 gate: they
+see images and gave real answers with reasoning off.
+
+| model | VRAM alone | cold load |
+|---|---|---|
+| google/gemma-4-12b-qat | 7.15 GB | 6.9 s |
+| qwen/qwen3.5-9b | 6.55 GB | 5.5 s |
+| google/gemma-4-e4b | 6.33 GB | 5.6 s |
+| qwen2.5-vl-7b-instruct | 6.04 GB | 3.5 s |
+| minicpm-v-4_5 | 5.90 GB | 4.0 s |
+| llama-3.2-3b-instruct | 2.02 GB | 2.0 s |
+
+Model swaps are cheap (seconds), which supports the one-model-at-a-time decision.
+
+**Aesthetics** (28 hand-ranked photos, ρ with 95% CI; a gap under 0.1 is a tie):
+
+| model | ρ | std | within ±0.5 of median | s/photo |
+|---|---|---|---|---|
+| gemma-4-e4b | 0.78 [0.54, 0.91] | **0.91** | 39% | 2.7 |
+| minicpm-v-4_5 | 0.75 [0.49, 0.89] | 1.37 | 43% | 2.3 |
+| qwen2.5-vl-7b (production) | 0.71 [0.42, 0.87] | 2.01 | 18% | 2.4 |
+| gemma-4-12b-qat | 0.71 [0.41, 0.87] | 1.51 | 18% | 4.4 |
+
+The re-run qwen gives 0.709 against the July 0.700, so the baseline reproduces. All
+four are a statistical tie on ρ. e4b's lead comes with the most squashed scores. That
+is the LAION failure mode, although the percentile normalisation compensates for it.
+No parse failures anywhere.
+
+**category-visual**, on the owner's 60 labels (precision / recall):
+
+| model | P / R | tags per photo | s/photo |
+|---|---|---|---|
+| **minicpm-v-4_5** | **0.54 / 0.56** | 3.0 | 0.69 |
+| qwen2.5-vl-7b (production) | 0.51 / 0.40 | 2.3 | 0.83 |
+| gemma-4-26b-a4b | 0.69 / 0.39 | 1.7 | 3.57 (not solo) |
+| gemma-4-12b-qat | 0.63 / **0.23** | 1.1 (under-tags) | 0.59 |
+| gemma-4-e4b | 0.33 / 0.29 | 2.5 | 0.50 |
+
+Recall on the Unsplash set agrees: minicpm 0.47, e4b 0.43, g12b 0.42, gemma-26b 0.40,
+qwen 0.39. minicpm is the first model to raise recall without giving up precision.
+
+**describe** (70 photos, automatic screens): every model answered 100%, with 0
+degenerate, 0 truncated and 0 retries. Words p50/p90: e4b 48/58, g12b 50/63,
+qwen3.5-9b 66/79, minicpm 82/120. s/photo: e4b 0.85, g12b 1.22, minicpm 1.35,
+qwen 1.48. The share of nouns CLIP doesn't support is flat at 5–6% for all of them,
+so it doesn't separate models. **The describe choice rests on the owner's claim labels.**
+
+**category-content / keywords** (frozen production descriptions):
+
+| model | cat tags per description | cat unsupported | off-vocab dropped | kw unsupported | cat / kw s |
+|---|---|---|---|---|---|
+| llama-3.2-3b (production) | 5.5 | 22% | 270 | 1% | 0.13 / 0.13 |
+| gemma-4-e4b | 9.2 | 43% | 44 | 0% | 0.26 / 0.24 |
+| gemma-4-12b-qat | 14.3 | 49% | 14 | 0% | 0.73 / 0.45 |
+| minicpm-v-4_5 | 12.1 | 63% | 459 | 25% | 0.46 / 0.33 |
+
+No timeouts: every call finished well inside the 10 s limit. The new models give 2–3×
+as many categories, and a much larger share of them have no support in the
+description. That's a precision warning, but "unsupported" also counts fair
+inferences, so the owner's Categories labels decide. Keywords: both gemmas stay
+anchored to the text. minicpm makes things up (25% unsupported).
+
+**Not yet measured:** verify, which needs the describe claim labels first, then the
+planted set.
+
+Raw reports: `describe_eval.py report`, `text_passes_eval.py report`,
+`aesthetics_bakeoff.py --report-only`, `visual_tags_eval.py report`,
+`visual_tags_unsplash.py report`, `model_eval_summary.py report`.
