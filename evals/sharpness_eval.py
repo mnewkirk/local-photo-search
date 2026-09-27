@@ -11,24 +11,23 @@ prints the ship-gate verdict. Nothing here writes to the DB.
     python evals/sharpness_eval.py report  --db photo_index.db.local
     python evals/sharpness_eval.py all     --db photo_index.db.local   # both
 
-LABELS. Same file shape as the visual-tag eval (`photosearch/visual_tag_eval`):
-`{"labels": {"<id>": {"yes": [...], "debatable": [...], "done": bool}}}` with a
-`sample.json` (`{"photos": [{"photo_id", "stratum"}]}`) beside it. `--labels`
-is repeatable (the plan keeps the original 60 in evals/visual-tags/ and a
-blurry-weighted set in its own directory); by default every `labels.json` in
-evals/visual-tags/ and evals/sharpness/ that exists is read. Only `done`
-photos count; a debatable tag is neither a hit nor a miss; a tag in neither
-list is a NO.
+LABELS come from `photosearch.visual_tag_eval.measured_labels()` -- the one
+ground-truth contract shared with the labelling page. By default it reads the
+`main` and `sharpness` label sets under `eval_dir()` (PHOTOSEARCH_VISUAL_EVAL_DIR,
+default ./evals/visual-tags; `--eval-dir` overrides it), keeps only `done`
+photos whose label carries `measured: true` (the sharp/blurry chips were
+shown), and takes each photo's stratum from the matching sample. A photo
+labelled before the chips existed has no `measured` flag and is skipped, so a
+tag in neither `yes` nor `debatable` is a real NO; a debatable tag is neither
+a hit nor a miss.
 
-That last rule is dangerous for photos labelled BEFORE sharp/blurry were on
-the page -- their silence is not a "no". `--labelled-after ISO` drops labels
-whose `updated_at` is older; a label carrying an `offered` list is only scored
-for the tags in it. The report prints how many labelled photos mention either
-tag at all so a silent-everywhere label set is obvious.
-
-MEASUREMENTS are cached in `--cache` (default evals/sharpness/measurements.json),
-keyed by SHARPNESS_VERSION then photo id; pixels come from `/full` through the
-shared originals cache of `photosearch.model_eval` (fetched once per photo).
+MEASUREMENTS are cached beside the labels, in
+`eval_dir()/sharpness/measurements.json` (`--cache` overrides), keyed by
+SHARPNESS_VERSION then photo id; pixels come from `/full` through the shared
+originals cache of `photosearch.model_eval` (fetched once per photo). An
+original smaller than the normalised long edge is UPSAMPLED
+(`detail.upsampled`) and may read artificially blurry, so the report counts
+them and breaks the top metrics down by it.
 
 THE GATE (plan step 3): `blurry` ships as a derived tag only if some metric and
 threshold (blurry = metric <= threshold) reaches P >= 0.8 at R >= 0.5 overall
@@ -56,14 +55,22 @@ from photosearch import sharpness  # noqa: E402
 
 MIN_N = 3
 DEFAULT_SERVER = "http://localhost:8001"
-DEFAULT_LABEL_DIRS = (os.environ.get("PHOTOSEARCH_VISUAL_EVAL_DIR", "./evals/visual-tags"),
-                      "./evals/sharpness")
-DEFAULT_CACHE = "./evals/sharpness/measurements.json"
+DEFAULT_LABEL_SETS = ("main", "sharpness")
 
 BLURRY_GATE = {"precision": 0.8, "recall": 0.5, "stratum_precision": 0.6}
 SHARP_GATE = {"precision": 0.8, "max_firing": 0.40}
-DEFAULT_NIGHT = ("night", "iso", "low-light", "lowlight", "dark")
-DEFAULT_BOKEH = ("bokeh",)
+# Substrings of the stratum names evals/visual_tags_eval.py actually writes:
+# `sample-sharpness` draws "iso>=3200-or-night" and "bokeh-portrait"; the
+# visual sample's EXIF "low-light" stratum is the same night/high-ISO regime.
+DEFAULT_NIGHT = ("iso>=3200-or-night", "low-light")
+DEFAULT_BOKEH = ("bokeh-portrait",)
+
+
+def default_cache_path() -> str:
+    """Beside the labels: eval_dir()/sharpness/measurements.json. Resolved at
+    call time so PHOTOSEARCH_VISUAL_EVAL_DIR / --eval-dir are honoured."""
+    from photosearch import visual_tag_eval
+    return str(visual_tag_eval.eval_dir() / "sharpness" / "measurements.json")
 
 
 # --------------------------------------------------------------------------
@@ -77,43 +84,20 @@ def _read_json(path, default):
         return json.load(f)
 
 
-def load_label_sets(label_paths: Iterable[str], sample_paths: Iterable[str] = (),
-                    labelled_after: Optional[str] = None, log=print):
-    """Merge label files (+ their sibling sample.json). Returns
-    (labels {pid: entry}, strata {pid: stratum}). Later files win; a
-    conflicting duplicate is reported."""
-    labels, strata = {}, {}
-    samples = list(sample_paths)
-    for lp in label_paths:
-        raw = _read_json(lp, {"labels": {}}).get("labels", {})
-        sib = os.path.join(os.path.dirname(os.path.abspath(lp)), "sample.json")
-        if os.path.exists(sib) and sib not in samples:
-            samples.append(sib)
-        for k, v in raw.items():
-            if not v.get("done"):
-                continue
-            if labelled_after and (v.get("updated_at") or "") < labelled_after:
-                continue
-            pid = int(k)
-            if pid in labels and _measured_view(labels[pid]) != _measured_view(v):
-                log(f"  note: photo {pid} labelled differently in {lp}; using it")
-            labels[pid] = v
-    for sp in samples:
-        for p in _read_json(sp, {"photos": []}).get("photos", []):
-            strata.setdefault(int(p["photo_id"]), str(p.get("stratum") or "?"))
+def load_labels(label_sets: Iterable[str] = DEFAULT_LABEL_SETS):
+    """Ground truth via visual_tag_eval.measured_labels(). Returns
+    (labels {pid: {"yes", "debatable", "set"}}, strata {pid: stratum})."""
+    from photosearch import visual_tag_eval
+    measured = visual_tag_eval.measured_labels(tuple(label_sets))
+    labels = {pid: {"yes": e["yes"], "debatable": e["debatable"], "set": e["set"]}
+              for pid, e in measured.items()}
+    strata = {pid: e.get("stratum") or "?" for pid, e in measured.items()}
     return labels, strata
 
 
-def _measured_view(entry):
-    return tuple(sorted(t for t in entry.get("yes", []) if t in ("sharp", "blurry"))), \
-        tuple(sorted(t for t in entry.get("debatable", []) if t in ("sharp", "blurry")))
-
-
 def truth_of(entry: dict, tag: str) -> Optional[bool]:
-    """True / False, or None for debatable or not offered (neither hit nor miss)."""
-    offered = entry.get("offered")
-    if offered is not None and tag not in offered:
-        return None
+    """True / False, or None for debatable (neither hit nor miss). Entries come
+    from measured_labels(), so the labeller was asked: silence is a NO."""
     if tag in entry.get("debatable", ()):
         return None
     return tag in entry.get("yes", ())
@@ -343,11 +327,12 @@ def build(labels, strata, rows, cache, night=DEFAULT_NIGHT, bokeh=DEFAULT_BOKEH)
              "sharp": {pid: truth_of(labels[pid], "sharp") for pid in ids}}
     st = {pid: strata.get(pid, "?") for pid in ids}
     groups = {"night/high-ISO": group_ids(st, night), "bokeh": group_ids(st, bokeh)}
+    upsampled = {pid: _upsampled_key(cache[str(pid)]) for pid in ids}
     out = {"n_labelled": len(labels), "n_measured": len(ids),
            "errors": sum(1 for pid in ids if "error" in (cache[str(pid)].get("detail") or {})),
-           "mentions": sum(1 for pid in ids if any(
-               t in labels[pid].get(k, ()) for t in ("sharp", "blurry")
-               for k in ("yes", "debatable"))),
+           "upsampled": sum(1 for v in upsampled.values() if v == "upsampled"),
+           "by_set": {s: sum(1 for pid in ids if labels[pid].get("set") == s)
+                      for s in sorted({labels[pid].get("set") or "?" for pid in ids})},
            "positives": {t: sum(1 for v in truth[t].values() if v) for t in truth},
            "negatives": {t: sum(1 for v in truth[t].values() if v is False) for t in truth},
            "groups": {k: len(v) for k, v in groups.items()},
@@ -373,7 +358,14 @@ def build(labels, strata, rows, cache, night=DEFAULT_NIGHT, bokeh=DEFAULT_BOKEH)
     out["_ids"], out["_feats"], out["_truth"], out["_strata"] = ids, feats, truth, st
     out["_camera"] = {pid: rows.get(pid, {}).get("camera_model") or "?" for pid in ids}
     out["_stored"], out["_aes"] = stored, aes
+    out["_upsampled"] = upsampled
     return out
+
+
+def _upsampled_key(result: dict) -> str:
+    """'upsampled' / 'native' / '?' (no size info, e.g. an older cache)."""
+    v = (result.get("detail") or {}).get("upsampled")
+    return "?" if v is None else ("upsampled" if v else "native")
 
 
 def _sharp_baseline(pred, truth):
@@ -417,9 +409,8 @@ def render(rep, top=6) -> str:
     secs = [s for s in rep["seconds"] if s]
     L.append(f"labelled photos: {rep['n_labelled']}   measured: {rep['n_measured']}   "
              f"decode errors: {rep['errors']}")
-    L.append(f"photos whose label mentions sharp/blurry at all: {rep['mentions']}"
-             + ("   <-- 0: were these labelled before sharp/blurry were offered? "
-                "see --labelled-after" if rep["n_measured"] and not rep["mentions"] else ""))
+    L.append("label sets: " + (", ".join(f"{k}={v}" for k, v in rep["by_set"].items()) or "-")
+             + f"   upsampled (original < normalised edge): {rep['upsampled']}")
     L.append(f"blurry: {rep['positives']['blurry']} yes / {rep['negatives']['blurry']} no   "
              f"sharp: {rep['positives']['sharp']} yes / {rep['negatives']['sharp']} no   "
              f"strata groups: " + ", ".join(f"{k}={v}" for k, v in rep["groups"].items()))
@@ -480,12 +471,14 @@ def render(rep, top=6) -> str:
         L += _sweep_lines(ev["sweep"])
         L += _breakdown(pred, truth, rep["_strata"], "stratum")
         L += _breakdown(pred, truth, rep["_camera"], "camera")
+        L += _breakdown(pred, truth, rep["_upsampled"], "resolution")
     for name, pred in (("stored blurry", {p: "blurry" in rep["_stored"][p] for p in ids}),
                        ("aes_sharpness<=2", {p: rep["_aes"][p] is not None and rep["_aes"][p] <= 2
                                              for p in ids})):
         L.append(f"  baseline {name}:")
         L += _breakdown(pred, truth, rep["_strata"], "stratum")
         L += _breakdown(pred, truth, rep["_camera"], "camera")
+        L += _breakdown(pred, truth, rep["_upsampled"], "resolution")
     L.append("")
 
     # ---- sharp ----
@@ -526,25 +519,18 @@ def render(rep, top=6) -> str:
 # CLI
 # --------------------------------------------------------------------------
 
-def _label_paths(args):
-    if args.labels:
-        return args.labels
-    return [p for p in (os.path.join(d, "labels.json") for d in DEFAULT_LABEL_DIRS)
-            if os.path.exists(p)]
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("cmd", choices=("measure", "report", "all"), nargs="?", default="all")
     ap.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"))
     ap.add_argument("--base-url", default=DEFAULT_SERVER)
-    ap.add_argument("--labels", action="append", default=[],
-                    help="labels.json (repeatable; default: evals/visual-tags + evals/sharpness)")
-    ap.add_argument("--sample", action="append", default=[],
-                    help="extra sample.json for strata (siblings of --labels are read anyway)")
-    ap.add_argument("--labelled-after", default=None,
-                    help="ignore labels whose updated_at is older (ISO timestamp)")
-    ap.add_argument("--cache", default=DEFAULT_CACHE)
+    ap.add_argument("--eval-dir", default=None,
+                    help="label directory (sets PHOTOSEARCH_VISUAL_EVAL_DIR; "
+                         "default ./evals/visual-tags)")
+    ap.add_argument("--label-sets", default=",".join(DEFAULT_LABEL_SETS),
+                    help="first-answer label sets to pool (visual_tag_eval.LABEL_SETS)")
+    ap.add_argument("--cache", default=None,
+                    help="measurement cache (default <eval-dir>/sharpness/measurements.json)")
     ap.add_argument("--force", action="store_true", help="re-measure cached photos")
     ap.add_argument("--night-strata", default=",".join(DEFAULT_NIGHT),
                     help="substrings naming the night/high-ISO strata")
@@ -554,20 +540,26 @@ def main(argv=None):
     ap.add_argument("--json-out", default=None)
     a = ap.parse_args(argv)
 
-    lpaths = _label_paths(a)
-    if not lpaths:
-        raise SystemExit("No labels found -- pass --labels PATH")
-    labels, strata = load_label_sets(lpaths, a.sample, a.labelled_after)
-    print(f"labels: {', '.join(lpaths)} -> {len(labels)} done photos")
+    if a.eval_dir:
+        os.environ["PHOTOSEARCH_VISUAL_EVAL_DIR"] = a.eval_dir
+    from photosearch import visual_tag_eval
+    sets = [s for s in a.label_sets.split(",") if s]
+    cache_path = a.cache or default_cache_path()
+    labels, strata = load_labels(sets)
+    print(f"labels: {visual_tag_eval.eval_dir()} [{', '.join(sets)}] -> "
+          f"{len(labels)} done + measured photos")
+    if not labels:
+        raise SystemExit("No measured labels -- label sharp/blurry on /eval/visual-tags "
+                         "(?set=sharpness) first")
     from photosearch.model_eval import open_db_readonly
     conn = open_db_readonly(a.db)
     ids = sorted(labels)
     rows = db_rows(conn, ids)
 
     if a.cmd in ("measure", "all"):
-        measure_all(ids, rows, a.cache, a.base_url, force=a.force)
+        measure_all(ids, rows, cache_path, a.base_url, force=a.force)
     if a.cmd in ("report", "all"):
-        cache = load_cache(a.cache)
+        cache = load_cache(cache_path)
         rep = build(labels, strata, rows, cache,
                     night=[s for s in a.night_strata.split(",") if s],
                     bokeh=[s for s in a.bokeh_strata.split(",") if s])

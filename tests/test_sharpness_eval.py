@@ -18,11 +18,25 @@ def _lab(yes=(), debatable=(), done=True, **kw):
     return {"yes": list(yes), "debatable": list(debatable), "done": done, **kw}
 
 
-def test_truth_is_three_state_and_respects_offered():
+def test_truth_is_three_state():
     assert E.truth_of(_lab(yes=["blurry"]), "blurry") is True
     assert E.truth_of(_lab(), "blurry") is False
     assert E.truth_of(_lab(debatable=["blurry"]), "blurry") is None
-    assert E.truth_of(_lab(offered=["moody"]), "blurry") is None
+
+
+def test_default_strata_match_what_the_sharpness_sampler_writes():
+    import importlib.util as iu
+    spec = iu.spec_from_file_location(
+        "visual_tags_eval", os.path.join(_HERE, "..", "evals", "visual_tags_eval.py"))
+    V = iu.module_from_spec(spec)
+    spec.loader.exec_module(V)
+    names = [n for n, _q, _p in V.build_sharpness_strata()]
+    for needles in (E.DEFAULT_NIGHT, E.DEFAULT_BOKEH):
+        assert any(n in s for n in needles for s in names), needles
+    assert E.group_ids({1: "iso>=3200-or-night", 2: "bokeh-portrait", 3: "stored-blurry"},
+                       E.DEFAULT_NIGHT) == [1]
+    assert E.group_ids({1: "iso>=3200-or-night", 2: "bokeh-portrait", 3: "stored-blurry"},
+                       E.DEFAULT_BOKEH) == [2]
 
 
 def test_counts_skip_debatable_and_missing_prediction_is_negative():
@@ -111,28 +125,71 @@ def test_sharp_keep_and_retire_rules():
     assert not E.evaluate_sharp(flat, truth)["keep"]
 
 
-def test_load_label_sets_merges_filters_and_reads_sibling_sample(tmp_path):
-    a = tmp_path / "a"
-    b = tmp_path / "b"
-    a.mkdir(), b.mkdir()
-    (a / "labels.json").write_text(json.dumps({"labels": {
-        "1": _lab(yes=["blurry"], updated_at="2026-09-20T00:00:00"),
-        "2": _lab(done=False),
-        "3": _lab(updated_at="2026-09-27T00:00:00")}}))
-    (a / "sample.json").write_text(json.dumps({"photos": [
-        {"photo_id": 1, "stratum": "night"}, {"photo_id": 3, "stratum": "bokeh"}]}))
-    (b / "labels.json").write_text(json.dumps({"labels": {
-        "4": _lab(yes=["sharp"], updated_at="2026-09-28T00:00:00")}}))
-    labels, strata = E.load_label_sets([str(a / "labels.json"), str(b / "labels.json")],
-                                       log=lambda *_: None)
-    assert sorted(labels) == [1, 3, 4]              # un-done photo dropped
-    assert strata == {1: "night", 3: "bokeh"}
-    labels, _ = E.load_label_sets([str(a / "labels.json"), str(b / "labels.json")],
-                                  labelled_after="2026-09-26", log=lambda *_: None)
-    assert sorted(labels) == [3, 4]
+@pytest.fixture
+def eval_dir(tmp_path, monkeypatch):
+    """A real label tree under a tmp PHOTOSEARCH_VISUAL_EVAL_DIR: the visual
+    sample + labels at the top, the sharpness ones under sharpness/."""
+    monkeypatch.setenv("PHOTOSEARCH_VISUAL_EVAL_DIR", str(tmp_path))
+    (tmp_path / "sharpness").mkdir()
+    (tmp_path / "sample.json").write_text(json.dumps({"photos": [
+        {"photo_id": 10, "stratum": "low-light"},
+        {"photo_id": 11, "stratum": "indoor"}]}))
+    (tmp_path / "labels.json").write_text(json.dumps({"labels": {
+        # measured: the chips were shown and the answer was "neither"
+        "10": _lab(yes=["moody"], measured=True),
+        # labelled before the chips existed: silence is NOT a no -> skipped
+        "11": _lab(yes=["sunny"])}}))
+    (tmp_path / "sharpness" / "sample.json").write_text(json.dumps({"photos": [
+        {"photo_id": 1, "stratum": "iso>=3200-or-night"},
+        {"photo_id": 2, "stratum": "bokeh-portrait"},
+        {"photo_id": 3, "stratum": "stored-blurry"},
+        {"photo_id": 4, "stratum": "random"}]}))
+    (tmp_path / "sharpness" / "labels.json").write_text(json.dumps({"labels": {
+        "1": _lab(yes=["blurry"], measured=True),
+        "2": _lab(yes=["sharp"], debatable=["blurry"], measured=True),
+        "3": _lab(yes=["blurry"], done=False, measured=True),     # not done
+        "4": _lab(yes=["peaceful"])}}))                             # unmeasured
+    return tmp_path
 
 
-def _fake_result(score, frame_med, error=False):
+def test_load_labels_uses_measured_labels_and_skips_unmeasured(eval_dir):
+    labels, strata = E.load_labels()
+    assert sorted(labels) == [1, 2, 10]         # 11 + 4 unmeasured, 3 not done
+    assert strata == {1: "iso>=3200-or-night", 2: "bokeh-portrait", 10: "low-light"}
+    assert labels[2] == {"yes": ["sharp"], "debatable": ["blurry"], "set": "sharpness"}
+    assert labels[10]["yes"] == [] and labels[10]["set"] == "main"
+    assert E.truth_of(labels[1], "blurry") is True
+    assert E.truth_of(labels[2], "blurry") is None
+    assert E.truth_of(labels[10], "blurry") is False
+    only, _ = E.load_labels(["sharpness"])
+    assert sorted(only) == [1, 2]
+    assert E.default_cache_path() == str(eval_dir / "sharpness" / "measurements.json")
+
+
+def test_main_reads_the_real_label_path_end_to_end(eval_dir, monkeypatch, capsys):
+    import sqlite3
+    db = eval_dir / "p.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE photos (id INTEGER PRIMARY KEY, camera_model TEXT, aes_sharpness REAL,"
+        " visual_tags TEXT, subject_boxes TEXT, iso INTEGER);"
+        "CREATE TABLE faces (photo_id INTEGER, bbox_left INT, bbox_top INT,"
+        " bbox_right INT, bbox_bottom INT);"
+        "INSERT INTO photos (id, camera_model) VALUES (1,'ILCE-7M4'),(2,'ILCE-7M4'),(10,'phone');")
+    conn.commit()
+    conn.close()
+    E.save_cache(E.default_cache_path(), {
+        "1": _fake_result(5.0, 1.0, upsampled=True),
+        "2": _fake_result(90.0, 9.0), "10": _fake_result(80.0, 8.0)})
+    assert E.main(["report", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "3 done + measured photos" in out
+    assert "main=1, sharpness=2" in out
+    assert "upsampled (original < normalised edge): 1" in out
+    assert "resolution" in out and "upsampled" in out
+
+
+def _fake_result(score, frame_med, error=False, upsampled=False):
     if error:
         return {"score": None, "detail": {"error": "boom"}, "version": 1, "seconds": 0.1}
     reg = {f: None for f in E.sharpness.REGION_FEATURES}
@@ -140,7 +197,7 @@ def _fake_result(score, frame_med, error=False):
                 "boxes": 1, "boxes_skipped": 0, "tiles": 4, "flat_skipped": 0})
     return {"score": score, "version": 1, "seconds": 0.2,
             "detail": {"noise_sigma": 1.0, "noise_sigma_raw": 1.2, "source": "frame",
-                       "regions": {"frame": reg}}}
+                       "upsampled": upsampled, "regions": {"frame": reg}}}
 
 
 def test_build_and_render_end_to_end_without_network():
@@ -148,7 +205,7 @@ def test_build_and_render_end_to_end_without_network():
     for i in range(24):
         blurry = i < 8
         labels[i] = _lab(yes=["blurry"] if blurry else (["sharp"] if i > 18 else []))
-        strata[i] = ["night-iso", "bokeh", "random"][i % 3]
+        strata[i] = ["iso>=3200-or-night", "bokeh-portrait", "random"][i % 3]
         rows[i] = {"camera_model": "ILCE-7M4" if i % 2 else "Pixel 7 Pro",
                    "aes_sharpness": 2 if i < 5 else 7,
                    "visual_tags": json.dumps(["blurry"] if i in (0, 9) else [])}
@@ -162,7 +219,7 @@ def test_build_and_render_end_to_end_without_network():
     text = E.render(rep)
     assert "BLURRY GATE: PASS" in text
     assert "SHARP:" in text
-    assert "Pixel 7 Pro" in text and "night-iso" in text
+    assert "Pixel 7 Pro" in text and "iso>=3200-or-night" in text
 
 
 def test_measure_all_caches_by_version_and_skips_cached(tmp_path):
