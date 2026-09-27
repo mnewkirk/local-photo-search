@@ -287,8 +287,24 @@ def summarize(run, *, strata=None, truth=None, conn=None, clip_cache=None, use_c
         "lat_p90": me.percentile(me.latencies(items), 0.9),
         "latency_label": run.get("latency_label", "unknown"),
     }
-    bad = (n - row["answered"]) + row["degenerate_final"] + row["truncated"]
+    row["format"] = sum(1 for t in answered if format_problem(t))
+    bad = (n - row["answered"]) + row["degenerate_final"] + row["truncated"] + row["format"]
     row["screen_out"] = n >= me.MIN_N and bad / n > SCREEN_MAX_BAD
+
+    # Disputed facts: each description is right / wrong / silent on each point
+    # its sibling descriptions disagreed on (describe_eval.py disputes).
+    disputes, dlabels = me.load_disputes(), me.load_dispute_labels()
+    tally = {"right": 0, "wrong": 0, "silent": 0}
+    for pid, it in items.items():
+        d = disputes.get(str(pid))
+        sha = it.get("text_sha") or me.text_sha(it.get("text"))
+        if not d or sha not in d.get("shas", []):
+            continue
+        for q in d["questions"]:
+            v = me.dispute_verdict(q["answers"].get(sha), dlabels.get(q["key"]))
+            if v:
+                tally[v] += 1
+    row.update({f"disp_{k}": v for k, v in tally.items()})
 
     claims = me.load_claims()
     errs = [me.claim_errors(claims.get(it.get("text_sha") or me.text_sha(t)))
@@ -404,6 +420,119 @@ def pairwise_table():
     return rows
 
 
+_FORMAT_RE = re.compile(r"\*\*|^\s*#{1,6}\s|^\s*[-*•]\s+\S|^\s*\d+[.)]\s+\S", re.M)
+
+
+def format_problem(text):
+    """Markdown/list structure in what should be plain prose. It lands verbatim
+    in the search blob and the photo modal — minicpm-v-4_5 appended a
+    '**Search Index Description:**' bullet list on 2026-09-26."""
+    return bool(text and _FORMAT_RE.search(text))
+
+
+DISPUTE_PROMPT = """You are comparing several descriptions of the SAME photo, written independently. You cannot see the photo.
+
+List the FACTUAL points on which the descriptions disagree AND that a person looking at the photo could settle: how many people or things there are, what is present or absent, colours, what people are doing, the activity or sport, ages or genders, and any text they quote. One question per disagreement.
+
+Ignore differences of wording, style, mood or amount of detail when the facts agree. Also list a notable object or detail that only ONE description claims, as a question about whether it is there. A description that says nothing about a point answers "not mentioned".
+
+{blocks}
+
+Answer with ONLY a JSON array of at most {max_q} objects, each {{"question": "...", "answers": {{{keys}}}}}, where every answer is a short phrase. If the descriptions agree on every checkable fact, answer [].
+"""
+
+
+def _parse_disputes(raw, labels):
+    import json as _json
+    if not raw:
+        return None
+    s = raw.strip()
+    a, b = s.find("["), s.rfind("]")
+    if a < 0 or b < a:
+        return None
+    try:
+        data = _json.loads(s[a:b + 1])
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    out = []
+    for q in data:
+        if not isinstance(q, dict) or not isinstance(q.get("question"), str):
+            continue
+        ans = q.get("answers")
+        if not isinstance(ans, dict):
+            continue
+        norm = {lab: me.norm_answer(ans.get(lab)) for lab in labels}
+        given = {v for v in norm.values() if v is not None}
+        silent = any(v is None for v in norm.values())
+        # A real dispute: two different answers, or one claim the rest are
+        # silent on. Unanimous answers are not a disagreement.
+        if len(given) >= 2 or (given and silent):
+            out.append({"question": q["question"].strip(), "answers": norm})
+    return out
+
+
+def build_disputes(*, model=None, variants=None, limit=None, force=False, max_q=6,
+                   chat=None, log=print):
+    """Ask a text model where each photo's descriptions disagree. Resumable:
+    a photo whose set of descriptions is unchanged is skipped."""
+    from photosearch import describe
+    import random as _random
+    me.pin_role_model("text", model)
+    effective = describe.effective_model(model or "llama3.2:3b", "text")
+    chat = chat or describe._ollama_chat_with_retry
+    variants = variants or me.list_variants(PASS)
+    runs = {v: me.load_run(PASS, v) for v in variants}
+    data = {} if force else me.load_disputes()
+    todo = []
+    for pid in me.sample_ids(PASS):
+        texts = {}
+        for r in runs.values():
+            it = (r or {"items": {}})["items"].get(str(pid)) or {}
+            if it.get("text"):
+                texts.setdefault(it.get("text_sha") or me.text_sha(it["text"]), it["text"])
+        if len(texts) < 2:
+            continue
+        shas = sorted(texts)
+        if (data.get(str(pid)) or {}).get("shas") == shas:
+            continue
+        todo.append((pid, texts, shas))
+    if limit is not None:
+        todo = todo[:limit]
+    log(f"[disputes] model={effective} — {len(todo)} photo(s) to compare")
+    fc = me.FailureCounter(log)
+    for i, (pid, texts, shas) in enumerate(todo, 1):
+        order = list(shas)
+        _random.Random(f"disputes-{pid}").shuffle(order)
+        labels = [f"D{k + 1}" for k in range(len(order))]
+        blocks = "\n\n".join(f"{lab}: {texts[sha]}" for lab, sha in zip(labels, order))
+        prompt = DISPUTE_PROMPT.format(blocks=blocks, max_q=max_q,
+                                       keys=", ".join(f'"{l}": "..."' for l in labels))
+        try:
+            raw = chat(model=model or "llama3.2:3b",
+                       messages=[{"role": "user", "content": prompt}],
+                       options={"temperature": 0}, role="text", timeout=180)
+        except Exception as e:
+            fc.fail(pid, e)
+            continue
+        qs = _parse_disputes(raw, labels)
+        if qs is None:
+            fc.fail(pid, f"unparseable: {(raw or '')[:80]!r}")
+            continue
+        fc.ok()
+        by_label = dict(zip(labels, order))
+        questions = [{"key": me.dispute_key(pid, q["question"], shas), "question": q["question"],
+                      "answers": {by_label[l]: a for l, a in q["answers"].items()}}
+                     for q in qs[:max_q]]
+        data[str(pid)] = {"shas": shas, "model": effective, "created": me.now_iso(),
+                          "questions": questions}
+        me.save_disputes(data)
+        log(f"  [{i}/{len(todo)}] {pid}: {len(questions)} disputed point(s)")
+    fc.summary()
+    return data
+
+
 def build_report(*, db=None, use_clip=True):
     """Rows for every cached variant (+ `stored` when a DB is given). Also the
     entry point step 7's cross-pass summary calls."""
@@ -429,7 +558,7 @@ def render(rows):
     out = []
     hdr = (f"{'variant':<18} {'effective model':<26} {'n':>3} {'ans':>5} {'degen1':>6} "
            f"{'degen':>5} {'trunc':>5} {'retry':>5} {'fallbk':>6} {'t/o':>4} "
-           f"{'words':>9} {'s/photo':>11} {'CLIP✗/noun':>10} {'text rec':>8}  latency")
+           f"{'fmt':>4} {'words':>9} {'s/photo':>11} {'CLIP✗/noun':>10} {'text rec':>8}  latency")
     out.append(hdr)
     for r in rows:
         n = r["n"]
@@ -441,10 +570,22 @@ def render(rows):
             f"{me.fmt_ratio(r['answered'], n):>5} {me.fmt_ratio(r['degenerate_first'], n):>6} "
             f"{me.fmt_ratio(r['degenerate_final'], n):>5} {me.fmt_ratio(r['truncated'], n):>5} "
             f"{me.fmt_ratio(r['retried'], n):>5} {me.fmt_ratio(r['fallback'], n):>6} "
-            f"{r['timeouts']:>4} "
+            f"{r['timeouts']:>4} {me.fmt_ratio(r['format'], n):>4} "
             f"{_f(r['words_p50'], 0) + '/' + _f(r['words_p90'], 0):>9} "
             f"{_f(r['lat_p50']) + '/' + _f(r['lat_p90']):>11} {clip:>10} {tr:>8}  "
             f"{r['latency_label']}{'   ✗ SCREEN OUT' if r['screen_out'] else ''}")
+    disp = [r for r in rows if r.get("disp_right") or r.get("disp_wrong")]
+    if disp:
+        out.append("")
+        out.append(f"{'variant':<18} {'disputed pts':>12} {'right':>6} {'wrong':>6} {'silent':>6} "
+                   f"{'right when it answered':>22}")
+        for r in disp:
+            ans = r["disp_right"] + r["disp_wrong"]
+            out.append(f"{str(r['variant']):<18} {ans + r['disp_silent']:>12} {r['disp_right']:>6} "
+                       f"{r['disp_wrong']:>6} {r['disp_silent']:>6} "
+                       f"{me.fmt_ratio(r['disp_right'], ans):>22}")
+        out.append("disputed pts = facts the descriptions disagreed on, labelled on the "
+                   "Differences tab; wrong = a claim the photo contradicts.")
     labelled = [r for r in rows if r.get("claims_n")]
     if labelled:
         out.append("")
@@ -466,7 +607,8 @@ def render(rows):
         out.append("win rate counts a tie as half; sign test excludes ties.")
     out.append("")
     out.append(f"ratios are shares of n; words and s/photo are p50/p90; 'n<3' = too few. "
-               f"SCREEN OUT = more than {SCREEN_MAX_BAD:.0%} unanswered/degenerate/truncated.")
+               f"fmt = markdown/list structure in the prose. SCREEN OUT = more than "
+               f"{SCREEN_MAX_BAD:.0%} unanswered/degenerate/truncated/badly formatted.")
     return "\n".join(out)
 
 
@@ -502,6 +644,12 @@ def main(argv=None):
     r.add_argument("--force", action="store_true")
     r.add_argument("--solo", action="store_true")
 
+    dp = sub.add_parser("disputes", help="find the facts each photo's descriptions disagree on")
+    dp.add_argument("--model", help="LM Studio id of the text model that compares them")
+    dp.add_argument("--variants", help="comma-separated; default every cached variant")
+    dp.add_argument("--limit", type=int)
+    dp.add_argument("--force", action="store_true")
+
     pr = sub.add_parser("pairs", help="build blind pairwise comparisons (finalists only)")
     pr.add_argument("--baseline", required=True)
     pr.add_argument("--variants", required=True, help="comma-separated challengers")
@@ -535,6 +683,9 @@ def main(argv=None):
         run_variant(args.variant, model=args.model, prompt_file=args.prompt_file,
                     server=args.server, limit=args.limit, force=args.force,
                     solo=args.solo)
+    elif args.cmd == "disputes":
+        build_disputes(model=args.model, limit=args.limit, force=args.force,
+                       variants=[v.strip() for v in args.variants.split(",")] if args.variants else None)
     elif args.cmd == "pairs":
         data = build_pairs(args.baseline, [v.strip() for v in args.variants.split(",") if v.strip()],
                            n=args.n, seed=args.seed)

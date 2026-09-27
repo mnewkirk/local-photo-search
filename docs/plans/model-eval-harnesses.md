@@ -495,3 +495,29 @@ planted set.
 Raw reports: `describe_eval.py report`, `text_passes_eval.py report`,
 `aesthetics_bakeoff.py --report-only`, `visual_tags_eval.py report`,
 `visual_tags_unsplash.py report`, `model_eval_summary.py report`.
+
+### Describe labelling changed to Differences (2026-09-27)
+
+After 30 photos the owner reported the per-description claim labelling wasn't
+useful: most descriptions agree, and only 7 of 51 labelled had any wrong claim.
+So the default tab is now **Differences**. `describe_eval.py disputes --model
+<text model>` has a text model read one photo's distinct descriptions **blind** (as
+D1…Dn) and list only the *checkable* facts they disagree on, as a question with
+each description's answer, at most 6 per photo. Examples: how many players, which
+sport, jersey text, and whether the car or flowers only one of them mentions are
+really there. The owner clicks the answer(s) that are right, or "None right" /
+"Can't tell". Each description is then **right**, **wrong** or **silent** on each
+point, and the report adds `disputed pts / right / wrong / silent / right when it
+answered`. Silence is never counted as wrong.
+
+- Comparer: `gemma-4-26b-a4b`, which is deliberately not a describe candidate. 70/70
+  photos compared, 386 points, 0 failures.
+- A question key hashes the photo, the question and the texts it was asked of, so a
+  re-run of any description orphans its old points instead of mis-scoring them.
+- The 51 existing claim labels stay (tab "All claims") and are still reported.
+- The describe report gained a **format** screen: markdown or list structure in the
+  prose, which counts toward SCREEN OUT. minicpm leaked a
+  "**Search Index Description:**" block on 1 of 70 photos.
+
+Tests: `tests/test_describe_disputes.py`.
+

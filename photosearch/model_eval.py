@@ -724,3 +724,72 @@ def confirm_planted(item_id: str, confirmed: bool) -> dict:
             save_verify_sets(data)
             return it
     raise KeyError(item_id)
+
+
+# --------------------------------------------------------------------------
+# Describe disputes: only the facts the descriptions DISAGREE on
+# --------------------------------------------------------------------------
+#
+# Labelling every description is wasted effort when most of them agree. A text
+# model reads one photo's distinct descriptions (blind, as D1..Dn) and lists
+# the checkable facts they disagree on, with each description's answer. The
+# owner picks the right answer(s) looking at the photo; each description is
+# then right, wrong or silent on each point.
+#
+#   describe/disputes.json        {<pid>: {"shas": [sha...], "model", "created",
+#                                  "questions": [{"key", "question",
+#                                                 "answers": {<sha>: str|None}}]}}
+#   describe/dispute_labels.json  {<key>: {"correct": [answer...], "cant_tell",
+#                                  "updated_at"}}
+#
+# A question key hashes the photo, the question text and the texts it was asked
+# of, so regenerating disputes for changed descriptions orphans old labels.
+
+NOT_MENTIONED = None
+
+
+def norm_answer(a) -> Optional[str]:
+    if a is None:
+        return None
+    s = " ".join(str(a).split()).strip().rstrip(".").lower()
+    if not s or s in ("not mentioned", "n/a", "none mentioned", "unspecified",
+                      "not stated", "does not say", "not specified"):
+        return None
+    return s
+
+
+def dispute_key(photo_id, question: str, shas) -> str:
+    import hashlib
+    h = hashlib.sha256(f"{int(photo_id)}|{question}|{','.join(sorted(shas))}".encode())
+    return f"{int(photo_id)}-{h.hexdigest()[:12]}"
+
+
+def load_disputes() -> dict:
+    return read_pass_file("describe", "disputes.json", {})
+
+
+def save_disputes(data: dict) -> None:
+    write_pass_file("describe", "disputes.json", data)
+
+
+def load_dispute_labels() -> dict:
+    return read_pass_file("describe", "dispute_labels.json", {})
+
+
+def save_dispute_label(key: str, correct: Iterable[str], cant_tell: bool = False) -> dict:
+    data = load_dispute_labels()
+    data[key] = {"correct": sorted(set(correct)), "cant_tell": bool(cant_tell),
+                 "updated_at": now_iso()}
+    write_pass_file("describe", "dispute_labels.json", data)
+    return data[key]
+
+
+def dispute_verdict(answer: Optional[str], label: Optional[dict]) -> Optional[str]:
+    """'right' | 'wrong' | 'silent' for one description's answer, or None when
+    the question is unlabelled or the owner could not tell."""
+    if not label or label.get("cant_tell"):
+        return None
+    a = norm_answer(answer)
+    if a is None:
+        return "silent"
+    return "right" if a in set(label.get("correct") or []) else "wrong"

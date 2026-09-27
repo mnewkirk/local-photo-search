@@ -407,3 +407,56 @@ def put_planted(item_id: str, body: PlantedBody):
     except KeyError:
         raise HTTPException(404, "no such planted item")
     return {"id": item_id, "confirmed": it["confirmed"]}
+
+
+# --------------------------------------------------------------------------
+# Differences: only the facts a photo's descriptions disagree on
+# --------------------------------------------------------------------------
+
+class DisputeBody(BaseModel):
+    correct: List[str] = []
+    cant_tell: bool = False
+
+
+def _dispute_options(q: dict) -> list[str]:
+    """Distinct answers, never attributed. 'Not mentioned' is not an option:
+    silence is neither right nor wrong."""
+    return sorted({a for a in q["answers"].values() if a is not None})
+
+
+@router.get("/describe/disputes")
+def get_disputes():
+    disputes = me.load_disputes()
+    labels = me.load_dispute_labels()
+    strata = {p["photo_id"]: p["stratum"] for p in me.load_sample("describe")["photos"]}
+    photos = []
+    for pid, d in disputes.items():
+        qs = [{"key": q["key"], "question": q["question"], "options": _dispute_options(q),
+               "label": labels.get(q["key"])} for q in d["questions"]]
+        if not qs:
+            continue
+        photos.append({"photo_id": int(pid), "stratum": strata.get(int(pid)), "questions": qs,
+                       "done": all(q["label"] for q in qs)})
+    # Most disagreement first: that is where a label separates models most.
+    photos.sort(key=lambda p: (-len(p["questions"]), p["photo_id"]))
+    total_q = sum(len(p["questions"]) for p in photos)
+    done_q = sum(1 for p in photos for q in p["questions"] if q["label"])
+    return {"photos": photos,
+            "progress": {"done": sum(p["done"] for p in photos), "total": len(photos),
+                         "points_done": done_q, "points_total": total_q},
+            "hint": None if photos else ("No disputes yet — run: python evals/describe_eval.py "
+                                         "disputes --model <text model>")}
+
+
+@router.put("/describe/disputes/{key}")
+def put_dispute(key: str, body: DisputeBody):
+    for d in me.load_disputes().values():
+        for q in d["questions"]:
+            if q["key"] == key:
+                opts = set(_dispute_options(q))
+                bad = [c for c in body.correct if c not in opts]
+                if bad:
+                    raise HTTPException(400, f"not an answer to this question: {bad}")
+                return {"key": key, "label": me.save_dispute_label(key, body.correct,
+                                                                   body.cant_tell)}
+    raise HTTPException(404, "no such disputed point")

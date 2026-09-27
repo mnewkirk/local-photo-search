@@ -116,6 +116,11 @@
     .add { display: flex; gap: 6px; margin-bottom: 12px; }
     .add input { flex: 1; background: var(--surface2); color: var(--text); border: 1px solid var(--border);
       border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px; }
+    .q { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .q-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+    .q-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .btn.small { padding: 3px 10px; font-size: 12px; }
+    .btn.small.on { border-color: var(--yellow); color: var(--yellow); }
     .keys { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
     kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
       background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
@@ -139,7 +144,8 @@
     // ever appear in the URL the owner typed, never next to a description.
     var VQ = PARAMS.get('variants') ? '?variants=' + encodeURIComponent(PARAMS.get('variants')) : '';
     var TABS = [
-      { id: 'claims', label: 'Claims' },
+      { id: 'diffs', label: 'Differences' },
+      { id: 'claims', label: 'All claims' },
       { id: 'pairs', label: 'Pairwise' },
       { id: 'truth', label: 'Visible text' },
       { id: 'categories', label: 'Categories' },
@@ -728,9 +734,148 @@
                             onClick: function () { answer(false); } }, 'No — it is actually true (3)')))));
     }
 
+    // ------------------------------------------------------------------
+    // Differences: only the facts this photo's descriptions DISAGREE on.
+    // Click every answer that is right for the photo (several phrasings can
+    // all be right). "None right" marks every answer wrong; "Can't tell"
+    // leaves the point out of the score.
+    // ------------------------------------------------------------------
+    function diffDraft(photo) {
+      var d = {};
+      photo.questions.forEach(function (q) {
+        var l = q.label;
+        d[q.key] = !l ? { correct: [], mode: null }
+          : l.cant_tell ? { correct: [], mode: 'cant' }
+          : { correct: (l.correct || []).slice(), mode: (l.correct || []).length ? 'pick' : 'none' };
+      });
+      return d;
+    }
+
+    function DiffsTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var draftS = useState({}); var draft = draftS[0]; var setDraft = draftS[1];
+      var dirtyS = useState(false); var dirty = dirtyS[0]; var setDirty = dirtyS[1];
+      var savingS = useState(false); var saving = savingS[0]; var setSaving = savingS[1];
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      useEffect(function () {
+        fetch(API + '/describe/disputes').then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.photos.findIndex(function (p) { return !p.done; });
+          var start = first < 0 ? 0 : first;
+          setIdx(start);
+          if (d.photos.length) setDraft(diffDraft(d.photos[start]));
+        }).catch(function (ex) { props.onError('Could not load differences: ' + ex.message); });
+      }, []);
+
+      var photos = data ? data.photos : [];
+      var photo = photos[idx];
+
+      function goTo(i) {
+        if (i < 0 || i >= photos.length || i === idx) return;
+        if (dirty && !window.confirm('Unsaved answers on this photo. Leave without saving?')) return;
+        setIdx(i); setDraft(diffDraft(photos[i])); setDirty(false);
+      }
+
+      function setQ(key, v) {
+        var d = Object.assign({}, draft); d[key] = v; setDraft(d); setDirty(true);
+      }
+
+      function toggle(key, opt) {
+        var cur = draft[key] || { correct: [], mode: null };
+        var c = cur.correct.slice();
+        var at = c.indexOf(opt);
+        if (at >= 0) c.splice(at, 1); else c.push(opt);
+        setQ(key, { correct: c, mode: c.length ? 'pick' : null });
+      }
+
+      var answered = photo ? photo.questions.filter(function (q) { return (draft[q.key] || {}).mode; }).length : 0;
+
+      function save() {
+        if (!photo || saving) return;
+        if (answered < photo.questions.length) {
+          props.onError('Answer every point (or mark it "Can\'t tell") before saving.');
+          return;
+        }
+        props.onError(null);
+        setSaving(true);
+        var at = idx;
+        Promise.all(photo.questions.map(function (q) {
+          var v = draft[q.key];
+          return fetch(API + '/describe/disputes/' + encodeURIComponent(q.key), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ correct: v.mode === 'pick' ? v.correct : [], cant_tell: v.mode === 'cant' }),
+          }).then(jsonOrThrow);
+        })).then(function (results) {
+          var byKey = {};
+          results.forEach(function (r) { byKey[r.key] = r.label; });
+          var next = photos.map(function (p, i) {
+            if (i !== at) return p;
+            return Object.assign({}, p, { done: true, questions: p.questions.map(function (q) {
+              return Object.assign({}, q, { label: byKey[q.key] || q.label });
+            }) });
+          });
+          var done = next.filter(function (p) { return p.done; }).length;
+          setData(Object.assign({}, data, { photos: next,
+            progress: Object.assign({}, data.progress, { done: done }) }));
+          setSaving(false); setDirty(false);
+          var n = nextOpen(next, at, function (p) { return p.done; });
+          if (n >= 0 && n !== at) { setIdx(n); setDraft(diffDraft(next[n])); }
+        }).catch(function (ex) { setSaving(false); props.onError('Save failed: ' + ex.message); });
+      }
+
+      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!photos.length) return e(Hint, { text: data.hint });
+
+      return e('div', null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: photos, idx: idx, onPick: goTo,
+                   isDone: function (p) { return p.done; },
+                   title: function (p) { return '#' + p.photo_id + ' · ' + p.questions.length + ' points'; } }),
+        e('div', { className: 'work' },
+          e(PhotoPane, { photoId: photo.photo_id },
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length),
+            e('span', { className: 'pill stratum' }, photo.stratum || ''),
+            e('span', { className: 'spacer' }),
+            dirty ? e('span', { className: 'pill dirty' }, '● unsaved')
+                  : photo.done ? e('span', { className: 'pill saved' }, '✓ saved') : null),
+          e('div', { className: 'card' },
+            e('div', { className: 'muted', style: { marginBottom: 12 } },
+              'The descriptions of this photo disagree on these points. Click every answer that is ',
+              'right for the photo. "None right" = every answer shown is wrong.'),
+            photo.questions.map(function (q) {
+              var v = draft[q.key] || { correct: [], mode: null };
+              return e('div', { className: 'q', key: q.key },
+                e('div', { className: 'q-title' }, q.question),
+                e('div', { className: 'chips' },
+                  q.options.map(function (o) {
+                    var on = v.correct.indexOf(o) >= 0;
+                    return e(PS.Chip, { key: o, label: o, wide: false, state: on ? 'yes' : 'no',
+                                        mark: on ? '✓' : '', onClick: function () { toggle(q.key, o); } });
+                  })),
+                e('div', { className: 'q-actions' },
+                  e('button', { type: 'button', className: 'btn small' + (v.mode === 'none' ? ' on' : ''),
+                                onClick: function () { setQ(q.key, { correct: [], mode: 'none' }); } },
+                    'None right'),
+                  e('button', { type: 'button', className: 'btn small' + (v.mode === 'cant' ? ' on' : ''),
+                                onClick: function () { setQ(q.key, { correct: [], mode: 'cant' }); } },
+                    "Can't tell")));
+            }),
+            e('div', { className: 'actions' },
+              e('button', { className: 'btn primary', type: 'button', disabled: saving, onClick: save },
+                saving ? 'Saving…' : 'Save & next (Enter)'),
+              e('span', { className: 'muted' }, answered + ' / ' + photo.questions.length + ' answered')))));
+    }
+
     function Page() {
       var initial = PARAMS.get('tab');
-      var tabS = useState(TABS.some(function (t) { return t.id === initial; }) ? initial : 'claims');
+      var tabS = useState(TABS.some(function (t) { return t.id === initial; }) ? initial : 'diffs');
       var tab = tabS[0]; var setTab = tabS[1];
       var errS = useState(null); var error = errS[0]; var setError = errS[1];
 
@@ -741,7 +886,8 @@
         window.history.replaceState(null, '', u.toString());
       }
 
-      var body = tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })
+      var body = tab === 'diffs' ? e(DiffsTab, { key: 'd', onError: setError })
+        : tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })
         : tab === 'pairs' ? e(PairsTab, { key: 'p', onError: setError })
         : tab === 'truth' ? e(TruthTab, { key: 't', onError: setError })
         : tab === 'planted' ? e(PlantedTab, { key: 'pl', onError: setError })
