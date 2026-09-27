@@ -1,6 +1,6 @@
 # Measured sharpness → derived `blurry`
 
-Status: **steps 1–5 built; step 3 eval run 2026-09-26 — the `blurry` gate FAILED.**
+Status: **CLOSED 2026-09-26 — `blurry` gate failed in three rounds (see Round 3); `blurry` and `sharp` stay FROZEN.**
 `blurry` stays FROZEN; step 6 is not started. Follows
 `docs/HANDOFF-2026-09-26-sharp-blurry.md`.
 
@@ -255,3 +255,32 @@ Caveats:
 - The rule only speaks inside a bucket of about 10k photos. It would tag about
   5,000 photos and stay silent on the rest, so it is a high-precision "clearly
   blurry" tag, not full coverage.
+
+## Round 3 (2026-09-26): the in-bucket rule did not hold up — `blurry` stays FROZEN
+
+Another 40 photos were drawn at random from `aes_sharpness ≤ 2` and labelled by
+the owner. That gives 68 random photos from that bucket, 32 of them blurry, so
+`aes_sharpness ≤ 2` alone is 0.47 precise.
+
+| `frame.ten_max` ≤ | all 68: P [95% CI] / R | only the 40 new (a true holdout): P / R |
+|---|---|---|
+| 2000 | 0.77 [0.57–0.90] / 0.53 | 0.69 / 0.53 |
+| 4000 (the round-2 pick) | 0.68 [0.51–0.81] / 0.72 | **0.55** / 0.65 |
+| 6000 | 0.68 [0.52–0.80] / 0.84 | 0.60 / 0.88 |
+
+The round-2 figure of 0.86 was optimistic: the threshold had been picked on the
+same 28 photos it was scored on. On photos it had never seen, the rule is about
+0.55–0.70 precise. No threshold reaches the 0.8 bar with useful recall.
+
+**Decision: the plan's fallback.**
+
+- `blurry` stays FROZEN.
+- No derivation, no step 6.
+- The v33 column and the opt-in backfill stay, unused.
+
+What's left for anyone reopening this: 208 hand labels (60 visual + 140
+sharpness, 80 blurry) in `evals/visual-tags/`, and the measurement cache beside
+them. A new signal can be scored against them with `evals/sharpness_eval.py`
+without labelling anything again. The evidence is that gradient energy cannot
+tell a soft scene from soft focus, even inside the bucket the VLM already
+suspects.
