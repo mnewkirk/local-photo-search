@@ -1,7 +1,62 @@
 # Measured sharpness → derived `blurry`
 
-Status: **steps 1, 2, 4 and 5 built** (labelling tools; `sharpness.py`; schema v33; the throttled opt-in backfill — CLI `photosearch sharpness`, maintenance stage `--sharpness`, optional batch step `sharpness`). Step 1 labels still awaited; nothing derives `blurry` until step 3. Follows
+Status: **steps 1–5 built; step 3 eval run 2026-09-26 — the `blurry` gate FAILED.**
+`blurry` stays FROZEN; step 6 is not started. Follows
 `docs/HANDOFF-2026-09-26-sharp-blurry.md`.
+
+## Step 3 result (2026-09-26)
+
+These are the owner's labels on 120 photos (the 60-photo sharpness sample plus
+the original 60 visual photos): 21 `blurry` and 99 `sharp`, all judged at 100%
+in the loupe. The blind recheck was not done, so there is no self-agreement
+kappa yet. Measured with v1 in `sharpness.py`; 0 decode errors, median 0.23 s
+per photo on the desktop.
+
+**`blurry`: no metric meets the gate.** The gate requires P ≥ 0.8 at R ≥ 0.5;
+the best recall any metric reaches at P ≥ 0.8 is about 0.4.
+
+| signal | best-F1 P / R | R at P ≥ 0.8 |
+|---|---|---|
+| `frame.ten_max` (whole-frame sharpest-tile Tenengrad), 4000 px | 0.59 / 0.62 | ~0.33 |
+| same, native resolution (no upsampling) | 0.65 / 0.62 | 0.33 |
+| `frame.ten_max` at a 1200 px long edge | 0.65 / 0.52 | 0.43 |
+| `score` (headline: best region, noise-corrected Laplacian) | 0.31 / 0.57 | — |
+| any `faces.*` feature | ≤ 0.40 / ≤ 0.19 | — |
+| baseline: stored `blurry` tag | 0.69 / 0.43 | — |
+| baseline: `aes_sharpness ≤ 2` | 0.65 / 0.71 | — |
+
+What this says:
+
+- **The whole frame beats the face and subject regions,** which is the opposite
+  of the design's premise. Face crops are mostly a single tile, and they carry no
+  signal on their own.
+- **The v1 headline score is the worst choice on the list.** Correcting for
+  noise did not help.
+- **Upsampling was not the cause.** Measuring at native resolution moves the
+  numbers by noise-level amounts. Scale does matter, but no single scale clears
+  the gate.
+- **The false positives are low-contrast or low-resolution scenes that are
+  sharp**: iPhone 5s, HTC One, and moody ILCE-6000 frames. Gradient energy does
+  not separate "soft scene" from "soft focus". This is the white-wall failure
+  the generic advice warns about, and the tiling did not fix it.
+- **The measurement does not beat `aes_sharpness ≤ 2` on these labels.** Pixels
+  alone are not the ground truth here either.
+
+**`sharp` saturates.** The owner called 99 of 120 photos sharp, and that is on a
+sample deliberately weighted towards blurry photos. At its best-F1 threshold the
+measurement fires on 95% of them. The plan's rule (retire `sharp` if it fires on
+more than 40% of photos) applies.
+
+**Caveat:** 21 positives is under the 25 the plan asked for, and the night and
+bokeh groups hold 11 and 6 photos, so the per-stratum parts of the gate are
+barely populated. More labels would tighten these numbers. It is unlikely they
+would move R at P ≥ 0.8 from about 0.35 to 0.5.
+
+**Per the plan, only the number ships.** The v33 column and the backfill exist,
+and both are opt-in; nothing derives a tag. The next option the planners agreed
+on is a small model over the stored features plus `aes_sharpness`, trained on
+these labels. It needs roughly 3× more blurry labels to be validated on
+held-out photos.
 
 Step 1 as built: `visual_tag_eval.MEASURED_TAGS` (never scored against a
 model, both directions); `eval_api.LABELLER_NOTES` for `sharp`/`blurry`;
