@@ -207,3 +207,51 @@ confirmation is pending.
 | Where it runs | extend `rank_measure` | new `sharpness.py` + maintenance stage + batch step; `rank_measure` untouched | B (recommended, pending owner) | 2026-09-26 |
 | Scope of `sharp` | derive both | derive `blurry` only; label `sharp`; retire it if it fires on >40% or P < 0.8 | B (recommended, pending owner) | 2026-09-26 |
 | Order | code, then eval | labels and eval before any backfill | B (both planners) | 2026-09-26 |
+
+## Round 2 (2026-09-26): 160 labels, and a rule that works in one bucket
+
+The sample was extended with `sample-sharpness --extend 40`, drawing 20 photos
+tagged `blurry` and 20 with `aes_sharpness ≤ 2`. That gives 160 labelled photos,
+48 of them `blurry`.
+
+**Single measured features still fail.** The best is `frame.ten_max`: P 0.75 /
+R 0.69 at best F1, and R 0.50 at P ≥ 0.8.
+
+**Combined with `aes_sharpness`, the model passes on the sample but not on the
+library.** A two-feature logistic regression on `frame.ten_max` +
+`aes_sharpness` was scored out-of-fold (5 folds × 20 repeats). It reaches
+R 0.83 at P ≥ 0.8. But the sample is enriched on `aes_sharpness ≤ 2`, a feature
+the model itself uses. Reweighted by bucket:
+
+| `aes_sharpness` bucket | library | labelled | blurry | flagged / correct |
+|---|---|---|---|---|
+| ≤ 2 | 10,103 | 57 | 39 | 42 / 36 |
+| 3–4 | 17,550 | 22 | 5 | 6 / 4 |
+| ≥ 5 | 130,458 | 81 | 4 | 2 / 0 |
+
+Projected to the library, that is roughly 60% precise. It also misses most
+blurry photos outside the ≤ 2 bucket (9 of 103 labelled photos there are
+blurry, which projects to about 12k photos library-wide).
+
+**Inside the `aes_sharpness ≤ 2` bucket, a two-condition rule holds up.** It is
+checked only on the 28 photos drawn at random from that bucket (the
+`aes-sharpness<=2` strata; the tagged-blurry draws are left out because they are
+biased):
+
+| rule | flags | precision | recall in bucket |
+|---|---|---|---|
+| `aes_sharpness ≤ 2` alone | 28 | 0.54 | 1.00 |
+| … and `frame.ten_max ≤ 4000` | 14 | **0.86** | 0.80 |
+| … and `frame.ten_max ≤ 2000` | 9 | 0.89 | 0.53 |
+
+`aes_sharpness ≤ 2` alone reproduces the original 2-of-4 hand check (0.54). The
+measured Tenengrad removes most of its false positives: the sharp, low-texture
+or noisy frames the VLM marked down. So each signal fixes the other's failure,
+which neither one does alone.
+
+Caveats:
+
+- 12 of 14 correct has a 95% interval of roughly 0.6–0.97.
+- The rule only speaks inside a bucket of about 10k photos. It would tag about
+  5,000 photos and stay silent on the rest, so it is a high-precision "clearly
+  blurry" tag, not full coverage.
