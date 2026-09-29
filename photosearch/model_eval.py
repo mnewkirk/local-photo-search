@@ -97,6 +97,48 @@ def write_pass_file(pass_: str, name: str, data) -> None:
     write_json_atomic(pass_dir(pass_) / name, data)
 
 
+_THREAD_LOCKS: dict = {}
+_THREAD_LOCKS_GUARD = __import__("threading").Lock()
+
+
+@contextmanager
+def _file_lock(path: Path):
+    """Exclusive lock for one JSON store: a thread lock (the web server runs
+    sync handlers in a pool) plus flock on a sidecar file (a CLI run at the same
+    time). Held around read-modify-write so parallel saves take turns."""
+    import threading
+    key = str(Path(path).resolve())
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import fcntl
+        except ImportError:          # not on the platforms this runs on
+            yield
+            return
+        with open(f"{path}.lock", "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def update_pass_file(pass_: str, name: str, default, fn):
+    """Locked read-modify-write of one store: `fn(data)` mutates `data` and
+    returns the caller's result. Every label save goes through here — the
+    labelling page saves a photo's labels as PARALLEL requests, and an unlocked
+    read-modify-write let them overwrite each other (2026-09-28: 126 answers
+    submitted, 38 survived)."""
+    path = pass_dir(pass_) / name
+    with _file_lock(path):
+        data = read_json(path, default)
+        result = fn(data)
+        write_json_atomic(path, data)
+        return result
+
+
 # --------------------------------------------------------------------------
 # Run cache
 # --------------------------------------------------------------------------
@@ -565,12 +607,13 @@ def save_claim(sha: str, photo_id: int, n_segments: int, wrong: Iterable[int],
     wrong = sorted(set(int(i) for i in wrong))
     if any(i < 0 or i >= n_segments for i in wrong):
         raise ValueError(f"segment index out of range 0..{n_segments - 1}")
-    data = read_pass_file("describe", "claims.json", {"labels": {}})
     label = {"photo_id": int(photo_id), "n_segments": int(n_segments), "wrong": wrong,
              "other_wrong": bool(other_wrong), "done": bool(done), "updated_at": now_iso()}
-    data["labels"][sha] = label
-    write_pass_file("describe", "claims.json", data)
-    return label
+
+    def put(data):
+        data["labels"][sha] = label
+        return label
+    return update_pass_file("describe", "claims.json", {"labels": {}}, put)
 
 
 def claim_errors(label: Optional[dict]) -> Optional[int]:
@@ -593,10 +636,10 @@ def load_prefs() -> dict:
 
 
 def save_pref(key: str, winner_sha: Optional[str]) -> dict:
-    data = read_pass_file("describe", "prefs.json", {"prefs": {}})
-    data["prefs"][key] = {"winner_sha": winner_sha, "updated_at": now_iso()}
-    write_pass_file("describe", "prefs.json", data)
-    return data["prefs"][key]
+    def put(data):
+        data["prefs"][key] = {"winner_sha": winner_sha, "updated_at": now_iso()}
+        return data["prefs"][key]
+    return update_pass_file("describe", "prefs.json", {"prefs": {}}, put)
 
 
 def load_text_truth() -> dict:
@@ -604,10 +647,10 @@ def load_text_truth() -> dict:
 
 
 def save_text_truth(photo_id: int, text: str, done: bool = True) -> dict:
-    data = load_text_truth()
-    data[str(int(photo_id))] = {"text": text, "done": bool(done), "updated_at": now_iso()}
-    write_pass_file("describe", "text_truth.json", data)
-    return data[str(int(photo_id))]
+    def put(data):
+        data[str(int(photo_id))] = {"text": text, "done": bool(done), "updated_at": now_iso()}
+        return data[str(int(photo_id))]
+    return update_pass_file("describe", "text_truth.json", {}, put)
 
 
 # --------------------------------------------------------------------------
@@ -669,10 +712,10 @@ def save_category_label(key: str, yes: Iterable[str], done: bool = True) -> dict
     bad = [t for t in yes if t not in vocab]
     if bad:
         raise ValueError(f"not in the content vocabulary: {bad}")
-    data = load_category_labels()
-    data[key] = {"yes": yes, "done": bool(done), "updated_at": now_iso()}
-    write_pass_file("text", "category_labels.json", data)
-    return data[key]
+    def put(data):
+        data[key] = {"yes": yes, "done": bool(done), "updated_at": now_iso()}
+        return data[key]
+    return update_pass_file("text", "category_labels.json", {}, put)
 
 
 def load_keyword_labels() -> dict:
@@ -687,10 +730,11 @@ def save_keyword_label(key: str, judged: Iterable[str], wrong: Iterable[str],
     wrong = sorted(set(wrong))
     if not set(wrong) <= set(judged):
         raise ValueError("wrong keywords must come from the judged pool")
-    data = load_keyword_labels()
-    data[key] = {"judged": judged, "wrong": wrong, "done": bool(done), "updated_at": now_iso()}
-    write_pass_file("text", "keyword_labels.json", data)
-    return data[key]
+    def put(data):
+        data[key] = {"judged": judged, "wrong": wrong, "done": bool(done),
+                     "updated_at": now_iso()}
+        return data[key]
+    return update_pass_file("text", "keyword_labels.json", {}, put)
 
 
 # --------------------------------------------------------------------------
@@ -714,16 +758,16 @@ def save_verify_sets(data: dict) -> None:
 
 
 def confirm_planted(item_id: str, confirmed: bool) -> dict:
-    data = load_verify_sets()
-    if data is None:
-        raise KeyError("no verify sets")
-    for it in data["items"]:
-        if it["id"] == item_id and it["kind"] == "planted":
-            it["confirmed"] = bool(confirmed)
-            it["confirmed_at"] = now_iso()
-            save_verify_sets(data)
-            return it
-    raise KeyError(item_id)
+    def put(data):
+        if data is None:
+            raise KeyError("no verify sets")
+        for it in data["items"]:
+            if it["id"] == item_id and it["kind"] == "planted":
+                it["confirmed"] = bool(confirmed)
+                it["confirmed_at"] = now_iso()
+                return it
+        raise KeyError(item_id)
+    return update_pass_file("verify", "sets.json", None, put)
 
 
 # --------------------------------------------------------------------------
@@ -777,11 +821,11 @@ def load_dispute_labels() -> dict:
 
 
 def save_dispute_label(key: str, correct: Iterable[str], cant_tell: bool = False) -> dict:
-    data = load_dispute_labels()
-    data[key] = {"correct": sorted(set(correct)), "cant_tell": bool(cant_tell),
-                 "updated_at": now_iso()}
-    write_pass_file("describe", "dispute_labels.json", data)
-    return data[key]
+    def put(data):
+        data[key] = {"correct": sorted(set(correct)), "cant_tell": bool(cant_tell),
+                     "updated_at": now_iso()}
+        return data[key]
+    return update_pass_file("describe", "dispute_labels.json", {}, put)
 
 
 def dispute_verdict(answer: Optional[str], label: Optional[dict]) -> Optional[str]:

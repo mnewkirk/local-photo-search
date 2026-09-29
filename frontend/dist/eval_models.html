@@ -67,6 +67,7 @@
       color: var(--text-muted); cursor: pointer; font-family: inherit; padding: 0; }
     .cell:hover { border-color: var(--accent); }
     .cell.done { background: rgba(74,222,128,0.18); border-color: rgba(74,222,128,0.5); color: var(--green); }
+    .cell.partial { background: rgba(250,204,21,0.14); border-color: rgba(250,204,21,0.5); color: var(--yellow); }
     .cell.current { outline: 2px solid var(--accent); outline-offset: 1px; color: var(--text); font-weight: 700; }
 
     .work { display: grid; grid-template-columns: minmax(0, 1fr) 560px; gap: 18px; align-items: start; }
@@ -191,7 +192,8 @@
         props.items.map(function (it, i) {
           return e('button', {
             key: i, type: 'button', title: props.title(it),
-            className: 'cell' + (props.isDone(it) ? ' done' : '') + (i === props.idx ? ' current' : ''),
+            className: 'cell' + (props.isDone(it) ? ' done'
+              : (props.isPartial && props.isPartial(it)) ? ' partial' : '') + (i === props.idx ? ' current' : ''),
             onClick: function () { props.onPick(i); },
           }, i + 1);
         }));
@@ -809,21 +811,23 @@
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ correct: v.mode === 'pick' ? v.correct : [], cant_tell: v.mode === 'cant' }),
           }).then(jsonOrThrow);
-        })).then(function (results) {
-          var byKey = {};
-          results.forEach(function (r) { byKey[r.key] = r.label; });
-          var next = photos.map(function (p, i) {
-            if (i !== at) return p;
-            return Object.assign({}, p, { done: true, questions: p.questions.map(function (q) {
-              return Object.assign({}, q, { label: byKey[q.key] || q.label });
-            }) });
-          });
-          var done = next.filter(function (p) { return p.done; }).length;
-          setData(Object.assign({}, data, { photos: next,
-            progress: Object.assign({}, data.progress, { done: done }) }));
+        })).then(function () {
+          // Re-read what is actually on disk rather than trusting local state:
+          // a server-side race once dropped most of a photo's answers while
+          // this page showed them all as saved.
+          return fetch(API + '/describe/disputes').then(jsonOrThrow);
+        }).then(function (fresh) {
+          setData(fresh);
           setSaving(false); setDirty(false);
-          var n = nextOpen(next, at, function (p) { return p.done; });
-          if (n >= 0 && n !== at) { setIdx(n); setDraft(diffDraft(next[n])); }
+          var next = fresh.photos;
+          var here = next.findIndex(function (p) { return p.photo_id === photo.photo_id; });
+          if (here >= 0 && !next[here].done) {
+            setIdx(here); setDraft(diffDraft(next[here]));
+            props.onError('Not every answer for this photo was saved — please check it and save again.');
+            return;
+          }
+          var n = nextOpen(next, here < 0 ? at : here, function (p) { return p.done; });
+          if (n >= 0) { setIdx(n); setDraft(diffDraft(next[n])); }
         }).catch(function (ex) { setSaving(false); props.onError('Save failed: ' + ex.message); });
       }
 
@@ -837,6 +841,7 @@
         e(Progress, { progress: data.progress }),
         e(Strip, { items: photos, idx: idx, onPick: goTo,
                    isDone: function (p) { return p.done; },
+                   isPartial: function (p) { return p.questions.some(function (q) { return q.label; }); },
                    title: function (p) { return '#' + p.photo_id + ' · ' + p.questions.length + ' points'; } }),
         e('div', { className: 'work' },
           e(PhotoPane, { photoId: photo.photo_id },
