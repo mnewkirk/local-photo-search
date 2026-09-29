@@ -72,7 +72,11 @@ def collect_describe(db):
             continue
         n = r["n"] or 0
         bad = (n - r["answered"]) + r["degenerate_final"] + r["truncated"]
-        if r.get("claims_n"):
+        answered = (r.get("disp_right") or 0) + (r.get("disp_wrong") or 0)
+        if answered:
+            head = _ratio(r["disp_right"], answered)
+            basis = f"right on disputed pts {r['disp_right']}/{answered}"
+        elif r.get("claims_n"):
             head, basis = _ratio(r["clean"], r["claims_n"]), f"clean {r['clean']}/{r['claims_n']}"
         else:
             head, basis = (1 - bad / n) if n else None, "no labels: 1 - bad output"

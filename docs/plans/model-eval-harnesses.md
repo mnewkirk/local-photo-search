@@ -543,3 +543,36 @@ every disputed point is right or silent; its **wrong answers are the real errors
 (`verify_eval.description_errors`). From qwen9b: 20 clean, 20 planted (11 object, 5
 colour, 4 count), 50 with real errors. The planted ones need the owner's yes/no on the
 Planted tab before they are scored.
+
+### Verify result (2026-09-28): switch to gemma-4-12b-qat
+
+Descriptions come from qwen3.5-9b (production describe): 20 clean, 20 planted (every one
+confirmed false by the owner), 50 with the real errors from the Differences labels. Each
+verify model ran alone, in both modes.
+
+| model | mode | planted: matched | real: matched | false reject | s/photo |
+|---|---|---|---|---|---|
+| gemma-4-e2b (production) | llm | 0.25 | 0.24 | **0.40** | 0.4 |
+| gemma-4-e2b (production) | pipeline (ships) | 0.20 | 0.06 | 0.00 | 0.6 |
+| **gemma-4-12b-qat** | llm | **0.80** | 0.12 | **0.05** | 0.7 |
+| **gemma-4-12b-qat** | pipeline | **0.65** | 0.02 | 0.00 | 1.1 |
+| minicpm-v-4_5 | llm | 0.45 | 0.02 | 0.00 | 0.7 |
+| gemma-4-e4b | llm | 0.80 | 0.56 | **0.95** (flags everything) | 0.6 |
+
+- **gemma-4-12b-qat** catches 16 of 20 planted errors and names them correctly, while
+  rejecting 1 of 20 clean descriptions. The production gemma-4-e2b names 5 of 20 and
+  rejects 8 of 20 clean ones. Its model-only verdicts are close to noise, and the
+  shipped pipeline is quiet only because the CLIP stages throw most of its flags away.
+- **The CLIP stages remove correct colour and count catches.** g12b's colour catches go
+  from 0.80 in llm mode to 0.20 in pipeline mode: CLIP cannot see a colour swap or a
+  miscount, so the override discards the LLM's right answer. Object catches are
+  unchanged (0.91 in both modes). Worth revisiting the override once g12b is the
+  verifier. Not changed here.
+- Real errors are hard for everyone except the model that flags everything. They are
+  subtle (a count, a shade), and "matched" needs the flag to name the labelled answer.
+  So read that column as relative, not absolute.
+- Small sets (20/20/50). g12b vs e2b on planted matched is 16/20 vs 5/20, and on false
+  rejects 1/20 vs 8/20: large enough not to be noise.
+
+The summary now ranks describe by the Differences labels (right on disputed points),
+not the sparse, damaged "All claims" labels.
