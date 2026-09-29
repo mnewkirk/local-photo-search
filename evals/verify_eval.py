@@ -64,12 +64,35 @@ def _content(text):
 # Plant
 # --------------------------------------------------------------------------
 
-def plant_object(text, rnd):
+# One fixed sentence would let a verifier learn the SENTENCE instead of
+# checking the photo, so the planted claim's wording varies too.
+OBJECT_TEMPLATES = [
+    "There is {a} {noun} in the background.",
+    "{A} {noun} is visible near the edge of the frame.",
+    "Off to one side sits {a} {noun}.",
+    "{A} {noun} can be seen behind them.",
+    "Nearby, {a} {noun} rests on the ground.",
+]
+
+
+def plant_object(text, rnd, used=None, tpl_rnd=None):
+    """Append one absent object. `used` (a Counter shared across one build)
+    makes the pick the LEAST-used eligible noun, so the same object is not
+    planted four times (it was: 4 of 11 plants were 'parrot'). Note a change
+    here DOES shift the colour/count plants drawn later from the same rnd —
+    random.choice consumes a variable amount of randomness — so a rebuild keeps
+    only confirmations whose planted text came out identical."""
     have = _content(text)
     choices = [n for n in ABSENT_NOUNS if not (_content(n) & have)]
+    if used is not None:
+        least = min(used.get(n, 0) for n in choices)
+        choices = [n for n in choices if used.get(n, 0) == least]
     noun = rnd.choice(choices)
-    article = "an" if noun[0] in "aeiou" else "a"
-    return text.rstrip() + f" There is {article} {noun} in the background.", [noun]
+    if used is not None:
+        used[noun] = used.get(noun, 0) + 1
+    a = "an" if noun[0] in "aeiou" else "a"
+    tpl = (tpl_rnd or rnd).choice(OBJECT_TEMPLATES) if tpl_rnd is not None else OBJECT_TEMPLATES[0]
+    return text.rstrip() + " " + tpl.format(a=a, A=a.capitalize(), noun=noun), [noun]
 
 
 def plant_colour(text, rnd):
@@ -134,6 +157,8 @@ def build_sets(source, *, seed=13):
         raise SystemExit(f"no describe run {source!r}")
     claims, disputes, dlabels = me.load_claims(), me.load_disputes(), me.load_dispute_labels()
     rnd = random.Random(seed)
+    used = {}
+    previous = {it["id"]: it for it in (me.load_verify_sets() or {}).get("items", [])}
     items = []
     order = ["object", "colour", "count"]
     k = 0
@@ -151,12 +176,18 @@ def build_sets(source, *, seed=13):
                           "type": None, "text": text, "spans": [], "confirmed": None})
             want = order[k % 3]
             k += 1
-            planted = PLANTERS[want](text, rnd)
+            tpl_rnd = random.Random(f"{seed}-tpl-{pid}")
+            planted = (plant_object(text, rnd, used, tpl_rnd) if want == "object"
+                       else PLANTERS[want](text, rnd))
             if planted is None:
-                want, planted = "object", plant_object(text, rnd)
+                want, planted = "object", plant_object(text, rnd, used, tpl_rnd)
             new_text, pspans = planted
+            old = previous.get(f"planted-{pid}")
+            # A confirmation is about one exact sentence: carry it over only
+            # when the planted text is unchanged.
+            kept = old.get("confirmed") if old and old.get("text") == new_text else None
             items.append({"id": f"planted-{pid}", "photo_id": int(pid), "kind": "planted",
-                          "type": want, "text": new_text, "spans": pspans, "confirmed": None})
+                          "type": want, "text": new_text, "spans": pspans, "confirmed": kept})
         else:
             items.append({"id": f"real-{pid}", "photo_id": int(pid), "kind": "real",
                           "type": None, "text": text, "spans": spans, "confirmed": None})

@@ -163,3 +163,25 @@ def test_sets_use_differences_labels():
     items = {it["id"]: it for it in V.build_sets("src")["items"]}
     assert "real-1" in items and items["real-1"]["spans"] == ["two"]
     assert "clean-3" in items and "planted-3" in items          # right + silent = clean
+
+
+def test_object_plants_do_not_repeat_and_vary_wording():
+    from collections import Counter
+    rnd, used = random.Random(1), {}
+    nouns, sentences = [], set()
+    for i in range(len(V.ABSENT_NOUNS)):
+        text, spans = V.plant_object(CLEAN3, rnd, used, random.Random(i))
+        nouns.append(spans[0])
+        sentences.add(text[len(CLEAN3):].replace(spans[0], "X"))
+    assert max(Counter(nouns).values()) == 1          # no repeats until the list runs out
+    assert len(sentences) > 1
+
+
+def test_rebuild_keeps_confirmations_for_unchanged_plants():
+    _describe_run()
+    first = V.build_sets("src")
+    for it in first["items"]:
+        if it["kind"] == "planted":
+            me.confirm_planted(it["id"], True)
+    again = V.build_sets("src")
+    assert all(it["confirmed"] is True for it in again["items"] if it["kind"] == "planted")
