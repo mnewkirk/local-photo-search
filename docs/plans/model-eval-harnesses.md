@@ -521,3 +521,25 @@ answered`. Silence is never counted as wrong.
 
 Tests: `tests/test_describe_disputes.py`.
 
+
+### Describe result (2026-09-28): keep qwen3.5-9b
+
+The owner labelled all 386 disputed points (380 scorable, 6 "can't tell"):
+
+| model | wrong claims per photo | right when it answered a disputed point | fewer wrong claims than it, photo by photo |
+|---|---|---|---|
+| **qwen/qwen3.5-9b (production)** | **1.06** | **0.75** | — |
+| gemma-4-12b-qat | 1.19 | 0.63 | qwen 27 vs 23 (sign p 0.67) |
+| minicpm-v-4_5 | 1.56 | 0.60 | qwen 32 vs 18 (p 0.06) |
+| gemma-4-e4b | 1.39 | 0.36 | qwen 33 vs 17 (p 0.03) |
+
+qwen leads in every stratum: sports 0.74, photos with visible text 0.76, the rest 0.74.
+e4b's short descriptions come from leaving things out (228 of 380 silent), and when it
+does commit to a disputed fact it is mostly wrong. **No candidate beats production
+describe.** g12b is a tie on wrong claims but answers fewer points correctly.
+
+Verify sets now also come from the Differences labels. A description is **clean** when
+every disputed point is right or silent; its **wrong answers are the real errors**
+(`verify_eval.description_errors`). From qwen9b: 20 clean, 20 planted (11 object, 5
+colour, 4 count), 50 with real errors. The planted ones need the owner's yes/no on the
+Planted tab before they are scored.

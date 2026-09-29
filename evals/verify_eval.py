@@ -99,12 +99,40 @@ def plant_count(text, rnd):
 PLANTERS = {"object": plant_object, "colour": plant_colour, "count": plant_count}
 
 
+def description_errors(pid, sha, text, claims, disputes, dlabels):
+    """(errors, spans) for one description from the owner's labels, or None
+    when it has not been judged.
+
+    Two sources, combined: 'All claims' labels (clicked segments) and the
+    Differences labels (disputed facts — its WRONG answers are the spans). A
+    description whose every disputed point is labelled and answered right or
+    silent counts as clean: facts all the descriptions agreed on were never
+    disputed, and are taken as right."""
+    judged, errs, spans = False, 0, []
+    lab = claims.get(sha)
+    if me.claim_errors(lab) is not None:
+        judged = True
+        errs += me.claim_errors(lab)
+        segs = me.segment_claims(text)
+        spans += [segs[i].strip() for i in lab.get("wrong") or [] if i < len(segs)]
+    d = disputes.get(str(pid))
+    if d and sha in d.get("shas", []):
+        qs = d["questions"]
+        if qs and all(q["key"] in dlabels for q in qs):
+            judged = True
+            for q in qs:
+                if me.dispute_verdict(q["answers"].get(sha), dlabels.get(q["key"])) == "wrong":
+                    errs += 1
+                    spans.append(q["answers"][sha])
+    return (errs, spans) if judged else None
+
+
 def build_sets(source, *, seed=13):
-    """Sets from `source`'s descriptions and the owner's claim labels."""
+    """Sets from `source`'s descriptions and the owner's describe labels."""
     run = me.load_run("describe", source)
     if run is None:
         raise SystemExit(f"no describe run {source!r}")
-    labels = me.load_claims()
+    claims, disputes, dlabels = me.load_claims(), me.load_disputes(), me.load_dispute_labels()
     rnd = random.Random(seed)
     items = []
     order = ["object", "colour", "count"]
@@ -114,10 +142,10 @@ def build_sets(source, *, seed=13):
         if not text:
             continue
         sha = it.get("text_sha") or me.text_sha(text)
-        lab = labels.get(sha)
-        errs = me.claim_errors(lab)
-        if errs is None:
+        judged = description_errors(pid, sha, text, claims, disputes, dlabels)
+        if judged is None:
             continue
+        errs, spans = judged
         if errs == 0:
             items.append({"id": f"clean-{pid}", "photo_id": int(pid), "kind": "clean",
                           "type": None, "text": text, "spans": [], "confirmed": None})
@@ -126,12 +154,10 @@ def build_sets(source, *, seed=13):
             planted = PLANTERS[want](text, rnd)
             if planted is None:
                 want, planted = "object", plant_object(text, rnd)
-            new_text, spans = planted
+            new_text, pspans = planted
             items.append({"id": f"planted-{pid}", "photo_id": int(pid), "kind": "planted",
-                          "type": want, "text": new_text, "spans": spans, "confirmed": None})
+                          "type": want, "text": new_text, "spans": pspans, "confirmed": None})
         else:
-            segs = me.segment_claims(text)
-            spans = [segs[i].strip() for i in lab.get("wrong") or [] if i < len(segs)]
             items.append({"id": f"real-{pid}", "photo_id": int(pid), "kind": "real",
                           "type": None, "text": text, "spans": spans, "confirmed": None})
     data = {"source_variant": source, "source_effective_model": run.get("effective_model"),

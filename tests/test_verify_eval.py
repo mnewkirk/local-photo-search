@@ -141,3 +141,25 @@ def test_planted_api_round_trip(client):
     assert client.put("/api/eval/models/verify/planted/nope",
                       json={"confirmed": True}).status_code == 404
     assert client.get("/api/eval/models/verify/planted").json()["progress"]["done"] == 1
+
+
+def test_sets_use_differences_labels():
+    """A description judged only on the Differences tab: its wrong answers
+    are the real errors; all-right-or-silent makes it clean."""
+    _describe_run()
+    s1, s3 = me.text_sha(CLEAN1), me.text_sha(CLEAN3)
+    other = "zzz"
+    # Photo 1 already has a clean claims label; photo 3 we judge by disputes only.
+    me.save_claim(me.text_sha(CLEAN3), 3, len(me.segment_claims(CLEAN3)), [], done=False)
+    me.save_disputes({
+        "1": {"shas": sorted([s1, other]), "questions": [
+            {"key": "a", "question": "How many?", "answers": {s1: "two", other: "four"}}]},
+        "3": {"shas": sorted([s3, other]), "questions": [
+            {"key": "b", "question": "Animal?", "answers": {s3: "dog", other: "cat"}},
+            {"key": "c", "question": "Porch?", "answers": {s3: None, other: "yes"}}]}})
+    me.save_dispute_label("a", ["four"])        # photo 1's source said two: wrong
+    me.save_dispute_label("b", ["dog"])
+    me.save_dispute_label("c", [])
+    items = {it["id"]: it for it in V.build_sets("src")["items"]}
+    assert "real-1" in items and items["real-1"]["spans"] == ["two"]
+    assert "clean-3" in items and "planted-3" in items          # right + silent = clean
