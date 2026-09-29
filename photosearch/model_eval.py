@@ -820,10 +820,21 @@ def load_dispute_labels() -> dict:
     return read_pass_file("describe", "dispute_labels.json", {})
 
 
-def save_dispute_label(key: str, correct: Iterable[str], cant_tell: bool = False) -> dict:
+def dispute_options(q: dict) -> list[str]:
+    """Distinct answers to one disputed point; silence is not an option."""
+    return sorted({a for a in q["answers"].values() if a is not None})
+
+
+def save_dispute_label(key: str, correct: Iterable[str], cant_tell: bool = False,
+                       options_seen: Optional[Iterable[str]] = None) -> dict:
+    """`options_seen` = the answers the owner was shown. A description added
+    later whose answer is not among them is UNJUDGED, never wrong by default —
+    "None right" said nothing about an answer that was not on screen."""
     def put(data):
         data[key] = {"correct": sorted(set(correct)), "cant_tell": bool(cant_tell),
                      "updated_at": now_iso()}
+        if options_seen is not None:
+            data[key]["options_seen"] = sorted(set(options_seen))
         return data[key]
     return update_pass_file("describe", "dispute_labels.json", {}, put)
 
@@ -836,4 +847,19 @@ def dispute_verdict(answer: Optional[str], label: Optional[dict]) -> Optional[st
     a = norm_answer(answer)
     if a is None:
         return "silent"
-    return "right" if a in set(label.get("correct") or []) else "wrong"
+    if a in set(label.get("correct") or []):
+        return "right"
+    seen = label.get("options_seen")
+    if seen is not None and a not in set(seen):
+        return None                     # an answer the owner never saw
+    return "wrong"
+
+
+def dispute_label_current(q: dict, label: Optional[dict]) -> bool:
+    """Is this point fully judged — labelled, and no answer added since?"""
+    if not label:
+        return False
+    if label.get("cant_tell"):
+        return True
+    seen = label.get("options_seen")
+    return seen is None or set(dispute_options(q)) <= set(seen)

@@ -746,8 +746,12 @@
       var d = {};
       photo.questions.forEach(function (q) {
         var l = q.label;
+        // A point with an answer added since it was labelled keeps the earlier
+        // picks but drops its mode: "None right" must be re-said with the new
+        // answer on screen, never carried over to it.
         d[q.key] = !l ? { correct: [], mode: null }
           : l.cant_tell ? { correct: [], mode: 'cant' }
+          : !q.current ? { correct: (l.correct || []).slice(), mode: null }
           : { correct: (l.correct || []).slice(), mode: (l.correct || []).length ? 'pick' : 'none' };
       });
       return d;
@@ -794,7 +798,10 @@
         setQ(key, { correct: c, mode: c.length ? 'pick' : null });
       }
 
-      var answered = photo ? photo.questions.filter(function (q) { return (draft[q.key] || {}).mode; }).length : 0;
+      var answered = photo ? photo.questions.filter(function (q) {
+        var v = draft[q.key] || {};
+        return v.mode || (v.correct && v.correct.length);
+      }).length : 0;
 
       function save() {
         if (!photo || saving) return;
@@ -809,7 +816,8 @@
           var v = draft[q.key];
           return fetch(API + '/describe/disputes/' + encodeURIComponent(q.key), {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ correct: v.mode === 'pick' ? v.correct : [], cant_tell: v.mode === 'cant' }),
+            body: JSON.stringify({ correct: v.mode === 'none' || v.mode === 'cant' ? [] : v.correct,
+                                   cant_tell: v.mode === 'cant' }),
           }).then(jsonOrThrow);
         })).then(function () {
           // Re-read what is actually on disk rather than trusting local state:
@@ -856,12 +864,16 @@
               'right for the photo. "None right" = every answer shown is wrong.'),
             photo.questions.map(function (q) {
               var v = draft[q.key] || { correct: [], mode: null };
+              var fresh = q.new_options || [];
               return e('div', { className: 'q', key: q.key },
-                e('div', { className: 'q-title' }, q.question),
+                e('div', { className: 'q-title' }, q.question,
+                  fresh.length ? e('span', { className: 'pill dirty', style: { marginLeft: 8 } },
+                    fresh.length === 1 ? 'new answer to judge' : fresh.length + ' new answers to judge') : null),
                 e('div', { className: 'chips' },
                   q.options.map(function (o) {
                     var on = v.correct.indexOf(o) >= 0;
-                    return e(PS.Chip, { key: o, label: o, wide: false, state: on ? 'yes' : 'no',
+                    return e(PS.Chip, { key: o, label: o + (fresh.indexOf(o) >= 0 ? '  ★ new' : ''),
+                                        wide: false, state: on ? 'yes' : 'no',
                                         mark: on ? '✓' : '', onClick: function () { toggle(q.key, o); } });
                   })),
                 e('div', { className: 'q-actions' },

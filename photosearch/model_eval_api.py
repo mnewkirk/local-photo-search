@@ -421,7 +421,7 @@ class DisputeBody(BaseModel):
 def _dispute_options(q: dict) -> list[str]:
     """Distinct answers, never attributed. 'Not mentioned' is not an option:
     silence is neither right nor wrong."""
-    return sorted({a for a in q["answers"].values() if a is not None})
+    return me.dispute_options(q)
 
 
 @router.get("/describe/disputes")
@@ -431,16 +431,25 @@ def get_disputes():
     strata = {p["photo_id"]: p["stratum"] for p in me.load_sample("describe")["photos"]}
     photos = []
     for pid, d in disputes.items():
-        qs = [{"key": q["key"], "question": q["question"], "options": _dispute_options(q),
-               "label": labels.get(q["key"])} for q in d["questions"]]
+        qs = []
+        for q in d["questions"]:
+            lab = labels.get(q["key"])
+            opts = _dispute_options(q)
+            seen = (lab or {}).get("options_seen")
+            qs.append({"key": q["key"], "question": q["question"], "options": opts,
+                       "label": lab,
+                       # answers added (by another model) since this was labelled
+                       "new_options": [o for o in opts if lab and seen is not None
+                                       and o not in seen],
+                       "current": me.dispute_label_current(q, lab)})
         if not qs:
             continue
         photos.append({"photo_id": int(pid), "stratum": strata.get(int(pid)), "questions": qs,
-                       "done": all(q["label"] for q in qs)})
+                       "done": all(q["current"] for q in qs)})
     # Most disagreement first: that is where a label separates models most.
     photos.sort(key=lambda p: (-len(p["questions"]), p["photo_id"]))
     total_q = sum(len(p["questions"]) for p in photos)
-    done_q = sum(1 for p in photos for q in p["questions"] if q["label"])
+    done_q = sum(1 for p in photos for q in p["questions"] if q["current"])
     return {"photos": photos,
             "progress": {"done": sum(p["done"] for p in photos), "total": len(photos),
                          "points_done": done_q, "points_total": total_q},
@@ -457,6 +466,6 @@ def put_dispute(key: str, body: DisputeBody):
                 bad = [c for c in body.correct if c not in opts]
                 if bad:
                     raise HTTPException(400, f"not an answer to this question: {bad}")
-                return {"key": key, "label": me.save_dispute_label(key, body.correct,
-                                                                   body.cant_tell)}
+                return {"key": key, "label": me.save_dispute_label(
+                    key, body.correct, body.cant_tell, options_seen=opts)}
     raise HTTPException(404, "no such disputed point")

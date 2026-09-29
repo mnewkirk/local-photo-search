@@ -123,3 +123,65 @@ def test_disputes_api_is_blind_and_validates(client):
                       json={"cant_tell": True}).status_code == 200
     got = client.get("/api/eval/models/describe/disputes").json()
     assert got["photos"][0]["done"] and got["progress"]["points_done"] == 2
+
+
+C = "Four boys play field hockey on turf, and a red kite flies overhead."
+
+
+def test_add_variant_reuses_labels_and_never_convicts_an_unseen_answer():
+    _runs([1])
+    sa, sb = me.text_sha(A), me.text_sha(B)
+    me.save_disputes({"1": {"shas": sorted([sa, sb]), "questions": [
+        {"key": "sport", "question": "What sport?", "answers": {sa: "soccer", sb: "field hockey"}},
+        {"key": "count", "question": "How many boys?", "answers": {sa: "four", sb: "two"}},
+        {"key": "car", "question": "Is there a car?", "answers": {sa: None, sb: "yes"}}]}})
+    me.save_dispute_label("sport", ["soccer"])
+    me.save_dispute_label("count", ["four"])
+    me.save_dispute_label("car", [])                     # "None right": there is no car
+    run = me.open_run("describe", "vc", effective_model="vc", prompt_sha=None)
+    run["items"]["1"] = {"text": C, "text_sha": me.text_sha(C)}
+    me.save_run("describe", "vc", run)
+
+    def chat(model=None, messages=None, **kw):
+        assert "field hockey" in messages[0]["content"]      # existing answers are shown
+        return json.dumps({"answers": {"Q1": "Field hockey.", "Q2": "four", "Q3": "a van"},
+                           "new": [{"question": "Is there a kite?", "answer": "a red kite"}]})
+    D.add_variant_to_disputes("vc", model="judge", chat=chat, log=lambda *_: None)
+
+    sc = me.text_sha(C)
+    d = me.load_disputes()["1"]
+    assert sc in d["shas"] and len(d["questions"]) == 4
+    L = me.load_dispute_labels()
+    q = {x["key"]: x for x in d["questions"]}
+    assert me.dispute_verdict(q["sport"]["answers"][sc], L["sport"]) == "wrong"   # seen, judged
+    assert me.dispute_verdict(q["count"]["answers"][sc], L["count"]) == "right"
+    # "a van" was never on screen: the old "None right" must not convict it.
+    assert me.dispute_verdict(q["car"]["answers"][sc], L["car"]) is None
+    assert not me.dispute_label_current(q["car"], L["car"])
+    kite = [x for x in d["questions"] if x["question"] == "Is there a kite?"][0]
+    assert kite["answers"][sc] == "a red kite" and kite["answers"][sa] is None
+
+    # The old variants' scores are unchanged by the addition.
+    rows = {r["variant"]: r for r in D.build_report(use_clip=False)}
+    assert (rows["va"]["disp_right"], rows["va"]["disp_wrong"]) == (2, 0)
+
+    # A plain re-extraction must not touch a labelled photo.
+    calls = []
+    D.build_disputes(model="judge", chat=lambda **kw: calls.append(1) or "[]",
+                     log=lambda *_: None)
+    assert calls == []
+
+
+def test_api_flags_new_answers_and_relabel_records_what_was_seen(client):
+    sa, sb = me.text_sha(A), me.text_sha(B)
+    me.save_sample("describe", [{"photo_id": 7, "stratum": "random"}])
+    me.save_disputes({"7": {"shas": [sa, sb, "sc"], "questions": [
+        {"key": "car", "question": "Car?", "answers": {sa: None, sb: "yes", "sc": "a van"}}]}})
+    me.save_dispute_label("car", [], options_seen=["yes"])
+    got = client.get("/api/eval/models/describe/disputes").json()
+    q = got["photos"][0]["questions"][0]
+    assert q["new_options"] == ["a van"] and q["current"] is False
+    assert got["photos"][0]["done"] is False
+    client.put("/api/eval/models/describe/disputes/car", json={"correct": ["a van"]})
+    assert me.load_dispute_labels()["car"]["options_seen"] == ["a van", "yes"]
+    assert client.get("/api/eval/models/describe/disputes").json()["photos"][0]["done"]

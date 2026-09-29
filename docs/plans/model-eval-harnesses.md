@@ -576,3 +576,29 @@ verify model ran alone, in both modes.
 
 The summary now ranks describe by the Differences labels (right on disputed points),
 not the sparse, damaged "All claims" labels.
+
+### Production describe was never qwen3.5-9b (2026-09-28)
+
+`generations.model_used` shows the web-UI fleet has described, verified,
+visual-tagged and scored aesthetics with **qwen2.5-vl-7b-instruct** since 2026-09-20.
+Every unset vision role fell back to the replica's `PHOTOSEARCH_LLM_VISUAL_MODEL`,
+now fixed with explicit per-role models (`rerun.FLEET_ROLE_MODELS`). So the describe
+comparison above was against the handoff's baseline, not the model actually running.
+
+To add qwen2.5-vl-7b **without re-extracting** (which would orphan all 386 labels),
+`describe_eval.py disputes --add-variant <variant> --model <text model>`:
+- The comparison model maps the new description onto each existing question and
+  copies an existing answer when it agrees, so those are scored by the labels as
+  they stand.
+- An answer the owner never saw is **unjudged, not wrong**. Each label now records
+  `options_seen`, stamped onto the old labels before anything is added, so a
+  "None right" never convicts an answer that wasn't on screen. The tab marks these
+  "★ new" and asks again.
+- At most **1** detail only the new description states becomes a new question
+  (`ADD_MAX_NEW`). In the original extraction each model faced ≤0.7 such questions
+  per photo (qwen3.5-9b 0.61, minicpm 0.70). The first run allowed 3, which is ~5×
+  the scrutiny and ~200 extra labels, so it was trimmed.
+
+qwen2.5-vl-7b: 70/70 photos added, **136 points to label** (70 new, 66 existing
+with an answer not yet judged). Labels, disputes and a backup of both from before
+the addition are in `evals/model-evals/describe/`.

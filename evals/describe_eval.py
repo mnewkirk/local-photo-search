@@ -495,7 +495,13 @@ def build_disputes(*, model=None, variants=None, limit=None, force=False, max_q=
         if len(texts) < 2:
             continue
         shas = sorted(texts)
-        if (data.get(str(pid)) or {}).get("shas") == shas:
+        prev = data.get(str(pid)) or {}
+        if set(shas) <= set(prev.get("shas") or []):
+            continue
+        if prev and not force and any(q["key"] in me.load_dispute_labels()
+                                      for q in prev.get("questions", [])):
+            log(f"  - {pid}: labelled; its descriptions changed — use --add-variant, "
+                "not a re-extraction (that would orphan the labels)")
             continue
         todo.append((pid, texts, shas))
     if limit is not None:
@@ -530,6 +536,136 @@ def build_disputes(*, model=None, variants=None, limit=None, force=False, max_q=
         me.save_disputes(data)
         log(f"  [{i}/{len(todo)}] {pid}: {len(questions)} disputed point(s)")
     fc.summary()
+    return data
+
+
+ADD_PROMPT = """A photo was described independently by several people. Where they disagreed, the facts were turned into questions, each listed below with the answers already given. You cannot see the photo.
+
+Read ONE more description, NEW, and do two things:
+1. For every question, give NEW's answer. If NEW says the same thing as one of the listed answers, copy that answer exactly. If NEW says something different, write NEW's own short answer. If NEW does not address the question, write "not mentioned".
+2. List up to {max_new} specific, checkable detail(s) that NEW states and that none of the questions already cover, most notable first: an object, a count, a colour, an action, or text it quotes. Write each as a question with NEW's answer. Skip mood, style and general setting.
+
+Questions:
+{questions}
+
+NEW: {text}
+
+Answer with ONLY a JSON object: {{"answers": {{{keys}}}, "new": [{{"question": "...", "answer": "..."}}]}}
+"""
+
+
+def _parse_add(raw, qids):
+    import json as _json
+    if not raw:
+        return None
+    s = raw.strip()
+    a, b = s.find("{"), s.rfind("}")
+    if a < 0 or b < a:
+        return None
+    try:
+        data = _json.loads(s[a:b + 1])
+    except ValueError:
+        return None
+    ans = data.get("answers") if isinstance(data, dict) else None
+    if not isinstance(ans, dict):
+        return None
+    answers = {q: me.norm_answer(ans.get(q)) for q in qids}
+    new = []
+    for item in data.get("new") or []:
+        if isinstance(item, dict) and isinstance(item.get("question"), str):
+            a2 = me.norm_answer(item.get("answer"))
+            if a2 is not None:
+                new.append({"question": item["question"].strip(), "answer": a2})
+    return answers, new
+
+
+# In the original extraction each model faced at most ~0.7 "only this one says
+# X" questions per photo (qwen3.5-9b 0.61, minicpm 0.70). Three per photo for an
+# added model (the first run of this) is ~5x the scrutiny and ~200 extra labels;
+# one keeps it close to parity.
+ADD_MAX_NEW = 1
+
+
+def add_variant_to_disputes(variant, *, model=None, chat=None, max_new=ADD_MAX_NEW, log=print):
+    """Score one more describe variant against the ALREADY-LABELLED disputes,
+    without re-extracting (which would orphan every label).
+
+    The text model maps the new description onto each existing question —
+    copying an existing answer when it agrees — so most of it is scored by the
+    owner's labels as they stand. An answer the owner never saw is left
+    unjudged (the label records `options_seen`) and shows on the Differences
+    tab as new. Up to `max_new` (default 1) details only the new description states
+    become new questions, so its own inventions are not invisible."""
+    from photosearch import describe
+    me.pin_role_model("text", model)
+    effective = describe.effective_model(model or "llama3.2:3b", "text")
+    chat = chat or describe._ollama_chat_with_retry
+    run = me.load_run(PASS, variant)
+    if run is None:
+        raise SystemExit(f"no describe run {variant!r}")
+    data = me.load_disputes()
+    labels = me.load_dispute_labels()
+    # Stamp every existing label with the answers it was made against, before
+    # any new answer appears — or "None right" would silently convict it.
+    for d in data.values():
+        for q in d["questions"]:
+            lab = labels.get(q["key"])
+            if lab is not None and "options_seen" not in lab and not lab.get("cant_tell"):
+                me.save_dispute_label(q["key"], lab.get("correct") or [], False,
+                                      options_seen=me.dispute_options(q))
+    todo = []
+    for pid, d in data.items():
+        it = run["items"].get(pid) or {}
+        sha = it.get("text_sha") or me.text_sha(it.get("text"))
+        if it.get("text") and sha not in d["shas"]:
+            todo.append((pid, d, it["text"], sha))
+    log(f"[add] {variant} into disputes via {effective} — {len(todo)} photo(s)")
+    fc = me.FailureCounter(log)
+    added_new = 0
+    for i, (pid, d, text, sha) in enumerate(todo, 1):
+        qids = [f"Q{k + 1}" for k in range(len(d["questions"]))]
+        listing = "\n".join(
+            f"{qid}: {q['question']} | answers: " +
+            "; ".join(f'"{o}"' for o in me.dispute_options(q))
+            for qid, q in zip(qids, d["questions"]))
+        prompt = ADD_PROMPT.format(questions=listing, text=text, max_new=max_new,
+                                   keys=", ".join(f'"{q}": "..."' for q in qids))
+        try:
+            raw = chat(model=model or "llama3.2:3b",
+                       messages=[{"role": "user", "content": prompt}],
+                       options={"temperature": 0}, role="text", timeout=180)
+        except Exception as e:
+            fc.fail(pid, e)
+            continue
+        parsed = _parse_add(raw, qids)
+        if parsed is None:
+            fc.fail(pid, f"unparseable: {(raw or '')[:80]!r}")
+            continue
+        fc.ok()
+        answers, new = parsed
+        new = new[:max_new]
+        for qid, q in zip(qids, d["questions"]):
+            a = answers[qid]
+            # Snap to an existing answer when it matches after normalisation.
+            for o in me.dispute_options(q):
+                if a is not None and a == o:
+                    a = o
+            q["answers"][sha] = a
+        for n in new:
+            q = {"key": me.dispute_key(pid, n["question"], [sha]), "question": n["question"],
+                 "answers": {s2: None for s2 in d["shas"]}, "added_by": variant}
+            q["answers"][sha] = n["answer"]
+            d["questions"].append(q)
+            added_new += 1
+        d["shas"] = sorted(d["shas"] + [sha])
+        d.setdefault("added", []).append({"variant": variant, "model": effective,
+                                          "at": me.now_iso()})
+        me.save_disputes(data)
+    fc.summary()
+    labels = me.load_dispute_labels()
+    unjudged = sum(1 for d in data.values() for q in d["questions"]
+                   if not me.dispute_label_current(q, labels.get(q["key"])))
+    log(f"[add] done — {added_new} new question(s); {unjudged} point(s) now need a label")
     return data
 
 
@@ -649,6 +785,8 @@ def main(argv=None):
     dp.add_argument("--variants", help="comma-separated; default every cached variant")
     dp.add_argument("--limit", type=int)
     dp.add_argument("--force", action="store_true")
+    dp.add_argument("--add-variant", help="score one more variant against the existing, "
+                                         "already-labelled disputes")
 
     pr = sub.add_parser("pairs", help="build blind pairwise comparisons (finalists only)")
     pr.add_argument("--baseline", required=True)
@@ -683,6 +821,8 @@ def main(argv=None):
         run_variant(args.variant, model=args.model, prompt_file=args.prompt_file,
                     server=args.server, limit=args.limit, force=args.force,
                     solo=args.solo)
+    elif args.cmd == "disputes" and args.add_variant:
+        add_variant_to_disputes(args.add_variant, model=args.model)
     elif args.cmd == "disputes":
         build_disputes(model=args.model, limit=args.limit, force=args.force,
                        variants=[v.strip() for v in args.variants.split(",")] if args.variants else None)
