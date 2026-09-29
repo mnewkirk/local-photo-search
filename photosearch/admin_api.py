@@ -1377,17 +1377,19 @@ def _fleet_server_url() -> str:
 
 
 def _fleet_env() -> dict:
-    """Env for run-workers.sh — inherits ours, filling LM Studio role models
-    with defaults when PHOTOSEARCH_TEXT_LLM_URL is set so the LLM passes route
-    to LM Studio out of the box."""
+    """Env for run-workers.sh — inherits ours, and on LM Studio sets EVERY role
+    model explicitly from `rerun.FLEET_ROLE_MODELS` (per-role override:
+    PHOTOSEARCH_FLEET_<ROLE>_MODEL).
+
+    Set, not setdefault: this server's own PHOTOSEARCH_LLM_VISUAL_MODEL is for
+    rerank_photos and the photobook hero picks, and the fleet used to inherit it
+    — and fall back to it for describe/verify/aesthetics too — so every vision
+    pass silently ran on whatever that was (qwen2.5-vl-7b, 2026-09-20..28)."""
+    from .rerun import FLEET_ROLE_MODELS, fleet_role_model
     env = os.environ.copy()
     if env.get("PHOTOSEARCH_TEXT_LLM_URL"):
-        visual = env.get("PHOTOSEARCH_LLM_VISUAL_MODEL") or "qwen2.5-vl-7b-instruct"
-        env.setdefault("PHOTOSEARCH_LLM_VISUAL_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_DESCRIBE_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_VERIFY_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_AESTHETICS_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_TEXT_MODEL", "llama-3.2-3b-instruct")
+        for role in FLEET_ROLE_MODELS:
+            env[f"PHOTOSEARCH_LLM_{role.upper()}_MODEL"] = fleet_role_model(role, env)
     return env
 
 

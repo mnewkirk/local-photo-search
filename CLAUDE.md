@@ -910,14 +910,34 @@ chosen by **role** env var (not by model name):
 | category-visual | `visual` | `PHOTOSEARCH_LLM_VISUAL_MODEL` |
 | category-content / keywords | `text` | `PHOTOSEARCH_LLM_TEXT_MODEL` |
 
-`run-workers.sh` has no flag for these — `export` them before a `--native`
+**The fleet's per-pass models live in one place: `rerun.FLEET_ROLE_MODELS`**,
+chosen by the model evals (`docs/plans/model-eval-harnesses.md`). As of
+2026-09-28: describe `qwen2.5-vl-7b-instruct`, **verify `google/gemma-4-12b-qat`**,
+**visual `minicpm-v-4_5`**, aesthetics `qwen2.5-vl-7b-instruct`, text
+`llama-3.2-3b-instruct`. The web-UI fleet (`admin_api._fleet_env`, used by
+`/admin/maintenance` and `/batches`) **sets every role explicitly** from it; override
+one role with `PHOTOSEARCH_FLEET_<ROLE>_MODEL`. It used to `setdefault` from the
+server's `PHOTOSEARCH_LLM_VISUAL_MODEL`, which the replica sets for rerank. So from
+2026-09-20 to 09-28, describe, verify, visual and aesthetics **all ran on
+qwen2.5-vl-7b**, not the per-role models this section used to list (visible in
+`generations.model_used`). `run-local-replica.sh` now exports the same role models
+for its in-server re-runs, and rerank/photobook read **`PHOTOSEARCH_LLM_RERANK_MODEL`**
+first (still qwen2.5-vl), so changing the visual pass doesn't move them.
+
+**A model the fleet JIT-loads needs an LM Studio per-model context default**
+(`%USERPROFILE%\.lmstudio\.internal\user-concrete-model-default-config\…json`,
+`llm.load.contextLength`). Otherwise it loads at 4096, split across 4 parallel
+slots, and vision requests 400. Set to 16384 for gemma-4-12b-qat and minicpm-v-4_5.
+
+`run-workers.sh` has no flag for these — `export` them before a hand-run `--native`
 launch (the native launcher inherits exported env):
 
 ```bash
 export PHOTOSEARCH_TEXT_LLM_URL=http://<host>:1234/v1
-export PHOTOSEARCH_LLM_DESCRIBE_MODEL=qwen/qwen3.5-9b
-export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-e2b
-export PHOTOSEARCH_LLM_VISUAL_MODEL=google/gemma-4-e2b
+export PHOTOSEARCH_LLM_DESCRIBE_MODEL=qwen2.5-vl-7b-instruct
+export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-12b-qat
+export PHOTOSEARCH_LLM_VISUAL_MODEL=minicpm-v-4_5
+export PHOTOSEARCH_LLM_AESTHETICS_MODEL=qwen2.5-vl-7b-instruct
 export PHOTOSEARCH_LLM_TEXT_MODEL=llama-3.2-3b-instruct
 ./run-workers.sh --native -s http://<NAS-IP>:8000 \
     -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -n 2

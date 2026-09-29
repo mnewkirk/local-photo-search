@@ -61,6 +61,32 @@ def nas_base() -> Optional[str]:
     return (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/") or None
 
 
+# The model each pass runs on LM Studio when the worker fleet is launched from
+# the web UI (admin_api._fleet_env: /admin/maintenance and /batches). Chosen by
+# the model evals — docs/plans/model-eval-harnesses.md, 2026-09-28:
+#   verify -> gemma-4-12b-qat: named 16/20 planted errors and wrongly rejected
+#             1/20 clean descriptions; the old verifier (qwen2.5-vl via the VISUAL
+#             fallback) had never been measured, gemma-4-e2b named 5/20, rejected 8/20.
+#   visual -> minicpm-v-4_5: precision 0.54 / recall 0.56 on the owner's 60 labels
+#             vs qwen2.5-vl-7b 0.51 / 0.40.
+# describe / aesthetics / text are what production already ran (describe and text
+# are pending evals). Explicit per role, deliberately: the server's own
+# PHOTOSEARCH_LLM_VISUAL_MODEL also drives rerank_photos and the photobook hero
+# picks, and letting the fleet's vision roles fall back to it is how describe,
+# verify and aesthetics all silently ran on qwen2.5-vl. Override one role for the
+# UI fleet with PHOTOSEARCH_FLEET_<ROLE>_MODEL.
+FLEET_ROLE_MODELS = {"describe":   "qwen2.5-vl-7b-instruct",
+                     "verify":     "google/gemma-4-12b-qat",
+                     "visual":     "minicpm-v-4_5",
+                     "aesthetics": "qwen2.5-vl-7b-instruct",
+                     "text":       "llama-3.2-3b-instruct"}
+
+
+def fleet_role_model(role: str, env=None) -> str:
+    env = os.environ if env is None else env
+    return env.get(f"PHOTOSEARCH_FLEET_{role.upper()}_MODEL") or FLEET_ROLE_MODELS[role]
+
+
 # LM Studio fallback models when no role env var is configured. These are this
 # deployment's loaded models; override with PHOTOSEARCH_LLM_<ROLE>_MODEL. The
 # raw Ollama defaults in _PASS_LLM are NOT valid LM Studio ids, so without these

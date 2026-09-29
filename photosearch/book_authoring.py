@@ -361,7 +361,10 @@ def pick_heroes(pdb, candidate_ids: list[int], beat_title: str,
     def _pp(i):
         w, h = dims.get(i, (0, 0)); return int(cover_ppi(w or 0, h or 0, _HERO_REF_W, _HERO_REF_H))
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
-    model = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
+    # RERANK first: VISUAL is also the category-visual pass's role model, and
+    # the two are chosen separately (minicpm tags better; qwen picks heroes).
+    model = (os.environ.get("PHOTOSEARCH_LLM_RERANK_MODEL")
+             or os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL"))
     criteria = (f"the single best photo to represent \"{beat_title}\" in a family "
                 "travel photo book — clearly shows the moment/place, the family "
                 "visible when relevant, sharp and well composed, not a duplicate")

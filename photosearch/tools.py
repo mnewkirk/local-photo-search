@@ -1946,7 +1946,10 @@ def _h_rerank_photos(db: PhotoDB, args: dict) -> dict:
         top_n = None
 
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
-    model = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
+    # RERANK first: VISUAL is also the category-visual pass's role model, and
+    # the two are chosen separately (minicpm tags better; qwen picks heroes).
+    model = (os.environ.get("PHOTOSEARCH_LLM_RERANK_MODEL")
+             or os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL"))
     photos = {pid: db.get_photo(pid) for pid in ids}
 
     def _compact(pid, score=None, reason=None):
