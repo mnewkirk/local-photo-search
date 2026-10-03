@@ -705,15 +705,22 @@ def load_category_labels() -> dict:
     return read_pass_file("text", "category_labels.json", {})
 
 
-def save_category_label(key: str, yes: Iterable[str], done: bool = True) -> dict:
+def save_category_label(key: str, yes: Iterable[str], done: bool = True,
+                        missing: Iterable[str] = ()) -> dict:
+    """`yes` = right categories from the vocabulary (scored). `missing` = right
+    categories the owner added that the vocabulary LACKS: no model may emit
+    them, so scoring them would charge every model the same miss. They are
+    kept as vocabulary-gap evidence instead (text_passes_eval report)."""
     from .vocab_content import CONTENT_VOCABULARY
     vocab = set(CONTENT_VOCABULARY)
     yes = sorted(set(yes))
     bad = [t for t in yes if t not in vocab]
     if bad:
         raise ValueError(f"not in the content vocabulary: {bad}")
+    missing = sorted({" ".join(str(t).lower().split()) for t in missing} - vocab - {""})
     def put(data):
-        data[key] = {"yes": yes, "done": bool(done), "updated_at": now_iso()}
+        data[key] = {"yes": yes, "missing": missing, "done": bool(done),
+                     "updated_at": now_iso()}
         return data[key]
     return update_pass_file("text", "category_labels.json", {}, put)
 

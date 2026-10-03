@@ -112,6 +112,8 @@
     .chip .mark { width: 12px; flex: none; font-weight: 700; }
     .chip.yes { background: rgba(74,222,128,0.16); border-color: var(--green); }
     .chip.yes .tag, .chip.yes .mark { color: var(--green); }
+    .chip.gap { background: rgba(250,204,21,0.14); border-color: var(--yellow); }
+    .chip.gap .tag, .chip.gap .mark { color: var(--yellow); }
     .chip.wrong { background: rgba(248,113,113,0.16); border-color: var(--red); }
     .chip.wrong .tag, .chip.wrong .mark { color: var(--red); text-decoration: line-through; }
     .add { display: flex; gap: 6px; margin-bottom: 12px; }
@@ -553,7 +555,7 @@
       function pickedFrom(photo) {
         var d = {};
         var l = photo.label || {};
-        (isCat ? (l.yes || []) : (l.wrong || [])).forEach(function (t) { d[t] = true; });
+        (isCat ? (l.yes || []).concat(l.missing || []) : (l.wrong || [])).forEach(function (t) { d[t] = true; });
         return d;
       }
 
@@ -585,7 +587,9 @@
       function addTerm() {
         var t = add.trim().toLowerCase();
         if (!t) return;
-        if (data.vocabulary.indexOf(t) < 0) { props.onError('"' + t + '" is not in the content vocabulary'); return; }
+        t = t.split(/\s+/).join(' ');
+        // A term the vocabulary lacks is still saved — as a vocabulary gap,
+        // shown amber. No model can emit it, so it is reported, not scored.
         var d = Object.assign({}, picked); d[t] = true;
         setPicked(d); setDirty(true); setAdd('');
       }
@@ -640,10 +644,13 @@
             e('div', { className: 'chips' },
               shown.map(function (t) {
                 var on = !!picked[t];
+                var gap = isCat && data.vocabulary.indexOf(t) < 0;
                 return e(PS.Chip, {
-                  key: t, label: t, wide: false,
-                  state: on ? (isCat ? 'yes' : 'wrong') : 'no',
+                  key: t, label: t + (gap ? '  (not in vocabulary)' : ''), wide: false,
+                  state: on ? (gap ? 'gap' : isCat ? 'yes' : 'wrong') : 'no',
                   mark: on ? (isCat ? '✓' : '✗') : '',
+                  title: gap ? 'Saved as a vocabulary gap: no model can output this term, so it is reported, not scored'
+                             : undefined,
                   onClick: function () { toggle(t); },
                 });
               })),
@@ -653,6 +660,18 @@
                            onKeyDown: function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addTerm(); } } }),
               e('datalist', { id: 'vocab' }, data.vocabulary.map(function (v) { return e('option', { key: v, value: v }); })),
               e('button', { className: 'btn', type: 'button', onClick: addTerm }, 'Add')) : null,
+            // Vocabulary terms containing what is typed, so an existing term
+            // ("boat") is found before a new one ("sailboat") is coined.
+            isCat && add.trim().length >= 2 ? e('div', { className: 'chips' },
+              data.vocabulary.filter(function (v) {
+                var w = add.trim().toLowerCase();
+                return v.indexOf(w) >= 0 || w.indexOf(v) >= 0;
+              }).slice(0, 8).map(function (v) {
+                return e(PS.Chip, { key: 'sug-' + v, label: '+ ' + v, wide: false, state: 'no',
+                  title: 'In the vocabulary — click to add',
+                  onClick: function () { var d = Object.assign({}, picked); d[v] = true;
+                                         setPicked(d); setDirty(true); setAdd(''); } });
+              })) : null,
             e('div', { className: 'actions' },
               e('button', { className: 'btn primary', type: 'button', onClick: save }, 'Save & next (Enter)')))));
     }

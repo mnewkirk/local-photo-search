@@ -329,6 +329,22 @@ def score_labels(pass_, answered, inputs):
     return {"labelled": labelled, "kw_right": right, "kw_wrong": wrong, "kw_unjudged": unjudged}
 
 
+def vocabulary_gaps(inputs_name="main"):
+    """[(term, photos)] the owner marked right that the content vocabulary
+    lacks — most frequent first. Evidence for growing the vocabulary; never
+    scored, since no model is allowed to emit them."""
+    inputs = me.load_inputs(inputs_name)
+    if inputs is None:
+        return []
+    keys = {me.label_key(pid, it["text_sha"]) for pid, it in inputs["items"].items()}
+    counts = {}
+    for key, lab in me.load_category_labels().items():
+        if key in keys and lab.get("done"):
+            for t in lab.get("missing") or []:
+                counts[t] = counts.get(t, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
 def build_report(*, db=None, inputs_name="main"):
     inputs = me.load_inputs(inputs_name)
     if inputs is None:
@@ -385,6 +401,11 @@ def render(rows):
                 out.append(f"  {str(r['variant']):<16} {r['labelled']:>8} "
                            f"{me.fmt_ratio(r['kw_right'], r['kw_right'] + r['kw_wrong']):>9} "
                            f"{r['kw_unjudged']:>8}")
+        out.append("")
+    gaps = vocabulary_gaps()
+    if gaps:
+        out.append("Vocabulary gaps (right categories the 360-term vocabulary lacks, "
+                   "by photos): " + ", ".join(f"{t} ({n})" for t, n in gaps[:30]))
         out.append("")
     out.append(f"defer = extractor returned None (timed out every attempt at the {TEXT_TIMEOUT_S}s "
                "limit): production retries the photo later. unsupp = share of tags with no "

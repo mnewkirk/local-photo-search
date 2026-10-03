@@ -328,7 +328,8 @@ def get_categories(inputs: str = Query("main")):
     for pid, item in inp["items"].items():
         key = me.label_key(pid, item["text_sha"])
         lab = labels.get(key)
-        terms = sorted(set(pool.get(pid, [])) | set((lab or {}).get("yes", [])))
+        terms = sorted(set(pool.get(pid, [])) | set((lab or {}).get("yes", []))
+                       | set((lab or {}).get("missing", [])))
         photos.append({"photo_id": int(pid), "description": item["text"],
                        "pool": terms, "label": lab})
     done = sum(1 for p in photos if (p["label"] or {}).get("done"))
@@ -343,8 +344,14 @@ def put_category(photo_id: int, body: CategoryBody, inputs: str = Query("main"))
     if item is None:
         raise HTTPException(404, f"photo {photo_id} is not in inputs {inputs!r}")
     try:
+        from .vocab_content import CONTENT_VOCABULARY
+        vocab = set(CONTENT_VOCABULARY)
+        terms = {" ".join(t.lower().split()) for t in body.yes} - {""}
+        # Split, don't reject: a right category the vocabulary lacks is a
+        # vocabulary gap, recorded but never scored.
         label = me.save_category_label(me.label_key(photo_id, item["text_sha"]),
-                                       body.yes, body.done)
+                                       sorted(terms & vocab), body.done,
+                                       missing=sorted(terms - vocab))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"photo_id": photo_id, "label": label}

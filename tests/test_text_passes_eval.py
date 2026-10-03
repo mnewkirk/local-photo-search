@@ -182,5 +182,11 @@ def test_category_api_adds_vocabulary_terms(client, db):
                       json={"yes": [term]}).status_code == 200
     photo = client.get("/api/eval/models/text/categories").json()["photos"][0]
     assert term in photo["pool"] and photo["label"]["done"]
-    assert client.put(f"/api/eval/models/text/categories/{ids[0]}",
-                      json={"yes": ["zzz not a term"]}).status_code == 400
+    # A term the vocabulary lacks is kept as a gap, never scored.
+    r = client.put(f"/api/eval/models/text/categories/{ids[0]}",
+                   json={"yes": [term, "Sail  Boat"]})
+    assert r.status_code == 200
+    assert r.json()["label"]["yes"] == [term] and r.json()["label"]["missing"] == ["sail boat"]
+    photo = client.get("/api/eval/models/text/categories").json()["photos"][0]
+    assert "sail boat" in photo["pool"]
+    assert X.vocabulary_gaps() == [("sail boat", 1)]
