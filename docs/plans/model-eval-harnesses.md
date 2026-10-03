@@ -602,3 +602,23 @@ To add qwen2.5-vl-7b **without re-extracting** (which would orphan all 386 label
 qwen2.5-vl-7b: 70/70 photos added, **136 points to label** (70 new, 66 existing
 with an answer not yet judged). Labels, disputes and a backup of both from before
 the addition are in `evals/model-evals/describe/`.
+
+### Describe decided (2026-10-02): switch to qwen3.5-9b
+
+All 456 points labelled, including the 136 for qwen2.5-vl-7b.
+
+| model | right on the ORIGINAL questions | right, all points | wrong claims / photo |
+|---|---|---|---|
+| **qwen/qwen3.5-9b** | **0.75** (219/292) | 0.75 | **1.04** |
+| gemma-4-12b-qat | 0.63 | 0.63 | 1.20 |
+| minicpm-v-4_5 | 0.61 | 0.61 | 1.53 |
+| qwen2.5-vl-7b (what production actually ran) | 0.50 (92/183) | 0.60 | 1.46 |
+| gemma-4-e4b | 0.38 | 0.38 | 1.36 |
+
+Photo by photo, qwen2.5-vl-7b had more wrong claims than qwen3.5-9b on 33 photos and
+fewer on 16 (sign p 0.02). By stratum it scored 0.48 on sports against qwen3.5-9b's 0.77.
+Its own added-detail questions went 59 right / 11 wrong; the "original questions"
+column compares every model on the same questions, which is the fair one.
+**`rerun.FLEET_ROLE_MODELS["describe"]` is now `qwen/qwen3.5-9b`** (1.5 vs 1.2 s/photo).
+Verify (gemma-4-12b-qat) is still a different model, as it must be, and was evaluated
+on qwen3.5-9b's own descriptions.

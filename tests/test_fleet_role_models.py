@@ -21,7 +21,7 @@ def test_fleet_gets_the_eval_chosen_model_per_role(monkeypatch):
     env = admin_api._fleet_env()
     assert env["PHOTOSEARCH_LLM_VERIFY_MODEL"] == "google/gemma-4-12b-qat"
     assert env["PHOTOSEARCH_LLM_VISUAL_MODEL"] == "minicpm-v-4_5"
-    assert env["PHOTOSEARCH_LLM_DESCRIBE_MODEL"] == "qwen2.5-vl-7b-instruct"
+    assert env["PHOTOSEARCH_LLM_DESCRIBE_MODEL"] == "qwen/qwen3.5-9b"
     assert env["PHOTOSEARCH_LLM_AESTHETICS_MODEL"] == "qwen2.5-vl-7b-instruct"
     assert env["PHOTOSEARCH_LLM_TEXT_MODEL"] == "llama-3.2-3b-instruct"
 

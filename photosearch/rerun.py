@@ -69,13 +69,16 @@ def nas_base() -> Optional[str]:
 #             fallback) had never been measured, gemma-4-e2b named 5/20, rejected 8/20.
 #   visual -> minicpm-v-4_5: precision 0.54 / recall 0.56 on the owner's 60 labels
 #             vs qwen2.5-vl-7b 0.51 / 0.40.
-# describe / aesthetics / text are what production already ran (describe and text
-# are pending evals). Explicit per role, deliberately: the server's own
+#   describe -> qwen3.5-9b: right on 0.75 of disputed facts vs qwen2.5-vl-7b 0.50
+#             (the model that had actually been describing), 1.04 vs 1.46 wrong
+#             claims per photo, fewer wrong on 33 photos to 16 (p 0.02); every
+#             other candidate scored lower too.
+# aesthetics / text are what production already ran (text is pending evals). Explicit per role, deliberately: the server's own
 # PHOTOSEARCH_LLM_VISUAL_MODEL also drives rerank_photos and the photobook hero
 # picks, and letting the fleet's vision roles fall back to it is how describe,
 # verify and aesthetics all silently ran on qwen2.5-vl. Override one role for the
 # UI fleet with PHOTOSEARCH_FLEET_<ROLE>_MODEL.
-FLEET_ROLE_MODELS = {"describe":   "qwen2.5-vl-7b-instruct",
+FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      "verify":     "google/gemma-4-12b-qat",
                      "visual":     "minicpm-v-4_5",
                      "aesthetics": "qwen2.5-vl-7b-instruct",
