@@ -1727,6 +1727,35 @@ def api_persons():
     return {"persons": [dict(r) for r in rows]}
 
 
+@app.delete("/api/persons/{person_id}")
+def api_delete_person(person_id: int):
+    """Delete a person no face is labelled as (a stray name from an early
+    Enter). 409 while any face still carries it — that is a real label.
+
+    Replica mode: delete on the NAS (authoritative) first, then locally, so
+    the next sync cannot bring it back and the local pickers drop it now."""
+    if _nas_url:
+        resp = _nas_json("DELETE", f"/api/persons/{person_id}")
+        with _get_db() as db:
+            try:
+                db.delete_empty_person(person_id)
+                resp["mirrored"] = True
+            except (KeyError, ValueError):
+                # Already gone locally, or the replica is behind: the NAS was
+                # the authority and the next sync reconciles.
+                resp["mirrored"] = False
+        return resp
+    with _get_db() as db:
+        try:
+            out = db.delete_empty_person(person_id)
+        except KeyError:
+            raise HTTPException(404, "Person not found")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+    logger.info("PERSON DELETE  person_id=%d  name=%r", person_id, out["name"])
+    return {"ok": True, **out}
+
+
 @app.get("/api/cameras")
 def api_cameras():
     """Distinct camera models with photo counts — feeds the camera filter

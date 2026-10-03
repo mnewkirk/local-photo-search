@@ -1436,6 +1436,36 @@ class PhotoDB:
     # Persons
     # ------------------------------------------------------------------
 
+    def delete_empty_person(self, person_id: int) -> dict:
+        """Delete a person that NO face is labelled as — the stray names left by
+        pressing Enter too soon ('Asa', 'cars'). Refuses (ValueError) while any
+        face still carries the name: that is a real label, and dropping it would
+        leave those faces pointing at nothing.
+
+        Takes the reference faces and match exclusions with it (both cascade),
+        and the person's rows in the on-demand face_dedupe_undo snapshot, so a
+        later restore can never re-attach a deleted name. Commits."""
+        row = self.conn.execute("SELECT id, name FROM persons WHERE id = ?",
+                                (person_id,)).fetchone()
+        if row is None:
+            raise KeyError(person_id)
+        n = self.conn.execute("SELECT COUNT(*) FROM faces WHERE person_id = ?",
+                              (person_id,)).fetchone()[0]
+        if n:
+            raise ValueError(f"{n} face(s) are still labelled {row['name']!r}; "
+                             "reassign or clear them first")
+        refs = self.conn.execute("SELECT COUNT(*) FROM face_references WHERE person_id = ?",
+                                 (person_id,)).fetchone()[0]
+        has_undo = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_dedupe_undo'"
+        ).fetchone()
+        if has_undo:
+            self.conn.execute("DELETE FROM face_dedupe_undo WHERE person_id = ?", (person_id,))
+        self.conn.execute("DELETE FROM face_references WHERE person_id = ?", (person_id,))
+        self.conn.execute("DELETE FROM persons WHERE id = ?", (person_id,))
+        self.conn.commit()
+        return {"id": person_id, "name": row["name"], "references_removed": refs}
+
     def add_person(self, name: str) -> int:
         """Create a named person, or return the existing id if the name exists (case-insensitive)."""
         existing = self.get_person_by_name(name)
