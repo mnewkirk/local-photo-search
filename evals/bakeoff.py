@@ -16,10 +16,10 @@ from the NAS web API and base64-embedded so the report is portable.
 Env:
   PHOTOSEARCH_DB            replica DB (default ./photo_index.db.local)
   PHOTOSEARCH_TEXT_LLM_URL  LM Studio /v1 (required)
-  PHOTOSEARCH_NAS_URL       NAS web for thumbnails (default http://dxp4800-f976:8000)
+  PHOTOSEARCH_NAS_URL       NAS web for thumbnails (required; env or ./nas.env)
 
 Usage:
-  PHOTOSEARCH_TEXT_LLM_URL=http://172.20.176.1:1234/v1 \
+  PHOTOSEARCH_TEXT_LLM_URL=http://<lm-studio-host>:1234/v1 \
     ./.venv/bin/python evals/bakeoff.py [model1 model2 ...]
 """
 from __future__ import annotations
@@ -37,11 +37,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from photosearch.db import PhotoDB
 from photosearch import agent
+from photosearch.nas_config import require_nas_url
 
 MODELS_DEFAULT = ["qwen/qwen3.5-9b", "google/gemma-4-e2b", "llama-3.2-3b-instruct"]
 
 REPLICA_DB = os.environ.get("PHOTOSEARCH_DB", "./photo_index.db.local")
-NAS_URL = (os.environ.get("PHOTOSEARCH_NAS_URL") or "http://dxp4800-f976:8000").rstrip("/")
+# Fails up front rather than silently producing a report with no thumbnails.
+NAS_URL = require_nas_url()  # $PHOTOSEARCH_NAS_URL or ./nas.env — never hard-coded
 OUT_DIR = Path(__file__).resolve().parent
 THUMBS_PER_CELL = 6
 

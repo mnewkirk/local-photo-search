@@ -9,7 +9,7 @@
 # On the NAS with Docker, mount this file's directory and use absolute paths
 # inside the container, e.g.:
 #   docker compose -f docker-compose.nas.yml run --rm \
-#     -v /home/cantimatt/docker/photosearch/references:/references:ro \
+#     -v /home/<nas-user>/docker/photosearch/references:/references:ro \
 #     photosearch add-persons --config /references/references.yml
 
 Matt:

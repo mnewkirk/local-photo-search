@@ -225,7 +225,7 @@ To enable person search, create a `references.yml` config file and add reference
 
 ### 6a. Create references.yml
 
-Place it alongside your reference photos (e.g. `/home/cantimatt/docker/photosearch/references/references.yml`):
+Place it alongside your reference photos (e.g. `/home/<nas-user>/docker/photosearch/references/references.yml`):
 
 ```yaml
 # references.yml
@@ -247,7 +247,7 @@ Paths inside the file should be the **container-side** paths (after the volume m
 
 ```bash
 docker compose -f docker-compose.nas.yml run --rm \
-  -v /home/cantimatt/docker/photosearch/references:/references:ro \
+  -v /home/<nas-user>/docker/photosearch/references:/references:ro \
   photosearch add-persons --config /references/references.yml
 ```
 

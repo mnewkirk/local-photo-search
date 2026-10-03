@@ -8,14 +8,16 @@
 # the production DB and faster for iterative debugging.
 #
 # Override paths via env:
-#   NAS_HOST           ssh target (e.g. user@192.168.1.237)
+#   NAS_HOST           ssh target, REQUIRED for `pull` (<nas-user>@<nas-host>).
+#                      No default — set it in the git-ignored ./nas.env
+#                      (copy nas.env.example) or the environment.
 #   NAS_COMPOSE_FILE   docker-compose.nas.yml path on the NAS
 #                      (default: /volume1/docker/photosearch/docker-compose.nas.yml)
 #   LOCAL_DB           local copy path (default: ./photo_index.db.local)
 
 set -euo pipefail
 
-NAS_HOST="${NAS_HOST:-cantimatt@192.168.1.237}"
+. "$(dirname "${BASH_SOURCE[0]}")/scripts/nas-env.sh"
 NAS_COMPOSE_FILE="${NAS_COMPOSE_FILE:-/volume1/docker/photosearch/docker-compose.nas.yml}"
 LOCAL_DB="${LOCAL_DB:-./photo_index.db.local}"
 
@@ -58,6 +60,7 @@ case "${cmd}" in
     # bind-mounted volume, then stream that file out via
     # `docker compose run --entrypoint cat`. Three SSH calls but
     # each is clean and no permission tangles.
+    nas_env_require NAS_HOST "the NAS ssh target, e.g. <nas-user>@<nas-host>"
     remote="docker compose -f '${NAS_COMPOSE_FILE}'"
 
     echo "1/3  creating consistent backup on NAS (sqlite3 backup API)…"
@@ -131,7 +134,7 @@ Usage:
   $0 help                        this
 
 Env overrides:
-  NAS_HOST          (default: ${NAS_HOST})
+  NAS_HOST          (required for pull; now: ${NAS_HOST:-<unset — see nas.env.example>})
   NAS_COMPOSE_FILE  (default: ${NAS_COMPOSE_FILE})
   LOCAL_DB          (default: ${LOCAL_DB})
 

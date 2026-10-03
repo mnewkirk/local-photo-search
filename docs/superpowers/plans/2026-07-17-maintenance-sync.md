@@ -1891,7 +1891,7 @@ schema and the new endpoints before any push can land.
 ### 1. Verify `CRON_TZ` is supported — the UTC pin depends on it
 
 ```bash
-ssh cantimatt@dxp4800-f976 'man 5 crontab | grep -c CRON_TZ'
+ssh <nas-user>@<nas-host> 'man 5 crontab | grep -c CRON_TZ'
 ```
 
 Non-zero → supported. `0` → use the fallback `0 18 * * *` (host-local; drifts to
@@ -1903,7 +1903,7 @@ fails, diagnose before retrying.
 ### 2. Smoke-test the exact cron command as a dry run, before trusting it unattended
 
 ```bash
-ssh cantimatt@dxp4800-f976 'cd /volume1/docker/photosearch && \
+ssh <nas-user>@<nas-host> 'cd /volume1/docker/photosearch && \
   docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep'
 ```
 
@@ -1912,8 +1912,8 @@ Expected: per-stage `would` counts, no writes.
 ### 3. Create the log file
 
 ```bash
-ssh cantimatt@dxp4800-f976 \
-  'sudo touch /var/log/photo-maintenance.log && sudo chown cantimatt:admin /var/log/photo-maintenance.log'
+ssh <nas-user>@<nas-host> \
+  'sudo touch /var/log/photo-maintenance.log && sudo chown <nas-user>:admin /var/log/photo-maintenance.log'
 ```
 
 ### 4. Install the cron entry
@@ -1922,7 +1922,7 @@ Via a temp file — the `( crontab -l; echo ... ) | crontab -` one-liner is
 paste-fragile and yields `"-":1: bad minute`:
 
 ```bash
-ssh cantimatt@dxp4800-f976 'sudo crontab -l > /tmp/rootcron 2>/dev/null; \
+ssh <nas-user>@<nas-host> 'sudo crontab -l > /tmp/rootcron 2>/dev/null; \
   grep -q CRON_TZ /tmp/rootcron || echo "CRON_TZ=UTC" >> /tmp/rootcron; \
   echo "0 1 * * * cd /volume1/docker/photosearch && docker compose -f docker-compose.nas.yml run --rm photosearch maintenance-sweep --apply >> /var/log/photo-maintenance.log 2>&1" >> /tmp/rootcron; \
   sudo crontab /tmp/rootcron && rm /tmp/rootcron && sudo crontab -l'
@@ -1941,7 +1941,7 @@ existing `0 3 * * *` ingest entry.
    `push` event.
 5. Confirm the watermark crossed over:
    ```bash
-   curl -s http://100.115.143.4:8000/api/admin/maintenance-fingerprint | python3 -m json.tool
+   curl -s http://<nas-host>:8000/api/admin/maintenance-fingerprint | python3 -m json.tool
    ```
    Pushed stages should read `"source": "replica"`.
 6. Reload `/admin_maintenance` — every pushed stage reads **In sync**.
