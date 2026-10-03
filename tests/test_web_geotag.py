@@ -114,6 +114,40 @@ def test_folder_photos_includes_inferred_when_requested(client, db):
     assert filenames == ["b1.jpg", "b2.jpg", "b3.jpg"]
 
 
+def test_folder_photos_excludes_exif_unless_show_located(client, db):
+    """Camera GPS is hidden by default (it is usually right) but must be
+    reachable: a phone-linked camera stamps the phone's position, which can
+    still need correcting."""
+    _seed_folders(db.db_path)
+    r = client.get("/api/geotag/folder-photos?folder=/ph/a&show_inferred=true")
+    assert [p["filename"] for p in r.json()["photos"]] == ["a3.jpg"]
+
+    r = client.get("/api/geotag/folder-photos?folder=/ph/a&show_located=true")
+    photos = r.json()["photos"]
+    assert sorted(p["filename"] for p in photos) == ["a1.jpg", "a2.jpg", "a3.jpg"]
+    assert {p["filename"]: p["location_source"] for p in photos}["a1.jpg"] == "exif"
+
+
+def test_exif_photo_relocates_only_with_overwrite(client, db):
+    _seed_folders(db.db_path)
+    ids = [p["id"] for p in client.get(
+        "/api/geotag/folder-photos?folder=/ph/a&show_located=true").json()["photos"]
+        if p["location_source"] == "exif"]
+    body = {"photo_ids": ids, "lat": 38.03, "lon": -122.548,
+            "place_name": "Miller Creek Middle School, California, US"}
+    r = client.post("/api/photos/bulk-set-location", json=body)
+    assert r.json()["updated_count"] == 0 and r.json()["skipped_count"] == 2
+
+    r = client.post("/api/photos/bulk-set-location", json={**body, "overwrite": True})
+    assert r.json()["updated_count"] == 2
+    with PhotoDB(db.db_path) as pdb:
+        rows = pdb.conn.execute(
+            "SELECT place_name, location_source FROM photos WHERE id IN (?, ?)",
+            ids).fetchall()
+    assert {tuple(r) for r in rows} == {
+        ("Miller Creek Middle School, California, US", "manual")}
+
+
 def test_folder_photos_does_not_match_subfolders(client, db):
     """A photo in /ph/a/sub must not appear when querying /ph/a."""
     with PhotoDB(db.db_path) as pdb:

@@ -3918,6 +3918,7 @@ def api_geotag_folders(include_fully_tagged: bool = False,
 
 @app.get("/api/geotag/folder-photos")
 def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
+                              show_located: bool = False,
                               camera: Optional[str] = None,
                               date_from: Optional[str] = None,
                               date_to: Optional[str] = None,
@@ -3927,9 +3928,13 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
     By default returns only photos where gps_lat IS NULL (the ones that
     need tagging). With `show_inferred=true`, also includes photos where
     `location_source='inferred'` so the user can manually correct any M19
-    misfires. `location_source='exif'` photos are always excluded — those
-    came from the camera and are authoritative. `camera`/`date_from`/`date_to`
-    narrow the set to match the folder-picker filters.
+    misfires. `location_source='exif'` (and 'manual') photos are excluded
+    unless `show_located=true`, which returns every photo in the folder —
+    camera GPS is usually right, but a phone-linked camera stamps the phone's
+    position, and a nearby-park label for a school field is still wrong.
+    Re-tagging those also needs `overwrite` on bulk-set-location.
+    `camera`/`date_from`/`date_to` narrow the set to match the folder-picker
+    filters.
     """
     # Match the exact folder via the indexed `folder` column (schema v25) — no
     # LIKE + Python subfolder guard. This also fixes a latent bug in the old
@@ -3937,7 +3942,9 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
     # Python filter, so a folder with many sub-folder photos could return fewer
     # than `limit` of its own.
     with _get_db() as db:
-        if show_inferred:
+        if show_located:
+            gps_where = "1=1"
+        elif show_inferred:
             gps_where = "(gps_lat IS NULL OR location_source='inferred')"
         else:
             gps_where = "gps_lat IS NULL"

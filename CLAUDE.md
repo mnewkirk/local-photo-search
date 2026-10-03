@@ -1620,6 +1620,13 @@ library place resolves its lat/lon via one cached Nominatim call at
 apply time. Writes `location_source='manual'` in a single transaction
 via `POST /api/photos/bulk-set-location`; overwrite is off by default
 (guards existing exif/inferred GPS unless the user explicitly toggles).
+The photo panel's **Show** selector picks which photos are listed:
+missing GPS (default), + inferred, or **All** (`show_located=true`, which
+also reveals fully-tagged folders). All is how you correct *camera* GPS —
+a phone-linked camera (Sony via the Creators' App) stamps the phone's
+position, so a school field can come out as the neighbouring park. Such
+rows are `location_source='exif'`, so replacing them also needs
+**Overwrite** ticked; the skipped-count toast says so.
 
 Map view: `/map` plots every GPS-bearing photo (exif + inferred) on a
 Leaflet map with marker clustering. Sidebar filters by source
