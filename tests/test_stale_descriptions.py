@@ -119,3 +119,42 @@ def test_requeue_clears_only_the_stale_pass(db):
     assert row[0] is None and json.loads(row[1]) == ["k"] and row[2] is not None
     ledger = {r[0] for r in db.conn.execute("SELECT pass_type FROM worker_processed")}
     assert ledger == {"keywords", "verify"}
+
+
+# --- the content check: keywords should be words of the description ----------
+
+def test_keyword_match_ratio_tolerates_paraphrase():
+    d = "A woman is wearing a blue hoodie while holding two dogs on the beach."
+    assert SD.keyword_match_ratio(d, ["woman's hoodie", "dogs", "beach"]) == 1.0
+    assert SD.keyword_match_ratio(d, ["beach", "sailboat"]) == 0.5
+    assert SD.keyword_match_ratio(d, []) is None
+    assert SD.keyword_match_ratio(d, ["a", "k"]) is None       # nothing judgeable
+
+
+def test_mismatch_flags_what_timestamps_cannot_see(db):
+    """Keywords from some OTHER text, with no generations at all to compare."""
+    _photo(db, 1, kws=json.dumps(["soccer", "goal", "field"]))
+    db.conn.execute("UPDATE photos SET description='A sailboat on a calm lake.' WHERE id=1")
+    _photo(db, 2, kws=json.dumps(["sailboat", "lake"]))
+    db.conn.execute("UPDATE photos SET description='A sailboat on a calm lake.' WHERE id=2")
+    f = SD.find_stale(db.conn)
+    assert f["keyword_mismatch"] == [1]
+    assert f["keywords"] == [1] and f["category-content"] == [1]   # both re-queued
+    assert f["by_timestamp"]["keywords"] == []
+
+
+def test_mismatch_reasons(db):
+    rows = {
+        1: ("A dog on a beach.", ["i couldn't find any text to extract keywords from"]),
+        2: ("A dog on a beach.", ["formal family garden blooming flowers wedding event"]),
+        3: ("A white desk with", ["office furniture", "chair"]),
+    }
+    for pid, (d, k) in rows.items():
+        _photo(db, pid, kws=json.dumps(k))
+        db.conn.execute("UPDATE photos SET description=? WHERE id=?", (d, pid))
+    f = SD.find_stale(db.conn)
+    assert f["mismatch_reasons"] == {"refusal stored as keywords": 1,
+                                     "whole list stored as one keyword": 1,
+                                     "description cut off": 1}
+    # a cut-off description is reported, not re-queued: same text, same miss
+    assert 3 not in f["keywords"] and 3 in f["truncated_description"]

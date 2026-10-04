@@ -6320,13 +6320,23 @@ def stale_description_passes(db, folder, collection_id, save_collection, requeue
         ids = SD.stale_ids(found)
         scope = (f"folder {folder}" if folder else
                  f"collection {collection_id}" if collection_id is not None else "library")
+        ts = found["by_timestamp"]
         click.echo(f"Stale description-derived passes ({scope}):")
+        click.echo(f"  {'':<17} {'timestamp':>9} {'requeue':>9}")
         for p in SD.TEXT_PASSES:
-            click.echo(f"  {p:<17} {len(found[p]):>7,}")
-        click.echo(f"  {'photos (any)':<17} {len(ids):>7,}")
-        click.echo(f"  not judgeable (output predates logging): "
+            click.echo(f"  {p:<17} {len(ts[p]):>9,} {len(found[p]):>9,}")
+        click.echo(f"  {'photos (any)':<17} {'':>9} {len(ids):>9,}")
+        click.echo(f"  timestamp check can't judge (output predates logging): "
                    f"categories {found['unknown_category-content']:,}, "
                    f"keywords {found['unknown_keywords']:,}")
+        mm = found["keyword_mismatch"]
+        only = len(set(mm) - set(ts["keywords"]))
+        click.echo(f"\nKeywords not found in the description (<{SD.KEYWORD_MATCH_MIN:.0%} match): "
+                   f"{len(mm):,} — {only:,} not caught by the timestamp check")
+        for reason, n in sorted(found["mismatch_reasons"].items(), key=lambda x: -x[1]):
+            click.echo(f"  {reason:<34} {n:>7,}")
+        click.echo(f"\nDescriptions cut off mid-sentence: {len(found['truncated_description']):,} "
+                   f"(not requeued — re-extracting keywords cannot fix them; they need a re-describe)")
         if not writes:
             click.echo("\nDry run — nothing written. --save-collection to queue, --requeue to clear now.")
             return

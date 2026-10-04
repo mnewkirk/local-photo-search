@@ -1066,6 +1066,18 @@ are explicit UTC (`worker._utc_stamp`, `…Z`);
 output with no generation row predates logging and is counted, never flagged
 (1,128 categories).
 
+**It also reads the content.** Keywords are extracted from the description, so
+their words should be in it (`keyword_match_ratio`, possessives/plurals/stopwords
+folded). Timestamp-current photos: 92% match >= 90%, 99.8% >= 50%; below 50%
+(`KEYWORD_MATCH_MIN`) is a real defect, not paraphrase — on 2026-10-04, 286
+photos the timestamps missed: whole keyword list stored as ONE string, a
+refusal stored as keywords ("i couldn't find any text…"), etc. A mismatch
+re-queues keywords AND categories (same source text). Categories get no content
+check of their own — they're a fixed vocabulary, not the description's words.
+A mismatch caused by a **cut-off description** is reported but not re-queued
+(re-extracting from the same truncated text repeats it); the report also counts
+all mid-sentence descriptions (4,350) — those need a re-describe.
+
 ### Provenance: log the model that RAN, not the one configured
 
 `generations.model_used` said `llava` for **159,647 of 159,650**
