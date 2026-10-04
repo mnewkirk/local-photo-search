@@ -1301,7 +1301,7 @@ _UI_FLEET_NAME = "ui"
 
 class WorkersStartRequest(BaseModel):
     passes: list[str]
-    count: int = 2
+    count: int = 3  # workers per launch (owner's default since 2026-10-03)
     collection: int | None = None  # optional: scope the fleet to one collection
     # optional: scope the fleet to a structured filter set (date range, people,
     # location, quality/aesthetic, camera, tags) — mutually exclusive with
@@ -1465,7 +1465,7 @@ class BatchAdvanceRequest(BaseModel):
 
 class BatchLaunchFleetRequest(BaseModel):
     batch_id: int
-    count: int = 2
+    count: int = 3  # workers per launch (owner's default since 2026-10-03)
 
 
 def _nas_url() -> str:

@@ -45,3 +45,9 @@ def test_ollama_route_is_untouched(monkeypatch):
 def test_verify_and_describe_differ():
     """The verify check must be independent of the model that wrote the text."""
     assert rerun.FLEET_ROLE_MODELS["verify"] != rerun.FLEET_ROLE_MODELS["describe"]
+
+
+def test_fleet_launches_default_to_three_workers():
+    """The owner's default since 2026-10-03 (/batches and /admin/maintenance)."""
+    assert admin_api.BatchLaunchFleetRequest(batch_id=1).count == 3
+    assert admin_api.WorkersStartRequest(passes=["clip"]).count == 3
