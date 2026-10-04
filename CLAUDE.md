@@ -1024,6 +1024,43 @@ Traps these exist to catch — don't undo them:
 - Pixels come from a local **originals cache** (`fetch-originals`), so neither a
   run nor the labelling page depends on the NAS staying up.
 
+### A new description re-queues what was derived from it
+
+category-content and keywords are extracted FROM `photos.description`, and
+verify checks it. Until 2026-10-04 the fleet ran **verify last**, so each verify
+rewrite (~16% of a batch) left categories/keywords extracted from text verify
+had just judged hallucinated — **13,637 photos** library-wide. Three fixes:
+
+- **Pass order** (`batch_state.WORKER_PASSES` = `rerun.ALL_PASSES` =
+  `worker_api._ALL_PASSES`, mirrored in `batch-flow.js`): `… describe, verify,
+  category-content, keywords, category-visual`. `/workers/start` sorts any
+  hand-picked `-p` into it. Also one load per model: qwen3.5 → +gemma → gemma →
+  minicpm. `DEPENDS_ON` is unchanged (text passes still wait on `describe`, not
+  `verify`), so a blocked verify never starves them.
+- **The server re-queues on every description write**
+  (`PhotoDB.invalidate_description_dependents`): a describe result NULLs
+  categories/keywords/verification + their ledger rows; a verify rewrite NULLs
+  categories/keywords only (its own verdict is the result). Order alone is not
+  enough — workers overlap at a pass boundary, and M28's re-run checks
+  `describe` or `verify` → auto-selects the text passes too. **Server-side:
+  deploy the NAS.**
+- **Verify no longer re-tags.** The rewrite path ran the visual tagger into the
+  legacy `tags` column (NULL since v23, read by nothing current), which also
+  pulled minicpm into VRAM beside gemma + qwen3.5. `visual_tags` come from the
+  pixels, so a rewrite doesn't stale them. An older worker's `tags` field is
+  ignored.
+
+**Historical cleanup — `photosearch stale-description-passes`**
+(`photosearch/stale_descriptions.py`). Dry run (read-only) reports, per pass,
+photos whose output predates the current description, from `generations`
+timestamps. `--folder` / `--collection` scope it; `--save-collection` queues
+the set as a collection; `--requeue` clears exactly the stale pass per photo
+(chunked commits). Run writes **on the NAS**. Traps it handles: `created_at`
+comes as both `…T…` and `… …` (normalized); `verified_at` is worker-local while
+generations are UTC (8 h margin — raw comparison flags 26,154, real is 1);
+output with no generation row predates logging and is counted, never flagged
+(1,128 categories).
+
 ### Provenance: log the model that RAN, not the one configured
 
 `generations.model_used` said `llava` for **159,647 of 159,650**

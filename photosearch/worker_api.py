@@ -835,6 +835,10 @@ def submit_results(req: SubmitRequest):
                     continue
                 try:
                     db.update_photo(r.photo_id, description=r.description)
+                    # A re-describe (M28, clear-pass) leaves categories /
+                    # keywords / verification about the OLD text. A first
+                    # describe has none, so this is a no-op there.
+                    db.invalidate_description_dependents(r.photo_id)
                     db.log_generation(r.photo_id, "describe", r.description,
                                       req.model, req.model_version)
                     outcome.written += 1
@@ -879,9 +883,14 @@ def submit_results(req: SubmitRequest):
                     # If hallucinations were found and descriptions regenerated
                     if r.description:
                         updates["description"] = r.description
-                    if r.tags:
-                        updates["tags"] = json.dumps(r.tags)
+                    # r.tags (an older worker's re-tag) is deliberately
+                    # dropped: it targeted the legacy `tags` column, NULL
+                    # since the v23 split and read by nothing current.
                     db.update_photo(r.photo_id, **updates)
+                    if r.description:
+                        # categories/keywords came from the hallucinated text.
+                        db.invalidate_description_dependents(
+                            r.photo_id, include_verify=False)
                     # Log the regenerated description as a 'verify' generation —
                     # marks it as produced by the verify/regen pass, distinct
                     # from a first-pass describe.
@@ -1284,9 +1293,8 @@ def photo_detail(photo_id: int):
 # / keywords, and no worker processes it anymore — its column was nulled at the
 # v23 migration, so count_unprocessed("tags") is pinned at the full library size
 # forever. Including it in queue_depth just showed a confusing dead counter.
-_ALL_PASSES = ("clip", "faces", "quality", "describe",
-               "category-content", "category-visual", "keywords", "verify",
-               "aesthetics")
+_ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
+               "verify", "category-content", "keywords", "category-visual")
 
 
 @router.get("/status")

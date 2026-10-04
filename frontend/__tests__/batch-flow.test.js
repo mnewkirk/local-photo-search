@@ -14,7 +14,7 @@ const BF = require('../dist/batch-flow.js');
 
 // Mirrors batch_state.STEP_ORDER exactly (globals.md, frozen).
 const STEP_ORDER = ['ingest', 'clip', 'faces', 'quality', 'aesthetics', 'describe',
-  'category-visual', 'category-content', 'keywords', 'verify',
+  'verify', 'category-content', 'keywords', 'category-visual',
   'stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops',
   'rank_measure', 'sharpness'];
 
@@ -99,7 +99,7 @@ describe('layout', () => {
       ['ingest'],
       ['clip'],
       ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'],
-      ['category-content', 'keywords', 'verify'],
+      ['verify', 'category-content', 'keywords'],
       ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
         'warm_crops', 'rank_measure', 'sharpness'],
     ]);
@@ -666,7 +666,7 @@ describe('advanceLogLine', () => {
 // other's test fails.
 
 const WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
-  'category-visual', 'category-content', 'keywords', 'verify'];
+  'verify', 'category-content', 'keywords', 'category-visual'];
 
 /** A state whose worker passes carry the given states (default needs_queue). */
 function workerState(over) {
@@ -692,8 +692,8 @@ describe('fleetLaunchPasses', () => {
     expect(BF.fleetLaunchPasses(workerState({
       describe: 'completed', 'category-content': 'waiting',
       keywords: 'waiting', verify: 'waiting',
-    }))).toEqual(['clip', 'faces', 'quality', 'aesthetics', 'category-visual',
-      'category-content', 'keywords', 'verify']);
+    }))).toEqual(['clip', 'faces', 'quality', 'aesthetics', 'verify',
+      'category-content', 'keywords', 'category-visual']);
   });
 
   test('case 3 — a blocked dependency does NOT admit its dependents', () => {

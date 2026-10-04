@@ -1032,7 +1032,7 @@ class TestFleetLaunchPasses:
             "describe": "completed", "category-content": "waiting",
             "keywords": "waiting", "verify": "waiting"}))
         assert got == ["clip", "faces", "quality", "aesthetics",
-                       "category-visual", "category-content", "keywords", "verify"]
+                       "verify", "category-content", "keywords", "category-visual"]
 
     def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
         """Case 3. `describe` having given up on every photo means there will

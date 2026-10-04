@@ -34,10 +34,11 @@ import tempfile
 import uuid
 from typing import Optional
 
-# Passes this module can re-run. Mirrors worker_api._ALL_PASSES order.
-ALL_PASSES = ("clip", "faces", "quality", "describe",
-              "category-content", "category-visual", "keywords", "verify",
-              "aesthetics")
+# Passes this module can re-run, in DEPENDENCY order — the sync re-run and the
+# fleet launcher both sort by it (see batch_state.WORKER_PASSES for why verify
+# precedes the text passes). Same order as batch_state.WORKER_PASSES.
+ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
+              "verify", "category-content", "keywords", "category-visual")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}

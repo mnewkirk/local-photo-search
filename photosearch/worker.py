@@ -876,7 +876,7 @@ def _process_verify(
             confirmed_nouns = {c["noun"] for c in verified_confirmed}
             elapsed = time.time() - t0
 
-            from .describe import describe_photo as _describe, tag_visual_photo as _tag, DESCRIBE_PROMPT
+            from .describe import describe_photo as _describe, DESCRIBE_PROMPT
             strict_prompt = DESCRIBE_PROMPT + (
                 "\n\nIMPORTANT: A previous description was found to contain "
                 "hallucinated objects. Be extra careful to ONLY describe what you "
@@ -884,7 +884,11 @@ def _process_verify(
                 + ", ".join(sorted(confirmed_nouns)) + "."
             )
             new_desc = _describe(path, model=regen_model, prompt=strict_prompt)
-            new_tags = _tag(path, model=regen_model) if new_desc else None
+            # No visual re-tag here: it wrote the legacy `tags` column (dead
+            # since v23) and dragged the visual model into VRAM beside the
+            # verifier and the regen model. visual_tags come from the pixels,
+            # not the description, so a rewrite does not make them stale; the
+            # server re-queues what DOES depend on the text.
 
             # Mirror verify.py: 'regenerated' only if we actually produced a new
             # description. Otherwise the photo's description in the DB is still
@@ -906,8 +910,6 @@ def _process_verify(
             }
             if new_desc:
                 result["description"] = new_desc
-            if new_tags:
-                result["tags"] = new_tags
             results.append(result)
 
         except _TRANSIENT as e:

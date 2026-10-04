@@ -61,8 +61,13 @@ import json
 from . import ingest_batches
 from .db import MAX_PROCESS_ATTEMPTS
 
+# Dependency order, which is also the fleet's drain order: verify runs right
+# after describe because a verify rewrite REPLACES the description, and
+# category-content / keywords are extracted from it — run them first and they
+# describe text that is gone (13,637 photos on 2026-10-04). It also loads each
+# model once: qwen3.5 describe -> (+gemma) verify -> gemma text x2 -> minicpm.
 WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-                 "category-visual", "category-content", "keywords", "verify")
+                 "verify", "category-content", "keywords", "category-visual")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
 # full native resolution to measure face sharpness, and only the NAS holds the
 # originals — the desktop replica has the DB and the thumbnails and no files at

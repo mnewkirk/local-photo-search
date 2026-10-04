@@ -6275,5 +6275,77 @@ def split_export_cmd(photo_id, db, sheet, grid, gutter, mode, sx, sy,
         click.echo(f"    {p['name']}  ({p['bytes'] / 1e6:.1f} MB)")
 
 
+@cli.command("stale-description-passes")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--folder", default=None,
+              help="Limit to one folder and its subfolders (e.g. 2026/2026-10-03_ILCE-7RM6).")
+@click.option("--collection", "collection_id", type=int, default=None,
+              help="Limit to the photos of one collection (e.g. one saved by --save-collection).")
+@click.option("--save-collection", is_flag=True,
+              help="Save the stale photos as a collection, to requeue and run later.")
+@click.option("--requeue", is_flag=True,
+              help="Clear the stale passes now so the worker fleet re-claims them.")
+def stale_description_passes(db, folder, collection_id, save_collection, requeue):
+    """Find photos whose categories / keywords / verification predate their description.
+
+    A verify rewrite or a re-describe replaces the description; the passes
+    extracted from the old text then describe something that is gone. The
+    server re-queues them on every description write now; this finds the ones
+    written before that (photosearch/stale_descriptions.py has the rules and
+    the measured traps).
+
+    DRY RUN by default, opened READ-ONLY. Run the writes on the NAS — it is the
+    sole writer, and a replica collection would be wiped by the next sync.
+
+    \b
+    Later-run recipe:
+      stale-description-passes --save-collection          # queue: writes a collection only
+      stale-description-passes --collection N --requeue   # when ready: clear the stale passes
+      run-workers.sh --native -s <NAS> --collection N -p verify,category-content,keywords
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date
+    from photosearch import stale_descriptions as SD
+
+    if folder and collection_id is not None:
+        raise click.UsageError("--folder and --collection are mutually exclusive")
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+    writes = save_collection or requeue
+    conn = (_sqlite3.connect(db, timeout=60) if writes
+            else _sqlite3.connect(f"file:{db}?mode=ro", uri=True))
+    try:
+        found = SD.find_stale(conn, folder=folder, collection_id=collection_id)
+        ids = SD.stale_ids(found)
+        scope = (f"folder {folder}" if folder else
+                 f"collection {collection_id}" if collection_id is not None else "library")
+        click.echo(f"Stale description-derived passes ({scope}):")
+        for p in SD.TEXT_PASSES:
+            click.echo(f"  {p:<17} {len(found[p]):>7,}")
+        click.echo(f"  {'photos (any)':<17} {len(ids):>7,}")
+        click.echo(f"  not judgeable (output predates logging): "
+                   f"categories {found['unknown_category-content']:,}, "
+                   f"keywords {found['unknown_keywords']:,}")
+        if not writes:
+            click.echo("\nDry run — nothing written. --save-collection to queue, --requeue to clear now.")
+            return
+        if save_collection and ids:
+            from photosearch.db import PhotoDB
+            with PhotoDB(db) as pdb:
+                passes = ",".join(p for p in SD.TEXT_PASSES if found[p])
+                cid = pdb.create_collection(
+                    f"Stale text passes — {scope} ({_date.today().isoformat()})",
+                    f"Photos whose {passes} predate their current description. "
+                    f"Requeue: photosearch stale-description-passes --collection <id> --requeue")
+                pdb.add_photos_to_collection(cid, ids)
+            click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
+        if requeue:
+            counts = SD.requeue(conn, found)
+            click.echo("\nRequeued: " + ", ".join(f"{p} {n:,}" for p, n in counts.items()))
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     cli()

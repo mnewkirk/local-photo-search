@@ -801,7 +801,7 @@
 
     // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
     // worker processes it; it would render a perpetual-0 pill).
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics'];
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'aesthetics', 'describe', 'verify', 'category-content', 'keywords', 'category-visual'];
 
     function formatTtl(expiresAtStr) {
       if (!expiresAtStr) return { text: '—', cls: '' };
@@ -2154,8 +2154,8 @@
     //   _incoming staging (ready / can't-ingest) → library backlog (CLIP / passes).
     // Stages 1-2 come from /api/admin/incoming-status (cheap _incoming scan);
     // stages 3-4 from the same authoritative queue the Workers panel polls.
-    var ENRICH_PASSES = ['faces', 'quality', 'describe', 'category-content',
-                         'category-visual', 'keywords', 'verify', 'aesthetics'];
+    var ENRICH_PASSES = ['faces', 'quality', 'aesthetics', 'describe', 'verify',
+                         'category-content', 'keywords', 'category-visual'];
 
     function fmt(n) { return (n || 0).toLocaleString(); }
 

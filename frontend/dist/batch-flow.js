@@ -58,7 +58,7 @@
     { key: 'enrich',  label: 'Worker passes — run in parallel',
       steps: ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'] },
     { key: 'text',    label: 'From the description',
-      steps: ['category-content', 'keywords', 'verify'] },
+      steps: ['verify', 'category-content', 'keywords'] },
     { key: 'nas',     label: 'NAS stages',
       steps: ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
               'warm_crops', 'rank_measure', 'sharpness'] },
@@ -222,7 +222,7 @@
 
   // Frozen in batch_state.py: WORKER_PASSES and DEPENDS_ON's worker half.
   var WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
-    'category-visual', 'category-content', 'keywords', 'verify'];
+    'verify', 'category-content', 'keywords', 'category-visual'];
   var WORKER_DEPENDS_ON = {
     'category-content': 'describe', keywords: 'describe', verify: 'describe',
   };

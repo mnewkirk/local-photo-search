@@ -1410,8 +1410,11 @@ def admin_workers_start(req: WorkersStartRequest):
     script = _run_workers_script()
     if not Path(script).exists():
         raise HTTPException(404, f"run-workers.sh not found: {script}")
+    # Dependency order regardless of how they were picked: a sequential fleet
+    # drains in -p order, and verify after the text passes re-queues them.
+    passes = [p for p in rerun.ALL_PASSES if p in req.passes]
     cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
-           "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
+           "-s", _fleet_server_url(), "-p", ",".join(passes), "-n", str(n)]
     filter_flags = _filters_to_worker_flags(req.filters) if req.filters else []
     # The three scope kinds are mutually exclusive (see WorkersStartRequest) —
     # checked here, not in a pydantic validator, so the response is a clear

@@ -356,8 +356,8 @@
     var gensLoading = _gensLoading[0];   var setGensLoading = _gensLoading[1];
 
     // ---- Re-run-passes state (M28) ----
-    var RERUN_PASSES = ['describe', 'category-content', 'category-visual',
-                        'keywords', 'verify', 'clip', 'faces', 'quality', 'aesthetics'];
+    var RERUN_PASSES = ['describe', 'verify', 'category-content', 'keywords',
+                        'category-visual', 'clip', 'faces', 'quality', 'aesthetics'];
     var _rerunOpen = useState(false);
     var rerunOpen = _rerunOpen[0];       var setRerunOpen = _rerunOpen[1];
     var _rerunSel = useState({});         // { pass: true }
@@ -489,7 +489,9 @@
         if (next[p]) { delete next[p]; }
         else {
           next[p] = true;
-          if (p === 'describe') { next['category-content'] = true; next['keywords'] = true; }
+          // Both can rewrite the description, which re-queues the text
+          // passes server-side — so re-run them in the same go.
+          if (p === 'describe' || p === 'verify') { next['category-content'] = true; next['keywords'] = true; }
         }
         return next;
       });

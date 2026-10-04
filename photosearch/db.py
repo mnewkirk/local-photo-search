@@ -1205,6 +1205,34 @@ class PhotoDB:
         )
         self._maybe_commit()
 
+    def invalidate_description_dependents(self, photo_id: int, *,
+                                          include_verify: bool = True) -> None:
+        """A photo's description just changed: re-queue what was derived from it.
+
+        category-content and keywords are extracted FROM the description, and
+        verify checks it. Writing a new description and leaving them alone
+        leaves categories/keywords describing text that is gone — measured
+        2026-10-04: 13,637 photos whose categories predate a verify rewrite,
+        i.e. were extracted from a description verify had judged hallucinated.
+        NULLing the columns and dropping their ledger rows is what clear-pass
+        does; the claim predicates then offer the photo again.
+
+        ``include_verify=False`` is for verify's OWN rewrite — the result being
+        written is the verification of this description.
+        """
+        cols = ["categories = NULL", "keywords = NULL"]
+        passes = ["category-content", "keywords"]
+        if include_verify:
+            cols += ["verified_at = NULL", "verification_status = NULL",
+                     "hallucination_flags = NULL"]
+            passes.append("verify")
+        self.conn.execute(
+            f"UPDATE photos SET {', '.join(cols)} WHERE id = ?", (photo_id,))
+        self.conn.execute(
+            f"DELETE FROM worker_processed WHERE photo_id = ? AND pass_type IN "
+            f"({','.join('?' * len(passes))})", [photo_id, *passes])
+        self._maybe_commit()
+
     def photo_count(self) -> int:
         """Return total number of indexed photos."""
         row = self.conn.execute("SELECT COUNT(*) as cnt FROM photos").fetchone()
