@@ -129,12 +129,15 @@ def search_by_filename(db: PhotoDB, query: str, limit: int = 50) -> list[dict]:
     if suffix in _PHOTO_EXTENSIONS:
         stem = Path(stem).stem
     pattern = f"%{stem}%"
+    # id-first: an infix LIKE can't seek, but it can scan the narrow UNIQUE
+    # filepath index instead of the whole table (560 -> 9 MB). filepath
+    # always ends in filename, so matching filepath alone is exact.
     rows = db.conn.execute(
         """SELECT * FROM photos
-           WHERE filename LIKE ? OR filepath LIKE ?
+           WHERE id IN (SELECT id FROM photos WHERE filepath LIKE ?)
            ORDER BY date_taken DESC
            LIMIT ?""",
-        (pattern, pattern, limit),
+        (pattern, limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1039,15 +1042,18 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
         print(f"  Person '{name}' not found. Use 'add-person' to register them.")
         return []
 
-    sql = """SELECT DISTINCT p.*
+    # id-first: resolve the photo ids from the faces index, then read each
+    # photo row once. Joining read the wide row once per FACE and then
+    # de-duplicated whole rows in a temp B-tree.
+    sql = """SELECT p.*
            FROM photos p
-           JOIN faces f ON f.photo_id = p.id
-           WHERE f.person_id = ?"""
+           WHERE p.id IN (SELECT f.photo_id FROM faces f WHERE f.person_id = ?"""
     params: list = [person["id"]]
 
     if match_source:
         sql += " AND f.match_source = ?"
         params.append(match_source)
+    sql += ")"
 
     scope_sql, scope_params = _scope_clause("p.id", scope)
     sql += scope_sql
@@ -1083,29 +1089,28 @@ def search_by_all_persons(
     if not person_ids:
         return []
 
+    # id-first: the intersection runs entirely on the faces index; only the
+    # matching photos' rows are read (331 MB -> 45 MB for two people,
+    # measured 2026-10-03). The old JOIN read the wide row once per face.
     placeholders = ",".join("?" * len(person_ids))
     sql = (
-        "SELECT p.* FROM photos p "
-        "JOIN faces f ON f.photo_id = p.id "
-        f"WHERE f.person_id IN ({placeholders})"
+        "SELECT p.* FROM photos p WHERE p.id IN ("
+        f"SELECT f.photo_id FROM faces f WHERE f.person_id IN ({placeholders})"
     )
     params: list = list(person_ids)
 
     if match_source:
         sql += " AND f.match_source = ?"
         params.append(match_source)
+    sql += " GROUP BY f.photo_id HAVING COUNT(DISTINCT f.person_id) = ?)"
+    params.append(len(person_ids))
 
     scope_sql, scope_params = _scope_clause("p.id", scope)
     sql += scope_sql
     params.extend(scope_params)
 
-    sql += (
-        " GROUP BY p.id"
-        " HAVING COUNT(DISTINCT f.person_id) = ?"
-        " ORDER BY p.date_taken DESC"
-        " LIMIT ?"
-    )
-    params.extend([len(person_ids), limit])
+    sql += " ORDER BY p.date_taken DESC LIMIT ?"
+    params.append(limit)
 
     rows = db.conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
@@ -1207,6 +1212,82 @@ def _filter_aesthetic(results: list[dict], min_aesthetic=None, min_technical=Non
             continue
         out.append(r)
     return out
+
+
+def _floor_sql(col: str, floor: float) -> str:
+    """SQL for `(row[col] or -1) >= floor`, the test `_filter_aesthetic`
+    applies. For a positive floor that is a plain, index-usable `col >= ?`;
+    otherwise NULL and 0 both read as -1, exactly as `or -1` does."""
+    if floor > 0:
+        return f"{col} >= ?"
+    return f"COALESCE(NULLIF({col}, 0), -1) >= ?"
+
+
+def _aesthetic_floor_sql(min_aesthetic, min_technical, min_composition,
+                         min_impact, min_subject_aesthetic,
+                         min_day_aesthetic) -> tuple[list[str], list]:
+    """`_filter_aesthetic`'s numeric floors as SQL (style_tag excluded — it is
+    matched in Python by `_style_tag_matches`)."""
+    clauses: list[str] = []
+    params: list = []
+    for col, floor in (("aes_overall_pct", min_aesthetic),
+                       ("aes_subject_overall_pct", min_subject_aesthetic),
+                       ("aes_technical", min_technical),
+                       ("aes_composition", min_composition),
+                       ("aes_impact", min_impact)):
+        if floor is not None:
+            clauses.append(_floor_sql(col, floor))
+            params.append(floor)
+    if min_day_aesthetic is not None:
+        clauses.append(
+            "COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct, -1) >= ?")
+        params.append(min_day_aesthetic)
+    return clauses, params
+
+
+def _sort_sql(sort: str, base: str) -> Optional[str]:
+    """`_apply_sort(sort)` as an ORDER BY, applied to rows that arrive in
+    `base` order (the sorts are stable, so `base` is the tie-break), or None
+    for a mode with no SQL form. Undated rows go last for the date sorts."""
+    keys = {
+        "relevance": None,
+        "aesthetic_desc": "COALESCE(aes_overall_pct, 0) DESC",
+        "subject_aesthetic_desc":
+            "COALESCE(aes_subject_overall_pct, aes_overall_pct, 0) DESC",
+        "quality_desc":
+            "CASE WHEN COALESCE(aes_subject_overall_pct, aes_overall_pct) IS NOT NULL"
+            " THEN 1000 + COALESCE(aes_subject_overall_pct, aes_overall_pct)"
+            " ELSE COALESCE(aesthetic_score, -1) END DESC",
+        "day_quality_desc":
+            "COALESCE(aes_subject_overall_day_pct, aes_overall_day_pct, -1) DESC",
+        "date_desc": "(date_taken IS NULL OR date_taken = '') ASC, date_taken DESC",
+        "date_asc": "(date_taken IS NULL OR date_taken = '') ASC, date_taken ASC",
+    }
+    if sort not in keys:
+        return None
+    return base if keys[sort] is None else f"{keys[sort]}, {base}"
+
+
+def _sql_page(db: PhotoDB, where: list[str], params: list, order_by: str,
+              offset: int, limit: int, with_total: bool):
+    """Count, then read only the requested page — instead of SELECT * over
+    every qualifying row and slicing in Python (the aesthetics browse read
+    846 MB to show 100 photos)."""
+    w = " AND ".join(where) or "1"
+    page_sql = f"SELECT * FROM photos WHERE {w} ORDER BY {order_by}"
+    page_params = list(params)
+    if limit:
+        page_sql += " LIMIT ? OFFSET ?"
+        page_params += [limit, offset]
+    elif offset:
+        page_sql += " LIMIT -1 OFFSET ?"
+        page_params.append(offset)
+    page = [dict(r) for r in db.conn.execute(page_sql, page_params)]
+    if not with_total:
+        return page
+    total = db.conn.execute(f"SELECT COUNT(*) FROM photos WHERE {w}",
+                            params).fetchone()[0]
+    return page, total
 
 
 def _filter_by_date(results: list[dict], date_from: str, date_to: str) -> list[dict]:
@@ -1619,9 +1700,13 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100,
 
     scope_sql, scope_params = _scope_clause("id", scope)
     placeholders = " OR ".join(["place_name LIKE ?"] * len(patterns))
+    # id-first: the LIKE scans the narrow idx_photos_place, and only matching
+    # rows are read (560 -> 7 MB). Only here: in tools._build_filter_sql the
+    # same shape makes the planner drop the date index (8.7 -> 259 MB).
     rows = db.conn.execute(
         f"""SELECT * FROM photos
-            WHERE place_name IS NOT NULL AND ({placeholders}){scope_sql}
+            WHERE id IN (SELECT id FROM photos
+                         WHERE place_name IS NOT NULL AND ({placeholders})){scope_sql}
             ORDER BY date_taken
             LIMIT ?""",
         (*patterns, *scope_params, limit),
@@ -1974,6 +2059,26 @@ def search_combined(
     # on the RAW aesthetic score the photo modal shows — the VLM `aes_overall`
     # (1-10) when scored, else the legacy LAION `aesthetic_score` — so setting
     # "min quality 5.5" matches the 5.5 displayed on a photo.
+    if not result_sets and min_quality is not None and not style_tag:
+        # Paginated in SQL: the floors, the date range and the sort all have
+        # an exact SQL form, so only the requested page is read.
+        where = ["COALESCE(aes_overall, aesthetic_score) IS NOT NULL",
+                 "COALESCE(aes_overall, aesthetic_score) >= ?"]
+        params: list = [min_quality]
+        if date_from:
+            where.append("date_taken >= ? AND date_taken <= ?")
+            params.extend(_date_bounds(date_from, date_to))
+        floors, floor_params = _aesthetic_floor_sql(
+            min_aesthetic, min_technical, min_composition, min_impact,
+            min_subject_aesthetic, min_day_aesthetic)
+        # `sort`, not sort_quality: these early returns go through _wrap,
+        # which has only ever applied `sort`.
+        order_by = _sort_sql(
+            sort, "COALESCE(aes_overall, aesthetic_score) DESC, id DESC")
+        if order_by:
+            return _sql_page(db, where + floors, params + floor_params,
+                             order_by, offset, limit, with_total)
+
     if not result_sets and min_quality is not None:
         # `COALESCE(aes_overall, aesthetic_score)` must stay textually identical
         # to the idx_photos_raw_quality expression (schema v34).
@@ -2008,6 +2113,27 @@ def search_combined(
         # percentile without a full-frame one (0 of 72,167 on 2026-10-04).
         order = ("COALESCE(aes_subject_overall_pct, aes_overall_pct)"
                  if sort == "subject_aesthetic_desc" else "aes_overall_pct")
+        if not style_tag:
+            # Paginated in SQL (it read 846 MB to show one page). Under the
+            # guard {order} is never NULL, so for the matching sort the
+            # tie-broken order is just the index order.
+            base = f"{order} DESC, id DESC"
+            order_by = _sort_sql(sort, base)  # `sort`, as _wrap applies it
+            if order_by and sort == ("subject_aesthetic_desc"
+                                     if order != "aes_overall_pct"
+                                     else "aesthetic_desc"):
+                order_by = base  # same order, and the index can serve it
+            if order_by:
+                where = [f"{order} IS NOT NULL"]
+                params: list = []
+                if date_from:
+                    where.append("date_taken >= ? AND date_taken <= ?")
+                    params.extend(_date_bounds(date_from, date_to))
+                floors, floor_params = _aesthetic_floor_sql(
+                    min_aesthetic, min_technical, min_composition, min_impact,
+                    min_subject_aesthetic, min_day_aesthetic)
+                return _sql_page(db, where + floors, params + floor_params,
+                                 order_by, offset, limit, with_total)
         rows = db.conn.execute(
             f"SELECT * FROM photos WHERE {order} IS NOT NULL "
             f"ORDER BY {order} DESC"

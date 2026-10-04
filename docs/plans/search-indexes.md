@@ -1,6 +1,6 @@
 # Search indexes (schema v34)
 
-**Status:** Phase 1 implemented 2026-10-04 (schema v34). Phase 2 and the aes_* index drop are still open.
+**Status:** Phase 1 (schema v34) and Phase 2 implemented 2026-10-04. Open: the aes_* index drop, and date pushdown into the remaining standalone filters.
 Planned 2026-10-03. Produced by a two-planner debate (Sonnet + Opus, two
 critique rounds); every point below was agreed by both.
 
@@ -215,6 +215,21 @@ this plan depends on statistics: with no STAT4, ANALYZE can't see that one place
 67k photos and another 290, and the key plans were unchanged before and after it.
 
 ## Phase 2: query rewrites (separate change, after v34 is verified on the NAS)
+
+**Shipped 2026-10-04.** Measured old vs new on a replica copy (cold-cache proxy):
+aesthetics browse `sort=aesthetic_desc` 856 → 4 MB; `min_aesthetic=90` 856 → 1–86 MB
+depending on sort; a 10-day `min_quality=6` 434 → 25 MB; filename search 566 → 9 MB;
+`location=Varenna` 567 → 7 MB; three people 24 → 8 MB. All 37 combinations returned the
+same totals and the same pages, except that photos with identical timestamps can swap
+places. The browses translate every sort mode and `_filter_aesthetic`'s floors into
+SQL (`_sort_sql`, `_aesthetic_floor_sql`), including the `or -1` treatment of 0 and
+the stable-sort tie-break. `tests/test_search_indexes.py` compares them against the
+Python path, which they replace, for every sort × floor × offset. A browse with
+`style_tag` keeps the Python path, because that match runs in Python.
+
+With a date range, SQLite starts from the date index. That is the right choice for a
+trip-sized range. Over several years it can read more than starting from the quality
+index (125 → 520 MB for `min_quality=7` over 3 years), but it is still faster.
 - `search_by_all_persons`: switch to an `id IN (SELECT photo_id ... GROUP BY photo_id
   HAVING COUNT(DISTINCT person_id)=?)` subquery. 331 → 45 MB.
 - Look up ids first for `_search_by_location`'s `place_name LIKE` and for

@@ -341,3 +341,101 @@ def test_nocase_location_matches_lower(lib):
             "SELECT id FROM photos WHERE admin2 = ? COLLATE NOCASE "
             "OR country = ? COLLATE NOCASE", (name, name))}
         assert lower == nocase and lower, name
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: id-first rewrites and SQL pagination
+# ---------------------------------------------------------------------------
+
+def test_people_queries_read_rows_by_id_from_the_faces_index(lib):
+    db, _ = lib
+    stmts = _traced(db, lambda: search_combined(db, query="Calvin and Ellie"))
+    stmts += _traced(db, lambda: search_combined(db, person="Calvin"))
+    plans = _plans_touching(db, stmts, "f.person_id")
+    assert len(plans) >= 2
+    for plan in plans:
+        assert "idx_faces_person_photo" in plan, plan
+        assert "SCAN p " not in plan and "SCAN photos" not in plan, plan
+
+
+@pytest.mark.parametrize("call,index", [
+    (lambda db: search_combined(db, query="IMG_3"), "sqlite_autoindex_photos_1"),
+    (lambda db: search_combined(db, location="Varenna"), "idx_photos_place"),
+])
+def test_substring_likes_scan_a_narrow_index(lib, call, index):
+    db, _ = lib
+    stmts = _traced(db, lambda: call(db))
+    plans = _plans_touching(db, stmts, " LIKE ")
+    assert plans
+    assert f"COVERING INDEX {index}" in plans[0], plans[0]
+
+
+@pytest.fixture
+def scored(lib):
+    """lib plus aesthetic scores with ties, zeros, NULLs and undated rows —
+    the cases where SQL and _apply_sort/_filter_aesthetic could disagree."""
+    db, ids = lib
+    vals = [  # pct, subj, day, subj_day, tech, impact, aes_overall
+        (90.0, None, 50.0, None, 8.0, 7.0, 7.0),
+        (90.0, 95.0, None, 99.0, 0.0, 8.0, 7.0),
+        (0.0, None, 10.0, None, None, 3.0, 5.5),
+        (40.0, 40.0, 40.0, 40.0, 5.0, 5.0, None),
+        (90.0, None, 70.0, 30.0, 8.0, 7.0, 7.0),  # subject day pct wins
+        (75.0, 10.0, 80.0, None, 9.0, 9.0, 6.2),
+        (75.0, None, None, None, 9.0, 9.0, 6.2),  # undated row (ids[6])
+        (None, None, None, None, None, None, None),
+    ]
+    for pid, v in zip(ids, vals):
+        db.conn.execute(
+            "UPDATE photos SET aes_overall_pct=?, aes_subject_overall_pct=?, "
+            "aes_overall_day_pct=?, aes_subject_overall_day_pct=?, "
+            "aes_technical=?, aes_impact=?, aes_overall=? WHERE id=?", (*v, pid))
+    db.conn.commit()
+    return db, ids
+
+
+PAGED = [
+    dict(min_aesthetic=50),
+    dict(min_aesthetic=0),
+    dict(min_aesthetic=-5),
+    dict(min_technical=0.0),
+    dict(min_technical=6, min_impact=6),
+    dict(min_subject_aesthetic=20),
+    dict(min_day_aesthetic=45),
+    dict(min_day_aesthetic=0),
+    dict(min_aesthetic=10, date_from="2026-09-26", date_to="2026-09-27"),
+    dict(min_quality=5.0),
+    dict(min_quality=5.0, min_aesthetic=80),
+    dict(min_quality=5.0, date_from="2026-01-01"),
+    dict(),  # browse: only with an aesthetic sort
+]
+SORTS = ["date_desc", "date_asc", "aesthetic_desc", "subject_aesthetic_desc",
+         "quality_desc", "day_quality_desc", "relevance"]
+
+
+@pytest.mark.parametrize("sort", SORTS)
+@pytest.mark.parametrize("kw", PAGED, ids=lambda kw: ",".join(
+    f"{k}={v}" for k, v in sorted(kw.items())) or "browse")
+@pytest.mark.parametrize("offset,limit", [(0, 100), (1, 2), (3, 0)])
+def test_sql_pagination_matches_the_python_path(scored, monkeypatch, kw, sort,
+                                                 offset, limit):
+    db, _ = scored
+
+    def run():
+        return search_combined(db, sort=sort, offset=offset, limit=limit,
+                               with_total=True, **kw)
+
+    page, total = run()
+    monkeypatch.setattr(search_mod, "_sort_sql", lambda *a, **k: None)
+    old_page, old_total = run()
+    assert total == old_total
+    assert [p["id"] for p in page] == [p["id"] for p in old_page]
+
+
+def test_aesthetic_sort_reads_only_the_page(scored):
+    db, _ = scored
+    stmts = _traced(db, lambda: search_combined(db, sort="aesthetic_desc", limit=2))
+    page = [s for s in stmts if s.startswith("SELECT * FROM photos WHERE")]
+    assert len(page) == 1 and "LIMIT 2" in page[0]
+    plan = _plan(db, page[0])
+    assert "idx_photos_aes_overall_pct" in plan and "TEMP B-TREE" not in plan
