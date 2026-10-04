@@ -121,8 +121,8 @@ def describe_module_roles() -> dict:
 def _unload_pass_models(pass_type: str) -> None:
     """Release torch models owned by a pass so MPS/CUDA memory is reclaimed.
 
-    Ollama-backed passes (describe/tags/verify) keep their models in the
-    sidecar, so there's nothing to unload here for those.
+    LLM passes keep their models in the backend (Ollama / LM Studio); those
+    are released per pass at retirement by `_release_llm_models`.
     """
     if pass_type == "clip":
         from .clip_embed import unload_model as _unload
@@ -137,6 +137,51 @@ def _unload_pass_models(pass_type: str) -> None:
         # Verify borrows clip_embed for its cross-check embeddings.
         from .clip_embed import unload_model as _unload
         _unload()
+
+
+def _llm_models_for(pass_type: str, pass_models: dict) -> set[str]:
+    """Effective LM Studio model ids a pass calls. `pass_models` maps pass ->
+    [(nominal model, role)]; verify lists two (verifier + describe regen)."""
+    from .describe import effective_model
+    return {effective_model(m, role) for m, role in pass_models.get(pass_type, ())}
+
+
+def _release_llm_models(client, retired: str, next_passes: list[str],
+                        pass_models: dict, status_scope: dict) -> list[str]:
+    """Unload the retired pass's LLMs from LM Studio, keeping any model that
+    the next pass(es) or ANOTHER WORKER's live claim still needs.
+
+    The claim check is what makes this safe with a fleet: workers drain a pass
+    at different moments, and unloading under a sibling's in-flight batch would
+    fail its requests. So the first worker out leaves the model alone and the
+    last one out unloads it. If the status call fails we unload nothing — a
+    resident model costs VRAM, a yanked one costs work.
+    """
+    if not os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return []          # Ollama evicts on its own
+    candidates = _llm_models_for(retired, pass_models)
+    for p in next_passes:
+        candidates -= _llm_models_for(p, pass_models)
+    if not candidates:
+        return []
+    try:
+        status = client.get_status(passes=[retired], **status_scope)
+    except Exception as e:
+        print(f"  (keeping {', '.join(sorted(candidates))} loaded: "
+              f"cannot check other workers' claims: {e})")
+        return []
+    busy = set()
+    for c in status.get("active_claims", []):
+        if c.get("worker_id") != client.worker_id:
+            busy |= _llm_models_for(c.get("pass_type"), pass_models)
+    held = candidates & busy
+    if held:
+        print(f"  keeping {', '.join(sorted(held))} loaded: another worker is still using it")
+    from .describe import unload_openai_models
+    done = unload_openai_models(candidates - busy)
+    if done:
+        print(f"  ⏏ unloaded {', '.join(done)} from LM Studio")
+    return done
 
 
 def _flush_caches() -> None:
@@ -1024,6 +1069,18 @@ def run_worker(
     # reports empty (unless --stay-alive); when the list empties, we're done.
     active: list[str] = list(passes)
     seq_idx = 0
+    # LLM passes -> the (nominal model, role) pairs they call, so a retiring
+    # pass can unload exactly its own LM Studio models (_release_llm_models).
+    pass_models = {
+        "describe":         [(describe_model, "describe")],
+        "verify":           [(verify_model, "verify"), (describe_model, "describe")],
+        "category-content": [(category_content_model, "text")],
+        "keywords":         [(keywords_model, "text")],
+        "category-visual":  [(category_visual_model, "visual")],
+        "aesthetics":       [(aesthetics_model, "aesthetics")],
+    }
+    status_scope = {"collection_id": collection_id, "directory": directory,
+                    "filters": filters}
     mode = ("sequential" if sequential else "round-robin") + \
            (", stay-alive" if stay_alive else ", exit when drained")
     print(f"\nPass order: {' -> '.join(active)}  ({mode})")
@@ -1224,6 +1281,15 @@ def run_worker(
                         active.remove(pt)
                         left = ", ".join(active) if active else "none"
                         print(f"  → retiring '{pt}' (queue empty). Remaining: {left}")
+                        # Sequential: only the pass up next keeps its model
+                        # resident — one model at a time. Round-robin: every
+                        # remaining pass is still in rotation.
+                        if sequential and active:
+                            keep = [active[seq_idx % len(active)]]
+                        else:
+                            keep = list(active)
+                        _release_llm_models(client, pt, keep, pass_models,
+                                            status_scope)
                 elif sequential:
                     seq_idx += 1
             if not active:

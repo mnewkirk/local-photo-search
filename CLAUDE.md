@@ -924,6 +924,17 @@ qwen2.5-vl-7b**, not the per-role models this section used to list (visible in
 for its in-server re-runs, and rerank/photobook read **`PHOTOSEARCH_LLM_RERANK_MODEL`**
 first (still qwen2.5-vl), so changing the visual pass doesn't move them.
 
+**Each pass unloads its model from LM Studio when it drains**
+(`worker._release_llm_models` → `describe.unload_openai_models`, LM Studio's
+`/api/v1/models/unload`). LM Studio never evicts a JIT-loaded model on its own,
+so before this a full fleet run ended with every role model resident at once
+(2026-10-04: qwen2.5-vl, qwen3.5-9b, minicpm and gemma, all at 16k context, on
+one 24 GB card). Rules: a model the **next** pass shares stays (gemma serves
+category-content → keywords → verify); a model **another worker** still holds a
+live claim on stays — so the last worker out unloads; a failed status call or
+the Ollama route unloads nothing. Needs LM Studio **JIT loading on** — the next
+request reloads whatever was unloaded (incl. the replica's rerank / Ask models).
+
 **A model the fleet JIT-loads needs an LM Studio per-model context default**
 (`%USERPROFILE%\.lmstudio\.internal\user-concrete-model-default-config\…json`,
 `llm.load.contextLength`). Otherwise it loads at 4096, split across 4 parallel

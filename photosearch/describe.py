@@ -631,6 +631,50 @@ def effective_model(model: str, role: Optional[str] = None) -> str:
     return model
 
 
+def unload_openai_models(models) -> list[str]:
+    """Unload `models` (effective ids) from LM Studio; return the ids unloaded.
+
+    LM Studio keeps every JIT-loaded model resident until told otherwise, so a
+    fleet that walks describe -> visual -> text -> verify ends with all of them
+    in VRAM at once (2026-10-04: four 16k-context models on one 24 GB card).
+    Ollama evicts on its own; this is the LM Studio half. Uses LM Studio's
+    native REST API (`/api/v1/models`, `/api/v1/models/unload`), which a plain
+    OpenAI-compatible server lacks — so it is best-effort: any failure, or a
+    backend without that API, unloads nothing and never raises. JIT loading
+    brings a model back on the next request that needs it.
+    """
+    import urllib.request
+    base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
+    wanted = {m for m in models if m}
+    if not base or not wanted:
+        return []
+    root = base.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    try:
+        with urllib.request.urlopen(f"{root}/api/v1/models", timeout=10) as r:
+            listing = json.load(r).get("models", [])
+    except Exception as e:
+        print(f"  (model unload skipped: cannot list LM Studio models: {e})", flush=True)
+        return []
+    done = []
+    for m in listing:
+        for inst in m.get("loaded_instances") or []:
+            iid = inst.get("id")
+            if m.get("key") not in wanted and iid not in wanted:
+                continue
+            try:
+                req = urllib.request.Request(
+                    f"{root}/api/v1/models/unload",
+                    data=json.dumps({"instance_id": iid}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=60).read()
+                done.append(iid)
+            except Exception as e:
+                print(f"  (could not unload {iid}: {e})", flush=True)
+    return done
+
+
 def effective_model_version(model: str) -> Optional[str]:
     """Provenance digest for `generations.model_version`.
 
