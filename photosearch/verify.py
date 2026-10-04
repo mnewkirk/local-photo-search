@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -667,7 +667,8 @@ def _regenerate(
 
 def _save_verification(db, photo_id: int, status: str, flags: list):
     """Write verification results to the database."""
-    now = datetime.now().isoformat()
+    # UTC with an explicit Z, like the worker (worker._utc_stamp).
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flags_json = json.dumps(flags) if flags else None
     db.conn.execute(
         """UPDATE photos

@@ -184,6 +184,14 @@ def _release_llm_models(client, retired: str, next_passes: list[str],
     return done
 
 
+def _utc_stamp() -> str:
+    """verified_at, in UTC with an explicit Z. It used to be the worker's
+    local clock with no zone (Pacific on every fleet machine since May 2026,
+    UTC for the April in-process runs), which made it impossible to order
+    against the UTC `generations` log — see stale_descriptions."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def _flush_caches() -> None:
     """Drop tensor allocator caches between batches to prevent drift."""
     gc.collect()
@@ -846,7 +854,7 @@ def _process_verify(
                 results.append({
                     "photo_id": pid,
                     "status": "pass",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "verified_at": _utc_stamp(),
                     "hallucination_flags": None,
                 })
                 continue
@@ -866,7 +874,7 @@ def _process_verify(
                 results.append({
                     "photo_id": pid,
                     "status": "pass",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "verified_at": _utc_stamp(),
                     "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
                 })
                 continue
@@ -903,7 +911,7 @@ def _process_verify(
             result = {
                 "photo_id": pid,
                 "status": status,
-                "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "verified_at": _utc_stamp(),
                 "hallucination_flags": json.dumps(
                     [{"noun": n, "llm_says": "NO"} for n in confirmed_nouns]
                 ),

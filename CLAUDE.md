@@ -1057,7 +1057,12 @@ timestamps. `--folder` / `--collection` scope it; `--save-collection` queues
 the set as a collection; `--requeue` clears exactly the stale pass per photo
 (chunked commits). Run writes **on the NAS**. Traps it handles: `created_at`
 comes as both `…T…` and `… …` (normalized); `verified_at` is worker-local while
-generations are UTC (8 h margin — raw comparison flags 26,154, real is 1);
+generations are UTC — read zone-less stamps as Pacific (exact for every
+fleet stamp since May, measured off the ~14k rewrite anchors; the lone UTC era,
+the 2026-04-12 NAS run, gets the later reading so it can never be flagged
+wrongly). **Not a margin**: verify runs within the hour of describe, so any
+slack wide enough to absorb the offset also hides real re-describes. New stamps
+are explicit UTC (`worker._utc_stamp`, `…Z`);
 output with no generation row predates logging and is counted, never flagged
 (1,128 categories).
 

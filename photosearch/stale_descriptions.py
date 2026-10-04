@@ -14,15 +14,31 @@ Evidence comes from `generations`, the per-artifact provenance log:
                         ('verify' rows ARE rewritten descriptions)
   categories stale  latest 'category-content' row < T
   keywords stale    latest 'keywords' row < T
-  verify stale      latest 'describe' row > verified_at + 8 h
+  verify stale      latest 'describe' row > verified_at, both in UTC
 
 Traps, each measured:
 - created_at comes in two spellings ('2026-04-12T20:04:19' and
   '2026-04-12 20:04:19'); compared raw, a 'T' row sorts after every space row
   of the same day. Normalized with replace(…,'T',' ').
-- verified_at is the WORKER's local clock with no zone, generations are UTC.
-  Raw comparison flags 26,154 photos; with an 8 h margin (> the PDT/PST
-  offset) it is 1 — the rest are verify running within hours of describe.
+- verified_at was the WORKER's clock with no zone; generations are UTC. The
+  clock is recoverable exactly: a verify REWRITE logs a 'verify' generation
+  (UTC, server) in the same submit as its verified_at, so their difference is
+  the worker's offset. Measured over all ~14,000 rewrites: every stamp from
+  2026-05-25 on is Pacific (-7 h in PDT; the few -7.25..-8 are submit
+  latency, never a third clock). April is mixed: 04-09 is Pacific (60 of 141
+  stamps precede their own photo's description if read as UTC, 0 as
+  Pacific), the 04-12 rewrites are UTC (offset 0, the in-process NAS run),
+  04-10/11 carry no evidence either way.
+  So `_verified_utc` reads every zone-less stamp as Pacific, with real DST
+  rules. That is EXACT for everything but the April UTC stamps, and for those
+  it is the later of the two readings — a photo is flagged only if stale
+  under both, never wrongly; it could miss a re-describe within 7 h of an
+  April-12 verification, and there are none (measured). NOT a margin: an 8 h
+  margin also hid every real re-describe inside it, and verify normally runs
+  within an hour of describe. Stamps written since the fix carry an explicit
+  Z (worker._utc_stamp). No margin is needed after conversion: a photo cannot
+  be claimed for verify until its description exists, so a describe logged
+  after the verification is a genuine re-describe.
 - A photo with categories but NO category-content row predates logging; there
   is nothing to compare, so it is counted (`unknown_*`) and never flagged.
 """
@@ -30,10 +46,31 @@ Traps, each measured:
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 TEXT_PASSES = ("category-content", "keywords", "verify")
-_VERIFY_TZ_MARGIN = "+8 hours"
+
+# Zone-less verified_at stamps are the fleet's local clock (module docstring).
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def _verified_utc(stamp: str) -> Optional[str]:
+    """`verified_at` as 'YYYY-MM-DD HH:MM:SS' UTC — the generations format."""
+    if not stamp:
+        return None
+    s = stamp.strip()
+    try:
+        if s.endswith("Z") or s.endswith("+00:00"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(s.replace(" ", "T"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_PACIFIC)
+    except ValueError:
+        return None
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _scope_sql(folder: Optional[str], collection_id: Optional[int]) -> tuple[str, list]:
@@ -62,8 +99,7 @@ def find_stale(conn: sqlite3.Connection, folder: Optional[str] = None,
         SELECT p.id,
                p.categories IS NOT NULL AND cc.t IS NOT NULL AND cc.t < d.t,
                p.keywords   IS NOT NULL AND kw.t IS NOT NULL AND kw.t < d.t,
-               p.verified_at IS NOT NULL AND ds.t IS NOT NULL
-                 AND ds.t > datetime(replace(p.verified_at, 'T', ' '), ?),
+               p.verified_at, ds.t,
                p.categories IS NOT NULL AND cc.t IS NULL,
                p.keywords   IS NOT NULL AND kw.t IS NULL
           FROM photos p
@@ -72,11 +108,13 @@ def find_stale(conn: sqlite3.Connection, folder: Optional[str] = None,
           LEFT JOIN g kw ON kw.photo_id = p.id AND kw.text_type = 'keywords'
           LEFT JOIN g ds ON ds.photo_id = p.id AND ds.text_type = 'describe'
          WHERE 1 = 1 {scope}
-    """, [_VERIFY_TZ_MARGIN, *params]).fetchall()
+    """, params).fetchall()
     out = {p: [] for p in TEXT_PASSES}
     out["unknown_category-content"] = 0
     out["unknown_keywords"] = 0
-    for pid, cc, kw, vf, ucc, ukw in rows:
+    for pid, cc, kw, verified_at, describe_t, ucc, ukw in rows:
+        v_utc = _verified_utc(verified_at) if describe_t else None
+        vf = v_utc is not None and describe_t > v_utc
         if cc:
             out["category-content"].append(pid)
         if kw:

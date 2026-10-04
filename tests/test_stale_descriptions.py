@@ -53,13 +53,44 @@ def test_mixed_timestamp_spellings_compare_correctly(db):
 
 
 def test_verify_staleness_tolerates_the_worker_timezone(db):
-    """verified_at is worker-local, generations are UTC: a describe 7 h
-    'after' a verification is just Pacific time, not a re-describe."""
+    """verified_at is worker-local, generations are UTC: a describe at 17:00
+    UTC is BEFORE a 10:00 PST (18:00 UTC) verification, not a re-describe."""
     _photo(db, 1, verified="2090-01-01T10:00:00")
     _gen(db, 1, "describe", "2090-01-01 17:00:00")
     _photo(db, 2, verified="2090-01-01T10:00:00")
     _gen(db, 2, "describe", "2090-01-03 00:00:00")   # genuinely re-described
     assert SD.find_stale(db.conn)["verify"] == [2]
+
+
+def test_redescribe_an_hour_after_verification_is_caught(db):
+    """The case a timezone MARGIN hid: verify normally runs within the hour,
+    so an 8 h slack swallowed every real re-describe. 10:00 PDT = 17:00 UTC."""
+    _photo(db, 1, verified="2090-07-01T10:00:00")
+    _gen(db, 1, "describe", "2090-07-01 16:30:00")   # before: describe -> verify
+    _photo(db, 2, verified="2090-07-01T10:00:00")
+    _gen(db, 2, "describe", "2090-07-01 18:00:00")   # 1 h after the verification
+    assert SD.find_stale(db.conn)["verify"] == [2]
+
+
+def test_explicit_utc_stamps_are_read_exactly(db):
+    _photo(db, 1, verified="2090-07-01T10:00:00Z")
+    _gen(db, 1, "describe", "2090-07-01 10:30:00")
+    assert SD.find_stale(db.conn)["verify"] == [1]
+
+
+def test_verified_utc_conversion():
+    assert SD._verified_utc("2026-07-01T10:00:00") == "2026-07-01 17:00:00"   # PDT
+    assert SD._verified_utc("2026-12-01T10:00:00") == "2026-12-01 18:00:00"   # PST
+    assert SD._verified_utc("2026-07-01T10:00:00Z") == "2026-07-01 10:00:00"
+    assert SD._verified_utc("2026-07-01T10:00:00+00:00") == "2026-07-01 10:00:00"
+    assert SD._verified_utc("garbage") is None and SD._verified_utc(None) is None
+
+
+def test_worker_stamps_verified_at_in_explicit_utc(monkeypatch):
+    from photosearch import worker as W
+    monkeypatch.setattr(W.time, "gmtime", lambda: __import__("time").struct_time(
+        (2090, 7, 1, 17, 0, 0, 0, 182, 0)))
+    assert W._utc_stamp() == "2090-07-01T17:00:00Z"
 
 
 def test_output_with_no_generation_row_is_counted_not_flagged(db):
