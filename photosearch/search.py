@@ -1026,7 +1026,7 @@ def _extract_persons_from_query(db: PhotoDB, query: str) -> tuple[str, list[dict
 
 
 def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str | None = None,
-                     scope: list[int] | None = None) -> list[dict]:
+                     scope: list[int] | None = None, columns: str = "p.*") -> list[dict]:
     """Find all photos containing a named person.
 
     Looks up the person by name, then finds all faces linked to that person,
@@ -1036,6 +1036,8 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
     this method ('strict', 'temporal', or 'manual').
 
     scope: restrict to these photo ids (see `_compose_scope`).
+    columns: the SELECT list; search_combined passes `_NARROW_COLUMNS` and
+        reads full rows for the requested page only.
     """
     person = db.get_person_by_name(name)
     if not person:
@@ -1045,7 +1047,7 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
     # id-first: resolve the photo ids from the faces index, then read each
     # photo row once. Joining read the wide row once per FACE and then
     # de-duplicated whole rows in a temp B-tree.
-    sql = """SELECT p.*
+    sql = f"""SELECT {columns}
            FROM photos p
            WHERE p.id IN (SELECT f.photo_id FROM faces f WHERE f.person_id = ?"""
     params: list = [person["id"]]
@@ -1059,7 +1061,9 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
     sql += scope_sql
     params.extend(scope_params)
 
-    sql += " ORDER BY p.date_taken LIMIT ?"
+    # p.id breaks timestamp ties so the order (which feeds relevance ranks and
+    # which duplicate copy survives _dedupe_by_hash) never depends on the plan.
+    sql += " ORDER BY p.date_taken, p.id LIMIT ?"
     params.append(limit)
 
     rows = db.conn.execute(sql, params).fetchall()
@@ -1072,6 +1076,7 @@ def search_by_all_persons(
     limit: int = 10,
     match_source: str | None = None,
     scope: list[int] | None = None,
+    columns: str = "p.*",
 ) -> list[dict]:
     """Find photos containing ALL of the given persons (AND intersection).
 
@@ -1094,7 +1099,7 @@ def search_by_all_persons(
     # measured 2026-10-03). The old JOIN read the wide row once per face.
     placeholders = ",".join("?" * len(person_ids))
     sql = (
-        "SELECT p.* FROM photos p WHERE p.id IN ("
+        f"SELECT {columns} FROM photos p WHERE p.id IN ("
         f"SELECT f.photo_id FROM faces f WHERE f.person_id IN ({placeholders})"
     )
     params: list = list(person_ids)
@@ -1109,7 +1114,7 @@ def search_by_all_persons(
     sql += scope_sql
     params.extend(scope_params)
 
-    sql += " ORDER BY p.date_taken DESC LIMIT ?"
+    sql += " ORDER BY p.date_taken DESC, p.id LIMIT ?"
     params.append(limit)
 
     rows = db.conn.execute(sql, params).fetchall()
@@ -1505,6 +1510,18 @@ def _pad_bbox(bbox: list[float]) -> tuple[float, float, float, float]:
 # face-image) keep `limit*3` because they're true top-N.
 _FILTER_PREFETCH_LIMIT = 100_000
 
+# Everything search_combined reads from a row AFTER the filters run — hash
+# dedupe, date / quality / aesthetic filters, style tag, RRF + recency decay,
+# every sort mode. When the only filters are people, their queries select
+# just these and full rows are read for the returned page alone: a person
+# with 17k photos read every wide row (223 MB) to show 100.
+# A column the post-filter pipeline starts reading must be added here.
+_NARROW_COLUMNS = ", ".join(f"p.{c}" for c in (
+    "id", "file_hash", "date_taken", "aes_overall", "aesthetic_score",
+    "aes_overall_pct", "aes_subject_overall_pct", "aes_overall_day_pct",
+    "aes_subject_overall_day_pct", "aes_technical", "aes_composition",
+    "aes_impact", "aes_style_tags"))
+
 
 # Composed scope (docs/plans/search-indexes.md, step 9a). Each structured
 # filter used to run over the WHOLE library as its own `SELECT *` and the
@@ -1580,6 +1597,13 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
     params.append(_SCOPE_MAX_IDS + 1)
     ids = [r[0] for r in db.conn.execute(sql, params)]
     return None if len(ids) > _SCOPE_MAX_IDS else ids
+
+
+def _hydrate(db: PhotoDB, narrow_rows: list[dict]) -> list[dict]:
+    """Full photo rows for `narrow_rows`, in order, keeping the keys the
+    pipeline computed on them (rrf_score, score, ...)."""
+    full = {r["id"]: r for r in _fetch_photos(db, [r["id"] for r in narrow_rows])}
+    return [{**full[r["id"]], **r} for r in narrow_rows if r["id"] in full]
 
 
 def _fetch_photos(db: PhotoDB, ids: list[int]) -> list[dict]:
@@ -1882,6 +1906,15 @@ def search_combined(
         if scope is not None:
             _log.info("SEARCH SCOPE  %d photos", len(scope))
 
+    # People-only searches select narrow rows and hydrate only the page.
+    # Every other filter's rows can become result_sets[0] (whose dicts are
+    # returned), so any of them keeps full rows.
+    query_left = (residual if name_matched else effective_query)
+    narrow = bool(name_matched or person or person_ids) and not (
+        query_left or face_image or color or place or location or category
+        or visual_tag or keyword or camera)
+    person_cols = _NARROW_COLUMNS if narrow else "p.*"
+
     if name_matched:
         _log.info(
             "QUERY NAMES: matched %s  residual=%r",
@@ -1892,13 +1925,13 @@ def search_combined(
             results = search_by_person(
                 db, name_matched[0]["name"],
                 limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
-                scope=scope,
+                scope=scope, columns=person_cols,
             )
         else:
             results = search_by_all_persons(
                 db, [p["id"] for p in name_matched],
                 limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
-                scope=scope,
+                scope=scope, columns=person_cols,
             )
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
@@ -1907,7 +1940,7 @@ def search_combined(
     if person:
         results = search_by_person(
             db, person, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
-            scope=scope)
+            scope=scope, columns=person_cols)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
@@ -1920,7 +1953,7 @@ def search_combined(
     if person_ids:
         results = search_by_all_persons(
             db, person_ids, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
-            scope=scope)
+            scope=scope, columns=person_cols)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
@@ -2203,6 +2236,8 @@ def search_combined(
 
     total = len(merged)
     page = merged[offset:offset + limit]
+    if narrow:
+        page = _hydrate(db, page)
     if with_total:
         return page, total
     return page

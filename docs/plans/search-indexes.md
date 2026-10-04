@@ -227,6 +227,15 @@ the stable-sort tie-break. `tests/test_search_indexes.py` compares them against 
 Python path, which they replace, for every sort × floor × offset. A browse with
 `style_tag` keeps the Python path, because that match runs in Python.
 
+**People-only searches (2026-10-04):** when the only filters are people, the person
+queries select `search._NARROW_COLUMNS` (what dedupe, the filters and the sorts read),
+and full rows are read only for the returned page (`_hydrate`). Calvin, 17,638 photos:
+223 → 75 MB, 3.1 → 0.07 s, with identical rows on 9 cases. A column the post-filter
+pipeline starts reading must be added to `_NARROW_COLUMNS`. The test compares narrow
+pages against full-row pages, so it fails if one is missing. Person results now
+tie-break on `p.id`, so the relevance rank, and which duplicate copy survives dedupe,
+no longer depend on the query plan.
+
 With a date range, SQLite starts from the date index. That is the right choice for a
 trip-sized range. Over several years it can read more than starting from the quality
 index (125 → 520 MB for `min_quality=7` over 3 years), but it is still faster.

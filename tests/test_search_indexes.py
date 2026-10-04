@@ -439,3 +439,66 @@ def test_aesthetic_sort_reads_only_the_page(scored):
     assert len(page) == 1 and "LIMIT 2" in page[0]
     plan = _plan(db, page[0])
     assert "idx_photos_aes_overall_pct" in plan and "TEMP B-TREE" not in plan
+
+
+# ---------------------------------------------------------------------------
+# People-only searches: narrow rows, full rows for the page only
+# ---------------------------------------------------------------------------
+
+NARROW = [
+    dict(person="Calvin"),
+    dict(person="Calvin", match_source="strict"),
+    dict(query="Calvin and Ellie"),
+    dict(person_ids=[1, 2]),
+    dict(person="Calvin", person_ids=[2]),
+    dict(person="Calvin", date_from="2026-09-26", date_to="2026-09-27"),
+    dict(person="Calvin", min_quality=5.0),
+    dict(person="Calvin", min_aesthetic=50, min_day_aesthetic=10),
+    dict(person="Calvin", style_tag="golden-hour"),
+    dict(person="Nobody"),
+]
+
+
+@pytest.mark.parametrize("sort", SORTS)
+@pytest.mark.parametrize("kw", NARROW, ids=lambda kw: ",".join(
+    f"{k}={v}" for k, v in sorted(kw.items())))
+@pytest.mark.parametrize("offset,limit", [(0, 100), (1, 2)])
+def test_people_only_page_matches_full_rows(scored, monkeypatch, kw, sort,
+                                            offset, limit):
+    db, ids = scored
+    db.conn.execute("UPDATE photos SET aes_style_tags = '[\"golden-hour\"]' "
+                    "WHERE id IN (?, ?)", (ids[0], ids[4]))
+    # A duplicate copy of a Calvin photo: hash dedupe must still apply.
+    dup = db.add_photo(filepath="2026/copy/IMG_0.JPG", filename="IMG_0.JPG",
+                       date_taken="2026-09-26 09:00:00", file_hash="h0",
+                       camera_model="ILCE-7RM6")
+    db.add_face(dup, (0, 10, 10, 0), [], person_id=1)
+    db.conn.commit()
+
+    # Recency decay (relevance sort) reads the clock; pin it so the two runs
+    # compare rrf_score exactly.
+    import datetime as real_dt
+
+    class _FrozenDatetime(real_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 4, 12, 0, 0)
+    monkeypatch.setattr(real_dt, "datetime", _FrozenDatetime)
+
+    def run():
+        return search_combined(db, sort=sort, offset=offset, limit=limit,
+                               with_total=True, **kw)
+
+    page, total = run()
+    monkeypatch.setattr(search_mod, "_NARROW_COLUMNS", "p.*")
+    full_page, full_total = run()
+    assert total == full_total
+    assert page == full_page  # same rows, same order, same keys and values
+
+
+def test_people_only_search_reads_full_rows_for_the_page_only(scored):
+    db, _ = scored
+    stmts = _traced(db, lambda: search_combined(db, person="Calvin", limit=2))
+    wide = [s for s in stmts if s.startswith("SELECT * FROM photos")
+            or "SELECT p.*" in s]
+    assert len(wide) == 1 and wide[0].count(",") == 1  # IN (id, id)
