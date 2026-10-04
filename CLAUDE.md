@@ -935,6 +935,14 @@ live claim on stays — so the last worker out unloads; a failed status call or
 the Ollama route unloads nothing. Needs LM Studio **JIT loading on** — the next
 request reloads whatever was unloaded (incl. the replica's rerank / Ask models).
 
+**A model loaded while VRAM was full STAYS spilled.** LM Studio places a model's
+layers when it loads and never rebalances, so a model JIT-loaded behind three
+others is partly on CPU for life. 2026-10-04: gemma-4-12b ran at **3 t/s**, every
+`category-content` call blew the 10 s cap even with reasoning off; unloading it
+(`POST :1234/api/v1/models/unload {"instance_id": …}`) and letting JIT reload it
+into empty VRAM gave **17 t/s** under 3 concurrent workers, ~3 s/photo. Symptom:
+text passes all `deferring (timeout/error)` with `reasoning_tokens` 0.
+
 **A model the fleet JIT-loads needs an LM Studio per-model context default**
 (`%USERPROFILE%\.lmstudio\.internal\user-concrete-model-default-config\…json`,
 `llm.load.contextLength`). Otherwise it loads at 4096, split across 4 parallel
