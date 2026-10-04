@@ -622,3 +622,40 @@ column compares every model on the same questions, which is the fair one.
 **`rerun.FLEET_ROLE_MODELS["describe"]` is now `qwen/qwen3.5-9b`** (1.5 vs 1.2 s/photo).
 Verify (gemma-4-12b-qat) is still a different model, as it must be, and was evaluated
 on qwen3.5-9b's own descriptions.
+
+### Text passes decided (2026-10-03): gemma-4-12b-qat
+
+The owner labelled all 70 frozen descriptions on Categories and Keywords.
+
+| model | category precision | right / wrong categories per photo | pooled recall | keyword precision | s (cat / kw) |
+|---|---|---|---|---|---|
+| llama-3.2-3b (production) | 0.83 | 4.5 / 0.9 | 0.25 | 0.94 | 0.13 / 0.13 |
+| **gemma-4-12b-qat** | **0.83** | **11.8** / 2.5 | **0.66** | 0.93 | 0.73 / 0.45 |
+| gemma-4-e4b | 0.83 | — | 0.43 | 0.94 | 0.26 / 0.24 |
+| minicpm-v-4_5 | 0.70 | — | 0.48 | 0.91 | 0.46 / 0.33 |
+
+gemma-4-12b-qat found more right categories than llama on 64 photos and fewer on 1
+(sign p ≈ 4e-18) at the same precision. It does produce more wrong ones in absolute
+terms: 2.5 vs 0.9 per photo, more on 52 photos and fewer on 5. **The automatic
+"unsupported by the description" screen was misleading here.** It flagged 44–49% of
+the new models' categories, yet their precision equals llama's: the extra categories
+are mostly fair inferences. Keywords are a tie. Both passes share the `text` role, so
+**`FLEET_ROLE_MODELS["text"]` is now `google/gemma-4-12b-qat`**, which is also the
+verify model, so there's no swap between those passes. Cost: about 27 min of text
+passes per 1,373-photo batch, against about 5.
+
+**Vocabulary gaps** the owner added (right, but not in the 360 terms): turf (10 photos),
+alpine (3), insect (3), and one each of alley, baby bottle, black jersey, computer, elk,
+fog, fox, golden hour, halloween, hike, marmot, medicine bottle, overcast, reflection,
+statue, stroller, vest. "turf" alone is in 10 of 70 photos (every artificial-turf
+soccer field). Worth adding before the next re-tag.
+
+## Final per-pass models (2026-10-03)
+
+| pass | model | was |
+|---|---|---|
+| describe | qwen/qwen3.5-9b | qwen2.5-vl-7b (fallback) |
+| verify | google/gemma-4-12b-qat | qwen2.5-vl-7b (fallback) |
+| category-visual | minicpm-v-4_5 | qwen2.5-vl-7b |
+| category-content + keywords | google/gemma-4-12b-qat | llama-3.2-3b |
+| aesthetics | qwen2.5-vl-7b-instruct | unchanged (tie) |

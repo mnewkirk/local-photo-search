@@ -103,7 +103,7 @@ export PHOTOSEARCH_LLM_DESCRIBE_MODEL="${PHOTOSEARCH_LLM_DESCRIBE_MODEL:-qwen/qw
 export PHOTOSEARCH_LLM_VERIFY_MODEL="${PHOTOSEARCH_LLM_VERIFY_MODEL:-google/gemma-4-12b-qat}"
 export PHOTOSEARCH_LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-minicpm-v-4_5}"
 export PHOTOSEARCH_LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-qwen2.5-vl-7b-instruct}"
-export PHOTOSEARCH_LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-llama-3.2-3b-instruct}"
+export PHOTOSEARCH_LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-google/gemma-4-12b-qat}"
 [ -n "${PHOTOSEARCH_AGENT_HINTS:-}" ] && export PHOTOSEARCH_AGENT_HINTS
 # Topaz upscale + Split print exports (M30/M31). These are NEW files, never
 # library photos, so the tree lives outside the library and nothing indexes it.

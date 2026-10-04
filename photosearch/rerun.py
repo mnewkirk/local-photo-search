@@ -73,7 +73,12 @@ def nas_base() -> Optional[str]:
 #             (the model that had actually been describing), 1.04 vs 1.46 wrong
 #             claims per photo, fewer wrong on 33 photos to 16 (p 0.02); every
 #             other candidate scored lower too.
-# aesthetics / text are what production already ran (text is pending evals). Explicit per role, deliberately: the server's own
+#   text     -> gemma-4-12b-qat (category-content + keywords share the role): on
+#             the owner's 70 labelled descriptions, category precision 0.83 —
+#             the same as llama-3.2-3b — with 11.8 right categories per photo
+#             vs 4.5 (more right on 64 photos, fewer on 1). Keyword precision a
+#             tie (0.93 vs 0.94). Also the verify model, so no swap between them.
+# aesthetics stays on what production ran: all four candidates tied. Explicit per role, deliberately: the server's own
 # PHOTOSEARCH_LLM_VISUAL_MODEL also drives rerank_photos and the photobook hero
 # picks, and letting the fleet's vision roles fall back to it is how describe,
 # verify and aesthetics all silently ran on qwen2.5-vl. Override one role for the
@@ -82,7 +87,7 @@ FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      "verify":     "google/gemma-4-12b-qat",
                      "visual":     "minicpm-v-4_5",
                      "aesthetics": "qwen2.5-vl-7b-instruct",
-                     "text":       "llama-3.2-3b-instruct"}
+                     "text":       "google/gemma-4-12b-qat"}
 
 
 def fleet_role_model(role: str, env=None) -> str:
