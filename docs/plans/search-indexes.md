@@ -1,6 +1,7 @@
 # Search indexes (schema v34)
 
-**Status:** planned 2026-10-03. Produced by a two-planner debate (Sonnet + Opus, two
+**Status:** Phase 1 implemented 2026-10-04 (schema v34). Phase 2 and the aes_* index drop are still open.
+Planned 2026-10-03. Produced by a two-planner debate (Sonnet + Opus, two
 critique rounds); every point below was agreed by both.
 
 ## Why

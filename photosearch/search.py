@@ -1022,7 +1022,8 @@ def _extract_persons_from_query(db: PhotoDB, query: str) -> tuple[str, list[dict
     return residual, matched
 
 
-def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str | None = None) -> list[dict]:
+def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str | None = None,
+                     scope: list[int] | None = None) -> list[dict]:
     """Find all photos containing a named person.
 
     Looks up the person by name, then finds all faces linked to that person,
@@ -1030,6 +1031,8 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
 
     match_source: if set, only return photos where the face was matched via
     this method ('strict', 'temporal', or 'manual').
+
+    scope: restrict to these photo ids (see `_compose_scope`).
     """
     person = db.get_person_by_name(name)
     if not person:
@@ -1046,6 +1049,10 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
         sql += " AND f.match_source = ?"
         params.append(match_source)
 
+    scope_sql, scope_params = _scope_clause("p.id", scope)
+    sql += scope_sql
+    params.extend(scope_params)
+
     sql += " ORDER BY p.date_taken LIMIT ?"
     params.append(limit)
 
@@ -1058,6 +1065,7 @@ def search_by_all_persons(
     person_ids: list[int],
     limit: int = 10,
     match_source: str | None = None,
+    scope: list[int] | None = None,
 ) -> list[dict]:
     """Find photos containing ALL of the given persons (AND intersection).
 
@@ -1086,6 +1094,10 @@ def search_by_all_persons(
     if match_source:
         sql += " AND f.match_source = ?"
         params.append(match_source)
+
+    scope_sql, scope_params = _scope_clause("p.id", scope)
+    sql += scope_sql
+    params.extend(scope_params)
 
     sql += (
         " GROUP BY p.id"
@@ -1413,8 +1425,97 @@ def _pad_bbox(bbox: list[float]) -> tuple[float, float, float, float]:
 _FILTER_PREFETCH_LIMIT = 100_000
 
 
+# Composed scope (docs/plans/search-indexes.md, step 9a). Each structured
+# filter used to run over the WHOLE library as its own `SELECT *` and the
+# sets were intersected in Python, so date x person x camera x location read
+# ~1.9 GB cold. When two or more structured filters are given, the cheap,
+# index-backed ones (date range, camera, people) are composed into one id
+# query first; every filter then runs only over those ids. The intersection
+# and _filter_by_date still run afterwards, so the scope is purely an
+# optimisation: it never adds a photo, and a photo it drops would have
+# failed the intersection anyway.
+#
+# Above this many ids the scope is dropped and each filter runs unscoped as
+# before: fetching that many rows by rowid stops being cheaper than a scan.
+_SCOPE_MAX_IDS = 20_000
+
+
+def _date_bounds(date_from: str, date_to: Optional[str]) -> tuple[str, str]:
+    """SQL bounds equivalent to `_filter_by_date` (date_taken is always
+    'YYYY-MM-DD hh:mm:ss'), so a range is index-searchable."""
+    return date_from, (date_to or _OPEN_DATE_HI) + " 23:59:59"
+
+
+def _scope_clause(column: str, scope: Optional[list[int]]) -> tuple[str, list]:
+    """` AND <column> IN (<scope ids>)`, or nothing when there is no scope."""
+    if scope is None:
+        return "", []
+    return f" AND {column} IN (SELECT value FROM json_each(?))", [json.dumps(scope)]
+
+
+def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[str],
+                   camera: Optional[str], person_ids: list[int],
+                   match_source: Optional[str]) -> Optional[list[int]]:
+    """Ids of photos passing every index-backed structured filter, or None
+    when there is nothing to compose or the result is too broad to help.
+
+    People are AND-ed, each tested with EXISTS on faces(photo_id, person_id)
+    — one index seek per candidate photo. Without a date or camera the query
+    is driven from the first person's faces instead.
+    """
+    if not (date_from or camera or person_ids):
+        return None
+    params: list = []
+
+    def person_exists(alias: str, pid: int) -> str:
+        params.append(pid)
+        sql = (f"EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = {alias} "
+               f"AND f.person_id = ?")
+        if match_source:
+            sql += " AND f.match_source = ?"
+            params.append(match_source)
+        return sql + ")"
+
+    if date_from or camera:
+        clauses = []
+        if camera:
+            clauses.append("p.camera_model = ?")
+            params.append(camera)
+        if date_from:
+            clauses.append("p.date_taken >= ? AND p.date_taken <= ?")
+            params.extend(_date_bounds(date_from, date_to))
+        clauses.extend(person_exists("p.id", pid) for pid in person_ids)
+        sql = "SELECT p.id FROM photos p WHERE " + " AND ".join(clauses)
+    else:
+        first, rest = person_ids[0], person_ids[1:]
+        sql = "SELECT DISTINCT f0.photo_id FROM faces f0 WHERE f0.person_id = ?"
+        params.append(first)
+        if match_source:
+            sql += " AND f0.match_source = ?"
+            params.append(match_source)
+        for pid in rest:
+            sql += " AND " + person_exists("f0.photo_id", pid)
+    sql += " LIMIT ?"
+    params.append(_SCOPE_MAX_IDS + 1)
+    ids = [r[0] for r in db.conn.execute(sql, params)]
+    return None if len(ids) > _SCOPE_MAX_IDS else ids
+
+
+def _fetch_photos(db: PhotoDB, ids: list[int]) -> list[dict]:
+    """Full rows for `ids`, in `ids` order, in chunks under SQLite's
+    variable limit."""
+    by_id: dict[int, dict] = {}
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        ph = ",".join("?" * len(chunk))
+        for r in db.conn.execute(f"SELECT * FROM photos WHERE id IN ({ph})", chunk):
+            by_id[r["id"]] = dict(r)
+    return [by_id[i] for i in ids if i in by_id]
+
+
 def _search_by_bbox(db: PhotoDB, south: float, north: float,
-                    west: float, east: float, limit: int = 100) -> list[dict]:
+                    west: float, east: float, limit: int = 100,
+                    scope: Optional[list[int]] = None) -> list[dict]:
     """Return photos whose GPS falls inside the given bounding box.
 
     Used by `_search_by_location` as a fallback when a query doesn't
@@ -1424,14 +1525,15 @@ def _search_by_bbox(db: PhotoDB, south: float, north: float,
     and the substring match misses them. Nominatim's bbox puts them
     back.
     """
+    scope_sql, scope_params = _scope_clause("id", scope)
     rows = db.conn.execute(
-        """SELECT * FROM photos
+        f"""SELECT * FROM photos
            WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL
              AND gps_lat BETWEEN ? AND ?
-             AND gps_lon BETWEEN ? AND ?
+             AND gps_lon BETWEEN ? AND ?{scope_sql}
            ORDER BY date_taken
            LIMIT ?""",
-        (south, north, west, east, limit),
+        (south, north, west, east, *scope_params, limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1483,7 +1585,8 @@ def _resolve_location_bbox(db, name: str):
     return _pad_bbox(top["bbox"])                # fall back to the padded point
 
 
-def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[dict]:
+def _search_by_location(db: PhotoDB, location: str, limit: int = 100,
+                        scope: Optional[list[int]] = None) -> list[dict]:
     """Search by place_name using case-insensitive LIKE matching, with
     two expansions on top of the raw substring:
 
@@ -1514,13 +1617,14 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
         # "Esterzili, Sardegna, IT"). No trailing % → end-of-string match.
         patterns.append(f"%, {code}")
 
+    scope_sql, scope_params = _scope_clause("id", scope)
     placeholders = " OR ".join(["place_name LIKE ?"] * len(patterns))
     rows = db.conn.execute(
         f"""SELECT * FROM photos
-            WHERE place_name IS NOT NULL AND ({placeholders})
+            WHERE place_name IS NOT NULL AND ({placeholders}){scope_sql}
             ORDER BY date_taken
             LIMIT ?""",
-        (*patterns, limit),
+        (*patterns, *scope_params, limit),
     ).fetchall()
     results = [dict(r) for r in rows]
 
@@ -1530,16 +1634,23 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
     # skips admin2, so "Marin County" as substring matched nothing.
     # This UNIONs exact-match hits on country/admin1/admin2/locality.
     # Graceful if columns don't exist yet (pre-backfill or old DB).
+    #
+    # `col = ? COLLATE NOCASE` (not LOWER(col) = LOWER(?), which no index can
+    # serve) uses the v34 idx_photos_*_nc indexes; NOCASE folds ASCII only,
+    # exactly like LOWER() without ICU. With a scope the columns get a unary
+    # `+` so the query is driven from the scope ids, not from every photo in
+    # a broad place.
+    plus = "+" if scope is not None else ""
+    struct_where = " OR ".join(
+        f"{plus}{col} = ? COLLATE NOCASE"
+        for col in ("country", "admin1", "admin2", "locality"))
     try:
         struct_rows = db.conn.execute(
-            """SELECT * FROM photos
-               WHERE LOWER(country) = LOWER(?)
-                  OR LOWER(admin1) = LOWER(?)
-                  OR LOWER(admin2) = LOWER(?)
-                  OR LOWER(locality) = LOWER(?)
+            f"""SELECT * FROM photos
+               WHERE ({struct_where}){scope_sql}
                ORDER BY date_taken
                LIMIT ?""",
-            (name, name, name, name, limit),
+            (name, name, name, name, *scope_params, limit),
         ).fetchall()
         if struct_rows:
             seen = {r["id"]: r for r in results}
@@ -1564,7 +1675,7 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100) -> list[di
     # for what's meant to be one location. The bbox catches all of them.
     bbox = _resolve_location_bbox(db, name)
     if bbox:
-        bbox_rows = _search_by_bbox(db, *bbox, limit)
+        bbox_rows = _search_by_bbox(db, *bbox, limit, scope=scope)
         seen = {r["id"]: r for r in results}
         for r in bbox_rows:
             if r["id"] not in seen:
@@ -1663,31 +1774,55 @@ def search_combined(
     # collapses to empty — exactly the symptom where "Calvin and Ellie and
     # Nicole" returns nothing despite many family photos existing.
     name_matched: list[dict] = []
+    residual = None
     if effective_query:
         residual, name_matched = _extract_persons_from_query(db, effective_query)
-        if name_matched:
-            _log.info(
-                "QUERY NAMES: matched %s  residual=%r",
-                [p["name"] for p in name_matched],
-                residual,
+
+    # Compose the index-backed structured filters into one id scope when
+    # two or more structured filters are combined (see _compose_scope).
+    scope_person_ids = [p["id"] for p in name_matched] + list(person_ids or [])
+    if person:
+        named = db.get_person_by_name(person)
+        if named:
+            scope_person_ids.append(named["id"])
+    n_structured = (len(scope_person_ids) + bool(camera) + bool(date_from)
+                    + bool(location) + bool(category) + bool(visual_tag)
+                    + bool(keyword))
+    scope: Optional[list[int]] = None
+    if n_structured >= 2:
+        scope = _compose_scope(
+            db, date_from=date_from, date_to=date_to, camera=camera,
+            person_ids=list(dict.fromkeys(scope_person_ids)),
+            match_source=match_source)
+        if scope is not None:
+            _log.info("SEARCH SCOPE  %d photos", len(scope))
+
+    if name_matched:
+        _log.info(
+            "QUERY NAMES: matched %s  residual=%r",
+            [p["name"] for p in name_matched],
+            residual,
+        )
+        if len(name_matched) == 1:
+            results = search_by_person(
+                db, name_matched[0]["name"],
+                limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
+                scope=scope,
             )
-            if len(name_matched) == 1:
-                results = search_by_person(
-                    db, name_matched[0]["name"],
-                    limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
-                )
-            else:
-                results = search_by_all_persons(
-                    db, [p["id"] for p in name_matched],
-                    limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
-                )
-            result_sets.append({r["id"]: r for r in results})
-            ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
-            effective_query = residual if residual else None
+        else:
+            results = search_by_all_persons(
+                db, [p["id"] for p in name_matched],
+                limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
+                scope=scope,
+            )
+        result_sets.append({r["id"]: r for r in results})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
+        effective_query = residual if residual else None
 
     if person:
         results = search_by_person(
-            db, person, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source)
+            db, person, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
+            scope=scope)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
@@ -1699,7 +1834,8 @@ def search_combined(
     # three-way "everyone together" search behave identically.
     if person_ids:
         results = search_by_all_persons(
-            db, person_ids, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source)
+            db, person_ids, limit=_FILTER_PREFETCH_LIMIT, match_source=match_source,
+            scope=scope)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
@@ -1754,62 +1890,62 @@ def search_combined(
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
     if location:
-        results = _search_by_location(db, location, limit=_FILTER_PREFETCH_LIMIT)
+        results = _search_by_location(db, location, limit=_FILTER_PREFETCH_LIMIT,
+                                      scope=scope)
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
-    if category:
-        cat_lower = category.lower()
-        matched_rows = []
-        for row in db.conn.execute(
-            "SELECT id, categories FROM photos WHERE categories IS NOT NULL"
-        ):
+    # JSON tag filters: membership is tested in Python, but the scan is of a
+    # covering (column, date_taken) index, not the 520 MB table. `+date_taken`
+    # and `+id` keep the planner on that index rather than idx_photos_date or
+    # rowid lookups (measured: a wide date range otherwise reads 399 MB).
+    def _tag_rows(col: str, matches) -> list[dict]:
+        sql = f"SELECT id, {col} FROM photos WHERE {col} IS NOT NULL"
+        params: list = []
+        if date_from:
+            sql += " AND +date_taken >= ? AND +date_taken <= ?"
+            params.extend(_date_bounds(date_from, date_to))
+        scope_sql, scope_params = _scope_clause("+id", scope)
+        sql += scope_sql
+        params.extend(scope_params)
+        ids = []
+        for row in db.conn.execute(sql, params):
             try:
-                if cat_lower in {c.lower() for c in json.loads(row["categories"])}:
-                    p = db.get_photo(row["id"])
-                    if p:
-                        matched_rows.append(p)
+                if matches(json.loads(row[col])):
+                    ids.append(row["id"])
             except (ValueError, TypeError):
                 pass
+        return _fetch_photos(db, ids)
+
+    if category:
+        cat_lower = category.lower()
+        matched_rows = _tag_rows(
+            "categories", lambda v: cat_lower in {c.lower() for c in v})
         result_sets.append({r["id"]: r for r in matched_rows})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
 
     if visual_tag:
         vis_lower = visual_tag.lower()
-        matched_rows = []
-        for row in db.conn.execute(
-            "SELECT id, visual_tags FROM photos WHERE visual_tags IS NOT NULL"
-        ):
-            try:
-                if vis_lower in {v.lower() for v in json.loads(row["visual_tags"])}:
-                    p = db.get_photo(row["id"])
-                    if p:
-                        matched_rows.append(p)
-            except (ValueError, TypeError):
-                pass
+        matched_rows = _tag_rows(
+            "visual_tags", lambda v: vis_lower in {t.lower() for t in v})
         result_sets.append({r["id"]: r for r in matched_rows})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
 
     if keyword:
         kw_lower = keyword.lower()
-        matched_rows = []
-        for row in db.conn.execute(
-            "SELECT id, keywords FROM photos WHERE keywords IS NOT NULL"
-        ):
-            try:
-                if any(kw_lower in k.lower() for k in json.loads(row["keywords"])):
-                    p = db.get_photo(row["id"])
-                    if p:
-                        matched_rows.append(p)
-            except (ValueError, TypeError):
-                pass
+        matched_rows = _tag_rows(
+            "keywords", lambda v: any(kw_lower in k.lower() for k in v))
         result_sets.append({r["id"]: r for r in matched_rows})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(matched_rows)})
 
     if camera:
-        rows = db.conn.execute(
-            "SELECT * FROM photos WHERE camera_model = ?", (camera,)
-        ).fetchall()
+        # idx_photos_camera_date serves camera alone and camera + date range.
+        sql, params = "SELECT * FROM photos WHERE camera_model = ?", [camera]
+        if date_from:
+            sql += " AND date_taken >= ? AND date_taken <= ?"
+            params.extend(_date_bounds(date_from, date_to))
+        scope_sql, scope_params = _scope_clause("id", scope)
+        rows = db.conn.execute(sql + scope_sql, params + scope_params).fetchall()
         results = [dict(r) for r in rows]
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
@@ -1839,12 +1975,17 @@ def search_combined(
     # (1-10) when scored, else the legacy LAION `aesthetic_score` — so setting
     # "min quality 5.5" matches the 5.5 displayed on a photo.
     if not result_sets and min_quality is not None:
-        rows = db.conn.execute(
-            """SELECT * FROM photos
+        # `COALESCE(aes_overall, aesthetic_score)` must stay textually identical
+        # to the idx_photos_raw_quality expression (schema v34).
+        sql = """SELECT * FROM photos
                WHERE COALESCE(aes_overall, aesthetic_score) IS NOT NULL
-                 AND COALESCE(aes_overall, aesthetic_score) >= ?
-               ORDER BY COALESCE(aes_overall, aesthetic_score) DESC""",
-            (min_quality,),
+                 AND COALESCE(aes_overall, aesthetic_score) >= ?"""
+        params: list = [min_quality]
+        if date_from:
+            sql += " AND +date_taken >= ? AND +date_taken <= ?"
+            params.extend(_date_bounds(date_from, date_to))
+        rows = db.conn.execute(
+            sql + " ORDER BY COALESCE(aes_overall, aesthetic_score) DESC", params,
         ).fetchall()
         results = [dict(r) for r in rows]
         if date_from:
@@ -1861,10 +2002,14 @@ def search_combined(
                             or sort in ("aesthetic_desc", "subject_aesthetic_desc")):
         # Subject sort ranks by the subject-crop percentile, falling back to the
         # full-frame percentile for photos without a subject score.
+        # The COALESCE must stay textually identical to idx_photos_subject_aes
+        # (schema v34); guarding on the same expression lets that index serve
+        # both the filter and the order. Same rows: no photo has a subject
+        # percentile without a full-frame one (0 of 72,167 on 2026-10-04).
         order = ("COALESCE(aes_subject_overall_pct, aes_overall_pct)"
                  if sort == "subject_aesthetic_desc" else "aes_overall_pct")
         rows = db.conn.execute(
-            f"SELECT * FROM photos WHERE aes_overall_pct IS NOT NULL "
+            f"SELECT * FROM photos WHERE {order} IS NOT NULL "
             f"ORDER BY {order} DESC"
         ).fetchall()
         results = _filter_aesthetic(

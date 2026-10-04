@@ -22,7 +22,15 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 33 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 34 (`SCHEMA_VERSION` in `db.py` is the source of truth).
+v34 is indexes only (`db._SEARCH_INDEXES`; `docs/plans/search-indexes.md`):
+camera+date, file_hash, covering tag composites, NOCASE location, /map GPS,
+quality expression indexes, worker-count partials, faces `(photo_id, person_id)`
+/ `(person_id, photo_id)`. Expression/partial indexes match the query TEXT —
+`tests/test_search_indexes.py` EXPLAINs the SQL production runs, so keep those
+expressions verbatim. `search_combined` composes date/camera/people into one id
+scope (`_compose_scope`) before running the other filters, instead of running
+each over the whole library and intersecting in Python. Key tables: photos, faces,
 persons, face_references, face_person_exclusions, collections, collection_photos,
 photo_stacks, stack_members, stacking_seen, review_selections, google_photos_uploads,
 ignored_clusters, generations, schema_info, ingest_sweeps, ingest_batches,

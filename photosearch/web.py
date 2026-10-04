@@ -1003,9 +1003,9 @@ def _face_filter_photo_ids(db, date_from, date_to, location, q, person, camera=N
         return {r["id"] for r in rows}
     sql, params = "SELECT id FROM photos WHERE 1=1", []
     if date_from:
-        sql += " AND substr(date_taken,1,10) >= ?"; params.append(date_from[:10])
+        sql += " AND date_taken >= ?"; params.append(date_from[:10])
     if date_to:
-        sql += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
+        sql += " AND date_taken <= ?"; params.append(date_to[:10] + " 23:59:59")
     if location:
         sql += " AND place_name LIKE ?"; params.append(f"%{location}%")
     if camera:
@@ -3890,9 +3890,9 @@ def api_geotag_folders(include_fully_tagged: bool = False,
     if camera:
         where.append("camera_model = ?"); params.append(camera)
     if date_from:
-        where.append("substr(date_taken,1,10) >= ?"); params.append(date_from[:10])
+        where.append("date_taken >= ?"); params.append(date_from[:10])
     if date_to:
-        where.append("substr(date_taken,1,10) <= ?"); params.append(date_to[:10])
+        where.append("date_taken <= ?"); params.append(date_to[:10] + " 23:59:59")
     with _get_db() as db:
         rows = db.conn.execute(
             "SELECT folder AS path, "
@@ -3952,9 +3952,9 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
         if camera:
             extra += " AND camera_model = ?"; params.append(camera)
         if date_from:
-            extra += " AND substr(date_taken,1,10) >= ?"; params.append(date_from[:10])
+            extra += " AND date_taken >= ?"; params.append(date_from[:10])
         if date_to:
-            extra += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
+            extra += " AND date_taken <= ?"; params.append(date_to[:10] + " 23:59:59")
         params.append(limit)
         rows = db.conn.execute(
             f"""SELECT id, filepath, filename, date_taken, gps_lat, gps_lon,

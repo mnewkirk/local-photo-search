@@ -914,8 +914,10 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
             sub.append("place_name LIKE ?")
             params.append(f"%, {code}")
         if _has_structured_location(db):
+            # `= ? COLLATE NOCASE`, not LOWER() = LOWER(): only this form can
+            # use the v34 idx_photos_*_nc indexes. Same matches (ASCII fold).
             for col in ("country", "admin1", "admin2", "locality"):
-                sub.append(f"LOWER({col}) = LOWER(?)")
+                sub.append(f"{col} = ? COLLATE NOCASE")
                 params.append(loc)
         clauses.append("(" + " OR ".join(sub) + ")")
 

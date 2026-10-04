@@ -114,7 +114,56 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
+
+# v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
+# PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
+_SEARCH_INDEXES: list[tuple[str, str]] = [
+    # camera alone and camera + date range (the 2026-10-03 >120 s search)
+    ("idx_photos_camera_date", "photos(camera_model, date_taken)"),
+    # ingest dedup looked up file_hash with a full scan per incoming file
+    ("idx_photos_file_hash", "photos(file_hash)"),
+    # JSON tag filters stay a Python membership test, but scan a covering
+    # index instead of the table. Queries add `+date_taken` so the planner
+    # keeps these rather than switching to idx_photos_date.
+    ("idx_photos_visual_tags", "photos(visual_tags, date_taken)"),
+    ("idx_photos_categories", "photos(categories, date_taken)"),
+    ("idx_photos_keywords", "photos(keywords, date_taken)"),
+    # structured location; queries compare `col = ? COLLATE NOCASE`
+    ("idx_photos_country_nc", "photos(country COLLATE NOCASE)"),
+    ("idx_photos_admin1_nc", "photos(admin1 COLLATE NOCASE)"),
+    ("idx_photos_admin2_nc", "photos(admin2 COLLATE NOCASE)"),
+    ("idx_photos_locality_nc", "photos(locality COLLATE NOCASE)"),
+    # /api/photos/geojson selects exactly these columns
+    ("idx_photos_gps_cover",
+     "photos(gps_lat, gps_lon, location_source, date_taken, place_name) "
+     "WHERE gps_lat IS NOT NULL"),
+    # min_quality floor and the subject-aesthetic sort
+    ("idx_photos_raw_quality", "photos(COALESCE(aes_overall, aesthetic_score))"),
+    ("idx_photos_subject_aes",
+     "photos(COALESCE(aes_subject_overall_pct, aes_overall_pct))"),
+    # worker "work remaining" counts, polled by /admin/maintenance and the
+    # fleet; near-empty once a library is drained
+    ("idx_photos_need_describe", "photos(id) WHERE description IS NULL"),
+    ("idx_photos_need_verify",
+     "photos(id) WHERE description IS NOT NULL AND verified_at IS NULL"),
+    ("idx_photos_need_quality",
+     "photos(id) WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL"),
+    # "is person P in photo X" (search's EXISTS) and "P's photos"
+    ("idx_faces_photo_person", "faces(photo_id, person_id)"),
+    ("idx_faces_person_photo", "faces(person_id, photo_id)"),
+]
+
+# Dropped in v34: replaced by a composite/NOCASE index above, or an exact
+# duplicate of a PRIMARY KEY / UNIQUE autoindex.
+_SUPERSEDED_INDEXES = (
+    "idx_faces_photo", "idx_faces_person",
+    "idx_photos_country", "idx_photos_admin1", "idx_photos_admin2",
+    "idx_photos_locality",
+    "idx_stack_members_photo", "idx_stack_members_stack",
+    "idx_collection_photos_coll",
+)
+
 
 # The marker resolve-duplicate-persons / dedupe-person-faces leave on the
 # LOSING face of a (photo, person) duplicate. Deliberately still matchable —
@@ -646,10 +695,7 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN admin1 TEXT")
             cur.execute("ALTER TABLE photos ADD COLUMN admin2 TEXT")
             cur.execute("ALTER TABLE photos ADD COLUMN locality TEXT")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_country ON photos(country)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin1 ON photos(admin1)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin2 ON photos(admin2)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_locality ON photos(locality)")
+            # Indexed (COLLATE NOCASE) by the v34 block below.
 
         # Migration: faces.det_score column (schema v20). InsightFace already
         # returns a detection confidence [0, 1] per face; we just weren't
@@ -1097,15 +1143,13 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_location_source ON photos(location_source)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aesthetic ON photos(aesthetic_score)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_dir ON review_selections(directory)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_stack_members_stack ON stack_members(stack_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_stack_members_photo ON stack_members(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_coll ON collection_photos(collection_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)")
+
+        # v34: search indexes (docs/plans/search-indexes.md).
+        self._create_search_indexes(cur)
 
         # sqlite-vec virtual tables for vector search
         if HAS_SQLITE_VEC:
@@ -1140,6 +1184,44 @@ class PhotoDB:
         )
 
         self.conn.commit()  # Schema init always commits immediately
+
+    def _create_search_indexes(self, cur) -> None:
+        """Schema v34 search indexes (docs/plans/search-indexes.md).
+
+        On the NAS the cost is bytes read from a spinning disk with a cold
+        cache, and every un-indexed filter was a ~545 MB scan of `photos`.
+
+        Each build commits on its own, so the write lock is held for one
+        index at a time and fleet submits can land in between, and the
+        table is read once up front by a plain SELECT (a WAL reader blocks
+        no writer) so the cold read happens outside the lock.
+
+        Expression and partial indexes match TEXTUALLY: the queries that use
+        them (search.py, tools.py, db.py claim predicates) must keep exactly
+        these expressions. tests/test_search_indexes.py pins every plan.
+        """
+        existing = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        todo = [(name, target) for name, target in _SEARCH_INDEXES
+                if name not in existing]
+        if any(target.startswith("photos(") for _, target in todo):
+            # Warm the page cache: one sequential read of the table, no lock.
+            cur.execute("SELECT count(*), sum(length(filepath)) FROM photos").fetchone()
+        for name, target in todo:
+            self.conn.commit()
+            try:
+                cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {target}")
+            except sqlite3.OperationalError as e:
+                # Only a hand-built minimal table (tests) lacks a column;
+                # every real DB has them all by this point in the migration.
+                if "no such column" not in str(e):
+                    raise
+                logger.warning("skipping index %s: %s", name, e)
+            self.conn.commit()
+        for name in _SUPERSEDED_INDEXES:
+            if name in existing:
+                cur.execute(f"DROP INDEX IF EXISTS {name}")
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Photo CRUD
