@@ -142,12 +142,62 @@ pass completes. The partial WHERE must match the predicate in `db.py` term for t
 SQLite still uses the index when the real query ANDs an extra `NOT EXISTS(...)`
 (verified). Pin each one with a plan test.
 
-### 9. Faces: replace, don't add
+### 9. Faces: both composites, replacing the single-column indexes (REQUIRED, see 9a)
 ```sql
-CREATE INDEX IF NOT EXISTS idx_faces_person_photo ON faces(person_id, photo_id);
+CREATE INDEX IF NOT EXISTS idx_faces_photo_person ON faces(photo_id, person_id);  -- replaces idx_faces_photo (same prefix)
+DROP INDEX IF EXISTS idx_faces_photo;
+CREATE INDEX IF NOT EXISTS idx_faces_person_photo ON faces(person_id, photo_id);  -- replaces idx_faces_person
 DROP INDEX IF EXISTS idx_faces_person;
 ```
-This one is optional; it's a small win, since the faces table is only 9.6 MB.
+**`(photo_id, person_id)` is not optional.** Step 9a depends on it. Without it, SQLite
+answers "is person P in this photo" through `idx_faces_person`, walking all of
+Calvin's 17,828 faces for every candidate photo.
+
+Measured on a replica copy, 2026-10-04, Calvin + two days:
+
+| | bytes read | time |
+|---|---|---|
+| without the index | 16 GB | 10 s |
+| with it | **1.3 MB** | ~0 s |
+
+The index builds in 0.06 s, and the net index count doesn't change. Pin the plan with
+a test (`SEARCH f USING COVERING INDEX idx_faces_photo_person (photo_id=? AND
+person_id=?)`). If the planner still picks the other index, use `INDEXED BY`.
+
+### 9a. Compose the structured filters into ONE query in `search_combined` (highest value)
+Today `search_combined` runs each structured filter over the **whole library** as its
+own `SELECT *`. It then intersects the result sets in Python and filters dates in
+Python. So date × person × camera × location costs the sum of every filter's full
+result. Cold-cache reads, measured on the replica:
+
+| filter, run alone over the whole library | bytes read |
+|---|---|
+| person = Calvin (17,828 photos) | 223 MB |
+| camera = ILCE-7RM6 | 552 MB |
+| location, `place_name LIKE` | 566 MB |
+| location, structured `LOWER()` | 570 MB |
+| **total for date × person × camera × location** | **~1.9 GB** |
+
+Composed into one WHERE clause, the date (or camera+date) index narrows first. Each
+other filter is then a cheap check on that small set, with person tested as
+`EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id AND f.person_id = ?)`:
+
+| composed query | rows | bytes read |
+|---|---|---|
+| 2 days × person | 276 | 1.3 MB |
+| 2 days × person × camera | 276 | 1.3 MB |
+| 3 years × person | 9,965 | 46.6 MB |
+| 3 years × person × camera | 1,099 | 5.6 MB |
+
+Any combination works this way. It needs **no per-combination composite index**:
+SQLite uses one index to narrow, then checks the other filters row by row.
+
+`tools._build_filter_sql` (Ask/MCP) already composes filters into one query. Reuse it,
+or extract its clause builder, so the two paths cannot drift. Keep the in-Python
+intersection only for things SQL can't express: the CLIP query, color and face-image
+searches. Run those over the composed id set instead of the whole library. Use the
+`EXISTS` form, not `id IN (SELECT photo_id ... WHERE person_id = ?)`. The `IN` form
+walks the person's whole history (78 MB for both the 2-day and the 3-year range).
 
 ### 10. Drop exact duplicates
 ```sql
@@ -246,3 +296,13 @@ Points where the planners started out apart and converged:
 | file_hash, NOCASE swap, worker partials, /map, duplicate drops | not in scope | proposed | adopted |
 | subject-aesthetic expression index | proposed | missed | adopted (count check: 0 affected) |
 | query rewrites | — | Phase 2 | separate Phase 2 after v34 is verified |
+
+Owner decisions, 2026-10-04:
+- **Dropping the `aes_technical` / `aes_composition` / `aes_impact` indexes:** yes, as a
+  separate change.
+- **Timing:** start Phase 1 (DB backup, migration, tests) only once the separate
+  session fixing the 2026-10-03 batch run reports the batch complete.
+- **Added after the debate:** step 9a (compose filters in `search_combined`) and the
+  `faces(photo_id, person_id)` index. These came from the owner's frequent
+  date × person × camera × location searches, measured above. Step 9a moves into
+  Phase 1, because it is the fix for exactly those searches.
