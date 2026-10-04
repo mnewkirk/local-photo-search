@@ -104,6 +104,10 @@ export PHOTOSEARCH_LLM_VERIFY_MODEL="${PHOTOSEARCH_LLM_VERIFY_MODEL:-google/gemm
 export PHOTOSEARCH_LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-minicpm-v-4_5}"
 export PHOTOSEARCH_LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-qwen2.5-vl-7b-instruct}"
 export PHOTOSEARCH_LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-google/gemma-4-12b-qat}"
+# gemma-4 / minicpm-v-4_5 / qwen3.5 think by default and, on these short tasks,
+# spend the whole token budget reasoning and return '' (rerun.FLEET_REASONING_EFFORT).
+# The evals ran with "none"; so does the Ask agent (evals/mcp_bakeoff.py).
+export PHOTOSEARCH_LLM_REASONING_EFFORT="${PHOTOSEARCH_LLM_REASONING_EFFORT:-none}"
 [ -n "${PHOTOSEARCH_AGENT_HINTS:-}" ] && export PHOTOSEARCH_AGENT_HINTS
 # Topaz upscale + Split print exports (M30/M31). These are NEW files, never
 # library photos, so the tree lives outside the library and nothing indexes it.

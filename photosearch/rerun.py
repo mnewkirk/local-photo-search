@@ -90,6 +90,17 @@ FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      "text":       "google/gemma-4-12b-qat"}
 
 
+# Every model eval that picked FLEET_ROLE_MODELS ran with reasoning OFF
+# (docs/plans/model-eval-harnesses.md). gemma-4 and minicpm-v-4_5 think by
+# default, and with thinking on the fleet is a different, broken system: on the
+# 2026-10-03 batch gemma-4-12b spent 297 of 300 tokens reasoning and returned ''
+# in 70 s, so every category-content call hit the 10 s text cap and deferred
+# forever (0 of 1,259 done); minicpm ran out its 768-token budget mid-thought on
+# 307 photos, which burned all three attempts. With "none": ~1-7 s, real answers.
+# Override for the UI fleet with PHOTOSEARCH_FLEET_REASONING_EFFORT.
+FLEET_REASONING_EFFORT = "none"
+
+
 def fleet_role_model(role: str, env=None) -> str:
     env = os.environ if env is None else env
     return env.get(f"PHOTOSEARCH_FLEET_{role.upper()}_MODEL") or FLEET_ROLE_MODELS[role]

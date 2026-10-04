@@ -939,6 +939,7 @@ export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-12b-qat
 export PHOTOSEARCH_LLM_VISUAL_MODEL=minicpm-v-4_5
 export PHOTOSEARCH_LLM_AESTHETICS_MODEL=qwen2.5-vl-7b-instruct
 export PHOTOSEARCH_LLM_TEXT_MODEL=google/gemma-4-12b-qat
+export PHOTOSEARCH_LLM_REASONING_EFFORT=none   # REQUIRED for gemma-4 / minicpm, see below
 ./run-workers.sh --native -s http://<NAS-IP>:8000 \
     -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -n 2
 ```
@@ -951,6 +952,16 @@ gemma-4-26b-a4b (2026-09-21): 765 of 768 tokens reasoning, empty content,
 _openai_chat_with_retry` adds `reasoning_effort` to the request (3.6 s, real
 answer). `chat_template_kwargs.enable_thinking=false` did nothing on LM
 Studio. Unset by default so backends that reject unknown fields never see it.
+**The fleet's role models are thinking models too** — gemma-4-12b-qat (text,
+verify), minicpm-v-4_5 (visual), qwen3.5-9b (describe) — and the evals that
+chose them all ran with `none`. The UI fleet (`admin_api._fleet_env`) now sets it
+from `rerun.FLEET_REASONING_EFFORT`, and `run-local-replica.sh` exports it. On
+2026-10-03 it was missing: gemma took 70 s per text call (297/300 tokens
+reasoning, `''` back), so every `category-content` call hit the 10 s cap and
+deferred forever (0 of 1,259, no attempt spent, no error logged); minicpm ran
+out of `max_tokens` mid-thought (`finish_reason=length`) on 307 photos and
+retired them `blocked` with **no `index_errors` row** — the "no usable answer"
+path. Symptom: `category-*` blocked or stuck "running" with `done` flat.
 
 This was adopted because Ollama proved unstable on a single 24 GB AMD GPU
 (`model runner has unexpectedly stopped` under VRAM contention). LM Studio

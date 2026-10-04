@@ -51,3 +51,17 @@ def test_fleet_launches_default_to_three_workers():
     """The owner's default since 2026-10-03 (/batches and /admin/maintenance)."""
     assert admin_api.BatchLaunchFleetRequest(batch_id=1).count == 3
     assert admin_api.WorkersStartRequest(passes=["clip"]).count == 3
+
+
+def test_fleet_runs_with_reasoning_off(monkeypatch):
+    """The evals picked these models with reasoning OFF. With it on, gemma-4 and
+    minicpm-v-4_5 spend their whole token budget thinking and return '' — the
+    2026-10-03 batch stalled (category-content 0/1,259) and burned 307 photos'
+    category-visual attempts. A stray server value must not leak in either."""
+    _clean(monkeypatch)
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
+    monkeypatch.setenv("PHOTOSEARCH_LLM_REASONING_EFFORT", "low")
+    monkeypatch.delenv("PHOTOSEARCH_FLEET_REASONING_EFFORT", raising=False)
+    assert admin_api._fleet_env()["PHOTOSEARCH_LLM_REASONING_EFFORT"] == "none"
+    monkeypatch.setenv("PHOTOSEARCH_FLEET_REASONING_EFFORT", "high")
+    assert admin_api._fleet_env()["PHOTOSEARCH_LLM_REASONING_EFFORT"] == "high"

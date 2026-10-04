@@ -1385,11 +1385,15 @@ def _fleet_env() -> dict:
     rerank_photos and the photobook hero picks, and the fleet used to inherit it
     — and fall back to it for describe/verify/aesthetics too — so every vision
     pass silently ran on whatever that was (qwen2.5-vl-7b, 2026-09-20..28)."""
-    from .rerun import FLEET_ROLE_MODELS, fleet_role_model
+    from .rerun import FLEET_REASONING_EFFORT, FLEET_ROLE_MODELS, fleet_role_model
     env = os.environ.copy()
     if env.get("PHOTOSEARCH_TEXT_LLM_URL"):
         for role in FLEET_ROLE_MODELS:
             env[f"PHOTOSEARCH_LLM_{role.upper()}_MODEL"] = fleet_role_model(role, env)
+        # Same reasoning as the models: the fleet runs the configuration the
+        # evals measured, not whatever this server's env happens to hold.
+        env["PHOTOSEARCH_LLM_REASONING_EFFORT"] = (
+            env.get("PHOTOSEARCH_FLEET_REASONING_EFFORT") or FLEET_REASONING_EFFORT)
     return env
 
 
