@@ -1702,11 +1702,18 @@ along with `photos/`).
 ## Adding Features
 
 - **New CLI command:** Add to `cli.py`, always include `envvar="PHOTOSEARCH_DB"` on `--db`
-- **New search type:** `search.py` → `search_combined()` → `web.py` param → `index.html` UI
+- **New search type:** `search.py` → `search_combined()` → `web.py` param → `index.html` UI.
+  Take `scope=None` and apply `_scope_clause` so the filter runs over the composed id
+  scope, push dates into SQL with `_date_bounds`, count it in `n_structured`, keep
+  people-only `narrow` mode correct (`_NARROW_COLUMNS`), and add a `COMBOS` case to
+  `tests/test_search_indexes.py` (see `docs/plans/search-indexes.md`)
 - **New indexing pass:** Add to both `index_directory()` and `_index_collection()` in `index.py`,
   add `--flag`/`--force-flag` to `cli.py`, use streaming generator pattern
-- **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops
-- **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`
+- **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops; add a rule to
+  `request_intent._RULES` so the request log can say what a UI call was for
+- **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`.
+  New indexes go in `db._SEARCH_INDEXES` (built one commit per index), replaced ones
+  in `_SUPERSEDED_INDEXES`
 
 ## Name extraction in search queries
 
@@ -3710,6 +3717,17 @@ Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessStep` in
 `tests/test_batch_state.py`, `test_v32_db_migrates_to_v33_sharpness_columns`.
 
 ## Planned milestones (see `docs/plans/`)
+
+- `docs/plans/search-indexes.md` — **SHIPPED 2026-10-04.** Schema v34 search
+  indexes; `search_combined` composes date/camera/people into one id scope;
+  id-first people and LIKE queries; SQL-paginated aesthetics/quality browses;
+  people-only searches read full rows for the page only. Same day: the
+  persistent API request log with source + intent (`request-stats`) and the
+  face-encoding cache for suggest-person / verify-labels. Measured: camera +
+  2 days >120 s → 0.4 s cold on the NAS; Calvin + camera + place + 2 days
+  2.2 GB → 1.3 MB read. Open: the `aes_technical/composition/impact` index
+  drop (now that the browse floors use them, weigh keeping them first) and
+  date pushdown into the remaining standalone filters.
 
 - `docs/plans/ingest-batch-readiness.md` — **SHIPPED 2026-09-19.** Per-batch
   readiness + status flow: one dated folder = one batch, a `/batches` page

@@ -10,10 +10,11 @@ description: >
   indexing jobs, troubleshooting the NAS deployment, understanding the codebase
   architecture, modifying the CLI or web API, updating the status page, managing face
   references, finding duplicate photos, working with collections, stacking burst photos,
-  uploading to Google Photos, or any other task related to this project.
+  uploading to Google Photos, search performance and indexes, the API request log
+  (latency, who made a request and why), or any other task related to this project.
 
   Trigger even for vague requests like "how do I index 2024?" or "why is search slow?"
-  or "I want to add a new filter" or "upload these to Google" — all of these relate
+  or "what were my last queries?" or "I want to add a new filter" or "upload these to Google" — all of these relate
   to this service.
 ---
 
@@ -98,15 +99,17 @@ local-photo-search/
 
 ---
 
-## Database Schema (v31)
+## Database Schema (v34)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
 > (v25), the VLM aesthetics `aes_*` columns (v26), per-day aesthetic
 > percentile normalization (v28), `maintenance_runs` (v29), and
-> `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30), and
-> `face_person_exclusions` (v31). `SCHEMA_VERSION` in `db.py` is the source of
-> truth — currently **31**. See CLAUDE.md for the aesthetics + folder +
+> `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30),
+> `face_person_exclusions` (v31), `stacking_seen` (v32), the measured
+> `sharpness*` columns (v33), and the **search indexes (v34, indexes only — see
+> "Search performance" below)**. `SCHEMA_VERSION` in `db.py` is the source of
+> truth — currently **34**. See CLAUDE.md for the aesthetics + folder +
 > ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
@@ -129,6 +132,7 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | ingest_sweeps | One row per ingest-incoming move+index sweep run (v30) |
 | ingest_batches | One row per dated ingest folder — identity + lifecycle, membership derived live (v30) |
 | ingest_batch_jobs | Per-(batch, step) job intent (worker fleet / NAS stage), TTL-gated (v30) |
+| stacking_seen | Which photos incremental stacking has considered, at which date_taken (v32) |
 | schema_info | Schema version + photo_root path |
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
@@ -164,6 +168,68 @@ manual `retry-failed-describe` flow for new failures). **v20:** `faces.det_score
 stores InsightFace detection confidence, used by the clustering quality
 pre-filter. Note: `face_dedupe_undo` (created on demand by the dedup commands
 below) is a utility table, NOT part of the migrated schema.
+
+### Search performance — indexes (v34) and how search uses them
+
+Full plan, measurements and decisions: `docs/plans/search-indexes.md`. On the
+NAS the cost of a query is **bytes read from a spinning disk with a cold
+cache**, and any `SCAN photos` reads ~545 MB (the table is 520 MB, ~3.5 KB a
+row). The trigger: a camera + two-day search took >120 s on 2026-10-03.
+
+**Indexes** — `db._SEARCH_INDEXES`, built by `PhotoDB._create_search_indexes`
+(one commit per index, after a lock-free warm-up read):
+
+| index | serves |
+|---|---|
+| `idx_photos_camera_date (camera_model, date_taken)` | camera alone, camera + dates |
+| `idx_photos_file_hash` | ingest dedup (was a full scan per incoming file) |
+| `idx_photos_{visual_tags,categories,keywords} (col, date_taken)` | tag filters scan a 10–25 MB covering index, not the table |
+| `idx_photos_{country,admin1,admin2,locality}_nc (col COLLATE NOCASE)` | structured location (`col = ? COLLATE NOCASE`) |
+| `idx_photos_gps_cover` (partial, `gps_lat IS NOT NULL`) | `/api/photos/geojson` (/map) |
+| `idx_photos_raw_quality`, `idx_photos_subject_aes` (expressions) | `min_quality`, subject-aesthetic sort |
+| `idx_photos_need_{describe,verify,quality}` (partial) | worker queue counts |
+| `idx_faces_photo_person`, `idx_faces_person_photo` | "is P in photo X" (one seek) and "P's photos" |
+
+Dropped in v34 (`_SUPERSEDED_INDEXES`): the single-column faces indexes, the
+BINARY location indexes (never used behind `LOWER()`), and three exact
+duplicates of PRIMARY KEY / UNIQUE autoindexes.
+
+**How `search_combined` uses them:**
+
+- **Composed scope** (`_compose_scope`). With 2+ structured filters, date /
+  camera / people are first combined into ONE id query (people as `EXISTS`
+  on `faces(photo_id, person_id)`); every other filter then runs only over
+  those ids (`_scope_clause`). Above `_SCOPE_MAX_IDS` (20k) the scope is
+  dropped. The Python intersection + `_filter_by_date` still run, so the scope
+  is a pure optimisation. Date × person × camera × location: ~1.9 GB → ~1 MB.
+- **id-first** people and substring-LIKE queries: resolve ids from a narrow
+  index, then read each row once. **Not** inside `tools._build_filter_sql`
+  (there the planner loses the date index: 8.7 → 259 MB measured).
+- **SQL pagination** for the aesthetics and `min_quality` browses
+  (`_sql_page`, `_sort_sql`, `_aesthetic_floor_sql`): floors, dates and every
+  sort mode translated exactly (incl. `or -1` on 0 and the stable-sort
+  tie-break); `COUNT(*)` for the total, only the page read. `style_tag` keeps
+  the Python path.
+- **People-only searches** select `_NARROW_COLUMNS` and `_hydrate` full rows
+  for the returned page only (Calvin, 17.6k photos: 223 → 75 MB, 3.1 → 0.07 s).
+
+**Traps:**
+
+- Expression and partial indexes match the query **text**. Keep
+  `COALESCE(aes_overall, aesthetic_score)`, `COALESCE(aes_subject_overall_pct,
+  aes_overall_pct)` and the worker-count predicates verbatim.
+- Tag queries write `+date_taken` (and `+id`) on purpose: without the `+` the
+  planner picks `idx_photos_date` for a wide range and reads 399 MB.
+- Date bounds are `date_taken >= from AND date_taken <= to || ' 23:59:59'`
+  (`_date_bounds`) — exact because every stored `date_taken` is
+  `YYYY-MM-DD hh:mm:ss` (verified). Never `substr(date_taken, 1, 10)`: it
+  cannot use an index.
+- A column the post-filter pipeline starts reading must be added to
+  `_NARROW_COLUMNS`, or people-only searches return rows missing it.
+- `tests/test_search_indexes.py` EXPLAINs the SQL production actually runs
+  (`set_trace_callback`) and compares scoped vs unscoped, SQL-paged vs
+  Python-paged, and narrow vs full-row answers. Run it after touching any of
+  this.
 
 ---
 
@@ -228,12 +294,28 @@ need cross-recluster persistence.
 
 ---
 
+### 10. Claude states the intent of every API call it makes
+
+Every `/api/*` request is logged with its timing, `source` and `intent`
+(`request_log.jsonl`, see "Request log" under Troubleshooting). UI intent is
+inferred; Claude's cannot be. So any curl/script call from a Claude session
+sends:
+
+```bash
+curl -H 'X-Photosearch-Source: claude' \
+     -H 'X-Photosearch-Intent: <one sentence: what you are finding out and why>' ...
+```
+
+MCP tool calls fill the optional `intent` argument instead.
+
 ## API Endpoints (50+)
 
 ### Search & Photos
 - `GET /api/search` — Combined search (CLIP semantic, color, face, place, date, filename)
-  - Params: q, person, color, place, limit, min_score, min_quality, sort_quality,
-    tag_match, date_from, date_to, location, match_source
+  - Params: q, person, color, place, limit, offset, min_score, min_quality,
+    sort_quality, sort, tag_match, date_from, date_to, location, match_source,
+    camera, category, visual_tag, keyword, min_aesthetic, min_day_aesthetic,
+    style_tag (see "Search performance" for how combinations execute)
   - **Name extraction from `q`** — `search.py:_extract_persons_from_query`
     pulls registered person names out of the free-text query and turns
     them into AND-intersected person filters via the same `result_sets`
@@ -823,6 +905,19 @@ clusters too — so a date scope is what keeps it affordable.
   from garbage; there is a manual hue override. The "Ungrouped" bucket is
   rendered but deliberately NOT assignable — it is DBSCAN noise, many different
   people.
+
+### Face-encoding cache (suggest-person, verify-labels)
+
+`PhotoDB.get_face_encodings_cached` — process-wide LRU of float32 encodings
+keyed by (DB real path, face id), ~40k faces / ~80 MB. Used by
+`face_suggest` (➕ More of this kid) and `face_verify` (🔍 Verify labels).
+No invalidation is needed: encodings are only INSERTed or DELETEd and
+`faces.id` is AUTOINCREMENT, so a relabel changes which ids are asked for,
+never an id's encoding. Koa over Sep 1–27: 12.3 s → 1.9 s first call, 0.4 s
+after (replica copy); NAS repeat calls 0.5–1.9 s. The first calls after a
+container restart are still slow (69 s measured, cold disk + MCP startup).
+**If an in-place encoding update is ever added, it must evict that face.**
+Tests: `tests/test_face_encoding_cache.py`.
 
 ### Frontend has no linter — run `scripts/check-frontend-refs.js`
 
@@ -1948,6 +2043,34 @@ after TTL expires and will be reclaimed by the next worker.
 
 ## Troubleshooting
 
+### Request log — "why was that slow?" / "what was that for?"
+
+Every `/api/*` request appends one JSON line to `request_log.jsonl` beside the
+DB (`/data/request_log.jsonl` on the NAS, `./request_log.jsonl` on the
+replica); MCP tool calls go to `request_log.mcp.jsonl`. Rotated at 20 MB × 5;
+written by a background thread so a starved disk never stalls a request.
+`PHOTOSEARCH_REQUEST_LOG=<path>|0` moves or disables it. Fields: `ts`,
+`method`, `path`, `query`, `status`, `ms`, `source`, `intent`,
+`intent_inferred`, `page` (the Referer), `client`, `streaming` (SSE: `ms` is
+time to headers).
+
+`source`: `ui` (browser, has a Referer) · `claude` (sent
+`X-Photosearch-Source`) · `claude-mcp` · `agent` (Ask; each tool call logged
+with the question) · `script` (Python HTTP client — the replica forwarding to
+the NAS) · `worker` · `other`. `intent`: a stated header / the Ask question /
+inferred from page + endpoint + parameters by `request_intent.infer_intent`
+(add a rule there for a new endpoint).
+
+```bash
+$DC run --rm photosearch request-stats --last 500             # per-endpoint latency
+$DC run --rm photosearch request-stats --recent 50            # who and why, newest last
+$DC run --rm photosearch request-stats --source ui --slowest 20
+./.venv/bin/python cli.py request-stats --db photo_index.db.local   # replica
+```
+
+Page polling and worker traffic are hidden unless `--include-polling`. The
+container's own stdout log is discarded on every redeploy; this file is not.
+
 **"Error: No such command 'python'" / "'sh' / '-c'" when running ad-hoc commands** —
 `docker-entrypoint.sh` routes every non-"serve"/"index" first arg to `python cli.py <arg> …`,
 so `docker compose … run --rm photosearch python -c "…"` becomes `python cli.py python -c "…"`
@@ -2078,6 +2201,12 @@ args)`. `search` (hence CLIP/torch) is imported lazily inside handlers, so
 the module imports cheap and is unit-testable without the CLIP stack. The
 same registry feeds both the MCP server (`mcp_tools()`) and the in-app
 `/api/ask` agent (`openai_tools()`).
+
+**Intent logging:** the MCP server adds an optional `intent` property to every
+tool's schema (`mcp_server._with_intent`) and its instructions ask Claude to
+fill it in. `call_tool_logged` strips it before the tool runs and logs the call
+(timing, args, intent) to `request_log.mcp.jsonl` with `source: claude-mcp`.
+The agent's tools never see `intent`.
 
 **Current tools** (`all_tools()` order): `get_library_overview`,
 `list_people`, `list_places`, `list_vocab`, `search_photos`, `summarize`
@@ -2289,6 +2418,12 @@ tool-call, it auto-falls-back to single-shot NL→filters.
 
 ---
 
+**Replica code vs replica data.** `sync-replica.sh` replaces the DB (schema
+and indexes come with it); the server only picks up new **code** on restart
+(`systemctl --user restart photosearch-replica`, port **8001**). The service
+starts without `--sync`, so after a NAS deploy that changes the schema: sync,
+then restart. The replica writes its own `./request_log.jsonl`.
+
 ## Planned milestones (see `docs/plans/`)
 
 Living roadmap entries — each is a design doc the next contributor can
@@ -2400,10 +2535,19 @@ def my_command(db):
 ```
 
 ### New search type
-1. Add `search_by_X()` in `search.py`
-2. Wire into `search_combined()` — add to `result_sets`
-3. Add query param to `web.py:api_search()`
-4. Add UI control in `frontend/dist/index.html`
+1. Add `search_by_X()` in `search.py`, taking `scope=None` and applying it
+   with `_scope_clause` so it runs over the composed id scope, not the
+   whole library
+2. Wire into `search_combined()` — add to `result_sets`, count it in
+   `n_structured`, and add it to the `narrow` exclusion list (only people
+   filters may run narrow)
+3. If the new filter has an index-backed exact form (equality / range),
+   consider adding it to `_compose_scope`; push any date range into its SQL
+   with `_date_bounds`
+4. Add query param to `web.py:api_search()` and a rule to
+   `request_intent._filters` so its intent reads well in the request log
+5. Add UI control in `frontend/dist/index.html`
+6. Add a case to `tests/test_search_indexes.py` (`COMBOS`) and EXPLAIN its SQL
 
 ### New indexing pass
 1. Add processing function in `photosearch/` module
@@ -2426,14 +2570,18 @@ def my_command(db):
      throttle emission to ~0.25s; check abort at every phase transition
      and every ~1000 iterations inside hot loops; raise `InterruptedError`
      on abort; terminal events `done` / `cancelled` / `fatal`.
-4. Add frontend integration in the appropriate HTML file. For POST+SSE,
+4. Add a rule to `request_intent._RULES` so the request log can say what a
+   UI call to it was for (the fallback is just `METHOD /path`)
+5. Add frontend integration in the appropriate HTML file. For POST+SSE,
    use `fetch` + `response.body.getReader()` + `\n\n`-split parsing
    (EventSource can't POST); keep an `AbortController` around so the UI
    can cancel. See `frontend/dist/status.html:StackingForm` for a
    minimal template.
 
 ### Schema changes
-1. Bump `SCHEMA_VERSION` in `db.py` (currently 31)
+1. Bump `SCHEMA_VERSION` in `db.py` (currently 34). New indexes go in
+   `db._SEARCH_INDEXES` (built one commit at a time); replaced ones in
+   `_SUPERSEDED_INDEXES`
 2. Add `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE` in `_init_schema()`
 3. Ensure migration SQL appears after any table it depends on
 4. Add test in `tests/test_db.py` that creates a minimal old-version DB and verifies

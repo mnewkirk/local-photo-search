@@ -303,6 +303,67 @@ B-tree.
 Phase 1 is about 1 day. The NAS migration takes 2–5 min, or 15–25 min worst case.
 Phase 2 is about 1 day.
 
+## What shipped (2026-10-04)
+
+| commit | what |
+|---|---|
+| `31f87c7` | Phase 1: schema v34 indexes, composed scope (9a), date pushdown, `substr()` date filters rewritten |
+| `686869e` | Phase 2: id-first people/LIKE queries, SQL-paginated aesthetics and quality browses |
+| `befe57e` | People-only searches read full rows for the returned page only (`_NARROW_COLUMNS`) |
+| `95b6b9a` | Persistent API request log + `request-stats` |
+| `7eaa3c6` | Face-encoding cache (suggest-person, verify-labels); request log records `source` + `intent` |
+
+**NAS migration:** the backup `/data/photo_index.db.bak-v33-20261004` was taken
+first and verified (`quick_check` ok, 163,286 photos, 53 s). The migration ran
+in a one-off container with the web container stopped: 25 s, `quick_check` ok.
+
+**NAS, cold cache, straight after a restart:**
+
+| request | before | after |
+|---|---|---|
+| camera + 2 days (the incident) | >120 s | 0.14–0.41 s |
+| Calvin + camera + place + 2 days | — | 0.11 s |
+| Calvin + ILCE-7M4, 2024–2026 | — | 1.24 s |
+| browse by aesthetic score | — | 0.87 s |
+| `min_quality=6`, 10 days | — | 0.35 s |
+| filename search | — | 0.20 s |
+| Calvin alone (17,638 photos) | 1.55 s | 0.35 s |
+| More of this kid, Alan, Aug 15–Sep 27 | 8.1 s | 2.4 s first call, 1.9 s repeat |
+| More of this kid, Robert, one day | 6.1 s | 0.58 s |
+
+Answers were checked against the previous code on a replica copy. There were
+19 Phase 1 combinations, 37 Phase 2 combinations and 9 people-only cases. Totals
+and pages match. The only exception is photos with identical timestamps
+swapping places.
+
+### Request log with source and intent
+
+There was no record of how real searches performed, because the NAS
+container's stdout is discarded on every redeploy. Every `/api/*` request is
+now logged to `request_log.jsonl` beside the DB:
+- `source`: ui / claude / claude-mcp / agent / script / worker / other.
+- `intent`: stated by Claude in the `X-Photosearch-Intent` header or the MCP
+  `intent` argument; for the Ask agent, the question; otherwise inferred from
+  the page, the endpoint and its parameters.
+
+`photosearch request-stats` summarises it. See CLAUDE.md, "API request timing
+log". Only 320 user-initiated requests were recoverable from before this, all
+from the replica's journal. Replayed against both servers, every one returned
+200. Apart from suggest-person, all were under about 3 s.
+
+### Face-encoding cache
+
+`PhotoDB.get_face_encodings_cached`: an LRU of float32 encodings in process
+memory, about 40k faces / 80 MB. "More of this kid" used to fetch about 10k
+trusted-label encodings from the vec0 table on every call: 1.7 s warm, about
+8 s cold. It needs no invalidation, because encodings are insert/delete-only
+and face ids are never reused. Outputs were identical to the old loader in 5
+sample calls. On a replica copy, Koa over Sep 1–27 went from 12.3 s to 1.9 s
+on the first call and 0.4 s on repeats; verify for one day went from 2.0 s to
+0.13–0.2 s. The first calls after a container restart are still slow (69 s
+measured): the disk is cold, and the MCP server reads the library at the same
+moment.
+
 ## Decisions
 
 The planners resolved every point between them, so the owner had no disagreement to
@@ -324,7 +385,9 @@ Points where the planners started out apart and converged:
 
 Owner decisions, 2026-10-04:
 - **Dropping the `aes_technical` / `aes_composition` / `aes_impact` indexes:** yes, as a
-  separate change.
+  separate change. *Not done yet, and worth re-asking:* since Phase 2, the
+  browse's `min_technical` / `min_composition` / `min_impact` floors are SQL
+  `col >= ?` predicates that can use them.
 - **Timing:** start Phase 1 (DB backup, migration, tests) only once the separate
   session fixing the 2026-10-03 batch run reports the batch complete.
 - **Added after the debate:** step 9a (compose filters in `search_combined`) and the
