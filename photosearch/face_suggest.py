@@ -98,7 +98,7 @@ def suggest(db, *, person, date_from=None, date_to=None, max_dist=None,
 
     ids = ([r["face_id"] for r in cand] + [r["face_id"] for r in refs]
            + [r["face_id"] for r in rivals])
-    encs = db.get_face_encodings_bulk(ids)
+    encs = db.get_face_encodings_cached(ids)
     cand = [r for r in cand if r["face_id"] in encs and r["face_id"] not in barred]
     refs = [r for r in refs if r["face_id"] in encs]
     rivals = [r for r in rivals if r["face_id"] in encs]

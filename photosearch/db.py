@@ -10,6 +10,8 @@ import re
 import sqlite3
 import struct
 import time
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -346,6 +348,70 @@ def backfill_exclusions_from_dedupe_undo(conn, apply: bool = False) -> int:
         return len(rows)
     return record_face_person_exclusions(
         conn, [(r["face_id"], r["person_id"]) for r in rows], reason="backfill")
+
+
+class _FaceEncodingCache:
+    """Process-wide LRU of face encodings, keyed by (database file, face id).
+
+    "More of this kid" (face_suggest) fetched ~10k trusted-label encodings
+    from the vec0 table on EVERY call (1.7 s warm, ~8 s cold on the NAS), and
+    verify-labels re-read the same scope's encodings on every open. The set
+    they ask for changes as people label faces; the encoding behind a face id
+    never does.
+
+    That is what makes caching safe without any invalidation: encodings are
+    only ever INSERTed (add_face) or DELETEd, never updated in place, and
+    faces.id is AUTOINCREMENT so an id is never reused. A relabel changes
+    which ids a caller asks for, not what an id's encoding is; a deleted face
+    is never asked for again. Keyed by the DB's real path so two databases
+    (tests, a restored copy) never share entries.
+
+    Stored as float32 numpy (2 KB a face); bounded at MAX_FACES (~80 MB).
+    """
+
+    MAX_FACES = 40_000
+
+    def __init__(self):
+        from collections import OrderedDict
+        self._lock = threading.Lock()
+        self._entries: "OrderedDict[tuple[str, int], np.ndarray]" = OrderedDict()
+
+    def get(self, db: "PhotoDB", face_ids: list[int]) -> dict:
+        import numpy as np
+        key = os.path.realpath(db.db_path)
+        out: dict = {}
+        missing: list[int] = []
+        with self._lock:
+            for fid in face_ids:
+                v = self._entries.get((key, fid))
+                if v is None:
+                    missing.append(fid)
+                else:
+                    self._entries.move_to_end((key, fid))
+                    out[fid] = v
+        if missing and HAS_SQLITE_VEC:
+            fetched = {}
+            for i in range(0, len(missing), 500):
+                batch = missing[i:i + 500]
+                ph = ",".join("?" * len(batch))
+                for r in db.conn.execute(
+                        f"SELECT face_id, encoding FROM face_encodings "
+                        f"WHERE face_id IN ({ph})", batch):
+                    fetched[r[0]] = np.frombuffer(r[1], dtype=np.float32).copy()
+            with self._lock:
+                for fid, v in fetched.items():
+                    self._entries[(key, fid)] = v
+                while len(self._entries) > self.MAX_FACES:
+                    self._entries.popitem(last=False)
+            out.update(fetched)
+        return out
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_FACE_ENCODING_CACHE = _FaceEncodingCache()
 
 
 class PhotoDB:
@@ -1541,6 +1607,11 @@ class PhotoDB:
             for r in rows:
                 result[r["face_id"]] = _deserialize_float_list(r["encoding"], FACE_DIMENSIONS)
         return result
+
+    def get_face_encodings_cached(self, face_ids: list[int]) -> dict[int, "np.ndarray"]:
+        """Like get_face_encodings_bulk, but float32 arrays served from a
+        process-wide cache. See _FaceEncodingCache."""
+        return _FACE_ENCODING_CACHE.get(self, face_ids)
 
     # ------------------------------------------------------------------
     # Persons

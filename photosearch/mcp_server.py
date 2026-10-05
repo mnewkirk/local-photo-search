@@ -50,9 +50,32 @@ import contextlib
 import json
 import logging
 import os
+import time
 
 from .db import PhotoDB
 from .tools import call_tool, get_tool, mcp_tools, server_instructions
+
+# Every tool takes an optional `intent`, logged with the call's timing to
+# request_log.mcp.jsonl (photosearch/request_log.py) and stripped before the
+# tool runs — the tools themselves never see it.
+INTENT_PROPERTY = {
+    "type": "string",
+    "description": ("One short sentence, in the user's terms: what you are "
+                    "trying to find out with this call and why. Logged with "
+                    "the call's timing; not used for the search."),
+}
+INTENT_INSTRUCTION = (
+    "\nEvery tool accepts an optional `intent`: one short sentence saying what "
+    "you are trying to find out for the user with that call and why. Always "
+    "fill it in; it is logged so the owner can see what each query was for.\n")
+
+
+def _with_intent(schema: dict) -> dict:
+    schema = dict(schema or {"type": "object"})
+    props = dict(schema.get("properties") or {})
+    props.setdefault("intent", INTENT_PROPERTY)
+    schema["properties"] = props
+    return schema
 
 logger = logging.getLogger("photosearch.mcp")
 
@@ -121,6 +144,29 @@ def _library_facts() -> str:
         return ""
 
 
+def call_tool_logged(db: PhotoDB, name: str, arguments: Optional[dict]):
+    """Run a tool with the caller's `intent` stripped off and logged, with
+    the call's timing, to request_log.mcp.jsonl."""
+    from . import request_intent, request_log
+    arguments = dict(arguments or {})
+    intent = arguments.pop("intent", None)
+    text = str(intent).strip()[:request_intent.MAX_INTENT] if intent else None
+    t0 = time.perf_counter()
+    status = 500
+    try:
+        result = call_tool(db, name, arguments)
+        status = 200
+        return result
+    finally:
+        request_log.record(
+            db.db_path, stream="mcp", method="TOOL", path=name,
+            query=json.dumps(arguments, sort_keys=True, default=str)[:500],
+            status=status, ms=(time.perf_counter() - t0) * 1000,
+            source="claude-mcp",
+            intent=text or f"MCP {name} (no intent given)",
+            intent_inferred=not text)
+
+
 def build_server():
     """Construct the low-level MCP ``Server`` with our tools registered."""
     from mcp.server.lowlevel import Server
@@ -134,7 +180,7 @@ def build_server():
         # The routing knowledge. Without it a client sees the tool list and none
         # of the rules for choosing among the search-family tools.
         instructions=server_instructions(include_writes=allow_writes,
-                                         library_facts=facts),
+                                         library_facts=facts) + INTENT_INSTRUCTION,
     )
 
     @app.list_resources()
@@ -159,7 +205,7 @@ def build_server():
             types.Tool(
                 name=spec["name"],
                 description=spec["description"],
-                inputSchema=spec["inputSchema"],
+                inputSchema=_with_intent(spec["inputSchema"]),
             )
             for spec in mcp_tools(include_images=allow_images,
                                   include_writes=allow_writes)
@@ -189,7 +235,7 @@ def build_server():
                 type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
 
         with _open_db() as db:
-            result = call_tool(db, name, arguments or {})
+            result = call_tool_logged(db, name, arguments)
 
             # get_photo_image hands back a thumbnail path; read it into an
             # ImageContent so the model actually sees the pixels.

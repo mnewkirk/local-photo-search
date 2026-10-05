@@ -105,11 +105,12 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
 async def _log_request_timing(request: Request, call_next):
     """Time every /api request into the persistent request log
     (photosearch/request_log.py) — the container's stdout log does not
-    survive a redeploy."""
+    survive a redeploy — with who made it and why
+    (photosearch/request_intent.py)."""
     path = request.url.path
     if not path.startswith("/api/"):
         return await call_next(request)
-    from . import request_log
+    from . import request_intent, request_log
     t0 = time.perf_counter()
     status = 500
     streaming = False
@@ -117,17 +118,31 @@ async def _log_request_timing(request: Request, call_next):
         response = await call_next(request)
         status = response.status_code
         # call_next always hands back a streamed wrapper, so recognise SSE
-        # by its content type rather than the response class.
+        # by its content type. For SSE, `ms` is the time to the response
+        # HEADERS, not to the end of the stream.
         streaming = response.headers.get(
             "content-type", "").startswith("text/event-stream")
         return response
     finally:
-        request_log.record(
-            _db_path, method=request.method, path=path,
-            query=request.url.query, status=status,
-            ms=(time.perf_counter() - t0) * 1000,
-            client=request.client.host if request.client else None,
-            streaming=streaming)
+        try:
+            headers = request.headers
+            page = request_intent.page_of(headers.get("referer"))
+            intent = (request_intent.explicit_intent(headers)
+                      or getattr(request.state, "log_intent", None))
+            inferred = intent is None
+            if inferred:
+                intent = request_intent.infer_intent(
+                    request.method, path, request.url.query, page)
+            request_log.record(
+                _db_path, method=request.method, path=path,
+                query=request.url.query or None, status=status,
+                ms=(time.perf_counter() - t0) * 1000,
+                source=request_intent.classify_source(path, headers),
+                intent=intent, intent_inferred=inferred, page=page,
+                client=request.client.host if request.client else None,
+                streaming=streaming)
+        except Exception:  # noqa: BLE001 — logging must never fail a request
+            pass
 
 # Database path — set by the CLI launcher, defaults to cwd
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
@@ -5627,6 +5642,9 @@ async def api_ask(request: Request):
         data = {}
     data = data or {}
     message = (data.get("message") or "").strip()
+    # The question IS the intent, for this request's log line and for each
+    # tool call the agent makes on its behalf (agent.run_agent).
+    request.state.log_intent = f"Ask: {message}"[:300]
     history = data.get("history") if isinstance(data.get("history"), list) else None
     # Structured Search filters pinned in the UI, fed in as HARD constraints on
     # every search the agent runs (not a post-filter on its results). The agent

@@ -11,7 +11,13 @@ background thread does the file I/O. On 2026-09-19 a starved NAS disk made
 every write take seconds; a synchronous append inside the async middleware
 would have stalled the whole event loop on it.
 
-    PHOTOSEARCH_REQUEST_LOG   path to the log file, or "0" to disable
+    PHOTOSEARCH_REQUEST_LOG   path to the API log file, or "0" to disable
+
+MCP tool calls (photosearch/mcp_server.py, a separate process) go to their own
+file, `request_log.mcp.jsonl`: two processes rotating one file would corrupt
+it. `read_records` merges any number of logs by timestamp.
+
+Each line carries `source` and `intent` (photosearch/request_intent.py).
 """
 
 from __future__ import annotations
@@ -29,26 +35,35 @@ MAX_BYTES = 20 * 1024 * 1024
 BACKUPS = 5
 
 _lock = threading.Lock()
-_logger: Optional[logging.Logger] = None
-_listener: Optional[logging.handlers.QueueListener] = None
-_disabled = False
+_loggers: dict[str, logging.Logger] = {}
+_listeners: dict[str, logging.handlers.QueueListener] = {}
+_disabled: set[str] = set()
+
+STREAMS = ("api", "mcp")
 
 
-def default_path(db_path: str) -> Optional[str]:
+def default_path(db_path: str, stream: str = "api") -> Optional[str]:
     env = os.environ.get("PHOTOSEARCH_REQUEST_LOG")
     if env is not None:
-        return None if env.strip() in ("", "0") else env
-    return os.path.join(os.path.dirname(os.path.abspath(db_path)), "request_log.jsonl")
+        if env.strip() in ("", "0"):
+            return None
+        base = env
+    else:
+        base = os.path.join(os.path.dirname(os.path.abspath(db_path)),
+                            "request_log.jsonl")
+    if stream == "api":
+        return base
+    root, ext = os.path.splitext(base)
+    return f"{root}.{stream}{ext}"
 
 
-def _get_logger(db_path: str) -> Optional[logging.Logger]:
-    global _logger, _listener, _disabled
-    if _logger is not None or _disabled:
-        return _logger
+def _get_logger(db_path: str, stream: str) -> Optional[logging.Logger]:
+    if stream in _loggers or stream in _disabled:
+        return _loggers.get(stream)
     with _lock:
-        if _logger is not None or _disabled:
-            return _logger
-        path = default_path(db_path)
+        if stream in _loggers or stream in _disabled:
+            return _loggers.get(stream)
+        path = default_path(db_path, stream)
         try:
             if not path:
                 raise OSError("disabled")
@@ -58,45 +73,46 @@ def _get_logger(db_path: str) -> Optional[logging.Logger]:
             if str(e) != "disabled":
                 logging.getLogger(__name__).warning(
                     "request log disabled (%s): %s", path, e)
-            _disabled = True
+            _disabled.add(stream)
             return None
         handler.setFormatter(logging.Formatter("%(message)s"))
         q: queue.Queue = queue.Queue(maxsize=10_000)
-        _listener = logging.handlers.QueueListener(q, handler)
-        _listener.start()
-        lg = logging.getLogger("photosearch.request_log")
+        listener = logging.handlers.QueueListener(q, handler)
+        listener.start()
+        lg = logging.getLogger(f"photosearch.request_log.{stream}")
         lg.propagate = False
         lg.setLevel(logging.INFO)
+        lg.handlers.clear()
         lg.addHandler(logging.handlers.QueueHandler(q))
-        _logger = lg
+        _loggers[stream] = lg
+        _listeners[stream] = listener
         return lg
 
 
-def record(db_path: str, *, method: str, path: str, query: str, status: int,
-           ms: float, client: Optional[str], streaming: bool) -> None:
-    """Enqueue one request record. Never raises: losing a log line is
-    always better than failing the request it describes."""
+def record(db_path: str, stream: str = "api", **fields) -> None:
+    """Enqueue one record: `ts` plus `fields` (method, path, query, status,
+    ms, client, source, intent, ...; None values are dropped). Never raises:
+    losing a log line is always better than failing the request it
+    describes."""
     try:
-        lg = _get_logger(db_path)
+        lg = _get_logger(db_path, stream)
         if lg is None:
             return
-        rec = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "method": method, "path": path, "query": query, "status": status,
-            "ms": round(ms, 1), "client": client,
-        }
-        if streaming:
-            # SSE / streamed bodies: `ms` is time to the response HEADERS,
-            # not to the end of the stream.
-            rec["streaming"] = True
-        lg.info(json.dumps(rec, separators=(",", ":")))
+        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
+        for k, v in fields.items():
+            if v is None or v is False:
+                continue
+            rec[k] = round(v, 1) if k == "ms" else v
+        lg.info(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
     except Exception:  # noqa: BLE001 — see docstring
         pass
 
 
-def read_records(path: str, last: Optional[int] = None) -> list[dict]:
-    """Records from `path` and its rotated backups, oldest first."""
-    files = [f"{path}.{i}" for i in range(BACKUPS, 0, -1)] + [path]
+def read_records(*paths: str, last: Optional[int] = None) -> list[dict]:
+    """Records from each log in `paths` and its rotated backups, merged
+    oldest first."""
+    files = [f for path in paths
+             for f in [f"{path}.{i}" for i in range(BACKUPS, 0, -1)] + [path]]
     out: list[dict] = []
     for f in files:
         if not os.path.exists(f):
@@ -107,18 +123,19 @@ def read_records(path: str, last: Optional[int] = None) -> list[dict]:
                     out.append(json.loads(line))
                 except ValueError:
                     continue
+    out.sort(key=lambda r: r.get("ts", ""))
     return out[-last:] if last else out
 
 
 def reset() -> None:
-    """Flush and forget the current log target (tests; a path change)."""
-    global _logger, _listener, _disabled
+    """Flush and forget every log target (tests; a path change)."""
     with _lock:
-        if _listener is not None:
-            _listener.stop()  # drains the queue to the file
-            for h in _listener.handlers:
+        for listener in _listeners.values():
+            listener.stop()  # drains the queue to the file
+            for h in listener.handlers:
                 h.close()
-        if _logger is not None:
-            _logger.handlers.clear()
-        _logger = _listener = None
-        _disabled = False
+        for lg in _loggers.values():
+            lg.handlers.clear()
+        _loggers.clear()
+        _listeners.clear()
+        _disabled.clear()

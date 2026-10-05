@@ -3229,23 +3229,35 @@ def dump_db(db, out_path):
                    "worker queues) and the worker fleet's own traffic.")
 @click.option("--slowest", default=10, show_default=True,
               help="Also list the N slowest individual requests.")
+@click.option("--recent", default=0,
+              help="Also list the N most recent requests with who made them "
+                   "and why.")
+@click.option("--source", "only_source", default=None,
+              help="Only one source: ui, claude, claude-mcp, agent, script, "
+                   "worker, other.")
 @click.option("--file", "log_file", default=None,
               help="Request log to read (default: beside the DB).")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file (locates the log).")
-def request_stats(last_n, since, include_polling, slowest, log_file, db):
-    """Latency per API endpoint, from the persistent request log."""
+def request_stats(last_n, since, include_polling, slowest, recent, only_source,
+                  log_file, db):
+    """Latency per API endpoint, from the persistent request log (web API
+    plus MCP tool calls), with who made each request and why."""
     import re
     import statistics
     from photosearch import request_log
 
-    path = log_file or request_log.default_path(db)
-    if not path or not os.path.exists(path):
-        raise click.ClickException(f"No request log at {path}")
+    paths = ([log_file] if log_file else
+             [p for p in (request_log.default_path(db, s)
+                          for s in request_log.STREAMS) if p])
+    if not any(os.path.exists(p) for p in paths):
+        raise click.ClickException(f"No request log at {', '.join(paths)}")
     polling = re.compile(
         r"^/api/(batches|worker/|admin/(maintenance-|workers/|incoming-status"
         r"|version|replica-status))")
-    recs = request_log.read_records(path)
+    recs = request_log.read_records(*paths)
+    if only_source:
+        recs = [r for r in recs if r.get("source") == only_source]
     if since:
         recs = [r for r in recs if r.get("ts", "") >= since]
     if not include_polling:
@@ -3264,9 +3276,14 @@ def request_stats(last_n, since, include_polling, slowest, log_file, db):
         key = f"{r['method']} {re.sub(r'/[0-9]+', '/{id}', r['path'])}"
         groups.setdefault(key, []).append(r)
     allms = sorted(r["ms"] for r in recs)
+    by_source: dict = {}
+    for r in recs:
+        by_source[r.get("source", "?")] = by_source.get(r.get("source", "?"), 0) + 1
     click.echo(f"{len(recs)} requests, {recs[0]['ts']} -> {recs[-1]['ts']}  "
                f"median {statistics.median(allms):.0f} ms  "
                f"p90 {pct(allms, 0.9):.0f} ms  max {allms[-1]:.0f} ms")
+    click.echo("by source: " + ", ".join(
+        f"{k} {v}" for k, v in sorted(by_source.items(), key=lambda kv: -kv[1])))
     click.echo(f"{'endpoint':52s} {'n':>5s} {'median':>8s} {'p90':>8s} "
                f"{'max':>8s} {'errors':>6s}")
     for key, rs in sorted(groups.items(), key=lambda kv: -sum(r["ms"] for r in kv[1])):
@@ -3281,6 +3298,18 @@ def request_stats(last_n, since, include_polling, slowest, log_file, db):
             sse = " (to headers; SSE)" if r.get("streaming") else ""
             click.echo(f"  {r['ms']:8.0f} ms  {r['status']}  {r['ts']}  "
                        f"{r['method']} {r['path']}{q}"[:220] + sse)
+            click.echo(f"             {_intent_line(r)}")
+    if recent:
+        click.echo(f"\nMost recent {recent}:")
+        for r in recs[-recent:]:
+            click.echo(f"  {r['ts'][:19]}  {r.get('source', '?'):10s} "
+                       f"{r['ms']:7.0f} ms  {r['status']}  {_intent_line(r)}")
+
+
+def _intent_line(r: dict) -> str:
+    """The intent, marked when it was inferred rather than stated."""
+    intent = r.get("intent") or f"{r['method']} {r['path']}"
+    return f"{intent} [inferred]" if r.get("intent_inferred") else intent
 
 
 @cli.command("person-coverage")

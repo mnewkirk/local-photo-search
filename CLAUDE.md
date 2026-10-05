@@ -172,6 +172,37 @@ $DC run --rm photosearch request-stats [--last 500] [--since 2026-10-05] [--incl
 Page polling (`/batches`, maintenance status, worker queues) and the worker
 fleet's own traffic are hidden unless `--include-polling` is given.
 
+**Every line says who made the request and why** (`photosearch/request_intent.py`):
+
+- `source`: an `X-Photosearch-Source` header wins. Otherwise `worker` for
+  `/api/worker/*`, `ui` when the browser sent a `Referer`, `script` for a Python
+  HTTP client (the replica forwarding to the NAS, helper scripts), and `other`
+  for anything else.
+- `intent`: an `X-Photosearch-Intent` header wins. Next, a handler can set
+  `request.state.log_intent`; `/api/ask` sets it to `Ask: <question>`, and each
+  tool call the agent makes is logged with that intent too (`source: agent`).
+  Otherwise the intent is inferred from the page, the endpoint and its
+  parameters, and the line is marked `intent_inferred`. For example:
+  `Search photos: person Calvin, camera ILCE-7RM6, 2026-09-26 to 2026-09-27
+  (from the search page)`.
+- **MCP tool calls** go to `request_log.mcp.jsonl` (`source: claude-mcp`): the
+  MCP server is a separate process, and two processes must not rotate one file.
+  Every tool advertises an optional `intent` argument. The server instructions
+  ask Claude to fill it in, and it is stripped before the tool runs.
+  `request-stats` merges both files.
+
+**When a Claude session calls the HTTP API itself (curl, scripts), it MUST state
+its intent**, because nothing can infer it:
+
+```bash
+curl -H 'X-Photosearch-Source: claude' \
+     -H 'X-Photosearch-Intent: Time the camera+date search after the v34 deploy' \
+     "http://<nas>:8000/api/search?..."
+```
+
+`request-stats --recent 50` lists recent requests with their source and
+intent. `--source claude` shows only one source.
+
 ## Debugging against the prod DB locally
 
 `./debug-db.sh` pulls `/data/photo_index.db` from the NAS via rsync
@@ -2973,6 +3004,20 @@ all fail on the same controlled set (`evals/adaface_compare.py`,
 identity ambiguity between similar-looking kids at the same event. The
 within-photo **relative** comparison is the only robust signal. Per-year
 references are worse than all-time.
+
+### Face-encoding cache
+
+`PhotoDB.get_face_encodings_cached` serves face encodings from a process-wide
+LRU (`db._FaceEncodingCache`, float32, ~40k faces / ~80 MB). Used by
+`face_suggest` (Find more of this kid) and `face_verify` (Verify labels). It
+needs no invalidation. Encodings are only ever INSERTed or DELETEd, never
+updated, and `faces.id` is AUTOINCREMENT. So a relabel changes which ids a
+caller asks for, never what an id's encoding is. It is keyed by the DB's real
+path. Measured on a replica copy: suggest for Koa over Sep 1–27 went from
+12.3 s to 1.9 s on the first call and 0.4 s on later calls; verify-labels for
+one day went from 2.0 s to 0.13–0.2 s. Outputs are identical. If an
+in-place encoding update is ever added, it must also evict that face from
+this cache.
 
 ### Desktop-as-client face recompute (heavy clustering off the NAS)
 
