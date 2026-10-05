@@ -6,6 +6,10 @@ with a realistic set of sample data — no real photos or ML models needed.
 
 import json
 import os
+
+# The API request log (photosearch/request_log.py) is off for the suite;
+# tests/test_request_log.py turns it on against a temp file.
+os.environ.setdefault("PHOTOSEARCH_REQUEST_LOG", "0")
 import struct
 import sys
 import tempfile

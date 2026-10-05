@@ -123,3 +123,6 @@ evals/model-evals/
 evals/sharpness-orientation/
 # The 2026-07-09 hand-ranked sample (personal photos) + its score caches.
 evals/aesthetics-bakeoff/
+
+# Persistent API request timing log (photosearch/request_log.py)
+request_log.jsonl*

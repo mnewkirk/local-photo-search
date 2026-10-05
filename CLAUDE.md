@@ -151,6 +151,27 @@ resident memory, no per-process load, and all 6.58M rows retained (so the
 population gate could go away). `rtree` is already compiled into the SQLite on
 both machines. Plan: `docs/plans/geocode-rtree.md`.
 
+## API request timing log
+
+Every `/api/*` request is appended as one JSON line (ts, method, path, query,
+status, ms, client) to `request_log.jsonl` **beside the DB**:
+`/data/request_log.jsonl` on the NAS and `./request_log.jsonl` on the replica.
+The container's stdout log is discarded on every redeploy, so this file is the
+only lasting record of how real requests performed. It rotates at 20 MB with 5
+backups. Set `PHOTOSEARCH_REQUEST_LOG` to a path to move it, or to `0` to turn
+it off; the test suite turns it off in `conftest.py`. Writes go through a
+queue to a background thread, so a starved disk never stalls a request. A
+logging failure never fails the request. For SSE endpoints (`"streaming": true`),
+`ms` is the time to the response headers, not to the end of the stream.
+
+```bash
+$DC run --rm photosearch request-stats [--last 500] [--since 2026-10-05] [--include-polling] [--slowest 10]
+./.venv/bin/python cli.py request-stats --db photo_index.db.local   # replica
+```
+
+Page polling (`/batches`, maintenance status, worker queues) and the worker
+fleet's own traffic are hidden unless `--include-polling` is given.
+
 ## Debugging against the prod DB locally
 
 `./debug-db.sh` pulls `/data/photo_index.db` from the NAS via rsync

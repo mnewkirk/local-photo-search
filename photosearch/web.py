@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -98,6 +99,35 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
                 headers={"Retry-After": "30", "Connection": "close"},
             )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _log_request_timing(request: Request, call_next):
+    """Time every /api request into the persistent request log
+    (photosearch/request_log.py) — the container's stdout log does not
+    survive a redeploy."""
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    from . import request_log
+    t0 = time.perf_counter()
+    status = 500
+    streaming = False
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        # call_next always hands back a streamed wrapper, so recognise SSE
+        # by its content type rather than the response class.
+        streaming = response.headers.get(
+            "content-type", "").startswith("text/event-stream")
+        return response
+    finally:
+        request_log.record(
+            _db_path, method=request.method, path=path,
+            query=request.url.query, status=status,
+            ms=(time.perf_counter() - t0) * 1000,
+            client=request.client.host if request.client else None,
+            streaming=streaming)
 
 # Database path — set by the CLI launcher, defaults to cwd
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")

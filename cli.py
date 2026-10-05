@@ -3218,6 +3218,71 @@ def dump_db(db, out_path):
     click.echo(f"Wrote {size:,} bytes to {out_path}")
 
 
+@cli.command("request-stats")
+@click.option("--last", "last_n", default=500, show_default=True,
+              help="Only the most recent N requests (0 = all).")
+@click.option("--since", default=None,
+              help="Only requests at or after this UTC timestamp prefix, "
+                   "e.g. 2026-10-05 or 2026-10-05T14.")
+@click.option("--include-polling", is_flag=True,
+              help="Include page polling (/batches, maintenance status, "
+                   "worker queues) and the worker fleet's own traffic.")
+@click.option("--slowest", default=10, show_default=True,
+              help="Also list the N slowest individual requests.")
+@click.option("--file", "log_file", default=None,
+              help="Request log to read (default: beside the DB).")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file (locates the log).")
+def request_stats(last_n, since, include_polling, slowest, log_file, db):
+    """Latency per API endpoint, from the persistent request log."""
+    import re
+    import statistics
+    from photosearch import request_log
+
+    path = log_file or request_log.default_path(db)
+    if not path or not os.path.exists(path):
+        raise click.ClickException(f"No request log at {path}")
+    polling = re.compile(
+        r"^/api/(batches|worker/|admin/(maintenance-|workers/|incoming-status"
+        r"|version|replica-status))")
+    recs = request_log.read_records(path)
+    if since:
+        recs = [r for r in recs if r.get("ts", "") >= since]
+    if not include_polling:
+        recs = [r for r in recs if not polling.match(r.get("path", ""))]
+    if last_n:
+        recs = recs[-last_n:]
+    if not recs:
+        click.echo("No matching requests.")
+        return
+
+    def pct(vals, q):
+        return vals[min(len(vals) - 1, int(q * len(vals)))]
+
+    groups: dict = {}
+    for r in recs:
+        key = f"{r['method']} {re.sub(r'/[0-9]+', '/{id}', r['path'])}"
+        groups.setdefault(key, []).append(r)
+    allms = sorted(r["ms"] for r in recs)
+    click.echo(f"{len(recs)} requests, {recs[0]['ts']} -> {recs[-1]['ts']}  "
+               f"median {statistics.median(allms):.0f} ms  "
+               f"p90 {pct(allms, 0.9):.0f} ms  max {allms[-1]:.0f} ms")
+    click.echo(f"{'endpoint':52s} {'n':>5s} {'median':>8s} {'p90':>8s} "
+               f"{'max':>8s} {'errors':>6s}")
+    for key, rs in sorted(groups.items(), key=lambda kv: -sum(r["ms"] for r in kv[1])):
+        ms = sorted(r["ms"] for r in rs)
+        errors = sum(1 for r in rs if r["status"] >= 500)
+        click.echo(f"{key[:52]:52s} {len(rs):5d} {statistics.median(ms):7.0f}ms "
+                   f"{pct(ms, 0.9):7.0f}ms {ms[-1]:7.0f}ms {errors:6d}")
+    if slowest:
+        click.echo(f"\nSlowest {slowest}:")
+        for r in sorted(recs, key=lambda r: -r["ms"])[:slowest]:
+            q = f"?{r['query']}" if r.get("query") else ""
+            sse = " (to headers; SSE)" if r.get("streaming") else ""
+            click.echo(f"  {r['ms']:8.0f} ms  {r['status']}  {r['ts']}  "
+                       f"{r['method']} {r['path']}{q}"[:220] + sse)
+
+
 @cli.command("person-coverage")
 @click.argument("name")
 @click.option("--place-like", "place_pattern", default=None,
