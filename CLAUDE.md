@@ -3725,9 +3725,10 @@ Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessStep` in
   persistent API request log with source + intent (`request-stats`) and the
   face-encoding cache for suggest-person / verify-labels. Measured: camera +
   2 days >120 s → 0.4 s cold on the NAS; Calvin + camera + place + 2 days
-  2.2 GB → 1.3 MB read. Open: the `aes_technical/composition/impact` index
-  drop (now that the browse floors use them, weigh keeping them first) and
-  date pushdown into the remaining standalone filters.
+  2.2 GB → 1.3 MB read. The `idx_photos_aes_technical/composition/impact`
+  indexes are deliberately KEPT (owner decision 2026-10-04): the SQL-paginated
+  browse floors use them. Open: date pushdown into the remaining standalone
+  filters.
 
 - `docs/plans/ingest-batch-readiness.md` — **SHIPPED 2026-09-19.** Per-batch
   readiness + status flow: one dated folder = one batch, a `/batches` page

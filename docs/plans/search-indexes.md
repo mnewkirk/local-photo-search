@@ -1,6 +1,6 @@
 # Search indexes (schema v34)
 
-**Status:** Phase 1 (schema v34) and Phase 2 implemented 2026-10-04. Open: the aes_* index drop, and date pushdown into the remaining standalone filters.
+**Status:** Phase 1 (schema v34) and Phase 2 implemented 2026-10-04. Open: date pushdown into the remaining standalone filters. The aes_* indexes are kept (owner decision, 2026-10-04).
 Planned 2026-10-03. Produced by a two-planner debate (Sonnet + Opus, two
 critique rounds); every point below was agreed by both.
 
@@ -258,10 +258,11 @@ index (125 → 520 MB for `min_quality=7` over 3 years), but it is still faster.
 - A bare `gps_lat` / `gps_lon` index: measured worse than today on the home bbox.
 - `worker_processed`: every predicate already uses its primary key.
 - More faces indexes: the table is 9.6 MB, and recluster rewrites 230k rows.
-- Owner call, separate change: dropping `idx_photos_aes_technical`, `_composition` and
-  `_impact`. They appear in no SQL predicate (those floors are applied in Python) but are
-  rewritten on every aesthetics submit. Keep the `*_pct` and `*_day_pct` indexes; the
-  sweep gate uses them.
+- ~~Dropping `idx_photos_aes_technical`, `_composition` and `_impact`.~~ **Kept**
+  (owner decision, 2026-10-04). When this was planned they appeared in no SQL
+  predicate. Since Phase 2 the browse's `min_technical` / `min_composition` /
+  `min_impact` floors are SQL `col >= ?` predicates that can use them. Keep the
+  `*_pct` and `*_day_pct` indexes too; the sweep gate uses them.
 
 Net: about **+95 MB** of indexes, roughly 4.5% of the DB. The `derive-visual-tags`
 backfill will run somewhat slower, because each row update now also touches one more
@@ -384,10 +385,10 @@ Points where the planners started out apart and converged:
 | query rewrites | — | Phase 2 | separate Phase 2 after v34 is verified |
 
 Owner decisions, 2026-10-04:
-- **Dropping the `aes_technical` / `aes_composition` / `aes_impact` indexes:** yes, as a
-  separate change. *Not done yet, and worth re-asking:* since Phase 2, the
-  browse's `min_technical` / `min_composition` / `min_impact` floors are SQL
-  `col >= ?` predicates that can use them.
+- **Dropping the `aes_technical` / `aes_composition` / `aes_impact` indexes:** first
+  approved as a separate change, then **reversed: keep them** (re-asked
+  2026-10-04). Since Phase 2 the browse's `min_technical` / `min_composition` /
+  `min_impact` floors are SQL `col >= ?` predicates that can use them.
 - **Timing:** start Phase 1 (DB backup, migration, tests) only once the separate
   session fixing the 2026-10-03 batch run reports the batch complete.
 - **Added after the debate:** step 9a (compose filters in `search_combined`) and the

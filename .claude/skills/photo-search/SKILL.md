@@ -194,6 +194,12 @@ Dropped in v34 (`_SUPERSEDED_INDEXES`): the single-column faces indexes, the
 BINARY location indexes (never used behind `LOWER()`), and three exact
 duplicates of PRIMARY KEY / UNIQUE autoindexes.
 
+**Kept on purpose:** `idx_photos_aes_technical` / `_composition` / `_impact`.
+Dropping them was approved once, then reversed (owner, 2026-10-04): the browse's
+`min_technical` / `min_composition` / `min_impact` floors are SQL `col >= ?`
+predicates (`_aesthetic_floor_sql`) that use them. Do not drop them as
+"unused".
+
 **How `search_combined` uses them:**
 
 - **Composed scope** (`_compose_scope`). With 2+ structured filters, date /
