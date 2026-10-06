@@ -6380,7 +6380,10 @@ def split_export_cmd(photo_id, db, sheet, grid, gutter, mode, sx, sy,
               help="Save the stale photos as a collection, to requeue and run later.")
 @click.option("--requeue", is_flag=True,
               help="Clear the stale passes now so the worker fleet re-claims them.")
-def stale_description_passes(db, folder, collection_id, save_collection, requeue):
+@click.option("--save-truncated", is_flag=True,
+              help="Save the descriptions cut off mid-sentence as a collection, to re-describe.")
+def stale_description_passes(db, folder, collection_id, save_collection, requeue,
+                             save_truncated):
     """Find photos whose categories / keywords / verification predate their description.
 
     A verify rewrite or a re-describe replaces the description; the passes
@@ -6397,6 +6400,12 @@ def stale_description_passes(db, folder, collection_id, save_collection, requeue
       stale-description-passes --save-collection          # queue: writes a collection only
       stale-description-passes --collection N --requeue   # when ready: clear the stale passes
       run-workers.sh --native -s <NAS> --collection N -p verify,category-content,keywords
+
+    \b
+    Cut-off descriptions (re-describe; the server re-queues what derives from them):
+      stale-description-passes --save-truncated           # writes a collection only
+      POST /api/worker/clear-pass {"pass_type":"describe","collection_id":N}
+      run-workers.sh --native -s <NAS> --collection N -p describe,verify,category-content,keywords
     """
     import sqlite3 as _sqlite3
     from datetime import date as _date
@@ -6406,7 +6415,7 @@ def stale_description_passes(db, folder, collection_id, save_collection, requeue
         raise click.UsageError("--folder and --collection are mutually exclusive")
     if not os.path.exists(db):
         raise click.ClickException(f"database not found: {db}")
-    writes = save_collection or requeue
+    writes = save_collection or requeue or save_truncated
     conn = (_sqlite3.connect(db, timeout=60) if writes
             else _sqlite3.connect(f"file:{db}?mode=ro", uri=True))
     try:
@@ -6432,8 +6441,20 @@ def stale_description_passes(db, folder, collection_id, save_collection, requeue
         click.echo(f"\nDescriptions cut off mid-sentence: {len(found['truncated_description']):,} "
                    f"(not requeued — re-extracting keywords cannot fix them; they need a re-describe)")
         if not writes:
-            click.echo("\nDry run — nothing written. --save-collection to queue, --requeue to clear now.")
+            click.echo("\nDry run — nothing written. --save-collection to queue, --requeue to clear now, "
+                       "--save-truncated to queue the cut-off descriptions for a re-describe.")
             return
+        cut = found["truncated_description"]
+        if save_truncated and cut:
+            from photosearch.db import PhotoDB
+            with PhotoDB(db) as pdb:
+                cid = pdb.create_collection(
+                    f"Cut-off descriptions — {scope} ({_date.today().isoformat()})",
+                    f"{len(cut):,} descriptions that end mid-sentence (stopped at the token "
+                    "limit). Re-describe: clear-pass describe on this collection, then the "
+                    "fleet with -p describe,verify,category-content,keywords.")
+                pdb.add_photos_to_collection(cid, cut)
+            click.echo(f"\nSaved {len(cut):,} cut-off descriptions as collection {cid}.")
         if save_collection and ids:
             from photosearch.db import PhotoDB
             with PhotoDB(db) as pdb:
@@ -6450,6 +6471,81 @@ def stale_description_passes(db, folder, collection_id, save_collection, requeue
     finally:
         conn.close()
 
+
+@cli.command("visual-tag-collapse")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--folder", default=None,
+              help="Limit to one folder and its subfolders (e.g. 2026).")
+@click.option("--min-photos", type=int, default=None,
+              help="Only judge folders with at least this many tagged photos (default 50).")
+@click.option("--min-share", type=float, default=None,
+              help="Flag when the commonest tag set covers this share (default 0.5).")
+@click.option("--limit", type=int, default=40, help="Rows to print.")
+@click.option("--save-collection", is_flag=True,
+              help="Save the flagged folders' tagged photos as a collection for a re-run.")
+@click.option("--top-set-only", is_flag=True,
+              help="With --save-collection: only the photos carrying each folder's dominant set.")
+def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collection,
+                        top_set_only):
+    """List folders where category-visual stamped one tag set on most photos.
+
+    The visual pass can be plausible photo by photo and still collapse across a
+    shoot: 1,211 of 1,260 photos on 2026-10-03 got exactly `colorful, sunny,
+    vibrant`. This finds those cohorts — the targeted re-run CLAUDE.md
+    recommends instead of a blanket ~44 h re-tag. Thresholds and their
+    evidence: photosearch/visual_collapse.py.
+
+    DRY RUN by default, opened READ-ONLY. --save-collection writes; run it on
+    the NAS (a replica collection is wiped by the next sync).
+
+    \b
+    Re-run recipe:
+      visual-tag-collapse --folder 2026 --save-collection      # on the NAS
+      clear-pass + run-workers.sh --collection N -p category-visual
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date
+    from photosearch import visual_collapse as VC
+
+    if top_set_only and not save_collection:
+        raise click.UsageError("--top-set-only only applies with --save-collection")
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+    kw = {"min_photos": min_photos if min_photos is not None else VC.COLLAPSE_MIN_PHOTOS,
+          "top_share": min_share if min_share is not None else VC.COLLAPSE_TOP_SHARE}
+    conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = VC.collapsed_folders(conn, folder_prefix=folder, **kw)
+        ids = (VC.folder_photo_ids(conn, [r["folder"] for r in rows], top_set_only)
+               if save_collection else [])
+    finally:
+        conn.close()
+    scope = f"folder {folder}" if folder else "library"
+    click.echo(f"category-visual collapse ({scope}; >= {kw['min_photos']} tagged photos, "
+               f"top set >= {kw['top_share']:.0%}): {len(rows):,} folder(s), "
+               f"{sum(r['top_count'] for r in rows):,} photos on the dominant set")
+    for r in rows[:limit]:
+        click.echo(f"  {r['top_share']:>4.0%}  {r['top_count']:>5,}/{r['tagged']:<5,} "
+                   f"sets={r['distinct_sets']:<4} {r['folder']}  [{r['top_set']}]")
+    if len(rows) > limit:
+        click.echo(f"  … {len(rows) - limit:,} more (--limit)")
+    if not save_collection:
+        click.echo("\nDry run — nothing written. --save-collection to queue a re-run.")
+        return
+    if not ids:
+        click.echo("\nNothing to save.")
+        return
+    from photosearch.db import PhotoDB
+    with PhotoDB(db) as pdb:
+        cid = pdb.create_collection(
+            f"Visual-tag collapse — {scope} ({_date.today().isoformat()})",
+            f"Tagged photos in {len(rows)} folder(s) where one category-visual set "
+            f"covers >= {kw['top_share']:.0%}"
+            + (" (dominant set only)" if top_set_only else "")
+            + ". Re-run: clear-pass category-visual on this collection, then the fleet.")
+        pdb.add_photos_to_collection(cid, ids)
+    click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
 
 if __name__ == "__main__":
     cli()

@@ -158,3 +158,32 @@ def test_mismatch_reasons(db):
                                      "description cut off": 1}
     # a cut-off description is reported, not re-queued: same text, same miss
     assert 3 not in f["keywords"] and 3 in f["truncated_description"]
+
+
+def test_save_truncated_queues_only_the_cut_off_descriptions(tmp_path):
+    """--save-truncated writes a collection of the mid-sentence descriptions —
+    and nothing else: no description is cleared, no pass requeued."""
+    from click.testing import CliRunner
+    from cli import cli
+    path = str(tmp_path / "t.db")
+    with PhotoDB(path) as d:
+        _photo(d, 1)
+        _photo(d, 2)
+        d.conn.execute("UPDATE photos SET description = 'Kids play on a field while a' "
+                       "WHERE id = 1")
+        d.conn.execute("UPDATE photos SET description = 'Kids play on a field.' WHERE id = 2")
+        d.conn.commit()
+    dry = CliRunner().invoke(cli, ["stale-description-passes", "--db", path])
+    assert dry.exit_code == 0, dry.output
+    assert "cut off mid-sentence: 1" in dry.output
+    res = CliRunner().invoke(cli, ["stale-description-passes", "--db", path,
+                                   "--save-truncated"])
+    assert res.exit_code == 0, res.output
+    assert "Saved 1 cut-off descriptions" in res.output
+    with PhotoDB(path) as d:
+        cid = d.conn.execute("SELECT id FROM collections WHERE name LIKE 'Cut-off%'").fetchone()[0]
+        members = [r[0] for r in d.conn.execute(
+            "SELECT photo_id FROM collection_photos WHERE collection_id = ?", (cid,))]
+        assert members == [1]
+        assert d.conn.execute("SELECT description FROM photos WHERE id = 1").fetchone()[0] \
+            == "Kids play on a field while a"

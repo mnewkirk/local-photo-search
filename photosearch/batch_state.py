@@ -241,9 +241,13 @@ def _running_passes(db, id_set: set[int]) -> set[str]:
 def _step_row(step: str, kind: str, state: str, *, total: int, eligible: int,
               done: int, remaining: int, failed: int = 0,
               waiting_on: str | None = None, detail: str | None = None) -> dict:
+    # `warning` / `warning_detail`: a finished step that is still wrong in
+    # aggregate (category-visual collapse). Null on every other step, so the
+    # row shape stays uniform.
     return {"step": step, "kind": kind, "state": state, "total": total,
             "eligible": eligible, "done": done, "remaining": remaining,
-            "failed": failed, "waiting_on": waiting_on, "detail": detail}
+            "failed": failed, "waiting_on": waiting_on, "detail": detail,
+            "warning": None, "warning_detail": None}
 
 
 # ---------------------------------------------------------------------------
@@ -346,9 +350,19 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     else:
         state, waiting_on = "needs_queue", None
 
-    return _step_row(pass_type, "worker", state, total=total, eligible=eligible,
-                     done=done, remaining=remaining, failed=failed,
-                     waiting_on=waiting_on, detail=detail)
+    row = _step_row(pass_type, "worker", state, total=total, eligible=eligible,
+                    done=done, remaining=remaining, failed=failed,
+                    waiting_on=waiting_on, detail=detail)
+    if pass_type == "category-visual" and ids:
+        # A collapse (one tag set stamped on the whole shoot) is invisible per
+        # photo and does not change the step's state — the pass DID finish.
+        # It is a flag for a human, carried in additive keys so the state
+        # machine and the caption are untouched. See visual_collapse.py.
+        from .visual_collapse import batch_warning, stats_for_ids
+        stats = stats_for_ids(db.conn, ids)
+        row["collapse"] = stats
+        row["warning"], row["warning_detail"] = batch_warning(stats)
+    return row
 
 
 # ---------------------------------------------------------------------------

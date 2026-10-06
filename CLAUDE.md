@@ -1193,6 +1193,27 @@ gemma answer. Making gemma less exhaustive is a prompt decision, not a guard.
 Worker-side only, since the server already handles `failures`: restart the
 fleet to pick it up. Tests: `tests/test_text_pass_safeguards.py`.
 
+**Collapse across a shoot is flagged, not gated** (`photosearch/visual_collapse.py`).
+A per-photo guard cannot see category-visual stamping one set on a whole shoot
+(2026-10-03: 1,211 of 1,260 photos `colorful, sunny, vibrant`). The flag fires
+when a folder has at least 50 tagged photos and its commonest set covers at
+least 50% (the p90 of 540 folders; the median is 24%). Stored `'[]'` is not
+counted. 59 folders library-wide trip it.
+- `/batches`: the category-visual node shows `⚠ N% share one tag set`, with the
+  set in the tooltip. Every step row now carries `warning` / `warning_detail`
+  (null except here), and category-visual also carries `collapse` stats. The
+  step's state is unchanged, because the pass did finish. Shows on the replica
+  only once the NAS runs this code (`/api/batches` proxies).
+- `photosearch visual-tag-collapse [--folder 2026] [--save-collection
+  [--top-set-only]]` lists collapsed folders worst-first, read-only. The
+  collection is a targeted re-run cohort; save it on the NAS.
+
+**Cut-off descriptions already stored** (4,333 on 2026-10-06):
+`stale-description-passes --save-truncated` saves them as a collection and
+clears nothing. Then `clear-pass describe` on that collection and run the fleet
+with `-p describe,verify,category-content,keywords`. Each new description
+re-queues its derived passes server-side.
+
 ### Provenance: log the model that RAN, not the one configured
 
 `generations.model_used` said `llava` for **159,647 of 159,650**

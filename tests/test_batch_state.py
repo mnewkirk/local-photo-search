@@ -210,8 +210,11 @@ class TestShape:
         batch_id, ids = _make_batch(db)
         state = batch_state(db, batch_id)
         for s in state["steps"]:
+            # category-visual also carries its collapse stats (visual_collapse.py).
+            extra = {"collapse"} if s["step"] == "category-visual" else set()
             assert set(s) == {"step", "kind", "state", "total", "eligible",
-                              "done", "remaining", "failed", "waiting_on", "detail"}
+                              "done", "remaining", "failed", "waiting_on", "detail",
+                              "warning", "warning_detail"} | extra
             assert s["state"] in STATES
             assert s["total"] == len(ids)
 
