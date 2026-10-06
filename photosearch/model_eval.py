@@ -459,6 +459,12 @@ class Recorder:
             self.calls.append(entry)
             try:
                 entry["raw"] = real_chat(*a, **kw)
+            except describe.UnusableAnswer as e:
+                # The model ANSWERED (cut off at its token limit) — a real
+                # outcome to score and cache, not a dead backend.
+                entry["raw"] = getattr(e, "text", None)
+                entry["unusable"] = str(e)
+                raise
             except Exception as e:
                 entry["error"] = f"{e.__class__.__name__}: {e}"
                 raise

@@ -606,7 +606,7 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
     Always includes every photo in results (description may be None) so the
     server can mark them as processed and avoid infinite reclaim loops.
     """
-    from .describe import describe_photo, check_available
+    from .describe import UnusableAnswer, describe_photo, check_available
     check_available(model)
 
     results = []
@@ -616,7 +616,7 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
         try:
-            desc = describe_photo(path, model=model)
+            desc = describe_photo(path, model=model, raise_unusable=True)
             elapsed = time.time() - t0
             if desc:
                 preview = desc[:80].replace("\n", " ")
@@ -624,6 +624,11 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
             else:
                 print(f" ({elapsed:.1f}s) no description")
             results.append({"photo_id": photo_info["id"], "description": desc})
+        except UnusableAnswer as e:
+            # Cut off / looping / mid-sentence even after the retries: one
+            # attempt spent and logged, nothing written.
+            print(f" ({time.time() - t0:.1f}s) unusable: {e}")
+            results.append(_failure_row(photo_info["id"], e))
         except Exception as e:
             print(f" ERROR: {e}")
             results.append({"photo_id": photo_info["id"], "description": None})
@@ -643,7 +648,8 @@ def _process_category_content(
     server does NOT mark them processed — they get re-claimed and retried later
     instead of being permanently recorded with empty categories on a stall.
     """
-    from .describe import extract_categories_from_description, check_available
+    from .describe import (UnusableAnswer, extract_categories_from_description,
+                           check_available)
     check_available(model)
     results = []
     total = len(photos)
@@ -653,6 +659,13 @@ def _process_category_content(
         t0 = time.time()
         try:
             cats = extract_categories_from_description(photo.get("description"), model=model)
+        except UnusableAnswer as e:
+            # The model answered, twice, with something unstorable. Unlike a
+            # stall this is the PHOTO's attempt: spend it and log it, so a
+            # photo that always comes back bad is retired by the cap.
+            print(f" ({time.time() - t0:.1f}s) unusable: {e}")
+            results.append(_failure_row(photo["id"], e))
+            continue
         except Exception as e:
             cats, err = None, str(e)
         else:
@@ -672,7 +685,8 @@ def _process_keywords(
     model: str = "llama3.2:3b",
 ) -> list[dict]:
     """Text-only pass: read description from photo dicts, extract free-form keywords."""
-    from .describe import extract_keywords_from_description, check_available
+    from .describe import (UnusableAnswer, extract_keywords_from_description,
+                           check_available)
     check_available(model)
     results = []
     total = len(photos)
@@ -682,6 +696,10 @@ def _process_keywords(
         t0 = time.time()
         try:
             kws = extract_keywords_from_description(photo.get("description"), model=model)
+        except UnusableAnswer as e:
+            print(f" ({time.time() - t0:.1f}s) unusable: {e}")
+            results.append(_failure_row(photo["id"], e))
+            continue
         except Exception as e:
             kws, err = None, str(e)
         else:
@@ -721,7 +739,13 @@ def _process_category_visual(
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
         try:
-            tags = _describe.tag_visual_photo(path, model=model)
+            tags = _describe.tag_visual_photo(path, model=model, raise_unusable=True)
+        except _describe.UnusableAnswer as e:
+            # Same attempt the `visual_tags: None` row spent, plus a logged
+            # reason — those used to retire photos `blocked` with no trace.
+            print(f" ({time.time() - t0:.1f}s) no usable answer: {e}")
+            results.append(_failure_row(photo["id"], e))
+            continue
         except Exception as e:
             print(f" ERROR: {e}")
             results.append({"photo_id": photo["id"], "visual_tags": None})
@@ -1198,7 +1222,7 @@ def run_worker(
                     kwargs = _submit_kwargs("face_results", results)
                 elif pass_type == "describe":
                     results = _process_describe(downloaded, model=describe_model)
-                    kwargs = {"describe_results": results,
+                    kwargs = {**_submit_kwargs("describe_results", results),
                               **_provenance_kwargs(pass_type, describe_model, results)}
                 elif pass_type == "verify":
                     results = _process_verify(
@@ -1213,15 +1237,15 @@ def run_worker(
                 elif pass_type == "category-content":
                     results = _process_category_content(photos, model=category_content_model)
                     _provenance_kwargs(pass_type, category_content_model, results)
-                    kwargs = {"category_content_results": results}
+                    kwargs = _submit_kwargs("category_content_results", results)
                 elif pass_type == "category-visual":
                     results = _process_category_visual(downloaded, model=category_visual_model)
                     _provenance_kwargs(pass_type, category_visual_model, results)
-                    kwargs = {"category_visual_results": results}
+                    kwargs = _submit_kwargs("category_visual_results", results)
                 elif pass_type == "keywords":
                     results = _process_keywords(photos, model=keywords_model)
                     _provenance_kwargs(pass_type, keywords_model, results)
-                    kwargs = {"keywords_results": results}
+                    kwargs = _submit_kwargs("keywords_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)

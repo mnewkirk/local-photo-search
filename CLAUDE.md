@@ -1148,6 +1148,51 @@ A mismatch caused by a **cut-off description** is reported but not re-queued
 (re-extracting from the same truncated text repeats it); the report also counts
 all mid-sentence descriptions (4,350) — those need a re-describe.
 
+### Bad LLM output is a failure, not a result
+
+Every LLM pass used to store whatever came back. Neither backend's stop reason
+was read, so a generation cut off at the token limit was stored as a finished
+answer: **4,350** live descriptions end mid-sentence (llava at `num_predict`
+150, qwen3.5 with reasoning on eating `max_tokens`). Keywords held refusals and
+unsplit lists, and llama3.2's category answers recited the vocabulary
+(53-232 tags). Each looked like a success until a later audit.
+
+- **Both chat helpers read the stop reason** (`finish_reason` / `done_reason`
+  == `"length"`), retry **once at double the budget**, then raise
+  `describe.TruncatedOutput`. An **empty** answer cut off mid-reasoning is a
+  truncation too.
+- **Per-role `max_tokens`** on the LM Studio route (`_OPENAI_MAX_TOKENS`:
+  describe/verify 512, text 256, visual 128, others 768). It used to be a flat
+  768 for everything.
+- **Answer guards** raise `describe.UnusableAnswer` after one retry
+  (temperature 0.4):
+  - describe: cut off, repetition loop, or ends mid-sentence
+    (`ends_mid_sentence` = `stale_descriptions.is_truncated`). A degenerate
+    answer is no longer returned as a last resort.
+  - category-content: empty, nothing in the vocabulary, or **more than 60**
+    categories.
+  - keywords: refusal, a whole list as one keyword (> 5 words), more than 30
+    keywords, or under `KEYWORD_MATCH_MIN` of them using the description's
+    words.
+  An explicit `none` is still a real empty result.
+- **The worker turns `UnusableAnswer` into a failure row**: one attempt spent
+  and an `index_errors` entry, nothing written. Describe and category-visual
+  opt in with `raise_unusable=True`; other callers still get `None`. Text
+  passes used to **defer** these, retrying forever at no cost, or store them.
+  A transport stall still defers.
+- **A cut-off verify verdict propagates** instead of returning `[]` (which
+  reads as ALL CORRECT and stamps the photo verified).
+- The eval `Recorder` records a truncation as `unusable`: a model outcome to
+  cache, not a `TransportError`.
+
+**The category cap is 60, not ~12, on purpose.** gemma-4-12b (the fleet text
+model) averages **25.7** categories and peaks at 52, and they are accurate,
+just exhaustive. A cap near the library median (5) would fail nearly every
+gemma answer. Making gemma less exhaustive is a prompt decision, not a guard.
+
+Worker-side only, since the server already handles `failures`: restart the
+fleet to pick it up. Tests: `tests/test_text_pass_safeguards.py`.
+
 ### Provenance: log the model that RAN, not the one configured
 
 `generations.model_used` said `llava` for **159,647 of 159,650**

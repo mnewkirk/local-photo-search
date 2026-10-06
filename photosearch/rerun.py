@@ -245,7 +245,7 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
         elif pass_type == "describe":
             model = _resolve_model("describe")
             results = W._process_describe(downloaded, model=model)
-            kwargs = {"describe_results": results, "model": model,
+            kwargs = {**W._submit_kwargs("describe_results", results), "model": model,
                       "model_version": _model_version(model)}
         elif pass_type == "verify":
             regen = _resolve_model("describe")
@@ -260,21 +260,21 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
-            kwargs = {"category_content_results": results}
+            kwargs = W._submit_kwargs("category_content_results", results)
         elif pass_type == "category-visual":
             model = _resolve_model("category-visual")
             results = W._process_category_visual(downloaded, model=model)
             mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
-            kwargs = {"category_visual_results": results}
+            kwargs = W._submit_kwargs("category_visual_results", results)
         elif pass_type == "keywords":
             model = _resolve_model("keywords")
             results = W._process_keywords([info], model=model)
             mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
-            kwargs = {"keywords_results": results}
+            kwargs = W._submit_kwargs("keywords_results", results)
         elif pass_type == "aesthetics":
             model = _resolve_model("aesthetics")
             results = W._process_aesthetics(downloaded, model=model)

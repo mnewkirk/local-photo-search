@@ -48,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
 sys.path.insert(0, PROJECT)
 
+from photosearch import describe  # noqa: E402
 from photosearch import model_eval as me  # noqa: E402
 
 PASSES = me.TEXT_PASSES
@@ -179,14 +180,20 @@ def extract_one(pass_, text, nominal, extractor=None):
     extractor = extractor or production_extractor
     rec = me.Recorder()
     t0 = time.time()
+    unusable = None
     with rec.active():
-        tags = extractor(pass_, text, nominal)
+        try:
+            tags = extractor(pass_, text, nominal)
+        except describe.UnusableAnswer as e:
+            # Production spends an attempt and stores nothing. Scored like a
+            # deferral (no tags to judge), but recorded with its reason.
+            tags, unusable = None, str(e)
     latency = time.time() - t0
     last = rec.calls[-1] if rec.calls else None
     timed_out = (tags is None and last is not None and "error" in last
                  and last["attempts"]
                  and all(a.get("outcome") == "timeout" for a in last["attempts"]))
-    if not timed_out:
+    if not timed_out and unusable is None:
         rec.check(tags is None, pass_)
     raw = (last or {}).get("raw")
     off_vocab = 0
@@ -194,7 +201,7 @@ def extract_one(pass_, text, nominal, extractor=None):
         tokens = [t.strip().lower().rstrip(".") for t in raw.split(",") if t.strip()]
         off_vocab = sum(1 for t in tokens if t not in set(tags))
     return {"tags": None if tags is None else list(tags), "deferred": tags is None,
-            "raw": raw, "off_vocab": off_vocab, "attempts": rec.attempts(),
+            "unusable": unusable, "raw": raw, "off_vocab": off_vocab, "attempts": rec.attempts(),
             "timeouts": rec.count("timeout"), "latency_s": round(latency, 3)}
 
 
@@ -230,7 +237,9 @@ def run_variant(pass_, variant, *, model=None, inputs_name="main", limit=None,
         item["text_sha"] = inputs["items"][pid]["text_sha"]
         run["items"][pid] = item
         me.save_run(pass_, variant, run)
-        shown = "DEFERRED (timeout)" if item["deferred"] else ", ".join(item["tags"]) or "none"
+        shown = (f"UNUSABLE ({item['unusable']})" if item.get("unusable")
+                 else "DEFERRED (timeout)" if item["deferred"]
+                 else ", ".join(item["tags"]) or "none")
         log(f"  [{i}/{len(todo)}] {pid}: {shown}  ({item['latency_s']:.1f}s)")
     fc.summary()
     loaded_end = me.lmstudio_loaded()

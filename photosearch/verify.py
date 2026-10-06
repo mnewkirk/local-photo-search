@@ -299,7 +299,7 @@ def llm_verify_description(
         List of confirmed hallucinations:
           [{"noun": str, "llm_says": "NO"}, ...]
     """
-    from .describe import _ollama_chat_with_retry
+    from .describe import UnusableAnswer, _ollama_chat_with_retry
 
     if not description and not tags:
         return []
@@ -323,6 +323,11 @@ def llm_verify_description(
             }],
             role="verify",
         )
+    except UnusableAnswer:
+        # A verdict cut off at the token limit is not a verdict. Returning []
+        # here would read as "ALL CORRECT" and stamp the photo verified; the
+        # worker turns this into a failure row (one attempt + index_errors).
+        raise
     except Exception as e:
         logger.warning("LLM verify failed for %s: %s", image_path, e)
         return []
@@ -743,21 +748,30 @@ def verify_photos(
 
     stats = {"total": total, "checked": 0, "passed": 0, "failed": 0, "regenerated": 0}
 
+    from .describe import UnusableAnswer
+
     for i, photo in enumerate(photos):
         pid = photo["id"]
         fname = photo.get("filename", f"id={pid}")
         print(f"  [{i+1}/{total}] {fname} ... ", end="", flush=True)
 
         emb = embeddings.get(pid)
-        result = verify_photo(
-            db, photo,
-            photo_embedding=emb,
-            clip_threshold=clip_threshold,
-            verify_model=verify_model,
-            regen_model=regen_model,
-            auto_regenerate=auto_regenerate,
-            llm_all=llm_all,
-        )
+        try:
+            result = verify_photo(
+                db, photo,
+                photo_embedding=emb,
+                clip_threshold=clip_threshold,
+                verify_model=verify_model,
+                regen_model=regen_model,
+                auto_regenerate=auto_regenerate,
+                llm_all=llm_all,
+            )
+        except UnusableAnswer as e:
+            # No verdict (cut off at the token limit). Leave the photo
+            # unverified so a later run picks it up; never record a pass.
+            print(f"skipped — {e}")
+            db.log_error("verify", photo.get("filepath") or str(pid), str(e))
+            continue
 
         stats["checked"] += 1
         if result["status"] == "pass":

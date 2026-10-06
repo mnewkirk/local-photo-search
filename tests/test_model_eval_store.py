@@ -184,20 +184,25 @@ def test_attempt_hook_sees_a_recovered_timeout_and_truncation(monkeypatch):
             raise TimeoutError("timed out")
         return _Resp({"choices": [{"message": {"content": "cut off mid"},
                                    "finish_reason": "length"}],
-                      "usage": {"completion_tokens": 768}})
+                      "usage": {"completion_tokens": 512}})
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
     rec = me.Recorder()
-    with rec.active():
-        out = describe._ollama_chat_with_retry(
+    # A truncated answer is retried once at double the budget, then raised —
+    # never returned as if it were whole.
+    with pytest.raises(describe.TruncatedOutput) as ei, rec.active():
+        describe._ollama_chat_with_retry(
             model="m", messages=[{"role": "user", "content": "hi"}],
             role="describe", timeout=5)
-    assert out == "cut off mid"
+    assert ei.value.text == "cut off mid"
     assert describe._ATTEMPT_HOOK is None          # only live inside the recorder
-    assert [a["outcome"] for a in rec.attempts()] == ["timeout", "ok"]
+    assert [a["outcome"] for a in rec.attempts()] == ["timeout", "ok", "ok"]
     assert rec.count("timeout") == 1
     assert rec.truncated() is True
+    # The model answered: an outcome to score, not a dead backend.
+    assert "error" not in rec.calls[-1] and rec.calls[-1]["unusable"]
+    rec.check(True)                                # does not raise TransportError
 
 
 def test_a_broken_hook_cannot_change_the_result(monkeypatch):

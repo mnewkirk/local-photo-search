@@ -265,6 +265,52 @@ _LLM_WATCHDOG_S = float(os.environ.get("PHOTOSEARCH_LLM_WATCHDOG_S", "30"))
 _ATTEMPT_HOOK = None
 
 
+class UnusableAnswer(ValueError):
+    """The model ANSWERED, but the answer must not be stored.
+
+    Cut off at the token limit, a refusal, a vocabulary recitation, a keyword
+    list that is not about the description. Every pass used to store these as
+    a success — 4,350 descriptions end mid-sentence on the live library — so
+    the bad output was invisible until a later audit.
+
+    Deliberately NOT a TimeoutError / ConnectionError: it is the PHOTO's
+    attempt, not the worker's transport problem. The worker reports it as a
+    failure row, which spends one of MAX_PROCESS_ATTEMPTS and logs to
+    `index_errors` — so a photo that always produces garbage is retired by the
+    cap instead of being deferred (text passes) or re-claimed forever.
+    """
+
+
+class TruncatedOutput(UnusableAnswer):
+    """The model stopped because it hit its output-token limit
+    (`finish_reason` / `done_reason` == "length") — even after one retry with
+    double the budget. `text` is the partial output, for diagnostics only."""
+
+    def __init__(self, message: str, text: Optional[str] = None):
+        super().__init__(message)
+        self.text = text
+
+
+# Output-token budget per role on the OpenAI-compatible route. It used to be a
+# flat 768 for every call, which let a reasoning model that was left thinking
+# spend 700 tokens before answering a 10-token tag question. With reasoning off
+# (PHOTOSEARCH_LLM_REASONING_EFFORT=none) the real answers are far smaller —
+# describe ~100 tokens, a visual tag line ~10, a category list <= ~200 (gemma
+# lists 25 tags on average, 52 at most). A truncation retries ONCE at double
+# the budget before it is treated as unusable, so these are bars to clear,
+# not hard ceilings. Unlisted roles (aesthetics: a JSON critique) keep 768.
+_OPENAI_MAX_TOKENS = {
+    "describe": 512,
+    "verify": 512,
+    "visual": 128,
+    "text": 256,
+}
+_DEFAULT_OPENAI_MAX_TOKENS = 768
+
+# The stop reason both backends report when generation ran out of tokens.
+_LENGTH = "length"
+
+
 def _notify_attempt(**kw):
     hook = _ATTEMPT_HOOK
     if hook is None:
@@ -407,6 +453,30 @@ def _ollama_chat_with_retry(
     if base:
         return _openai_route(base, model, messages, retries, timeout, options, role)
 
+    text, done_reason = _ollama_chat_attempts(model, messages, retries, options, timeout)
+    if done_reason != _LENGTH:
+        return text
+    # Ran out of num_predict. Answering with a cut-off description (llava's
+    # ~680-char descriptions were num_predict=150) is what this guards.
+    budget = (options or {}).get("num_predict")
+    if not budget or budget < 0:
+        # No per-call cap to raise — the context window itself filled.
+        raise TruncatedOutput(
+            f"LLM {role or 'call'} output was cut off (done_reason=length, "
+            f"model={model})", text)
+    bigger = dict(options, num_predict=budget * 2)
+    print(f" [output cut off at {budget} tokens; retrying at {budget * 2}]",
+          end="", flush=True)
+    text, done_reason = _ollama_chat_attempts(model, messages, retries, bigger, timeout)
+    if done_reason == _LENGTH:
+        raise TruncatedOutput(
+            f"LLM {role or 'call'} output was cut off at {budget * 2} tokens "
+            f"twice (done_reason=length, model={model})", text)
+    return text
+
+
+def _ollama_chat_attempts(model, messages, retries, options, timeout):
+    """The transport-retry loop for one Ollama call. Returns (text, done_reason)."""
     import queue as _queue
     import threading as _threading
 
@@ -424,7 +494,9 @@ def _ollama_chat_with_retry(
             try:
                 response = ollama.chat(**call_kwargs)
                 text = response.message.content.strip()
-                result_q.put(("ok", text if text else None))
+                reason = getattr(response, "done_reason", None)
+                result_q.put(("ok", (text if text else None,
+                                     reason if isinstance(reason, str) else None)))
             except Exception as ex:
                 result_q.put(("err", ex))
 
@@ -453,7 +525,7 @@ def _ollama_chat_with_retry(
             time.sleep(_RETRY_DELAY)
         else:
             raise e
-    return None
+    return None, None
 
 
 def _openai_chat_with_retry(
@@ -463,13 +535,47 @@ def _openai_chat_with_retry(
     retries: int = _MAX_RETRIES,
     timeout: Optional[float] = None,
     temperature: float = 0.0,
-    max_tokens: int = 768,
+    max_tokens: int = _DEFAULT_OPENAI_MAX_TOKENS,
     role: Optional[str] = None,
 ) -> Optional[str]:
     """Call an OpenAI-compatible /chat/completions endpoint (LM Studio,
     llama-server, ...). Same return contract as _ollama_chat_with_retry: text on
     success, None on empty, raises on persistent timeout/connection error so the
     caller's defer-on-error path still works.
+
+    A response that stopped at `max_tokens` (`finish_reason == "length"`) is
+    retried once at double the budget and then raises TruncatedOutput — it is
+    never returned as if it were a whole answer. That includes an EMPTY
+    response cut off mid-reasoning: a thinking model with reasoning left on
+    spends the whole budget thinking and returns '' (the 2026-10-03 batch).
+    """
+    text, finish = _openai_chat_attempts(base_url, model, messages, retries,
+                                         timeout, temperature, max_tokens, role)
+    if finish != _LENGTH:
+        return text
+    print(f" [output cut off at {max_tokens} tokens; retrying at {max_tokens * 2}]",
+          end="", flush=True)
+    text, finish = _openai_chat_attempts(base_url, model, messages, retries,
+                                         timeout, temperature, max_tokens * 2, role)
+    if finish == _LENGTH:
+        raise TruncatedOutput(
+            f"LLM {role or 'call'} output was cut off at {max_tokens * 2} tokens "
+            f"twice (finish_reason=length, model={model})", text)
+    return text
+
+
+def _openai_chat_attempts(
+    base_url: str,
+    model: str,
+    messages: list,
+    retries: int,
+    timeout: Optional[float],
+    temperature: float,
+    max_tokens: int,
+    role: Optional[str],
+):
+    """The transport-retry loop for one OpenAI-compatible call.
+    Returns (text, finish_reason).
 
     `timeout` is a true WALL-CLOCK cap per attempt: the request runs in a daemon
     thread and is abandoned via queue.get(timeout=) if it overruns, mirroring the
@@ -547,7 +653,7 @@ def _openai_chat_with_retry(
                             completion_tokens=usage.get("completion_tokens"),
                             finish_reason=choice.get("finish_reason"))
             text = (choice["message"]["content"] or "").strip()
-            return text if text else None
+            return (text if text else None), choice.get("finish_reason")
 
         e = val
         es = str(e).lower()
@@ -566,7 +672,7 @@ def _openai_chat_with_retry(
             time.sleep(_RETRY_DELAY)
         else:
             raise e
-    return None
+    return None, None
 
 
 def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
@@ -720,7 +826,9 @@ def _openai_route(base, model, messages, retries, timeout, options, role=None):
     temp = (options or {}).get("temperature", 0.0)
     return _openai_chat_with_retry(
         base, _resolve_openai_model(model, role), conv,
-        retries=retries, timeout=timeout, temperature=temp, role=role)
+        retries=retries, timeout=timeout, temperature=temp,
+        max_tokens=_OPENAI_MAX_TOKENS.get(role, _DEFAULT_OPENAI_MAX_TOKENS),
+        role=role)
 
 
 def _text_chat_with_retry(model, messages, options=None, timeout=None):
@@ -730,10 +838,36 @@ def _text_chat_with_retry(model, messages, options=None, timeout=None):
                                    timeout=timeout, role="text")
 
 
+def ends_mid_sentence(text: str) -> bool:
+    """True when a description stops mid-sentence — no closing punctuation.
+
+    The write-time twin of `stale_descriptions.is_truncated` (which audits
+    what is already stored). It catches the cut-offs no stop reason reports:
+    llama3.2-vision's 20-60-token stops ended on a normal EOS, so neither
+    `done_reason` nor `finish_reason` said anything was wrong.
+    """
+    from .stale_descriptions import is_truncated
+    return is_truncated(text)
+
+
+def _description_problem(text: Optional[str]) -> Optional[str]:
+    """Why a describe answer must not be stored, or None if it is fine."""
+    if text is None:
+        return "empty response"
+    if not _is_valid_description(text):
+        return "not a description"
+    if _is_degenerate(text):
+        return "repetition loop"
+    if ends_mid_sentence(text):
+        return "ends mid-sentence"
+    return None
+
+
 def describe_photo(
     image_path: str,
     model: str = MODEL,
     prompt: Optional[str] = None,
+    raise_unusable: bool = False,
 ) -> Optional[str]:
     """Generate a description for a single photo.
 
@@ -743,9 +877,18 @@ def describe_photo(
         prompt: The prompt to send alongside the image. Defaults to the
                 model-appropriate prompt (moondream gets a simpler question-style
                 prompt; all others get the structured DESCRIBE_PROMPT).
+        raise_unusable: when the model answered but every answer was unusable
+                (cut off, a repetition loop, ends mid-sentence), raise
+                UnusableAnswer instead of returning None. The worker sets it,
+                so the photo becomes a failure row — one attempt spent AND an
+                `index_errors` entry — instead of a silent "no description".
 
     Returns:
         A text description string, or None if generation failed.
+
+    A bad answer is never returned as a description. This used to hand back
+    whatever the last retry produced, even a degenerate one, and stored cut-off
+    text as a finished description — 4,350 of them on the live library.
     """
     if not HAS_OLLAMA:
         return None
@@ -766,59 +909,53 @@ def describe_photo(
     messages = [{"role": "user", "content": prompt, "images": [image_ref]}]
     options = _options_for_model(model)
 
+    def _ask(model_, messages_, options_):
+        """(text, problem). A truncation the chat helper could not recover
+        from is a problem like any other, not an exception."""
+        try:
+            text = _ollama_chat_with_retry(model=model_, messages=messages_,
+                                           options=options_, role="describe")
+        except TruncatedOutput as e:
+            return None, str(e)
+        return text, _description_problem(text)
+
     try:
-        result = _ollama_chat_with_retry(
-            model=model,
-            messages=messages,
-            options=options,
-            role="describe",
-        )
-        # Filter out moondream's bounding-box coordinate dumps and other garbage
-        if result is not None and not _is_valid_description(result):
-            result = None
+        result, problem = _ask(model, messages, options)
 
         # Moondream sometimes returns empty or coordinate garbage on the first
         # attempt. Retry once with a bare fallback question — different enough
         # to avoid the same failure mode.
-        if result is None and model.startswith("moondream"):
-            result = _ollama_chat_with_retry(
-                model=model,
-                messages=[{
-                    "role": "user",
-                    "content": "Describe what you see in this photo in 2 sentences.",
-                    "images": [image_ref],
-                }],
-                options=options,
-                role="describe",
-            )
-            if result is not None and not _is_valid_description(result):
-                result = None
+        if problem and model.startswith("moondream"):
+            result, problem = _ask(model, [{
+                "role": "user",
+                "content": "Describe what you see in this photo in 2 sentences.",
+                "images": [image_ref],
+            }], options)
 
-        # Degeneration recovery: llama3.2-vision occasionally falls into
-        # repetition loops. Its options carry temperature>0 so each retry is
-        # independent — a 100-image bakeoff showed up to 2 retries clears every
-        # loop. If retries still fail, fall back to llava (not loop-prone under
-        # greedy decoding) before giving up.
-        if result is not None and _is_degenerate(result):
+        # Recovery: llama3.2-vision occasionally falls into repetition loops.
+        # Its options carry temperature>0 so each retry is independent — a
+        # 100-image bakeoff showed up to 2 retries clears every loop. If
+        # retries still fail, fall back to llava (not loop-prone under greedy
+        # decoding). A cut-off or mid-sentence answer takes the same path.
+        if problem and problem not in ("empty response", "not a description"):
             for _ in range(2):
-                retry = _ollama_chat_with_retry(model=model, messages=messages, options=options, role="describe")
-                if retry and _is_valid_description(retry) and not _is_degenerate(retry):
-                    result = retry
+                result, problem = _ask(model, messages, options)
+                if not problem:
                     break
-            else:
-                if not model.startswith("llava"):
-                    fallback = _ollama_chat_with_retry(
-                        model="llava", messages=messages,
-                        options=_options_for_model("llava"),
-                        role="describe",
-                    )
-                    if fallback and _is_valid_description(fallback) and not _is_degenerate(fallback):
-                        result = fallback
-
-        return result
+            if problem and not model.startswith("llava"):
+                result, problem = _ask("llava", messages, _options_for_model("llava"))
     except Exception as e:
         print(f"  Warning: description failed for {path.name}: {e}")
         return None
+
+    if problem is None:
+        return result
+    if problem in ("empty response", "not a description"):
+        return None        # unchanged contract: "no description" is not news
+    if raise_unusable:
+        raise UnusableAnswer(f"describe: {problem}")
+    print(f"  Warning: no usable description for {path.name}: {problem}")
+    return None
 
 
 # Prompt for aesthetic critique — complements the numeric aesthetic score
@@ -882,15 +1019,77 @@ def _build_category_prompt(description: str, vocab: list[str]) -> str:
     )
 
 
+# Above this many categories an answer is a recitation of the vocabulary, not
+# a reading of the description. Set from the live library: gemma-4-12b (the
+# fleet's text model) lists 25.7 categories on average and 52 at most — long
+# but every tag supported by the text — while llama3.2:3b's recitations run
+# 53 to 232, alphabetical, with `bed, book, bottle` on a soccer photo. A cap
+# near the library median (5) would reject nearly every gemma answer.
+_CATEGORY_MAX_PLAUSIBLE = 60
+
+# Keywords: the prompt asks for 5-15 and no stored row has more than 24.
+_KEYWORDS_MAX_PLAUSIBLE = 30
+# One "keyword" this long is a whole list the model forgot to comma-separate
+# (847 stored rows, e.g. "bride groom wedding ceremony reception lace veil").
+_KEYWORD_MAX_WORDS = 5
+
+# Sentinel: the call stalled or errored, so the photo is DEFERRED (re-claimed
+# later, no attempt spent) — distinct from a bad answer, which raises.
+_DEFER = object()
+
+
+def _text_pass_answer(pass_name, model, prompt, parse, problem_of):
+    """Ask, judge the answer, retry once (temperature 0.4) if it is bad.
+
+    Returns the parsed list, None to defer (transport stall/error), or raises
+    UnusableAnswer when both answers were bad — including a truncation."""
+    def ask(temperature):
+        try:
+            raw = _text_chat_with_retry(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": temperature, "num_ctx": _TEXT_NUM_CTX},
+                timeout=_TEXT_OLLAMA_TIMEOUT_S,
+            )
+        except TruncatedOutput as e:
+            return None, f"cut off ({e})"
+        except Exception:
+            return _DEFER, None
+        if _is_explicit_empty_answer(raw) and (raw or "").strip():
+            return [], None               # the model answered: "none"
+        if not raw:
+            return None, "empty response"
+        out = parse(raw)
+        return out, problem_of(raw, out)
+
+    out, problem = ask(0)
+    if out is _DEFER:
+        return None
+    if problem is None:
+        return out
+    out2, problem2 = ask(0.4)
+    if out2 is _DEFER:
+        return None
+    if problem2 is None:
+        return out2
+    raise UnusableAnswer(f"{pass_name}: {problem2}")
+
+
 def extract_categories_from_description(
     description: Optional[str],
     model: str = CATEGORY_CONTENT_MODEL,
 ) -> Optional[list[str]]:
     """Map a description → list of in-vocab categories via a text-only LLM.
 
-    Returns a list (possibly empty = genuinely no in-vocab categories) on
-    success, or None if the Ollama call timed out / errored so the caller can
-    defer the photo for retry instead of recording an empty result.
+    Returns a list (empty only when the model explicitly answered "none") on
+    success, or None if the call timed out / errored so the caller can defer
+    the photo for retry instead of recording an empty result.
+
+    Raises UnusableAnswer when the model answered but, twice, the answer could
+    not be stored: cut off at the token limit, empty, nothing from the
+    vocabulary, or a recitation of the vocabulary (> _CATEGORY_MAX_PLAUSIBLE).
+    An empty or off-vocabulary answer used to be stored as '[]' — done, for
+    good, with no categories.
     """
     if not description or not description.strip():
         return []
@@ -898,30 +1097,27 @@ def extract_categories_from_description(
     if not HAS_OLLAMA:
         return []
     vocab_set = set(CONTENT_VOCABULARY)
-    prompt = _build_category_prompt(description, CONTENT_VOCABULARY)
-    try:
-        raw = _text_chat_with_retry(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_ctx": _TEXT_NUM_CTX},
-            timeout=_TEXT_OLLAMA_TIMEOUT_S,
-        )
-    except Exception:
-        # Timeout / connection error — return None (NOT []) so the caller can
-        # tell "Ollama stalled, retry later" apart from "ran fine, no categories".
-        # Returning [] here would let the worker mark the photo permanently done
-        # with empty categories on a mere stall.
+
+    def parse(raw):
+        out: list[str] = []
+        seen: set[str] = set()
+        for token in raw.split(","):
+            t = token.strip().lower().rstrip(".")
+            if t in vocab_set and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    def problem_of(raw, cats):
+        if not cats:
+            return "no in-vocabulary categories"
+        if len(cats) > _CATEGORY_MAX_PLAUSIBLE:
+            return f"vocabulary recitation ({len(cats)} categories)"
         return None
-    if not raw:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for token in raw.split(","):
-        t = token.strip().lower().rstrip(".")
-        if t in vocab_set and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+
+    return _text_pass_answer("category-content", model,
+                             _build_category_prompt(description, CONTENT_VOCABULARY),
+                             parse, problem_of)
 
 
 def extract_keywords_from_description(
@@ -930,26 +1126,39 @@ def extract_keywords_from_description(
 ) -> Optional[list[str]]:
     """Extract 5-15 free-form lowercased keywords from a description.
 
-    Returns a list on success (possibly empty), or None if the Ollama call
-    timed out / errored, so the caller can defer the photo for retry.
+    Returns a list on success, or None if the call timed out / errored, so the
+    caller can defer the photo for retry.
+
+    Raises UnusableAnswer when the model answered but, twice, the answer could
+    not be stored: cut off, empty, a refusal ("i couldn't find any text…"),
+    a whole list as one keyword, implausibly many, or keywords that are not
+    about the description (fewer than KEYWORD_MATCH_MIN of them use its
+    words). Each of those used to be stored as the photo's keywords.
     """
     if not description or not description.strip():
         return []
     if not HAS_OLLAMA:
         return []
     from .bakeoff import build_keyword_prompt, parse_keywords_response
-    prompt = build_keyword_prompt(description)
-    try:
-        raw = _text_chat_with_retry(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_ctx": _TEXT_NUM_CTX},
-            timeout=_TEXT_OLLAMA_TIMEOUT_S,
-        )
-    except Exception:
-        # None (not []) signals "stalled, retry later" vs "ran fine, no keywords".
+    from .stale_descriptions import (KEYWORD_MATCH_MIN, _REFUSAL,
+                                     keyword_match_ratio)
+
+    def problem_of(raw, kws):
+        if not kws:
+            return "no keywords"
+        if any(_REFUSAL.search(k) for k in kws):
+            return "refusal stored as keywords"
+        if len(kws) == 1 and len(kws[0].split()) > _KEYWORD_MAX_WORDS:
+            return "whole list as one keyword"
+        if len(kws) > _KEYWORDS_MAX_PLAUSIBLE:
+            return f"implausibly many keywords ({len(kws)})"
+        ratio = keyword_match_ratio(description, kws)
+        if ratio is not None and ratio < KEYWORD_MATCH_MIN:
+            return f"keywords not in the description ({ratio:.0%} match)"
         return None
-    return parse_keywords_response(raw)
+
+    return _text_pass_answer("keywords", model, build_keyword_prompt(description),
+                             parse_keywords_response, problem_of)
 
 
 def _build_visual_prompt(vocab: list[str]) -> str:
@@ -1139,6 +1348,7 @@ def _drop_visual_contradictions(tags) -> list[str]:
 def tag_visual_photo(
     image_path: str,
     model: str = TAGS_MODEL,
+    raise_unusable: bool = False,
 ) -> Optional[list[str]]:
     """Generate PERCEIVED visual tags for a single photo via Ollama (vision).
 
@@ -1170,6 +1380,12 @@ def tag_visual_photo(
                 still marks it processed, so a repeatable failure is bounded by
                 MAX_PROCESS_ATTEMPTS instead of being re-claimed forever. Same
                 shape as the aesthetics pass's empty-scores row.
+
+    With `raise_unusable=True` (the worker) a no-usable-answer case raises
+    UnusableAnswer instead of returning None, so it is reported as a failure
+    row: the same one attempt, plus an `index_errors` entry. 307 photos were
+    retired `blocked` on 2026-10-03 with no error recorded anywhere.
+    Transport failures still return None either way.
     """
     from .visual_tags_derive import PERCEIVED_VOCABULARY
     if not HAS_OLLAMA:
@@ -1186,6 +1402,11 @@ def tag_visual_photo(
     image_ref = encoded if encoded is not None else str(path)
     options = _options_for_model(model)
 
+    def _no_answer(reason):
+        if raise_unusable:
+            raise UnusableAnswer(f"category-visual: {reason}")
+        return None
+
     try:
         raw = _ollama_chat_with_retry(
             model=model,
@@ -1193,10 +1414,12 @@ def tag_visual_photo(
             options=options,
             role="visual",
         )
+    except TruncatedOutput as e:
+        return _no_answer(f"cut off ({e})")
     except Exception:
         return None
     if not raw:
-        return None                       # no response at all — a failure
+        return _no_answer("empty response")   # no response at all — a failure
     if _is_explicit_empty_answer(raw):
         return []                         # the model answered: "no tags"
     tags = _parse_visual_response(raw, vocab_set)
@@ -1236,8 +1459,8 @@ def tag_visual_photo(
             # Regurgitation, or still unparseable: no usable answer. None (not
             # []) so the column stays NULL and the photo is re-claimed, bounded
             # by MAX_PROCESS_ATTEMPTS.
-            return None
-    return tags if tags else None
+            return _no_answer(problem2 or problem)
+    return tags if tags else _no_answer("contradictions left no tags")
 
 
 def describe_photos_batch(

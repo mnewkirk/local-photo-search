@@ -153,7 +153,7 @@ def test_the_worker_sends_an_empty_list_for_a_legitimately_empty_answer(
     from photosearch import worker as W
 
     monkeypatch.setattr("photosearch.describe.tag_visual_photo",
-                        lambda path, model=None: [])
+                        lambda path, model=None, **kw: [])
     monkeypatch.setattr("photosearch.describe.check_available", lambda m: None)
     out = W._process_category_visual([({"id": 7, "filename": "a.jpg"}, "/x")])
     assert out == [{"photo_id": 7, "visual_tags": []}]
