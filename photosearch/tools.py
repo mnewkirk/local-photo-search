@@ -1872,8 +1872,11 @@ def _thumb_b64(db: PhotoDB, photo_id: int) -> Optional[str]:
     if nas:
         import urllib.request
         try:
-            req = urllib.request.Request(f"{nas}/api/photos/{photo_id}/thumbnail",
-                                         headers={"User-Agent": "photosearch-rerank"})
+            from .request_intent import outbound_headers
+            req = urllib.request.Request(
+                f"{nas}/api/photos/{photo_id}/thumbnail",
+                headers=outbound_headers(
+                    f"Fetch thumbnail of photo {photo_id} for a VLM rerank"))
             with urllib.request.urlopen(req, timeout=20) as r:
                 return base64.b64encode(r.read()).decode("ascii")
         except Exception:
@@ -2157,8 +2160,11 @@ def _nas_post(path: str, body: dict, timeout: float = _NAS_WRITE_TIMEOUT_S) -> d
     base = _nas_base()
     url = base + path
     payload = json.dumps(body).encode("utf-8")
+    from .request_intent import outbound_headers
     req = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"},
+        url, data=payload,
+        headers={**outbound_headers(f"Write via the NAS: POST {path}"),
+                 "Content-Type": "application/json"},
         method="POST")
     resp = urllib.request.urlopen(req, timeout=timeout)
     return json.loads(resp.read())

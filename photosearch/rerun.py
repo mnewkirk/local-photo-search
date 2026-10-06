@@ -348,8 +348,11 @@ def mirror_photos(db, photo_ids: list[int], server: Optional[str] = None) -> dic
     mirrored = errors = missing = 0
     for pid in photo_ids:
         try:
-            with urllib.request.urlopen(
-                f"{base}/api/photos/{pid}/mirror-fields", timeout=30) as r:
+            from .request_intent import outbound_headers
+            req = urllib.request.Request(
+                f"{base}/api/photos/{pid}/mirror-fields",
+                headers=outbound_headers(f"Mirror photo {pid} from the NAS"))
+            with urllib.request.urlopen(req, timeout=30) as r:
                 fields = json.loads(r.read())
         except urllib.error.HTTPError as e:
             # 404 → no such photo on the NAS (or NAS predates /mirror-fields);

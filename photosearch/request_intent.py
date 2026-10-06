@@ -9,6 +9,12 @@ Source, in order of precedence:
      replica forwarding to the NAS, the fleet's helpers, ad-hoc scripts.
   5. Otherwise `other` (curl without headers, a bookmark, ...).
 
+A call the replica forwards to the NAS sends `X-Photosearch-Source: replica`
+via `outbound_headers`, with an intent naming its own purpose plus the intent
+of the request that caused it ("fetch preview 123 - for: Review team faces
+(from the faces page)"). Anything with a `photosearch-*` User-Agent that
+still forgets the header is classified `replica` too.
+
 Intent: an explicit `X-Photosearch-Intent` header wins; a handler can set
 `request.state.log_intent` (the Ask agent uses the question); otherwise it is
 inferred from the endpoint and its parameters by `infer_intent`, and the log
@@ -17,6 +23,7 @@ line says `"intent_inferred": true`.
 
 from __future__ import annotations
 
+import contextvars
 import re
 from typing import Callable, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -41,6 +48,8 @@ def classify_source(path: str, headers) -> str:
     if headers.get("referer"):
         return "ui"
     ua = (headers.get("user-agent") or "").lower()
+    if ua.startswith("photosearch-"):
+        return "replica"
     if ua.startswith(("python-urllib", "python-httpx", "python-requests")):
         return "script"
     return "other"
@@ -198,3 +207,46 @@ def explicit_intent(headers) -> Optional[str]:
     except (UnicodeEncodeError, UnicodeDecodeError):
         pass
     return v[:MAX_INTENT] or None
+
+
+# The intent of the request currently being served, so a call it causes to
+# the NAS can say what it is for. Set by web._log_request_timing. Thread
+# pools do NOT inherit it; submit with contextvars.copy_context().run (as
+# face_review does) to carry it across.
+_current_intent: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "photosearch_request_intent", default=None)
+
+
+def set_current_intent(intent: Optional[str]):
+    return _current_intent.set(intent)
+
+
+def reset_current_intent(token) -> None:
+    _current_intent.reset(token)
+
+
+def _header_safe(text: str) -> str:
+    """Header values travel as latin-1: send the UTF-8 bytes (explicit_intent
+    decodes them back), with no line breaks."""
+    text = " ".join(text.split())[:MAX_INTENT]
+    return text.encode("utf-8").decode("latin-1")
+
+
+def outbound_headers(purpose: str, source: str = "replica") -> dict:
+    """Headers for a call this server makes to the NAS on someone's behalf."""
+    cause = _current_intent.get()
+    intent = f"{purpose} - for: {cause}" if cause else purpose
+    return {"User-Agent": f"photosearch-{source}",
+            "X-Photosearch-Source": source,
+            "X-Photosearch-Intent": _header_safe(intent)}
+
+
+def carry_context(fn: Callable) -> Callable:
+    """Wrap `fn` so it runs with the CURRENT context (and so the current
+    request's intent) in whichever thread calls it. Each call gets its own
+    copy, so the wrapper is safe for a thread pool's concurrent tasks."""
+    parent = contextvars.copy_context()
+
+    def run(*args, **kwargs):
+        return parent.copy().run(fn, *args, **kwargs)
+    return run

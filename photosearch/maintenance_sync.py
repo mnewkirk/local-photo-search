@@ -31,6 +31,8 @@ import logging
 
 import requests
 
+from .request_intent import outbound_headers
+
 logger = logging.getLogger(__name__)
 
 # Cheap + deterministic: the NAS redoes these itself in ~a second.
@@ -175,7 +177,9 @@ def fetch_nas_fingerprint(nas_url: str, timeout: int = 10) -> dict:
     user retries. Do not add a second backoff for a case that can't arise.
     """
     r = requests.get(f"{nas_url.rstrip('/')}/api/admin/maintenance-fingerprint",
-                     timeout=timeout)
+                     timeout=timeout,
+                     headers=outbound_headers(
+                         "Read the NAS maintenance fingerprint before a sweep"))
     r.raise_for_status()
     return r.json()
 
@@ -236,7 +240,9 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
                 "stacking": payload["stacking"]}
         try:
             r = requests.post(f"{nas_url}/api/admin/maintenance-apply",
-                              json=body, timeout=timeout)
+                              json=body, timeout=timeout,
+                              headers=outbound_headers(
+                                  "Push replica maintenance results to the NAS"))
         except requests.exceptions.RequestException as e:
             logger.warning("maintenance push (transfer) failed: %s", e)
             return _push_result("unreachable", out)
@@ -270,7 +276,9 @@ def push_to_nas(db, nas_url: str, stage_results: list, *,
             # completion and hands back the whole body.
             r = requests.post(f"{nas_url}/api/admin/maintenance-sweep",
                               json={"apply": True, "stages": trigger},
-                              timeout=timeout)
+                              timeout=timeout,
+                              headers=outbound_headers(
+                                  "Trigger maintenance stages on the NAS"))
         except requests.exceptions.RequestException as e:
             logger.warning("maintenance push (trigger) failed: %s", e)
             for name in trigger:
@@ -311,7 +319,9 @@ def _push_face_state(db, nas_url: str, fingerprint: dict, stages: dict,
         with open(path, "rb") as fh:
             r = requests.post(f"{nas_url}/api/admin/maintenance-apply-face-state",
                               data=fh, timeout=timeout,
-                              headers={"Content-Type": "application/vnd.sqlite3"})
+                              headers={**outbound_headers(
+                                  "Push recomputed face state to the NAS"),
+                                  "Content-Type": "application/vnd.sqlite3"})
     except requests.exceptions.RequestException as e:
         logger.warning("maintenance push (face_state) failed: %s", e)
         return fail("unreachable")

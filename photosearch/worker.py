@@ -229,6 +229,9 @@ class WorkerClient:
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.session = requests.Session()
+        # Labels the fleet's requests in the server's request log (its photo
+        # downloads hit /api/photos/{id}/full, outside /api/worker/).
+        self.session.headers["X-Photosearch-Source"] = "worker"
         # Quick connectivity test. `/api/stats` runs heavy count scans and can
         # take >10s on a cold N100 NAS (full-table COUNT/MIN/MAX over photos,
         # faces, clip_embeddings). A *read* timeout means the TCP connection

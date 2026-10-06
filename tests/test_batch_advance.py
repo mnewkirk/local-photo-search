@@ -950,9 +950,10 @@ def nas(monkeypatch):
     calls = []
     box = {"response": FakeResponse({"ok": True}), "raise": None}
 
-    def fake_request(method, url, params=None, json=None, timeout=None):
+    def fake_request(method, url, params=None, json=None, timeout=None,
+                     headers=None):
         calls.append({"method": method, "url": url, "params": params,
-                      "json": json, "timeout": timeout})
+                      "json": json, "timeout": timeout, "headers": headers})
         if box["raise"] is not None:
             raise box["raise"]
         resp = box["response"]

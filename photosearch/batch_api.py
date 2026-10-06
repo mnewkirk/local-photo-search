@@ -163,8 +163,10 @@ def _proxy(method: str, path: str, *, params=None, json_body=None):
     nas = _nas_url()
     url = f"{nas}{path}"
     try:
-        resp = requests.request(method, url, params=params, json=json_body,
-                                timeout=_PROXY_TIMEOUT)
+        from .request_intent import outbound_headers
+        resp = requests.request(
+            method, url, params=params, json=json_body, timeout=_PROXY_TIMEOUT,
+            headers=outbound_headers(f"Forward {method} {path} to the NAS"))
     except requests.RequestException as exc:
         raise HTTPException(
             502, f"could not reach the authoritative server at {nas}: {exc}")

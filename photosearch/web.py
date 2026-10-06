@@ -101,6 +101,13 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
     return await call_next(request)
 
 
+def _carry_context(fn):
+    """Background threads started for a request keep its intent, so the NAS
+    calls they make say what they were for (request_intent.carry_context)."""
+    from .request_intent import carry_context
+    return carry_context(fn)
+
+
 @app.middleware("http")
 async def _log_request_timing(request: Request, call_next):
     """Time every /api request into the persistent request log
@@ -111,6 +118,18 @@ async def _log_request_timing(request: Request, call_next):
     if not path.startswith("/api/"):
         return await call_next(request)
     from . import request_intent, request_log
+    headers = request.headers
+    page = request_intent.page_of(headers.get("referer"))
+    stated = request_intent.explicit_intent(headers)
+    inferred_intent = None
+    if stated is None:
+        try:
+            inferred_intent = request_intent.infer_intent(
+                request.method, path, request.url.query, page)
+        except Exception:  # noqa: BLE001
+            inferred_intent = f"{request.method} {path}"
+    # Calls this request makes to the NAS say what they are for.
+    token = request_intent.set_current_intent(stated or inferred_intent)
     t0 = time.perf_counter()
     status = 500
     streaming = False
@@ -124,21 +143,18 @@ async def _log_request_timing(request: Request, call_next):
             "content-type", "").startswith("text/event-stream")
         return response
     finally:
+        request_intent.reset_current_intent(token)
         try:
-            headers = request.headers
-            page = request_intent.page_of(headers.get("referer"))
-            intent = (request_intent.explicit_intent(headers)
-                      or getattr(request.state, "log_intent", None))
+            # A handler may know better (the Ask agent: the question).
+            intent = stated or getattr(request.state, "log_intent", None)
             inferred = intent is None
-            if inferred:
-                intent = request_intent.infer_intent(
-                    request.method, path, request.url.query, page)
             request_log.record(
                 _db_path, method=request.method, path=path,
                 query=request.url.query or None, status=status,
                 ms=(time.perf_counter() - t0) * 1000,
                 source=request_intent.classify_source(path, headers),
-                intent=intent, intent_inferred=inferred, page=page,
+                intent=intent or inferred_intent, intent_inferred=inferred,
+                page=page,
                 client=request.client.host if request.client else None,
                 streaming=streaming)
         except Exception:  # noqa: BLE001 — logging must never fail a request
@@ -250,7 +266,7 @@ def _start_push(stage_results, deferred_triggers=None) -> None:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
 
-    threading.Thread(target=_run, name="maintenance-push", daemon=True).start()
+    threading.Thread(target=_carry_context(_run), name="maintenance-push", daemon=True).start()
 
 
 def _ensure_thumb_dir():
@@ -350,8 +366,10 @@ def _fetch_from_nas(photo_id: int, kind: str, timeout: float = 30.0) -> bytes:
     map it to a 404/502.
     """
     import urllib.request
+    from .request_intent import outbound_headers
     url = f"{_nas_url}/api/photos/{photo_id}/{kind}"
-    req = urllib.request.Request(url, headers={"User-Agent": "photosearch-replica"})
+    req = urllib.request.Request(url, headers=outbound_headers(
+        f"Fetch {kind} of photo {photo_id} (not cached on the replica)"))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -368,9 +386,10 @@ def _nas_json(method: str, path: str, body: Optional[dict] = None,
     import urllib.error
     url = f"{_nas_url}{path}"
     data = json.dumps(body).encode() if body is not None else None
+    from .request_intent import outbound_headers
     req = urllib.request.Request(
         url, data=data, method=method,
-        headers={"User-Agent": "photosearch-replica",
+        headers={**outbound_headers(f"Forward {method} {path} to the NAS"),
                  "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -862,7 +881,7 @@ async def api_review_team(request: Request):
             logger.exception("review-team failed")
             _emit({"type": "fatal", "message": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def gen():
         try:
@@ -921,8 +940,11 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
         if _nas_url:
             try:
                 import urllib.request
+                from .request_intent import outbound_headers
                 url = f"{_nas_url.rstrip('/')}/api/faces/crop/{face_id}?size={size}"
-                with urllib.request.urlopen(url, timeout=30) as r:
+                req = urllib.request.Request(url, headers=outbound_headers(
+                    f"Fetch face crop {face_id} (not cached on the replica)"))
+                with urllib.request.urlopen(req, timeout=30) as r:
                     _cache_bytes_atomic(cache_path, r.read())
                 return FileResponse(
                     cache_path, media_type="image/jpeg",
@@ -5021,7 +5043,7 @@ async def api_book_authoring_draft(book_id: int, request: Request):
             logger.exception("AUTHORING draft failed")
             _emit({"type": "fatal", "message": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -5274,7 +5296,7 @@ async def api_detect_stacks_stream(request: Request):
             logger.exception("STACKING stream failed")
             _emit({"type": "fatal", "message": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -5568,7 +5590,7 @@ async def api_maintenance_sweep(request: Request):
             })
         sweep_held = True
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -5701,7 +5723,7 @@ async def api_ask(request: Request):
             _emit({"type": "error", "message": str(exc)})
             _emit({"type": "done"})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -6304,7 +6326,7 @@ async def api_google_upload(body: dict, request: Request):
             _emit({"type": "fatal", "message": str(exc)})
 
     # Launch upload in background thread
-    thread = threading.Thread(target=run_upload, daemon=True)
+    thread = threading.Thread(target=_carry_context(run_upload), daemon=True)
     thread.start()
 
     async def generate():

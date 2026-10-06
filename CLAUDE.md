@@ -175,9 +175,19 @@ fleet's own traffic are hidden unless `--include-polling` is given.
 **Every line says who made the request and why** (`photosearch/request_intent.py`):
 
 - `source`: an `X-Photosearch-Source` header wins. Otherwise `worker` for
-  `/api/worker/*`, `ui` when the browser sent a `Referer`, `script` for a Python
-  HTTP client (the replica forwarding to the NAS, helper scripts), and `other`
-  for anything else.
+  `/api/worker/*`, `ui` when the browser sent a `Referer`, `replica` for a
+  `photosearch-*` User-Agent, `script` for any other Python HTTP client, and
+  `other` for anything else.
+- **Calls the replica makes to the NAS are `replica`, with a chained intent.**
+  Every such call site sends `request_intent.outbound_headers(purpose)`. The
+  intent is its own purpose plus the intent of the request that caused it,
+  e.g. `Fetch preview of photo 248304 (not cached on the replica) - for: Review
+  team faces (from the faces page)`. The middleware puts the current request's
+  intent in a contextvar. Background threads and pools do not inherit it, so
+  wrap them in `carry_context` (`web._carry_context` for the SSE threads,
+  face_review's preview pool). A new replica→NAS call must use
+  `outbound_headers`; a new background thread should be started through
+  `_carry_context`. Workers label their session `worker`.
 - `intent`: an `X-Photosearch-Intent` header wins. Next, a handler can set
   `request.state.log_intent`; `/api/ask` sets it to `Ask: <question>`, and each
   tool call the agent makes is logged with that intent too (`source: agent`).

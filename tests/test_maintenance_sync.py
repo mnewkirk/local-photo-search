@@ -305,8 +305,9 @@ def test_nas_fingerprint_proxy_forwards_the_nas_response(client, monkeypatch):
         def json(self):
             return nas_body
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, headers=None):
         assert url == "http://nas:8000/api/admin/maintenance-fingerprint"
+        assert headers["X-Photosearch-Source"] == "replica"
         return FakeResponse()
 
     monkeypatch.setattr(requests, "get", fake_get)
@@ -323,7 +324,7 @@ def test_nas_fingerprint_proxy_returns_error_body_when_nas_unreachable(client, m
     # special-case a non-2xx response.
     monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://unreachable:8000")
 
-    def boom(url, timeout=None):
+    def boom(url, timeout=None, headers=None):
         raise requests.ConnectionError("connection refused")
 
     monkeypatch.setattr(requests, "get", boom)

@@ -2062,8 +2062,13 @@ time to headers).
 
 `source`: `ui` (browser, has a Referer) · `claude` (sent
 `X-Photosearch-Source`) · `claude-mcp` · `agent` (Ask; each tool call logged
-with the question) · `script` (Python HTTP client — the replica forwarding to
-the NAS) · `worker` · `other`. `intent`: a stated header / the Ask question /
+with the question) · `replica` (the replica calling the NAS — every such
+call site uses `request_intent.outbound_headers(purpose)`, so its intent reads
+"Fetch preview of photo N … - for: <the UI request that needed it>") ·
+`script` (any other Python HTTP client) · `worker` · `other`. A new replica→NAS
+call must send `outbound_headers`; a new background thread or pool must be
+wrapped in `carry_context` (`web._carry_context`) or its NAS calls lose the
+"for:" part. `intent`: a stated header / the Ask question /
 inferred from page + endpoint + parameters by `request_intent.infer_intent`
 (add a rule there for a new endpoint).
 

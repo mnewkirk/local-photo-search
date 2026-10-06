@@ -541,7 +541,11 @@ def admin_replica_status():
     if nas_url:
         try:
             import urllib.request
-            with urllib.request.urlopen(f"{nas_url}/api/stats", timeout=8) as r:
+            from .request_intent import outbound_headers
+            req = urllib.request.Request(
+                f"{nas_url}/api/stats", headers=outbound_headers(
+                    "Compare photo counts with the NAS (replica status)"))
+            with urllib.request.urlopen(req, timeout=8) as r:
                 nas_count = json.loads(r.read()).get("photos")
         except Exception as e:
             logger.info("replica-status NAS reach failed: %s", e)
@@ -605,7 +609,10 @@ def admin_maintenance_nas_fingerprint():
         return {"error": "not in replica mode", "stages": {}}
     import requests
     try:
-        r = requests.get(f"{nas}/api/admin/maintenance-fingerprint", timeout=10)
+        from .request_intent import outbound_headers
+        r = requests.get(f"{nas}/api/admin/maintenance-fingerprint", timeout=10,
+                         headers=outbound_headers(
+                             "Read the NAS maintenance fingerprint"))
         r.raise_for_status()
         return r.json()
     except requests.RequestException as exc:
@@ -1489,8 +1496,10 @@ def _proxy_sse(url: str, payload: dict):
     """
     import requests
     try:
-        with requests.post(url, json=payload, stream=True,
-                           timeout=(10, 3600)) as resp:
+        from .request_intent import outbound_headers
+        with requests.post(url, json=payload, stream=True, timeout=(10, 3600),
+                           headers=outbound_headers(
+                               f"Run {url.split('/api/', 1)[-1]} on the NAS")) as resp:
             if resp.status_code >= 400:
                 body = resp.text[:500]
                 yield ("event: fatal\ndata: "
@@ -1741,7 +1750,10 @@ def admin_workers_queue_status():
             # authoritative server" on the maintenance page for a box that's
             # actually up. This is a 5s background poll, so a generous read
             # timeout is harmless — prefer stale-but-shown over a false error.
-            r = requests.get(f"{nas}/api/worker/status", timeout=30)
+            from .request_intent import outbound_headers
+            r = requests.get(f"{nas}/api/worker/status", timeout=30,
+                             headers=outbound_headers(
+                                 "Read the worker queue from the NAS"))
             r.raise_for_status()
             data = r.json()
             data["source"] = nas
@@ -1773,7 +1785,10 @@ def admin_incoming_status():
     if nas:
         import requests
         try:
-            r = requests.get(f"{nas}/api/admin/incoming-status", timeout=30)
+            from .request_intent import outbound_headers
+            r = requests.get(f"{nas}/api/admin/incoming-status", timeout=30,
+                             headers=outbound_headers(
+                                 "Read incoming-file status from the NAS"))
             r.raise_for_status()
             data = r.json()
             data["source"] = nas
