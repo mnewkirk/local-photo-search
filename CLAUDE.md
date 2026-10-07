@@ -1180,6 +1180,13 @@ unsplit lists, and llama3.2's category answers recited the vocabulary
   opt in with `raise_unusable=True`; other callers still get `None`. Text
   passes used to **defer** these, retrying forever at no cost, or store them.
   A transport stall still defers.
+- **A timeout on the double-budget retry is a truncation, not a stall**
+  (`_expanded_retry`). The first call already proved the answer overruns. On
+  2026-10-06, gemma looped `railing, railing, …` at temperature 0 on one photo
+  (IMAG2074). The 512-token retry overran the 10 s text cap, read as a stall,
+  and the photo was re-claimed ~90 times in 1.5 h with no attempt spent. Now
+  it spends attempts, and the 0.4 retry escaped the loop on attempt 3.
+  Connection errors on that retry are still transport.
 - **A cut-off verify verdict propagates** instead of returning `[]` (which
   reads as ALL CORRECT and stamps the photo verified).
 - The eval `Recorder` records a truncation as `unusable`: a model outcome to
@@ -1208,7 +1215,9 @@ counted. 59 folders library-wide trip it.
   [--top-set-only]]` lists collapsed folders worst-first, read-only. The
   collection is a targeted re-run cohort; save it on the NAS.
 
-**Cut-off descriptions already stored** (4,333 on 2026-10-06):
+**Cut-off descriptions already stored** (4,333 on 2026-10-06; re-described
+2026-10-06/07 as NAS collection 57: 0 cut off afterwards, 207 rewritten by
+verify, categories now 17 per photo on average, 3 failure rows in total):
 `stale-description-passes --save-truncated` saves them as a collection and
 clears nothing. Then `clear-pass describe` on that collection and run the fleet
 with `-p describe,verify,category-content,keywords`. Each new description
