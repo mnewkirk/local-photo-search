@@ -325,3 +325,52 @@ def test_visual_unusable_is_a_failure_row(monkeypatch):
     monkeypatch.setattr("photosearch.describe.check_available", lambda m: None)
     out = W._process_category_visual([({"id": 7, "filename": "a.jpg"}, "/x")])
     assert out[0]["photo_id"] == 7 and "error" in out[0]
+
+
+# ---------------------------------------------------------------------------
+# A timeout AFTER a proven truncation is a truncation, not a stall
+# ---------------------------------------------------------------------------
+
+def test_a_timed_out_expanded_retry_is_a_truncation(monkeypatch):
+    """IMAG2074, 2026-10-06: gemma loops `railing, railing, …` at temperature
+    0. The 256-token call is cut off, the 512-token retry overruns the 10 s
+    cap, and the timeout used to read as a transport stall — deferred with no
+    attempt spent, re-claimed ~90 times in 1.5 h."""
+    monkeypatch.setattr(d, "_RETRY_DELAY", 0)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _Resp({"choices": [{"message": {"content": "railing, railing"},
+                                       "finish_reason": "length"}], "usage": {}})
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
+    with pytest.raises(d.TruncatedOutput) as ei:
+        _chat(role="text")
+    assert ei.value.text == "railing, railing"
+
+
+def test_a_connection_error_on_the_expanded_retry_stays_transport(monkeypatch):
+    monkeypatch.setattr(d, "_RETRY_DELAY", 0)
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _Resp({"choices": [{"message": {"content": "a, b"},
+                                       "finish_reason": "length"}], "usage": {}})
+        raise ConnectionRefusedError("refused")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
+    with pytest.raises(ConnectionRefusedError):
+        _chat(role="text")
+
+
+def test_the_looping_photo_is_spent_not_deferred(monkeypatch, vocab):
+    """End to end: both answers truncated → UnusableAnswer → the worker's
+    failure row, which spends an attempt (retired after MAX_PROCESS_ATTEMPTS)."""
+    _text(monkeypatch, [d.TruncatedOutput("overran"), d.TruncatedOutput("overran")])
+    with pytest.raises(d.UnusableAnswer):
+        d.extract_categories_from_description("a performer on a stage")

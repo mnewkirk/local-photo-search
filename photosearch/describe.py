@@ -311,6 +311,33 @@ _DEFAULT_OPENAI_MAX_TOKENS = 768
 _LENGTH = "length"
 
 
+def _is_timeout(e: BaseException) -> bool:
+    es = str(e).lower()
+    return isinstance(e, TimeoutError) or "timed out" in es or "exceeded" in es \
+        or "timeout" in es
+
+
+def _expanded_retry(call, budget, role, model, partial):
+    """Run the double-budget retry after a confirmed truncation.
+
+    A TIMEOUT here is not a transport stall: the first call already proved
+    the answer does not fit the budget, and the bigger one could not finish
+    inside the wall-clock cap. Treating it as a stall deferred the photo
+    without spending an attempt, so it was claimed again at once — forever.
+    IMAG2074 (2026-10-06) was claimed ~90 times in 1.5 h: gemma loops
+    `railing, railing, …` at temperature 0 until any limit it is given.
+    Connection errors are still re-raised as transport failures.
+    """
+    try:
+        return call()
+    except Exception as e:
+        if _is_timeout(e):
+            raise TruncatedOutput(
+                f"LLM {role or 'call'} output overran {budget} tokens and the "
+                f"{budget * 2}-token retry timed out (model={model})", partial) from e
+        raise
+
+
 def _notify_attempt(**kw):
     hook = _ATTEMPT_HOOK
     if hook is None:
@@ -467,7 +494,9 @@ def _ollama_chat_with_retry(
     bigger = dict(options, num_predict=budget * 2)
     print(f" [output cut off at {budget} tokens; retrying at {budget * 2}]",
           end="", flush=True)
-    text, done_reason = _ollama_chat_attempts(model, messages, retries, bigger, timeout)
+    text, done_reason = _expanded_retry(
+        lambda: _ollama_chat_attempts(model, messages, retries, bigger, timeout),
+        budget, role, model, text)
     if done_reason == _LENGTH:
         raise TruncatedOutput(
             f"LLM {role or 'call'} output was cut off at {budget * 2} tokens "
@@ -555,8 +584,10 @@ def _openai_chat_with_retry(
         return text
     print(f" [output cut off at {max_tokens} tokens; retrying at {max_tokens * 2}]",
           end="", flush=True)
-    text, finish = _openai_chat_attempts(base_url, model, messages, retries,
-                                         timeout, temperature, max_tokens * 2, role)
+    text, finish = _expanded_retry(
+        lambda: _openai_chat_attempts(base_url, model, messages, retries,
+                                      timeout, temperature, max_tokens * 2, role),
+        max_tokens, role, model, text)
     if finish == _LENGTH:
         raise TruncatedOutput(
             f"LLM {role or 'call'} output was cut off at {max_tokens * 2} tokens "
