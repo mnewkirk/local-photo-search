@@ -1195,7 +1195,9 @@ unsplit lists, and llama3.2's category answers recited the vocabulary
 **The category cap is 60, not ~12, on purpose.** gemma-4-12b (the fleet text
 model) averages **25.7** categories and peaks at 52, and they are accurate,
 just exhaustive. A cap near the library median (5) would fail nearly every
-gemma answer. Making gemma less exhaustive is a prompt decision, not a guard.
+gemma answer. **Owner decision 2026-10-07: the long lists and some
+near-duplicates (grass / grassy field) are fine.** Leave the prompt and the
+vocabulary as they are.
 
 Worker-side only, since the server already handles `failures`: restart the
 fleet to pick it up. Tests: `tests/test_text_pass_safeguards.py`.
