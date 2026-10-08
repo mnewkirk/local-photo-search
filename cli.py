@@ -6486,8 +6486,10 @@ def stale_description_passes(db, folder, collection_id, save_collection, requeue
               help="Save the flagged folders' tagged photos as a collection for a re-run.")
 @click.option("--top-set-only", is_flag=True,
               help="With --save-collection: only the photos carrying each folder's dominant set.")
+@click.option("--exclude-folder", "exclude_folders", multiple=True,
+              help="Leave out a folder you have judged genuinely uniform (repeatable).")
 def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collection,
-                        top_set_only):
+                        top_set_only, exclude_folders):
     """List folders where category-visual stamped one tag set on most photos.
 
     The visual pass can be plausible photo by photo and still collapse across a
@@ -6517,6 +6519,10 @@ def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collectio
     conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         rows = VC.collapsed_folders(conn, folder_prefix=folder, **kw)
+        # A flag measures uniformity, not wrongness: 2026-10-03 is a sunny match
+        # in neon kits, and every model agrees on `sunny, colorful`.
+        excluded = {f.rstrip("/") for f in exclude_folders}
+        rows = [r for r in rows if r["folder"] not in excluded]
         ids = (VC.folder_photo_ids(conn, [r["folder"] for r in rows], top_set_only)
                if save_collection else [])
     finally:

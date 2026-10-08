@@ -110,3 +110,19 @@ def test_a_varied_batch_carries_no_warning(db):
     batch_id = _batch(db, [json.dumps([f"t{i % 7}"]) for i in range(60)])
     step = _visual(db, batch_id)
     assert step["warning"] is None and step["collapse"]["collapsed"] is False
+
+
+def test_cli_excludes_a_folder_judged_uniform(tmp_path):
+    from click.testing import CliRunner
+    from cli import cli
+    path = str(tmp_path / "c.db")
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE photos (id INTEGER PRIMARY KEY, folder TEXT, visual_tags TEXT)")
+    c.executemany("INSERT INTO photos (folder, visual_tags) VALUES (?, ?)",
+                  [("2026/a", SUNNY)] * 60 + [("2026/b", SUNNY)] * 60)
+    c.commit(); c.close()
+    res = CliRunner().invoke(cli, ["visual-tag-collapse", "--db", path,
+                                   "--exclude-folder", "2026/a"])
+    assert res.exit_code == 0, res.output
+    assert "2026/b" in res.output and "2026/a" not in res.output
+    assert "1 folder(s)" in res.output
