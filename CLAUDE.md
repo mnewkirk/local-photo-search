@@ -1217,6 +1217,24 @@ counted. 59 folders library-wide trip it.
   [--top-set-only]]` lists collapsed folders worst-first, read-only. The
   collection is a targeted re-run cohort; save it on the NAS.
 
+**Re-tagging a flagged folder with minicpm does not fix it** (probe on
+2026-10-07, 24 photos across three flagged folders, read against the photos).
+minicpm-v-4_5, the fleet visual model, collapses to its own default set,
+`sunny, colorful, vibrant`. It put that on indoor gym futsal and on an indoor
+classroom party.
+- **qwen2.5-vl** half-fixes it: it answered `[]` on most of the gym shots but
+  still called classroom shots `sunny`.
+- **gemma-4-26b-a4b** was right on all three folders: `[]` on the gym,
+  `golden-hour, soft-light` at dusk. It is ~5.7 s/photo vs ~1 s for minicpm.
+- **2026-10-03 itself is NOT a failure.** All three models agree on
+  `sunny, colorful(, vibrant)` for a bright match in neon kits, so it is a
+  legitimately uniform shoot (the flag's known false-positive case).
+
+Clearing a folder also used to delete its frozen `sharp`/`blurry`: the re-tag
+carried them over from the column `clear-pass` had just nulled. They are now
+stashed first (`db.stash_frozen_visual_tags`, on-demand table
+`visual_frozen_carry`) and read back by the write when the column is NULL.
+
 **Cut-off descriptions already stored** (4,333 on 2026-10-06; re-described
 2026-10-06/07 as NAS collection 57: 0 cut off afterwards, 207 rewritten by
 verify, categories now 17 per photo on average, 3 failure rows in total):

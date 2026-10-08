@@ -570,7 +570,14 @@ def _merge_visual_tags(db, photo_id: int, perceived) -> list:
         row = None
     if row is None:
         return merge_tags(perceived, [])
-    return merge_vlm_answer(perceived, row, existing=row["visual_tags"])
+    existing = row["visual_tags"]
+    if existing is None:
+        # Queued by a clear: the frozen terms were stashed before the column
+        # was nulled (db.stash_frozen_visual_tags). A transient lock here is
+        # re-raised by the caller's handler, like the EXIF read above.
+        from .db import carried_frozen_visual_tags
+        existing = carried_frozen_visual_tags(db.conn, photo_id)
+    return merge_vlm_answer(perceived, row, existing=existing)
 
 
 def _perceived_only(tags) -> list:
@@ -1203,6 +1210,9 @@ def clear_pass(req: ClearPassRequest):
                 photo_ids,
             )
         elif req.pass_type == "category-visual":
+            # Frozen `sharp` / `blurry` must survive the re-tag this queues.
+            from .db import stash_frozen_visual_tags
+            stash_frozen_visual_tags(db.conn, photo_ids)
             cur = db.conn.execute(
                 f"UPDATE photos SET visual_tags = NULL WHERE id IN ({placeholders})", photo_ids
             )

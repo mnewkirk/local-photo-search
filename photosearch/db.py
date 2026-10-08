@@ -271,6 +271,70 @@ def load_face_person_exclusions(conn) -> dict[int, set[int]]:
     return out
 
 
+_VISUAL_CARRY_DDL = (
+    "CREATE TABLE IF NOT EXISTS visual_frozen_carry ("
+    "photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE, "
+    "tags TEXT NOT NULL, stashed_at TEXT DEFAULT (datetime('now')))")
+
+
+def stash_frozen_visual_tags(conn, photo_ids) -> int:
+    """Keep each photo's FROZEN visual tags (`sharp` / `blurry`) across a
+    clear of `visual_tags`.
+
+    A re-tag carries frozen terms over from the photo's CURRENT
+    `visual_tags`, but a re-tag is queued by setting that column to NULL
+    (`clear-pass category-visual`, which M28's "Queue for fleet" also uses).
+    So the carry read an empty column and the re-tag silently deleted the
+    frozen tags, which nothing is allowed to delete until a labelled eval
+    decides them. The 59 collapsed folders alone held 41 `sharp` and 142 `blurry`.
+
+    Call BEFORE nulling. The rows for `photo_ids` are refreshed (deleted, then
+    re-inserted where frozen terms exist), so a stale carry can never bring
+    back a tag a human removed between clears. They are read only while
+    `visual_tags` IS NULL (`carried_frozen_visual_tags`), so leaving them in
+    place after the re-tag is harmless. On-demand table, like
+    `face_dedupe_undo`: no schema bump. Does NOT commit. Returns photos
+    stashed.
+    """
+    from .visual_tags_derive import FROZEN_TAGS
+
+    ids = [int(i) for i in photo_ids]
+    if not ids:
+        return 0
+    conn.execute(_VISUAL_CARRY_DDL)
+    stashed = 0
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        ph = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM visual_frozen_carry WHERE photo_id IN ({ph})", chunk)
+        for pid, raw in conn.execute(
+                f"SELECT id, visual_tags FROM photos WHERE id IN ({ph}) "
+                f"AND visual_tags IS NOT NULL", chunk).fetchall():
+            try:
+                tags = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            frozen = sorted({t for t in tags if isinstance(t, str)} & FROZEN_TAGS) \
+                if isinstance(tags, list) else []
+            if frozen:
+                conn.execute("INSERT INTO visual_frozen_carry (photo_id, tags) VALUES (?, ?)",
+                             (pid, json.dumps(frozen)))
+                stashed += 1
+    return stashed
+
+
+def carried_frozen_visual_tags(conn, photo_id: int) -> list:
+    """The frozen tags stashed for `photo_id` by the last clear, or []."""
+    try:
+        row = conn.execute("SELECT tags FROM visual_frozen_carry WHERE photo_id = ?",
+                           (photo_id,)).fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []
+        raise
+    return json.loads(row[0]) if row else []
+
+
 def unmatch_faces_as_duplicates(conn, face_ids, reason: str = "resolve_dups") -> int:
     """THE shared write for "this face lost a (photo, person) duplicate".
 
