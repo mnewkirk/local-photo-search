@@ -1230,6 +1230,26 @@ classroom party.
   `sunny, colorful(, vibrant)` for a bright match in neon kits, so it is a
   legitimately uniform shoot (the flag's known false-positive case).
 
+**The prompt now rules the attractor set out (2026-10-09)**, so minicpm stays
+the fleet's visual model. `sunny` and `overcast` say "never indoors", the LIGHT
+header says indoor or lamp-lit photos get no weather tag, `colorful` and
+`vibrant` got definitions, and COLOUR says most photos get no colour tag.
+Measured on minicpm:
+- **Collapse probe** (`2026-01-24` gym, `2025-10-31` classroom, `2026-10-03`
+  control): gym went from `sunny, colorful, vibrant` on 12 of 12 frames to 0
+  `sunny`. The classroom's remaining `sunny` frames are the outdoor costume
+  parade. The control kept `sunny` on 8 of 8.
+- **60 owner labels**: false positives 82 -> 53, precision 0.54 -> 0.61,
+  recall 0.56 -> 0.49. `vibrant` fp 30 -> 9, `sunny` fp 13 -> 5, `colorful`
+  recall 0.95 -> 0.68.
+- The first draft defined `colorful` as "at least three bright hues". That
+  halved its recall (0.50) and called indoor rooms `overcast`. The shipped
+  wording is variant B (`evals/prompts/visual_attractor_b.txt`, eval run
+  `attrB-minicpm`).
+
+Photos tagged before this keep their old tags. Re-tag a flagged folder with
+`clear-pass category-visual` and the fleet.
+
 **Done 2026-10-07/08 with gemma-4-26b as a one-off** (owner decision; the fleet
 default stays minicpm). NAS collection 58 held 16,276 photos in 58 folders,
 excluding 2026-10-03. The run took ~23 h at ~4.5 s/photo with 3 workers.

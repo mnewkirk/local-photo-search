@@ -1216,6 +1216,14 @@ def _build_visual_prompt(vocab: list[str]) -> str:
     axes prompt 16 right / 5 wrong / 3.3 tags per photo; this one 14 right /
     0 wrong / 1.8 tags; this one plus two examples 14 right / 1 wrong.
 
+    3. (2026-10-09) minicpm-v-4_5, the fleet's visual model, settled on
+       `sunny, colorful, vibrant` for whole shoots, indoor gym futsal
+       included. So `sunny`/`overcast` now say "never indoors", the LIGHT
+       header rules weather out under lamps or flash, and COLOUR says most
+       photos get no colour tag. 12 gym frames: 12 `sunny` -> 0. 60 owner
+       labels: 82 -> 53 false positives, precision 0.54 -> 0.61, recall
+       0.56 -> 0.49 (`evals/prompts/visual_attractor_b.txt` is this prompt).
+
     The capture-fact and frozen terms are deliberately absent — see
     photosearch/visual_tags_derive.py.
     """
