@@ -1230,6 +1230,17 @@ classroom party.
   `sunny, colorful(, vibrant)` for a bright match in neon kits, so it is a
   legitimately uniform shoot (the flag's known false-positive case).
 
+**Done 2026-10-07/08 with gemma-4-26b as a one-off** (owner decision; the fleet
+default stays minicpm). NAS collection 58 held 16,276 photos in 58 folders,
+excluding 2026-10-03. The run took ~23 h at ~4.5 s/photo with 3 workers.
+Results:
+- 0 failures, all 183 frozen tags kept.
+- 4,726 photos now hold `[]`.
+- Flagged folders went from 59 library-wide to 19.
+- The rest are genuinely uniform shoots: an outdoor graduation in full sun,
+  `vibrant` neon kits in the gym, EXIF-derived overnight `long-exposure`.
+- gemma over-uses `soft-light`, e.g. on hard midday shadows.
+
 Clearing a folder also used to delete its frozen `sharp`/`blurry`: the re-tag
 carried them over from the column `clear-pass` had just nulled. They are now
 stashed first (`db.stash_frozen_visual_tags`, on-demand table
