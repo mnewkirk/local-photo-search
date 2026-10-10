@@ -1232,20 +1232,26 @@ classroom party.
 
 **The prompt now rules the attractor set out (2026-10-09)**, so minicpm stays
 the fleet's visual model. `sunny` and `overcast` say "never indoors", the LIGHT
-header says indoor or lamp-lit photos get no weather tag, `colorful` and
-`vibrant` got definitions, and COLOUR says most photos get no colour tag.
-Measured on minicpm:
+header says indoor or lamp-lit photos get no weather tag, and `colorful`,
+`vibrant` and `muted` got definitions. Measured on minicpm (variant D,
+`evals/prompts/visual_attractor_d.txt`, eval run `attrD-minicpm`):
 - **Collapse probe** (`2026-01-24` gym, `2025-10-31` classroom, `2026-10-03`
   control): gym went from `sunny, colorful, vibrant` on 12 of 12 frames to 0
   `sunny`. The classroom's remaining `sunny` frames are the outdoor costume
   parade. The control kept `sunny` on 8 of 8.
-- **60 owner labels**: false positives 82 -> 53, precision 0.54 -> 0.61,
-  recall 0.56 -> 0.49. `vibrant` fp 30 -> 9, `sunny` fp 13 -> 5, `colorful`
-  recall 0.95 -> 0.68.
-- The first draft defined `colorful` as "at least three bright hues". That
-  halved its recall (0.50) and called indoor rooms `overcast`. The shipped
-  wording is variant B (`evals/prompts/visual_attractor_b.txt`, eval run
-  `attrB-minicpm`).
+- **60 owner labels**: false positives 82 -> 58, precision 0.54 -> 0.63,
+  recall unchanged at 0.56. `vibrant` fp 30 -> 10, `sunny` fp 13 -> 3 at
+  recall 0.96, `muted` recall 0.23 -> 0.54.
+
+Variants that lost, and why (don't reintroduce them without re-running both
+the probe and the eval):
+- **B**: a blanket "most photos have NO colour tag" rule. Precision 0.61 but
+  recall 0.49, mostly `colorful` (0.95 -> 0.68).
+- **C**: D plus the labeller definitions of `harsh-light` and `soft-light`.
+  Recall 0.58, but `sunny` fp went back up to 11 and the gym got 3 `sunny`.
+  The `harsh-light` text ends "...is just sunny", which seems to steer the
+  model toward `sunny`. `soft-light` recall barely moved (0.14 -> 0.21):
+  minicpm rarely uses it whatever the definition.
 
 Photos tagged before this keep their old tags. Re-tag a flagged folder with
 `clear-pass category-visual` and the fleet.

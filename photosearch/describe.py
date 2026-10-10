@@ -1219,10 +1219,13 @@ def _build_visual_prompt(vocab: list[str]) -> str:
     3. (2026-10-09) minicpm-v-4_5, the fleet's visual model, settled on
        `sunny, colorful, vibrant` for whole shoots, indoor gym futsal
        included. So `sunny`/`overcast` now say "never indoors", the LIGHT
-       header rules weather out under lamps or flash, and COLOUR says most
-       photos get no colour tag. 12 gym frames: 12 `sunny` -> 0. 60 owner
-       labels: 82 -> 53 false positives, precision 0.54 -> 0.61, recall
-       0.56 -> 0.49 (`evals/prompts/visual_attractor_b.txt` is this prompt).
+       header rules weather out under lamps or flash, and colorful / vibrant
+       / muted got definitions. 12 gym frames: 12 `sunny` -> 0. 60 owner
+       labels: 82 -> 58 false positives, precision 0.54 -> 0.63, recall
+       unchanged at 0.56 (`evals/prompts/visual_attractor_d.txt` is this
+       prompt). A blanket "most photos have NO colour tag" rule cut recall
+       to 0.49; defining harsh-light as "...is just sunny" brought indoor
+       `sunny` back.
 
     The capture-fact and frozen terms are deliberately absent — see
     photosearch/visual_tags_derive.py.

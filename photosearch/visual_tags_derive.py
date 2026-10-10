@@ -114,8 +114,7 @@ PROMPT_SECTIONS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
      "overexposed:",
      (("sunny", "overcast", "golden-hour", "backlit", "silhouette",
        "harsh-light", "soft-light", "overexposed", "foggy", "hazy", "snowy"),)),
-    ("COLOUR - most photos have NO colour tag; ordinary everyday colours are "
-     "not worth a tag:",
+    ("COLOUR:",
      (("colorful", "vibrant", "muted", "monochromatic", "black-and-white"),)),
     ("MOOD - only when unmistakable; ordinary snapshots and sports have none:",
      (("dramatic", "joyful", "melancholy", "moody", "peaceful"),)),
@@ -125,8 +124,8 @@ PROMPT_SECTIONS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
 )
 
 #: Sections whose terms sit on the header line rather than underneath it.
-#: Empty since COLOUR gained a rule in its header (2026-10-09); the mechanism
-#: stays so a short, gloss-free section can use it again.
+#: Empty since COLOUR's terms gained definitions (2026-10-09) — too long for
+#: the header line. The mechanism stays for a short, gloss-free section.
 _INLINE_SECTIONS: frozenset[str] = frozenset()
 
 #: Definitions rendered beside a term. These are NOT tidy 3-6 word glosses any
@@ -146,6 +145,8 @@ PERCEIVED_GLOSS: dict[str, str] = {
                  "scene is not colorful"),
     "vibrant": ("colours far more intense and saturated than a normal photo; "
                 "never just because a photo is colorful"),
+    "muted": ("the colours are subdued: darker, greyer shades with little "
+              "contrast between them; a photo can be muted and colorful"),
     "monochromatic": "one hue family throughout",
     "moody": "dark, low-key, brooding",
     "peaceful": "a still, quiet scene with no action in it",

@@ -87,11 +87,14 @@ def test_the_attractor_set_is_ruled_out_indoors(prompt):
     """minicpm-v-4_5 (the fleet's visual model) settled on `sunny, colorful,
     vibrant` for whole shoots, indoor gym futsal included (12 of 12 probed
     frames). These rules took the gym to 0 `sunny` and the 60-label eval from
-    82 to 53 false positives. Don't drop them without re-running both."""
+    82 to 58 false positives at unchanged recall (variant D). A blanket "most
+    photos have NO colour tag" rule (variant B) cost `colorful` recall 0.95 ->
+    0.68, and defining harsh-light as "... is just sunny" (variant C) brought
+    indoor `sunny` back. Don't change these without re-running both."""
     assert "INDOORS or under lamps, gym lights or flash" in prompt
     assert "never indoors, never on a grey day" in prompt          # sunny
     assert "outdoors under a flat grey sky, no shadows; never indoors" in prompt
-    assert "most photos have NO colour tag" in prompt
+    assert "a photo can be muted and colorful" in prompt
     assert "never just because a photo is colorful" in prompt     # vibrant
 
 
