@@ -251,6 +251,11 @@
     .btn.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
     .btn.primary:disabled { border-color: var(--border); color: var(--text); font-weight: 400; }
     .action-reason { font-size: 12px; color: var(--text-muted); }
+    .worker-count { font-size: 12px; color: var(--text-muted); display: flex; gap: 6px; align-items: center; }
+    .worker-count select {
+      background: var(--bg, #111); color: var(--text); border: 1px solid var(--border);
+      border-radius: 4px; padding: 3px 6px; font-size: 12px;
+    }
 
     /* The advance log. Fixed height so a long stream can't push the diagram
        off screen, monospace so the CLI's own aligned output stays aligned. */
@@ -485,6 +490,21 @@
       var _b = useState(false);         var busy = _b[0];       var setBusy = _b[1];
       var _r = useState(false);         var running = _r[0];    var setRunning = _r[1];
       var _lg = useState(null);         var log = _lg[0];       var setLog = _lg[1];
+      // Workers per fleet launch. 3 matches the server default
+      // (BatchLaunchFleetRequest.count), which clamps to 1..8. Remembered per
+      // browser only — a convenience, not state anything else reads.
+      var _wc = useState(function () {
+        try {
+          var v = parseInt(localStorage.getItem('batches.workerCount'), 10);
+          if (v >= 1 && v <= 8) return v;
+        } catch (_) {}
+        return 3;
+      });
+      var workerCount = _wc[0];
+      function setWorkerCount(v) {
+        _wc[1](v);
+        try { localStorage.setItem('batches.workerCount', String(v)); } catch (_) {}
+      }
       var selRef = useRef(null);
 
       function appendLog(text, cls) {
@@ -598,7 +618,8 @@
         };
         if (adv.action === 'launch_fleet') {
           appendLog('Launching the worker fleet…');
-          postJSON('/api/admin/batch-launch-fleet', { batch_id: id })
+          postJSON('/api/admin/batch-launch-fleet',
+                   { batch_id: id, count: workerCount })
             .then(function (d) {
               appendLog('Started ' + d.count + ' worker(s) for: '
                 + (d.passes || []).join(', '), 'l-ok');
@@ -668,6 +689,15 @@
               title: adv.reason || '',
               onClick: advance,
             }, adv.label),
+            adv.action === 'launch_fleet' ? e('label', { className: 'worker-count' },
+              'Workers',
+              e('select', {
+                value: workerCount,
+                disabled: running,
+                onChange: function (ev) { setWorkerCount(parseInt(ev.target.value, 10)); },
+              }, [1, 2, 3, 4, 5, 6, 7, 8].map(function (n) {
+                return e('option', { key: n, value: n }, n);
+              }))) : null,
             // Never a greyed button with no explanation.
             adv.reason ? e('span', { className: 'action-reason' }, adv.reason) : null,
             e('button', {
