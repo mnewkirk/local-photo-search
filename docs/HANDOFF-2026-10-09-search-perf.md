@@ -77,7 +77,9 @@ They match, apart from photos with identical timestamps swapping places.
 
 ## Backlog, in the order I'd take it
 
-1. **`/api/stats` is the slowest thing in the NAS log, and the worker fleet
+1. **DONE 2026-10-09** (worker probe → `/api/health`; `/api/stats` memoized,
+   one scan instead of four; replica card → fingerprint). Original note:
+   **`/api/stats` is the slowest thing in the NAS log, and the worker fleet
    causes it.** `WorkerClient.__init__` (`worker.py:~235`) checks the connection
    with `GET /api/stats`, which runs full-library COUNT/MIN/MAX scans. Every
    worker in a fleet calls it at the same moment. On 2026-10-07 07:59 that was

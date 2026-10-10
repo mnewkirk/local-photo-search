@@ -3613,85 +3613,99 @@ def delete_settings(namespace: str):
     return {"namespace": namespace, "values": {}}
 
 
-@app.get("/api/stats")
-def api_stats():
-    """Database statistics."""
-    with _get_db() as db:
-        photo_count = db.photo_count()
-        clip_count = db.conn.execute("SELECT COUNT(*) as c FROM clip_embeddings").fetchone()["c"]
-        face_count = db.conn.execute("SELECT COUNT(*) as c FROM faces").fetchone()["c"]
-        person_count = db.conn.execute("SELECT COUNT(*) as c FROM persons").fetchone()["c"]
-        described = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE description IS NOT NULL"
-        ).fetchone()["c"]
-        scored = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_score IS NOT NULL"
-        ).fetchone()["c"]
+@app.get("/api/health")
+def api_health():
+    """Liveness probe that touches no database.
 
-        quality_stats = None
-        if scored > 0:
-            row = db.conn.execute(
-                """SELECT MIN(aesthetic_score) as min_s, MAX(aesthetic_score) as max_s,
-                          AVG(aesthetic_score) as avg_s
-                   FROM photos WHERE aesthetic_score IS NOT NULL"""
-            ).fetchone()
-            quality_stats = {
-                "min": round(row["min_s"], 2),
-                "max": round(row["max_s"], 2),
-                "mean": round(row["avg_s"], 2),
-            }
+    The worker fleet used to probe with /api/stats at startup, and every worker
+    in a fleet calls it at the same moment: on 2026-10-07 that was three
+    concurrent 117 s requests against a cold N100. A reachability check needs
+    an answer, not library statistics.
+    """
+    return {"ok": True}
 
-        stack_row = db.conn.execute(
-            """SELECT COUNT(DISTINCT stack_id) as stack_count,
-                      COUNT(*) as stacked_photos
-               FROM stack_members"""
+
+def _compute_stats(db: PhotoDB) -> dict:
+    """The library counters behind /api/stats.
+
+    Shaped so the cold NAS reads `photos` at most ONCE. Every counter that has
+    a covering index uses it (the tag columns, aesthetic_score, aes_overall,
+    aes_overall_pct, and `description IS NULL` via idx_photos_need_describe).
+    The two with no index (aesthetic_concepts, verification_status) share a
+    single scan instead of one each — each cold `SCAN photos` is ~545 MB off
+    the NAS's spinning disk.
+    """
+    conn = db.conn
+    one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
+
+    photo_count = one("SELECT COUNT(*) FROM photos")
+    clip_count = one("SELECT COUNT(*) FROM clip_embeddings")
+    face_count = one("SELECT COUNT(*) FROM faces")
+    person_count = one("SELECT COUNT(*) FROM persons")
+    # Counted as total minus the "still needs describe" partial index; a
+    # direct `description IS NOT NULL` count reads the whole wide table.
+    described = photo_count - one(
+        "SELECT COUNT(*) FROM photos WHERE description IS NULL")
+    scored = one("SELECT COUNT(*) FROM photos WHERE aesthetic_score IS NOT NULL")
+
+    quality_stats = None
+    if scored > 0:
+        row = conn.execute(
+            """SELECT MIN(aesthetic_score) AS min_s, MAX(aesthetic_score) AS max_s,
+                      AVG(aesthetic_score) AS avg_s
+               FROM photos WHERE aesthetic_score IS NOT NULL"""
         ).fetchone()
-        stack_count = stack_row["stack_count"]
-        stacked_photos = stack_row["stacked_photos"]
+        quality_stats = {
+            "min": round(row["min_s"], 2),
+            "max": round(row["max_s"], 2),
+            "mean": round(row["avg_s"], 2),
+        }
 
-        concepts_analyzed = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_concepts IS NOT NULL"
-        ).fetchone()["c"]
+    stack_row = conn.execute(
+        """SELECT COUNT(DISTINCT stack_id) AS stack_count,
+                  COUNT(*) AS stacked_photos
+           FROM stack_members"""
+    ).fetchone()
 
-        category_tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE categories IS NOT NULL AND categories != '[]'"
-        ).fetchone()["c"]
-        visual_tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE visual_tags IS NOT NULL AND visual_tags != '[]'"
-        ).fetchone()["c"]
-        keyword_tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE keywords IS NOT NULL AND keywords != '[]'"
-        ).fetchone()["c"]
+    category_tagged = one(
+        "SELECT COUNT(*) FROM photos WHERE categories IS NOT NULL AND categories != '[]'")
+    visual_tagged = one(
+        "SELECT COUNT(*) FROM photos WHERE visual_tags IS NOT NULL AND visual_tags != '[]'")
+    keyword_tagged = one(
+        "SELECT COUNT(*) FROM photos WHERE keywords IS NOT NULL AND keywords != '[]'")
 
-        aes_scored = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE aes_overall IS NOT NULL"
-        ).fetchone()["c"]
-        aesthetics_stats = None
-        if aes_scored > 0:
-            row = db.conn.execute(
-                """SELECT MIN(aes_overall) as min_s, MAX(aes_overall) as max_s,
-                          AVG(aes_overall) as avg_s,
-                          SUM(CASE WHEN aes_overall_pct IS NOT NULL THEN 1 ELSE 0 END) as pct_done
-                   FROM photos WHERE aes_overall IS NOT NULL"""
-            ).fetchone()
-            aesthetics_stats = {
-                "min": round(row["min_s"], 2),
-                "max": round(row["max_s"], 2),
-                "mean": round(row["avg_s"], 2),
-                "normalized": row["pct_done"],
-            }
+    aes_scored = one("SELECT COUNT(*) FROM photos WHERE aes_overall IS NOT NULL")
+    aesthetics_stats = None
+    if aes_scored > 0:
+        row = conn.execute(
+            """SELECT MIN(aes_overall) AS min_s, MAX(aes_overall) AS max_s,
+                      AVG(aes_overall) AS avg_s
+               FROM photos WHERE aes_overall IS NOT NULL"""
+        ).fetchone()
+        # Separate query so it stays on idx_photos_aes_overall_pct; folding it
+        # into the MIN/MAX/AVG above as a SUM(CASE) forced a table scan.
+        pct_done = one(
+            "SELECT COUNT(*) FROM photos WHERE aes_overall_pct IS NOT NULL")
+        aesthetics_stats = {
+            "min": round(row["min_s"], 2),
+            "max": round(row["max_s"], 2),
+            "mean": round(row["avg_s"], 2),
+            "normalized": pct_done,
+        }
 
-        verify_rows = db.conn.execute(
-            """SELECT verification_status AS status, COUNT(*) AS c
-               FROM photos
-               WHERE verified_at IS NOT NULL
-               GROUP BY verification_status"""
-        ).fetchall()
-        verify_counts = {"pass": 0, "fail": 0, "regenerated": 0}
-        for r in verify_rows:
-            st = r["status"] or "pass"
-            if st in verify_counts:
-                verify_counts[st] += r["c"]
+    # The one unavoidable scan. A NULL verification_status on a verified row
+    # counts as a pass (verify predates the status column).
+    row = conn.execute(
+        """SELECT
+             COALESCE(SUM(aesthetic_concepts IS NOT NULL), 0) AS concepts,
+             COALESCE(SUM(verified_at IS NOT NULL
+                          AND COALESCE(verification_status, 'pass') = 'pass'), 0) AS v_pass,
+             COALESCE(SUM(verified_at IS NOT NULL
+                          AND verification_status = 'fail'), 0) AS v_fail,
+             COALESCE(SUM(verified_at IS NOT NULL
+                          AND verification_status = 'regenerated'), 0) AS v_regen
+           FROM photos"""
+    ).fetchone()
 
     return {
         "photos": photo_count,
@@ -3703,19 +3717,80 @@ def api_stats():
         "quality_stats": quality_stats,
         "aesthetics_scored": aes_scored,
         "aesthetics_stats": aesthetics_stats,
-        "concepts_analyzed": concepts_analyzed,
+        "concepts_analyzed": row["concepts"],
         "category_tagged": category_tagged,
         "visual_tagged": visual_tagged,
         "keyword_tagged": keyword_tagged,
-        "stacks": stack_count,
-        "stacked_photos": stacked_photos,
-        "verify_passed": verify_counts["pass"],
-        "verify_failed": verify_counts["fail"],
-        "verify_regenerated": verify_counts["regenerated"],
+        "stacks": stack_row["stack_count"],
+        "stacked_photos": stack_row["stacked_photos"],
+        "verify_passed": row["v_pass"],
+        "verify_failed": row["v_fail"],
+        "verify_regenerated": row["v_regen"],
+    }
+
+
+# /api/stats memo: {db_path: (computed_at_epoch, payload)}. Stale-while-
+# revalidate — once a value exists, no request ever waits on the counts again:
+# a stale hit returns the old value and refreshes it on one background thread.
+# Only the first request after a start (or a DB swap) computes inline, and
+# concurrent first requests share that one computation instead of each
+# scanning the library (the 2026-09-19 thread pile-up had this shape).
+_STATS_TTL_SECONDS = 60.0
+_stats_memo: dict = {}
+_stats_lock = threading.Lock()
+
+
+def _refresh_stats(db_path: str) -> dict:
+    """Compute and store. Caller holds `_stats_lock`."""
+    with PhotoDB(db_path, photo_root=_photo_root) as db:
+        payload = _compute_stats(db)
+    _stats_memo[db_path] = (time.time(), payload)
+    return payload
+
+
+def _refresh_stats_in_background(db_path: str) -> None:
+    try:
+        _refresh_stats(db_path)
+    except Exception:
+        logger.exception("background /api/stats refresh failed")
+    finally:
+        _stats_lock.release()
+
+
+def _cached_stats() -> tuple[dict, float]:
+    db_path = _db_path
+    hit = _stats_memo.get(db_path)
+    if hit is not None:
+        computed_at, payload = hit
+        if (time.time() - computed_at >= _STATS_TTL_SECONDS
+                and _stats_lock.acquire(blocking=False)):
+            threading.Thread(target=_refresh_stats_in_background,
+                             args=(db_path,), daemon=True,
+                             name="stats-refresh").start()
+        return payload, computed_at
+    with _stats_lock:
+        hit = _stats_memo.get(db_path)  # another request filled it meanwhile
+        if hit is not None:
+            return hit[1], hit[0]
+        payload = _refresh_stats(db_path)
+        return payload, _stats_memo[db_path][0]
+
+
+@app.get("/api/stats")
+def api_stats():
+    """Database statistics, at most ~_STATS_TTL_SECONDS old (see _cached_stats).
+
+    Use /api/health for a reachability check, not this.
+    """
+    payload, computed_at = _cached_stats()
+    return {
+        **payload,
+        "computed_at": computed_at,
         # Capability flag for the "✨ Ask" toggle. The agent needs a local LLM
         # backend; on the NAS there is none (the N100 can't run one usefully),
         # so Ask there 404s at the model layer. Piggy-backed on /api/stats
-        # because the search page already fetches it on mount.
+        # because the search page already fetches it on mount. Read per
+        # request, never cached.
         "ask_available": _ask_available(),
     }
 

@@ -134,6 +134,7 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("GET", r"/api/cameras", _fixed("Load the camera list")),
     ("GET", r"/api/collections", _fixed("List collections")),
     ("GET", r"/api/stats(/.*)?", _fixed("Load library statistics")),
+    ("GET", r"/api/health", _fixed("Check the server is reachable")),
     ("GET", r"/api/photos/geojson", _fixed("Load map points")),
     ("GET", r"/api/photos/(?P<id>\d+)/thumbnail", _fixed("Show thumbnail of photo {id}")),
     ("GET", r"/api/photos/(?P<id>\d+)/preview", _fixed("Show preview of photo {id}")),

@@ -232,22 +232,21 @@ class WorkerClient:
         # Labels the fleet's requests in the server's request log (its photo
         # downloads hit /api/photos/{id}/full, outside /api/worker/).
         self.session.headers["X-Photosearch-Source"] = "worker"
-        # Quick connectivity test. `/api/stats` runs heavy count scans and can
-        # take >10s on a cold N100 NAS (full-table COUNT/MIN/MAX over photos,
-        # faces, clip_embeddings). A *read* timeout means the TCP connection
-        # succeeded — the server is reachable, just slow to compute stats — so
-        # it's a false negative to treat it as unreachable (this is why the
-        # first fleet launch failed and the second, cache-warm, succeeded).
-        # Only genuine connection failures are fatal; a read timeout warns and
-        # proceeds (the real claim/download/submit calls have their own timeouts
-        # + retries). Callers that just submit a single result (the M28 sync
-        # re-run path) pass probe=False to skip it entirely.
+        # Quick connectivity test against /api/health, which touches no DB.
+        # It used to be /api/stats — full-library COUNT scans, and every worker
+        # in a fleet calls this at the same moment (3 x 117 s on a cold NAS,
+        # 2026-10-07). Any HTTP answer proves the server is reachable: a 404
+        # is an older server without /api/health. A *read* timeout also means
+        # the TCP connection succeeded, so it warns and proceeds; only a
+        # genuine connection failure is fatal. Callers that just submit a
+        # single result (the M28 sync re-run path) pass probe=False.
         if probe:
             try:
-                r = self.session.get(f"{self.server_url}/api/stats", timeout=30)
-                r.raise_for_status()
+                r = self.session.get(f"{self.server_url}/api/health", timeout=30)
+                if r.status_code != 404:
+                    r.raise_for_status()
             except ReqReadTimeout:
-                print(f"  ⚠ {self.server_url}/api/stats slow to respond (cold cache?) — "
+                print(f"  ⚠ {self.server_url}/api/health slow to respond — "
                       f"server is reachable, continuing")
             except Exception as e:
                 raise ConnectionError(f"Cannot reach server at {self.server_url}: {e}")

@@ -181,6 +181,16 @@ SAMPLE_PHOTOS = [
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
+def _clear_stats_memo():
+    """/api/stats is memoized per DB path; a test must never see another's."""
+    import sys
+    web = sys.modules.get("photosearch.web")
+    if web is not None:
+        web._stats_memo.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _redirect_ask_logs(tmp_path, monkeypatch):
     """Keep the agent's per-query Ask logs out of the repo during tests."""
     monkeypatch.setenv("PHOTOSEARCH_ASK_LOG_DIR", str(tmp_path / "ask-logs"))

@@ -361,6 +361,14 @@ reloaded every batch. `--round-robin` (cli.py worker, run-workers.sh) restores
 the old one-batch-per-pass-per-cycle interleave; the `/admin/maintenance`
 Sequential checkbox now defaults on.
 
+**Startup probe is `GET /api/health`** (no DB), never `/api/stats`: every
+worker in a fleet probes at once, and `/api/stats` cost 3 × 117 s on a cold NAS
+(2026-10-07). A 404 from an older server counts as reachable. `/api/stats` is
+itself now memoized (`web._cached_stats`, 60 s, stale-while-revalidate: only
+the first request after a start computes inline) and reads `photos` with one
+table scan instead of four (`web._compute_stats`; `tests/test_api_stats_cache.py`
+pins it). The replica card counts NAS photos via `/api/admin/maintenance-fingerprint`.
+
 Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
 (not hostname) — Docker containers can't resolve local DNS names.
 

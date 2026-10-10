@@ -542,11 +542,14 @@ def admin_replica_status():
         try:
             import urllib.request
             from .request_intent import outbound_headers
+            # The fingerprint is one indexed COUNT; /api/stats is every
+            # library counter (12.5 s cold on the NAS, 2026-10-09).
             req = urllib.request.Request(
-                f"{nas_url}/api/stats", headers=outbound_headers(
+                f"{nas_url}/api/admin/maintenance-fingerprint",
+                headers=outbound_headers(
                     "Compare photo counts with the NAS (replica status)"))
             with urllib.request.urlopen(req, timeout=8) as r:
-                nas_count = json.loads(r.read()).get("photos")
+                nas_count = json.loads(r.read()).get("photo_count")
         except Exception as e:
             logger.info("replica-status NAS reach failed: %s", e)
 
