@@ -10,3 +10,4 @@ $NasSshTarget   = '<user>@<nas-host>'             # ssh target used to trigger i
 # $LocalArchive   = 'D:\Photos\Archive'
 # $OrganizeScript = 'D:\Photos\organize.ps1'
 # $NasComposeDir  = '/volume1/docker/photosearch'
+# $CardDrives     = @('F:', 'H:')               # SD-card drive letters (see card-sources.ps1)

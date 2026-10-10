@@ -49,3 +49,18 @@ wins if both are set. The script refuses to run without `NasPhotosShare`.
 Avoid running a large backup/sync that reads the NAS share while an import is
 ingesting: on 2026-09-19 a ~50 MB/s SMB read slowed ingest to one file per
 ~3 minutes.
+
+## Cleaning the cards afterwards
+
+```powershell
+.\verify-and-clean-cards.ps1             # dry run: report what has a same-size archive copy
+.\verify-and-clean-cards.ps1 -Delete     # delete only the verified files from the cards
+.\verify-and-clean-cards.ps1 -Hash       # compare SHA256 instead of size
+```
+
+Anything without a matching copy under `$LocalArchive` is listed as UNMATCHED
+and left on the card. Both scripts read the card folders from `card-sources.ps1`
+(`DCIM`, `PRIVATE\M4ROOT\CLIP` and `M4ROOT\CLIP` on each of `$CardDrives`,
+default `F:` and `H:`; override `$CardDrives` in `import-config.local.ps1`).
+Sony bodies don't agree on where clips go: on 2026-10-10 a card with clips at
+`H:\M4ROOT\CLIP` was skipped by both scripts.

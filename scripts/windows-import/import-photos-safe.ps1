@@ -43,6 +43,7 @@ foreach ($name in 'StagingPath','LocalArchive','OrganizeScript','NasComposeDir',
 }
 $localConfig = Join-Path $PSScriptRoot "import-config.local.ps1"
 if (Test-Path -LiteralPath $localConfig) { . $localConfig }   # local file wins over env
+. (Join-Path $PSScriptRoot "card-sources.ps1")                 # $CardDrives (config may override) + Get-CardSources
 
 if ([string]::IsNullOrWhiteSpace($NasPhotosShare)) {
     Write-Host "ERROR: NasPhotosShare is not set." -ForegroundColor Red
@@ -255,24 +256,13 @@ function Push-ToIncoming {
 # Step 1: Import from SD cards (COPY not MOVE, skip existing)
 Write-Host "=== Importing from SD cards ===" -ForegroundColor Cyan
 
-if (Test-Path "F:\DCIM") {
-    Write-Host "Copying from F:\DCIM..."
-    $result = Copy-NewFiles -Source "F:\DCIM" -Destination $stagingPath -Recurse
-    Write-Host "  Copied: $($result.Copied), Skipped: $($result.Skipped)" -ForegroundColor Gray
+$cardSources = @(Get-CardSources)
+if ($cardSources.Count -eq 0) {
+    Write-Host "No card folders found on $($CardDrives -join ', ') (looked for DCIM, PRIVATE\M4ROOT\CLIP, M4ROOT\CLIP)." -ForegroundColor Yellow
 }
-if (Test-Path "F:\private\m4root\clip") {
-    Write-Host "Copying videos from F:\private\m4root\clip..."
-    $result = Copy-NewFiles -Source "F:\private\m4root\clip" -Destination $stagingPath
-    Write-Host "  Copied: $($result.Copied), Skipped: $($result.Skipped)" -ForegroundColor Gray
-}
-if (Test-Path "H:\dcim") {
-    Write-Host "Copying from H:\dcim..."
-    $result = Copy-NewFiles -Source "H:\dcim" -Destination $stagingPath -Recurse
-    Write-Host "  Copied: $($result.Copied), Skipped: $($result.Skipped)" -ForegroundColor Gray
-}
-if (Test-Path "H:\private\m4root\clip") {
-    Write-Host "Copying videos from H:\private\m4root\clip..."
-    $result = Copy-NewFiles -Source "H:\private\m4root\clip" -Destination $stagingPath
+foreach ($src in $cardSources) {
+    Write-Host "Copying from $($src.Path)..."
+    $result = Copy-NewFiles -Source $src.Path -Destination $stagingPath -Recurse:$src.Recurse
     Write-Host "  Copied: $($result.Copied), Skipped: $($result.Skipped)" -ForegroundColor Gray
 }
 
