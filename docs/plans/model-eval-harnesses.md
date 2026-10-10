@@ -1,0 +1,661 @@
+# Eval harnesses for aesthetics, describe, category-content, keywords, verify
+
+Status: **built** (2026-09-26, commits `6856e4a`..step 7). Not yet run against
+the new models — see "Runbook" at the end. Picks up from
+`docs/HANDOFF-2026-09-26-model-evals.md` (Phases 1–4). Built by plan-debate
+(two planners, two critique rounds). The three points they still disagreed on
+went to the owner; see "Decisions" at the end.
+
+Goal: compare `google/gemma-4-12b-qat`, `minicpm-v-4_5` and `google/gemma-4-e4b`
+against the production role models on every LLM pass, and pick the best model
+**per role**. The owner accepts running **one model loaded at a time**, with the
+passes run in sequence (decided 2026-09-26, see Decisions), so the handoff's
+"all role models fit in 24 GB together" constraint no longer applies. Each
+model only has to fit on its own.
+
+## What the code shows (read this before building)
+
+1. **The aesthetics bake-off's `--vlm` stopped meaning what it says on
+   2026-07-10.** `describe._resolve_openai_model` now falls back from the
+   `aesthetics` role to `PHOTOSEARCH_LLM_VISUAL_MODEL` when
+   `PHOTOSEARCH_LLM_AESTHETICS_MODEL` is unset (`4cfc202`, 2026-07-10 16:59).
+   From then on, the harness's "DO NOT set …AESTHETICS_MODEL — the per-call id
+   wins" advice was wrong for any shell that exported VISUAL. The fix is to pin
+   the role variable and record `effective_model`.
+   - **The 2026-07-09 ρ 0.70 IS qwen2.5-vl-7b-instruct's score** — corrected
+     after the plan was written, from git history. `scores.json` was written
+     2026-07-09 09:00 and recorded in `7d1b7c6` at 09:16, ~32 h before the
+     fallback existed. The resolver then was: AESTHETICS_MODEL env → the
+     legacy `PHOTOSEARCH_TEXT_LLM_MODEL` → the call-site id. So the per-call
+     `qwen2.5-vl-7b-instruct` ran unless one of those two was exported, and
+     nothing suggests either was. Re-running qwen is still worthwhile to get the
+     new columns (parse failures, spread, s/photo), not to fix attribution.
+2. **The ground truth is `evals/aesthetics-bakeoff/ranked.csv`**: 28 rows that
+   match `sample/`. The directory is untracked but not in `.gitignore`, so check
+   that no personal photos get committed.
+3. **Production code turns transport failures into answers:**
+   - `describe_photo` swallows every error and returns None (describe.py:732).
+   - `llm_verify_description` returns `[]` on error (verify.py:326-328), which
+     is indistinguishable from "ALL CORRECT".
+   - `score_photo_aesthetics` returns None for both a transport error and a
+     parse failure.
+   - The text extractors return None on timeout.
+
+   Every harness therefore wraps the chat call with a Recorder that turns "no
+   call answered" into a `TransportError`, and never caches it. This is the
+   same pattern as `production_tagger` in `evals/visual_tags_eval.py:332-367`.
+4. **Retries and timeouts happen inside `_openai_chat_with_retry`**
+   (describe.py:471-526: 3 attempts with a 5 s sleep between them).
+   - A `None` from a text extractor means three timeouts.
+   - A timeout that recovered on a later attempt can't be seen from outside the
+     loop.
+   - Truncation (`max_tokens=768`, `finish_reason`) is invisible too.
+5. **On LM Studio the `llava` fallback is really a third retry.** The fallback
+   call (describe.py:722-729) resolves by role, so it runs the same describe
+   model. Count it by the recorded nominal name `llava`, not by comparing model
+   names.
+6. **Production verify has three stages, written inline in
+   `worker._process_verify`** (worker.py:809-870): CLIP gate → LLM `WRONG:`
+   pass → CLIP override. `verify.verify_photo` writes to the DB, so the eval
+   must not call it.
+7. **The content vocabulary has 360 terms**, so the owner can't label against a
+   full checklist. The checklist is pooled instead (step 5).
+
+## Steps
+
+### 1. Shared infrastructure (unblocks everything)
+
+**New: `photosearch/model_eval.py`.** The single storage contract for the new
+passes, namespaced per pass.
+- `eval_dir()` reads `PHOTOSEARCH_MODEL_EVAL_DIR`, default
+  `./evals/model-evals/`. Add that path to `.gitignore`.
+- Atomic write and read. Lift `visual_tag_eval._write_atomic` and `_read`
+  rather than copying them.
+- Run cache `<dir>/<pass>/runs/<variant>.json`. Its header records `variant`,
+  `model`, `effective_model`, `role`, `prompt_sha`, `input_source`,
+  `loaded_models_start/end`, `created`, and `items{}`.
+- **Resume guard:** a mismatch in effective model, prompt or input refuses to
+  run ("use a new `--variant` or `--force`").
+- `pin_role_model(role, model)` generalises `_pin_model` to any role. It refuses
+  when `--model` is given but `PHOTOSEARCH_TEXT_LLM_URL` is unset.
+- **Originals cache:** `<dir>/originals/<pid>`, fetched once through the
+  replica's `/api/photos/{pid}/full` and written atomically. A failed fetch
+  raises and caches nothing. A `fetch-originals` subcommand pulls the whole
+  sample while the NAS is up.
+- `lmstudio_loaded()`: a best-effort `GET /api/v0/models`, recorded at the start
+  and end of each run. Latency is labelled `solo`, `shared(<others>)` or
+  `unknown`; `--solo` lets the operator assert it.
+- `Recorder` context manager: wraps `describe._ollama_chat_with_retry` and
+  collects the per-attempt records.
+- Helpers: `fmt_ratio`/`MIN_N`, and median latency that skips the first call
+  (which pays the JIT load).
+- Failed-photo line: "N photo(s) failed and were NOT cached — re-run without
+  --force", with a loud warning when 5 or more photos in a row fail (the
+  LM Studio drop).
+
+**Modified: `photosearch/describe.py`, with no behaviour change.**
+- Add an optional `_ATTEMPT_HOOK`, default None.
+- `_openai_chat_with_retry` calls it after every attempt with `role`, `model`,
+  `attempt`, `outcome` (ok, timeout or error), `elapsed`, `completion_tokens`
+  and `finish_reason`.
+- Exceptions raised by the hook are swallowed.
+- Fallback if the owner rejects this change: patch `describe._llm_trace` and
+  count `None` returns.
+
+**Modified: `evals/visual_tags_eval.py`.** `fetch_image` goes through the
+originals cache, on by default.
+
+**Tests: `tests/test_model_eval_store.py`.** Atomic write, resume-guard
+mismatch, the originals cache fetching once and not caching failures, the
+pinning refusal, transport errors vs "answered but useless", and the hook
+firing on timeout (stubbed `urlopen`).
+
+### 2. Aesthetics (independent; starts right after step 1)
+
+`evals/aesthetics_bakeoff.py` keeps its CLI and gains:
+- `--vlm M` pins `PHOTOSEARCH_LLM_AESTHETICS_MODEL`, with one model per
+  process.
+- A new `scores-v2.json` with per-scorer `effective_model`, `loaded_models` and
+  per-item `{overall, attempts, first_parse_ok, latency_s}`. The legacy
+  `scores.json` is read-only and reported as "effective model unknown".
+- Report columns: n, **parse-failure rate** (first attempt and final), **spread**
+  (std, IQR, distinct values, share within ±0.5 of the median), **s/photo**
+  (median and p90, labelled solo or shared), and ρ against `ranked.csv` with a
+  Fisher-z 95% CI. A ρ gap under 0.1 is a tie.
+- `--ground-truth` defaults to `ranked.csv`.
+- Optional `--selections-gt --db <replica>`: within-cluster pairwise agreement
+  with `review_selections` (opened `mode=ro`, ~150 clusters, 0 owner minutes).
+  Report it with the caveat that culling picks mix sharpness and moment.
+- A larger owner ranking is deferred.
+
+Tests: `tests/test_aesthetics_bakeoff.py` (spread metrics, parse-failure
+classification, legacy and v2 caches side by side, pinning, a hand-computed
+ρ with its CI).
+
+### 3. Describe: sample, run, automatic report
+
+**New: `evals/describe_eval.py`**, with subcommands
+`sample | fetch-originals | run | report | pairs`.
+- **`sample`**: the 60 visual-tags sample ids with their strata, plus
+  `--text-n 10` photos in a `text` stratum. Candidates come from stored
+  descriptions matching sign/menu/label/quoted text, shown on a contact sheet;
+  `--exclude` lets the owner veto some.
+- **`run --variant V --model M [--prompt-file]`**: pins the `describe` role,
+  uses the Recorder, and calls the **production** `describe.describe_photo`.
+  Each item caches `text`, `text_sha`, `latency_s`, the calls and attempts,
+  `retried`, `fallback_called` and `truncated` (`finish_reason=="length"` or
+  `completion_tokens>=768`). An answered call with a None result is cached as
+  `text: null`.
+- **`report`** covers every variant plus a `stored` pseudo-variant: the current
+  `photos.description`, with its model taken from `generations`. Columns:
+  - answered %
+  - degenerate %, on the first attempt and on the final text
+  - truncated %, retry %, fallback %
+  - words (median and p90)
+  - latency (solo or shared)
+  - **CLIP-unsupported nouns**: `verify._extract_nouns` →
+    `clip_score_description` against the stored embedding → `_flag_by_clip`.
+    This check only runs on the desktop.
+  - **text accuracy** on the `text` stratum, against the owner's typed truth
+  - a **screen verdict**: a model with more than 10% unanswered, degenerate or
+    truncated output gets no owner time.
+
+Tests: `tests/test_describe_eval_harness.py`.
+
+### 4. Labelling API and page
+
+**New: `photosearch/model_eval_api.py`.**
+- Router `/api/eval/models`, with the page served at `/eval/models`. Mount it
+  next to `eval_router` in `web.py`.
+- Local only: it never proxies to the NAS.
+- `GET /original/{pid}` serves the originals cache, downscaled to 1920 px.
+
+**New: `frontend/dist/eval_models.html`.** One page with the tabs **Claims |
+Pairwise | Visible text | Categories | Keywords | Planted**.
+- Built with React UMD and `React.createElement`; its own shared component
+  goes in `shared.js` as `PS.Chip` (see below).
+- Keyboard navigation copied from `eval_visual_tags.html`.
+- Link it from `admin_maintenance.html`.
+
+**Describe claims** are stored in `claims.json`, **keyed by `text_sha`**, not by
+variant.
+- Each photo is shown once, with all its de-duplicated descriptions stacked in
+  shuffled order.
+- Each description is split into claim chips by a deterministic
+  `segment_claims()`. The owner toggles the wrong chips, or marks the
+  description "all correct"; "other wrong (unsegmented)" is a free flag.
+- The API never sends a variant or model name; a test asserts this.
+- Identical texts share one label, and a re-run that changes the text orphans
+  its old label.
+
+**Pairwise preference** (`pairs.json`, `prefs.json`) covers only the finalists
+against the baseline: about 40 photos, at most 2 pairs each, with a seeded
+left/right order. The report shows the win rate (a tie counts as ½), n and a
+sign-test p-value.
+
+**Visible text** (`text_truth.json`): the owner types the visible text once per
+photo in the `text` stratum.
+
+**Move `Chip` into `shared.js` as `PS.Chip`** and make
+`eval_visual_tags.html` use it. `scripts/check-frontend-refs.js` must pass.
+
+**Report additions:** clean-description rate, wrong claims per description
+(bootstrap CI), and breakdowns per stratum.
+
+Tests: `tests/test_model_eval_api.py` (the page is blind, out-of-sample
+requests return 404, out-of-range segments return 400, labels survive a
+re-run).
+
+### 5. category-content and keywords (text-only; runs in parallel with 3–4)
+
+**New: `evals/text_passes_eval.py`**, with subcommands `freeze | run | report`.
+- **`freeze`** snapshots the descriptions of the 60 sample photos into
+  `<dir>/text/inputs.json` as `{source, source_effective_model, items{pid:
+  {text, text_sha}}}`.
+  - The default source is **`stored`** (the production descriptions), so text
+    runs don't wait for describe.
+  - It refuses to overwrite without `--force`, because labels are keyed to
+    `(pid, text_sha)`.
+- **`run --pass category-content|keywords --variant X --model M`** pins the
+  `text` role, uses the Recorder, and calls the production
+  `extract_categories_from_description` / `extract_keywords_from_description`.
+- **Automatic metrics:**
+  - timeouts per 100 attempts, measured against the 10 s
+    `_TEXT_OLLAMA_TIMEOUT_S`
+  - None rate
+  - p50 and p95 latency
+  - **unsupported-tag rate**, strict and lenient; the lenient version uses a
+    small `SUPPORT_SYNONYMS` map, and keywords are scored strict only
+  - tags per description
+  - off-vocabulary drops
+- **Owner labels** (`<dir>/text/labels.json`, keyed `pid:text_sha`):
+  - **Categories:** a **pooled** checklist (every variant's output plus the
+    stored `photos.categories`, shuffled and unattributed), with a search box
+    for any of the 360 terms. The report gives precision and **pooled recall**.
+    Wrong categories are split into ones the description supports (the describe
+    model's fault) and ones it doesn't (the text model's fault). That split is
+    the direct measure of the "soccer" failure.
+  - **Keywords:** the owner marks the wrong chips; the report gives precision
+    only.
+- **Chain check:** once a describe winner exists, run
+  `freeze --from <winner> --inputs chain` and then the text winner on that
+  input. This check is automatic metrics only.
+
+Tests: `tests/test_text_passes_eval.py` (freeze immutability, a support matcher
+that includes the sailboat-vs-soccer case, timeout counting from hook records,
+pooled precision and recall).
+
+### 6. Verify (depends on the step 4 labels)
+
+**Modified: `photosearch/verify.py`.** Add
+`check_description(image_path, description, tags, clip_embedding,
+verify_model, llm_all=False)`, which is `worker.py:809-870` moved verbatim.
+**`worker._process_verify`** calls it; regeneration stays in the worker. Add a
+parity test in `tests/test_verify.py`. This mode can be deferred if review
+objects to touching the worker.
+
+**New: `evals/verify_eval.py`**, with subcommands `plant | run | report`.
+- **`plant`** builds `sets.json`:
+  - **clean**: descriptions the owner marked all-correct.
+  - **planted**: one templated false claim per clean description, of three
+    types. **object** appends an absent noun from a fixed list, chosen **without
+    looking at CLIP**. **colour** swaps a colour word. **count** changes a
+    number word. Each plant records its `planted_span`.
+  - **real**: the wrong claims the owner flagged in step 4.
+
+  On the **Planted** tab the owner gives a **quick yes/no that each planted
+  claim is actually false** (~5 s each). Unconfirmed plants aren't scored.
+- **`run --variant X --model M --mode llm|pipeline`** pins the `verify` role.
+  - It **refuses when the verify model's effective model is the same as the
+    source describe model**.
+  - `llm` mode is the headline model comparison.
+  - `pipeline` mode adds the CLIP gate and override, which is the number that
+    would actually ship.
+  - Transport errors are never cached.
+- **`report`**:
+  - catch rate on the planted set, overall, per type and **matched** (a flag
+    must overlap the planted span)
+  - catch rate on real errors
+  - **false-rejection rate** on the clean set
+  - s/photo
+  - a table of describe source × verify model showing only legal pairs
+
+Tests: `tests/test_verify_eval.py` (deterministic planting, the same-model
+refusal, the matching rules, `[]`-on-error counted as a transport error).
+
+### 7. Cross-pass summary
+
+**New: `evals/model_eval_summary.py`.**
+- Reads `<dir>/models.json`, which the owner fills in during Phase 0: VRAM when
+  loaded on its own, context length, reasoning setting, whether the model sees
+  images, and **swap time** (seconds to load it cold in LM Studio).
+- Calls each harness's `build_report()`.
+- Prints one table per role with the headline metric, screen flags and solo
+  s/photo.
+- Picks per role **independently**. The constraints are that each model fits
+  in 24 GB on its own and that verify ≠ describe. It marks the Pareto-dominant
+  choices per role and doesn't pick a winner.
+- **Sequential-schedule estimate:** for a typical batch (default 1,373 photos,
+  the 2026-09-19 shoot), fleet wall-clock = Σ over passes (photos × solo
+  s/photo) + one swap per model change. Two roles sharing one model save a
+  swap, so shared models show up as a cost saving rather than a requirement.
+- There is **no all-models-loaded final run**, because production won't load
+  them together.
+
+**Production follow-up (outside the harness, not built here).** The fleet
+currently runs every pass concurrently, with LM Studio keeping several models
+resident (max-loaded ≥3, TTL off). Switching to one model at a time means:
+- launching the passes in dependency order: describe → category-content +
+  keywords (one text model) → verify → category-visual → aesthetics
+- setting LM Studio to one loaded model with JIT loading, or unloading
+  explicitly between passes
+
+`/batches`' one-click fleet launch would need to learn that sequence. Plan it
+once the winners are known.
+
+## Ordering
+
+```
+1 infra ─┬─ 2 aesthetics
+         ├─ fetch-originals (NAS up) ─ 3 describe runs ─ 4 labels (owner) ─ 6 verify
+         └─ 5 text (freeze from stored) ─────────────── chain check after 4
+                                              all ─ 7 summary
+```
+
+Run GPU jobs only with the worker fleet stopped, and with one model loaded at a
+time. Watch jobs with a marker file or the log's final line, never
+`pgrep -f`.
+
+## Risks
+
+- `/api/v0/models` is unverified. If it's missing, latency reads `unknown`
+  unless the operator passes `--solo`.
+- The describe hook and the verify extraction touch production code. Both are
+  behaviour-neutral and tested. The verify extraction is the larger change and
+  can be deferred, since `llm` mode doesn't need it.
+- The CLIP noun check needs torch, so it only runs on the desktop; CI mocks
+  `embed_text`.
+- Splitting descriptions into claims is crude. The free "other wrong" flag
+  mitigates it.
+- Pooled recall misses terms that no model and no stored value proposed. The
+  search box mitigates it.
+- Templated plants may read less naturally than real hallucinations, which
+  makes them easier to catch. The real-error set is the check on this.
+- 28 photos is small for ρ. Report the CI, and treat a gap under 0.1 as a tie.
+
+## Estimate
+
+**Engineering: about 31 h.**
+
+| step | hours |
+|---|---|
+| 1 infra + hook | 4 |
+| 2 aesthetics | 2.5 |
+| 3 describe | 4 |
+| 4 API + page + `PS.Chip` | 7 |
+| 5 text passes | 5 |
+| 6 verify | 5 |
+| 7 summary | 2 |
+| test slack | 1.5 |
+
+**Owner labelling: about 3 h.**
+
+| task | minutes |
+|---|---|
+| visible text | 8 |
+| claims (about 70 photo views) | ~70 |
+| pairwise | ~25 |
+| categories | ~40 |
+| keywords | ~20 |
+| planted yes/no | ~5 |
+
+**GPU: about 2.5 h** of wall-clock time, including model swaps.
+
+## Decisions
+
+| topic | option A | option B | owner's choice | date |
+|---|---|---|---|---|
+| Code/page structure | Per-pass modules, routers and pages (`describe_eval`, `category_eval`, `verify_eval`; `eval_describe.html`, `eval_categories.html`) over a thin `eval_common` | One shared `photosearch/model_eval.py`, one `/api/eval/models` router, one `/eval/models` page with tabs; the CLIs stay per pass | **B: one shared module + one page** | 2026-09-26 |
+| Review of planted errors | The owner approves each full planted description for naturalness (~90 s each, ~1 h) | Templated plants with a recorded span; the owner gives a yes/no that each claim is false (~5 s each) | **B: quick yes/no per claim** | 2026-09-26 |
+| Inputs for the text passes | Freeze the chosen describe model's descriptions after Phase 2 (text work waits on describe) | Freeze the stored production descriptions now; run the describe→text chain on the winner later as a check | **B: freeze from production now** | 2026-09-26 |
+| Loading models in production | All role models loaded at once in 24 GB (the handoff's goal), verified by a final all-loaded run | One model loaded at a time with the passes run in sequence; winners chosen per role, each only has to fit alone | **One at a time, sequential passes** (raised by the owner after the debate) | 2026-09-26 |
+
+## Runbook (build done — this is the order to run it)
+
+With the worker fleet stopped, and ONE model loaded in LM Studio at a time
+(`--solo` if LM Studio's `/api/v0/models` isn't available):
+
+```bash
+export PHOTOSEARCH_TEXT_LLM_URL=http://localhost:1234/v1 PHOTOSEARCH_LLM_REASONING_EFFORT=none
+DB=photo_index.db.local
+
+# 0. sample + pixels, once, while the NAS is up
+python evals/describe_eval.py sample --db $DB          # --list to see text candidates
+python evals/describe_eval.py fetch-originals
+python evals/text_passes_eval.py freeze --db $DB       # production descriptions
+
+# 1. aesthetics (re-run qwen once for the new columns; its 0.70 is attributable, see item 1)
+python evals/aesthetics_bakeoff.py --photos-dir evals/aesthetics-bakeoff/sample --vlm <id>
+
+# 2. describe, per model, then screen
+python evals/describe_eval.py run --variant <short> --model <id>
+python evals/describe_eval.py report --db $DB
+
+# 3. text passes, per model (no GPU contention with describe needed — inputs are frozen)
+python evals/text_passes_eval.py run --pass category-content --variant <short> --model <id>
+python evals/text_passes_eval.py run --pass keywords         --variant <short> --model <id>
+
+# 4. owner: /eval/models — Visible text, Claims, then Categories / Keywords
+python evals/describe_eval.py pairs --baseline <prod> --variants <finalist>[,<finalist>]
+#    then the Pairwise tab
+
+# 5. verify, from one describe variant's labelled descriptions
+python evals/verify_eval.py plant --source <describe variant>   # then the Planted tab
+python evals/verify_eval.py run --variant <short> --model <id> [--mode pipeline --db $DB]
+
+# 6. summary
+python evals/model_eval_summary.py init-models          # fill in vram_gb + swap_s
+python evals/model_eval_summary.py report --db $DB [--assign role=model,...]
+```
+
+Re-run any `run` without `--force` after a failure line: only the gaps are
+filled.
+
+
+## Results 2026-09-26 — automated (owner labels still to come)
+
+One driver run, **each model loaded alone** in LM Studio (`lms load -c 16384 --gpu
+max`), `PHOTOSEARCH_LLM_REASONING_EFFORT=none`, replica on :8001. 35 min wall-clock,
+**0 uncached failures** (every run re-ran once to fill gaps and found none), and every
+latency below is labelled `solo`. All three new models passed the Phase-0 gate: they
+see images and gave real answers with reasoning off.
+
+| model | VRAM alone | cold load |
+|---|---|---|
+| google/gemma-4-12b-qat | 7.15 GB | 6.9 s |
+| qwen/qwen3.5-9b | 6.55 GB | 5.5 s |
+| google/gemma-4-e4b | 6.33 GB | 5.6 s |
+| qwen2.5-vl-7b-instruct | 6.04 GB | 3.5 s |
+| minicpm-v-4_5 | 5.90 GB | 4.0 s |
+| llama-3.2-3b-instruct | 2.02 GB | 2.0 s |
+
+Model swaps are cheap (seconds), which supports the one-model-at-a-time decision.
+
+**Aesthetics** (28 hand-ranked photos, ρ with 95% CI; a gap under 0.1 is a tie):
+
+| model | ρ | std | within ±0.5 of median | s/photo |
+|---|---|---|---|---|
+| gemma-4-e4b | 0.78 [0.54, 0.91] | **0.91** | 39% | 2.7 |
+| minicpm-v-4_5 | 0.75 [0.49, 0.89] | 1.37 | 43% | 2.3 |
+| qwen2.5-vl-7b (production) | 0.71 [0.42, 0.87] | 2.01 | 18% | 2.4 |
+| gemma-4-12b-qat | 0.71 [0.41, 0.87] | 1.51 | 18% | 4.4 |
+
+The re-run qwen gives 0.709 against the July 0.700, so the baseline reproduces. All
+four are a statistical tie on ρ. e4b's lead comes with the most squashed scores. That
+is the LAION failure mode, although the percentile normalisation compensates for it.
+No parse failures anywhere.
+
+**category-visual**, on the owner's 60 labels (precision / recall):
+
+| model | P / R | tags per photo | s/photo |
+|---|---|---|---|
+| **minicpm-v-4_5** | **0.54 / 0.56** | 3.0 | 0.69 |
+| qwen2.5-vl-7b (production) | 0.51 / 0.40 | 2.3 | 0.83 |
+| gemma-4-26b-a4b | 0.69 / 0.39 | 1.7 | 3.57 (not solo) |
+| gemma-4-12b-qat | 0.63 / **0.23** | 1.1 (under-tags) | 0.59 |
+| gemma-4-e4b | 0.33 / 0.29 | 2.5 | 0.50 |
+
+Recall on the Unsplash set agrees: minicpm 0.47, e4b 0.43, g12b 0.42, gemma-26b 0.40,
+qwen 0.39. minicpm is the first model to raise recall without giving up precision.
+
+**describe** (70 photos, automatic screens): every model answered 100%, with 0
+degenerate, 0 truncated and 0 retries. Words p50/p90: e4b 48/58, g12b 50/63,
+qwen3.5-9b 66/79, minicpm 82/120. s/photo: e4b 0.85, g12b 1.22, minicpm 1.35,
+qwen 1.48. The share of nouns CLIP doesn't support is flat at 5–6% for all of them,
+so it doesn't separate models. **The describe choice rests on the owner's claim labels.**
+
+**category-content / keywords** (frozen production descriptions):
+
+| model | cat tags per description | cat unsupported | off-vocab dropped | kw unsupported | cat / kw s |
+|---|---|---|---|---|---|
+| llama-3.2-3b (production) | 5.5 | 22% | 270 | 1% | 0.13 / 0.13 |
+| gemma-4-e4b | 9.2 | 43% | 44 | 0% | 0.26 / 0.24 |
+| gemma-4-12b-qat | 14.3 | 49% | 14 | 0% | 0.73 / 0.45 |
+| minicpm-v-4_5 | 12.1 | 63% | 459 | 25% | 0.46 / 0.33 |
+
+No timeouts: every call finished well inside the 10 s limit. The new models give 2–3×
+as many categories, and a much larger share of them have no support in the
+description. That's a precision warning, but "unsupported" also counts fair
+inferences, so the owner's Categories labels decide. Keywords: both gemmas stay
+anchored to the text. minicpm makes things up (25% unsupported).
+
+**Not yet measured:** verify, which needs the describe claim labels first, then the
+planted set.
+
+Raw reports: `describe_eval.py report`, `text_passes_eval.py report`,
+`aesthetics_bakeoff.py --report-only`, `visual_tags_eval.py report`,
+`visual_tags_unsplash.py report`, `model_eval_summary.py report`.
+
+### Describe labelling changed to Differences (2026-09-27)
+
+After 30 photos the owner reported the per-description claim labelling wasn't
+useful: most descriptions agree, and only 7 of 51 labelled had any wrong claim.
+So the default tab is now **Differences**. `describe_eval.py disputes --model
+<text model>` has a text model read one photo's distinct descriptions **blind** (as
+D1…Dn) and list only the *checkable* facts they disagree on, as a question with
+each description's answer, at most 6 per photo. Examples: how many players, which
+sport, jersey text, and whether the car or flowers only one of them mentions are
+really there. The owner clicks the answer(s) that are right, or "None right" /
+"Can't tell". Each description is then **right**, **wrong** or **silent** on each
+point, and the report adds `disputed pts / right / wrong / silent / right when it
+answered`. Silence is never counted as wrong.
+
+- Comparer: `gemma-4-26b-a4b`, which is deliberately not a describe candidate. 70/70
+  photos compared, 386 points, 0 failures.
+- A question key hashes the photo, the question and the texts it was asked of, so a
+  re-run of any description orphans its old points instead of mis-scoring them.
+- The 51 existing claim labels stay (tab "All claims") and are still reported.
+- The describe report gained a **format** screen: markdown or list structure in the
+  prose, which counts toward SCREEN OUT. minicpm leaked a
+  "**Search Index Description:**" block on 1 of 70 photos.
+
+Tests: `tests/test_describe_disputes.py`.
+
+
+### Describe result (2026-09-28): keep qwen3.5-9b
+
+The owner labelled all 386 disputed points (380 scorable, 6 "can't tell"):
+
+| model | wrong claims per photo | right when it answered a disputed point | fewer wrong claims than it, photo by photo |
+|---|---|---|---|
+| **qwen/qwen3.5-9b (production)** | **1.06** | **0.75** | — |
+| gemma-4-12b-qat | 1.19 | 0.63 | qwen 27 vs 23 (sign p 0.67) |
+| minicpm-v-4_5 | 1.56 | 0.60 | qwen 32 vs 18 (p 0.06) |
+| gemma-4-e4b | 1.39 | 0.36 | qwen 33 vs 17 (p 0.03) |
+
+qwen leads in every stratum: sports 0.74, photos with visible text 0.76, the rest 0.74.
+e4b's short descriptions come from leaving things out (228 of 380 silent), and when it
+does commit to a disputed fact it is mostly wrong. **No candidate beats production
+describe.** g12b is a tie on wrong claims but answers fewer points correctly.
+
+Verify sets now also come from the Differences labels. A description is **clean** when
+every disputed point is right or silent; its **wrong answers are the real errors**
+(`verify_eval.description_errors`). From qwen9b: 20 clean, 20 planted (11 object, 5
+colour, 4 count), 50 with real errors. The planted ones need the owner's yes/no on the
+Planted tab before they are scored.
+
+### Verify result (2026-09-28): switch to gemma-4-12b-qat
+
+Descriptions come from qwen3.5-9b (production describe): 20 clean, 20 planted (every one
+confirmed false by the owner), 50 with the real errors from the Differences labels. Each
+verify model ran alone, in both modes.
+
+| model | mode | planted: matched | real: matched | false reject | s/photo |
+|---|---|---|---|---|---|
+| gemma-4-e2b (production) | llm | 0.25 | 0.24 | **0.40** | 0.4 |
+| gemma-4-e2b (production) | pipeline (ships) | 0.20 | 0.06 | 0.00 | 0.6 |
+| **gemma-4-12b-qat** | llm | **0.80** | 0.12 | **0.05** | 0.7 |
+| **gemma-4-12b-qat** | pipeline | **0.65** | 0.02 | 0.00 | 1.1 |
+| minicpm-v-4_5 | llm | 0.45 | 0.02 | 0.00 | 0.7 |
+| gemma-4-e4b | llm | 0.80 | 0.56 | **0.95** (flags everything) | 0.6 |
+
+- **gemma-4-12b-qat** catches 16 of 20 planted errors and names them correctly, while
+  rejecting 1 of 20 clean descriptions. The production gemma-4-e2b names 5 of 20 and
+  rejects 8 of 20 clean ones. Its model-only verdicts are close to noise, and the
+  shipped pipeline is quiet only because the CLIP stages throw most of its flags away.
+- **The CLIP stages remove correct colour and count catches.** g12b's colour catches go
+  from 0.80 in llm mode to 0.20 in pipeline mode: CLIP cannot see a colour swap or a
+  miscount, so the override discards the LLM's right answer. Object catches are
+  unchanged (0.91 in both modes). Worth revisiting the override once g12b is the
+  verifier. Not changed here.
+- Real errors are hard for everyone except the model that flags everything. They are
+  subtle (a count, a shade), and "matched" needs the flag to name the labelled answer.
+  So read that column as relative, not absolute.
+- Small sets (20/20/50). g12b vs e2b on planted matched is 16/20 vs 5/20, and on false
+  rejects 1/20 vs 8/20: large enough not to be noise.
+
+The summary now ranks describe by the Differences labels (right on disputed points),
+not the sparse, damaged "All claims" labels.
+
+### Production describe was never qwen3.5-9b (2026-09-28)
+
+`generations.model_used` shows the web-UI fleet has described, verified,
+visual-tagged and scored aesthetics with **qwen2.5-vl-7b-instruct** since 2026-09-20.
+Every unset vision role fell back to the replica's `PHOTOSEARCH_LLM_VISUAL_MODEL`,
+now fixed with explicit per-role models (`rerun.FLEET_ROLE_MODELS`). So the describe
+comparison above was against the handoff's baseline, not the model actually running.
+
+To add qwen2.5-vl-7b **without re-extracting** (which would orphan all 386 labels),
+`describe_eval.py disputes --add-variant <variant> --model <text model>`:
+- The comparison model maps the new description onto each existing question and
+  copies an existing answer when it agrees, so those are scored by the labels as
+  they stand.
+- An answer the owner never saw is **unjudged, not wrong**. Each label now records
+  `options_seen`, stamped onto the old labels before anything is added, so a
+  "None right" never convicts an answer that wasn't on screen. The tab marks these
+  "★ new" and asks again.
+- At most **1** detail only the new description states becomes a new question
+  (`ADD_MAX_NEW`). In the original extraction each model faced ≤0.7 such questions
+  per photo (qwen3.5-9b 0.61, minicpm 0.70). The first run allowed 3, which is ~5×
+  the scrutiny and ~200 extra labels, so it was trimmed.
+
+qwen2.5-vl-7b: 70/70 photos added, **136 points to label** (70 new, 66 existing
+with an answer not yet judged). Labels, disputes and a backup of both from before
+the addition are in `evals/model-evals/describe/`.
+
+### Describe decided (2026-10-02): switch to qwen3.5-9b
+
+All 456 points labelled, including the 136 for qwen2.5-vl-7b.
+
+| model | right on the ORIGINAL questions | right, all points | wrong claims / photo |
+|---|---|---|---|
+| **qwen/qwen3.5-9b** | **0.75** (219/292) | 0.75 | **1.04** |
+| gemma-4-12b-qat | 0.63 | 0.63 | 1.20 |
+| minicpm-v-4_5 | 0.61 | 0.61 | 1.53 |
+| qwen2.5-vl-7b (what production actually ran) | 0.50 (92/183) | 0.60 | 1.46 |
+| gemma-4-e4b | 0.38 | 0.38 | 1.36 |
+
+Photo by photo, qwen2.5-vl-7b had more wrong claims than qwen3.5-9b on 33 photos and
+fewer on 16 (sign p 0.02). By stratum it scored 0.48 on sports against qwen3.5-9b's 0.77.
+Its own added-detail questions went 59 right / 11 wrong; the "original questions"
+column compares every model on the same questions, which is the fair one.
+**`rerun.FLEET_ROLE_MODELS["describe"]` is now `qwen/qwen3.5-9b`** (1.5 vs 1.2 s/photo).
+Verify (gemma-4-12b-qat) is still a different model, as it must be, and was evaluated
+on qwen3.5-9b's own descriptions.
+
+### Text passes decided (2026-10-03): gemma-4-12b-qat
+
+The owner labelled all 70 frozen descriptions on Categories and Keywords.
+
+| model | category precision | right / wrong categories per photo | pooled recall | keyword precision | s (cat / kw) |
+|---|---|---|---|---|---|
+| llama-3.2-3b (production) | 0.83 | 4.5 / 0.9 | 0.25 | 0.94 | 0.13 / 0.13 |
+| **gemma-4-12b-qat** | **0.83** | **11.8** / 2.5 | **0.66** | 0.93 | 0.73 / 0.45 |
+| gemma-4-e4b | 0.83 | — | 0.43 | 0.94 | 0.26 / 0.24 |
+| minicpm-v-4_5 | 0.70 | — | 0.48 | 0.91 | 0.46 / 0.33 |
+
+gemma-4-12b-qat found more right categories than llama on 64 photos and fewer on 1
+(sign p ≈ 4e-18) at the same precision. It does produce more wrong ones in absolute
+terms: 2.5 vs 0.9 per photo, more on 52 photos and fewer on 5. **The automatic
+"unsupported by the description" screen was misleading here.** It flagged 44–49% of
+the new models' categories, yet their precision equals llama's: the extra categories
+are mostly fair inferences. Keywords are a tie. Both passes share the `text` role, so
+**`FLEET_ROLE_MODELS["text"]` is now `google/gemma-4-12b-qat`**, which is also the
+verify model, so there's no swap between those passes. Cost: about 27 min of text
+passes per 1,373-photo batch, against about 5.
+
+**Vocabulary gaps** the owner added (right, but not in the 360 terms): turf (10 photos),
+alpine (3), insect (3), and one each of alley, baby bottle, black jersey, computer, elk,
+fog, fox, golden hour, halloween, hike, marmot, medicine bottle, overcast, reflection,
+statue, stroller, vest. "turf" alone is in 10 of 70 photos (every artificial-turf
+soccer field). Worth adding before the next re-tag.
+
+## Final per-pass models (2026-10-03)
+
+| pass | model | was |
+|---|---|---|
+| describe | qwen/qwen3.5-9b | qwen2.5-vl-7b (fallback) |
+| verify | google/gemma-4-12b-qat | qwen2.5-vl-7b (fallback) |
+| category-visual | minicpm-v-4_5 | qwen2.5-vl-7b |
+| category-content + keywords | google/gemma-4-12b-qat | llama-3.2-3b |
+| aesthetics | qwen2.5-vl-7b-instruct | unchanged (tie) |

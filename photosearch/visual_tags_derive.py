@@ -108,7 +108,10 @@ PERCEIVED_VOCABULARY: list[str] = [
 #: situation each over-applied term needs — see `describe._build_visual_prompt`.
 #: Must partition PERCEIVED_VOCABULARY exactly (pinned by a test).
 PROMPT_SECTIONS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
-    ("LIGHT AND WEATHER - use when it is the obvious character of the light:",
+    ("LIGHT AND WEATHER - use when it is the obvious character of the light. "
+     "A photo taken INDOORS or under lamps, gym lights or flash has none of "
+     "these except backlit, silhouette, harsh-light, soft-light or "
+     "overexposed:",
      (("sunny", "overcast", "golden-hour", "backlit", "silhouette",
        "harsh-light", "soft-light", "overexposed", "foggy", "hazy", "snowy"),)),
     ("COLOUR:",
@@ -121,7 +124,9 @@ PROMPT_SECTIONS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
 )
 
 #: Sections whose terms sit on the header line rather than underneath it.
-_INLINE_SECTIONS = frozenset({"COLOUR:"})
+#: Empty since COLOUR's terms gained definitions (2026-10-09) — too long for
+#: the header line. The mechanism stays for a short, gloss-free section.
+_INLINE_SECTIONS: frozenset[str] = frozenset()
 
 #: Definitions rendered beside a term. These are NOT tidy 3-6 word glosses any
 #: more: the RARE ones spell out the exact situation the term needs, including
@@ -129,11 +134,19 @@ _INLINE_SECTIONS = frozenset({"COLOUR:"})
 #: short definition was what let `close-up` and `symmetrical` land on photo
 #: after photo. Terms with no entry here are self-explanatory.
 PERCEIVED_GLOSS: dict[str, str] = {
-    "sunny": "direct sunlight, hard shadows on the ground",
-    "overcast": "flat grey sky, no shadows",
+    "sunny": ("outdoors in direct sunlight: the sun casts hard-edged shadows "
+              "you can see; never indoors, never on a grey day"),
+    "overcast": "outdoors under a flat grey sky, no shadows; never indoors",
     "golden-hour": "warm low orange sun at sunrise or sunset",
     "backlit": "the main light is behind the subject, facing the camera",
     "silhouette": "the subject is a black shape against a bright background",
+    "colorful": ("several different strong colours stand out, such as bright "
+                 "clothing, toys, flowers or signs; a dull or mostly one-colour "
+                 "scene is not colorful"),
+    "vibrant": ("colours far more intense and saturated than a normal photo; "
+                "never just because a photo is colorful"),
+    "muted": ("the colours are subdued: darker, greyer shades with little "
+              "contrast between them; a photo can be muted and colorful"),
     "monochromatic": "one hue family throughout",
     "moody": "dark, low-key, brooding",
     "peaceful": "a still, quiet scene with no action in it",

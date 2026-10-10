@@ -70,9 +70,10 @@ def test_saving_one_label_keeps_the_others_and_replaces_its_own():
 
 
 @pytest.mark.parametrize("tag", ["long-exposure", "low-light", "panoramic",  # derived
-                                 "sharp", "blurry",                          # frozen
                                  "motion-blur",                              # retired
                                  "not-a-tag"])
+# sharp / blurry are FROZEN for the model but labellable as MEASURED tags —
+# see the measured-tag tests below.
 def test_non_perceived_tags_are_rejected_in_either_list(tag):
     with pytest.raises(ValueError, match="not perceived"):
         E.save_label(1, [tag], [])

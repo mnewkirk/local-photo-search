@@ -1,6 +1,76 @@
 # Measured sharpness → derived `blurry`
 
-Status: **planned, not started.** Follows `docs/HANDOFF-2026-09-26-sharp-blurry.md`.
+Status: **CLOSED 2026-09-26 — `blurry` gate failed in three rounds (see Round 3); `blurry` and `sharp` stay FROZEN.**
+`blurry` stays FROZEN; step 6 is not started. Follows
+`docs/HANDOFF-2026-09-26-sharp-blurry.md`.
+
+## Step 3 result (2026-09-26)
+
+These are the owner's labels on 120 photos (the 60-photo sharpness sample plus
+the original 60 visual photos): 21 `blurry` and 99 `sharp`, all judged at 100%
+in the loupe. The blind recheck was not done, so there is no self-agreement
+kappa yet. Measured with v1 in `sharpness.py`; 0 decode errors, median 0.23 s
+per photo on the desktop.
+
+**`blurry`: no metric meets the gate.** The gate requires P ≥ 0.8 at R ≥ 0.5;
+the best recall any metric reaches at P ≥ 0.8 is about 0.4.
+
+| signal | best-F1 P / R | R at P ≥ 0.8 |
+|---|---|---|
+| `frame.ten_max` (whole-frame sharpest-tile Tenengrad), 4000 px | 0.59 / 0.62 | ~0.33 |
+| same, native resolution (no upsampling) | 0.65 / 0.62 | 0.33 |
+| `frame.ten_max` at a 1200 px long edge | 0.65 / 0.52 | 0.43 |
+| `score` (headline: best region, noise-corrected Laplacian) | 0.31 / 0.57 | — |
+| any `faces.*` feature | ≤ 0.40 / ≤ 0.19 | — |
+| baseline: stored `blurry` tag | 0.69 / 0.43 | — |
+| baseline: `aes_sharpness ≤ 2` | 0.65 / 0.71 | — |
+
+What this says:
+
+- **The whole frame beats the face and subject regions,** which is the opposite
+  of the design's premise. Face crops are mostly a single tile, and they carry no
+  signal on their own.
+- **The v1 headline score is the worst choice on the list.** Correcting for
+  noise did not help.
+- **Upsampling was not the cause.** Measuring at native resolution moves the
+  numbers by noise-level amounts. Scale does matter, but no single scale clears
+  the gate.
+- **The false positives are low-contrast or low-resolution scenes that are
+  sharp**: iPhone 5s, HTC One, and moody ILCE-6000 frames. Gradient energy does
+  not separate "soft scene" from "soft focus". This is the white-wall failure
+  the generic advice warns about, and the tiling did not fix it.
+- **The measurement does not beat `aes_sharpness ≤ 2` on these labels.** Pixels
+  alone are not the ground truth here either.
+
+**`sharp` saturates.** The owner called 99 of 120 photos sharp, and that is on a
+sample deliberately weighted towards blurry photos. At its best-F1 threshold the
+measurement fires on 95% of them. The plan's rule (retire `sharp` if it fires on
+more than 40% of photos) applies.
+
+**Caveat:** 21 positives is under the 25 the plan asked for, and the night and
+bokeh groups hold 11 and 6 photos, so the per-stratum parts of the gate are
+barely populated. More labels would tighten these numbers. It is unlikely they
+would move R at P ≥ 0.8 from about 0.35 to 0.5.
+
+**Per the plan, only the number ships.** The v33 column and the backfill exist,
+and both are opt-in; nothing derives a tag. The next option the planners agreed
+on is a small model over the stored features plus `aes_sharpness`, trained on
+these labels. It needs roughly 3× more blurry labels to be validated on
+held-out photos.
+
+Step 1 as built: `visual_tag_eval.MEASURED_TAGS` (never scored against a
+model, both directions); `eval_api.LABELLER_NOTES` for `sharp`/`blurry`;
+`PS.Loupe` on `/eval/visual-tags` (click the photo or press `l`: the original
+from `/full` at 1 image px = 1 device px, drag/arrows to pan, `z` for 200%);
+a separate sample under `<eval_dir>/sharpness/` drawn by
+`python evals/visual_tags_eval.py sample-sharpness --db photo_index.db.local`
+(read-only, excludes the visual 60 and HEIC/RAW, which the loupe cannot draw)
+and labelled at `/eval/visual-tags?set=sharpness`; blind recheck at
+`?set=sharpness-recheck` (20 photos) and
+`visual_tags_eval.py agreement --set all`. Every label now records
+`measured` (the chips were shown), because the first 60 visual labels predate
+them — their missing `blurry` is "never asked", not "no", and
+`visual_tag_eval.measured_labels()` skips them until re-saved.
 Produced by a two-planner debate (2026-09-26); both planners converged on every
 point, so there were no owner tie-breaks. The four "decisions to make" from the
 handoff are answered below as **recommendations** — the owner can still overrule
@@ -137,3 +207,80 @@ confirmation is pending.
 | Where it runs | extend `rank_measure` | new `sharpness.py` + maintenance stage + batch step; `rank_measure` untouched | B (recommended, pending owner) | 2026-09-26 |
 | Scope of `sharp` | derive both | derive `blurry` only; label `sharp`; retire it if it fires on >40% or P < 0.8 | B (recommended, pending owner) | 2026-09-26 |
 | Order | code, then eval | labels and eval before any backfill | B (both planners) | 2026-09-26 |
+
+## Round 2 (2026-09-26): 160 labels, and a rule that works in one bucket
+
+The sample was extended with `sample-sharpness --extend 40`, drawing 20 photos
+tagged `blurry` and 20 with `aes_sharpness ≤ 2`. That gives 160 labelled photos,
+48 of them `blurry`.
+
+**Single measured features still fail.** The best is `frame.ten_max`: P 0.75 /
+R 0.69 at best F1, and R 0.50 at P ≥ 0.8.
+
+**Combined with `aes_sharpness`, the model passes on the sample but not on the
+library.** A two-feature logistic regression on `frame.ten_max` +
+`aes_sharpness` was scored out-of-fold (5 folds × 20 repeats). It reaches
+R 0.83 at P ≥ 0.8. But the sample is enriched on `aes_sharpness ≤ 2`, a feature
+the model itself uses. Reweighted by bucket:
+
+| `aes_sharpness` bucket | library | labelled | blurry | flagged / correct |
+|---|---|---|---|---|
+| ≤ 2 | 10,103 | 57 | 39 | 42 / 36 |
+| 3–4 | 17,550 | 22 | 5 | 6 / 4 |
+| ≥ 5 | 130,458 | 81 | 4 | 2 / 0 |
+
+Projected to the library, that is roughly 60% precise. It also misses most
+blurry photos outside the ≤ 2 bucket (9 of 103 labelled photos there are
+blurry, which projects to about 12k photos library-wide).
+
+**Inside the `aes_sharpness ≤ 2` bucket, a two-condition rule holds up.** It is
+checked only on the 28 photos drawn at random from that bucket (the
+`aes-sharpness<=2` strata; the tagged-blurry draws are left out because they are
+biased):
+
+| rule | flags | precision | recall in bucket |
+|---|---|---|---|
+| `aes_sharpness ≤ 2` alone | 28 | 0.54 | 1.00 |
+| … and `frame.ten_max ≤ 4000` | 14 | **0.86** | 0.80 |
+| … and `frame.ten_max ≤ 2000` | 9 | 0.89 | 0.53 |
+
+`aes_sharpness ≤ 2` alone reproduces the original 2-of-4 hand check (0.54). The
+measured Tenengrad removes most of its false positives: the sharp, low-texture
+or noisy frames the VLM marked down. So each signal fixes the other's failure,
+which neither one does alone.
+
+Caveats:
+
+- 12 of 14 correct has a 95% interval of roughly 0.6–0.97.
+- The rule only speaks inside a bucket of about 10k photos. It would tag about
+  5,000 photos and stay silent on the rest, so it is a high-precision "clearly
+  blurry" tag, not full coverage.
+
+## Round 3 (2026-09-26): the in-bucket rule did not hold up — `blurry` stays FROZEN
+
+Another 40 photos were drawn at random from `aes_sharpness ≤ 2` and labelled by
+the owner. That gives 68 random photos from that bucket, 32 of them blurry, so
+`aes_sharpness ≤ 2` alone is 0.47 precise.
+
+| `frame.ten_max` ≤ | all 68: P [95% CI] / R | only the 40 new (a true holdout): P / R |
+|---|---|---|
+| 2000 | 0.77 [0.57–0.90] / 0.53 | 0.69 / 0.53 |
+| 4000 (the round-2 pick) | 0.68 [0.51–0.81] / 0.72 | **0.55** / 0.65 |
+| 6000 | 0.68 [0.52–0.80] / 0.84 | 0.60 / 0.88 |
+
+The round-2 figure of 0.86 was optimistic: the threshold had been picked on the
+same 28 photos it was scored on. On photos it had never seen, the rule is about
+0.55–0.70 precise. No threshold reaches the 0.8 bar with useful recall.
+
+**Decision: the plan's fallback.**
+
+- `blurry` stays FROZEN.
+- No derivation, no step 6.
+- The v33 column and the opt-in backfill stay, unused.
+
+What's left for anyone reopening this: 208 hand labels (60 visual + 140
+sharpness, 80 blurry) in `evals/visual-tags/`, and the measurement cache beside
+them. A new signal can be scored against them with `evals/sharpness_eval.py`
+without labelling anything again. The evidence is that gradient energy cannot
+tell a soft scene from soft focus, even inside the bucket the VLM already
+suspects.

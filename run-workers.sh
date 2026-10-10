@@ -82,7 +82,7 @@ TTL=30
 MEM_LIMIT="3g"
 FORCE=""
 STAY_ALIVE=""
-SEQUENTIAL=""
+SEQUENTIAL="1"   # default: drain each pass fully before the next; --round-robin clears it
 DESCRIBE_MODEL=""
 TAGS_MODEL=""
 VERIFY_MODEL=""
@@ -178,7 +178,9 @@ Start workers:
                           retires when its queue is empty and workers exit when
                           all are done)
       --sequential        Drain each pass fully before the next, in -p order
-                          (default: round-robin one batch per pass)
+                          (the default)
+      --round-robin       Claim one batch per pass per cycle instead of draining
+                          each pass in turn
       --force             Clear existing data and reprocess
       --describe-model M  Ollama model for describe (default: llama3.2-vision)
       --tags-model M      (legacy — the tags pass was removed; ignored by the worker)
@@ -861,6 +863,7 @@ while [[ $# -gt 0 ]]; do
         --force)            FORCE="1";             shift ;;
         --stay-alive)       STAY_ALIVE="1";        shift ;;
         --sequential)       SEQUENTIAL="1";        shift ;;
+        --round-robin)      SEQUENTIAL="";         shift ;;
         --describe-model)   DESCRIBE_MODEL="$2";   shift 2 ;;
         --tags-model)       TAGS_MODEL="$2";       shift 2 ;;
         --verify-model)     VERIFY_MODEL="$2";     shift 2 ;;
@@ -1020,7 +1023,9 @@ for _p in "${PERSONS[@]}"; do WORKER_CMD+=(--person "$_p"); done
 [ -n "$STYLE_TAG" ]    && WORKER_CMD+=(--style-tag "$STYLE_TAG")
 [ -n "$FORCE" ]        && WORKER_CMD+=(--force)
 [ -n "$STAY_ALIVE" ]   && WORKER_CMD+=(--stay-alive)
-[ -n "$SEQUENTIAL" ]   && WORKER_CMD+=(--sequential)
+# Always explicit: --sequential is understood by every worker image, while
+# --round-robin (only sent when asked for) needs a worker from this change on.
+if [ -n "$SEQUENTIAL" ]; then WORKER_CMD+=(--sequential); else WORKER_CMD+=(--round-robin); fi
 [ -n "$DESCRIBE_MODEL" ]   && WORKER_CMD+=(--describe-model "$DESCRIBE_MODEL")
 [ -n "$TAGS_MODEL" ]       && WORKER_CMD+=(--tags-model "$TAGS_MODEL")
 [ -n "$VERIFY_MODEL" ]     && WORKER_CMD+=(--verify-model "$VERIFY_MODEL")

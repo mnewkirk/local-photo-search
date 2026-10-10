@@ -22,7 +22,15 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 32 (`SCHEMA_VERSION` in `db.py` is the source of truth). Key tables: photos, faces,
+File is `photo_index.db` (not `photos.db`). Schema version 34 (`SCHEMA_VERSION` in `db.py` is the source of truth).
+v34 is indexes only (`db._SEARCH_INDEXES`; `docs/plans/search-indexes.md`):
+camera+date, file_hash, covering tag composites, NOCASE location, /map GPS,
+quality expression indexes, worker-count partials, faces `(photo_id, person_id)`
+/ `(person_id, photo_id)`. Expression/partial indexes match the query TEXT —
+`tests/test_search_indexes.py` EXPLAINs the SQL production runs, so keep those
+expressions verbatim. `search_combined` composes date/camera/people into one id
+scope (`_compose_scope`) before running the other filters, instead of running
+each over the whole library and intersecting in Python. Key tables: photos, faces,
 persons, face_references, face_person_exclusions, collections, collection_photos,
 photo_stacks, stack_members, stacking_seen, review_selections, google_photos_uploads,
 ignored_clusters, generations, schema_info, ingest_sweeps, ingest_batches,
@@ -142,6 +150,68 @@ The durable fix is a **SQLite R-tree** instead of an in-memory KDTree — ~0
 resident memory, no per-process load, and all 6.58M rows retained (so the
 population gate could go away). `rtree` is already compiled into the SQLite on
 both machines. Plan: `docs/plans/geocode-rtree.md`.
+
+## API request timing log
+
+Every `/api/*` request is appended as one JSON line (ts, method, path, query,
+status, ms, client) to `request_log.jsonl` **beside the DB**:
+`/data/request_log.jsonl` on the NAS and `./request_log.jsonl` on the replica.
+The container's stdout log is discarded on every redeploy, so this file is the
+only lasting record of how real requests performed. It rotates at 20 MB with 5
+backups. Set `PHOTOSEARCH_REQUEST_LOG` to a path to move it, or to `0` to turn
+it off; the test suite turns it off in `conftest.py`. Writes go through a
+queue to a background thread, so a starved disk never stalls a request. A
+logging failure never fails the request. For SSE endpoints (`"streaming": true`),
+`ms` is the time to the response headers, not to the end of the stream.
+
+```bash
+$DC run --rm photosearch request-stats [--last 500] [--since 2026-10-05] [--include-polling] [--slowest 10]
+./.venv/bin/python cli.py request-stats --db photo_index.db.local   # replica
+```
+
+Page polling (`/batches`, maintenance status, worker queues) and the worker
+fleet's own traffic are hidden unless `--include-polling` is given.
+
+**Every line says who made the request and why** (`photosearch/request_intent.py`):
+
+- `source`: an `X-Photosearch-Source` header wins. Otherwise `worker` for
+  `/api/worker/*`, `ui` when the browser sent a `Referer`, `replica` for a
+  `photosearch-*` User-Agent, `script` for any other Python HTTP client, and
+  `other` for anything else.
+- **Calls the replica makes to the NAS are `replica`, with a chained intent.**
+  Every such call site sends `request_intent.outbound_headers(purpose)`. The
+  intent is its own purpose plus the intent of the request that caused it,
+  e.g. `Fetch preview of photo 248304 (not cached on the replica) - for: Review
+  team faces (from the faces page)`. The middleware puts the current request's
+  intent in a contextvar. Background threads and pools do not inherit it, so
+  wrap them in `carry_context` (`web._carry_context` for the SSE threads,
+  face_review's preview pool). A new replica→NAS call must use
+  `outbound_headers`; a new background thread should be started through
+  `_carry_context`. Workers label their session `worker`.
+- `intent`: an `X-Photosearch-Intent` header wins. Next, a handler can set
+  `request.state.log_intent`; `/api/ask` sets it to `Ask: <question>`, and each
+  tool call the agent makes is logged with that intent too (`source: agent`).
+  Otherwise the intent is inferred from the page, the endpoint and its
+  parameters, and the line is marked `intent_inferred`. For example:
+  `Search photos: person Calvin, camera ILCE-7RM6, 2026-09-26 to 2026-09-27
+  (from the search page)`.
+- **MCP tool calls** go to `request_log.mcp.jsonl` (`source: claude-mcp`): the
+  MCP server is a separate process, and two processes must not rotate one file.
+  Every tool advertises an optional `intent` argument. The server instructions
+  ask Claude to fill it in, and it is stripped before the tool runs.
+  `request-stats` merges both files.
+
+**When a Claude session calls the HTTP API itself (curl, scripts), it MUST state
+its intent**, because nothing can infer it:
+
+```bash
+curl -H 'X-Photosearch-Source: claude' \
+     -H 'X-Photosearch-Intent: Time the camera+date search after the v34 deploy' \
+     "http://<nas>:8000/api/search?..."
+```
+
+`request-stats --recent 50` lists recent requests with their source and
+intent. `--source claude` shows only one source.
 
 ## Debugging against the prod DB locally
 
@@ -278,6 +348,32 @@ Worker claims batches via HTTP, downloads photos, processes locally, POSTs resul
 ./run-workers.sh --logs      # tail all workers live
 ./run-workers.sh --stop      # stop all workers
 ```
+Worker log lines are **timestamped** (`worker.install_log_timestamps`, applied
+by `cli.py worker`). The OpenAI-route reachability check
+(`describe.check_available`) now retries ~2.5 min: LM Studio stops answering
+while it JIT-loads a model, and that single un-retried check used to kill a
+worker whose pass started right after its model was ejected.
+
+**Workers drain passes sequentially by default** (since 2026-09-26): each pass
+in `-p` order is drained completely before the next starts, so a new shoot is
+CLIP-searchable before the slow LLM passes begin and model weights aren't
+reloaded every batch. `--round-robin` (cli.py worker, run-workers.sh) restores
+the old one-batch-per-pass-per-cycle interleave; the `/admin/maintenance`
+Sequential checkbox now defaults on.
+
+**Startup probe is `GET /api/health`** (no DB), never `/api/stats`: every
+worker in a fleet probes at once, and `/api/stats` cost 3 × 117 s on a cold NAS
+(2026-10-07). A 404 from an older server counts as reachable. `/api/stats` is
+itself now memoized (`web._cached_stats`, 60 s, stale-while-revalidate: only
+the first request after a start computes inline) and reads `photos` with one
+table scan instead of four (`web._compute_stats`; `tests/test_api_stats_cache.py`
+pins it). The replica card counts NAS photos via `/api/admin/maintenance-fingerprint`.
+Scoped queue counts (`count_unprocessed_photos(photo_ids=...)`, behind
+`/api/worker/status?collection_id=…`) write `+id IN (...)` above 2,000 ids
+(`db._scope_col`) so they drive from the need-index rather than reading one
+`photos` leaf per id (16k-id collection: 19–33 s on the NAS). Checking the
+queue by hand? Pass `passes=` — all nine counts is what was slow.
+
 Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
 (not hostname) — Docker containers can't resolve local DNS names.
 
@@ -602,14 +698,20 @@ would be a second unvalidated decision on top of the first; they stay exactly
 as they are until a **hand-labelled eval** decides. The backfill's before/after
 table therefore shows both at **delta 0**.
 
-**The right long-term source is a native-resolution Laplacian, not a VLM
-score.** That signal already exists for photos WITH faces: `scripts/rank_shoot.py`
-ranks a shoot on native-resolution face-crop Laplacian variance precisely
-because "what separates frames in a sports burst is whether the face is in
-focus", and it insists on the ORIGINAL pixels — a preview or a cached 200 px
-crop has already discarded the signal. `photosearch/rank_measure.py` lifts that
-measurement out of the script. Wire `sharp`/`blurry` to it, with a hand-labelled
-eval, rather than to another model's opinion.
+**A native-resolution Laplacian was tried as the source, and it FAILED**
+(2026-09-26, `docs/plans/sharpness-measurement.md`). The eval used 208
+owner-labelled photos, 80 of them blurry, judged at 100%. It tested
+face-, subject- and frame-tiled Laplacian and Tenengrad, noise-corrected, at
+several scales. No measured feature reached P ≥ 0.8 at R ≥ 0.5. Gradient energy
+cannot tell a soft *scene* from soft *focus*.
+
+The best idea looked good only in-sample: `aes_sharpness ≤ 2 AND
+frame.ten_max ≤ 4000` scored 0.86, but fell to **0.55** on a 40-photo random
+holdout. The labels and the measurement cache are kept in `evals/visual-tags/`,
+so a new signal can be scored with `evals/sharpness_eval.py` without
+relabelling anything. Face-crop Laplacian is still the right *within-shoot
+ranking* signal (`rank_shoot`): comparing frames of one burst cancels the
+scene. It is not a library-wide tag.
 
 **Deliberately NOT derived**, because the EXIF cannot decide them: `macro`
 (needs subject distance / magnification, which is not stored), `aerial` (no
@@ -757,6 +859,17 @@ self-agreement and Cohen's kappa. A tag the owner disagrees with themself on
 (kappa < ~0.4) is not tightly enough defined to score a model against — fix
 the definition (`eval_api.LABELLER_NOTES`), not the prompt.
 
+**Sharpness labels ride on the same page** (`docs/plans/sharpness-measurement.md`
+step 1). `sharp`/`blurry` are `visual_tag_eval.MEASURED_TAGS`: labellable on
+every set, outside `CANDIDATE_TAGS`, and never scored against a VLM variant in
+either direction. They are judged in `PS.Loupe` — the original from `/full` at
+one image pixel per device pixel — never from `/preview`. A separate
+blurry-weighted sample lives in `<eval_dir>/sharpness/` (`sample-sharpness`,
+`?set=sharpness`, `?set=sharpness-recheck`, `agreement --set all`) so drawing
+it never orphans the visual sample. Labels carry `measured: true` once the
+chips were shown; the first visual labels do not, and `measured_labels()`
+skips them — a missing `blurry` there means "never asked".
+
 **Second set — Unsplash recall** (`evals/visual_tags_unsplash.py`): the
 Unsplash Research Dataset Lite's PHOTOGRAPHER-supplied keywords as positives
 (up to 40 photos per tag from the 25k local thumbs in
@@ -880,15 +993,55 @@ chosen by **role** env var (not by model name):
 | category-visual | `visual` | `PHOTOSEARCH_LLM_VISUAL_MODEL` |
 | category-content / keywords | `text` | `PHOTOSEARCH_LLM_TEXT_MODEL` |
 
-`run-workers.sh` has no flag for these — `export` them before a `--native`
+**The fleet's per-pass models live in one place: `rerun.FLEET_ROLE_MODELS`**,
+chosen by the model evals (`docs/plans/model-eval-harnesses.md`). As of
+2026-10-02: **describe `qwen/qwen3.5-9b`**, **verify `google/gemma-4-12b-qat`**,
+**visual `minicpm-v-4_5`**, aesthetics `qwen2.5-vl-7b-instruct`, **text
+(category-content + keywords) `google/gemma-4-12b-qat`**. The web-UI fleet (`admin_api._fleet_env`, used by
+`/admin/maintenance` and `/batches`) **sets every role explicitly** from it; override
+one role with `PHOTOSEARCH_FLEET_<ROLE>_MODEL`. It used to `setdefault` from the
+server's `PHOTOSEARCH_LLM_VISUAL_MODEL`, which the replica sets for rerank. So from
+2026-09-20 to 09-28, describe, verify, visual and aesthetics **all ran on
+qwen2.5-vl-7b**, not the per-role models this section used to list (visible in
+`generations.model_used`). `run-local-replica.sh` now exports the same role models
+for its in-server re-runs, and rerank/photobook read **`PHOTOSEARCH_LLM_RERANK_MODEL`**
+first (still qwen2.5-vl), so changing the visual pass doesn't move them.
+
+**Each pass unloads its model from LM Studio when it drains**
+(`worker._release_llm_models` → `describe.unload_openai_models`, LM Studio's
+`/api/v1/models/unload`). LM Studio never evicts a JIT-loaded model on its own,
+so before this a full fleet run ended with every role model resident at once
+(2026-10-04: qwen2.5-vl, qwen3.5-9b, minicpm and gemma, all at 16k context, on
+one 24 GB card). Rules: a model the **next** pass shares stays (gemma serves
+category-content → keywords → verify); a model **another worker** still holds a
+live claim on stays — so the last worker out unloads; a failed status call or
+the Ollama route unloads nothing. Needs LM Studio **JIT loading on** — the next
+request reloads whatever was unloaded (incl. the replica's rerank / Ask models).
+
+**A model loaded while VRAM was full STAYS spilled.** LM Studio places a model's
+layers when it loads and never rebalances, so a model JIT-loaded behind three
+others is partly on CPU for life. 2026-10-04: gemma-4-12b ran at **3 t/s**, every
+`category-content` call blew the 10 s cap even with reasoning off; unloading it
+(`POST :1234/api/v1/models/unload {"instance_id": …}`) and letting JIT reload it
+into empty VRAM gave **17 t/s** under 3 concurrent workers, ~3 s/photo. Symptom:
+text passes all `deferring (timeout/error)` with `reasoning_tokens` 0.
+
+**A model the fleet JIT-loads needs an LM Studio per-model context default**
+(`%USERPROFILE%\.lmstudio\.internal\user-concrete-model-default-config\…json`,
+`llm.load.contextLength`). Otherwise it loads at 4096, split across 4 parallel
+slots, and vision requests 400. Set to 16384 for gemma-4-12b-qat and minicpm-v-4_5.
+
+`run-workers.sh` has no flag for these — `export` them before a hand-run `--native`
 launch (the native launcher inherits exported env):
 
 ```bash
 export PHOTOSEARCH_TEXT_LLM_URL=http://<host>:1234/v1
 export PHOTOSEARCH_LLM_DESCRIBE_MODEL=qwen/qwen3.5-9b
-export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-e2b
-export PHOTOSEARCH_LLM_VISUAL_MODEL=google/gemma-4-e2b
-export PHOTOSEARCH_LLM_TEXT_MODEL=llama-3.2-3b-instruct
+export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-12b-qat
+export PHOTOSEARCH_LLM_VISUAL_MODEL=minicpm-v-4_5
+export PHOTOSEARCH_LLM_AESTHETICS_MODEL=qwen2.5-vl-7b-instruct
+export PHOTOSEARCH_LLM_TEXT_MODEL=google/gemma-4-12b-qat
+export PHOTOSEARCH_LLM_REASONING_EFFORT=none   # REQUIRED for gemma-4 / minicpm, see below
 ./run-workers.sh --native -s http://<NAS-IP>:8000 \
     -p clip,faces,quality,describe,category-content,category-visual,keywords,verify -n 2
 ```
@@ -901,6 +1054,16 @@ gemma-4-26b-a4b (2026-09-21): 765 of 768 tokens reasoning, empty content,
 _openai_chat_with_retry` adds `reasoning_effort` to the request (3.6 s, real
 answer). `chat_template_kwargs.enable_thinking=false` did nothing on LM
 Studio. Unset by default so backends that reject unknown fields never see it.
+**The fleet's role models are thinking models too** — gemma-4-12b-qat (text,
+verify), minicpm-v-4_5 (visual), qwen3.5-9b (describe) — and the evals that
+chose them all ran with `none`. The UI fleet (`admin_api._fleet_env`) now sets it
+from `rerun.FLEET_REASONING_EFFORT`, and `run-local-replica.sh` exports it. On
+2026-10-03 it was missing: gemma took 70 s per text call (297/300 tokens
+reasoning, `''` back), so every `category-content` call hit the 10 s cap and
+deferred forever (0 of 1,259, no attempt spent, no error logged); minicpm ran
+out of `max_tokens` mid-thought (`finish_reason=length`) on 307 photos and
+retired them `blocked` with **no `index_errors` row** — the "no usable answer"
+path. Symptom: `category-*` blocked or stuck "running" with `done` flat.
 
 This was adopted because Ollama proved unstable on a single 24 GB AMD GPU
 (`model runner has unexpectedly stopped` under VRAM contention). LM Studio
@@ -908,6 +1071,227 @@ caveats: enable JIT loading + max-loaded-models ≥3 + TTL off, and **raise each
 model's context length above the 4096 JIT default** (LM Studio splits context
 across parallel slots, so a vision describe request 400s with `Context size has
 been exceeded`; qwen3.5-9b→16384, gemma→8192 worked).
+
+### Model evals for every LLM pass (`/eval/models`)
+
+`docs/plans/model-eval-harnesses.md` (plan + runbook). Harnesses:
+`evals/aesthetics_bakeoff.py`, `describe_eval.py`, `text_passes_eval.py`,
+`verify_eval.py`, `model_eval_summary.py`; storage in `photosearch/model_eval.py`
+(files under `PHOTOSEARCH_MODEL_EVAL_DIR`, default `./evals/model-evals`,
+git-ignored); owner labelling on `/eval/models` (`model_eval_api.py`, local-only).
+Production is to run **one model loaded at a time, passes in sequence** (owner
+decision 2026-09-26), so winners are picked per role.
+
+Traps these exist to catch — don't undo them:
+
+- **`--model` must PIN the role env var** (`model_eval.pin_role_model`). On the
+  LM Studio route the call-site name is ignored and the vision roles fall back
+  to `PHOTOSEARCH_LLM_VISUAL_MODEL` (since `4cfc202`, 2026-07-10). The
+  2026-07-09 aesthetics "qwen ρ 0.70" predates that fallback and IS qwen's —
+  verified from file times vs git history; it reports as `legacy:` only because
+  scores.json records no effective model.
+- **Production turns transport failures into answers**: `describe_photo` →
+  None, `llm_verify_description` → `[]` (== ALL CORRECT), the text extractors →
+  None. Every harness wraps the call in `model_eval.Recorder`, which raises
+  `TransportError` (never cached) when the LAST call errored. A text call that
+  timed out on every attempt IS cached, as `deferred` — that is what production
+  does at the 10 s limit.
+- **Retries hide timeouts and truncation**: `describe._ATTEMPT_HOOK` (None in
+  production, exceptions swallowed) reports each attempt's outcome and
+  `finish_reason`.
+- **Labels are keyed by `text_sha`, never by variant**, so the page is blind by
+  construction (a test asserts no variant/model name in any response).
+- **Verify's pipeline lives in `verify.check_description`** (extracted from
+  `worker._process_verify`, parity-tested); `llm_all=True` is the pure-model mode.
+  The verify model must not be the describe model — `run` refuses.
+- Pixels come from a local **originals cache** (`fetch-originals`), so neither a
+  run nor the labelling page depends on the NAS staying up.
+
+### A new description re-queues what was derived from it
+
+category-content and keywords are extracted FROM `photos.description`, and
+verify checks it. Until 2026-10-04 the fleet ran **verify last**, so each verify
+rewrite (~16% of a batch) left categories/keywords extracted from text verify
+had just judged hallucinated — **13,637 photos** library-wide. Three fixes:
+
+- **Pass order** (`batch_state.WORKER_PASSES` = `rerun.ALL_PASSES` =
+  `worker_api._ALL_PASSES`, mirrored in `batch-flow.js`): `… describe, verify,
+  category-content, keywords, category-visual`. `/workers/start` sorts any
+  hand-picked `-p` into it. Also one load per model: qwen3.5 → +gemma → gemma →
+  minicpm. `DEPENDS_ON` is unchanged (text passes still wait on `describe`, not
+  `verify`), so a blocked verify never starves them.
+- **The server re-queues on every description write**
+  (`PhotoDB.invalidate_description_dependents`): a describe result NULLs
+  categories/keywords/verification + their ledger rows; a verify rewrite NULLs
+  categories/keywords only (its own verdict is the result). Order alone is not
+  enough — workers overlap at a pass boundary, and M28's re-run checks
+  `describe` or `verify` → auto-selects the text passes too. **Server-side:
+  deploy the NAS.**
+- **Verify no longer re-tags.** The rewrite path ran the visual tagger into the
+  legacy `tags` column (NULL since v23, read by nothing current), which also
+  pulled minicpm into VRAM beside gemma + qwen3.5. `visual_tags` come from the
+  pixels, so a rewrite doesn't stale them. An older worker's `tags` field is
+  ignored.
+
+**Historical cleanup — `photosearch stale-description-passes`**
+(`photosearch/stale_descriptions.py`). Dry run (read-only) reports, per pass,
+photos whose output predates the current description, from `generations`
+timestamps. `--folder` / `--collection` scope it; `--save-collection` queues
+the set as a collection; `--requeue` clears exactly the stale pass per photo
+(chunked commits). Run writes **on the NAS**. Traps it handles: `created_at`
+comes as both `…T…` and `… …` (normalized); `verified_at` is worker-local while
+generations are UTC — read zone-less stamps as Pacific (exact for every
+fleet stamp since May, measured off the ~14k rewrite anchors; the lone UTC era,
+the 2026-04-12 NAS run, gets the later reading so it can never be flagged
+wrongly). **Not a margin**: verify runs within the hour of describe, so any
+slack wide enough to absorb the offset also hides real re-describes. New stamps
+are explicit UTC (`worker._utc_stamp`, `…Z`);
+output with no generation row predates logging and is counted, never flagged
+(1,128 categories).
+
+**It also reads the content.** Keywords are extracted from the description, so
+their words should be in it (`keyword_match_ratio`, possessives/plurals/stopwords
+folded). Timestamp-current photos: 92% match >= 90%, 99.8% >= 50%; below 50%
+(`KEYWORD_MATCH_MIN`) is a real defect, not paraphrase — on 2026-10-04, 286
+photos the timestamps missed: whole keyword list stored as ONE string, a
+refusal stored as keywords ("i couldn't find any text…"), etc. A mismatch
+re-queues keywords AND categories (same source text). Categories get no content
+check of their own — they're a fixed vocabulary, not the description's words.
+A mismatch caused by a **cut-off description** is reported but not re-queued
+(re-extracting from the same truncated text repeats it); the report also counts
+all mid-sentence descriptions (4,350) — those need a re-describe.
+
+### Bad LLM output is a failure, not a result
+
+Every LLM pass used to store whatever came back. Neither backend's stop reason
+was read, so a generation cut off at the token limit was stored as a finished
+answer: **4,350** live descriptions end mid-sentence (llava at `num_predict`
+150, qwen3.5 with reasoning on eating `max_tokens`). Keywords held refusals and
+unsplit lists, and llama3.2's category answers recited the vocabulary
+(53-232 tags). Each looked like a success until a later audit.
+
+- **Both chat helpers read the stop reason** (`finish_reason` / `done_reason`
+  == `"length"`), retry **once at double the budget**, then raise
+  `describe.TruncatedOutput`. An **empty** answer cut off mid-reasoning is a
+  truncation too.
+- **Per-role `max_tokens`** on the LM Studio route (`_OPENAI_MAX_TOKENS`:
+  describe/verify 512, text 256, visual 128, others 768). It used to be a flat
+  768 for everything.
+- **Answer guards** raise `describe.UnusableAnswer` after one retry
+  (temperature 0.4):
+  - describe: cut off, repetition loop, or ends mid-sentence
+    (`ends_mid_sentence` = `stale_descriptions.is_truncated`). A degenerate
+    answer is no longer returned as a last resort.
+  - category-content: empty, nothing in the vocabulary, or **more than 60**
+    categories.
+  - keywords: refusal, a whole list as one keyword (> 5 words), more than 30
+    keywords, or under `KEYWORD_MATCH_MIN` of them using the description's
+    words.
+  An explicit `none` is still a real empty result.
+- **The worker turns `UnusableAnswer` into a failure row**: one attempt spent
+  and an `index_errors` entry, nothing written. Describe and category-visual
+  opt in with `raise_unusable=True`; other callers still get `None`. Text
+  passes used to **defer** these, retrying forever at no cost, or store them.
+  A transport stall still defers.
+- **A timeout on the double-budget retry is a truncation, not a stall**
+  (`_expanded_retry`). The first call already proved the answer overruns. On
+  2026-10-06, gemma looped `railing, railing, …` at temperature 0 on one photo
+  (IMAG2074). The 512-token retry overran the 10 s text cap, read as a stall,
+  and the photo was re-claimed ~90 times in 1.5 h with no attempt spent. Now
+  it spends attempts, and the 0.4 retry escaped the loop on attempt 3.
+  Connection errors on that retry are still transport.
+- **A cut-off verify verdict propagates** instead of returning `[]` (which
+  reads as ALL CORRECT and stamps the photo verified).
+- The eval `Recorder` records a truncation as `unusable`: a model outcome to
+  cache, not a `TransportError`.
+
+**The category cap is 60, not ~12, on purpose.** gemma-4-12b (the fleet text
+model) averages **25.7** categories and peaks at 52, and they are accurate,
+just exhaustive. A cap near the library median (5) would fail nearly every
+gemma answer. **Owner decision 2026-10-07: the long lists and some
+near-duplicates (grass / grassy field) are fine.** Leave the prompt and the
+vocabulary as they are.
+
+Worker-side only, since the server already handles `failures`: restart the
+fleet to pick it up. Tests: `tests/test_text_pass_safeguards.py`.
+
+**Collapse across a shoot is flagged, not gated** (`photosearch/visual_collapse.py`).
+A per-photo guard cannot see category-visual stamping one set on a whole shoot
+(2026-10-03: 1,211 of 1,260 photos `colorful, sunny, vibrant`). The flag fires
+when a folder has at least 50 tagged photos and its commonest set covers at
+least 50% (the p90 of 540 folders; the median is 24%). Stored `'[]'` is not
+counted. 59 folders library-wide trip it.
+- `/batches`: the category-visual node shows `⚠ N% share one tag set`, with the
+  set in the tooltip. Every step row now carries `warning` / `warning_detail`
+  (null except here), and category-visual also carries `collapse` stats. The
+  step's state is unchanged, because the pass did finish. Shows on the replica
+  only once the NAS runs this code (`/api/batches` proxies).
+- `photosearch visual-tag-collapse [--folder 2026] [--save-collection
+  [--top-set-only]]` lists collapsed folders worst-first, read-only. The
+  collection is a targeted re-run cohort; save it on the NAS.
+
+**Re-tagging a flagged folder with minicpm does not fix it** (probe on
+2026-10-07, 24 photos across three flagged folders, read against the photos).
+minicpm-v-4_5, the fleet visual model, collapses to its own default set,
+`sunny, colorful, vibrant`. It put that on indoor gym futsal and on an indoor
+classroom party.
+- **qwen2.5-vl** half-fixes it: it answered `[]` on most of the gym shots but
+  still called classroom shots `sunny`.
+- **gemma-4-26b-a4b** was right on all three folders: `[]` on the gym,
+  `golden-hour, soft-light` at dusk. It is ~5.7 s/photo vs ~1 s for minicpm.
+- **2026-10-03 itself is NOT a failure.** All three models agree on
+  `sunny, colorful(, vibrant)` for a bright match in neon kits, so it is a
+  legitimately uniform shoot (the flag's known false-positive case).
+
+**The prompt now rules the attractor set out (2026-10-09)**, so minicpm stays
+the fleet's visual model. `sunny` and `overcast` say "never indoors", the LIGHT
+header says indoor or lamp-lit photos get no weather tag, and `colorful`,
+`vibrant` and `muted` got definitions. Measured on minicpm (variant D,
+`evals/prompts/visual_attractor_d.txt`, eval run `attrD-minicpm`):
+- **Collapse probe** (`2026-01-24` gym, `2025-10-31` classroom, `2026-10-03`
+  control): gym went from `sunny, colorful, vibrant` on 12 of 12 frames to 0
+  `sunny`. The classroom's remaining `sunny` frames are the outdoor costume
+  parade. The control kept `sunny` on 8 of 8.
+- **60 owner labels**: false positives 82 -> 58, precision 0.54 -> 0.63,
+  recall unchanged at 0.56. `vibrant` fp 30 -> 10, `sunny` fp 13 -> 3 at
+  recall 0.96, `muted` recall 0.23 -> 0.54.
+
+Variants that lost, and why (don't reintroduce them without re-running both
+the probe and the eval):
+- **B**: a blanket "most photos have NO colour tag" rule. Precision 0.61 but
+  recall 0.49, mostly `colorful` (0.95 -> 0.68).
+- **C**: D plus the labeller definitions of `harsh-light` and `soft-light`.
+  Recall 0.58, but `sunny` fp went back up to 11 and the gym got 3 `sunny`.
+  The `harsh-light` text ends "...is just sunny", which seems to steer the
+  model toward `sunny`. `soft-light` recall barely moved (0.14 -> 0.21):
+  minicpm rarely uses it whatever the definition.
+
+Photos tagged before this keep their old tags. Re-tag a flagged folder with
+`clear-pass category-visual` and the fleet.
+
+**Done 2026-10-07/08 with gemma-4-26b as a one-off** (owner decision; the fleet
+default stays minicpm). NAS collection 58 held 16,276 photos in 58 folders,
+excluding 2026-10-03. The run took ~23 h at ~4.5 s/photo with 3 workers.
+Results:
+- 0 failures, all 183 frozen tags kept.
+- 4,726 photos now hold `[]`.
+- Flagged folders went from 59 library-wide to 19.
+- The rest are genuinely uniform shoots: an outdoor graduation in full sun,
+  `vibrant` neon kits in the gym, EXIF-derived overnight `long-exposure`.
+- gemma over-uses `soft-light`, e.g. on hard midday shadows.
+
+Clearing a folder also used to delete its frozen `sharp`/`blurry`: the re-tag
+carried them over from the column `clear-pass` had just nulled. They are now
+stashed first (`db.stash_frozen_visual_tags`, on-demand table
+`visual_frozen_carry`) and read back by the write when the column is NULL.
+
+**Cut-off descriptions already stored** (4,333 on 2026-10-06; re-described
+2026-10-06/07 as NAS collection 57: 0 cut off afterwards, 207 rewritten by
+verify, categories now 17 per photo on average, 3 failure rows in total):
+`stale-description-passes --save-truncated` saves them as a collection and
+clears nothing. Then `clear-pass describe` on that collection and run the fleet
+with `-p describe,verify,category-content,keywords`. Each new description
+re-queues its derived passes server-side.
 
 ### Provenance: log the model that RAN, not the one configured
 
@@ -987,17 +1371,56 @@ shape (`describe`, `tags`, `category-content`, `category-visual`, `keywords`,
 
 An attempt is now spent only when the result was **persisted**, or when the
 **worker** reported a genuine per-photo outcome. The deliberate semantics are
-unchanged and must stay: a photo with no faces, no description, or an empty
-tag list is *done* in one pass (`'[]'` is written), and a worker-side timeout
-defers by being omitted from the payload entirely.
+unchanged and must stay: a photo with no description or an empty tag list is
+*done* in one pass (`'[]'` is written), and a worker-side timeout defers by
+being omitted from the payload entirely.
+
+**Worker-reported failures are a separate `failures` list** on the submit
+payload (`FailedResult{photo_id, error}`), built by `worker._submit_kwargs`
+from `_failure_row`s. Each spends ONE attempt, writes no column, and is logged
+to `index_errors` — so a poison photo (an unloadable image, a detection or
+verification that raises every time) is retired by the cap instead of being
+re-claimed forever. It is deliberately NOT folded into the per-pass rows: an
+older server ignores the unknown field and behaves as before, whereas
+`aesthetic_score=None` would 422 an old `QualityResult` and a verify
+`status="error"` row would be written as a real verification. Timeouts /
+network errors (`worker._TRANSIENT`) are still omitted, never reported.
+
+**`quality` and `verify` are on the ledger now.** Their claim/count
+predicates carry the same `attempts >= MAX_PROCESS_ATTEMPTS` exclusion as the
+other passes (`db._QUALITY_NOT_EXHAUSTED` / `_VERIFY_NOT_EXHAUSTED`; quality
+keeps its either-column self-heal), `submit_results` marks both processed, and
+`clear-pass` deletes their ledger rows. Before, the worker silently dropped a
+photo it could not score or verify and nothing recorded it; a quality photo
+whose concept analysis failed rewrote its score and stayed claimable — both
+infinite re-claims. Existing libraries have no quality/verify ledger rows, so
+deploying changes nothing until a photo actually fails.
+
+**A clean empty `faces` result is TERMINAL.** `submit_results` marks it with
+`db.mark_processed(..., terminal=True)`, which sets `attempts` straight to
+`MAX_PROCESS_ATTEMPTS` (never lowering a higher count; no schema change). It
+used to be `+1`, so every photo with nobody in frame was detected three times —
+67,853 such photos, ~136k wasted InsightFace runs. This is only safe because
+the worker no longer sends `faces: []` for a detection **exception**: that is
+now a failure row (one attempt, still retried). A non-empty result is
+unchanged. The in-process `index.py` faces writers (directory + collection
+mode) follow the same contract — terminal on empty, one attempt on an error,
+skip exhausted photos, and `--force-faces` clears the ledger.
+
+**Deploy the server and the workers together.** A worker older than this
+change still sends `faces: []` on a detection error, which the new server
+reads as "nobody here" and retires in one shot — a transiently-failing photo
+would lose its two retries (recover with `clear-pass faces` on the affected
+scope). The reverse (new worker, old server) is safe but uncapped: the old
+server ignores `failures`, so a failing photo is re-claimed as it always was.
 
 Deferral is for a **transient lock only** — `_is_transient_db_error`: a
 `sqlite3.OperationalError` whose message mentions "locked" or "busy".
 **Do not widen this back to a bare `except Exception`.** Deferring every
 error uncaps the pass: a deterministically-failing photo never reaches
 MAX_PROCESS_ATTEMPTS, is re-claimed every TTL forever, and pays for a model
-run each cycle — the pathology documented below for the un-capped `clip`
-claim. (The first version of this fix did exactly that; review caught it.)
+run each cycle — the pathology documented below for the formerly un-capped
+`clip` claim. (The first version of this fix did exactly that; review caught it.)
 `faces` is the worst case, because its predicate is
 `NOT EXISTS(faces) AND attempts < MAX` with no column to heal it and a
 malformed payload (short bbox, missing `encoding`, non-512 vector) raises
@@ -1039,15 +1462,29 @@ $DC photosearch cleanup-orphans [--dry-run]
 
 ## Non-image rows & the clip-claim infinite re-claim
 
-CLIP is the **only** worker pass with no `worker_processed.attempts >=
-MAX_PROCESS_ATTEMPTS` cap — the claim/count predicates (`db.py
-get_unprocessed_photos`/`count_unprocessed_photos`) just check
-`id NOT IN (SELECT photo_id FROM clip_embeddings)`, and the clip branch of
-`worker_api.submit_results` never calls `mark_processed`. So a photo that can't
-be loaded leaves *no trace* (no embedding, no attempts row) and is re-claimed
-every TTL forever. SQLite returns the claim set in rowid order, so the same
-unloadable rows sit at the front of every claim — workers churn at ~290% CPU
-and `queue_depth.clip` never reaches 0 ("workers won't drain").
+**FIXED — clip is on the attempts ledger now.** It used to be the only worker
+pass with no `worker_processed.attempts >= MAX_PROCESS_ATTEMPTS` cap: the
+claim/count predicates just checked `id NOT IN (SELECT photo_id FROM
+clip_embeddings)`, the clip branch of `worker_api.submit_results` never called
+`mark_processed`, and the worker silently skipped an image it could not load.
+So such a photo left *no trace* and was re-claimed every TTL forever. SQLite
+returns the claim set in rowid order, so the same unloadable rows sat at the
+front of every claim — workers churned at ~290% CPU and `queue_depth.clip`
+never reached 0 ("workers won't drain").
+
+Now: both predicates carry `db._CLIP_NOT_EXHAUSTED`; `worker._process_clip`
+reports a photo `embed_images_stream` skipped as a failure row (the shared
+`failures` list); the server spends one attempt per failure (and per non-lock
+write error — a malformed vector), defers only a transient lock, and after
+three tries the photo stops being claimed and its batch reads `blocked`. A
+**successful** embedding is still its own marker and writes no ledger row
+(clip is the highest-volume pass; a row per photo on the N100 buys nothing).
+`clear-pass clip` deletes the clip ledger rows along with the embeddings, so a
+re-embed starts clean. Same deploy note as the other passes: an old worker
+never sends `failures`, so against it clip stays uncapped until the fleet is
+updated. Tests: `tests/test_worker_attempts_cap.py`.
+
+The rows are still worth removing rather than leaving capped:
 
 The usual culprit: files whose extension lies about their content — iOS Live
 Photo / motion bundles saved as `IMG_xxxx(1).JPG` that are actually **ZIP
@@ -1420,11 +1857,18 @@ along with `photos/`).
 ## Adding Features
 
 - **New CLI command:** Add to `cli.py`, always include `envvar="PHOTOSEARCH_DB"` on `--db`
-- **New search type:** `search.py` → `search_combined()` → `web.py` param → `index.html` UI
+- **New search type:** `search.py` → `search_combined()` → `web.py` param → `index.html` UI.
+  Take `scope=None` and apply `_scope_clause` so the filter runs over the composed id
+  scope, push dates into SQL with `_date_bounds`, count it in `n_structured`, keep
+  people-only `narrow` mode correct (`_NARROW_COLUMNS`), and add a `COMBOS` case to
+  `tests/test_search_indexes.py` (see `docs/plans/search-indexes.md`)
 - **New indexing pass:** Add to both `index_directory()` and `_index_collection()` in `index.py`,
   add `--flag`/`--force-flag` to `cli.py`, use streaming generator pattern
-- **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops
-- **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`
+- **New API endpoint:** `web.py` with `_get_db()`, SSE for long ops; add a rule to
+  `request_intent._RULES` so the request log can say what a UI call was for
+- **Schema change:** Bump `SCHEMA_VERSION`, add migration SQL in `_init_schema()`.
+  New indexes go in `db._SEARCH_INDEXES` (built one commit per index), replaced ones
+  in `_SUPERSEDED_INDEXES`
 
 ## Name extraction in search queries
 
@@ -1482,6 +1926,13 @@ library place resolves its lat/lon via one cached Nominatim call at
 apply time. Writes `location_source='manual'` in a single transaction
 via `POST /api/photos/bulk-set-location`; overwrite is off by default
 (guards existing exif/inferred GPS unless the user explicitly toggles).
+The photo panel's **Show** selector picks which photos are listed:
+missing GPS (default), + inferred, or **All** (`show_located=true`, which
+also reveals fully-tagged folders). All is how you correct *camera* GPS —
+a phone-linked camera (Sony via the Creators' App) stamps the phone's
+position, so a school field can come out as the neighbouring park. Such
+rows are `location_source='exif'`, so replacing them also needs
+**Overwrite** ticked; the skipped-count toast says so.
 
 Map view: `/map` plots every GPS-bearing photo (exif + inferred) on a
 Leaflet map with marker clustering. Sidebar filters by source
@@ -2372,6 +2823,27 @@ Three things it does that a SQL `UPDATE ... SET person_id=NULL` does not:
   and a data loss. A face with **no usable reference is never cleared by a
   gate**: "unknown" is not "far".
 
+### Finding more of one person: `➕ More of this kid` on `/faces`
+
+**Hand labels do not teach the strict matcher anything.** `match_faces_to_persons`
+compares only against `face_references` (from `add-person --photo`); assigning
+faces in `/faces` adds none. On 2026-09-26, after six kids were hand-labelled,
+re-running `match_faces` matched **0** — correctly, as far as its inputs went.
+
+Feeding the hand labels to the matcher's global 1.15 tolerance was measured and
+rejected: on that shoot it would have written 793 labels, with a kid who had
+**one** label absorbing 220. So `photosearch/face_suggest.py` +
+`GET /api/faces/suggest-person` (date scope REQUIRED) + the panel rank the
+scope's unmatched faces by distance to the person's trusted labels
+(`manual`/`merge_review`, **library-wide** — Beckham had 94 from earlier shoots,
+not today's 6) and **never write**: a cutoff slider dims tiles beyond it,
+"Select ≤ cutoff" takes the rest, Assign goes through `bulk-assign`. Two flags,
+both excluded from the cutoff selection: **nearer another kid** (distance to
+every other person's trusted labels, library-wide) and **in photo** (the person
+is already tagged in that photo). On the replica copy, 0.8–0.9 was the clean
+band (Beckham 56→109, 0–2 rival flags); 1.0 starts collecting rival flags.
+Tests: `tests/test_face_suggest.py`.
+
 ### The high-level view: `📊 Label health` on `/faces`
 
 Over-matching is invisible one date at a time — you only notice it when a grid
@@ -2694,6 +3166,20 @@ all fail on the same controlled set (`evals/adaface_compare.py`,
 identity ambiguity between similar-looking kids at the same event. The
 within-photo **relative** comparison is the only robust signal. Per-year
 references are worse than all-time.
+
+### Face-encoding cache
+
+`PhotoDB.get_face_encodings_cached` serves face encodings from a process-wide
+LRU (`db._FaceEncodingCache`, float32, ~40k faces / ~80 MB). Used by
+`face_suggest` (Find more of this kid) and `face_verify` (Verify labels). It
+needs no invalidation. Encodings are only ever INSERTed or DELETEd, never
+updated, and `faces.id` is AUTOINCREMENT. So a relabel changes which ids a
+caller asks for, never what an id's encoding is. It is keyed by the DB's real
+path. Measured on a replica copy: suggest for Koa over Sep 1–27 went from
+12.3 s to 1.9 s on the first call and 0.4 s on later calls; verify-labels for
+one day went from 2.0 s to 0.13–0.2 s. Outputs are identical. If an
+in-place encoding update is ever added, it must also evict that face from
+this cache.
 
 ### Desktop-as-client face recompute (heavy clustering off the NAS)
 
@@ -3079,9 +3565,9 @@ becoming a phantom batch.
 `photosearch/batch_state.py` reports exactly one of `completed / running /
 queued / needs_queue / waiting / blocked` for every step — the 9 worker
 passes (`clip`, `faces`, `quality`, `aesthetics`, `describe`,
-`category-visual`, `category-content`, `keywords`, `verify`) and the 6 NAS
+`category-visual`, `category-content`, `keywords`, `verify`) and the 7 NAS
 steps (`stacking`, `normalize_aesthetics`, `match_faces`, `resolve_dups`,
-`warm_crops`, `rank_measure`). The module exists because
+`warm_crops`, `rank_measure`, `sharpness`). The module exists because
 `db.count_unprocessed_photos` — the fleet's **claim predicate**, not a
 progress bar — returns 0 in two situations that are not "done":
 
@@ -3093,30 +3579,26 @@ progress bar — returns 0 in two situations that are not "done":
    eligible — this reads `waiting`, never `completed`.
 
 So every step carries `total / eligible / done / remaining / failed`, and
-`completed` is `done == total`, never `remaining == 0`. `quality`, `verify`
-and `clip` complicate `done` further: they are the only three passes whose
-claim predicate carries **no attempts filter** (`db.py`
-`count_unprocessed_photos`), so their `failed` count sits *inside*
-`remaining` rather than disjoint from it — for those three, `done = eligible
-- remaining` (no second subtraction) and `blocked` is `remaining == failed >
-0`, not `remaining == 0 and failed > 0`. Get this backwards and `done`
-double-subtracts `failed` on every other pass.
+`completed` is `done == total`, never `remaining == 0`. Every worker pass's
+claim predicate now excludes exhausted photos, so `failed` and `remaining` are
+disjoint: `done = eligible - remaining - failed` and `blocked` is `remaining
+== 0 and failed > 0` (`_REMAINING_FILTERS_ATTEMPTS`, all `True`). `clip`,
+`quality` and `verify` used to carry **no attempts filter** — `failed` sat
+inside `remaining`, so they needed `done = eligible - remaining` and `blocked =
+remaining == failed > 0` — until they joined the ledger (see "A failed
+SERVER-side write must not burn a retry attempt" and "Non-image rows"). The
+table stays: a future pass added without the cap must say `False` there, or
+`done` double-subtracts `failed`.
 
-**`clip` does NOT get the `blocked` escape hatch this reasoning gives
-`quality`/`verify`.** `_OUTPUT_MISSING["clip"] is None` in
-`photosearch/batch_state.py` (it keeps no attempts ledger at all — see
-"Non-image rows" above), so `_worker_step` hardcodes `failed = 0` for clip,
-and `blocked` requires `failed > 0`. A clip-unloadable photo (e.g. a
-ZIP-wrapped `.JPG` Live Photo saved with an image extension) therefore leaves
-that batch's `clip` step sitting at `remaining > 0` **indefinitely**:
-`next_action` stays `launch_fleet` and `ready` is never true — it does not
-surface as `blocked`. In practice this should be rare for new batches:
-`index.py:is_real_image()` gates row creation at ingest, so a photo that
-can't be decoded is reclassified as a move-only companion and never gets a
-`photos` row (and therefore never enters a batch) in the first place.
-`purge-nonimage-photos` is the remedy for old rows that predate that gate.
-Short of that, the manual escape is the `/batches` page's **Mark ready**
-button, which force-completes a batch regardless of step state.
+**A poison `clip` photo now reads `blocked`.** It used to be the exception:
+clip kept no ledger, so `_worker_step` hardcoded `failed = 0` and a
+clip-unloadable photo (a ZIP-wrapped `.JPG` Live Photo) left the batch's `clip`
+step at `remaining > 0` **indefinitely** — `next_action` stuck on
+`launch_fleet`, never `ready`, never `blocked`. `_OUTPUT_MISSING["clip"]` is
+now the embedding test and the step counts exhausted photos like any other.
+Such rows should still be rare for new batches (`index.py:is_real_image()`
+gates row creation at ingest); `purge-nonimage-photos` removes old ones, and
+**Mark ready** remains the manual escape.
 
 Worker-pass precedence is **running > completed > blocked > queued > waiting
 > needs_queue** — `completed` deliberately outranks an open job row, because
@@ -3130,9 +3612,10 @@ the fleet had exited.
 ### `faces` is the one pass where "no output" means done
 
 A photo with nobody facing the camera has **no `faces` rows after a perfectly
-successful run**. The claim path can't tell that from a failure, so the fleet
-re-tries it `MAX_PROCESS_ATTEMPTS` times and stops (pre-existing, and 3× the
-work it should be). `batch_state._EMPTY_OUTPUT_IS_DONE` therefore counts an
+successful run**. The server now records that as terminal — attempts set
+straight to `MAX_PROCESS_ATTEMPTS` on the first clean empty result (it used to
+re-try it three times). Either way it ends exhausted with no rows, which the
+claim predicate cannot tell from three failures. `batch_state._EMPTY_OUTPUT_IS_DONE` therefore counts an
 exhausted no-face photo toward `done`, not `failed`, and reports the count in the
 step's `detail` ("113 with no detectable face"), which the page shows on the
 completed box.
@@ -3223,9 +3706,19 @@ Two things keep that from changing the rest of the flow:
 
 ### What's deliberately not in "ready" — and why
 
+**A waiting step is deferred, not a stop** (2026-09-26). `batch-advance` used
+to halt at the first `waiting` step — and `normalize_aesthetics` (waiting on the
+slow VLM `aesthetics` pass) sits before `match_faces`, so face matching could
+not run until aesthetics finished even though it needs only `faces`. Now a
+waiting/blocked step is recorded `deferred` and later steps whose own
+dependency is satisfied still run; dependents of a deferred step derive as
+waiting on it and are deferred too. A step that FAILS still stops the run.
+`stopped_at` still names the first deferred step. Run `Advance batch` once
+after clip+faces (stacking, face matching, crops) and again after aesthetics.
+
 `ready` is `all(step == completed for step in WORKER_PASSES + NAS_STEPS if
 step not in OPTIONAL_STEPS)`. `batch-advance`
-(`photosearch/batch_advance.py`) runs the six NAS steps in order and
+(`photosearch/batch_advance.py`) runs the NAS steps in order and
 deliberately leaves two things out of "ready":
 
 - **Temporal face matching** (`match_faces_temporal`) — ~4% accurate on these
@@ -3314,7 +3807,83 @@ M26b write paths: a stale local read would let `batch-launch-fleet`'s
 409-avoidance check pass on stale job rows and double-launch a fleet that's
 already running on the authoritative side.
 
+## Measured sharpness (schema v33) — column + throttled backfill
+
+`docs/plans/sharpness-measurement.md` steps 4–5. `photos.sharpness` (REAL,
+the headline score; NULL when unmeasurable), `sharpness_json` (every candidate
+feature from `sharpness.measure_photo`, or `{"error": …}`), `sharpness_version`
+(the `SHARPNESS_VERSION` that produced the row) and `sharpness_scored_at`, plus
+`idx_photos_sharpness_version`. The **only writer** is
+`photosearch/sharpness_backfill.py`. Nothing derives a tag from it yet: `sharp`
+/ `blurry` stay FROZEN until the labelled eval (step 3) passes.
+
+**Where:** only where the originals are — the NAS. On the replica
+`photo_root` is unset, stored paths stay relative, and every photo counts
+`not_local`: nothing is written, nothing is recorded as failed.
+
+**Rules not to simplify away:**
+
+- **Missing-only** = `sharpness_version IS NULL OR < SHARPNESS_VERSION`; a
+  version bump re-measures, nothing else does. The candidate query orders by
+  `+p.id` so the planner uses the index (MULTI-INDEX OR) — measured on a
+  161k-row replica copy: 0.21 s table scan → 0.002 s, and the nightly "nothing
+  left" check 0.17 s → ~0. The scan reads the whole wide `photos` table, the
+  disk traffic a starved N100 can't afford.
+- **Faces first:** a photo is a candidate only once its faces pass is done
+  (a face row, or faces `attempts >= MAX`). Face boxes are the headline
+  region; measuring before detection would stamp a frame-only answer with the
+  current version that missing-only never revisits.
+- **A decode error is STORED** (`sharpness` NULL, the error in
+  `sharpness_json`, the version set) so a bad file is never re-decoded forever
+  (the CLIP re-claim trap). An **absent** file records nothing (`not_local`).
+- Every UPDATE is guarded `WHERE id = ? AND sharpness_version IS ?` (the old
+  value, as the chunked percentile refresh does); a lost race counts `raced`.
+- **`photo_ids=[]` is NO photos**, never the whole library; a `--folder` that
+  matches nothing is empty too.
+
+**Throttles (the 2026-09-19 disk-starvation incident):** `pause_s` (0.2 s)
+between photos; commit every 25; `os.nice(10)` + the Linux IDLE I/O class via a
+raw `ioprio_set` syscall (no psutil; skipped where unavailable; per-THREAD on
+Linux, so inside the web server it only lowers the sweep/advance worker
+thread); **refuses to start** (`status: "refused"`) while `ingest-incoming`
+holds its lock — `ingest.sweep_lock_held` is a shared non-blocking PROBE,
+never a hold, so it can't make the 04:00 cron fail — or while any open,
+unexpired batch-advance **NAS** job row exists (a crashed advance therefore
+blocks it for up to the 6 h TTL), and re-checks every chunk, stopping as
+`"yielded"` if one starts mid-run.
+
+**Where it's wired — all opt-in:**
+
+- CLI: `photosearch sharpness [--limit N] [--apply] [--pause 0.2] [--folder F]`.
+  Dry run by default, opened `mode=ro` (a missing `--db` is an error, never a
+  stub); on a pre-v33 DB it says to migrate first.
+- Maintenance stage `sharpness`: OFF by default — `maintenance-sweep
+  --sharpness [--sharpness-limit 5000]`, API `"sharpness": true` (or
+  `do_sharpness`) + `"sharpness_limit"`, a checkbox on `/admin/maintenance`.
+  Needs pixels, so like `colors` it is EXCLUDED on the replica (400).
+- Batch step `sharpness`: last in `NAS_STEPS`, in `OPTIONAL_STEPS` (never gates
+  `ready`), waits on `faces`, and is **derived from the column** (done =
+  current version; a stored error counts done and shows as "N unreadable") —
+  a closed job row proves nothing for it. A refused/yielded runner raises, so
+  the step reads failed and the next Advance resumes.
+- `mirror-fields` / `rerun._MIRROR_COLUMNS` carry the four columns.
+
+Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessStep` in
+`tests/test_batch_state.py`, `test_v32_db_migrates_to_v33_sharpness_columns`.
+
 ## Planned milestones (see `docs/plans/`)
+
+- `docs/plans/search-indexes.md` — **SHIPPED 2026-10-04.** Schema v34 search
+  indexes; `search_combined` composes date/camera/people into one id scope;
+  id-first people and LIKE queries; SQL-paginated aesthetics/quality browses;
+  people-only searches read full rows for the page only. Same day: the
+  persistent API request log with source + intent (`request-stats`) and the
+  face-encoding cache for suggest-person / verify-labels. Measured: camera +
+  2 days >120 s → 0.4 s cold on the NAS; Calvin + camera + place + 2 days
+  2.2 GB → 1.3 MB read. The `idx_photos_aes_technical/composition/impact`
+  indexes are deliberately KEPT (owner decision 2026-10-04): the SQL-paginated
+  browse floors use them. Open: date pushdown into the remaining standalone
+  filters.
 
 - `docs/plans/ingest-batch-readiness.md` — **SHIPPED 2026-09-19.** Per-batch
   readiness + status flow: one dated folder = one batch, a `/batches` page

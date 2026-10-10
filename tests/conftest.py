@@ -6,6 +6,10 @@ with a realistic set of sample data — no real photos or ML models needed.
 
 import json
 import os
+
+# The API request log (photosearch/request_log.py) is off for the suite;
+# tests/test_request_log.py turns it on against a temp file.
+os.environ.setdefault("PHOTOSEARCH_REQUEST_LOG", "0")
 import struct
 import sys
 import tempfile
@@ -175,6 +179,16 @@ SAMPLE_PHOTOS = [
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_stats_memo():
+    """/api/stats is memoized per DB path; a test must never see another's."""
+    import sys
+    web = sys.modules.get("photosearch.web")
+    if web is not None:
+        web._stats_memo.clear()
+    yield
+
 
 @pytest.fixture(autouse=True)
 def _redirect_ask_logs(tmp_path, monkeypatch):

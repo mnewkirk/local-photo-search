@@ -58,10 +58,10 @@
     { key: 'enrich',  label: 'Worker passes — run in parallel',
       steps: ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'] },
     { key: 'text',    label: 'From the description',
-      steps: ['category-content', 'keywords', 'verify'] },
+      steps: ['verify', 'category-content', 'keywords'] },
     { key: 'nas',     label: 'NAS stages',
       steps: ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
-              'warm_crops', 'rank_measure'] },
+              'warm_crops', 'rank_measure', 'sharpness'] },
   ];
 
   var OTHER_ROW_LABEL = 'Other steps';
@@ -71,7 +71,10 @@
   // its own "Desktop" row with nothing anywhere that could run it, so its box
   // read "Needs to be queued" forever; it runs on the NAS (it decodes the
   // originals, which only the NAS holds) and the advance button runs it.
-  var OPTIONAL_STEPS = { rank_measure: 'measure sharpness for ranking' };
+  // `sharpness` (schema v33) is the library-comparable measurement; it stays
+  // optional until the labelled eval lets a tag be derived from it.
+  var OPTIONAL_STEPS = { rank_measure: 'measure sharpness for ranking',
+                         sharpness: 'measure library sharpness' };
 
   function optionalNeedingQueue(steps) {
     return (steps || []).filter(function (s) {
@@ -219,7 +222,7 @@
 
   // Frozen in batch_state.py: WORKER_PASSES and DEPENDS_ON's worker half.
   var WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
-    'category-visual', 'category-content', 'keywords', 'verify'];
+    'verify', 'category-content', 'keywords', 'category-visual'];
   var WORKER_DEPENDS_ON = {
     'category-content': 'describe', keywords: 'describe', verify: 'describe',
   };

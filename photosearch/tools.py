@@ -914,8 +914,10 @@ def _build_filter_sql(db, args: dict) -> tuple[str, list]:
             sub.append("place_name LIKE ?")
             params.append(f"%, {code}")
         if _has_structured_location(db):
+            # `= ? COLLATE NOCASE`, not LOWER() = LOWER(): only this form can
+            # use the v34 idx_photos_*_nc indexes. Same matches (ASCII fold).
             for col in ("country", "admin1", "admin2", "locality"):
-                sub.append(f"LOWER({col}) = LOWER(?)")
+                sub.append(f"{col} = ? COLLATE NOCASE")
                 params.append(loc)
         clauses.append("(" + " OR ".join(sub) + ")")
 
@@ -1870,8 +1872,11 @@ def _thumb_b64(db: PhotoDB, photo_id: int) -> Optional[str]:
     if nas:
         import urllib.request
         try:
-            req = urllib.request.Request(f"{nas}/api/photos/{photo_id}/thumbnail",
-                                         headers={"User-Agent": "photosearch-rerank"})
+            from .request_intent import outbound_headers
+            req = urllib.request.Request(
+                f"{nas}/api/photos/{photo_id}/thumbnail",
+                headers=outbound_headers(
+                    f"Fetch thumbnail of photo {photo_id} for a VLM rerank"))
             with urllib.request.urlopen(req, timeout=20) as r:
                 return base64.b64encode(r.read()).decode("ascii")
         except Exception:
@@ -1946,7 +1951,10 @@ def _h_rerank_photos(db: PhotoDB, args: dict) -> dict:
         top_n = None
 
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL")
-    model = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
+    # RERANK first: VISUAL is also the category-visual pass's role model, and
+    # the two are chosen separately (minicpm tags better; qwen picks heroes).
+    model = (os.environ.get("PHOTOSEARCH_LLM_RERANK_MODEL")
+             or os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL"))
     photos = {pid: db.get_photo(pid) for pid in ids}
 
     def _compact(pid, score=None, reason=None):
@@ -2152,8 +2160,11 @@ def _nas_post(path: str, body: dict, timeout: float = _NAS_WRITE_TIMEOUT_S) -> d
     base = _nas_base()
     url = base + path
     payload = json.dumps(body).encode("utf-8")
+    from .request_intent import outbound_headers
     req = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"},
+        url, data=payload,
+        headers={**outbound_headers(f"Write via the NAS: POST {path}"),
+                 "Content-Type": "application/json"},
         method="POST")
     resp = urllib.request.urlopen(req, timeout=timeout)
     return json.loads(resp.read())

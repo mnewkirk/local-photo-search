@@ -29,6 +29,16 @@ Three steps, one subcommand each:
            (what `photos.visual_tags` holds right now — no model run needed):
                python evals/visual_tags_eval.py report --db photo_index.db.local
 
+Plus the sharpness ground truth (docs/plans/sharpness-measurement.md, step 1):
+
+  sample-sharpness   a SEPARATE, blurry-weighted 60 under sharpness/, labelled
+                     for `sharp` / `blurry` at /eval/visual-tags?set=sharpness
+                     in a 100% loupe on the original. Never touches sample.json.
+               python evals/visual_tags_eval.py sample-sharpness --db photo_index.db.local
+  agreement --set all   labeller self-consistency on `blurry` over both samples.
+
+`sharp` / `blurry` are MEASURED tags: no model variant is ever scored on them.
+
 Storage lives in photosearch/visual_tag_eval.py (shared with the labelling
 page); the directory is `PHOTOSEARCH_VISUAL_EVAL_DIR`, default
 ./evals/visual-tags, git-ignored.
@@ -57,7 +67,8 @@ sys.path.insert(0, PROJECT)
 
 from photosearch import visual_tag_eval as store  # noqa: E402
 from photosearch.visual_tags_derive import (  # noqa: E402
-    DERIVE_COLUMNS, PERCEIVED_VOCABULARY, PROMPT_SECTIONS, derive_tags)
+    DERIVE_COLUMNS, PERCEIVED_VOCABULARY, PROMPT_SECTIONS, derive_tags,
+    parse_exif_number)
 
 _PERCEIVED = frozenset(PERCEIVED_VOCABULARY)
 
@@ -216,6 +227,226 @@ def cmd_sample(args):
 
 
 # --------------------------------------------------------------------------
+# Sharpness sample — ground truth for the measured `sharp` / `blurry` tags
+# --------------------------------------------------------------------------
+#
+# docs/plans/sharpness-measurement.md, step 1. A SEPARATE sample
+# (store.load_sample("sharpness"), files under sharpness/) so drawing it never
+# orphans the visual sample, its labels or its cached runs. Stratified to
+# OVERSAMPLE likely-blurry photos: a uniform draw would hold a handful of
+# genuinely blurry frames and the eval gate needs at least 25 positives.
+
+SHARPNESS_CAMERAS = ("ILCE-7RM6", "ILCE-7M4")        # a7R VI, a7 IV
+_PHONE_MAKES = ("apple", "google", "samsung", "oneplus", "motorola", "xiaomi",
+                "huawei", "lg", "sony mobile", "nothing")
+_PHONE_MODEL_PREFIXES = ("iphone", "pixel", "sm-", "galaxy")
+# Chrome cannot draw these, so the 100% loupe cannot show them — a photo the
+# labeller cannot judge at native resolution must not be in this sample.
+_UNVIEWABLE_EXT = (".heic", ".heif", ".arw", ".dng", ".cr2", ".cr3", ".nef",
+                   ".raf", ".orf", ".rw2")
+_INDOOR_SPORT_TERMS = ("indoor soccer", "soccer indoor", "futsal", "gymnasium",
+                       "gymnastics", "gym", "basketball", "volleyball",
+                       "badminton", "hockey rink", "ice rink", "swimming pool")
+NIGHT_HOURS = frozenset(list(range(21, 24)) + list(range(0, 6)))   # 21:00-06:00
+HIGH_ISO = 3200
+BOKEH_MAX_F = 2.8
+AES_SHARPNESS_MAX = 2
+_SHARPNESS_COLUMNS = ("folder", "filepath", "visual_tags", "categories", "keywords",
+                      "aes_sharpness", "subject_boxes", "date_taken",
+                      "camera_make", "camera_model") + tuple(DERIVE_COLUMNS)
+_HOUR_RE = re.compile(r"[T ](\d{2}):\d{2}")
+
+
+def camera_class(make, model):
+    """'ILCE-7RM6' | 'ILCE-7M4' | 'phone' | 'gopro' | None."""
+    make_l, model_s = (make or "").strip().lower(), (model or "").strip()
+    model_l = model_s.lower()
+    if model_s in SHARPNESS_CAMERAS:
+        return model_s
+    if "gopro" in make_l or model_l.startswith("hero"):
+        return "gopro"
+    if make_l.startswith(_PHONE_MAKES) or model_l.startswith(_PHONE_MODEL_PREFIXES):
+        return "phone"
+    return None
+
+
+def _hour(date_taken):
+    m = _HOUR_RE.search(date_taken or "")
+    return int(m.group(1)) if m else None
+
+
+def _load_sharpness_candidates(conn):
+    have = {r[1] for r in conn.execute("PRAGMA table_info(photos)")}
+    # A column an older DB lacks reads as NULL, so its stratum is simply empty.
+    cols = ", ".join(c if c in have else f"NULL AS {c}" for c in _SHARPNESS_COLUMNS)
+    faces = {}
+    try:
+        for pid, n in conn.execute("SELECT photo_id, COUNT(*) FROM faces GROUP BY photo_id"):
+            faces[pid] = n
+    except sqlite3.OperationalError:
+        pass
+    rows = []
+    for r in conn.execute(f"SELECT id, {cols} FROM photos ORDER BY id"):
+        if (r["filepath"] or "").lower().endswith(_UNVIEWABLE_EXT):
+            continue
+        text = " ".join(_json_list(r["categories"]) + _json_list(r["keywords"])).lower()
+        derived = derive_tags(r)
+        rows.append({
+            "id": r["id"],
+            "tags": frozenset(_json_list(r["visual_tags"])),
+            "aes_sharpness": r["aes_sharpness"],
+            "long_exposure": "long-exposure" in derived,
+            "indoor_sport": any(t in text for t in _INDOOR_SPORT_TERMS)
+                            or ("indoor" in text and "sport" in text),
+            "iso": _parse_float(r["iso"]),
+            "hour": _hour(r["date_taken"]),
+            "f": _parse_float(r["f_number"]),
+            "faces": faces.get(r["id"], 0),
+            # '[]' = grounded, no clear subject; NULL = never grounded.
+            "no_subject": _is_empty_json_list(r["subject_boxes"]),
+            "camera": camera_class(r["camera_make"], r["camera_model"]),
+        })
+    return rows
+
+
+def _parse_float(raw):
+    return parse_exif_number(raw)
+
+
+def _is_empty_json_list(raw):
+    if raw is None:
+        return False
+    try:
+        return json.loads(raw) == []
+    except (TypeError, ValueError):
+        return False
+
+
+def build_sharpness_strata():
+    """[(name, quota-per-60, predicate(row))] in assignment order — the
+    likely-blurry strata first, so they are filled before the camera and
+    random strata take anything."""
+    return [
+        # What the VLM already called blurry (1,284 photos live): a biased
+        # pool, but it is where positives are densest.
+        ("stored-blurry", 9, lambda r: "blurry" in r["tags"]),
+        # Half of a 4-photo hand check was a false positive; label it anyway —
+        # it is the baseline step 3 must beat.
+        ("aes-sharpness<=2", 8, lambda r: r["aes_sharpness"] is not None
+                                          and r["aes_sharpness"] <= AES_SHARPNESS_MAX),
+        # Intentional motion counts as blurry (eval_api.LABELLER_NOTES) but is
+        # reported separately: a measurement SHOULD fire on it, and a reader
+        # must be able to see how much of the recall it accounts for.
+        ("long-exposure", 4, lambda r: r["long_exposure"]),
+        ("indoor-sports", 7, lambda r: r["indoor_sport"]),
+        # Noise is NOT blur: the GoPro night street false positive lives here.
+        ("iso>=3200-or-night", 7, lambda r: (r["iso"] is not None and r["iso"] >= HIGH_ISO)
+                                            or r["hour"] in NIGHT_HOURS),
+        # Bokeh is NOT blur: a sharp face over a melted background.
+        ("bokeh-portrait", 6, lambda r: r["faces"] > 0 and r["f"] is not None
+                                        and r["f"] <= BOKEH_MAX_F),
+        # No subject: the whole frame decides, so a whole-frame metric is
+        # tested where it is supposed to work.
+        ("no-subject-landscape", 4, lambda r: r["no_subject"] and r["faces"] == 0),
+        ("camera:a7RVI", 3, lambda r: r["camera"] == "ILCE-7RM6"),
+        ("camera:a7IV", 3, lambda r: r["camera"] == "ILCE-7M4"),
+        ("camera:phone", 3, lambda r: r["camera"] == "phone"),
+        ("camera:gopro", 3, lambda r: r["camera"] == "gopro"),
+    ]
+
+
+def choose_sharpness_sample(conn, n=60, seed=1, exclude=()):
+    """[{"photo_id", "stratum"}] — deterministic for (DB, n, seed, exclude).
+    `exclude` = ids already in the visual sample, so the owner's combined
+    labelling set is n + 60 DISTINCT photos."""
+    excluded = set(int(i) for i in exclude)
+    rows = [r for r in _load_sharpness_candidates(conn) if r["id"] not in excluded]
+    chosen, taken = [], set()
+
+    def draw(name, pool, k):
+        pool = [r for r in pool if r["id"] not in taken]
+        rng = random.Random(f"{seed}:sharpness:{name}")    # per-stratum, as above
+        for r in rng.sample(pool, min(k, len(pool))):
+            taken.add(r["id"])
+            chosen.append({"photo_id": r["id"], "stratum": name})
+
+    for name, per60, pred in build_sharpness_strata():
+        k = min(max(1, round(per60 * n / 60)), n - len(chosen))
+        if k <= 0:
+            break
+        draw(name, [r for r in rows if pred(r)], k)
+    draw("random", rows, n - len(chosen))
+    return chosen
+
+
+#: `sample-sharpness --extend N` draws only from these: on the first 120
+#: labels they held 9 of 21 blurry photos at a ~50% hit rate, against ~5%
+#: everywhere else. Suffixed so the report can tell the draws apart.
+EXTEND_STRATA = ("stored-blurry", "aes-sharpness<=2")
+
+
+def extend_sharpness_sample(conn, existing, n, seed=1, exclude=(),
+                            strata=EXTEND_STRATA):
+    """`existing` + n NEW photos split evenly over EXTEND_STRATA, never
+    repeating an existing or excluded id, so labels already keyed to the
+    sample stay valid (appending never orphans them)."""
+    taken = {int(p["photo_id"]) for p in existing} | {int(i) for i in exclude}
+    rows = [r for r in _load_sharpness_candidates(conn) if r["id"] not in taken]
+    preds = {name: pred for name, _q, pred in build_sharpness_strata()}
+    out = list(existing)
+    for i, name in enumerate(strata):
+        k = n // len(strata) + (1 if i < n % len(strata) else 0)
+        pool = [r for r in rows if preds[name](r) and r["id"] not in taken]
+        rng = random.Random(f"{seed}:sharpness-extend:{name}:{len(existing)}")
+        for r in rng.sample(pool, min(k, len(pool))):
+            taken.add(r["id"])
+            out.append({"photo_id": r["id"], "stratum": f"{name}+ext"})
+    return out
+
+
+def cmd_sample_sharpness(args):
+    existing = store.load_sample("sharpness")
+    path = store.eval_dir() / store.SAMPLE_FILES["sharpness"]
+    if args.extend:
+        if not existing["photos"]:
+            raise SystemExit("nothing to extend: draw the sample first")
+        exclude = [p["photo_id"] for p in store.load_sample("visual")["photos"]]
+        conn = open_db_readonly(args.db)
+        try:
+            photos = extend_sharpness_sample(conn, existing["photos"], args.extend,
+                                             seed=existing.get("seed") or args.seed,
+                                             exclude=exclude,
+                                             strata=tuple(args.extend_from.split(",")))
+        finally:
+            conn.close()
+        store.save_sample(photos, existing.get("seed") or args.seed, sample="sharpness")
+        print(f"[sample-sharpness] extended {len(existing['photos'])} -> {len(photos)} "
+              f"photos -> {path}")
+        return
+    if existing["photos"] and not args.force:
+        raise SystemExit(
+            f"{path} already holds {len(existing['photos'])} photos. Labels are "
+            "keyed to it — re-sampling orphans them. Pass --force if that is "
+            "what you want.")
+    exclude = [p["photo_id"] for p in store.load_sample("visual")["photos"]]
+    conn = open_db_readonly(args.db)
+    try:
+        photos = choose_sharpness_sample(conn, n=args.n, seed=args.seed, exclude=exclude)
+    finally:
+        conn.close()
+    store.save_sample(photos, args.seed, sample="sharpness")
+    counts = {}
+    for p in photos:
+        counts[p["stratum"]] = counts.get(p["stratum"], 0) + 1
+    print(f"[sample-sharpness] {len(photos)} photos (seed {args.seed}, "
+          f"{len(exclude)} visual-sample ids excluded) -> {path}")
+    for name, _q, _p in build_sharpness_strata() + [("random", 0, None)]:
+        print(f"  {name:<28} {counts.get(name, 0):>3}")
+    print("Label at /eval/visual-tags?set=sharpness "
+          "(blind recheck: ?set=sharpness-recheck).")
+
+
+# --------------------------------------------------------------------------
 # Run cache
 # --------------------------------------------------------------------------
 
@@ -276,10 +507,13 @@ def fetch_image(server, photo_id, kind="full", timeout=120):
     LANCZOS / JPEG q85 re-encode it does in the fleet. `preview` (1920 px,
     q82) is ~10x lighter but adds a JPEG generation the fleet never sees.
     """
-    import urllib.request
-    url = f"{server.rstrip('/')}/api/photos/{int(photo_id)}/{kind}"
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
+    from photosearch import model_eval
+    if kind == "full":
+        # Read once through the shared originals cache: every variant x model
+        # otherwise re-pulls the same photos from the NAS via the replica, and
+        # a NAS restart 502'd 28 of them mid-run on 2026-09-26.
+        return model_eval.original_path(photo_id, server).read_bytes()
+    return model_eval.fetch_from_server(server, photo_id, kind, timeout)
 
 
 @contextmanager
@@ -437,6 +671,8 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
         f"{prompt_file or 'production'} — {len(todo)} to do, "
         f"{len(run['predictions'])} cached, {len(labels)} labelled")
 
+    from photosearch import model_eval
+    loaded_start = model_eval.lmstudio_loaded()
     errors = 0
     with prompt_override(prompt_text), vocab_override(extra_vocab), \
             tempfile.TemporaryDirectory() as tmp:
@@ -467,6 +703,12 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
             log(f"  [{i}/{len(todo)}] {pid}: {shown}  ({latency:.1f}s)")
     if errors:
         log(f"[run] {errors} photo(s) failed and were NOT cached — re-run to retry")
+    # Speed depends on what else is loaded (gemma-4-26b: 0.45 s alone, 3.1 s
+    # beside qwen); record it so the model-eval summary can say which.
+    loaded_end = model_eval.lmstudio_loaded()
+    if loaded_start is not None or loaded_end is not None or "latency_label" not in run:
+        run["latency_label"] = model_eval.latency_label(effective, loaded_start, loaded_end)
+        save_run(variant, run)
     return run
 
 
@@ -752,11 +994,14 @@ def cmd_report(args):
 # --------------------------------------------------------------------------
 
 def cmd_agreement(args):
-    """Labeller self-consistency: main vs the blind recheck set, per tag."""
-    res = store.self_agreement()
+    """Labeller self-consistency: first answer vs the blind recheck, per tag."""
+    which = getattr(args, "agreement_set", "visual")
+    res = store.self_agreement(AGREEMENT_SETS[which])
     if not res["photos"]:
+        page = {"visual": "?set=recheck", "sharpness": "?set=sharpness-recheck",
+                "all": "?set=recheck and ?set=sharpness-recheck"}[which]
         raise SystemExit("No photos labelled done in BOTH sets — label the "
-                         "recheck subset at /eval/visual-tags?set=recheck first.")
+                         f"recheck subset at /eval/visual-tags{page} first.")
     print(f"{res['photos']} photos labelled twice. Agreement is on yes/no calls; "
           f"a debatable on either side is set aside. kappa < 0.4 = the tag is "
           f"not tightly defined enough to score a model on.")
@@ -792,6 +1037,23 @@ def build_parser():
                     help="Photos outside it form the `travel` stratum.")
     sp.set_defaults(func=cmd_sample)
 
+    ss = sub.add_parser("sample-sharpness",
+                        help="Choose the blurry-weighted sharpness sample (once), "
+                             "beside the visual one.")
+    ss.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"),
+                    help="photo_index.db — opened READ-ONLY.")
+    ss.add_argument("--n", type=int, default=60)
+    ss.add_argument("--seed", type=int, default=1)
+    ss.add_argument("--force", action="store_true",
+                    help="Overwrite an existing sharpness sample (orphans its labels).")
+    ss.add_argument("--extend", type=int, default=0, metavar="N",
+                    help="APPEND N photos from the blurry-rich strata "
+                         "(EXTEND_STRATA); existing labels stay valid.")
+    ss.add_argument("--extend-from", default=",".join(EXTEND_STRATA),
+                    help="comma-separated strata --extend draws from "
+                         "(default: %(default)s)")
+    ss.set_defaults(func=cmd_sample_sharpness)
+
     rp = sub.add_parser("run", help="Predict the labelled photos for one variant.")
     rp.add_argument("--variant", default=DEFAULT_VARIANT)
     rp.add_argument("--model", help="Model id. On the LM Studio route this is "
@@ -826,9 +1088,18 @@ def build_parser():
     return ap
 
 
+AGREEMENT_SETS = {"visual": ("recheck",), "sharpness": ("sharpness-recheck",),
+                  "all": ("recheck", "sharpness-recheck")}
+
+
 def _add_agreement(sub):
-    ap = sub.add_parser("agreement", help="Labeller self-consistency (main vs "
-                        "the blind recheck set).")
+    ap = sub.add_parser("agreement", help="Labeller self-consistency (first "
+                        "answer vs the blind recheck set).")
+    ap.add_argument("--set", dest="agreement_set", choices=sorted(AGREEMENT_SETS),
+                    default="visual",
+                    help="visual = main vs recheck (default); sharpness = the "
+                         "sharpness sample vs its recheck; all = both pooled "
+                         "(the one to read for `blurry`).")
     ap.set_defaults(func=cmd_agreement)
 
 

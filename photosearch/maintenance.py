@@ -45,6 +45,7 @@ SWEEP_STAGE_ORDER = (
     "resolve_dups",
     "normalize_aesthetics",
     "normalize_subject_aesthetics",
+    "sharpness",
     "recluster",
 )
 
@@ -362,6 +363,39 @@ def _abort_flag(check_abort) -> bool:
         return False
     except InterruptedError:
         return True
+
+
+def _stage_sharpness(db, apply, emit, check_abort,
+                     limit=None, pause_s=None):
+    """Measured sharpness from the originals (photosearch/sharpness_backfill.py).
+
+    OPT-IN (``do_sharpness``), never in the default plan: it decodes every
+    photo at up to 4000 px on the N100, so a first backfill is several nights.
+    Capped per run (``limit``, default ``DEFAULT_STAGE_LIMIT`` ~5000), paced,
+    niced, and it refuses to start (``status: "refused"``) while ingest or a
+    batch-advance NAS job is running. Needs pixels, so like ``colors`` it is
+    EXCLUDED on the replica (maintenance_sync).
+    """
+    from . import sharpness_backfill as sb
+    if limit is None:
+        limit = sb.DEFAULT_STAGE_LIMIT
+    if pause_s is None:
+        pause_s = sb.DEFAULT_PAUSE_S
+
+    def on_progress(ev):
+        emit({"phase": "sweep", "stage": "sharpness", "status": "running",
+              "done": ev.get("done"), "total": ev.get("total")})
+
+    res = sb.run_sharpness_backfill(
+        db, limit=limit, apply=apply, pause_s=pause_s,
+        should_abort=lambda: _abort_flag(check_abort),
+        on_progress=on_progress)
+    return {"stage": "sharpness", "would": res.get("would", 0),
+            "applied": res.get("measured", 0) if apply else 0,
+            "status": res.get("status", "done"),
+            "message": res.get("message") or res.get("busy"),
+            "errors": res.get("errors", 0), "not_local": res.get("not_local", 0),
+            "raced": res.get("raced", 0), "limit": limit}
 
 
 def _stage_stacking(db, apply, emit, check_abort):
@@ -761,6 +795,8 @@ def run_maintenance_sweep(
     do_recluster: bool = False,
     do_dedup: bool = False,
     do_requeue: bool = False,
+    do_sharpness: bool = False,
+    sharpness_limit: Optional[int] = None,
     force_normalize_aesthetics: bool = False,
     force_normalize_subject_aesthetics: bool = False,
     requeue_passes: Optional[tuple] = None,
@@ -790,6 +826,9 @@ def run_maintenance_sweep(
             worker_processed markers so the fleet re-claims them. Bypasses the
             attempts cap, so off by default (run it after fixing a root cause).
         requeue_passes: restrict do_requeue to these passes (default: all four).
+        do_sharpness: opt-in — measure photos.sharpness from the originals
+            (heavy decode; paced + niced; refuses while ingest runs).
+        sharpness_limit: per-run cap for do_sharpness (default ~5000).
         window_minutes / max_drift_km / min_confidence: infer-locations tuning.
         on_progress: callback(dict) invoked per stage (and inside long stages)
             with a {"phase": "sweep", "stage": ..., "status": ...} event.
@@ -840,6 +879,9 @@ def run_maintenance_sweep(
                  lambda: _stage_normalize_subject_aesthetics(
                      db, apply, emit, check_abort,
                      force=force_normalize_subject_aesthetics)))
+    if do_sharpness:
+        plan.append(("sharpness", lambda: _stage_sharpness(
+            db, apply, emit, check_abort, limit=sharpness_limit)))
     if do_recluster:
         plan.append(("recluster", lambda: _stage_recluster(db, apply, emit, check_abort)))
 

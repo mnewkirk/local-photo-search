@@ -801,7 +801,7 @@
 
     // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
     // worker processes it; it would render a perpetual-0 pill).
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'describe', 'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics'];
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'aesthetics', 'describe', 'verify', 'category-content', 'keywords', 'category-visual'];
 
     function formatTtl(expiresAtStr) {
       if (!expiresAtStr) return { text: '—', cls: '' };
@@ -1365,6 +1365,7 @@
       var _rc = useState(false); var doRecluster = _rc[0]; var setRecluster = _rc[1];
       var _dd = useState(false); var doDedup = _dd[0]; var setDedup = _dd[1];
       var _rq = useState(false); var doRequeue = _rq[0]; var setRequeue = _rq[1];
+      var _sh = useState(false); var doSharpness = _sh[0]; var setSharpness = _sh[1];
       var _na = useState(false); var doNormAes = _na[0]; var setNormAes = _na[1];
       var _nsa = useState(false); var doNormSubjAes = _nsa[0]; var setNormSubjAes = _nsa[1];
       var _b = useState(false); var busy = _b[0]; var setBusy = _b[1];
@@ -1433,6 +1434,7 @@
               do_recluster: doRecluster,
               do_dedup: doDedup,
               do_requeue: doRequeue,
+              sharpness: doSharpness,
               force_normalize_aesthetics: doNormAes,
               force_normalize_subject_aesthetics: doNormSubjAes,
             }),
@@ -1601,6 +1603,11 @@
                 disabled: busy || replicaMode,
                 onChange: function(ev) { setRequeue(ev.target.checked); } }),
               'Re-queue stuck passes'),
+            e('label', { title: replicaMode ? 'Needs the photo originals — run on the NAS, not the replica.' : 'Measure photos.sharpness from the ORIGINAL pixels (full-res decode, ~0.5 s/photo on the N100). Missing-only, capped at ~5,000 per run, paced and niced; refuses to start while an ingest sweep or batch advance is running.' },
+              e('input', { type: 'checkbox', checked: doSharpness,
+                disabled: busy || replicaMode,
+                onChange: function(ev) { setSharpness(ev.target.checked); } }),
+              'Sharpness (heavy)'),
             e('label', { title: 'Force a full re-rank of the full-frame aesthetic percentile (aes_overall_pct) — both library-wide AND per-day (aes_overall_day_pct) — across the whole library. Normally only new rows get one; run this after a scoring batch shifts the distribution or after retuning the dimension weights.' },
               e('input', { type: 'checkbox', checked: doNormAes, disabled: busy,
                 onChange: function(ev) { setNormAes(ev.target.checked); } }),
@@ -1966,12 +1973,13 @@
     function FleetLauncher() {
       var _sel = useState({ describe: true, 'category-content': true, keywords: true });
       var sel = _sel[0]; var setSel = _sel[1];
-      var _n = useState(2); var count = _n[0]; var setCount = _n[1];
-      // --sequential drains a pass fully before the next (no model thrash);
-      // --stay-alive keeps the fleet polling a dry queue. Default OFF so the
+      var _n = useState(3); var count = _n[0]; var setCount = _n[1];
+      // --sequential (default ON) drains a pass fully before the next (no model
+      // thrash; CLIP first); --stay-alive keeps the fleet polling a dry queue.
+      // Stay-alive defaults OFF so the
       // fleet exits when the backlog is gone instead of holding the NAS
       // write lock — idle polling has starved ingests and face writes.
-      var _seq = useState(false); var sequential = _seq[0]; var setSequential = _seq[1];
+      var _seq = useState(true); var sequential = _seq[0]; var setSequential = _seq[1];
       var _sa = useState(false); var stayAlive = _sa[0]; var setStayAlive = _sa[1];
       var _busy = useState(false); var busy = _busy[0]; var setBusy = _busy[1];
       var _msg = useState(null); var msg = _msg[0]; var setMsg = _msg[1];
@@ -2146,8 +2154,8 @@
     //   _incoming staging (ready / can't-ingest) → library backlog (CLIP / passes).
     // Stages 1-2 come from /api/admin/incoming-status (cheap _incoming scan);
     // stages 3-4 from the same authoritative queue the Workers panel polls.
-    var ENRICH_PASSES = ['faces', 'quality', 'describe', 'category-content',
-                         'category-visual', 'keywords', 'verify', 'aesthetics'];
+    var ENRICH_PASSES = ['faces', 'quality', 'aesthetics', 'describe', 'verify',
+                         'category-content', 'keywords', 'category-visual'];
 
     function fmt(n) { return (n || 0).toLocaleString(); }
 
@@ -2260,7 +2268,8 @@
           // dated ingest folder, which is the view you want after a card dump.
           e('a', { className: 'h2-link', href: '/batches' }, 'Per-batch view →'),
           // Owner-only labelling tool for the category-visual eval; not in the nav.
-          e('a', { className: 'h2-link', href: '/eval/visual-tags' }, 'Visual-tag eval →')),
+          e('a', { className: 'h2-link', href: '/eval/visual-tags' }, 'Visual-tag eval →'),
+          e('a', { className: 'h2-link', href: '/eval/models' }, 'Model eval →')),
         e('div', { className: 'workers-wrap' },
           inc && inc.error && e('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, inc.error),
           e('div', { className: 'funnel-groups' },

@@ -126,7 +126,10 @@ def sample_faces(faces: list[dict], fetch_preview: Callable[[int], bytes],
         return pid, {f["id"]: torso_sample(im, f, scale) for f in group}
 
     with cf.ThreadPoolExecutor(workers) as ex:
-        for pid, got in ex.map(work, list(by_photo)):
+        # carry_context: each preview fetched from the NAS names the review
+        # it was for in the NAS request log.
+        from .request_intent import carry_context
+        for pid, got in ex.map(carry_context(work), list(by_photo)):
             for fid, s in got.items():
                 if s is not None:
                     out[fid] = s

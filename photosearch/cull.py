@@ -197,17 +197,18 @@ def select_best_photos(
 
     if use_range:
         # Date-range mode: pull every photo whose date_taken falls in the
-        # window, regardless of which (per-camera) folder it lives in. Compare
-        # the leading YYYY-MM-DD so the bounds are inclusive whole days and
-        # separator-agnostic ("2026-03-13 10:00" and "2026-03-13T10:00" both
-        # match), and callers pass plain dates.
+        # window, regardless of which (per-camera) folder it lives in. The
+        # bounds are inclusive whole days and separator-agnostic: "~" sorts
+        # after both " " and "T", so "2026-03-13 10:00" and "2026-03-13T10:00"
+        # both match, and callers pass plain dates. A plain range (not
+        # substr()) so idx_photos_date can serve it.
         lo = date_from or "0000-01-01"
         hi = date_to or "9999-12-31"
         rows = db.conn.execute(
             "SELECT id, filepath, filename, aesthetic_score, aes_overall_pct, aes_subject_overall_pct, aes_overall_day_pct, aes_subject_overall_day_pct, camera_make, camera_model, date_taken, raw_filepath, place_name "
             "FROM photos WHERE date_taken IS NOT NULL "
-            "AND substr(date_taken, 1, 10) >= ? AND substr(date_taken, 1, 10) <= ?",
-            (lo, hi),
+            "AND date_taken >= ? AND date_taken <= ?",
+            (lo, hi + "~"),
         ).fetchall()
         dir_photos = [
             dict(row) | {"_abs_path": db.resolve_filepath(row["filepath"])}

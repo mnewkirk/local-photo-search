@@ -2118,9 +2118,10 @@ def purge_nonimage_photos(db, apply, scan_all, audit_path, sample):
     """Delete photos rows whose file content is not a decodable image.
 
     Targets ZIP-wrapped iOS Live Photo bundles saved as IMG_xxxx(1).JPG (PK
-    magic, a .mov inside) that PIL can't open: they never get a CLIP embedding
-    and, because the clip claim path has no attempts cap, the worker fleet
-    re-claims them on every TTL cycle forever — the clip queue never reaches 0.
+    magic, a .mov inside) that PIL can't open: they never get a CLIP embedding.
+    The clip claim path is attempts-capped now, so the fleet gives up after
+    MAX_PROCESS_ATTEMPTS failures (it used to re-claim them forever), but each
+    one still leaves its batch's clip step `blocked` until it is purged.
 
     Default scans only photos with no CLIP embedding (the stuck set). Cascades
     via FK to faces/stack_members/collection_photos/review_selections; run
@@ -2555,13 +2556,19 @@ def normalize_subject_aesthetics(db, apply):
 @click.option("--normalize-subject-aesthetics", is_flag=True, default=False,
               help="Force a full re-rank of the subject-crop aesthetic percentile "
                    "(aes_subject_overall_pct) across the whole library.")
+@click.option("--sharpness", "do_sharpness", is_flag=True, default=False,
+              help="Opt-in: measure photos.sharpness from the ORIGINAL pixels "
+                   "(heavy full-res decode; missing-only, paced, niced; skipped "
+                   "while an ingest sweep or batch advance is running).")
+@click.option("--sharpness-limit", default=5000, show_default=True, type=int,
+              help="Per-run cap for --sharpness.")
 @click.option("--window-minutes", default=30, show_default=True, help="infer-locations window.")
 @click.option("--max-drift-km", default=25.0, show_default=True, help="infer-locations drift guard.")
 @click.option("--min-confidence", default=0.0, show_default=True, help="infer-locations min confidence.")
 def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_temporal, light, recluster,
                       dedup_photos, requeue, requeue_passes, normalize_aesthetics,
-                      normalize_subject_aesthetics, window_minutes,
-                      max_drift_km, min_confidence):
+                      normalize_subject_aesthetics, do_sharpness, sharpness_limit,
+                      window_minutes, max_drift_km, min_confidence):
     """Idempotent, dependency-ordered backfill sweep over only-the-missing rows.
 
     Backfills nothing else schedules: structured locations, inferred GPS, colors,
@@ -2599,6 +2606,7 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_tempora
                 do_match=not no_match, match_temporal=match_temporal,
                 do_recluster=recluster, do_dedup=dedup_photos,
                 do_requeue=requeue, requeue_passes=rq_passes,
+                do_sharpness=do_sharpness, sharpness_limit=sharpness_limit,
                 force_normalize_aesthetics=normalize_aesthetics,
                 force_normalize_subject_aesthetics=normalize_subject_aesthetics,
                 window_minutes=window_minutes,
@@ -2612,6 +2620,84 @@ def maintenance_sweep(db, apply, no_colors, no_stacking, no_match, match_tempora
                f"{len(res['stages'])} stages, "
                + (f"{total_applied} rows changed." if apply
                   else f"{total_would} rows would change. Re-run with --apply."))
+
+
+@cli.command("sharpness")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--limit", default=None, type=int,
+              help="Measure at most N photos this run (newest first).")
+@click.option("--apply", "apply_", is_flag=True, default=False,
+              help="Measure and write. Default: dry run (counts, writes nothing, "
+                   "opens the DB read-only).")
+@click.option("--pause", default=0.2, show_default=True, type=float,
+              help="Seconds to sleep between photos (disk courtesy on the NAS).")
+@click.option("--folder", default=None,
+              help="Only photos in this folder (or below), e.g. 2026/2026-09-19_ILCE-7RM6.")
+def sharpness_cmd(db, limit, apply_, pause, folder):
+    """Backfill photos.sharpness from the ORIGINAL pixels (schema v33).
+
+    Missing-only (sharpness_version NULL or older than the code's
+    SHARPNESS_VERSION), and only for photos whose faces pass is done. A decode
+    error is stored with the version so it is never retried; a file that is not
+    on this machine (the replica) is skipped and counted `not_local`.
+
+    Runs where the originals are: the NAS. Niced + idle I/O class, pauses
+    between photos, commits every 25, and refuses to start while an
+    ingest-incoming sweep or a batch-advance NAS step is running. Ctrl-C stops
+    after committing what was measured. See photosearch/sharpness_backfill.py.
+    """
+    import sqlite3 as _sqlite3
+    from photosearch import sharpness_backfill as sb
+
+    if limit is not None and limit <= 0:
+        raise click.BadParameter("must be positive", param_hint="--limit")
+
+    def on_prog(ev):
+        click.echo(f"  {ev['done']}/{ev['total']}  measured {ev['measured']}  "
+                   f"errors {ev['errors']}  not_local {ev['not_local']}"
+                   + (f"  raced {ev['raced']}" if ev.get("raced") else ""))
+
+    try:
+        if apply_:
+            pdb = PhotoDB(db)
+        else:
+            pdb = sb.open_readonly(db)
+            click.echo("Opened the database read-only (dry run).")
+    except FileNotFoundError:
+        raise click.ClickException(f"no such database: {db}")
+    try:
+        try:
+            res = sb.run_sharpness_backfill(
+                pdb, limit=limit, folder=folder, apply=apply_, pause_s=pause,
+                on_progress=on_prog)
+        except _sqlite3.OperationalError as exc:
+            if "sharpness" in str(exc):
+                raise click.ClickException(
+                    f"{exc} -- this database predates schema v33. Open it once "
+                    "read-write (restart the web server, or run any read-write "
+                    "command such as `photosearch stats`) to migrate.")
+            raise
+        except (KeyboardInterrupt, InterruptedError):
+            click.echo("Stopped; everything measured so far is committed.")
+            return
+    finally:
+        pdb.close()
+
+    status = res.get("status")
+    if res.get("busy"):
+        if status == "preview":
+            click.echo(f"Note: {res['busy']} -- an --apply now would refuse to start.")
+        else:
+            click.echo(f"Not running: {res['busy']}.")
+    if not apply_:
+        click.echo(f"Dry run: {res.get('would', 0)} photo(s) would be measured "
+                   f"(sharpness v{res.get('version')}). Re-run with --apply.")
+        return
+    click.echo(f"sharpness {status}: measured {res.get('measured', 0)}, "
+               f"errors stored {res.get('errors', 0)}, "
+               f"not_local {res.get('not_local', 0)}, raced {res.get('raced', 0)}"
+               + (f" -- {res['message']}" if res.get("message") else ""))
 
 
 @cli.command("validate-data")
@@ -2703,8 +2789,10 @@ def batch_advance_cmd(db, batch_id, apply):
         click.echo(f"Batch {batch_id} ({res['directory']}) dry-run: "
                    + (f"would run {', '.join(planned)}. Re-run with --apply."
                       if planned else "nothing to run."))
-    if res["stopped_at"]:
-        click.echo(f"Stopped at {res['stopped_at']}: {res['stopped_reason']}")
+    deferred = [s for s in res["steps"] if s["status"] == "deferred"]
+    if deferred:
+        click.echo("Deferred (run batch-advance again once these finish): "
+                   + "; ".join(f"{s['step']} ({s['reason']})" for s in deferred))
     if res["error"]:
         raise click.ClickException(res["error"])
 
@@ -3128,6 +3216,100 @@ def dump_db(db, out_path):
         src.close()
     size = os.path.getsize(out_path)
     click.echo(f"Wrote {size:,} bytes to {out_path}")
+
+
+@cli.command("request-stats")
+@click.option("--last", "last_n", default=500, show_default=True,
+              help="Only the most recent N requests (0 = all).")
+@click.option("--since", default=None,
+              help="Only requests at or after this UTC timestamp prefix, "
+                   "e.g. 2026-10-05 or 2026-10-05T14.")
+@click.option("--include-polling", is_flag=True,
+              help="Include page polling (/batches, maintenance status, "
+                   "worker queues) and the worker fleet's own traffic.")
+@click.option("--slowest", default=10, show_default=True,
+              help="Also list the N slowest individual requests.")
+@click.option("--recent", default=0,
+              help="Also list the N most recent requests with who made them "
+                   "and why.")
+@click.option("--source", "only_source", default=None,
+              help="Only one source: ui, claude, claude-mcp, agent, script, "
+                   "worker, other.")
+@click.option("--file", "log_file", default=None,
+              help="Request log to read (default: beside the DB).")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file (locates the log).")
+def request_stats(last_n, since, include_polling, slowest, recent, only_source,
+                  log_file, db):
+    """Latency per API endpoint, from the persistent request log (web API
+    plus MCP tool calls), with who made each request and why."""
+    import re
+    import statistics
+    from photosearch import request_log
+
+    paths = ([log_file] if log_file else
+             [p for p in (request_log.default_path(db, s)
+                          for s in request_log.STREAMS) if p])
+    if not any(os.path.exists(p) for p in paths):
+        raise click.ClickException(f"No request log at {', '.join(paths)}")
+    polling = re.compile(
+        r"^/api/(batches|worker/|admin/(maintenance-|workers/|incoming-status"
+        r"|version|replica-status))")
+    recs = request_log.read_records(*paths)
+    if only_source:
+        recs = [r for r in recs if r.get("source") == only_source]
+    if since:
+        recs = [r for r in recs if r.get("ts", "") >= since]
+    if not include_polling:
+        recs = [r for r in recs if not polling.match(r.get("path", ""))]
+    if last_n:
+        recs = recs[-last_n:]
+    if not recs:
+        click.echo("No matching requests.")
+        return
+
+    def pct(vals, q):
+        return vals[min(len(vals) - 1, int(q * len(vals)))]
+
+    groups: dict = {}
+    for r in recs:
+        key = f"{r['method']} {re.sub(r'/[0-9]+', '/{id}', r['path'])}"
+        groups.setdefault(key, []).append(r)
+    allms = sorted(r["ms"] for r in recs)
+    by_source: dict = {}
+    for r in recs:
+        by_source[r.get("source", "?")] = by_source.get(r.get("source", "?"), 0) + 1
+    click.echo(f"{len(recs)} requests, {recs[0]['ts']} -> {recs[-1]['ts']}  "
+               f"median {statistics.median(allms):.0f} ms  "
+               f"p90 {pct(allms, 0.9):.0f} ms  max {allms[-1]:.0f} ms")
+    click.echo("by source: " + ", ".join(
+        f"{k} {v}" for k, v in sorted(by_source.items(), key=lambda kv: -kv[1])))
+    click.echo(f"{'endpoint':52s} {'n':>5s} {'median':>8s} {'p90':>8s} "
+               f"{'max':>8s} {'errors':>6s}")
+    for key, rs in sorted(groups.items(), key=lambda kv: -sum(r["ms"] for r in kv[1])):
+        ms = sorted(r["ms"] for r in rs)
+        errors = sum(1 for r in rs if r["status"] >= 500)
+        click.echo(f"{key[:52]:52s} {len(rs):5d} {statistics.median(ms):7.0f}ms "
+                   f"{pct(ms, 0.9):7.0f}ms {ms[-1]:7.0f}ms {errors:6d}")
+    if slowest:
+        click.echo(f"\nSlowest {slowest}:")
+        for r in sorted(recs, key=lambda r: -r["ms"])[:slowest]:
+            q = f"?{r['query']}" if r.get("query") else ""
+            sse = " (to headers; SSE)" if r.get("streaming") else ""
+            click.echo(f"  {r['ms']:8.0f} ms  {r['status']}  {r['ts']}  "
+                       f"{r['method']} {r['path']}{q}"[:220] + sse)
+            click.echo(f"             {_intent_line(r)}")
+    if recent:
+        click.echo(f"\nMost recent {recent}:")
+        for r in recs[-recent:]:
+            click.echo(f"  {r['ts'][:19]}  {r.get('source', '?'):10s} "
+                       f"{r['ms']:7.0f} ms  {r['status']}  {_intent_line(r)}")
+
+
+def _intent_line(r: dict) -> str:
+    """The intent, marked when it was inferred rather than stated."""
+    intent = r.get("intent") or f"{r['method']} {r['path']}"
+    return f"{intent} [inferred]" if r.get("intent_inferred") else intent
 
 
 @cli.command("person-coverage")
@@ -5008,10 +5190,11 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Keep polling forever even when every queue is empty. By default a pass is "
                    "retired once its queue comes back empty and the worker exits when all are "
                    "done — idle polling holds the NAS write lock.")
-@click.option("--sequential", is_flag=True,
-              help="Drain each pass completely before starting the next, in the order given "
-                   "(default: round-robin one batch per pass). Avoids swapping model weights "
-                   "in and out between passes.")
+@click.option("--sequential/--round-robin", default=True, show_default=True,
+              help="--sequential (default) drains each pass completely before starting the "
+                   "next, in the order given, so every photo is CLIP-searchable before the "
+                   "slow LLM passes start and model weights aren't swapped every batch. "
+                   "--round-robin claims one batch per pass per cycle instead.")
 @click.option("--dry-run", is_flag=True, help="Resolve the scope and print per-pass queue depth, then exit (no claims).")
 @click.option("--force", is_flag=True, help="Clear existing data and re-process from scratch (requires --collection, --directory, or a filter).")
 @click.option("--describe-model", default="llama3.2-vision", show_default=True,
@@ -5132,6 +5315,8 @@ def worker(server, passes, collection_id, directory,
             click.echo(f"  {p}: {status['queue_depth'].get(p, 0)}")
         return
 
+    from photosearch.worker import install_log_timestamps
+    install_log_timestamps()
     run_worker(
         server=server,
         passes=pass_list,
@@ -6183,6 +6368,190 @@ def split_export_cmd(photo_id, db, sheet, grid, gutter, mode, sx, sy,
     for p in res["panels"]:
         click.echo(f"    {p['name']}  ({p['bytes'] / 1e6:.1f} MB)")
 
+
+@cli.command("stale-description-passes")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--folder", default=None,
+              help="Limit to one folder and its subfolders (e.g. 2026/2026-10-03_ILCE-7RM6).")
+@click.option("--collection", "collection_id", type=int, default=None,
+              help="Limit to the photos of one collection (e.g. one saved by --save-collection).")
+@click.option("--save-collection", is_flag=True,
+              help="Save the stale photos as a collection, to requeue and run later.")
+@click.option("--requeue", is_flag=True,
+              help="Clear the stale passes now so the worker fleet re-claims them.")
+@click.option("--save-truncated", is_flag=True,
+              help="Save the descriptions cut off mid-sentence as a collection, to re-describe.")
+def stale_description_passes(db, folder, collection_id, save_collection, requeue,
+                             save_truncated):
+    """Find photos whose categories / keywords / verification predate their description.
+
+    A verify rewrite or a re-describe replaces the description; the passes
+    extracted from the old text then describe something that is gone. The
+    server re-queues them on every description write now; this finds the ones
+    written before that (photosearch/stale_descriptions.py has the rules and
+    the measured traps).
+
+    DRY RUN by default, opened READ-ONLY. Run the writes on the NAS — it is the
+    sole writer, and a replica collection would be wiped by the next sync.
+
+    \b
+    Later-run recipe:
+      stale-description-passes --save-collection          # queue: writes a collection only
+      stale-description-passes --collection N --requeue   # when ready: clear the stale passes
+      run-workers.sh --native -s <NAS> --collection N -p verify,category-content,keywords
+
+    \b
+    Cut-off descriptions (re-describe; the server re-queues what derives from them):
+      stale-description-passes --save-truncated           # writes a collection only
+      POST /api/worker/clear-pass {"pass_type":"describe","collection_id":N}
+      run-workers.sh --native -s <NAS> --collection N -p describe,verify,category-content,keywords
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date
+    from photosearch import stale_descriptions as SD
+
+    if folder and collection_id is not None:
+        raise click.UsageError("--folder and --collection are mutually exclusive")
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+    writes = save_collection or requeue or save_truncated
+    conn = (_sqlite3.connect(db, timeout=60) if writes
+            else _sqlite3.connect(f"file:{db}?mode=ro", uri=True))
+    try:
+        found = SD.find_stale(conn, folder=folder, collection_id=collection_id)
+        ids = SD.stale_ids(found)
+        scope = (f"folder {folder}" if folder else
+                 f"collection {collection_id}" if collection_id is not None else "library")
+        ts = found["by_timestamp"]
+        click.echo(f"Stale description-derived passes ({scope}):")
+        click.echo(f"  {'':<17} {'timestamp':>9} {'requeue':>9}")
+        for p in SD.TEXT_PASSES:
+            click.echo(f"  {p:<17} {len(ts[p]):>9,} {len(found[p]):>9,}")
+        click.echo(f"  {'photos (any)':<17} {'':>9} {len(ids):>9,}")
+        click.echo(f"  timestamp check can't judge (output predates logging): "
+                   f"categories {found['unknown_category-content']:,}, "
+                   f"keywords {found['unknown_keywords']:,}")
+        mm = found["keyword_mismatch"]
+        only = len(set(mm) - set(ts["keywords"]))
+        click.echo(f"\nKeywords not found in the description (<{SD.KEYWORD_MATCH_MIN:.0%} match): "
+                   f"{len(mm):,} — {only:,} not caught by the timestamp check")
+        for reason, n in sorted(found["mismatch_reasons"].items(), key=lambda x: -x[1]):
+            click.echo(f"  {reason:<34} {n:>7,}")
+        click.echo(f"\nDescriptions cut off mid-sentence: {len(found['truncated_description']):,} "
+                   f"(not requeued — re-extracting keywords cannot fix them; they need a re-describe)")
+        if not writes:
+            click.echo("\nDry run — nothing written. --save-collection to queue, --requeue to clear now, "
+                       "--save-truncated to queue the cut-off descriptions for a re-describe.")
+            return
+        cut = found["truncated_description"]
+        if save_truncated and cut:
+            from photosearch.db import PhotoDB
+            with PhotoDB(db) as pdb:
+                cid = pdb.create_collection(
+                    f"Cut-off descriptions — {scope} ({_date.today().isoformat()})",
+                    f"{len(cut):,} descriptions that end mid-sentence (stopped at the token "
+                    "limit). Re-describe: clear-pass describe on this collection, then the "
+                    "fleet with -p describe,verify,category-content,keywords.")
+                pdb.add_photos_to_collection(cid, cut)
+            click.echo(f"\nSaved {len(cut):,} cut-off descriptions as collection {cid}.")
+        if save_collection and ids:
+            from photosearch.db import PhotoDB
+            with PhotoDB(db) as pdb:
+                passes = ",".join(p for p in SD.TEXT_PASSES if found[p])
+                cid = pdb.create_collection(
+                    f"Stale text passes — {scope} ({_date.today().isoformat()})",
+                    f"Photos whose {passes} predate their current description. "
+                    f"Requeue: photosearch stale-description-passes --collection <id> --requeue")
+                pdb.add_photos_to_collection(cid, ids)
+            click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
+        if requeue:
+            counts = SD.requeue(conn, found)
+            click.echo("\nRequeued: " + ", ".join(f"{p} {n:,}" for p, n in counts.items()))
+    finally:
+        conn.close()
+
+
+@cli.command("visual-tag-collapse")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--folder", default=None,
+              help="Limit to one folder and its subfolders (e.g. 2026).")
+@click.option("--min-photos", type=int, default=None,
+              help="Only judge folders with at least this many tagged photos (default 50).")
+@click.option("--min-share", type=float, default=None,
+              help="Flag when the commonest tag set covers this share (default 0.5).")
+@click.option("--limit", type=int, default=40, help="Rows to print.")
+@click.option("--save-collection", is_flag=True,
+              help="Save the flagged folders' tagged photos as a collection for a re-run.")
+@click.option("--top-set-only", is_flag=True,
+              help="With --save-collection: only the photos carrying each folder's dominant set.")
+@click.option("--exclude-folder", "exclude_folders", multiple=True,
+              help="Leave out a folder you have judged genuinely uniform (repeatable).")
+def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collection,
+                        top_set_only, exclude_folders):
+    """List folders where category-visual stamped one tag set on most photos.
+
+    The visual pass can be plausible photo by photo and still collapse across a
+    shoot: 1,211 of 1,260 photos on 2026-10-03 got exactly `colorful, sunny,
+    vibrant`. This finds those cohorts — the targeted re-run CLAUDE.md
+    recommends instead of a blanket ~44 h re-tag. Thresholds and their
+    evidence: photosearch/visual_collapse.py.
+
+    DRY RUN by default, opened READ-ONLY. --save-collection writes; run it on
+    the NAS (a replica collection is wiped by the next sync).
+
+    \b
+    Re-run recipe:
+      visual-tag-collapse --folder 2026 --save-collection      # on the NAS
+      clear-pass + run-workers.sh --collection N -p category-visual
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date
+    from photosearch import visual_collapse as VC
+
+    if top_set_only and not save_collection:
+        raise click.UsageError("--top-set-only only applies with --save-collection")
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+    kw = {"min_photos": min_photos if min_photos is not None else VC.COLLAPSE_MIN_PHOTOS,
+          "top_share": min_share if min_share is not None else VC.COLLAPSE_TOP_SHARE}
+    conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = VC.collapsed_folders(conn, folder_prefix=folder, **kw)
+        # A flag measures uniformity, not wrongness: 2026-10-03 is a sunny match
+        # in neon kits, and every model agrees on `sunny, colorful`.
+        excluded = {f.rstrip("/") for f in exclude_folders}
+        rows = [r for r in rows if r["folder"] not in excluded]
+        ids = (VC.folder_photo_ids(conn, [r["folder"] for r in rows], top_set_only)
+               if save_collection else [])
+    finally:
+        conn.close()
+    scope = f"folder {folder}" if folder else "library"
+    click.echo(f"category-visual collapse ({scope}; >= {kw['min_photos']} tagged photos, "
+               f"top set >= {kw['top_share']:.0%}): {len(rows):,} folder(s), "
+               f"{sum(r['top_count'] for r in rows):,} photos on the dominant set")
+    for r in rows[:limit]:
+        click.echo(f"  {r['top_share']:>4.0%}  {r['top_count']:>5,}/{r['tagged']:<5,} "
+                   f"sets={r['distinct_sets']:<4} {r['folder']}  [{r['top_set']}]")
+    if len(rows) > limit:
+        click.echo(f"  … {len(rows) - limit:,} more (--limit)")
+    if not save_collection:
+        click.echo("\nDry run — nothing written. --save-collection to queue a re-run.")
+        return
+    if not ids:
+        click.echo("\nNothing to save.")
+        return
+    from photosearch.db import PhotoDB
+    with PhotoDB(db) as pdb:
+        cid = pdb.create_collection(
+            f"Visual-tag collapse — {scope} ({_date.today().isoformat()})",
+            f"Tagged photos in {len(rows)} folder(s) where one category-visual set "
+            f"covers >= {kw['top_share']:.0%}"
+            + (" (dominant set only)" if top_set_only else "")
+            + ". Re-run: clear-pass category-visual on this collection, then the fleet.")
+        pdb.add_photos_to_collection(cid, ids)
+    click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
 
 if __name__ == "__main__":
     cli()

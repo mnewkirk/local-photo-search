@@ -34,6 +34,8 @@ set_ = set  # the handlers take a `set=` query param, which shadows the builtin
 
 _SAMPLE_HINT = ("No sample yet. Draw one with: "
                 "python evals/visual_tags_eval.py sample --db <db>")
+_SHARPNESS_HINT = ("No sharpness sample yet. Draw one with: "
+                   "python evals/visual_tags_eval.py sample-sharpness --db <db>")
 
 # SQLite's default SQLITE_MAX_VARIABLE_NUMBER floor; a sample is ~60 photos,
 # but nothing stops someone drawing a bigger one.
@@ -58,6 +60,12 @@ LABELLER_NOTES: dict[str, str] = {
                     "most of the sky); not a bright photo, not a small highlight"),
     "backlit": ("labeller note: judge the clearest subject, not a secondary "
                 "figure - its camera-facing side is in its own shadow"),
+    # 2026-09-26: the owner's own recheck disagreed with itself on `muted`
+    # (kappa 0.06). Their reading: the SHADES are subdued, not the light and
+    # not the number of hues.
+    "muted": ("the colours are subdued: darker, greyer shades with little "
+              "contrast between them. About the shades, not the light or the "
+              "number of hues - a photo can be muted and colorful"),
     # 2026-09-26: gemma picked `hazy` on a foggy sunrise and the owner read a
     # photographer's "fog" shot as not foggy — the boundary was undefined.
     "foggy": ("fog or mist in the scene: the air itself is visible and nearby "
@@ -65,13 +73,31 @@ LABELLER_NOTES: dict[str, str] = {
     "hazy": ("distance is washed out - far hills or skyline pale and "
              "low-contrast from haze, smog, smoke or dust - while the near "
              "scene stays clear"),
+    # MEASURED tags (visual_tag_eval.MEASURED_TAGS): ground truth for the
+    # native-resolution sharpness measurement, never asked of a model. Judge
+    # them in the 100% loupe on the original, never from the fitted preview —
+    # a downscale hides exactly the focus error being labelled.
+    "blurry": ("the intended subject - or everything, when there is no subject "
+               "- is out of focus when viewed at 100%. Deliberate bokeh around a "
+               "sharp subject is NOT blurry. Noise or grain is NOT blur. "
+               "Intentional long-exposure motion (light trails, silky water) "
+               "DOES count as blurry; the sample puts those in their own stratum"),
+    "sharp": ("the in-focus part of the subject is crisp at 100%: edges, "
+              "eyelashes, fine texture resolve cleanly. Only the subject has to "
+              "be sharp - a soft background does not stop it"),
 }
+
+_SHARPNESS_SETS = frozenset({"sharpness", "sharpness-recheck"})
 
 
 class LabelBody(BaseModel):
     yes: List[str] = []
     debatable: List[str] = []
     done: bool = True
+    # True when the labeller was shown the sharp/blurry chips. The first 60
+    # visual labels predate them, so their missing `blurry` means "never
+    # asked", not "no" — measured_labels() skips such a label.
+    measured: bool = False
 
 
 def _get_db():
@@ -80,10 +106,24 @@ def _get_db():
     return web._get_db()
 
 
-def _vocabulary() -> dict:
+def _measured_section() -> dict:
+    return {"title": "SHARPNESS - judge in the 100% loupe on the original, not "
+                     "this preview (measured, never asked of a model):",
+            "measured": True,
+            "tags": [{"tag": t, "gloss": None, "note": LABELLER_NOTES.get(t)}
+                     for t in visual_tag_eval.MEASURED_TAGS]}
+
+
+def _vocabulary(label_set: str = "main") -> dict:
     """The perceived terms grouped exactly as the prompt presents them, with
     the same gloss text the model reads — so the labeller and the model are
-    judged against one definition of each term, not two."""
+    judged against one definition of each term, not two.
+
+    Both sets offer the MEASURED sharp/blurry chips. The sharpness sets offer
+    ONLY those: their labels feed the sharpness eval alone, and 30 perceived
+    chips per photo would just slow the labeller down."""
+    if label_set in _SHARPNESS_SETS:
+        return {"sections": [_measured_section()]}
     sections = []
     for title, groups in PROMPT_SECTIONS:
         tags = [{"tag": t, "gloss": PERCEIVED_GLOSS.get(t),
@@ -97,6 +137,7 @@ def _vocabulary() -> dict:
             "candidate": True,
             "tags": [{"tag": t, "gloss": None, "note": g}
                      for t, g in visual_tag_eval.CANDIDATE_TAGS.items()]})
+    sections.append(_measured_section())
     return {"sections": sections}
 
 
@@ -138,12 +179,9 @@ def get_eval(set: str = Query("main")):
     """`set=recheck` serves the blind-relabel subset: the same photos, the
     recheck file's labels only — the first answer is deliberately withheld."""
     label_set = _label_set(set)
-    sample = visual_tag_eval.load_sample()
+    sample = visual_tag_eval.load_sample(visual_tag_eval.SET_SAMPLE[label_set])
     labels = visual_tag_eval.load_labels(label_set)
-    entries = sample.get("photos") or []
-    if label_set == "recheck":
-        keep = set_(visual_tag_eval.recheck_ids())
-        entries = [p for p in entries if int(p["photo_id"]) in keep]
+    entries = visual_tag_eval.set_entries(label_set)
     ids = [int(p["photo_id"]) for p in entries]
     info = _stored_tags(ids)
 
@@ -161,38 +199,49 @@ def get_eval(set: str = Query("main")):
             "in_db": row is not None,
         })
 
-    done = sum(1 for p in photos if (p["label"] or {}).get("done"))
     return {
         "sample": {"created": sample.get("created"), "seed": sample.get("seed")},
         "photos": photos,
-        "vocabulary": _vocabulary(),
-        "progress": {"done": done, "total": len(photos)},
+        "vocabulary": _vocabulary(label_set),
+        "progress": _progress(ids, labels),
+        "measured_done": _measured_done(ids, labels),
         "set": label_set,
-        "hint": None if photos else _SAMPLE_HINT,
+        "hint": None if photos else (
+            _SHARPNESS_HINT if label_set in _SHARPNESS_SETS else _SAMPLE_HINT),
         "eval_dir": str(visual_tag_eval.eval_dir()),
     }
+
+
+def _progress(ids, labels) -> dict:
+    labs = [labels.get(pid) or {} for pid in ids]
+    return {"done": sum(1 for lab in labs if lab.get("done")), "total": len(ids)}
+
+
+def _measured_done(ids, labels) -> int:
+    """Photos done AND with sharp/blurry judged — what the sharpness eval can
+    use. The first visual labels predate the chips, so done != measured."""
+    return sum(1 for pid in ids
+               if (labels.get(pid) or {}).get("done") and labels[pid].get("measured"))
 
 
 @router.put("/{photo_id}")
 def put_label(photo_id: int, body: LabelBody, set: str = Query("main")):
     label_set = _label_set(set)
-    sample_ids = {int(p["photo_id"])
-                  for p in visual_tag_eval.load_sample().get("photos") or []}
-    if label_set == "recheck":
-        sample_ids &= set_(visual_tag_eval.recheck_ids())
+    sample_ids = [int(p["photo_id"]) for p in visual_tag_eval.set_entries(label_set)]
     # Only sampled photos: a label outside the sample would sit in labels.json
     # and be scored by the harness against a stratum it was never drawn for.
-    if photo_id not in sample_ids:
+    if photo_id not in set_(sample_ids):
         raise HTTPException(404, f"photo {photo_id} is not in the eval sample")
     try:
         label = visual_tag_eval.save_label(
-            photo_id, body.yes, body.debatable, done=body.done, label_set=label_set)
+            photo_id, body.yes, body.debatable, done=body.done, label_set=label_set,
+            measured=body.measured)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     labels = visual_tag_eval.load_labels(label_set)
-    done = sum(1 for pid in sample_ids if (labels.get(pid) or {}).get("done"))
     return {"photo_id": photo_id, "label": label,
-            "progress": {"done": done, "total": len(sample_ids)}}
+            "progress": _progress(sample_ids, labels),
+            "measured_done": _measured_done(sample_ids, labels)}
 
 
 # Same env var + default as evals/visual_tags_unsplash.py's THUMBS.

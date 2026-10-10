@@ -114,5 +114,15 @@ suggestions.json
 # Windows importer machine config — holds the NAS hostname/username
 scripts/windows-import/import-config.local.ps1
 
-# Visual-tag eval: hand labels + run caches stay on the owner's machine
+# Visual-tag eval: hand labels + run caches stay on the owner's machine.
+# The sharpness eval lives inside it too (visual-tags/sharpness/: sample,
+# labels, measurements.json cache).
 evals/visual-tags/
+evals/model-evals/
+# Sharpness orientation-check contact sheets
+evals/sharpness-orientation/
+# The 2026-07-09 hand-ranked sample (personal photos) + its score caches.
+evals/aesthetics-bakeoff/
+
+# Persistent API request timing log (photosearch/request_log.py)
+request_log.jsonl*

@@ -10,6 +10,8 @@ import re
 import sqlite3
 import struct
 import time
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -114,7 +116,56 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 34
+
+# v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
+# PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
+_SEARCH_INDEXES: list[tuple[str, str]] = [
+    # camera alone and camera + date range (the 2026-10-03 >120 s search)
+    ("idx_photos_camera_date", "photos(camera_model, date_taken)"),
+    # ingest dedup looked up file_hash with a full scan per incoming file
+    ("idx_photos_file_hash", "photos(file_hash)"),
+    # JSON tag filters stay a Python membership test, but scan a covering
+    # index instead of the table. Queries add `+date_taken` so the planner
+    # keeps these rather than switching to idx_photos_date.
+    ("idx_photos_visual_tags", "photos(visual_tags, date_taken)"),
+    ("idx_photos_categories", "photos(categories, date_taken)"),
+    ("idx_photos_keywords", "photos(keywords, date_taken)"),
+    # structured location; queries compare `col = ? COLLATE NOCASE`
+    ("idx_photos_country_nc", "photos(country COLLATE NOCASE)"),
+    ("idx_photos_admin1_nc", "photos(admin1 COLLATE NOCASE)"),
+    ("idx_photos_admin2_nc", "photos(admin2 COLLATE NOCASE)"),
+    ("idx_photos_locality_nc", "photos(locality COLLATE NOCASE)"),
+    # /api/photos/geojson selects exactly these columns
+    ("idx_photos_gps_cover",
+     "photos(gps_lat, gps_lon, location_source, date_taken, place_name) "
+     "WHERE gps_lat IS NOT NULL"),
+    # min_quality floor and the subject-aesthetic sort
+    ("idx_photos_raw_quality", "photos(COALESCE(aes_overall, aesthetic_score))"),
+    ("idx_photos_subject_aes",
+     "photos(COALESCE(aes_subject_overall_pct, aes_overall_pct))"),
+    # worker "work remaining" counts, polled by /admin/maintenance and the
+    # fleet; near-empty once a library is drained
+    ("idx_photos_need_describe", "photos(id) WHERE description IS NULL"),
+    ("idx_photos_need_verify",
+     "photos(id) WHERE description IS NOT NULL AND verified_at IS NULL"),
+    ("idx_photos_need_quality",
+     "photos(id) WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL"),
+    # "is person P in photo X" (search's EXISTS) and "P's photos"
+    ("idx_faces_photo_person", "faces(photo_id, person_id)"),
+    ("idx_faces_person_photo", "faces(person_id, photo_id)"),
+]
+
+# Dropped in v34: replaced by a composite/NOCASE index above, or an exact
+# duplicate of a PRIMARY KEY / UNIQUE autoindex.
+_SUPERSEDED_INDEXES = (
+    "idx_faces_photo", "idx_faces_person",
+    "idx_photos_country", "idx_photos_admin1", "idx_photos_admin2",
+    "idx_photos_locality",
+    "idx_stack_members_photo", "idx_stack_members_stack",
+    "idx_collection_photos_coll",
+)
+
 
 # The marker resolve-duplicate-persons / dedupe-person-faces leave on the
 # LOSING face of a (photo, person) duplicate. Deliberately still matchable —
@@ -133,6 +184,45 @@ AUTO_MATCH_SOURCES = ("strict", "temporal")
 # OOM blips) auto-heal on the next pass instead of needing a manual
 # retry-failed-* CLI.
 MAX_PROCESS_ATTEMPTS = 3
+
+# Attempts-cap clauses for the two passes whose output columns alone used to
+# decide claimability (see get_unprocessed_photos / count_unprocessed_photos).
+# `photos` is the unaliased table in both queries.
+_QUALITY_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = photos.id AND wp.pass_type = 'quality' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+# clip's predicates alias photos as `p`. clip keeps its own output test (an
+# embedding row) and, like every other pass, stops being offered a photo once
+# the worker has failed on it MAX_PROCESS_ATTEMPTS times — see CLAUDE.md
+# "Non-image rows & the clip-claim infinite re-claim".
+_CLIP_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'clip' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+# Scoped queue counts (`count_unprocessed_photos(photo_ids=...)`) above this
+# many ids write the id test as `+id IN (...)`. The unary `+` stops SQLite
+# looking each id up by rowid — which reads one leaf of the wide photos table
+# per id, ~1 s per 16k ids cold even on NVMe and far worse on the NAS's HDD —
+# so it drives from the pass's small "needs work" partial index (or a narrow
+# covering index) and checks membership instead. Measured on a replica copy,
+# cold: 16k-photo collection, describe/verify/quality 1.1 s -> 0.00 s,
+# clip/faces 1.2 s -> 0.17 s. Below the threshold the rowid lookups win (a
+# 50-photo directory is 50 reads vs a whole index scan).
+_SCOPE_DRIVE_FROM_INDEX_AT = 2000
+
+
+def _scope_col(col: str, photo_ids) -> str:
+    return f"+{col}" if len(photo_ids) > _SCOPE_DRIVE_FROM_INDEX_AT else col
+
+
+_VERIFY_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = photos.id AND wp.pass_type = 'verify' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -195,6 +285,70 @@ def load_face_person_exclusions(conn) -> dict[int, set[int]]:
     ):
         out.setdefault(face_id, set()).add(person_id)
     return out
+
+
+_VISUAL_CARRY_DDL = (
+    "CREATE TABLE IF NOT EXISTS visual_frozen_carry ("
+    "photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE, "
+    "tags TEXT NOT NULL, stashed_at TEXT DEFAULT (datetime('now')))")
+
+
+def stash_frozen_visual_tags(conn, photo_ids) -> int:
+    """Keep each photo's FROZEN visual tags (`sharp` / `blurry`) across a
+    clear of `visual_tags`.
+
+    A re-tag carries frozen terms over from the photo's CURRENT
+    `visual_tags`, but a re-tag is queued by setting that column to NULL
+    (`clear-pass category-visual`, which M28's "Queue for fleet" also uses).
+    So the carry read an empty column and the re-tag silently deleted the
+    frozen tags, which nothing is allowed to delete until a labelled eval
+    decides them. The 59 collapsed folders alone held 41 `sharp` and 142 `blurry`.
+
+    Call BEFORE nulling. The rows for `photo_ids` are refreshed (deleted, then
+    re-inserted where frozen terms exist), so a stale carry can never bring
+    back a tag a human removed between clears. They are read only while
+    `visual_tags` IS NULL (`carried_frozen_visual_tags`), so leaving them in
+    place after the re-tag is harmless. On-demand table, like
+    `face_dedupe_undo`: no schema bump. Does NOT commit. Returns photos
+    stashed.
+    """
+    from .visual_tags_derive import FROZEN_TAGS
+
+    ids = [int(i) for i in photo_ids]
+    if not ids:
+        return 0
+    conn.execute(_VISUAL_CARRY_DDL)
+    stashed = 0
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        ph = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM visual_frozen_carry WHERE photo_id IN ({ph})", chunk)
+        for pid, raw in conn.execute(
+                f"SELECT id, visual_tags FROM photos WHERE id IN ({ph}) "
+                f"AND visual_tags IS NOT NULL", chunk).fetchall():
+            try:
+                tags = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            frozen = sorted({t for t in tags if isinstance(t, str)} & FROZEN_TAGS) \
+                if isinstance(tags, list) else []
+            if frozen:
+                conn.execute("INSERT INTO visual_frozen_carry (photo_id, tags) VALUES (?, ?)",
+                             (pid, json.dumps(frozen)))
+                stashed += 1
+    return stashed
+
+
+def carried_frozen_visual_tags(conn, photo_id: int) -> list:
+    """The frozen tags stashed for `photo_id` by the last clear, or []."""
+    try:
+        row = conn.execute("SELECT tags FROM visual_frozen_carry WHERE photo_id = ?",
+                           (photo_id,)).fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []
+        raise
+    return json.loads(row[0]) if row else []
 
 
 def unmatch_faces_as_duplicates(conn, face_ids, reason: str = "resolve_dups") -> int:
@@ -274,6 +428,70 @@ def backfill_exclusions_from_dedupe_undo(conn, apply: bool = False) -> int:
         return len(rows)
     return record_face_person_exclusions(
         conn, [(r["face_id"], r["person_id"]) for r in rows], reason="backfill")
+
+
+class _FaceEncodingCache:
+    """Process-wide LRU of face encodings, keyed by (database file, face id).
+
+    "More of this kid" (face_suggest) fetched ~10k trusted-label encodings
+    from the vec0 table on EVERY call (1.7 s warm, ~8 s cold on the NAS), and
+    verify-labels re-read the same scope's encodings on every open. The set
+    they ask for changes as people label faces; the encoding behind a face id
+    never does.
+
+    That is what makes caching safe without any invalidation: encodings are
+    only ever INSERTed (add_face) or DELETEd, never updated in place, and
+    faces.id is AUTOINCREMENT so an id is never reused. A relabel changes
+    which ids a caller asks for, not what an id's encoding is; a deleted face
+    is never asked for again. Keyed by the DB's real path so two databases
+    (tests, a restored copy) never share entries.
+
+    Stored as float32 numpy (2 KB a face); bounded at MAX_FACES (~80 MB).
+    """
+
+    MAX_FACES = 40_000
+
+    def __init__(self):
+        from collections import OrderedDict
+        self._lock = threading.Lock()
+        self._entries: "OrderedDict[tuple[str, int], np.ndarray]" = OrderedDict()
+
+    def get(self, db: "PhotoDB", face_ids: list[int]) -> dict:
+        import numpy as np
+        key = os.path.realpath(db.db_path)
+        out: dict = {}
+        missing: list[int] = []
+        with self._lock:
+            for fid in face_ids:
+                v = self._entries.get((key, fid))
+                if v is None:
+                    missing.append(fid)
+                else:
+                    self._entries.move_to_end((key, fid))
+                    out[fid] = v
+        if missing and HAS_SQLITE_VEC:
+            fetched = {}
+            for i in range(0, len(missing), 500):
+                batch = missing[i:i + 500]
+                ph = ",".join("?" * len(batch))
+                for r in db.conn.execute(
+                        f"SELECT face_id, encoding FROM face_encodings "
+                        f"WHERE face_id IN ({ph})", batch):
+                    fetched[r[0]] = np.frombuffer(r[1], dtype=np.float32).copy()
+            with self._lock:
+                for fid, v in fetched.items():
+                    self._entries[(key, fid)] = v
+                while len(self._entries) > self.MAX_FACES:
+                    self._entries.popitem(last=False)
+            out.update(fetched)
+        return out
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_FACE_ENCODING_CACHE = _FaceEncodingCache()
 
 
 class PhotoDB:
@@ -623,10 +841,7 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN admin1 TEXT")
             cur.execute("ALTER TABLE photos ADD COLUMN admin2 TEXT")
             cur.execute("ALTER TABLE photos ADD COLUMN locality TEXT")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_country ON photos(country)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin1 ON photos(admin1)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_admin2 ON photos(admin2)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_locality ON photos(locality)")
+            # Indexed (COLLATE NOCASE) by the v34 block below.
 
         # Migration: faces.det_score column (schema v20). InsightFace already
         # returns a detection confidence [0, 1] per face; we just weren't
@@ -733,6 +948,30 @@ class PhotoDB:
             cur.execute("ALTER TABLE photos ADD COLUMN aes_subject_overall_day_pct REAL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_overall_day_pct ON photos(aes_overall_day_pct)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aes_subject_overall_day_pct ON photos(aes_subject_overall_day_pct)")
+
+        # v33: measured sharpness from the ORIGINAL pixels (photosearch/
+        # sharpness.py; docs/plans/sharpness-measurement.md). sharpness is the
+        # headline score (NULL when unmeasurable), sharpness_json every
+        # candidate feature or {"error": ...}, sharpness_version the
+        # SHARPNESS_VERSION that produced the row (set even on a decode error,
+        # so a bad file is never retried forever), sharpness_scored_at when.
+        # Written only by photosearch/sharpness_backfill.py.
+        try:
+            cur.execute("SELECT sharpness_version FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness REAL")
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness_json TEXT")
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness_version INTEGER")
+            cur.execute("ALTER TABLE photos ADD COLUMN sharpness_scored_at TEXT")
+            # Serves the backfill's missing-only predicate
+            # (`sharpness_version IS NULL OR sharpness_version < ?`) as a
+            # MULTI-INDEX OR. Measured on a 161k-row replica copy with 2% of
+            # rows missing: the candidate query drops from a 0.21 s full table
+            # scan to 0.002 s, and the "nothing left" nightly check from 0.17 s
+            # to ~0 — the scan reads the whole (wide) photos table, which is
+            # exactly the disk traffic a starved N100 cannot afford.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_sharpness_version "
+                        "ON photos(sharpness_version)")
 
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
@@ -1050,15 +1289,13 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_place ON photos(place_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_location_source ON photos(location_source)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_aesthetic ON photos(aesthetic_score)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_dir ON review_selections(directory)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_stack_members_stack ON stack_members(stack_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_stack_members_photo ON stack_members(photo_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_coll ON collection_photos(collection_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)")
+
+        # v34: search indexes (docs/plans/search-indexes.md).
+        self._create_search_indexes(cur)
 
         # sqlite-vec virtual tables for vector search
         if HAS_SQLITE_VEC:
@@ -1093,6 +1330,44 @@ class PhotoDB:
         )
 
         self.conn.commit()  # Schema init always commits immediately
+
+    def _create_search_indexes(self, cur) -> None:
+        """Schema v34 search indexes (docs/plans/search-indexes.md).
+
+        On the NAS the cost is bytes read from a spinning disk with a cold
+        cache, and every un-indexed filter was a ~545 MB scan of `photos`.
+
+        Each build commits on its own, so the write lock is held for one
+        index at a time and fleet submits can land in between, and the
+        table is read once up front by a plain SELECT (a WAL reader blocks
+        no writer) so the cold read happens outside the lock.
+
+        Expression and partial indexes match TEXTUALLY: the queries that use
+        them (search.py, tools.py, db.py claim predicates) must keep exactly
+        these expressions. tests/test_search_indexes.py pins every plan.
+        """
+        existing = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'")}
+        todo = [(name, target) for name, target in _SEARCH_INDEXES
+                if name not in existing]
+        if any(target.startswith("photos(") for _, target in todo):
+            # Warm the page cache: one sequential read of the table, no lock.
+            cur.execute("SELECT count(*), sum(length(filepath)) FROM photos").fetchone()
+        for name, target in todo:
+            self.conn.commit()
+            try:
+                cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {target}")
+            except sqlite3.OperationalError as e:
+                # Only a hand-built minimal table (tests) lacks a column;
+                # every real DB has them all by this point in the migration.
+                if "no such column" not in str(e):
+                    raise
+                logger.warning("skipping index %s: %s", name, e)
+            self.conn.commit()
+        for name in _SUPERSEDED_INDEXES:
+            if name in existing:
+                cur.execute(f"DROP INDEX IF EXISTS {name}")
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Photo CRUD
@@ -1156,6 +1431,34 @@ class PhotoDB:
             f"UPDATE photos SET {set_clause} WHERE id = ?",
             list(kwargs.values()) + [photo_id],
         )
+        self._maybe_commit()
+
+    def invalidate_description_dependents(self, photo_id: int, *,
+                                          include_verify: bool = True) -> None:
+        """A photo's description just changed: re-queue what was derived from it.
+
+        category-content and keywords are extracted FROM the description, and
+        verify checks it. Writing a new description and leaving them alone
+        leaves categories/keywords describing text that is gone — measured
+        2026-10-04: 13,637 photos whose categories predate a verify rewrite,
+        i.e. were extracted from a description verify had judged hallucinated.
+        NULLing the columns and dropping their ledger rows is what clear-pass
+        does; the claim predicates then offer the photo again.
+
+        ``include_verify=False`` is for verify's OWN rewrite — the result being
+        written is the verification of this description.
+        """
+        cols = ["categories = NULL", "keywords = NULL"]
+        passes = ["category-content", "keywords"]
+        if include_verify:
+            cols += ["verified_at = NULL", "verification_status = NULL",
+                     "hallucination_flags = NULL"]
+            passes.append("verify")
+        self.conn.execute(
+            f"UPDATE photos SET {', '.join(cols)} WHERE id = ?", (photo_id,))
+        self.conn.execute(
+            f"DELETE FROM worker_processed WHERE photo_id = ? AND pass_type IN "
+            f"({','.join('?' * len(passes))})", [photo_id, *passes])
         self._maybe_commit()
 
     def photo_count(self) -> int:
@@ -1385,9 +1688,44 @@ class PhotoDB:
                 result[r["face_id"]] = _deserialize_float_list(r["encoding"], FACE_DIMENSIONS)
         return result
 
+    def get_face_encodings_cached(self, face_ids: list[int]) -> dict[int, "np.ndarray"]:
+        """Like get_face_encodings_bulk, but float32 arrays served from a
+        process-wide cache. See _FaceEncodingCache."""
+        return _FACE_ENCODING_CACHE.get(self, face_ids)
+
     # ------------------------------------------------------------------
     # Persons
     # ------------------------------------------------------------------
+
+    def delete_empty_person(self, person_id: int) -> dict:
+        """Delete a person that NO face is labelled as — the stray names left by
+        pressing Enter too soon ('Asa', 'cars'). Refuses (ValueError) while any
+        face still carries the name: that is a real label, and dropping it would
+        leave those faces pointing at nothing.
+
+        Takes the reference faces and match exclusions with it (both cascade),
+        and the person's rows in the on-demand face_dedupe_undo snapshot, so a
+        later restore can never re-attach a deleted name. Commits."""
+        row = self.conn.execute("SELECT id, name FROM persons WHERE id = ?",
+                                (person_id,)).fetchone()
+        if row is None:
+            raise KeyError(person_id)
+        n = self.conn.execute("SELECT COUNT(*) FROM faces WHERE person_id = ?",
+                              (person_id,)).fetchone()[0]
+        if n:
+            raise ValueError(f"{n} face(s) are still labelled {row['name']!r}; "
+                             "reassign or clear them first")
+        refs = self.conn.execute("SELECT COUNT(*) FROM face_references WHERE person_id = ?",
+                                 (person_id,)).fetchone()[0]
+        has_undo = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_dedupe_undo'"
+        ).fetchone()
+        if has_undo:
+            self.conn.execute("DELETE FROM face_dedupe_undo WHERE person_id = ?", (person_id,))
+        self.conn.execute("DELETE FROM face_references WHERE person_id = ?", (person_id,))
+        self.conn.execute("DELETE FROM persons WHERE id = ?", (person_id,))
+        self.conn.commit()
+        return {"id": person_id, "name": row["name"], "references_removed": refs}
 
     def add_person(self, name: str) -> int:
         """Create a named person, or return the existing id if the name exists (case-insensitive)."""
@@ -2212,7 +2550,8 @@ class PhotoDB:
         self._maybe_commit()
         return final
 
-    def mark_processed(self, photo_ids: list[int], pass_type: str):
+    def mark_processed(self, photo_ids: list[int], pass_type: str,
+                       terminal: bool = False):
         """Record an attempt at processing these photos for the given pass.
 
         Used for passes (faces, describe, tags) where a no-result outcome produces
@@ -2220,16 +2559,29 @@ class PhotoDB:
         increments `attempts` so the claim path can skip after MAX_PROCESS_ATTEMPTS
         — transient failures (HEIC pre-decoder, runner-OOM blips) auto-retry on
         the next pass; truly broken files stop being claimed after N tries.
+
+        ``terminal=True`` records a FINISHED outcome that leaves no output row —
+        today only a clean faces run that found nobody. It sets `attempts`
+        straight to MAX_PROCESS_ATTEMPTS (never lowers a higher count), so the
+        claim path stops at once instead of re-detecting the same empty photo
+        MAX_PROCESS_ATTEMPTS times. A detection *error* must NOT use this: it
+        spends one ordinary attempt so a transient failure still gets retried.
+        No schema change — it is the same column the cap already reads.
         """
+        if terminal:
+            sql = f"""INSERT INTO worker_processed (photo_id, pass_type, attempts)
+                      VALUES (?, ?, {MAX_PROCESS_ATTEMPTS})
+                      ON CONFLICT(photo_id, pass_type) DO UPDATE SET
+                        attempts = MAX(attempts, {MAX_PROCESS_ATTEMPTS}),
+                        processed_at = datetime('now')"""
+        else:
+            sql = """INSERT INTO worker_processed (photo_id, pass_type, attempts)
+                     VALUES (?, ?, 1)
+                     ON CONFLICT(photo_id, pass_type) DO UPDATE SET
+                       attempts = attempts + 1,
+                       processed_at = datetime('now')"""
         for pid in photo_ids:
-            self.conn.execute(
-                """INSERT INTO worker_processed (photo_id, pass_type, attempts)
-                   VALUES (?, ?, 1)
-                   ON CONFLICT(photo_id, pass_type) DO UPDATE SET
-                     attempts = attempts + 1,
-                     processed_at = datetime('now')""",
-                (pid, pass_type),
-            )
+            self.conn.execute(sql, (pid, pass_type))
         self.conn.commit()
 
     def get_claimed_photo_ids(self, pass_type: str, commit_cleanup: bool = True) -> set[int]:
@@ -2267,20 +2619,24 @@ class PhotoDB:
         # from processed-with-no-results). Other passes store NULL → value
         # in photos columns, so we can check IS NULL directly.
         if pass_type == "clip":
-            # Photos with no CLIP embedding
+            # Photos with no CLIP embedding whose attempts aren't exhausted.
+            # Without the cap an unloadable file (a ZIP-wrapped Live Photo
+            # saved as .JPG) sat at the front of every claim forever.
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"""SELECT p.id, p.filepath FROM photos p
                         WHERE p.id IN ({placeholders})
                         AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                        AND {_CLIP_NOT_EXHAUSTED}
                         LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    """SELECT p.id, p.filepath FROM photos p
+                    f"""SELECT p.id, p.filepath FROM photos p
                        WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                       AND {_CLIP_NOT_EXHAUSTED}
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
@@ -2312,17 +2668,24 @@ class PhotoDB:
             # Either column missing is enough to claim — worker re-runs both
             # phases and submit-results writes both. Heals interrupted runs
             # where scoring committed but concept analysis didn't.
+            #
+            # Capped by the attempts ledger like every other pass except clip:
+            # without it a photo whose concept analysis fails every time (score
+            # written, concepts NULL) or that cannot be decoded was re-claimed
+            # forever. submit_results marks quality photos processed.
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
-                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) LIMIT ?",
+                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED} LIMIT ?",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
                     "SELECT id, filepath FROM photos "
-                    "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL LIMIT ?",
+                    "WHERE (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED} LIMIT ?",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type in ("describe", "tags", "category-content", "keywords"):
@@ -2387,7 +2750,10 @@ class PhotoDB:
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "verify":
-            # Photos that have a description but haven't been verified yet
+            # Photos that have a description but haven't been verified yet,
+            # capped by the attempts ledger (a photo whose verification raises
+            # every time is retired after MAX_PROCESS_ATTEMPTS, not re-claimed
+            # forever).
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
@@ -2395,14 +2761,16 @@ class PhotoDB:
                         WHERE id IN ({placeholders})
                         AND description IS NOT NULL
                         AND verified_at IS NULL
+                        AND {_VERIFY_NOT_EXHAUSTED}
                         LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    """SELECT id, filepath FROM photos
+                    f"""SELECT id, filepath FROM photos
                        WHERE description IS NOT NULL
                        AND verified_at IS NULL
+                       AND {_VERIFY_NOT_EXHAUSTED}
                        LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
@@ -2447,20 +2815,23 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
-                        WHERE p.id IN ({placeholders})
-                        AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)""",
+                        WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
+                        AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
+                        AND {_CLIP_NOT_EXHAUSTED}""",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    "SELECT COUNT(*) FROM photos p WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)"
+                    "SELECT COUNT(*) FROM photos p "
+                    "WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings) "
+                    f"AND {_CLIP_NOT_EXHAUSTED}"
                 ).fetchone()
         elif pass_type == "faces":
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
-                        WHERE p.id IN ({placeholders})
+                        WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
                         AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
@@ -2479,14 +2850,16 @@ class PhotoDB:
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
-                    f"SELECT COUNT(*) FROM photos WHERE id IN ({placeholders}) "
-                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL)",
+                    f"SELECT COUNT(*) FROM photos WHERE {_scope_col('id', photo_ids)} IN ({placeholders}) "
+                    f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED}",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
                     "SELECT COUNT(*) FROM photos "
-                    "WHERE aesthetic_score IS NULL OR aesthetic_concepts IS NULL"
+                    "WHERE (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
+                    f"AND {_QUALITY_NOT_EXHAUSTED}"
                 ).fetchone()
         elif pass_type in ("describe", "tags", "category-content", "keywords"):
             # All four passes gate on the same condition: photos.<col> IS NULL
@@ -2507,7 +2880,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
@@ -2529,7 +2902,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND visual_tags IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
@@ -2549,23 +2922,25 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND description IS NOT NULL
-                        AND verified_at IS NULL""",
+                        AND verified_at IS NULL
+                        AND {_VERIFY_NOT_EXHAUSTED}""",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
-                    """SELECT COUNT(*) FROM photos
+                    f"""SELECT COUNT(*) FROM photos
                        WHERE description IS NOT NULL
-                       AND verified_at IS NULL"""
+                       AND verified_at IS NULL
+                       AND {_VERIFY_NOT_EXHAUSTED}"""
                 ).fetchone()
         elif pass_type == "aesthetics":
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND aes_overall IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'

@@ -157,6 +157,9 @@
     .section { margin-bottom: 14px; }
     /* Trial tags: labelled here, not in the shipped prompt. */
     .section.candidate { border-left: 2px solid var(--accent, #8b7cf6); padding-left: 10px; }
+    /* Measured tags: ground truth for the sharpness measurement, judged in
+       the 100% loupe — never scored against a model. */
+    .section.measured { border-left: 2px solid var(--yellow); padding-left: 10px; }
     .section-title {
       font-size: 11.5px; font-weight: 600; color: var(--text-muted);
       letter-spacing: 0.03em; margin-bottom: 6px;
@@ -208,7 +211,16 @@
     // ?set=recheck re-labels a blind subset into a second file; the first
     // answers are never shown, so the eval can measure the labeller's own
     // consistency per tag (`visual_tags_eval.py agreement`).
-    var LABEL_SET = new URLSearchParams(window.location.search).get('set') === 'recheck' ? 'recheck' : 'main';
+    // ?set=sharpness labels the separate blurry-weighted sample for sharp /
+    // blurry only (?set=sharpness-recheck is its blind recheck). Those two
+    // are MEASURED tags — ground truth for the native-resolution sharpness
+    // measurement, never scored against a model — and are offered on every
+    // set, judged in the 100% loupe on the original.
+    var SETS = ['main', 'recheck', 'sharpness', 'sharpness-recheck'];
+    var ASKED = new URLSearchParams(window.location.search).get('set');
+    var LABEL_SET = SETS.indexOf(ASKED) >= 0 ? ASKED : 'main';
+    var IS_RECHECK = LABEL_SET === 'recheck' || LABEL_SET === 'sharpness-recheck';
+    var IS_SHARPNESS = LABEL_SET === 'sharpness' || LABEL_SET === 'sharpness-recheck';
     var API = '/api/eval/visual-tags';
     var SETQ = '?set=' + LABEL_SET;
     // no -> yes -> debatable -> no
@@ -228,16 +240,31 @@
     }
 
     function isDone(photo) { return !!(photo.label && photo.label.done); }
+    // Done, but saved before the sharp/blurry chips existed: its missing
+    // `blurry` means "never asked", so it still needs one more look.
+    function needsSharpness(photo) { return isDone(photo) && !photo.label.measured; }
+    function isComplete(photo) { return isDone(photo) && !needsSharpness(photo); }
 
-    // Next not-done photo strictly after `from`, wrapping; -1 when all done.
+    // Next incomplete photo strictly after `from`, wrapping; -1 when none.
     function nextUnlabelled(photos, from) {
       for (var k = 1; k <= photos.length; k++) {
         var i = (from + k) % photos.length;
-        if (!isDone(photos[i])) return i;
+        if (!isComplete(photos[i])) return i;
       }
       return -1;
     }
 
+    // Where on the fitted <img> the click landed, as fractions of the image —
+    // the loupe opens centred there, so a click on the subject shows the
+    // subject at 100%.
+    function clickFocus(ev) {
+      var r = ev.currentTarget.getBoundingClientRect();
+      if (!r.width || !r.height) return { x: 0.5, y: 0.5 };
+      return { x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+               y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)) };
+    }
+
+    // The three-state cycle lives here; the chip itself is PS.Chip.
     function Chip(props) {
       var state = props.state;
       function click(ev) {
@@ -249,16 +276,14 @@
         ev.preventDefault();
         props.onSet(state === 'debatable' ? 'no' : 'debatable');
       }
-      return e('button', {
-        type: 'button', className: 'chip ' + state + ((props.gloss || props.note) ? ' wide' : ''),
+      return e(PS.Chip, {
+        label: props.tag, state: state, gloss: props.gloss,
+        // Labeller-only guidance; the model never sees this text.
+        note: props.note,
+        mark: state === 'yes' ? '✓' : state === 'debatable' ? '?' : '',
         onClick: click, onContextMenu: context,
         title: 'click: no → yes → debatable → no · right-click / shift-click: debatable',
-      },
-        e('span', { className: 'mark' }, state === 'yes' ? '✓' : state === 'debatable' ? '?' : ''),
-        e('span', { className: 'tag' }, props.tag),
-        props.gloss ? e('span', { className: 'gloss' }, props.gloss) : null,
-        // Labeller-only guidance; the model never sees this text.
-        props.note ? e('span', { className: 'gloss note' }, props.note) : null);
+      });
     }
 
     function Page() {
@@ -269,6 +294,8 @@
       var savingS = useState(false); var saving = savingS[0]; var setSaving = savingS[1];
       var errS = useState(null); var error = errS[0]; var setError = errS[1];
       var revealS = useState(false); var reveal = revealS[0]; var setReveal = revealS[1];
+      // null, or {x, y}: the 100% loupe is open, centred on that fraction.
+      var loupeS = useState(null); var loupe = loupeS[0]; var setLoupe = loupeS[1];
 
       // The key handler is bound once; it reads the live values through here
       // rather than a stale closure.
@@ -282,7 +309,7 @@
           return r.json();
         }).then(function (d) {
           setData(d);
-          var first = d.photos.findIndex(function (p) { return !isDone(p); });
+          var first = d.photos.findIndex(function (p) { return !isComplete(p); });
           var start = first < 0 ? 0 : first;
           setIdx(start);
           if (d.photos.length) setDraft(draftFromLabel(d.photos[start].label));
@@ -303,7 +330,12 @@
         // Re-hide on every photo: the model's answer must never be on screen
         // when a new photo appears, or it anchors the label.
         setReveal(false);
+        setLoupe(null);
       }
+
+      // Every set offers the sharp/blurry chips, so every save records that
+      // they were asked (visual_tag_eval.save_label's `measured`).
+      var measuredOffered = !!(data && data.vocabulary.sections.some(function (s) { return s.measured; }));
 
       function setTag(tag, state) {
         var d = Object.assign({}, draft);
@@ -324,6 +356,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             yes: tagsIn(useDraft, 'yes'), debatable: tagsIn(useDraft, 'debatable'), done: done,
+            measured: measuredOffered,
           }),
         }).then(function (r) {
           return r.json().then(function (body) {
@@ -334,7 +367,8 @@
           var next = photos.map(function (p, i) {
             return i === at ? Object.assign({}, p, { label: body.label }) : p;
           });
-          setData(Object.assign({}, data, { photos: next, progress: body.progress }));
+          setData(Object.assign({}, data, { photos: next, progress: body.progress,
+                                            measured_done: body.measured_done }));
           setDraft(draftFromLabel(body.label));
           setDirty(false);
           setSaving(false);
@@ -344,6 +378,7 @@
               setIdx(n);
               setDraft(draftFromLabel(next[n].label));
               setReveal(false);
+              setLoupe(null);
             }
           }
         }).catch(function (ex) {
@@ -371,6 +406,8 @@
         // keyboard save until the new photo has been on screen for a moment.
         save: function () { if (Date.now() - shownAt.current > 600) save(draft, true); },
         jump: jumpUnlabelled,
+        openLoupe: function () { if (photo) setLoupe({ x: 0.5, y: 0.5 }); },
+        loupeOpen: !!loupe,
         dirty: dirty,
       };
 
@@ -380,7 +417,10 @@
           var tn = ev.target && ev.target.tagName;
           if (tn === 'INPUT' || tn === 'TEXTAREA' || tn === 'SELECT') return;
           var L = live.current;
-          if (ev.key === 'ArrowLeft') { ev.preventDefault(); L.prev(); }
+          // The loupe owns the keyboard while open (arrows pan it, Esc closes).
+          if (L.loupeOpen) return;
+          if (ev.key === 'l') { ev.preventDefault(); L.openLoupe(); }
+          else if (ev.key === 'ArrowLeft') { ev.preventDefault(); L.prev(); }
           else if (ev.key === 'ArrowRight') { ev.preventDefault(); L.next(); }
           // preventDefault matters for Enter: the last-clicked chip still has
           // focus, and Enter would otherwise toggle it on the way to saving.
@@ -407,13 +447,22 @@
         if (n) { new Image().src = '/api/photos/' + n.photo_id + '/preview'; }
       }, [idx, photos.length]);
 
-      var intro = e('div', { className: 'page-sub' },
-        'Hand-label each sample photo with the perceived visual tags that are genuinely right for it. '
-        + 'This is the ground truth the category-visual prompt is scored against. '
-        + 'Only PERCEIVED terms are asked: long-exposure, low-light and panoramic are decided by EXIF '
-        + '(a shutter speed cannot be read off pixels), sharp / blurry are frozen pending a real '
-        + 'sharpness measurement, and motion-blur is retired. '
-        + 'Most photos deserve few tags or none.');
+      var intro = IS_SHARPNESS
+        ? e('div', { className: 'page-sub' },
+            'Label each photo sharp, blurry, or neither — the ground truth for the native-resolution '
+            + 'sharpness measurement (no model is scored on these). Judge ONLY in the 100% loupe: '
+            + 'click the subject in the photo (or press l) to see the original at actual pixels. '
+            + 'The fitted preview is downscaled and hides exactly the focus error being labelled. '
+            + 'This sample is weighted toward likely-blurry photos; its stratum is hidden so it '
+            + 'cannot anchor you.')
+        : e('div', { className: 'page-sub' },
+            'Hand-label each sample photo with the perceived visual tags that are genuinely right for it. '
+            + 'This is the ground truth the category-visual prompt is scored against. '
+            + 'Only PERCEIVED terms are asked of the model: long-exposure, low-light and panoramic are '
+            + 'decided by EXIF (a shutter speed cannot be read off pixels) and motion-blur is retired. '
+            + 'sharp / blurry at the bottom are for the sharpness measurement, never the model — '
+            + 'judge them in the 100% loupe (click the photo, or press l). '
+            + 'Most photos deserve few tags or none.');
 
       var body;
       if (!data) {
@@ -432,6 +481,10 @@
         var label = photo.label;
         var statePill = dirty
           ? e('span', { className: 'pill dirty' }, '● unsaved changes')
+          : needsSharpness(photo)
+            ? e('span', { className: 'pill draft',
+                          title: 'Labelled before the sharp / blurry chips existed — judge those and save again' },
+                'saved — sharp / blurry not judged yet')
           : isDone(photo)
             ? e('span', { className: 'pill saved' }, '✓ saved')
             : label
@@ -444,19 +497,25 @@
         body = e('div', null,
           e('div', { className: 'topbar' },
             e('span', { className: 'progress-num' }, prog.done + ' / ' + prog.total + ' done'),
+            data.measured_done != null && data.measured_done !== prog.done
+              ? e('span', { className: 'muted' }, data.measured_done + ' with sharp / blurry judged')
+              : null,
             e('div', { className: 'progress-bar' },
               e('div', { className: 'progress-fill',
                          style: { width: (prog.total ? 100 * prog.done / prog.total : 0) + '%' } })),
-            prog.done === prog.total
+            nextUnlabelled(photos, idx) < 0
               ? e('span', { className: 'pill saved' }, 'All labelled — run the harness')
               : e('button', { className: 'btn', type: 'button', onClick: jumpUnlabelled }, 'Next unlabelled (u)')),
           e('div', { className: 'strip' },
             photos.map(function (p, i) {
-              var cls = 'cell' + (isDone(p) ? ' done' : p.label ? ' draft' : '')
+              var cls = 'cell' + (isComplete(p) ? ' done' : p.label ? ' draft' : '')
                 + (i === idx ? ' current' : '');
               return e('button', {
                 key: p.photo_id, type: 'button', className: cls,
-                title: '#' + p.photo_id + ' · ' + (p.stratum || ''),
+                // The sharpness strata name the likely answer (stored-blurry,
+                // aes-sharpness<=2) — never show them before the label.
+                title: '#' + p.photo_id + (IS_SHARPNESS ? '' : ' · ' + (p.stratum || ''))
+                  + (needsSharpness(p) ? ' · sharp / blurry not judged yet' : ''),
                 onClick: function () { goTo(i); },
               }, i + 1);
             })),
@@ -469,16 +528,24 @@
                   key: photo.photo_id,
                   src: '/api/photos/' + photo.photo_id + '/preview',
                   alt: 'photo ' + photo.photo_id,
-                  title: 'Open full size',
-                  onClick: function () { window.open('/api/photos/' + photo.photo_id + '/full', '_blank'); },
+                  title: 'Click to inspect the ORIGINAL at 100% here (l)',
+                  onClick: function (ev) { setLoupe(clickFocus(ev)); },
                 })),
+              e('div', { className: 'photo-meta' },
+                e('button', { className: 'btn primary', type: 'button',
+                              title: 'The original at actual pixels, centred — or click the subject in the photo',
+                              onClick: function () { setLoupe({ x: 0.5, y: 0.5 }); } },
+                  '🔍 100% loupe (l)'),
+                e('a', { className: 'muted', href: '/api/photos/' + photo.photo_id + '/full',
+                         target: '_blank', rel: 'noopener' }, 'original in a new tab')),
               e('div', { className: 'photo-meta' },
                 e('button', { className: 'btn', type: 'button', disabled: idx === 0,
                               onClick: function () { goTo(idx - 1); } }, '← Prev'),
                 e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length),
                 e('button', { className: 'btn', type: 'button', disabled: idx >= photos.length - 1,
                               onClick: function () { goTo(idx + 1); } }, 'Next →'),
-                e('span', { className: 'pill stratum' }, photo.stratum || 'no stratum'),
+                IS_SHARPNESS ? null
+                  : e('span', { className: 'pill stratum' }, photo.stratum || 'no stratum'),
                 e('span', { className: 'muted' },
                   '#' + photo.photo_id + (photo.filename ? ' · ' + photo.filename : '')),
                 photo.in_db ? null : e('span', { className: 'pill dirty' }, 'not in this DB'),
@@ -486,13 +553,15 @@
                 statePill)),
             e('div', { className: 'card' },
               e('button', { className: 'btn none', type: 'button', disabled: saving, onClick: saveNone },
-                'None of these — nothing notable  (save empty & next)'),
+                IS_SHARPNESS ? 'Neither — not notably sharp or blurry  (save empty & next)'
+                             : 'None of these — nothing notable  (save empty & next)'),
               e('div', { className: 'legend' },
                 'Click: ', e('b', { className: 'y' }, '✓ yes'), ' → ',
                 e('b', { className: 'd' }, '? debatable'), ' → no.  Right-click or shift-click = debatable. ',
                 'Debatable is scored as neither right nor wrong — use it instead of forcing a call.'),
               data.vocabulary.sections.map(function (sec) {
-                return e('div', { className: 'section' + (sec.candidate ? ' candidate' : ''), key: sec.title },
+                return e('div', { className: 'section' + (sec.candidate ? ' candidate' : '')
+                                    + (sec.measured ? ' measured' : ''), key: sec.title },
                   e('div', { className: 'section-title' }, sec.title),
                   e('div', { className: 'chips' },
                     sec.tags.map(function (t) {
@@ -517,12 +586,17 @@
               e('div', { className: 'keys' },
                 e('kbd', null, '←'), ' ', e('kbd', null, '→'), ' prev / next · ',
                 e('kbd', null, 'Enter'), ' or ', e('kbd', null, 's'), ' save as done + next unlabelled · ',
-                e('kbd', null, 'u'), ' next unlabelled'),
+                e('kbd', null, 'u'), ' next unlabelled · ',
+                e('kbd', null, 'l'), ' 100% loupe'),
               // Hidden by default and re-hidden per photo, so the model's
               // answer cannot anchor the label. Look only AFTER deciding.
               e('div', { className: 'reveal' },
                 reveal
                   ? e('span', null,
+                      IS_SHARPNESS
+                        ? e('span', null, e('span', { className: 'muted' }, 'Stratum: '),
+                            photo.stratum || '—', ' · ')
+                        : null,
                       e('span', { className: 'muted' }, 'Model stored: '),
                       photo.stored_tags == null ? 'not tagged'
                         : photo.stored_tags.length ? photo.stored_tags.join(', ') : '[] (none)',
@@ -531,11 +605,28 @@
                       'Show what the model said (decide first — it will bias you)')))));
       }
 
+      var title = {
+        main: 'Visual-tag eval — labelling',
+        recheck: 'Visual-tag eval — RECHECK (blind re-label)',
+        sharpness: 'Sharpness eval — sharp / blurry at 100%',
+        'sharpness-recheck': 'Sharpness eval — RECHECK (blind re-label)',
+      }[LABEL_SET];
+
       return e('div', null,
         e(PS.SharedHeader, { activePage: 'eval-visual-tags' }),
+        loupe && photo
+          ? e(PS.Loupe, { key: photo.photo_id, src: '/api/photos/' + photo.photo_id + '/full',
+                          focus: loupe, onClose: function () { setLoupe(null); } })
+          : null,
         e('div', { className: 'container' },
-          e('h1', null, LABEL_SET === 'recheck' ? 'Visual-tag eval — RECHECK (blind re-label)' : 'Visual-tag eval — labelling'),
-          LABEL_SET === 'recheck'
+          e('h1', null, title),
+          e('div', { className: 'muted', style: { marginBottom: '8px' } },
+            SETS.map(function (s, i) {
+              return e('span', { key: s }, i ? ' · ' : 'Sets: ',
+                s === LABEL_SET ? e('b', null, s)
+                  : e('a', { className: 'nav-link', href: '?set=' + s }, s));
+            })),
+          IS_RECHECK
             ? e('div', { className: 'gloss note', style: { marginBottom: '12px' } },
                 'These photos were labelled once already. Label them again without trying to remember the first answer — the point is to measure how consistently the definitions are being applied.')
             : null,

@@ -912,8 +912,8 @@ class TestSchemaV19Migration:
                 assert expected in cols, f"missing column {expected}"
             indexes = {r["name"] for r in pdb.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
-            for expected in ("idx_photos_country", "idx_photos_admin1",
-                             "idx_photos_admin2", "idx_photos_locality"):
+            for expected in ("idx_photos_country_nc", "idx_photos_admin1_nc",
+                             "idx_photos_admin2_nc", "idx_photos_locality_nc"):
                 assert expected in indexes, f"missing index {expected}"
 
 

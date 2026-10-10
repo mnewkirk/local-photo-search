@@ -35,11 +35,14 @@ def prompt():
 
 def _listed_terms(prompt):
     """Every term the prompt OFFERS, in order — i.e. outside the parenthetical
-    definitions. A term may legitimately recur inside its own definition
-    ("people seen full-length are never close-up")."""
+    definitions and the section headers. A term may legitimately recur inside
+    its own definition ("people seen full-length are never close-up"), and a
+    header may name terms in its rule (LIGHT's indoor exception)."""
     import re
 
-    stripped = re.sub(r"\([^()]*\)", "", prompt)
+    body = "\n".join(line for line in prompt.splitlines()
+                     if not (line and not line[0].isspace() and line.rstrip().endswith(":")))
+    stripped = re.sub(r"\([^()]*\)", "", body)
     return [t for t in re.findall(r"[a-z][a-z-]+", stripped)
             if t in set(V.PERCEIVED_VOCABULARY)]
 
@@ -78,6 +81,21 @@ def test_a_rare_section_exists_and_holds_the_over_applied_terms(prompt):
     for term in ("close-up", "macro", "wide-angle", "aerial", "centered",
                  "symmetrical"):
         assert term in rare, f"{term} belongs in the RARE section"
+
+
+def test_the_attractor_set_is_ruled_out_indoors(prompt):
+    """minicpm-v-4_5 (the fleet's visual model) settled on `sunny, colorful,
+    vibrant` for whole shoots, indoor gym futsal included (12 of 12 probed
+    frames). These rules took the gym to 0 `sunny` and the 60-label eval from
+    82 to 58 false positives at unchanged recall (variant D). A blanket "most
+    photos have NO colour tag" rule (variant B) cost `colorful` recall 0.95 ->
+    0.68, and defining harsh-light as "... is just sunny" (variant C) brought
+    indoor `sunny` back. Don't change these without re-running both."""
+    assert "INDOORS or under lamps, gym lights or flash" in prompt
+    assert "never indoors, never on a grey day" in prompt          # sunny
+    assert "outdoors under a flat grey sky, no shadows; never indoors" in prompt
+    assert "a photo can be muted and colorful" in prompt
+    assert "never just because a photo is colorful" in prompt     # vibrant
 
 
 def test_the_rare_section_explains_the_exact_situation(prompt):

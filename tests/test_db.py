@@ -1160,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 32
+        assert int(version) == SCHEMA_VERSION == 34
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1238,7 +1238,7 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 32
+        assert int(version) == SCHEMA_VERSION == 34
 
     # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
     # the tables intact (schema-version fast-path skips the DDL entirely).
@@ -1271,7 +1271,7 @@ def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 32
+        assert int(version) == SCHEMA_VERSION == 34
 
     # Idempotent: the version fast-path skips the DDL and the table survives.
     with PhotoDB(tmp_db_path) as again:
@@ -1306,9 +1306,54 @@ def test_v31_db_migrates_to_v32_stacking_seen(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 32
+        assert int(version) == SCHEMA_VERSION == 34
         assert reopened.conn.execute(
             "SELECT COUNT(*) FROM stack_members").fetchone()[0] == 2
+
+
+def test_v32_db_migrates_to_v33_sharpness_columns(tmp_path):
+    """A v32 DB (photos without the sharpness columns) gains all four on open,
+    NULL on existing rows — i.e. every photo reads as never-measured, which is
+    exactly what the missing-only backfill predicate wants — and is stamped
+    33. Other columns are untouched."""
+    import sqlite3
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    path = str(tmp_path / "v32.db")
+    with PhotoDB(path) as db:
+        pid = db.add_photo(filepath="a.jpg", filename="a.jpg",
+                           description="kept")
+    # Rebuild `photos` without the v33 columns to simulate a real v32 file
+    # (SQLite >= 3.35 has DROP COLUMN; use it rather than a hand copy).
+    conn = sqlite3.connect(path)
+    conn.execute("DROP INDEX idx_photos_sharpness_version")
+    for col in ("sharpness", "sharpness_json", "sharpness_version",
+                "sharpness_scored_at"):
+        conn.execute(f"ALTER TABLE photos DROP COLUMN {col}")
+    conn.execute("UPDATE schema_info SET value = '32' WHERE key = 'version'")
+    conn.commit()
+    conn.close()
+
+    with PhotoDB(path) as reopened:
+        cols = {r["name"] for r in reopened.conn.execute(
+            "PRAGMA table_info(photos)")}
+        assert {"sharpness", "sharpness_json", "sharpness_version",
+                "sharpness_scored_at"} <= cols
+        row = reopened.conn.execute(
+            "SELECT description, sharpness, sharpness_json, sharpness_version,"
+            " sharpness_scored_at FROM photos WHERE id = ?", (pid,)).fetchone()
+        assert row["description"] == "kept"
+        assert row["sharpness"] is None and row["sharpness_version"] is None
+        assert row["sharpness_json"] is None
+        assert row["sharpness_scored_at"] is None
+        # The missing-only predicate's index comes with the columns.
+        assert reopened.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_photos_sharpness_version'").fetchone()
+        version = reopened.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 34
 
 
 class TestNormalizeDirectory:

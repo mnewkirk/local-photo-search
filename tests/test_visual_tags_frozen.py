@@ -228,6 +228,48 @@ def test_generations_never_records_a_frozen_term(client):
     assert json.loads(text) == ["sunny"]
 
 
+def _set_tags(pid, tags):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        db.conn.execute("UPDATE photos SET visual_tags=? WHERE id=?",
+                        (None if tags is None else json.dumps(tags), pid))
+        db.conn.commit()
+
+
+def _clear(client, ids):
+    r = client.post("/api/worker/clear-pass",
+                    json={"pass_type": "category-visual", "photo_ids": ids})
+    assert r.status_code == 200, r.text
+
+
+def test_a_cleared_then_retagged_photo_keeps_its_frozen_tag(client):
+    """clear-pass NULLs visual_tags to queue a re-tag, and the re-tag used to
+    carry frozen terms over from that (now empty) column — so the collapsed-
+    folder re-run would have deleted 41 `sharp` and 142 `blurry`."""
+    _set_tags(1, ["blurry", "colorful", "sunny", "vibrant"])
+    _clear(client, [1])
+    assert _stored(1) is None                      # claimable again
+    r = _submit(client, [{"photo_id": 1, "model": "m", "visual_tags": ["moody"]}])
+    assert r.status_code == 200, r.text
+    assert _stored(1) == ["blurry", "moody"]
+
+
+def test_a_stale_carry_cannot_resurrect_a_removed_tag(client):
+    _set_tags(1, ["blurry", "sunny"])
+    _clear(client, [1])
+    _submit(client, [{"photo_id": 1, "model": "m", "visual_tags": ["sunny"]}])
+    _set_tags(1, ["sunny"])                        # a human removed `blurry`
+    _clear(client, [1])                            # re-queue: carry refreshed
+    _submit(client, [{"photo_id": 1, "model": "m", "visual_tags": ["moody"]}])
+    assert _stored(1) == ["moody"]
+
+
+def test_a_never_tagged_photo_gains_no_frozen_term_from_a_clear(client):
+    _clear(client, [2])
+    _submit(client, [{"photo_id": 2, "model": "m", "visual_tags": ["peaceful"]}])
+    assert "sharp" not in _stored(2) and "blurry" not in _stored(2)
+
+
 # ---------------------------------------------------------------------------
 # The backfill leaves them at delta 0
 # ---------------------------------------------------------------------------

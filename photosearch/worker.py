@@ -121,8 +121,8 @@ def describe_module_roles() -> dict:
 def _unload_pass_models(pass_type: str) -> None:
     """Release torch models owned by a pass so MPS/CUDA memory is reclaimed.
 
-    Ollama-backed passes (describe/tags/verify) keep their models in the
-    sidecar, so there's nothing to unload here for those.
+    LLM passes keep their models in the backend (Ollama / LM Studio); those
+    are released per pass at retirement by `_release_llm_models`.
     """
     if pass_type == "clip":
         from .clip_embed import unload_model as _unload
@@ -137,6 +137,59 @@ def _unload_pass_models(pass_type: str) -> None:
         # Verify borrows clip_embed for its cross-check embeddings.
         from .clip_embed import unload_model as _unload
         _unload()
+
+
+def _llm_models_for(pass_type: str, pass_models: dict) -> set[str]:
+    """Effective LM Studio model ids a pass calls. `pass_models` maps pass ->
+    [(nominal model, role)]; verify lists two (verifier + describe regen)."""
+    from .describe import effective_model
+    return {effective_model(m, role) for m, role in pass_models.get(pass_type, ())}
+
+
+def _release_llm_models(client, retired: str, next_passes: list[str],
+                        pass_models: dict, status_scope: dict) -> list[str]:
+    """Unload the retired pass's LLMs from LM Studio, keeping any model that
+    the next pass(es) or ANOTHER WORKER's live claim still needs.
+
+    The claim check is what makes this safe with a fleet: workers drain a pass
+    at different moments, and unloading under a sibling's in-flight batch would
+    fail its requests. So the first worker out leaves the model alone and the
+    last one out unloads it. If the status call fails we unload nothing — a
+    resident model costs VRAM, a yanked one costs work.
+    """
+    if not os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return []          # Ollama evicts on its own
+    candidates = _llm_models_for(retired, pass_models)
+    for p in next_passes:
+        candidates -= _llm_models_for(p, pass_models)
+    if not candidates:
+        return []
+    try:
+        status = client.get_status(passes=[retired], **status_scope)
+    except Exception as e:
+        print(f"  (keeping {', '.join(sorted(candidates))} loaded: "
+              f"cannot check other workers' claims: {e})")
+        return []
+    busy = set()
+    for c in status.get("active_claims", []):
+        if c.get("worker_id") != client.worker_id:
+            busy |= _llm_models_for(c.get("pass_type"), pass_models)
+    held = candidates & busy
+    if held:
+        print(f"  keeping {', '.join(sorted(held))} loaded: another worker is still using it")
+    from .describe import unload_openai_models
+    done = unload_openai_models(candidates - busy)
+    if done:
+        print(f"  ⏏ unloaded {', '.join(done)} from LM Studio")
+    return done
+
+
+def _utc_stamp() -> str:
+    """verified_at, in UTC with an explicit Z. It used to be the worker's
+    local clock with no zone (Pacific on every fleet machine since May 2026,
+    UTC for the April in-process runs), which made it impossible to order
+    against the UTC `generations` log — see stale_descriptions."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _flush_caches() -> None:
@@ -176,22 +229,24 @@ class WorkerClient:
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.session = requests.Session()
-        # Quick connectivity test. `/api/stats` runs heavy count scans and can
-        # take >10s on a cold N100 NAS (full-table COUNT/MIN/MAX over photos,
-        # faces, clip_embeddings). A *read* timeout means the TCP connection
-        # succeeded — the server is reachable, just slow to compute stats — so
-        # it's a false negative to treat it as unreachable (this is why the
-        # first fleet launch failed and the second, cache-warm, succeeded).
-        # Only genuine connection failures are fatal; a read timeout warns and
-        # proceeds (the real claim/download/submit calls have their own timeouts
-        # + retries). Callers that just submit a single result (the M28 sync
-        # re-run path) pass probe=False to skip it entirely.
+        # Labels the fleet's requests in the server's request log (its photo
+        # downloads hit /api/photos/{id}/full, outside /api/worker/).
+        self.session.headers["X-Photosearch-Source"] = "worker"
+        # Quick connectivity test against /api/health, which touches no DB.
+        # It used to be /api/stats — full-library COUNT scans, and every worker
+        # in a fleet calls this at the same moment (3 x 117 s on a cold NAS,
+        # 2026-10-07). Any HTTP answer proves the server is reachable: a 404
+        # is an older server without /api/health. A *read* timeout also means
+        # the TCP connection succeeded, so it warns and proceeds; only a
+        # genuine connection failure is fatal. Callers that just submit a
+        # single result (the M28 sync re-run path) pass probe=False.
         if probe:
             try:
-                r = self.session.get(f"{self.server_url}/api/stats", timeout=30)
-                r.raise_for_status()
+                r = self.session.get(f"{self.server_url}/api/health", timeout=30)
+                if r.status_code != 404:
+                    r.raise_for_status()
             except ReqReadTimeout:
-                print(f"  ⚠ {self.server_url}/api/stats slow to respond (cold cache?) — "
+                print(f"  ⚠ {self.server_url}/api/health slow to respond — "
                       f"server is reachable, continuing")
             except Exception as e:
                 raise ConnectionError(f"Cannot reach server at {self.server_url}: {e}")
@@ -427,15 +482,55 @@ def _download_batch(client: WorkerClient, photos: list[dict], temp_dir: str) -> 
     return downloaded
 
 
+def _failure_row(photo_id: int, error) -> dict:
+    """A photo this worker tried and could NOT process (unloadable image,
+    detection/verification raised). Split out of the result list by
+    `_submit_kwargs` and sent as `failures`, which spends one of the photo's
+    MAX_PROCESS_ATTEMPTS on the server without writing anything — so a poison
+    photo is retired by the cap instead of re-claimed forever.
+
+    NOT for timeouts or network errors: those are the worker's problem, not
+    the photo's, and are omitted from the payload so they cost nothing.
+    """
+    return {"photo_id": photo_id, "error": (str(error) or type(error).__name__)[:500]}
+
+
+def _is_failure_row(row: dict) -> bool:
+    return "error" in row
+
+
+def _submit_kwargs(results_key: str, results: list[dict]) -> dict:
+    """Build submit kwargs, moving failure rows into the separate `failures`
+    list. Kept out of the per-pass result rows on purpose: an older server
+    ignores the unknown `failures` field, whereas a failure folded into a
+    result row would 422 (QualityResult.aesthetic_score is required there) or
+    be written as a real verification."""
+    ok = [r for r in results if not _is_failure_row(r)]
+    failed = [r for r in results if _is_failure_row(r)]
+    kwargs = {results_key: ok}
+    if failed:
+        kwargs["failures"] = failed
+    return kwargs
+
+
 def _process_clip(downloaded: list[tuple[dict, str]], batch_size: int = 8) -> list[dict]:
     """Run CLIP embedding on downloaded photos. Returns list of {photo_id, embedding}."""
     from .clip_embed import embed_images_stream
 
     paths = [path for _, path in downloaded]
     results = []
+    embedded = set()
     for idx, emb in embed_images_stream(paths, batch_size=batch_size):
         photo_info = downloaded[idx][0]
         results.append({"photo_id": photo_info["id"], "embedding": emb})
+        embedded.add(idx)
+    # embed_images_stream skips an image it cannot open. Report it, so the
+    # attempts cap retires it — before this it left no trace and headed every
+    # clip claim forever (a ZIP-wrapped Live Photo saved as .JPG).
+    for idx, (photo_info, _) in enumerate(downloaded):
+        if idx not in embedded:
+            results.append(_failure_row(
+                photo_info["id"], "CLIP embedding failed (image could not be loaded)"))
     return results
 
 
@@ -466,6 +561,11 @@ def _process_quality(downloaded: list[tuple[dict, str]], batch_size: int = 8) ->
                 "aesthetic_score": scores[pid],
                 "aesthetic_concepts": concepts.get(pid),
             })
+        else:
+            # score_photos_stream skips an image it cannot open. That used to
+            # drop the photo silently, so it was re-claimed every TTL forever;
+            # report it so the attempts cap can retire it.
+            results.append(_failure_row(pid, "quality scoring failed (image could not be loaded)"))
     return results
 
 
@@ -490,8 +590,12 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
                 "faces": face_data,
             })
         except Exception as e:
+            # NEVER `faces: []` here: the server now treats an empty list as a
+            # clean "nobody in frame" and retires the photo in one submit. An
+            # error is a failure row — it spends ONE attempt, so a transient
+            # detection failure still gets retried.
             print(f"    Face detection failed for {photo_info['filename']}: {e}")
-            results.append({"photo_id": photo_info["id"], "faces": []})
+            results.append(_failure_row(photo_info["id"], e))
     return results
 
 
@@ -501,7 +605,7 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
     Always includes every photo in results (description may be None) so the
     server can mark them as processed and avoid infinite reclaim loops.
     """
-    from .describe import describe_photo, check_available
+    from .describe import UnusableAnswer, describe_photo, check_available
     check_available(model)
 
     results = []
@@ -511,7 +615,7 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
         try:
-            desc = describe_photo(path, model=model)
+            desc = describe_photo(path, model=model, raise_unusable=True)
             elapsed = time.time() - t0
             if desc:
                 preview = desc[:80].replace("\n", " ")
@@ -519,6 +623,11 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
             else:
                 print(f" ({elapsed:.1f}s) no description")
             results.append({"photo_id": photo_info["id"], "description": desc})
+        except UnusableAnswer as e:
+            # Cut off / looping / mid-sentence even after the retries: one
+            # attempt spent and logged, nothing written.
+            print(f" ({time.time() - t0:.1f}s) unusable: {e}")
+            results.append(_failure_row(photo_info["id"], e))
         except Exception as e:
             print(f" ERROR: {e}")
             results.append({"photo_id": photo_info["id"], "description": None})
@@ -538,7 +647,8 @@ def _process_category_content(
     server does NOT mark them processed — they get re-claimed and retried later
     instead of being permanently recorded with empty categories on a stall.
     """
-    from .describe import extract_categories_from_description, check_available
+    from .describe import (UnusableAnswer, extract_categories_from_description,
+                           check_available)
     check_available(model)
     results = []
     total = len(photos)
@@ -548,6 +658,13 @@ def _process_category_content(
         t0 = time.time()
         try:
             cats = extract_categories_from_description(photo.get("description"), model=model)
+        except UnusableAnswer as e:
+            # The model answered, twice, with something unstorable. Unlike a
+            # stall this is the PHOTO's attempt: spend it and log it, so a
+            # photo that always comes back bad is retired by the cap.
+            print(f" ({time.time() - t0:.1f}s) unusable: {e}")
+            results.append(_failure_row(photo["id"], e))
+            continue
         except Exception as e:
             cats, err = None, str(e)
         else:
@@ -567,7 +684,8 @@ def _process_keywords(
     model: str = "llama3.2:3b",
 ) -> list[dict]:
     """Text-only pass: read description from photo dicts, extract free-form keywords."""
-    from .describe import extract_keywords_from_description, check_available
+    from .describe import (UnusableAnswer, extract_keywords_from_description,
+                           check_available)
     check_available(model)
     results = []
     total = len(photos)
@@ -577,6 +695,10 @@ def _process_keywords(
         t0 = time.time()
         try:
             kws = extract_keywords_from_description(photo.get("description"), model=model)
+        except UnusableAnswer as e:
+            print(f" ({time.time() - t0:.1f}s) unusable: {e}")
+            results.append(_failure_row(photo["id"], e))
+            continue
         except Exception as e:
             kws, err = None, str(e)
         else:
@@ -616,7 +738,13 @@ def _process_category_visual(
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
         try:
-            tags = _describe.tag_visual_photo(path, model=model)
+            tags = _describe.tag_visual_photo(path, model=model, raise_unusable=True)
+        except _describe.UnusableAnswer as e:
+            # Same attempt the `visual_tags: None` row spent, plus a logged
+            # reason — those used to retire photos `blocked` with no trace.
+            print(f" ({time.time() - t0:.1f}s) no usable answer: {e}")
+            results.append(_failure_row(photo["id"], e))
+            continue
         except Exception as e:
             print(f" ERROR: {e}")
             results.append({"photo_id": photo["id"], "visual_tags": None})
@@ -752,85 +880,37 @@ def _process_verify(
                 results.append({
                     "photo_id": pid,
                     "status": "pass",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "verified_at": _utc_stamp(),
                     "hallucination_flags": None,
                 })
                 continue
 
-            # Pass 1: CLIP scoring
-            clip_flags = []
-            if clip_embedding:
-                from .verify import clip_score_description, clip_score_tags, _flag_by_clip
-                desc_scores = clip_score_description(clip_embedding, description) if description else []
-                tag_scores = clip_score_tags(clip_embedding, tags) if tags else []
-                desc_flagged, tag_flagged, all_clip_items = _flag_by_clip(
-                    desc_scores, tag_scores, clip_threshold=0.18
-                )
-                clip_flags = [item for item in all_clip_items
-                              if any(f.get("noun") == item.get("noun") for f in desc_flagged)
-                              or any(f.get("tag") == item.get("tag") for f in tag_flagged)]
-
-                if not desc_flagged and not tag_flagged:
-                    elapsed = time.time() - t0
-                    print(f" ({elapsed:.1f}s) pass (CLIP clean)")
-                    results.append({
-                        "photo_id": pid,
-                        "status": "pass",
-                        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
-                    })
-                    continue
-
-            # Pass 2: LLM verification
-            from .verify import llm_verify_description
-            confirmed = llm_verify_description(path, description, tags, model=verify_model)
-
-            if not confirmed:
+            # Passes 1-3 (CLIP gate, LLM, CLIP override) live in
+            # verify.check_description so the model eval measures this exact
+            # pipeline (evals/verify_eval.py --mode pipeline).
+            from .verify import check_description
+            chk = check_description(path, description, tags, clip_embedding,
+                                    verify_model=verify_model)
+            clip_flags = chk["clip_flags"]
+            if chk["stage"] != "confirmed":
                 elapsed = time.time() - t0
-                print(f" ({elapsed:.1f}s) pass (LLM cleared)")
+                label = {"clip_clean": "CLIP clean", "llm_cleared": "LLM cleared",
+                         "clip_override": "CLIP override"}[chk["stage"]]
+                print(f" ({elapsed:.1f}s) pass ({label})")
                 results.append({
                     "photo_id": pid,
                     "status": "pass",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "verified_at": _utc_stamp(),
                     "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
                 })
                 continue
-
-            # Pass 3: CLIP cross-check on LLM findings
-            import numpy as np
-            verified_confirmed = confirmed
-            if clip_embedding:
-                from .clip_embed import embed_text
-                photo_vec = np.array(clip_embedding, dtype=np.float32)
-                desc_scores_sims = [s["similarity"] for s in desc_scores] + [s["similarity"] for s in tag_scores]
-                median_sim = float(np.median(desc_scores_sims)) if desc_scores_sims else 0.0
-
-                verified_confirmed = []
-                for item in confirmed:
-                    text_emb = embed_text(f"a photo of {item['noun']}")
-                    if text_emb is not None:
-                        text_vec = np.array(text_emb, dtype=np.float32)
-                        sim = float(np.dot(photo_vec, text_vec))
-                        if sim >= median_sim:
-                            continue  # CLIP overrides LLM
-                    verified_confirmed.append(item)
-
-            if not verified_confirmed:
-                elapsed = time.time() - t0
-                print(f" ({elapsed:.1f}s) pass (CLIP override)")
-                results.append({
-                    "photo_id": pid,
-                    "status": "pass",
-                    "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "hallucination_flags": json.dumps(clip_flags) if clip_flags else None,
-                })
-                continue
+            verified_confirmed = chk["confirmed"]
 
             # Hallucinations confirmed — regenerate
             confirmed_nouns = {c["noun"] for c in verified_confirmed}
             elapsed = time.time() - t0
 
-            from .describe import describe_photo as _describe, tag_visual_photo as _tag, DESCRIBE_PROMPT
+            from .describe import describe_photo as _describe, DESCRIBE_PROMPT
             strict_prompt = DESCRIBE_PROMPT + (
                 "\n\nIMPORTANT: A previous description was found to contain "
                 "hallucinated objects. Be extra careful to ONLY describe what you "
@@ -838,7 +918,11 @@ def _process_verify(
                 + ", ".join(sorted(confirmed_nouns)) + "."
             )
             new_desc = _describe(path, model=regen_model, prompt=strict_prompt)
-            new_tags = _tag(path, model=regen_model) if new_desc else None
+            # No visual re-tag here: it wrote the legacy `tags` column (dead
+            # since v23) and dragged the visual model into VRAM beside the
+            # verifier and the regen model. visual_tags come from the pixels,
+            # not the description, so a rewrite does not make them stale; the
+            # server re-queues what DOES depend on the text.
 
             # Mirror verify.py: 'regenerated' only if we actually produced a new
             # description. Otherwise the photo's description in the DB is still
@@ -853,20 +937,61 @@ def _process_verify(
             result = {
                 "photo_id": pid,
                 "status": status,
-                "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "verified_at": _utc_stamp(),
                 "hallucination_flags": json.dumps(
                     [{"noun": n, "llm_says": "NO"} for n in confirmed_nouns]
                 ),
             }
             if new_desc:
                 result["description"] = new_desc
-            if new_tags:
-                result["tags"] = new_tags
             results.append(result)
 
+        except _TRANSIENT as e:
+            # Network / LLM-backend timeout — the worker's problem, not the
+            # photo's. Omit it so the photo comes back without spending an
+            # attempt.
+            print(f" deferring ({e.__class__.__name__}: {e})")
         except Exception as e:
             print(f" ERROR: {e}")
+            results.append(_failure_row(pid, e))
     return results
+
+
+class _TimestampedStream:
+    """Prefix every output line with a local timestamp.
+
+    Worker logs had none, so "how long did describe take" or "how long does a
+    submit sit on the NAS" could only be guessed. Stamps at the START of a
+    line only: the worker writes a line in pieces ("Downloading X..." then
+    "19.0MB (0.5s)" on the same line), and those must not be split.
+    """
+
+    def __init__(self, stream):
+        self._s = stream
+        self._at_line_start = True
+
+    def write(self, text):
+        if not text:
+            return 0
+        out = []
+        for piece in text.splitlines(keepends=True):
+            if self._at_line_start and piece not in ("\n", "\r\n"):
+                out.append(time.strftime("[%Y-%m-%d %H:%M:%S] "))
+            out.append(piece)
+            self._at_line_start = piece.endswith("\n")
+        self._s.write("".join(out))
+        return len(text)
+
+    def __getattr__(self, name):          # flush, fileno, isatty, encoding …
+        return getattr(self._s, name)
+
+
+def install_log_timestamps() -> None:
+    """Wrap stdout/stderr so every worker log line carries a timestamp."""
+    if not isinstance(sys.stdout, _TimestampedStream):
+        sys.stdout = _TimestampedStream(sys.stdout)
+    if not isinstance(sys.stderr, _TimestampedStream):
+        sys.stderr = _TimestampedStream(sys.stderr)
 
 
 def run_worker(
@@ -880,7 +1005,7 @@ def run_worker(
     ttl_minutes: int = 30,
     one_shot: bool = False,
     stay_alive: bool = False,
-    sequential: bool = False,
+    sequential: bool = True,
     force: bool = False,
     describe_model: str = "llama3.2-vision",
     tags_model: str = "llava",
@@ -912,9 +1037,9 @@ def run_worker(
             claim opens BEGIN IMMEDIATE on the NAS's SQLite file and takes the
             single write lock, which has previously starved face assignments,
             collection writes and an entire overnight ingest.
-        sequential: If True, drain one pass completely before starting the
-            next, in the order given. Default is round-robin, one batch per
-            pass per cycle. Sequential avoids thrashing model weights in and
+        sequential: If True (the default), drain one pass completely before
+            starting the next, in the order given. False is round-robin, one
+            batch per pass per cycle. Sequential avoids thrashing model weights in and
             out of memory between passes (-p clip,quality otherwise alternates
             ViT-B/16 and ViT-L/14 every batch).
         force: If True, clear existing data and re-process from scratch
@@ -980,6 +1105,18 @@ def run_worker(
     # reports empty (unless --stay-alive); when the list empties, we're done.
     active: list[str] = list(passes)
     seq_idx = 0
+    # LLM passes -> the (nominal model, role) pairs they call, so a retiring
+    # pass can unload exactly its own LM Studio models (_release_llm_models).
+    pass_models = {
+        "describe":         [(describe_model, "describe")],
+        "verify":           [(verify_model, "verify"), (describe_model, "describe")],
+        "category-content": [(category_content_model, "text")],
+        "keywords":         [(keywords_model, "text")],
+        "category-visual":  [(category_visual_model, "visual")],
+        "aesthetics":       [(aesthetics_model, "aesthetics")],
+    }
+    status_scope = {"collection_id": collection_id, "directory": directory,
+                    "filters": filters}
     mode = ("sequential" if sequential else "round-robin") + \
            (", stay-alive" if stay_alive else ", exit when drained")
     print(f"\nPass order: {' -> '.join(active)}  ({mode})")
@@ -1075,16 +1212,16 @@ def run_worker(
 
                 if pass_type == "clip":
                     results = _process_clip(downloaded, batch_size=model_batch_size)
-                    kwargs = {"clip_results": results}
+                    kwargs = _submit_kwargs("clip_results", results)
                 elif pass_type == "quality":
                     results = _process_quality(downloaded, batch_size=model_batch_size)
-                    kwargs = {"quality_results": results}
+                    kwargs = _submit_kwargs("quality_results", results)
                 elif pass_type == "faces":
                     results = _process_faces(downloaded)
-                    kwargs = {"face_results": results}
+                    kwargs = _submit_kwargs("face_results", results)
                 elif pass_type == "describe":
                     results = _process_describe(downloaded, model=describe_model)
-                    kwargs = {"describe_results": results,
+                    kwargs = {**_submit_kwargs("describe_results", results),
                               **_provenance_kwargs(pass_type, describe_model, results)}
                 elif pass_type == "verify":
                     results = _process_verify(
@@ -1093,21 +1230,21 @@ def run_worker(
                     )
                     # regen_model == describe_model produces any regenerated
                     # text, so the artifact's provenance is the DESCRIBE role.
-                    kwargs = {"verify_results": results,
+                    kwargs = {**_submit_kwargs("verify_results", results),
                               **_provenance_kwargs(pass_type, describe_model,
                                                    results, role="describe")}
                 elif pass_type == "category-content":
                     results = _process_category_content(photos, model=category_content_model)
                     _provenance_kwargs(pass_type, category_content_model, results)
-                    kwargs = {"category_content_results": results}
+                    kwargs = _submit_kwargs("category_content_results", results)
                 elif pass_type == "category-visual":
                     results = _process_category_visual(downloaded, model=category_visual_model)
                     _provenance_kwargs(pass_type, category_visual_model, results)
-                    kwargs = {"category_visual_results": results}
+                    kwargs = _submit_kwargs("category_visual_results", results)
                 elif pass_type == "keywords":
                     results = _process_keywords(photos, model=keywords_model)
                     _provenance_kwargs(pass_type, keywords_model, results)
-                    kwargs = {"keywords_results": results}
+                    kwargs = _submit_kwargs("keywords_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)
@@ -1180,6 +1317,15 @@ def run_worker(
                         active.remove(pt)
                         left = ", ".join(active) if active else "none"
                         print(f"  → retiring '{pt}' (queue empty). Remaining: {left}")
+                        # Sequential: only the pass up next keeps its model
+                        # resident — one model at a time. Round-robin: every
+                        # remaining pass is still in rotation.
+                        if sequential and active:
+                            keep = [active[seq_idx % len(active)]]
+                        else:
+                            keep = list(active)
+                        _release_llm_models(client, pt, keep, pass_models,
+                                            status_scope)
                 elif sequential:
                     seq_idx += 1
             if not active:

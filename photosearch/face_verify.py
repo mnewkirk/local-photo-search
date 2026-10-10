@@ -157,7 +157,7 @@ def verify_labels(db, *, date_from=None, date_to=None, person=None,
     if not rows:
         return [], [], {"faces": 0, "people": 0}
 
-    encs = db.get_face_encodings_bulk([r["face_id"] for r in rows])
+    encs = db.get_face_encodings_cached([r["face_id"] for r in rows])
     rows = [r for r in rows if r["face_id"] in encs]
 
     by_person: dict[str, list] = {}
@@ -346,7 +346,7 @@ def _photo_rivals(db, labelled_rows, encs, refs, names, radius, d_to):
     missing = [f["face_id"] for f in all_faces if f["face_id"] not in encs]
     if missing:
         encs = dict(encs)
-        encs.update(db.get_face_encodings_bulk(missing))
+        encs.update(db.get_face_encodings_cached(missing))
     all_faces = [f for f in all_faces if f["face_id"] in encs]
 
     by_photo: dict[int, list] = {}

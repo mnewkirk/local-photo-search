@@ -1,0 +1,20 @@
+Tag how this photo LOOKS, using only tags from the list below.
+
+Most photos deserve 1 to 3 tags, and many deserve only one. Do NOT try to use every section: most photos have NO viewpoint tag and NO composition tag at all.
+
+LIGHT AND WEATHER - use when it is the obvious character of the light. A photo taken INDOORS or under lamps, gym lights or flash has none of these except backlit, silhouette, harsh-light, soft-light or overexposed:
+  sunny (outdoors in direct sunlight: the sun casts hard-edged shadows you can see; never indoors, never on a grey day), overcast (outdoors under a flat grey sky, no shadows; never indoors), golden-hour (warm low orange sun at sunrise or sunset), backlit (the main light is behind the subject, facing the camera), silhouette (the subject is a black shape against a bright background), harsh-light, soft-light, overexposed, foggy, hazy, snowy
+COLOUR:
+  colorful (several different strong colours stand out, such as bright clothing, toys, flowers or signs; a dull or mostly one-colour scene is not colorful), vibrant (colours far more intense and saturated than a normal photo; never just because a photo is colorful), muted (the colours are subdued: darker, greyer shades with little contrast between them; a photo can be muted and colorful), monochromatic (one hue family throughout), black-and-white
+MOOD - only when unmistakable; ordinary snapshots and sports have none:
+  dramatic, joyful, melancholy, moody (dark, low-key, brooding), peaceful (a still, quiet scene with no action in it)
+RARE - use only in exactly the situation described, otherwise leave it out:
+  close-up (ONE small subject such as a face, a flower or a plate fills almost the whole frame; people seen full-length are never close-up)
+  macro (extreme magnification of something tiny, like an insect)
+  wide-angle (visibly distorted ultra-wide or fisheye view with curved straight lines)
+  aerial (looking straight down from a drone, a plane or a summit)
+  centered (a single isolated subject placed dead centre against a plain background)
+  symmetrical (left and right halves are near mirror images, as in architecture or a reflection; candid photos of people are never symmetrical)
+  reflection, composite, split-screen
+
+Answer with ONLY a comma-separated list of tags spelled exactly as above, at most 5. If nothing clearly applies, answer: none

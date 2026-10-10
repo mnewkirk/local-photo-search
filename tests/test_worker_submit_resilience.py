@@ -224,9 +224,11 @@ def test_faces_defers_when_a_face_row_fails_but_keeps_no_faces_done(client, monk
             {"photo_id": 3, "faces": []},
         ],
     }).json()
+    from photosearch.db import MAX_PROCESS_ATTEMPTS
     assert body["deferred_photo_ids"] == [2]
     marked = _attempts("faces")
-    assert marked.get(3) == 1, "no faces found is a completed pass"
+    assert marked.get(3) == MAX_PROCESS_ATTEMPTS, \
+        "no faces found is a completed pass — terminal in one submit"
     assert marked.get(1) == 1
     assert marked.get(2) is None
 

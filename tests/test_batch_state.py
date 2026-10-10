@@ -32,6 +32,7 @@ from photosearch.batch_state import (
     fleet_launch_passes,
 )
 from photosearch.db import MAX_PROCESS_ATTEMPTS
+from photosearch.sharpness import SHARPNESS_VERSION
 from photosearch.ingest_batches import (
     STALL_SECONDS,
     register_batch,
@@ -144,6 +145,10 @@ def _complete_all_nas_steps(db, batch_id, ids, include_optional=False):
     for step in NAS_STEPS:
         if step in OPTIONAL_STEPS and not include_optional:
             continue
+        if step == "sharpness":
+            # Column-derived, not job-derived: a closed row proves nothing.
+            _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+            continue
         open_job(db, batch_id, step, "nas")
         close_job(db, batch_id, step)
 
@@ -184,12 +189,13 @@ class TestShape:
     def test_rank_measure_is_a_nas_step_and_runs_last(self):
         """It reads the ORIGINAL files at full resolution and only the NAS has
         them (the replica holds no originals), so it is not a desktop step —
-        the plan's "desktop-only" label was simply wrong. Last, because it is
-        the optional one."""
-        assert NAS_STEPS[-1] == "rank_measure"
-        assert OPTIONAL_STEPS == ("rank_measure",)
+        the plan's "desktop-only" label was simply wrong. The two optional
+        measurement steps run last: rank_measure, then sharpness."""
+        assert NAS_STEPS[-2:] == ("rank_measure", "sharpness")
+        assert OPTIONAL_STEPS == ("rank_measure", "sharpness")
         assert set(OPTIONAL_STEPS) <= set(NAS_STEPS)
         assert DEPENDS_ON["rank_measure"] == "faces"
+        assert DEPENDS_ON["sharpness"] == "faces"
 
     def test_kinds_match_the_step_family(self, db):
         batch_id, ids = _make_batch(db)
@@ -204,8 +210,11 @@ class TestShape:
         batch_id, ids = _make_batch(db)
         state = batch_state(db, batch_id)
         for s in state["steps"]:
+            # category-visual also carries its collapse stats (visual_collapse.py).
+            extra = {"collapse"} if s["step"] == "category-visual" else set()
             assert set(s) == {"step", "kind", "state", "total", "eligible",
-                              "done", "remaining", "failed", "waiting_on", "detail"}
+                              "done", "remaining", "failed", "waiting_on", "detail",
+                              "warning", "warning_detail"} | extra
             assert s["state"] in STATES
             assert s["total"] == len(ids)
 
@@ -380,21 +389,21 @@ class TestExhaustedAttemptsAreBlocked:
         assert step["done"] == 0
         assert step["state"] == "needs_queue"
 
-    # --- passes whose `remaining` does NOT filter exhausted attempts ------
+    # --- quality / verify joined the attempts ledger ------------------------
     #
-    # `quality` (db.py:2235-2247) and `verify` (db.py:2304-2319) have no
-    # attempts clause in their claim predicate, so an exhausted photo is
-    # still counted in `remaining`. Subtracting `failed` as well would
-    # under-count `done` by exactly `failed`, and `remaining == 0` can never
-    # coincide with `failed > 0` — so `blocked` needs the subset form
-    # `remaining == failed`.
+    # They used to be, with clip, the passes whose claim predicate had
+    # no attempts clause, so an exhausted photo stayed inside `remaining` and
+    # needed the subset arithmetic (`done = eligible - remaining`,
+    # `blocked = remaining == failed`). They now filter exhausted photos like
+    # every other ledgered pass, so `failed` and `remaining` are DISJOINT and
+    # the ordinary `done = eligible - remaining - failed` applies.
 
-    def test_quality_done_does_not_subtract_failed_twice(self, db):
+    def test_quality_failed_is_disjoint_from_remaining(self, db):
         batch_id, ids = _make_batch(db, count=4)
         _do_quality(db, ids[:2])          # 2 genuinely scored
         _exhaust(db, ids[2:], "quality")  # 2 given up on
         step = _step(batch_state(db, batch_id), "quality")
-        assert step["remaining"] == 2
+        assert step["remaining"] == 0, "exhausted photos are no longer claimable"
         assert step["failed"] == 2
         assert step["done"] == 2, "the 2 scored photos are done"
 
@@ -410,19 +419,33 @@ class TestExhaustedAttemptsAreBlocked:
         _do_quality(db, ids[:2])
         _exhaust(db, ids[2:3], "quality")   # 1 exhausted, 1 untried
         step = _step(batch_state(db, batch_id), "quality")
-        assert step["remaining"] == 2
+        assert step["remaining"] == 1
         assert step["failed"] == 1
         assert step["done"] == 2
         assert step["state"] == "needs_queue"
 
-    def test_verify_done_does_not_subtract_failed_twice(self, db):
+    def test_quality_concepts_only_failure_counts_as_failed(self, db):
+        """Score written, concepts NULL, attempts exhausted: that is the
+        infinite re-claim the cap exists to stop — it reads failed, not
+        remaining."""
+        batch_id, ids = _make_batch(db, count=2)
+        _do_quality(db, ids[:1])
+        _set_col(db, ids[1:], "aesthetic_score", 5.0)
+        _exhaust(db, ids[1:], "quality")
+        step = _step(batch_state(db, batch_id), "quality")
+        assert step["remaining"] == 0
+        assert step["failed"] == 1
+        assert step["done"] == 1
+        assert step["state"] == "blocked"
+
+    def test_verify_failed_is_disjoint_from_remaining(self, db):
         batch_id, ids = _make_batch(db, count=4)
         _complete_pass(db, ids, "describe")          # all eligible
         _set_col(db, ids[:2], "verified_at", "2091-09-19 12:00:00")
         _exhaust(db, ids[2:], "verify")
         step = _step(batch_state(db, batch_id), "verify")
         assert step["eligible"] == 4
-        assert step["remaining"] == 2
+        assert step["remaining"] == 0
         assert step["failed"] == 2
         assert step["done"] == 2
 
@@ -432,6 +455,15 @@ class TestExhaustedAttemptsAreBlocked:
         _set_col(db, ids[:2], "verified_at", "2091-09-19 12:00:00")
         _exhaust(db, ids[2:], "verify")
         assert _step(batch_state(db, batch_id), "verify")["state"] == "blocked"
+
+    def test_verify_below_the_cap_is_still_remaining(self, db):
+        batch_id, ids = _make_batch(db, count=2)
+        _complete_pass(db, ids, "describe")
+        _exhaust(db, ids, "verify", attempts=MAX_PROCESS_ATTEMPTS - 1)
+        step = _step(batch_state(db, batch_id), "verify")
+        assert step["remaining"] == 2
+        assert step["failed"] == 0
+        assert step["state"] == "needs_queue"
 
     def test_quality_and_verify_still_complete_normally(self, db):
         batch_id, ids = _make_batch(db, count=4)
@@ -444,9 +476,30 @@ class TestExhaustedAttemptsAreBlocked:
             assert step["state"] == "completed"
             assert step["done"] == 4
 
-    def test_clip_has_no_attempts_ledger(self, db):
+    def test_poison_clip_photo_reads_blocked(self, db):
+        """clip used to keep no ledger: an unloadable photo sat at
+        `remaining > 0` forever and the batch could never be `blocked` or
+        `ready`. Now it is capped like every other pass."""
+        batch_id, ids = _make_batch(db, count=3)
+        _do_clip(db, ids[:2])
+        _exhaust(db, ids[2:], "clip")
+        step = _step(batch_state(db, batch_id), "clip")
+        assert step["remaining"] == 0
+        assert step["failed"] == 1
+        assert step["done"] == 2
+        assert step["state"] == "blocked"
+
+    def test_clip_exhausted_but_embedded_is_done(self, db):
         batch_id, ids = _make_batch(db)
         _exhaust(db, ids, "clip")
+        _do_clip(db, ids)
+        step = _step(batch_state(db, batch_id), "clip")
+        assert step["failed"] == 0
+        assert step["state"] == "completed"
+
+    def test_clip_below_the_cap_stays_actionable(self, db):
+        batch_id, ids = _make_batch(db)
+        _exhaust(db, ids, "clip", attempts=MAX_PROCESS_ATTEMPTS - 1)
         step = _step(batch_state(db, batch_id), "clip")
         assert step["failed"] == 0
         assert step["remaining"] == len(ids)
@@ -709,6 +762,77 @@ class TestJobOnlyNasSteps:
         assert _step(batch_state(db, batch_id), "resolve_dups")["state"] == "needs_queue"
 
 
+class TestSharpnessStep:
+    """Schema v33. Derived from the COLUMN, not a job row: a photo is done
+    once its sharpness_version is current. Optional — never gates `ready`."""
+
+    def test_waits_on_faces(self, db):
+        batch_id, ids = _make_batch(db)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "waiting" and step["waiting_on"] == "faces"
+        assert step["kind"] == "nas"
+        assert step["remaining"] == len(ids)
+
+    def test_needs_queue_then_queued_then_completed_from_the_column(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "needs_queue"
+        open_job(db, batch_id, "sharpness", "nas")
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "queued"
+        # A closed job row is NOT completion evidence for a derived step...
+        close_job(db, batch_id, "sharpness")
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "needs_queue"
+        # ...the column is.
+        _set_col(db, ids[:2], "sharpness_version", SHARPNESS_VERSION)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "needs_queue"
+        assert (step["done"], step["remaining"]) == (2, 1)
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "completed" and step["done"] == len(ids)
+
+    def test_an_older_version_reads_as_remaining(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION - 1)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["remaining"] == len(ids) and step["state"] == "needs_queue"
+
+    def test_a_stored_decode_error_is_done_and_named(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+        _set_col(db, ids[:1], "sharpness_json",
+                 json.dumps({"error": "UnidentifiedImageError: x"}))
+        _set_col(db, ids[1:], "sharpness", 50.0)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "completed"
+        assert step["failed"] == 0
+        assert step["detail"] == "1 unreadable"
+
+    def test_does_not_gate_ready_and_is_offered_as_optional(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_all_worker_passes(db, ids)
+        _complete_all_nas_steps(db, batch_id, ids)
+        open_job(db, batch_id, "rank_measure", "nas")
+        close_job(db, batch_id, "rank_measure")
+        state = batch_state(db, batch_id)
+        assert _step(state, "sharpness")["state"] == "needs_queue"
+        assert state["ready"] is True
+        assert state["next_action"] == "advance_nas"
+
+    def test_late_arrivals_reopen_it(self, db):
+        batch_id, ids = _make_batch(db)
+        _complete_pass(db, ids, "faces")
+        _set_col(db, ids, "sharpness_version", SHARPNESS_VERSION)
+        assert _step(batch_state(db, batch_id), "sharpness")["state"] == "completed"
+        late = db.add_photo(filepath=f"{_DIR}/late.jpg", filename="late.jpg")
+        _complete_pass(db, [late], "faces")
+        register_batch(db, _DIR)
+        step = _step(batch_state(db, batch_id), "sharpness")
+        assert step["state"] == "needs_queue" and step["remaining"] == 1
+
+
 # =========================================================================
 # ready + next_action
 # =========================================================================
@@ -777,8 +901,10 @@ class TestReadyAndNextAction:
         _complete_all_worker_passes(db, ids)
         _complete_all_nas_steps(db, batch_id, ids)
         open_job(db, batch_id, "rank_measure", "nas")
+        open_job(db, batch_id, "sharpness", "nas")
         state = batch_state(db, batch_id)
         assert _step(state, "rank_measure")["state"] == "queued"
+        assert _step(state, "sharpness")["state"] == "queued"
         assert state["ready"] is True
         assert state["next_action"] is None
 
@@ -909,7 +1035,7 @@ class TestFleetLaunchPasses:
             "describe": "completed", "category-content": "waiting",
             "keywords": "waiting", "verify": "waiting"}))
         assert got == ["clip", "faces", "quality", "aesthetics",
-                       "category-visual", "category-content", "keywords", "verify"]
+                       "verify", "category-content", "keywords", "category-visual"]
 
     def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
         """Case 3. `describe` having given up on every photo means there will

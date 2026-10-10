@@ -142,6 +142,39 @@ def _sweep_lock(db_path: str) -> Iterator[Optional[Path]]:
         fh.close()  # closing the fd releases our flock (and only ours)
 
 
+def sweep_lock_held(db_path: str) -> bool:
+    """Is an `ingest-incoming` sweep holding `_sweep_lock` right now?
+
+    For background jobs that must YIELD to ingest (the sharpness backfill —
+    the 2026-09-19 disk-starvation incident) without ever blocking it. A
+    PROBE, not a hold: takes a shared non-blocking `flock` on the same lockfile
+    and drops it at once. Holding it for the duration instead would make the
+    04:00 ingest cron fail with `IngestAlreadyRunning`, which is exactly
+    backwards. The probe window is microseconds; a sweep starting inside it
+    would see its `LOCK_EX|LOCK_NB` refused once and retry on its next run.
+
+    Never creates the lockfile (a missing file means no sweep has run with it
+    here), and answers False when `fcntl` is unavailable — the same "losing the
+    mutex beats losing the job" rule `_sweep_lock` follows.
+    """
+    if fcntl is None or not db_path:
+        return False
+    lock_path = Path(db_path).expanduser().resolve().parent / LOCKFILE_NAME
+    try:
+        fd = os.open(str(lock_path), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _looks_like_camera_model(source: str) -> bool:
     """Heuristic: uppercase alnum model code with a digit (e.g. 'ILCE-7RM6').
 

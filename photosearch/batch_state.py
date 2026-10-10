@@ -27,11 +27,9 @@ it has not started. So each pass carries four numbers instead of one:
   ``remaining``  ``worker_api._count_scoped`` — what a worker would claim
   ``failed``     eligible photos whose attempts are exhausted *and* whose
                  output column is still missing
-  ``done``       ``eligible - remaining - failed``, floored at 0 — but only
-                 for the seven passes whose ``remaining`` excludes exhausted
-                 photos. For ``quality`` / ``verify`` / ``clip`` it doesn't,
-                 so ``failed`` is already inside ``remaining`` and ``done``
-                 is ``eligible - remaining``. See
+  ``done``       ``eligible - remaining - failed``, floored at 0. Every
+                 pass's ``remaining`` now excludes exhausted photos, so
+                 ``failed`` and ``remaining`` are disjoint. See
                  ``_REMAINING_FILTERS_ATTEMPTS``.
 
 and `completed` is ``done == total``, never ``remaining == 0``.
@@ -63,8 +61,13 @@ import json
 from . import ingest_batches
 from .db import MAX_PROCESS_ATTEMPTS
 
+# Dependency order, which is also the fleet's drain order: verify runs right
+# after describe because a verify rewrite REPLACES the description, and
+# category-content / keywords are extracted from it — run them first and they
+# describe text that is gone (13,637 photos on 2026-10-04). It also loads each
+# model once: qwen3.5 describe -> (+gemma) verify -> gemma text x2 -> minicpm.
 WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-                 "category-visual", "category-content", "keywords", "verify")
+                 "verify", "category-content", "keywords", "category-visual")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
 # full native resolution to measure face sharpness, and only the NAS holds the
 # originals — the desktop replica has the DB and the thumbnails and no files at
@@ -72,18 +75,24 @@ WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
 # heavy; heavy it is (~10 min for 1,260 photos on the N100), but heavy where
 # the pixels are. As a desktop step it had no runner anywhere and read
 # "Needs to be queued" forever.
+#
+# `sharpness` (schema v33, photosearch/sharpness_backfill.py) comes after it:
+# the library-comparable measured sharpness, from the same originals. Like
+# rank_measure it is OPTIONAL — nothing derives a tag from it until the
+# labelled eval passes (docs/plans/sharpness-measurement.md step 3).
 NAS_STEPS = ("stacking", "normalize_aesthetics", "match_faces",
-             "resolve_dups", "warm_crops", "rank_measure")
+             "resolve_dups", "warm_crops", "rank_measure", "sharpness")
 # NAS steps that do NOT gate `ready` — optional work the owner can run from
 # the same button, but a batch is reviewable without it. Subtracted from
 # `ready` explicitly: the rule is "every step in WORKER_PASSES + NAS_STEPS",
 # so moving a step into NAS_STEPS would otherwise silently make it a gate.
-OPTIONAL_STEPS = ("rank_measure",)
+OPTIONAL_STEPS = ("rank_measure", "sharpness")
 STEP_ORDER = ("ingest",) + WORKER_PASSES + NAS_STEPS
 DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "verify": "describe", "normalize_aesthetics": "aesthetics",
               "match_faces": "faces", "resolve_dups": "match_faces",
-              "warm_crops": "faces", "rank_measure": "faces"}
+              "warm_crops": "faces", "rank_measure": "faces",
+              "sharpness": "faces"}
 STATES = ("completed", "running", "queued", "needs_queue", "waiting", "blocked")
 
 # Steps whose only completion evidence is a closed ingest_batch_jobs row —
@@ -102,18 +111,17 @@ _DESCRIPTION_GATED = ("category-content", "keywords", "verify")
 _ID_CHUNK = 20000
 
 # Per-pass "the output is still missing" column test, transcribed from
-# db.count_unprocessed_photos. `p` is the photos alias. `None` means the pass
-# keeps no attempts ledger, so it can never contribute a `failed` count.
+# db.count_unprocessed_photos. `p` is the photos alias.
 #
-#   clip             photos.id NOT IN clip_embeddings      (no attempts filter)
+#   clip             photos.id NOT IN clip_embeddings
 #   faces            no faces row for the photo
-#   quality          aesthetic_score OR aesthetic_concepts NULL (no attempts filter)
+#   quality          aesthetic_score OR aesthetic_concepts NULL
 #   aesthetics       aes_overall IS NULL
 #   describe         description IS NULL
 #   category-visual  visual_tags IS NULL
 #   category-content categories IS NULL  AND description IS NOT NULL
 #   keywords         keywords IS NULL    AND description IS NOT NULL
-#   verify           verified_at IS NULL AND description IS NOT NULL (no attempts filter)
+#   verify           verified_at IS NULL AND description IS NOT NULL
 #
 # The description clause is kept on the three gated passes because a photo
 # with no description has not *failed* that pass, it has never been offered
@@ -122,7 +130,7 @@ _ID_CHUNK = 20000
 # the `!= ''` rule below while db.py's `IS NOT NULL` still counts it here.
 # `done` floors at 0, so the only effect is a conservative under-count.)
 _OUTPUT_MISSING = {
-    "clip": None,
+    "clip": "p.id NOT IN (SELECT photo_id FROM clip_embeddings)",
     "faces": "NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)",
     "quality": "(p.aesthetic_score IS NULL OR p.aesthetic_concepts IS NULL)",
     "aesthetics": "p.aes_overall IS NULL",
@@ -137,21 +145,27 @@ _OUTPUT_MISSING = {
 # DONE, not failed — because an empty result is a legitimate one.
 #
 # `faces` is the only one. A photo with nobody facing the camera has no `faces`
-# rows after a perfectly successful run; the claim path cannot tell that from a
-# failure, so the fleet re-tries it MAX_PROCESS_ATTEMPTS times and stops. On the
-# first real batch (2026-09-19, 1,373 photos) 113 photos sat at attempts=3 with
-# no face rows — every one a player facing away or a distant shot — while 3,696
-# faces were found in the other 1,260. Counting those as `failed` read the pass
-# as `blocked` and held match_faces / warm_crops / rank_measure in `waiting`
-# behind a pass that had finished. A genuinely corrupt file ends in the same
-# place and is indistinguishable here; it is rare, and the step's `detail`
+# rows after a perfectly successful run. The server now records that as
+# TERMINAL — `worker_processed.attempts` set straight to MAX_PROCESS_ATTEMPTS on
+# the first clean empty result (db.mark_processed(terminal=True)) — so it is
+# detected once, not three times. Either way it ends exhausted with no rows, and
+# this rule is what reads it as done. On the first real batch (2026-09-19, 1,373
+# photos) 113 photos sat at attempts=3 with no face rows — every one a player
+# facing away or a distant shot — while 3,696 faces were found in the other
+# 1,260. Counting those as `failed` read the pass as `blocked` and held
+# match_faces / warm_crops / rank_measure in `waiting` behind a pass that had
+# finished. A genuinely corrupt file (detection raising three times) ends in the
+# same place and is indistinguishable here; it is rare, and the step's `detail`
 # reports the count so it is not hidden.
 _EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
 
 # Does this pass's *claim* predicate (what `remaining` counts) exclude photos
-# whose attempts are exhausted? Seven do; `quality` (db.py:2235-2247),
-# `verify` (db.py:2304-2319) and `clip` (db.py:2202-2214) carry no attempts
-# filter at all. That single fact decides two things:
+# whose attempts are exhausted? Every pass does now. `clip`, `quality` and
+# `verify` used to carry no attempts filter — a photo that failed them every
+# time was re-claimed forever and could never read `blocked` — until they
+# joined the ledger. The table stays because the arithmetic below is only
+# right for the True shape; a pass added without the cap must say False here.
+# That single fact decides two things:
 #
 #   True  -> `failed` and `remaining` are DISJOINT sets.
 #            done    = eligible - remaining - failed
@@ -162,18 +176,16 @@ _EMPTY_OUTPUT_IS_DONE = {"faces": "no detectable face"}
 #            done    = eligible - remaining
 #            blocked = remaining == failed and failed > 0   (every photo the
 #                      fleet would still claim is one it can never finish)
-#
-# `clip` is False but keeps no ledger, so `failed` is 0 and both rows agree.
 _REMAINING_FILTERS_ATTEMPTS = {
-    "clip": False,
+    "clip": True,
     "faces": True,
-    "quality": False,
+    "quality": True,
     "aesthetics": True,
     "describe": True,
     "category-visual": True,
     "category-content": True,
     "keywords": True,
-    "verify": False,
+    "verify": True,
 }
 
 
@@ -229,9 +241,13 @@ def _running_passes(db, id_set: set[int]) -> set[str]:
 def _step_row(step: str, kind: str, state: str, *, total: int, eligible: int,
               done: int, remaining: int, failed: int = 0,
               waiting_on: str | None = None, detail: str | None = None) -> dict:
+    # `warning` / `warning_detail`: a finished step that is still wrong in
+    # aggregate (category-visual collapse). Null on every other step, so the
+    # row shape stays uniform.
     return {"step": step, "kind": kind, "state": state, "total": total,
             "eligible": eligible, "done": done, "remaining": remaining,
-            "failed": failed, "waiting_on": waiting_on, "detail": detail}
+            "failed": failed, "waiting_on": waiting_on, "detail": detail,
+            "warning": None, "warning_detail": None}
 
 
 # ---------------------------------------------------------------------------
@@ -273,19 +289,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
     missing = _OUTPUT_MISSING[pass_type]
-    if missing is None:
-        # clip keeps no attempts ledger — its claim predicate is purely
-        # "no embedding row", so a photo can never be permanently skipped
-        # (which is the non-image re-claim loop documented in CLAUDE.md).
-        failed = 0
-    else:
-        failed = _count_where(
-            db, ids,
-            f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
-            f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
-            f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
-            (pass_type,),
-        )
+    failed = _count_where(
+        db, ids,
+        f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
+        f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
+        f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
+        (pass_type,),
+    )
 
     # See _EMPTY_OUTPUT_IS_DONE: for `faces`, exhausted-with-no-rows is a
     # finished photo that had nothing to find, so it counts toward `done`.
@@ -340,9 +350,19 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     else:
         state, waiting_on = "needs_queue", None
 
-    return _step_row(pass_type, "worker", state, total=total, eligible=eligible,
-                     done=done, remaining=remaining, failed=failed,
-                     waiting_on=waiting_on, detail=detail)
+    row = _step_row(pass_type, "worker", state, total=total, eligible=eligible,
+                    done=done, remaining=remaining, failed=failed,
+                    waiting_on=waiting_on, detail=detail)
+    if pass_type == "category-visual" and ids:
+        # A collapse (one tag set stamped on the whole shoot) is invisible per
+        # photo and does not change the step's state — the pass DID finish.
+        # It is a flag for a human, carried in additive keys so the state
+        # machine and the caption are untouched. See visual_collapse.py.
+        from .visual_collapse import batch_warning, stats_for_ids
+        stats = stats_for_ids(db.conn, ids)
+        row["collapse"] = stats
+        row["warning"], row["warning_detail"] = batch_warning(stats)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +416,39 @@ def _normalize_aesthetics_step(db, ids: list[int], total: int,
     return _step_row("normalize_aesthetics", "nas", state, total=total,
                      eligible=eligible, done=done, remaining=remaining,
                      waiting_on=waiting_on)
+
+
+def _sharpness_step(db, ids: list[int], total: int, open_steps: set[str],
+                    completed: set[str]) -> dict:
+    """Derived from the column, like stacking: a photo is done once its
+    ``sharpness_version`` is current. A stored decode error counts as done
+    (it is never retried — sharpness_backfill's rule) and is named in
+    ``detail``. Waits on `faces` because the backfill only measures photos
+    whose faces pass is done (face boxes are the headline region)."""
+    from .sharpness import SHARPNESS_VERSION
+    from .sharpness_backfill import missing_sql
+    remaining = _count_where(db, ids, missing_sql("p"), (SHARPNESS_VERSION,))
+    done = max(0, total - remaining)
+    unreadable = _count_where(
+        db, ids,
+        "p.sharpness IS NULL AND p.sharpness_version >= ? "
+        "AND p.sharpness_json LIKE '{\"error\"%'",
+        (SHARPNESS_VERSION,))
+    detail = f"{unreadable:,} unreadable" if unreadable else None
+
+    depends_on = DEPENDS_ON["sharpness"]
+    waiting_on = None
+    if total > 0 and remaining == 0:
+        state = "completed"
+    elif depends_on not in completed:
+        state, waiting_on = "waiting", depends_on
+    elif "sharpness" in open_steps:
+        state = "queued"
+    else:
+        state = "needs_queue"
+    return _step_row("sharpness", "nas", state, total=total, eligible=total,
+                     done=done, remaining=remaining, waiting_on=waiting_on,
+                     detail=detail)
 
 
 def _job_only_step(step: str, kind: str, total: int, open_steps: set[str],
@@ -554,14 +607,16 @@ def batch_state(db, batch_id: int) -> dict:
             row = _stacking_step(db, ids, total, open_steps, closed)
         elif step == "normalize_aesthetics":
             row = _normalize_aesthetics_step(db, ids, total, open_steps, completed)
+        elif step == "sharpness":
+            row = _sharpness_step(db, ids, total, open_steps, completed)
         else:
             row = _job_only_step(step, "nas", total, open_steps, closed, completed)
         steps[step] = row
         if row["state"] == "completed":
             completed.add(step)
 
-    # OPTIONAL_STEPS (rank_measure) are deliberately NOT part of `ready`: the
-    # batch is reviewable without the sharpness measurement. `next_action`
+    # OPTIONAL_STEPS (rank_measure, sharpness) are deliberately NOT part of
+    # `ready`: the batch is reviewable without either measurement. `next_action`
     # still offers to run it — see `_optional_runnable`.
     ready = all(steps[s]["state"] == "completed"
                 for s in WORKER_PASSES + NAS_STEPS if s not in OPTIONAL_STEPS)

@@ -541,8 +541,15 @@ def admin_replica_status():
     if nas_url:
         try:
             import urllib.request
-            with urllib.request.urlopen(f"{nas_url}/api/stats", timeout=8) as r:
-                nas_count = json.loads(r.read()).get("photos")
+            from .request_intent import outbound_headers
+            # The fingerprint is one indexed COUNT; /api/stats is every
+            # library counter (12.5 s cold on the NAS, 2026-10-09).
+            req = urllib.request.Request(
+                f"{nas_url}/api/admin/maintenance-fingerprint",
+                headers=outbound_headers(
+                    "Compare photo counts with the NAS (replica status)"))
+            with urllib.request.urlopen(req, timeout=8) as r:
+                nas_count = json.loads(r.read()).get("photo_count")
         except Exception as e:
             logger.info("replica-status NAS reach failed: %s", e)
 
@@ -605,7 +612,10 @@ def admin_maintenance_nas_fingerprint():
         return {"error": "not in replica mode", "stages": {}}
     import requests
     try:
-        r = requests.get(f"{nas}/api/admin/maintenance-fingerprint", timeout=10)
+        from .request_intent import outbound_headers
+        r = requests.get(f"{nas}/api/admin/maintenance-fingerprint", timeout=10,
+                         headers=outbound_headers(
+                             "Read the NAS maintenance fingerprint"))
         r.raise_for_status()
         return r.json()
     except requests.RequestException as exc:
@@ -1301,7 +1311,7 @@ _UI_FLEET_NAME = "ui"
 
 class WorkersStartRequest(BaseModel):
     passes: list[str]
-    count: int = 2
+    count: int = 3  # workers per launch (owner's default since 2026-10-03)
     collection: int | None = None  # optional: scope the fleet to one collection
     # optional: scope the fleet to a structured filter set (date range, people,
     # location, quality/aesthetic, camera, tags) — mutually exclusive with
@@ -1317,9 +1327,9 @@ class WorkersStartRequest(BaseModel):
     # a pass retires when empty and the fleet exits, so it stops holding the
     # NAS write lock once the backlog is gone.
     stay_alive: bool = False
-    # Drain each pass fully before the next, in the order given, instead of
-    # round-robining a batch at a time.
-    sequential: bool = False
+    # Drain each pass fully before the next, in the order given (the default),
+    # instead of round-robining a batch at a time.
+    sequential: bool = True
 
     # The three scope kinds (collection / filters / directory) are mutually
     # exclusive — `cli.py worker` enforces the same rule, and sending two
@@ -1377,17 +1387,23 @@ def _fleet_server_url() -> str:
 
 
 def _fleet_env() -> dict:
-    """Env for run-workers.sh — inherits ours, filling LM Studio role models
-    with defaults when PHOTOSEARCH_TEXT_LLM_URL is set so the LLM passes route
-    to LM Studio out of the box."""
+    """Env for run-workers.sh — inherits ours, and on LM Studio sets EVERY role
+    model explicitly from `rerun.FLEET_ROLE_MODELS` (per-role override:
+    PHOTOSEARCH_FLEET_<ROLE>_MODEL).
+
+    Set, not setdefault: this server's own PHOTOSEARCH_LLM_VISUAL_MODEL is for
+    rerank_photos and the photobook hero picks, and the fleet used to inherit it
+    — and fall back to it for describe/verify/aesthetics too — so every vision
+    pass silently ran on whatever that was (qwen2.5-vl-7b, 2026-09-20..28)."""
+    from .rerun import FLEET_REASONING_EFFORT, FLEET_ROLE_MODELS, fleet_role_model
     env = os.environ.copy()
     if env.get("PHOTOSEARCH_TEXT_LLM_URL"):
-        visual = env.get("PHOTOSEARCH_LLM_VISUAL_MODEL") or "qwen2.5-vl-7b-instruct"
-        env.setdefault("PHOTOSEARCH_LLM_VISUAL_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_DESCRIBE_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_VERIFY_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_AESTHETICS_MODEL", visual)
-        env.setdefault("PHOTOSEARCH_LLM_TEXT_MODEL", "llama-3.2-3b-instruct")
+        for role in FLEET_ROLE_MODELS:
+            env[f"PHOTOSEARCH_LLM_{role.upper()}_MODEL"] = fleet_role_model(role, env)
+        # Same reasoning as the models: the fleet runs the configuration the
+        # evals measured, not whatever this server's env happens to hold.
+        env["PHOTOSEARCH_LLM_REASONING_EFFORT"] = (
+            env.get("PHOTOSEARCH_FLEET_REASONING_EFFORT") or FLEET_REASONING_EFFORT)
     return env
 
 
@@ -1404,8 +1420,11 @@ def admin_workers_start(req: WorkersStartRequest):
     script = _run_workers_script()
     if not Path(script).exists():
         raise HTTPException(404, f"run-workers.sh not found: {script}")
+    # Dependency order regardless of how they were picked: a sequential fleet
+    # drains in -p order, and verify after the text passes re-queues them.
+    passes = [p for p in rerun.ALL_PASSES if p in req.passes]
     cmd = ["bash", script, "--native", "--name", _UI_FLEET_NAME,
-           "-s", _fleet_server_url(), "-p", ",".join(req.passes), "-n", str(n)]
+           "-s", _fleet_server_url(), "-p", ",".join(passes), "-n", str(n)]
     filter_flags = _filters_to_worker_flags(req.filters) if req.filters else []
     # The three scope kinds are mutually exclusive (see WorkersStartRequest) —
     # checked here, not in a pydantic validator, so the response is a clear
@@ -1425,8 +1444,7 @@ def admin_workers_start(req: WorkersStartRequest):
     cmd += filter_flags
     if req.stay_alive:
         cmd.append("--stay-alive")
-    if req.sequential:
-        cmd.append("--sequential")
+    cmd.append("--sequential" if req.sequential else "--round-robin")
     try:
         r = subprocess.run(cmd, cwd=_native_repo_dir(), env=_fleet_env(),
                            capture_output=True, text=True, timeout=180)
@@ -1464,7 +1482,7 @@ class BatchAdvanceRequest(BaseModel):
 
 class BatchLaunchFleetRequest(BaseModel):
     batch_id: int
-    count: int = 2
+    count: int = 3  # workers per launch (owner's default since 2026-10-03)
 
 
 def _nas_url() -> str:
@@ -1481,8 +1499,10 @@ def _proxy_sse(url: str, payload: dict):
     """
     import requests
     try:
-        with requests.post(url, json=payload, stream=True,
-                           timeout=(10, 3600)) as resp:
+        from .request_intent import outbound_headers
+        with requests.post(url, json=payload, stream=True, timeout=(10, 3600),
+                           headers=outbound_headers(
+                               f"Run {url.split('/api/', 1)[-1]} on the NAS")) as resp:
             if resp.status_code >= 400:
                 body = resp.text[:500]
                 yield ("event: fatal\ndata: "
@@ -1733,7 +1753,10 @@ def admin_workers_queue_status():
             # authoritative server" on the maintenance page for a box that's
             # actually up. This is a 5s background poll, so a generous read
             # timeout is harmless — prefer stale-but-shown over a false error.
-            r = requests.get(f"{nas}/api/worker/status", timeout=30)
+            from .request_intent import outbound_headers
+            r = requests.get(f"{nas}/api/worker/status", timeout=30,
+                             headers=outbound_headers(
+                                 "Read the worker queue from the NAS"))
             r.raise_for_status()
             data = r.json()
             data["source"] = nas
@@ -1765,7 +1788,10 @@ def admin_incoming_status():
     if nas:
         import requests
         try:
-            r = requests.get(f"{nas}/api/admin/incoming-status", timeout=30)
+            from .request_intent import outbound_headers
+            r = requests.get(f"{nas}/api/admin/incoming-status", timeout=30,
+                             headers=outbound_headers(
+                                 "Read incoming-file status from the NAS"))
             r.raise_for_status()
             data = r.json()
             data["source"] = nas

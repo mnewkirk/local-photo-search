@@ -214,6 +214,7 @@
       margin-top: 6px; height: 3px; border-radius: 2px;
       background: rgba(255,255,255,0.07); overflow: hidden;
     }
+    .node-warn { font-size: 11px; color: var(--yellow); margin-top: 2px; }
     .node-bar-fill { height: 100%; background: currentColor; opacity: 0.55; }
 
     /* One class per state — colour AND glyph AND the state's word, so the
@@ -355,13 +356,17 @@
         : (s.state === 'completed' ? 100 : 0);
       return e('div', {
         className: 'node ' + meta.cls,
-        title: s.step + ' — ' + meta.label + ' — ' + BF.stepCaption(s),
+        title: s.step + ' — ' + meta.label + ' — ' + BF.stepCaption(s)
+          + (s.warning_detail ? '\n\n' + s.warning_detail : ''),
       },
         e('div', { className: 'node-head' },
           e('span', { className: 'node-glyph' }, meta.glyph),
           e('span', { className: 'node-name' }, BF.stepLabel(s.step))),
         e('div', { className: 'node-state' }, meta.label),
         e('div', { className: 'node-cap' }, BF.stepCaption(s)),
+        // A finished pass can still be wrong in aggregate (category-visual
+        // collapse): flagged, never a state change.
+        s.warning ? e('div', { className: 'node-warn' }, s.warning) : null,
         e('div', { className: 'node-bar' },
           e('div', { className: 'node-bar-fill', style: { width: pct + '%' } }))
       );

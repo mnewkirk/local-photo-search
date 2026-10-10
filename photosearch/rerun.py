@@ -34,10 +34,11 @@ import tempfile
 import uuid
 from typing import Optional
 
-# Passes this module can re-run. Mirrors worker_api._ALL_PASSES order.
-ALL_PASSES = ("clip", "faces", "quality", "describe",
-              "category-content", "category-visual", "keywords", "verify",
-              "aesthetics")
+# Passes this module can re-run, in DEPENDENCY order — the sync re-run and the
+# fleet launcher both sort by it (see batch_state.WORKER_PASSES for why verify
+# precedes the text passes). Same order as batch_state.WORKER_PASSES.
+ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
+              "verify", "category-content", "keywords", "category-visual")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
@@ -59,6 +60,51 @@ def nas_base() -> Optional[str]:
     """Authoritative-writer base URL, or None when this process IS the writer
     (running on the NAS). Same env var the thumbnail proxy / write tools use."""
     return (os.environ.get("PHOTOSEARCH_NAS_URL") or "").rstrip("/") or None
+
+
+# The model each pass runs on LM Studio when the worker fleet is launched from
+# the web UI (admin_api._fleet_env: /admin/maintenance and /batches). Chosen by
+# the model evals — docs/plans/model-eval-harnesses.md, 2026-09-28:
+#   verify -> gemma-4-12b-qat: named 16/20 planted errors and wrongly rejected
+#             1/20 clean descriptions; the old verifier (qwen2.5-vl via the VISUAL
+#             fallback) had never been measured, gemma-4-e2b named 5/20, rejected 8/20.
+#   visual -> minicpm-v-4_5: precision 0.54 / recall 0.56 on the owner's 60 labels
+#             vs qwen2.5-vl-7b 0.51 / 0.40.
+#   describe -> qwen3.5-9b: right on 0.75 of disputed facts vs qwen2.5-vl-7b 0.50
+#             (the model that had actually been describing), 1.04 vs 1.46 wrong
+#             claims per photo, fewer wrong on 33 photos to 16 (p 0.02); every
+#             other candidate scored lower too.
+#   text     -> gemma-4-12b-qat (category-content + keywords share the role): on
+#             the owner's 70 labelled descriptions, category precision 0.83 —
+#             the same as llama-3.2-3b — with 11.8 right categories per photo
+#             vs 4.5 (more right on 64 photos, fewer on 1). Keyword precision a
+#             tie (0.93 vs 0.94). Also the verify model, so no swap between them.
+# aesthetics stays on what production ran: all four candidates tied. Explicit per role, deliberately: the server's own
+# PHOTOSEARCH_LLM_VISUAL_MODEL also drives rerank_photos and the photobook hero
+# picks, and letting the fleet's vision roles fall back to it is how describe,
+# verify and aesthetics all silently ran on qwen2.5-vl. Override one role for the
+# UI fleet with PHOTOSEARCH_FLEET_<ROLE>_MODEL.
+FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
+                     "verify":     "google/gemma-4-12b-qat",
+                     "visual":     "minicpm-v-4_5",
+                     "aesthetics": "qwen2.5-vl-7b-instruct",
+                     "text":       "google/gemma-4-12b-qat"}
+
+
+# Every model eval that picked FLEET_ROLE_MODELS ran with reasoning OFF
+# (docs/plans/model-eval-harnesses.md). gemma-4 and minicpm-v-4_5 think by
+# default, and with thinking on the fleet is a different, broken system: on the
+# 2026-10-03 batch gemma-4-12b spent 297 of 300 tokens reasoning and returned ''
+# in 70 s, so every category-content call hit the 10 s text cap and deferred
+# forever (0 of 1,259 done); minicpm ran out its 768-token budget mid-thought on
+# 307 photos, which burned all three attempts. With "none": ~1-7 s, real answers.
+# Override for the UI fleet with PHOTOSEARCH_FLEET_REASONING_EFFORT.
+FLEET_REASONING_EFFORT = "none"
+
+
+def fleet_role_model(role: str, env=None) -> str:
+    env = os.environ if env is None else env
+    return env.get(f"PHOTOSEARCH_FLEET_{role.upper()}_MODEL") or FLEET_ROLE_MODELS[role]
 
 
 # LM Studio fallback models when no role env var is configured. These are this
@@ -189,46 +235,46 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
 
         if pass_type == "clip":
             results = W._process_clip(downloaded, batch_size=model_batch_size)
-            kwargs = {"clip_results": results}
+            kwargs = W._submit_kwargs("clip_results", results)
         elif pass_type == "quality":
             results = W._process_quality(downloaded, batch_size=model_batch_size)
-            kwargs = {"quality_results": results}
+            kwargs = W._submit_kwargs("quality_results", results)
         elif pass_type == "faces":
             results = W._process_faces(downloaded)
-            kwargs = {"face_results": results}
+            kwargs = W._submit_kwargs("face_results", results)
         elif pass_type == "describe":
             model = _resolve_model("describe")
             results = W._process_describe(downloaded, model=model)
-            kwargs = {"describe_results": results, "model": model,
+            kwargs = {**W._submit_kwargs("describe_results", results), "model": model,
                       "model_version": _model_version(model)}
         elif pass_type == "verify":
             regen = _resolve_model("describe")
             results = W._process_verify(downloaded, client=client,
                                         verify_model=_resolve_model("verify"),
                                         regen_model=regen)
-            kwargs = {"verify_results": results, "model": regen,
-                      "model_version": _model_version(regen)}
+            kwargs = {**W._submit_kwargs("verify_results", results),
+                      "model": regen, "model_version": _model_version(regen)}
         elif pass_type == "category-content":
             model = _resolve_model("category-content")
             results = W._process_category_content([info], model=model)
             mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
-            kwargs = {"category_content_results": results}
+            kwargs = W._submit_kwargs("category_content_results", results)
         elif pass_type == "category-visual":
             model = _resolve_model("category-visual")
             results = W._process_category_visual(downloaded, model=model)
             mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
-            kwargs = {"category_visual_results": results}
+            kwargs = W._submit_kwargs("category_visual_results", results)
         elif pass_type == "keywords":
             model = _resolve_model("keywords")
             results = W._process_keywords([info], model=model)
             mv = _model_version(model)
             for r in results:
                 r["model"], r["model_version"] = model, mv
-            kwargs = {"keywords_results": results}
+            kwargs = W._submit_kwargs("keywords_results", results)
         elif pass_type == "aesthetics":
             model = _resolve_model("aesthetics")
             results = W._process_aesthetics(downloaded, model=model)
@@ -279,6 +325,10 @@ _MIRROR_COLUMNS = (
     "verified_at", "verification_status", "hallucination_flags",
     "aesthetic_score", "aesthetic_concepts", "aesthetic_critique",
     *_aes_mirror_columns(),
+    # schema v33 — measured on the NAS (sharpness_backfill), carried so a
+    # targeted mirror doesn't leave the replica's copy staler than the rest.
+    # An older NAS omits them, and `if c in fields` below skips the absent.
+    "sharpness", "sharpness_json", "sharpness_version", "sharpness_scored_at",
 )
 
 
@@ -298,8 +348,11 @@ def mirror_photos(db, photo_ids: list[int], server: Optional[str] = None) -> dic
     mirrored = errors = missing = 0
     for pid in photo_ids:
         try:
-            with urllib.request.urlopen(
-                f"{base}/api/photos/{pid}/mirror-fields", timeout=30) as r:
+            from .request_intent import outbound_headers
+            req = urllib.request.Request(
+                f"{base}/api/photos/{pid}/mirror-fields",
+                headers=outbound_headers(f"Mirror photo {pid} from the NAS"))
+            with urllib.request.urlopen(req, timeout=30) as r:
                 fields = json.loads(r.read())
         except urllib.error.HTTPError as e:
             # 404 → no such photo on the NAS (or NAS predates /mirror-fields);

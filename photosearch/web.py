@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -43,6 +44,7 @@ from .admin_api import router as admin_router
 from .batch_api import router as batches_router
 from .eval_api import router as eval_router
 from .eval_api import sheet_router as eval_sheet_router
+from .model_eval_api import router as model_eval_router
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -53,6 +55,7 @@ app.include_router(worker_router)
 app.include_router(batches_router)
 app.include_router(eval_router)
 app.include_router(eval_sheet_router)
+app.include_router(model_eval_router)
 app.include_router(admin_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)
@@ -96,6 +99,66 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
                 headers={"Retry-After": "30", "Connection": "close"},
             )
     return await call_next(request)
+
+
+def _carry_context(fn):
+    """Background threads started for a request keep its intent, so the NAS
+    calls they make say what they were for (request_intent.carry_context)."""
+    from .request_intent import carry_context
+    return carry_context(fn)
+
+
+@app.middleware("http")
+async def _log_request_timing(request: Request, call_next):
+    """Time every /api request into the persistent request log
+    (photosearch/request_log.py) — the container's stdout log does not
+    survive a redeploy — with who made it and why
+    (photosearch/request_intent.py)."""
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    from . import request_intent, request_log
+    headers = request.headers
+    page = request_intent.page_of(headers.get("referer"))
+    stated = request_intent.explicit_intent(headers)
+    inferred_intent = None
+    if stated is None:
+        try:
+            inferred_intent = request_intent.infer_intent(
+                request.method, path, request.url.query, page)
+        except Exception:  # noqa: BLE001
+            inferred_intent = f"{request.method} {path}"
+    # Calls this request makes to the NAS say what they are for.
+    token = request_intent.set_current_intent(stated or inferred_intent)
+    t0 = time.perf_counter()
+    status = 500
+    streaming = False
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        # call_next always hands back a streamed wrapper, so recognise SSE
+        # by its content type. For SSE, `ms` is the time to the response
+        # HEADERS, not to the end of the stream.
+        streaming = response.headers.get(
+            "content-type", "").startswith("text/event-stream")
+        return response
+    finally:
+        request_intent.reset_current_intent(token)
+        try:
+            # A handler may know better (the Ask agent: the question).
+            intent = stated or getattr(request.state, "log_intent", None)
+            inferred = intent is None
+            request_log.record(
+                _db_path, method=request.method, path=path,
+                query=request.url.query or None, status=status,
+                ms=(time.perf_counter() - t0) * 1000,
+                source=request_intent.classify_source(path, headers),
+                intent=intent or inferred_intent, intent_inferred=inferred,
+                page=page,
+                client=request.client.host if request.client else None,
+                streaming=streaming)
+        except Exception:  # noqa: BLE001 — logging must never fail a request
+            pass
 
 # Database path — set by the CLI launcher, defaults to cwd
 _db_path: str = os.environ.get("PHOTOSEARCH_DB", "photo_index.db")
@@ -203,7 +266,7 @@ def _start_push(stage_results, deferred_triggers=None) -> None:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
 
-    threading.Thread(target=_run, name="maintenance-push", daemon=True).start()
+    threading.Thread(target=_carry_context(_run), name="maintenance-push", daemon=True).start()
 
 
 def _ensure_thumb_dir():
@@ -303,8 +366,10 @@ def _fetch_from_nas(photo_id: int, kind: str, timeout: float = 30.0) -> bytes:
     map it to a 404/502.
     """
     import urllib.request
+    from .request_intent import outbound_headers
     url = f"{_nas_url}/api/photos/{photo_id}/{kind}"
-    req = urllib.request.Request(url, headers={"User-Agent": "photosearch-replica"})
+    req = urllib.request.Request(url, headers=outbound_headers(
+        f"Fetch {kind} of photo {photo_id} (not cached on the replica)"))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -321,9 +386,10 @@ def _nas_json(method: str, path: str, body: Optional[dict] = None,
     import urllib.error
     url = f"{_nas_url}{path}"
     data = json.dumps(body).encode() if body is not None else None
+    from .request_intent import outbound_headers
     req = urllib.request.Request(
         url, data=data, method=method,
-        headers={"User-Agent": "photosearch-replica",
+        headers={**outbound_headers(f"Forward {method} {path} to the NAS"),
                  "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -815,7 +881,7 @@ async def api_review_team(request: Request):
             logger.exception("review-team failed")
             _emit({"type": "fatal", "message": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def gen():
         try:
@@ -874,8 +940,11 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
         if _nas_url:
             try:
                 import urllib.request
+                from .request_intent import outbound_headers
                 url = f"{_nas_url.rstrip('/')}/api/faces/crop/{face_id}?size={size}"
-                with urllib.request.urlopen(url, timeout=30) as r:
+                req = urllib.request.Request(url, headers=outbound_headers(
+                    f"Fetch face crop {face_id} (not cached on the replica)"))
+                with urllib.request.urlopen(req, timeout=30) as r:
                     _cache_bytes_atomic(cache_path, r.read())
                 return FileResponse(
                     cache_path, media_type="image/jpeg",
@@ -1001,9 +1070,9 @@ def _face_filter_photo_ids(db, date_from, date_to, location, q, person, camera=N
         return {r["id"] for r in rows}
     sql, params = "SELECT id FROM photos WHERE 1=1", []
     if date_from:
-        sql += " AND substr(date_taken,1,10) >= ?"; params.append(date_from[:10])
+        sql += " AND date_taken >= ?"; params.append(date_from[:10])
     if date_to:
-        sql += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
+        sql += " AND date_taken <= ?"; params.append(date_to[:10] + " 23:59:59")
     if location:
         sql += " AND place_name LIKE ?"; params.append(f"%{location}%")
     if camera:
@@ -1513,7 +1582,9 @@ def api_photo_mirror_fields(photo_id: int):
             f"""SELECT description, categories, visual_tags, keywords, tags,
                       verified_at, verification_status, hallucination_flags,
                       aesthetic_score, aesthetic_concepts, aesthetic_critique,
-                      {', '.join(_aes_cols)}
+                      {', '.join(_aes_cols)},
+                      sharpness, sharpness_json, sharpness_version,
+                      sharpness_scored_at
                  FROM photos WHERE id = ?""",
             (photo_id,),
         ).fetchone()
@@ -1721,6 +1792,35 @@ def api_persons():
         ).fetchall()
 
     return {"persons": [dict(r) for r in rows]}
+
+
+@app.delete("/api/persons/{person_id}")
+def api_delete_person(person_id: int):
+    """Delete a person no face is labelled as (a stray name from an early
+    Enter). 409 while any face still carries it — that is a real label.
+
+    Replica mode: delete on the NAS (authoritative) first, then locally, so
+    the next sync cannot bring it back and the local pickers drop it now."""
+    if _nas_url:
+        resp = _nas_json("DELETE", f"/api/persons/{person_id}")
+        with _get_db() as db:
+            try:
+                db.delete_empty_person(person_id)
+                resp["mirrored"] = True
+            except (KeyError, ValueError):
+                # Already gone locally, or the replica is behind: the NAS was
+                # the authority and the next sync reconciles.
+                resp["mirrored"] = False
+        return resp
+    with _get_db() as db:
+        try:
+            out = db.delete_empty_person(person_id)
+        except KeyError:
+            raise HTTPException(404, "Person not found")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+    logger.info("PERSON DELETE  person_id=%d  name=%r", person_id, out["name"])
+    return {"ok": True, **out}
 
 
 @app.get("/api/cameras")
@@ -2280,6 +2380,40 @@ def api_unmatch_preview(
     return {"person": person, "sources": list(src),
             "faces": rows[:limit], "truncated": len(rows) > limit,
             "stats": stats}
+
+
+@app.get("/api/faces/suggest-person")
+def api_suggest_person(
+    person: str = Query(..., description="Who to find more of."),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    max_dist: Optional[float] = Query(None, ge=0.0, le=2.0),
+    exclude_closer_to_other: bool = Query(False),
+    limit: int = Query(2000, ge=1, le=5000),
+):
+    """"More of this kid": the scope's unmatched faces, nearest to `person` first.
+
+    Backs the More-of-this-kid panel on /faces. Never writes — the grid is the
+    review and the selection is the confirmation; applying goes through
+    `POST /api/faces/bulk-assign`. See `photosearch/face_suggest.py` for why a
+    matcher run from hand labels was rejected (one label absorbed 220 faces).
+
+    **A DATE SCOPE IS REQUIRED**, for the same reason as unmatch-preview: this
+    is a per-shoot review, not a library-wide select-all.
+    """
+    from . import face_suggest
+
+    if not (date_from or date_to):
+        raise HTTPException(400, "a date scope is required — review one shoot at a time")
+    with _get_db() as db:
+        try:
+            rows, stats = face_suggest.suggest(
+                db, person=person, date_from=date_from, date_to=date_to,
+                max_dist=max_dist, exclude_closer_to_other=exclude_closer_to_other)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+    return {"person": person, "faces": rows[:limit],
+            "truncated": len(rows) > limit, "stats": stats}
 
 
 @app.get("/api/faces/person/{person_id}/inspect")
@@ -3479,85 +3613,99 @@ def delete_settings(namespace: str):
     return {"namespace": namespace, "values": {}}
 
 
-@app.get("/api/stats")
-def api_stats():
-    """Database statistics."""
-    with _get_db() as db:
-        photo_count = db.photo_count()
-        clip_count = db.conn.execute("SELECT COUNT(*) as c FROM clip_embeddings").fetchone()["c"]
-        face_count = db.conn.execute("SELECT COUNT(*) as c FROM faces").fetchone()["c"]
-        person_count = db.conn.execute("SELECT COUNT(*) as c FROM persons").fetchone()["c"]
-        described = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE description IS NOT NULL"
-        ).fetchone()["c"]
-        scored = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_score IS NOT NULL"
-        ).fetchone()["c"]
+@app.get("/api/health")
+def api_health():
+    """Liveness probe that touches no database.
 
-        quality_stats = None
-        if scored > 0:
-            row = db.conn.execute(
-                """SELECT MIN(aesthetic_score) as min_s, MAX(aesthetic_score) as max_s,
-                          AVG(aesthetic_score) as avg_s
-                   FROM photos WHERE aesthetic_score IS NOT NULL"""
-            ).fetchone()
-            quality_stats = {
-                "min": round(row["min_s"], 2),
-                "max": round(row["max_s"], 2),
-                "mean": round(row["avg_s"], 2),
-            }
+    The worker fleet used to probe with /api/stats at startup, and every worker
+    in a fleet calls it at the same moment: on 2026-10-07 that was three
+    concurrent 117 s requests against a cold N100. A reachability check needs
+    an answer, not library statistics.
+    """
+    return {"ok": True}
 
-        stack_row = db.conn.execute(
-            """SELECT COUNT(DISTINCT stack_id) as stack_count,
-                      COUNT(*) as stacked_photos
-               FROM stack_members"""
+
+def _compute_stats(db: PhotoDB) -> dict:
+    """The library counters behind /api/stats.
+
+    Shaped so the cold NAS reads `photos` at most ONCE. Every counter that has
+    a covering index uses it (the tag columns, aesthetic_score, aes_overall,
+    aes_overall_pct, and `description IS NULL` via idx_photos_need_describe).
+    The two with no index (aesthetic_concepts, verification_status) share a
+    single scan instead of one each — each cold `SCAN photos` is ~545 MB off
+    the NAS's spinning disk.
+    """
+    conn = db.conn
+    one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
+
+    photo_count = one("SELECT COUNT(*) FROM photos")
+    clip_count = one("SELECT COUNT(*) FROM clip_embeddings")
+    face_count = one("SELECT COUNT(*) FROM faces")
+    person_count = one("SELECT COUNT(*) FROM persons")
+    # Counted as total minus the "still needs describe" partial index; a
+    # direct `description IS NOT NULL` count reads the whole wide table.
+    described = photo_count - one(
+        "SELECT COUNT(*) FROM photos WHERE description IS NULL")
+    scored = one("SELECT COUNT(*) FROM photos WHERE aesthetic_score IS NOT NULL")
+
+    quality_stats = None
+    if scored > 0:
+        row = conn.execute(
+            """SELECT MIN(aesthetic_score) AS min_s, MAX(aesthetic_score) AS max_s,
+                      AVG(aesthetic_score) AS avg_s
+               FROM photos WHERE aesthetic_score IS NOT NULL"""
         ).fetchone()
-        stack_count = stack_row["stack_count"]
-        stacked_photos = stack_row["stacked_photos"]
+        quality_stats = {
+            "min": round(row["min_s"], 2),
+            "max": round(row["max_s"], 2),
+            "mean": round(row["avg_s"], 2),
+        }
 
-        concepts_analyzed = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE aesthetic_concepts IS NOT NULL"
-        ).fetchone()["c"]
+    stack_row = conn.execute(
+        """SELECT COUNT(DISTINCT stack_id) AS stack_count,
+                  COUNT(*) AS stacked_photos
+           FROM stack_members"""
+    ).fetchone()
 
-        category_tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE categories IS NOT NULL AND categories != '[]'"
-        ).fetchone()["c"]
-        visual_tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE visual_tags IS NOT NULL AND visual_tags != '[]'"
-        ).fetchone()["c"]
-        keyword_tagged = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE keywords IS NOT NULL AND keywords != '[]'"
-        ).fetchone()["c"]
+    category_tagged = one(
+        "SELECT COUNT(*) FROM photos WHERE categories IS NOT NULL AND categories != '[]'")
+    visual_tagged = one(
+        "SELECT COUNT(*) FROM photos WHERE visual_tags IS NOT NULL AND visual_tags != '[]'")
+    keyword_tagged = one(
+        "SELECT COUNT(*) FROM photos WHERE keywords IS NOT NULL AND keywords != '[]'")
 
-        aes_scored = db.conn.execute(
-            "SELECT COUNT(*) as c FROM photos WHERE aes_overall IS NOT NULL"
-        ).fetchone()["c"]
-        aesthetics_stats = None
-        if aes_scored > 0:
-            row = db.conn.execute(
-                """SELECT MIN(aes_overall) as min_s, MAX(aes_overall) as max_s,
-                          AVG(aes_overall) as avg_s,
-                          SUM(CASE WHEN aes_overall_pct IS NOT NULL THEN 1 ELSE 0 END) as pct_done
-                   FROM photos WHERE aes_overall IS NOT NULL"""
-            ).fetchone()
-            aesthetics_stats = {
-                "min": round(row["min_s"], 2),
-                "max": round(row["max_s"], 2),
-                "mean": round(row["avg_s"], 2),
-                "normalized": row["pct_done"],
-            }
+    aes_scored = one("SELECT COUNT(*) FROM photos WHERE aes_overall IS NOT NULL")
+    aesthetics_stats = None
+    if aes_scored > 0:
+        row = conn.execute(
+            """SELECT MIN(aes_overall) AS min_s, MAX(aes_overall) AS max_s,
+                      AVG(aes_overall) AS avg_s
+               FROM photos WHERE aes_overall IS NOT NULL"""
+        ).fetchone()
+        # Separate query so it stays on idx_photos_aes_overall_pct; folding it
+        # into the MIN/MAX/AVG above as a SUM(CASE) forced a table scan.
+        pct_done = one(
+            "SELECT COUNT(*) FROM photos WHERE aes_overall_pct IS NOT NULL")
+        aesthetics_stats = {
+            "min": round(row["min_s"], 2),
+            "max": round(row["max_s"], 2),
+            "mean": round(row["avg_s"], 2),
+            "normalized": pct_done,
+        }
 
-        verify_rows = db.conn.execute(
-            """SELECT verification_status AS status, COUNT(*) AS c
-               FROM photos
-               WHERE verified_at IS NOT NULL
-               GROUP BY verification_status"""
-        ).fetchall()
-        verify_counts = {"pass": 0, "fail": 0, "regenerated": 0}
-        for r in verify_rows:
-            st = r["status"] or "pass"
-            if st in verify_counts:
-                verify_counts[st] += r["c"]
+    # The one unavoidable scan. A NULL verification_status on a verified row
+    # counts as a pass (verify predates the status column).
+    row = conn.execute(
+        """SELECT
+             COALESCE(SUM(aesthetic_concepts IS NOT NULL), 0) AS concepts,
+             COALESCE(SUM(verified_at IS NOT NULL
+                          AND COALESCE(verification_status, 'pass') = 'pass'), 0) AS v_pass,
+             COALESCE(SUM(verified_at IS NOT NULL
+                          AND verification_status = 'fail'), 0) AS v_fail,
+             COALESCE(SUM(verified_at IS NOT NULL
+                          AND verification_status = 'regenerated'), 0) AS v_regen
+           FROM photos"""
+    ).fetchone()
 
     return {
         "photos": photo_count,
@@ -3569,19 +3717,80 @@ def api_stats():
         "quality_stats": quality_stats,
         "aesthetics_scored": aes_scored,
         "aesthetics_stats": aesthetics_stats,
-        "concepts_analyzed": concepts_analyzed,
+        "concepts_analyzed": row["concepts"],
         "category_tagged": category_tagged,
         "visual_tagged": visual_tagged,
         "keyword_tagged": keyword_tagged,
-        "stacks": stack_count,
-        "stacked_photos": stacked_photos,
-        "verify_passed": verify_counts["pass"],
-        "verify_failed": verify_counts["fail"],
-        "verify_regenerated": verify_counts["regenerated"],
+        "stacks": stack_row["stack_count"],
+        "stacked_photos": stack_row["stacked_photos"],
+        "verify_passed": row["v_pass"],
+        "verify_failed": row["v_fail"],
+        "verify_regenerated": row["v_regen"],
+    }
+
+
+# /api/stats memo: {db_path: (computed_at_epoch, payload)}. Stale-while-
+# revalidate — once a value exists, no request ever waits on the counts again:
+# a stale hit returns the old value and refreshes it on one background thread.
+# Only the first request after a start (or a DB swap) computes inline, and
+# concurrent first requests share that one computation instead of each
+# scanning the library (the 2026-09-19 thread pile-up had this shape).
+_STATS_TTL_SECONDS = 60.0
+_stats_memo: dict = {}
+_stats_lock = threading.Lock()
+
+
+def _refresh_stats(db_path: str) -> dict:
+    """Compute and store. Caller holds `_stats_lock`."""
+    with PhotoDB(db_path, photo_root=_photo_root) as db:
+        payload = _compute_stats(db)
+    _stats_memo[db_path] = (time.time(), payload)
+    return payload
+
+
+def _refresh_stats_in_background(db_path: str) -> None:
+    try:
+        _refresh_stats(db_path)
+    except Exception:
+        logger.exception("background /api/stats refresh failed")
+    finally:
+        _stats_lock.release()
+
+
+def _cached_stats() -> tuple[dict, float]:
+    db_path = _db_path
+    hit = _stats_memo.get(db_path)
+    if hit is not None:
+        computed_at, payload = hit
+        if (time.time() - computed_at >= _STATS_TTL_SECONDS
+                and _stats_lock.acquire(blocking=False)):
+            threading.Thread(target=_refresh_stats_in_background,
+                             args=(db_path,), daemon=True,
+                             name="stats-refresh").start()
+        return payload, computed_at
+    with _stats_lock:
+        hit = _stats_memo.get(db_path)  # another request filled it meanwhile
+        if hit is not None:
+            return hit[1], hit[0]
+        payload = _refresh_stats(db_path)
+        return payload, _stats_memo[db_path][0]
+
+
+@app.get("/api/stats")
+def api_stats():
+    """Database statistics, at most ~_STATS_TTL_SECONDS old (see _cached_stats).
+
+    Use /api/health for a reachability check, not this.
+    """
+    payload, computed_at = _cached_stats()
+    return {
+        **payload,
+        "computed_at": computed_at,
         # Capability flag for the "✨ Ask" toggle. The agent needs a local LLM
         # backend; on the NAS there is none (the N100 can't run one usefully),
         # so Ask there 404s at the model layer. Piggy-backed on /api/stats
-        # because the search page already fetches it on mount.
+        # because the search page already fetches it on mount. Read per
+        # request, never cached.
         "ask_available": _ask_available(),
     }
 
@@ -3823,9 +4032,9 @@ def api_geotag_folders(include_fully_tagged: bool = False,
     if camera:
         where.append("camera_model = ?"); params.append(camera)
     if date_from:
-        where.append("substr(date_taken,1,10) >= ?"); params.append(date_from[:10])
+        where.append("date_taken >= ?"); params.append(date_from[:10])
     if date_to:
-        where.append("substr(date_taken,1,10) <= ?"); params.append(date_to[:10])
+        where.append("date_taken <= ?"); params.append(date_to[:10] + " 23:59:59")
     with _get_db() as db:
         rows = db.conn.execute(
             "SELECT folder AS path, "
@@ -3851,6 +4060,7 @@ def api_geotag_folders(include_fully_tagged: bool = False,
 
 @app.get("/api/geotag/folder-photos")
 def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
+                              show_located: bool = False,
                               camera: Optional[str] = None,
                               date_from: Optional[str] = None,
                               date_to: Optional[str] = None,
@@ -3860,9 +4070,13 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
     By default returns only photos where gps_lat IS NULL (the ones that
     need tagging). With `show_inferred=true`, also includes photos where
     `location_source='inferred'` so the user can manually correct any M19
-    misfires. `location_source='exif'` photos are always excluded — those
-    came from the camera and are authoritative. `camera`/`date_from`/`date_to`
-    narrow the set to match the folder-picker filters.
+    misfires. `location_source='exif'` (and 'manual') photos are excluded
+    unless `show_located=true`, which returns every photo in the folder —
+    camera GPS is usually right, but a phone-linked camera stamps the phone's
+    position, and a nearby-park label for a school field is still wrong.
+    Re-tagging those also needs `overwrite` on bulk-set-location.
+    `camera`/`date_from`/`date_to` narrow the set to match the folder-picker
+    filters.
     """
     # Match the exact folder via the indexed `folder` column (schema v25) — no
     # LIKE + Python subfolder guard. This also fixes a latent bug in the old
@@ -3870,7 +4084,9 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
     # Python filter, so a folder with many sub-folder photos could return fewer
     # than `limit` of its own.
     with _get_db() as db:
-        if show_inferred:
+        if show_located:
+            gps_where = "1=1"
+        elif show_inferred:
             gps_where = "(gps_lat IS NULL OR location_source='inferred')"
         else:
             gps_where = "gps_lat IS NULL"
@@ -3878,9 +4094,9 @@ def api_geotag_folder_photos(folder: str, show_inferred: bool = False,
         if camera:
             extra += " AND camera_model = ?"; params.append(camera)
         if date_from:
-            extra += " AND substr(date_taken,1,10) >= ?"; params.append(date_from[:10])
+            extra += " AND date_taken >= ?"; params.append(date_from[:10])
         if date_to:
-            extra += " AND substr(date_taken,1,10) <= ?"; params.append(date_to[:10])
+            extra += " AND date_taken <= ?"; params.append(date_to[:10] + " 23:59:59")
         params.append(limit)
         rows = db.conn.execute(
             f"""SELECT id, filepath, filename, date_taken, gps_lat, gps_lon,
@@ -4902,7 +5118,7 @@ async def api_book_authoring_draft(book_id: int, request: Request):
             logger.exception("AUTHORING draft failed")
             _emit({"type": "fatal", "message": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -5155,7 +5371,7 @@ async def api_detect_stacks_stream(request: Request):
             logger.exception("STACKING stream failed")
             _emit({"type": "fatal", "message": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -5192,6 +5408,7 @@ async def api_maintenance_sweep(request: Request):
     Body (all optional; defaults match the CLI, ``apply`` defaults False):
       {"apply"?, "do_colors"?, "do_stacking"?, "do_recluster"?, "do_dedup"?,
        "do_requeue"?, "requeue_passes"?, "stages"?,
+       "sharpness"? (alias "do_sharpness"), "sharpness_limit"?,
        "window_minutes"?, "max_drift_km"?, "min_confidence"?}
 
     ``stages``, when present, restricts the run to that subset of stage names
@@ -5232,6 +5449,17 @@ async def api_maintenance_sweep(request: Request):
     do_recluster = bool(data.get("do_recluster", False))
     do_dedup = bool(data.get("do_dedup", False))
     do_requeue = bool(data.get("do_requeue", False))
+    # Measured sharpness (heavy full-res decode). Opt-in; accepts the plain
+    # `sharpness` field and the `do_*` spelling the other toggles use.
+    do_sharpness = bool(data.get("sharpness", data.get("do_sharpness", False)))
+    sharpness_limit = data.get("sharpness_limit")
+    if sharpness_limit is not None:
+        try:
+            sharpness_limit = int(sharpness_limit)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "sharpness_limit must be an integer")
+        if sharpness_limit <= 0 or sharpness_limit > 200000:
+            raise HTTPException(400, "sharpness_limit must be in (0, 200000]")
 
     # --- replica-mode gating ------------------------------------------------
     # A sweep on the replica writes to photo_index.db.local, which the next
@@ -5248,6 +5476,7 @@ async def api_maintenance_sweep(request: Request):
         requested_excluded = [
             name for name, on in (
                 ("colors", do_colors),
+                ("sharpness", do_sharpness),
                 ("match_faces", do_match),
                 ("recluster", do_recluster),
                 ("dedup_photos", do_dedup),
@@ -5340,6 +5569,7 @@ async def api_maintenance_sweep(request: Request):
                 "do_recluster": do_recluster,
                 "do_dedup": do_dedup,
                 "do_requeue": do_requeue,
+                "do_sharpness": do_sharpness,
             })
             # Pre-flight BEFORE compute: a sync replaces the whole local DB, so
             # discovering drift after a local stacking run would destroy the very
@@ -5386,6 +5616,8 @@ async def api_maintenance_sweep(request: Request):
                     do_recluster=do_recluster,
                     do_dedup=do_dedup,
                     do_requeue=do_requeue,
+                    do_sharpness=do_sharpness,
+                    sharpness_limit=sharpness_limit,
                     force_normalize_aesthetics=force_normalize_aesthetics,
                     force_normalize_subject_aesthetics=force_normalize_subject_aesthetics,
                     requeue_passes=tuple(requeue_passes) if requeue_passes else None,
@@ -5433,7 +5665,7 @@ async def api_maintenance_sweep(request: Request):
             })
         sweep_held = True
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -5507,6 +5739,9 @@ async def api_ask(request: Request):
         data = {}
     data = data or {}
     message = (data.get("message") or "").strip()
+    # The question IS the intent, for this request's log line and for each
+    # tool call the agent makes on its behalf (agent.run_agent).
+    request.state.log_intent = f"Ask: {message}"[:300]
     history = data.get("history") if isinstance(data.get("history"), list) else None
     # Structured Search filters pinned in the UI, fed in as HARD constraints on
     # every search the agent runs (not a post-filter on its results). The agent
@@ -5563,7 +5798,7 @@ async def api_ask(request: Request):
             _emit({"type": "error", "message": str(exc)})
             _emit({"type": "done"})
 
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_carry_context(run), daemon=True).start()
 
     async def generate():
         try:
@@ -6166,7 +6401,7 @@ async def api_google_upload(body: dict, request: Request):
             _emit({"type": "fatal", "message": str(exc)})
 
     # Launch upload in background thread
-    thread = threading.Thread(target=run_upload, daemon=True)
+    thread = threading.Thread(target=_carry_context(run_upload), daemon=True)
     thread.start()
 
     async def generate():
@@ -6332,6 +6567,14 @@ if _frontend_dir.exists():
     def serve_eval_visual_tags():
         """Serve the visual-tag labelling page (local-only eval tool — see eval_api)."""
         page = _frontend_dir / "eval_visual_tags.html"
+        if page.exists():
+            return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h1>Eval page not found</h1>")
+
+    @app.get("/eval/models")
+    def serve_eval_models():
+        """Serve the model-eval labelling page (local-only — see model_eval_api)."""
+        page = _frontend_dir / "eval_models.html"
         if page.exists():
             return HTMLResponse(page.read_text(), headers={"Cache-Control": "no-cache"})
         return HTMLResponse("<h1>Eval page not found</h1>")

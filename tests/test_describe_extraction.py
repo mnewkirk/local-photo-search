@@ -40,9 +40,21 @@ def test_extract_categories_returns_only_vocab_terms(monkeypatch):
     assert set(out) == {"beach", "dog", "mountain"}
 
 
-def test_extract_categories_returns_empty_on_empty_response(monkeypatch):
+def test_extract_categories_rejects_an_empty_response(monkeypatch):
+    """An empty answer used to be stored as '[]' — done for good, with no
+    categories. It is now an unusable answer (retried once, then raised)."""
+    import pytest
     from photosearch import describe as d
     monkeypatch.setattr(d, "_ollama_chat_with_retry", lambda **kw: "")
+    monkeypatch.setattr("photosearch.vocab_content.CONTENT_VOCABULARY",
+                        ["beach", "dog"])
+    with pytest.raises(d.UnusableAnswer, match="empty response"):
+        d.extract_categories_from_description("a dog")
+
+
+def test_extract_categories_returns_empty_on_an_explicit_none(monkeypatch):
+    from photosearch import describe as d
+    monkeypatch.setattr(d, "_ollama_chat_with_retry", lambda **kw: "none")
     monkeypatch.setattr("photosearch.vocab_content.CONTENT_VOCABULARY",
                         ["beach", "dog"])
     assert d.extract_categories_from_description("a dog") == []
@@ -58,7 +70,8 @@ def test_extract_keywords_uses_bakeoff_parser(monkeypatch):
     from photosearch import describe as d
     monkeypatch.setattr(d, "_ollama_chat_with_retry",
                         lambda **kw: "Golden Retriever, Stinson Beach, sunset")
-    out = d.extract_keywords_from_description("a dog at the beach")
+    out = d.extract_keywords_from_description(
+        "A golden retriever runs on Stinson Beach at sunset.")
     assert out == ["golden retriever", "stinson beach", "sunset"]
 
 

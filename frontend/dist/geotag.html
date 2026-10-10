@@ -417,7 +417,7 @@
 
     // ---- Folders panel -------------------------------------------------------
     function FoldersPanel(props) {
-      const [includeTagged, setIncludeTagged] = useState(false);
+      const includeTagged = props.includeTagged;
       return e('div', { className: 'col col-folders' },
         e('div', { className: 'col-header' },
           e('span', null, 'Folders'),
@@ -426,7 +426,7 @@
           e('span', { className: 'spacer', style: { flex: 1 } }),
           e('button', {
             className: 'btn',
-            onClick: () => props.onReload(includeTagged),
+            onClick: () => props.onReload(),
             title: 'Re-scan folders',
           }, '↻'),
         ),
@@ -435,10 +435,7 @@
             e('input', {
               type: 'checkbox',
               checked: includeTagged,
-              onChange: (ev) => {
-                setIncludeTagged(ev.target.checked);
-                props.onReload(ev.target.checked);
-              },
+              onChange: (ev) => props.onIncludeTagged(ev.target.checked),
             }),
             ' Show fully-tagged folders'),
         ),
@@ -559,7 +556,8 @@
                   loading: 'lazy',
                   alt: p.filename,
                 }),
-                p.location_source === 'inferred' && e('span', { className: 'src-badge' }, 'inferred'),
+                (p.location_source === 'inferred' || (props.gpsScope === 'all' && p.location_source))
+                  && e('span', { className: 'src-badge' }, p.location_source),
               );
             })
           ),
@@ -571,13 +569,17 @@
           e('span', null, props.folder),
         ),
         e('div', { className: 'photo-toolbar' },
-          e('label', null,
-            e('input', {
-              type: 'checkbox',
-              checked: props.showInferred,
-              onChange: (ev) => props.onToggleInferred(ev.target.checked),
-            }),
-            ' Include inferred (for correction)'),
+          e('label', null, 'Show ',
+            e('select', {
+              value: props.gpsScope,
+              onChange: (ev) => props.onGpsScope(ev.target.value),
+              title: 'Which photos to list. Replacing GPS that is already set'
+                     + ' also needs "Overwrite existing GPS" ticked.',
+            },
+              e('option', { value: 'missing' }, 'Missing GPS'),
+              e('option', { value: 'inferred' }, '+ inferred (for correction)'),
+              e('option', { value: 'all' }, 'All (incl. camera/manual GPS)'),
+            )),
           e('span', { className: 'spacer' }),
           e('span', { className: 'selected-count' },
             selectedCount.toLocaleString() + ' of ' + totalCount.toLocaleString() + ' selected'),
@@ -595,7 +597,8 @@
         e('div', { className: 'col-body' },
           props.loading ? e('div', { className: 'loading' }, 'Loading…')
             : photos.length === 0 ? e('div', { className: 'empty-state' },
-                'No photos needing tags in this folder.')
+                props.gpsScope === 'all' ? 'No photos in this folder match the filters.'
+                  : 'No photos needing tags in this folder.')
             : dayGroups.map(renderDay)
         ),
       );
@@ -754,7 +757,7 @@
               checked: overwrite,
               onChange: (ev) => setOverwrite(ev.target.checked),
             }),
-            ' Overwrite existing GPS (inferred/exif)'),
+            ' Overwrite existing GPS (inferred/exif/manual)'),
           e('button', {
             className: 'btn-primary',
             onClick: () => props.onApply(overwrite),
@@ -776,7 +779,8 @@
       const [photos, setPhotos] = useState(null);
       const [loadingPhotos, setLoadingPhotos] = useState(false);
       const [selected, setSelected] = useState(new Set());
-      const [showInferred, setShowInferred] = useState(false);
+      // 'missing' | 'inferred' | 'all' — which photos the middle panel lists.
+      const [gpsScope, setGpsScope] = useState('missing');
       const [chosen, setChosen] = useState(null);
       const [applying, setApplying] = useState(false);
       const [toast, setToast] = useState(null);
@@ -793,7 +797,10 @@
         return s;
       }, [cameraFilter, dateFrom, dateTo]);
 
-      const loadFolders = useCallback((includeTagged) => {
+      // Lifted out of FoldersPanel so the "All" photo scope can turn it on
+      // and a filter change / apply refresh keeps it.
+      const [includeTagged, setIncludeTagged] = useState(false);
+      const loadFolders = useCallback(() => {
         setFolders(null);
         const url = '/api/geotag/folders?_=1'
                     + (includeTagged ? '&include_fully_tagged=true' : '')
@@ -802,16 +809,17 @@
           .then(r => r.json())
           .then(body => setFolders(body.folders || []))
           .catch(() => setFolders([]));
-      }, [filterQS]);
+      }, [filterQS, includeTagged]);
 
-      useEffect(() => { loadFolders(false); }, [loadFolders]);
+      useEffect(() => { loadFolders(); }, [loadFolders]);
 
-      const loadPhotos = useCallback((folder, inferred) => {
+      const loadPhotos = useCallback((folder, scope) => {
         if (!folder) return;
         setLoadingPhotos(true);
         const url = '/api/geotag/folder-photos?folder='
                     + encodeURIComponent(folder)
-                    + (inferred ? '&show_inferred=true' : '')
+                    + (scope === 'inferred' ? '&show_inferred=true' : '')
+                    + (scope === 'all' ? '&show_located=true' : '')
                     + filterQS();
         fetch(url)
           .then(r => r.json())
@@ -829,23 +837,26 @@
       const _didMountPhotos = useRef(false);
       useEffect(() => {
         if (!_didMountPhotos.current) { _didMountPhotos.current = true; return; }
-        if (activeFolder) loadPhotos(activeFolder, showInferred);
+        if (activeFolder) loadPhotos(activeFolder, gpsScope);
       }, [loadPhotos]);
 
       function selectFolder(path) {
         setActiveFolder(path);
-        loadPhotos(path, showInferred);
+        loadPhotos(path, gpsScope);
       }
 
-      function toggleInferred(val) {
-        setShowInferred(val);
+      function changeGpsScope(val) {
+        setGpsScope(val);
+        // Already-located photos usually sit in fully-tagged folders, which
+        // the folder list hides by default — reveal them with the scope.
+        if (val === 'all') setIncludeTagged(true);
         if (activeFolder) loadPhotos(activeFolder, val);
       }
 
       // Track the last-clicked photo id so shift-click can form a range.
       // Reset whenever the folder changes or the photo list reloads.
       const [anchorId, setAnchorId] = useState(null);
-      useEffect(() => { setAnchorId(null); }, [activeFolder, showInferred]);
+      useEffect(() => { setAnchorId(null); }, [activeFolder, gpsScope]);
 
       function togglePhoto(id, shiftKey) {
         // Shift-click: add every photo from anchor to target (inclusive)
@@ -943,12 +954,13 @@
           const skipped = body.skipped_count || 0;
           flashToast('success',
             'Tagged ' + body.updated_count.toLocaleString() + ' photos'
-            + (skipped > 0 ? ' (' + skipped + ' skipped)' : ''));
+            + (skipped > 0 ? ' (' + skipped.toLocaleString() + ' skipped — they already'
+               + ' had GPS; tick "Overwrite existing GPS" to replace it)' : ''));
 
           // Refresh: folder list counts changed; current folder's photos
           // likely have fewer no-GPS rows now.
-          loadFolders(false);
-          if (activeFolder) loadPhotos(activeFolder, showInferred);
+          loadFolders();
+          if (activeFolder) loadPhotos(activeFolder, gpsScope);
         } catch (err) {
           flashToast('error', String(err.message || err));
         } finally {
@@ -963,6 +975,7 @@
             folders: folders,
             activeFolder: activeFolder,
             onReload: loadFolders,
+            includeTagged: includeTagged, onIncludeTagged: setIncludeTagged,
             onSelect: selectFolder,
             camera: cameraFilter, onCamera: setCameraFilter,
             dateFrom: dateFrom, onDateFrom: setDateFrom,
@@ -973,8 +986,8 @@
             photos: photos,
             loading: loadingPhotos,
             selected: selected,
-            showInferred: showInferred,
-            onToggleInferred: toggleInferred,
+            gpsScope: gpsScope,
+            onGpsScope: changeGpsScope,
             onToggle: togglePhoto,
             onSelectAll: selectAll,
             onSelectNone: selectNone,

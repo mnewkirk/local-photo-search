@@ -430,7 +430,7 @@ def _run_single_shot(db: PhotoDB, message: str,
                        "use the structured filters."}
         return
     yield {"type": "tool_call", "tool": "search_photos", "arguments": args}
-    result = toolmod.call_tool(db, "search_photos", args)
+    result = _logged_tool_call(db, "search_photos", args, message)
     yield {"type": "tool_result", "tool": "search_photos",
            "summary": _summarize("search_photos", result)}
     if isinstance(result, dict):
@@ -698,6 +698,24 @@ def _grouping_for(name: str, result) -> tuple[Optional[str], Optional[list]]:
     return None, None
 
 
+def _logged_tool_call(db: PhotoDB, name: str, args: dict, message: str):
+    """toolmod.call_tool, timed into the request log with the user's question
+    as the intent (photosearch/request_log.py)."""
+    from . import request_log
+    t0 = time.perf_counter()
+    status = 500
+    try:
+        result = toolmod.call_tool(db, name, args)
+        status = 200
+        return result
+    finally:
+        request_log.record(
+            db.db_path, method="TOOL", path=name,
+            query=json.dumps(args, sort_keys=True, default=str)[:500],
+            status=status, ms=(time.perf_counter() - t0) * 1000,
+            source="agent", intent=f"Ask: {message}"[:300])
+
+
 def run_agent(
     db: PhotoDB,
     message: str,
@@ -863,7 +881,7 @@ def run_agent(
                         deadline = max(deadline,
                                        time.monotonic() + _RERANK_DEADLINE_EXTEND_S)
                     try:
-                        result = toolmod.call_tool(db, name, eff_args)
+                        result = _logged_tool_call(db, name, eff_args, message)
                     except KeyError:
                         result = {"error": f"unknown tool: {name}"}
                     except Exception as exc:

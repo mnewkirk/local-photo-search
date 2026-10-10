@@ -48,7 +48,7 @@ def test_stacking_is_the_only_transfer_stage():
     assert push_mode("stacking") == "transfer"
 
 
-@pytest.mark.parametrize("stage", ["colors", "dedup_photos", "requeue"])
+@pytest.mark.parametrize("stage", ["colors", "sharpness", "dedup_photos", "requeue"])
 def test_excluded_stages(stage):
     assert push_mode(stage) == "excluded"
 
@@ -305,8 +305,9 @@ def test_nas_fingerprint_proxy_forwards_the_nas_response(client, monkeypatch):
         def json(self):
             return nas_body
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, headers=None):
         assert url == "http://nas:8000/api/admin/maintenance-fingerprint"
+        assert headers["X-Photosearch-Source"] == "replica"
         return FakeResponse()
 
     monkeypatch.setattr(requests, "get", fake_get)
@@ -323,7 +324,7 @@ def test_nas_fingerprint_proxy_returns_error_body_when_nas_unreachable(client, m
     # special-case a non-2xx response.
     monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://unreachable:8000")
 
-    def boom(url, timeout=None):
+    def boom(url, timeout=None, headers=None):
         raise requests.ConnectionError("connection refused")
 
     monkeypatch.setattr(requests, "get", boom)
@@ -783,6 +784,24 @@ def test_excluded_stage_rejected_in_replica_mode(client, monkeypatch):
     assert r.status_code == 400
     assert r.json()["detail"]["error"] == "excluded_stage_in_replica_mode"
     assert "colors" in r.json()["detail"]["stages"]
+
+
+@pytest.mark.parametrize("field", ["sharpness", "do_sharpness"])
+def test_sharpness_stage_rejected_in_replica_mode(client, monkeypatch, field):
+    """Like colors, it decodes the originals — which the replica does not
+    have. Both spellings of the toggle hit the same 400."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": True, field: True})
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "excluded_stage_in_replica_mode"
+    assert r.json()["detail"]["stages"] == ["sharpness"]
+
+
+def test_sharpness_limit_is_validated(client):
+    r = client.post("/api/admin/maintenance-sweep",
+                    json={"apply": False, "sharpness": True, "sharpness_limit": 0})
+    assert r.status_code == 400
 
 
 @pytest.mark.parametrize("flag", ["do_match", "do_recluster"])
