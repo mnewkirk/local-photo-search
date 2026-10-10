@@ -87,7 +87,18 @@ They match, apart from photos with identical timestamps swapping places.
    point the check at a cheap endpoint (`/api/admin/version`, or add a trivial
    `/api/health`). Separately, make `/api/stats` cheaper or cached, since the
    status page and replica-status (12.5 s on 10-09) use it too.
-2. **`/api/worker/status` is slow cold: 8.6, 18.5, 43 and 82 s measured.** It
+2. **PARTLY DONE 2026-10-09.** The NAS log showed every slow call omitted
+   `passes=` (all 9 counts): Claude's idle checks (unscoped, 18–82 s) and
+   collection-58 checks (16k ids, 19–33 s). Worker calls send `passes=` and
+   take 0.01–0.2 s; the replica panel's polls were ~absent that week. Fixed
+   the scoped case: above `db._SCOPE_DRIVE_FROM_INDEX_AT` (2000) ids the count
+   writes `+id IN (...)`, driving from the need-index instead of a rowid
+   lookup per id (replica, cold, 16k ids: 1.1 s → 0.00 s describe/verify/
+   quality, 1.2 → 0.17 s clip/faces). The unscoped counts were already
+   index-only (worst: faces 1.45 s cold on the replica); the 82 s was not
+   reproduced — re-check `request-stats` after deploy before doing more.
+   **When checking the queue by hand, pass `passes=`.** Original note:
+   **`/api/worker/status` is slow cold: 8.6, 18.5, 43 and 82 s measured.** It
    counts nine worker queues over the whole library. Only describe, verify and
    quality have partial "work remaining" indexes. The likely costly ones are
    `clip` (`NOT IN clip_embeddings`, a vec0 read) and `faces`

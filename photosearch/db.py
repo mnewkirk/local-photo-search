@@ -202,6 +202,22 @@ _CLIP_NOT_EXHAUSTED = (
     "WHERE wp.photo_id = p.id AND wp.pass_type = 'clip' "
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
+# Scoped queue counts (`count_unprocessed_photos(photo_ids=...)`) above this
+# many ids write the id test as `+id IN (...)`. The unary `+` stops SQLite
+# looking each id up by rowid — which reads one leaf of the wide photos table
+# per id, ~1 s per 16k ids cold even on NVMe and far worse on the NAS's HDD —
+# so it drives from the pass's small "needs work" partial index (or a narrow
+# covering index) and checks membership instead. Measured on a replica copy,
+# cold: 16k-photo collection, describe/verify/quality 1.1 s -> 0.00 s,
+# clip/faces 1.2 s -> 0.17 s. Below the threshold the rowid lookups win (a
+# 50-photo directory is 50 reads vs a whole index scan).
+_SCOPE_DRIVE_FROM_INDEX_AT = 2000
+
+
+def _scope_col(col: str, photo_ids) -> str:
+    return f"+{col}" if len(photo_ids) > _SCOPE_DRIVE_FROM_INDEX_AT else col
+
+
 _VERIFY_NOT_EXHAUSTED = (
     "NOT EXISTS (SELECT 1 FROM worker_processed wp "
     "WHERE wp.photo_id = photos.id AND wp.pass_type = 'verify' "
@@ -2799,7 +2815,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
-                        WHERE p.id IN ({placeholders})
+                        WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
                         AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
                         AND {_CLIP_NOT_EXHAUSTED}""",
                     list(photo_ids),
@@ -2815,7 +2831,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
-                        WHERE p.id IN ({placeholders})
+                        WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
                         AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
@@ -2834,7 +2850,7 @@ class PhotoDB:
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
-                    f"SELECT COUNT(*) FROM photos WHERE id IN ({placeholders}) "
+                    f"SELECT COUNT(*) FROM photos WHERE {_scope_col('id', photo_ids)} IN ({placeholders}) "
                     f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
                     f"AND {_QUALITY_NOT_EXHAUSTED}",
                     list(photo_ids),
@@ -2864,7 +2880,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
@@ -2886,7 +2902,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND visual_tags IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
@@ -2906,7 +2922,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND description IS NOT NULL
                         AND verified_at IS NULL
                         AND {_VERIFY_NOT_EXHAUSTED}""",
@@ -2924,7 +2940,7 @@ class PhotoDB:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos
-                        WHERE id IN ({placeholders})
+                        WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND aes_overall IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'

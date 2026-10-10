@@ -368,6 +368,11 @@ itself now memoized (`web._cached_stats`, 60 s, stale-while-revalidate: only
 the first request after a start computes inline) and reads `photos` with one
 table scan instead of four (`web._compute_stats`; `tests/test_api_stats_cache.py`
 pins it). The replica card counts NAS photos via `/api/admin/maintenance-fingerprint`.
+Scoped queue counts (`count_unprocessed_photos(photo_ids=...)`, behind
+`/api/worker/status?collection_id=…`) write `+id IN (...)` above 2,000 ids
+(`db._scope_col`) so they drive from the need-index rather than reading one
+`photos` leaf per id (16k-id collection: 19–33 s on the NAS). Checking the
+queue by hand? Pass `passes=` — all nine counts is what was slow.
 
 Uses CPU-only PyTorch with 3GB hard memory limit per container. Use NAS IP address
 (not hostname) — Docker containers can't resolve local DNS names.
