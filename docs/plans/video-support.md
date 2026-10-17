@@ -1,4 +1,4 @@
-# Video support (mp4/mov): faces + main-focus share, description, quality
+# Video support (mp4/mov): main subject share (people, animals, scenery), description, quality
 
 Status: **planned** (2026-10-17). Built by plan-debate: two planners drafted
 independently, critiqued each other over two rounds, and converged on every
@@ -104,9 +104,12 @@ HTTP Range against the NAS plus one first-frame decode: duration, codec,
 rotation, dates, GPS, the unreadable verdict, and the poster at three sizes,
 with Live Photo pairing decided server-side from the submitted duration and
 date), **`video-scan`** (non-LLM: one rate-capped download,
-dense cv2 decode, InsightFace on sampled frames, a numpy tracker, per-person
-main-focus share, CLIP mean embedding, quality measurements, keyframes uploaded
-back to the NAS) and **`video-describe`** (new LLM role `video`, K keyframes in
+dense cv2 decode, InsightFace on sampled frames, a numpy tracker, face
+salience, CLIP mean embedding, quality measurements, per-segment keyframes and
+per-identity face crops uploaded back to the NAS), **`video-subjects`** (LLM:
+VLM grounding of the main subject per segment keyframe — a person, a dog, a
+mountain — joined to the face tracks for identity; this is what the share is
+computed from) and **`video-describe`** (new LLM role `video`, K keyframes in
 one multi-image request). **Each within-video identity becomes one `faces`
 row**, so `/faces`, clustering, the strict matcher, verify-labels, the rival
 test and the one-person-per-photo invariant apply to videos unchanged, and the
@@ -230,6 +233,10 @@ where the owner gets value.
   `probe_json`, `probe_version`, `probe_error`; `kind` ('clip' | 'live'),
   `live_of_photo_id`; `poster_t`; `scan_version`, `scan_error`, `scanned_at`;
   `shake`, `noise`, `focus_consistency`, `quality_json`.
+- `video_subjects` (`id`, `photo_id` CASCADE, `subject_ix`, `label`,
+  `category`, `face_id` → `faces` ON DELETE SET NULL, `focus_s`,
+  `focus_intervals` JSON, `rep_t`, `rep_frame`, `rep_bbox`, `n_segments`);
+  indexes `(photo_id)`, `(face_id)`, `(label)`.
 - `video_tracks` (`id`, `photo_id` CASCADE, `face_id` → `faces` ON DELETE SET
   NULL, `ident_ix`, `t_start`, `t_end`, `n_det`, `presence_s`, `focus_s`,
   `focus_intervals`, `rep_t`, `rep_frame`, `mean_salience`); indexes on
@@ -488,7 +495,7 @@ salience are computed here; the **subject** share needs step 3b and is
   clip reads a per-kid breakdown that matches the eye, a landscape pan reads
   "mountain lake" with no person rows.
 
-### Step 4 — Video eval harness and blind labelling (6 d engineering, ≈ 2.8 h owner)
+### Step 4 — Video eval harness and blind labelling (6 d engineering, ≈ 3.1 h owner)
 
 General rules, inherited from `model-eval-harnesses.md` and the visual-tags
 eval: pin the role (`model_eval.pin_role_model`); wrap every LLM call in
@@ -626,15 +633,15 @@ cv2; **Live pairing precision must be 10/10** on the owner-confirmed 10 pairs
 + 5 near-misses (same stem, Δt 3–10 s) — wrongly hiding a real video is the
 costly error; tighten Δt or require Apple's content identifier if it fails.
 
-**Owner time**: focus ~60 min, Differences ~45 min, temporal ratings ~15 min,
-quality ~30 min, recheck ~15 min, Live pairs ~5 min ≈ **2.8 h**. (A per-frame,
+**Owner time**: subject ~75 min, Differences ~45 min, temporal ratings ~15 min,
+quality ~30 min, recheck ~15 min, Live pairs ~5 min ≈ **3.1 h**. (A per-frame,
 per-person label grid was considered and rejected: 6–8 h for a worse signal.)
 
 Files: `evals/video_eval.py` (`sample | fetch-originals | run-faces |
 run-describe | run-quality | disputes | report | agreement`); video stores and
 a detection cache in `model_eval.py`; video tabs + Range-served originals + a
 native frame grab in `model_eval_api.py`; `eval_models.html` tabs **Video
-focus | Video quality**, and Differences shows a `<video>`;
+subject | Video quality**, and Differences shows a `<video>`;
 `eval_api.LABELLER_NOTES` entries. Tests `tests/test_video_eval.py`: page is
 blind, labels keyed by `(pid, seg_version, seg_ix)`, `TransportError` never
 cached, context-overflow cached as `rejected`, holdout split deterministic.
@@ -697,7 +704,8 @@ wins a flag, it becomes a `video-quality` LLM pass in step 5's shape.
 - Backfill: `register-videos --apply` per year starting with 2026 (a walk +
   inserts) → fleet `-p video-probe -n 2` (header reads only; the spike says
   how many bytes) → `-p video-scan -n 2` overnight (≈ 4,200 readable videos,
-  ≈ 300 GB at 30 MB/s ≈ 3 h transfer + 1–2 h analysis) → `video-describe` →
+  ≈ 300 GB at 30 MB/s ≈ 3 h transfer + 1–2 h analysis) → `-p video-subjects`
+  over two or three nights (≈ 36k grounding calls) → `video-describe` →
   advance batches (match_faces; warm_crops skips videos). Report the cost up
   front before each year, the way the gemma-4-26b one-off did.
 - CLAUDE.md gains a "Video" section: `PASS_MEDIA`, the unreadable rule, the
@@ -721,7 +729,7 @@ wins a flag, it becomes a `video-quality` LLM pass in step 5's shape.
 | 8 backfill / docs | 1.5 | — |
 | **total** | **≈ 32.5** (≈ 35 with review slack) | |
 
-Owner ≈ 2.8 h labelling. GPU/CPU ≈ 4–6 h for the eval, ≈ 5–8 h for the
+Owner ≈ 3.1 h labelling. GPU/CPU ≈ 4–6 h for the eval, ≈ 5–8 h for the
 scan backfill plus **20–30 h** for the subject pass. 0 → 1 → 2 → 2b is serial; step 4's harness can start alongside steps 3/3b
 (both call the pure `video_analysis.py` / `video_subjects.py`); step 5 needs step 4's describe
 result and step 6 needs its faces result; 5 and 6 are independent — the owner
