@@ -3873,6 +3873,17 @@ Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessStep` in
 
 ## Planned milestones (see `docs/plans/`)
 
+- `docs/plans/video-support.md` — **PLANNED 2026-10-17** (plan-debate, both
+  planners converged). Videos become `photos` rows (`media_type='video'`, NULL =
+  still) with `video_meta`/`video_tracks`; `db.PASS_MEDIA` keeps image passes off
+  them. NAS does ffprobe + one poster frame only; the desktop `video-scan` pass
+  downloads each file once at a 30 MB/s cap, tracks faces, and writes one
+  `faces` row per identity so `/faces` tooling applies unchanged. Main-focus
+  share = time-weighted salience (face size × centre weight) over the WHOLE
+  clip, hidden until a 90-video owner-labelled holdout eval passes its gates.
+  Corpus: 5,577 files, ~400 GB, 25% unreadable (`moov atom not found`), median
+  3 s (Live Photos, paired to the still and skipped).
+
 - `docs/plans/search-indexes.md` — **SHIPPED 2026-10-04.** Schema v34 search
   indexes; `search_combined` composes date/camera/people into one id scope;
   id-first people and LIKE queries; SQL-paginated aesthetics/quality browses;
