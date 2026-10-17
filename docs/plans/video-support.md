@@ -2,8 +2,11 @@
 
 Status: **planned** (2026-10-17). Built by plan-debate: two planners drafted
 independently, critiqued each other over two rounds, and converged on every
-contested point. The owner-facing forks and their adopted defaults are in
-"Decisions" at the end; none of them block starting.
+contested point. The owner then decided three things (recorded in "Decisions"):
+**skip Live Photo clips**, **the whole clip is the share denominator**, and
+**all work other than indexing runs on the desktop, never the NAS** — the NAS
+only registers rows, stores results and serves files. That last decision moved
+the probe and the poster frame off the NAS into a new `video-probe` worker pass.
 
 ## Why, and what the owner asked for
 
@@ -45,7 +48,8 @@ re-decoded**.
   venv's `cv2` 4.13 reports `FFMPEG: YES`; the NAS image installs the same
   `opencv-python` wheel. There is **no `ffmpeg` binary in the Dockerfile** and
   none on the desktop host; `ffmpeg`/`ffprobe` exist only on the NAS *host*
-  (`/usr/bin`). HEVC decode through the wheel on the N100 is unverified (spike).
+  (`/usr/bin`). After D19 the NAS never decodes, so only the desktop wheel's
+  HEVC support matters (spike).
 - **Desktop torch is a CUDA build with no usable device.** CLIP and any
   torch model run on CPU there; the AMD GPU is reachable only through
   `onnxruntime-rocm` (InsightFace) and LM Studio. A native video-input VLM via
@@ -90,9 +94,13 @@ re-decoded**.
 backfill of existing rows). Its probe and analysis live in two side tables,
 `video_meta` and `video_tracks`. One map, `db.PASS_MEDIA`, says which passes
 see videos; image passes never do, and `category-content`/`keywords` run on
-video descriptions unchanged. The NAS does only **ffprobe metadata + one cv2
-first-frame poster** per video at registration. Two new worker passes do the
-rest on the desktop: **`video-scan`** (non-LLM: one rate-capped download,
+video descriptions unchanged. **The NAS runs no decoder and no prober**: it walks the tree, inserts rows,
+stores what the workers upload, and serves files with Range support. Three new
+worker passes do everything on the desktop: **`video-probe`** (ffprobe over
+HTTP Range against the NAS plus one first-frame decode: duration, codec,
+rotation, dates, GPS, the unreadable verdict, and the poster at three sizes,
+with Live Photo pairing decided server-side from the submitted duration and
+date), **`video-scan`** (non-LLM: one rate-capped download,
 dense cv2 decode, InsightFace on sampled frames, a numpy tracker, per-person
 main-focus share, CLIP mean embedding, quality measurements, keyframes uploaded
 back to the NAS) and **`video-describe`** (new LLM role `video`, K keyframes in
@@ -172,18 +180,22 @@ where the owner gets value.
   rotation, an HDR/Dolby Vision clip, a Live Photo MOV + HEIC, a Takeout MP4, a
   `moov atom not found` file, an ILCE-7RM6 4K file, a Kodak PIXPRO file, a 720p
   2016 file, one `.avi`, one `.mts`.
-- Measure: cv2 open/rotation/decode fps on the desktop (1080p and 4K HEVC);
-  first-frame decode time and RSS **inside the NAS container** (use `$DCPY`,
-  never bare `$DC`); HEVC playback in the owner's browsers (Chrome/Edge on
-  Windows, iOS Safari) from a static `<video>` page; image-size growth from
-  adding `ffmpeg` to the runtime stage (the NAS has been disk-starved).
+- Install `ffmpeg`/`ffprobe` on the WSL desktop (`apt`; there is none today).
+  The Dockerfile is **not** touched: the NAS never probes or decodes (D19).
+- Measure on the desktop: cv2 open/rotation/decode fps (1080p and 4K HEVC);
+  **bytes read by `ffprobe <http url>` and by a cv2 first-frame grab over HTTP
+  Range** for three file shapes — faststart (moov first), moov-at-end, and
+  no-moov (the unreadable 25%; ffprobe may read to EOF looking for `moov`, so
+  measure it, and check whether a 1 MB head + 1 MB tail `moov` search can
+  short-circuit it); HEVC playback in the owner's browsers (Chrome/Edge on
+  Windows, iOS Safari) from a static `<video>` page.
 - Measure the per-camera offset between `mvhd` creation time and sibling photo
   `date_taken` (feeds the date policy).
 - Files: this doc gains a spike table. Nothing in `photosearch/` yet.
-- **Gate:** if cv2 cannot decode HEVC inside the NAS container, posters move to
-  the worker (step 2 changes, step 1 doesn't). The NAS never needs more than one
-  frame. The planners' "~46 h of N100 CPU for dense NAS-side decode" figure is
-  an estimate, not a measurement; the spike replaces it with a number.
+- **Gate:** the probe pass must cost well under one whole-file download per
+  video on average, or the probe is folded into `video-scan`'s single
+  download and unreadable files are detected there instead (the row still
+  stores the error either way).
 
 ### Step 1 — Schema v35, media isolation, registration, unreadable handling (4 d)
 
@@ -220,47 +232,54 @@ purge-nonimage-photos` (**must land in this step** — the one data-loss risk),
 `face_review`, `upscale`, `split_export`, `book_export`, `shutterfly_export`,
 `google_photos` upload, `subjects`/`aesthetics` if they read pixels.
 
-**Probe + registration:**
+**Registration (NAS, "indexing" only):**
 
-- **Dockerfile**: add `ffmpeg` to the runtime stage's apt list (one line,
-  ~5 min rebuild). Used **only** as `ffprobe -print_format json -show_format
-  -show_streams`. All pixel decoding stays on cv2 — one decode path, already
-  pinned, nothing new on the desktop. Why ffprobe and not a hand-rolled atom
-  parser: it is the tool that produced the brief's 15/60 figure, so the stored
-  `probe_error` matches by construction; cv2 cannot read creation time, Apple
-  `com.apple.quicktime.creationdate` with its offset, ISO6709 GPS, or the
-  rotation display matrix; and it covers `.avi`/`.mts` natively. Fallback if
-  the image growth measured in step 0 is unacceptable: a pure-Python atom
-  parser for mp4/mov and mtime dates for `.avi`/`.mts`.
-- **`photosearch/video_probe.py`** parses ffprobe JSON (CI tests feed canned
-  JSON fixtures; ffprobe stays absent on CI). `PROBE_VERSION` constant. Errors
-  stored verbatim (`moov atom not found`, truncated).
 - **`photosearch/video_registry.py`**: `register_video(db, path, file_hash)`
-  inserts the `photos` row via `add_photo` (`media_type='video'`,
-  `date_taken` per the date policy, `gps_*` with `location_source='exif'`,
-  `camera_make/model`, `image_width/height` as **display** dims after
-  rotation) and the `video_meta` row. **A probe error is STORED** (`probe_error`
-  + `probe_version` set): the row exists, no pass ever claims it, nothing
-  re-probes unless `PROBE_VERSION` bumps (the CLIP re-claim / sharpness rule).
-  **Live Photo pairing**: same stem as a still in the same folder or a ±1-day
-  sibling folder, `duration ≤ 4 s`, capture times within 3 s → `kind='live'`,
-  `live_of_photo_id`. `register_videos(...)` is the backfill driver: walks the
-  photo root for `VIDEO_EXTENSIONS` with no row; dry run by default (`mode=ro`);
-  chunked commits every 25; `sharpness_backfill`'s throttles (`os.nice(10)`,
-  IDLE ioprio, refuse/yield while `ingest.sweep_lock_held` or an open
-  batch-advance job).
-- **Hash policy.** New ingests store the hash ingest already computed. The
-  backfill does **not** whole-file-hash 400 GB on the N100: the worker hashes
-  while it streams the download in `video-scan` and the server fills
-  `file_hash` when NULL. Only unreadable rows (never downloaded) are hashed by
-  the backfill, throttled.
+  inserts the `photos` row via `add_photo` (`media_type='video'`, filename,
+  `filepath`/`folder`, `date_taken` = file mtime **provisionally**, replaced by
+  the probe pass) and an empty `video_meta` row (`probe_version IS NULL`).
+  No ffprobe, no decode, no hashing on the NAS. `register_videos(...)` is the
+  backfill driver: walks the photo root for `VIDEO_EXTENSIONS` with no row;
+  dry run by default (`mode=ro`); chunked commits every 25; `os.nice(10)` and
+  IDLE ioprio out of habit, though a walk + insert is cheap.
 - **Ingest** (`ingest.py`): after a video companion moves, call
-  `register_video` with the known hash; folders that received only videos join
-  `new_dirs` so `register_batch` sees them; routing uses the probe date before
-  mtime, forward only (**no refile of existing files**, D15); DB-hash dedup now
+  `register_video` with the hash ingest already computed; folders that
+  received only videos join `new_dirs` so `register_batch` sees them. Routing
+  keeps using mtime (the probe date arrives later and only fixes
+  `date_taken`; **no refile of existing files**, D15). DB-hash dedup now
   applies to videos too.
 - **CLI**: `register-videos [--folder F] [--limit N] [--apply]`,
   `envvar="PHOTOSEARCH_DB"`.
+
+**Probe (desktop, the `video-probe` worker pass — step 2b):**
+
+- `photosearch/video_probe.py` runs `ffprobe -print_format json -show_format
+  -show_streams` against the NAS URL (`/full?purpose=worker`, Range-capable,
+  so ffprobe reads only the header and the `moov` box) and parses the JSON.
+  CI feeds canned JSON fixtures; ffprobe is never on CI. A head+tail `moov`
+  pre-check (two 1 MB Range reads) short-circuits the no-`moov` files if the
+  spike shows ffprobe otherwise reads them to EOF. `PROBE_VERSION` constant.
+  Why ffprobe and not cv2 or a hand-rolled atom parser: it is the tool that
+  produced the 15/60 figure, so the stored `probe_error` matches it by
+  construction; cv2 cannot read creation time, Apple
+  `com.apple.quicktime.creationdate` with its offset, ISO6709 GPS, or the
+  rotation display matrix; and it covers `.avi`/`.mts` natively.
+- The same pass grabs the **first decoded frame** with cv2 over HTTP (no
+  seek) and uploads the poster as thumb/preview/full-size JPEGs, so the NAS
+  never resizes anything either. A paired Live clip gets no poster (it shows
+  its still); an unreadable file gets none (static placeholder).
+- **A probe error is STORED** on submit (`probe_error` + `probe_version` set):
+  the row exists, no later pass ever claims it, nothing re-probes unless
+  `PROBE_VERSION` bumps (the CLIP re-claim / sharpness rule).
+- **Live Photo pairing is decided server-side in the submit branch** from the
+  submitted duration and capture time: same stem as a still in the same folder
+  or a ±1-day sibling folder, `duration ≤ 4 s`, capture times within 3 s →
+  `kind='live'`, `live_of_photo_id`. Pure SQL, so it counts as indexing.
+- **Hash policy.** New ingests store the hash ingest already computed. The
+  backfill never hashes on the N100: the worker hashes while it streams the
+  download in `video-scan` and the server fills `file_hash` when NULL.
+  Unreadable rows are never downloaded whole, so they keep `file_hash` NULL;
+  their dedup is by path only, which is acceptable for files nothing can play.
 - **Date policy** (D14): Apple `creationdate` (local wall time with offset) →
   else `mvhd.creation_time` treated as UTC, corrected by the per-camera offset
   measured in step 0 → else mtime.
@@ -274,41 +293,77 @@ media_type IS NULL` keeps the partial `need_*` indexes usable because the query
 predicate implies the index predicate — verify, don't assume).
 
 Verify: `./scripts/test-like-ci.sh` green; a dry run on a replica copy reports
-≈ 5,577 files, ≈ 25% probe errors, Live-paired count, per-year counts matching
-the table above; apply on one NAS folder and `/api/worker/status?passes=…`
-shows its video rows in **no** still-pass queue; `purge-nonimage-photos` dry
-run reports 0 video rows.
+≈ 5,577 files and per-year counts matching the table above (probe errors and
+Live pairs appear only after step 2b); apply on one NAS folder and
+`/api/worker/status?passes=…` shows its video rows in the `video-probe` queue
+and in **no** still-pass queue; `purge-nonimage-photos` dry run reports 0
+video rows.
 
-### Step 2 — Posters, playback, grid, modal (3 d) — **SHIP A**
+### Step 2 — Playback, grid, modal, media filter (2.5 d) — **SHIP A**
 
-- `web.py` thumbnails/previews: paired Live → the still's thumbnail; probe
-  error → static "unreadable video" placeholder, no decode; otherwise the
-  first decoded frame (no seek), generated **at registration**, never lazily
-  on a grid view (50 fresh videos must not run 50 HEVC decodes on the N100's
-  request threads). Cached as the usual `{id}_thumb.jpg` / `{id}_preview.jpg`.
+- `web.py` thumbnails/previews for a video are **never generated on the
+  NAS**: paired Live → the still's thumbnail; probe error → a static
+  "unreadable video" placeholder; not yet probed → a static "video" placeholder;
+  otherwise the poster JPEGs the probe pass uploaded, cached under the usual
+  `{id}_thumb.jpg` / `{id}_preview.jpg` names so every grid and the replica's
+  thumbnail mirror work unchanged.
 - `/full` for a video: correct mime (`video/mp4`, `video/quicktime`),
   `FileResponse` Range passthrough on the NAS, and **`?purpose=worker` streams
   through a token-bucket generator capped at `PHOTOSEARCH_VIDEO_STREAM_MBPS`
   (default 30 MB/s)**. The 2026-09-19 disk starvation was a ~50 MB/s bulk read;
   the backfill is 400 GB of exactly that shape and must never run at LAN
-  speed (400 GB at 30 MB/s ≈ 3.7 h). Replica mode: a streaming proxy that
+  speed (400 GB at 30 MB/s ≈ 3.7 h). Range requests from ffprobe/cv2 in the
+  probe pass go through the same route. Replica mode: a streaming proxy that
   forwards `Range` and returns 206 with `iter_content`, never `.read()`.
+- `POST /api/videos/{id}/assets` (worker-authenticated like `submit-results`):
+  atomic write of poster/keyframe/crop JPEGs under
+  `/data/video_frames/{pid}/v{version}/`, used by the probe and scan passes.
 - Frontend: `PS.PhotoModal` renders `<video controls preload=metadata
   poster=…>` for `media_type==='video'`, hides face overlays, adds a Download
-  link for `.avi`/`.mts`; grid card gets a "▶ 0:42" badge; `index.html` gets
-  **Media: All / Photos / Videos** (`media=` through `search_combined` →
-  `_scope_clause`, plus a `COMBOS` case in `test_search_indexes.py`). Default
-  search hides `kind='live'` and probe-error rows (D2, D3); an "Unreadable
-  videos" list on `/admin/maintenance` links to them. `request_intent._RULES`
-  for new endpoints; `check-frontend-refs.js` passes.
+  link for `.avi`/`.mts`; grid card gets a "▶ 0:42" badge once the duration is
+  known; `index.html` gets **Media: All / Photos / Videos** (`media=` through
+  `search_combined` → `_scope_clause`, plus a `COMBOS` case in
+  `test_search_indexes.py`). Default search hides `kind='live'` and
+  probe-error rows (D2, D3); an "Unreadable videos" list on
+  `/admin/maintenance` links to them. `request_intent._RULES` for new
+  endpoints; `check-frontend-refs.js` passes.
 
 Verify: an iPhone portrait MOV plays upright on desktop Chrome and iPhone,
 seeking works, the replica plays the same clip through the proxy;
 `request_log.jsonl` thumbnail p95 unchanged for photo grids; no
 `/full?purpose=worker` read exceeds the cap.
 
-**Value:** all ~4,200 readable videos browsable by date/folder/place/filename
-and playable; the ~1,400 unreadable ones listed.
+**Value:** every registered video is browsable by date/folder/filename and
+playable, with a generic poster until step 2b fills the real one.
+
+### Step 2b — `video-probe` worker pass (2 d)
+
+- `worker._process_video_probe`: for each claimed video, the head+tail `moov`
+  pre-check, then `ffprobe` over HTTP Range, then one cv2 first-frame grab over
+  HTTP, poster resized to thumb/preview/full on the desktop and uploaded via
+  the assets endpoint. Claim size 25; the pass is cheap, so `-n 2` is plenty.
+  A transport failure is omitted (`_TRANSIENT`); an ffprobe or cv2 failure on
+  a complete read is the **probe verdict**, submitted as `probe_error`, not a
+  `failures` row — it is the result the row exists to store.
+- `worker_api.VideoProbeResult` + `video_probe_results` on `SubmitRequest`.
+  The branch goes through `_SubmitOutcome`: write `video_meta` probe columns,
+  rewrite `date_taken` per the date policy (D14), `gps_*` with
+  `location_source='exif'`, `camera_make/model`, `image_width/height` as
+  **display** dims after rotation, then run the Live-pairing SQL. A transient
+  lock defers; a non-lock error spends the attempt.
+- Claim predicate: `media_type='video' AND probe_version IS NULL`. Later video
+  passes require `probe_error IS NULL AND kind != 'live'`.
+- `_ALL_PASSES` / `WORKER_PASSES` / `rerun.ALL_PASSES` / `batch-flow.js` /
+  `cli.py valid_passes` / fleet checkboxes gain `video-probe` before
+  `video-scan`; `batch_state` counts probe errors as done with detail "N
+  unreadable" (as `sharpness`), and `video-scan` depends on `video-probe`.
+- Tests: `test_video_probe.py` (fixture JSON: ok, moov-missing, truncated,
+  rotation 90/180/270, Apple date/GPS; pre-check on synthetic head/tail
+  bytes), `test_video_probe_submit.py` (Live pairing positives/negatives,
+  stored error not retried, date policy, deferral on lock).
+- Verify: on one NAS folder the pass fills ≈ 25% `probe_error`, the Live
+  count, and real posters; NAS bytes/sec during the run stays far below the
+  cap; a second fleet run claims nothing.
 
 ### Step 3 — `video-scan` worker pass (6 d) — **SHIP B**
 
@@ -329,8 +384,11 @@ and playable; the ~1,400 unreadable ones listed.
   here"); **K keyframes** (1 for d ≤ 2 s, 3 for ≤ 10 s, rising to 8 at ≥ 60 s,
   at uniform quantile centres nudged to the sharpest frame within ±0.5 s);
   CLIP mean of the L2-normalised keyframe embeddings, renormalised, into
-  `clip_embeddings`; poster = highest-salience keyframe; one native-res
-  representative frame JPEG per identity for face crops.
+  `clip_embeddings`; the poster is **replaced** by the highest-salience
+  keyframe (the probe pass's first frame is often a black lead-in); one
+  native-res representative frame JPEG per identity, **plus the face-crop
+  JPEGs at the sizes `face_crop.py` serves**, so the NAS never decodes a frame
+  even for `/faces` tiles.
 - **`worker.py`** `_process_video_scan`: download through
   `/full?purpose=worker`, hashing as it streams, size-checked against
   Content-Length. A transient truncated download is omitted (`_TRANSIENT`);
@@ -338,9 +396,10 @@ and playable; the ~1,400 unreadable ones listed.
   version set, counted "N unreadable" in the batch step); an exception
   mid-analysis is a `failures` row. Claim limit 1 video per batch; `-n 2`.
 - **`worker_api.py`**: `VideoScanResult` + `video_scan_results` on
-  `SubmitRequest`; the branch goes through `_SubmitOutcome`: write assets
-  atomically under `/data/video_frames/{pid}/v{SCAN_VERSION}/` (≈ 2–3 MB per
-  video, ≈ 12–15 GB library-wide, D5), then in one transaction delete old
+  `SubmitRequest`; the branch goes through `_SubmitOutcome`: upload assets
+  through the step 2 endpoint, atomic under
+  `/data/video_frames/{pid}/v{SCAN_VERSION}/` (≈ 2–4 MB per video with crops,
+  ≈ 12–18 GB library-wide, D5), then in one transaction delete old
   `video_tracks` and their `faces`/`face_encodings`, insert the new `faces`
   rows (bbox in representative-frame coordinates, `det_score`, encoding = mean
   of the top-5 detections), insert `video_tracks`, write `clip_embeddings`
@@ -351,8 +410,8 @@ and playable; the ~1,400 unreadable ones listed.
   one-to-one to new identities at L2 ≤ 0.6 (D13); unmatched labels are logged
   in the response, never silently dropped. `_ALL_PASSES` gains `video-scan`;
   the claim response adds `media_type` and `duration_s`.
-- `face_crop.py` crops video faces from the representative frame so
-  `warm_crops`, `/faces` and verify-labels tiles work. `batch_state.py` +
+- `face_crop.py` serves video face crops straight from the uploaded crop
+  files; `warm_crops` is a no-op for videos (already warm on upload). `batch_state.py` +
   `batch-flow.js`: `video-scan` right after `faces`, `_OUTPUT_MISSING`
   (`scan_version IS NULL OR < N`, readable, not live),
   `_REMAINING_FILTERS_ATTEMPTS=True`; `match_faces`/`warm_crops` also depend on
@@ -504,8 +563,9 @@ native-resolution frame grab in `PS.Loupe`), shaky, noisy/grainy, keeper
 becomes a tag only at holdout P ≥ 0.8 with R ≥ 0.5**, the gate `blurry`
 failed. If nothing passes, step 7 ships numbers and sorts only.
 
-**Registration checks** (automatic): probe vs ffprobe on the 40 probe-check
-files must agree 100% on readable/unreadable; every probe-ok file opens in
+**Registration checks** (automatic): the probe pass over HTTP Range vs
+`ffprobe` on the local original for the 40 probe-check files must agree 100%
+on readable/unreadable (the Range path must not misread a moov-at-end file); every probe-ok file opens in
 cv2; **Live pairing precision must be 10/10** on the owner-confirmed 10 pairs
 + 5 near-misses (same stem, Δt 3–10 s) — wrongly hiding a real video is the
 costly error; tighten Δt or require Apple's content identifier if it fails.
@@ -574,31 +634,34 @@ wins a flag, it becomes a `video-quality` LLM pass in step 5's shape.
 
 - **Deploy the NAS first** (new endpoints and schema; the M28/batches lesson),
   then the workers, together (the `failures` semantics).
-- Backfill: `register-videos --apply` per year starting with 2026 under the
-  IDLE throttle → fleet `-p video-scan -n 2` overnight (≈ 4,200 readable
-  videos, ≈ 300 GB at 30 MB/s ≈ 3 h transfer + 1–2 h analysis) →
-  `video-describe` → advance batches (match_faces, warm_crops). Report the
-  cost up front before each year, the way the gemma-4-26b one-off did.
+- Backfill: `register-videos --apply` per year starting with 2026 (a walk +
+  inserts) → fleet `-p video-probe -n 2` (header reads only; the spike says
+  how many bytes) → `-p video-scan -n 2` overnight (≈ 4,200 readable videos,
+  ≈ 300 GB at 30 MB/s ≈ 3 h transfer + 1–2 h analysis) → `video-describe` →
+  advance batches (match_faces; warm_crops skips videos). Report the cost up
+  front before each year, the way the gemma-4-26b one-off did.
 - CLAUDE.md gains a "Video" section: `PASS_MEDIA`, the unreadable rule, the
-  throttle, Live pairing, the focus metric, what not to simplify back.
+  throttle, Live pairing, the focus metric, the "nothing decodes on the NAS"
+  rule, what not to simplify back.
 
 ## Estimate and ordering
 
 | step | days | ships |
 |---|---|---|
 | 0 spike | 1 | — |
-| 1 schema / isolation / registration | 4 | — |
-| 2 posters / playback / filter | 3 | **A**: videos visible + playable |
+| 1 schema / isolation / registration | 3 | — |
+| 2 playback / filter | 2.5 | **A**: videos visible + playable |
+| 2b video-probe pass | 2 | real posters, dates, unreadable list |
 | 3 video-scan | 6 | **B**: person + CLIP search find videos |
 | 4 eval harness + labels | 6 | picks configs |
 | 5 video-describe | 2.5 | **C**: text/category/keyword search |
 | 6 share UI + filters | 3 | **D**: "videos where X is the main focus" |
 | 7 quality | 1.5 | numbers (tags only if gated) |
 | 8 backfill / docs | 1.5 | — |
-| **total** | **≈ 28.5** (≈ 30 with review slack) | |
+| **total** | **≈ 29** (≈ 31 with review slack) | |
 
 Owner ≈ 2.8 h labelling. GPU/CPU ≈ 3–4 h for the eval, ≈ 5–8 h for the
-backfill. 0 → 1 → 2 is serial; step 4's harness can start alongside step 3
+backfill. 0 → 1 → 2 → 2b is serial; step 4's harness can start alongside step 3
 (both call the pure `video_analysis.py`); step 5 needs step 4's describe
 result and step 6 needs its faces result; 5 and 6 are independent — the owner
 picks which ships first.
@@ -613,8 +676,11 @@ picks which ships first.
    stacking clear, dedupe prune). Guarded in step 1 with a test per tool. The
    one risk that loses data.
 3. **HEVC in cv2 or the browser.** The spike settles both. Fallbacks: desktop
-   ffmpeg via subprocess for decode; H.264 720p proxies made on the desktop
-   for playback (D12).
+   ffmpeg via subprocess for decode (it is installed for ffprobe anyway); H.264
+   720p proxies made on the desktop for playback (D12).
+3b. **Probe bandwidth on no-`moov` files.** ffprobe may read a whole 70 MB
+   file hunting for `moov`; 25% of the corpus is that shape, ≈ 100 GB. The
+   head+tail pre-check and the stream cap bound it; the spike measures it.
 4. **HDR / Dolby Vision iPhone clips** decode to washed-out 8-bit in cv2.
    Faces unaffected; CLIP/VLM slightly worse. Spike checks; a levels stretch
    before keyframe JPEG if needed.
@@ -651,8 +717,8 @@ any of them before the relevant step starts.
 
 | topic | Planner A | Planner B | outcome | date |
 |---|---|---|---|---|
-| Probe toolchain | ffmpeg/ffprobe apt package in the image | cv2 + a pure-Python atom parser | **ffprobe in the container for metadata only** (one apt line); **cv2 for all decoding**. ffprobe is the tool behind the 25% figure, reads creation time/GPS/rotation cv2 can't, covers .avi/.mts; atom parser dropped. Fallback to the parser if step 0 finds the image growth unacceptable. | 2026-10-17 |
-| Where frames are decoded | NAS seek-extracts 3–12 sparse JPEG frames, ships those | Desktop downloads each file once (30 MB/s cap), decodes densely at 2–4 fps, uploads keyframes | **B.** No `/dev/dri` passthrough, so container decode is software HEVC on an OOM-killed N100; 3–12 frames make the share too coarse; A's three passes re-extracted each video three times. NAS does ffprobe + one first-frame poster only. | 2026-10-17 |
+| Probe toolchain | ffmpeg/ffprobe apt package in the image | cv2 + a pure-Python atom parser | **ffprobe for metadata, cv2 for decoding** — both on the **desktop** after the owner's D19 (the planners had put ffprobe in the NAS image). ffprobe is the tool behind the 25% figure, reads creation time/GPS/rotation cv2 can't, covers .avi/.mts; atom parser dropped. | 2026-10-17 |
+| Where frames are decoded | NAS seek-extracts 3–12 sparse JPEG frames, ships those | Desktop downloads each file once (30 MB/s cap), decodes densely at 2–4 fps, uploads keyframes | **B.** No `/dev/dri` passthrough, so container decode is software HEVC on an OOM-killed N100; 3–12 frames make the share too coarse; A's three passes re-extracted each video three times. After D19 the NAS does not even probe or grab the poster; a `video-probe` pass does both over HTTP Range. | 2026-10-17 |
 | Video face storage | Separate per-frame `video_faces`; only named people can be main focus | One `faces` row per identity + `video_tracks`; share grouped by `faces.person_id` | **B.** A's design kept video faces out of `/faces`, clustering, verify-labels and the rival test, and had a correctness bug (an unknown dominant kid credits a small named one). Focus is computed over **all** faces; identity attached afterward. | 2026-10-17 |
 | Tracking | None (citing the ~4% temporal matcher) | Dependency-free numpy tracker | **B as default F1, A as baseline F0 in the eval**; < 5 pts = tie, simpler wins. The temporal matcher links photos 30 min apart; boxes 0.25–0.5 s apart are a different problem. | 2026-10-17 |
 | Live Photo clips | No decision | Pair to the still, hide, don't analyse | **B.** Changes how much of the backlog needs analysis; pairing precision gated at 10/10. | 2026-10-17 |
@@ -669,14 +735,14 @@ any of them before the relevant step starts.
 |---|---|---|---|---|---|
 | D1 | Data model | `photos` row + `media_type`, side tables `video_meta`/`video_tracks` | separate `videos` table (zero blast radius, every UI surface rebuilt) | default | 2026-10-17 |
 | D2 | Unreadable 25% | register a row with a stored `probe_error`; hidden from search; listed on `/admin/maintenance` | report file only, no rows | default | 2026-10-17 |
-| D3 | Live Photo clips | register, hide behind the still ("▶ Live" in the modal), don't analyse | first-class videos, fully analysed | default | 2026-10-17 |
-| D4 | Decode location | desktop, after a 30 MB/s-capped download | NAS-side extraction | default (planners resolved) | 2026-10-17 |
+| D3 | Live Photo clips | register, hide behind the still ("▶ Live" in the modal), don't analyse | first-class videos, fully analysed | **owner: skip them** (default confirmed) | 2026-10-17 |
+| D4 | Decode location | desktop, after a 30 MB/s-capped download | NAS-side extraction | default; superseded by D19 for the probe/poster too | 2026-10-17 |
 | D5 | Keyframes on NAS `/data` | yes, ≈ 12–15 GB | desktop-only cache (breaks re-runs from another machine, face crops) | default | 2026-10-17 |
 | D6 | Body tracker (F3) | only if the eval gains ≥ 5 pts on sports | always / never | default | 2026-10-17 |
 | D7 | Native video-input VLM | excluded (desktop torch has no GPU; LM Studio route is image-only) | owner sets up ROCm torch or vLLM to include it | default | 2026-10-17 |
 | D8 | Role for video describe | new `video` role even if the same model | reuse `describe` | default | 2026-10-17 |
 | D9 | Videos in default search | yes, with a Media filter | opt-in (Media=Photos default) | default | 2026-10-17 |
-| D10 | Share denominator | whole clip duration; shared frames split credit | people-frames only (show both in the modal) | default | 2026-10-17 |
+| D10 | Share denominator | whole clip duration; shared frames split credit | people-frames only (show both in the modal) | **owner: whole clip** (default confirmed, "for now") | 2026-10-17 |
 | D11 | Quality tags | numbers only unless P ≥ 0.8 / R ≥ 0.5 on holdout | ship VLM tags un-gated | default | 2026-10-17 |
 | D12 | HEVC playback | rely on browser HEVC (spike confirms) | H.264 720p proxies made on the desktop | default | 2026-10-17 |
 | D13 | Re-scan and manual labels | carry over by one-to-one encoding match ≤ 0.6 | freeze `faces` rows once any is manual | default | 2026-10-17 |
@@ -685,3 +751,5 @@ any of them before the relevant step starts.
 | D16 | Before the eval | compute the share, hide the filter | show it as "beta" immediately | default | 2026-10-17 |
 | D17 | Hash for backfilled videos | worker hashes during the scan download; NAS hashes only unreadable ones | NAS whole-file hash of 400 GB (throttled ~3–4 h) | default | 2026-10-17 |
 | D18 | `verify` on videos | off (still-only) | adapt verify to keyframes later | default | 2026-10-17 |
+| D19 | Where the work runs | **everything except registering rows, storing uploads, serving files and the Live-pairing SQL runs on the desktop**: probe, poster, keyframes, face crops, all models. No ffmpeg in the NAS image; no decode on the N100 ever. | planners' version: NAS probes with ffprobe and grabs one poster frame | **owner decision** | 2026-10-17 |
+| D20 | ffprobe on the desktop | `apt install ffmpeg` in WSL (one-time; matches the measurement tool) | the `av` (PyAV) wheel, no sudo, reads the same metadata and decodes; costs a new pinned dependency | default | 2026-10-17 |
