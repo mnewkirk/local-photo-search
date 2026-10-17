@@ -33,14 +33,17 @@ moves `VIDEO_EXTENSIONS` as companions and never indexes them.
 | size | ~70 MB average, ≈ **400 GB** |
 | by year | 2016–18 ≈ 1,650 · 2022–24 ≈ 1,200 · **2025: 1,405 · 2026: 471** |
 | 2026 sources | phone-nicole 226, phone-matt 97, ILCE-7RM6 39, KODAK PIXPRO 29 |
-| unreadable | **15 of 60 sampled (25%)**: `moov atom not found`, Takeout-era iPhone MOV / Android mp4 |
-| codecs (readable) | hevc 32, h264 13 |
-| duration | **p10 1.6 s, p50 3.0 s, p90 59 s, max 133 s** |
+| unreadable | **111 of 400 sampled (28%)**: `moov atom not found`, all from **2016–2017** (Takeout-era iPhone MOV / Android mp4) |
+| codecs (readable, 60-sample) | hevc 32, h264 13 |
+| duration (289 readable of 400) | **p50 7.5 s, p75 25 s, p90 54 s, p95 68 s, p99 161 s, max 1,751 s** (one 29-min 2016 clip) |
+| duration buckets | 42% under 4 s · 21% 4–15 s · 30% 15–60 s · 7% 1–5 min · 2 files over 5 min |
+| total footage | ≈ 30 h library-wide; **clips over 60 s hold 51% of it** |
 
-The median is 3 s because many are **iPhone Live Photo clips**. The design has
-to treat those as cheap (or skip them) and a 2-minute soccer clip as the real
-work. ~1,400 files are probably unreadable and must be **recorded once, never
-re-decoded**.
+42% of files are under 4 s, mostly **iPhone Live Photo clips** (paired to
+their still and skipped, D3). Long videos are rare by count but half the
+footage by time, so the design has to be cheap on a 3 s clip and correct on a
+5-minute match. ~1,400 files are probably unreadable and must be **recorded
+once, never re-decoded**.
 
 ## Facts found in the code that shape the design
 
@@ -110,64 +113,81 @@ test and the one-person-per-photo invariant apply to videos unchanged, and the
 share is grouped by `faces.person_id` at query time so a relabel moves it with
 no recompute.
 
-## The main-focus share metric (concrete)
+## The main-subject share metric (concrete)
 
-Bracketed numbers are tunables the eval sweeps on the dev split.
+**The owner's requirement is the SUBJECT of the video, not the faces in it**:
+"whether that's a dog or a mountain or a person". Faces alone cannot see a dog,
+a mountain, or a kid facing away from the camera. So the metric has two layers
+that the eval scores separately and together:
 
-**Sampling** by duration *d*: ≤ 10 s → 4 fps with a minimum of 6 frames;
-10–120 s → 2 fps; > 120 s → 1 fps. Each frame carries a time weight *w_f* (the
-interval it represents). Frames analysed at ≤ 1920 px long edge.
+1. **Subject layer (sparse, VLM).** One keyframe per **segment** (3 s segments,
+   capped at 40 per video, so a 29-min clip gets 44 s segments). Each keyframe
+   goes through the existing **`subjects.ground_photo_subjects`** (qwen2.5-vl
+   grounding, already in production for photos: returns `[{label, bbox}]` for
+   the main subject(s), `[]` for a pure landscape) with the prompt extended to
+   return a **category** (`person | animal | landscape | object | activity`)
+   and, for `landscape`, a label anyway ("mountain lake"). The **primary
+   subject** of a segment is the returned box with the highest salience
+   (area × centre weight, below); `[]` is "no subject". Subjects are linked
+   across segments into one identity per video by normalized label plus CLIP
+   similarity of the box crop, so "dog" in segment 2 and "the dog" in segment 5
+   are one subject.
+2. **Face layer (dense, no VLM).** InsightFace at 2–4 fps with the numpy tracker
+   (below) gives every **person** an identity (a `faces` row, so `/faces`
+   labelling applies) and a dense presence/salience signal.
 
-**Detections.** InsightFace per frame. A detection counts for *presence* at
-`det_score ≥ [0.5]` and face short edge ≥ 16 px; it is *eligible for focus* at
-apparent size `A = sqrt(w·h) / min(W, H) ≥ [0.03]` (≈ 32 px on 1080p).
+**Joining them**: a `person` subject box that contains a tracked face box in
+that keyframe, or within ±1 s via the track's coasting, takes that face's
+identity. A person box with no face in it stays an "unidentified person"
+subject (a player facing away). This is what the body-tracker candidate F3 was
+for; the VLM box now plays that role for free, so F3 is demoted to a fallback.
 
-**Tracks.** Greedy association, pure numpy: IoU ≥ 0.3 with the track's last
-box, or ArcFace L2 ≤ 0.9 to the track's running mean within a 1.5 s gap. Gaps
-≤ 1 s are coasted so a one-frame miss does not flip focus. Tracks are merged
-within the video into **identities** by complete linkage on mean embeddings at
-L2 ≤ [0.9]; two tracks that overlap in time are never merged (two people).
-
-**Salience** of an eligible detection in a frame:
-
-```
-S = A × C [× Q]
-C = exp(−r² / (2σ²)),  σ = [0.35]
-r² = (dx / (W/2))² + 0.5·(dy / (H/2))²      # vertical offset counts half
-```
-
-`Q` is an optional *within-frame* relative sharpness (face-crop Laplacian ÷ the
-sharpest face in the same frame, clipped to [0.25, 1]) — the rank_shoot insight
-that comparing faces in one frame cancels the scene. It is not a library
-threshold. Off by default; an eval variant. `S` is smoothed per track with a
-±0.75 s running median.
-
-**Main focus of a frame** is computed over **all** detected faces, named or
-not (a frame dominated by an unknown kid must not credit Calvin small in the
-background): the top identity wins if `S_top ≥ [1.4] × S_second`; 2–3 within
-that factor share the frame at 1/k each; no eligible face → nobody, and the
-frame **stays in the denominator**.
+**Shares.** Each segment carries its duration as weight. For subject *S*:
 
 ```
-focus_share(P)    = Σ_f w_f · credit_f(P) / Σ_f w_f     # share of the WHOLE clip
-presence_share(P) = Σ_f w_f · [P detected]  / Σ_f w_f
-main_subject      = argmax_P focus_share(P)  if ≥ [0.3]
+subject_share(S) = Σ_seg w_seg · [primary(seg) == S] / Σ_seg w_seg   # whole-clip denominator (D10)
+focus_seconds(S) = Σ_seg w_seg · [primary(seg) == S]
+presence_share(P) = dense face-track presence / duration            # people only
 ```
 
-So a 60 s clip where Calvin is the clear subject for 30 s scores **0.50**, the
-literal reading of "how much of the video". The people-frames-only variant can
-be shown beside it (D10). A 3 s clip reduces to "who is the subject of this
-burst" through the same formula, no special case.
+"Whole clip" means the video's full running time; the sampling only decides how
+finely it is estimated. A 60 s clip where Calvin is the subject for 30 s scores
+**0.50**; a 10-min match where he is the subject for 2 min scores 0.20 and
+`focus_seconds` 120. Both are stored and both are filterable, because on a long
+video "≥ 2 minutes of Calvin" is the natural question and on a burst "mostly
+Calvin" is.
 
-**Stored** per identity in `video_tracks`: `face_id`, `presence_s`, `focus_s`,
-`focus_intervals` (run-length JSON for the UI timeline), `rep_t`, `rep_frame`,
-`n_det`, `mean_salience`. Share = `SUM(focus_s)/duration_s GROUP BY
-faces.person_id`.
+**Within-segment refinement for people (variant S2).** When the VLM names a
+person as a segment's primary subject and that person's face track is present
+for only part of the segment, credit only the tracked portion. The eval decides
+whether this beats whole-segment credit (S1).
 
-**Candidate F3 (body tracker)**: an ONNX person detector (YOLOX-s / RT-DETR,
-Apache-2.0) on `onnxruntime-rocm`, body tracks carrying the identity of any face
-in the top third of the body box, salience from body height. For sports, where
-the subject is often facing away. Ships only if the eval earns it (D6).
+**Face salience** (used to pick among several person boxes, to break ties, and
+as the eval's no-VLM baseline F1): for a detection with apparent size
+`A = sqrt(w·h) / min(W, H)` and centre offset `(dx, dy)`:
+
+```
+S = A × C,   C = exp(−r² / (2σ²)),  σ = [0.35],  r² = (dx/(W/2))² + 0.5·(dy/(H/2))²
+```
+
+Eligible for focus at `A ≥ [0.03]`; presence at `det_score ≥ [0.5]` and short
+edge ≥ 16 px. Tracks: greedy association (IoU ≥ 0.3 with the last box, or
+ArcFace L2 ≤ 0.9 to the running mean within 1.5 s); gaps ≤ 1 s coasted; tracks
+merged into identities by complete linkage at L2 ≤ [0.9], never when they
+overlap in time. Bracketed numbers are tunables swept on the dev split.
+
+**Stored.** `video_subjects` (`photo_id`, `subject_ix`, `label`, `category`,
+`face_id` nullable → `faces`, `focus_s`, `focus_intervals` JSON, `rep_t`,
+`rep_frame`, `rep_bbox`, `n_segments`). `video_tracks` (per person identity:
+`face_id`, `presence_s`, `intervals`, `rep_t`, `rep_frame`, `n_det`,
+`mean_salience`). Person shares are read `GROUP BY faces.person_id` so a
+relabel in `/faces` moves the share with no recompute; non-person subjects are
+searchable by label (`subject=dog`, `min_subject_share`).
+
+**Cost.** From the 400-file sample, ≈ 8.6 segments per readable video → ≈ 36k
+grounding calls library-wide at ~2–3 s each on qwen2.5-vl ≈ **20–30 GPU
+hours**, two or three nights of fleet time. The 40-segment cap is what keeps
+the 29-min clip from costing 580 calls.
 
 ## Steps
 
@@ -434,9 +454,39 @@ clusters with working crops; `person=Calvin` returns his videos; "kids on a
 trampoline" returns a known video; measure s/video, NAS bytes/sec and the NAS
 web p95 in `request-stats` during the run.
 
-**Value:** videos found by person and by text. The share is computed with the
-defaults above but **hidden in the UI until step 4's eval picks the config**
-(D16).
+**Value:** videos found by person and by text. Dense presence and face
+salience are computed here; the **subject** share needs step 3b and is
+**hidden in the UI until step 4's eval picks the config** (D16).
+
+### Step 3b — `video-subjects` LLM pass (3 d)
+
+- `photosearch/video_subjects.py`: segment schedule (3 s, cap 40), one
+  keyframe per segment taken from `video-scan`'s uploaded frames (so
+  `video-scan` must upload a per-segment keyframe set, not just K ≤ 8;
+  ≈ 100–200 KB each at 768 px, still ≈ 2–4 MB per typical video), the
+  grounding call via `subjects.ground_photo_subjects` with the category
+  extension, primary-subject choice, cross-segment linking, the face-track
+  join, S1/S2 credit, shares and intervals. Pure-Python scoring over cached
+  JSON so it is CI-testable; the VLM call is the only non-deterministic part.
+- `describe.py`: role `subject` → `PHOTOSEARCH_LLM_SUBJECT_MODEL`
+  (default qwen2.5-vl-7b-instruct, the grounding model photos already use),
+  `PASS_ROLES["video-subjects"]="subject"`, per-role `max_tokens` 256, the
+  usual guards: an unparseable answer retries once then is a `failures` row;
+  `[]` is a real answer ("no subject").
+- `worker._process_video_subjects` + `worker_api.VideoSubjectsResult` through
+  `_SubmitOutcome`: replace `video_subjects` rows for the photo in one
+  transaction, log one `generations` row per video (`text_type='subjects'`,
+  the segment JSON) with `effective_model(role='subject')`.
+- Pass order: after `video-scan`, before `video-describe`, and its segment
+  summary is handed to the describe prompt ("subjects over time: 0–12 s dog,
+  12–40 s Calvin, …"). `batch_state`/`batch-flow.js`/`rerun`/`cli` mirrors.
+- Tests: `test_video_subjects.py` — linking "dog"/"the dog" into one subject,
+  the face join through coasting, S1 vs S2 credit, `[]` segments in the
+  denominator, the 40-segment cap, a person box with no face stays
+  unidentified.
+- Verify: on the two NAS test folders, a dog video reads "dog 0.9", a soccer
+  clip reads a per-kid breakdown that matches the eye, a landscape pan reads
+  "mountain lake" with no person rows.
 
 ### Step 4 — Video eval harness and blind labelling (6 d engineering, ≈ 2.8 h owner)
 
@@ -473,52 +523,58 @@ camera, duration, year, Live pairing), never from a candidate's own output:
 | **labelled total** | **90** | 60 dev / 30 holdout |
 | probe-check | 40 | 20 probe-error + 20 ok: automatic ffprobe comparison, no owner time |
 
-**Faces / main focus.** Detections are cached per video (npz) so focus-rule
-variants are rescored without re-detection or relabelling.
+**Main subject (people and non-people).** Face detections are cached per
+video (npz) and grounding answers per keyframe (JSON), so rule variants are
+rescored with no re-detection and no relabelling.
 
 | id | approach | new model? |
 |---|---|---|
-| F0 | InsightFace per frame at det 640, per-detection identity, **no tracking** (Planner A's original) | no |
-| F1 | F0 + tracks + coasting + within-video identity merge + pooled embedding (**default**) | no |
-| F2 | F1 at det_size 1280, or 2×2 tiles on 4K | no |
-| F3 | F1 + ONNX person detector + body tracks carrying face identity | **yes** (D6) |
+| F0 | InsightFace per frame, per-detection identity, no tracking — people only | no |
+| F1 | F0 + tracks + coasting + identity merge; main focus by face salience — people only | no |
+| S1 | VLM grounding per segment keyframe (qwen2.5-vl), primary = largest salience box, face join for identity, whole-segment credit (**default**) | no (already the photo subject model) |
+| S2 | S1 with within-segment credit refined by the person's face track | no |
+| S1-m | S1 with the grounding model swapped: minicpm-v-4_5, gemma-4-12b-qat | no |
+| F3 | S1 + ONNX person detector for the no-face person case | **yes**, fallback only (D6) |
 
-Rule grid swept on dev: dominance κ ∈ {1.2, 1.4, 1.8}; centre σ ∈ {0.25, 0.35,
-0.5, off}; A_min ∈ {0.02, 0.03, 0.05}; Q on/off. Identity for every candidate
-uses the production strict matcher against `face_references` + manual labels
-**as of a frozen replica snapshot**, separating identity quality from focus
-quality.
+Rule grid swept on dev: centre σ ∈ {0.25, 0.35, 0.5, off}; A_min ∈ {0.02,
+0.03, 0.05}; link threshold for subjects; face-join window {0, ±1 s}. Identity
+for every candidate uses the production strict matcher against
+`face_references` + manual labels **as of a frozen replica snapshot**.
 
-Owner's "Video focus" tab: watch the clip; answer **"Who is in this video?"**
-(multi-select chips with typeahead over `persons`, plus "someone else", nothing
-pre-selected); then label each **segment** — `clamp(round(d / 3 s), 1, 12)`
-equal segments, each looping in the player, keys 1–9 — with the **main focus**:
-a person from the first answer, "someone else", "nobody / no person is the
-subject", or "can't tell". `LABELLER_NOTES`: "the person the camera operator
-is framing or following; if two are framed equally, can't tell is fine". About
-60 min for 90 videos. The model's answer per segment is the credit-weighted
-argmax when it covers ≥ 50% of the segment's time, else "nobody"; a tie is
-"shared".
+Owner's "Video subject" tab: watch the clip; answer **"Who is in this video?"**
+(multi-select chips with typeahead over `persons`, plus "someone else",
+nothing pre-selected); then label each **segment** (3 s, **at most 12 per
+video** — long eval videos are labelled on a 12-way coarsening of the
+production segments) with the **main subject**: a person from the first
+answer, "someone else", **a non-person subject** picked from a blind, shuffled
+chip list of every candidate's labels for that segment plus free text, "no
+subject", or "can't tell". `LABELLER_NOTES`: "what the camera operator is
+framing or following: a person, an animal, a thing, or the scenery; if two are
+framed equally, can't tell is fine". About 75 min for 90 videos.
 
-Metrics (holdout headline, dev shown): segment main-focus accuracy ("can't
-tell" excluded, "shared" scores ½ if the owner's person is in the set, per
-stratum); top-person agreement per video; **share MAE** per (video, person)
-over the owner's set ∪ the model's named persons; retrieval precision/recall of
-`focus_share ≥ 0.5` against the owner's share ≥ 0.5 for persons with ≥ 3
-sample videos; named-presence precision/recall; **error diagnosis** per wrong
-segment (detection miss / identity miss / focus-rule miss — says whether to
-change the detector, the matcher or the rule); s/video.
+Non-person labels are scored by normalized label match (lowercase, lemmatized,
+articles stripped); when the owner typed free text, the comparer model
+(gemma-4-26b-a4b, not a candidate) judges "same subject?" and the owner
+spot-checks 20 of those judgements.
 
-Winner thresholds: among F0–F2 the highest holdout segment accuracy, a gap
-**< 5 points is a tie and the simpler wins** (F1 over F2 over F0); **F3** only
-if it beats the best of F0–F2 by **≥ 5 points on the sports strata** without
-losing more than 2 elsewhere. **Ship gate for the main-focus filter** (step 6):
-top-person agreement ≥ **0.80**, named-presence precision ≥ **0.95**, holdout
-segment accuracy ≥ **0.70**, and share MAE ≤ **0.15** (a share off by more is
-not decision-useful for "Calvin ≥ 30%"). Fallbacks: presence passes but focus
-fails → ship presence % only, keep focus hidden; named-presence precision fails
-→ it is the matcher's problem, raise the match bar for video faces (the
-embedder swap is a known dead end).
+Metrics (holdout headline, dev shown): segment main-subject accuracy ("can't
+tell" excluded, per stratum, and split **person / non-person**); top-subject
+agreement per video; **share MAE** per (video, subject); retrieval
+precision/recall of `subject_share ≥ 0.5` against the owner's; named-presence
+precision/recall; **error diagnosis** per wrong segment (not detected /
+detected but unnamed or misnamed / wrong primary / wrong category); s/video.
+
+Winner thresholds: among S1, S2, S1-m the highest holdout segment accuracy; a
+gap **< 5 points is a tie** and the simpler or cheaper wins. **F1 must be
+reported beside it**: if S1 does not beat F1 by ≥ 5 points on the person
+strata, the VLM has not earned its 20–30 GPU hours for people and ships only
+for non-person subjects. **F3** is tried only if the diagnosis shows ≥ 10% of
+sports segments lost to "person box, no face, misattributed". **Ship gate for
+the subject filter** (step 6): top-subject agreement ≥ **0.80**,
+named-presence precision ≥ **0.95**, holdout segment accuracy ≥ **0.70** on
+both the person and non-person splits, and share MAE ≤ **0.15**. Fallbacks:
+presence passes but subject fails → ship presence % only; non-person passes
+but person fails → ship non-person subjects and person presence only.
 
 **Description.** Frames come from the production keyframe sampler on the
 cached original.
@@ -606,22 +662,26 @@ cached, context-overflow cached as `rejected`, holdout split deterministic.
   tooling ignores videos for `verify`; a deliberately tiny `max_tokens`
   produces a failure row, not stored truncated text.
 
-### Step 6 — Surface the share (3 d) — **SHIP D**
+### Step 6 — Surface the subject share (3.5 d) — **SHIP D**
 
-- `search_combined`: `min_focus_share` (requires a person; restricts to
-  videos) and sort `focus_desc`, composed into `_compose_scope`;
-  `tools._build_filter_sql` + `_CURATION_FILTER_PROPS` so Ask and MCP get
-  `media` and `min_focus_share`; book tools default to `media=photo`.
+- `search_combined`: `min_focus_share` and **`min_focus_seconds`** (both need
+  a person; restrict to videos), `subject=<label>` with `min_subject_share`
+  for non-person subjects, sorts `focus_desc` / `subject_desc`, composed into
+  `_compose_scope`; `tools._build_filter_sql` + `_CURATION_FILTER_PROPS` so
+  Ask and MCP get `media`, `min_focus_share`, `min_focus_seconds`, `subject`;
+  book tools default to `media=photo`.
 - `index.html`: with a person selected and Media ∈ {All, Videos}, a "Main
-  focus ≥ [x]%" slider; cards show "Calvin 63%".
-- PhotoModal **people strip** for a video: per person, presence % and focus %
-  bars plus a **timeline** of `focus_intervals` where a click seeks the video —
-  also the owner's fastest way to audit the metric. `/faces` gets a video
-  badge; verify-labels / rival tools work unchanged. `/api/stats` and the
-  status card split photos and videos.
-- Verify: "Calvin ≥ 50% main focus" returns the owner-labelled holdout
-  positives; EXPLAIN on the new filter (`COMBOS`); the timeline matches the
-  clip by eye on 5 videos.
+  subject ≥ [x]% / ≥ [n] s" control; a Subject typeahead over
+  `video_subjects.label`; cards show "Calvin 63%" or "dog 90%".
+- PhotoModal **subject strip** for a video: a **timeline** of segments
+  coloured by primary subject (person name, "dog", "mountain lake", "no
+  subject"), per-person presence and focus bars beneath, click to seek. This
+  is the owner's fastest way to audit the metric.
+- `/faces`: a video badge on face tiles; verify-labels / rival tools work
+  unchanged. `/api/stats` and the status card split photos and videos.
+- Verify: "Calvin ≥ 50% main subject" and "dog ≥ 50%" return the
+  owner-labelled holdout positives; EXPLAIN on the new filters (`COMBOS`); the
+  timeline matches the clip by eye on 5 videos.
 
 ### Step 7 — Quality surfacing (1.5 d)
 
@@ -653,16 +713,17 @@ wins a flag, it becomes a `video-quality` LLM pass in step 5's shape.
 | 2 playback / filter | 2.5 | **A**: videos visible + playable |
 | 2b video-probe pass | 2 | real posters, dates, unreadable list |
 | 3 video-scan | 6 | **B**: person + CLIP search find videos |
+| 3b video-subjects | 3 | subject per segment (dog / mountain / person) |
 | 4 eval harness + labels | 6 | picks configs |
 | 5 video-describe | 2.5 | **C**: text/category/keyword search |
-| 6 share UI + filters | 3 | **D**: "videos where X is the main focus" |
+| 6 subject share UI + filters | 3.5 | **D**: "videos where X is the main subject" |
 | 7 quality | 1.5 | numbers (tags only if gated) |
 | 8 backfill / docs | 1.5 | — |
-| **total** | **≈ 29** (≈ 31 with review slack) | |
+| **total** | **≈ 32.5** (≈ 35 with review slack) | |
 
-Owner ≈ 2.8 h labelling. GPU/CPU ≈ 3–4 h for the eval, ≈ 5–8 h for the
-backfill. 0 → 1 → 2 → 2b is serial; step 4's harness can start alongside step 3
-(both call the pure `video_analysis.py`); step 5 needs step 4's describe
+Owner ≈ 2.8 h labelling. GPU/CPU ≈ 4–6 h for the eval, ≈ 5–8 h for the
+scan backfill plus **20–30 h** for the subject pass. 0 → 1 → 2 → 2b is serial; step 4's harness can start alongside steps 3/3b
+(both call the pure `video_analysis.py` / `video_subjects.py`); step 5 needs step 4's describe
 result and step 6 needs its faces result; 5 and 6 are independent — the owner
 picks which ships first.
 
@@ -703,7 +764,15 @@ picks which ships first.
     ≤ 8 keyframes at 1024 px q85; mind the 120 s submit timeout.
 11. **Small eval sets** — 90 videos, ~540 segments, holdout 30. Report CIs,
     use tie bands, say "tie" rather than overclaim.
-12. **The quality tag may simply fail its eval**, as it did twice for photos.
+12. **The subject pass is the expensive one** (≈ 36k VLM calls). The
+    40-segment cap bounds it; the eval's F1-vs-S1 comparison decides whether
+    people even need it. Run it after `video-scan` has already made videos
+    searchable, so nothing waits on it.
+13. **Grounding labels are free text.** "dog" / "puppy" / "our dog" must link
+    into one subject; the normalizer + CLIP-crop similarity handle most of it
+    and the eval measures the rest. Searching by label needs the same
+    normalization at query time.
+14. **The quality tag may simply fail its eval**, as it did twice for photos.
     "Ship numbers, no tag" is the expected outcome, not a worst case.
 
 ## Decisions
@@ -738,11 +807,11 @@ any of them before the relevant step starts.
 | D3 | Live Photo clips | register, hide behind the still ("▶ Live" in the modal), don't analyse | first-class videos, fully analysed | **owner: skip them** (default confirmed) | 2026-10-17 |
 | D4 | Decode location | desktop, after a 30 MB/s-capped download | NAS-side extraction | default; superseded by D19 for the probe/poster too | 2026-10-17 |
 | D5 | Keyframes on NAS `/data` | yes, ≈ 12–15 GB | desktop-only cache (breaks re-runs from another machine, face crops) | default | 2026-10-17 |
-| D6 | Body tracker (F3) | only if the eval gains ≥ 5 pts on sports | always / never | default | 2026-10-17 |
+| D6 | Body tracker (F3) | fallback only, tried if the diagnosis shows ≥ 10% of sports segments lost to "person box, no face" (the VLM subject box now covers that case) | always / never | default, demoted by D21 | 2026-10-17 |
 | D7 | Native video-input VLM | excluded (desktop torch has no GPU; LM Studio route is image-only) | owner sets up ROCm torch or vLLM to include it | default | 2026-10-17 |
 | D8 | Role for video describe | new `video` role even if the same model | reuse `describe` | default | 2026-10-17 |
 | D9 | Videos in default search | yes, with a Media filter | opt-in (Media=Photos default) | default | 2026-10-17 |
-| D10 | Share denominator | whole clip duration; shared frames split credit | people-frames only (show both in the modal) | **owner: whole clip** (default confirmed, "for now") | 2026-10-17 |
+| D10 | Share denominator | whole clip duration = the video's full running time (the sample only sets the estimate's resolution); `focus_seconds` stored and filterable beside the share for long videos | people-frames only (show both in the modal) | **owner: whole clip** (confirmed after clarifying it is not the sample, "for now") | 2026-10-17 |
 | D11 | Quality tags | numbers only unless P ≥ 0.8 / R ≥ 0.5 on holdout | ship VLM tags un-gated | default | 2026-10-17 |
 | D12 | HEVC playback | rely on browser HEVC (spike confirms) | H.264 720p proxies made on the desktop | default | 2026-10-17 |
 | D13 | Re-scan and manual labels | carry over by one-to-one encoding match ≤ 0.6 | freeze `faces` rows once any is manual | default | 2026-10-17 |
@@ -752,4 +821,5 @@ any of them before the relevant step starts.
 | D17 | Hash for backfilled videos | worker hashes during the scan download; NAS hashes only unreadable ones | NAS whole-file hash of 400 GB (throttled ~3–4 h) | default | 2026-10-17 |
 | D18 | `verify` on videos | off (still-only) | adapt verify to keyframes later | default | 2026-10-17 |
 | D19 | Where the work runs | **everything except registering rows, storing uploads, serving files and the Live-pairing SQL runs on the desktop**: probe, poster, keyframes, face crops, all models. No ffmpeg in the NAS image; no decode on the N100 ever. | planners' version: NAS probes with ffprobe and grabs one poster frame | **owner decision** | 2026-10-17 |
+| D21 | What "main focus" means | **the SUBJECT, whatever it is** — person, animal, landscape, object — via VLM grounding per segment keyframe (`subjects.ground_photo_subjects`, already the photo subject model), with faces supplying identity for people | faces only (the planners' version; cannot see a dog, a mountain, or a kid facing away) | **owner decision** | 2026-10-17 |
 | D20 | ffprobe on the desktop | `apt install ffmpeg` in WSL (one-time; matches the measurement tool) | the `av` (PyAV) wheel, no sudo, reads the same metadata and decodes; costs a new pinned dependency | default | 2026-10-17 |
