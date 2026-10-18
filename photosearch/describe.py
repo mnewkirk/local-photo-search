@@ -291,6 +291,73 @@ class TruncatedOutput(UnusableAnswer):
         self.text = text
 
 
+class ContextOverflow(RuntimeError):
+    """The request does not fit the model's context window.
+
+    LM Studio splits a model's context across its parallel slots, so a
+    multi-image request (a video's K keyframes) can 400 with "Context size has
+    been exceeded" -- Risk 8 of docs/plans/video-support.md. That is a
+    CONFIGURATION failure (raise the model's per-model context default, or
+    send fewer / smaller frames), never an answer: it is deliberately neither
+    an UnusableAnswer (which would spend the video's attempts) nor a
+    TimeoutError / ConnectionError (which would defer and retry forever).
+
+    The message deliberately avoids the words the timeout classifiers match
+    ("exceeded", "timeout"); the backend's own error text is on `.detail`.
+    """
+
+    def __init__(self, message: str, detail: Optional[str] = None):
+        super().__init__(message)
+        self.detail = detail
+
+
+class RoleModelNotConfigured(RuntimeError):
+    """A strict role (see `_STRICT_ROLES`) has no model configured on the
+    OpenAI-compatible route. Raised instead of silently falling back to
+    another role's model -- the fleet should fail at startup
+    (`require_role_model`), not log a video description under the wrong
+    model."""
+
+
+# Substrings a backend uses for "the prompt does not fit the context".
+# LM Studio: "Context size has been exceeded"; llama.cpp: "exceeds the
+# available context size" / n_ctx; OpenAI-style: "maximum context length";
+# Ollama: "input length exceeds context length".
+_CONTEXT_OVERFLOW_PATTERNS = (
+    "context size", "context length", "context window", "n_ctx",
+    "maximum context", "available context", "too many tokens",
+)
+
+
+def _context_overflow_detail(e: BaseException) -> Optional[str]:
+    """The backend's error text when `e` is a context overflow, else None.
+
+    An HTTP 400/413 carries the reason only in its body, which `_do_request`
+    stashes on the exception as `photosearch_body`; Ollama puts it in the
+    message itself."""
+    if isinstance(e, ContextOverflow):
+        return e.detail or str(e)
+    body = getattr(e, "photosearch_body", None)
+    code = getattr(e, "code", None)
+    candidates = []
+    if body and code in (400, 413):
+        candidates.append(str(body))
+    candidates.append(str(e))
+    for text in candidates:
+        low = text.lower()
+        if any(p in low for p in _CONTEXT_OVERFLOW_PATTERNS):
+            return text[:500]
+    return None
+
+
+def _context_overflow(role, model, detail) -> ContextOverflow:
+    return ContextOverflow(
+        f"LLM {role or 'call'} request does not fit the context window of "
+        f"model={model} -- raise that model's context length (LM Studio "
+        f"per-model default, 16384+ for video) or send fewer/smaller images",
+        detail)
+
+
 # Output-token budget per role on the OpenAI-compatible route. It used to be a
 # flat 768 for every call, which let a reasoning model that was left thinking
 # spend 700 tokens before answering a 10-token tag question. With reasoning off
@@ -304,6 +371,11 @@ _OPENAI_MAX_TOKENS = {
     "verify": 512,
     "visual": 128,
     "text": 256,
+    # Video roles (docs/plans/video-support.md steps 3b / 5). `subject` is a
+    # short grounding JSON array; `video` is a whole-clip description, longer
+    # than a photo's because it narrates a sequence over K frames.
+    "subject": 256,
+    "video": 768,
 }
 _DEFAULT_OPENAI_MAX_TOKENS = 768
 
@@ -330,6 +402,8 @@ def _expanded_retry(call, budget, role, model, partial):
     """
     try:
         return call()
+    except ContextOverflow:
+        raise
     except Exception as e:
         if _is_timeout(e):
             raise TruncatedOutput(
@@ -542,6 +616,9 @@ def _ollama_chat_attempts(model, messages, retries, options, timeout):
             return val
 
         e = val
+        detail = _context_overflow_detail(e)
+        if detail is not None:
+            raise _context_overflow(None, model, detail) from e
         err_str = str(e).lower()
         if any(p in err_str for p in _RUNNER_OOM_PATTERNS):
             _maybe_print_runner_oom_hint()
@@ -661,6 +738,14 @@ def _openai_chat_attempts(
                 resp = urllib.request.urlopen(req, timeout=timeout)
                 result_q.put(("ok", json.loads(resp.read())))
             except Exception as ex:
+                # An HTTP 400's reason (e.g. LM Studio's "Context size has
+                # been exceeded") is only in the body; keep it for
+                # _context_overflow_detail.
+                if getattr(ex, "code", None) in (400, 413) and hasattr(ex, "read"):
+                    try:
+                        ex.photosearch_body = ex.read().decode("utf-8", "replace")
+                    except Exception:
+                        pass
                 result_q.put(("err", ex))
 
         _threading.Thread(target=_watchdog, daemon=True).start()
@@ -693,6 +778,9 @@ def _openai_chat_attempts(
                         or "timed out" in es or "timeout" in es else "error",
                         elapsed=time.time() - t0, completion_tokens=None,
                         finish_reason=None)
+        detail = _context_overflow_detail(e)
+        if detail is not None:
+            raise _context_overflow(role, model, detail) from e
         transient = any(k in es for k in [
             "timeout", "timed out", "exceeded", "connection", "refused", "reset",
             "broken pipe", "502", "503", "500", "unavailable",
@@ -715,22 +803,40 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
         verify     -> verify's independent verifier   PHOTOSEARCH_LLM_VERIFY_MODEL
         visual     -> category-visual tags            PHOTOSEARCH_LLM_VISUAL_MODEL
         aesthetics -> VLM aesthetic scoring           PHOTOSEARCH_LLM_AESTHETICS_MODEL
+        subject    -> video-subjects grounding        PHOTOSEARCH_LLM_SUBJECT_MODEL
+        video      -> video-describe                  PHOTOSEARCH_LLM_VIDEO_MODEL
 
     So you point each role at whatever you actually loaded in LM Studio (Gemma,
     Qwen-VL, llava, ...) without the config keys pretending to be model names.
     Falls back to PHOTOSEARCH_TEXT_LLM_MODEL (legacy single-model) then the raw
     name.
+
+    `subject` falls back to the AESTHETICS model first: the photo subject pass
+    (`subjects.ground_photo_subjects`) grounds under role `aesthetics`, so an
+    unset SUBJECT var grounds video keyframes with exactly the model photos
+    use today. `video` is STRICT (`_STRICT_ROLES`): with its env var unset it
+    raises RoleModelNotConfigured rather than falling back to anything (D8 /
+    step 5 of docs/plans/video-support.md).
     """
     if role:
         v = os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL")
         if v:
             return v
+        if role in _STRICT_ROLES:
+            raise RoleModelNotConfigured(
+                f"no model configured for LLM role {role!r}: set "
+                f"PHOTOSEARCH_LLM_{role.upper()}_MODEL (this role deliberately "
+                f"does not fall back to another role's model)")
+        if role == "subject":
+            aes = os.environ.get("PHOTOSEARCH_LLM_AESTHETICS_MODEL")
+            if aes:
+                return aes
         # Vision roles reuse the configured vision model if their own role env
         # var is unset — the raw Ollama defaults (e.g. "qwen2.5-vl",
         # "llama3.2-vision") are NOT valid LM Studio ids, so falling through to
         # `model` would 400 with "Invalid model identifier". Mirrors
         # rerun._resolve_model. `aesthetics` is the pass that surfaced this.
-        if role in ("describe", "verify", "visual", "aesthetics"):
+        if role in ("describe", "verify", "visual", "aesthetics", "subject"):
             visual = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
             if visual:
                 return visual
@@ -749,6 +855,42 @@ PASS_ROLES = {
     "category-visual":  "visual",
     "aesthetics":       "aesthetics",
 }
+
+# Roles that must be configured explicitly on the OpenAI-compatible route —
+# no fallback to another role's model, no legacy single-model var.
+_STRICT_ROLES = frozenset({"video"})
+
+# The video passes' roles. Kept OUT of PASS_ROLES until the passes are wired:
+# tests/test_llm_provenance.py pins set(PASS_ROLES) == set(rerun._PASS_LLM)
+# and counts one `_provenance_kwargs(` call in worker.py per entry. When
+# worker/rerun gain `video-subjects` / `video-describe`, move these two
+# entries into PASS_ROLES (and add them to rerun._PASS_LLM) in that commit.
+VIDEO_PASS_ROLES = {
+    "video-subjects": "subject",
+    "video-describe": "video",
+}
+
+
+def require_role_model(role: str, model: Optional[str] = None) -> Optional[str]:
+    """Fail fast when `role` cannot resolve to a model — for fleet startup.
+
+    OpenAI-compatible route (PHOTOSEARCH_TEXT_LLM_URL set): returns the model
+    id the role resolves to (`_resolve_openai_model`, the same function the
+    request uses). Raises RoleModelNotConfigured for a strict role (`video`)
+    whose env var is unset, or for any role that resolves to nothing.
+
+    Ollama route: models are chosen by NAME, not role, so this returns
+    `model` unchanged (None when not given) and never raises — the passed
+    name (the pass's CLI default or --*-model flag) is what runs.
+    """
+    if not os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return model
+    resolved = _resolve_openai_model(model or "", role)
+    if not resolved:
+        raise RoleModelNotConfigured(
+            f"no model configured for LLM role {role!r}: set "
+            f"PHOTOSEARCH_LLM_{role.upper()}_MODEL")
+    return resolved
 
 
 def effective_model(model: str, role: Optional[str] = None) -> str:
@@ -986,6 +1128,170 @@ def describe_photo(
     if raise_unusable:
         raise UnusableAnswer(f"describe: {problem}")
     print(f"  Warning: no usable description for {path.name}: {problem}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Video describe (docs/plans/video-support.md step 5)
+# ---------------------------------------------------------------------------
+
+# The video-describe prompt. A module constant so the eval harness can swap it
+# (pass `prompt=` to describe_video). Placeholders are replaced literally, not
+# via str.format, so a swapped prompt may contain other braces freely:
+#   {n_frames}   number of frames sent
+#   {duration}   clip running time, e.g. "42.0 s" or "12:05 (725.0 s)"
+#   {frame_list} one line per frame: "frame 1 at 0.0 s"
+#   {subjects}   the subjects-over-time block (with trailing newline) or ""
+VIDEO_DESCRIBE_PROMPT = """\
+These {n_frames} images are frames sampled in order from ONE video clip that \
+runs {duration}. Frame times:
+{frame_list}
+{subjects}Describe what HAPPENS over the course of the clip in 3 to 5 \
+sentences: who or what is in it, what they do, and how things change from the \
+start to the end (actions, the sequence of events, camera movement). Mention \
+the setting and any clearly readable text. Describe it as one continuous \
+event: do not describe the frames one by one and do not mention frames, \
+images or timestamps. Be factual; only use a person's name if it is given \
+above. End with a complete sentence.
+"""
+
+# How the optional subjects-over-time summary is introduced in the prompt.
+VIDEO_SUBJECTS_PREFIX = (
+    "A separate detector found these main subjects over time (it may be "
+    "imperfect): "
+)
+
+# Ollama options for a multi-image request. K keyframes at ~1024 px are
+# ~1k tokens each on qwen-VL, so the 8k photo context is too small.
+_VIDEO_NUM_CTX = 16384
+_VIDEO_NUM_PREDICT = 768
+
+
+def _fmt_seconds(s: float) -> str:
+    s = max(0.0, float(s))
+    if s < 60:
+        return f"{s:.1f} s"
+    m, sec = divmod(int(round(s)), 60)
+    return f"{m}:{sec:02d} ({s:.1f} s)"
+
+
+def build_video_prompt(timestamps, duration_s: float,
+                       subject_summary: Optional[str] = None,
+                       template: Optional[str] = None) -> str:
+    """Fill the video-describe template (VIDEO_DESCRIBE_PROMPT by default)."""
+    tpl = VIDEO_DESCRIBE_PROMPT if template is None else template
+    frame_list = "\n".join(f"frame {i} at {float(t):.1f} s"
+                           for i, t in enumerate(timestamps, 1))
+    subjects = ""
+    if subject_summary and str(subject_summary).strip():
+        subjects = VIDEO_SUBJECTS_PREFIX + str(subject_summary).strip() + "\n"
+    return (tpl.replace("{n_frames}", str(len(timestamps)))
+               .replace("{duration}", _fmt_seconds(duration_s))
+               .replace("{frame_list}", frame_list)
+               .replace("{subjects}", subjects))
+
+
+def _frame_to_b64(frame) -> str:
+    """A keyframe as bare base64 JPEG. Accepts raw bytes (already-encoded
+    JPEG/PNG from video-scan's upload, sent as-is) or a file path (resized to
+    _MAX_IMAGE_PX like a photo)."""
+    if isinstance(frame, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(frame)).decode("utf-8")
+    path = Path(frame)
+    if not path.exists():
+        raise FileNotFoundError(f"keyframe not found: {frame}")
+    b64 = _encode_image_for_ollama(str(path))
+    if b64 is None:
+        b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return b64
+
+
+def describe_video(
+    frames,
+    timestamps,
+    duration_s: float,
+    model: Optional[str] = None,
+    prompt: Optional[str] = None,
+    raise_unusable: bool = False,
+    subject_summary: Optional[str] = None,
+) -> Optional[str]:
+    """Describe what happens over a video clip from K keyframes in ONE call.
+
+    Args:
+        frames: K keyframes, each a file path or encoded image bytes, in time
+            order.
+        timestamps: K frame times in seconds (same order as `frames`).
+        duration_s: the clip's full running time in seconds.
+        model: the model name for the Ollama route (default: the describe
+            MODEL). On the OpenAI-compatible route the model is chosen by role
+            `video` (PHOTOSEARCH_LLM_VIDEO_MODEL) and the name is ignored; that
+            role has NO fallback, so an unset var raises
+            RoleModelNotConfigured.
+        prompt: a template replacing VIDEO_DESCRIBE_PROMPT (same
+            placeholders; see build_video_prompt). For the eval.
+        raise_unusable: raise UnusableAnswer (TruncatedOutput for a cut-off)
+            instead of returning None when the model answered but every answer
+            was unusable. The worker sets it so the video becomes a failure
+            row.
+        subject_summary: optional "0-12 s dog, 12-40 s Calvin" line from the
+            video-subjects pass, included in the prompt.
+
+    Returns the description, or None for: no Ollama client, an empty /
+    non-description answer, a transport failure (defer), or an unusable
+    answer with raise_unusable=False.
+
+    Raises ContextOverflow when the K-image request does not fit the model's
+    context (a config failure, never an answer) and RoleModelNotConfigured
+    for a missing video model on the OpenAI route — neither is swallowed.
+
+    Guards are describe's (`_description_problem`): a truncation is retried
+    at double the budget inside the chat helper; a cut-off, repetition loop or
+    mid-sentence answer gets ONE retry at temperature 0.4, then is unusable.
+    """
+    frames = list(frames)
+    timestamps = [float(t) for t in timestamps]
+    if not frames:
+        raise ValueError("describe_video needs at least one frame")
+    if len(frames) != len(timestamps):
+        raise ValueError(f"{len(frames)} frames but {len(timestamps)} timestamps")
+    if not HAS_OLLAMA and not os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return None
+    model = model or MODEL
+    images = [_frame_to_b64(f) for f in frames]
+    text_prompt = build_video_prompt(timestamps, duration_s,
+                                     subject_summary=subject_summary,
+                                     template=prompt)
+    messages = [{"role": "user", "content": text_prompt, "images": images}]
+
+    def _ask(temperature):
+        options = {"temperature": temperature, "num_ctx": _VIDEO_NUM_CTX,
+                   "num_predict": _VIDEO_NUM_PREDICT}
+        try:
+            text = _ollama_chat_with_retry(model=model, messages=messages,
+                                           options=options, role="video")
+        except TruncatedOutput as e:
+            return None, f"cut off ({e})", e
+        return text, _description_problem(text), None
+
+    try:
+        result, problem, trunc = _ask(0.0)
+        if problem and problem not in ("empty response", "not a description"):
+            result, problem, trunc = _ask(0.4)
+    except (ContextOverflow, RoleModelNotConfigured):
+        raise
+    except Exception as e:
+        print(f"  Warning: video description failed: {e}")
+        return None
+
+    if problem is None:
+        return result
+    if problem in ("empty response", "not a description"):
+        return None
+    if raise_unusable:
+        if trunc is not None:
+            raise trunc
+        raise UnusableAnswer(f"video-describe: {problem}")
+    print(f"  Warning: no usable video description: {problem}")
     return None
 
 
