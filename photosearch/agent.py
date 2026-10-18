@@ -544,7 +544,8 @@ _FILTER_TOOLS = {"search_photos", "representatives", "daily_highlights",
 # inferred; every other key hard-overrides the model's value.
 _LOCKED_KEYS = ("people", "location", "date_from", "date_to", "color", "category",
                 "visual_tag", "keyword", "min_quality", "min_aesthetic",
-                "min_day_aesthetic", "style_tag", "match_source", "camera", "sort")
+                "min_day_aesthetic", "style_tag", "match_source", "camera", "sort",
+                "media")
 
 # Tool-SCOPED locked params: unlike _LOCKED_KEYS (generic filters injected into
 # every filter-consuming tool), these only apply where the param exists. `per_day`
@@ -569,6 +570,18 @@ def _normalize_locked(locked) -> dict:
         if isinstance(v, (list, tuple)) and not v:
             continue
         out[k] = v
+    # Media (video-support step 2): 'photo' | 'video' pin; 'all' is the
+    # default and an unknown value is dropped rather than enforced.
+    if "media" in out:
+        from .db import normalize_media
+        try:
+            m = normalize_media(out["media"])
+        except ValueError:
+            m = "all"
+        if m in ("photo", "video"):
+            out["media"] = m
+        else:
+            del out["media"]
     for k in _SCOPED_LOCKED:
         v = locked.get(k)
         if v is None or (isinstance(v, str) and not v.strip()):
@@ -613,6 +626,7 @@ _LOCKED_LABELS = {
     "visual_tag": "visual tag", "keyword": "keyword", "min_quality": "min quality",
     "min_aesthetic": "min aesthetic pct",
     "min_day_aesthetic": "min per-day aesthetic pct", "style_tag": "style",
+    "media": "media",
     "match_source": "match source", "camera": "camera", "sort": "sort",
 }
 

@@ -597,7 +597,9 @@ def _subject_ranked_search(db: PhotoDB, args: dict, person_ids: list, limit: int
     sweet-spot band, then quality) — for 'best photos of X where X is the
     foreground subject' in a single scope (no per-bucket spread). Same logic as
     representatives(rank_by='subject') but a flat list, not one-per-bucket."""
-    where, params = _build_filter_sql(db, args)
+    # Same media default as the normal search_photos path: all, with paired
+    # Live clips and unreadable videos hidden.
+    where, params = _build_filter_sql(db, args, default_media="all")
     ph = ",".join("?" * len(person_ids))
     prom_join = (
         f"JOIN (SELECT f.photo_id, MAX("

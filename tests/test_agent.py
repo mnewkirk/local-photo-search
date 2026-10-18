@@ -264,6 +264,25 @@ def test_merge_locked_overrides_scalars_and_unions_people():
     assert merged["date_from"] == "2026-06-28"
 
 
+def test_locked_media_is_normalized_and_enforced(db, monkeypatch):
+    assert agent._normalize_locked({"media": "videos"}) == {"media": "video"}
+    assert agent._normalize_locked({"media": "all"}) == {}
+    assert agent._normalize_locked({"media": "films"}) == {}
+    merged = agent._merge_locked("search_photos", {"media": "all"}, {"media": "photo"})
+    assert merged["media"] == "photo"
+    assert "media=video" in agent._locked_prompt({"media": "video"})
+    # End to end: the pinned Media=Videos reaches the tool call; the fixture
+    # library has no videos, so nothing comes back.
+    monkeypatch.setattr(agent, "_chat", _script(
+        _tc("search_photos", {"people": ["Alex"]}),
+        _answer("No videos of Alex."),
+    ))
+    events = _run(db, "videos of Alex", locked_filters={"media": "video"})
+    call = next(e for e in events if e["type"] == "tool_call")
+    assert call["arguments"]["media"] == "video"
+    assert next(e for e in events if e["type"] == "photos")["total"] == 0
+
+
 def test_merge_locked_only_filter_tools():
     # rerank_photos takes ids, not filters — locked filters must not leak in.
     args = {"photo_ids": [1, 2], "criteria": "x"}

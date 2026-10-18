@@ -608,10 +608,11 @@ def _video_image(photo_id: int, state: dict, size: str):
         return FileResponse(str(video_api.PLACEHOLDER_UNREADABLE),
                             media_type=video_api.PLACEHOLDER_MIME, headers=_NO_CACHE)
     if src == "poster":
-        if size == "thumb":
-            cache_path = os.path.join(_ensure_thumb_dir(), f"{photo_id}_thumb.jpg")
-        else:
-            cache_path = os.path.join(_ensure_preview_dir(), f"{photo_id}_preview.jpg")
+        cache_dir = _ensure_thumb_dir() if size == "thumb" else _ensure_preview_dir()
+        # Replica: a versioned name, so a replaced NAS poster is re-fetched.
+        name = (video_api.replica_poster_name(photo_id, size, state) if _nas_url
+                else f"{photo_id}_{size}.jpg")
+        cache_path = os.path.join(cache_dir, name)
         if os.path.exists(cache_path):
             return FileResponse(cache_path, media_type="image/jpeg", headers=_NO_CACHE)
         if _nas_url:

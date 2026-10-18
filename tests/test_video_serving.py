@@ -99,7 +99,7 @@ def test_replica_caches_only_a_real_poster(env, monkeypatch):
     monkeypatch.setattr(web, "_nas_url", "http://fake-nas:8000")
     answers = {"data": b"<svg>placeholder</svg>"}
     monkeypatch.setattr(web, "_fetch_from_nas", lambda pid, kind, timeout=30.0: answers["data"])
-    cache = env["thumbs"] / f"{ids['clip']}_thumb.jpg"
+    cache = env["thumbs"] / f"{ids['clip']}_thumb.p1.jpg"
     r = c.get(f"/api/photos/{ids['clip']}/thumbnail")
     assert r.headers["content-type"].startswith("image/svg+xml")
     assert not cache.exists()  # a placeholder must never stick in the cache
@@ -107,6 +107,16 @@ def test_replica_caches_only_a_real_poster(env, monkeypatch):
     r = c.get(f"/api/photos/{ids['clip']}/thumbnail")
     assert r.headers["content-type"] == "image/jpeg"
     assert cache.read_bytes() == JPEG + b"nas-poster"
+    # A new poster on the NAS arrives with a new version in the synced
+    # video_meta: a cache miss, not a stale hit.
+    with PhotoDB(env["db_path"]) as db:
+        db.conn.execute("UPDATE video_meta SET probe_version=2 WHERE photo_id=?",
+                        (ids["clip"],))
+        db.conn.commit()
+    answers["data"] = JPEG + b"nas-poster-v2"
+    r = c.get(f"/api/photos/{ids['clip']}/thumbnail")
+    assert r.content == JPEG + b"nas-poster-v2"
+    assert (env["thumbs"] / f"{ids['clip']}_thumb.p2.jpg").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +148,13 @@ def test_full_range_206(env, header, start, end):
     assert r.headers["content-range"] == f"bytes {start}-{end}/{len(VIDEO_BYTES)}"
     assert int(r.headers["content-length"]) == end - start + 1
     assert r.content == VIDEO_BYTES[start:end + 1]
+
+
+@pytest.mark.parametrize("header", ["bytes=5-2", "bytes=0-1,5-9", "chunks=0-5"])
+def test_invalid_or_multi_range_is_ignored(env, header):
+    r = env["client"].get(f"/api/photos/{env['ids']['clip']}/full",
+                          headers={"Range": header})
+    assert r.status_code == 200 and r.content == VIDEO_BYTES
 
 
 def test_full_range_not_satisfiable(env):
@@ -441,3 +458,76 @@ def test_request_intents_for_video_routes():
     assert ri.infer_intent("GET", "/api/photos/3/full", "", None) == \
         "Fetch the original of photo 3"
     assert ri.classify_source("/api/videos/7/assets", {}) == "worker"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency cap and deterministic cleanup
+# ---------------------------------------------------------------------------
+
+def test_worker_stream_cap_returns_503(env, monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_VIDEO_WORKER_STREAMS", "2")
+    held = [video_api.acquire_worker_stream(), video_api.acquire_worker_stream()]
+    try:
+        url = f"/api/photos/{env['ids']['clip']}/full"
+        r = env["client"].get(url + "?purpose=worker")
+        assert r.status_code == 503 and r.headers["retry-after"] == "10"
+        assert env["client"].get(url).status_code == 200  # browsers are not capped
+    finally:
+        for rel in held:
+            rel()
+    r = env["client"].get(f"/api/photos/{env['ids']['clip']}/full?purpose=worker")
+    assert r.status_code == 200 and r.content == VIDEO_BYTES
+    # every finished stream gave its slot back
+    assert video_api._active_worker_streams == 0
+
+
+def test_release_is_one_shot(monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_VIDEO_WORKER_STREAMS", "1")
+    rel = video_api.acquire_worker_stream()
+    assert video_api.acquire_worker_stream() is None
+    rel()
+    rel()
+    assert video_api._active_worker_streams == 0
+
+
+def _disconnecting_call(response):
+    """Drive an ASGI 2.4 response whose client goes away after the headers."""
+    import anyio
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            raise OSError("client went away")
+
+    async def run():
+        try:
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}},
+                           receive, send)
+        except Exception:  # noqa: BLE001 — ClientDisconnect
+            pass
+
+    anyio.run(run)
+
+
+def test_file_stream_closed_on_client_disconnect(env, monkeypatch):
+    monkeypatch.setattr(video_api, "worker_bucket", lambda: None)
+    path = str(env["root"] / "2026" / "d" / "CLIP.MP4")
+    resp = video_api.serve_video_file(None, path, "CLIP.MP4", "worker", {})
+    closed = []
+    real = video_api.FileStream.close
+    monkeypatch.setattr(video_api.FileStream, "close",
+                        lambda self: (closed.append(1), real(self)))
+    _disconnecting_call(resp)
+    assert closed
+    assert video_api._active_worker_streams == 0
+
+
+def test_proxy_upstream_closed_even_if_never_iterated(monkeypatch):
+    import requests
+    up = FakeUpstream(206, {"Content-Type": "video/mp4"}, [b"abc"])
+    monkeypatch.setattr(requests, "get", lambda *a, **k: up)
+    resp = video_api.proxy_video("http://nas", 1, "bytes=0-2", "worker", False)
+    _disconnecting_call(resp)
+    assert up.closed

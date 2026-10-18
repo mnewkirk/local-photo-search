@@ -87,6 +87,23 @@ def image_source(state: dict) -> str:
     return "poster"
 
 
+def poster_version(state: dict):
+    """The version that names a poster: today the probe pass's
+    `probe_version` (the probe uploads the poster). A later pass that
+    REPLACES the poster (e.g. video-scan picking a better frame) must bump
+    what this returns — a `poster_version` column — or the replica keeps
+    serving the old one. This is the single place to change."""
+    return state.get("probe_version")
+
+
+def replica_poster_name(photo_id: int, size: str, state: dict) -> str:
+    """The replica's cache name for a NAS poster: versioned, so a new poster
+    on the NAS (a new version in the synced video_meta) is a cache miss
+    instead of a stale hit. The NAS itself keeps the plain {id}_thumb.jpg /
+    {id}_preview.jpg names the asset upload installs."""
+    return f"{int(photo_id)}_{size}.p{poster_version(state)}.jpg"
+
+
 def video_fields(conn, rows) -> dict[int, dict]:
     """{photo_id: {media_type, duration_s, video_kind}} for the video rows
     among `rows` (dicts or sqlite rows with id + media_type). Stills are not
@@ -145,8 +162,8 @@ def parse_range(header: Optional[str], size: int) -> Optional[tuple[int, int]]:
     if start >= size:
         raise RangeNotSatisfiable()
     end = size - 1 if b == "" else min(int(b), size - 1)
-    if end < start:
-        raise RangeNotSatisfiable()
+    if b != "" and int(b) < start:
+        return None  # last-pos < first-pos: invalid, ignored (RFC 9110 14.1.1)
     return start, end
 
 
@@ -204,28 +221,110 @@ def worker_bucket() -> TokenBucket:
         return _bucket
 
 
+class FileStream:
+    """`length` bytes of `path` from `start`, through `bucket` if set.
+
+    The file is opened up front and closed by `close()` — called by the
+    response when it finishes, errors or the client disconnects — not left
+    to garbage collection of a half-iterated generator."""
+
+    def __init__(self, path: str, start: int, length: int,
+                 bucket: Optional[TokenBucket] = None, chunk: Optional[int] = None):
+        self.fh = open(path, "rb")
+        self.fh.seek(start)
+        self.remaining = length
+        self.bucket = bucket
+        self.chunk = chunk or CHUNK
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            while self.remaining > 0 and not self.fh.closed:
+                n = min(self.chunk, self.remaining)
+                if self.bucket is not None:
+                    self.bucket.consume(n)
+                try:
+                    data = self.fh.read(n)
+                except ValueError:  # closed under us by a disconnect
+                    break
+                if not data:
+                    break
+                self.remaining -= len(data)
+                yield data
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        try:
+            self.fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def iter_file(path: str, start: int, length: int,
               bucket: Optional[TokenBucket] = None,
-              chunk: int = CHUNK) -> Iterator[bytes]:
-    """Yield `length` bytes of `path` from `start`, through `bucket` if set."""
-    remaining = length
-    with open(path, "rb") as fh:
-        fh.seek(start)
-        while remaining > 0:
-            n = min(chunk, remaining)
-            if bucket is not None:
-                bucket.consume(n)
-            data = fh.read(n)
-            if not data:
-                break
-            remaining -= len(data)
-            yield data
+              chunk: Optional[int] = None) -> Iterator[bytes]:
+    return iter(FileStream(path, start, length, bucket, chunk))
+
+
+def _closing_streaming_response(content, on_close: Callable[[], None], **kw):
+    """A StreamingResponse that ALWAYS runs `on_close` once it is done with —
+    completed, failed or the client went away (Starlette's `background` is
+    skipped on the ASGI 2.4 disconnect path)."""
+    from fastapi.responses import StreamingResponse
+
+    class _Closing(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                on_close()
+
+    return _Closing(content, **kw)
+
+
+# Throttled worker streams sleep inside the threadpool; cap how many can run
+# at once so a fleet cannot starve the web server's threads. Over the cap the
+# request gets 503 + Retry-After, which WorkerClient._request already backs
+# off on.
+DEFAULT_WORKER_STREAMS = 4
+WORKER_STREAM_RETRY_AFTER = 10
+_streams_lock = threading.Lock()
+_active_worker_streams = 0
+
+
+def worker_stream_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("PHOTOSEARCH_VIDEO_WORKER_STREAMS")
+                          or DEFAULT_WORKER_STREAMS))
+    except ValueError:
+        return DEFAULT_WORKER_STREAMS
+
+
+def acquire_worker_stream() -> Optional[Callable[[], None]]:
+    """A one-shot release callable, or None when the cap is reached."""
+    global _active_worker_streams
+    with _streams_lock:
+        if _active_worker_streams >= worker_stream_limit():
+            return None
+        _active_worker_streams += 1
+    released = threading.Event()
+
+    def release() -> None:
+        global _active_worker_streams
+        if released.is_set():
+            return
+        released.set()
+        with _streams_lock:
+            _active_worker_streams -= 1
+
+    return release
 
 
 def serve_video_file(range_header: Optional[str], path: str, filename: str,
                      purpose: Optional[str], headers: dict):
-    """A 200/206/416 StreamingResponse for a local video file."""
-    from fastapi.responses import Response, StreamingResponse
+    """A 200/206/416 StreamingResponse for a local video file (503 when the
+    concurrent purpose=worker cap is reached)."""
+    from fastapi.responses import Response
 
     size = os.path.getsize(path)
     headers = dict(headers)
@@ -235,7 +334,16 @@ def serve_video_file(range_header: Optional[str], path: str, filename: str,
     except RangeNotSatisfiable:
         headers["Content-Range"] = f"bytes */{size}"
         return Response(status_code=416, headers=headers)
-    bucket = worker_bucket() if purpose == "worker" else None
+    release = None
+    bucket = None
+    if purpose == "worker":
+        release = acquire_worker_stream()
+        if release is None:
+            return Response(
+                status_code=503,
+                content=b"too many concurrent worker video streams, retry shortly",
+                headers={"Retry-After": str(WORKER_STREAM_RETRY_AFTER)})
+        bucket = worker_bucket()
     if rng is None:
         start, length, status = 0, size, 200
     else:
@@ -243,9 +351,21 @@ def serve_video_file(range_header: Optional[str], path: str, filename: str,
         length, status = end - start + 1, 206
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
     headers["Content-Length"] = str(length)
-    return StreamingResponse(iter_file(path, start, length, bucket),
-                             status_code=status, media_type=video_mime(filename),
-                             headers=headers)
+    try:
+        stream = FileStream(path, start, length, bucket)
+    except BaseException:
+        if release:
+            release()
+        raise
+
+    def on_close() -> None:
+        stream.close()
+        if release:
+            release()
+
+    return _closing_streaming_response(iter(stream), on_close, status_code=status,
+                                       media_type=video_mime(filename),
+                                       headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +384,6 @@ def proxy_video(nas_url: str, photo_id: int, range_header: Optional[str],
     the NAS's status (200/206/416) and range headers. The body is iterated
     (`iter_content`), never read whole: a clip can be gigabytes."""
     import requests
-    from fastapi.responses import StreamingResponse
     from .request_intent import outbound_headers
 
     params = {}
@@ -290,9 +409,12 @@ def proxy_video(nas_url: str, photo_id: int, range_header: Optional[str],
         finally:
             upstream.close()
 
-    return StreamingResponse(body(), status_code=upstream.status_code,
-                             headers=out_headers,
-                             media_type=upstream.headers.get("content-type"))
+    # upstream.close() also runs from the response itself, so a response that
+    # is never iterated, or whose client disconnects mid-stream, still
+    # releases the NAS connection (Response.close is idempotent).
+    return _closing_streaming_response(
+        body(), upstream.close, status_code=upstream.status_code,
+        headers=out_headers, media_type=upstream.headers.get("content-type"))
 
 
 # ---------------------------------------------------------------------------

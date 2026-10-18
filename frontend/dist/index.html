@@ -1031,6 +1031,7 @@
         if (colorFilter) askUrl.set('color', colorFilter);
         if (locationFilter) askUrl.set('location', locationFilter);
         if (cameraFilter) askUrl.set('camera', cameraFilter);
+        if (mediaFilter) askUrl.set('media', mediaFilter);
         if (dateFrom) askUrl.set('date_from', dateFrom);
         if (dateTo) askUrl.set('date_to', dateTo);
         if (minQuality) askUrl.set('min_quality', minQuality);
@@ -1065,6 +1066,7 @@
         if (colorFilter) askFilters.color = colorFilter;
         if (locationFilter) askFilters.location = locationFilter;
         if (cameraFilter) askFilters.camera = cameraFilter;
+        if (mediaFilter) askFilters.media = mediaFilter;
         if (dateFrom) askFilters.date_from = dateFrom;
         if (dateTo) askFilters.date_to = dateTo;
         if (minQuality) askFilters.min_quality = parseFloat(minQuality);
@@ -1138,7 +1140,7 @@
             setAsking(false);
           });
       }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
-          cameraFilter, dateFrom, dateTo, minQuality, minAesthetic, minDayAesthetic,
+          cameraFilter, mediaFilter, dateFrom, dateTo, minQuality, minAesthetic, minDayAesthetic,
           perDay, sortQuality, thinking, consolidatedSearch]);
 
       // Fetch the next page and append to existing results. Reuses the
