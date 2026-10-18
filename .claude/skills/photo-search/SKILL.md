@@ -99,7 +99,7 @@ local-photo-search/
 
 ---
 
-## Database Schema (v38)
+## Database Schema (v39)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
@@ -110,10 +110,10 @@ local-photo-search/
 > `sharpness*` columns (v33), the **search indexes (v34, indexes only — see
 > "Search performance" below)**, and **video** (v35 `photos.media_type` +
 > `video_meta`/`video_tracks`/`video_subjects`; v36 `poster_version`; v37
-> subject shares; v38 `scan_generation` — see "Video" below and CLAUDE.md
-> "## Video"). `SCHEMA_VERSION` in `db.py` is the source of
-> truth — currently **38**. See CLAUDE.md for the aesthetics + folder +
-> ingest-batch + face-exclusion details.
+> subject shares; v38 `scan_generation`; v39 `video_meta.proxy_*` playback
+> proxies — see "Video" below and CLAUDE.md "## Video"). `SCHEMA_VERSION` in
+> `db.py` is the source of truth — currently **39**. See CLAUDE.md for the
+> aesthetics + folder + ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
 
@@ -342,7 +342,7 @@ MCP tool calls fill the optional `intent` argument instead.
 - `GET /api/photos/{id}/full` — Full resolution
 - `GET /api/photos/{id}/preview` — Preview size
 
-### Video (built 2026-10-17, not yet deployed — CLAUDE.md "## Video")
+### Video (built 2026-10-17, deployed 2026-10-18 — backfill not started — CLAUDE.md "## Video")
 - `GET /api/photos/{id}/full` — for a video: single-range HTTP Range (206/416);
   `?purpose=worker` is throttled (`PHOTOSEARCH_VIDEO_STREAM_MBPS`, default 30
   MB/s) and capped at `PHOTOSEARCH_VIDEO_WORKER_STREAMS` (4) → 503 Retry-After.
@@ -356,14 +356,25 @@ MCP tool calls fill the optional `intent` argument instead.
 - `GET /api/videos/subject-labels` — Subject typeahead
 - `GET /api/admin/unreadable-videos` — unreadable / ZIP-wrapped list
   (`/admin/maintenance` card)
+- `PUT /api/videos/{id}/proxy?version=N` — worker upload of the H.264
+  playback proxy (raw `video/mp4` stream, not base64; 409 on the replica —
+  upload to the NAS directly)
+- `GET /api/videos/{id}/proxy` — serves the playable copy with HTTP Range
+  (`?v=` pins a version); the replica forwards Range to the NAS
 - CLI: `photosearch register-videos [--folder 2026] [--limit N] [--apply]`
   (NAS; walk + insert only, dry run read-only)
-- Worker passes (`--native` only — ffprobe isn't in the Docker worker image):
-  `video-probe`, `video-scan`, `video-subjects` (role `subject`,
-  `PHOTOSEARCH_LLM_SUBJECT_MODEL`, `--llm-subject-model`), `video-describe`
-  (strict role `video`, `PHOTOSEARCH_LLM_VIDEO_MODEL`, `--llm-video-model`,
-  no fallback). `clear-pass` accepts all four. Runbook: Step 8 of
-  `docs/plans/video-support.md`.
+- CLI: `photosearch unwrap-zip-videos [--year 2016] [--folder F] [--mbps N]
+  [--apply --audit PATH] [--undo PATH]` (NAS; fixes ZIP-wrapped video files
+  in place — see CLAUDE.md "## Video" ZIP unwrap section). Run **before**
+  `register-videos` for ZIP-heavy years (2016-17).
+- Worker passes (`--native` only — ffprobe/ffmpeg aren't in the Docker worker
+  image): `video-probe`, `video-proxy` (needs ffmpeg + ffprobe; D12 fallback
+  for clips the browser can't decode as-is), `video-scan`, `video-subjects`
+  (role `subject`, `PHOTOSEARCH_LLM_SUBJECT_MODEL`, `--llm-subject-model`),
+  `video-describe` (strict role `video`, `PHOTOSEARCH_LLM_VIDEO_MODEL`,
+  `--llm-video-model`, no fallback). `clear-pass` accepts all five. Pass
+  order: `video-probe, video-proxy, video-scan, ..., video-subjects, ...,
+  video-describe`. Runbook: Step 8 of `docs/plans/video-support.md`.
 - Eval: `evals/video_eval.py`; labelling `/eval/models?tab=vsubject|vquality`.
 
 ### Faces
@@ -1377,6 +1388,7 @@ Collection-only options:
 | Geocoding | (auto) | GeoNames (offline) | Fast | GPS data in EXIF |
 | Verification | `--verify` | `llava` checker + `llama3.2-vision` regen | Slow (2 LLM passes) | Descriptions exist |
 | Video probe | worker `video-probe` only | ffprobe over Range + 1 cv2 frame (desktop) | header reads | `register-videos` row |
+| Video proxy | worker `video-proxy` only | ffmpeg transcode to H.264 720p-class (desktop); only clips `needs_proxy` | 0.1–0.25x real time (8K HEVC 1.4x) | video-probe |
 | Video scan | worker `video-scan` only | InsightFace + tracker + CLIP (desktop CPU) | ~7–43 s/video | video-probe |
 | Video subjects | worker `video-subjects` only | role `subject` (qwen2.5-vl) | ~0.7–1.9 s/keyframe | video-scan |
 | Video describe | worker `video-describe` only | role `video` (qwen3.5-9b), strict | ~3–8 s/video | video-scan |

@@ -1,7 +1,9 @@
 # Video support (mp4/mov): main subject share (people, animals, scenery), description, quality
 
-Status: **built 2026-10-17, not yet deployed** (see "As built" below; the
-backfill runbook is Step 8). Planned 2026-10-17. Built by plan-debate: two planners drafted
+Status: **deployed 2026-10-18** (NAS + replica on `8eb246c`, schema v39);
+**backfill not started** — nothing registered, no fleet run, no sampling yet
+(owner's instruction). See "As built" below for Steps 0–10; the backfill
+runbook is Step 8. Planned 2026-10-17. Built by plan-debate: two planners drafted
 independently, critiqued each other over two rounds, and converged on every
 contested point. The owner then decided three things (recorded in "Decisions"):
 **skip Live Photo clips**, **the whole clip is the share denominator**, and
@@ -15,7 +17,11 @@ All of Steps 0–7 landed in one day on `main` (`9015b61` … `461c7a0`), each s
 followed by a review-fix commit. Verified on `461c7a0`: `scripts/test-like-ci.sh`
 3,333 passed / 68 skipped, `node scripts/check-frontend-refs.js` clean, jest
 210/210. Operating notes and the traps live in CLAUDE.md "## Video"; the
-runbook is Step 8 below.
+runbook is Step 8 below. Two more steps landed the next day (2026-10-18),
+after the owner tested HEVC playback for real and it failed outright (see
+Step 0 results and D12): Step 9 (ZIP unwrap, the NAS-side fix) and Step 10
+(the H.264 proxy pass D12 calls for). The NAS and replica were then deployed
+on schema v39 the same day; the backfill itself has not started.
 
 | step | commits | as built — and where it deviates from the plan |
 |---|---|---|
@@ -29,7 +35,9 @@ runbook is Step 8 below.
 | 5 video-describe | `21cfebd`, `461c7a0` | **Strict** role `video` (no fallback, `PHOTOSEARCH_LLM_VIDEO_MODEL`, fleet default qwen3.5-9b until the eval). **Pass order changed** from the plan: `clip, faces, quality, video-probe, video-scan, aesthetics, video-subjects, describe, video-describe, verify, category-content, keywords, category-visual` (shared model loads; text passes after video-describe). Not gated on video-subjects. Review: no forever-defer on a None answer; result for a replaced scan generation deferred; exhausted-describe videos leave text-pass totals. |
 | 6 subject share | `e4b20ec` | Behind `PHOTOSEARCH_VIDEO_SUBJECT_SHARE` (D16): off → `/api/search` **400s** the share params, tool schemas omit them. The modal timeline always shows (audit tool). |
 | 7 quality | `1f4b526` | Numbers only (D11) + `sort=steadiest|least_noisy` (two partial indexes on `video_meta`). |
-| 8 docs | this commit | CLAUDE.md "## Video", SKILL.md, this table + runbook. **Nothing deployed.** |
+| 8 docs | this commit | CLAUDE.md "## Video", SKILL.md, this table + runbook. **Nothing deployed** (superseded below — the NAS and replica deployed 2026-10-18). |
+| 9 ZIP unwrap | `2075c92` | `unwrap-zip-videos` NAS CLI fixes the files themselves (the 2016-17 iOS Live-bundle ZIPs, see Step 0 results) in place: extract the one safe member, `os.link` the zip to `<name>.zip` (never overwrites), `os.replace` the playable video under the original name. Throttled (nice + IDLE ioprio + `--mbps`), refuses while an ingest sweep holds its lock, `--apply` holds that lock itself. Audited CSV + `--undo`. Member rules shared with `video_scan.unwrap_zip` via `photosearch/zip_video.py` so the two can't disagree. |
+| 10 video-proxy | `8eb246c` | New worker pass + schema v39: a desktop ffmpeg transcode to H.264 720p-class (`video_proxy.needs_proxy`, pure) for every clip the owner's browser can't play as-is — see D12. `PUT /api/videos/{id}/proxy` stores it under `<DB dir>/video_proxies/`; `GET` serves it with Range. `PhotoModal` picks proxy vs original via `PS.canPlayVideo`/`PS.chooseVideoSource`. Pass order: right after `video-probe`, before `video-scan`. (The `cli.py`/`worker.py`/`worker_api.py`/`admin_maintenance.html` hunks landed early inside `b7e5b03`, a concurrent commit; `8eb246c` adds the module and everything else.) |
 
 **Smoke timings (desktop, 2026-10-17):** video-scan 6.7–43 s/video on CPU
 InsightFace; video-subjects 0.7–1.9 s/keyframe (qwen2.5-vl-7b); video-describe
@@ -424,6 +432,15 @@ proprietary codec pack regardless of what the owner's real, GPU-accelerated
 Chrome/Edge supports. Treat HEVC-in-browser as still unverified; the plan's
 fallback (transcode or serve an H.264 preview) should stay on the table until
 a human checks `playback.html` for real.
+
+**Resolved 2026-10-18: the owner checked `playback.html` on Windows
+Chrome/Edge, and it decodes NO HEVC at all** — `MediaSource.
+isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"')` is `false` and
+`decodingInfo` is unsupported. What played: H.264 8-bit `yuv420p`/`yuvj420p`
+in `.mp4`/`.mov`. What did NOT: HEVC Main10 HLG HDR (iPhone `.mov`), 8K HEVC
+(Sony `.mp4`), MPEG-4 ASP (Canon `.avi`), H.264 in `.mts`. This settles D12
+against the adopted default — see the Decisions table — and is why Steps 9
+and 10 (ZIP unwrap, `video-proxy`) landed the next day.
 
 ### Step 1 — Schema v35, media isolation, registration, unreadable handling (4 d)
 
@@ -921,11 +938,16 @@ wins a flag, it becomes a `video-quality` LLM pass in step 5's shape.
 
 ### Step 8 — Backfill runbook, docs, deploy (1.5 d)
 
-Docs done (CLAUDE.md "## Video", SKILL.md, "As built" above). **Nothing below
-has been run.** Order is fixed: **NAS first** (schema v35–v38 + the endpoints
-the workers call), **then the workers, together** (the `failures` semantics),
-then the backfill one year at a time, starting with 2026. Report each year's
-counts and cost estimate to the owner before starting it, the way the
+Docs done (CLAUDE.md "## Video", SKILL.md, "As built" above). The NAS and
+replica are now **deployed** on schema v39 (2026-10-18, Steps 9–10 included)
+but **the backfill itself has not been run** — no `register-videos`, no
+`unwrap-zip-videos --apply`, no fleet launch. Order is fixed: **NAS first**
+(schema v35–v39 + the endpoints the workers call — done), **then the
+workers, together** (the `failures` semantics), then **ZIP unwrap before
+registration** (Step 2 below — a row registered from a still-wrapped ZIP
+would need a second re-probe pass anyway), then the backfill one year at a
+time, starting with 2016-17 (the ZIP-heavy years) then 2026. Report each
+year's counts and cost estimate to the owner before starting it, the way the
 gemma-4-26b one-off did.
 
 **Cost estimate** (≈ 4,200 readable non-Live videos library-wide, ≈ 300 GB;
@@ -935,6 +957,7 @@ smoke timings from the "As built" table; divide by the year's share of the
 | pass | per unit | library-wide, `-n 2` |
 |---|---|---|
 | video-probe | ffprobe reads ~3–15% of a file; < 1% when moov-less | ≈ 15–25 GB read → ≈ 10–15 min at the 30 MB/s cap |
+| video-proxy | 0.1–0.25× real time (8K HEVC 1.4×); only clips `needs_proxy` flags, measured ~5/12 fixtures | library estimate ≈ 15–40 GB written (likely ≈ 25 GB), ≈ 6–10 h with one worker |
 | video-scan | 6.7–43 s/video (CPU InsightFace) + its download | ≈ 3 h transfer at 30 MB/s, ≈ 4–25 h analysis (typical ≈ 8–12 h): **one or two nights** |
 | video-subjects | 0.7–1.9 s/keyframe, ≈ 8.6 keyframes/video | ≈ 36k calls → ≈ 7–19 GPU h (was 20–30 h at the plan's 2–3 s guess) |
 | video-describe | 3–8 s/video | ≈ 3.5–9 h |
@@ -963,9 +986,9 @@ $DCPY photosearch -c "
 import os, sqlite3
 c = sqlite3.connect(os.environ['PHOTOSEARCH_DB'])
 print(c.execute(\"SELECT value FROM schema_info WHERE key='version'\").fetchone())"
-# -> ('38',)
+# -> ('39',)
 curl -s -H 'X-Photosearch-Source: claude' \
-     -H 'X-Photosearch-Intent: Check the video endpoints after the v38 deploy' \
+     -H 'X-Photosearch-Intent: Check the video endpoints after the v39 deploy' \
      http://<NAS-IP>:8000/api/admin/unreadable-videos | head -c 300   # 200, not 404
 ```
 
@@ -977,7 +1000,27 @@ replica kills a UI-launched fleet.**
 git -C ~/local-photo-search pull && systemctl --user restart photosearch-replica
 ```
 
-#### 2. Register (per year, NAS)
+#### 2. Unwrap ZIP-wrapped videos first (per year, NAS)
+
+Register would otherwise insert a row for a ZIP under a video extension,
+which then needs a second re-probe pass once unwrapped — do this before
+`register-videos`, starting with 2016-17 (where ~58% of "unreadable" files
+are ZIPs, see Step 0 results):
+
+```bash
+$DC run --rm photosearch unwrap-zip-videos --year 2016               # dry run
+$DC run --rm photosearch unwrap-zip-videos --year 2016 --apply --audit /data/unwrap-2016.csv
+$DC run --rm photosearch unwrap-zip-videos --year 2017 --apply --audit /data/unwrap-2017.csv
+```
+
+Dry run opens the DB read-only and writes nothing; `--apply` requires
+`--audit`, holds the ingest sweep lock itself, and is throttled (nice + IDLE
+ioprio + `--mbps`). The zip is kept as `<name>.zip`, never deleted; `--undo
+<audit.csv> [--apply]` restores it under the original name if the file there
+still matches size + sha256. Repeat per year before that year's
+`register-videos`.
+
+#### 3. Register (per year, NAS)
 
 ```bash
 $DC run --rm photosearch register-videos --folder 2026            # dry run: counts per year
@@ -988,12 +1031,15 @@ A walk + inserts only (no ffprobe, no hash; commits every 25). New rows show
 as placeholder posters until probed. Later years: `--folder 2025`, … (omit
 `--folder` for the remainder once the per-year cadence is boring).
 
-#### 3. The fleet (desktop, `--native` only)
+#### 4. The fleet (desktop, `--native` only)
 
 ffprobe must be on the host (`~/.local/bin/ffprobe -version`); it is not in
-the Docker worker image. LM Studio needs JIT loading on and a ≥ 16384 context
-default for qwen2.5-vl and qwen3.5-9b. If the server is on this machine, use
-`127.0.0.1`, never `localhost` (the static ffprobe segfaults resolving it).
+the Docker worker image. `video-proxy` also needs ffmpeg on the host
+(`PHOTOSEARCH_FFMPEG` / PATH / `~/.local/bin`) — the worker drops the pass up
+front if either tool is missing. LM Studio needs JIT loading on and a ≥ 16384
+context default for qwen2.5-vl and qwen3.5-9b. If the server is on this
+machine, use `127.0.0.1`, never `localhost` (the static ffprobe segfaults
+resolving it).
 
 ```bash
 cd ~/local-photo-search
@@ -1008,21 +1054,23 @@ export PHOTOSEARCH_LLM_VIDEO_MODEL=qwen/qwen3.5-9b      # strict: unset = pass r
 export PHOTOSEARCH_LLM_REASONING_EFFORT=none
 NAS=http://<NAS-IP>:8000
 
-./run-workers.sh --native -s $NAS -d /photos/2026 -p video-probe -n 2
+./run-workers.sh --native -s $NAS -d /photos/2026 -p video-probe,video-proxy -n 2
 ./run-workers.sh --status        # wait until it drains and exits
 ./run-workers.sh --native -s $NAS -d /photos/2026 -p video-scan -n 2      # overnight
 ./run-workers.sh --native -s $NAS -d /photos/2026 -p video-subjects -n 2
 ./run-workers.sh --native -s $NAS -d /photos/2026 -p video-describe,category-content,keywords -n 2
 ```
 
-Or one launch: `-p video-probe,video-scan,video-subjects,video-describe,category-content,keywords`
-(sequential drain is the default). Dry-run the queue depth first with
+Or one launch: `-p video-probe,video-proxy,video-scan,video-subjects,video-describe,category-content,keywords`
+(sequential drain is the default; `video-proxy` only picks up clips
+`needs_proxy` flagged, so it is cheap to run alongside `video-probe`).
+Dry-run the queue depth first with
 `python cli.py worker -s $NAS -d /photos/2026 -p video-scan --dry-run`.
 Face labels: the nightly sweep's **strict** `match_faces` picks up the new
 video faces; to do it now, `$DC run --rm photosearch match-faces` (never
 `--temporal` on these). `warm_crops` skips video faces by design.
 
-#### 4. Watch the NAS while it runs
+#### 5. Watch the NAS while it runs
 
 The scan download is the 2026-09-19 incident's shape. On the first night:
 
@@ -1038,7 +1086,7 @@ then `$DC up -d --force-recreate photosearch`. Unreadable verdicts land on
 `/admin/maintenance` → **Unreadable videos** (ZIP-wrapped ones should mostly
 clear after video-scan unwraps them).
 
-#### 5. Eval (after the 2026 backfill, on the replica)
+#### 6. Eval (after the 2026 backfill, on the replica)
 
 Sync the replica (`/status` → **Sync from NAS**), then:
 
@@ -1063,7 +1111,7 @@ and `?tab=vquality`, the recheck set included; then
 `python evals/video_eval.py report` — holdout numbers decide every gate in
 Step 4. A failed gate leaves the flag off.
 
-#### 6. Turn the subject share on (only after the gates pass)
+#### 7. Turn the subject share on (only after the gates pass)
 
 The flag is read per process; nothing is recomputed. NAS: both
 `photosearch` and `photosearch-mcp` already pass
@@ -1185,7 +1233,7 @@ any of them before the relevant step starts.
 | D9 | Videos in default search | yes, with a Media filter | opt-in (Media=Photos default) | default | 2026-10-17 |
 | D10 | Share denominator | whole clip duration = the video's full running time (the sample only sets the estimate's resolution); `focus_seconds` stored and filterable beside the share for long videos | people-frames only (show both in the modal) | **owner: whole clip** (confirmed after clarifying it is not the sample, "for now") | 2026-10-17 |
 | D11 | Quality tags | numbers only unless P ≥ 0.8 / R ≥ 0.5 on holdout | ship VLM tags un-gated | default | 2026-10-17 |
-| D12 | HEVC playback | rely on browser HEVC (spike confirms) | H.264 720p proxies made on the desktop | default | 2026-10-17 |
+| D12 | HEVC playback | rely on browser HEVC (spike confirms) | H.264 720p proxies made on the desktop | **proxies adopted 2026-10-18** — the owner's real browser decodes no HEVC at all (see Step 0 results) | 2026-10-18 |
 | D13 | Re-scan and manual labels | carry over by one-to-one encoding match ≤ 0.6 | freeze `faces` rows once any is manual | default | 2026-10-17 |
 | D14 | Video date source | Apple creationdate > mvhd + per-camera offset > mtime | mtime (current ingest behaviour) | default | 2026-10-17 |
 | D15 | Existing mis-foldered videos | leave files in place; fix only `date_taken` | refile (same care as `refile-unknown-camera`) | default | 2026-10-17 |
