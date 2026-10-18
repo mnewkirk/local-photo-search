@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Category-grounding eval — Photo Search</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --border: #333;
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --accent: #4a9eff;
+      --accent-hover: #6bb3ff;
+      --green: #4ade80;
+      --yellow: #facc15;
+      --red: #f87171;
+      --violet: #a78bfa;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      min-height: 42px;
+      flex-wrap: wrap;
+    }
+
+    .container { max-width: 1400px; margin: 0 auto; padding: 18px 24px 60px; }
+
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 2px; }
+    .page-sub { color: var(--text-muted); font-size: 13px; margin-bottom: 14px; max-width: 1000px; }
+    .page-sub code, .hint code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      background: var(--surface2); padding: 1px 5px; border-radius: 4px; color: var(--text);
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+    }
+    .hint { font-size: 14px; }
+    .hint code { display: block; margin-top: 10px; padding: 8px 10px; font-size: 13px; }
+
+    .muted { color: var(--text-muted); font-size: 13px; }
+    .error {
+      color: var(--red); font-size: 13px; margin-bottom: 12px; padding: 9px 12px;
+      background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.45);
+      border-radius: 6px;
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Score header                                                       */
+    /* ---------------------------------------------------------------- */
+    .score-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+    .score-card {
+      flex: 1; min-width: 180px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 14px;
+    }
+    .score-card .name { font-size: 13px; font-weight: 600; margin-bottom: 4px;
+                        display: flex; align-items: center; gap: 6px; }
+    .score-card .num { font-size: 20px; font-weight: 700; }
+    .score-card .sub { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+    .pill {
+      font-size: 11px; padding: 1px 8px; border-radius: 999px;
+      border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap;
+      font-weight: 600;
+    }
+    .pill.pass { color: var(--green); border-color: rgba(74,222,128,0.5);
+                background: rgba(74,222,128,0.1); }
+    .pill.fail { color: var(--red); border-color: rgba(248,113,113,0.5);
+                background: rgba(248,113,113,0.08); }
+    .pill.wait { color: var(--text-muted); }
+
+    /* ---------------------------------------------------------------- */
+    /* Tabs                                                               */
+    /* ---------------------------------------------------------------- */
+    .tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+    .tab {
+      background: var(--surface); border: 1px solid var(--border); color: var(--text-muted);
+      border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+      font-family: inherit; display: flex; align-items: center; gap: 8px;
+    }
+    .tab:hover { border-color: var(--accent); color: var(--text); }
+    .tab.active { border-color: var(--accent); color: var(--text); background: var(--surface2); }
+    .tab .count { font-size: 11px; color: var(--text-muted); }
+
+    .group-rule {
+      font-size: 12.5px; color: var(--text-muted); margin-bottom: 14px; padding: 9px 12px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .group-rule b { color: var(--text); }
+
+    /* ---------------------------------------------------------------- */
+    /* Rows                                                               */
+    /* ---------------------------------------------------------------- */
+    .rows { display: flex; flex-direction: column; gap: 8px; }
+    .row {
+      display: grid; grid-template-columns: 120px minmax(0, 1fr) 230px;
+      gap: 14px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 12px; align-items: start;
+    }
+    .row.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+    .row.done { border-left: 3px solid var(--green); }
+    @media (max-width: 860px) { .row { grid-template-columns: 1fr; } }
+
+    .thumb-wrap { position: relative; }
+    .thumb {
+      width: 120px; height: 90px; object-fit: cover; border-radius: 6px; cursor: zoom-in;
+      background: #000; display: block; border: 1px solid var(--border);
+    }
+    .thumb-id { font-size: 10.5px; color: var(--text-muted); margin-top: 4px; }
+
+    .desc { font-size: 13px; line-height: 1.45; }
+    .desc mark { background: rgba(250,204,21,0.28); color: var(--text); border-radius: 2px;
+                padding: 0 1px; }
+    .desc mark b { color: var(--yellow); }
+    .evidence-fallback { font-size: 12px; color: var(--text-muted); margin-top: 6px;
+                        font-style: italic; }
+    .reason { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+    .reason b { color: var(--text); }
+    .cats { font-size: 12.5px; margin-top: 8px; line-height: 1.6; }
+    .cat-chip {
+      display: inline-block; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1px 8px; margin: 0 4px 4px 0; color: var(--text-muted);
+    }
+    .cat-chip.dropped {
+      color: var(--red); border-color: rgba(248,113,113,0.6); background: rgba(248,113,113,0.1);
+      font-weight: 700; text-decoration: line-through;
+    }
+    .not-in-cats { font-size: 11.5px; color: var(--yellow); margin-top: 4px; }
+
+    .actions { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+    .lbl-btn {
+      border: 1px solid var(--border); background: var(--surface2); color: var(--text);
+      border-radius: 6px; padding: 7px 10px; font-size: 13px; cursor: pointer;
+      font-family: inherit; display: flex; align-items: center; justify-content: space-between;
+    }
+    .lbl-btn kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+      background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px;
+    }
+    .lbl-btn:hover { border-color: var(--text-muted); }
+    .lbl-btn.correct.selected { background: rgba(74,222,128,0.18); border-color: var(--green); color: var(--green); }
+    .lbl-btn.wrong.selected { background: rgba(248,113,113,0.18); border-color: var(--red); color: var(--red); }
+    .lbl-btn.debatable.selected { background: rgba(250,204,21,0.15); border-color: var(--yellow); color: var(--yellow); }
+    .in-db-warn { font-size: 11px; color: var(--yellow); margin-top: 6px; }
+
+    .keys { font-size: 12px; color: var(--text-muted); margin: 10px 0 16px; }
+    .keys kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="/shared.js"></script>
+  <script>
+    var e = React.createElement;
+    var useState = React.useState;
+    var useEffect = React.useEffect;
+    var useRef = React.useRef;
+
+    var API = '/api/eval/category-grounding';
+    var GROUPS = ['sport', 'setting', 'light', 'weather'];
+    var LABELS = ['correct', 'wrong', 'debatable'];
+    var KEY_TO_LABEL = { '1': 'correct', '2': 'wrong', '3': 'debatable' };
+
+    // "[cue] rest of the sentence" -> {cue, sentence}. The sample's evidence
+    // string is always built this way (evals/category_grounding_eval.py's
+    // `_sentence`); a photo with no cue match stores "no cue".
+    function parseEvidence(evidence) {
+      if (!evidence || evidence === 'no cue') return { cue: null, sentence: null };
+      var m = /^\[([^\]]*)\]\s*(.*)$/.exec(evidence);
+      if (!m) return { cue: null, sentence: evidence };
+      return { cue: m[1], sentence: m[2] };
+    }
+
+    // Highlight the evidence sentence inside the CURRENT description (which
+    // may have moved on since the sample was drawn — a re-describe runs
+    // between sampling and labelling). Falls back to showing the evidence
+    // verbatim when it is no longer a literal substring.
+    function Description(props) {
+      var desc = props.description || '(no description)';
+      var parsed = parseEvidence(props.evidence);
+      if (!parsed.sentence) {
+        return e('div', { className: 'desc' }, desc);
+      }
+      var idx = desc.indexOf(parsed.sentence);
+      if (idx < 0) {
+        return e('div', null,
+          e('div', { className: 'desc' }, desc),
+          e('div', { className: 'evidence-fallback' },
+            'Evidence at sampling time (description has since changed): ', props.evidence));
+      }
+      var before = desc.slice(0, idx);
+      var match = desc.slice(idx, idx + parsed.sentence.length);
+      var after = desc.slice(idx + parsed.sentence.length);
+      // Bold the exact cue word/phrase within the highlighted sentence.
+      var cueRe = parsed.cue ? new RegExp('(' + parsed.cue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'i') : null;
+      var matchParts = cueRe ? match.split(cueRe) : [match];
+      return e('div', { className: 'desc' },
+        before,
+        e('mark', null, matchParts.map(function (part, i) {
+          return cueRe && cueRe.test(part) && part.toLowerCase() === (parsed.cue || '').toLowerCase()
+            ? e('b', { key: i }, part) : part;
+        })),
+        after);
+    }
+
+    function Categories(props) {
+      var cats = props.categories;
+      if (cats == null) {
+        return e('div', { className: 'not-in-cats' }, 'No categories stored for this photo (NULL column).');
+      }
+      if (!cats.length) {
+        return e('div', { className: 'not-in-cats' }, 'Categories stored as [] (empty).');
+      }
+      var hasTerm = cats.indexOf(props.term) >= 0;
+      return e('div', null,
+        e('div', { className: 'cats' },
+          cats.map(function (c) {
+            return e('span', {
+              key: c, className: 'cat-chip' + (c === props.term ? ' dropped' : ''),
+            }, c);
+          })),
+        hasTerm ? null : e('div', { className: 'not-in-cats' },
+          'Note: the current stored categories no longer include "' + props.term + '" — '
+          + 'already re-tagged since this sample was drawn.'));
+    }
+
+    function Row(props) {
+      var it = props.item;
+      function openLoupe(ev) {
+        var r = ev.currentTarget.getBoundingClientRect();
+        props.onOpenLoupe(r.width ? (ev.clientX - r.left) / r.width : 0.5,
+                          r.height ? (ev.clientY - r.top) / r.height : 0.5);
+      }
+      return e('div', {
+        className: 'row' + (props.current ? ' current' : '') + (it.label ? ' done' : ''),
+        onClick: props.onSelect,
+      },
+        e('div', { className: 'thumb-wrap' },
+          e('img', {
+            className: 'thumb', src: '/api/photos/' + it.photo_id + '/thumbnail',
+            alt: 'photo ' + it.photo_id, title: 'Click to inspect at 100%',
+            onClick: openLoupe,
+          }),
+          e('div', { className: 'thumb-id' }, '#' + it.photo_id + (it.in_db ? '' : ' (not in this DB)')),
+          !it.in_db ? null : e('a', {
+            className: 'muted', style: { fontSize: 11, display: 'block' },
+            href: '/api/photos/' + it.photo_id + '/full', target: '_blank', rel: 'noopener',
+          }, 'original ↗')),
+        e('div', null,
+          e(Description, { description: it.description, evidence: it.evidence }),
+          e('div', { className: 'reason' }, e('b', null, 'Dropped term: '), it.term,
+            ' — ', it.reason || '(no reason recorded)'),
+          e(Categories, { categories: it.categories, term: it.term })),
+        e('div', { className: 'actions' },
+          LABELS.map(function (lab) {
+            var sel = it.label === lab;
+            return e('button', {
+              key: lab, type: 'button',
+              className: 'lbl-btn ' + lab + (sel ? ' selected' : ''),
+              onClick: function (ev) { ev.stopPropagation(); props.onLabel(sel ? null : lab); },
+            },
+              lab === 'correct' ? 'Correct — right to drop'
+                : lab === 'wrong' ? 'Wrong — should have stayed'
+                : 'Debatable',
+              e('kbd', null, lab === 'correct' ? '1' : lab === 'wrong' ? '2' : '3'));
+          })));
+    }
+
+    function ScoreCard(props) {
+      var s = props.score;
+      var label = props.label;
+      if (!s) return null;
+      var judged = s.correct + s.wrong;
+      var pillCls = s.precision == null ? 'wait' : s.passes ? 'pass' : 'fail';
+      var pillText = s.precision == null ? 'not enough data'
+        : (s.passes ? 'PASS' : 'below bar') + ' · ' + (100 * s.precision).toFixed(0) + '%';
+      return e('div', { className: 'score-card' },
+        e('div', { className: 'name' }, label, e('span', { className: 'pill ' + pillCls }, pillText)),
+        e('div', { className: 'num' }, s.labelled + ' / ' + s.n, e('span', { className: 'sub' }, ' labelled')),
+        e('div', { className: 'sub' },
+          'correct ' + s.correct + ' · wrong ' + s.wrong + ' · debatable ' + s.debatable
+          + ' · judged ' + judged + ' (bar: 90% of ≥20)'));
+    }
+
+    function Page() {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var scoreS = useState(null); var score = scoreS[0]; var setScore = scoreS[1];
+      var tabS = useState('sport'); var tab = tabS[0]; var setTab = tabS[1];
+      var curS = useState(0); var cur = curS[0]; var setCur = curS[1];
+      var errS = useState(null); var error = errS[0]; var setError = errS[1];
+      var loupeS = useState(null); var loupe = loupeS[0]; var setLoupe = loupeS[1];
+      var live = useRef({});
+
+      function load() {
+        return fetch(API + '/items?set=holdout').then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }).then(setData).catch(function (ex) {
+          setError('Could not load the eval sample: ' + ex.message);
+        });
+      }
+      function loadScore() {
+        return fetch(API + '/score').then(function (r) { return r.json(); }).then(setScore).catch(function () {});
+      }
+
+      useEffect(function () { load(); loadScore(); }, []);
+      useEffect(function () { setCur(0); setLoupe(null); }, [tab]);
+
+      var items = (data && data.groups && data.groups[tab]) || [];
+
+      function nextUnlabelled(from) {
+        for (var k = 1; k <= items.length; k++) {
+          var i = (from + k) % items.length;
+          if (!items[i].label) return i;
+        }
+        return -1;
+      }
+
+      function setLabel(idx, label) {
+        var it = items[idx];
+        if (!it) return;
+        fetch(API + '/label', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_id: it.photo_id, term: it.term, group: tab, label: label }),
+        }).then(function (r) {
+          return r.json().then(function (body) {
+            if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+            return body;
+          });
+        }).then(function (body) {
+          setData(function (d) {
+            var next = JSON.parse(JSON.stringify(d));
+            next.groups[tab][idx].label = body.label;
+            next.progress = body.progress;
+            return next;
+          });
+          loadScore();
+          if (label != null) {
+            var n = nextUnlabelled(idx);
+            if (n >= 0) setCur(n);
+          }
+        }).catch(function (ex) {
+          setError('Save failed — nothing was written: ' + ex.message);
+        });
+      }
+
+      live.current = { setLabel: setLabel, cur: cur, items: items,
+        move: function (delta) {
+          setCur(function (c) {
+            var n = c + delta;
+            if (n < 0) n = 0;
+            if (n >= items.length) n = items.length - 1;
+            return n;
+          });
+        } };
+
+      useEffect(function () {
+        function onKey(ev) {
+          if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
+          var tn = ev.target && ev.target.tagName;
+          if (tn === 'INPUT' || tn === 'TEXTAREA' || tn === 'SELECT') return;
+          var L = live.current;
+          if (KEY_TO_LABEL[ev.key]) {
+            ev.preventDefault();
+            var it = L.items[L.cur];
+            if (it) L.setLabel(L.cur, it.label === KEY_TO_LABEL[ev.key] ? null : KEY_TO_LABEL[ev.key]);
+          } else if (ev.key === 'ArrowDown' || ev.key === 'j') { ev.preventDefault(); L.move(1); }
+          else if (ev.key === 'ArrowUp' || ev.key === 'k') { ev.preventDefault(); L.move(-1); }
+        }
+        window.addEventListener('keydown', onKey);
+        return function () { window.removeEventListener('keydown', onKey); };
+      }, []);
+
+      var body;
+      if (!data) {
+        body = error ? null : e('div', { className: 'muted' }, 'Loading…');
+      } else if (!data.groups || GROUPS.every(function (g) { return !(data.groups[g] || []).length; })) {
+        var hint = data.hint || '';
+        var cut = hint.indexOf('python ');
+        body = e('div', { className: 'card hint' },
+          cut >= 0 ? hint.slice(0, cut) : hint,
+          cut >= 0 ? e('code', null, hint.slice(cut)) : null,
+          e('div', { className: 'muted', style: { marginTop: 10 } },
+            'Sample and labels are a file in ', e('code', { style: { display: 'inline' } }, data.eval_dir),
+            ' on this machine — never the DB, which a replica sync replaces wholesale.'));
+      } else {
+        var progress = data.progress || { done: 0, total: 0 };
+        body = e('div', null,
+          e('div', { className: 'tabs' },
+            GROUPS.map(function (g) {
+              var gItems = (data.groups && data.groups[g]) || [];
+              var done = gItems.filter(function (x) { return x.label; }).length;
+              return e('button', {
+                key: g, type: 'button', className: 'tab' + (g === tab ? ' active' : ''),
+                onClick: function () { setTab(g); },
+              }, g, e('span', { className: 'count' }, done + '/' + gItems.length));
+            })),
+          e('div', { className: 'group-rule' }, e('b', null, tab + ': '), data.group_rules[tab]),
+          e('div', { className: 'rows' },
+            items.map(function (it, i) {
+              return e(Row, {
+                key: it.photo_id + ':' + it.term, item: it, current: i === cur,
+                onSelect: function () { setCur(i); },
+                onLabel: function (label) { setLabel(i, label); },
+                onOpenLoupe: function (x, y) { setCur(i); setLoupe({ photoId: it.photo_id, x: x, y: y }); },
+              });
+            })),
+          e('div', { className: 'keys' },
+            e('kbd', null, '↑'), '/', e('kbd', null, '↓'), ' or ',
+            e('kbd', null, 'j'), '/', e('kbd', null, 'k'), ' move · ',
+            e('kbd', null, '1'), ' correct · ', e('kbd', null, '2'), ' wrong · ',
+            e('kbd', null, '3'), ' debatable · pressing the selected state again clears it'),
+          e('div', { className: 'muted', style: { marginTop: 6 } },
+            'Overall: ' + progress.done + ' / ' + progress.total + ' drops labelled across all groups.'));
+      }
+
+      return e('div', null,
+        e(PS.SharedHeader, { activePage: 'eval-category-grounding' }),
+        loupe
+          ? e(PS.Loupe, {
+              key: loupe.photoId, src: '/api/photos/' + loupe.photoId + '/full',
+              focus: { x: loupe.x, y: loupe.y }, onClose: function () { setLoupe(null); },
+            })
+          : null,
+        e('div', { className: 'container' },
+          e('h1', null, 'Category-grounding eval — holdout labelling'),
+          e('div', { className: 'page-sub' },
+            'For each row, the category-content pass dropped the TERM below because the description '
+            + 'contradicted it (the highlighted evidence). Judge whether dropping it was CORRECT '
+            + '(the description really does contradict the term), WRONG (the term was right and '
+            + 'should have stayed), or DEBATABLE. A group ships at the 90% precision bar once at '
+            + 'least 20 drops are judged correct/wrong (debatable is excluded from the bar). '
+            + 'See docs/plans/category-grounding.md.'),
+          data && data.seed != null
+            ? e('div', { className: 'muted', style: { marginBottom: 10 } },
+                'Holdout sample, seed ' + data.seed + '. ' + (data.note || ''))
+            : null,
+          score
+            ? e('div', { className: 'score-row' },
+                e(ScoreCard, { label: 'Overall', score: score.overall }),
+                GROUPS.map(function (g) {
+                  return e(ScoreCard, { key: g, label: g, score: score.per_group[g] });
+                }))
+            : null,
+          error ? e('div', { className: 'error' }, error) : null,
+          body));
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(Page, null));
+  </script>
+</body>
+</html>

@@ -1,0 +1,714 @@
+{
+ "_note": "HOLDOUT candidate (seed 11) for owner labelling: 25 random drops per group from current gemma rows, disjoint from the seed-7 tuning sample. Label each drop correct / wrong / debatable; a group ships only at >= 90% correct (docs/plans/category-grounding.md).",
+ "seed": 11,
+ "groups": {
+  "sport": [
+   {
+    "photo_id": 250464,
+    "term": "basketball",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] Two boys in soccer uniforms—one wearing blue with number 16 and the other in green—are actively playing on an outdoor artificial turf field near a goal net.",
+    "label": null
+   },
+   {
+    "photo_id": 251263,
+    "term": "basketball",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] On an outdoor artificial turf field, two boys in soccer uniforms are actively playing — one in navy with “WCSL” on his jersey is dribbling a soccer ball, while another in green runs nearby.",
+    "label": null
+   },
+   {
+    "photo_id": 250555,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] Five boys, approximately 8–12 years old, play soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 251263,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] On an outdoor artificial turf field, two boys in soccer uniforms are actively playing — one in navy with “WCSL” on his jersey is dribbling a soccer ball, while another in green runs nearby.",
+    "label": null
+   },
+   {
+    "photo_id": 250865,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A young boy in a navy blue soccer uniform with “MCS” on the front is mid-kick, striking a white and yellow soccer ball on an artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 129682,
+    "term": "basketball court",
+    "reason": "sport: baseball cued, basketball not",
+    "evidence": "[baseball] Five young boys, approximately 5–8 years old, are playing baseball on a grassy field outdoors.",
+    "label": null
+   },
+   {
+    "photo_id": 129682,
+    "term": "basketball",
+    "reason": "sport: baseball cued, basketball not",
+    "evidence": "[baseball] Five young boys, approximately 5–8 years old, are playing baseball on a grassy field outdoors.",
+    "label": null
+   },
+   {
+    "photo_id": 250999,
+    "term": "basketball",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] Two boys in youth soccer uniforms—one in navy blue, one in green with “NYSA” printed—are actively engaged in play on an artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 250605,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] Three young boys, approximately 8–12 years old, play soccer on a green artificial turf field: one in a green “NYS” jersey dribbles the ball while two others in navy blue uniforms run nearby.",
+    "label": null
+   },
+   {
+    "photo_id": 251039,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A young boy in a dark blue “MCSL” jersey and red-and-white socks kicks a soccer ball on an outdoor artificial turf field, while another player in matching gear runs nearby.",
+    "label": null
+   },
+   {
+    "photo_id": 248843,
+    "term": "basketball hoop",
+    "reason": "sport: soccer, baseball cued, basketball not",
+    "evidence": "[soccer] Four children are playing soccer on a grassy field outdoors, wearing athletic uniforms—two in neon green jerseys and two in dark blue—with one child actively kicking a red ball.",
+    "label": null
+   },
+   {
+    "photo_id": 250378,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] Four children, approximately 10–14 years old, are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 86740,
+    "term": "basketball hoop",
+    "reason": "sport: baseball cued, basketball not",
+    "evidence": "[baseball] A group of young boys, approximately 8–12 years old, play baseball on an outdoor field under a clear blue sky.",
+    "label": null
+   },
+   {
+    "photo_id": 49556,
+    "term": "baseball glove",
+    "reason": "sport: basketball, baseball all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 248843,
+    "term": "basketball court",
+    "reason": "sport: soccer, baseball cued, basketball not",
+    "evidence": "[soccer] Four children are playing soccer on a grassy field outdoors, wearing athletic uniforms—two in neon green jerseys and two in dark blue—with one child actively kicking a red ball.",
+    "label": null
+   },
+   {
+    "photo_id": 247949,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A group of young boys wearing matching navy blue soccer uniforms with yellow \"MCSL\" lettering pose for a team photo in front of a large soccer goal net.",
+    "label": null
+   },
+   {
+    "photo_id": 249858,
+    "term": "basketball",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] Two young boys in soccer uniforms—one in blue and one in orange with number 5—are actively playing on a green artificial turf field, with the boy in blue controlling a black-and-white soccer ball.",
+    "label": null
+   },
+   {
+    "photo_id": 251237,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A group of young boys, approximately 8–12 years old, play soccer on a green artificial turf field outdoors.",
+    "label": null
+   },
+   {
+    "photo_id": 20417,
+    "term": "youth soccer game",
+    "reason": "sport: baseball cued, soccer not",
+    "evidence": "[baseball] A group of young children in orange baseball uniforms and black caps are gathered on a grassy field, sitting or kneeling while two adults — one in an orange shirt and cap, the other in gray — kneel beside them, appearing to give instructions.",
+    "label": null
+   },
+   {
+    "photo_id": 86749,
+    "term": "basketball hoop",
+    "reason": "sport: baseball cued, basketball not",
+    "evidence": "[baseball] A group of young boys, approximately 8–12 years old, wearing navy blue jerseys with yellow numbers and white pants, are playing baseball on an outdoor field.",
+    "label": null
+   },
+   {
+    "photo_id": 247937,
+    "term": "basketball court",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A group of young boys wearing dark blue \"MCSL\" soccer jerseys pose for a team photo on a grassy field in front of a white net.",
+    "label": null
+   },
+   {
+    "photo_id": 249942,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A group of young boys, approximately 8–12 years old, wearing matching navy blue soccer uniforms with neon green accents and “MCS” lettering, are actively playing on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 115043,
+    "term": "youth soccer game",
+    "reason": "sport: baseball cued, soccer not",
+    "evidence": "[baseball] Three young boys in baseball uniforms are on a green turf field: one in red helmet and black jersey runs left, another in black “GIANTS” jersey and blue helmet walks forward, and a third in maroon shirt is partially visible near an adult in jeans and maroon shirt.",
+    "label": null
+   },
+   {
+    "photo_id": 247948,
+    "term": "basketball hoop",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A group of young boys wearing matching dark blue soccer uniforms with yellow lettering poses for a team photo on a grassy field.",
+    "label": null
+   },
+   {
+    "photo_id": 247948,
+    "term": "basketball court",
+    "reason": "sport: soccer cued, basketball not",
+    "evidence": "[soccer] A group of young boys wearing matching dark blue soccer uniforms with yellow lettering poses for a team photo on a grassy field.",
+    "label": null
+   }
+  ],
+  "setting": [
+   {
+    "photo_id": 179661,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoors] A physical photograph resting on a wooden surface depicts four adults standing outdoors in front of a building with blue trim and trees under bright daylight.",
+    "label": null
+   },
+   {
+    "photo_id": 202993,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] It is an outdoor commercial setting under bright daylight with the sun creating glare near the top right.",
+    "label": null
+   },
+   {
+    "photo_id": 203011,
+    "term": "restaurant",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoors] The setting is outdoors on a sunny day, featuring a modern structure with large glass windows and a prominent sign displaying the brand name in red lettering.",
+    "label": null
+   },
+   {
+    "photo_id": 250371,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Four children, approximately 8–12 years old, are on an outdoor artificial turf field wearing soccer uniforms—three in dark blue jerseys (one with “NYSA” visible) and one in green.",
+    "label": null
+   },
+   {
+    "photo_id": 179661,
+    "term": "floor indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoors] A physical photograph resting on a wooden surface depicts four adults standing outdoors in front of a building with blue trim and trees under bright daylight.",
+    "label": null
+   },
+   {
+    "photo_id": 249448,
+    "term": "indoor soccer",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Three young boys are actively playing soccer on an outdoor artificial turf field, with one in a blue jersey dribbling the ball while another in orange attempts to defend and a third in blue runs nearby.",
+    "label": null
+   },
+   {
+    "photo_id": 19686,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoors] The scene appears to be outdoors during a festive event, possibly winter-themed, given the clothing and falling confetti resembling snow.",
+    "label": null
+   },
+   {
+    "photo_id": 197493,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] This is an outdoor night scene of a residential home entrance, featuring a concrete walkway leading to a dark wooden door framed by a stone arch and flanked by potted plants and wall-mounted lighting.",
+    "label": null
+   },
+   {
+    "photo_id": 250370,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Four children, approximately 6–10 years old, are actively playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 203000,
+    "term": "indoor",
+    "reason": "setting: indoor, outdoor all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 249782,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Two children, approximately 8–12 years old, are on an outdoor artificial turf soccer field: one wears a navy blue jersey with “NCSL” and matching shorts, the other an orange jersey with number 7 and gray shorts.",
+    "label": null
+   },
+   {
+    "photo_id": 203010,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoors] There are no people present in the scene, and the setting is outdoors under clear skies near what appears to be a parking area or roadside location.",
+    "label": null
+   },
+   {
+    "photo_id": 250528,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Five young male soccer players are actively engaged in a game on an outdoor artificial turf field, with one player in green (number 10) positioned near the goal and another leaping to head the ball.",
+    "label": null
+   },
+   {
+    "photo_id": 129127,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoors] The setting is outdoors, surrounded by moss-covered trees and undergrowth, with fallen leaves scattered on the bridge deck.",
+    "label": null
+   },
+   {
+    "photo_id": 249627,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Four individuals are visible on an outdoor artificial turf field: a young boy in a blue soccer uniform dribbling a ball, an adult man in a blue shirt and cap holding a clipboard, another boy standing nearby in matching gear, and a seated player under a “Miller Creek” canopy.",
+    "label": null
+   },
+   {
+    "photo_id": 34846,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] The setting is an outdoor public space adjacent to a large building with reflective glass panels.",
+    "label": null
+   },
+   {
+    "photo_id": 250630,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Four young boys, approximately 8–12 years old, are actively playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 55103,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Three people are visible at an outdoor nighttime gathering under string lights.",
+    "label": null
+   },
+   {
+    "photo_id": 249387,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Six children, approximately 6–10 years old, play soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 250582,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] Six young boys, approximately 8–12 years old, are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 131456,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[daylight] The setting appears to be inside a vehicle, indicated by the car seat design and blurred background showing daylight outside.",
+    "label": null
+   },
+   {
+    "photo_id": 15901,
+    "term": "outdoor",
+    "reason": "setting: indoor cued, outdoor not",
+    "evidence": "[indoor] A group of children and adults are gathered in an indoor gymnasium during a youth soccer activity.",
+    "label": null
+   },
+   {
+    "photo_id": 249943,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[turf] A group of young boys in matching dark blue soccer uniforms with yellow-green accents are actively running and jogging across a green artificial turf field marked with white lines.",
+    "label": null
+   },
+   {
+    "photo_id": 250692,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[turf] Two young boys, approximately 10–12 years old, compete for a soccer ball on an artificial turf field — one in navy blue with “MCSL” and the other in green with “NYSA.” A referee in yellow and black watches from behind, while additional players and spectators are visible near blue event tents under large trees.",
+    "label": null
+   },
+   {
+    "photo_id": 62300,
+    "term": "indoor",
+    "reason": "setting: outdoor cued, indoor not",
+    "evidence": "[outdoor] This photo captures an outdoor street scene in a European-style town, viewed from inside a vehicle.",
+    "label": null
+   }
+  ],
+  "light": [
+   {
+    "photo_id": 249909,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Four young boys, approximately 8–12 years old, are on an outdoor artificial turf soccer field near a goal net.",
+    "label": null
+   },
+   {
+    "photo_id": 251267,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Seven children and one adult referee are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 249648,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Three young boys, approximately 8–12 years old, are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 250560,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Two young boys, approximately 6–10 years old, play soccer on an outdoor artificial turf field marked with white and yellow lines.",
+    "label": null
+   },
+   {
+    "photo_id": 249828,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Four children, approximately 8–12 years old, play soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 66586,
+    "term": "natural light",
+    "reason": "light: artificial, natural all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 82087,
+    "term": "artificial lighting",
+    "reason": "light: artificial, natural all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 250710,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Four young male soccer players and one referee in a yellow shirt are on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 251284,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Six children, approximately 8–12 years old, play soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 249252,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Four young boys are playing soccer on an outdoor artificial turf field marked with white lines.",
+    "label": null
+   },
+   {
+    "photo_id": 250212,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Two young female soccer players are on an outdoor artificial turf field: one in a blue jersey with number 19 is running toward a soccer ball, while the other, wearing gloves and dark pants, stands ready as goalkeeper near the net.",
+    "label": null
+   },
+   {
+    "photo_id": 249835,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Four children and one adult are on an outdoor artificial turf soccer field during a game.",
+    "label": null
+   },
+   {
+    "photo_id": 250140,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] A group of young boys, approximately 10–14 years old, play soccer on an outdoor artificial turf field under bright daylight.",
+    "label": null
+   },
+   {
+    "photo_id": 114967,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[daylight] Spectators sit in folding chairs behind a chain-link fence, watching the scene under bright daylight.",
+    "label": null
+   },
+   {
+    "photo_id": 125490,
+    "term": "natural light",
+    "reason": "light: artificial, natural all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 251071,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Six young male soccer players, approximately 10–14 years old, are on an outdoor artificial turf field under a clear blue sky.",
+    "label": null
+   },
+   {
+    "photo_id": 95104,
+    "term": "natural light",
+    "reason": "light: artificial cued, natural not",
+    "evidence": "[lights] He stands indoors near a decorated Christmas tree with ornaments and lights visible to his left.",
+    "label": null
+   },
+   {
+    "photo_id": 249592,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] A group of young children, approximately 8–12 years old, play soccer on an outdoor artificial turf field under bright sunlight.",
+    "label": null
+   },
+   {
+    "photo_id": 249584,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Two boys, approximately 8–12 years old, are on an outdoor artificial turf field bordered by a black chain-link fence and trees.",
+    "label": null
+   },
+   {
+    "photo_id": 202981,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[sunny] This photo captures a sunny outdoor scene of a modern commercial building, likely a retail store or fast-food restaurant, viewed from inside a vehicle.",
+    "label": null
+   },
+   {
+    "photo_id": 250447,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Five young boys, approximately 8–12 years old, are playing soccer on an outdoor artificial turf field under a clear blue sky.",
+    "label": null
+   },
+   {
+    "photo_id": 250116,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Two children, approximately 8–12 years old, play soccer on an outdoor artificial turf field under a clear blue sky.",
+    "label": null
+   },
+   {
+    "photo_id": 251132,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Four young boys, approximately 8–12 years old, are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 250199,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Two young boys, approximately 8–12 years old, are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   },
+   {
+    "photo_id": 250315,
+    "term": "artificial lighting",
+    "reason": "light: natural cued, artificial not",
+    "evidence": "[outdoor] Five young boys, approximately 8–12 years old, are playing soccer on an outdoor artificial turf field.",
+    "label": null
+   }
+  ],
+  "weather": [
+   {
+    "photo_id": 146704,
+    "term": "clear sky",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[overcast] A wide, sandy beach curves along a calm sea under an overcast sky, viewed from an elevated balcony railing in the foreground.",
+    "label": null
+   },
+   {
+    "photo_id": 82806,
+    "term": "clear day",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[cloudy] The setting is outdoors at a cultural site surrounded by green trees and hills under a cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 181948,
+    "term": "clear sky",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[overcast] The sky is overcast and dim, suggesting dusk or dawn lighting conditions.",
+    "label": null
+   },
+   {
+    "photo_id": 202904,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[scattered clouds] Trees line the perimeter of the lot under a bright sky with scattered clouds.",
+    "label": null
+   },
+   {
+    "photo_id": 159544,
+    "term": "clear sky",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[overcast] Behind them is a stone railing overlooking a coastal cityscape with beaches, buildings, and distant hills under an overcast sky.",
+    "label": null
+   },
+   {
+    "photo_id": 203198,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] The road stretches forward under a partly cloudy sky, flanked by green trees and grassy embankments on both sides.",
+    "label": null
+   },
+   {
+    "photo_id": 142169,
+    "term": "clear sky",
+    "reason": "weather: sunny, overcast all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 48635,
+    "term": "clear sky",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[overcast] A wide sandy beach stretches along a calm bay under an overcast sky, with small boats anchored in the water and gentle waves lapping the shore.",
+    "label": null
+   },
+   {
+    "photo_id": 203424,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] This photo, taken from inside a vehicle, captures an outdoor suburban street scene under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 197539,
+    "term": "fog",
+    "reason": "weather: sunny cued, overcast not",
+    "evidence": "[bright daylight] The scene is outdoors under bright daylight, with no other people or objects clearly visible besides the natural coastal features and the lone path left behind.",
+    "label": null
+   },
+   {
+    "photo_id": 34905,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] Two adults, approximately 30s–40s, sit side by side in a small white boat on open water under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 93210,
+    "term": "clear sky",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[overcast] The background includes hills, trees, and distant buildings under an overcast sky.",
+    "label": null
+   },
+   {
+    "photo_id": 202679,
+    "term": "clear day",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] A white road sign with black text stands on the grassy median to the right, under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 202881,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] The setting is an outdoor commercial area with a single-story building (possibly a restaurant or retail store) under a bright, partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 202917,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] The sky is partly cloudy, and a streetlamp stands near the entrance; no people are visible in the scene.",
+    "label": null
+   },
+   {
+    "photo_id": 48907,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] This photo depicts an outdoor coastal scene featuring a concrete pier extending into calm water under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 36681,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] Behind him is a large ornate fountain with water jets and sculptural figures, set outdoors under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 17369,
+    "term": "clear day",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] This is a daytime outdoor photo taken from inside a vehicle, showing a two-lane asphalt road stretching ahead under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 40734,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] This is an outdoor landscape photo showing a grassy hillside in the foreground, rolling green hills in the midground, and a body of water visible on the left side under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 85496,
+    "term": "clear sky",
+    "reason": "weather: overcast cued, sunny not",
+    "evidence": "[overcast] The setting is an outdoor park with trees, hills, and a small building in the background under an overcast sky.",
+    "label": null
+   },
+   {
+    "photo_id": 202901,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] The view is from within a car, showing an outdoor parking lot in front of a low commercial building with signage under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 36702,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] They stand in front of the Notre-Dame Cathedral in Paris, with its twin towers visible behind them under a partly cloudy sky.",
+    "label": null
+   },
+   {
+    "photo_id": 205308,
+    "term": "clear sky",
+    "reason": "weather: sunny, overcast all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 205629,
+    "term": "clear sky",
+    "reason": "weather: sunny, overcast all emitted, none cued",
+    "evidence": "no cue",
+    "label": null
+   },
+   {
+    "photo_id": 202912,
+    "term": "clear sky",
+    "reason": "weather: overcast weakly cued (partly cloudy), sunny not",
+    "evidence": "[partly cloudy] The scene is set outdoors under a partly cloudy sky, with no people present in the frame.",
+    "label": null
+   }
+  ]
+ }
+}

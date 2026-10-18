@@ -2224,6 +2224,7 @@ def cleanup_orphans(db, dry_run):
     """
     import shutil
     from photosearch.video_api import frames_root
+    from photosearch.video_proxy import proxies_root, stale_proxy_files
     from photosearch.video_scan_store import stale_frame_dirs
 
     with PhotoDB(db) as photo_db:
@@ -2232,21 +2233,34 @@ def cleanup_orphans(db, dry_run):
         # neither the current scan nor the current probe uses (a SCAN_VERSION
         # bump leaves the old keyframes/crops behind).
         stale = stale_frame_dirs(photo_db.conn, frames_root(photo_db.db_path))
+        # video_proxies/{pid}.v{N}.mp4 of deleted videos, of versions the
+        # row no longer names (a PROXY_VERSION bump, a clear-pass), and
+        # crashed-upload temp files.
+        stale_px = stale_proxy_files(photo_db.conn, proxies_root(photo_db.db_path))
         click.echo(f"  clip_embeddings orphans: {result['clip_orphans']}")
         click.echo(f"  face_encodings  orphans: {result['face_orphans']}")
         click.echo(f"  stale video_frames dirs: {len(stale)}")
         for d in stale[:10]:
             click.echo(f"    {d}")
+        click.echo(f"  stale video proxies:     {len(stale_px)}")
+        for f in stale_px[:10]:
+            click.echo(f"    {f}")
         if dry_run:
             click.echo("\nDry run — no changes written. Re-run without --dry-run to delete.")
             return
         for d in stale:
             shutil.rmtree(d, ignore_errors=True)
-        if result["clip_deleted"] or result["face_deleted"] or stale:
+        for f in stale_px:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        if result["clip_deleted"] or result["face_deleted"] or stale or stale_px:
             click.echo(
                 f"\nDeleted {result['clip_deleted']} clip_embeddings "
                 f"and {result['face_deleted']} face_encodings rows, "
-                f"and {len(stale)} stale video_frames dirs."
+                f"{len(stale)} stale video_frames dirs "
+                f"and {len(stale_px)} stale video proxies."
             )
         else:
             click.echo("\nNo orphans found — nothing to delete.")
@@ -5296,7 +5310,9 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--passes", "-p", default="clip", show_default=True,
               help="Comma-separated pass types: clip, faces, quality, aesthetics, describe, "
                    "verify, category-content, keywords, category-visual, video-probe, "
-                   "video-scan, video-subjects, video-describe (video-probe needs ffprobe: PATH, "
+                   "video-proxy, video-scan, video-subjects, video-describe (video-proxy "
+                   "needs ffmpeg + ffprobe: PATH, ~/.local/bin or PHOTOSEARCH_FFMPEG; "
+                   "video-probe needs ffprobe: PATH, "
                    "~/.local/bin or PHOTOSEARCH_FFPROBE; video-scan needs cv2 + "
                    "InsightFace + CLIP, and ffprobe only for ZIP-wrapped files; "
                    "video-subjects needs a vision LLM, role `subject`; video-describe "
@@ -5443,6 +5459,8 @@ def worker(server, passes, collection_id, directory,
         "category-content", "category-visual", "keywords", "aesthetics",
         # docs/plans/video-support.md step 2b: needs ffprobe on this machine
         "video-probe",
+        # D12 fallback: H.264 playable copies, needs ffmpeg + ffprobe here
+        "video-proxy",
         # step 3: one rate-capped download per video, cv2 + InsightFace + CLIP
         "video-scan",
         # step 3b: VLM grounding of each segment keyframe (role `subject`)
@@ -5837,6 +5855,271 @@ def derive_visual_tags(db, apply_):
         click.echo(f"Updated {written:,} photos"
                    + (f" ({skipped:,} changed underneath us, left alone)"
                       if skipped else "") + ".")
+    finally:
+        if pdb is not None:
+            pdb.close()
+        else:
+            conn.close()
+
+
+_GROUND_CATEGORIES_CHUNK = 2000
+
+#: --model -> how generations.model_used is matched (SQLite LIKE is
+#: case-insensitive). The rows ARE told apart by the latest category-content
+#: generation's model, never by date.
+_GROUND_MODEL_MATCH = {"gemma": "gemma", "llama": "llama"}
+
+
+def _ground_model_in_scope(choice: str, model_used) -> bool:
+    if choice == "all":
+        return True
+    return bool(model_used) and _GROUND_MODEL_MATCH[choice] in model_used.lower()
+
+
+@cli.command("ground-categories")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", "apply_", is_flag=True,
+              help="Write the grounded lists. Default is a dry run.")
+@click.option("--model", "model_choice", type=click.Choice(["gemma", "llama", "all"]),
+              default="gemma", show_default=True,
+              help="Only rows whose latest category-content generation came from "
+                   "this model family (matched on generations.model_used).")
+@click.option("--folder", default=None,
+              help="Limit to one folder and its subfolders (e.g. 2026/2026-10-17_ILCE-7RM6).")
+@click.option("--requeue-recitations", is_flag=True,
+              help="With --apply: NULL `categories` on rows judged a vocabulary "
+                   "recitation and delete their category-content ledger row, so "
+                   "the fleet re-extracts them.")
+def ground_categories(db, apply_, model_choice, folder, requeue_recitations):
+    """Drop the categories each photo's description contradicts (backfill).
+
+    Applies the same rule the worker and the server apply to new answers —
+    photosearch/category_grounding.py, docs/plans/category-grounding.md —
+    to `photos.categories` already stored: `basketball` on a soccer
+    description, `artificial lighting` on "outdoors under trees". It only
+    ever REMOVES terms.
+
+    \b
+    Rows it never writes, and reports instead:
+      - NULL categories (not yet extracted; that drives the worker queue);
+      - no category-content generation at all (pre-logging rows);
+      - stored list not a subset of its latest generation (hand-edited via
+        set_photo_tags / bulk-set-tags — a human's choice wins);
+      - a vocabulary recitation (only --requeue-recitations touches these);
+      - a non-empty list grounding would EMPTY ('[]' is never written over a
+        non-empty list).
+
+    DRY RUN by default, opened READ-ONLY (`mode=ro`); a missing database is
+    an error, never a stub. `--apply` writes in 2,000-row chunks with a commit
+    between, each UPDATE guarded on the value it was computed from, so a
+    concurrent worker write wins and is counted as a lost race. Nothing is
+    logged to `generations`. Run the apply on the NAS — it is the sole writer.
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+    from collections import Counter, defaultdict
+
+    from photosearch import category_grounding as cg
+
+    if requeue_recitations and not apply_:
+        click.echo("--requeue-recitations has no effect without --apply "
+                   "(the dry run below reports what it would requeue).")
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+
+    scope_sql, params = "", []
+    if folder:
+        f = folder.strip("/")
+        # "in f or any subfolder" on the indexed folder column (see
+        # get_directory_photo_ids); '0' is the character after '/'.
+        scope_sql = " AND (p.folder = ? OR (p.folder >= ? AND p.folder < ?))"
+        params = [f, f + "/", f + "0"]
+    select = (
+        "SELECT p.id, p.description, p.categories, g.generated_text, g.model_used "
+        "FROM photos p "
+        "LEFT JOIN (SELECT photo_id, MAX(id) AS gid FROM generations "
+        "           WHERE text_type = 'category-content' GROUP BY photo_id) lg "
+        "       ON lg.photo_id = p.id "
+        "LEFT JOIN generations g ON g.id = lg.gid "
+        "WHERE p.categories IS NOT NULL" + scope_sql)
+
+    def _load(text):
+        try:
+            v = _json.loads(text) if text else None
+        except (ValueError, TypeError):
+            return None
+        return v if isinstance(v, list) and all(isinstance(t, str) for t in v) else None
+
+    if apply_:
+        pdb = PhotoDB(db)
+        conn = pdb.conn
+    else:
+        pdb = None
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        click.echo("Opened the database read-only (dry run).")
+
+    try:
+        stats = defaultdict(Counter)          # model -> counters
+        before, after = Counter(), Counter()  # over rows this run would write
+        reasons = Counter()                   # reason -> tags it drops (all rows)
+        pending = []                          # (id, old_json, new_json)
+        recitations = []                      # (id, old_json, model, n, unsupported)
+        emptied = []                          # (id, model, dropped terms)
+        hand_edited = []                      # (id, model)
+        scanned = no_generation = out_of_scope = unparseable = 0
+
+        # One read, then bounded writes — never a cursor held across a commit.
+        for pid, desc, raw, gen_raw, model in conn.execute(select, params).fetchall():
+            scanned += 1
+            if gen_raw is None:
+                no_generation += 1
+                continue
+            if not _ground_model_in_scope(model_choice, model):
+                out_of_scope += 1
+                continue
+            m = model or "(unknown model)"
+            st = stats[m]
+            st["rows"] += 1
+            stored, gen = _load(raw), _load(gen_raw)
+            if stored is None or gen is None:
+                unparseable += 1
+                st["unparseable"] += 1
+                continue
+            if not set(stored) <= set(gen):
+                st["hand_edited"] += 1
+                hand_edited.append((pid, m))
+                continue
+            st["eligible"] += 1
+            if not stored:
+                continue
+            if not desc or not desc.strip():
+                st["no_description"] += 1
+                continue
+            g = cg.ground(desc, stored)
+            if g.dropped:
+                st["rows_with_drops"] += 1
+                st["tags_dropped"] += len(g.dropped)
+                reasons.update(g.dropped.values())
+            if g.recitation:
+                s = cg.recitation_stats(desc, stored)
+                st["recitation"] += 1
+                recitations.append((pid, raw, m, len(stored), s["unsupported_obj"]))
+                continue
+            if not g.dropped:
+                continue
+            if not g.kept:
+                st["would_empty"] += 1
+                emptied.append((pid, m, list(g.dropped)))
+                continue
+            new_json = _json.dumps(g.kept)
+            if new_json == raw:
+                continue
+            st["to_write"] += 1
+            st["tags_written"] += len(g.dropped)
+            before.update(stored)
+            after.update(g.kept)
+            pending.append((pid, raw, new_json))
+
+        scope = f"folder {folder}" if folder else "library"
+        click.echo(f"Scanned {scanned:,} photos with categories ({scope}); "
+                   f"model filter: {model_choice}.")
+        click.echo(f"  skipped: {no_generation:,} with no category-content generation "
+                   f"(pre-logging), {out_of_scope:,} whose latest generation is "
+                   f"another model, {unparseable:,} unparseable.")
+
+        hdr = ["model", "rows", "eligible", "hand-edited", "with drops",
+               "tags dropped", "would write", "would empty", "recitation"]
+        click.echo("\nPer model:")
+        click.echo("  " + " | ".join(hdr))
+        tot = Counter()
+        for m, st in sorted(stats.items(), key=lambda kv: -kv[1]["rows"]):
+            vals = [st["rows"], st["eligible"], st["hand_edited"], st["rows_with_drops"],
+                    st["tags_dropped"], st["to_write"], st["would_empty"], st["recitation"]]
+            tot.update(st)
+            click.echo("  " + " | ".join([m] + [f"{v:,}" for v in vals]))
+        if len(stats) > 1:
+            vals = [tot["rows"], tot["eligible"], tot["hand_edited"], tot["rows_with_drops"],
+                    tot["tags_dropped"], tot["to_write"], tot["would_empty"], tot["recitation"]]
+            click.echo("  " + " | ".join(["TOTAL"] + [f"{v:,}" for v in vals]))
+        click.echo("  (\"with drops\" / \"tags dropped\" count every eligible row, "
+                   "including recitation and would-empty rows, which are NOT written.)")
+
+        if reasons:
+            click.echo("\nPer reason (tags dropped, all eligible rows):")
+            for why, n in reasons.most_common():
+                click.echo(f"  {n:>8,}  {why}")
+
+        changed_terms = sorted((t for t in set(before) | set(after) if before[t] != after[t]),
+                               key=lambda t: after[t] - before[t])
+        if changed_terms:
+            click.echo(f"\n{'term (rows written)':32s} {'before':>8s} {'after':>8s} {'delta':>8s}")
+            for t in changed_terms:
+                click.echo(f"{t:32s} {before[t]:8,d} {after[t]:8,d} {after[t] - before[t]:+8,d}")
+
+        if hand_edited:
+            click.echo(f"\nHand-edited (stored list not a subset of its latest generation) — "
+                       f"left alone: {len(hand_edited):,}; e.g. "
+                       + ", ".join(str(p) for p, _ in hand_edited[:10]))
+        if emptied:
+            click.echo(f"\nWould EMPTY a non-empty list — never written as '[]', left alone: "
+                       f"{len(emptied):,}")
+            for pid, m, dropped in emptied[:20]:
+                click.echo(f"  {pid} ({m}): {', '.join(dropped)}")
+        if recitations:
+            click.echo(f"\nVocabulary recitations — left alone"
+                       f"{'' if requeue_recitations else ' (requeue with --requeue-recitations)'}: "
+                       f"{len(recitations):,}")
+            for pid, _raw, m, n, unsup in recitations[:20]:
+                click.echo(f"  {pid} ({m}): {n} categories, {unsup} unsupported")
+
+        total = len(pending)
+        click.echo(f"\n{total:,} photo rows would change.")
+        if not apply_:
+            click.echo("Dry run — no rows written. Re-run with --apply.")
+            return
+
+        written = raced = 0
+        for start in range(0, total, _GROUND_CATEGORIES_CHUNK):
+            chunk = pending[start:start + _GROUND_CATEGORIES_CHUNK]
+            for photo_id, old_json, new_json in chunk:
+                # Guarded on the value it was computed from: a worker that
+                # re-extracted this photo since the read must win.
+                cur = conn.execute(
+                    "UPDATE photos SET categories = ? WHERE id = ? AND categories IS ?",
+                    (new_json, photo_id, old_json))
+                if cur.rowcount:
+                    written += 1
+                else:
+                    raced += 1
+            conn.commit()
+            done = min(start + len(chunk), total)
+            click.echo(f"  ... committed {done:,}/{total:,} ({100 * done // total}%)")
+        click.echo(f"Updated {written:,} photos"
+                   + (f" ({raced:,} changed underneath us, left alone)" if raced else "")
+                   + ".")
+
+        if requeue_recitations and recitations:
+            requeued = rq_raced = 0
+            for start in range(0, len(recitations), _GROUND_CATEGORIES_CHUNK):
+                chunk = recitations[start:start + _GROUND_CATEGORIES_CHUNK]
+                for photo_id, old_json, *_ in chunk:
+                    cur = conn.execute(
+                        "UPDATE photos SET categories = NULL WHERE id = ? AND categories IS ?",
+                        (photo_id, old_json))
+                    if not cur.rowcount:
+                        rq_raced += 1
+                        continue
+                    # As stale_descriptions.requeue: the ledger row goes too,
+                    # so the photo is claimable with a fresh attempt count.
+                    conn.execute("DELETE FROM worker_processed WHERE "
+                                 "pass_type = 'category-content' AND photo_id = ?",
+                                 (photo_id,))
+                    requeued += 1
+                conn.commit()
+            click.echo(f"Requeued {requeued:,} recitation rows for category-content"
+                       + (f" ({rq_raced:,} changed underneath us, left alone)"
+                          if rq_raced else "") + ".")
     finally:
         if pdb is not None:
             pdb.close()

@@ -154,3 +154,45 @@ def test_verify_logs_the_regen_model_not_the_verifier():
     from photosearch import worker as W
     src = inspect.getsource(W.run_worker)
     assert 'role="describe"' in src
+
+
+# ---------------------------------------------------------------------------
+# Server-side category grounding keeps provenance intact
+# ---------------------------------------------------------------------------
+
+def test_a_server_grounded_category_list_keeps_its_models_provenance(
+        tmp_path, monkeypatch):
+    """The server drops contradicted terms (docs/plans/category-grounding.md)
+    but the artifact is still the worker model's: the generation row carries
+    the reported model + version, and its text is exactly what was stored."""
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from photosearch import web, worker_api
+    from photosearch.db import PhotoDB
+
+    db_path = str(tmp_path / "p.db")
+    monkeypatch.setenv("PHOTOSEARCH_DB", db_path)
+    monkeypatch.setattr(web, "_db_path", db_path, raising=False)
+    monkeypatch.setattr(worker_api, "_db_path", db_path, raising=False)
+    monkeypatch.setattr(worker_api, "_shutting_down", False, raising=False)
+    with PhotoDB(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO photos (id, filepath, filename, description) VALUES (1, 'a.jpg', "
+            "'a.jpg', 'Boys play soccer outdoors on a sunny field.')")
+        db.conn.commit()
+
+    r = TestClient(web.app).post("/api/worker/submit-results", json={
+        "batch_id": "no-such-claim", "pass_type": "category-content",
+        "category_content_results": [{
+            "photo_id": 1, "categories": ["soccer", "basketball court", "sunny day"],
+            "model": "google/gemma-4-12b-qat", "model_version": "lmstudio"}]})
+    assert r.status_code == 200, r.text
+    with PhotoDB(db_path) as db:
+        stored = db.conn.execute("SELECT categories FROM photos WHERE id=1").fetchone()[0]
+        gen = db.conn.execute(
+            "SELECT generated_text, model_used, model_version FROM generations "
+            "WHERE photo_id=1 AND text_type='category-content'").fetchall()
+    assert json.loads(stored) == ["soccer", "sunny day"]
+    assert [tuple(g) for g in gen] == [(stored, "google/gemma-4-12b-qat", "lmstudio")]

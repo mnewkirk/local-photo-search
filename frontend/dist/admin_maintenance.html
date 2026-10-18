@@ -801,7 +801,7 @@
 
     // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
     // worker processes it; it would render a perpetual-0 pill).
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'video-probe', 'video-scan', 'aesthetics', 'video-subjects', 'describe', 'video-describe', 'verify', 'category-content', 'keywords', 'category-visual'];
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'video-probe', 'video-proxy', 'video-scan', 'aesthetics', 'video-subjects', 'describe', 'video-describe', 'verify', 'category-content', 'keywords', 'category-visual'];
 
     function formatTtl(expiresAtStr) {
       if (!expiresAtStr) return { text: '—', cls: '' };
@@ -2040,7 +2040,7 @@
     // any hand-launched fleet.
     var FLEET_PASSES = ['clip', 'faces', 'quality', 'describe',
                         'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics',
-                        'video-probe', 'video-scan', 'video-subjects', 'video-describe'];
+                        'video-probe', 'video-proxy', 'video-scan', 'video-subjects', 'video-describe'];
 
     function FleetLauncher() {
       var _sel = useState({ describe: true, 'category-content': true, keywords: true });
@@ -2228,7 +2228,7 @@
     // stages 3-4 from the same authoritative queue the Workers panel polls.
     var ENRICH_PASSES = ['faces', 'quality', 'aesthetics', 'describe', 'verify',
                          'category-content', 'keywords', 'category-visual', 'video-probe',
-                         'video-scan', 'video-subjects', 'video-describe'];
+                         'video-proxy', 'video-scan', 'video-subjects', 'video-describe'];
 
     function fmt(n) { return (n || 0).toLocaleString(); }
 
@@ -2342,7 +2342,8 @@
           e('a', { className: 'h2-link', href: '/batches' }, 'Per-batch view →'),
           // Owner-only labelling tool for the category-visual eval; not in the nav.
           e('a', { className: 'h2-link', href: '/eval/visual-tags' }, 'Visual-tag eval →'),
-          e('a', { className: 'h2-link', href: '/eval/models' }, 'Model eval →')),
+          e('a', { className: 'h2-link', href: '/eval/models' }, 'Model eval →'),
+          e('a', { className: 'h2-link', href: '/eval/category-grounding' }, 'Category-grounding eval →')),
         e('div', { className: 'workers-wrap' },
           inc && inc.error && e('div', { style: { color: '#f87171', fontSize: 12, marginBottom: 8 } }, inc.error),
           e('div', { className: 'funnel-groups' },

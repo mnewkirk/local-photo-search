@@ -1,7 +1,11 @@
 # Category grounding: make `photos.categories` trustworthy
 
-**Status: PLANNED 2026-10-18** (plan-debate, two planners, two critique rounds;
-owner decisions below). Nothing built yet.
+**Status: BUILT 2026-10-18, NOT DEPLOYED.** Steps 1 to 6 are on main (rule
+module + tests, eval + holdout sample, worker guard, server repair,
+`ground-categories` CLI, labelling page `/eval/category-grounding`, docs).
+Step 7 (NAS redeploy, fleet restart, backfill) waits on the owner's holdout
+labels reaching >= 90% correct drops per group. Plan-debate, two planners, two
+critique rounds; owner decisions below.
 
 ## Problem
 
@@ -327,3 +331,6 @@ deleted with it; 27. `'[]'` is never written from a non-empty list.
 | Contradiction resolution | drop both members of a pair (visual-pass shape) | the description picks the side, incl. one-side-emitted | resolved by the planners: **description decides** | 2026-10-18 |
 | v1 scope | contradiction groups only | also required-cue families | resolved by the planners: **groups only; families later behind a 90% holdout gate** | 2026-10-18 |
 | Retry on a repairable answer | retry once at 0.4 on any contradiction, then repair | no retry when the description decided; retry only when both sides emitted and neither cued | resolved by the planners: **B's rule** | 2026-10-18 |
+| Recitation verdict objects | every `OBJECT_TERMS` entry incl. required-cue family terms (flagged 23 honest gemma rows) | concrete nouns only (1 gemma row, 141/141 llama recitations) | **concrete nouns only** (eval result adopted) | 2026-10-18 |
+| `basketball court` / `basketball hoop` on indoor soccer | contradicted by soccer like `basketball` | kept when the setting group's indoor side is cued (literal venue; 18 of 67 drops were gym soccer) | **kept when indoor is cued** | 2026-10-18 |
+| "partly cloudy" in the weather group | neutral | cues the cloudy side: contradicts `clear sky`, not `cloudy sky`; bare "cloud" stays neutral | **cues the cloudy side** | 2026-10-18 |

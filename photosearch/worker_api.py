@@ -224,6 +224,20 @@ class VideoProbeResult(BaseModel):
     probe_json: Optional[dict] = None
 
 
+class VideoProxyResult(BaseModel):
+    """One video's ``video-proxy`` result (photosearch/video_proxy.py). The
+    proxy FILE was already streamed to ``PUT /api/videos/{id}/proxy``, which
+    installed it and recorded ``video_meta.proxy_version``; this only closes
+    the claim. A proxy the server does not have on record is a failure (one
+    attempt), never a silent success."""
+    photo_id: int
+    proxy_version: int
+    bytes: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    seconds: Optional[float] = None
+
+
 class VideoScanIdentity(BaseModel):
     """One within-video person: becomes ONE `faces` row + one `video_tracks`
     row. `bbox` is (top, right, bottom, left) in the coordinates of its
@@ -349,6 +363,8 @@ class SubmitRequest(BaseModel):
     aesthetics_results: Optional[list[AestheticsResult]] = None
     # video-probe (schema v35). Optional, so older workers are unaffected.
     video_probe_results: Optional[list[VideoProbeResult]] = None
+    # video-proxy (schema v39). Optional, so older workers are unaffected.
+    video_proxy_results: Optional[list[VideoProxyResult]] = None
     # video-scan (schema v35/v36). Optional, so older workers are unaffected.
     video_scan_results: Optional[list[VideoScanResult]] = None
     # video-subjects (schema v37). Optional, so older workers are unaffected.
@@ -564,6 +580,14 @@ def claim_batch(req: ClaimRequest):
                 # joins the VLM boxes to — so it never needs a second call.
                 from .video_subjects_store import subjects_input
                 result_photos[-1]["subjects_input"] = subjects_input(db.conn, p["id"])
+            elif req.pass_type == "video-proxy":
+                # The stored probe, so the worker builds the transcode
+                # (rotation, HDR transfer, interlacing, audio) without a
+                # second ffprobe over the network.
+                vm = db.conn.execute(
+                    "SELECT codec, container, width, height, has_audio, duration_s, "
+                    "probe_json FROM video_meta WHERE photo_id = ?", (p["id"],)).fetchone()
+                result_photos[-1]["proxy_input"] = dict(vm) if vm else None
             elif req.pass_type == "video-describe":
                 # Step 5: the K keyframes of the current scan + the subjects
                 # timeline with person names resolved NOW (a /faces relabel
@@ -851,24 +875,111 @@ def _mark_processed(db, outcome: _SubmitOutcome, pass_type: str,
 
 
 def _record_worker_failures(db, outcome: _SubmitOutcome, pass_type: str,
-                            failures: list[FailedResult]):
+                            failures: list[FailedResult], origin: str = "worker"):
     """Spend one attempt per photo the WORKER could not process.
 
     This is a real per-photo outcome, not a server-side write failure, so it
     is never deferred — deferring would uncap the pass (see
     `_TRANSIENT_DB_MARKERS`). Runs BEFORE `begin_batch`, because `log_error`
     commits unconditionally.
+
+    `origin` prefixes the `index_errors` message. The server's own verdict on
+    an answer (category grounding) is the same kind of outcome — the ANSWER is
+    unusable — and goes through here as "server".
     """
     for f in failures:
-        logger.warning("Worker reported %s failure for photo %s: %s",
-                       pass_type, f.photo_id, f.error)
+        logger.warning("%s reported %s failure for photo %s: %s",
+                       origin.capitalize(), pass_type, f.photo_id, f.error)
         outcome.failed(f.photo_id)
         try:
             db.log_error(pass_type, str(f.photo_id),
-                         f"worker: {f.error or 'failed'}")
+                         f"{origin}: {f.error or 'failed'}")
         except Exception as log_exc:
             logger.warning("Could not log the worker-reported %s failure for "
                            "photo %s (%s)", pass_type, f.photo_id, log_exc)
+
+
+_GROUND_READ_CHUNK = 500
+
+
+def _ground_category_results(db, outcome: _SubmitOutcome,
+                             results: list[CategoryContentResult]) -> dict[int, list[str]]:
+    """Re-ground category-content answers against the CURRENT description.
+
+    The worker grounds its own answer (`describe.extract_categories_from_
+    description`), but the server repeats it with the one shared rule
+    (`category_grounding.ground`) because it holds state the worker cannot
+    guarantee: an older worker that predates grounding, a description
+    rewritten by verify / re-describe between claim and submit, an M28 re-run.
+    Same precedent as `_merge_visual_tags`. Idempotent, so a grounded answer
+    passes through unchanged.
+
+    Returns {photo_id: categories to write}. A photo whose answer is a
+    vocabulary recitation, or whose non-empty answer grounding would empty, is
+    absent from the map and recorded as a failure (one attempt, an
+    `index_errors` row, the column stays NULL) — the server never retries.
+
+    Runs BEFORE `begin_batch`: `db.log_error` commits unconditionally and
+    would otherwise flush a half-written batch.
+
+    A NULL description stores the list unchanged (nothing to judge against).
+    A transient lock on the read defers every result in the batch (no attempt
+    spent); any other read error degrades to storing the lists as submitted,
+    since a current worker has already grounded them.
+    """
+    from .category_grounding import ground, recitation_stats
+
+    ids = sorted({r.photo_id for r in results})
+    descriptions: dict[int, Optional[str]] = {}
+    try:
+        for i in range(0, len(ids), _GROUND_READ_CHUNK):
+            part = ids[i:i + _GROUND_READ_CHUNK]
+            ph = ",".join("?" * len(part))
+            for row in db.conn.execute(
+                    f"SELECT id, description FROM photos WHERE id IN ({ph})", part):
+                descriptions[row[0]] = row[1]
+    except sqlite3.Error as e:
+        if _is_transient_db_error(e):
+            logger.warning("Could not read descriptions to ground %d category-content "
+                           "result(s) — deferring them: %s", len(results), e)
+            for r in results:
+                outcome.defer(r.photo_id)
+            return {}
+        logger.error("Could not read descriptions to ground category-content — "
+                     "storing the submitted lists UNGROUNDED: %s", e)
+        return {r.photo_id: list(r.categories or []) for r in results}
+
+    keep: dict[int, list[str]] = {}
+    rejected: list[FailedResult] = []
+    for r in results:
+        cats = list(r.categories or [])
+        desc = descriptions.get(r.photo_id)
+        if not cats or not desc:
+            keep[r.photo_id] = cats
+            continue
+        g = ground(desc, cats)
+        if g.recitation:
+            st = recitation_stats(desc, cats)
+            rejected.append(FailedResult(
+                photo_id=r.photo_id,
+                error=(f"category-content: vocabulary recitation ({len(cats)} "
+                       f"categories, {st['unsupported_obj']} unsupported)")))
+        elif not g.kept:
+            rejected.append(FailedResult(
+                photo_id=r.photo_id,
+                error=(f"category-content: no grounded categories "
+                       f"(dropped {', '.join(g.dropped)})")))
+        else:
+            if g.dropped:
+                logger.info("Grounded category-content for photo %s: kept %d, "
+                            "dropped %d (%s)", r.photo_id, len(g.kept),
+                            len(g.dropped), "; ".join(
+                                f"{t}: {why}" for t, why in g.dropped.items()))
+            keep[r.photo_id] = g.kept
+    if rejected:
+        _record_worker_failures(db, outcome, "category-content", rejected,
+                                origin="server")
+    return keep
 
 
 @router.post("/submit-results")
@@ -1072,16 +1183,25 @@ def submit_results(req: SubmitRequest):
 
         elif req.pass_type == "category-content":
             category_content_results = req.category_content_results or []
+            # Before begin_batch: a rejected answer is logged via log_error,
+            # which commits. Photos absent from `grounded` were recorded as a
+            # failure or deferred there and are not written.
+            grounded = _ground_category_results(db, outcome, category_content_results)
             db.begin_batch(batch_size=100)
             for r in category_content_results:
+                if r.photo_id not in grounded:
+                    continue
+                cats = grounded[r.photo_id]
                 try:
                     # Always persist the column. A successful-but-empty result
                     # writes '[]' so the photo is marked done in ONE pass (column
                     # is NOT NULL). Only a timeout/error defers, and the worker
-                    # omits those from results. Provenance logged for non-empty only.
-                    cats_json = json.dumps(r.categories or [])
+                    # omits those from results. Provenance logged for non-empty
+                    # only, and it is the GROUNDED list, so the stored column
+                    # still equals its latest generation.
+                    cats_json = json.dumps(cats)
                     db.update_photo(r.photo_id, categories=cats_json)
-                    if r.categories:
+                    if cats:
                         db.log_generation(r.photo_id, "category-content", cats_json,
                                           r.model, r.model_version)
                     outcome.written += 1
@@ -1230,6 +1350,29 @@ def submit_results(req: SubmitRequest):
                         pass
                     _record_write_failure(db, outcome, "video-probe", r.photo_id, e)
             _mark_processed(db, outcome, "video-probe", skip=probed)
+
+        elif req.pass_type == "video-proxy":
+            # The upload (PUT /api/videos/{id}/proxy) already installed the
+            # file and recorded proxy_version — that column IS the marker, so
+            # a confirmed result writes no ledger row (as video-probe). A
+            # result the row does not confirm (the PUT never landed, or
+            # landed an older version) spends the attempt: the cap must
+            # bound a worker that keeps claiming and not uploading.
+            proxied: set[int] = set()
+            for r in req.video_proxy_results or []:
+                try:
+                    row = db.conn.execute(
+                        "SELECT proxy_version FROM video_meta WHERE photo_id = ?",
+                        (r.photo_id,)).fetchone()
+                    if row is None or row[0] is None or int(row[0]) < int(r.proxy_version):
+                        raise ValueError(f"no proxy v{r.proxy_version} on record for "
+                                         f"video {r.photo_id} (upload missing?)")
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                    proxied.add(r.photo_id)
+                except Exception as e:
+                    _record_write_failure(db, outcome, "video-proxy", r.photo_id, e)
+            _mark_processed(db, outcome, "video-proxy", skip=proxied)
 
         elif req.pass_type == "video-scan":
             # One transaction PER VIDEO (faces, encodings, tracks, CLIP,
@@ -1584,12 +1727,25 @@ def clear_pass(req: ClearPassRequest):
                 f"probe_json = NULL, kind = NULL, live_of_photo_id = NULL, "
                 f"duration_s = NULL, fps = NULL, codec = NULL, container = NULL, "
                 f"width = NULL, height = NULL, rotation = NULL, bitrate = NULL, "
-                f"has_audio = NULL, poster_t = NULL "
+                f"has_audio = NULL, poster_t = NULL, proxy_needed = NULL "
                 f"WHERE photo_id IN ({placeholders})", photo_ids
             )
             cleared = cur.rowcount
             db.conn.execute(
                 f"DELETE FROM worker_processed WHERE pass_type = 'video-probe' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
+        elif req.pass_type == "video-proxy":
+            # Re-queue the proxy. The file stays until the next upload
+            # replaces it (same version) or `cleanup-orphans` removes it (a
+            # file whose version the row no longer names is stale).
+            cur = db.conn.execute(
+                f"UPDATE video_meta SET proxy_version = NULL, proxy_bytes = NULL, "
+                f"proxy_w = NULL, proxy_h = NULL, proxy_at = NULL "
+                f"WHERE photo_id IN ({placeholders})", photo_ids)
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'video-proxy' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
         elif req.pass_type == "video-scan":
@@ -1682,7 +1838,7 @@ def photo_detail(photo_id: int):
 # / keywords, and no worker processes it anymore — its column was nulled at the
 # v23 migration, so count_unprocessed("tags") is pinned at the full library size
 # forever. Including it in queue_depth just showed a confusing dead counter.
-_ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-scan",
+_ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
                "aesthetics", "video-subjects", "describe", "video-describe",
                "verify", "category-content", "keywords", "category-visual")
 

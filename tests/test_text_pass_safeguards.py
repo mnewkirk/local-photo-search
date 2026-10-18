@@ -208,12 +208,129 @@ def _text(monkeypatch, answers):
     return temps
 
 
-def test_a_vocabulary_recitation_is_rejected(monkeypatch, vocab):
-    recital = ", ".join(vocab[:70])
+# --- category grounding (docs/plans/category-grounding.md) -----------------
+# These use the REAL vocabulary: the recitation verdict and the contradiction
+# groups are defined over real terms, so the fake `term000` vocabulary above
+# can no longer exercise them.
+
+SOCCER = "Two boys play soccer on a grassy field."
+
+
+@pytest.fixture
+def real_vocab(monkeypatch):
+    monkeypatch.setattr(d, "HAS_OLLAMA", True)
+    from photosearch import category_grounding as cg
+    from photosearch.vocab_content import CONTENT_VOCABULARY
+    grouped = {t for g in cg.GROUPS for side in g.sides for t in side.terms}
+    return cg, list(CONTENT_VOCABULARY), grouped
+
+
+def _llama_recital(cg, vocab, grouped, description, n=30):
+    """llama3.2:3b's shape: concrete nouns the text never mentions, in
+    vocabulary order (41317: "beehive-like stone structure" stored
+    `bleacher, bridge, chain link fence, cityscape, grassy field`)."""
+    terms = [t for t in vocab if t in cg.OBJECT_TERMS and t not in grouped
+             and not cg.is_supported(description, t)]
+    assert len(terms) >= n
+    return terms[:n]
+
+
+def test_a_vocabulary_recitation_is_rejected(monkeypatch, real_vocab):
+    cg, vocab, grouped = real_vocab
+    recital = ", ".join(_llama_recital(cg, vocab, grouped, SOCCER))
     temps = _text(monkeypatch, [recital, recital])
     with pytest.raises(d.UnusableAnswer, match="recitation"):
-        d.extract_categories_from_description("a dog at the beach")
+        d.extract_categories_from_description(SOCCER)
     assert temps == [0, 0.4]
+
+
+def test_a_70_tag_grounded_list_is_kept(monkeypatch, real_vocab):
+    """The old 60 cap retired 251357 for an honest, non-alphabetical 68-tag
+    gemma answer. Length alone is no longer a verdict."""
+    import random
+    cg, vocab, grouped = real_vocab
+    terms = [t for t in vocab if t not in grouped][:70]
+    random.Random(7).shuffle(terms)
+    assert cg.order_share(terms) < cg.RECITATION_MIN_ORDER
+    temps = _text(monkeypatch, [", ".join(terms)])
+    assert d.extract_categories_from_description(SOCCER) == terms
+    assert temps == [0]
+
+
+def test_a_description_decided_contradiction_is_repaired_without_a_retry(
+        monkeypatch, real_vocab):
+    """The description is the evidence; a resample adds nothing (251357's 0.4
+    retry was worse, 84 tags). A repairable answer costs ONE model call."""
+    temps = _text(monkeypatch, ["soccer, basketball, basketball hoop, grass, boy"])
+    report = {}
+    assert d.extract_categories_from_description(SOCCER, report=report) == \
+        ["soccer", "grass", "boy"]
+    assert temps == [0]
+    assert report["raw"] == 5
+    assert set(report["dropped"]) == {"basketball", "basketball hoop"}
+
+
+DOG = "A dog sits on a lawn."      # cues neither a sunny nor an overcast sky
+
+
+def test_both_sides_emitted_and_uncued_retries_once_then_drops_both(
+        monkeypatch, real_vocab):
+    temps = _text(monkeypatch, ["dog, clear sky, cloudy sky"] * 2)
+    assert d.extract_categories_from_description(DOG) == ["dog"]
+    assert temps == [0, 0.4]
+
+
+def test_an_undecided_answer_takes_a_clean_retry(monkeypatch, real_vocab):
+    temps = _text(monkeypatch, ["dog, clear sky, cloudy sky", "dog, clear sky"])
+    assert d.extract_categories_from_description(DOG) == ["dog", "clear sky"]
+    assert temps == [0, 0.4]
+
+
+def test_a_bad_retry_never_replaces_an_undecided_first_answer(monkeypatch, real_vocab):
+    """The soft retry can only improve the answer: a garbage or stalled retry
+    keeps the (repaired) first answer instead of failing or deferring it."""
+    _text(monkeypatch, ["dog, clear sky, cloudy sky", "I cannot help."])
+    assert d.extract_categories_from_description(DOG) == ["dog"]
+    _text(monkeypatch, ["dog, clear sky, cloudy sky", TimeoutError("stalled")])
+    assert d.extract_categories_from_description(DOG) == ["dog"]
+
+
+def test_an_answer_grounding_empties_twice_is_unusable(monkeypatch, real_vocab):
+    temps = _text(monkeypatch, ["basketball, basketball hoop"] * 2)
+    with pytest.raises(d.UnusableAnswer, match="no grounded categories"):
+        d.extract_categories_from_description(SOCCER)
+    assert temps == [0, 0.4]
+
+
+def test_more_than_120_categories_is_rejected(monkeypatch, real_vocab):
+    import random
+    cg, vocab, grouped = real_vocab
+    terms = [t for t in vocab if t not in grouped][:cg.MAX_PLAUSIBLE + 1]
+    random.Random(3).shuffle(terms)
+    _text(monkeypatch, [", ".join(terms)] * 2)
+    with pytest.raises(d.UnusableAnswer, match="runaway"):
+        d.extract_categories_from_description(SOCCER)
+    assert d._CATEGORY_MAX_PLAUSIBLE == cg.MAX_PLAUSIBLE == 120
+
+
+def test_the_undecided_marker_matches_the_rule_module():
+    """describe's soft retry keys on group_drops' reason text."""
+    from photosearch import category_grounding as cg
+    dropped = cg.ground(DOG, ["dog", "clear sky", "cloudy sky"]).dropped
+    assert dropped and all(d._CATEGORY_UNDECIDED in r for r in dropped.values())
+    decided = cg.ground(SOCCER, ["soccer", "basketball"]).dropped
+    assert decided and not any(d._CATEGORY_UNDECIDED in r for r in decided.values())
+
+
+def test_the_worker_logs_kept_and_dropped(monkeypatch, real_vocab, capsys):
+    from photosearch import worker as W
+    monkeypatch.setattr("photosearch.describe.check_available", lambda m: None)
+    _text(monkeypatch, ["soccer, basketball, grass"])
+    out = W._process_category_content([{"id": 7, "filename": "a.jpg",
+                                        "description": SOCCER}])
+    assert out == [{"photo_id": 7, "categories": ["soccer", "grass"]}]
+    line = capsys.readouterr().out
+    assert "kept 2, dropped 1 (sport: soccer cued, basketball not: basketball)" in line
 
 
 def test_a_long_but_plausible_category_list_is_kept(monkeypatch, vocab):

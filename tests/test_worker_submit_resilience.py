@@ -422,3 +422,96 @@ def test_a_failing_log_error_still_reaches_the_logger(client, monkeypatch, caplo
     assert "category-visual" in text
     assert "log" in text.lower(), "the failure to log the reason must itself be logged"
     assert _attempts("category-visual") == {}
+
+
+# ---------------------------------------------------------------------------
+# Server-side category grounding: an unusable answer is a FAILURE, recorded
+# before begin_batch (log_error commits), and the column stays NULL.
+# ---------------------------------------------------------------------------
+
+SOCCER = "Two boys play soccer on a grassy field."
+
+
+def _recital():
+    """A llama3.2:3b-style recitation: concrete nouns the text never mentions,
+    in vocabulary order."""
+    from photosearch import category_grounding as cg
+    from photosearch.vocab_content import CONTENT_VOCABULARY
+    grouped = {t for g in cg.GROUPS for s in g.sides for t in s.terms}
+    terms = [t for t in CONTENT_VOCABULARY if t in cg.OBJECT_TERMS
+             and t not in grouped and not cg.is_supported(SOCCER, t)][:30]
+    assert cg.is_recitation(SOCCER, terms)
+    return terms
+
+
+@pytest.mark.parametrize("categories,why", [
+    (None, "vocabulary recitation"),
+    (["basketball", "basketball hoop"], "no grounded categories"),
+])
+def test_an_unusable_category_answer_is_a_failure_before_begin_batch(
+        client, monkeypatch, categories, why):
+    from photosearch.db import PhotoDB
+    with _open() as db:
+        db.conn.execute("UPDATE photos SET description=? WHERE id=1", (SOCCER,))
+        db.conn.commit()
+
+    in_batch = []
+    real_log = PhotoDB.log_error
+
+    def spy(self, *a, **kw):
+        in_batch.append(getattr(self, "_batch_mode", False))
+        return real_log(self, *a, **kw)
+    monkeypatch.setattr(PhotoDB, "log_error", spy)
+
+    body = client.post("/api/worker/submit-results", json={
+        "batch_id": "no-such-claim", "pass_type": "category-content",
+        "category_content_results": [
+            {"photo_id": 1, "categories": categories or _recital()},
+            {"photo_id": 2, "categories": ["mountain"]},
+        ],
+    }).json()
+    assert in_batch == [False], "the failure must be logged before begin_batch"
+    assert _attempts("category-content") == {1: 1, 2: 1}
+    assert body["written"] == 1
+    with _open() as db:
+        rows = {r[0]: r[1] for r in db.conn.execute(
+            "SELECT id, categories FROM photos WHERE id IN (1, 2)")}
+        errors = [r[0] for r in db.conn.execute(
+            "SELECT message FROM index_errors WHERE pass_type='category-content'")]
+        gens = db.conn.execute(
+            "SELECT COUNT(*) FROM generations WHERE photo_id=1").fetchone()[0]
+    assert rows[1] is None, "the column stays NULL so the photo is re-claimed"
+    assert json.loads(rows[2]) == ["mountain"]
+    assert len(errors) == 1 and errors[0].startswith("server: ") and why in errors[0]
+    assert gens == 0
+
+
+def test_a_locked_description_read_defers_the_category_batch(client, monkeypatch):
+    """A transient lock on the grounding read must not spend attempts or write
+    ungrounded lists."""
+    from photosearch import worker_api
+
+    real = worker_api._ground_category_results
+
+    def locked(db, outcome, results):
+        class Boom:
+            def __getattr__(self, name):
+                return getattr(db, name)
+
+            @property
+            def conn(self):
+                class C:
+                    def execute(self, *a, **kw):
+                        raise sqlite3.OperationalError("database is locked")
+                return C()
+        return real(Boom(), outcome, results)
+    monkeypatch.setattr(worker_api, "_ground_category_results", locked)
+    body = client.post("/api/worker/submit-results", json={
+        "batch_id": "no-such-claim", "pass_type": "category-content",
+        "category_content_results": [{"photo_id": 1, "categories": ["dog"]}],
+    }).json()
+    assert body["deferred_photo_ids"] == [1]
+    assert _attempts("category-content") == {}
+    with _open() as db:
+        assert db.conn.execute("SELECT categories FROM photos WHERE id=1"
+                               ).fetchone()[0] is None

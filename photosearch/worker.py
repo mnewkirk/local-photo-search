@@ -651,6 +651,16 @@ def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2
     return results
 
 
+def _grounding_summary(kept: list, dropped: Optional[dict]) -> str:
+    """`kept N, dropped M (reason: terms; ...)` for one category-content answer."""
+    dropped = dropped or {}
+    by_reason: dict[str, list[str]] = {}
+    for term, reason in dropped.items():
+        by_reason.setdefault(reason, []).append(term)
+    why = "; ".join(f"{r}: {', '.join(t)}" for r, t in by_reason.items())
+    return f"kept {len(kept)}, dropped {len(dropped)}" + (f" ({why})" if why else "")
+
+
 def _process_category_content(
     photos: list[dict],
     model: str = "llama3.2:3b",
@@ -673,8 +683,10 @@ def _process_category_content(
         fname = photo["filename"]
         print(f"    [{idx}/{total}] {fname} ...", end="", flush=True)
         t0 = time.time()
+        report: dict = {}
         try:
-            cats = extract_categories_from_description(photo.get("description"), model=model)
+            cats = extract_categories_from_description(photo.get("description"),
+                                                       model=model, report=report)
         except UnusableAnswer as e:
             # The model answered, twice, with something unstorable. Unlike a
             # stall this is the PHOTO's attempt: spend it and log it, so a
@@ -691,7 +703,8 @@ def _process_category_content(
             # timeout/error → defer (omit from results so it isn't marked done)
             print(f" ({elapsed:.1f}s) deferring (timeout/error{': ' + err if err else ''})")
             continue
-        print(f" ({elapsed:.1f}s) {', '.join(cats) if cats else 'no categories'}")
+        print(f" ({elapsed:.1f}s) {_grounding_summary(cats, report.get('dropped'))}: "
+              f"{', '.join(cats) if cats else 'no categories'}")
         results.append({"photo_id": photo["id"], "categories": cats})
     return results
 
@@ -1015,6 +1028,8 @@ def install_log_timestamps() -> None:
 # is cheap per video (a 12-byte read, ffprobe, one frame), so 25 per claim
 # keeps the claim overhead down without holding many videos per worker.
 PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1,
+                     # one download + one transcode per video
+                     "video-proxy": 1,
                      # ~9 grounding calls per typical video at 2-3 s each
                      "video-subjects": 2,
                      # one K-image call per video (~10-30 s on a 9B VLM)
@@ -1024,7 +1039,8 @@ PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1,
 # rate-capped streamed download) instead of through _download_batch.
 # video-subjects reads only the scan's uploaded segment keyframes.
 # video-describe reads only the scan's K uploaded keyframes.
-SELF_READ_PASSES = {"video-probe", "video-scan", "video-subjects", "video-describe"}
+SELF_READ_PASSES = {"video-probe", "video-proxy", "video-scan", "video-subjects",
+                    "video-describe"}
 
 
 class TruncatedDownload(ConnectionError):
@@ -1165,6 +1181,117 @@ def _process_video_probe(client: "WorkerClient", photos: list[dict],
         except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
             print(f"    {label}: {type(e).__name__}: {e}")
             out.append(_failure_row(pid, e))
+    return out
+
+
+# The proxy upload's own 503 back-off: WorkerClient._request would RE-SEND a
+# consumed file body, so the PUT loops here and reopens the file each try.
+_PROXY_UPLOAD_RETRIES = 20
+
+
+def _upload_proxy(client: "WorkerClient", photo_id: int, path: str, version: int,
+                  width: Optional[int], height: Optional[int]) -> requests.Response:
+    """Stream one proxy file to ``PUT /api/videos/{id}/proxy`` (raw
+    ``video/mp4`` body, never base64). Backs off on 503 + Retry-After (the
+    server is restarting, or its DB was locked when recording the proxy)."""
+    url = f"{client.server_url}/api/videos/{photo_id}/proxy"
+    params = {"version": int(version)}
+    if width:
+        params["w"] = int(width)
+    if height:
+        params["h"] = int(height)
+    for _ in range(_PROXY_UPLOAD_RETRIES):
+        with open(path, "rb") as fh:
+            r = client.session.put(url, params=params, data=fh, timeout=600,
+                                   headers={"Content-Type": "video/mp4"})
+        if r.status_code != 503:
+            return r
+        try:
+            wait = max(1, int(r.headers.get("Retry-After", "30")))
+        except (TypeError, ValueError):
+            wait = 30
+        r.close()
+        print(f"    proxy upload: server busy (503) — backing off {wait}s")
+        time.sleep(wait)
+    raise ConnectionError(f"proxy upload still 503 after {_PROXY_UPLOAD_RETRIES} tries")
+
+
+def _process_video_proxy(client: "WorkerClient", photos: list[dict], workdir: str) -> list[dict]:
+    """video-proxy (photosearch/video_proxy.py, D12 fallback) for claimed
+    videos (one per claim). Per video: one rate-capped download of the
+    original (``/full?purpose=worker``) -> unwrap a ZIP-wrapped file -> ffmpeg
+    to H.264 High 8-bit yuv420p, long edge <= PROXY_LONG_EDGE, HDR tone-mapped
+    -> ffprobe check (h264, yuv420p, duration within 1 s) -> streamed
+    ``PUT /api/videos/{id}/proxy`` -> a result row.
+
+    Outcomes, following the worker conventions:
+      * transport trouble, a truncated download, an upload that keeps
+        getting 503 -> OMITTED (no attempt spent, re-claimed after the TTL);
+      * ffmpeg missing/failing on the COMPLETE file, an output that does not
+        verify, a bad ZIP, a 4xx from the NAS -> a failure row (one of
+        MAX_PROCESS_ATTEMPTS spent; three strikes retire the video, which
+        then reads `blocked` on /batches and keeps its Download link).
+    """
+    from . import video_probe as VP
+    from . import video_proxy as VPx
+
+    out: list[dict] = []
+    for photo in photos:
+        pid = photo["id"]
+        label = photo.get("filename") or str(pid)
+        meta = photo.get("proxy_input")
+        if not meta:
+            out.append(_failure_row(pid, "claim carried no proxy_input (no probe on record)"))
+            continue
+        vdir = tempfile.mkdtemp(prefix=f"vproxy-{pid}-", dir=workdir)
+        try:
+            t0 = time.time()
+            path = os.path.join(vdir, "video.bin")
+            dl = _download_hashed(client, pid, path)
+            if dl["status"] != 200:
+                print(f"    {label}: HTTP {dl['status']} downloading")
+                out.append(_failure_row(pid, f"HTTP {dl['status']} downloading the video"))
+                continue
+            t_dl = time.time() - t0
+            with open(path, "rb") as fh:
+                head = fh.read(4)
+            if VP.is_zip_magic(head):
+                # video-scan already unwrapped this one's probe; the file on
+                # the NAS is still the ZIP (video_scan_store sets
+                # proxy_needed = 1). Same safety rules as the scan.
+                from . import video_scan as VS
+                try:
+                    path = VS.unwrap_zip(path, vdir)
+                except VS.ZipRefused as e:
+                    out.append(_failure_row(pid, f"zip: {e}"))
+                    continue
+                meta = VPx.local_meta(path)
+            dst = os.path.join(vdir, "proxy.mp4")
+            res = VPx.transcode(path, dst, meta)
+            up = _upload_proxy(client, pid, dst, VPx.PROXY_VERSION,
+                               res["width"], res["height"])
+            if not up.ok:
+                print(f"    {label}: proxy upload HTTP {up.status_code}")
+                out.append(_failure_row(pid, f"proxy upload HTTP {up.status_code}: "
+                                             f"{up.text[:200]}"))
+                continue
+            print(f"    {label}: {dl['bytes'] / 1e6:.1f} MB in {t_dl:.1f}s -> "
+                  f"{res['width']}x{res['height']} {res['bytes'] / 1e6:.1f} MB "
+                  f"in {res['seconds']:.1f}s")
+            out.append({"photo_id": pid, "proxy_version": VPx.PROXY_VERSION,
+                        "bytes": res["bytes"], "width": res["width"],
+                        "height": res["height"], "seconds": res["seconds"]})
+        except (_TRANSIENT + (TruncatedDownload,)) as e:
+            print(f"    {label}: transport ({e}) — will be retried")
+            continue
+        except VPx.ProxyToolError as e:
+            print(f"    {label}: {e}")
+            out.append(_failure_row(pid, e))
+        except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
+            print(f"    {label}: {type(e).__name__}: {e}")
+            out.append(_failure_row(pid, f"{type(e).__name__}: {e}"))
+        finally:
+            shutil.rmtree(vdir, ignore_errors=True)
     return out
 
 
@@ -1583,6 +1710,17 @@ def run_worker(
             passes = [p for p in passes if p != "video-describe"]
             if not passes:
                 return
+    if "video-proxy" in passes:
+        from .video_probe import find_ffprobe
+        from .video_proxy import find_ffmpeg
+        if not (find_ffmpeg() and find_ffprobe()):
+            # A missing tool must not spend three attempts on every video.
+            print("Error: video-proxy needs ffmpeg + ffprobe (PATH, ~/.local/bin, or "
+                  "PHOTOSEARCH_FFMPEG / PHOTOSEARCH_FFPROBE) — dropping the pass.",
+                  file=sys.stderr)
+            passes = [p for p in passes if p != "video-proxy"]
+            if not passes:
+                return
     if "video-probe" in passes:
         from .video_probe import find_ffprobe
         if not find_ffprobe():
@@ -1796,6 +1934,9 @@ def run_worker(
                 elif pass_type == "video-probe":
                     results = _process_video_probe(client, photos)
                     kwargs = _submit_kwargs("video_probe_results", results)
+                elif pass_type == "video-proxy":
+                    results = _process_video_proxy(client, photos, batch_temp)
+                    kwargs = _submit_kwargs("video_proxy_results", results)
                 elif pass_type == "video-scan":
                     results = _process_video_scan(client, photos, batch_temp)
                     kwargs = _submit_kwargs("video_scan_results", results)
@@ -1860,7 +2001,7 @@ def run_worker(
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
                 elif pass_type in ("describe", "category-content", "category-visual", "keywords",
-                                   "aesthetics", "video-probe", "video-scan",
+                                   "aesthetics", "video-probe", "video-proxy", "video-scan",
                                    "video-subjects", "video-describe"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:

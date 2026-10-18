@@ -1379,13 +1379,17 @@ def _build_category_prompt(description: str, vocab: list[str]) -> str:
     )
 
 
-# Above this many categories an answer is a recitation of the vocabulary, not
-# a reading of the description. Set from the live library: gemma-4-12b (the
-# fleet's text model) lists 25.7 categories on average and 52 at most — long
-# but every tag supported by the text — while llama3.2:3b's recitations run
-# 53 to 232, alphabetical, with `bed, book, bottle` on a soccer photo. A cap
-# near the library median (5) would reject nearly every gemma answer.
-_CATEGORY_MAX_PLAUSIBLE = 60
+# Count BACKSTOP for one category-content answer, judged on the GROUNDED list
+# (docs/plans/category-grounding.md). It used to be the only guard, at 60, set
+# for llama3.2:3b's recitations (53 to 232 alphabetical terms) — but a count
+# cap is blind to a 20-52-term partial recitation and fired on gemma's honest
+# 68-tag answer for photo 251357, throwing away ~44 good tags. Recitation is
+# now judged by `category_grounding.is_recitation` (vocabulary order AND
+# unsupported concrete nouns); this cap only guards a runaway answer. gemma's
+# worst observed answer was 84 and the 256-token text budget makes > 100
+# nearly impossible on LM Studio, so it mainly guards the Ollama route.
+# Alias of `category_grounding.MAX_PLAUSIBLE`, which is the source of truth.
+from .category_grounding import MAX_PLAUSIBLE as _CATEGORY_MAX_PLAUSIBLE  # noqa: E402
 
 # Keywords: the prompt asks for 5-15 and no stored row has more than 24.
 _KEYWORDS_MAX_PLAUSIBLE = 30
@@ -1398,11 +1402,20 @@ _KEYWORD_MAX_WORDS = 5
 _DEFER = object()
 
 
-def _text_pass_answer(pass_name, model, prompt, parse, problem_of):
+def _text_pass_answer(pass_name, model, prompt, parse, problem_of,
+                      soft_problem_of=None):
     """Ask, judge the answer, retry once (temperature 0.4) if it is bad.
 
     Returns the parsed list, None to defer (transport stall/error), or raises
-    UnusableAnswer when both answers were bad — including a truncation."""
+    UnusableAnswer when both answers were bad — including a truncation.
+
+    `problem_of(raw, parsed)` judges the RAW parse; a problem makes the answer
+    unstorable. `soft_problem_of(parsed)` (optional) names a problem the caller
+    can repair but would rather resample once: a storable first answer that
+    has one gets ONE retry at 0.4, and the retry wins only when it is clean of
+    both kinds. Otherwise — the retry is bad, stalled, or has the same soft
+    problem — the first answer is returned, so a soft retry can never make the
+    result worse or turn a usable answer into a deferral."""
     def ask(temperature):
         try:
             raw = _text_chat_with_retry(
@@ -1426,7 +1439,13 @@ def _text_pass_answer(pass_name, model, prompt, parse, problem_of):
     if out is _DEFER:
         return None
     if problem is None:
-        return out
+        if soft_problem_of is None or not out or soft_problem_of(out) is None:
+            return out
+        out2, problem2 = ask(0.4)
+        if (out2 is _DEFER or out2 is None or problem2 is not None
+                or (out2 and soft_problem_of(out2) is not None)):
+            return out
+        return out2
     out2, problem2 = ask(0.4)
     if out2 is _DEFER:
         return None
@@ -1438,6 +1457,7 @@ def _text_pass_answer(pass_name, model, prompt, parse, problem_of):
 def extract_categories_from_description(
     description: Optional[str],
     model: str = CATEGORY_CONTENT_MODEL,
+    report: Optional[dict] = None,
 ) -> Optional[list[str]]:
     """Map a description → list of in-vocab categories via a text-only LLM.
 
@@ -1445,17 +1465,34 @@ def extract_categories_from_description(
     success, or None if the call timed out / errored so the caller can defer
     the photo for retry instead of recording an empty result.
 
+    The returned list is GROUNDED (`category_grounding.ground`): terms the
+    description contradicts — `basketball` on a soccer description,
+    `artificial lighting` on "outdoors under trees" — are dropped. Grounding
+    never adds a term. When the description decides the contradiction there
+    is NO retry: the description is the evidence, and a resample adds nothing
+    (the 0.4 retry on photo 251357 was worse, 84 tags). Only when two sides of
+    a group were emitted and the text cues neither is the answer resampled
+    once; if the retry still cannot be decided, both sides are dropped.
+
     Raises UnusableAnswer when the model answered but, twice, the answer could
-    not be stored: cut off at the token limit, empty, nothing from the
-    vocabulary, or a recitation of the vocabulary (> _CATEGORY_MAX_PLAUSIBLE).
-    An empty or off-vocabulary answer used to be stored as '[]' — done, for
-    good, with no categories.
+    not be stored, judged in this order: cut off at the token limit, empty or
+    nothing from the vocabulary, a runaway list (more than
+    `category_grounding.MAX_PLAUSIBLE` after grounding), a vocabulary
+    recitation (`category_grounding.is_recitation`), or an answer grounding
+    would empty ("no grounded categories"). An empty or off-vocabulary answer
+    used to be stored as '[]' — done, for good, with no categories.
+
+    `report`, when given, is filled with `raw` (terms before grounding) and
+    `dropped` ({term: reason}) for the worker's log line.
     """
+    if report is not None:
+        report.update(raw=0, dropped={})
     if not description or not description.strip():
         return []
     from .vocab_content import CONTENT_VOCABULARY
     if not HAS_OLLAMA:
         return []
+    from . import category_grounding as cg
     vocab_set = set(CONTENT_VOCABULARY)
 
     def parse(raw):
@@ -1471,13 +1508,41 @@ def extract_categories_from_description(
     def problem_of(raw, cats):
         if not cats:
             return "no in-vocabulary categories"
-        if len(cats) > _CATEGORY_MAX_PLAUSIBLE:
-            return f"vocabulary recitation ({len(cats)} categories)"
+        g = cg.ground(description, cats)
+        if len(g.kept) > cg.MAX_PLAUSIBLE:
+            return (f"runaway answer ({len(g.kept)} categories, "
+                    f"more than {cg.MAX_PLAUSIBLE})")
+        if g.recitation:
+            s = cg.recitation_stats(description, cats)
+            return (f"vocabulary recitation ({len(cats)} categories, "
+                    f"{s['unsupported_obj']} unsupported)")
+        if not g.kept:
+            return "no grounded categories"
         return None
 
-    return _text_pass_answer("category-content", model,
-                             _build_category_prompt(description, CONTENT_VOCABULARY),
-                             parse, problem_of)
+    def undecided(cats):
+        # Two or more sides of a group emitted and the text cues none: the
+        # one case where the description cannot pick, so resample once.
+        reasons = {r for r in cg.ground(description, cats).dropped.values()
+                   if _CATEGORY_UNDECIDED in r}
+        return "; ".join(sorted(reasons)) or None
+
+    out = _text_pass_answer("category-content", model,
+                            _build_category_prompt(description, CONTENT_VOCABULARY),
+                            parse, problem_of, soft_problem_of=undecided)
+    if not out:
+        return out
+    g = cg.ground(description, out)
+    if report is not None:
+        report.update(raw=len(out), dropped=dict(g.dropped))
+    return g.kept
+
+
+# `category_grounding.group_drops` words the reason for a group whose emitted
+# sides are ALL uncued as "<group>: <sides> all emitted, none cued".
+# tests/test_text_pass_safeguards.py pins the retry on it, so a rewording
+# there fails a test instead of silently dropping the retry.
+_CATEGORY_UNDECIDED = "none cued"
 
 
 def extract_keywords_from_description(

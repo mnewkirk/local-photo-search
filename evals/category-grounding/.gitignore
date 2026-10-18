@@ -1,0 +1,7 @@
+# Samples are regenerable and hold descriptions; only the summary and the
+# fixtures are committed.
+*
+!.gitignore
+!summary.md
+!fixtures.json
+!samples-holdout-seed11.json

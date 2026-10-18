@@ -1187,8 +1187,10 @@ unsplit lists, and llama3.2's category answers recited the vocabulary
   - describe: cut off, repetition loop, or ends mid-sentence
     (`ends_mid_sentence` = `stale_descriptions.is_truncated`). A degenerate
     answer is no longer returned as a last resort.
-  - category-content: empty, nothing in the vocabulary, or **more than 60**
-    categories.
+  - category-content: empty, nothing in the vocabulary, a **vocabulary
+    recitation** (`category_grounding.is_recitation`, below), more than
+    `category_grounding.MAX_PLAUSIBLE` (120) categories, or an answer that
+    grounding emptied.
   - keywords: refusal, a whole list as one keyword (> 5 words), more than 30
     keywords, or under `KEYWORD_MATCH_MIN` of them using the description's
     words.
@@ -1210,15 +1212,93 @@ unsplit lists, and llama3.2's category answers recited the vocabulary
 - The eval `Recorder` records a truncation as `unusable`: a model outcome to
   cache, not a `TransportError`.
 
-**The category cap is 60, not ~12, on purpose.** gemma-4-12b (the fleet text
-model) averages **25.7** categories and peaks at 52, and they are accurate,
-just exhaustive. A cap near the library median (5) would fail nearly every
-gemma answer. **Owner decision 2026-10-07: the long lists and some
-near-duplicates (grass / grassy field) are fine.** Leave the prompt and the
-vocabulary as they are.
+**There is no 60-category cap any more.** It was set just above gemma's
+then-maximum of 52 and just under llama3.2's recitation floor of 53, and
+gemma-4-12b (the fleet text model) averages **25.7** categories, accurate but
+exhaustive. **Owner decision 2026-10-07: the long lists and some
+near-duplicates (grass / grassy field) are fine.** On 2026-10-18 the cap
+retired DSC05775 (photo 251357, a daylight outdoor soccer frame) after four
+answers of 84, 83, 62 and 65 categories that were NOT recitations: about two
+thirds right, the rest padding and contradictions (basketball court,
+artificial lighting, indoor, kitchen). The count was the wrong test; see
+"category-content grounding" below for what replaced it. The 120 backstop is
+judged on the REPAIRED list and exists for the Ollama route.
 
-Worker-side only, since the server already handles `failures`: restart the
-fleet to pick it up. Tests: `tests/test_text_pass_safeguards.py`.
+Worker-side guards need a fleet restart; the server-side grounding repair
+needs a NAS redeploy. Tests: `tests/test_text_pass_safeguards.py`.
+
+### category-content grounding: the description decides
+
+`photosearch/category_grounding.py` (`docs/plans/category-grounding.md`,
+built 2026-10-18 by plan-debate; **not deployed until the owner's holdout
+labels pass**). The category-content pass used to store any in-vocabulary
+term the model returned. Now one pure function, `ground(description,
+categories) -> Grounding(kept, dropped, recitation)`, runs on the **worker**
+(`describe.extract_categories_from_description`, so the fleet, both
+`index.py` writers and M28 all get it) and again on the **server**
+(`worker_api.submit_results`, against the CURRENT stored description, the
+same precedent as `_merge_visual_tags`). Idempotent; output is a subset of
+input in input order; a NULL description changes nothing.
+
+**Four contradiction GROUPS, and the description picks the side.** sport
+(soccer / basketball / baseball / volleyball terms), setting (indoor terms vs
+`outdoor`), light (`artificial lighting` vs natural-light terms), weather
+(clear-sky terms vs cloudy terms). Per group: a present side is dropped when
+a rival side is cued in the description and its own is not, **including when
+only one side was emitted** (`artificial lighting` alone on "outdoors under
+trees"); both are dropped only when both were emitted and nothing is cued;
+both are kept when both are cued. Drop-both as the default was rejected on
+the data: it would delete 329 soccer tags from 124 soccer photos. Negated and
+through-the-window spans are blanked before any cue runs (`SCRUB_PATTERNS`).
+Owner decisions 2026-10-18: `basketball court` / `basketball hoop` are KEPT
+when an indoor setting is cued (gym soccer: they are the venue, 18 of 67
+drops); "partly cloudy" cues the cloudy side, so it contradicts `clear sky`
+but not `cloudy sky`; a bare "cloud" is neutral. Traps pinned by tests:
+"light blue", "daylight", "sunlight" are not artificial-light cues; "baseball
+cap" is not a baseball cue; `collage` skips the setting group; `car interior`
+/ `interior space` are not indoor terms (photos taken from inside a car).
+
+**No retry when the description decided a drop.** The 0.4 retry on 251357 was
+worse (84 tags). A repairable answer costs one model call. Retry once only
+when both sides were emitted and neither cued, or on a recitation verdict.
+
+**Unsupported padding is NOT dropped.** Only 41% of gemma tags appear
+literally in the description ("vehicle" for cars, "child" for boys), so a
+word match would delete correct tags. Required-cue FAMILIES (basketball needs
+a hoop, kitchen a stove, water a water word, city, building, celebration,
+coach, hat, wall, ...) are a diagnostic in the eval only; each is promoted
+one at a time after >= 90% correct drops on a fresh owner-labelled holdout.
+
+**The recitation verdict replaces the count cap:** vocabulary-order share
+>= 0.9 AND >= 10 unsupported CONCRETE nouns AND they are >= 50% of the
+answer's concrete nouns. Objects are the ~126 concrete nouns in
+`_CONCRETE` only; the family terms are exactly gemma's padding vocabulary,
+and counting them flagged 23 honest gemma rows. Measured on the replica:
+141/141 llama recitations over 53 tags caught, 121 of the 702 llama lists at
+20 to 52 tags (partial recitations the cap never saw: "beehive-like stone
+structure, no people" stored `bleacher, bridge, chain link fence`), 1 gemma
+row flagged out of 7,769. Order alone is NOT a signal: 72% of gemma lists
+are >= 0.9 in vocabulary order.
+
+**Measured on 7,769 current gemma rows:** 1,031 rows hit (13%), 1,228 of
+163,106 tags dropped (0.75%): light 851 (`artificial lighting` 1,186 → 387),
+sport 171, setting 129, weather 77. 251357 at temperature 0: 68 → 64, not a
+recitation, so it would now be STORED. Eval: `evals/category_grounding_eval.py`
+(read-only, no model calls, ~50 s) writes `evals/category-grounding/summary.md`;
+the seed-7 samples were used to tune the cue lists, so the owner labels the
+seed-11 holdout (`samples-holdout-seed11.json`, 25 drops per group) on
+`/eval/category-grounding`; a group ships only at >= 90% correct drops.
+
+**Backfill:** `photosearch ground-categories [--model gemma|llama|all]
+[--folder F] [--apply] [--requeue-recitations]`. Dry run by default, opened
+`mode=ro`; 2,000-row chunks with a commit between; `UPDATE ... WHERE id=? AND
+categories IS ?`; unchanged rows skipped; never touches NULL (it drives the
+worker queue); never writes `'[]'` over a non-empty list (33 llama rows would
+be emptied: reported, not written); only rows whose stored set is a subset of
+their latest `generations` row are eligible (hand-set rows skipped); no
+`generations` row is written. Recitation rows (255 llama, 1 gemma) are only
+re-queued behind `--requeue-recitations`. Default scope is gemma; 154k llama
+rows are the bulk of the library and were not the target.
 
 **Collapse across a shoot is flagged, not gated** (`photosearch/visual_collapse.py`).
 A per-photo guard cannot see category-visual stamping one set on a whole shoot

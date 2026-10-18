@@ -194,3 +194,88 @@ def test_clear_pass_keywords_nulls_column_and_resets_attempts(client):
             "SELECT 1 FROM worker_processed WHERE pass_type='keywords' AND photo_id=1"
         ).fetchall()
         assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Server-side grounding (docs/plans/category-grounding.md, step 4): the server
+# re-grounds every category-content answer against the CURRENT description,
+# because an older worker, a description rewritten since the claim, or an M28
+# re-run can all hand it an ungrounded list.
+# ---------------------------------------------------------------------------
+
+def _seed(photo_id, description):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        db.conn.execute(
+            "INSERT INTO photos (id, filepath, filename, description) VALUES (?, ?, ?, ?)",
+            (photo_id, f"{photo_id}.jpg", f"{photo_id}.jpg", description))
+        db.conn.commit()
+
+
+def _submit_categories(client, results):
+    r = client.post("/api/worker/submit-results", json={
+        "batch_id": "no-such-claim", "pass_type": "category-content",
+        "category_content_results": results,
+    })
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _stored_and_logged(photo_id):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        stored = db.conn.execute("SELECT categories FROM photos WHERE id=?",
+                                 (photo_id,)).fetchone()[0]
+        logged = [r[0] for r in db.conn.execute(
+            "SELECT generated_text FROM generations WHERE photo_id=? "
+            "AND text_type='category-content' ORDER BY id", (photo_id,))]
+    return stored, logged
+
+
+def test_an_old_workers_list_is_repaired_and_the_kept_list_logged(client):
+    """An older worker sends `basketball` for a soccer description; the server
+    stores and logs it without, so stored == latest generation still holds."""
+    _seed(3, "Two boys play soccer on an outdoor grass field.")
+    _submit_categories(client, [{
+        "photo_id": 3, "model": "google/gemma-4-12b-qat",
+        "categories": ["soccer", "basketball", "basketball hoop", "grass",
+                       "artificial lighting"]}])
+    stored, logged = _stored_and_logged(3)
+    assert json.loads(stored) == ["soccer", "grass"]
+    assert logged == [stored]
+
+
+def test_grounding_uses_the_description_stored_now_not_at_claim(client):
+    """verify rewrote the description between claim and submit."""
+    _seed(3, "Children play indoor soccer inside a gym.")
+    claim = client.post("/api/worker/claim-batch", json={
+        "worker_id": "w1", "pass_type": "category-content", "limit": 10}).json()
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        db.conn.execute("UPDATE photos SET description=? WHERE id=3",
+                        ("Children play soccer on an outdoor turf field.",))
+        db.conn.commit()
+    client.post("/api/worker/submit-results", json={
+        "batch_id": claim["batch_id"], "pass_type": "category-content",
+        "category_content_results": [
+            {"photo_id": 3, "categories": ["soccer", "indoor", "gym"]}]})
+    stored, _ = _stored_and_logged(3)
+    assert json.loads(stored) == ["soccer"]
+
+
+def test_a_null_description_stores_the_list_unchanged(client):
+    _seed(3, None)
+    _submit_categories(client, [{"photo_id": 3,
+                                 "categories": ["basketball", "soccer"]}])
+    stored, logged = _stored_and_logged(3)
+    assert json.loads(stored) == ["basketball", "soccer"]
+    assert logged == [stored]
+
+
+def test_an_explicit_empty_answer_is_still_done(client):
+    """'[]' (the model answered "none") is a result, not an emptied list."""
+    _seed(3, "Two boys play soccer on an outdoor grass field.")
+    body = _submit_categories(client, [{"photo_id": 3, "categories": []}])
+    stored, _ = _stored_and_logged(3)
+    assert stored == "[]"
+    assert body["processed"] == 1

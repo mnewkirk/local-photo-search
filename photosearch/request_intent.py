@@ -200,6 +200,12 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
          f" matching {p['q']!r}" if p.get("q") else "")),
     ("GET", r"/api/videos/(?P<id>\d+)/subjects",
      _fixed("Read the subjects timeline of video {id}")),
+    ("GET", r"/api/eval/category-grounding/items",
+     _fixed("Load the category-grounding eval sample")),
+    ("POST", r"/api/eval/category-grounding/label",
+     _fixed("Label a category-grounding drop")),
+    ("GET", r"/api/eval/category-grounding/score",
+     _fixed("Score the category-grounding eval")),
 ]
 _COMPILED = [(m, re.compile(rx + r"/?$"), b) for m, rx, b in _RULES]
 
