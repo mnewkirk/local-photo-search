@@ -35,13 +35,13 @@ import os
 import shutil
 import tempfile
 import time
-import zipfile
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 import numpy as np
 
 from . import video_analysis as VA
+from . import zip_video as ZV
 from .video_analysis import DEFAULT_PARAMS, AnalysisParams
 from .video_scan_store import (CROP_SIZES, SCAN_VERSION, crop_name, keyframe_name,
                                rep_name, segment_name)
@@ -64,9 +64,9 @@ FACE_SHARP_PX = 96
 # focus-eligible faces, so identity crops are rendered at native resolution.
 NATIVE_CROP_PAD = 1.2      # half-side = PAD x the face's larger edge
 
-# ZIP unwrap guards.
-ZIP_MAX_BYTES = 16 * 1024 ** 3
-ZIP_MAX_RATIO = 50.0       # inflated / compressed — anything above is a bomb
+# ZIP unwrap guards (shared with the unwrap-zip-videos CLI: zip_video).
+ZIP_MAX_BYTES = ZV.ZIP_MAX_BYTES
+ZIP_MAX_RATIO = ZV.ZIP_MAX_RATIO
 
 _LAPLACE = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float64)
 
@@ -76,9 +76,9 @@ class ScanOpenError(Exception):
     terminal verdict, stored as ``scan_error``."""
 
 
-class ZipRefused(Exception):
-    """A ZIP-wrapped file that is not exactly one safe video member — a
-    terminal verdict, stored as ``scan_error``."""
+# A ZIP-wrapped file that is not exactly one safe video member — a terminal
+# verdict, stored as ``scan_error``. Defined in zip_video (shared).
+ZipRefused = ZV.ZipRefused
 
 
 # ---------------------------------------------------------------------------
@@ -367,24 +367,14 @@ def needed_times(duration: float) -> list[float]:
 # ---------------------------------------------------------------------------
 
 def is_zip_file(path: str) -> bool:
-    with open(path, "rb") as fh:
-        return fh.read(4) == b"PK\x03\x04"
+    return ZV.has_zip_magic(path)
 
 
-ZIP_SIZE_SLACK = 1.2       # inner <= 1.2 x the ZIP itself: video is incompressible
-
-
-def _is_junk_member(name: str) -> bool:
-    """macOS resource-fork litter that rides along in a ZIP: never the video."""
-    parts = [p for p in name.split("/") if p]
-    return (not parts or parts[0] == "__MACOSX" or parts[-1].startswith("._")
-            or parts[-1] in (".DS_Store", "Thumbs.db"))
-
-
-def _safe_member_name(name: str) -> bool:
-    parts = [p for p in name.split("/") if p]
-    return bool(parts) and not name.startswith("/") and ".." not in parts \
-        and ":" not in parts[0] and "." not in parts
+# Member selection / caps live in zip_video (shared with the NAS
+# unwrap-zip-videos CLI, so the two cannot drift). Re-exported names kept.
+ZIP_SIZE_SLACK = ZV.ZIP_SIZE_SLACK
+_is_junk_member = ZV.is_junk_member
+_safe_member_name = ZV.safe_member_name
 
 
 def unwrap_zip(path: str, dest_dir: str, *, max_bytes: int = ZIP_MAX_BYTES,
@@ -399,54 +389,23 @@ def unwrap_zip(path: str, dest_dir: str, *, max_bytes: int = ZIP_MAX_BYTES,
     not compress, so a member that inflates past that is not a video — this
     holds even when the header's compressed size is 0 and the ratio check
     cannot run). The caps are enforced on the bytes actually read, not the
-    header's claim. Returns the extracted path."""
+    header's claim. Returns the extracted path. Rules: ``zip_video``."""
     from .video_api import VIDEO_MIME
-    try:
-        zf = zipfile.ZipFile(path)
-    except zipfile.BadZipFile as e:
-        raise ZipRefused(f"not a readable ZIP: {e}")
-    cap = min(int(max_bytes), int(ZIP_SIZE_SLACK * os.path.getsize(path)) + 65536)
+    zf = ZV.open_zip(path)
     with zf:
-        members = [m for m in zf.infolist()
-                   if not m.is_dir() and not _is_junk_member(m.filename.replace("\\", "/"))]
-        videos = [m for m in members
-                  if os.path.splitext(m.filename)[1].lower() in VIDEO_MIME]
-        if len(videos) != 1:
-            raise ZipRefused(f"ZIP holds {len(videos)} video file(s) among "
-                             f"{len(members)} member(s), expected exactly 1")
-        m = videos[0]
-        name = m.filename.replace("\\", "/")
-        parts = [p for p in name.split("/") if p]
-        if not _safe_member_name(name):
-            raise ZipRefused(f"unsafe member name {m.filename!r}")
-        if m.flag_bits & 0x1:
-            raise ZipRefused("encrypted ZIP member")
-        if m.file_size > cap:
-            raise ZipRefused(f"member is {m.file_size} bytes > {cap}")
-        if m.compress_size > 0 and m.file_size / m.compress_size > max_ratio:
-            raise ZipRefused("member inflates suspiciously (zip bomb?)")
-        base = os.path.basename(parts[-1])
+        m, cap = ZV.select_video_member(zf, os.path.getsize(path), max_bytes=max_bytes,
+                                        max_ratio=max_ratio, video_exts=VIDEO_MIME)
+        base = ZV.member_basename(m)
         safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in base) or "inner.mov"
         out = os.path.join(dest_dir, "inner_" + safe)
-        n = 0
-        import zlib
         try:
-            with zf.open(m) as src, open(out, "wb") as dst:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
-                    n += len(chunk)
-                    if n > cap:
-                        raise ZipRefused(f"member exceeded {cap} bytes while extracting")
-                    dst.write(chunk)
-        except BaseException as e:
+            with open(out, "wb") as dst:
+                ZV.copy_member(zf, m, dst, cap)
+        except BaseException:
             try:
                 os.unlink(out)
             except OSError:
                 pass
-            if isinstance(e, (zipfile.BadZipFile, zlib.error, EOFError)):
-                raise ZipRefused(f"member does not inflate: {e}")
             raise
     return out
 

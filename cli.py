@@ -3165,6 +3165,73 @@ def refile_unknown_camera_cmd(photo_root, db, apply, audit_path, only, limit,
 
 
 # ---------------------------------------------------------------------------
+# unwrap-zip-videos
+# ---------------------------------------------------------------------------
+
+@cli.command("unwrap-zip-videos")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--photo-root", default=None,
+              help="Library root. Precedence: this flag, then PHOTO_ROOT, then "
+                   "the DB's stored photo_root (the NAS stores none).")
+@click.option("--folder", default=None,
+              help="Only this folder (or below), relative to the photo root.")
+@click.option("--year", default=None, help="Only this top-level year folder.")
+@click.option("--limit", default=None, type=int,
+              help="Unwrap (or validate) at most N ZIP-wrapped files.")
+@click.option("--mbps", default=30.0, show_default=True, type=float,
+              help="Byte-rate cap (MB/s) on the extract/verify copies.")
+@click.option("--apply", is_flag=True, default=False,
+              help="Unwrap. Default: dry run (DB opened read-only, nothing written).")
+@click.option("--audit", "audit_path", default=None,
+              help="CSV audit (REQUIRED with --apply; must be outside the photo "
+                   "root, e.g. /data/unwrap.csv). It is the undo.")
+@click.option("--undo", "undo_path", default=None,
+              help="Restore the zips recorded in this audit file "
+                   "(dry run unless --apply).")
+def unwrap_zip_videos_cmd(db, photo_root, folder, year, limit, mbps, apply,
+                          audit_path, undo_path):
+    """Extract ZIP-wrapped videos in place; the zip is kept as <name>.zip.
+
+    Finds VIDEO_EXTENSIONS files whose first bytes are PK\\x03\\x04 (iOS Live
+    bundle exports), validates exactly one safe video member, extracts it beside
+    the file and swaps it in under the ORIGINAL name (filepath unchanged, mtime
+    and mode preserved); the archive survives as IMG_1234.MOV.zip. A matching
+    video row is reset for re-probe. Run on the NAS:
+
+    \b
+        photosearch unwrap-zip-videos --year 2016
+        photosearch unwrap-zip-videos --year 2016 --apply --audit /data/unwrap-2016.csv
+        photosearch unwrap-zip-videos --undo /data/unwrap-2016.csv [--apply]
+    """
+    from photosearch.ingest import IngestAlreadyRunning
+    from photosearch import unwrap_zip_videos as UZ
+
+    if limit is not None and limit <= 0:
+        raise click.BadParameter("must be positive", param_hint="--limit")
+    try:
+        if undo_path:
+            res = UZ.undo_unwrap(undo_path, db, apply=apply, mbps=mbps)
+            click.echo(UZ.render_undo_report(res))
+            if not apply:
+                click.echo("\nDry run — nothing restored. Re-run with --apply.")
+            return
+        res = UZ.unwrap_zip_videos(
+            db, photo_root=photo_root, folder=folder, year=year, limit=limit,
+            apply=apply, audit_path=audit_path, mbps=mbps,
+            on_progress=lambda c: click.echo(
+                f"  ... zip {c['zip_found']:,}, unwrapped {c['unwrapped']:,}", err=True))
+    except (IngestAlreadyRunning, UZ.UnwrapRefused, ValueError,
+            FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(UZ.render_report(res))
+    if apply:
+        click.echo(f"\nAudit: {audit_path}  (undo with --undo {audit_path} --apply)")
+    else:
+        click.echo("\nDry run — nothing written. Re-run with --apply --audit /data/<file>.csv.")
+
+
+# ---------------------------------------------------------------------------
 # face-clusters
 # ---------------------------------------------------------------------------
 
