@@ -53,6 +53,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(web, "_thumb_dir", str(thumbs))
     monkeypatch.setattr(web, "_preview_dir", str(previews))
     monkeypatch.setattr(web, "_nas_url", None)
+    monkeypatch.setattr(web, "_face_crop_dir", None)      # cached per process
     monkeypatch.setattr(worker_api, "_db_path", db_path)
     monkeypatch.setattr(worker_api, "_shutting_down", False)
 
@@ -441,3 +442,198 @@ def test_stale_frame_dirs_keep_current_scan_and_probe_versions(env):
     if PROBE_VERSION == 2:
         want.discard(str(root / str(pid) / "v2"))
     assert set(stale) == want
+
+
+# --- review fixes: coordinates, staging, exclusions --------------------------------
+
+def test_4k_face_bbox_is_native_and_the_crop_fallback_scales_to_the_rep_frame(env):
+    """A 3840-wide video: the faces row is in native display px (what
+    photos.image_width means), the rep JPEG is 1920 wide, and the crop
+    endpoint's rep-frame fallback scales the box by 1920/3840."""
+    db, client = env["db"], env["client"]
+    pid = env["video"]("UHD.MOV")
+    db.conn.execute("UPDATE photos SET image_width = 3840, image_height = 2160 WHERE id = ?",
+                    (pid,))
+    db.conn.commit()
+    rep = Image.new("RGB", (1920, 1080), (0, 0, 255))
+    # the face, native (2000..2400, 800..1200) -> rep (1000..1200, 400..600)
+    rep.paste((255, 0, 0), (1000, 400, 1200, 600))
+    buf = io.BytesIO()
+    rep.save(buf, "JPEG", quality=95)
+    gen = "abcdef0123456789"
+    body = {"version": SCAN_VERSION, "generation": gen, "assets": [
+        {"kind": "keyframe", "name": rep_name(4),
+         "data_b64": base64.b64encode(buf.getvalue()).decode()}]}
+    assert client.post(f"/api/videos/{pid}/assets", json=body).status_code == 200
+    _submit(client, [_result(pid, [_ident(0, _unit(0), bbox=(800, 2400, 1200, 2000))],
+                             generation=gen)])
+    face = _faces(db, pid)[0]
+    assert (face["bbox_top"], face["bbox_right"], face["bbox_bottom"],
+            face["bbox_left"]) == (800, 2400, 1200, 2000)
+    r = client.get(f"/api/faces/crop/{face['id']}?size=200")
+    assert r.status_code == 200
+    px = Image.open(io.BytesIO(r.content)).convert("RGB").getpixel((100, 100))
+    assert px[0] > 200 and px[2] < 60, f"crop centre should be the red face, got {px}"
+
+
+def _gen_upload(client, pid, gen, color=(10, 20, 30), with_poster=True):
+    assets = [{"kind": "keyframe", "name": "s000.jpg",
+               "data_b64": base64.b64encode(_jpeg(color=color)).decode()}]
+    if with_poster:
+        assets.append({"kind": "poster", "size": "thumb",
+                       "data_b64": base64.b64encode(_jpeg(color=color)).decode()})
+    r = client.post(f"/api/videos/{pid}/assets",
+                    json={"version": SCAN_VERSION, "generation": gen, "assets": assets})
+    assert r.status_code == 200, r.text
+
+
+def test_a_failed_rescan_never_touches_the_live_generation_or_poster(env):
+    db, client = env["db"], env["client"]
+    pid = env["video"]("A.MOV")
+    thumb = env["thumbs"] / f"{pid}_thumb.jpg"
+    _gen_upload(client, pid, "aaaaaaaa11111111", color=(200, 0, 0))
+    assert not thumb.exists(), "a staged poster is not installed by the upload"
+    _submit(client, [_result(pid, [_ident(0, _unit(0))], generation="aaaaaaaa11111111",
+                             poster_uploaded=True, poster_t=1.0)])
+    first = thumb.read_bytes()
+    m = _meta(db, pid)
+    assert m["scan_generation"] == "aaaaaaaa11111111"
+    pv = m["poster_version"]
+    old_face = _faces(db, pid)[0]["id"]
+
+    # The re-scan's upload lands in a NEW generation; its submit is deferred.
+    _gen_upload(client, pid, "bbbbbbbb22222222", color=(0, 200, 0))
+    from unittest import mock
+    with mock.patch("photosearch.video_scan_store.apply_scan_result",
+                    side_effect=sqlite3.OperationalError("database is locked")):
+        resp = _submit(client, [_result(pid, [_ident(0, _unit(1))],
+                                        generation="bbbbbbbb22222222",
+                                        poster_uploaded=True, poster_t=2.0)])
+    assert resp["deferred"] == 1
+    m = _meta(db, pid)
+    assert m["scan_generation"] == "aaaaaaaa11111111" and m["poster_version"] == pv
+    assert thumb.read_bytes() == first
+    assert _faces(db, pid)[0]["id"] == old_face
+    r = client.get(f"/api/videos/{pid}/frames/keyframe_s000.jpg")
+    assert Image.open(io.BytesIO(r.content)).getpixel((5, 5))[0] > 150   # still the red one
+
+    # ...and when it finally lands, everything moves together.
+    _submit(client, [_result(pid, [_ident(0, _unit(1))], generation="bbbbbbbb22222222",
+                             poster_uploaded=True, poster_t=2.0)])
+    m = _meta(db, pid)
+    assert m["scan_generation"] == "bbbbbbbb22222222" and m["poster_version"] == pv + 1
+    assert thumb.read_bytes() != first
+    r = client.get(f"/api/videos/{pid}/frames/keyframe_s000.jpg")
+    assert Image.open(io.BytesIO(r.content)).getpixel((5, 5))[1] > 150
+
+
+def test_cleanup_sweeps_unpromoted_generations_after_the_grace(env):
+    db, client = env["db"], env["client"]
+    pid = env["video"]("A.MOV")
+    _gen_upload(client, pid, "aaaaaaaa11111111")
+    _submit(client, [_result(pid, [], generation="aaaaaaaa11111111")])
+    _gen_upload(client, pid, "cccccccc33333333")      # a scan whose submit never came
+    root = env["data"] / "video_frames"
+    vdir = root / str(pid) / f"v{SCAN_VERSION}"
+    import time
+    assert stale_frame_dirs(db.conn, root) == []      # inside the grace period
+    later = time.time() + 2 * 86400
+    assert stale_frame_dirs(db.conn, root, now=later) == [str(vdir / "gcccccccc33333333")]
+
+
+def test_an_unsafe_generation_is_rejected(env):
+    pid = env["video"]("A.MOV")
+    r = env["client"].post(f"/api/videos/{pid}/assets", json={
+        "version": SCAN_VERSION, "generation": "../x", "assets": [
+            {"kind": "keyframe", "name": "s000.jpg",
+             "data_b64": base64.b64encode(_jpeg()).decode()}]})
+    assert r.status_code == 400
+
+
+def test_exclusions_carry_for_every_matched_old_face_not_just_labels(env):
+    """A strict match the duplicate resolver stripped (dedupe_unmatched) has
+    an exclusion that stops the matcher re-applying it; a re-scan must carry
+    it to the new face id or the nightly churn loop restarts."""
+    db, client = env["db"], env["client"]
+    pid = env["video"]("A.MOV")
+    _submit(client, [_result(pid, [_ident(0, _unit(0)), _ident(1, _unit(1))])])
+    f0, f1 = [f["id"] for f in _faces(db, pid)]
+    calvin = db.conn.execute("INSERT INTO persons (name) VALUES ('Calvin')").lastrowid
+    db.conn.execute("UPDATE faces SET match_source='dedupe_unmatched' WHERE id=?", (f0,))
+    db.conn.execute("INSERT OR IGNORE INTO face_person_exclusions (face_id, person_id, reason) "
+                    "VALUES (?, ?, 'resolve_dups')", (f0, calvin))
+    db.conn.commit()
+    resp = _submit(client, [_result(pid, [_ident(0, _unit(1)), _ident(1, _unit(0))])])
+    new_f0 = next(f["id"] for f in _faces(db, pid)
+                  if f["id"] not in (f0, f1)
+                  and db.conn.execute("SELECT ident_ix FROM video_tracks WHERE face_id=?",
+                                      (f["id"],)).fetchone()[0] == 1)
+    assert db.conn.execute("SELECT COUNT(*) FROM face_person_exclusions WHERE face_id=? "
+                           "AND person_id=?", (new_f0, calvin)).fetchone()[0] == 1
+    assert _faces(db, pid)[1]["person_id"] is None     # the auto label is NOT carried
+    assert resp["video_scan"][0]["exclusions_carried"][0]["old_face_id"] == f0
+
+
+def test_similar_by_photo_media_filter(env):
+    db = env["db"]
+    still = db.add_photo(filepath=f"{DIR}/S.JPG", filename="S.JPG")
+    other = db.add_photo(filepath=f"{DIR}/T.JPG", filename="T.JPG")
+    vid = env["video"]("A.MOV")
+    for pid, i in ((still, 0), (other, 0), (vid, 0)):
+        db.add_clip_embedding(pid, _unit(i))
+    db.conn.commit()
+    anyk = {r["photo_id"] for r in db.similar_by_photo(still, limit=10)}
+    assert vid in anyk
+    stills = {r["photo_id"] for r in db.similar_by_photo(still, limit=10, media="still")}
+    assert stills == {still, other}
+    assert {r["photo_id"] for r in db.similar_by_photo(still, media="video")} == {vid}
+    with pytest.raises(ValueError):
+        db.similar_by_photo(still, media="nope")
+    # the print-alternatives caller asks for stills
+    import inspect
+    assert 'similar_by_photo(int(pid), limit=200, media="still")' in inspect.getsource(web)
+
+
+def test_mirror_never_attaches_a_track_to_another_photos_face(env):
+    """The NAS face id is already a different photo's face locally: the
+    mirrored face gets a new id and the track follows IT, never the
+    colliding face."""
+    from photosearch import rerun
+    db = env["db"]
+    still = db.add_photo(filepath=f"{DIR}/S.JPG", filename="S.JPG")
+    clash = db.add_face(still, (1, 2, 3, 0), _unit(5))
+    vid = env["video"]("A.MOV")
+    rerun._apply_mirror(db, vid, {
+        "faces": [{"id": clash, "bbox": [10, 20, 30, 0], "encoding": _unit(0),
+                   "det_score": 0.9, "person_id": None, "cluster_id": None,
+                   "match_source": None}],
+        "video_tracks": [{"face_id": clash, "ident_ix": 0, "presence_s": 3.0}],
+        "video_meta": {"scan_version": SCAN_VERSION, "scan_generation": "aaaaaaaa11111111"},
+    })
+    mine = _faces(db, vid)
+    assert len(mine) == 1 and mine[0]["id"] != clash
+    track = db.conn.execute("SELECT face_id FROM video_tracks WHERE photo_id=?",
+                            (vid,)).fetchone()
+    assert track[0] == mine[0]["id"]
+    assert db.conn.execute("SELECT photo_id FROM faces WHERE id=?", (clash,)).fetchone()[0] == still
+    assert _meta(db, vid)["scan_generation"] == "aaaaaaaa11111111"
+
+    # Without a faces payload, a track naming another photo's face is unlinked.
+    rerun._apply_mirror(db, vid, {"video_tracks": [{"face_id": clash, "ident_ix": 0}]})
+    assert db.conn.execute("SELECT face_id FROM video_tracks WHERE photo_id=?",
+                           (vid,)).fetchone()[0] is None
+
+
+def test_cull_never_offers_a_video(env):
+    """A video has a CLIP mean now; the /review cull picks images only."""
+    from photosearch.cull import select_best_photos
+    db = env["db"]
+    still = db.add_photo(filepath=f"{DIR}/S.JPG", filename="S.JPG",
+                         date_taken="2091-07-04 10:00:00", aesthetic_score=6.0)
+    vid = env["video"]("A.MOV")
+    for pid in (still, vid):
+        db.add_clip_embedding(pid, _unit(0))
+    db.conn.commit()
+    got = {p["id"] for p in select_best_photos(db, None, date_from="2091-07-04",
+                                                date_to="2091-07-04")}
+    assert still in got and vid not in got

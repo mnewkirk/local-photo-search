@@ -1220,12 +1220,17 @@ def _process_video_scan(client: "WorkerClient", photos: list[dict], workdir: str
             t1 = time.time()
             built = VS.build_scan_result(scan)
             t_build = time.time() - t1
-            for body in VS.assets_bodies(built["assets"], built["poster"]):
+            # A fresh staging generation: a re-scan never overwrites the
+            # files the live faces point at until its submit commits.
+            generation = VS.new_generation()
+            for body in VS.assets_bodies(built["assets"], built["poster"],
+                                         generation=generation):
                 up = client._request("POST", f"{client.server_url}/api/videos/{pid}/assets",
                                      json=body, timeout=120)
                 if not up.ok:
                     raise RuntimeError(f"asset upload HTTP {up.status_code}: {up.text[:200]}")
             res = dict(base, **built["result"])
+            res["generation"] = generation
             if probe:
                 res["probe"] = probe
             res["quality_json"]["timings"].update(

@@ -206,7 +206,7 @@ def select_best_photos(
         hi = date_to or "9999-12-31"
         rows = db.conn.execute(
             "SELECT id, filepath, filename, aesthetic_score, aes_overall_pct, aes_subject_overall_pct, aes_overall_day_pct, aes_subject_overall_day_pct, camera_make, camera_model, date_taken, raw_filepath, place_name "
-            "FROM photos WHERE date_taken IS NOT NULL "
+            "FROM photos WHERE date_taken IS NOT NULL AND media_type IS NULL "
             "AND date_taken >= ? AND date_taken <= ?",
             (lo, hi + "~"),
         ).fetchall()
@@ -233,7 +233,9 @@ def select_best_photos(
         # Get all photos in the directory
         all_rows = db.conn.execute(
             "SELECT id, filepath, filename, aesthetic_score, aes_overall_pct, aes_subject_overall_pct, aes_overall_day_pct, aes_subject_overall_day_pct, camera_make, camera_model, date_taken, raw_filepath, place_name "
-            "FROM photos"
+            # Stills only: a video now has a CLIP mean (video-scan), but the
+            # cull picks and exports images.
+            "FROM photos WHERE media_type IS NULL"
         ).fetchall()
 
         # Filter to the target directory — match both relative and absolute paths

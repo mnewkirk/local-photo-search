@@ -429,6 +429,10 @@ MAX_ASSET_BYTES = 12 * 1024 * 1024
 MAX_ASSETS = 128
 MAX_TOTAL_BYTES = 96 * 1024 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.jpe?g$")
+# A video-scan staging generation (video_scan_store): uploads land in
+# v{version}/g{generation}/ and posters are NOT installed until the submit
+# that names this generation commits.
+_GEN_RE = re.compile(r"^[a-z0-9]{8,32}$")
 
 
 class AssetError(ValueError):
@@ -458,6 +462,35 @@ def atomic_write(path: Path, data: bytes) -> None:
         except OSError:
             pass
         raise
+
+
+def asset_dir(db_path: str, photo_id: int, version: int,
+              generation: Optional[str] = None) -> Path:
+    """Where one upload's files live: ``video_frames/{id}/v{version}/`` or,
+    for a staged video-scan upload, ``.../v{version}/g{generation}/``."""
+    d = frames_root(db_path) / str(int(photo_id)) / f"v{int(version)}"
+    return d / f"g{generation}" if generation else d
+
+
+def install_posters(db_path: str, photo_id: int, version: int, generation: str, *,
+                    thumb_dir: str, preview_dir: str) -> int:
+    """Install a staged generation's posters where every grid reads them —
+    called only after the submit naming that generation has committed."""
+    src = asset_dir(db_path, photo_id, version, generation)
+    n = 0
+    for size in POSTER_SIZES:
+        f = src / f"poster_{size}.jpg"
+        if not f.exists():
+            continue
+        if size == "thumb":
+            inst = Path(thumb_dir) / f"{int(photo_id)}_thumb.jpg"
+        elif size == "preview":
+            inst = Path(preview_dir) / f"{int(photo_id)}_preview.jpg"
+        else:
+            inst = frames_root(db_path) / str(int(photo_id)) / "poster.jpg"
+        atomic_write(inst, f.read_bytes())
+        n += 1
+    return n
 
 
 def _decode_assets(body: dict) -> tuple[int, list[dict]]:
@@ -516,8 +549,12 @@ def store_assets(db_path: str, photo_id: int, body: dict, *,
     video row. Everything is decoded and validated BEFORE the first write, so
     a bad asset rejects the whole request and nothing lands."""
     version, assets = _decode_assets(body)
+    generation = body.get("generation")
+    if generation is not None and (not isinstance(generation, str)
+                                   or not _GEN_RE.match(generation)):
+        raise AssetError("generation must be 8-32 lowercase letters/digits")
     root = frames_root(db_path)
-    vdir = root / str(int(photo_id)) / f"v{version}"
+    vdir = asset_dir(db_path, photo_id, version, generation)
     written = []
     for a in assets:
         dest = vdir / a["name"]
@@ -527,7 +564,7 @@ def store_assets(db_path: str, photo_id: int, body: dict, *,
         atomic_write(dest, a["data"])
         entry = {"kind": a["kind"], "name": a["name"], "bytes": len(a["data"]),
                  "path": str(dest.relative_to(root.parent))}
-        if a["kind"] == "poster":
+        if a["kind"] == "poster" and not generation:
             # Install where every grid already looks, so the replica's
             # thumbnail mirror and the photo routes need no video branch.
             if a["size"] == "thumb":
@@ -539,4 +576,5 @@ def store_assets(db_path: str, photo_id: int, body: dict, *,
             atomic_write(inst, a["data"])
             entry["installed"] = str(inst)
         written.append(entry)
-    return {"photo_id": int(photo_id), "version": version, "written": written}
+    return {"photo_id": int(photo_id), "version": version, "generation": generation,
+            "written": written}

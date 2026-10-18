@@ -1160,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1238,7 +1238,7 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
 
     # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
     # the tables intact (schema-version fast-path skips the DDL entirely).
@@ -1271,7 +1271,7 @@ def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
 
     # Idempotent: the version fast-path skips the DDL and the table survives.
     with PhotoDB(tmp_db_path) as again:
@@ -1306,7 +1306,7 @@ def test_v31_db_migrates_to_v32_stacking_seen(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
         assert reopened.conn.execute(
             "SELECT COUNT(*) FROM stack_members").fetchone()[0] == 2
 
@@ -1353,7 +1353,7 @@ def test_v32_db_migrates_to_v33_sharpness_columns(tmp_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
 
 
 def test_v34_db_migrates_to_v35_media_type_and_video_tables(tmp_path):
@@ -1404,7 +1404,7 @@ def test_v34_db_migrates_to_v35_media_type_and_video_tables(tmp_path):
         version = c.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
 
         # FKs: deleting the photo cascades the side tables; deleting a face
         # only NULLs the track/subject link.
@@ -1480,4 +1480,28 @@ def test_v35_db_migrates_to_v36_poster_version_and_presence_intervals(tmp_path):
         assert video_api.replica_poster_name(a, "thumb", st) == f"{a}_thumb.p1.jpg"
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'").fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 37
+        assert int(version) == SCHEMA_VERSION == 38
+
+
+def test_v37_db_migrates_to_v38_scan_generation(tmp_path):
+    """v38 adds video_meta.scan_generation (the promoted staging dir of the
+    current video-scan); a pre-v38 scan reads NULL = files in v{version}/."""
+    import sqlite3
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    path = str(tmp_path / "v37.db")
+    with PhotoDB(path) as db:
+        v = db.add_photo(filepath="v/a.mov", filename="a.mov", media_type="video")
+        db.conn.execute("INSERT INTO video_meta (photo_id, scan_version) VALUES (?, 1)", (v,))
+        db.conn.commit()
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE video_meta DROP COLUMN scan_generation")
+    conn.execute("UPDATE schema_info SET value = '37' WHERE key = 'version'")
+    conn.commit()
+    conn.close()
+    with PhotoDB(path) as db:
+        row = db.conn.execute("SELECT scan_version, scan_generation FROM video_meta").fetchone()
+        assert tuple(row) == (1, None)
+        version = db.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'").fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 38

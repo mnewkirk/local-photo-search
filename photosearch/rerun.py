@@ -29,10 +29,13 @@ gate sync mode on replica mode).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import uuid
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Passes this module can re-run, in DEPENDENCY order — the sync re-run and the
 # fleet launcher both sort by it (see batch_state.WORKER_PASSES for why verify
@@ -379,6 +382,7 @@ _VIDEO_META_MIRROR = (
     "bitrate", "has_audio", "probe_json", "probe_version", "probe_error", "kind",
     "live_of_photo_id", "poster_t", "poster_version", "scan_version", "scan_error",
     "scanned_at", "shake", "noise", "focus_consistency", "quality_json",
+    "scan_generation",
     # video-subjects (step 3b, schema v37)
     "subjects_version", "subjects_at", "subjects_json",
 )
@@ -446,7 +450,12 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
         if emb:
             db.add_clip_embedding(photo_id, emb)
 
+    # NAS face id -> local face id, for the video rows below that reference
+    # faces by id. Usually identical; a collision (the NAS id is already a
+    # different photo's face locally) remaps instead of mis-attaching.
+    id_map: Optional[dict] = None
     if "faces" in fields:
+        id_map = {}
         faces = fields["faces"] or []
         old = [r[0] for r in db.conn.execute(
             "SELECT id FROM faces WHERE photo_id=?", (photo_id,)).fetchall()]
@@ -457,9 +466,11 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
         for f in faces:
             # Keep the NAS face id when it is free locally: video_tracks
             # (and every later sync) reference faces by id.
-            want = f.get("id")
+            nas_id = want = f.get("id")
             if want is not None and db.conn.execute(
                     "SELECT 1 FROM faces WHERE id=?", (want,)).fetchone():
+                logger.warning("mirror photo %s: NAS face id %s is a different local "
+                               "face; inserting under a new id", photo_id, want)
                 want = None
             if want is not None:
                 bb = tuple(f["bbox"])
@@ -481,6 +492,8 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
                                   encoding=f["encoding"], det_score=f.get("det_score"),
                                   person_id=f.get("person_id"),
                                   cluster_id=f.get("cluster_id"))
+            if nas_id is not None:
+                id_map[nas_id] = fid
             # match_source isn't an add_face param — set it so mirrored manual /
             # temporal assignments keep their provenance locally.
             if f.get("match_source") is not None:
@@ -495,13 +508,23 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
             db.conn.execute(
                 f"UPDATE video_meta SET {', '.join(f'{c} = ?' for c in cols)} "
                 f"WHERE photo_id = ?", (*[vm[c] for c in cols], photo_id))
+    def _local_face(nas_id):
+        """The local id of this photo's face that the NAS calls ``nas_id``, or
+        None — never a face of another photo."""
+        if nas_id is None:
+            return None
+        if id_map is not None:
+            return id_map.get(nas_id)
+        hit = db.conn.execute("SELECT 1 FROM faces WHERE id=? AND photo_id=?",
+                              (nas_id, photo_id)).fetchone()
+        return nas_id if hit else None
+
     if "video_tracks" in fields:
         db.conn.execute("DELETE FROM video_tracks WHERE photo_id=?", (photo_id,))
         for t in fields["video_tracks"] or []:
             cols = [c for c in _VIDEO_TRACK_MIRROR if c in t]
-            if t.get("face_id") is not None and not db.conn.execute(
-                    "SELECT 1 FROM faces WHERE id=?", (t["face_id"],)).fetchone():
-                t = dict(t, face_id=None)
+            if t.get("face_id") is not None:
+                t = dict(t, face_id=_local_face(t["face_id"]))
             db.conn.execute(
                 f"INSERT INTO video_tracks (photo_id, {', '.join(cols)}) "
                 f"VALUES (?, {', '.join('?' * len(cols))})",
@@ -513,9 +536,8 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
         db.conn.execute("DELETE FROM video_subjects WHERE photo_id=?", (photo_id,))
         for v in fields["video_subjects"] or []:
             cols = [c for c in _VIDEO_SUBJECT_MIRROR if c in v]
-            if v.get("face_id") is not None and not db.conn.execute(
-                    "SELECT 1 FROM faces WHERE id=?", (v["face_id"],)).fetchone():
-                v = dict(v, face_id=None)
+            if v.get("face_id") is not None:
+                v = dict(v, face_id=_local_face(v["face_id"]))
             db.conn.execute(
                 f"INSERT INTO video_subjects (photo_id, {', '.join(cols)}) "
                 f"VALUES (?, {', '.join('?' * len(cols))})",

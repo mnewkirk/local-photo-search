@@ -371,33 +371,58 @@ def is_zip_file(path: str) -> bool:
         return fh.read(4) == b"PK\x03\x04"
 
 
+ZIP_SIZE_SLACK = 1.2       # inner <= 1.2 x the ZIP itself: video is incompressible
+
+
+def _is_junk_member(name: str) -> bool:
+    """macOS resource-fork litter that rides along in a ZIP: never the video."""
+    parts = [p for p in name.split("/") if p]
+    return (not parts or parts[0] == "__MACOSX" or parts[-1].startswith("._")
+            or parts[-1] in (".DS_Store", "Thumbs.db"))
+
+
+def _safe_member_name(name: str) -> bool:
+    parts = [p for p in name.split("/") if p]
+    return bool(parts) and not name.startswith("/") and ".." not in parts \
+        and ":" not in parts[0] and "." not in parts
+
+
 def unwrap_zip(path: str, dest_dir: str, *, max_bytes: int = ZIP_MAX_BYTES,
                max_ratio: float = ZIP_MAX_RATIO) -> str:
     """Extract the single video inside a ZIP-wrapped file to ``dest_dir``.
 
-    Refuses (ZipRefused) anything but exactly one regular, non-encrypted
-    member with a safe relative name, an uncompressed size <= ``max_bytes``
-    and a ratio <= ``max_ratio`` (zip bomb). Extraction streams with a byte
-    cap that is enforced on the bytes actually read, not the header's claim.
-    Returns the extracted path."""
+    ``__MACOSX/`` and AppleDouble ``._*`` members are ignored; among the rest
+    the ONE member with a video extension is taken (a JPG + MOV Live bundle
+    gives the MOV). Refuses (ZipRefused) no video member, more than one, an
+    unsafe name (absolute, ``..``, drive letter), an encrypted member, and
+    anything bigger than ``max_bytes`` OR 1.2 x the ZIP's own size (video does
+    not compress, so a member that inflates past that is not a video — this
+    holds even when the header's compressed size is 0 and the ratio check
+    cannot run). The caps are enforced on the bytes actually read, not the
+    header's claim. Returns the extracted path."""
+    from .video_api import VIDEO_MIME
     try:
         zf = zipfile.ZipFile(path)
     except zipfile.BadZipFile as e:
         raise ZipRefused(f"not a readable ZIP: {e}")
+    cap = min(int(max_bytes), int(ZIP_SIZE_SLACK * os.path.getsize(path)) + 65536)
     with zf:
-        members = [m for m in zf.infolist() if not m.is_dir()]
-        if len(members) != 1:
-            raise ZipRefused(f"ZIP holds {len(members)} files, expected exactly 1")
-        m = members[0]
+        members = [m for m in zf.infolist()
+                   if not m.is_dir() and not _is_junk_member(m.filename.replace("\\", "/"))]
+        videos = [m for m in members
+                  if os.path.splitext(m.filename)[1].lower() in VIDEO_MIME]
+        if len(videos) != 1:
+            raise ZipRefused(f"ZIP holds {len(videos)} video file(s) among "
+                             f"{len(members)} member(s), expected exactly 1")
+        m = videos[0]
         name = m.filename.replace("\\", "/")
         parts = [p for p in name.split("/") if p]
-        if (not parts or name.startswith("/") or ".." in parts
-                or ":" in parts[0] or any(p in (".",) for p in parts)):
+        if not _safe_member_name(name):
             raise ZipRefused(f"unsafe member name {m.filename!r}")
         if m.flag_bits & 0x1:
             raise ZipRefused("encrypted ZIP member")
-        if m.file_size > max_bytes:
-            raise ZipRefused(f"member is {m.file_size} bytes > {max_bytes}")
+        if m.file_size > cap:
+            raise ZipRefused(f"member is {m.file_size} bytes > {cap}")
         if m.compress_size > 0 and m.file_size / m.compress_size > max_ratio:
             raise ZipRefused("member inflates suspiciously (zip bomb?)")
         base = os.path.basename(parts[-1])
@@ -412,8 +437,8 @@ def unwrap_zip(path: str, dest_dir: str, *, max_bytes: int = ZIP_MAX_BYTES,
                     if not chunk:
                         break
                     n += len(chunk)
-                    if n > max_bytes:
-                        raise ZipRefused(f"member exceeded {max_bytes} bytes while extracting")
+                    if n > cap:
+                        raise ZipRefused(f"member exceeded {cap} bytes while extracting")
                     dst.write(chunk)
         except BaseException as e:
             try:
@@ -785,11 +810,11 @@ def build_scan_result(scan: ScanData, params: AnalysisParams = DEFAULT_PARAMS,
                     assets.append({"kind": "crop", "name": crop_name(ident.ix, size),
                                    "data": data})
                 manifest["reps"][str(ident.ix)] = f"keyframe_{rep_name(fi)}"
-            sw = int(round(scan.width * scan.store_scale))
-            shh = int(round(scan.height * scan.store_scale))
             identities.append({
                 "ident_ix": ident.ix,
-                "bbox": trbl_from_xyxy(ident.rep_bbox, scan.store_scale, sw, shh),
+                # native display px — photos.image_width/height's space
+                # (coordinate systems: video_scan_store's module docstring)
+                "bbox": trbl_from_xyxy(ident.rep_bbox, 1.0, scan.width, scan.height),
                 "det_score": ident.rep_det_score,
                 "encoding": ident.encoding,
                 "rep_t": ident.rep_t,
@@ -844,8 +869,16 @@ def build_scan_result(scan: ScanData, params: AnalysisParams = DEFAULT_PARAMS,
     return {"result": result, "assets": assets, "poster": poster, "analysis": fa}
 
 
+def new_generation() -> str:
+    """A fresh staging generation token (video_scan_store: uploads land in
+    ``v{SCAN_VERSION}/g{token}/`` until the submit promotes them)."""
+    import uuid
+    return uuid.uuid4().hex[:16]
+
+
 def assets_bodies(assets: list[dict], poster: Optional[dict], version: int = SCAN_VERSION,
-                  max_assets: int = 100, max_bytes: int = 48 * 1024 * 1024) -> list[dict]:
+                  max_assets: int = 100, max_bytes: int = 48 * 1024 * 1024,
+                  generation: Optional[str] = None) -> list[dict]:
     """Split assets into POST /api/videos/{id}/assets bodies under the
     endpoint's per-request caps (video_api.MAX_ASSETS / MAX_TOTAL_BYTES).
     The poster goes in the LAST body, so it is installed only once every
@@ -867,6 +900,10 @@ def assets_bodies(assets: list[dict], poster: Optional[dict], version: int = SCA
         cur_n += it["_n"]
     if cur:
         bodies.append(cur)
-    return [{"version": int(version),
-             "assets": [{k: v for k, v in it.items() if k != "_n"} for it in body]}
-            for body in bodies]
+    out = [{"version": int(version),
+            "assets": [{k: v for k, v in it.items() if k != "_n"} for it in body]}
+           for body in bodies]
+    if generation:
+        for b in out:
+            b["generation"] = generation
+    return out

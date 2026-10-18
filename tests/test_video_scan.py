@@ -114,12 +114,54 @@ def test_unwrap_refuses_unsafe_zips(tmp_path, members):
 
 def test_unwrap_refuses_oversized_and_bombs(tmp_path):
     p = _zip(tmp_path / "big.mov", [("v.mov", b"\x00" * 200_000)])
-    with pytest.raises(VS.ZipRefused, match="zip bomb|inflates"):
+    with pytest.raises(VS.ZipRefused):
         VS.unwrap_zip(p, str(tmp_path))
     p = _zip(tmp_path / "big2.mov", [("v.mov", os.urandom(5000))])
     with pytest.raises(VS.ZipRefused):
         VS.unwrap_zip(p, str(tmp_path), max_bytes=1000)
     assert not [f for f in os.listdir(tmp_path) if f.startswith("inner_")]
+
+
+def test_unwrap_caps_the_member_relative_to_the_zip_even_without_a_ratio(tmp_path):
+    """With the ratio check out of the way (as when a header says
+    compress_size 0), the inner file may still be at most ~1.2 x the ZIP:
+    video does not compress."""
+    p = _zip(tmp_path / "z.mov", [("v.mov", b"\x00" * 300_000)])
+    with pytest.raises(VS.ZipRefused, match="bytes >"):
+        VS.unwrap_zip(p, str(tmp_path), max_ratio=1e12)
+    # incompressible payload of the same size passes the relative cap
+    p = _zip(tmp_path / "ok.mov", [("v.mov", os.urandom(300_000))])
+    assert os.path.getsize(VS.unwrap_zip(p, str(tmp_path), max_ratio=1e12)) == 300_000
+
+
+def test_unwrap_ignores_mac_litter_and_takes_the_video_of_a_bundle(tmp_path):
+    payload = os.urandom(4096)
+    p = _zip(tmp_path / "IMG_1.MOV", [
+        ("__MACOSX/._IMG_1.MOV", b"resource fork"),
+        ("._IMG_1.MOV", b"appledouble"),
+        ("IMG_1.JPG", os.urandom(512)),
+        ("IMG_1.MOV", payload)])
+    out = VS.unwrap_zip(p, str(tmp_path))
+    assert open(out, "rb").read() == payload and out.endswith("IMG_1.MOV")
+
+
+def test_unwrap_refuses_two_videos_even_beside_litter(tmp_path):
+    p = _zip(tmp_path / "w.mov", [("a.mov", b"1"), ("b.mp4", b"2"), ("._a.mov", b"x")])
+    with pytest.raises(VS.ZipRefused, match="2 video"):
+        VS.unwrap_zip(p, str(tmp_path))
+    p = _zip(tmp_path / "j.mov", [("only.jpg", b"1")])
+    with pytest.raises(VS.ZipRefused, match="0 video"):
+        VS.unwrap_zip(p, str(tmp_path))
+
+
+def test_a_4k_identity_bbox_is_in_native_display_pixels(tmp_path):
+    """The rep frame JPEG is stored at <= 1920 px, but the faces bbox is in
+    the video's own display pixels — photos.image_width's space."""
+    scan = _synthetic_scan(tmp_path, with_frames=False, two=False)
+    scan.width, scan.height, scan.store_scale = 3840, 2160, 0.5
+    built = VS.build_scan_result(scan, with_clip=False)
+    # _det(810): x 810..1110, y 300..600 in decoded (native) px
+    assert built["result"]["identities"][0]["bbox"] == [300, 1110, 600, 810]
 
 
 def test_a_plain_video_is_not_a_zip(tmp_path):

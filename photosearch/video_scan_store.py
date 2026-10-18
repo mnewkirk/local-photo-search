@@ -7,13 +7,35 @@ per-segment keyframes, representative frames and face crops through
 ``worker_api.submit_results`` calls :func:`apply_scan_result` inside one
 transaction per video, commits, then :func:`install_crops`.
 
-**One ``faces`` row per within-video identity.** Its bbox is in the
-coordinates of the identity's representative frame, stored as
-``video_frames/{pid}/v{SCAN_VERSION}/keyframe_rep_f{rep_frame:05d}.jpg``; its
-encoding is the identity's mean top-k ArcFace embedding. So ``/faces``,
-clustering, the strict matcher, verify-labels and the rival test apply to
-videos unchanged, and a face crop is served from the uploaded crop (or the rep
-frame) — never from the video file.
+**One ``faces`` row per within-video identity**; its encoding is the
+identity's mean top-k ArcFace embedding. So ``/faces``, clustering, the strict
+matcher, verify-labels and the rival test apply to videos unchanged, and a face
+crop is served from the uploaded crop (or the rep frame) — never from the
+video file.
+
+**Coordinate systems — the one place this is written down.**
+
+* ``faces`` bbox (top, right, bottom, left) of a video face: **native display
+  pixels** of the decoded, rotation-applied frame — the same space as
+  ``photos.image_width`` / ``image_height`` (the probe's display dims), exactly
+  as for a still. So ``tools`` in-frame / prominence tests and the clustering
+  ``min_bbox_edge`` gate read a 4K video's faces at full size.
+* The representative frame JPEG (``keyframe_rep_f{rep_frame:05d}.jpg``) is
+  stored at <= 1920 px: anything drawing that bbox on it scales by
+  ``rep_jpeg_width / image_width`` (``/api/faces/crop``'s fallback does).
+* ``quality_json["frames"]["segments"][i]["faces"]`` and
+  ``quality_json["identities"]``: decoded native display pixels too
+  (``x1, y1, x2, y2``), ``quality_json["width"/"height"]`` the frame size.
+* ``video_subjects.rep_bbox`` and the grounding boxes in ``subjects_json``:
+  normalised 0-1 of the segment keyframe (resolution-free).
+
+**Staged uploads.** Assets upload into a fresh *generation*,
+``video_frames/{pid}/v{SCAN_VERSION}/g{generation}/``, and the posters are not
+installed by the upload. Only the committed submit points
+``video_meta.scan_generation`` at it, installs the posters and bumps
+``poster_version``; a failed or deferred re-scan leaves the live files alone.
+``cleanup-orphans`` removes generations no row points at (after a day, so an
+in-flight scan's staging dir is not swept from under it).
 
 **A re-scan replaces everything** (old ``video_tracks``, old ``faces`` and their
 vec0 ``face_encodings`` rows, the CLIP embedding) **but carries human labels**
@@ -26,7 +48,7 @@ response and logged — never silently dropped.
 Asset naming (shared with the worker; the asset endpoint prefixes the kind):
 
 ==========================  ==============================================
-asset ``name`` (kind)       stored as ``video_frames/{pid}/v{ver}/...``
+asset ``name`` (kind)       stored as ``video_frames/{pid}/v{ver}/g{gen}/...``
 ==========================  ==============================================
 ``k00.jpg`` (keyframe)      ``keyframe_k00.jpg`` — the K keyframes, 1024 px
 ``s000.jpg`` (keyframe)     ``keyframe_s000.jpg`` — one per
@@ -98,8 +120,15 @@ def stored_name(kind: str, name: str) -> str:
     return f"{kind}_{name}"
 
 
-def frames_dir(frames_root, photo_id: int, version: int) -> Path:
-    return Path(frames_root) / str(int(photo_id)) / f"v{int(version)}"
+def frames_dir(frames_root, photo_id: int, version: int,
+               generation: Optional[str] = None) -> Path:
+    d = Path(frames_root) / str(int(photo_id)) / f"v{int(version)}"
+    return d / f"g{generation}" if generation else d
+
+
+# Unpromoted staging generations younger than this are left alone by
+# cleanup-orphans: they may belong to a scan whose submit is still coming.
+STAGING_GRACE_S = 24 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +296,17 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
     # D13 — match labelled old faces to new identities BEFORE deleting them.
     old = _old_faces(conn, pid)
     labelled = [o for o in old if o["match_source"] in CARRY_LABEL_SOURCES]
-    carried, unmatched = match_labels(labelled, [i.get("encoding") for i in idents])
+    new_encs = [i.get("encoding") for i in idents]
+    carried, unmatched = match_labels(labelled, new_encs)
+    # Then every OTHER old face that carries face/person exclusions (a strict
+    # match the duplicate resolver stripped, a dedupe_unmatched loser) is
+    # matched one-to-one among the identities still free: the exclusions move
+    # with it, or the nightly match/resolve churn loop would restart on the
+    # new face ids. Only the exclusions travel — not the auto label.
+    free = [None if ni in carried else e for ni, e in enumerate(new_encs)]
+    excl_only, _ = match_labels(
+        [o for o in old if o["match_source"] not in CARRY_LABEL_SOURCES and o["exclusions"]],
+        free)
 
     # Replace: tracks, faces (+ their vec0 encodings, explicitly — vec0 has
     # no FK cascade), CLIP embedding.
@@ -289,7 +328,8 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
             conn.execute(f"DELETE FROM face_encodings WHERE face_id IN ({ph})", chunk)
         conn.execute(f"DELETE FROM faces WHERE id IN ({ph})", chunk)
 
-    frames_v = frames_dir(frames_root, pid, version) if frames_root else None
+    generation = r.get("generation")
+    frames_v = frames_dir(frames_root, pid, version, generation) if frames_root else None
     for ni, ident in enumerate(idents):
         bbox = ident["bbox"]
         if len(bbox) != 4:
@@ -316,6 +356,13 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
             out["carried"].append({"old_face_id": lab["face_id"], "face_id": fid,
                                    "person_id": person_id, "match_source": source,
                                    "l2": lab.get("l2")})
+        ex = excl_only.get(ni)
+        if ex and ex.get("exclusions"):
+            record_face_person_exclusions(conn, [(fid, p) for p in ex["exclusions"]],
+                                          reason="rescan_carry")
+            out.setdefault("exclusions_carried", []).append(
+                {"old_face_id": ex["face_id"], "face_id": fid,
+                 "person_ids": list(ex["exclusions"])})
         ix = int(ident.get("ident_ix", ni))
         conn.execute(
             "INSERT INTO video_tracks (photo_id, face_id, ident_ix, t_start, t_end, n_det, "
@@ -351,13 +398,18 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
                          (pid, _serialize_float_list(emb)))
 
     sets = ["scan_version = ?", "scan_error = NULL", "scanned_at = ?", "shake = ?",
-            "noise = ?", "focus_consistency = ?", "quality_json = ?"]
+            "noise = ?", "focus_consistency = ?", "quality_json = ?",
+            "scan_generation = ?"]
     vals = [version, now, r.get("shake"), r.get("noise"), r.get("focus_consistency"),
-            _json(r.get("quality_json"))]
+            _json(r.get("quality_json")), generation]
     if r.get("poster_uploaded"):
+        # Bumped in the same transaction that promotes the generation; the
+        # caller installs the staged posters only after the commit.
         sets += ["poster_t = ?",
                  "poster_version = COALESCE(poster_version, probe_version, 0) + 1"]
         vals.append(r.get("poster_t"))
+        if generation:
+            out["_posters"] = (version, generation)
     conn.execute(f"UPDATE video_meta SET {', '.join(sets)} WHERE photo_id = ?",
                  (*vals, pid))
     return out
@@ -393,17 +445,21 @@ def video_face_source(conn, face_id: int, frames_root) -> Optional[dict]:
     is relative to) and the uploaded crops. None for a still's face or a face
     with no track. Never touches the video file."""
     row = conn.execute(
-        "SELECT f.photo_id, p.media_type, vt.ident_ix, vt.rep_frame, vm.scan_version "
+        "SELECT f.photo_id, p.media_type, vt.ident_ix, vt.rep_frame, vm.scan_version, "
+        "vm.scan_generation, COALESCE(p.image_width, vm.width), "
+        "COALESCE(p.image_height, vm.height) "
         "FROM faces f JOIN photos p ON p.id = f.photo_id "
         "LEFT JOIN video_tracks vt ON vt.face_id = f.id "
         "LEFT JOIN video_meta vm ON vm.photo_id = f.photo_id WHERE f.id = ?",
         (face_id,)).fetchone()
     if row is None or row[1] != "video":
         return None
-    out = {"photo_id": row[0], "rep_path": None, "crop_paths": {}}
+    # native_w/h: the space the faces bbox is in (see the module docstring).
+    out = {"photo_id": row[0], "rep_path": None, "crop_paths": {},
+           "native_w": row[6], "native_h": row[7]}
     if row[2] is None or row[4] is None or frames_root is None:
         return out
-    d = frames_dir(frames_root, row[0], row[4])
+    d = frames_dir(frames_root, row[0], row[4], row[5])
     if row[3] is not None:
         out["rep_path"] = str(d / stored_name("keyframe", rep_name(row[3])))
     for size in CROP_SIZES:
@@ -421,9 +477,18 @@ def current_versions(conn, photo_id: int) -> set[int]:
     return {int(v) for v in row if v is not None}
 
 
-def stale_frame_dirs(conn, frames_root) -> list[str]:
-    """``video_frames/{pid}/v*`` directories no longer referenced: the photo
-    is gone, or the version is neither the current scan nor probe version."""
+def stale_frame_dirs(conn, frames_root, now: Optional[float] = None,
+                     grace_s: float = STAGING_GRACE_S) -> list[str]:
+    """Asset directories no longer referenced, for cleanup-orphans:
+
+    * ``video_frames/{pid}/v*`` when the photo is gone, or the version is
+      neither the current scan nor probe version;
+    * ``v{ver}/g{gen}`` staging generations other than the row's current
+      ``scan_generation`` — superseded scans and uploads whose submit never
+      landed — once older than ``grace_s`` (an in-flight scan's staging dir
+      must not be swept between its upload and its submit)."""
+    import time
+    now = time.time() if now is None else now
     root = Path(frames_root)
     if not root.is_dir():
         return []
@@ -431,9 +496,11 @@ def stale_frame_dirs(conn, frames_root) -> list[str]:
     for pdir in root.iterdir():
         if not pdir.is_dir() or not pdir.name.isdigit():
             continue
-        exists = conn.execute("SELECT 1 FROM photos WHERE id = ?",
-                              (int(pdir.name),)).fetchone()
-        keep = current_versions(conn, int(pdir.name)) if exists else set()
+        pid = int(pdir.name)
+        exists = conn.execute("SELECT 1 FROM photos WHERE id = ?", (pid,)).fetchone()
+        keep = current_versions(conn, pid) if exists else set()
+        gen_row = conn.execute("SELECT scan_version, scan_generation FROM video_meta "
+                               "WHERE photo_id = ?", (pid,)).fetchone() if exists else None
         for vdir in pdir.iterdir():
             if not vdir.is_dir() or not vdir.name.startswith("v"):
                 continue
@@ -443,4 +510,17 @@ def stale_frame_dirs(conn, frames_root) -> list[str]:
                 continue
             if v not in keep:
                 stale.append(str(vdir))
+                continue
+            live = (gen_row[1] if gen_row and gen_row[0] == v else None)
+            for gdir in vdir.iterdir():
+                if not gdir.is_dir() or not gdir.name.startswith("g"):
+                    continue
+                if gdir.name[1:] == live:
+                    continue
+                try:
+                    age = now - gdir.stat().st_mtime
+                except OSError:
+                    continue
+                if age >= grace_s:
+                    stale.append(str(gdir))
     return sorted(stale)

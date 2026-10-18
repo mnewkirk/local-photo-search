@@ -270,6 +270,9 @@ class VideoScanResult(BaseModel):
     poster_uploaded: bool = False
     poster_t: Optional[float] = None
     probe: Optional[dict] = None
+    # The staging generation the assets were uploaded into (v38); the submit
+    # promotes it. None = an older worker that wrote straight into v{ver}/.
+    generation: Optional[str] = None
 
 
 class VideoSubjectSpec(BaseModel):
@@ -1222,6 +1225,19 @@ def submit_results(req: SubmitRequest):
                         crop_cache_dir=face_crop_cache_dir(db.db_path),
                         frames_root=frames_root(db.db_path))
                     db.conn.commit()
+                    # Only now — the generation is promoted — do the staged
+                    # posters and crops become visible.
+                    posters = info.pop("_posters", None)
+                    if posters:
+                        from .video_api import install_posters
+                        from . import web as _web
+                        try:
+                            install_posters(db.db_path, r.photo_id, posters[0], posters[1],
+                                            thumb_dir=_web._ensure_thumb_dir(),
+                                            preview_dir=_web._ensure_preview_dir())
+                        except OSError as e:
+                            logger.warning("video-scan %s: poster install failed: %s",
+                                           r.photo_id, e)
                     install_crops(info.pop("_install", []))
                     outcome.written += 1
                     outcome.persisted(r.photo_id)

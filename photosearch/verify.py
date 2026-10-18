@@ -717,13 +717,14 @@ def verify_photos(
     if photos is None:
         if force:
             rows = db.conn.execute(
-                "SELECT * FROM photos WHERE description IS NOT NULL OR tags IS NOT NULL"
+                "SELECT * FROM photos WHERE (description IS NOT NULL OR tags IS NOT NULL) "
+                "AND media_type IS NULL"   # verify is still-only (video-support D18)
             ).fetchall()
         else:
             rows = db.conn.execute(
                 """SELECT * FROM photos
                    WHERE (description IS NOT NULL OR tags IS NOT NULL)
-                   AND verified_at IS NULL"""
+                   AND verified_at IS NULL AND media_type IS NULL"""
             ).fetchall()
         photos = [dict(r) for r in rows]
 

@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -1352,7 +1352,8 @@ class PhotoDB:
                 poster_version    INTEGER,
                 subjects_version  INTEGER,
                 subjects_at       TEXT,
-                subjects_json     TEXT
+                subjects_json     TEXT,
+                scan_generation   TEXT
             )
         """)
         # v36: video_meta.poster_version — the counter that names a video's
@@ -1381,6 +1382,16 @@ class PhotoDB:
                 cur.execute(f"SELECT {col} FROM video_meta LIMIT 1")
             except sqlite3.OperationalError:
                 cur.execute(f"ALTER TABLE video_meta ADD COLUMN {col} {typ}")
+        # v38: video_meta.scan_generation — the staging dir
+        # (video_frames/{id}/v{scan_version}/g{generation}/) the current scan's
+        # keyframes and crops were uploaded into. A re-scan uploads into a NEW
+        # generation and only the committed submit points here, so a failed or
+        # deferred re-scan never overwrites the files the live faces/subjects
+        # reference. NULL = a pre-v38 scan, whose files sit in v{scan_version}/.
+        try:
+            cur.execute("SELECT scan_generation FROM video_meta LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE video_meta ADD COLUMN scan_generation TEXT")
         # Main subject per video (person, animal, scenery), joined to a face
         # track for identity when it is a person.
         cur.execute("""
@@ -1841,10 +1852,16 @@ class PhotoDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def similar_by_photo(self, photo_id: int, limit: int = 100) -> list[dict]:
+    def similar_by_photo(self, photo_id: int, limit: int = 100,
+                         media: str = "any") -> list[dict]:
         """CLIP nearest-neighbors of an existing photo, by its own embedding.
         Returns [{photo_id, distance}] sorted nearest-first (the query photo
-        itself is included at distance ~0). Empty if the photo has no embedding."""
+        itself is included at distance ~0). Empty if the photo has no embedding.
+
+        ``media``: 'any' (default), 'still' or 'video'. Videos have a CLIP
+        embedding too (video-scan's keyframe mean), so a caller that needs an
+        IMAGE (book print alternatives) must ask for 'still'. The KNN is
+        over-fetched and filtered, so fewer than ``limit`` may come back."""
         if not HAS_SQLITE_VEC:
             return []
         row = self.conn.execute(
@@ -1864,7 +1881,20 @@ class PhotoDB:
                 "SELECT photo_id, distance FROM clip_embeddings "
                 "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
                 (blob, limit)).fetchall()
-        return [dict(r) for r in rows]
+        out = [dict(r) for r in rows]
+        if media in ("still", "video") and out:
+            frag = STILL_SQL if media == "still" else VIDEO_SQL
+            ids = [r["photo_id"] for r in out]
+            keep = set()
+            for i in range(0, len(ids), 900):
+                chunk = ids[i:i + 900]
+                keep.update(x[0] for x in self.conn.execute(
+                    f"SELECT id FROM photos WHERE id IN ({','.join('?' * len(chunk))}) "
+                    f"AND {frag}", chunk))
+            out = [r for r in out if r["photo_id"] in keep]
+        elif media != "any":
+            raise ValueError(f"media must be any|still|video, not {media!r}")
+        return out
 
     # ------------------------------------------------------------------
     # Vec0 orphan cleanup
