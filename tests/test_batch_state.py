@@ -1070,3 +1070,55 @@ class TestFleetLaunchPasses:
         got = fleet_launch_passes(batch_state(db, batch_id))
         assert set(got) <= set(WORKER_PASSES)
         assert not set(got) & set(NAS_STEPS)
+
+
+
+# --- videos in a batch (schema v35, video-support step 1) -------------------
+
+def _finish_stills(db, ids):
+    for i, pid in enumerate(ids):
+        db.add_clip_embedding(pid, _embedding(i))
+        db.conn.execute(
+            "UPDATE photos SET aesthetic_score = 5, aesthetic_concepts = '[]', "
+            "aes_overall = 6, aes_overall_pct = 50, description = 'd', "
+            "verified_at = datetime('now'), visual_tags = '[]', "
+            "categories = '[]', keywords = '[]' WHERE id = ?", (pid,))
+    db.mark_processed(ids, "faces", terminal=True)
+    db.conn.commit()
+
+
+def _close_nas_steps(db, batch_id):
+    from photosearch.batch_state import JOB_ONLY_STEPS
+    for step in ("stacking",) + JOB_ONLY_STEPS:
+        open_job(db, batch_id, step, "nas")
+        close_job(db, batch_id, step)
+
+
+def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
+    """A video gets no description until video-describe (step 5), so no
+    worker pass may count it yet — or the batch could never read ready."""
+    batch_id, ids = _make_batch(db, count=2)
+    vid = db.add_photo(filepath=f"{_DIR}/C0001.MP4", filename="C0001.MP4",
+                       media_type="video", date_taken="2091-09-19T11:00:00")
+    db.conn.execute("INSERT INTO video_meta (photo_id) VALUES (?)", (vid,))
+    db.conn.commit()
+    _finish_stills(db, ids)
+    _close_nas_steps(db, batch_id)
+
+    state = batch_state(db, batch_id)
+    not_done = [s["step"] for s in state["steps"]
+                if s["state"] != "completed" and s["step"] not in OPTIONAL_STEPS]
+    assert not_done == [] and state["ready"] is True
+    assert state["next_action"] != "launch_fleet"
+
+
+def test_video_only_batch_never_asks_for_a_fleet_launch(db):
+    directory = "2091/2091-09-20_phone-matt"
+    vid = db.add_photo(filepath=f"{directory}/PXL_1.mp4", filename="PXL_1.mp4",
+                       media_type="video", date_taken="2091-09-20T11:00:00")
+    batch_id = register_batch(db, directory)
+    state = batch_state(db, batch_id)
+    for p in WORKER_PASSES:
+        assert _step(state, p)["state"] == "completed", _step(state, p)
+    assert state["next_action"] != "launch_fleet"
+    assert vid

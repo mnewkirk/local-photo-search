@@ -188,10 +188,13 @@ PASS_MEDIA: dict[str, str] = {
     # otherwise claim a video the moment a video description lands.
     "verify": "still",
     "category-visual": "still",
-    # text-only passes over photos.description — a video description is as
-    # good an input as a photo's.
-    "category-content": "any",
-    "keywords": "any",
+    # text-only passes over photos.description. "still" FOR NOW: nothing
+    # writes a video description until video-describe (step 5), so as "any"
+    # a batch holding a video could never read `ready` (the pass sat on
+    # needs_queue with nothing claimable). Step 5 flips these to "any" AND
+    # must make batch_state's video eligibility depend on video-describe.
+    "category-content": "still",
+    "keywords": "still",
     # legacy pre-v23 pass, still accepted by the claim path for cleanup
     "tags": "still",
     # future video passes (steps 2b-5). Present here so their claim
@@ -1557,7 +1560,10 @@ class PhotoDB:
             list(kwargs.values()),
         )
         self._maybe_commit()
-        if cur.lastrowid == 0:
+        # rowcount, not lastrowid: an IGNORED insert leaves lastrowid at the
+        # connection's PREVIOUS insert (non-zero once anything was inserted),
+        # which returned another row's id for an existing filepath.
+        if cur.rowcount == 0:
             # Photo already existed — fetch its id
             row = self.conn.execute(
                 "SELECT id FROM photos WHERE filepath = ?", (kwargs["filepath"],)

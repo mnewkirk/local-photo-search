@@ -35,6 +35,12 @@ def lib(tmp_path):
     _touch(root / "_incoming" / "matt" / ".processed" / "OLD.mp4")
     _touch(root / "2025" / ".staging-abc" / "X.mp4")
     _touch(root / "thumbnails" / "T.mp4")
+    # NAS trash / snapshot / metadata dirs
+    _touch(root / "#recycle" / "2025" / "DEL.mp4")
+    _touch(root / "2025" / "#snapshot" / "S.mp4")
+    _touch(root / "2025" / "@eaDir" / "PXL_1.mp4" / "SYNOVIDEO.mp4")
+    _touch(root / "2025" / ".@__thumb" / "Q.mp4")
+    _touch(root / "#anything" / "Z.mp4")
     _touch(root / "2025" / "2025-07-04_phone-matt" / "DSC1.ARW")
     dbp = str(tmp_path / "photo_index.db")
     with PhotoDB(dbp) as db:
@@ -142,3 +148,30 @@ def test_cli_register_videos(lib):
     assert "Registered 3 video(s)" in r.output
     r = CliRunner().invoke(cli, ["register-videos", "--db", dbp + ".missing"])
     assert r.exit_code != 0
+
+
+def test_reregistering_after_other_inserts_returns_the_right_id(lib):
+    """INSERT OR IGNORE leaves lastrowid at the connection's PREVIOUS insert,
+    so re-registering the first video after a second one used to come back
+    with the SECOND row's id (and attach video_meta to the wrong photo)."""
+    dbp, root = lib
+    d = root / "2025" / "2025-07-04_phone-matt"
+    with PhotoDB(dbp) as db:
+        a = register_video(db, str(d / "PXL_1.mp4"))
+        b = register_video(db, str(d / "PXL_2.MP4"))
+        assert a != b
+        assert register_video(db, str(d / "PXL_1.mp4")) == a
+        meta = [r[0] for r in db.conn.execute(
+            "SELECT photo_id FROM video_meta ORDER BY photo_id")]
+        assert meta == sorted([a, b])
+
+
+def test_image_walk_shares_the_nas_dir_exclusions(tmp_path):
+    from photosearch.index import find_photos, is_excluded_dir
+    for name in ("#recycle", "#snapshot", "#whatever", "@eaDir", ".@__thumb",
+                 "_incoming", "thumbnails"):
+        assert is_excluded_dir(name), name
+    assert not is_excluded_dir("2025-07-04_phone-matt")
+    _touch(tmp_path / "#recycle" / "A.JPG", b"\xff\xd8\xff\xe0")
+    _touch(tmp_path / "2025" / "B.JPG", b"\xff\xd8\xff\xe0")
+    assert [os.path.basename(p) for p in find_photos(str(tmp_path))] == ["B.JPG"]

@@ -142,6 +142,19 @@ EXCLUDED_DIRS = _BUILTIN_EXCLUDED_DIRS | {
 }
 
 
+# NAS trash / snapshot / metadata directories (UGOS / Synology / QNAP). Never
+# library content: `#recycle` holds deleted files, `@eaDir` and `.@__thumb`
+# hold generated thumbnails.
+_NAS_SYSTEM_DIRS = {"@eaDir", ".@__thumb", "#recycle", "#snapshot"}
+
+
+def is_excluded_dir(name: str) -> bool:
+    """Should a library walk skip a directory with this name? Shared by the
+    image walk (find_photos) and the video registry walk."""
+    return (name in EXCLUDED_DIRS or name in _NAS_SYSTEM_DIRS
+            or name.startswith("#"))
+
+
 import re as _re
 _NUMBERED_COPY_RE = _re.compile(r'^(.+?)_\d+(\.[^.]+)$', _re.IGNORECASE)
 
@@ -169,7 +182,7 @@ def find_photos(directory: str) -> list[str]:
 
     for root, dirs, files in os.walk(directory):
         # Skip excluded subdirectories in-place so os.walk doesn't descend into them
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        dirs[:] = [d for d in dirs if not is_excluded_dir(d)]
 
         # Build a lowercase set of all filenames in this dir for fast lookup
         file_set_lower = {f.lower() for f in files}

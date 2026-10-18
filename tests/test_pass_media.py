@@ -62,15 +62,18 @@ def test_every_worker_pass_has_a_media_entry():
 
 
 def test_the_map_says_what_the_plan_says():
+    # category-content / keywords are "still" until video-describe (step 5)
+    # exists: as "any" a batch holding a video could never read `ready`.
     still = {"clip", "faces", "quality", "aesthetics", "describe", "verify",
-             "category-visual"}
-    anyp = {"category-content", "keywords"}
+             "category-visual", "category-content", "keywords"}
     for p in still:
         assert PASS_MEDIA[p] == "still"
         assert media_sql(p) == STILL_SQL
-    for p in anyp:
-        assert PASS_MEDIA[p] == "any"
-        assert media_sql(p) is None and media_clause(p) == ""
+
+
+def test_an_any_pass_gets_no_media_fragment(monkeypatch):
+    monkeypatch.setitem(PASS_MEDIA, "keywords", "any")
+    assert media_sql("keywords") is None and media_clause("keywords") == ""
     for p in ("video-probe", "video-scan", "video-subjects", "video-describe"):
         assert PASS_MEDIA[p] == "video"
         assert media_sql(p, "p") == f"p.{VIDEO_SQL}"
@@ -157,8 +160,6 @@ def test_still_passes_complete_with_unprocessed_videos_in_the_batch(mixed):
         if PASS_MEDIA[p] == "still":
             assert steps[p]["state"] == "completed", (p, steps[p])
         else:
-            # the videos' descriptions still need categories / keywords
-            assert steps[p]["state"] != "completed", (p, steps[p])
             assert steps[p]["remaining"] == len(videos)
 
 

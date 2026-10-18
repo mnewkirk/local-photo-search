@@ -44,11 +44,6 @@ def _video_extensions() -> set[str]:
     return VIDEO_EXTENSIONS
 
 
-def _excluded_dirs() -> set[str]:
-    from .index import EXCLUDED_DIRS
-    return set(EXCLUDED_DIRS)
-
-
 def _mtime_date(path: str) -> Optional[str]:
     try:
         ts = os.stat(path).st_mtime
@@ -109,13 +104,14 @@ def iter_video_files(root: str, folder: Optional[str] = None):
     """Yield absolute paths of video files under ``root`` (or ``root/folder``),
     sorted, skipping excluded/hidden directories and AppleDouble ``._*`` files.
 
-    The excluded set is the indexer's (``index.EXCLUDED_DIRS``: ``_incoming``,
-    thumbnails, ...), so the staging tree -- and its ``.processed`` archive --
-    is never walked. Hidden directories (``.processed``, ``.staging-*``) and
-    NAS metadata dirs (``@eaDir``) are skipped too.
+    The excluded set is the image walk's (``index.is_excluded_dir``:
+    ``_incoming``, thumbnails, NAS trash/system dirs such as ``#recycle``,
+    ``#snapshot``, ``@eaDir``), so the staging tree -- and its ``.processed``
+    archive -- is never walked. Hidden (``.staging-*``, ``.@__thumb``) and
+    ``@``-prefixed directories are skipped too.
     """
+    from .index import is_excluded_dir
     exts = _video_extensions()
-    excluded = _excluded_dirs()
     start = Path(root)
     if folder:
         f = Path(folder)
@@ -124,7 +120,7 @@ def iter_video_files(root: str, folder: Optional[str] = None):
         return
     for dirpath, dirs, files in os.walk(start):
         dirs[:] = sorted(d for d in dirs
-                         if d not in excluded and not d.startswith(".")
+                         if not is_excluded_dir(d) and not d.startswith(".")
                          and not d.startswith("@"))
         for name in sorted(files):
             if name.startswith("._"):
