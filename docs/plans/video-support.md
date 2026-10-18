@@ -220,6 +220,184 @@ where the owner gets value.
   download and unreadable files are detected there instead (the row still
   stores the error either way).
 
+### Step 0 results (spike, 2026-10-17)
+
+12 fixtures pulled to `/home/mattn/video-fixtures/` (outside the repo;
+`MANIFEST.md` there has per-file NAS paths/sizes/codecs). Static
+`ffmpeg`/`ffprobe` 7.0.2 installed to `~/.local/bin` (D20 deviation — WSL has
+no `sudo`, so the johnvansickle.com amd64-static tarball stood in for `apt
+install ffmpeg`; same binary, installable via apt later with root). Desktop
+`cv2` 4.13 already has `FFMPEG: YES` — no new dependency needed for decode.
+
+**The single biggest finding: most "moov atom not found" files are not
+corrupt — they are ZIP archives with a `.MOV` extension.** Both
+`moov_missing_1/2.mov` turned out to start with `PK\x03\x04`, and
+`python zipfile.ZipFile(...)` opens them cleanly, each containing exactly one
+entry (`IMG_1585.MOV`, `IMG_2760.MOV`) that is a perfectly normal, playable
+h264 1080x1920 video (105 s and longer). This is the same iOS Live-Photo/motion
+bundle bug CLAUDE.md already documents for **images** (`IMG_xxxx(1).JPG` that
+is really a ZIP wrapping a `.mov`) — it turns out the bug also produces
+ZIP-wrapped files that keep the **video** extension, not just the photo one.
+A random 40-file sample of 2016–2017 `.mov`/`.mp4` (NAS-host `ffprobe`, read
+only the first 12 bytes) found **23/40 (57.5%) are `PK\x03\x04` ZIPs**, 17/40
+have a real `ftyp` box, 0 "other" — consistent with the corpus table's "111 of
+400 sampled (28%) unreadable, all 2016–2017": if the 400-sample's 2016–2017
+slice is roughly 190 files, 111/190 ≈ 58% lines up with this 57.5% almost
+exactly. **This means the large majority of the ~1,400-file "unreadable"
+bucket is not lost footage — it is normal, playable video sitting inside a
+same-name ZIP**, recoverable by `zipfile.ZipFile(path).read(name)`.
+
+The catch: the ZIP's `compress_type` is DEFLATE but `compress_size` ≈
+`file_size` (86,303,581 / 86,330,047 — 0.03% smaller) because the payload is
+already-compressed H.264/HEVC. **Unwrapping is not a cheap header read — it
+costs a full decompress of the whole file**, i.e. the same order of cost as
+downloading it once. So ZIP-unwrap recovery belongs in **`video-scan`'s
+existing single rate-capped download**, not in the cheap `video-probe` pass.
+`video-probe` should still do the **4-byte magic check** (free — a few bytes
+over Range) and store a distinct `probe_error` value (e.g.
+`"zip_wrapped_pending_scan"`) rather than lumping it in with genuine
+corruption, so `video-scan`'s claim predicate knows to unzip-then-probe-then-analyze
+instead of skipping. Dates/codec/dims must then be read from the **inner**
+file after unwrapping, never the outer ZIP's own mtime.
+
+**ffprobe/cv2 over HTTP Range already short-circuit cheaply — no separate
+head+tail `moov` pre-check is needed for cost reasons.** Measured with a
+custom Range-logging HTTP server (`scripts/range_server.py`) serving the
+fixtures locally, bytes actually transferred per `ffprobe -show_format
+-show_streams <url>` call:
+
+| file | filesize | class (atom walk) | ffprobe bytes read | % of file |
+|---|---|---|---|---|
+| `y2016_1080p_normal.mp4` | 131.6 MB | moov_tail | 6.3 MB | 4.8% |
+| `ilce_8k_short.mp4` | 134.4 MB | moov_tail | 16.9 MB | 12.6% |
+| `hdr_normal.mov` | 63.5 MB | moov_tail | 3.5 MB | 5.6% |
+| `sample.mts` | 36.9 MB | moov_tail-ish (MPEG-TS) | 13.4 MB | 36.2% |
+| `canon_mvi.avi` | 17.4 MB | RIFF (no moov) | 3.3 MB | 18.9% |
+| `iphone_portrait_rot.mp4` | 3.1 MB | moov_tail | 2.95 MB | 93.9% (whole file is small) |
+| `kodak_pixpro.mov` | 2.6 MB | moov_tail | 3.4 MB | >100% (re-reads on a tiny file) |
+| `y2016_720p.mp4` | 2.9 MB | moov_head (faststart) | 1.3 MB | 44.8% |
+| `facebook_takeout.mp4` | 1.1 MB | moov_head (faststart) | 0.79 MB | 74.6% |
+| `moov_missing_1.mov` (ZIP) | 86.3 MB | no_moov | **2.4 MB** | **2.8%** |
+| synthetic 100 MB truncated moov-tail (no moov at all, real corruption case) | 100 MB | no_moov | **0.52 MB** | **0.5%** |
+
+`cv2.VideoCapture(url).read()` (first-frame grab) is similarly cheap: 3.3% of
+a 131.6 MB moov-tail file, 4.2% of the 86 MB ZIP-wrapped file (fails to open,
+same as ffprobe, after a small read). **ffprobe does NOT read to EOF on a
+genuinely moov-less file** — confirmed with a synthetic 100 MB truncated copy
+of a real moov-tail MP4 (head truncated before the moov atom): ffprobe gave up
+after ~524 KB, not 100 MB. The one surprising cost outlier is `.mts`
+(AVCHT/MPEG-TS): no single `moov` atom to seek to, so ffprobe reads more of the
+stream (36% here) to establish stream parameters — still far under a whole
+download, and `.mts` is 4 files library-wide, so it doesn't move the average.
+
+**Atom layout matters more than file shape for the gate, and it skews heavily
+toward moov-tail.** `scripts/atom_walk.py` (pure-stdlib top-level-atom walker)
+found **9 of 10 real-camera `.mov`/`.mp4` fixtures have `moov` at the tail**
+(iPhone, Sony ILCE-7RM6, Kodak PIXPRO, the 2016 1080p baseline) — only the
+oldest/simplest files (`y2016_720p.mp4`, `facebook_takeout.mp4`) are faststart.
+This confirms most of the corpus needs the tail read, which `ffprobe`/`cv2`
+already do efficiently via `Range: bytes=N-` requests (no head+tail
+pre-fetch needed to find the offset — the format prober seeks directly).
+
+**GATE: PASS, with margin.** Per-video probe cost (ffprobe + one cv2
+first-frame grab) is in the low single-digit megabytes to ~15% of filesize for
+large real videos, and under 1% for files with no readable container at all —
+nowhere near "one whole-file download" (≈70 MB average, ≈400 GB library-wide).
+Folding the probe into `video-scan`'s download (the gate's fallback) is **not
+needed**. The only thing that *does* need `video-scan`'s full download is the
+ZIP-unwrap recovery path above, which is a correctness feature, not a
+probe-cost one — and it only applies to the subset of files whose magic bytes
+are `PK\x03\x04`, not to every file.
+
+**cv2 decodes HEVC fine, including 8K, and auto-applies rotation.**
+`scripts/cv2_test.py` results:
+
+| file | reported dims | first-frame shape | `CAP_PROP_ORIENTATION_META` | `CAP_PROP_ORIENTATION_AUTO` | decode fps (60-frame sample) |
+|---|---|---|---|---|---|
+| `hdr_live_short.mov` (hevc, -90 rot) | 1080x1920 | (1920,1080,3) | 90.0 | 1.0 (on by default) | 73.8 |
+| `iphone_portrait_rot.mp4` (h264, -90 rot) | 1080x1440 | (1440,1080,3) | 90.0 | 1.0 | 412.1 |
+| `ilce_8k_short.mp4` (hevc, 7680x4320) | 7680x4320 | (4320,7680,3) | 0.0 | 1.0 | 17.3 |
+| `y2016_1080p_normal.mp4` (h264 1080p) | 1920x1080 | (1080,1920,3) | 0.0 | 1.0 | 743.8 |
+| `sample.mts` (interlaced AVCHD) | 1920x1080 | (1080,1920,3) | 0.0 | 1.0 | 535.5 (but every frame logs an `swscaler` "cannot convert interlaced to progressive" warning) |
+
+`CAP_PROP_ORIENTATION_AUTO` defaults to `1` (on) in this cv2 build, and the
+reported frame width/height and the decoded frame's numpy shape already come
+back **rotated to display orientation** — no manual display-matrix handling
+needed in `video_probe.py`/`video_analysis.py` for the common `-90`/`90` case;
+reading `CAP_PROP_ORIENTATION_META` is still worth doing (it's what ffprobe's
+`rotate`/`side_data_list` rotation tag independently confirms) so the stored
+`rotation` column has a value even where cv2's auto-handling silently absorbs
+it. 8K HEVC decodes at 17.3 fps on the desktop CPU — real but not fast; a
+dense 2–4 fps sampling pass (per the plan) is comfortably inside that budget,
+a full-fps scan of an 8K clip would not be. `.mts`'s interlaced warning spam is
+noise (decode still succeeds) but worth suppressing/handling explicitly in
+`video_analysis.py` rather than ignoring — interlaced source quality (shake/
+noise/focus) measurements may be unreliable on raw interlaced frames without a
+deinterlace step.
+
+**Per-camera `mvhd creation_time` behavior differs by camera family — "apply a
+per-camera UTC offset" is not one number, it's a per-family *interpretation*.**
+Cross-checked `ffprobe` `format.tags.creation_time` /
+`com.apple.quicktime.creationdate` against sibling-photo `date_taken` in the
+replica DB (`photo_index.db.local`, read-only):
+
+- **iPhone (`phone-nicole`)**: `com.apple.quicktime.creationdate` carries an
+  explicit local time + UTC offset (e.g. `2025-06-24T14:16:05+0200`), and
+  `format.tags.creation_time` is **exactly** that value converted to UTC in
+  every sample checked (10/10) — no offset/correction needed, just prefer
+  `apple_cd` when present (already D14's order) and convert for display.
+  Oddity, not a blocker: the **filename's own embedded local timestamp**
+  sometimes disagrees with `apple_cd` by hours (e.g. filename says `11:14:56`,
+  `apple_cd` says `20:14:56+0200`) — ingest's filename stamp is evidently not
+  always derived from the same source as the capture metadata, which is an
+  argument for never trusting the filename-embedded time over `apple_cd`.
+- **Android (`phone-matt`, Pixel)**: no `apple_cd`. `creation_time` is close
+  to but consistently **later** than the `PXL_YYYYMMDD_HHMMSSmmm` filename
+  timestamp (which is the recording **start**, UTC) — by roughly 10–20 s in
+  every sample, tracking each clip's own duration. This is the Android/Pixel
+  MP4 muxer stamping `creation_time` at **finalization** (recording end), not
+  start. **Policy implication: for this family, `date_taken = creation_time −
+  duration_s`, not a fixed clock offset** — the plan's D14 phrasing
+  ("corrected by the per-camera offset") should read as "per-camera-family
+  correction *function*", not a scalar.
+- **Sony ILCE-7RM6 and Kodak PIXPRO WPZ2**: no `apple_cd`. `creation_time`
+  carries the `Z` (UTC) suffix per the container spec, but treating it as true
+  UTC and converting to Pacific local puts it **hours away** from sibling
+  JPEGs' `date_taken` in the same folder; treating it as **already local wall
+  time** (strip the `Z`, apply zero offset) lines up with siblings to within
+  minutes on every folder checked (e.g. `100_0433.MOV` `creation_time`
+  `09:20:57` vs sibling JPEGs `09:15:35`–`09:20:XX` local; ILCE `C0004.MP4`
+  `14:09:12` vs sibling JPEG `14:34:42` local, same session). **Both of these
+  consumer/prosumer camera bodies mislabel local camera-clock time as UTC in
+  the container.** Treating their `creation_time` as real UTC and applying a
+  timezone correction would move every one of their videos by a full
+  timezone offset in the wrong direction.
+
+  Net: the date policy needs a **per-camera-model table** (keyed by
+  `camera_make`/`model` the same way `ingest._file_suffix` already keys
+  folder routing), not a single global "treat mvhd as UTC, add an offset"
+  rule — `{iPhone: apple_cd verbatim, Android/Pixel: creation_time −
+  duration_s, Sony/Kodak/unknown: creation_time with no tz conversion}`, falling
+  back to mtime only when none of the above is present. This changes Step
+  1/2b's D14 implementation from "one correction constant" to "one small
+  per-family dispatch", and the dispatch should be re-validated against a
+  larger sample before `PROBE_VERSION` ships, since this spike's n≈10/family
+  is enough to see the pattern, not to fully trust the exact minute-level
+  offsets.
+
+**HEVC browser playback: untested by a human, as expected — inconclusive
+headless probe only.** `playback.html` (static `<video>` tags for all 10
+decodable fixtures + a `canPlayType` probe table) needs the owner to open it
+in Chrome/Edge on Windows and Safari on iOS; that did not happen in this
+spike. Headless Playwright Chromium (`chrome-linux64` 1228, `--headless=new`)
+reports `canPlayType('video/mp4; codecs="hvc1"')` and `("hev1")` as `""` (no)
+and `video/quicktime` as `""`, vs `"probably"` for plain H.264 — **as
+expected, and not conclusive**: headless Chromium ships without the
+proprietary codec pack regardless of what the owner's real, GPU-accelerated
+Chrome/Edge supports. Treat HEVC-in-browser as still unverified; the plan's
+fallback (transcode or serve an H.264 preview) should stay on the table until
+a human checks `playback.html` for real.
+
 ### Step 1 — Schema v35, media isolation, registration, unreadable handling (4 d)
 
 **Schema v35** (`db.py`, migration in `_init_schema`):
