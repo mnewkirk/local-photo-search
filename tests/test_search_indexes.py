@@ -70,6 +70,28 @@ def lib(tmp_path):
                             (source, fid))
     # A stranger's face beside Calvin, so person EXISTS has to discriminate.
     db.add_face(ids[0], (20, 30, 30, 20), [])
+    # Videos (schema v35): a playable clip, a not-yet-probed one, and the two
+    # kinds default search hides — a paired Live clip and an unreadable file.
+    # Kept OUT of `ids` so the per-photo fixtures below are unchanged.
+    for name, cam, dt, meta in (
+            ("CLIP.MP4", "ILCE-7RM6", "2026-09-26 11:00:00",
+             {"probe_version": 1, "kind": "clip", "duration_s": 42.0}),
+            ("NEW.MOV", "Pixel 8", "2026-09-27 09:00:00", {}),
+            ("IMG_0.MOV", "ILCE-7RM6", "2026-09-26 09:00:01",
+             {"probe_version": 1, "kind": "live", "live_of_photo_id": ids[0],
+              "duration_s": 2.5}),
+            ("BAD.MP4", "ILCE-7RM6", "2026-09-27 10:00:00",
+             {"probe_version": 1, "probe_error": "moov atom not found"})):
+        vid = db.add_photo(filepath=f"2026/f/{name}", filename=name,
+                           camera_model=cam, date_taken=dt, media_type="video",
+                           keywords='["soccer game"]', categories='["sports"]',
+                           visual_tags='["sunny"]', country="US",
+                           admin2="Marin County",
+                           place_name="San Rafael, California, US")
+        cols = ["photo_id"] + list(meta)
+        db.conn.execute(
+            f"INSERT INTO video_meta ({', '.join(cols)}) VALUES "
+            f"({', '.join('?' * len(cols))})", [vid, *meta.values()])
     db.conn.commit()
     yield db, ids
     db.conn.close()
@@ -289,6 +311,14 @@ COMBOS = [
     dict(category="sports", person="Ellie", date_from="2025-01-01"),
     dict(person="Nobody", camera="ILCE-7RM6"),
     dict(camera="Pixel 8", person="Calvin"),
+    # Media (video-support step 2): Videos composes into the scope.
+    dict(media="video", date_from="2026-09-26", date_to="2026-09-27"),
+    dict(media="video", camera="ILCE-7RM6"),
+    dict(media="video", location="Marin County"),
+    dict(media="video", keyword="soccer"),
+    dict(media="video", person="Calvin"),
+    dict(media="photo", camera="ILCE-7RM6", date_from="2026-09-26"),
+    dict(media="photo", visual_tag="sunny", date_from="2026-09-26"),
 ]
 
 
@@ -502,3 +532,92 @@ def test_people_only_search_reads_full_rows_for_the_page_only(scored):
     wide = [s for s in stmts if s.startswith("SELECT * FROM photos")
             or "SELECT p.*" in s]
     assert len(wide) == 1 and wide[0].count(",") == 1  # IN (id, id)
+
+
+# ---------------------------------------------------------------------------
+# Media filter (video-support step 2): rowid-only predicates keep stills cheap
+# ---------------------------------------------------------------------------
+
+def _names(page):
+    return sorted(p["filename"] for p in page)
+
+
+def test_default_search_hides_live_and_unreadable_videos(lib):
+    db, _ = lib
+    page = search_combined(db, date_from="2026-09-26", date_to="2026-09-27",
+                           limit=100)
+    names = _names(page)
+    assert "CLIP.MP4" in names and "NEW.MOV" in names
+    assert "IMG_0.MOV" not in names and "BAD.MP4" not in names
+    assert "IMG_0.JPG" in names  # the Live clip's still is untouched
+
+
+@pytest.mark.parametrize("kw", [
+    dict(camera="ILCE-7RM6"), dict(keyword="soccer"), dict(location="Marin County"),
+    dict(visual_tag="sunny"), dict(min_quality=0.0),
+    dict(date_from="2026-09-26"),
+], ids=lambda kw: ",".join(sorted(kw)))
+def test_media_modes_partition_the_results(lib, kw):
+    db, _ = lib
+    def run(media):
+        return {p["filename"] for p in search_combined(db, limit=1000,
+                                                       media=media, **kw)}
+    every, photos, videos = run(None), run("photo"), run("video")
+    assert photos | videos == every and not photos & videos
+    assert all(n.endswith(".JPG") for n in photos)
+    assert videos <= {"CLIP.MP4", "NEW.MOV"}
+
+
+def test_videos_only_browse_and_scope(lib):
+    db, _ = lib
+    page, total = search_combined(db, media="video", limit=100, with_total=True)
+    assert _names(page) == ["CLIP.MP4", "NEW.MOV"] and total == 2
+    assert search_mod._compose_scope(
+        db, date_from=None, date_to=None, camera=None, person_ids=[],
+        match_source=None, videos_only=True) is not None
+
+
+def test_unknown_media_value_is_an_error(lib):
+    db, _ = lib
+    with pytest.raises(ValueError):
+        search_combined(db, camera="ILCE-7RM6", media="movies")
+
+
+def test_media_predicate_keeps_the_sql_page_on_its_index(lib):
+    """The hidden-video predicate is `id NOT IN (<tiny video_meta set>)`:
+    rowid-only, so the aesthetic browse stays a COVERING scan of its index and
+    no still pays a join."""
+    db, _ = lib
+    db.conn.execute("UPDATE photos SET aes_overall_pct = 50")
+    stmts = _traced(db, lambda: search_combined(db, sort="aesthetic_desc",
+                                                limit=2, with_total=True))
+    page = [s for s in stmts if s.startswith("SELECT * FROM photos WHERE")]
+    count = [s for s in stmts if s.startswith("SELECT COUNT(*) FROM photos WHERE")]
+    assert len(page) == 1 and len(count) == 1
+    assert "video_meta" in page[0]
+    plan = _plan(db, page[0])
+    assert "idx_photos_aes_overall_pct" in plan and "TEMP B-TREE" not in plan
+    assert "LIST SUBQUERY" in plan and "SCAN video_meta" in plan
+    assert "COVERING INDEX idx_photos_aes_overall_pct" in _plan(db, count[0])
+    photo_only = _traced(db, lambda: search_combined(
+        db, sort="aesthetic_desc", limit=2, with_total=True, media="photo"))
+    cplan = _plan(db, [s for s in photo_only
+                       if s.startswith("SELECT COUNT(*) FROM photos WHERE")][0])
+    assert "COVERING INDEX idx_photos_aes_overall_pct" in cplan
+    assert "idx_photos_media_video" in cplan
+
+
+def test_videos_only_scope_is_driven_from_the_partial_index(lib):
+    db, _ = lib
+    stmts = _traced(db, lambda: search_combined(db, media="video",
+                                                location="Marin County"))
+    scope = [s for s in stmts
+             if s.startswith("SELECT id FROM photos WHERE media_type") and "LIMIT" in s]
+    assert len(scope) == 1
+    assert "idx_photos_media_video" in _plan(db, scope[0])
+    stmts = _traced(db, lambda: search_combined(db, media="video",
+                                                camera="ILCE-7RM6"))
+    scope = [s for s in stmts if s.startswith("SELECT p.id FROM photos p")]
+    assert len(scope) == 1
+    plan = _plan(db, scope[0])
+    assert "idx_photos_camera_date" in plan and "idx_photos_media_video" in plan

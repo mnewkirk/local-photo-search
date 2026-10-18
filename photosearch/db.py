@@ -232,6 +232,53 @@ def media_clause(pass_type: str, alias: str = "") -> str:
     return f" AND {frag}" if frag else ""
 
 
+# ---------------------------------------------------------------------------
+# The search-side Media filter (video-support step 2, D2/D3/D9)
+# ---------------------------------------------------------------------------
+# Videos are visible in default search (D9), but a paired Live Photo clip (it
+# is shown behind its still) and a video ffprobe could not read (nothing can
+# play it; listed on /admin/maintenance instead) never are. Every form is
+# keyed on the ROWID only, so a still is tested with one probe of a tiny
+# ephemeral set (a few thousand video ids) and a covering index scan stays
+# covering — no join, no read of the wide photos row for the predicate.
+HIDDEN_VIDEO_IDS_SQL = ("SELECT photo_id FROM video_meta "
+                        "WHERE kind = 'live' OR probe_error IS NOT NULL")
+VIDEO_IDS_SQL = "SELECT id FROM photos WHERE media_type IS NOT NULL"
+
+# 'all' = photos + playable videos (the default), 'photo' = stills only,
+# 'video' = playable videos only, 'any' = no filter at all (the worker scope
+# resolver: the claim predicates already isolate media per pass).
+MEDIA_FILTERS = ("all", "photo", "video", "any")
+_MEDIA_ALIASES = {None: "all", "": "all", "all": "all", "photo": "photo",
+                  "photos": "photo", "still": "photo", "stills": "photo",
+                  "video": "video", "videos": "video", "any": "any"}
+
+
+def normalize_media(media) -> str:
+    """'all' | 'photo' | 'video' | 'any' for a user-facing media value.
+    Raises ValueError for anything else (a typo must not silently mean all)."""
+    key = media.strip().lower() if isinstance(media, str) else media
+    try:
+        return _MEDIA_ALIASES[key]
+    except (KeyError, TypeError):
+        raise ValueError(f"unknown media filter {media!r} "
+                         f"(expected one of: all, photo, video)")
+
+
+def media_filter_sql(media, id_col: str = "id") -> str | None:
+    """The WHERE fragment for a Media filter over `id_col` (a photos rowid
+    expression, e.g. "p.id" or "photos.id"), or None for 'any'."""
+    m = normalize_media(media)
+    if m == "any":
+        return None
+    if m == "photo":
+        return f"{id_col} NOT IN ({VIDEO_IDS_SQL})"
+    hidden = f"{id_col} NOT IN ({HIDDEN_VIDEO_IDS_SQL})"
+    if m == "video":
+        return f"{id_col} IN ({VIDEO_IDS_SQL}) AND {hidden}"
+    return hidden
+
+
 # Dropped in v34: replaced by a composite/NOCASE index above, or an exact
 # duplicate of a PRIMARY KEY / UNIQUE autoindex.
 _SUPERSEDED_INDEXES = (

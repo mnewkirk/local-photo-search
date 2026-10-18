@@ -1021,6 +1021,62 @@
       );
     }
 
+    // Videos ffprobe could not read (video-support D2): registered, hidden from
+    // search, listed here so they can be inspected, downloaded or deleted.
+    function UnreadableVideos() {
+      var PAGE = 50;
+      var _r = useState(null); var data = _r[0];   var setData = _r[1];
+      var _o = useState(0);    var offset = _o[0]; var setOffset = _o[1];
+      var _er = useState(null); var err = _er[0];  var setErr = _er[1];
+
+      function load(off) {
+        setErr(null);
+        return fetch('/api/admin/unreadable-videos?limit=' + PAGE + '&offset=' + off)
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function (d) { setData(d); setOffset(off); })
+          .catch(function (ex) { setErr(ex.message); });
+      }
+      useEffect(function () { load(0); }, []);
+
+      var rows = (data && data.results) || [];
+      var total = (data && data.total) || 0;
+      return e('div', null,
+        e('h2', null, 'Unreadable videos'),
+        e('div', { className: 'deploy-wrap' },
+          e('div', { className: 'deploy-meta' },
+            'Videos the probe pass could not read (no moov atom, truncated, unknown '
+            + 'codec). They are kept as rows so nothing re-probes them, and hidden '
+            + 'from search. ' + (data ? total.toLocaleString() + ' total.' : '')),
+          err && e('div', { className: 'deploy-meta', style: { color: 'var(--warn, #db4)' } },
+            'Could not load: ' + err),
+          rows.length > 0 && e('table', { style: { width: '100%', fontSize: 12, borderCollapse: 'collapse' } },
+            e('thead', null, e('tr', null,
+              e('th', { style: { textAlign: 'left' } }, 'id'),
+              e('th', { style: { textAlign: 'left' } }, 'file'),
+              e('th', { style: { textAlign: 'left' } }, 'error'),
+              e('th', null, ''))),
+            e('tbody', null, rows.map(function (r) {
+              return e('tr', { key: r.id, style: { borderTop: '1px solid var(--border)' } },
+                e('td', null, e('a', { href: '/?photo=' + r.id, title: 'Open in the photo modal' }, r.id)),
+                e('td', { style: { wordBreak: 'break-all' } }, r.filepath),
+                e('td', { style: { color: 'var(--text-muted)' } }, r.probe_error),
+                e('td', null, e('a', { href: '/api/photos/' + r.id + '/full?download=1' }, 'download')));
+            }))),
+          data && total === 0 && e('div', { className: 'deploy-meta' }, 'None.'),
+          total > PAGE && e('div', { className: 'deploy-actions' },
+            e('button', { className: 'btn', disabled: offset === 0,
+              onClick: function () { load(Math.max(0, offset - PAGE)); } }, '\u2039 Prev'),
+            e('span', { className: 'deploy-meta' },
+              (offset + 1) + '\u2013' + Math.min(offset + PAGE, total) + ' of ' + total),
+            e('button', { className: 'btn', disabled: offset + PAGE >= total,
+              onClick: function () { load(offset + PAGE); } }, 'Next \u203A'))
+        )
+      );
+    }
+
     function LightIndex() {
       var _b = useState(false);        var busy = _b[0]; var setBusy = _b[1];
       var _dir = useState('/photos');  var dir = _dir[0]; var setDir = _dir[1];
@@ -2306,6 +2362,7 @@
           e(LightIndex, null),
           e(IngestIncoming, null),
           e(WarmFaceCrops, null),
+          e(UnreadableVideos, null),
           e(StackingForm, { onComplete: noop }),
           e(MaintenanceSweep, { onComplete: noop }),
           e(InferLocationForm, { onDone: noop })

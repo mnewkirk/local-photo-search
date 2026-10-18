@@ -43,7 +43,8 @@ def classify_source(path: str, headers) -> str:
     explicit = (headers.get("x-photosearch-source") or "").strip().lower()
     if explicit:
         return re.sub(r"[^a-z0-9_.-]", "", explicit)[:32] or "other"
-    if path.startswith("/api/worker/"):
+    if path.startswith("/api/worker/") or (
+            path.startswith("/api/videos/") and path.endswith("/assets")):
         return "worker"
     if headers.get("referer"):
         return "ui"
@@ -126,6 +127,13 @@ def _fixed(text: str) -> Callable:
     return lambda m, p: text.format(**m.groupdict())
 
 
+def _full(m, p):
+    if p.get("purpose") == "worker":
+        return "Worker fleet: read the original of {id} (rate-capped if a video)".format(
+            **m.groupdict())
+    return "Fetch the original of photo {id}".format(**m.groupdict())
+
+
 # (method or None for any, path regex, builder(match, params) -> str)
 _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("GET", r"/api/search", _search),
@@ -138,7 +146,7 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("GET", r"/api/photos/geojson", _fixed("Load map points")),
     ("GET", r"/api/photos/(?P<id>\d+)/thumbnail", _fixed("Show thumbnail of photo {id}")),
     ("GET", r"/api/photos/(?P<id>\d+)/preview", _fixed("Show preview of photo {id}")),
-    ("GET", r"/api/photos/(?P<id>\d+)/full", _fixed("Fetch the original of photo {id}")),
+    ("GET", r"/api/photos/(?P<id>\d+)/full", _full),
     ("GET", r"/api/photos/(?P<id>\d+)/mirror-fields",
      _fixed("Mirror photo {id} to the replica")),
     ("GET", r"/api/photos/(?P<id>\d+)", _fixed("Open photo {id}")),
@@ -174,6 +182,9 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("POST", r"/api/admin/rerun-passes", _fixed("Re-run index passes on photos")),
     ("POST", r"/api/admin/mirror-photos", _fixed("Mirror photos from the NAS")),
     (None, r"/api/worker/(?P<op>[\w-]+)", _fixed("Worker fleet: {op}")),
+    ("POST", r"/api/videos/(?P<id>\d+)/assets",
+     _fixed("Worker fleet: upload poster/keyframes of video {id}")),
+    ("GET", r"/api/admin/unreadable-videos", _fixed("List unreadable videos")),
 ]
 _COMPILED = [(m, re.compile(rx + r"/?$"), b) for m, rx, b in _RULES]
 

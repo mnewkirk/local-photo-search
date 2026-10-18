@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 from .clip_embed import embed_text
-from .db import PhotoDB
+from .db import (PhotoDB, HIDDEN_VIDEO_IDS_SQL, VIDEO_IDS_SQL,
+                 media_filter_sql, normalize_media)
 
 # Debug logger for step-by-step search tracing
 _log = logging.getLogger("photosearch.search")
@@ -1553,16 +1554,23 @@ def _scope_clause(column: str, scope: Optional[list[int]]) -> tuple[str, list]:
 
 def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[str],
                    camera: Optional[str], person_ids: list[int],
-                   match_source: Optional[str]) -> Optional[list[int]]:
+                   match_source: Optional[str],
+                   videos_only: bool = False) -> Optional[list[int]]:
     """Ids of photos passing every index-backed structured filter, or None
     when there is nothing to compose or the result is too broad to help.
 
     People are AND-ed, each tested with EXISTS on faces(photo_id, person_id)
     — one index seek per candidate photo. Without a date or camera the query
-    is driven from the first person's faces instead.
+    is driven from the first person's faces instead. `videos_only` (Media =
+    Videos) is a rowid probe of the partial idx_photos_media_video set; with
+    nothing else to compose, that set (a few thousand ids) IS the scope.
     """
-    if not (date_from or camera or person_ids):
+    if not (date_from or camera or person_ids or videos_only):
         return None
+    if videos_only and not (date_from or camera or person_ids):
+        ids = [r[0] for r in db.conn.execute(
+            VIDEO_IDS_SQL + " LIMIT ?", (_SCOPE_MAX_IDS + 1,))]
+        return None if len(ids) > _SCOPE_MAX_IDS else ids
     params: list = []
 
     def person_exists(alias: str, pid: int) -> str:
@@ -1583,6 +1591,8 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
             clauses.append("p.date_taken >= ? AND p.date_taken <= ?")
             params.extend(_date_bounds(date_from, date_to))
         clauses.extend(person_exists("p.id", pid) for pid in person_ids)
+        if videos_only:
+            clauses.append(f"p.id IN ({VIDEO_IDS_SQL})")
         sql = "SELECT p.id FROM photos p WHERE " + " AND ".join(clauses)
     else:
         first, rest = person_ids[0], person_ids[1:]
@@ -1593,6 +1603,8 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
             params.append(match_source)
         for pid in rest:
             sql += " AND " + person_exists("f0.photo_id", pid)
+        if videos_only:
+            sql += f" AND f0.photo_id IN ({VIDEO_IDS_SQL})"
     sql += " LIMIT ?"
     params.append(_SCOPE_MAX_IDS + 1)
     ids = [r[0] for r in db.conn.execute(sql, params)]
@@ -1794,6 +1806,30 @@ def _search_by_location(db: PhotoDB, location: str, limit: int = 100,
     return results
 
 
+def _rid(row: dict):
+    """A result row's photo id (color results key it `photo_id`)."""
+    return row["id"] if "id" in row else row.get("photo_id")
+
+
+def _media_keep(db: PhotoDB, media: str):
+    """A `keep(photo_id) -> bool` for the Media filter, or None when it
+    removes nothing (no videos in the library, or media='any') — so a
+    library without videos runs exactly the SQL it always did.
+
+    Both id sets are tiny (video rows only), read from the partial
+    idx_photos_media_video index and the small video_meta table."""
+    if media == "any":
+        return None
+    if media == "photo":
+        videos = {r[0] for r in db.conn.execute(VIDEO_IDS_SQL)}
+        return (lambda i: i not in videos) if videos else None
+    hidden = {r[0] for r in db.conn.execute(HIDDEN_VIDEO_IDS_SQL)}
+    if media == "video":
+        playable = {r[0] for r in db.conn.execute(VIDEO_IDS_SQL)} - hidden
+        return lambda i: i in playable
+    return (lambda i: i not in hidden) if hidden else None
+
+
 def search_combined(
     db: PhotoDB,
     query: Optional[str] = None,
@@ -1826,6 +1862,7 @@ def search_combined(
     min_subject_aesthetic: Optional[float] = None,
     min_day_aesthetic: Optional[float] = None,
     camera: Optional[str] = None,
+    media: Optional[str] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1840,6 +1877,9 @@ def search_combined(
         date_from: If set, filter to photos taken on or after this date (YYYY-MM-DD).
         date_to: If set, filter to photos taken on or before this date (YYYY-MM-DD).
         location: If set, search by place name (matched against reverse-geocoded place_name).
+        media: 'all' (default: photos + playable videos — a paired Live Photo
+            clip or an unreadable video is never shown), 'photo' (stills
+            only) or 'video' (playable videos only). See db.media_filter_sql.
     """
     from .date_parse import parse_date_from_query
     from .geocode import extract_location_from_query
@@ -1861,6 +1901,13 @@ def search_combined(
             if parsed_loc:
                 location = parsed_loc
                 effective_query = cleaned if cleaned else None
+
+    media = normalize_media(media)
+    media_keep = _media_keep(db, media)
+    # The SQL-paginated paths take the same filter as a rowid predicate; it is
+    # added only when it removes something, so their plans are unchanged on a
+    # library with no videos.
+    media_where = [media_filter_sql(media)] if media_keep is not None else []
 
     result_sets = []
     # Parallel to result_sets; index i holds {photo_id: rank} for the
@@ -1894,15 +1941,16 @@ def search_combined(
         named = db.get_person_by_name(person)
         if named:
             scope_person_ids.append(named["id"])
+    videos_only = media == "video"
     n_structured = (len(scope_person_ids) + bool(camera) + bool(date_from)
                     + bool(location) + bool(category) + bool(visual_tag)
-                    + bool(keyword))
+                    + bool(keyword) + videos_only)
     scope: Optional[list[int]] = None
     if n_structured >= 2:
         scope = _compose_scope(
             db, date_from=date_from, date_to=date_to, camera=camera,
             person_ids=list(dict.fromkeys(scope_person_ids)),
-            match_source=match_source)
+            match_source=match_source, videos_only=videos_only)
         if scope is not None:
             _log.info("SEARCH SCOPE  %d photos", len(scope))
 
@@ -1912,7 +1960,7 @@ def search_combined(
     query_left = (residual if name_matched else effective_query)
     narrow = bool(name_matched or person or person_ids) and not (
         query_left or face_image or color or place or location or category
-        or visual_tag or keyword or camera)
+        or visual_tag or keyword or camera or videos_only)
     person_cols = _NARROW_COLUMNS if narrow else "p.*"
 
     if name_matched:
@@ -2068,10 +2116,26 @@ def search_combined(
         result_sets.append({r["id"]: r for r in results})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(results)})
 
+    # Media = Videos as a filter of its own: the video rows (the partial
+    # idx_photos_media_video set), within the date range and composed scope.
+    if videos_only:
+        sql, params = "SELECT * FROM photos WHERE media_type IS NOT NULL", []
+        if date_from:
+            sql += " AND date_taken >= ? AND date_taken <= ?"
+            params.extend(_date_bounds(date_from, date_to))
+        scope_sql, scope_params = _scope_clause("id", scope)
+        rows = [dict(r) for r in db.conn.execute(sql + scope_sql,
+                                                 params + scope_params)]
+        rows = [r for r in rows if media_keep(r["id"])]
+        result_sets.append({r["id"]: r for r in rows})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(rows)})
+
     def _wrap(items: list[dict]):
         """Honor the caller's with_total + sort preferences on early-
         return paths. Pagination slicing happens here so these paths
         match the main path's contract."""
+        if media_keep is not None:
+            items = [r for r in items if media_keep(_rid(r))]
         items = _apply_sort(items, sort)
         page = items[offset:offset + limit] if limit else items[offset:]
         return (page, len(items)) if with_total else page
@@ -2109,7 +2173,7 @@ def search_combined(
         order_by = _sort_sql(
             sort, "COALESCE(aes_overall, aesthetic_score) DESC, id DESC")
         if order_by:
-            return _sql_page(db, where + floors, params + floor_params,
+            return _sql_page(db, where + floors + media_where, params + floor_params,
                              order_by, offset, limit, with_total)
 
     if not result_sets and min_quality is not None:
@@ -2165,7 +2229,7 @@ def search_combined(
                 floors, floor_params = _aesthetic_floor_sql(
                     min_aesthetic, min_technical, min_composition, min_impact,
                     min_subject_aesthetic, min_day_aesthetic)
-                return _sql_page(db, where + floors, params + floor_params,
+                return _sql_page(db, where + floors + media_where, params + floor_params,
                                  order_by, offset, limit, with_total)
         rows = db.conn.execute(
             f"SELECT * FROM photos WHERE {order} IS NOT NULL "
@@ -2197,16 +2261,20 @@ def search_combined(
         _apply_recency_decay(list(result_sets[0].values()))
 
     if len(result_sets) == 1:
-        merged = _dedupe_by_hash(list(result_sets[0].values()))
+        candidates = list(result_sets[0].values())
     else:
         # Intersect: only keep photos present in all result sets
         common_ids = set(result_sets[0].keys())
         for rs in result_sets[1:]:
             common_ids &= set(rs.keys())
         # Use first result set for ranking/data
-        merged = _dedupe_by_hash(
-            [result_sets[0][pid] for pid in common_ids if pid in result_sets[0]]
-        )
+        candidates = [result_sets[0][pid] for pid in common_ids
+                      if pid in result_sets[0]]
+    # Media filter BEFORE the hash dedupe, so a hidden copy can never be the
+    # one dedupe keeps in place of a visible one.
+    if media_keep is not None:
+        candidates = [r for r in candidates if media_keep(_rid(r))]
+    merged = _dedupe_by_hash(candidates)
 
     # Apply date filter (when date is combined with other search criteria)
     if date_from:

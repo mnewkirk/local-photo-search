@@ -92,7 +92,9 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
             path.startswith("/api/photos/")
             and path.endswith("/full")
         )
-        if path.startswith("/api/worker/") or is_worker_full_fetch:
+        is_asset_upload = (path.startswith("/api/videos/")
+                           and path.endswith("/assets"))
+        if path.startswith("/api/worker/") or is_worker_full_fetch or is_asset_upload:
             return JSONResponse(
                 {"detail": "server shutting down, retry shortly"},
                 status_code=503,
@@ -440,6 +442,8 @@ def api_search(
     visual_tag: Optional[str] = Query(None, description="Filter by visual tag"),
     keyword: Optional[str] = Query(None, description="Filter by keyword (substring match)"),
     camera: Optional[str] = Query(None, description="Filter by exact camera_model"),
+    media: Optional[str] = Query(None, description="Media: all (default; photos + "
+                                 "playable videos), photo, or video"),
     tag: Optional[str] = Query(None, deprecated=True, description="Deprecated; use category"),
 ):
     """Search photos using any combination of criteria."""
@@ -461,7 +465,8 @@ def api_search(
                 min_aesthetic is not None, min_technical is not None,
                 min_composition is not None, min_impact is not None, style_tag,
                 min_subject_aesthetic is not None, min_day_aesthetic is not None,
-                sort in ("aesthetic_desc", "subject_aesthetic_desc")]):
+                sort in ("aesthetic_desc", "subject_aesthetic_desc"),
+                (media or "").strip().lower() in ("video", "videos")]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
 
@@ -472,6 +477,11 @@ def api_search(
     from .search import SORT_MODES
     if sort not in SORT_MODES:
         sort = "date_desc"
+    from .db import normalize_media
+    try:
+        media = normalize_media(media)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     with _get_db() as db:
         results, total = search_combined(
@@ -503,6 +513,7 @@ def api_search(
             min_subject_aesthetic=min_subject_aesthetic,
             min_day_aesthetic=min_day_aesthetic,
             camera=camera,
+            media=media,
         )
 
         logger.info(
@@ -514,11 +525,17 @@ def api_search(
         )
 
         # Serialize results
+        from .video_api import video_fields
+        vids = video_fields(db.conn, results)
         items = []
         for r in results:
+            vf = vids.get(r.get("id")) or {}
             item = {
                 "id": r.get("id"),
                 "filename": r.get("filename"),
+                "media_type": vf.get("media_type"),
+                "duration_s": vf.get("duration_s"),
+                "video_kind": vf.get("video_kind"),
                 "date_taken": r.get("date_taken"),
                 "score": r.get("score"),
                 "clip_score": r.get("clip_score"),
@@ -573,6 +590,54 @@ def api_search(
     }
 
 
+_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
+def _video_image(photo_id: int, state: dict, size: str):
+    """Thumbnail/preview of a VIDEO row — never decoded or resized here
+    (docs/plans/video-support.md step 2, D19). A paired Live clip shows its
+    still; an unreadable file and a not-yet-probed one show static
+    placeholders; otherwise the poster the probe pass uploaded, under the
+    usual {id}_thumb.jpg / {id}_preview.jpg cache names."""
+    from . import video_api
+    src = video_api.image_source(state)
+    if src == "live" and state.get("live_of_photo_id") != photo_id:
+        still = state["live_of_photo_id"]
+        return api_thumbnail(still) if size == "thumb" else api_preview_photo(still)
+    if src == "unreadable":
+        return FileResponse(str(video_api.PLACEHOLDER_UNREADABLE),
+                            media_type=video_api.PLACEHOLDER_MIME, headers=_NO_CACHE)
+    if src == "poster":
+        if size == "thumb":
+            cache_path = os.path.join(_ensure_thumb_dir(), f"{photo_id}_thumb.jpg")
+        else:
+            cache_path = os.path.join(_ensure_preview_dir(), f"{photo_id}_preview.jpg")
+        if os.path.exists(cache_path):
+            return FileResponse(cache_path, media_type="image/jpeg", headers=_NO_CACHE)
+        if _nas_url:
+            # The NAS answers with the poster, or a placeholder SVG when it has
+            # none yet — only a real JPEG is cached, or the placeholder would
+            # stick on the replica after the poster lands.
+            try:
+                data = _fetch_from_nas(photo_id, "thumbnail" if size == "thumb" else "preview")
+            except Exception:  # noqa: BLE001 — fall through to the placeholder
+                data = b""
+            if data[:3] == b"\xff\xd8\xff":
+                _cache_bytes_atomic(cache_path, data)
+                return FileResponse(cache_path, media_type="image/jpeg", headers=_NO_CACHE)
+    return FileResponse(str(video_api.PLACEHOLDER_VIDEO),
+                        media_type=video_api.PLACEHOLDER_MIME, headers=_NO_CACHE)
+
+
+def _video_state_if_video(db, photo) -> Optional[dict]:
+    """video_meta state for a video row, None for a still."""
+    from .db import is_video_row
+    if not is_video_row(photo):
+        return None
+    from .video_api import video_state
+    return video_state(db.conn, photo["id"])
+
+
 @app.get("/api/photos/{photo_id}/thumbnail")
 def api_thumbnail(photo_id: int):
     """Serve a cached thumbnail for a photo."""
@@ -581,7 +646,10 @@ def api_thumbnail(photo_id: int):
         if not photo:
             raise HTTPException(404, "Photo not found")
         photo = dict(photo)
+        vstate = _video_state_if_video(db, photo)
         photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
+    if vstate is not None:
+        return _video_image(photo_id, vstate, "thumb")
 
     try:
         thumb_path = _get_or_create_thumbnail(photo)
@@ -618,12 +686,22 @@ def _attachment_header(filename: str) -> str:
 
 @app.get("/api/photos/{photo_id}/full")
 def api_full_photo(
+    request: Request,
     photo_id: int,
     download: bool = Query(False, description="Force a file download (attachment) "
                            "with the original filename, instead of inline display."),
+    purpose: Optional[str] = Query(None, description="'worker' for a fleet read: "
+                                   "videos are then rate-capped at "
+                                   "PHOTOSEARCH_VIDEO_STREAM_MBPS (default 30 MB/s)."),
 ):
     """Serve the full-resolution original photo. ``?download=1`` attaches it as a
-    downloadable file rather than displaying inline."""
+    downloadable file rather than displaying inline.
+
+    A VIDEO is served with its own mime and single-range HTTP Range (206), so
+    browsers can seek and ffprobe/cv2 can read just the header; with
+    ``?purpose=worker`` every byte (ranged or not) goes through the shared
+    token bucket. On the replica it is a streaming Range-forwarding proxy."""
+    from .db import is_video_row
     with _get_db() as db:
         photo = db.get_photo(photo_id)
         if not photo:
@@ -631,10 +709,25 @@ def api_full_photo(
 
         filename = photo.get("filename") or f"photo_{photo_id}.jpg"
         filepath = db.resolve_filepath(photo.get("filepath", ""))
+        is_video = is_video_row(photo)
 
     headers = {"Cache-Control": "no-cache, must-revalidate"}
     if download:
         headers["Content-Disposition"] = _attachment_header(filename)
+
+    if is_video:
+        from . import video_api
+        range_header = request.headers.get("range")
+        if filepath and os.path.exists(filepath):
+            return video_api.serve_video_file(range_header, filepath, filename,
+                                              purpose, headers)
+        if _nas_url:
+            try:
+                return video_api.proxy_video(_nas_url, photo_id, range_header,
+                                             purpose, download)
+            except Exception as e:
+                raise HTTPException(502, f"NAS video fetch failed: {e}")
+        raise HTTPException(404, "Video file not found on disk")
 
     if not filepath or not os.path.exists(filepath):
         # Replica mode: stream the original through from the NAS (not cached —
@@ -663,7 +756,10 @@ def api_preview_photo(photo_id: int):
         if not photo:
             raise HTTPException(404, "Photo not found")
         photo = dict(photo)
+        vstate = _video_state_if_video(db, photo)
         photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
+    if vstate is not None:
+        return _video_image(photo_id, vstate, "preview")
 
     try:
         preview_path = _get_or_create_preview(photo)
@@ -1713,10 +1809,25 @@ def api_photo_detail(photo_id: int):
             } for r in gen_rows
         }
 
+        video = None
+        if photo.get("media_type") == "video":
+            vm = db.conn.execute(
+                "SELECT duration_s, fps, codec, container, width, height, rotation, "
+                "has_audio, kind, live_of_photo_id, probe_version, probe_error "
+                "FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
+            video = dict(vm) if vm else {}
+            from .video_api import NOT_BROWSER_PLAYABLE
+            video["browser_playable"] = (
+                Path(photo["filename"] or "").suffix.lower() not in NOT_BROWSER_PLAYABLE)
+
         return {
             "id": photo["id"],
             "filename": photo["filename"],
             "filepath": photo["filepath"],
+            "media_type": photo.get("media_type"),
+            "duration_s": (video or {}).get("duration_s"),
+            "video_kind": (video or {}).get("kind"),
+            "video": video,
             "date_taken": photo["date_taken"],
             "place_name": photo.get("place_name"),
             "description": photo["description"],
@@ -6461,6 +6572,72 @@ def api_logs():
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Videos (docs/plans/video-support.md step 2)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/videos/{photo_id}/assets")
+async def api_video_assets(photo_id: int, request: Request):
+    """Store poster / keyframe / face-crop JPEGs a worker computed for a video.
+
+    Guarded like the worker endpoints (`/api/worker/submit-results`): a
+    LAN-trusted route with no token, 503 during a server shutdown. Body (JSON,
+    so the worker's `requests.Session` posts it with `json=`)::
+
+        {"version": 1,                       # the pass's PROBE/SCAN version
+         "assets": [
+           {"kind": "poster", "size": "thumb"|"preview"|"full", "data_b64": "..."},
+           {"kind": "keyframe", "name": "seg003_t12.50.jpg", "data_b64": "..."},
+           {"kind": "crop",     "name": "ident02.jpg",       "data_b64": "..."}]}
+
+    Each JPEG is written atomically (temp + fsync + os.replace) to
+    `<DB dir>/video_frames/{id}/v{version}/` as `poster_<size>.jpg` /
+    `keyframe_<name>` / `crop_<name>`. A poster is also installed under the
+    cache names every grid already reads: thumb -> thumbnails/{id}_thumb.jpg,
+    preview -> previews/{id}_preview.jpg, full -> video_frames/{id}/poster.jpg.
+    The whole request is validated before the first write (400 on any bad
+    asset: not a JPEG, too big, unsafe name); 404 unless the id is a video.
+    On the replica the body is forwarded to the NAS, which owns the files.
+    """
+    from . import video_api
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "body must be JSON")
+    if _nas_url:
+        return _nas_json("POST", f"/api/videos/{photo_id}/assets", body)
+    with _get_db() as db:
+        row = db.conn.execute("SELECT media_type FROM photos WHERE id = ?",
+                              (photo_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Photo not found")
+    if row["media_type"] != "video":
+        raise HTTPException(404, f"Photo {photo_id} is not a video")
+    try:
+        return video_api.store_assets(
+            _db_path, photo_id, body,
+            thumb_dir=_ensure_thumb_dir(), preview_dir=_ensure_preview_dir())
+    except video_api.AssetError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/admin/unreadable-videos")
+def api_unreadable_videos(limit: int = Query(100, ge=1, le=1000),
+                          offset: int = Query(0, ge=0)):
+    """Videos ffprobe could not read (D2: registered, hidden from search,
+    listed here). Paged, newest id first."""
+    with _get_db() as db:
+        total = db.conn.execute(
+            "SELECT COUNT(*) FROM video_meta WHERE probe_error IS NOT NULL").fetchone()[0]
+        rows = db.conn.execute(
+            "SELECT p.id, p.filename, p.filepath, p.date_taken, vm.probe_error, "
+            "vm.probe_version FROM video_meta vm JOIN photos p ON p.id = vm.photo_id "
+            "WHERE vm.probe_error IS NOT NULL ORDER BY p.id DESC LIMIT ? OFFSET ?",
+            (limit, offset)).fetchall()
+    return {"total": total, "offset": offset, "limit": limit,
+            "results": [dict(r) for r in rows]}
+
+
 # Serve the frontend (production mode — built files)
 # ---------------------------------------------------------------------------
 

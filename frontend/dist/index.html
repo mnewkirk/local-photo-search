@@ -640,6 +640,7 @@
         sort_quality: p.get('sort_quality') === 'true',
         match_source: p.get('match_source') || '',
         camera: p.get('camera') || '',
+        media: p.get('media') || '',
         sort: p.get('sort') || '',
         ask: p.get('ask') || '',
         group_by: p.get('group_by') || '',
@@ -666,6 +667,8 @@
       const [sortQuality, setSortQuality] = useState(initParams.sort_quality);
       const [locationFilter, setLocationFilter] = useState(initParams.location);
       const [cameraFilter, setCameraFilter] = useState(initParams.camera);
+      // Media: '' (all: photos + playable videos) | 'photo' | 'video'.
+      const [mediaFilter, setMediaFilter] = useState(initParams.media);
       const [dateFrom, setDateFrom] = useState(initParams.date_from);
       const [dateTo, setDateTo] = useState(initParams.date_to);
       const [results, setResults] = useState(null);
@@ -945,7 +948,7 @@
         const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
         const mdaVal = minDayAesthetic ? parseFloat(minDayAesthetic) : null;
         if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter
-            && !dateFrom && !dateTo && mqVal == null && maVal == null && mdaVal == null && !matchSource
+            && mediaFilter !== 'video' && !dateFrom && !dateTo && mqVal == null && maVal == null && mdaVal == null && !matchSource
             && sortBy !== 'aesthetic_desc' && sortBy !== 'subject_aesthetic_desc') return null;
         const params = new URLSearchParams();
         if (query) params.set('q', query);
@@ -953,6 +956,7 @@
         if (colorFilter) params.set('color', colorFilter);
         if (locationFilter) params.set('location', locationFilter);
         if (cameraFilter) params.set('camera', cameraFilter);
+        if (mediaFilter) params.set('media', mediaFilter);
         if (dateFrom) params.set('date_from', dateFrom);
         if (dateTo) params.set('date_to', dateTo);
         if (mqVal != null && !isNaN(mqVal)) params.set('min_quality', mqVal);
@@ -962,7 +966,7 @@
         if (matchSource) params.set('match_source', matchSource);
         if (sortBy) params.set('sort', sortBy);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, minAesthetic, minDayAesthetic, sortQuality, locationFilter, cameraFilter, dateFrom, dateTo, matchSource, sortBy]);
+      }, [query, personFilter, colorFilter, minQuality, minAesthetic, minDayAesthetic, sortQuality, locationFilter, cameraFilter, mediaFilter, dateFrom, dateTo, matchSource, sortBy]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -1167,7 +1171,7 @@
         if (p.ask) {
           hasAutoSearched.current = true;
           runAsk();
-        } else if (p.q || p.person || p.color || p.location || p.camera || p.date_from || p.date_to || p.min_quality || p.match_source) {
+        } else if (p.q || p.person || p.color || p.location || p.camera || p.media === 'video' || p.date_from || p.date_to || p.min_quality || p.match_source) {
           hasAutoSearched.current = true;
           doSearch();
         }
@@ -1410,6 +1414,18 @@
               onChange: setCameraFilter,
               style: { maxWidth: 170 },
             }),
+          ),
+          e('div', { className: 'filter-group' },
+            e('span', { className: 'filter-label' }, 'Media:'),
+            e('select', {
+              value: mediaFilter,
+              onChange: (ev) => setMediaFilter(ev.target.value),
+              title: 'Photos, videos, or both',
+            },
+              e('option', { value: '' }, 'All'),
+              e('option', { value: 'photo' }, 'Photos'),
+              e('option', { value: 'video' }, 'Videos'),
+            ),
           ),
           e('div', { className: 'filter-group' },
             e('span', { className: 'filter-label' }, 'From:'),
@@ -1884,6 +1900,7 @@
           title: photo.place_name,
           style: multiSelect ? { left: 44 } : null,
         }, '\ud83d\udccd ' + photo.place_name.split(',')[0].trim()),
+        PS.videoBadge(photo, { style: { top: 8, right: showBadge ? 56 : 8 } }),
         showBadge && e('div', {
           className: 'stack-badge',
           onClick: (ev) => {

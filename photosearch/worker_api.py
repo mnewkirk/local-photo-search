@@ -293,7 +293,7 @@ def _resolve_scope_ids(db, collection_id, directory, filters):
         return ids
     if filters:
         from .tools import _build_filter_sql  # local import: keeps CLIP/torch out of import path
-        where, params = _build_filter_sql(db, filters)
+        where, params = _build_filter_sql(db, filters, default_media="any")
         if where == "1":
             return None  # no recognized filter key → whole library
         ids = [r[0] for r in db.conn.execute(

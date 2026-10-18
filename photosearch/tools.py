@@ -687,6 +687,7 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         sort=sort,
         limit=limit,
         with_total=True,
+        media=_tool_media(args.get("media")),
     )
 
     # Face-framing filters don't flow through search_combined, so post-filter
@@ -766,6 +767,9 @@ _register(ToolSpec(
                             "raw scores cluster ~5 and a floor can exclude everything; "
                             "use sort='quality_desc' instead."},
             **_CURATION_FILTER_PROPS,
+            "media": {"type": "string", "enum": ["all", "photo", "video"],
+                "description": "Photos, videos, or both (default 'all'). Set "
+                "'video' only when the user asks for videos/clips/movies."},
             "match_source": {"type": "string", "enum": ["strict", "temporal", "manual"],
                 "description": "Restrict person matches by confidence source "
                 "(strict = high-confidence face match, temporal = same-session "
@@ -883,12 +887,35 @@ def _ids_passing_face_constraints(
     return {r[0] for r in rows}
 
 
-def _build_filter_sql(db, args: dict) -> tuple[str, list]:
+def _tool_media(value) -> str:
+    """A model-supplied media value, degrading an unknown one to 'all'
+    rather than failing the tool call."""
+    from .db import normalize_media
+    try:
+        m = normalize_media(value)
+    except ValueError:
+        return "all"
+    return "all" if m == "any" else m
+
+
+def _build_filter_sql(db, args: dict, default_media: str = "photo") -> tuple[str, list]:
     """Build a WHERE clause + params from the structured filters (the same set
     search_photos accepts, minus the free-text CLIP `query`). Mirrors
-    search_combined's structured semantics closely enough for faceting."""
+    search_combined's structured semantics closely enough for faceting.
+
+    `args["media"]` ('all' | 'photo' | 'video') picks the media; absent, the
+    curation/book tools see STILLS ONLY (`default_media`) — a video has no
+    aesthetic scores and no printable pixels. The worker scope resolver passes
+    default_media='any': its claim predicates already isolate media per pass.
+    """
     clauses: list[str] = []
     params: list = []
+
+    from .db import media_filter_sql
+    media = _tool_media(args["media"]) if args.get("media") else default_media
+    media_frag = media_filter_sql(media, "photos.id")
+    if media_frag:
+        clauses.append(media_frag)
 
     people = _coerce_str_list(args.get("people"))
     person_ids: list = []

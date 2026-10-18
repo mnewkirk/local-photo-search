@@ -334,6 +334,9 @@
     var setInternalDetail = _internalDetail[1];
 
     var detail = fetchDetailProp ? internalDetail : externalDetail;
+    // Videos (video-support step 2): played with <video>, no face overlays.
+    var isVideo = PS.isVideo(photo) || PS.isVideo(detail);
+    var videoPlayable = !isVideo || PS.videoBrowserPlayable(detail || photo);
 
     useEffect(function () {
       if (!fetchDetailProp || !photo) return;
@@ -1559,17 +1562,42 @@
                    onMouseMove: onImgMouseMove,
                    onMouseUp: onImgMouseUp,
                    onMouseLeave: function () { if (addingBox) { dragStartRef.current = null; setDragBox(null); } } },
-          e('img', {
-            key: 'photo-' + photo.id,
-            ref: imgRef,
-            src: API + '/api/photos/' + photo.id + '/preview',
-            alt: photo.filename,
-            onLoad: updateImgRect,
-            draggable: false,
-          }),
+          isVideo && videoPlayable
+            ? e('video', {
+                key: 'video-' + photo.id,
+                src: API + '/api/photos/' + photo.id + '/full',
+                poster: API + '/api/photos/' + photo.id + '/preview',
+                controls: true,
+                preload: 'metadata',
+                playsInline: true,
+                style: { maxWidth: '100%', maxHeight: '100%', background: '#000' },
+              })
+            : e('img', {
+                key: 'photo-' + photo.id,
+                ref: imgRef,
+                src: API + '/api/photos/' + photo.id + '/preview',
+                alt: photo.filename,
+                onLoad: updateImgRect,
+                draggable: false,
+              }),
+          // .avi / .mts: no browser plays them — say so and offer the file.
+          isVideo && !videoPlayable && e('div', {
+            style: { position: 'absolute', left: 0, right: 0, bottom: 16,
+                     textAlign: 'center' },
+          },
+            e('a', {
+              href: API + '/api/photos/' + photo.id + '/full?download=1',
+              download: photo.filename || '',
+              style: { padding: '6px 14px', borderRadius: 6, background: 'var(--surface2)',
+                       color: 'var(--text)', border: '1px solid var(--border)',
+                       textDecoration: 'none', fontSize: 13 },
+            }, '\u2193 This format does not play in the browser \u2014 download ' +
+               (photo.filename || 'the video')),
+          ),
           // Face bounding box overlays (hovered face, or ALL while arming a box
           // so the user sees what already exists before drawing a new one).
-          faceOverlays.filter(function (ov) { return addingBox || hoveredFace === ov.id; }).map(function (ov) {
+          // None on a video: the boxes belong to one frame, not the clip.
+          (isVideo ? [] : faceOverlays).filter(function (ov) { return addingBox || hoveredFace === ov.id; }).map(function (ov) {
             var active = hoveredFace === ov.id;
             return e('div', {
               key: 'bbox-' + ov.id,
@@ -2430,6 +2458,46 @@
   };
 
   // ---- Camera: shared badge + filter dropdown, used on every grid ----------
+  // ---- Video: shared helpers (docs/plans/video-support.md step 2) --------
+  PS.isVideo = function (photo) {
+    return !!(photo && photo.media_type === 'video');
+  };
+
+  // "0:42", "12:05", "1:02:03" — null when the duration is unknown.
+  PS.formatDuration = function (seconds) {
+    if (seconds == null || isNaN(seconds)) return null;
+    var t = Math.max(0, Math.round(seconds));
+    var h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+    var ss = (sec < 10 ? '0' : '') + sec;
+    if (h) return h + ':' + (m < 10 ? '0' : '') + m + ':' + ss;
+    return m + ':' + ss;
+  };
+
+  // .avi / .mts / .m2ts play in no mainstream browser.
+  PS.videoBrowserPlayable = function (photo) {
+    if (photo && photo.video && photo.video.browser_playable === false) return false;
+    var name = ((photo && photo.filename) || '').toLowerCase();
+    return !/\.(avi|mts|m2ts)$/.test(name);
+  };
+
+  // The grid-card badge: "▶ 0:42" once the probe has filled the duration,
+  // a plain "▶" before. null for a still. opts.style merges onto the span.
+  PS.videoBadge = function (photo, opts) {
+    if (!PS.isVideo(photo)) return null;
+    opts = opts || {};
+    var d = PS.formatDuration(photo.duration_s);
+    return e('span', {
+      className: 'video-badge',
+      title: d ? 'Video, ' + d : 'Video',
+      style: Object.assign({
+        position: 'absolute', top: 6, right: 6, zIndex: 2,
+        padding: '1px 7px', borderRadius: 10, fontSize: 12, fontWeight: 600,
+        background: 'rgba(0,0,0,0.65)', color: '#fff', whiteSpace: 'nowrap',
+        pointerEvents: 'none',
+      }, opts.style || {}),
+    }, d ? '\u25B6 ' + d : '\u25B6');
+  };
+
   PS.cameraLabel = function (photo) {
     if (!photo) return null;
     return photo.camera_model || photo.camera_make || null;
