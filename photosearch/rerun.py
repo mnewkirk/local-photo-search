@@ -365,6 +365,13 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     mirror = mirror_photos(db, [photo_id], server=base)
+    # A worker-reported failure (W._failure_row) is submitted as `failures`:
+    # the server spends an attempt and writes nothing, so the response reads
+    # `written: 0, processed: 1` — which every caller used to print as
+    # success. The message was computed HERE before submission, so surface it
+    # rather than make the caller guess from the counts
+    # (docs/plans/batch-blocked-rerun.md step 3).
+    failure_row = next((r for r in results if W._is_failure_row(r)), None)
     return {
         "pass": pass_type,
         "photo_id": photo_id,
@@ -374,6 +381,7 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
         "deferred": not results,
         "mirrored": mirror.get("mirrored", 0),
         "authority": "nas",
+        "error": failure_row["error"] if failure_row else None,
     }
 
 

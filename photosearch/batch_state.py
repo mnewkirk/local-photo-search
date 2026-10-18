@@ -328,6 +328,38 @@ def _ingest_step(batch: dict, sweep: dict | None, total: int) -> dict:
 # worker passes
 # ---------------------------------------------------------------------------
 
+def _failed_sql(pass_type: str) -> tuple[str, tuple]:
+    """The photo-level predicate behind a worker step's `failed` count: the
+    pass's output is still missing, the photo is of the pass's media, and its
+    attempts are exhausted. One fragment over alias `p`, shared by
+    `_worker_step` (COUNT) and `blocked_photo_ids` (the ids themselves), so
+    the list the page shows can never disagree with the number on the box.
+
+    Does NOT apply `_EMPTY_OUTPUT_IS_DONE` — callers do, because for `faces`
+    the count is still wanted (it becomes the step's `detail`)."""
+    missing = _OUTPUT_MISSING[pass_type]
+    if pass_type == "video-probe":
+        from .video_probe import PROBE_VERSION
+        missing = missing.format(probe_version=int(PROBE_VERSION))
+    elif pass_type == "video-scan":
+        from .video_scan_store import claimable_sql
+        missing = missing.format(video_scan_missing=claimable_sql("p"))
+    elif pass_type == "video-subjects":
+        from .video_subjects_store import claimable_sql as subjects_claimable
+        missing = missing.format(video_subjects_missing=subjects_claimable("p"))
+    elif pass_type == "video-describe":
+        from .video_describe_store import claimable_sql as describe_claimable
+        missing = missing.format(video_describe_missing=describe_claimable("p"))
+    media = media_sql(pass_type, "p")
+    if media:
+        missing = f"({missing}) AND {media}"
+    return (
+        f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
+        f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
+        f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
+        (pass_type,),
+    )
+
 def _worker_step(db, pass_type: str, ids: list[int], total: int,
                  described: int, running: set[str], open_steps: set[str],
                  completed: set[str], batch_total: int | None = None) -> dict:
@@ -348,29 +380,7 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     # purge-nonimage-photos, or a clock retime that rewrites `folder`.
     remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
-    missing = _OUTPUT_MISSING[pass_type]
-    if pass_type == "video-probe":
-        from .video_probe import PROBE_VERSION
-        missing = missing.format(probe_version=int(PROBE_VERSION))
-    elif pass_type == "video-scan":
-        from .video_scan_store import claimable_sql
-        missing = missing.format(video_scan_missing=claimable_sql("p"))
-    elif pass_type == "video-subjects":
-        from .video_subjects_store import claimable_sql as subjects_claimable
-        missing = missing.format(video_subjects_missing=subjects_claimable("p"))
-    elif pass_type == "video-describe":
-        from .video_describe_store import claimable_sql as describe_claimable
-        missing = missing.format(video_describe_missing=describe_claimable("p"))
-    media = media_sql(pass_type, "p")
-    if media:
-        missing = f"({missing}) AND {media}"
-    failed = _count_where(
-        db, ids,
-        f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
-        f"  WHERE wp.photo_id = p.id AND wp.pass_type = ? "
-        f"    AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})",
-        (pass_type,),
-    )
+    failed = _count_where(db, ids, *_failed_sql(pass_type))
 
     # See _EMPTY_OUTPUT_IS_DONE: for `faces`, exhausted-with-no-rows is a
     # finished photo that had nothing to find, so it counts toward `done`.
@@ -636,6 +646,95 @@ def _next_action(steps: dict[str, dict], ready: bool, total: int) -> str | None:
     if any(s["state"] == "blocked" for s in steps.values()):
         return "review_blocked"
     return "wait"
+
+
+# ---------------------------------------------------------------------------
+# blocked photos — what a `blocked` step box is made of
+# ---------------------------------------------------------------------------
+#
+# docs/plans/batch-blocked-rerun.md. `_worker_step` keeps only the COUNT of
+# exhausted photos; these return the photos themselves so the page can name
+# them, show why they failed, and offer a re-run. Same predicate
+# (`_failed_sql`), so the list always matches the number on the box.
+
+def blocked_photo_ids(db, batch_id: int, step: str) -> list[int]:
+    """Ids of the batch's photos that `step`'s `failed` count is made of,
+    ascending.
+
+    ``[]`` at once for anything but a worker pass, and for a pass in
+    `_EMPTY_OUTPUT_IS_DONE` (`faces`): its exhausted no-face photos are DONE,
+    and listing them as blocked would invite re-running a detector that
+    already found nobody — `_worker_step` never reports `faces` blocked for
+    the same reason. The guard is explicit so a stale or hand-typed step name
+    cannot reach them either.
+
+    Raises ValueError for an unknown batch, like `batch_state`.
+    """
+    if step not in WORKER_PASSES or step in _EMPTY_OUTPUT_IS_DONE:
+        return []
+    batch = ingest_batches.get_batch(db, batch_id)
+    if batch is None:
+        raise ValueError(f"no such batch: {batch_id!r}")
+    ids = ingest_batches.batch_photo_ids(db, batch)
+    where, params = _failed_sql(step)
+    out: list[int] = []
+    for chunk in _chunks(ids):
+        placeholders = ",".join("?" * len(chunk))
+        out.extend(r[0] for r in db.conn.execute(
+            f"SELECT p.id FROM photos p "
+            f"WHERE p.id IN ({placeholders}) AND ({where})",
+            list(chunk) + list(params),
+        ).fetchall())
+    return sorted(out)
+
+
+def blocked_photo_detail(db, batch_id: int, step: str, limit: int = 200) -> dict:
+    """``{"total", "truncated", "photos": [{photo_id, filename, attempts,
+    last_error}]}`` for `step`'s blocked photos, the first `limit` by id.
+
+    `attempts` comes from `worker_processed`. `last_error` is the message of
+    the NEWEST `index_errors` row with ``pass_type = step AND filepath =
+    str(photo_id)`` — that column holds the stringified photo id only for the
+    worker-failure writers (`worker_api._record_worker_failures`,
+    `_record_write_failure`; every other `log_error` caller stores a path or
+    basename), so the match is specific to these failures. The message is
+    returned verbatim, including the server's ``worker: `` prefix. None when
+    no such row exists (e.g. a pre-ledger failure).
+
+    Costs one ids query, one detail query over at most `limit` photos, and one
+    `index_errors` read filtered to those ids — never a query per photo.
+    """
+    ids = blocked_photo_ids(db, batch_id, step)
+    limit = max(0, int(limit))
+    shown = ids[:limit]
+    photos: list[dict] = []
+    if shown:
+        placeholders = ",".join("?" * len(shown))
+        rows = db.conn.execute(
+            f"SELECT p.id, p.filename, p.filepath, wp.attempts FROM photos p "
+            f"LEFT JOIN worker_processed wp "
+            f"  ON wp.photo_id = p.id AND wp.pass_type = ? "
+            f"WHERE p.id IN ({placeholders}) ORDER BY p.id",
+            [step] + shown,
+        ).fetchall()
+        # Ascending id order, so the last row seen per photo is the newest.
+        last_error: dict[str, str] = {}
+        for e in db.conn.execute(
+            f"SELECT filepath, message FROM index_errors "
+            f"WHERE pass_type = ? AND filepath IN ({placeholders}) ORDER BY id",
+            [step] + [str(i) for i in shown],
+        ).fetchall():
+            last_error[e[0]] = e[1]
+        for r in rows:
+            filename = r["filename"] or (r["filepath"] or "").rsplit("/", 1)[-1]
+            photos.append({
+                "photo_id": r["id"],
+                "filename": filename,
+                "attempts": r["attempts"],
+                "last_error": last_error.get(str(r["id"])),
+            })
+    return {"total": len(ids), "truncated": len(ids) > len(shown),
+            "photos": photos}
 
 
 # ---------------------------------------------------------------------------

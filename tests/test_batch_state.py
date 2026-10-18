@@ -29,6 +29,8 @@ from photosearch.batch_state import (
     DEPENDS_ON,
     STATES,
     batch_state,
+    blocked_photo_detail,
+    blocked_photo_ids,
     fleet_launch_passes,
 )
 from photosearch.db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA
@@ -1250,3 +1252,91 @@ def test_match_faces_and_warm_crops_wait_on_video_scan(db):
     for step in ("match_faces", "warm_crops"):
         row = _step(state, step)
         assert row["state"] == "waiting" and row["waiting_on"] == "video-scan", row
+
+
+# =========================================================================
+# blocked_photo_ids / blocked_photo_detail (docs/plans/batch-blocked-rerun.md)
+# =========================================================================
+
+class TestBlockedPhotos:
+    """The photos a `blocked` box is made of. Same predicate as the step's
+    `failed` count, so the list can never disagree with the number."""
+
+    def _blocked_cc_batch(self, db, count=4, n_exhausted=2):
+        batch_id, ids = _make_batch(db, count=count)
+        _do_describe(db, ids)                        # make category-content eligible
+        _exhaust(db, ids[:n_exhausted], "category-content")
+        return batch_id, ids
+
+    def test_ids_are_exactly_the_failed_count(self, db):
+        batch_id, ids = self._blocked_cc_batch(db)
+        # A photo below the cap is still claimable, not blocked.
+        _exhaust(db, ids[2:3], "category-content", attempts=MAX_PROCESS_ATTEMPTS - 1)
+        # An exhausted photo whose output landed anyway is done, not blocked.
+        _exhaust(db, ids[3:], "category-content")
+        _set_col(db, ids[3:], "categories", json.dumps(["x"]))
+
+        got = blocked_photo_ids(db, batch_id, "category-content")
+        assert got == sorted(ids[:2])
+        step = _step(batch_state(db, batch_id), "category-content")
+        assert step["failed"] == len(got)
+
+    def test_scoped_to_the_batch(self, db):
+        batch_id, ids = self._blocked_cc_batch(db)
+        _, other = _make_batch(db, directory="2091/2091-09-20_OTHER", count=2)
+        _do_describe(db, other)
+        _exhaust(db, other, "category-content")
+        assert blocked_photo_ids(db, batch_id, "category-content") == sorted(ids[:2])
+
+    def test_faces_never_lists_its_exhausted_no_face_photos(self, db):
+        """An exhausted photo with no face rows is DONE for `faces`
+        (_EMPTY_OUTPUT_IS_DONE) — offering it for a re-run would re-run a
+        detector that already found nobody."""
+        batch_id, ids = _make_batch(db, count=3)
+        _do_faces(db, ids[:1])
+        _exhaust(db, ids[1:], "faces")
+        assert blocked_photo_ids(db, batch_id, "faces") == []
+        d = blocked_photo_detail(db, batch_id, "faces")
+        assert d == {"total": 0, "truncated": False, "photos": []}
+
+    @pytest.mark.parametrize("step", ["stacking", "match_faces", "ingest", "bogus"])
+    def test_non_worker_steps_are_empty(self, db, step):
+        batch_id, ids = self._blocked_cc_batch(db)
+        assert blocked_photo_ids(db, batch_id, step) == []
+        assert blocked_photo_detail(db, batch_id, step)["total"] == 0
+
+    def test_unknown_batch_raises(self, db):
+        with pytest.raises(ValueError):
+            blocked_photo_ids(db, 999999, "describe")
+
+    def test_detail_shape_attempts_and_newest_error(self, db):
+        batch_id, ids = self._blocked_cc_batch(db)
+        _exhaust(db, ids[1:2], "category-content", attempts=MAX_PROCESS_ATTEMPTS + 1)
+        # Two failures for photo 0: the NEWEST must win.
+        db.log_error("category-content", str(ids[0]), "worker: first failure")
+        db.log_error("category-content", str(ids[0]), "worker: vocabulary recitation")
+        # Same filepath, other pass: must not leak across passes.
+        db.log_error("keywords", str(ids[1]), "worker: a keywords failure")
+        # A basename-shaped row from another log_error caller never matches.
+        db.log_error("category-content", "img001.jpg", "something else")
+
+        d = blocked_photo_detail(db, batch_id, "category-content")
+        assert d["total"] == 2 and d["truncated"] is False
+        assert [p["photo_id"] for p in d["photos"]] == sorted(ids[:2])
+        p0, p1 = d["photos"]
+        assert p0 == {"photo_id": ids[0], "filename": "img000.jpg",
+                      "attempts": MAX_PROCESS_ATTEMPTS,
+                      "last_error": "worker: vocabulary recitation"}
+        assert p1["attempts"] == MAX_PROCESS_ATTEMPTS + 1
+        assert p1["last_error"] is None
+        assert p1["filename"] == "img001.jpg"
+
+    def test_detail_truncates_at_limit_but_counts_everything(self, db):
+        batch_id, ids = self._blocked_cc_batch(db, count=5, n_exhausted=5)
+        d = blocked_photo_detail(db, batch_id, "category-content", limit=2)
+        assert d["total"] == 5
+        assert d["truncated"] is True
+        assert [p["photo_id"] for p in d["photos"]] == sorted(ids)[:2]
+
+        full = blocked_photo_detail(db, batch_id, "category-content", limit=5)
+        assert full["truncated"] is False and len(full["photos"]) == 5

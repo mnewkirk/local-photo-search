@@ -658,6 +658,89 @@ describe('advanceLogLine', () => {
 });
 
 // =========================================================================
+// canInspectBlocked — which step rows get a "Show blocked (N)" button
+// =========================================================================
+
+describe('canInspectBlocked', () => {
+  test('true for a blocked worker pass', () => {
+    expect(BF.canInspectBlocked(step('category-content', 'blocked', { failed: 1 }))).toBe(true);
+    expect(BF.canInspectBlocked(step('describe', 'blocked'))).toBe(true);
+  });
+
+  test('false for a blocked NAS step — ingest sweep failures have no blocked-list endpoint', () => {
+    expect(BF.canInspectBlocked(step('ingest', 'blocked', { detail: 'disk full' }))).toBe(false);
+    expect(BF.canInspectBlocked(step('stacking', 'blocked'))).toBe(false);
+    expect(BF.canInspectBlocked(step('match_faces', 'blocked'))).toBe(false);
+  });
+
+  test('false for a worker pass in any other state', () => {
+    STATES.filter((s) => s !== 'blocked').forEach((st) => {
+      expect(BF.canInspectBlocked(step('describe', st))).toBe(false);
+    });
+  });
+
+  test('survives a missing step', () => {
+    expect(BF.canInspectBlocked(null)).toBe(false);
+    expect(BF.canInspectBlocked(undefined)).toBe(false);
+  });
+});
+
+// =========================================================================
+// rerunResultLine — one POST /api/admin/rerun-passes sync result -> a line
+// =========================================================================
+//
+// The regression this exists for: the server used to report a worker-side
+// failure as `written: 0, processed: 1` with no `error` field, and the
+// existing caller (PS.PhotoModal's submitRerun) read that as success. The fix
+// adds `error` to the result; this helper is the one place that decides what
+// counts as "still failing" from it.
+
+describe('rerunResultLine', () => {
+  test('a worker-reported failure reads as still failing, with the message', () => {
+    const out = BF.rerunResultLine({
+      pass: 'category-content', photo_id: 251357, written: 0, processed: 1,
+      deferred: false, mirrored: false, authority: 'nas',
+      error: 'vocabulary recitation',
+    });
+    expect(out).toEqual({ text: 'still failing: vocabulary recitation', cls: 'l-err' });
+  });
+
+  test('a successful write reads as done', () => {
+    const out = BF.rerunResultLine({
+      pass: 'describe', photo_id: 1, written: 1, processed: 1,
+      deferred: false, mirrored: true, authority: 'nas', error: null,
+    });
+    expect(out).toEqual({ text: 'done', cls: 'l-ok' });
+  });
+
+  test('zero writes with no error is STILL a failure — the exact bug this fixes', () => {
+    // This is the batch-6 case: written 0, processed 1, no error field at
+    // all. Before the backend fix this was indistinguishable from success.
+    const out = BF.rerunResultLine({
+      pass: 'category-content', photo_id: 251357, written: 0, processed: 1,
+      deferred: false, mirrored: false, authority: 'nas',
+    });
+    expect(out.cls).toBe('l-err');
+    expect(out.text).toBe('still failing');
+  });
+
+  test('a deferred zero-write is NOT a failure — it is a transient defer, not a result', () => {
+    const out = BF.rerunResultLine({
+      pass: 'describe', photo_id: 2, written: 0, processed: 0,
+      deferred: true, mirrored: false, authority: 'nas', error: null,
+    });
+    expect(out).toEqual({ text: 'done', cls: 'l-ok' });
+  });
+
+  test('survives a missing or empty result without inventing a failure', () => {
+    // Neither carries a `written: 0`, so there is nothing to read as failed —
+    // this is a defensive fallback, not a real server response shape.
+    expect(BF.rerunResultLine(null)).toEqual({ text: 'done', cls: 'l-ok' });
+    expect(BF.rerunResultLine({})).toEqual({ text: 'done', cls: 'l-ok' });
+  });
+});
+
+// =========================================================================
 // fleetLaunchPasses — MIRROR of batch_state.fleet_launch_passes
 // =========================================================================
 //

@@ -462,6 +462,51 @@
   }
 
   // ---------------------------------------------------------------------
+  // canInspectBlocked / rerunResultLine — the blocked-step panel
+  // ---------------------------------------------------------------------
+
+  /**
+   * Whether a step row should offer "Show blocked (N)".
+   *
+   * Only a `blocked` WORKER_PASSES row qualifies: `ingest`'s sweep-failed
+   * blocked state has no `GET /api/batches/{id}/blocked?step=` behind it
+   * (that endpoint 400s on a non-worker-pass step — batch_state.py's
+   * `blocked_photo_ids` returns `[]` for the same reason), and neither do the
+   * NAS steps. `faces` can never read `blocked` in the first place
+   * (`_EMPTY_OUTPUT_IS_DONE` — an exhausted no-face photo is DONE, not
+   * failed), so this needs no separate faces guard: a `faces` row is simply
+   * never in state `blocked`.
+   */
+  function canInspectBlocked(step) {
+    return !!step && step.state === 'blocked' && WORKER_PASSES.indexOf(step.step) !== -1;
+  }
+
+  /**
+   * One `POST /api/admin/rerun-passes` sync result (one pass, one photo) ->
+   * `{text, cls}` for the blocked panel's per-photo log.
+   *
+   * `rerun.run_pass_sync` now carries `error` — the worker-reported failure
+   * message captured BEFORE submission, not a re-derived one — so a result
+   * can be confidently read as "still failing" instead of the `written: 0`
+   * silently printing as success that motivated this whole plan (batch 6,
+   * 2026-10-18: a fourth `category-content` failure came back as
+   * `written: 0, processed: 1` and the existing caller reported it as done).
+   *
+   * `written === 0 && !deferred` is also a failure even when `error` is
+   * somehow absent — a worker-side timeout instead DEFERS by omitting the
+   * photo from the payload entirely (see CLAUDE.md "A failed SERVER-side
+   * write must not burn a retry attempt"), so a present, non-deferred,
+   * zero-write result has nothing else to mean.
+   */
+  function rerunResultLine(result) {
+    var r = result || {};
+    if (r.error || (r.written === 0 && !r.deferred)) {
+      return { text: 'still failing' + (r.error ? ': ' + r.error : ''), cls: 'l-err' };
+    }
+    return { text: 'done', cls: 'l-ok' };
+  }
+
+  // ---------------------------------------------------------------------
   // advanceLogLine — one SSE frame -> one log line
   // ---------------------------------------------------------------------
 
@@ -553,6 +598,8 @@
     OPTIONAL_STEPS: OPTIONAL_STEPS,
     advanceButton: advanceButton,
     advanceLogLine: advanceLogLine,
+    canInspectBlocked: canInspectBlocked,
+    rerunResultLine: rerunResultLine,
     fleetLaunchPasses: fleetLaunchPasses,
     layout: layout,
     placeholder: placeholder,

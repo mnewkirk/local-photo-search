@@ -366,3 +366,153 @@ class TestMemoKeyedByDbPath:
         data = resp.json()
         assert data["batch"]["directory"] == other_dir
         assert data["batch"]["directory"] != first_data["batch"]["directory"]
+
+
+# =========================================================================
+# GET /{id}/blocked and POST /{id}/invalidate (docs/plans/batch-blocked-rerun.md)
+# =========================================================================
+
+def _exhaust(db, ids, pass_type):
+    from photosearch.db import MAX_PROCESS_ATTEMPTS
+    for pid in ids:
+        db.conn.execute(
+            "INSERT OR REPLACE INTO worker_processed (photo_id, pass_type, attempts) "
+            "VALUES (?, ?, ?)", (pid, pass_type, MAX_PROCESS_ATTEMPTS))
+    db.conn.commit()
+
+
+class TestBlockedEndpoint:
+    def test_lists_the_blocked_photos(self, client, db):
+        batch_id, ids = _make_batch(db)
+        _exhaust(db, ids[:1], "describe")
+        db.log_error("describe", str(ids[0]), "worker: description ends mid-sentence")
+        resp = client.get(f"/api/batches/{batch_id}/blocked",
+                          params={"step": "describe"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1 and data["truncated"] is False
+        assert data["photos"] == [{
+            "photo_id": ids[0], "filename": "img000.jpg", "attempts": 3,
+            "last_error": "worker: description ends mid-sentence"}]
+
+    @pytest.mark.parametrize("step", ["stacking", "ingest", "bogus"])
+    def test_400_on_a_non_worker_pass(self, client, db, step):
+        batch_id, _ = _make_batch(db)
+        resp = client.get(f"/api/batches/{batch_id}/blocked", params={"step": step})
+        assert resp.status_code == 400
+
+    def test_404_unknown_batch(self, client):
+        resp = client.get("/api/batches/999999/blocked", params={"step": "describe"})
+        assert resp.status_code == 404
+
+    def test_faces_is_an_empty_list_not_an_error(self, client, db):
+        batch_id, ids = _make_batch(db)
+        _exhaust(db, ids, "faces")   # exhausted with no face rows == done
+        resp = client.get(f"/api/batches/{batch_id}/blocked", params={"step": "faces"})
+        assert resp.status_code == 200
+        assert resp.json() == {"total": 0, "truncated": False, "photos": []}
+
+
+class TestInvalidateEndpoint:
+    def test_invalidate_clears_the_memo_and_the_next_get_recomputes(
+            self, client, db, monkeypatch):
+        batch_id, _ = _make_batch(db)
+        calls = {"n": 0}
+        real = batch_api._batch_state
+
+        def counting(db_, bid):
+            calls["n"] += 1
+            return real(db_, bid)
+
+        monkeypatch.setattr(batch_api, "_batch_state", counting)
+
+        client.get(f"/api/batches/{batch_id}")
+        client.get(f"/api/batches/{batch_id}")
+        assert calls["n"] == 1                       # memoized
+
+        resp = client.post(f"/api/batches/{batch_id}/invalidate")
+        assert resp.status_code == 200
+        assert resp.json() == {"batch_id": batch_id, "invalidated": True}
+        assert batch_api._key(batch_id) not in batch_api._memo
+
+        client.get(f"/api/batches/{batch_id}")
+        assert calls["n"] == 2                       # recomputed after invalidate
+
+    def test_invalidate_bumps_the_generation(self, client, db):
+        """So a recompute already in flight cannot cache its pre-re-run
+        snapshot (TestGenerationGuardsAgainstLostInvalidation)."""
+        batch_id, _ = _make_batch(db)
+        key = batch_api._key(batch_id)
+        before = batch_api._generation.get(key, 0)
+        client.post(f"/api/batches/{batch_id}/invalidate")
+        assert batch_api._generation.get(key, 0) == before + 1
+
+    def test_404_unknown_batch(self, client):
+        resp = client.post("/api/batches/999999/invalidate")
+        assert resp.status_code == 404
+
+
+class _FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+@pytest.fixture
+def nas(monkeypatch):
+    """Replica mode with a recording stand-in for `requests.request`."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas.example:8000/")
+    calls = []
+    box = {"response": _FakeResponse({"ok": True})}
+
+    def fake_request(method, url, params=None, json=None, timeout=None,
+                     headers=None):
+        calls.append({"method": method, "url": url, "params": params})
+        return box["response"]
+
+    import requests
+    monkeypatch.setattr(requests, "request", fake_request)
+    return {"calls": calls, "box": box}
+
+
+class TestBlockedAndInvalidateProxy:
+    def test_blocked_comes_from_the_nas_not_the_local_copy(self, client, db, nas):
+        batch_id, ids = _make_batch(db)
+        _exhaust(db, ids, "describe")   # local copy says 3 — must NOT be used
+        nas["box"]["response"] = _FakeResponse(
+            {"total": 1, "truncated": False, "photos": [
+                {"photo_id": 77, "filename": "x.jpg", "attempts": 3,
+                 "last_error": "worker: boom"}]})
+        data = client.get(f"/api/batches/{batch_id}/blocked",
+                          params={"step": "describe"}).json()
+        assert data["total"] == 1 and data["photos"][0]["photo_id"] == 77
+        call = nas["calls"][0]
+        assert call["method"] == "GET"
+        assert call["url"] == f"http://nas.example:8000/api/batches/{batch_id}/blocked"
+        assert call["params"] == {"step": "describe"}
+
+    def test_blocked_validation_is_the_nas_s_job(self, client, db, nas):
+        """The NAS's own 400 survives the hop; the replica does not answer
+        for it locally."""
+        nas["box"]["response"] = _FakeResponse(
+            {"detail": "not a worker pass: stacking"}, status_code=400)
+        r = client.get("/api/batches/1/blocked", params={"step": "stacking"})
+        assert r.status_code == 400
+        assert r.json()["detail"] == "not a worker pass: stacking"
+        assert nas["calls"], "did not proxy"
+
+    def test_invalidate_goes_to_the_nas(self, client, db, nas):
+        """The memo that matters is the NAS's — the replica's /batches
+        reads are proxied and never touch its own memo."""
+        batch_id, _ = _make_batch(db)
+        nas["box"]["response"] = _FakeResponse(
+            {"batch_id": batch_id, "invalidated": True})
+        resp = client.post(f"/api/batches/{batch_id}/invalidate")
+        assert resp.status_code == 200
+        assert resp.json() == {"batch_id": batch_id, "invalidated": True}
+        assert nas["calls"][0]["method"] == "POST"
+        assert nas["calls"][0]["url"].endswith(f"/api/batches/{batch_id}/invalidate")

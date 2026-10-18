@@ -216,6 +216,11 @@
     }
     .node-warn { font-size: 11px; color: var(--yellow); margin-top: 2px; }
     .node-bar-fill { height: 100%; background: currentColor; opacity: 0.55; }
+    .node-blocked-btn {
+      margin-top: 6px; font-size: 11px; padding: 3px 8px; color: var(--red);
+      border-color: rgba(248,113,113,0.45);
+    }
+    .node-blocked-btn:hover { color: var(--red); border-color: var(--red); }
 
     /* One class per state — colour AND glyph AND the state's word, so the
        diagram never depends on colour alone. */
@@ -276,6 +281,34 @@
     .links { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
     .links a { color: var(--accent); text-decoration: none; }
     .links a:hover { text-decoration: underline; }
+
+    /* ---------------------------------------------------------------- */
+    /* Blocked-step panel                                                */
+    /* ---------------------------------------------------------------- */
+    .blocked-sub { font-size: 12.5px; color: var(--text-muted); margin-bottom: 12px; }
+    .blocked-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px; margin-bottom: 14px;
+    }
+    .blocked-tile {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 6px; overflow: hidden; cursor: pointer;
+    }
+    .blocked-tile:hover { border-color: var(--accent); }
+    .blocked-tile img { width: 100%; height: 110px; object-fit: cover; display: block; }
+    .blocked-tile-meta { padding: 6px 8px; font-size: 11px; }
+    .blocked-tile-fn {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--text-muted); word-break: break-all; margin-bottom: 2px;
+    }
+    .blocked-tile-attempts { color: var(--text-muted); }
+    .blocked-tile-err {
+      color: var(--red); margin-top: 3px; word-break: break-word;
+      max-height: 2.8em; overflow: hidden;
+    }
+    .blocked-truncated {
+      font-size: 12px; color: var(--yellow); margin-bottom: 10px;
+    }
 
     @media (max-width: 720px) {
       .container { padding: 20px 14px 50px; }
@@ -373,7 +406,14 @@
         // collapse): flagged, never a state change.
         s.warning ? e('div', { className: 'node-warn' }, s.warning) : null,
         e('div', { className: 'node-bar' },
-          e('div', { className: 'node-bar-fill', style: { width: pct + '%' } }))
+          e('div', { className: 'node-bar-fill', style: { width: pct + '%' } })),
+        // Only a blocked worker pass has a blocked-photo list behind it — see
+        // BF.canInspectBlocked. `ev.stopPropagation()` isn't needed: the node
+        // div itself has no onClick, only a title tooltip.
+        BF.canInspectBlocked(s) ? e('button', {
+          className: 'btn node-blocked-btn',
+          onClick: function () { props.onInspect(s.step); },
+        }, 'Show blocked (' + BF.fmt(s.failed) + ')') : null
       );
     }
 
@@ -390,7 +430,7 @@
               e('div', { className: 'flow-row-label' }, row.label),
               e('div', { className: 'flow-nodes' },
                 row.steps.map(function (s) {
-                  return e(Node, { key: s.step, step: s });
+                  return e(Node, { key: s.step, step: s, onInspect: props.onInspect });
                 })))
           );
         })
@@ -479,6 +519,178 @@
     }
 
     // ---------------------------------------------------------------------
+    // BlockedPanel — review + re-run the photos stuck on one blocked step
+    //
+    // Opened from a node's "Show blocked (N)" button (BF.canInspectBlocked).
+    // Fetches with a plain fetch, not PS.poll: this is operator-opened — one
+    // click, one read — not an ambient background poll.
+    // ---------------------------------------------------------------------
+    function BlockedPanel(props) {
+      var batchId = props.batchId;
+      var step = props.step;
+      var onClose = props.onClose;
+      var onSettled = props.onSettled;
+
+      var _d = useState(null);      var data = _d[0];      var setData = _d[1];
+      var _err = useState(null);    var err = _err[0];     var setErr = _err[1];
+      // 'run' | 'queue' | null — which action (if any) is in flight.
+      var _busy = useState(null);   var busy = _busy[0];   var setBusy = _busy[1];
+      var _log = useState(null);    var log = _log[0];     var setLog = _log[1];
+      var _mi = useState(-1);       var modalIdx = _mi[0]; var setModalIdx = _mi[1];
+
+      function load() {
+        return fetch('/api/batches/' + batchId + '/blocked?step=' + encodeURIComponent(step))
+          .then(jsonOrThrow)
+          .then(function (d) { setData(d); setErr(null); })
+          .catch(function (ex) { setErr(errText(ex)); });
+      }
+
+      useEffect(function () {
+        setData(null); setErr(null); setLog(null); setModalIdx(-1);
+        load();
+      }, [batchId, step]);
+
+      var photos = (data && data.photos) || [];
+
+      function appendLog(text, cls) {
+        setLog(function (prev) { return (prev || []).concat([{ t: text, cls: cls || '' }]); });
+      }
+
+      // After either write: /invalidate clears batch_api's 30s memo (the
+      // writes land through worker_api / clear-pass, which know nothing
+      // about that cache), then reload the page's detail AND this panel's
+      // own blocked list — same "act()" shape the dismiss/ready buttons use.
+      function settle() {
+        return postJSON('/api/batches/' + batchId + '/invalidate', {})
+          .catch(function () {})
+          .then(function () { return onSettled ? onSettled() : Promise.resolve(); })
+          .then(load);
+      }
+
+      // One sync call PER VISIBLE PHOTO — never a single multi-id call — so
+      // one poison photo cannot hide the others' results behind it.
+      function runNow() {
+        if (!photos.length || busy) return;
+        setBusy('run');
+        setLog([]);
+        var chain = Promise.resolve();
+        photos.forEach(function (p) {
+          chain = chain.then(function () {
+            return postJSON('/api/admin/rerun-passes',
+                { photo_ids: [p.photo_id], passes: [step], mode: 'sync' })
+              .then(function (d) {
+                // A top-level `errors` entry is a raised exception from
+                // run_pass_sync itself (transport/code failure) — distinct
+                // from a worker-reported failure, which comes back as a
+                // normal `results` row carrying `error` (see rerunResultLine).
+                var topErrs = (d && d.errors) || [];
+                if (topErrs.length) {
+                  appendLog(p.filename + ' — error: ' + topErrs[0].error, 'l-err');
+                  return;
+                }
+                var results = (d && d.results) || [];
+                var line = BF.rerunResultLine(results[0]);
+                appendLog(p.filename + ' — ' + line.text, line.cls);
+              })
+              .catch(function (ex) { appendLog(p.filename + ' — ' + errText(ex), 'l-err'); });
+          });
+        });
+        chain.then(settle).then(function () { setBusy(null); });
+      }
+
+      // One call, every photo currently in view. Resets attempts only — the
+      // fleet (or a hand-launched one) is what actually re-processes them, so
+      // there is no instant result to report here.
+      function queueForFleet() {
+        if (!photos.length || busy) return;
+        setBusy('queue');
+        postJSON('/api/admin/rerun-passes', {
+          photo_ids: photos.map(function (p) { return p.photo_id; }),
+          passes: [step], mode: 'queue',
+        }).then(function () {
+          appendLog('Queued ' + photos.length + ' photo(s) for ' + BF.stepLabel(step)
+            + ' — attempts reset; a worker fleet run will pick them up.', 'l-ok');
+        }).catch(function (ex) { appendLog('! ' + errText(ex), 'l-err'); })
+          .then(settle)
+          .then(function () { setBusy(null); });
+      }
+
+      var modalPhoto = (modalIdx >= 0 && photos[modalIdx])
+        ? { id: photos[modalIdx].photo_id, filename: photos[modalIdx].filename }
+        : null;
+
+      function stepModal(delta) {
+        if (!photos.length) return;
+        setModalIdx(function (i) { return ((i + delta) % photos.length + photos.length) % photos.length; });
+      }
+
+      return e('div', { className: 'card blocked-panel' },
+        e('div', { className: 'card-head' },
+          e('h2', null, 'Blocked — ' + BF.stepLabel(step)),
+          e('button', { className: 'btn', disabled: !!busy, onClick: onClose }, '× Close')),
+        err ? e('div', { className: 'error' }, err) : null,
+        !data && !err ? e('div', { className: 'muted' }, 'Loading…') : null,
+        data ? e('div', { className: 'blocked-sub' + (data.truncated ? ' blocked-truncated' : '') },
+          data.truncated
+            ? (BF.fmt(photos.length) + ' of ' + BF.fmt(data.total) + ' shown — narrow '
+               + 'the batch or clear some first to see the rest.')
+            : (BF.fmt(data.total) + ' blocked photo(s).')) : null,
+        data && !photos.length && !err ? e('div', { className: 'muted' },
+          'Nothing blocked here now.') : null,
+        photos.length ? e('div', { className: 'blocked-grid' },
+          photos.map(function (p, i) {
+            return e('div', {
+              key: p.photo_id, className: 'blocked-tile',
+              onClick: function () { setModalIdx(i); },
+            },
+              e('img', {
+                src: '/api/photos/' + p.photo_id + '/thumbnail',
+                alt: p.filename || '', loading: 'lazy',
+              }),
+              e('div', { className: 'blocked-tile-meta' },
+                e('div', { className: 'blocked-tile-fn' }, p.filename || ('#' + p.photo_id)),
+                e('div', { className: 'blocked-tile-attempts' },
+                  p.attempts == null ? 'attempts: unknown' : (p.attempts + ' attempt(s)')),
+                p.last_error ? e('div', { className: 'blocked-tile-err', title: p.last_error },
+                  p.last_error) : null));
+          })) : null,
+        e('div', { className: 'actions' },
+          e('button', {
+            className: 'btn primary', disabled: !!busy || !photos.length,
+            onClick: runNow,
+          }, busy === 'run' ? 'Running…' : 'Run now'),
+          e('button', {
+            className: 'btn', disabled: !!busy || !photos.length,
+            title: 'Resets attempts; a worker fleet run picks it up — no instant result.',
+            onClick: queueForFleet,
+          }, busy === 'queue' ? 'Queuing…' : 'Queue for fleet'),
+          e('button', { className: 'btn', disabled: !!busy, onClick: onClose }, 'Accept'),
+          e('span', { className: 'action-reason' },
+            'Queue for fleet resets attempts — a worker fleet run picks it up next, '
+            + 'not instantly.')),
+        log && log.length ? e('div', null,
+          e('div', { className: 'job-log-head' }, e('span', null, 'Re-run log')),
+          e('div', { className: 'job-log' },
+            log.map(function (l, i) {
+              return e('div', { key: i, className: l.cls }, l.t);
+            }))) : null,
+        modalPhoto && e(PS.PhotoModal, {
+          photo: modalPhoto,
+          fetchDetail: true,
+          onClose: function () { setModalIdx(-1); },
+          onPrev: function () { stepModal(-1); },
+          onNext: function () { stepModal(1); },
+          index: modalIdx,
+          total: photos.length,
+          showFaces: true,
+          showCollections: false,
+          showLocation: true,
+          showAesthetics: true,
+        })
+      );
+    }
+
+    // ---------------------------------------------------------------------
     // Page
     // ---------------------------------------------------------------------
     function Page() {
@@ -490,6 +702,8 @@
       var _b = useState(false);         var busy = _b[0];       var setBusy = _b[1];
       var _r = useState(false);         var running = _r[0];    var setRunning = _r[1];
       var _lg = useState(null);         var log = _lg[0];       var setLog = _lg[1];
+      // Which blocked worker-pass step the BlockedPanel is open for, or null.
+      var _is = useState(null);         var inspectStep = _is[0]; var setInspectStep = _is[1];
       // Workers per fleet launch. 3 matches the server default
       // (BatchLaunchFleetRequest.count), which clamps to 1..8. Remembered per
       // browser only — a convenience, not state anything else reads.
@@ -583,6 +797,7 @@
         setComputing(true);
         setErr(null);
         setLog(null);              // nor the old batch's advance log
+        setInspectStep(null);      // nor a blocked panel scoped to the old batch
         setSel(id);
         try {
           history.replaceState(null, '', location.pathname + '?batch=' + id);
@@ -679,7 +894,7 @@
               className: 'steps-bar-fill' + (pct === 100 ? ' complete' : ''),
               style: { width: pct + '%' },
             })),
-          e(Flow, { steps: state.steps }),
+          e(Flow, { steps: state.steps, onInspect: setInspectStep }),
           e(Legend, null),
           e('div', { className: 'actions' },
             // The one action leads — the other two are bookkeeping.
@@ -757,7 +972,14 @@
             // last good picture, and a first fetch that fails must not leave
             // the page saying "Loading…" forever.
             ph.error ? e('div', { className: 'error notice' }, ph.error) : null,
-            diagram)
+            diagram),
+          inspectStep && sel != null ? e(BlockedPanel, {
+            key: sel + ':' + inspectStep,
+            batchId: sel,
+            step: inspectStep,
+            onClose: function () { setInspectStep(null); },
+            onSettled: function () { return Promise.all([loadList(), loadDetail()]); },
+          }) : null
         )
       );
     }

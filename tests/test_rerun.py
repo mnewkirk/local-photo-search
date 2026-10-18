@@ -195,6 +195,46 @@ def test_run_pass_sync_describe_dispatch(db, monkeypatch):
     assert submitted["kwargs"]["describe_results"][0]["description"] == "new desc"
     assert "model" in submitted["kwargs"] and "model_version" in submitted["kwargs"]
     assert res["written"] == 1 and res["mirrored"] == 1 and res["authority"] == "nas"
+    # a success carries no failure message (docs/plans/batch-blocked-rerun.md)
+    assert res["error"] is None
+
+
+def test_run_pass_sync_reports_a_worker_failure_instead_of_success(db, monkeypatch):
+    """A worker-reported failure (worker._failure_row) is submitted as
+    `failures`: the server spends an attempt, writes nothing, and answers
+    `written: 0, processed: 1`. The result must carry the message so callers
+    stop printing that as success (the 2026-10-18 batch 6 case: a re-run of
+    a "vocabulary recitation" photo read as done)."""
+    monkeypatch.setenv("PHOTOSEARCH_NAS_URL", "http://nas:8000")
+    pid = db._test_photo_ids["DSC04894.JPG"]
+    from photosearch import worker as W
+
+    submitted = {}
+
+    class _FakeClient:
+        def __init__(self, *a, **k): pass
+
+    def fake_cc(photos, model="x"):
+        return [W._failure_row(photos[0]["id"],
+                               "category answer recites the vocabulary")]
+
+    def fake_submit(self, batch_id, pass_type, **kwargs):
+        submitted["kwargs"] = kwargs
+        return {"written": 0, "processed": 1}
+
+    monkeypatch.setattr(W, "WorkerClient", _FakeClient)
+    monkeypatch.setattr(rerun, "_model_version", lambda m: "deadbeef")
+    monkeypatch.setattr(W, "_process_category_content", fake_cc)
+    monkeypatch.setattr(_FakeClient, "submit_results", fake_submit, raising=False)
+    monkeypatch.setattr(rerun, "mirror_photos", lambda db, ids, server=None: {"mirrored": 0})
+
+    res = rerun.run_pass_sync(db, pid, "category-content")
+    # the failure went to the server as `failures`, not as a result row
+    assert submitted["kwargs"]["category_content_results"] == []
+    assert submitted["kwargs"]["failures"][0]["photo_id"] == pid
+    assert res["error"] == "category answer recites the vocabulary"
+    assert res["written"] == 0 and res["processed"] == 1
+    assert res["deferred"] is False  # a failure is a result, not a deferral
 
 
 def test_run_pass_sync_text_pass_skips_download(db, monkeypatch):

@@ -240,3 +240,22 @@ def test_worker_session_labels_itself():
     from photosearch.worker import WorkerClient
     wc = WorkerClient("http://nas.invalid:8000", probe=False)
     assert wc.session.headers["X-Photosearch-Source"] == "worker"
+
+
+def test_batch_blocked_and_invalidate_routes_have_their_own_intent():
+    """The two /batches step-box routes (docs/plans/batch-blocked-rerun.md)
+    must not fall through to the bare `/api/batches/{id}` rule — the rules are
+    `$`-anchored, so they need their own entries."""
+    from photosearch.request_intent import infer_intent
+    assert infer_intent("GET", "/api/batches/6/blocked",
+                        "step=category-content") == \
+        "List blocked photos for batch 6"
+    assert infer_intent("POST", "/api/batches/6/invalidate", "") == \
+        "Refresh cached state for batch 6"
+    # The neighbouring rule is unchanged, and the method gates each rule.
+    assert infer_intent("GET", "/api/batches/6", "") == "Poll batch 6"
+    assert infer_intent("GET", "/api/batches/6/invalidate", "") != \
+        "Refresh cached state for batch 6"
+    assert infer_intent("GET", "/api/batches/6/blocked", "",
+                        "batches") == \
+        "List blocked photos for batch 6 (from the batches page)"

@@ -27,9 +27,10 @@ So a ``GET`` never waits on another request's derivation:
   if there is no memo yet for this batch, a minimal placeholder
   (``computing: True``).
 
-Every write endpoint below (dismiss / ready / register) invalidates that
-batch's memo entry, so the next poll recomputes instead of serving a stale
-``ready``/``next_action``.
+Every write endpoint below (dismiss / ready / jobs / register) invalidates
+that batch's memo entry, and ``POST /{id}/invalidate`` does only that, for
+writes that land elsewhere (a re-run through ``worker_api``) — so the next
+poll recomputes instead of serving a stale ``ready``/``next_action``.
 
 **Two correctness details, both added in review (fix round 1):**
 
@@ -272,6 +273,33 @@ def get_batch_status(batch_id: int):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/batches/{id}/blocked — the photos behind a `blocked` step box
+# ---------------------------------------------------------------------------
+
+@router.get("/{batch_id}/blocked")
+def get_blocked_photos(batch_id: int, step: str = Query(...)):
+    """Which photos a worker step's `failed` count is made of, with their
+    attempts and newest worker-failure message
+    (docs/plans/batch-blocked-rerun.md).
+
+    Not memoized: it is opened by an operator clicking "Show blocked", not
+    polled, and it costs one ids query plus two over at most `limit` photos.
+    Proxied in replica mode like every route here — the NAS's ledger is the
+    authoritative one, and the replica's copy lags by up to a full sync.
+    """
+    if _nas_url():
+        return _proxy("GET", f"/api/batches/{batch_id}/blocked",
+                      params={"step": step})
+    from .batch_state import WORKER_PASSES, blocked_photo_detail
+    if step not in WORKER_PASSES:
+        raise HTTPException(400, f"not a worker pass: {step}")
+    with _get_db() as db:
+        if ingest_batches.get_batch(db, batch_id) is None:
+            raise HTTPException(404, f"no such batch: {batch_id}")
+        return blocked_photo_detail(db, batch_id, step)
+
+
+# ---------------------------------------------------------------------------
 # Writes — each invalidates the batch's memo entry
 # ---------------------------------------------------------------------------
 
@@ -299,6 +327,25 @@ def mark_ready_endpoint(batch_id: int):
         batch = ingest_batches.get_batch(db, batch_id)
     _invalidate(_key(batch_id))
     return {"batch": batch}
+
+
+@router.post("/{batch_id}/invalidate")
+def invalidate_batch_endpoint(batch_id: int):
+    """Drop this batch's memo so the next GET recomputes.
+
+    For the page to call after a re-run or a queue from the blocked panel.
+    Those writes land through ``worker_api`` (submit-results / clear-pass),
+    which does not know this module's memo exists, so without this the box
+    would keep reading `blocked` for up to ``_TTL_SECONDS``. Proxied in
+    replica mode: the memo that matters is the NAS's, one hop away.
+    """
+    if _nas_url():
+        return _proxy("POST", f"/api/batches/{batch_id}/invalidate")
+    with _get_db() as db:
+        if ingest_batches.get_batch(db, batch_id) is None:
+            raise HTTPException(404, f"no such batch: {batch_id}")
+    _invalidate(_key(batch_id))
+    return {"batch_id": batch_id, "invalidated": True}
 
 
 @router.post("/{batch_id}/jobs")
