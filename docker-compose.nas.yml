@@ -80,6 +80,8 @@ services:
       - PHOTOSEARCH_DB=/data/photo_index.db
       - INSIGHTFACE_HOME=/data/.insightface
       - PHOTO_ROOT=/photos
+      # Video subject-share filters/sorts (D16): off until the video eval passes.
+      - PHOTOSEARCH_VIDEO_SUBJECT_SHARE=${PHOTOSEARCH_VIDEO_SUBJECT_SHARE:-0}
       - PYTHONUNBUFFERED=1
       - PHOTOSEARCH_CACHE=/data/.cache/photosearch
       - HF_TOKEN=${HF_TOKEN}
@@ -141,6 +143,8 @@ services:
       # Image returns are ON by default. Set to 0 to only allow text metadata;
       # connected MCP clients pull thumbnails (pixels then leave the NAS).
       - PHOTOSEARCH_MCP_ALLOW_IMAGES=${PHOTOSEARCH_MCP_ALLOW_IMAGES:-1}
+      # Video subject-share filters/sorts (D16): off until the video eval passes.
+      - PHOTOSEARCH_VIDEO_SUBJECT_SHARE=${PHOTOSEARCH_VIDEO_SUBJECT_SHARE:-0}
     command: ["mcp"]
     depends_on:
       photosearch:

@@ -1065,9 +1065,10 @@ Step 4. A failed gate leaves the flag off.
 
 #### 6. Turn the subject share on (only after the gates pass)
 
-The flag is read per process; nothing is recomputed. NAS: add
-`- PHOTOSEARCH_VIDEO_SUBJECT_SHARE=1` to the `environment:` of **both**
-`photosearch` and `photosearch-mcp` in `docker-compose.nas.yml`, then
+The flag is read per process; nothing is recomputed. NAS: both
+`photosearch` and `photosearch-mcp` already pass
+`PHOTOSEARCH_VIDEO_SUBJECT_SHARE=${PHOTOSEARCH_VIDEO_SUBJECT_SHARE:-0}`, so set
+`PHOTOSEARCH_VIDEO_SUBJECT_SHARE=1` in the repo's `.env` on the NAS, then
 `$DC up -d --force-recreate photosearch photosearch-mcp`. Replica: add
 `export PHOTOSEARCH_VIDEO_SUBJECT_SHARE=1` to `run-local-replica.sh` and
 restart the service. Check: `/api/search?media=video&min_focus_share=0.5`
