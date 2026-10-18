@@ -821,16 +821,18 @@ def dispute_key(photo_id, question: str, shas) -> str:
     return f"{int(photo_id)}-{h.hexdigest()[:12]}"
 
 
-def load_disputes() -> dict:
-    return read_pass_file("describe", "disputes.json", {})
+def load_disputes(pass_: str = "describe") -> dict:
+    """`pass_` is `describe` (photos) or `video-describe` (step 4 of
+    docs/plans/video-support.md): same format, separate files."""
+    return read_pass_file(pass_, "disputes.json", {})
 
 
-def save_disputes(data: dict) -> None:
-    write_pass_file("describe", "disputes.json", data)
+def save_disputes(data: dict, pass_: str = "describe") -> None:
+    write_pass_file(pass_, "disputes.json", data)
 
 
-def load_dispute_labels() -> dict:
-    return read_pass_file("describe", "dispute_labels.json", {})
+def load_dispute_labels(pass_: str = "describe") -> dict:
+    return read_pass_file(pass_, "dispute_labels.json", {})
 
 
 def dispute_options(q: dict) -> list[str]:
@@ -839,7 +841,8 @@ def dispute_options(q: dict) -> list[str]:
 
 
 def save_dispute_label(key: str, correct: Iterable[str], cant_tell: bool = False,
-                       options_seen: Optional[Iterable[str]] = None) -> dict:
+                       options_seen: Optional[Iterable[str]] = None,
+                       pass_: str = "describe") -> dict:
     """`options_seen` = the answers the owner was shown. A description added
     later whose answer is not among them is UNJUDGED, never wrong by default —
     "None right" said nothing about an answer that was not on screen."""
@@ -849,7 +852,7 @@ def save_dispute_label(key: str, correct: Iterable[str], cant_tell: bool = False
         if options_seen is not None:
             data[key]["options_seen"] = sorted(set(options_seen))
         return data[key]
-    return update_pass_file("describe", "dispute_labels.json", {}, put)
+    return update_pass_file(pass_, "dispute_labels.json", {}, put)
 
 
 def dispute_verdict(answer: Optional[str], label: Optional[dict]) -> Optional[str]:
@@ -876,3 +879,504 @@ def dispute_label_current(q: dict, label: Optional[dict]) -> bool:
         return True
     seen = label.get("options_seen")
     return seen is None or set(dispute_options(q)) <= set(seen)
+
+
+# --------------------------------------------------------------------------
+# Video eval (docs/plans/video-support.md, step 4)
+# --------------------------------------------------------------------------
+#
+# Everything lives under eval_dir()/video (git-ignored), never in the DB:
+#
+#   video/sample.json             {"created", "seed", "photos": [{"photo_id",
+#                                  "stratum", "split": dev|holdout|check,
+#                                  "filename", "duration_s", "width", "height",
+#                                  "live_still_id"}], "probe_check": [{...}],
+#                                  "recheck": [pid], "shortfall": {stratum: n}}
+#   video/subject_labels[-recheck].json
+#                                 {"who": {<pid>: {"people": [person_id],
+#                                          "someone_else", "live_pair",
+#                                          "done", "updated_at"}},
+#                                  "segments": {"<pid>:<seg_version>:<ix>":
+#                                          {"kind", "person_id", "label",
+#                                           "free_text"}}}
+#   video/quality_labels[-recheck].json  {<pid>: {"in_focus", "shaky", "noisy",
+#                                          "keeper", "done", "updated_at"}}
+#   video/temporal_labels.json    {<text_sha>: {"photo_id", "answer", "updated_at"}}
+#   video/detections/<tag>/<pid>.npz + .json   the face-detection cache
+#   video/frames/<pid>/<ms>-<px>.jpg           grabbed keyframes
+#   video-grounding/runs/<v>.json, video-subject/runs/<v>.json,
+#   video-describe/runs/<v>.json, video-quality/runs/<v>.json  (run caches)
+#
+# Segment labels are keyed by (pid, seg_version, seg_ix): a change to the
+# segment schedule or its 12-way coarsening changes seg_version and orphans
+# the old labels instead of scoring them against different time ranges.
+
+VIDEO = "video"
+VIDEO_LABEL_MAX_SEGMENTS = 12
+VIDEO_HOLDOUT_FRAC = 1 / 3
+VIDEO_LABEL_SETS = ("main", "recheck")
+SUBJECT_KINDS = ("person", "someone_else", "subject", "none", "cant_tell")
+THREE_STATE = ("yes", "debatable", "no")
+QUALITY_FLAGS = ("in_focus", "shaky", "noisy")
+KEEPER = ("keep", "meh", "delete")
+TEMPORAL = ("yes", "partly", "no")
+
+
+def video_seg_version() -> str:
+    """Identity of the labelling segmentation. Derived from the production
+    schedule's constants, so changing them orphans labels automatically."""
+    from .video_analysis import SEGMENT_CAP, SEGMENT_S
+    return f"s{SEGMENT_S:g}c{SEGMENT_CAP}m{VIDEO_LABEL_MAX_SEGMENTS}"
+
+
+def video_production_segments(duration: float) -> list:
+    from .video_analysis import segment_schedule
+    return [tuple(s) for s in segment_schedule(float(duration or 0.0))]
+
+
+def video_label_segments(duration: float) -> list:
+    """The <= 12 segments the owner labels: the production 3 s / cap-40
+    schedule, coarsened on production boundaries."""
+    from .video_analysis import coarsen_segments
+    return [tuple(s) for s in coarsen_segments(video_production_segments(duration),
+                                               VIDEO_LABEL_MAX_SEGMENTS)]
+
+
+def coarsen_keys(prod_segments, keys, label_segments) -> list:
+    """Map one key per production segment onto the label segments: each label
+    segment takes the key holding the most time inside it (None = no subject
+    counts as a key; ties go to the earliest)."""
+    out = []
+    for a, b in label_segments:
+        acc: dict = {}
+        order: list = []
+        for (pa, pb), k in zip(prod_segments, keys):
+            ov = min(b, pb) - max(a, pa)
+            if ov <= 1e-9:
+                continue
+            kk = json.dumps(k, sort_keys=True)
+            if kk not in acc:
+                order.append(kk)
+            acc[kk] = acc.get(kk, 0.0) + ov
+        if not acc:
+            out.append(None)
+            continue
+        best = max(order, key=lambda kk: (acc[kk], -order.index(kk)))
+        out.append(json.loads(best))
+    return out
+
+
+def holdout_split(entries: Iterable[dict], seed: int = 1,
+                  frac: float = VIDEO_HOLDOUT_FRAC) -> dict:
+    """{photo_id: "dev"|"holdout"} — stratified and deterministic: within each
+    stratum the ids are sorted, shuffled with a seed derived from (seed,
+    stratum), and the first round(n * frac) are holdout. Input order and the
+    other strata never change a video's split."""
+    import random
+    by: dict = {}
+    for e in entries:
+        by.setdefault(str(e["stratum"]), []).append(int(e["photo_id"]))
+    out = {}
+    for stratum, ids in by.items():
+        ids = sorted(set(ids))
+        random.Random(f"video-split-{seed}-{stratum}").shuffle(ids)
+        k = int(round(len(ids) * frac))
+        for i, pid in enumerate(ids):
+            out[pid] = "holdout" if i < k else "dev"
+    return out
+
+
+def load_video_sample() -> dict:
+    return read_pass_file(VIDEO, "sample.json", {"created": None, "photos": [],
+                                                  "probe_check": [], "recheck": []})
+
+
+def save_video_sample(data: dict) -> dict:
+    data = dict(data)
+    data.setdefault("created", now_iso())
+    write_pass_file(VIDEO, "sample.json", data)
+    return data
+
+
+def video_sample_entry(photo_id: int) -> Optional[dict]:
+    s = load_video_sample()
+    for p in list(s["photos"]) + list(s.get("probe_check") or []):
+        if int(p["photo_id"]) == int(photo_id):
+            return p
+    return None
+
+
+def is_labelled_clip(entry: dict) -> bool:
+    """Live clips are paired to their still and only get a pairing question."""
+    return not str(entry.get("stratum", "")).startswith("live")
+
+
+def _label_file(base: str, label_set: str) -> str:
+    if label_set not in VIDEO_LABEL_SETS:
+        raise ValueError(f"unknown label set {label_set!r}")
+    return f"{base}.json" if label_set == "main" else f"{base}-{label_set}.json"
+
+
+def seg_label_key(photo_id, seg_version: str, seg_ix: int) -> str:
+    return f"{int(photo_id)}:{seg_version}:{int(seg_ix)}"
+
+
+def load_video_subject_labels(label_set: str = "main") -> dict:
+    return read_pass_file(VIDEO, _label_file("subject_labels", label_set),
+                          {"who": {}, "segments": {}})
+
+
+def _clean_seg_label(s: dict, people: set) -> dict:
+    kind = s.get("kind")
+    if kind not in SUBJECT_KINDS:
+        raise ValueError(f"segment kind must be one of {SUBJECT_KINDS}")
+    out = {"kind": kind}
+    if kind == "person":
+        pid = s.get("person_id")
+        if pid is None or int(pid) not in people:
+            raise ValueError("a person segment must name someone from 'who is in this video'")
+        out["person_id"] = int(pid)
+    elif kind == "subject":
+        lab = " ".join(str(s.get("label") or "").split()).strip().lower()
+        if not lab:
+            raise ValueError("a subject segment needs a label")
+        out["label"] = lab
+        out["free_text"] = bool(s.get("free_text"))
+    return out
+
+
+def save_video_subject_label(photo_id: int, *, seg_version: str, n_segments: int,
+                             people: Iterable[int] = (), someone_else: bool = False,
+                             segments: Optional[dict] = None, live_pair: Optional[str] = None,
+                             done: bool = True, label_set: str = "main") -> dict:
+    """Save one video's answers. `segments` = {seg_ix: {"kind", ...}}; every
+    key is written as (pid, seg_version, seg_ix). Refuses a seg_version that
+    is not the current one — a page built on an old schedule must not label
+    the new one's time ranges."""
+    if seg_version != video_seg_version():
+        raise ValueError(f"stale segmentation {seg_version!r}; reload the page")
+    if live_pair is not None and live_pair not in ("yes", "no", "cant_tell"):
+        raise ValueError("live_pair must be yes, no or cant_tell")
+    people = sorted({int(p) for p in people})
+    cleaned = {}
+    for ix, s in (segments or {}).items():
+        ix = int(ix)
+        if ix < 0 or ix >= n_segments:
+            raise ValueError(f"segment index out of range 0..{n_segments - 1}")
+        cleaned[ix] = _clean_seg_label(s, set(people))
+    who = {"people": people, "someone_else": bool(someone_else),
+           "seg_version": seg_version, "n_segments": int(n_segments),
+           "done": bool(done), "updated_at": now_iso()}
+    if live_pair is not None:
+        who["live_pair"] = live_pair
+
+    def put(data):
+        data.setdefault("who", {})[str(int(photo_id))] = who
+        segs = data.setdefault("segments", {})
+        prefix = f"{int(photo_id)}:{seg_version}:"
+        for k in [k for k in segs if k.startswith(prefix)]:
+            del segs[k]
+        for ix, lab in cleaned.items():
+            segs[seg_label_key(photo_id, seg_version, ix)] = lab
+        return {"who": who, "segments": {str(i): v for i, v in cleaned.items()}}
+    return update_pass_file(VIDEO, _label_file("subject_labels", label_set),
+                            {"who": {}, "segments": {}}, put)
+
+
+def video_segment_labels(labels: dict, photo_id: int, seg_version: str,
+                         n_segments: int) -> list:
+    """One label (or None) per segment, for the CURRENT seg_version only."""
+    segs = labels.get("segments") or {}
+    return [segs.get(seg_label_key(photo_id, seg_version, i)) for i in range(n_segments)]
+
+
+def load_video_quality_labels(label_set: str = "main") -> dict:
+    return read_pass_file(VIDEO, _label_file("quality_labels", label_set), {})
+
+
+def save_video_quality_label(photo_id: int, answers: dict, done: bool = True,
+                             label_set: str = "main") -> dict:
+    lab = {}
+    for f in QUALITY_FLAGS:
+        v = answers.get(f)
+        if v is not None and v not in THREE_STATE:
+            raise ValueError(f"{f} must be one of {THREE_STATE}")
+        lab[f] = v
+    k = answers.get("keeper")
+    if k is not None and k not in KEEPER:
+        raise ValueError(f"keeper must be one of {KEEPER}")
+    lab["keeper"] = k
+    if done and any(lab[f] is None for f in QUALITY_FLAGS + ("keeper",)):
+        raise ValueError("answer all four questions before marking done")
+    lab.update(done=bool(done), updated_at=now_iso())
+
+    def put(data):
+        data[str(int(photo_id))] = lab
+        return lab
+    return update_pass_file(VIDEO, _label_file("quality_labels", label_set), {}, put)
+
+
+def load_temporal_labels() -> dict:
+    return read_pass_file(VIDEO, "temporal_labels.json", {})
+
+
+def save_temporal_label(sha: str, photo_id: int, answer: str) -> dict:
+    """"Does it say what happens over the clip, not just one moment?" — keyed
+    by the description's text_sha, like every label on generated text."""
+    if answer not in TEMPORAL:
+        raise ValueError(f"answer must be one of {TEMPORAL}")
+    lab = {"photo_id": int(photo_id), "answer": answer, "updated_at": now_iso()}
+
+    def put(data):
+        data[sha] = lab
+        return lab
+    return update_pass_file(VIDEO, "temporal_labels.json", {}, put)
+
+
+def video_recheck_ids(n: int = 15, seed: int = 7) -> list[int]:
+    """The seeded recheck subset: clips only, stable for a given sample."""
+    import random
+    ids = sorted(int(p["photo_id"]) for p in load_video_sample()["photos"]
+                 if is_labelled_clip(p))
+    random.Random(f"video-recheck-{seed}").shuffle(ids)
+    return sorted(ids[:n])
+
+
+# ---- failure classification ---------------------------------------------
+
+_CONTEXT_RE = re.compile(r"context (size|length|window)|exceed(s|ed)? (the )?context|"
+                         r"too many tokens|maximum context|n_ctx", re.I)
+
+
+def is_context_overflow(err) -> bool:
+    """A 400 "context exceeded" from LM Studio (its slot split): a CONFIG
+    failure that screens the variant out, cached as `rejected`, never retried
+    as if the backend were down."""
+    texts = [str(err)]
+    body = getattr(err, "body_text", None)
+    if body:
+        texts.append(str(body))
+    return any(_CONTEXT_RE.search(t) for t in texts)
+
+
+def http_error_body(exc) -> Optional[str]:
+    """Best-effort body of a urllib HTTPError (the message alone is
+    'HTTP Error 400: Bad Request', which does not say why)."""
+    try:
+        read = getattr(exc, "read", None)
+        if read is None:
+            return None
+        data = read()
+        return data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
+    except Exception:
+        return None
+
+
+def classify_failure(exc) -> str:
+    """'rejected' (context overflow — cache it) or 'transport' (never cache)."""
+    if getattr(exc, "body_text", None) is None:
+        body = http_error_body(exc)
+        if body:
+            try:
+                exc.body_text = body
+            except Exception:
+                pass
+    return "rejected" if is_context_overflow(exc) else "transport"
+
+
+# ---- detection cache ------------------------------------------------------
+
+def _det_dir(tag: str) -> Path:
+    if not VARIANT_RE.match(tag or ""):
+        raise ValueError(f"bad detection tag {tag!r}")
+    return pass_dir(VIDEO) / "detections" / tag
+
+
+def save_detections(photo_id: int, tag: str, frames: list, meta: dict) -> Path:
+    """Cache one video's per-frame face detections (video_analysis input
+    format) as npz + a JSON sidecar, so rule variants are rescored without
+    re-decoding or re-detecting. Atomic: npz first, then the sidecar that
+    marks the entry complete."""
+    import numpy as np
+    d = _det_dir(tag)
+    d.mkdir(parents=True, exist_ok=True)
+    t, fi, bbox, score, emb, has_emb, sharp = [], [], [], [], [], [], []
+    for i, fr in enumerate(frames):
+        t.append(float(fr["t"]))
+        for det in fr.get("faces") or []:
+            fi.append(i)
+            bbox.append([float(x) for x in det["bbox"]])
+            score.append(float(det.get("det_score") or 0.0))
+            e = det.get("embedding")
+            has_emb.append(e is not None)
+            emb.append(np.zeros(512, np.float32) if e is None else np.asarray(e, np.float32))
+            s = det.get("sharpness")
+            sharp.append(np.nan if s is None else float(s))
+    arrays = dict(t=np.asarray(t, np.float64), frame_ix=np.asarray(fi, np.int32),
+                  bbox=np.asarray(bbox, np.float32).reshape(-1, 4),
+                  det_score=np.asarray(score, np.float32),
+                  embedding=np.asarray(emb, np.float32).reshape(-1, 512),
+                  has_embedding=np.asarray(has_emb, bool),
+                  sharpness=np.asarray(sharp, np.float64))
+    npz = d / f"{int(photo_id)}.npz"
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{int(photo_id)}.", suffix=".npz")
+    os.close(fd)
+    try:
+        np.savez_compressed(tmp, **arrays)
+        os.replace(tmp, npz)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    write_json_atomic(d / f"{int(photo_id)}.json", {**meta, "n_frames": len(t),
+                                                    "saved": now_iso()})
+    return npz
+
+
+def load_detections(photo_id: int, tag: str) -> Optional[tuple]:
+    """(frames, meta) or None when not cached (or only half-written)."""
+    import numpy as np
+    d = _det_dir(tag)
+    meta = read_json(d / f"{int(photo_id)}.json", None)
+    npz = d / f"{int(photo_id)}.npz"
+    if meta is None or not npz.exists():
+        return None
+    z = np.load(npz)
+    frames = [{"t": float(x), "faces": []} for x in z["t"]]
+    for k in range(len(z["frame_ix"])):
+        s = float(z["sharpness"][k])
+        frames[int(z["frame_ix"][k])]["faces"].append({
+            "bbox": [float(x) for x in z["bbox"][k]],
+            "det_score": float(z["det_score"][k]),
+            "embedding": z["embedding"][k].astype(float).tolist() if z["has_embedding"][k] else None,
+            "sharpness": None if s != s else s})
+    return frames, meta
+
+
+# ---- originals + frames ----------------------------------------------------
+
+def fetch_video_original(photo_id: int, server: str = DEFAULT_SERVER, *,
+                         intent: str = "Video eval: cache an original for labelling",
+                         timeout: float = 600, chunk: int = 1 << 20,
+                         retries: int = 5) -> Path:
+    """Stream one video into the originals cache via
+    /api/photos/{id}/full?purpose=worker (the fleet's rate-capped read), with
+    the request-log source/intent headers. Size-checked against
+    Content-Length; a short or failed read writes nothing. A 503 (worker
+    stream cap) is waited out per Retry-After."""
+    import time as _time
+    import urllib.error
+    import urllib.request
+    hit = cached_original(photo_id)
+    if hit is not None:
+        return hit
+    url = f"{server.rstrip('/')}/api/photos/{int(photo_id)}/full?purpose=worker"
+    req = urllib.request.Request(url, headers={
+        "X-Photosearch-Source": "claude",
+        "X-Photosearch-Intent": f"{intent} (video {int(photo_id)})"})
+    d = originals_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries):
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code == 503 and attempt < retries - 1:
+                _time.sleep(float(e.headers.get("Retry-After") or 10))
+                continue
+            raise
+        break
+    want = resp.headers.get("Content-Length")
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{int(photo_id)}.", suffix=".tmp")
+    try:
+        got = 0
+        with os.fdopen(fd, "wb") as f, resp:
+            while True:
+                buf = resp.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                got += len(buf)
+            f.flush()
+            os.fsync(f.fileno())
+        if want is not None and got != int(want):
+            raise RuntimeError(f"short read for video {photo_id}: {got} of {want} bytes")
+        if got == 0:
+            raise RuntimeError(f"empty response for video {photo_id}")
+        os.replace(tmp, d / str(int(photo_id)))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return d / str(int(photo_id))
+
+
+def copy_video_original(photo_id: int, src: str) -> Path:
+    """Cache an original from a local path (the NAS share mounted, or the
+    photo root on the machine that holds the files). Hardlink when possible."""
+    import shutil
+    hit = cached_original(photo_id)
+    if hit is not None:
+        return hit
+    d = originals_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / str(int(photo_id))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{int(photo_id)}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        shutil.copyfile(src, tmp)
+        if os.path.getsize(tmp) != os.path.getsize(src):
+            raise RuntimeError(f"short copy of {src}")
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return dest
+
+
+def grab_frame(path, t: float, max_px: int = 0):
+    """One frame at `t` seconds as a PIL RGB image (cv2, imported lazily —
+    never on the NAS). max_px 0 = native resolution (for the loupe)."""
+    import cv2
+    from PIL import Image
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise RuntimeError("cv2 cannot open this video")
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t)) * 1000.0)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"no frame at {t:.2f}s")
+    finally:
+        cap.release()
+    im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    if max_px and max(im.size) > max_px:
+        im.thumbnail((max_px, max_px), Image.LANCZOS)
+    return im
+
+
+def cached_frame_jpeg(photo_id: int, t: float, max_px: int = 768,
+                      grab: Optional[Callable] = None) -> Path:
+    """Path of a keyframe JPEG under video/frames, grabbed on first use."""
+    d = pass_dir(VIDEO) / "frames" / str(int(photo_id))
+    p = d / f"{int(round(float(t) * 1000))}-{int(max_px)}.jpg"
+    if p.exists():
+        return p
+    src = cached_original(photo_id)
+    if src is None:
+        raise FileNotFoundError(f"video {photo_id} is not in the originals cache")
+    im = (grab or grab_frame)(src, t, max_px)
+    d.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".f", suffix=".jpg")
+    os.close(fd)
+    try:
+        im.save(tmp, "JPEG", quality=85)
+        os.replace(tmp, p)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return p

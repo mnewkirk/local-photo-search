@@ -85,6 +85,30 @@ LABELLER_NOTES: dict[str, str] = {
     "sharp": ("the in-focus part of the subject is crisp at 100%: edges, "
               "eyelashes, fine texture resolve cleanly. Only the subject has to "
               "be sharp - a soft background does not stop it"),
+    # VIDEO eval (docs/plans/video-support.md step 4), keyed `video:*` so they
+    # can never collide with a visual tag. Shown on /eval/models' Video
+    # subject / Video quality tabs; never part of any production prompt.
+    "video:main-subject": ("what the camera operator is framing or following: a "
+                           "person, an animal, a thing, or the scenery. If two are "
+                           "framed equally, can't tell is fine"),
+    "video:someone-else": ("a person is the subject, but not one of the people you "
+                           "picked for this video (or you cannot say who)"),
+    "video:no-subject": ("nothing is being framed or followed: the camera is "
+                         "pointed at the ground, moving between subjects, or "
+                         "the frame is black"),
+    "video:in_focus": ("judge the MAIN SUBJECT in the 100% frame grab, not the "
+                       "background; 'debatable' when it is soft in part of the "
+                       "clip and sharp in the rest"),
+    "video:shaky": ("the picture jitters or wobbles from the camera moving by "
+                    "accident; a smooth deliberate pan or follow is NOT shaky"),
+    "video:noisy": ("visible grain or colour speckle, usually in dark areas or "
+                    "low light; compression blocks count only if they are what "
+                    "you notice"),
+    "video:keeper": ("would you keep this clip? keep / meh (fine, would not miss "
+                     "it) / delete"),
+    "video:temporal": ("does the description say what HAPPENS over the clip - "
+                       "what changes from start to end - not just one moment? "
+                       "'partly' when it hints at it"),
 }
 
 _SHARPNESS_SETS = frozenset({"sharpness", "sharpness-recheck"})

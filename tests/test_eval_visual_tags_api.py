@@ -185,6 +185,9 @@ def test_labeller_notes_never_leak_into_the_production_prompt():
     prompt = _build_visual_prompt(list(PERCEIVED_VOCABULARY))
     from photosearch.visual_tag_eval import MEASURED_TAGS
     for tag, note in eval_api.LABELLER_NOTES.items():
+        assert note not in prompt
+        if tag.startswith("video:"):        # the video eval's notes, not tags
+            continue
         # sharp / blurry notes are for the MEASURED labels, never the model.
         assert tag in PERCEIVED_VOCABULARY or tag in MEASURED_TAGS
         assert note not in prompt

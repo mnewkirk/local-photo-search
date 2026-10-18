@@ -154,6 +154,8 @@
       { id: 'categories', label: 'Categories' },
       { id: 'keywords', label: 'Keywords' },
       { id: 'planted', label: 'Planted' },
+      { id: 'vsubject', label: 'Video subject' },
+      { id: 'vquality', label: 'Video quality' },
     ];
 
     function jsonOrThrow(r) {
@@ -786,8 +788,12 @@
       var shownAt = useRef(0);
       useEffect(function () { shownAt.current = Date.now(); }, [idx]);
 
+      // ?dpass=video-describe labels the VIDEO descriptions' disagreements;
+      // the clip plays where the photo would be.
+      var isVideo = props.dpass === 'video-describe';
+      var DQ = isVideo ? '?pass=video-describe' : '';
       useEffect(function () {
-        fetch(API + '/describe/disputes').then(jsonOrThrow).then(function (d) {
+        fetch(API + '/describe/disputes' + DQ).then(jsonOrThrow).then(function (d) {
           setData(d);
           var first = d.photos.findIndex(function (p) { return !p.done; });
           var start = first < 0 ? 0 : first;
@@ -833,7 +839,7 @@
         var at = idx;
         Promise.all(photo.questions.map(function (q) {
           var v = draft[q.key];
-          return fetch(API + '/describe/disputes/' + encodeURIComponent(q.key), {
+          return fetch(API + '/describe/disputes/' + encodeURIComponent(q.key) + DQ, {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ correct: v.mode === 'none' || v.mode === 'cant' ? [] : v.correct,
                                    cant_tell: v.mode === 'cant' }),
@@ -842,7 +848,7 @@
           // Re-read what is actually on disk rather than trusting local state:
           // a server-side race once dropped most of a photo's answers while
           // this page showed them all as saved.
-          return fetch(API + '/describe/disputes').then(jsonOrThrow);
+          return fetch(API + '/describe/disputes' + DQ).then(jsonOrThrow);
         }).then(function (fresh) {
           setData(fresh);
           setSaving(false); setDirty(false);
@@ -861,17 +867,26 @@
       live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
       useKeys(live);
 
-      if (!data) return e('div', { className: 'muted' }, 'Loading…');
-      if (!photos.length) return e(Hint, { text: data.hint });
+      var toggle_ = e('div', { className: 'topbar' },
+        e('span', { className: 'muted' }, 'Descriptions of:'),
+        [['describe', 'Photos'], ['video-describe', 'Videos']].map(function (o) {
+          return e('button', { key: o[0], type: 'button',
+            className: 'btn small' + ((props.dpass || 'describe') === o[0] ? ' on' : ''),
+            onClick: function () { props.onPass(o[0]); } }, o[1]);
+        }));
+      if (!data) return e('div', null, toggle_, e('div', { className: 'muted' }, 'Loading…'));
+      if (!photos.length) return e('div', null, toggle_, e(Hint, { text: data.hint }));
 
+      var Pane = photo.media === 'video' ? VideoPane : PhotoPane;
       return e('div', null,
+        toggle_,
         e(Progress, { progress: data.progress }),
         e(Strip, { items: photos, idx: idx, onPick: goTo,
                    isDone: function (p) { return p.done; },
                    isPartial: function (p) { return p.questions.some(function (q) { return q.label; }); },
                    title: function (p) { return '#' + p.photo_id + ' · ' + p.questions.length + ' points'; } }),
         e('div', { className: 'work' },
-          e(PhotoPane, { photoId: photo.photo_id },
+          e(Pane, { photoId: photo.photo_id },
             e('span', { className: 'muted' }, (idx + 1) + ' of ' + photos.length),
             e('span', { className: 'pill stratum' }, photo.stratum || ''),
             e('span', { className: 'spacer' }),
@@ -906,7 +921,383 @@
             e('div', { className: 'actions' },
               e('button', { className: 'btn primary', type: 'button', disabled: saving, onClick: save },
                 saving ? 'Saving…' : 'Save & next (Enter)'),
-              e('span', { className: 'muted' }, answered + ' / ' + photo.questions.length + ' answered')))));
+              e('span', { className: 'muted' }, answered + ' / ' + photo.questions.length + ' answered')),
+            isVideo ? e(TemporalBox, { photoId: photo.photo_id, onError: props.onError }) : null)));
+    }
+
+    // ------------------------------------------------------------------
+    // Video eval (docs/plans/video-support.md step 4). The clip comes from
+    // the LOCAL originals cache, Range-served so it seeks; nothing here
+    // names a model, a variant or the dev/holdout split.
+    // ------------------------------------------------------------------
+    var VSET = PARAMS.get('vset') === 'recheck' ? 'recheck' : 'main';
+    var VQS = '?set=' + VSET;
+
+    function fmtS(x) { return (Math.round(x * 10) / 10).toFixed(1) + 's'; }
+
+    function VideoPane(props) {
+      return e('div', { className: 'photo-pane' },
+        e('div', { className: 'photo-frame' },
+          e('video', {
+            key: props.photoId, ref: props.videoRef, controls: true, preload: 'metadata',
+            src: API + '/video/original/' + props.photoId,
+            style: { maxWidth: '100%', maxHeight: '100%', display: 'block' },
+          })),
+        e('div', { className: 'photo-meta' }, props.children));
+    }
+
+    // "Does it say what happens over the clip?" — one 3-state answer per
+    // distinct description, keyed by its text, saved on click.
+    function TemporalBox(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      useEffect(function () {
+        fetch(API + '/video/temporal').then(jsonOrThrow).then(setData)
+          .catch(function (ex) { props.onError('Could not load descriptions: ' + ex.message); });
+      }, []);
+      if (!data) return null;
+      var v = data.videos.find(function (x) { return x.photo_id === props.photoId; });
+      if (!v || !v.texts.length) return null;
+      function answer(t, a) {
+        fetch(API + '/video/temporal/' + t.sha, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ photo_id: props.photoId, answer: a }),
+        }).then(jsonOrThrow).then(function () {
+          setData(Object.assign({}, data, { videos: data.videos.map(function (x) {
+            if (x !== v) return x;
+            return Object.assign({}, x, { texts: x.texts.map(function (y) {
+              return y.sha === t.sha ? Object.assign({}, y, { answer: a }) : y;
+            }) });
+          }) }));
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+      return e('div', { style: { marginTop: 18 } },
+        e('div', { className: 'q-title' }, 'Does each description say what HAPPENS over the clip?'),
+        e('div', { className: 'muted', style: { marginBottom: 8 } }, data.notes.temporal || ''),
+        v.texts.map(function (t, n) {
+          return e('div', { className: 'desc', key: t.sha },
+            e('div', { className: 'desc-head' }, e('span', null, 'Description ' + String.fromCharCode(65 + n))),
+            t.text,
+            e('div', { className: 'q-actions' },
+              [['yes', 'Yes'], ['partly', 'Partly'], ['no', 'No — one moment']].map(function (o) {
+                return e('button', { key: o[0], type: 'button',
+                  className: 'btn small' + (t.answer === o[0] ? ' on' : ''),
+                  onClick: function () { answer(t, o[0]); } }, o[1]);
+              })));
+        }));
+    }
+
+    function subjectDraft(v) {
+      var w = v.who || {};
+      var people = {};
+      (w.people || []).forEach(function (id) { people[id] = true; });
+      var segs = {};
+      v.segments.forEach(function (s) { if (s.label) segs[s.ix] = Object.assign({}, s.label); });
+      return { people: people, someoneElse: !!w.someone_else, segs: segs, livePair: w.live_pair || null };
+    }
+
+    function VideoSubjectTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var draftS = useState(null); var draft = draftS[0]; var setDraft = draftS[1];
+      var dirtyS = useState(false); var dirty = dirtyS[0]; var setDirty = dirtyS[1];
+      var qS = useState(''); var q = qS[0]; var setQ = qS[1];
+      var freeS = useState({}); var free = freeS[0]; var setFree = freeS[1];
+      var videoRef = useRef(null);
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      function load(keepAt) {
+        return fetch(API + '/video/subject' + VQS).then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var start = keepAt;
+          if (start == null) {
+            var first = d.videos.findIndex(function (v) { return !v.done; });
+            start = first < 0 ? 0 : first;
+          }
+          setIdx(start);
+          if (d.videos.length) setDraft(subjectDraft(d.videos[start]));
+          return d;
+        });
+      }
+      useEffect(function () {
+        load(null).catch(function (ex) { props.onError('Could not load videos: ' + ex.message); });
+      }, []);
+
+      var videos = data ? data.videos : [];
+      var v = videos[idx];
+      var byId = {};
+      (data ? data.persons : []).forEach(function (p) { byId[p.id] = p.name; });
+
+      function goTo(i) {
+        if (i < 0 || i >= videos.length || i === idx) return;
+        if (dirty && !window.confirm('Unsaved answers on this video. Leave without saving?')) return;
+        setIdx(i); setDraft(subjectDraft(videos[i])); setDirty(false); setQ(''); setFree({});
+      }
+      function upd(patch) { setDraft(Object.assign({}, draft, patch)); setDirty(true); }
+      function setSeg(ix, lab) {
+        var segs = Object.assign({}, draft.segs); segs[ix] = lab; upd({ segs: segs });
+      }
+      function togglePerson(id) {
+        var p = Object.assign({}, draft.people);
+        if (p[id]) {
+          delete p[id];
+          // A segment naming someone no longer in the video is unanswered again.
+          var segs = Object.assign({}, draft.segs);
+          Object.keys(segs).forEach(function (k) {
+            if (segs[k].kind === 'person' && segs[k].person_id === id) delete segs[k];
+          });
+          upd({ people: p, segs: segs });
+        } else { p[id] = true; upd({ people: p }); }
+      }
+      function addPerson() {
+        var name = q.trim().toLowerCase();
+        var hit = (data.persons || []).find(function (p) { return p.name.toLowerCase() === name; });
+        if (hit) { if (!draft.people[hit.id]) togglePerson(hit.id); setQ(''); }
+      }
+      function seek(t) {
+        var el = videoRef.current;
+        if (el) { el.currentTime = t; el.play(); }
+      }
+
+      function save() {
+        if (!v || !draft) return;
+        var body = { seg_version: v.seg_version, done: true,
+                     people: Object.keys(draft.people).map(Number),
+                     someone_else: draft.someoneElse, segments: draft.segs };
+        if (v.kind === 'live') body.live_pair = draft.livePair;
+        var at = idx;
+        fetch(API + '/video/subject/' + v.photo_id + VQS, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        }).then(jsonOrThrow).then(function () {
+          props.onError(null);
+          setDirty(false);
+          return fetch(API + '/video/subject' + VQS).then(jsonOrThrow);
+        }).then(function (d) {
+          setData(d);
+          var n = nextOpen(d.videos, at, function (x) { return x.done; });
+          var go = n >= 0 ? n : at;
+          setIdx(go); setDraft(subjectDraft(d.videos[go])); setQ(''); setFree({});
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+
+      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!videos.length) return e(Hint, { text: data.hint });
+      var notes = data.notes || {};
+
+      function chip(key, label, on, onClick, title) {
+        return e(PS.Chip, { key: key, label: label, wide: false, state: on ? 'yes' : 'no',
+                            mark: on ? '✓' : '', title: title, onClick: onClick });
+      }
+
+      var body;
+      if (v.kind === 'live') {
+        body = e('div', { className: 'card' },
+          e('div', { className: 'q-title' }, 'Is this clip the Live Photo of this still?'),
+          v.live_still_id ? e('img', { src: '/api/photos/' + v.live_still_id + '/preview',
+            alt: 'still', style: { maxWidth: '100%', maxHeight: 320, display: 'block', margin: '8px 0' } })
+            : e('div', { className: 'muted' }, 'No still recorded.'),
+          e('div', { className: 'q-actions' },
+            [['yes', 'Yes, same moment'], ['no', 'No'], ['cant_tell', "Can't tell"]].map(function (o) {
+              return e('button', { key: o[0], type: 'button',
+                className: 'btn choice' + (draft.livePair === o[0] ? ' on' : ''),
+                onClick: function () { upd({ livePair: o[0] }); } }, o[1]);
+            })),
+          e('div', { className: 'actions', style: { marginTop: 12 } },
+            e('button', { className: 'btn primary', type: 'button', onClick: save,
+                          disabled: !draft.livePair }, 'Save & next (Enter)')));
+      } else {
+        var picked = Object.keys(draft.people).map(Number);
+        var answeredN = v.segments.filter(function (s) { return draft.segs[s.ix]; }).length;
+        body = e('div', { className: 'card' },
+          e('div', { className: 'q' },
+            e('div', { className: 'q-title' }, '1. Who is in this video?'),
+            e('div', { className: 'chips' },
+              picked.map(function (id) {
+                return chip('p' + id, byId[id] || ('#' + id), true, function () { togglePerson(id); });
+              }),
+              chip('else', 'Someone else', draft.someoneElse,
+                   function () { upd({ someoneElse: !draft.someoneElse }); }, notes['someone-else'])),
+            e('div', { className: 'add' },
+              e('input', { list: 'vpersons', value: q, placeholder: 'Add a person…',
+                           onChange: function (ev) { setQ(ev.target.value); },
+                           onKeyDown: function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPerson(); } } }),
+              e('datalist', { id: 'vpersons' }, (data.persons || []).map(function (p) {
+                return e('option', { key: p.id, value: p.name });
+              })),
+              e('button', { className: 'btn', type: 'button', onClick: addPerson }, 'Add'))),
+          e('div', { className: 'q-title' }, '2. Main subject of each segment'),
+          e('div', { className: 'muted', style: { marginBottom: 10 } }, notes['main-subject'] || ''),
+          v.segments.map(function (s) {
+            var cur = draft.segs[s.ix] || null;
+            function is(kind, extra) {
+              if (!cur || cur.kind !== kind) return false;
+              if (kind === 'person') return cur.person_id === extra;
+              if (kind === 'subject') return cur.label === extra;
+              return true;
+            }
+            var labelsShown = s.choices.slice();
+            if (cur && cur.kind === 'subject' && labelsShown.indexOf(cur.label) < 0) labelsShown.push(cur.label);
+            return e('div', { className: 'q', key: s.ix },
+              e('div', { className: 'q-title' },
+                e('button', { type: 'button', className: 'btn small', style: { marginRight: 8 },
+                              onClick: function () { seek(s.start); } }, '▶'),
+                fmtS(s.start) + ' – ' + fmtS(s.end),
+                cur ? null : e('span', { className: 'pill dirty', style: { marginLeft: 8 } }, 'unanswered')),
+              e('div', { className: 'chips' },
+                picked.map(function (id) {
+                  return chip('p' + id, byId[id] || ('#' + id), is('person', id),
+                              function () { setSeg(s.ix, { kind: 'person', person_id: id }); });
+                }),
+                chip('else', 'Someone else', is('someone_else'),
+                     function () { setSeg(s.ix, { kind: 'someone_else' }); }),
+                labelsShown.map(function (l) {
+                  return chip('s' + l, l, is('subject', l),
+                              function () { setSeg(s.ix, { kind: 'subject', label: l,
+                                                           free_text: s.choices.indexOf(l) < 0 }); });
+                }),
+                chip('none', 'No subject', is('none'), function () { setSeg(s.ix, { kind: 'none' }); },
+                     notes['no-subject']),
+                chip('cant', "Can't tell", is('cant_tell'), function () { setSeg(s.ix, { kind: 'cant_tell' }); })),
+              e('div', { className: 'add' },
+                e('input', { value: free[s.ix] || '', placeholder: 'Other subject (dog, mountain lake…)',
+                             onChange: function (ev) { var f = Object.assign({}, free); f[s.ix] = ev.target.value; setFree(f); },
+                             onKeyDown: function (ev) {
+                               if (ev.key !== 'Enter') return;
+                               ev.preventDefault();
+                               var t = (free[s.ix] || '').trim().toLowerCase();
+                               if (t) setSeg(s.ix, { kind: 'subject', label: t, free_text: s.choices.indexOf(t) < 0 });
+                             } })));
+          }),
+          e('div', { className: 'actions' },
+            e('button', { className: 'btn primary', type: 'button', onClick: save,
+                          disabled: answeredN < v.segments.length }, 'Save & next (Enter)'),
+            e('span', { className: 'muted' }, answeredN + ' / ' + v.segments.length + ' segments answered')));
+      }
+
+      return e('div', null,
+        e(Progress, { progress: data.progress },
+          VSET === 'recheck' ? e('span', { className: 'pill stratum' }, 'recheck — first answers hidden') : null),
+        e(Strip, { items: videos, idx: idx, onPick: goTo,
+                   isDone: function (x) { return x.done; },
+                   title: function (x) { return '#' + x.photo_id + ' · ' + x.stratum; } }),
+        e('div', { className: 'work' },
+          e(VideoPane, { photoId: v.photo_id, videoRef: videoRef },
+            e('button', { className: 'btn', type: 'button', disabled: idx === 0,
+                          onClick: function () { goTo(idx - 1); } }, '← Prev'),
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + videos.length +
+              (v.duration_s ? ' · ' + fmtS(v.duration_s) : '')),
+            e('button', { className: 'btn', type: 'button', disabled: idx >= videos.length - 1,
+                          onClick: function () { goTo(idx + 1); } }, 'Next →'),
+            e('span', { className: 'spacer' }),
+            dirty ? e('span', { className: 'pill dirty' }, '● unsaved')
+                  : v.done ? e('span', { className: 'pill saved' }, '✓ saved') : null),
+          body));
+    }
+
+    var QUALITY_QS = [
+      { key: 'in_focus', title: 'Is the main subject in focus?', note: 'in_focus',
+        opts: [['yes', 'Yes'], ['debatable', 'Debatable'], ['no', 'No']] },
+      { key: 'shaky', title: 'Is it shaky?', note: 'shaky',
+        opts: [['yes', 'Yes'], ['debatable', 'Debatable'], ['no', 'No']] },
+      { key: 'noisy', title: 'Is it noisy / grainy?', note: 'noisy',
+        opts: [['yes', 'Yes'], ['debatable', 'Debatable'], ['no', 'No']] },
+      { key: 'keeper', title: 'Keeper?', note: 'keeper',
+        opts: [['keep', 'Keep'], ['meh', 'Meh'], ['delete', 'Delete']] },
+    ];
+
+    function VideoQualityTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
+      var draftS = useState({}); var draft = draftS[0]; var setDraft = draftS[1];
+      var loupeS = useState(null); var loupe = loupeS[0]; var setLoupe = loupeS[1];
+      var videoRef = useRef(null);
+      var live = useRef(null);
+      var shownAt = useRef(0);
+      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+
+      function draftOf(v) { return Object.assign({}, v.label || {}); }
+      useEffect(function () {
+        fetch(API + '/video/quality' + VQS).then(jsonOrThrow).then(function (d) {
+          setData(d);
+          var first = d.videos.findIndex(function (v) { return !(v.label && v.label.done); });
+          var start = first < 0 ? 0 : first;
+          setIdx(start);
+          if (d.videos.length) setDraft(draftOf(d.videos[start]));
+        }).catch(function (ex) { props.onError('Could not load videos: ' + ex.message); });
+      }, []);
+
+      var videos = data ? data.videos : [];
+      var v = videos[idx];
+      function goTo(i) {
+        if (i < 0 || i >= videos.length) return;
+        setIdx(i); setDraft(draftOf(videos[i])); setLoupe(null);
+      }
+      function answered() {
+        return QUALITY_QS.every(function (qq) { return draft[qq.key]; });
+      }
+      function save() {
+        if (!v || !answered()) return;
+        var at = idx;
+        fetch(API + '/video/quality/' + v.photo_id + VQS, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ in_focus: draft.in_focus, shaky: draft.shaky, noisy: draft.noisy,
+                                 keeper: draft.keeper, done: true }),
+        }).then(jsonOrThrow).then(function (body) {
+          var next = videos.map(function (x, i) { return i === at ? Object.assign({}, x, { label: body.label }) : x; });
+          var done = next.filter(function (x) { return x.label && x.label.done; }).length;
+          setData(Object.assign({}, data, { videos: next, progress: { done: done, total: next.length } }));
+          var n = nextOpen(next, at, function (x) { return !!(x.label && x.label.done); });
+          if (n >= 0 && n !== at) { setIdx(n); setDraft(draftOf(next[n])); }
+        }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+      function grab() {
+        var el = videoRef.current;
+        var t = el ? el.currentTime : 0;
+        if (el) el.pause();
+        setLoupe({ t: t });
+      }
+
+      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      useKeys(live);
+
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!videos.length) return e(Hint, { text: data.hint });
+      var notes = data.notes || {};
+
+      return e('div', null,
+        loupe ? e(PS.Loupe, { key: v.photo_id + ':' + loupe.t,
+                              src: API + '/video/frame/' + v.photo_id + '?t=' + loupe.t.toFixed(3),
+                              onClose: function () { setLoupe(null); } }) : null,
+        e(Progress, { progress: data.progress }),
+        e(Strip, { items: videos, idx: idx, onPick: goTo,
+                   isDone: function (x) { return !!(x.label && x.label.done); },
+                   title: function (x) { return '#' + x.photo_id + ' · ' + x.stratum; } }),
+        e('div', { className: 'work' },
+          e(VideoPane, { photoId: v.photo_id, videoRef: videoRef },
+            e('span', { className: 'muted' }, (idx + 1) + ' of ' + videos.length),
+            e('span', { className: 'spacer' }),
+            e('button', { className: 'btn', type: 'button', onClick: grab,
+                          title: 'Pause and open this frame at 100% to judge focus' }, 'Frame at 100% (focus)')),
+          e('div', { className: 'card' },
+            QUALITY_QS.map(function (qq) {
+              return e('div', { className: 'q', key: qq.key },
+                e('div', { className: 'q-title' }, qq.title),
+                e('div', { className: 'muted', style: { marginBottom: 6 } }, notes[qq.note] || ''),
+                e('div', { className: 'q-actions' },
+                  qq.opts.map(function (o) {
+                    return e('button', { key: o[0], type: 'button',
+                      className: 'btn choice' + (draft[qq.key] === o[0] ? ' on' : ''),
+                      onClick: function () { var d = Object.assign({}, draft); d[qq.key] = o[0]; setDraft(d); } }, o[1]);
+                  })));
+            }),
+            e('div', { className: 'actions' },
+              e('button', { className: 'btn primary', type: 'button', disabled: !answered(), onClick: save },
+                'Save & next (Enter)')))));
     }
 
     function Page() {
@@ -914,6 +1305,15 @@
       var tabS = useState(TABS.some(function (t) { return t.id === initial; }) ? initial : 'diffs');
       var tab = tabS[0]; var setTab = tabS[1];
       var errS = useState(null); var error = errS[0]; var setError = errS[1];
+      var dpassS = useState(PARAMS.get('dpass') === 'video-describe' ? 'video-describe' : 'describe');
+      var dpass = dpassS[0]; var setDpass = dpassS[1];
+
+      function pickPass(pp) {
+        setDpass(pp); setError(null);
+        var u = new URL(window.location.href);
+        u.searchParams.set('dpass', pp);
+        window.history.replaceState(null, '', u.toString());
+      }
 
       function pick(id) {
         setTab(id); setError(null);
@@ -922,7 +1322,9 @@
         window.history.replaceState(null, '', u.toString());
       }
 
-      var body = tab === 'diffs' ? e(DiffsTab, { key: 'd', onError: setError })
+      var body = tab === 'diffs' ? e(DiffsTab, { key: 'd' + dpass, dpass: dpass, onPass: pickPass, onError: setError })
+        : tab === 'vsubject' ? e(VideoSubjectTab, { key: 'vs', onError: setError })
+        : tab === 'vquality' ? e(VideoQualityTab, { key: 'vq', onError: setError })
         : tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })
         : tab === 'pairs' ? e(PairsTab, { key: 'p', onError: setError })
         : tab === 'truth' ? e(TruthTab, { key: 't', onError: setError })
@@ -935,7 +1337,9 @@
           e('h1', null, 'Model eval — labelling'),
           e('div', { className: 'page-sub' },
             'Ground truth for the describe / text / verify model evals ',
-            '(', e('code', null, 'docs/plans/model-eval-harnesses.md'), '). ',
+            '(', e('code', null, 'docs/plans/model-eval-harnesses.md'), ') and the video eval ',
+            '(', e('code', null, 'docs/plans/video-support.md'), ' step 4; add ',
+            e('code', null, '?vset=recheck'), ' for the blind recheck). ',
             'Model names are never shown. Labels are files on this machine, not DB rows.'),
           e('div', { className: 'tabs' },
             TABS.map(function (t) {

@@ -24,7 +24,7 @@ import io
 import random
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -431,11 +431,23 @@ def _dispute_options(q: dict) -> list[str]:
     return me.dispute_options(q)
 
 
+_DISPUTE_PASSES = ("describe", "video-describe")
+
+
+def _dispute_pass(name: str) -> str:
+    if name not in _DISPUTE_PASSES:
+        raise HTTPException(400, f"pass must be one of {_DISPUTE_PASSES}")
+    return name
+
+
 @router.get("/describe/disputes")
-def get_disputes():
-    disputes = me.load_disputes()
-    labels = me.load_dispute_labels()
-    strata = {p["photo_id"]: p["stratum"] for p in me.load_sample("describe")["photos"]}
+def get_disputes(pass_: str = Query("describe", alias="pass")):
+    pass_ = _dispute_pass(pass_)
+    is_video = pass_ == "video-describe"
+    disputes = me.load_disputes(pass_)
+    labels = me.load_dispute_labels(pass_)
+    strata = {p["photo_id"]: p["stratum"] for p in
+              (me.load_video_sample() if is_video else me.load_sample("describe"))["photos"]}
     photos = []
     for pid, d in disputes.items():
         qs = []
@@ -452,6 +464,7 @@ def get_disputes():
         if not qs:
             continue
         photos.append({"photo_id": int(pid), "stratum": strata.get(int(pid)), "questions": qs,
+                       "media": "video" if is_video else "photo",
                        "done": all(q["current"] for q in qs)})
     # Most disagreement first: that is where a label separates models most.
     photos.sort(key=lambda p: (-len(p["questions"]), p["photo_id"]))
@@ -460,13 +473,16 @@ def get_disputes():
     return {"photos": photos,
             "progress": {"done": sum(p["done"] for p in photos), "total": len(photos),
                          "points_done": done_q, "points_total": total_q},
-            "hint": None if photos else ("No disputes yet — run: python evals/describe_eval.py "
-                                         "disputes --model <text model>")}
+            "hint": None if photos else (
+                "No disputes yet — run: python evals/"
+                + ("video_eval.py" if is_video else "describe_eval.py")
+                + " disputes --model <text model>")}
 
 
 @router.put("/describe/disputes/{key}")
-def put_dispute(key: str, body: DisputeBody):
-    for d in me.load_disputes().values():
+def put_dispute(key: str, body: DisputeBody, pass_: str = Query("describe", alias="pass")):
+    pass_ = _dispute_pass(pass_)
+    for d in me.load_disputes(pass_).values():
         for q in d["questions"]:
             if q["key"] == key:
                 opts = set(_dispute_options(q))
@@ -474,5 +490,249 @@ def put_dispute(key: str, body: DisputeBody):
                 if bad:
                     raise HTTPException(400, f"not an answer to this question: {bad}")
                 return {"key": key, "label": me.save_dispute_label(
-                    key, body.correct, body.cant_tell, options_seen=opts)}
+                    key, body.correct, body.cant_tell, options_seen=opts, pass_=pass_)}
     raise HTTPException(404, "no such disputed point")
+
+
+# --------------------------------------------------------------------------
+# Video eval (docs/plans/video-support.md step 4): Video subject + Video
+# quality tabs, the temporal question, Range-served originals, frame grabs.
+#
+# Same two rules as above. BLIND: no response carries a variant, model or
+# approach name; candidate subject labels are pooled across every run,
+# normalized, de-duplicated and shuffled with a per-segment seed, and the
+# dev/holdout split is never sent. LOCAL-ONLY: the video bytes come from the
+# local originals cache (never the NAS), served with HTTP Range so the
+# browser can seek.
+# --------------------------------------------------------------------------
+
+_VIDEO_HINT = ("No video sample yet. Draw one with: "
+               "python evals/video_eval.py sample --db <db>")
+_VIDEO_SUBJECT_PASS = "video-subject"
+_VIDEO_DESCRIBE_PASS = "video-describe"
+
+
+def _video_notes() -> dict:
+    from .eval_api import LABELLER_NOTES
+    return {k[len("video:"):]: v for k, v in LABELLER_NOTES.items() if k.startswith("video:")}
+
+
+def _label_set(name: str) -> str:
+    if name not in me.VIDEO_LABEL_SETS:
+        raise HTTPException(400, f"set must be one of {me.VIDEO_LABEL_SETS}")
+    return name
+
+
+def _video_entries(label_set: str, clips_only: bool = False) -> list[dict]:
+    sample = me.load_video_sample()
+    entries = list(sample["photos"])
+    if label_set == "recheck":
+        ids = set(int(i) for i in sample.get("recheck") or [])
+        entries = [p for p in entries if int(p["photo_id"]) in ids]
+    if clips_only:
+        entries = [p for p in entries if me.is_labelled_clip(p)]
+    return entries
+
+
+def _persons() -> list[dict]:
+    try:
+        with _get_db() as db:
+            return [{"id": int(r[0]), "name": r[1]} for r in db.conn.execute(
+                "SELECT id, name FROM persons WHERE name IS NOT NULL ORDER BY name COLLATE NOCASE")]
+    except Exception:
+        return []
+
+
+def candidate_labels(photo_id: int, n_segments: int) -> list[list[str]]:
+    """Per label segment, every NON-PERSON subject label any run predicted,
+    normalized and de-duplicated, in a seeded shuffled order. Unattributed:
+    the labeller judges subjects, never models."""
+    from .video_subjects import normalize_label
+    seg_v = me.video_seg_version()
+    pools: list[set] = [set() for _ in range(n_segments)]
+    for v in me.list_variants(_VIDEO_SUBJECT_PASS):
+        it = ((me.load_run(_VIDEO_SUBJECT_PASS, v) or {}).get("items") or {}).get(str(photo_id))
+        if not it or it.get("seg_version") != seg_v:
+            continue
+        for i, key in enumerate((it.get("pred") or [])[:n_segments]):
+            if key and key[0] == "s" and key[1]:
+                pools[i].add(normalize_label(key[1]) or key[1])
+    out = []
+    for i, pool in enumerate(pools):
+        labs = sorted(pool)
+        random.Random(f"video-chips-{photo_id}-{seg_v}-{i}").shuffle(labs)
+        out.append(labs)
+    return out
+
+
+class VideoSubjectBody(BaseModel):
+    seg_version: str
+    people: List[int] = []
+    someone_else: bool = False
+    segments: dict = {}
+    live_pair: Optional[str] = None
+    done: bool = True
+
+
+@router.get("/video/subject")
+def get_video_subject(set: str = Query("main")):  # noqa: A002 - query name
+    label_set = _label_set(set)
+    seg_v = me.video_seg_version()
+    labels = me.load_video_subject_labels(label_set)
+    videos, done_n = [], 0
+    for p in _video_entries(label_set):
+        pid = int(p["photo_id"])
+        live = not me.is_labelled_clip(p)
+        segs = [] if live else me.video_label_segments(p.get("duration_s") or 0)
+        chips = [] if live else candidate_labels(pid, len(segs))
+        who = (labels.get("who") or {}).get(str(pid))
+        seg_labels = me.video_segment_labels(labels, pid, seg_v, len(segs))
+        done = bool(who and who.get("done") and (live or who.get("seg_version") == seg_v))
+        done_n += done
+        videos.append({
+            "photo_id": pid, "stratum": p["stratum"], "kind": "live" if live else "clip",
+            "duration_s": p.get("duration_s"), "live_still_id": p.get("live_still_id"),
+            "seg_version": seg_v,
+            "segments": [{"ix": i, "start": a, "end": b, "choices": chips[i],
+                          "label": seg_labels[i]} for i, (a, b) in enumerate(segs)],
+            "who": who, "done": done})
+    return {"videos": videos, "persons": _persons(), "notes": _video_notes(),
+            "set": label_set, "progress": {"done": done_n, "total": len(videos)},
+            "hint": None if videos else _VIDEO_HINT}
+
+
+@router.put("/video/subject/{photo_id}")
+def put_video_subject(photo_id: int, body: VideoSubjectBody, set: str = Query("main")):  # noqa: A002
+    label_set = _label_set(set)
+    entry = next((p for p in _video_entries(label_set) if int(p["photo_id"]) == photo_id), None)
+    if entry is None:
+        raise HTTPException(404, f"video {photo_id} is not in the {label_set} set")
+    live = not me.is_labelled_clip(entry)
+    if live and body.live_pair is None and body.done:
+        raise HTTPException(400, "answer the pairing question")
+    n = 0 if live else len(me.video_label_segments(entry.get("duration_s") or 0))
+    if not live and body.done:
+        missing = [i for i in range(n) if str(i) not in body.segments and i not in body.segments]
+        if missing:
+            raise HTTPException(400, f"label every segment first (missing {missing})")
+    try:
+        saved = me.save_video_subject_label(
+            photo_id, seg_version=body.seg_version, n_segments=n, people=body.people,
+            someone_else=body.someone_else, segments=body.segments,
+            live_pair=body.live_pair, done=body.done, label_set=label_set)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"photo_id": photo_id, "label": saved}
+
+
+class VideoQualityBody(BaseModel):
+    in_focus: Optional[str] = None
+    shaky: Optional[str] = None
+    noisy: Optional[str] = None
+    keeper: Optional[str] = None
+    done: bool = True
+
+
+@router.get("/video/quality")
+def get_video_quality(set: str = Query("main")):  # noqa: A002
+    label_set = _label_set(set)
+    labels = me.load_video_quality_labels(label_set)
+    videos = []
+    for p in _video_entries(label_set, clips_only=True):
+        pid = int(p["photo_id"])
+        videos.append({"photo_id": pid, "stratum": p["stratum"],
+                       "duration_s": p.get("duration_s"), "label": labels.get(str(pid))})
+    done = sum(1 for v in videos if (v["label"] or {}).get("done"))
+    return {"videos": videos, "notes": _video_notes(), "set": label_set,
+            "progress": {"done": done, "total": len(videos)},
+            "hint": None if videos else _VIDEO_HINT}
+
+
+@router.put("/video/quality/{photo_id}")
+def put_video_quality(photo_id: int, body: VideoQualityBody, set: str = Query("main")):  # noqa: A002
+    label_set = _label_set(set)
+    if photo_id not in {int(p["photo_id"]) for p in _video_entries(label_set, clips_only=True)}:
+        raise HTTPException(404, f"video {photo_id} is not in the {label_set} set")
+    try:
+        lab = me.save_video_quality_label(photo_id, body.dict(exclude={"done"}), body.done,
+                                          label_set=label_set)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"photo_id": photo_id, "label": lab}
+
+
+class TemporalBody(BaseModel):
+    photo_id: int
+    answer: str
+
+
+def video_texts() -> dict[int, list[dict]]:
+    """{photo_id: [{"sha", "text"}]} over every video-describe run,
+    de-duplicated and shuffled per video (blind)."""
+    found: dict[int, dict] = {}
+    for v in me.list_variants(_VIDEO_DESCRIBE_PASS):
+        for pid_s, it in ((me.load_run(_VIDEO_DESCRIBE_PASS, v) or {}).get("items") or {}).items():
+            if it.get("text"):
+                found.setdefault(int(pid_s), {}).setdefault(
+                    it.get("text_sha") or me.text_sha(it["text"]), it["text"])
+    out = {}
+    for pid, by in found.items():
+        texts = [{"sha": s, "text": t} for s, t in sorted(by.items())]
+        random.Random(f"video-texts-{pid}").shuffle(texts)
+        out[pid] = texts
+    return out
+
+
+@router.get("/video/temporal")
+def get_video_temporal():
+    labels = me.load_temporal_labels()
+    by = video_texts()
+    videos = [{"photo_id": pid, "texts": [{"sha": t["sha"], "text": t["text"],
+                                           "answer": (labels.get(t["sha"]) or {}).get("answer")}
+                                          for t in texts]}
+              for pid, texts in sorted(by.items())]
+    total = sum(len(v["texts"]) for v in videos)
+    done = sum(1 for v in videos for t in v["texts"] if t["answer"])
+    return {"videos": videos, "notes": _video_notes(), "progress": {"done": done, "total": total}}
+
+
+@router.put("/video/temporal/{sha}")
+def put_video_temporal(sha: str, body: TemporalBody):
+    if not any(t["sha"] == sha for t in video_texts().get(body.photo_id, [])):
+        raise HTTPException(404, "no such description for this video")
+    try:
+        return {"sha": sha, "label": me.save_temporal_label(sha, body.photo_id, body.answer)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/video/original/{photo_id}")
+def get_video_original(photo_id: int, request: Request):
+    """The cached original, Range-served (seekable <video>). Never proxied."""
+    from . import video_api
+    entry = me.video_sample_entry(photo_id)
+    path = me.cached_original(photo_id)
+    if entry is None or path is None:
+        raise HTTPException(404, "not in the local video originals cache — run "
+                                 "`python evals/video_eval.py fetch-originals`")
+    return video_api.serve_video_file(request.headers.get("range"), str(path),
+                                      entry.get("filename") or f"{photo_id}.mp4", None,
+                                      {"Cache-Control": "max-age=3600"})
+
+
+@router.get("/video/frame/{photo_id}")
+def get_video_frame(photo_id: int, t: float = Query(0.0, ge=0.0),
+                    max_px: int = Query(0, ge=0, le=8000)):
+    """One frame of the cached original, at NATIVE resolution by default
+    (max_px=0) — focus is judged in PS.Loupe at 1 image px per device px."""
+    path = me.cached_original(photo_id)
+    if me.video_sample_entry(photo_id) is None or path is None:
+        raise HTTPException(404, "not in the local video originals cache")
+    try:
+        im = me.grab_frame(path, t, max_px)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=92)
+    except Exception as exc:
+        raise HTTPException(500, f"could not grab a frame: {exc}")
+    return Response(buf.getvalue(), media_type="image/jpeg",
+                    headers={"Cache-Control": "max-age=3600"})
