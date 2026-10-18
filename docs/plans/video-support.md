@@ -846,6 +846,23 @@ cached, context-overflow cached as `rejected`, holdout split deterministic.
   model; categories/keywords appear on the next pass; stale-description
   tooling ignores videos for `verify`; a deliberately tiny `max_tokens`
   produces a failure row, not stored truncated text.
+- **As built (2026-10-17).** Pass order is now `clip, faces, quality,
+  video-probe, video-scan, aesthetics, video-subjects, describe,
+  video-describe, verify, category-content, keywords, category-visual`
+  (WORKER_PASSES = ALL_PASSES = `_ALL_PASSES`, batch-flow.js). "Right after
+  `describe`" could only hold if the scan drains first, so probe + scan moved
+  up behind `faces` (torch passes adjacent); that also puts `video-subjects`
+  right after `aesthetics` (one qwen2.5-vl load) and keeps describe ->
+  video-describe -> verify on one qwen3.5 load. Cost: a batch's videos are
+  scanned before its stills' LLM passes start. No `/keyframes` endpoint: the
+  claim response carries `describe_input` (current-scan keyframes, duration,
+  and the subjects timeline with person names resolved at claim time through
+  `video_tracks -> faces.person_id -> persons`; `video_describe_store.py`).
+  `category-content`/`keywords` are PASS_MEDIA "any"; batch_state drops
+  never-describable videos (Live, unreadable, scan error) from their total
+  and has them wait on `video-describe` too (`EXTRA_DEPENDS_ON`). A
+  `describe_video` None (transport or empty answer) is omitted, not a failure.
+  `FLEET_ROLE_MODELS["video"]` = qwen/qwen3.5-9b until the step 4 eval.
 
 ### Step 6 — Surface the subject share (3.5 d) — **SHIP D**
 

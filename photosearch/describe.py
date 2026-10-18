@@ -856,20 +856,19 @@ PASS_ROLES = {
     "aesthetics":       "aesthetics",
     # docs/plans/video-support.md step 3b: per-segment keyframe grounding.
     "video-subjects":   "subject",
+    # step 5: one multi-image call per clip, strict role (no fallback, D8).
+    "video-describe":   "video",
 }
 
 # Roles that must be configured explicitly on the OpenAI-compatible route —
 # no fallback to another role's model, no legacy single-model var.
 _STRICT_ROLES = frozenset({"video"})
 
-# The video passes' roles. A pass stays OUT of PASS_ROLES until it is wired:
-# tests/test_llm_provenance.py pins set(PASS_ROLES) == set(rerun._PASS_LLM)
-# and counts one `_provenance_kwargs(` call in worker.py per entry.
-# `video-subjects` moved into PASS_ROLES with step 3b; when worker/rerun gain
-# `video-describe` (step 5), move it too (and add it to rerun._PASS_LLM).
-VIDEO_PASS_ROLES = {
-    "video-describe": "video",
-}
+# The video passes' roles. Both are wired now (video-subjects in step 3b,
+# video-describe in step 5) and live in PASS_ROLES, which
+# tests/test_llm_provenance.py pins to rerun._PASS_LLM; this view is kept for
+# callers that want only the video passes.
+VIDEO_PASS_ROLES = {p: r for p, r in PASS_ROLES.items() if p.startswith("video-")}
 
 
 def require_role_model(role: str, model: Optional[str] = None) -> Optional[str]:

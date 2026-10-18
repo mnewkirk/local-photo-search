@@ -40,16 +40,17 @@ logger = logging.getLogger(__name__)
 # Passes this module can re-run, in DEPENDENCY order — the sync re-run and the
 # fleet launcher both sort by it (see batch_state.WORKER_PASSES for why verify
 # precedes the text passes). Same order as batch_state.WORKER_PASSES.
-ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-              "verify", "category-content", "keywords", "category-visual",
-              "video-probe", "video-scan", "video-subjects")
+ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-scan",
+              "aesthetics", "video-subjects", "describe", "video-describe",
+              "verify", "category-content", "keywords", "category-visual")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
 # Passes that read the original themselves over HTTP Range — never download it
 # whole (video-probe: ffprobe + one frame of a possibly multi-GB clip).
 # video-scan: its own hashed download; video-subjects: the uploaded keyframes.
-RANGE_READ_PASSES = {"video-probe", "video-scan", "video-subjects"}
+# video-describe: the K uploaded keyframes.
+RANGE_READ_PASSES = {"video-probe", "video-scan", "video-subjects", "video-describe"}
 
 # pass -> (LLM role, Ollama-style default model). The role drives LM Studio model
 # selection (PHOTOSEARCH_LLM_<ROLE>_MODEL via describe._resolve_openai_model);
@@ -63,6 +64,9 @@ _PASS_LLM = {
     "aesthetics":       ("aesthetics", "qwen2.5-vl"),
     # docs/plans/video-support.md step 3b: grounding per segment keyframe
     "video-subjects":   ("subject",  "qwen2.5-vl"),
+    # step 5: one multi-image call per clip. qwen2.5-vl is the Ollama default
+    # because llama3.2-vision (describe's) takes a single image only.
+    "video-describe":   ("video",    "qwen2.5-vl"),
 }
 
 
@@ -102,7 +106,12 @@ FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      # video-subjects (step 3b): the grounding model photos
                      # already use for subject boxes (subjects.py), so the
                      # aesthetics -> subject pass order loads it once.
-                     "subject":    "qwen2.5-vl-7b-instruct"}
+                     "subject":    "qwen2.5-vl-7b-instruct",
+                     # video-describe (step 5, D8): the describe winner until
+                     # the step 4 video eval picks one; same model as
+                     # describe, so describe -> video-describe loads it once.
+                     # Needs LM Studio's per-model context >= 16384 (Risk 8).
+                     "video":      "qwen/qwen3.5-9b"}
 
 
 # Every model eval that picked FLEET_ROLE_MODELS ran with reasoning OFF
@@ -146,6 +155,10 @@ def _resolve_model(pass_type: str) -> str:
                or os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL"))
         if env:
             return env
+        if role == "video":
+            # Strict (D8): no fallback to another role's model.
+            from .describe import require_role_model
+            return require_role_model("video")
         if role == "subject":
             # Same fallback chain as describe._resolve_openai_model: an unset
             # SUBJECT var grounds with the aesthetics model, as photos do.
@@ -324,6 +337,21 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             for r in results:
                 r["model"], r["model_version"] = model, mv
             kwargs = W._submit_kwargs("video_subjects_results", results)
+        elif pass_type == "video-describe":
+            from .video_describe_store import describe_input
+            info["describe_input"] = describe_input(db.conn, photo_id)
+            if info["describe_input"] is None:
+                raise RuntimeError(f"video {photo_id} has no clean current scan "
+                                   f"(run video-scan first)")
+            model = _resolve_model("video-describe")
+            try:
+                results = W._process_video_describe(client, [info], model=model)
+            except W.PassHalted as e:
+                raise RuntimeError(str(e)) from e
+            mv = _model_version(model)
+            for r in results:
+                r["model"], r["model_version"] = model, mv
+            kwargs = W._submit_kwargs("video_describe_results", results)
         else:  # pragma: no cover - guarded above
             raise ValueError(f"unknown pass type: {pass_type}")
 

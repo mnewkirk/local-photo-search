@@ -500,7 +500,10 @@ def test_clear_pass_requeues_and_drops_rows(env, monkeypatch):
 def test_pass_lists_and_roles_agree():
     from photosearch import batch_state, describe, rerun
     for lst in (batch_state.WORKER_PASSES, rerun.ALL_PASSES, worker_api._ALL_PASSES):
-        assert lst.index("video-subjects") == lst.index("video-scan") + 1
+        # after the scan it reads; right after aesthetics, whose model
+        # (qwen2.5-vl) it shares, so the fleet loads it once (step 5 order)
+        assert lst.index("video-subjects") > lst.index("video-scan")
+        assert lst.index("video-subjects") == lst.index("aesthetics") + 1
     assert batch_state.DEPENDS_ON["video-subjects"] == "video-scan"
     assert describe.PASS_ROLES["video-subjects"] == "subject"
     assert rerun._PASS_LLM["video-subjects"][0] == "subject"

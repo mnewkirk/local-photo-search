@@ -105,6 +105,7 @@ export PHOTOSEARCH_LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-minicpm-v-4
 export PHOTOSEARCH_LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-qwen2.5-vl-7b-instruct}"
 export PHOTOSEARCH_LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-google/gemma-4-12b-qat}"
 export PHOTOSEARCH_LLM_SUBJECT_MODEL="${PHOTOSEARCH_LLM_SUBJECT_MODEL:-qwen2.5-vl-7b-instruct}"   # video-subjects grounding (step 3b)
+export PHOTOSEARCH_LLM_VIDEO_MODEL="${PHOTOSEARCH_LLM_VIDEO_MODEL:-qwen/qwen3.5-9b}"   # video-describe (step 5); strict role, no fallback
 # gemma-4 / minicpm-v-4_5 / qwen3.5 think by default and, on these short tasks,
 # spend the whole token budget reasoning and return '' (rerun.FLEET_REASONING_EFFORT).
 # The evals ran with "none"; so does the Ask agent (evals/mcp_bakeoff.py).

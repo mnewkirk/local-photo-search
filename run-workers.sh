@@ -100,6 +100,7 @@ LLM_VISUAL_MODEL="${PHOTOSEARCH_LLM_VISUAL_MODEL:-}"
 LLM_TEXT_MODEL="${PHOTOSEARCH_LLM_TEXT_MODEL:-}"
 LLM_AESTHETICS_MODEL="${PHOTOSEARCH_LLM_AESTHETICS_MODEL:-}"
 LLM_SUBJECT_MODEL="${PHOTOSEARCH_LLM_SUBJECT_MODEL:-}"
+LLM_VIDEO_MODEL="${PHOTOSEARCH_LLM_VIDEO_MODEL:-}"
 
 # Execution mode. `native` runs `cli.py worker` processes directly from the
 # repo venv (GPU-capable — picks up CUDA/ROCm torch); `docker` runs the
@@ -162,6 +163,9 @@ Start workers:
                           the NAS); keep -n 2 for it
                           video-subjects grounds each segment keyframe with a
                           vision LLM (role subject; ~9 calls per video)
+                          video-describe describes each clip from its K
+                          keyframes (role video — set --llm-video-model or
+                          PHOTOSEARCH_LLM_VIDEO_MODEL on LM Studio; no fallback)
   -d, --directory DIR      Scope to directory on NAS (e.g. /photos/2026)
   -c, --collection ID     Scope to collection ID
       --from DATE         Filter scope: photos on/after DATE (YYYY-MM-DD)
@@ -204,6 +208,7 @@ Start workers:
       --llm-visual-model M     category-visual    (role: visual)
       --llm-text-model M       category-content + keywords (role: text)
       --llm-subject-model M    video-subjects grounding (role: subject)
+      --llm-video-model M      video-describe (role: video, no fallback)
       --native            Run bare-metal venv workers (GPU-capable). Auto on WSL2.
       --docker            Run the CPU-only Docker fleet. Auto on Mac/Linux.
       --name NAME         Fleet instance name. Lets multiple fleets run at once
@@ -426,6 +431,7 @@ required_ollama_models() {
             keywords)         echo "${KEYWORDS_MODEL:-llama3.2:3b}" ;;
             aesthetics)       echo "${AESTHETICS_MODEL:-qwen2.5-vl}" ;;
             video-subjects)   echo "qwen2.5-vl" ;;
+            video-describe)   echo "qwen2.5-vl" ;;
             verify)
                 echo "${VERIFY_MODEL:-llava}"
                 echo "${DESCRIBE_MODEL:-llama3.2-vision}"
@@ -884,6 +890,7 @@ while [[ $# -gt 0 ]]; do
         --llm-text-model)     LLM_TEXT_MODEL="$2";     shift 2 ;;
         --llm-aesthetics-model) LLM_AESTHETICS_MODEL="$2"; shift 2 ;;
         --llm-subject-model)    LLM_SUBJECT_MODEL="$2";    shift 2 ;;
+        --llm-video-model)      LLM_VIDEO_MODEL="$2";      shift 2 ;;
         --native)           MODE="native";         shift ;;
         --docker)           MODE="docker";         shift ;;
         --name)             FLEET_NAME="$2";       shift 2 ;;
@@ -914,6 +921,7 @@ LLM_ENV_PAIRS=()
 [ -n "$LLM_TEXT_MODEL" ]     && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_TEXT_MODEL=$LLM_TEXT_MODEL")
 [ -n "$LLM_AESTHETICS_MODEL" ] && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_AESTHETICS_MODEL=$LLM_AESTHETICS_MODEL")
 [ -n "$LLM_SUBJECT_MODEL" ]    && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_SUBJECT_MODEL=$LLM_SUBJECT_MODEL")
+[ -n "$LLM_VIDEO_MODEL" ]      && LLM_ENV_PAIRS+=("PHOTOSEARCH_LLM_VIDEO_MODEL=$LLM_VIDEO_MODEL")
 LLM_ENV_DOCKER=()
 for _kv in ${LLM_ENV_PAIRS[@]+"${LLM_ENV_PAIRS[@]}"}; do
     LLM_ENV_DOCKER+=("-e" "$_kv")

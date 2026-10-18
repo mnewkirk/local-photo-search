@@ -126,6 +126,7 @@ _PASS_DOERS = {
     "video-probe": lambda db, ids: None,
     "video-scan": lambda db, ids: None,
     "video-subjects": lambda db, ids: None,
+    "video-describe": lambda db, ids: None,
 }
 
 # The worker passes a STILLS-only batch actually has work for.
@@ -1044,9 +1045,9 @@ class TestFleetLaunchPasses:
         got = fleet_launch_passes(_fake_state({
             "describe": "completed", "category-content": "waiting",
             "keywords": "waiting", "verify": "waiting"}))
-        assert got == ["clip", "faces", "quality", "aesthetics",
-                       "verify", "category-content", "keywords", "category-visual",
-                       "video-probe", "video-scan", "video-subjects"]
+        assert got == ["clip", "faces", "quality", "video-probe", "video-scan",
+                       "aesthetics", "video-subjects", "video-describe",
+                       "verify", "category-content", "keywords", "category-visual"]
 
     def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
         """Case 3. `describe` having given up on every photo means there will
@@ -1106,8 +1107,8 @@ def _close_nas_steps(db, batch_id):
 
 
 def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
-    """A video gets no description until video-describe (step 5), so no
-    worker pass may count it yet — or the batch could never read ready."""
+    """A video's description comes from video-describe (step 5); the text
+    passes then need it too, and the batch reads ready once they ran."""
     batch_id, ids = _make_batch(db, count=2)
     vid = db.add_photo(filepath=f"{_DIR}/C0001.MP4", filename="C0001.MP4",
                        media_type="video", date_taken="2091-09-19T11:00:00")
@@ -1120,8 +1121,11 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
     state = batch_state(db, batch_id)
     assert state["ready"] is False and state["next_action"] == "launch_fleet"
     # video-scan waits on the probe, which this same launch queues (and
-    # video-subjects on the scan)
-    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects"]
+    # video-subjects / video-describe on the scan, the text passes on
+    # video-describe)
+    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects",
+                                          "video-describe", "category-content", "keywords"]
+    assert _step(state, "category-content")["waiting_on"] == "video-describe"
     assert _step(state, "video-scan")["state"] == "waiting"
     from photosearch.video_probe import PROBE_VERSION
     db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
@@ -1130,19 +1134,35 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
 
     # probed and playable: now the scan is the work (subjects follow it)
     state = batch_state(db, batch_id)
-    assert fleet_launch_passes(state) == ["video-scan", "video-subjects"]
+    assert fleet_launch_passes(state) == ["video-scan", "video-subjects", "video-describe",
+                                          "category-content", "keywords"]
     from photosearch.video_scan_store import SCAN_VERSION
     db.conn.execute("UPDATE video_meta SET scan_version = ? WHERE photo_id = ?",
                     (SCAN_VERSION, vid))
     db.conn.commit()
 
-    # scanned: the subjects are the last video work
+    # scanned: subjects + the description, then the text passes on it
     state = batch_state(db, batch_id)
-    assert fleet_launch_passes(state) == ["video-subjects"]
+    assert fleet_launch_passes(state) == ["video-subjects", "video-describe",
+                                          "category-content", "keywords"]
     assert state["ready"] is False
     from photosearch.video_subjects_store import SUBJECTS_VERSION
     db.conn.execute("UPDATE video_meta SET subjects_version = ? WHERE photo_id = ?",
                     (SUBJECTS_VERSION, vid))
+    db.conn.execute("UPDATE photos SET description = 'a kid jumps' WHERE id = ?", (vid,))
+    db.conn.commit()
+
+    # described: the category passes need the video (and only it)
+    state = batch_state(db, batch_id)
+    for p in ("category-content", "keywords"):
+        st = _step(state, p)
+        assert st["state"] == "needs_queue" and st["remaining"] == 1, st
+        assert st["total"] == 3
+    assert _step(state, "video-describe")["state"] == "completed"
+    assert _step(state, "verify")["state"] == "completed"   # still-only (D18)
+    assert fleet_launch_passes(state) == ["category-content", "keywords"]
+    db.conn.execute("UPDATE photos SET categories = '[]', keywords = '[]' WHERE id = ?",
+                    (vid,))
     db.conn.commit()
 
     state = batch_state(db, batch_id)
@@ -1159,11 +1179,13 @@ def test_video_only_batch_asks_the_fleet_for_video_probe_only(db):
                        media_type="video", date_taken="2091-09-20T11:00:00")
     batch_id = register_batch(db, directory)
     state = batch_state(db, batch_id)
-    for p in _STILL_PASSES:
-        assert _step(state, p)["state"] == "completed", _step(state, p)
+    for p in WORKER_PASSES:
+        if PASS_MEDIA[p] == "still":
+            assert _step(state, p)["state"] == "completed", _step(state, p)
     assert _step(state, "video-probe")["state"] == "needs_queue"
     assert state["next_action"] == "launch_fleet"
-    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects"]
+    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects",
+                                          "video-describe", "category-content", "keywords"]
     assert vid
 
 

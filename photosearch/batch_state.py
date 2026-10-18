@@ -67,14 +67,25 @@ from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 # describe text that is gone (13,637 photos on 2026-10-04). It also loads each
 # model once: qwen3.5 describe -> (+gemma) verify -> gemma text x2 -> minicpm.
 #
-# `video-probe` (docs/plans/video-support.md step 2b) runs over the batch's
-# VIDEOS only (db.PASS_MEDIA) and depends on nothing; `video-scan` (step 3)
-# goes after it and depends on it (it only claims probed, playable clips);
-# `video-subjects` (step 3b, the VLM grounding) goes after the scan and
-# depends on it (it reads the scan's keyframes and face identities).
-WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-                 "verify", "category-content", "keywords", "category-visual",
-                 "video-probe", "video-scan", "video-subjects")
+# The video passes (docs/plans/video-support.md) run over the batch's VIDEOS
+# only (db.PASS_MEDIA). `video-probe` (step 2b) depends on nothing;
+# `video-scan` (step 3) on the probe; `video-subjects` (step 3b, VLM
+# grounding) and `video-describe` (step 5) on the scan.
+#
+# Where they sit (step 5, "as built"): video-describe writes a description
+# that category-content / keywords then read, so it must drain BEFORE them —
+# and it needs the scan's keyframes, so probe + scan must come before it too.
+# The order also keeps each model loaded once across adjacent passes:
+#   faces -> video-probe -> video-scan   (InsightFace + CLIP, no LLM)
+#   aesthetics -> video-subjects         (qwen2.5-vl, roles aesthetics/subject)
+#   describe -> video-describe -> verify (qwen3.5-9b; verify regens with it)
+#   verify -> category-content -> keywords (gemma) -> category-visual (minicpm)
+# The cost: a batch's videos are downloaded and scanned before its stills'
+# LLM passes begin (videos are a few per batch; the scan is what makes them
+# searchable at all, the same reason clip runs first).
+WORKER_PASSES = ("clip", "faces", "quality", "video-probe", "video-scan",
+                 "aesthetics", "video-subjects", "describe", "video-describe",
+                 "verify", "category-content", "keywords", "category-visual")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
 # full native resolution to measure face sharpness, and only the NAS holds the
 # originals — the desktop replica has the DB and the thumbnails and no files at
@@ -100,12 +111,17 @@ DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "match_faces": "faces", "resolve_dups": "match_faces",
               "warm_crops": "faces", "rank_measure": "faces",
               "sharpness": "faces", "video-scan": "video-probe",
-              "video-subjects": "video-scan"}
+              "video-subjects": "video-scan", "video-describe": "video-scan"}
 # Second dependencies, for the job-only NAS steps that must also wait on a
 # pass DEPENDS_ON cannot name (it holds one). video-scan writes the video
 # faces rows, so matching them and warming crops waits on it too. A batch
 # with no videos reads video-scan completed, so this never holds it up.
-EXTRA_DEPENDS_ON = {"match_faces": ("video-scan",), "warm_crops": ("video-scan",)}
+EXTRA_DEPENDS_ON = {"match_faces": ("video-scan",), "warm_crops": ("video-scan",),
+                    # a video's description comes from video-describe, not
+                    # describe (step 5); a batch with no videos reads it
+                    # completed, so stills-only batches are unaffected.
+                    "category-content": ("video-describe",),
+                    "keywords": ("video-describe",)}
 STATES = ("completed", "running", "queued", "needs_queue", "waiting", "blocked")
 
 # Steps whose only completion evidence is a closed ingest_batch_jobs row —
@@ -118,6 +134,9 @@ JOB_ONLY_STEPS = ("match_faces", "resolve_dups", "warm_crops", "rank_measure")
 # Passes gated on an existing description. `eligible` is the count of batch
 # photos that have one; everything else is `total`.
 _DESCRIPTION_GATED = ("category-content", "keywords", "verify")
+# The description-gated passes that also read VIDEO descriptions
+# (PASS_MEDIA "any", written by video-describe). verify stays still-only (D18).
+_VIDEO_DESCRIBED_TOO = ("category-content", "keywords")
 
 # SQLite's variable cap. Mirrors worker_api._SCOPE_CHUNK — a batch is
 # typically 1-3k photos but a big card dump can be far larger.
@@ -165,6 +184,10 @@ _OUTPUT_MISSING = {
     # and Live videos are never offered and count done once the scan is
     # settled (see _worker_step's `eligible`).
     "video-subjects": "{video_subjects_missing}",
+    # cleanly scanned, not Live, no description — the claim predicate
+    # (video_describe_store.claimable_sql). Scan errors, unreadable and Live
+    # videos are never offered and count done once the scan is settled.
+    "video-describe": "{video_describe_missing}",
 }
 
 # Passes for which "attempts exhausted and still no output" means the work is
@@ -215,6 +238,7 @@ _REMAINING_FILTERS_ATTEMPTS = {
     "video-probe": True,
     "video-scan": True,
     "video-subjects": True,
+    "video-describe": True,
 }
 
 
@@ -334,6 +358,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     elif pass_type == "video-subjects":
         from .video_subjects_store import claimable_sql as subjects_claimable
         missing = missing.format(video_subjects_missing=subjects_claimable("p"))
+    elif pass_type == "video-describe":
+        from .video_describe_store import claimable_sql as describe_claimable
+        missing = missing.format(video_describe_missing=describe_claimable("p"))
     media = media_sql(pass_type, "p")
     if media:
         missing = f"({missing}) AND {media}"
@@ -369,6 +396,10 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         from .video_subjects_store import eligible_sql as subjects_eligible
         eligible = _count_where(
             db, ids, f"{subjects_eligible('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
+    elif pass_type == "video-describe":
+        from .video_describe_store import eligible_sql as describe_eligible
+        eligible = _count_where(
+            db, ids, f"{describe_eligible('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
 
     # See _REMAINING_FILTERS_ATTEMPTS: for the passes whose claim predicate
     # has no attempts filter, `failed` is already counted inside `remaining`,
@@ -398,6 +429,12 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     # which would bury a real failure behind a dependency that may itself
     # never finish.
     depends_on = DEPENDS_ON.get(pass_type)
+    # A gated pass can wait on a second producer (category-content /
+    # keywords: describe for stills, video-describe for videos). Report the
+    # first one that has not completed.
+    deps = [d for d in ((depends_on,) + EXTRA_DEPENDS_ON.get(pass_type, ()))
+            if d is not None]
+    pending = next((d for d in deps if d not in completed), None)
     if pass_type in running:
         state, waiting_on = "running", None
     elif batch_total > 0 and done == total:
@@ -408,9 +445,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         state, waiting_on = "blocked", None
     elif pass_type in open_steps:
         state, waiting_on = "queued", None
-    elif eligible < total and depends_on is not None and depends_on not in completed:
+    elif eligible < total and pending is not None:
         # The count-zero trap: this pass hasn't become eligible yet.
-        state, waiting_on = "waiting", depends_on
+        state, waiting_on = "waiting", pending
     else:
         state, waiting_on = "needs_queue", None
 
@@ -678,8 +715,22 @@ def batch_state(db, batch_id: int) -> dict:
     # batch costs at most two extra COUNTs.
     media_totals: dict[str, tuple[int, int]] = {}
 
+    never_described: list[int] = []
+
     def _media_counts(pass_type: str) -> tuple[int, int]:
         kind = PASS_MEDIA[pass_type]
+        if pass_type in _VIDEO_DESCRIBED_TOO:
+            # "any" text passes: a video that can never be described (Live,
+            # unreadable, scan error) is not work for them — drop it from the
+            # total so it cannot hold the step at needs_queue / waiting.
+            a_total, a_described = _media_counts_kind(kind, pass_type)
+            if not never_described:
+                from .video_describe_store import never_described_sql
+                never_described.append(_count_where(db, ids, never_described_sql("p")))
+            return a_total - never_described[0], a_described
+        return _media_counts_kind(kind, pass_type)
+
+    def _media_counts_kind(kind: str, pass_type: str) -> tuple[int, int]:
         if kind not in media_totals:
             frag = media_sql(pass_type, "p")
             desc = "p.description IS NOT NULL AND p.description != ''"

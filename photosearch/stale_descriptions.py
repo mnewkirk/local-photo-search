@@ -166,7 +166,7 @@ def find_stale(conn: sqlite3.Connection, folder: Optional[str] = None,
                p.verified_at, ds.t,
                p.categories IS NOT NULL AND cc.t IS NULL,
                p.keywords   IS NOT NULL AND kw.t IS NULL,
-               p.description, p.keywords
+               p.description, p.keywords, p.media_type
           FROM photos p
           LEFT JOIN d ON d.photo_id = p.id
           LEFT JOIN g cc ON cc.photo_id = p.id AND cc.text_type = 'category-content'
@@ -178,8 +178,10 @@ def find_stale(conn: sqlite3.Connection, folder: Optional[str] = None,
     mismatch, truncated, reasons = [], [], Counter()
     fixable = set()   # mismatches a re-extraction can actually repair
     unknown_cc = unknown_kw = 0
-    for pid, cc, kw, verified_at, describe_t, ucc, ukw, desc, kw_json in rows:
-        v_utc = _verified_utc(verified_at) if describe_t else None
+    for pid, cc, kw, verified_at, describe_t, ucc, ukw, desc, kw_json, media in rows:
+        # verify is still-only (video-support D18): a video's description
+        # (video-describe) is never verified, so it is never verify-stale.
+        v_utc = _verified_utc(verified_at) if describe_t and media is None else None
         if cc:
             ts["category-content"].append(pid)
         if kw:

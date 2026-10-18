@@ -24,8 +24,8 @@ def _make_eligible(db, pass_type, ids):
     """The fixture describes everything (so the gated passes are eligible);
     describe itself then needs the description cleared; video-scan needs a
     current probe (it only claims probed, playable clips); video-subjects a
-    current, clean scan."""
-    if pass_type == "video-subjects":
+    current, clean scan; video-describe a clean scan and no description."""
+    if pass_type in ("video-subjects", "video-describe"):
         from photosearch.video_probe import PROBE_VERSION
         from photosearch.video_scan_store import SCAN_VERSION
         for pid in ids:
@@ -41,7 +41,7 @@ def _make_eligible(db, pass_type, ids):
             db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
                             "WHERE photo_id = ?", (PROBE_VERSION, pid))
         db.conn.commit()
-    if pass_type == "describe":
+    if pass_type in ("describe", "video-describe"):
         db.conn.execute(
             f"UPDATE photos SET description = NULL WHERE id IN ({','.join('?' * len(ids))})",
             ids)
@@ -80,13 +80,16 @@ def test_every_worker_pass_has_a_media_entry():
 
 
 def test_the_map_says_what_the_plan_says():
-    # category-content / keywords are "still" until video-describe (step 5)
-    # exists: as "any" a batch holding a video could never read `ready`.
+    # verify stays still-only (D18); category-content / keywords read any
+    # description since video-describe (step 5) writes one for videos.
     still = {"clip", "faces", "quality", "aesthetics", "describe", "verify",
-             "category-visual", "category-content", "keywords"}
+             "category-visual"}
     for p in still:
         assert PASS_MEDIA[p] == "still"
         assert media_sql(p) == STILL_SQL
+    for p in ("category-content", "keywords"):
+        assert PASS_MEDIA[p] == "any"
+        assert media_sql(p) is None
 
 
 def test_an_any_pass_gets_no_media_fragment(monkeypatch):
@@ -95,11 +98,9 @@ def test_an_any_pass_gets_no_media_fragment(monkeypatch):
     for p in ("video-probe", "video-scan", "video-subjects", "video-describe"):
         assert PASS_MEDIA[p] == "video"
         assert media_sql(p, "p") == f"p.{VIDEO_SQL}"
-    # video-probe (2b), video-scan (3) and video-subjects (3b) are live;
-    # video-describe is a placeholder until step 5
-    for p in ("video-probe", "video-scan", "video-subjects"):
+    # all four video passes are live (2b, 3, 3b, 5)
+    for p in ("video-probe", "video-scan", "video-subjects", "video-describe"):
         assert p in WORKER_PASSES
-    assert "video-describe" not in WORKER_PASSES
 
 
 def test_a_pass_missing_from_the_map_fails_loudly():
@@ -186,8 +187,8 @@ def test_still_passes_complete_with_unprocessed_videos_in_the_batch(mixed):
             # unprobed videos are not claimable yet: it waits on the probe
             assert steps[p]["state"] == "waiting", steps[p]
             assert steps[p]["waiting_on"] == "video-probe"
-        elif p == "video-subjects":
-            # and the subjects wait on the scan
+        elif p in ("video-subjects", "video-describe"):
+            # and the subjects / description wait on the scan
             assert steps[p]["state"] == "waiting", steps[p]
             assert steps[p]["waiting_on"] == "video-scan"
         else:

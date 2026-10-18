@@ -5229,10 +5229,12 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--passes", "-p", default="clip", show_default=True,
               help="Comma-separated pass types: clip, faces, quality, aesthetics, describe, "
                    "verify, category-content, keywords, category-visual, video-probe, "
-                   "video-scan, video-subjects (video-probe needs ffprobe: PATH, "
+                   "video-scan, video-subjects, video-describe (video-probe needs ffprobe: PATH, "
                    "~/.local/bin or PHOTOSEARCH_FFPROBE; video-scan needs cv2 + "
                    "InsightFace + CLIP, and ffprobe only for ZIP-wrapped files; "
-                   "video-subjects needs a vision LLM, role `subject`).")
+                   "video-subjects needs a vision LLM, role `subject`; video-describe "
+                   "a multi-image vision LLM, role `video` — on LM Studio "
+                   "PHOTOSEARCH_LLM_VIDEO_MODEL must be set).")
 @click.option("--collection", "collection_id", type=int, default=None,
               help="Scope work to a specific collection (by ID).")
 @click.option("--directory", "-d", default=None,
@@ -5294,13 +5296,16 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--subjects-model", default="qwen2.5-vl", show_default=True,
               help="Vision model for video-subjects grounding (Ollama route; on LM "
                    "Studio PHOTOSEARCH_LLM_SUBJECT_MODEL decides).")
+@click.option("--video-describe-model", default="qwen2.5-vl", show_default=True,
+              help="Multi-image vision model for video-describe (Ollama route; on LM "
+                   "Studio PHOTOSEARCH_LLM_VIDEO_MODEL decides, with no fallback).")
 def worker(server, passes, collection_id, directory,
            date_from, date_to, persons, location, min_quality, min_aesthetic,
            camera, category, visual_tag, keyword, style_tag,
            batch_size, model_batch_size, ttl,
            one_shot, stay_alive, sequential, dry_run, force, describe_model, tags_model, verify_model,
            category_content_model, category_visual_model, keywords_model,
-           aesthetics_model, subjects_model):
+           aesthetics_model, subjects_model, video_describe_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -5375,6 +5380,8 @@ def worker(server, passes, collection_id, directory,
         "video-scan",
         # step 3b: VLM grounding of each segment keyframe (role `subject`)
         "video-subjects",
+        # step 5: one multi-image VLM call per clip (role `video`)
+        "video-describe",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.
@@ -5427,6 +5434,7 @@ def worker(server, passes, collection_id, directory,
         keywords_model=keywords_model,
         aesthetics_model=aesthetics_model,
         subjects_model=subjects_model,
+        video_describe_model=video_describe_model,
     )
 
 

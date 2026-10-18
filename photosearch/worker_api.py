@@ -308,6 +308,18 @@ class VideoSubjectsResult(BaseModel):
     model_version: Optional[str] = None
 
 
+class VideoDescribeResult(BaseModel):
+    """One video's ``video-describe`` result (docs/plans/video-support.md
+    step 5): the description of what happens over the clip, from the K
+    keyframes of scan ``scan_version``. Provenance per result (the effective
+    `video`-role model)."""
+    photo_id: int
+    description: str
+    scan_version: Optional[int] = None
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
 class FailedResult(BaseModel):
     """A photo the WORKER tried and could not process — an unloadable image, a
     detection or verification that raised. Spends one attempt on the server
@@ -338,6 +350,8 @@ class SubmitRequest(BaseModel):
     video_scan_results: Optional[list[VideoScanResult]] = None
     # video-subjects (schema v37). Optional, so older workers are unaffected.
     video_subjects_results: Optional[list[VideoSubjectsResult]] = None
+    # video-describe (step 5). Optional, so older workers are unaffected.
+    video_describe_results: Optional[list[VideoDescribeResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older
     # server ignores the unknown field (pydantic's default) and behaves as it
@@ -547,6 +561,12 @@ def claim_batch(req: ClaimRequest):
                 # joins the VLM boxes to — so it never needs a second call.
                 from .video_subjects_store import subjects_input
                 result_photos[-1]["subjects_input"] = subjects_input(db.conn, p["id"])
+            elif req.pass_type == "video-describe":
+                # Step 5: the K keyframes of the current scan + the subjects
+                # timeline with person names resolved NOW (a /faces relabel
+                # must reach the next description, so names are never cached).
+                from .video_describe_store import describe_input
+                result_photos[-1]["describe_input"] = describe_input(db.conn, p["id"])
 
         return ClaimResponse(
             batch_id=batch_id,
@@ -1290,6 +1310,33 @@ def submit_results(req: SubmitRequest):
                     _record_write_failure(db, outcome, "video-subjects", r.photo_id, e)
             _mark_processed(db, outcome, "video-subjects", skip=done_subj)
 
+        elif req.pass_type == "video-describe":
+            # The description is its own marker (the claim predicate is
+            # `description IS NULL`), so only failures write the ledger. A
+            # new description re-queues what was derived from the old one —
+            # categories / keywords; verify never runs on a video (D18), so
+            # its columns are left alone.
+            db.begin_batch(batch_size=100)
+            done_vd: set[int] = set()
+            for r in req.video_describe_results or []:
+                try:
+                    row = db.conn.execute("SELECT media_type FROM photos WHERE id = ?",
+                                          (r.photo_id,)).fetchone()
+                    if row is None or row[0] != "video":
+                        raise ValueError(f"photo {r.photo_id} is not a video")
+                    db.update_photo(r.photo_id, description=r.description)
+                    db.invalidate_description_dependents(r.photo_id, include_verify=False)
+                    db.log_generation(r.photo_id, "describe", r.description,
+                                      r.model, r.model_version)
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                    done_vd.add(r.photo_id)
+                except Exception as e:
+                    _record_write_failure(db, outcome, "video-describe", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "video-describe")
+            if committed:
+                _mark_processed(db, outcome, "video-describe", skip=done_vd)
+
         # Log activity for the chart
         if outcome.written > 0:
             try:
@@ -1545,6 +1592,19 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM worker_processed WHERE pass_type = 'video-scan' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
+        elif req.pass_type == "video-describe":
+            # Re-queue: drop the description (and what was derived from it —
+            # the next description re-queues those anyway, but a cleared
+            # video must not keep categories about text that is gone).
+            # (photo_ids is already narrowed to videos via PASS_MEDIA above.)
+            cur = db.conn.execute(
+                f"UPDATE photos SET description = NULL, categories = NULL, "
+                f"keywords = NULL WHERE id IN ({placeholders})", photo_ids)
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type IN "
+                f"('video-describe', 'category-content', 'keywords') "
+                f"AND photo_id IN ({placeholders})", photo_ids)
         elif req.pass_type == "video-subjects":
             # Re-queue: drop the subject rows and the marker (they are
             # derived from the scan, carry no human input, and a name comes
@@ -1610,9 +1670,9 @@ def photo_detail(photo_id: int):
 # / keywords, and no worker processes it anymore — its column was nulled at the
 # v23 migration, so count_unprocessed("tags") is pinned at the full library size
 # forever. Including it in queue_depth just showed a confusing dead counter.
-_ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-               "verify", "category-content", "keywords", "category-visual",
-               "video-probe", "video-scan", "video-subjects")
+_ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-scan",
+               "aesthetics", "video-subjects", "describe", "video-describe",
+               "verify", "category-content", "keywords", "category-visual")
 
 
 @router.get("/status")

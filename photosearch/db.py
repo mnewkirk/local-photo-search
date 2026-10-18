@@ -188,19 +188,17 @@ PASS_MEDIA: dict[str, str] = {
     # otherwise claim a video the moment a video description lands.
     "verify": "still",
     "category-visual": "still",
-    # text-only passes over photos.description. "still" FOR NOW: nothing
-    # writes a video description until video-describe (step 5), so as "any"
-    # a batch holding a video could never read `ready` (the pass sat on
-    # needs_queue with nothing claimable). Step 5 flips these to "any" AND
-    # must make batch_state's video eligibility depend on video-describe.
-    "category-content": "still",
-    "keywords": "still",
+    # text-only passes over photos.description — any row that HAS one. A
+    # video gets its description from video-describe (step 5), whose submit
+    # re-queues these two (invalidate_description_dependents). batch_state
+    # drops videos that can never be described (Live, unreadable, scan
+    # error) from their total, and makes them wait on video-describe too.
+    "category-content": "any",
+    "keywords": "any",
     # legacy pre-v23 pass, still accepted by the claim path for cleanup
     "tags": "still",
-    # video passes. video-probe (step 2b), video-scan (step 3) and
-    # video-subjects (step 3b) are live; video-describe is a placeholder so
-    # its claim predicate has an entry the day it lands (NOT yet in
-    # WORKER_PASSES).
+    # video passes: video-probe (step 2b), video-scan (step 3),
+    # video-subjects (step 3b), video-describe (step 5).
     "video-probe": "video",
     "video-scan": "video",
     "video-subjects": "video",
@@ -402,9 +400,25 @@ _VIDEO_SUBJECTS_NOT_EXHAUSTED = (
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
 
+# video-describe (step 5). Claimable once the CURRENT scan landed cleanly on
+# a non-Live clip (its K keyframes exist) and the video has no description
+# (video_describe_store.claimable_sql, shared with batch_state). Does NOT wait
+# for video-subjects: its timeline is used when present.
+def video_describe_missing_sql(alias: str = "p") -> str:
+    from .video_describe_store import claimable_sql
+    return claimable_sql(alias)
+
+
+_VIDEO_DESCRIBE_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-describe' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+
 _VIDEO_CLAIM_SQL = {
     "video-scan": (video_scan_missing_sql, _VIDEO_SCAN_NOT_EXHAUSTED),
     "video-subjects": (video_subjects_missing_sql, _VIDEO_SUBJECTS_NOT_EXHAUSTED),
+    "video-describe": (video_describe_missing_sql, _VIDEO_DESCRIBE_NOT_EXHAUSTED),
 }
 
 
@@ -3177,7 +3191,8 @@ class PhotoDB:
         elif pass_type in _VIDEO_CLAIM_SQL:
             # video-scan: probed, playable (or ZIP-wrapped), not Live, scan
             # missing or stale. video-subjects: scanned cleanly, not Live,
-            # subjects missing or stale. Both capped by the attempts ledger.
+            # subjects missing or stale. video-describe: scanned cleanly, not
+            # Live, no description. All capped by the attempts ledger.
             missing_fn, not_exhausted = _VIDEO_CLAIM_SQL[pass_type]
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))

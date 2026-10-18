@@ -525,8 +525,11 @@
 
     // ---- Re-run-passes state (M28) ----
     // A video only has its own passes (db.PASS_MEDIA): the image passes
-    // would never claim it, and a still has no video-probe.
-    var RERUN_PASSES = PS.isVideo(photo) ? ['video-probe', 'video-scan', 'video-subjects']
+    // would never claim it, and a still has no video-probe. category-content
+    // and keywords read any description, a video's included (step 5).
+    var RERUN_PASSES = PS.isVideo(photo)
+      ? ['video-probe', 'video-scan', 'video-subjects', 'video-describe',
+         'category-content', 'keywords']
       : ['describe', 'verify', 'category-content', 'keywords',
          'category-visual', 'clip', 'faces', 'quality', 'aesthetics'];
     var _rerunOpen = useState(false);
@@ -662,7 +665,7 @@
           next[p] = true;
           // Both can rewrite the description, which re-queues the text
           // passes server-side — so re-run them in the same go.
-          if (p === 'describe' || p === 'verify') { next['category-content'] = true; next['keywords'] = true; }
+          if (p === 'describe' || p === 'verify' || p === 'video-describe') { next['category-content'] = true; next['keywords'] = true; }
         }
         return next;
       });

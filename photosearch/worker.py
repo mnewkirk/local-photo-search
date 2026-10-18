@@ -1005,12 +1005,15 @@ def install_log_timestamps() -> None:
 # keeps the claim overhead down without holding many videos per worker.
 PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1,
                      # ~9 grounding calls per typical video at 2-3 s each
-                     "video-subjects": 2}
+                     "video-subjects": 2,
+                     # one K-image call per video (~10-30 s on a 9B VLM)
+                     "video-describe": 4}
 
 # Passes that read the NAS file themselves (over HTTP Range, or as one
 # rate-capped streamed download) instead of through _download_batch.
 # video-subjects reads only the scan's uploaded segment keyframes.
-SELF_READ_PASSES = {"video-probe", "video-scan", "video-subjects"}
+# video-describe reads only the scan's K uploaded keyframes.
+SELF_READ_PASSES = {"video-probe", "video-scan", "video-subjects", "video-describe"}
 
 
 class TruncatedDownload(ConnectionError):
@@ -1390,6 +1393,92 @@ def _process_video_subjects(client: "WorkerClient", photos: list[dict], model: s
     return out
 
 
+def _describe_one_video(client: "WorkerClient", pid: int, inp: dict, model: str,
+                        label: str) -> dict:
+    """Fetch one video's K keyframes and describe it in one call.
+
+    Returns a ``VideoDescribeResult`` dict or a failure row. Raises transport
+    errors / :class:`_GroundingDeferred` (omit the video), ContextOverflow /
+    RoleModelNotConfigured (stop the pass)."""
+    import io
+
+    from PIL import Image
+
+    from .describe import UnusableAnswer, describe_video
+
+    kfs = list(inp.get("keyframes") or [])
+    if not kfs:
+        return _failure_row(pid, "the scan uploaded no keyframes to describe")
+    frames, times = [], []
+    for k in kfs:
+        r = client._request("GET", f"{client.server_url}/api/videos/{pid}/frames/{k['name']}",
+                            params={"v": inp["scan_version"]}, timeout=60)
+        if r.status_code != 200:
+            return _failure_row(pid, f"keyframe {k['name']}: HTTP {r.status_code}")
+        try:
+            with Image.open(io.BytesIO(r.content)) as im:
+                im.verify()
+        except Exception as e:  # noqa: BLE001 — a corrupt keyframe is this video's problem
+            return _failure_row(pid, f"keyframe {k['name']} unreadable: {e}")
+        frames.append(r.content)
+        times.append(float(k.get("t") or 0.0))
+    t0 = time.time()
+    try:
+        text = describe_video(frames, times, float(inp.get("duration") or times[-1] or 0.0),
+                              model=model, raise_unusable=True,
+                              subject_summary=inp.get("subject_summary"))
+    except UnusableAnswer as e:
+        # Cut off (TruncatedOutput, even at double the budget) / looping /
+        # mid-sentence after the retry: one attempt spent, nothing written.
+        print(f"    {label}: unusable after {time.time() - t0:.1f}s: {e}")
+        return _failure_row(pid, e)
+    if not text:
+        # describe_video folds transport failures and an empty answer into
+        # None; neither is the video's fault -> omitted, re-claimed later.
+        raise _GroundingDeferred(f"{label}: no answer from the video model")
+    print(f"    {label}: {len(frames)} keyframes in {time.time() - t0:.1f}s — "
+          f"{text[:80].replace(chr(10), ' ')}...")
+    return {"photo_id": pid, "description": text, "scan_version": inp["scan_version"]}
+
+
+def _process_video_describe(client: "WorkerClient", photos: list[dict],
+                            model: str) -> list[dict]:
+    """video-describe (docs/plans/video-support.md step 5): one multi-image
+    ``describe.describe_video`` call (role ``video``) per claimed video, over
+    the K keyframes video-scan uploaded, with the video-subjects timeline
+    (person names resolved server-side at claim time) when it exists.
+
+    Outcomes, following the worker conventions:
+      * an unusable answer (cut off even at double the budget, looping,
+        mid-sentence after the retry) or a missing / corrupt keyframe ->
+        a failure row (one attempt spent, nothing written);
+      * no answer / transport trouble -> OMITTED (re-claimed, no attempt);
+      * ContextOverflow / RoleModelNotConfigured -> :class:`PassHalted`
+        (configuration: no attempts spent, the pass stops);
+      * anything else -> a failure row.
+    """
+    from .describe import ContextOverflow, RoleModelNotConfigured
+    out: list[dict] = []
+    for photo in photos:
+        pid = photo["id"]
+        label = photo.get("filename") or str(pid)
+        inp = photo.get("describe_input")
+        if not inp:
+            print(f"    {label}: no describe input in the claim (no clean current scan) — skipped")
+            continue
+        try:
+            out.append(_describe_one_video(client, pid, inp, model, label))
+        except (ContextOverflow, RoleModelNotConfigured) as e:
+            raise PassHalted(f"{type(e).__name__}: {e}", out) from e
+        except (_TRANSIENT + (_GroundingDeferred,)) as e:
+            print(f"    {label}: transport ({e}) — will be retried")
+            continue
+        except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
+            print(f"    {label}: {type(e).__name__}: {e}")
+            out.append(_failure_row(pid, f"{type(e).__name__}: {e}"))
+    return out
+
+
 def run_worker(
     server: str,
     passes: list[str],
@@ -1411,6 +1500,7 @@ def run_worker(
     keywords_model: str = "llama3.2:3b",
     aesthetics_model: str = "qwen2.5-vl",
     subjects_model: str = "qwen2.5-vl",
+    video_describe_model: str = "qwen2.5-vl",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
@@ -1449,7 +1539,21 @@ def run_worker(
         aesthetics_model: Vision model for the aesthetics scoring pass (default: qwen2.5-vl)
         subjects_model: Vision model for video-subjects grounding (default:
             qwen2.5-vl; on LM Studio the `subject` role env var decides)
+        video_describe_model: Multi-image vision model for video-describe on
+            the Ollama route (default: qwen2.5-vl). On LM Studio the strict
+            `video` role (PHOTOSEARCH_LLM_VIDEO_MODEL) decides — no fallback.
     """
+    if "video-describe" in passes:
+        from .describe import RoleModelNotConfigured, require_role_model
+        try:
+            require_role_model("video", video_describe_model)
+        except RoleModelNotConfigured as e:
+            # Fail fast and loudly, before a single claim: never describe a
+            # video with some other role's model (D8).
+            print(f"Error: video-describe: {e} — dropping the pass.", file=sys.stderr)
+            passes = [p for p in passes if p != "video-describe"]
+            if not passes:
+                return
     if "video-probe" in passes:
         from .video_probe import find_ffprobe
         if not find_ffprobe():
@@ -1525,6 +1629,7 @@ def run_worker(
         "category-visual":  [(category_visual_model, "visual")],
         "aesthetics":       [(aesthetics_model, "aesthetics")],
         "video-subjects":   [(subjects_model, "subject")],
+        "video-describe":   [(video_describe_model, "video")],
     }
     status_scope = {"collection_id": collection_id, "directory": directory,
                     "filters": filters}
@@ -1679,6 +1784,18 @@ def run_worker(
                             active.remove(pass_type)
                     _provenance_kwargs(pass_type, subjects_model, results)
                     kwargs = _submit_kwargs("video_subjects_results", results)
+                elif pass_type == "video-describe":
+                    try:
+                        results = _process_video_describe(client, photos,
+                                                          model=video_describe_model)
+                    except PassHalted as e:
+                        results = e.results
+                        print(f"  ✗ stopping {pass_type}: {e} — fix the model "
+                              f"configuration (context length / role model) and relaunch")
+                        if pass_type in active:
+                            active.remove(pass_type)
+                    _provenance_kwargs(pass_type, video_describe_model, results)
+                    kwargs = _submit_kwargs("video_describe_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)
@@ -1715,7 +1832,7 @@ def run_worker(
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
                 elif pass_type in ("describe", "category-content", "category-visual", "keywords",
                                    "aesthetics", "video-probe", "video-scan",
-                                   "video-subjects"):
+                                   "video-subjects", "video-describe"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")
