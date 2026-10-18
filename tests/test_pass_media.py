@@ -77,7 +77,10 @@ def test_an_any_pass_gets_no_media_fragment(monkeypatch):
     for p in ("video-probe", "video-scan", "video-subjects", "video-describe"):
         assert PASS_MEDIA[p] == "video"
         assert media_sql(p, "p") == f"p.{VIDEO_SQL}"
-        # placeholders only — not claimable until their step lands
+    # video-probe (step 2b) is live; the rest are placeholders until their
+    # step lands
+    assert "video-probe" in WORKER_PASSES
+    for p in ("video-scan", "video-subjects", "video-describe"):
         assert p not in WORKER_PASSES
 
 
@@ -114,7 +117,8 @@ def test_large_scope_branch_is_media_isolated_too(mixed, monkeypatch, pass_type)
     _make_eligible(db, pass_type, stills + videos)
     monkeypatch.setattr(dbmod, "_SCOPE_DRIVE_FROM_INDEX_AT", 0)
     n = db.count_unprocessed_photos(pass_type, photo_ids=stills + videos)
-    expected = 2 if PASS_MEDIA[pass_type] == "still" else 4
+    expected = {"still": len(stills), "video": len(videos)}.get(
+        PASS_MEDIA[pass_type], len(stills) + len(videos))
     assert n == expected
 
 
@@ -135,7 +139,8 @@ def test_batch_state_agrees_with_the_claim_predicate(mixed, pass_type):
     step = next(s for s in batch_state(db, bid)["steps"] if s["step"] == pass_type)
     assert step["remaining"] == db.count_unprocessed_photos(
         pass_type, photo_ids=stills + videos)
-    expect_total = len(stills) if PASS_MEDIA[pass_type] == "still" else 4
+    expect_total = {"still": len(stills), "video": len(videos)}.get(
+        PASS_MEDIA[pass_type], len(stills) + len(videos))
     assert step["total"] == expect_total
 
 

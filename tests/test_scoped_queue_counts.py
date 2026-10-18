@@ -55,8 +55,16 @@ def test_large_scope_does_not_search_by_rowid(varied, monkeypatch, pass_type):
     finally:
         db.conn.set_trace_callback(None)
     sql = [s for s in statements if "COUNT(*)" in s][-1]
-    plan = " | ".join(r[3] for r in db.conn.execute("EXPLAIN QUERY PLAN " + sql))
-    assert "INTEGER PRIMARY KEY" not in plan, plan
+    rows = [r[3] for r in db.conn.execute("EXPLAIN QUERY PLAN " + sql)]
+    plan = " | ".join(rows)
+    # The cost is a rowid lookup into the wide PHOTOS table per id. A
+    # correlated primary-key probe of a small side table (video-probe's
+    # video_meta, a few thousand rows, driven from idx_photos_media_video)
+    # is not that.
+    photos_by_rowid = [r for r in rows
+                       if r.startswith(("SEARCH p ", "SEARCH photos "))
+                       and "INTEGER PRIMARY KEY" in r]
+    assert not photos_by_rowid, plan
 
 
 def test_small_scope_keeps_rowid_lookups():

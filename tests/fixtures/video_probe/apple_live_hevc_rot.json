@@ -1,0 +1,138 @@
+{
+ "format": {
+  "bit_rate": "10526387",
+  "duration": "3.038333",
+  "filename": "http://nas/api/photos/1/full?purpose=worker",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 6,
+  "size": "3997834",
+  "tags": {
+   "com.apple.quicktime.cinematic-video": "",
+   "com.apple.quicktime.creationdate": "2025-06-24T14:16:05+0200",
+   "com.apple.quicktime.full-frame-rate-playback-intent": "0",
+   "com.apple.quicktime.make": "Apple",
+   "com.apple.quicktime.model": "iPhone 15 Pro",
+   "com.apple.quicktime.software": "18.5",
+   "compatible_brands": "qt  ",
+   "creation_time": "2025-06-24T12:16:05.000000Z",
+   "major_brand": "qt  ",
+   "minor_version": "0"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30/1",
+   "bit_rate": "9599621",
+   "codec_name": "hevc",
+   "codec_type": "video",
+   "duration": "3.038333",
+   "height": 1080,
+   "index": 0,
+   "nb_frames": "92",
+   "r_frame_rate": "30/1",
+   "side_data_list": [
+    {
+     "bl_present_flag": 1,
+     "dv_bl_signal_compatibility_id": 4,
+     "dv_level": 4,
+     "dv_profile": 8,
+     "dv_version_major": 1,
+     "dv_version_minor": 0,
+     "el_present_flag": 0,
+     "rpu_present_flag": 1,
+     "side_data_type": "DOVI configuration record"
+    },
+    {
+     "rotation": -90,
+     "side_data_type": "Display Matrix"
+    },
+    {
+     "ambient_illuminance": "3140000/10000",
+     "ambient_light_x": "15635/50000",
+     "ambient_light_y": "16450/50000",
+     "side_data_type": "Ambient viewing environment"
+    }
+   ],
+   "tags": {
+    "creation_time": "2025-06-24T12:16:05.000000Z",
+    "encoder": "HEVC",
+    "handler_name": "Core Media Video",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   },
+   "width": 1920
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "505820",
+   "codec_type": "data",
+   "duration": "3.038333",
+   "index": 1,
+   "nb_frames": "92",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2025-06-24T12:16:05.000000Z",
+    "handler_name": "Core Media Auxiliary Picture",
+    "language": "und"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "191981",
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "duration": "3.036667",
+   "index": 2,
+   "nb_frames": "133",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2025-06-24T12:16:05.000000Z",
+    "handler_name": "Core Media Audio",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "95040",
+   "codec_type": "data",
+   "duration": "3.038333",
+   "index": 3,
+   "nb_frames": "92",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2025-06-24T12:16:05.000000Z",
+    "handler_name": "Core Media Metadata",
+    "language": "und"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "2879",
+   "codec_type": "data",
+   "duration": "3.036700",
+   "index": 4,
+   "nb_frames": "92",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2025-06-24T12:16:05.000000Z",
+    "handler_name": "Core Media Metadata",
+    "language": "und"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "114",
+   "codec_type": "data",
+   "duration": "3.038333",
+   "index": 5,
+   "nb_frames": "1",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2025-06-24T12:16:05.000000Z",
+    "handler_name": "Core Media Metadata",
+    "language": "und"
+   }
+  }
+ ]
+}

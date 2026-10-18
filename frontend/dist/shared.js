@@ -359,8 +359,11 @@
     var gensLoading = _gensLoading[0];   var setGensLoading = _gensLoading[1];
 
     // ---- Re-run-passes state (M28) ----
-    var RERUN_PASSES = ['describe', 'verify', 'category-content', 'keywords',
-                        'category-visual', 'clip', 'faces', 'quality', 'aesthetics'];
+    // A video only has its own passes (db.PASS_MEDIA): the image passes
+    // would never claim it, and a still has no video-probe.
+    var RERUN_PASSES = PS.isVideo(photo) ? ['video-probe']
+      : ['describe', 'verify', 'category-content', 'keywords',
+         'category-visual', 'clip', 'faces', 'quality', 'aesthetics'];
     var _rerunOpen = useState(false);
     var rerunOpen = _rerunOpen[0];       var setRerunOpen = _rerunOpen[1];
     var _rerunSel = useState({});         // { pass: true }

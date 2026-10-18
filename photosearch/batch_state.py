@@ -66,8 +66,13 @@ from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 # category-content / keywords are extracted from it — run them first and they
 # describe text that is gone (13,637 photos on 2026-10-04). It also loads each
 # model once: qwen3.5 describe -> (+gemma) verify -> gemma text x2 -> minicpm.
+#
+# `video-probe` (docs/plans/video-support.md step 2b) runs over the batch's
+# VIDEOS only (db.PASS_MEDIA) and depends on nothing; `video-scan` (step 3)
+# goes after it and will depend on it.
 WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-                 "verify", "category-content", "keywords", "category-visual")
+                 "verify", "category-content", "keywords", "category-visual",
+                 "video-probe")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
 # full native resolution to measure face sharpness, and only the NAS holds the
 # originals — the desktop replica has the DB and the thumbnails and no files at
@@ -139,6 +144,9 @@ _OUTPUT_MISSING = {
     "category-content": "p.categories IS NULL AND p.description IS NOT NULL",
     "keywords": "p.keywords IS NULL AND p.description IS NOT NULL",
     "verify": "p.verified_at IS NULL AND p.description IS NOT NULL",
+    # a stored probe ERROR is a probe — it counts done, named in `detail`
+    "video-probe": "NOT EXISTS (SELECT 1 FROM video_meta vm "
+                   "WHERE vm.photo_id = p.id AND vm.probe_version >= {probe_version})",
 }
 
 # Passes for which "attempts exhausted and still no output" means the work is
@@ -186,6 +194,7 @@ _REMAINING_FILTERS_ATTEMPTS = {
     "category-content": True,
     "keywords": True,
     "verify": True,
+    "video-probe": True,
 }
 
 
@@ -296,6 +305,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
     missing = _OUTPUT_MISSING[pass_type]
+    if pass_type == "video-probe":
+        from .video_probe import PROBE_VERSION
+        missing = missing.format(probe_version=int(PROBE_VERSION))
     media = media_sql(pass_type, "p")
     if media:
         missing = f"({missing}) AND {media}"
@@ -313,6 +325,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     if pass_type in _EMPTY_OUTPUT_IS_DONE and failed:
         detail = f"{failed:,} with {_EMPTY_OUTPUT_IS_DONE[pass_type]}"
         failed = 0
+
+    if pass_type == "video-probe" and ids:
+        detail = _probe_error_detail(db, ids)
 
     eligible = described if pass_type in _DESCRIPTION_GATED else total
 
@@ -373,6 +388,22 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         row["collapse"] = stats
         row["warning"], row["warning_detail"] = batch_warning(stats)
     return row
+
+
+def _probe_error_detail(db, ids: list[int]) -> str | None:
+    """"N unreadable (M zip-wrapped)" for the batch's videos whose current
+    probe stored an error — done, like sharpness's "N unreadable", because
+    the error IS the stored result. ZIP-wrapped files are counted apart:
+    video-scan can still recover them (video_probe.classify_probe_error)."""
+    from .video_probe import PROBE_VERSION, ZIP_WRAPPED
+    cur = ("p.id IN (SELECT vm.photo_id FROM video_meta vm "
+           "WHERE vm.probe_error IS NOT NULL AND vm.probe_version >= ?{})")
+    n = _count_where(db, ids, cur.format(""), (PROBE_VERSION,))
+    if not n:
+        return None
+    z = _count_where(db, ids, cur.format(" AND vm.probe_error LIKE ?"),
+                     (PROBE_VERSION, ZIP_WRAPPED + "%"))
+    return f"{n:,} unreadable" + (f" ({z:,} zip-wrapped)" if z else "")
 
 
 # ---------------------------------------------------------------------------

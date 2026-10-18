@@ -193,6 +193,37 @@ class AestheticsResult(BaseModel):
     model_version: Optional[str] = None
 
 
+class VideoProbeResult(BaseModel):
+    """One video's `video-probe` result (docs/plans/video-support.md step 2b).
+
+    `probe_error` set (`zip_wrapped` / `unreadable: <reason>`) IS the result
+    for a file ffprobe read and could not play — it is stored, never retried
+    until PROBE_VERSION bumps. Otherwise the probe columns; width/height are
+    DISPLAY dims (after rotation); `date_taken` is local wall time from the
+    per-camera-family date policy, or None to keep the provisional mtime.
+    """
+    photo_id: int
+    probe_version: int
+    probe_error: Optional[str] = None
+    duration_s: Optional[float] = None
+    fps: Optional[float] = None
+    codec: Optional[str] = None
+    container: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    rotation: Optional[int] = None
+    bitrate: Optional[int] = None
+    has_audio: Optional[bool] = None
+    poster_t: Optional[float] = None
+    camera_make: Optional[str] = None
+    camera_model: Optional[str] = None
+    date_taken: Optional[str] = None
+    date_source: Optional[str] = None
+    gps_lat: Optional[float] = None
+    gps_lon: Optional[float] = None
+    probe_json: Optional[dict] = None
+
+
 class FailedResult(BaseModel):
     """A photo the WORKER tried and could not process — an unloadable image, a
     detection or verification that raised. Spends one attempt on the server
@@ -217,6 +248,8 @@ class SubmitRequest(BaseModel):
     category_visual_results: Optional[list[CategoryVisualResult]] = None
     keywords_results: Optional[list[KeywordsResult]] = None
     aesthetics_results: Optional[list[AestheticsResult]] = None
+    # video-probe (schema v35). Optional, so older workers are unaffected.
+    video_probe_results: Optional[list[VideoProbeResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older
     # server ignores the unknown field (pydantic's default) and behaves as it
@@ -1049,6 +1082,30 @@ def submit_results(req: SubmitRequest):
             if committed:
                 _mark_processed(db, outcome, "aesthetics")
 
+        elif req.pass_type == "video-probe":
+            # One transaction PER VIDEO, not begin_batch: a result touches
+            # video_meta, photos and the Live pairing, and a half-applied one
+            # (meta written, date not) must never land. A probe ERROR is a
+            # result like any other — stored, so the file is not re-probed.
+            # A successful probe is its own marker (probe_version), so only
+            # failures write the ledger (as clip).
+            from .video_probe_store import apply_probe_result
+            probed: set[int] = set()
+            for r in req.video_probe_results or []:
+                try:
+                    apply_probe_result(db.conn, r.model_dump())
+                    db.conn.commit()
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                    probed.add(r.photo_id)
+                except Exception as e:
+                    try:
+                        db.conn.rollback()
+                    except Exception:
+                        pass
+                    _record_write_failure(db, outcome, "video-probe", r.photo_id, e)
+            _mark_processed(db, outcome, "video-probe", skip=probed)
+
         # Log activity for the chart
         if outcome.written > 0:
             try:
@@ -1252,6 +1309,23 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM worker_processed WHERE pass_type = 'aesthetics' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
+        elif req.pass_type == "video-probe":
+            # Re-queue the probe: forget every probe column (and the Live
+            # pairing derived from it). Uploaded posters stay on disk and are
+            # simply overwritten by the next probe's upload.
+            cur = db.conn.execute(
+                f"UPDATE video_meta SET probe_version = NULL, probe_error = NULL, "
+                f"probe_json = NULL, kind = NULL, live_of_photo_id = NULL, "
+                f"duration_s = NULL, fps = NULL, codec = NULL, container = NULL, "
+                f"width = NULL, height = NULL, rotation = NULL, bitrate = NULL, "
+                f"has_audio = NULL, poster_t = NULL "
+                f"WHERE photo_id IN ({placeholders})", photo_ids
+            )
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'video-probe' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         else:
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
@@ -1304,7 +1378,8 @@ def photo_detail(photo_id: int):
 # v23 migration, so count_unprocessed("tags") is pinned at the full library size
 # forever. Including it in queue_depth just showed a confusing dead counter.
 _ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-               "verify", "category-content", "keywords", "category-visual")
+               "verify", "category-content", "keywords", "category-visual",
+               "video-probe")
 
 
 @router.get("/status")

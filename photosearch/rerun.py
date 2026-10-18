@@ -38,10 +38,14 @@ from typing import Optional
 # fleet launcher both sort by it (see batch_state.WORKER_PASSES for why verify
 # precedes the text passes). Same order as batch_state.WORKER_PASSES.
 ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
-              "verify", "category-content", "keywords", "category-visual")
+              "verify", "category-content", "keywords", "category-visual",
+              "video-probe")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
+# Passes that read the original themselves over HTTP Range — never download it
+# whole (video-probe: ffprobe + one frame of a possibly multi-GB clip).
+RANGE_READ_PASSES = {"video-probe"}
 
 # pass -> (LLM role, Ollama-style default model). The role drives LM Studio model
 # selection (PHOTOSEARCH_LLM_<ROLE>_MODEL via describe._resolve_openai_model);
@@ -223,7 +227,7 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
     }
 
     client = W.WorkerClient(base, probe=False)
-    needs_image = pass_type not in TEXT_ONLY_PASSES
+    needs_image = pass_type not in TEXT_ONLY_PASSES | RANGE_READ_PASSES
     tmpdir = tempfile.mkdtemp(prefix="photosearch-rerun-")
     try:
         downloaded = None
@@ -282,6 +286,9 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             for r in results:
                 r["model"], r["model_version"] = model, mv
             kwargs = {"aesthetics_results": results}
+        elif pass_type == "video-probe":
+            results = W._process_video_probe(client, [info])
+            kwargs = W._submit_kwargs("video_probe_results", results)
         else:  # pragma: no cover - guarded above
             raise ValueError(f"unknown pass type: {pass_type}")
 

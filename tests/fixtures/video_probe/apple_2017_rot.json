@@ -1,0 +1,93 @@
+{
+ "format": {
+  "bit_rate": "8579150",
+  "duration": "2.933333",
+  "filename": "http://nas/api/photos/1/full?purpose=worker",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 4,
+  "size": "3145688",
+  "tags": {
+   "com.apple.quicktime.content.identifier": "0D1A914C-E6F6-4476-B1D5-F64E6199617D",
+   "com.apple.quicktime.creationdate": "2017-10-04T06:36:33-0700",
+   "com.apple.quicktime.make": "Apple",
+   "com.apple.quicktime.model": "iPhone SE",
+   "com.apple.quicktime.software": "11.0.1",
+   "compatible_brands": "qt  ",
+   "creation_time": "2017-10-04T13:36:33.000000Z",
+   "major_brand": "qt  ",
+   "minor_version": "0"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "15/1",
+   "bit_rate": "7839706",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "duration": "2.933333",
+   "field_order": "progressive",
+   "height": 1080,
+   "index": 0,
+   "nb_frames": "44",
+   "r_frame_rate": "15/1",
+   "side_data_list": [
+    {
+     "rotation": -90,
+     "side_data_type": "Display Matrix"
+    }
+   ],
+   "tags": {
+    "creation_time": "2017-10-04T13:36:33.000000Z",
+    "encoder": "H.264",
+    "handler_name": "Core Media Video",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   },
+   "width": 1440
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "705600",
+   "codec_name": "pcm_s16le",
+   "codec_type": "audio",
+   "duration": "2.931678",
+   "index": 1,
+   "nb_frames": "129354",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2017-10-04T13:36:33.000000Z",
+    "handler_name": "Core Media Audio",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "6720",
+   "codec_type": "data",
+   "duration": "2.933333",
+   "index": 2,
+   "nb_frames": "44",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2017-10-04T13:36:33.000000Z",
+    "handler_name": "Core Media Metadata",
+    "language": "und"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "43200",
+   "codec_type": "data",
+   "duration": "0.001667",
+   "index": 3,
+   "nb_frames": "1",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2017-10-04T13:36:33.000000Z",
+    "handler_name": "Core Media Metadata",
+    "language": "und"
+   }
+  }
+ ]
+}

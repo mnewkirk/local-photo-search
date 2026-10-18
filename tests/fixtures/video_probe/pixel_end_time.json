@@ -1,0 +1,77 @@
+{
+ "format": {
+  "bit_rate": "50480866",
+  "duration": "4.033400",
+  "filename": "http://nas/api/photos/1/full?purpose=worker",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 3,
+  "size": "25451191",
+  "tags": {
+   "com.android.capture.fps": "30.000000",
+   "com.android.manufacturer": "Google",
+   "com.android.model": "Pixel 10 Pro XL",
+   "compatible_brands": "isomiso2mp41",
+   "creation_time": "2026-09-04T16:59:24.000000Z",
+   "location": "+37.8199-122.4783/",
+   "location-eng": "+37.8199-122.4783/",
+   "major_brand": "isom",
+   "minor_version": "131072"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "2722500/90751",
+   "bit_rate": "50104198",
+   "codec_name": "hevc",
+   "codec_type": "video",
+   "duration": "4.033378",
+   "height": 2160,
+   "index": 0,
+   "nb_frames": "121",
+   "r_frame_rate": "30/1",
+   "side_data_list": [
+    {
+     "rotation": -90,
+     "side_data_type": "Display Matrix"
+    }
+   ],
+   "tags": {
+    "creation_time": "2026-09-04T16:59:24.000000Z",
+    "handler_name": "VideoHandle",
+    "language": "eng",
+    "vendor_id": "[0][0][0][0]"
+   },
+   "width": 3840
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "192469",
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "duration": "4.012979",
+   "index": 1,
+   "nb_frames": "188",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2026-09-04T16:59:24.000000Z",
+    "handler_name": "SoundHandle",
+    "language": "eng",
+    "vendor_id": "[0][0][0][0]"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "51760",
+   "codec_type": "data",
+   "duration": "4.033378",
+   "index": 2,
+   "nb_frames": "121",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2026-09-04T16:59:24.000000Z",
+    "handler_name": "MetaHandle",
+    "language": "eng"
+   }
+  }
+ ]
+}

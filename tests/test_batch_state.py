@@ -31,7 +31,7 @@ from photosearch.batch_state import (
     batch_state,
     fleet_launch_passes,
 )
-from photosearch.db import MAX_PROCESS_ATTEMPTS
+from photosearch.db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA
 from photosearch.sharpness import SHARPNESS_VERSION
 from photosearch.ingest_batches import (
     STALL_SECONDS,
@@ -122,7 +122,12 @@ _PASS_DOERS = {
     "category-content": lambda db, ids: _set_col(db, ids, "categories", json.dumps(["x"])),
     "keywords": lambda db, ids: _set_col(db, ids, "keywords", json.dumps(["x"])),
     "verify": lambda db, ids: _set_col(db, ids, "verified_at", "2091-09-19 12:00:00"),
+    # these fixtures are stills-only: a video pass has nothing to do
+    "video-probe": lambda db, ids: None,
 }
+
+# The worker passes a STILLS-only batch actually has work for.
+_STILL_PASSES = [p for p in WORKER_PASSES if PASS_MEDIA[p] != "video"]
 
 
 def _complete_pass(db, ids, pass_type):
@@ -216,7 +221,9 @@ class TestShape:
                               "done", "remaining", "failed", "waiting_on", "detail",
                               "warning", "warning_detail"} | extra
             assert s["state"] in STATES
-            assert s["total"] == len(ids)
+            # a video pass counts only the batch's videos (none here)
+            want = 0 if PASS_MEDIA.get(s["step"]) == "video" else len(ids)
+            assert s["total"] == want
 
     def test_top_level_keys(self, db):
         batch_id, ids = _make_batch(db)
@@ -1027,7 +1034,8 @@ class TestFleetLaunchPasses:
         queued by the button at all."""
         batch_id, ids = _make_batch(db)
         state = batch_state(db, batch_id)
-        assert fleet_launch_passes(state) == list(WORKER_PASSES)
+        # a stills-only batch: video-probe has nothing to do (completed)
+        assert fleet_launch_passes(state) == _STILL_PASSES
 
     def test_a_completed_dependency_admits_its_dependents(self, db):
         """Case 2."""
@@ -1035,7 +1043,8 @@ class TestFleetLaunchPasses:
             "describe": "completed", "category-content": "waiting",
             "keywords": "waiting", "verify": "waiting"}))
         assert got == ["clip", "faces", "quality", "aesthetics",
-                       "verify", "category-content", "keywords", "category-visual"]
+                       "verify", "category-content", "keywords", "category-visual",
+                       "video-probe"]
 
     def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
         """Case 3. `describe` having given up on every photo means there will
@@ -1105,6 +1114,15 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
     _finish_stills(db, ids)
     _close_nas_steps(db, batch_id)
 
+    # an unprobed video is real work: only video-probe asks for the fleet
+    state = batch_state(db, batch_id)
+    assert state["ready"] is False and state["next_action"] == "launch_fleet"
+    assert fleet_launch_passes(state) == ["video-probe"]
+    from photosearch.video_probe import PROBE_VERSION
+    db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
+                    "WHERE photo_id = ?", (PROBE_VERSION, vid))
+    db.conn.commit()
+
     state = batch_state(db, batch_id)
     not_done = [s["step"] for s in state["steps"]
                 if s["state"] != "completed" and s["step"] not in OPTIONAL_STEPS]
@@ -1112,13 +1130,16 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
     assert state["next_action"] != "launch_fleet"
 
 
-def test_video_only_batch_never_asks_for_a_fleet_launch(db):
+def test_video_only_batch_asks_the_fleet_for_video_probe_only(db):
+    """No still pass has anything to do; the one fleet ask is the probe."""
     directory = "2091/2091-09-20_phone-matt"
     vid = db.add_photo(filepath=f"{directory}/PXL_1.mp4", filename="PXL_1.mp4",
                        media_type="video", date_taken="2091-09-20T11:00:00")
     batch_id = register_batch(db, directory)
     state = batch_state(db, batch_id)
-    for p in WORKER_PASSES:
+    for p in _STILL_PASSES:
         assert _step(state, p)["state"] == "completed", _step(state, p)
-    assert state["next_action"] != "launch_fleet"
+    assert _step(state, "video-probe")["state"] == "needs_queue"
+    assert state["next_action"] == "launch_fleet"
+    assert fleet_launch_passes(state) == ["video-probe"]
     assert vid

@@ -994,6 +994,106 @@ def install_log_timestamps() -> None:
         sys.stderr = _TimestampedStream(sys.stderr)
 
 
+# Passes whose claim size is fixed by the pass, not by --batch-size: the probe
+# is cheap per video (a 12-byte read, ffprobe, one frame), so 25 per claim
+# keeps the claim overhead down without holding many videos per worker.
+PASS_CLAIM_LIMITS = {"video-probe": 25}
+
+
+def _process_video_probe(client: "WorkerClient", photos: list[dict],
+                         tz_name: Optional[str] = None) -> list[dict]:
+    """video-probe (docs/plans/video-support.md step 2b) for claimed videos.
+
+    Per video: a 12-byte Range read (ZIP magic) -> ffprobe over HTTP Range
+    -> one cv2 first frame -> poster JPEGs uploaded to the NAS -> a result
+    row. Nothing is downloaded whole.
+
+    Outcomes, following the worker conventions:
+      * transport trouble (timeout, refused, 5xx) -> OMITTED: no attempt
+        spent, re-claimed after the TTL;
+      * ffprobe read the bytes and they are not a playable video -> a RESULT
+        with `probe_error` (`zip_wrapped` / `unreadable: ...`): stored, the
+        row exists for exactly this, never re-probed;
+      * anything else (404, unknown ffprobe failure, a poster the NAS
+        rejected) -> a failure row: one of MAX_PROCESS_ATTEMPTS spent.
+    A readable video whose first frame cv2 cannot decode still gets its
+    probe stored (`poster_error` in probe_json) and the static placeholder.
+    """
+    from . import video_probe as VP
+
+    out: list[dict] = []
+    for photo in photos:
+        pid = photo["id"]
+        url = f"{client.server_url}/api/photos/{pid}/full?purpose=worker"
+        label = photo.get("filename") or str(pid)
+        try:
+            r = client._request("GET", url, headers={"Range": "bytes=0-11"},
+                                timeout=60, stream=True)
+            try:
+                if r.status_code not in (200, 206):
+                    print(f"    {label}: HTTP {r.status_code} on the magic read")
+                    out.append(_failure_row(pid, f"HTTP {r.status_code} reading the file"))
+                    continue
+                head = r.raw.read(12) or b""
+            finally:
+                r.close()
+            if VP.is_zip_magic(head):
+                print(f"    {label}: ZIP-wrapped (left for video-scan)")
+                out.append({"photo_id": pid, "probe_version": VP.PROBE_VERSION,
+                            "probe_error": VP.ZIP_WRAPPED,
+                            "probe_json": {"magic": head[:4].hex()}})
+                continue
+
+            data = VP.run_ffprobe(url)
+            if "_verdict" in data:
+                print(f"    {label}: {data['_verdict']}")
+                out.append({"photo_id": pid, "probe_version": VP.PROBE_VERSION,
+                            "probe_error": data["_verdict"],
+                            "probe_json": {"magic": head[:4].hex()}})
+                continue
+            res = VP.parse_probe(data, tz_name=tz_name)
+            probe_json = res.pop("probe_json")
+            if res.get("probe_error"):
+                print(f"    {label}: {res['probe_error']}")
+                out.append({"photo_id": pid, "probe_version": VP.PROBE_VERSION,
+                            "probe_error": res["probe_error"],
+                            "probe_json": probe_json})
+                continue
+
+            frame, t = VP.grab_first_frame(url)
+            if frame is None:
+                probe_json["poster_error"] = "cv2 could not decode a first frame"
+            else:
+                jpegs = VP.poster_jpegs(frame)
+                up = client._request(
+                    "POST", f"{client.server_url}/api/videos/{pid}/assets",
+                    json=VP.poster_assets_body(jpegs, VP.PROBE_VERSION), timeout=120)
+                if not up.ok:
+                    print(f"    {label}: poster upload HTTP {up.status_code}")
+                    out.append(_failure_row(
+                        pid, f"poster upload HTTP {up.status_code}: {up.text[:200]}"))
+                    continue
+            for k in ("camera_family", "gps_alt"):
+                res.pop(k, None)
+            res.update({"photo_id": pid, "probe_version": VP.PROBE_VERSION,
+                        "poster_t": t if frame is not None else None,
+                        "probe_json": probe_json})
+            print(f"    {label}: {res.get('codec')} {res.get('width')}x{res.get('height')} "
+                  f"{res.get('duration_s')}s date={res.get('date_taken')} "
+                  f"({res.get('date_source')})")
+            out.append(res)
+        except (_TRANSIENT + (VP.ProbeTransportError,)) as e:
+            print(f"    {label}: transport ({e}) — will be retried")
+            continue
+        except VP.ProbeToolError as e:
+            print(f"    {label}: {e}")
+            out.append(_failure_row(pid, e))
+        except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
+            print(f"    {label}: {type(e).__name__}: {e}")
+            out.append(_failure_row(pid, e))
+    return out
+
+
 def run_worker(
     server: str,
     passes: list[str],
@@ -1051,6 +1151,17 @@ def run_worker(
         keywords_model: Ollama model for keywords text pass (default: llama3.2:3b)
         aesthetics_model: Vision model for the aesthetics scoring pass (default: qwen2.5-vl)
     """
+    if "video-probe" in passes:
+        from .video_probe import find_ffprobe
+        if not find_ffprobe():
+            # Never let a missing tool turn into stored verdicts: drop the
+            # pass instead of claiming videos it cannot probe.
+            print("Error: video-probe needs ffprobe (PATH, ~/.local/bin, or "
+                  "PHOTOSEARCH_FFPROBE) — dropping the pass.", file=sys.stderr)
+            passes = [p for p in passes if p != "video-probe"]
+            if not passes:
+                return
+
     print(f"Connecting to {server}...")
     client = WorkerClient(server)
     print(f"Connected as {client.worker_id}")
@@ -1142,11 +1253,12 @@ def run_worker(
                     loaded_pass = None
                 # Claim a batch (with retry for sleep/wake)
                 print(f"\n{'='*60}")
-                print(f"Claiming {pass_type} batch (limit={batch_size})...")
+                claim_limit = PASS_CLAIM_LIMITS.get(pass_type, batch_size)
+                print(f"Claiming {pass_type} batch (limit={claim_limit})...")
                 try:
                     batch = _retry(
                         lambda pt=pass_type: client.claim_batch(
-                            pass_type=pt, limit=batch_size,
+                            pass_type=pt, limit=claim_limit,
                             collection_id=collection_id, directory=directory,
                             filters=filters, ttl_minutes=ttl_minutes,
                         ),
@@ -1191,7 +1303,9 @@ def run_worker(
                 os.makedirs(batch_temp, exist_ok=True)
 
                 TEXT_ONLY_PASSES = {"category-content", "keywords"}
-                needs_images = pass_type not in TEXT_ONLY_PASSES
+                # video-probe reads the file itself over HTTP Range.
+                RANGE_READ_PASSES = {"video-probe"}
+                needs_images = pass_type not in TEXT_ONLY_PASSES | RANGE_READ_PASSES
 
                 if needs_images:
                     print(f"\n  Downloading {len(photos)} photos...")
@@ -1245,6 +1359,9 @@ def run_worker(
                     results = _process_keywords(photos, model=keywords_model)
                     _provenance_kwargs(pass_type, keywords_model, results)
                     kwargs = _submit_kwargs("keywords_results", results)
+                elif pass_type == "video-probe":
+                    results = _process_video_probe(client, photos)
+                    kwargs = _submit_kwargs("video_probe_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)
@@ -1279,7 +1396,8 @@ def run_worker(
                 n_processed = resp.get("processed", n_written)
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
-                elif pass_type in ("describe", "category-content", "category-visual", "keywords", "aesthetics"):
+                elif pass_type in ("describe", "category-content", "category-visual", "keywords",
+                                   "aesthetics", "video-probe"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")

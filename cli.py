@@ -5212,7 +5212,9 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @cli.command()
 @click.option("--server", "-s", required=True, help="NAS server URL (e.g. http://nas.local:8000).")
 @click.option("--passes", "-p", default="clip", show_default=True,
-              help="Comma-separated pass types: clip, faces, quality, describe, tags.")
+              help="Comma-separated pass types: clip, faces, quality, aesthetics, describe, "
+                   "verify, category-content, keywords, category-visual, video-probe "
+                   "(video-probe needs ffprobe: PATH, ~/.local/bin or PHOTOSEARCH_FFPROBE).")
 @click.option("--collection", "collection_id", type=int, default=None,
               help="Scope work to a specific collection (by ID).")
 @click.option("--directory", "-d", default=None,
@@ -5346,6 +5348,8 @@ def worker(server, passes, collection_id, directory,
     valid_passes = {
         "clip", "faces", "quality", "describe", "verify",
         "category-content", "category-visual", "keywords", "aesthetics",
+        # docs/plans/video-support.md step 2b: needs ffprobe on this machine
+        "video-probe",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.

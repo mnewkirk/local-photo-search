@@ -197,8 +197,9 @@ PASS_MEDIA: dict[str, str] = {
     "keywords": "still",
     # legacy pre-v23 pass, still accepted by the claim path for cleanup
     "tags": "still",
-    # future video passes (steps 2b-5). Present here so their claim
-    # predicates have an entry the day they land; NOT yet in WORKER_PASSES.
+    # video passes. video-probe (step 2b) is live; the others are
+    # placeholders so their claim predicates have an entry the day they land
+    # (NOT yet in WORKER_PASSES).
     "video-probe": "video",
     "video-scan": "video",
     "video-subjects": "video",
@@ -344,6 +345,25 @@ def _scope_col(col: str, photo_ids) -> str:
 _VERIFY_NOT_EXHAUSTED = (
     "NOT EXISTS (SELECT 1 FROM worker_processed wp "
     "WHERE wp.photo_id = photos.id AND wp.pass_type = 'verify' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+
+
+# video-probe (docs/plans/video-support.md step 2b). The output is the
+# video_meta row's probe_version — a probe ERROR is stored too (probe_error +
+# probe_version), so an unreadable file is never re-probed until
+# video_probe.PROBE_VERSION is bumped. NOT EXISTS rather than a join, so a
+# video row whose video_meta row is somehow missing is still offered (the
+# submit upserts it). Alias `p`.
+def video_probe_missing_sql(alias: str = "p") -> str:
+    from .video_probe import PROBE_VERSION
+    return (f"NOT EXISTS (SELECT 1 FROM video_meta vm WHERE vm.photo_id = {alias}.id "
+            f"AND vm.probe_version >= {int(PROBE_VERSION)})")
+
+
+_VIDEO_PROBE_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-probe' "
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
 
@@ -3015,6 +3035,28 @@ class PhotoDB:
                         {m} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
+        elif pass_type == "video-probe":
+            # Videos with no current probe (a stored probe ERROR counts as
+            # probed), capped by the attempts ledger like every other pass.
+            # `m` restricts to media_type='video' (idx_photos_media_video).
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT p.id, p.filepath FROM photos p
+                        WHERE p.id IN ({placeholders})
+                        AND {video_probe_missing_sql('p')}
+                        AND {_VIDEO_PROBE_NOT_EXHAUSTED}
+                        {media_clause(pass_type, 'p')} LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""SELECT p.id, p.filepath FROM photos p
+                        WHERE {video_probe_missing_sql('p')}
+                        AND {_VIDEO_PROBE_NOT_EXHAUSTED}
+                        {media_clause(pass_type, 'p')} LIMIT ?""",
+                    (limit + len(claimed),),
+                ).fetchall()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")
 
@@ -3170,6 +3212,22 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}"""
+                ).fetchone()
+        elif pass_type == "video-probe":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos p
+                        WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
+                        AND {video_probe_missing_sql('p')}
+                        AND {_VIDEO_PROBE_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos p
+                        WHERE {video_probe_missing_sql('p')}
+                        AND {_VIDEO_PROBE_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}"""
                 ).fetchone()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")

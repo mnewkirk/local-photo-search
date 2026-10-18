@@ -34,6 +34,9 @@ from unittest.mock import patch
 import pytest
 
 from photosearch import batch_advance, batch_api, batch_state, ingest_batches
+from photosearch.db import PASS_MEDIA
+
+_STILL_PASSES = [p for p in batch_state.WORKER_PASSES if PASS_MEDIA[p] != "video"]
 
 _DIR = "2090/2090-03-01_TEST"
 
@@ -753,7 +756,8 @@ class TestLaunchFleetEndpoint:
         assert seen["status"] == 200, seen
         cmd = seen["cmd"]
         passes = cmd[cmd.index("-p") + 1].split(",")
-        assert passes == list(batch_state.WORKER_PASSES)
+        # a stills-only batch: the video passes have nothing to do
+        assert passes == _STILL_PASSES
         assert cmd[cmd.index("-n") + 1] == "2"
         assert "--sequential" in cmd
 
@@ -763,8 +767,7 @@ class TestLaunchFleetEndpoint:
         display — the fleet really is going to run it."""
         batch_id, _ = _make_batch(db)
         _fleet_cmd(client, {"batch_id": batch_id})
-        assert set(ingest_batches.open_jobs(db, batch_id)) == set(
-            batch_state.WORKER_PASSES)
+        assert set(ingest_batches.open_jobs(db, batch_id)) == set(_STILL_PASSES)
         state = batch_state.batch_state(db, batch_id)
         by = {s["step"]: s["state"] for s in state["steps"]}
         assert by["keywords"] == "queued"

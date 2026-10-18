@@ -1,0 +1,68 @@
+{
+ "format": {
+  "bit_rate": "536913166",
+  "duration": "2.002000",
+  "filename": "http://nas/api/photos/1/full?purpose=worker",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 3,
+  "size": "134362520",
+  "tags": {
+   "compatible_brands": "XAVCmp42nrasiso6",
+   "creation_time": "2026-07-08T07:33:10.000000Z",
+   "major_brand": "XAVC",
+   "minor_version": "17506303"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30000/1001",
+   "bit_rate": "415836387",
+   "codec_name": "hevc",
+   "codec_type": "video",
+   "duration": "2.002000",
+   "height": 4320,
+   "index": 0,
+   "nb_frames": "60",
+   "r_frame_rate": "30000/1001",
+   "tags": {
+    "creation_time": "2026-07-08T07:33:10.000000Z",
+    "encoder": "HEVC Coding",
+    "handler_name": "Video Media Handler",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   },
+   "width": 7680
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "1536000",
+   "codec_name": "pcm_s16be",
+   "codec_type": "audio",
+   "duration": "2.002000",
+   "index": 1,
+   "nb_frames": "96096",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2026-07-08T07:33:10.000000Z",
+    "handler_name": "Sound Media Handler",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   }
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "7119920",
+   "codec_type": "data",
+   "duration": "2.002000",
+   "index": 2,
+   "nb_frames": "60",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2026-07-08T07:33:10.000000Z",
+    "handler_name": "Timed Metadata Media Handler",
+    "language": "und",
+    "timecode": "00:02:41:04"
+   }
+  }
+ ]
+}

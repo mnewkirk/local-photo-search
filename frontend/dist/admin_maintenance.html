@@ -801,7 +801,7 @@
 
     // Mirrors worker_api._ALL_PASSES — the legacy "tags" pass is excluded (no
     // worker processes it; it would render a perpetual-0 pill).
-    var PASS_ORDER = ['clip', 'faces', 'quality', 'aesthetics', 'describe', 'verify', 'category-content', 'keywords', 'category-visual'];
+    var PASS_ORDER = ['clip', 'faces', 'quality', 'aesthetics', 'describe', 'verify', 'category-content', 'keywords', 'category-visual', 'video-probe'];
 
     function formatTtl(expiresAtStr) {
       if (!expiresAtStr) return { text: '—', cls: '' };
@@ -1023,6 +1023,12 @@
 
     // Videos ffprobe could not read (video-support D2): registered, hidden from
     // search, listed here so they can be inspected, downloaded or deleted.
+    // Mirrors photosearch/video_probe.classify_probe_error.
+    function unreadableReason(err) {
+      if (!err) return null;
+      return String(err).indexOf('zip_wrapped') === 0 ? 'zip_wrapped' : 'unreadable';
+    }
+
     function UnreadableVideos() {
       var PAGE = 50;
       var _r = useState(null); var data = _r[0];   var setData = _r[1];
@@ -1062,7 +1068,16 @@
               return e('tr', { key: r.id, style: { borderTop: '1px solid var(--border)' } },
                 e('td', null, e('a', { href: '/?photo=' + r.id, title: 'Open in the photo modal' }, r.id)),
                 e('td', { style: { wordBreak: 'break-all' } }, r.filepath),
-                e('td', { style: { color: 'var(--text-muted)' } }, r.probe_error),
+                e('td', { style: { color: 'var(--text-muted)' } },
+                  // video_probe.classify_probe_error: a ZIP-wrapped file is
+                  // recoverable (video-scan unzips it); the rest is not.
+                  e('span', { className: 'badge', title: String(r.probe_error || ''),
+                    style: { marginRight: 6, fontWeight: 600,
+                      color: unreadableReason(r.probe_error) === 'zip_wrapped' ? 'var(--accent, #6ad)' : 'var(--warn, #db4)' } },
+                    unreadableReason(r.probe_error) === 'zip_wrapped' ? 'ZIP-wrapped' : 'unreadable'),
+                  unreadableReason(r.probe_error) === 'zip_wrapped'
+                    ? 'a ZIP archive with a video extension (iOS Live bundle) — video-scan can unwrap it'
+                    : String(r.probe_error || '').replace(/^unreadable:\s*/, '')),
                 e('td', null, e('a', { href: '/api/photos/' + r.id + '/full?download=1' }, 'download')));
             }))),
           data && total === 0 && e('div', { className: 'deploy-meta' }, 'None.'),
@@ -2024,7 +2039,8 @@
     // in replica mode). Managed as the named "ui" fleet so it doesn't disturb
     // any hand-launched fleet.
     var FLEET_PASSES = ['clip', 'faces', 'quality', 'describe',
-                        'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics'];
+                        'category-content', 'category-visual', 'keywords', 'verify', 'aesthetics',
+                        'video-probe'];
 
     function FleetLauncher() {
       var _sel = useState({ describe: true, 'category-content': true, keywords: true });
@@ -2211,7 +2227,7 @@
     // Stages 1-2 come from /api/admin/incoming-status (cheap _incoming scan);
     // stages 3-4 from the same authoritative queue the Workers panel polls.
     var ENRICH_PASSES = ['faces', 'quality', 'aesthetics', 'describe', 'verify',
-                         'category-content', 'keywords', 'category-visual'];
+                         'category-content', 'keywords', 'category-visual', 'video-probe'];
 
     function fmt(n) { return (n || 0).toLocaleString(); }
 

@@ -155,6 +155,8 @@ Usage: ./run-workers.sh [OPTIONS]
 Start workers:
   -s, --server URL        NAS server URL (required, e.g. http://nas.local:8000)
   -p, --passes PASSES     Comma-separated passes (default: clip)
+                          video-probe needs ffprobe on the host: use --native
+                          (the Docker image has none; the worker drops the pass)
   -d, --directory DIR      Scope to directory on NAS (e.g. /photos/2026)
   -c, --collection ID     Scope to collection ID
       --from DATE         Filter scope: photos on/after DATE (YYYY-MM-DD)

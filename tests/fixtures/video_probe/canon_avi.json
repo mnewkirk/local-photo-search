@@ -1,0 +1,33 @@
+{
+ "format": {
+  "bit_rate": "11023753",
+  "duration": "12.637625",
+  "filename": "http://nas/api/photos/1/full?purpose=worker",
+  "format_name": "avi",
+  "nb_streams": 2,
+  "size": "17414258"
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "24000/1001",
+   "bit_rate": "9503431",
+   "codec_name": "mpeg4",
+   "codec_type": "video",
+   "duration": "12.637625",
+   "height": 1080,
+   "index": 0,
+   "nb_frames": "303",
+   "r_frame_rate": "24000/1001",
+   "width": 1920
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "1536000",
+   "codec_name": "pcm_s16le",
+   "codec_type": "audio",
+   "index": 1,
+   "nb_frames": "606606",
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

@@ -1,0 +1,52 @@
+{
+ "format": {
+  "bit_rate": "894963",
+  "duration": "26.168889",
+  "filename": "http://nas/api/photos/1/full?purpose=worker",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 2,
+  "size": "2927524",
+  "tags": {
+   "compatible_brands": "isommp42",
+   "creation_time": "2016-05-03T21:06:46.000000Z",
+   "major_brand": "mp42",
+   "minor_version": "0"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "14951/500",
+   "bit_rate": "704101",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "duration": "26.016654",
+   "field_order": "progressive",
+   "height": 720,
+   "index": 0,
+   "nb_frames": "778",
+   "r_frame_rate": "14951/500",
+   "tags": {
+    "handler_name": "VideoHandler",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   },
+   "width": 1280
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "191999",
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "duration": "26.168889",
+   "index": 1,
+   "nb_frames": "1127",
+   "r_frame_rate": "0/0",
+   "tags": {
+    "creation_time": "2016-05-03T21:06:46.000000Z",
+    "handler_name": "IsoMedia File Produced by Google, 5-11-2011",
+    "language": "und",
+    "vendor_id": "[0][0][0][0]"
+   }
+  }
+ ]
+}
