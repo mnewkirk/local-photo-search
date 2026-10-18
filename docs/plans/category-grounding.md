@@ -3,8 +3,25 @@
 **Status: BUILT 2026-10-18, NOT DEPLOYED.** Steps 1 to 6 are on main (rule
 module + tests, eval + holdout sample, worker guard, server repair,
 `ground-categories` CLI, labelling page `/eval/category-grounding`, docs).
-Step 7 (NAS redeploy, fleet restart, backfill) waits on the owner's holdout
-labels reaching >= 90% correct drops per group. Plan-debate, two planners, two
+**Holdout labelled 2026-10-18 (seed 11, 100 drops, owner):** every group
+passed the 90% bar, so step 7 (NAS redeploy, backfill) went ahead the same day.
+
+| group | correct | wrong | debatable | precision |
+|---|---|---|---|---|
+| sport | 24 | 1 | 0 | 0.96 |
+| setting | 20 | 2 | 3 | 0.91 |
+| light | 24 | 1 | 0 | 0.96 |
+| weather | 24 | 0 | 1 | 1.00 |
+| overall | 92 | 4 | 4 | 0.958 |
+
+The four wrong drops, left as known misses rather than tuned on the holdout:
+`baseball glove` + basketball terms with neither cued (49556); `restaurant`
+dropped on a restaurant EXTERIOR described as outdoors (203011: a restaurant
+has an outside, so it arguably does not belong on the indoor side);
+`indoor` dropped on "inside a vehicle ... daylight outside" (131456: the
+owner reads a car interior as indoor; the module deliberately does not);
+`artificial lighting` + `natural light` with neither cued (82087). Labels:
+`evals/category-grounding/samples-holdout-seed11.json`. Plan-debate, two planners, two
 critique rounds; owner decisions below.
 
 ## Problem
