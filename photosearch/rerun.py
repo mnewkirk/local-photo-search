@@ -150,15 +150,17 @@ def _resolve_model(pass_type: str) -> str:
     to this box's loaded models (_LMSTUDIO_DEFAULTS). Otherwise the Ollama
     default (or an explicit PHOTOSEARCH_LLM_<ROLE>_MODEL override) is used."""
     role, default = _PASS_LLM[pass_type]
+    if role == "video" and os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        # Strict (D8), through the SAME resolver the request uses — no legacy
+        # PHOTOSEARCH_TEXT_LLM_MODEL, no other role's model. Fails here,
+        # before any download, and provenance names the model that runs.
+        from .describe import require_role_model
+        return require_role_model("video")
     if os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
         env = (os.environ.get(f"PHOTOSEARCH_LLM_{role.upper()}_MODEL")
                or os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL"))
         if env:
             return env
-        if role == "video":
-            # Strict (D8): no fallback to another role's model.
-            from .describe import require_role_model
-            return require_role_model("video")
         if role == "subject":
             # Same fallback chain as describe._resolve_openai_model: an unset
             # SUBJECT var grounds with the aesthetics model, as photos do.

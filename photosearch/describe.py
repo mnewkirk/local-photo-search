@@ -311,6 +311,13 @@ class ContextOverflow(RuntimeError):
         self.detail = detail
 
 
+class VideoTransportError(ConnectionError):
+    """describe_video(raise_unusable=True) could not reach the model at all
+    (timeout, refused connection, backend error). A ConnectionError on
+    purpose: the worker treats it as transient and defers the video without
+    spending an attempt — distinct from an answer that was unusable."""
+
+
 class RoleModelNotConfigured(RuntimeError):
     """A strict role (see `_STRICT_ROLES`) has no model configured on the
     OpenAI-compatible route. Raised instead of silently falling back to
@@ -1236,9 +1243,11 @@ def describe_video(
         subject_summary: optional "0-12 s dog, 12-40 s Calvin" line from the
             video-subjects pass, included in the prompt.
 
-    Returns the description, or None for: no Ollama client, an empty /
-    non-description answer, a transport failure (defer), or an unusable
-    answer with raise_unusable=False.
+    Returns the description, or None for: no Ollama client, or (only with
+    raise_unusable=False) an empty / non-description answer, a transport
+    failure, or an unusable answer. With raise_unusable=True every bad answer
+    raises UnusableAnswer (after one retry at temperature 0.4) and a
+    transport failure raises VideoTransportError (a ConnectionError).
 
     Raises ContextOverflow when the K-image request does not fit the model's
     context (a config failure, never an answer) and RoleModelNotConfigured
@@ -1273,19 +1282,33 @@ def describe_video(
             return None, f"cut off ({e})", e
         return text, _description_problem(text), None
 
+    empty = ("empty response", "not a description")
     try:
         result, problem, trunc = _ask(0.0)
-        if problem and problem not in ("empty response", "not a description"):
+        # The worker (raise_unusable) gives an empty / non-description answer
+        # the same one retry as any other problem, then calls it unusable: a
+        # None there used to be deferred, i.e. re-claimed forever.
+        if problem and (raise_unusable or problem not in empty):
             result, problem, trunc = _ask(0.4)
     except (ContextOverflow, RoleModelNotConfigured):
         raise
+    except UnusableAnswer:
+        if raise_unusable:
+            raise
+        return None
     except Exception as e:
+        if raise_unusable:
+            # Transport (timeout, refused connection, backend 5xx): the
+            # worker's problem, not the video's — a ConnectionError, so the
+            # worker's _TRANSIENT handler defers it with no attempt spent.
+            raise VideoTransportError(f"video-describe transport failure: "
+                                      f"{type(e).__name__}: {e}") from e
         print(f"  Warning: video description failed: {e}")
         return None
 
     if problem is None:
         return result
-    if problem in ("empty response", "not a description"):
+    if problem in empty and not raise_unusable:
         return None
     if raise_unusable:
         if trunc is not None:

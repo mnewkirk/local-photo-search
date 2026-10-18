@@ -147,9 +147,20 @@ def _unload_pass_models(pass_type: str) -> None:
 
 def _llm_models_for(pass_type: str, pass_models: dict) -> set[str]:
     """Effective LM Studio model ids a pass calls. `pass_models` maps pass ->
-    [(nominal model, role)]; verify lists two (verifier + describe regen)."""
-    from .describe import effective_model
-    return {effective_model(m, role) for m, role in pass_models.get(pass_type, ())}
+    [(nominal model, role)]; verify lists two (verifier + describe regen).
+
+    A strict role this worker has no model for (`video` without
+    PHOTOSEARCH_LLM_VIDEO_MODEL — another worker's video-describe claim)
+    contributes nothing instead of raising: this runs while RETIRING a pass,
+    and a crash there would kill a worker that never ran video-describe."""
+    from .describe import RoleModelNotConfigured, effective_model
+    out = set()
+    for m, role in pass_models.get(pass_type, ()):
+        try:
+            out.add(effective_model(m, role))
+        except RoleModelNotConfigured:
+            continue
+    return out
 
 
 def _release_llm_models(client, retired: str, next_passes: list[str],
@@ -1258,6 +1269,16 @@ def _process_video_scan(client: "WorkerClient", photos: list[dict], workdir: str
     return out
 
 
+def _frame_params(inp: dict) -> dict:
+    """Query for /api/videos/{id}/frames: the scan version, and the staged
+    generation when the claim named one, so a keyframe is read from exactly
+    the scan the claim described (never a re-scan landed since)."""
+    params = {"v": inp["scan_version"]}
+    if inp.get("scan_generation"):
+        params["g"] = inp["scan_generation"]
+    return params
+
+
 class PassHalted(RuntimeError):
     """A CONFIGURATION failure that no retry of this pass can fix — the
     request does not fit the model's context (``describe.ContextOverflow``)
@@ -1301,7 +1322,7 @@ def _subjects_for_video(client: "WorkerClient", pid: int, inp: dict, model: str,
     t0 = time.time()
     for i, s in enumerate(segs):
         r = client._request("GET", f"{client.server_url}/api/videos/{pid}/frames/{s['name']}",
-                            params={"v": inp["scan_version"]}, timeout=60)
+                            params=_frame_params(inp), timeout=60)
         if r.status_code != 200:
             failed.append({"seg": i, "error": f"keyframe HTTP {r.status_code}"})
             groundings.append(None)
@@ -1349,6 +1370,7 @@ def _subjects_for_video(client: "WorkerClient", pid: int, inp: dict, model: str,
     print(f"    {label}: {len(segs)} segments in {time.time() - t0:.1f}s"
           f"{f' ({len(failed)} failed)' if failed else ''} — {an.summary_text() or 'no subject'}")
     return {"photo_id": pid, "scan_version": inp["scan_version"],
+            "scan_generation": inp.get("scan_generation"),
             "subjects_version": SUBJECTS_VERSION, "subjects": subjects,
             "analysis": analysis}
 
@@ -1398,8 +1420,8 @@ def _describe_one_video(client: "WorkerClient", pid: int, inp: dict, model: str,
     """Fetch one video's K keyframes and describe it in one call.
 
     Returns a ``VideoDescribeResult`` dict or a failure row. Raises transport
-    errors / :class:`_GroundingDeferred` (omit the video), ContextOverflow /
-    RoleModelNotConfigured (stop the pass)."""
+    errors (incl. ``describe.VideoTransportError``: omit the video),
+    ContextOverflow / RoleModelNotConfigured (stop the pass)."""
     import io
 
     from PIL import Image
@@ -1412,7 +1434,7 @@ def _describe_one_video(client: "WorkerClient", pid: int, inp: dict, model: str,
     frames, times = [], []
     for k in kfs:
         r = client._request("GET", f"{client.server_url}/api/videos/{pid}/frames/{k['name']}",
-                            params={"v": inp["scan_version"]}, timeout=60)
+                            params=_frame_params(inp), timeout=60)
         if r.status_code != 200:
             return _failure_row(pid, f"keyframe {k['name']}: HTTP {r.status_code}")
         try:
@@ -1433,12 +1455,17 @@ def _describe_one_video(client: "WorkerClient", pid: int, inp: dict, model: str,
         print(f"    {label}: unusable after {time.time() - t0:.1f}s: {e}")
         return _failure_row(pid, e)
     if not text:
-        # describe_video folds transport failures and an empty answer into
-        # None; neither is the video's fault -> omitted, re-claimed later.
-        raise _GroundingDeferred(f"{label}: no answer from the video model")
+        # With raise_unusable, describe_video raises for transport
+        # (VideoTransportError, a ConnectionError -> deferred by the caller)
+        # and for a bad answer. A bare None is left only for "no backend at
+        # all"; deferring it would re-claim the video forever, so it spends
+        # an attempt like any other per-video failure.
+        print(f"    {label}: no description returned")
+        return _failure_row(pid, "video-describe: no description returned")
     print(f"    {label}: {len(frames)} keyframes in {time.time() - t0:.1f}s — "
           f"{text[:80].replace(chr(10), ' ')}...")
-    return {"photo_id": pid, "description": text, "scan_version": inp["scan_version"]}
+    return {"photo_id": pid, "description": text, "scan_version": inp["scan_version"],
+            "scan_generation": inp.get("scan_generation")}
 
 
 def _process_video_describe(client: "WorkerClient", photos: list[dict],
@@ -1450,9 +1477,11 @@ def _process_video_describe(client: "WorkerClient", photos: list[dict],
 
     Outcomes, following the worker conventions:
       * an unusable answer (cut off even at double the budget, looping,
-        mid-sentence after the retry) or a missing / corrupt keyframe ->
-        a failure row (one attempt spent, nothing written);
-      * no answer / transport trouble -> OMITTED (re-claimed, no attempt);
+        mid-sentence, empty or not a description — after the retry), no
+        description at all, or a missing / corrupt keyframe -> a failure row
+        (one attempt spent, nothing written);
+      * transport trouble (VideoTransportError, network errors) -> OMITTED
+        (re-claimed, no attempt);
       * ContextOverflow / RoleModelNotConfigured -> :class:`PassHalted`
         (configuration: no attempts spent, the pass stops);
       * anything else -> a failure row.

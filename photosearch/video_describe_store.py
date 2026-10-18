@@ -52,12 +52,20 @@ def eligible_sql(alias: str = "p") -> str:
 
 
 def never_described_sql(alias: str = "p") -> str:
-    """A video that has no description and never will: video-scan is settled
-    on it and it is NOT describable (Live, unreadable, a stored scan error).
-    batch_state drops these from the text passes' ``total`` — otherwise one
-    unplayable clip would hold category-content / keywords short of done."""
+    """A video that has no description and never will: either video-scan is
+    settled on it and it is NOT describable (Live, unreadable, a stored scan
+    error), or video-describe has exhausted its attempts on it. batch_state
+    drops these from the text passes' ``total`` — otherwise one unplayable
+    (or undescribable) clip would hold category-content / keywords at
+    waiting, and fleet_launch_passes would not launch them for the stills.
+    (An exhausted video still shows on the video-describe step as failed.)"""
+    from .db import MAX_PROCESS_ATTEMPTS
+    exhausted = (f"EXISTS (SELECT 1 FROM worker_processed wp WHERE wp.photo_id = {alias}.id "
+                 f"AND wp.pass_type = 'video-describe' "
+                 f"AND wp.attempts >= {int(MAX_PROCESS_ATTEMPTS)})")
     return (f"({alias}.media_type = 'video' AND {alias}.description IS NULL "
-            f"AND {eligible_sql(alias)} AND NOT {_scan_ok_sql(alias)})")
+            f"AND (({eligible_sql(alias)} AND NOT {_scan_ok_sql(alias)}) "
+            f"OR {exhausted}))")
 
 
 def _loads(v, default=None):
@@ -116,7 +124,8 @@ def describe_input(conn, photo_id: int) -> Optional[dict]:
     subjects result). None when the video has no clean current scan."""
     vm = conn.execute(
         "SELECT scan_version, scan_error, quality_json, duration_s, subjects_version, "
-        "subjects_json FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
+        "subjects_json, scan_generation FROM video_meta WHERE photo_id = ?",
+        (photo_id,)).fetchone()
     if vm is None or vm[0] is None or vm[1] is not None:
         return None
     q = _loads(vm[2], {}) or {}
@@ -128,7 +137,24 @@ def describe_input(conn, photo_id: int) -> Optional[dict]:
         summary = subject_summary(conn, photo_id, _loads(vm[5], {}) or {})
     return {
         "scan_version": int(vm[0]),
+        "scan_generation": vm[6],
         "duration": q.get("duration") or vm[3],
         "keyframes": keyframes,
         "subject_summary": summary,
     }
+
+
+def is_stale(conn, photo_id: int, scan_version, scan_generation) -> bool:
+    """True when the result was computed from keyframes of a scan that has
+    since been replaced (another version, or — same version — another
+    generation after a clear-pass re-scan). An older worker sends neither and
+    is never called stale."""
+    if scan_version is None and scan_generation is None:
+        return False
+    vm = conn.execute("SELECT scan_version, scan_generation FROM video_meta "
+                      "WHERE photo_id = ?", (photo_id,)).fetchone()
+    if vm is None:
+        return True
+    if scan_version is not None and vm[0] != scan_version:
+        return True
+    return scan_generation is not None and vm[1] != scan_generation

@@ -98,8 +98,8 @@ def subjects_input(conn, photo_id: int) -> Optional[dict]:
     keyframe names/times and per-segment face boxes, and the face tracks.
     None when the video has no current scan."""
     vm = conn.execute(
-        "SELECT scan_version, scan_error, quality_json, duration_s, width, height "
-        "FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
+        "SELECT scan_version, scan_error, quality_json, duration_s, width, height, "
+        "scan_generation FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
     if vm is None or vm[0] is None or vm[1] is not None:
         return None
     q = _loads(vm[2], {}) or {}
@@ -111,6 +111,9 @@ def subjects_input(conn, photo_id: int) -> Optional[dict]:
                   "WHERE photo_id = ? ORDER BY ident_ix", (photo_id,))]
     return {
         "scan_version": int(vm[0]),
+        # The staged upload generation (schema v38): a clear-pass re-scan at
+        # the SAME version gets a new one, with new identities and keyframes.
+        "scan_generation": vm[6],
         "duration": q.get("duration") or vm[3],
         "W": q.get("width") or vm[4],
         "H": q.get("height") or vm[5],
@@ -147,11 +150,17 @@ def apply_subjects_result(conn, r: dict) -> dict:
         raise NotAVideo(f"photo {pid} does not exist")
     if row[0] != "video":
         raise NotAVideo(f"photo {pid} is not a video")
-    vm = conn.execute("SELECT scan_version, scan_error FROM video_meta WHERE photo_id = ?",
-                      (pid,)).fetchone()
+    vm = conn.execute("SELECT scan_version, scan_error, scan_generation FROM video_meta "
+                      "WHERE photo_id = ?", (pid,)).fetchone()
     if vm is None or vm[0] is None or vm[1] is not None or int(vm[0]) != int(r["scan_version"]):
         raise StaleSubjects(f"video {pid}: scanned at {vm[0] if vm else None}, the "
                             f"subjects were computed from scan {r['scan_version']}")
+    # Same version, different generation = a clear-pass re-scan landed while
+    # this result was in flight: its face_ix would map onto the NEW tracks.
+    # An older worker sends no generation and is only version-checked.
+    if r.get("scan_generation") is not None and r["scan_generation"] != vm[2]:
+        raise StaleSubjects(f"video {pid}: re-scanned (generation {vm[2]}) since the "
+                            f"subjects were computed from generation {r['scan_generation']}")
 
     ident_face = {int(t[0]): t[1] for t in conn.execute(
         "SELECT ident_ix, face_id FROM video_tracks WHERE photo_id = ? "

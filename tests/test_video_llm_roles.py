@@ -306,14 +306,22 @@ def test_describe_video_context_overflow_propagates(monkeypatch):
         d.describe_video(FRAMES, TS, 42.0, raise_unusable=True)
 
 
-def test_describe_video_transport_error_is_none(monkeypatch):
+def test_describe_video_transport_error_is_transient_for_the_worker(monkeypatch):
+    # The worker defers it (a ConnectionError); other callers still get None.
     _script(monkeypatch, [ConnectionError("refused")])
-    assert d.describe_video(FRAMES, TS, 42.0, raise_unusable=True) is None
+    with pytest.raises(d.VideoTransportError):
+        d.describe_video(FRAMES, TS, 42.0, raise_unusable=True)
+    _script(monkeypatch, [ConnectionError("refused")])
+    assert d.describe_video(FRAMES, TS, 42.0) is None
 
 
-def test_describe_video_empty_answer_is_none_even_for_the_worker(monkeypatch):
+def test_describe_video_empty_answer_is_unusable_for_the_worker(monkeypatch):
+    # Retried once, then a failure (it used to be None -> deferred forever).
+    _script(monkeypatch, [None, None])
+    with pytest.raises(d.UnusableAnswer):
+        d.describe_video(FRAMES, TS, 42.0, raise_unusable=True)
     _script(monkeypatch, [None])
-    assert d.describe_video(FRAMES, TS, 42.0, raise_unusable=True) is None
+    assert d.describe_video(FRAMES, TS, 42.0) is None
 
 
 # ---------------------------------------------------------------------------

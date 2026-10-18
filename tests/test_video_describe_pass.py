@@ -256,7 +256,8 @@ def test_worker_describes_with_keyframes_and_summary(env, monkeypatch):
     _, photo = _claim(env, pid)
     fc = FakeFrames()
     out = W._process_video_describe(fc, [photo], model="qwen2.5-vl")
-    assert out == [{"photo_id": pid, "description": GOOD, "scan_version": SCAN_VERSION}]
+    assert out == [{"photo_id": pid, "description": GOOD, "scan_version": SCAN_VERSION,
+                    "scan_generation": None}]
     (c,) = calls
     assert len(c["frames"]) == 3 and c["timestamps"] == [1.0, 4.5, 8.0]
     assert c["duration_s"] == 9.0 and c["raise_unusable"] is True
@@ -291,14 +292,6 @@ def test_a_missing_keyframe_is_a_failure_row(env, monkeypatch):
                                     model="m")
     assert out[0]["photo_id"] == pid and "keyframe_k01.jpg" in out[0]["error"]
     assert not calls
-
-
-def test_no_answer_is_omitted(env, monkeypatch):
-    pid = env["video"]("A.MOV")
-    _scan(env, pid)
-    _fake_describe(monkeypatch, None)
-    _, photo = _claim(env, pid)
-    assert W._process_video_describe(FakeFrames(), [photo], model="m") == []
 
 
 @pytest.mark.parametrize("exc", [D.ContextOverflow("too big", detail="Context size"),
@@ -557,3 +550,157 @@ def test_rerun_resolve_model_is_strict_for_video(monkeypatch):
         rerun._resolve_model("video-describe")
     monkeypatch.setenv("PHOTOSEARCH_LLM_VIDEO_MODEL", "vid-m")
     assert rerun._resolve_model("video-describe") == "vid-m"
+
+
+# --- review fixes (2026-10-17) ------------------------------------------------
+
+def _script_chat(monkeypatch, answers):
+    calls = []
+    q = list(answers)
+
+    def chat(**kw):
+        calls.append(kw)
+        a = q.pop(0)
+        if isinstance(a, BaseException):
+            raise a
+        return a
+    monkeypatch.setattr(D, "HAS_OLLAMA", True)
+    monkeypatch.setattr(D, "_ollama_chat_with_retry", chat)
+    return calls
+
+
+FR, TS3 = [b"\xff\xd8a", b"\xff\xd8b"], [0.0, 3.0]
+
+
+def test_transport_failure_raises_a_connection_error_for_the_worker(monkeypatch):
+    _script_chat(monkeypatch, [TimeoutError("read timed out")])
+    with pytest.raises(D.VideoTransportError) as ei:
+        D.describe_video(FR, TS3, 4.0, raise_unusable=True)
+    assert isinstance(ei.value, ConnectionError)
+    assert isinstance(ei.value, W._TRANSIENT)
+    # the eval / non-worker caller still gets None
+    _script_chat(monkeypatch, [TimeoutError("read timed out")])
+    assert D.describe_video(FR, TS3, 4.0) is None
+
+
+@pytest.mark.parametrize("bad", ["", None])
+def test_empty_or_non_description_is_retried_then_unusable(monkeypatch, bad):
+    calls = _script_chat(monkeypatch, [bad, bad])
+    with pytest.raises(D.UnusableAnswer):
+        D.describe_video(FR, TS3, 4.0, raise_unusable=True)
+    assert len(calls) == 2
+    assert calls[1]["options"]["temperature"] == 0.4
+
+
+def test_empty_then_good_answer_recovers_on_the_retry(monkeypatch):
+    _script_chat(monkeypatch, ["", GOOD])
+    assert D.describe_video(FR, TS3, 4.0, raise_unusable=True) == GOOD
+
+
+def test_worker_none_is_a_failure_row_and_transport_is_omitted(env, monkeypatch):
+    pid = env["video"]("A.MOV")
+    _scan(env, pid)
+    _fake_describe(monkeypatch, None)
+    _, photo = _claim(env, pid)
+    out = W._process_video_describe(FakeFrames(), [photo], model="m")
+    assert out[0]["photo_id"] == pid and "error" in out[0]
+    _fake_describe(monkeypatch, D.VideoTransportError("refused"))
+    assert W._process_video_describe(FakeFrames(), [photo], model="m") == []
+
+
+def test_llm_models_for_skips_an_unconfigured_strict_role(monkeypatch):
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
+    pm = {"video-describe": [("qwen2.5-vl", "video")],
+          "describe": [("llama3.2-vision", "describe")]}
+    monkeypatch.setenv("PHOTOSEARCH_LLM_DESCRIBE_MODEL", "qwen/qwen3.5-9b")
+    assert W._llm_models_for("video-describe", pm) == set()
+
+    class C:
+        worker_id = "me"
+
+        def get_status(self, **kw):
+            return {"active_claims": [{"worker_id": "other",
+                                       "pass_type": "video-describe"}]}
+    unloaded = []
+    monkeypatch.setattr(D, "unload_openai_models", lambda m: unloaded.append(set(m)) or [])
+    # retiring describe while another worker holds a video-describe claim
+    W._release_llm_models(C(), "describe", [], pm, {})
+    assert unloaded == [{"qwen/qwen3.5-9b"}]
+
+
+def test_subjects_result_for_a_replaced_generation_is_deferred(env):
+    db = env["db"]
+    pid = env["video"]("A.MOV")
+    _scan(env, pid)
+    db.conn.execute("UPDATE video_meta SET scan_generation = 'genbbbbb' WHERE photo_id = ?",
+                    (pid,))
+    db.conn.commit()
+    from photosearch.video_subjects_store import subjects_input
+    assert subjects_input(db.conn, pid)["scan_generation"] == "genbbbbb"
+    r = env["client"].post("/api/worker/submit-results", json={
+        "batch_id": "b", "pass_type": "video-subjects", "video_subjects_results": [
+            {"photo_id": pid, "scan_version": SCAN_VERSION,
+             "scan_generation": "genaaaaa", "subjects": [], "analysis": {}}]})
+    assert r.status_code == 200 and r.json()["written"] == 0
+    assert pid in r.json()["deferred_photo_ids"]
+    assert db.conn.execute("SELECT subjects_version FROM video_meta WHERE photo_id=?",
+                           (pid,)).fetchone()[0] is None
+    assert _ledger(db, pid, "video-subjects") == 0
+
+
+def test_describe_result_for_a_replaced_generation_is_deferred(env, monkeypatch):
+    db = env["db"]
+    pid = env["video"]("A.MOV")
+    _scan(env, pid)
+    db.conn.execute("UPDATE video_meta SET scan_generation = 'genaaaaa' WHERE photo_id = ?",
+                    (pid,))
+    db.conn.commit()
+    _fake_describe(monkeypatch, GOOD)
+    batch, photo = _claim(env, pid)
+    assert photo["describe_input"]["scan_generation"] == "genaaaaa"
+    fc = FakeFrames()
+    out = W._process_video_describe(fc, [photo], model="m")
+    assert all(p == {"v": SCAN_VERSION, "g": "genaaaaa"} for _, p in fc.urls)
+    # a clear-pass re-scan at the same version lands meanwhile
+    db.conn.execute("UPDATE video_meta SET scan_generation = 'genbbbbb' WHERE photo_id = ?",
+                    (pid,))
+    db.conn.commit()
+    resp = _submit(env, batch, out)
+    assert resp["written"] == 0 and pid in resp["deferred_photo_ids"]
+    assert db.conn.execute("SELECT description FROM photos WHERE id=?",
+                           (pid,)).fetchone()[0] is None
+    assert _ledger(db, pid) == 0
+
+
+def test_an_exhausted_video_does_not_hold_the_stills_text_passes(env):
+    from photosearch.batch_state import fleet_launch_passes
+    db = env["db"]
+    stills = [db.add_photo(filepath=f"{DIR}/IMG_{i}.JPG", filename=f"IMG_{i}.JPG",
+                           date_taken="2091-07-06 09:00:00") for i in range(2)]
+    pid = env["video"]("A.MOV")
+    _scan(env, pid)
+    _finish_stills(db, stills)
+    db.conn.execute("UPDATE photos SET categories = NULL, keywords = NULL WHERE id IN (?, ?)",
+                    stills)
+    db.conn.execute("INSERT INTO worker_processed (photo_id, pass_type, attempts) "
+                    "VALUES (?, 'video-describe', ?)", (pid, MAX_PROCESS_ATTEMPTS))
+    db.conn.commit()
+    bid = register_batch(db, DIR)
+    state = batch_state(db, bid)
+    st = {s["step"]: s for s in state["steps"]}
+    assert st["video-describe"]["state"] == "blocked"
+    for p in ("category-content", "keywords"):
+        assert st[p]["total"] == 2 and st[p]["state"] == "needs_queue", st[p]
+    launch = fleet_launch_passes(state)
+    assert "category-content" in launch and "keywords" in launch
+
+
+def test_rerun_ignores_the_legacy_single_model_var_for_video(monkeypatch):
+    from photosearch import rerun
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_MODEL", "legacy-m")
+    with pytest.raises(D.RoleModelNotConfigured):
+        rerun._resolve_model("video-describe")
+    # the request path agrees (same strict resolver)
+    with pytest.raises(D.RoleModelNotConfigured):
+        D.effective_model("x", "video")

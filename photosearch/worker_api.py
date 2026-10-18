@@ -301,6 +301,8 @@ class VideoSubjectsResult(BaseModel):
     (stored as video_meta.subjects_json and the `generations` row)."""
     photo_id: int
     scan_version: int
+    # schema v38 staged generation; None from an older worker
+    scan_generation: Optional[str] = None
     subjects_version: int = 1
     subjects: list[VideoSubjectSpec] = []
     analysis: Optional[dict] = None
@@ -316,6 +318,7 @@ class VideoDescribeResult(BaseModel):
     photo_id: int
     description: str
     scan_version: Optional[int] = None
+    scan_generation: Optional[str] = None
     model: Optional[str] = None
     model_version: Optional[str] = None
 
@@ -1316,9 +1319,18 @@ def submit_results(req: SubmitRequest):
             # new description re-queues what was derived from the old one —
             # categories / keywords; verify never runs on a video (D18), so
             # its columns are left alone.
+            from .video_describe_store import is_stale
             db.begin_batch(batch_size=100)
             done_vd: set[int] = set()
             for r in req.video_describe_results or []:
+                if is_stale(db.conn, r.photo_id, r.scan_version, r.scan_generation):
+                    # Described from keyframes of a scan replaced since the
+                    # claim: deferred (no attempt), re-offered if the column
+                    # is still empty. Consistent with video-subjects.
+                    logger.warning("video-describe %s: re-scanned since the claim — "
+                                   "deferring", r.photo_id)
+                    outcome.defer(r.photo_id)
+                    continue
                 try:
                     row = db.conn.execute("SELECT media_type FROM photos WHERE id = ?",
                                           (r.photo_id,)).fetchone()

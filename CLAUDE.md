@@ -1115,8 +1115,11 @@ rewrite (~16% of a batch) left categories/keywords extracted from text verify
 had just judged hallucinated — **13,637 photos** library-wide. Three fixes:
 
 - **Pass order** (`batch_state.WORKER_PASSES` = `rerun.ALL_PASSES` =
-  `worker_api._ALL_PASSES`, mirrored in `batch-flow.js`): `… describe, verify,
-  category-content, keywords, category-visual`. `/workers/start` sorts any
+  `worker_api._ALL_PASSES`, mirrored in `batch-flow.js`): `clip, faces,
+  quality, video-probe, video-scan, aesthetics, video-subjects, describe,
+  video-describe, verify, category-content, keywords, category-visual`
+  (video-describe must drain before the text passes that read its output).
+  `/workers/start` sorts any
   hand-picked `-p` into it. Also one load per model: qwen3.5 → +gemma → gemma →
   minicpm. `DEPENDS_ON` is unchanged (text passes still wait on `describe`, not
   `verify`), so a blocked verify never starves them.
