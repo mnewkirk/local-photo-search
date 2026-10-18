@@ -158,6 +158,12 @@ _SEARCH_INDEXES: list[tuple[str, str]] = [
     # ~160k. Partial, so every still-only predicate (`media_type IS NULL`) is
     # free and the video passes' claim/count drive from this tiny index.
     ("idx_photos_media_video", "photos(id) WHERE media_type IS NOT NULL"),
+    # video-support step 7: the `steadiest` / `least_noisy` search sorts read
+    # video_meta.shake / .noise ascending (search._VIDEO_QUALITY_SORTS). video_meta
+    # is tiny (one row per video), but the partial index lets SQLite serve the
+    # ORDER BY directly instead of a scan + sort, and skips unmeasured rows.
+    ("idx_video_meta_shake", "video_meta(shake) WHERE shake IS NOT NULL"),
+    ("idx_video_meta_noise", "video_meta(noise) WHERE noise IS NOT NULL"),
 ]
 
 # ---------------------------------------------------------------------------

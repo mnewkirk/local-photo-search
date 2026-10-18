@@ -430,7 +430,7 @@ def api_search(
     style_tag: Optional[str] = Query(None, description="Filter by aesthetic style tag (e.g. golden-hour)"),
     min_subject_aesthetic: Optional[float] = Query(None, description="Minimum SUBJECT-crop aesthetic percentile (0-100)"),
     min_day_aesthetic: Optional[float] = Query(None, description="Minimum PER-DAY aesthetic percentile (0-100) — rank among photos taken the same day"),
-    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, aesthetic_desc, subject_aesthetic_desc, relevance"),
+    sort: str = Query("date_desc", description="Sort order: date_desc, date_asc, quality_desc, aesthetic_desc, subject_aesthetic_desc, relevance, steadiest, least_noisy (the last two are videos-only and imply media=video)"),
     sort_quality: bool = Query(False, description="Legacy: equivalent to sort=quality_desc"),
     text_match: str = Query("all", description="Text matching mode: all, dict, categories, visual, keywords, off"),
     tag_match: Optional[str] = Query(None, deprecated=True, description="Deprecated; use text_match"),
@@ -488,7 +488,8 @@ def api_search(
                 min_aesthetic is not None, min_technical is not None,
                 min_composition is not None, min_impact is not None, style_tag,
                 min_subject_aesthetic is not None, min_day_aesthetic is not None,
-                sort in ("aesthetic_desc", "subject_aesthetic_desc"),
+                sort in ("aesthetic_desc", "subject_aesthetic_desc",
+                        "steadiest", "least_noisy"),
                 (media or "").strip().lower() in ("video", "videos")]):
         logger.info("SEARCH REJECTED — no criteria provided")
         return {"results": [], "count": 0, "error": "Provide at least one search criterion"}
@@ -602,6 +603,11 @@ def api_search(
             # Video main-subject share, when that filter/sort ran (step 6).
             for k in ("focus_share", "focus_seconds", "focus_people",
                       "subject_label", "subject_share", "subject_seconds"):
+                if r.get(k) is not None:
+                    item[k] = r[k]
+
+            # Video quality (step 7): shake/noise, when that sort ran.
+            for k in ("shake", "noise"):
                 if r.get(k) is not None:
                     item[k] = r[k]
 
@@ -1899,9 +1905,30 @@ def api_photo_detail(photo_id: int):
         if photo.get("media_type") == "video":
             vm = db.conn.execute(
                 "SELECT duration_s, fps, codec, container, width, height, rotation, "
-                "has_audio, kind, live_of_photo_id, probe_version, probe_error "
+                "has_audio, kind, live_of_photo_id, probe_version, probe_error, "
+                "scan_version, scan_error, shake, noise, focus_consistency, quality_json "
                 "FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
             video = dict(vm) if vm else {}
+            # Video quality (step 7, D11): always NUMBERS — shown in the modal
+            # with plain-language bands as display text only. No tag is ever
+            # derived or written from these (D11 gates a tag behind a holdout
+            # eval that hasn't run). `exposure` is the mean clipped highlight/
+            # shadow fraction from quality_json (video_scan.py's aggregate_exposure).
+            qj = video.pop("quality_json", None)
+            exposure = None
+            if qj:
+                try:
+                    exposure = json.loads(qj).get("exposure")
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    exposure = None
+            video["quality"] = {
+                "shake": video.pop("shake", None),
+                "noise": video.pop("noise", None),
+                "focus_consistency": video.pop("focus_consistency", None),
+                "exposure": exposure,
+                "scan_version": video.pop("scan_version", None),
+                "scan_error": video.pop("scan_error", None),
+            }
             from .video_api import NOT_BROWSER_PLAYABLE
             video["browser_playable"] = (
                 Path(photo["filename"] or "").suffix.lower() not in NOT_BROWSER_PLAYABLE)

@@ -993,10 +993,14 @@
         const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
         const mdaVal = minDayAesthetic ? parseFloat(minDayAesthetic) : null;
         const share = shareParams();
-        // A focus/subject sort is only valid while its filter is shown.
+        // A focus/subject/video-quality sort is only valid while its
+        // control is shown (video-quality sorts imply media=video, so
+        // leaving them armed after switching Media away from Videos would
+        // silently narrow the search back to videos).
         let sortVal = sortBy;
         if (sortVal === 'focus_desc' && !focusOn) sortVal = 'date_desc';
         if (sortVal === 'subject_desc' && !share.subject) sortVal = 'date_desc';
+        if ((sortVal === 'steadiest' || sortVal === 'least_noisy') && mediaFilter !== 'video') sortVal = 'date_desc';
         if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter && !share.subject
             && mediaFilter !== 'video' && !dateFrom && !dateTo && mqVal == null && maVal == null && mdaVal == null && !matchSource
             && sortBy !== 'aesthetic_desc' && sortBy !== 'subject_aesthetic_desc') return null;
@@ -1771,7 +1775,10 @@
                            setSortBy: askMode ? null : setSortBy,
                            sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc', 'day_quality_desc']
                              .concat(focusOn ? ['focus_desc'] : [])
-                             .concat(subjectOn && (subjectFilter || '').trim() ? ['subject_desc'] : []),
+                             .concat(subjectOn && (subjectFilter || '').trim() ? ['subject_desc'] : [])
+                             // Video quality (step 7, ungated): only meaningful once
+                             // Media is narrowed to Videos.
+                             .concat(mediaFilter === 'video' ? ['steadiest', 'least_noisy'] : []),
                            // Ask uses tool-driven grouping (ordered labels); structured
                            // search uses the client-side "Group by" control. In Ask mode a
                            // "Group by" selection is a fallback when no tool grouped.

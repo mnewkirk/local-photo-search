@@ -316,6 +316,10 @@ def _compact_hit(photo: dict) -> dict:
               "subject_seconds"):
         if photo.get(k) is not None:
             hit[k] = photo[k]
+    # Video quality (step 7), present only when sort='steadiest'/'least_noisy' ran.
+    for k in ("shake", "noise"):
+        if photo.get(k) is not None:
+            hit[k] = photo[k]
     return hit
 
 
@@ -661,7 +665,9 @@ def _has_column(db, col: str) -> bool:
 _VALID_SORTS = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
                 "day_quality_desc", "relevance", "subject",
                 # Video main-subject share (step 6, flag-gated by _gate_schema).
-                "focus_desc", "subject_desc")
+                "focus_desc", "subject_desc",
+                # Video quality (step 7) — ungated, implies media=video.
+                "steadiest", "least_noisy")
 
 
 def _subject_ranked_search(db: PhotoDB, args: dict, person_ids: list, limit: int) -> dict:
@@ -897,7 +903,10 @@ _register(ToolSpec(
                                     "HERE, never in `query`, and add no score floor. "
                                     "'subject' (with a `people` filter) ranks by how "
                                     "foreground/prominent that person is — for 'best "
-                                    "photos of X where X is the main subject'."},
+                                    "photos of X where X is the main subject'. "
+                                    "'steadiest'/'least_noisy' rank VIDEOS by measured "
+                                    "camera shake / sensor noise, least first; either "
+                                    "implies media=video."},
             "limit": {"type": "integer",
                       "description": f"Max results (default {_SEARCH_DEFAULT_LIMIT}, "
                                      f"max {_SEARCH_MAX_LIMIT})."},

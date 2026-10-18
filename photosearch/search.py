@@ -1335,13 +1335,23 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
     return [dict(r) for r in rows]
 
 
+# Video quality sorts (video-support step 7, D11): shake/noise are stored and
+# shown as plain numbers, never as a tag, so these two are the only surfacing
+# — ungated (no holdout eval gates a sort, unlike focus_desc/subject_desc).
+# Picking either implies media=video (search_combined overrides `media`),
+# since shake/noise only ever exist on a video row. Keyed by the video_meta
+# column each reads; _apply_sort and the index-driven lookup share this map.
+_VIDEO_QUALITY_SORTS = {"steadiest": "shake", "least_noisy": "noise"}
+
 # Allowed values for search_combined's `sort` param. Kept as a module
 # constant so callers (web.py, cli.py) and tests reference one list.
 SORT_MODES = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
               "subject_aesthetic_desc", "day_quality_desc", "relevance",
               # Video main-subject share (video-support step 6; the HTTP and
               # tool surfaces gate them behind PHOTOSEARCH_VIDEO_SUBJECT_SHARE).
-              "focus_desc", "subject_desc")
+              "focus_desc", "subject_desc",
+              # Video quality (step 7) — ungated.
+              "steadiest", "least_noisy")
 
 # Reciprocal Rank Fusion constant. Textbook default is 60 — smaller k
 # makes the top-ranked item in each filter dominate more; larger k
@@ -1475,6 +1485,16 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
                            if r.get("aes_subject_overall_pct") is not None
                            else (r.get("aes_overall_pct") or 0)),
             reverse=True,
+        )
+    if sort in _VIDEO_QUALITY_SORTS:
+        # Video quality (step 7): ascending shake/noise (lower is steadier /
+        # cleaner), NULLs (unmeasured — scan hasn't run, or decode failed)
+        # last. Values are annotated onto `merged` by search_combined just
+        # before this call.
+        key = _VIDEO_QUALITY_SORTS[sort]
+        return sorted(
+            merged,
+            key=lambda r: (r.get(key) is None, r.get(key) if r.get(key) is not None else 0.0),
         )
     if sort in ("focus_desc", "subject_desc"):
         # Video main-subject share (annotated by search_combined); rows without
@@ -1982,6 +2002,9 @@ def search_combined(
             on its share. Sort `subject_desc` ranks by it.
         Matching rows carry focus_share / focus_seconds / focus_people and
         subject_label / subject_share / subject_seconds.
+        sort='steadiest' / 'least_noisy' (step 7, ungated): video shake/noise
+            ascending, NULLs (unmeasured) last. Implies media=video. Matching
+            rows carry shake / noise (whichever is annotated).
     """
     from .date_parse import parse_date_from_query
     from .geocode import extract_location_from_query
@@ -2004,6 +2027,11 @@ def search_combined(
                 location = parsed_loc
                 effective_query = cleaned if cleaned else None
 
+    # steadiest / least_noisy (step 7) imply media=video — shake/noise only
+    # ever exist on a video row, so this overrides whatever media filter was
+    # passed, the same way focus_desc/subject_desc imply a person/subject.
+    if sort in _VIDEO_QUALITY_SORTS:
+        media = "video"
     media = normalize_media(media)
     media_keep = _media_keep(db, media)
     # The SQL-paginated paths take the same filter as a rowid predicate; it is
@@ -2474,6 +2502,26 @@ def search_combined(
                 r.update(focus_info[rid])
             if rid in subject_info:
                 r.update(subject_info[rid])
+
+    # Video quality (step 7): annotate shake/noise from video_meta onto the
+    # already-merged rows (`photos` itself has neither column) so _apply_sort
+    # can read them. Reads the whole measured set, ASC — video_meta is a few
+    # thousand rows at most, and ordering here lets the partial index
+    # (idx_video_meta_shake / idx_video_meta_noise) serve it directly instead
+    # of a scan + sort. Rows with no video_meta row, or a NULL value (not yet
+    # scanned, or a decode error), are simply never annotated — _apply_sort
+    # sorts a missing key last.
+    if sort in _VIDEO_QUALITY_SORTS:
+        col = _VIDEO_QUALITY_SORTS[sort]
+        quality_vals = {
+            r[0]: r[1] for r in db.conn.execute(
+                f"SELECT photo_id, {col} FROM video_meta WHERE {col} IS NOT NULL "
+                f"ORDER BY {col} ASC")
+        }
+        for r in merged:
+            v = quality_vals.get(_rid(r))
+            if v is not None:
+                r[col] = v
 
     # Back-compat: sort_quality=True overrides sort to quality_desc.
     # Prefer the explicit `sort` param in new callers.

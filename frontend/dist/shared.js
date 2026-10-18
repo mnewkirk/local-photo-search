@@ -470,6 +470,75 @@
     );
   };
 
+  // =========================================================================
+  // Video quality numbers (video-support step 7, D11). Always shown as plain
+  // NUMBERS with a display-only plain-language band — never written as a tag
+  // anywhere (that needs a holdout eval that hasn't run; see D11 in
+  // docs/plans/video-support.md). Reads `detail.video.quality`, already part
+  // of the PhotoModal's own /api/photos/{id} fetch — no extra network call.
+  // =========================================================================
+  // Bands are a rough, undocumented-elsewhere display heuristic (not derived
+  // from an eval) — purely to help a human read the raw number at a glance.
+  function _shakeBand(v) {
+    if (v == null) return null;
+    return v < 0.5 ? 'steady' : v < 2.0 ? 'some movement' : 'shaky';
+  }
+  function _noiseBand(v) {
+    if (v == null) return null;
+    return v < 3 ? 'clean' : v < 8 ? 'some noise' : 'noisy';
+  }
+  function _focusBand(v) {
+    if (v == null) return null;
+    return v >= 0.8 ? 'consistently sharp' : v >= 0.5 ? 'sometimes soft' : 'often soft';
+  }
+  function _qualityRow(label, value, decimals, band) {
+    return e('div', {
+      key: label,
+      style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginTop: 2 },
+    },
+      e('span', { style: { color: 'var(--text-muted)' } }, label),
+      e('span', null,
+        value == null ? '—' : value.toFixed(decimals) + (band ? '  (' + band + ')' : '')),
+    );
+  }
+
+  PS.VideoQualityBlock = function VideoQualityBlock(props) {
+    var q = props.quality;
+    if (!q) return null;
+    if (q.scan_error) {
+      return e('div', { className: 'detail-section' },
+        e('h3', null, 'Video quality'),
+        e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } },
+          'Could not be measured: ' + q.scan_error));
+    }
+    if (q.shake == null && q.noise == null && q.focus_consistency == null) {
+      return e('div', { className: 'detail-section' },
+        e('h3', null, 'Video quality'),
+        e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } },
+          'Not measured yet — the video-scan pass has not run on this clip.'));
+    }
+    var exp = q.exposure || {};
+    var hi = exp.highlight_frac, lo = exp.shadow_frac;
+    var expBand = (hi != null || lo != null)
+      ? (((hi || 0) > 0.05 || (lo || 0) > 0.05) ? 'some clipping' : 'well exposed')
+      : null;
+    return e('div', { className: 'detail-section' },
+      e('h3', null, 'Video quality'),
+      _qualityRow('Shake', q.shake, 2, _shakeBand(q.shake)),
+      _qualityRow('Noise', q.noise, 1, _noiseBand(q.noise)),
+      _qualityRow('Focus consistency',
+        q.focus_consistency != null ? q.focus_consistency * 100 : null, 0,
+        _focusBand(q.focus_consistency)),
+      (hi != null || lo != null) && e('div', {
+        style: { display: 'flex', justifyContent: 'space-between', fontSize: 12, marginTop: 2 },
+      },
+        e('span', { style: { color: 'var(--text-muted)' } }, 'Exposure clipping'),
+        e('span', null,
+          'highlights ' + Math.round((hi || 0) * 100) + '%, shadows ' + Math.round((lo || 0) * 100) + '%'
+          + (expBand ? '  (' + expBand + ')' : ''))),
+    );
+  };
+
   PS.PhotoModal = function PhotoModal(props) {
     var photo = props.photo;
     var externalDetail = props.detail || null;
@@ -1830,6 +1899,10 @@
           // Video main-subject timeline (step 6) — an audit tool, always on.
           isVideo && e(PS.VideoSubjectStrip, { key: 'subj-' + photo.id, photoId: photo.id, videoRef: videoRef }),
 
+          // Video quality numbers (step 7) — numbers only, no tags.
+          isVideo && e(PS.VideoQualityBlock, { key: 'vq-' + photo.id,
+                                               quality: detail && detail.video && detail.video.quality }),
+
           // Stack
           stackData && stackData.members && stackData.members.length > 1 && e('div', { className: 'detail-section' },
             e('h3', {
@@ -2562,6 +2635,8 @@
     day_quality_desc: { label: 'Best of day', icon: '\ud83d\udcc5' },  // \ud83d\udcc5 - per-day percentile
     focus_desc:   { label: 'Main subject',   icon: '\u25B6' },  // video: person's main-subject share
     subject_desc: { label: 'Subject share',  icon: '\u25B6' },  // video: subject label's share
+    steadiest:    { label: 'Steadiest',      icon: '\uD83C\uDFA5' },  // video: ascending shake
+    least_noisy:  { label: 'Least noisy',    icon: '\uD83C\uDFA5' },  // video: ascending noise
     name_asc:     { label: 'Name A\u2013Z',  icon: 'Az' },
   };
 
@@ -2865,6 +2940,20 @@
           var av = a[shareKey] != null ? a[shareKey] : -1;
           var bv = b[shareKey] != null ? b[shareKey] : -1;
           return bv - av;
+        });
+        break;
+      case 'steadiest':
+      case 'least_noisy':
+        // Video quality (server-annotated shake/noise); ascending, rows
+        // without a measured value last (never NULL-first — unmeasured is
+        // not "steadiest").
+        var qKey = sortKey === 'steadiest' ? 'shake' : 'noise';
+        sorted.sort(function (a, b) {
+          var av = a[qKey], bv = b[qKey];
+          if (av == null && bv == null) return 0;
+          if (av == null) return 1;
+          if (bv == null) return -1;
+          return av - bv;
         });
         break;
       case 'relevance':

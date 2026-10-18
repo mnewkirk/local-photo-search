@@ -624,6 +624,69 @@ def test_videos_only_scope_is_driven_from_the_partial_index(lib):
 
 
 # ---------------------------------------------------------------------------
+# Video quality sorts (video-support step 7): the shake/noise index + scope
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def quality_lib(lib):
+    """`lib` plus shake/noise on CLIP.MP4 (measured) — NEW.MOV stays
+    unmeasured (NULL), which is what proves "NULLs last"."""
+    db, _ = lib
+    clip = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'CLIP.MP4'").fetchone()[0]
+    db.conn.execute("UPDATE video_meta SET shake = 1.2, noise = 4.0 "
+                    "WHERE photo_id = ?", (clip,))
+    db.conn.commit()
+    return db, clip
+
+
+@pytest.mark.parametrize("sort,col,index", [
+    ("steadiest", "shake", "idx_video_meta_shake"),
+    ("least_noisy", "noise", "idx_video_meta_noise"),
+])
+def test_video_quality_sort_uses_the_partial_index(quality_lib, sort, col, index):
+    db, _ = quality_lib
+    stmts = _traced(db, lambda: search_combined(db, sort=sort))
+    plans = _plans_touching(db, stmts, f"FROM video_meta WHERE {col}")
+    assert plans
+    assert index in plans[0]
+    assert "SCAN video_meta" not in plans[0]
+
+
+def test_steadiest_sort_implies_media_video(quality_lib):
+    db, clip = quality_lib
+    stmts = _traced(db, lambda: search_combined(db, sort="steadiest"))
+    scope = [s for s in stmts
+             if s.startswith("SELECT * FROM photos WHERE media_type IS NOT NULL")]
+    assert len(scope) == 1
+    assert "idx_photos_media_video" in _plan(db, scope[0])
+
+
+VIDEO_QUALITY_COMBOS = [
+    dict(sort="steadiest"),
+    dict(sort="least_noisy"),
+    dict(sort="steadiest", camera="ILCE-7RM6"),
+    dict(sort="least_noisy", date_from="2026-09-26", date_to="2026-09-27"),
+    dict(sort="steadiest", media="photo"),  # overridden to video regardless
+    dict(sort="steadiest", person="Calvin"),
+]
+
+
+@pytest.mark.parametrize("kw", VIDEO_QUALITY_COMBOS, ids=lambda kw: ",".join(sorted(kw)))
+def test_video_quality_scoped_results_match_unscoped(quality_lib, monkeypatch, kw):
+    db, _ = quality_lib
+
+    def run():
+        page, total = search_combined(db, limit=100, with_total=True,
+                                      **{"sort": "date_desc", **kw})
+        return total, [p["id"] for p in page]  # order matters here
+
+    scoped = run()
+    monkeypatch.setattr(search_mod, "_SCOPE_MAX_IDS", -1)  # never scope
+    assert scoped == run()
+
+
+# ---------------------------------------------------------------------------
 # Video main-subject share (video-support step 6): composed scope + plans
 # ---------------------------------------------------------------------------
 
