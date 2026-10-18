@@ -1338,7 +1338,10 @@ def _search_by_date(db: PhotoDB, date_from: str, date_to: str, limit: int = 0) -
 # Allowed values for search_combined's `sort` param. Kept as a module
 # constant so callers (web.py, cli.py) and tests reference one list.
 SORT_MODES = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
-              "subject_aesthetic_desc", "day_quality_desc", "relevance")
+              "subject_aesthetic_desc", "day_quality_desc", "relevance",
+              # Video main-subject share (video-support step 6; the HTTP and
+              # tool surfaces gate them behind PHOTOSEARCH_VIDEO_SUBJECT_SHARE).
+              "focus_desc", "subject_desc")
 
 # Reciprocal Rank Fusion constant. Textbook default is 60 — smaller k
 # makes the top-ranked item in each filter dominate more; larger k
@@ -1473,6 +1476,17 @@ def _apply_sort(merged: list[dict], sort: str) -> list[dict]:
                            else (r.get("aes_overall_pct") or 0)),
             reverse=True,
         )
+    if sort in ("focus_desc", "subject_desc"):
+        # Video main-subject share (annotated by search_combined); rows without
+        # one sort last, ties broken by seconds as the subject.
+        pre = "focus" if sort == "focus_desc" else "subject"
+        return sorted(
+            merged,
+            key=lambda r: ((r.get(f"{pre}_share") if r.get(f"{pre}_share") is not None
+                            else -1.0),
+                           r.get(f"{pre}_seconds") or 0.0),
+            reverse=True,
+        )
     # Date sorts: split dated / undated so NULLs land at the tail.
     dated = [r for r in merged if r.get("date_taken")]
     undated = [r for r in merged if not r.get("date_taken")]
@@ -1555,7 +1569,8 @@ def _scope_clause(column: str, scope: Optional[list[int]]) -> tuple[str, list]:
 def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[str],
                    camera: Optional[str], person_ids: list[int],
                    match_source: Optional[str],
-                   videos_only: bool = False) -> Optional[list[int]]:
+                   videos_only: bool = False,
+                   subject_label: Optional[str] = None) -> Optional[list[int]]:
     """Ids of photos passing every index-backed structured filter, or None
     when there is nothing to compose or the result is too broad to help.
 
@@ -1564,12 +1579,20 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
     is driven from the first person's faces instead. `videos_only` (Media =
     Videos) is a rowid probe of the partial idx_photos_media_video set; with
     nothing else to compose, that set (a few thousand ids) IS the scope.
+    `subject_label` (an already-normalized video subject label, step 6) is
+    an `IN` probe of idx_video_subjects_label.
     """
-    if not (date_from or camera or person_ids or videos_only):
+    if not (date_from or camera or person_ids or videos_only or subject_label):
         return None
-    if videos_only and not (date_from or camera or person_ids):
-        ids = [r[0] for r in db.conn.execute(
-            VIDEO_IDS_SQL + " LIMIT ?", (_SCOPE_MAX_IDS + 1,))]
+    if not (date_from or camera or person_ids):
+        if subject_label:
+            ids = [r[0] for r in db.conn.execute(
+                f"SELECT DISTINCT photo_id FROM video_subjects WHERE label = ? "
+                f"AND photo_id IN ({VIDEO_IDS_SQL}) LIMIT ?",
+                (subject_label, _SCOPE_MAX_IDS + 1))]
+        else:
+            ids = [r[0] for r in db.conn.execute(
+                VIDEO_IDS_SQL + " LIMIT ?", (_SCOPE_MAX_IDS + 1,))]
         return None if len(ids) > _SCOPE_MAX_IDS else ids
     params: list = []
 
@@ -1593,6 +1616,9 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
         clauses.extend(person_exists("p.id", pid) for pid in person_ids)
         if videos_only:
             clauses.append(f"p.id IN ({VIDEO_IDS_SQL})")
+        if subject_label:
+            clauses.append(f"p.id IN ({_SUBJECT_IDS_SQL})")
+            params.append(subject_label)
         sql = "SELECT p.id FROM photos p WHERE " + " AND ".join(clauses)
     else:
         first, rest = person_ids[0], person_ids[1:]
@@ -1605,10 +1631,72 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
             sql += " AND " + person_exists("f0.photo_id", pid)
         if videos_only:
             sql += f" AND f0.photo_id IN ({VIDEO_IDS_SQL})"
+        if subject_label:
+            sql += f" AND f0.photo_id IN ({_SUBJECT_IDS_SQL})"
+            params.append(subject_label)
     sql += " LIMIT ?"
     params.append(_SCOPE_MAX_IDS + 1)
     ids = [r[0] for r in db.conn.execute(sql, params)]
     return None if len(ids) > _SCOPE_MAX_IDS else ids
+
+
+# ---------------------------------------------------------------------------
+# Video main-subject share (docs/plans/video-support.md step 6)
+# ---------------------------------------------------------------------------
+#
+# `video_subjects` holds one row per linked subject of a video with its
+# whole-clip `share` (D10) and `focus_s`. A PERSON's share is read through
+# faces.person_id at query time — summed over every subject row whose face
+# carries that person, exactly as GET /api/videos/{id}/subjects sums its
+# per-person totals — so a relabel in /faces moves the share with no
+# recompute. Non-person subjects match on the label normalized by
+# video_subjects.normalize_label (the pass stores normalized labels; the
+# query value is normalized the same way, so "the dog" finds "dog").
+
+_SUBJECT_IDS_SQL = "SELECT photo_id FROM video_subjects WHERE label = ?"
+
+# Driven from faces(person_id, photo_id), then one idx_video_subjects_face
+# probe per face — never a scan of faces.
+_PERSON_FOCUS_SQL = (
+    "SELECT f.photo_id AS pid, TOTAL(vs.share) AS share, "
+    "TOTAL(vs.focus_s) AS focus_s "
+    "FROM faces f JOIN video_subjects vs ON vs.face_id = f.id "
+    "WHERE f.person_id = ?")
+
+_SUBJECT_FOCUS_SQL = (
+    "SELECT vs.photo_id AS pid, TOTAL(vs.share) AS share, "
+    "TOTAL(vs.focus_s) AS focus_s FROM video_subjects vs WHERE vs.label = ?")
+
+
+def _person_focus(db: PhotoDB, person_id: int, match_source: Optional[str],
+                  scope: Optional[list[int]]) -> dict[int, tuple[float, float]]:
+    """{video id: (share, focus seconds)} for one person."""
+    sql, params = _PERSON_FOCUS_SQL, [person_id]
+    if match_source:
+        sql += " AND f.match_source = ?"
+        params.append(match_source)
+    scope_sql, scope_params = _scope_clause("f.photo_id", scope)
+    rows = db.conn.execute(sql + scope_sql + " GROUP BY f.photo_id",
+                           params + scope_params)
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def _subject_focus(db: PhotoDB, label: str,
+                   scope: Optional[list[int]]) -> dict[int, tuple[float, float]]:
+    """{video id: (share, focus seconds)} for one normalized subject label."""
+    scope_sql, scope_params = _scope_clause("vs.photo_id", scope)
+    rows = db.conn.execute(_SUBJECT_FOCUS_SQL + scope_sql + " GROUP BY vs.photo_id",
+                           [label] + scope_params)
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def _check_fraction(name: str, v) -> Optional[float]:
+    if v is None:
+        return None
+    v = float(v)
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"{name} is a fraction of the clip, 0-1 (got {v})")
+    return v
 
 
 def _hydrate(db: PhotoDB, narrow_rows: list[dict]) -> list[dict]:
@@ -1863,6 +1951,10 @@ def search_combined(
     min_day_aesthetic: Optional[float] = None,
     camera: Optional[str] = None,
     media: Optional[str] = None,
+    min_focus_share: Optional[float] = None,
+    min_focus_seconds: Optional[float] = None,
+    subject: Optional[str] = None,
+    min_subject_share: Optional[float] = None,
 ):
     """Run multiple search types and merge results.
 
@@ -1880,6 +1972,16 @@ def search_combined(
         media: 'all' (default: photos + playable videos — a paired Live Photo
             clip or an unreadable video is never shown), 'photo' (stills
             only) or 'video' (playable videos only). See db.media_filter_sql.
+        min_focus_share / min_focus_seconds: video main-subject floors for the
+            requested person(s) — the whole-clip share (0-1, D10) and the
+            seconds they were the segment's primary subject. Need a person
+            filter; restrict to videos. With several people, EACH must pass.
+            Sort `focus_desc` ranks by the share (the lowest person's).
+        subject / min_subject_share: a non-person video subject by label
+            ("the dog" -> "dog", video_subjects.normalize_label) and a floor
+            on its share. Sort `subject_desc` ranks by it.
+        Matching rows carry focus_share / focus_seconds / focus_people and
+        subject_label / subject_share / subject_seconds.
     """
     from .date_parse import parse_date_from_query
     from .geocode import extract_location_from_query
@@ -1942,15 +2044,37 @@ def search_combined(
         if named:
             scope_person_ids.append(named["id"])
     videos_only = media == "video"
+
+    # Video main-subject share (step 6). Both kinds only exist for videos.
+    min_focus_share = _check_fraction("min_focus_share", min_focus_share)
+    min_subject_share = _check_fraction("min_subject_share", min_subject_share)
+    if min_focus_seconds is not None and float(min_focus_seconds) < 0:
+        raise ValueError("min_focus_seconds must be >= 0")
+    focus_active = (min_focus_share is not None or min_focus_seconds is not None
+                    or sort == "focus_desc")
+    if focus_active and not (name_matched or person or person_ids):
+        raise ValueError("min_focus_share / min_focus_seconds / sort=focus_desc "
+                         "need a person filter")
+    subject_label = None
+    if subject or min_subject_share is not None or sort == "subject_desc":
+        from .video_subjects import normalize_label
+        subject_label = normalize_label(subject)
+        if not subject_label:
+            raise ValueError("min_subject_share / sort=subject_desc need a "
+                             "subject label (e.g. subject=dog)")
+    subject_active = subject_label is not None
+
     n_structured = (len(scope_person_ids) + bool(camera) + bool(date_from)
                     + bool(location) + bool(category) + bool(visual_tag)
-                    + bool(keyword) + videos_only)
+                    + bool(keyword) + videos_only + focus_active + subject_active)
     scope: Optional[list[int]] = None
     if n_structured >= 2:
         scope = _compose_scope(
             db, date_from=date_from, date_to=date_to, camera=camera,
             person_ids=list(dict.fromkeys(scope_person_ids)),
-            match_source=match_source, videos_only=videos_only)
+            match_source=match_source,
+            videos_only=videos_only or focus_active or subject_active,
+            subject_label=subject_label)
         if scope is not None:
             _log.info("SEARCH SCOPE  %d photos", len(scope))
 
@@ -2130,6 +2254,52 @@ def search_combined(
         result_sets.append({r["id"]: r for r in rows})
         ranks_per_set.append({r["id"]: i for i, r in enumerate(rows)})
 
+    # Video main-subject share: one result set per kind, plus the per-video
+    # numbers annotated onto the returned rows below.
+    focus_info: dict[int, dict] = {}
+    if focus_active:
+        pids = list(dict.fromkeys(scope_person_ids))
+        per = [_person_focus(db, pid, match_source, scope) for pid in pids]
+        names = {}
+        if pids:
+            ph = ",".join("?" * len(pids))
+            names = {r[0]: r[1] for r in db.conn.execute(
+                f"SELECT id, name FROM persons WHERE id IN ({ph})", pids)}
+        common = set(per[0]) if per else set()
+        for d in per[1:]:
+            common &= set(d)
+        for vid in common:
+            vals = [d[vid] for d in per]
+            if any((min_focus_share is not None and sh < min_focus_share)
+                   or (min_focus_seconds is not None and fs < float(min_focus_seconds))
+                   for sh, fs in vals):
+                continue
+            focus_info[vid] = {
+                "focus_share": round(min(sh for sh, _ in vals), 4),
+                "focus_seconds": round(min(fs for _, fs in vals), 3),
+                "focus_people": [{"person_id": pid, "name": names.get(pid),
+                                  "share": round(sh, 4), "focus_s": round(fs, 3)}
+                                 for pid, (sh, fs) in zip(pids, vals)],
+            }
+        ordered = sorted(focus_info, key=lambda v: -focus_info[v]["focus_share"])
+        rows = _fetch_photos(db, ordered)
+        result_sets.append({r["id"]: r for r in rows})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(rows)})
+
+    subject_info: dict[int, dict] = {}
+    if subject_active:
+        for vid, (sh, fs) in _subject_focus(db, subject_label, scope).items():
+            if min_subject_share is not None and sh < min_subject_share:
+                continue
+            subject_info[vid] = {"subject_label": subject_label,
+                                 "subject_share": round(sh, 4),
+                                 "subject_seconds": round(fs, 3)}
+        ordered = sorted(subject_info,
+                         key=lambda v: -subject_info[v]["subject_share"])
+        rows = _fetch_photos(db, ordered)
+        result_sets.append({r["id"]: r for r in rows})
+        ranks_per_set.append({r["id"]: i for i, r in enumerate(rows)})
+
     def _wrap(items: list[dict]):
         """Honor the caller's with_total + sort preferences on early-
         return paths. Pagination slicing happens here so these paths
@@ -2296,6 +2466,14 @@ def search_combined(
         merged = _filter_aesthetic(
             merged, min_aesthetic, min_technical, min_composition,
             min_impact, style_tag, min_subject_aesthetic, min_day_aesthetic)
+
+    if focus_info or subject_info:
+        for r in merged:
+            rid = _rid(r)
+            if rid in focus_info:
+                r.update(focus_info[rid])
+            if rid in subject_info:
+                r.update(subject_info[rid])
 
     # Back-compat: sort_quality=True overrides sort to quality_desc.
     # Prefer the explicit `sort` param in new callers.

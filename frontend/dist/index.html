@@ -641,6 +641,11 @@
         match_source: p.get('match_source') || '',
         camera: p.get('camera') || '',
         media: p.get('media') || '',
+        // Video main-subject share (step 6) — fractions in the URL, like the API.
+        min_focus_share: p.get('min_focus_share') || '',
+        min_focus_seconds: p.get('min_focus_seconds') || '',
+        subject: p.get('subject') || '',
+        min_subject_share: p.get('min_subject_share') || '',
         sort: p.get('sort') || '',
         ask: p.get('ask') || '',
         group_by: p.get('group_by') || '',
@@ -669,6 +674,15 @@
       const [cameraFilter, setCameraFilter] = useState(initParams.camera);
       // Media: '' (all: photos + playable videos) | 'photo' | 'video'.
       const [mediaFilter, setMediaFilter] = useState(initParams.media);
+      // Video main-subject share (video-support step 6). Percent in the UI,
+      // a 0-1 fraction on the wire. Hidden unless the server enables it
+      // (stats.video_subject_share — PHOTOSEARCH_VIDEO_SUBJECT_SHARE, D16).
+      const pctOf = (v) => (v === '' || v == null || isNaN(parseFloat(v)))
+        ? '' : String(Math.round(parseFloat(v) * 100));
+      const [focusSharePct, setFocusSharePct] = useState(pctOf(initParams.min_focus_share));
+      const [focusSeconds, setFocusSeconds] = useState(initParams.min_focus_seconds);
+      const [subjectFilter, setSubjectFilter] = useState(initParams.subject);
+      const [subjectSharePct, setSubjectSharePct] = useState(pctOf(initParams.min_subject_share));
       const [dateFrom, setDateFrom] = useState(initParams.date_from);
       const [dateTo, setDateTo] = useState(initParams.date_to);
       const [results, setResults] = useState(null);
@@ -719,6 +733,37 @@
       // Undefined until stats load — treat unknown as available so the button
       // doesn't flicker disabled on a normal replica load.
       const askDisabled = !!stats && stats.ask_available === false;
+      // Video subject-share controls exist only when the server says so.
+      const shareOn = !!stats && stats.video_subject_share === true;
+      const shareMediaOk = mediaFilter !== 'photo';
+      const focusOn = shareOn && shareMediaOk && !!personFilter;
+      const subjectOn = shareOn && shareMediaOk;
+      // Subject typeahead: the distinct labels, fetched once (server-cached).
+      const [subjectLabels, setSubjectLabels] = useState([]);
+      useEffect(() => {
+        if (!shareOn) return;
+        fetch(API + '/api/videos/subject-labels?limit=200')
+          .then(r => r.ok ? r.json() : { labels: [] })
+          .then(d => setSubjectLabels(d.labels || []))
+          .catch(() => {});
+      }, [shareOn]);
+      // The share params, as the API takes them; {} when hidden/empty.
+      const shareParams = useCallback(() => {
+        const out = {};
+        const frac = (v) => { const n = parseFloat(v); return isNaN(n) ? null : Math.min(1, Math.max(0, n / 100)); };
+        if (focusOn) {
+          const fs = frac(focusSharePct);
+          if (fs != null && focusSharePct !== '') out.min_focus_share = fs;
+          const sec = parseFloat(focusSeconds);
+          if (focusSeconds !== '' && !isNaN(sec)) out.min_focus_seconds = Math.max(0, sec);
+        }
+        if (subjectOn && (subjectFilter || '').trim()) {
+          out.subject = subjectFilter.trim();
+          const ss = frac(subjectSharePct);
+          if (ss != null && subjectSharePct !== '') out.min_subject_share = ss;
+        }
+        return out;
+      }, [focusOn, subjectOn, focusSharePct, focusSeconds, subjectFilter, subjectSharePct]);
       // A shared ?ask= URL opened against a backend-less server (the NAS) would
       // otherwise sit in Ask mode and fail on submit — fall back to Search.
       useEffect(() => {
@@ -947,7 +992,12 @@
         const mqVal = minQuality ? parseFloat(minQuality) : null;
         const maVal = minAesthetic ? parseFloat(minAesthetic) : null;
         const mdaVal = minDayAesthetic ? parseFloat(minDayAesthetic) : null;
-        if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter
+        const share = shareParams();
+        // A focus/subject sort is only valid while its filter is shown.
+        let sortVal = sortBy;
+        if (sortVal === 'focus_desc' && !focusOn) sortVal = 'date_desc';
+        if (sortVal === 'subject_desc' && !share.subject) sortVal = 'date_desc';
+        if (!query && !personFilter && !colorFilter && !locationFilter && !cameraFilter && !share.subject
             && mediaFilter !== 'video' && !dateFrom && !dateTo && mqVal == null && maVal == null && mdaVal == null && !matchSource
             && sortBy !== 'aesthetic_desc' && sortBy !== 'subject_aesthetic_desc') return null;
         const params = new URLSearchParams();
@@ -964,9 +1014,10 @@
         if (mdaVal != null && !isNaN(mdaVal)) params.set('min_day_aesthetic', mdaVal);
         if (sortQuality) params.set('sort_quality', 'true');
         if (matchSource) params.set('match_source', matchSource);
-        if (sortBy) params.set('sort', sortBy);
+        Object.keys(share).forEach(k => params.set(k, share[k]));
+        if (sortVal) params.set('sort', sortVal);
         return params;
-      }, [query, personFilter, colorFilter, minQuality, minAesthetic, minDayAesthetic, sortQuality, locationFilter, cameraFilter, mediaFilter, dateFrom, dateTo, matchSource, sortBy]);
+      }, [query, personFilter, colorFilter, minQuality, minAesthetic, minDayAesthetic, sortQuality, locationFilter, cameraFilter, mediaFilter, dateFrom, dateTo, matchSource, sortBy, shareParams, focusOn]);
 
       const doSearch = useCallback((ev) => {
         if (ev) ev.preventDefault();
@@ -1038,6 +1089,8 @@
         if (minAesthetic) askUrl.set('min_aesthetic', minAesthetic);
         if (minDayAesthetic) askUrl.set('min_day_aesthetic', minDayAesthetic);
         if (perDay) askUrl.set('per_day', perDay);
+        const askShare = shareParams();
+        Object.keys(askShare).forEach(k => askUrl.set(k, askShare[k]));
         if (sortQuality) askUrl.set('sort_quality', 'true');
         if (groupByAttr) askUrl.set('group_by', groupByAttr);
         window.history.pushState(null, '',
@@ -1073,6 +1126,7 @@
         if (minAesthetic) askFilters.min_aesthetic = parseFloat(minAesthetic);
         if (minDayAesthetic) askFilters.min_day_aesthetic = parseFloat(minDayAesthetic);
         if (perDay) askFilters.per_day = parseInt(perDay, 10);
+        Object.assign(askFilters, askShare);
         if (sortQuality) askFilters.sort = 'quality_desc';
 
         const askBody = { message: q, filters: askFilters };
@@ -1141,7 +1195,7 @@
           });
       }, [query, asking, personFilter, matchSource, colorFilter, locationFilter,
           cameraFilter, mediaFilter, dateFrom, dateTo, minQuality, minAesthetic, minDayAesthetic,
-          perDay, sortQuality, thinking, consolidatedSearch]);
+          perDay, sortQuality, thinking, consolidatedSearch, shareParams]);
 
       // Fetch the next page and append to existing results. Reuses the
       // same search params but bumps offset to results.length.
@@ -1170,14 +1224,17 @@
       useEffect(() => {
         if (hasAutoSearched.current) return;
         const p = getUrlParams();
+        // A deep link carrying a video subject-share filter waits for /api/stats
+        // (which says whether those filters are enabled) before searching.
+        if ((p.subject || p.min_focus_share || p.min_focus_seconds) && !stats) return;
         if (p.ask) {
           hasAutoSearched.current = true;
           runAsk();
-        } else if (p.q || p.person || p.color || p.location || p.camera || p.media === 'video' || p.date_from || p.date_to || p.min_quality || p.match_source) {
+        } else if (p.q || p.person || p.color || p.location || p.camera || p.media === 'video' || p.subject || p.date_from || p.date_to || p.min_quality || p.match_source) {
           hasAutoSearched.current = true;
           doSearch();
         }
-      }, [doSearch, runAsk]);
+      }, [doSearch, runAsk, stats]);
 
       // Re-fetch whenever the sort dropdown changes (but not on first
       // mount — the auto-search above handles the initial load). Sort
@@ -1429,6 +1486,44 @@
               e('option', { value: 'video' }, 'Videos'),
             ),
           ),
+          // Video main-subject share (step 6, flag-gated): how much of each
+          // video the selected person is the main subject of.
+          focusOn && e('div', { className: 'filter-group',
+                                title: 'Videos where ' + personFilter + ' is the MAIN SUBJECT for at least this share of the whole clip, and/or this many seconds (beta)' },
+            e('span', { className: 'filter-label' }, 'Main subject \u2265'),
+            e('input', {
+              className: 'filter-input', type: 'number', placeholder: '%',
+              value: focusSharePct, onChange: (ev) => setFocusSharePct(ev.target.value),
+              min: 0, max: 100, step: 5, style: { width: 58 },
+            }),
+            e('span', { className: 'filter-label' }, '% \u2265'),
+            e('input', {
+              className: 'filter-input', type: 'number', placeholder: 's',
+              value: focusSeconds, onChange: (ev) => setFocusSeconds(ev.target.value),
+              min: 0, step: 5, style: { width: 58 },
+            }),
+            e('span', { className: 'filter-label' }, 's'),
+          ),
+          subjectOn && e('div', { className: 'filter-group',
+                                  title: 'Videos whose main subject is this (a dog, a mountain lake …) for at least this share of the clip (beta)' },
+            e('span', { className: 'filter-label' }, 'Subject:'),
+            e('input', {
+              className: 'filter-input', type: 'text', placeholder: 'dog, waterfall…',
+              list: 'video-subject-labels',
+              value: subjectFilter, onChange: (ev) => setSubjectFilter(ev.target.value),
+              style: { width: 120 },
+            }),
+            e('datalist', { id: 'video-subject-labels' },
+              ...subjectLabels.map(l => e('option', { key: l.label, value: l.label },
+                                          l.label + ' (' + l.videos + ')'))),
+            e('span', { className: 'filter-label' }, '\u2265'),
+            e('input', {
+              className: 'filter-input', type: 'number', placeholder: '%',
+              value: subjectSharePct, onChange: (ev) => setSubjectSharePct(ev.target.value),
+              min: 0, max: 100, step: 5, style: { width: 58 },
+            }),
+            e('span', { className: 'filter-label' }, '%'),
+          ),
           e('div', { className: 'filter-group' },
             e('span', { className: 'filter-label' }, 'From:'),
             e('input', {
@@ -1534,7 +1629,9 @@
             ),
           ),
           stats && e('div', { className: 'stats-bar' },
-            stats.photos + ' photos indexed · ' +
+            (stats.videos != null
+              ? (stats.photos - stats.videos) + ' photos + ' + stats.videos + ' videos indexed · '
+              : stats.photos + ' photos indexed · ') +
             stats.described + ' described · ' +
             (stats.quality_scored || 0) + ' scored' +
             (stats.quality_stats ? ' (' + stats.quality_stats.min + '–' + stats.quality_stats.max + ')' : '')
@@ -1672,7 +1769,9 @@
             e(PhotoGrid, { results: askMode ? results : PS.applySortOrder(results, sortBy),
                            sortBy: askMode ? null : sortBy,
                            setSortBy: askMode ? null : setSortBy,
-                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc', 'day_quality_desc'],
+                           sortOptions: ['relevance', 'date_desc', 'date_asc', 'quality_desc', 'subject_aesthetic_desc', 'day_quality_desc']
+                             .concat(focusOn ? ['focus_desc'] : [])
+                             .concat(subjectOn && (subjectFilter || '').trim() ? ['subject_desc'] : []),
                            // Ask uses tool-driven grouping (ordered labels); structured
                            // search uses the client-side "Group by" control. In Ask mode a
                            // "Group by" selection is a fallback when no tool grouped.
@@ -1928,6 +2027,7 @@
           e('span', { className: 'filename' }, photo.filename),
           e('span', { style: { float: 'right', display: 'flex', gap: 8, alignItems: 'center' } },
             PS.cameraBadge(photo, { style: { fontSize: 11 } }),
+            PS.subjectShareBadge(photo),
             PS.aestheticBadge(photo),
             photo.score != null && e('span', { className: 'score' }, photo.score.toFixed(3)),
           ),

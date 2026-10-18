@@ -733,6 +733,12 @@
         e('img', { src: API + '/api/faces/crop/' + f.face_id + '?size=120', loading: 'lazy' }),
         e('span', { className: 'dist-badge' }, hasDist ? f.dist.toFixed(2) : '—'),
         f.dup_group != null && e('span', { className: 'dup-badge', title: 'duplicate of another face' }, 'dup'),
+        // A face from a video (video-scan identity): its crop is one keyframe.
+        f.media_type === 'video' && e('span', {
+          className: 'video-face-badge', title: 'From a video (photo ' + f.photo_id + ')',
+          style: { position: 'absolute', left: 3, bottom: 3, padding: '0 5px', borderRadius: 8,
+                   fontSize: 10, background: 'rgba(0,0,0,0.7)', color: '#fff', pointerEvents: 'none' },
+        }, '\u25B6 video'),
         e('span', { className: 'checkmark' }, '✓'),
       );
     }

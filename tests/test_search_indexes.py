@@ -621,3 +621,80 @@ def test_videos_only_scope_is_driven_from_the_partial_index(lib):
     assert len(scope) == 1
     plan = _plan(db, scope[0])
     assert "idx_photos_camera_date" in plan and "idx_photos_media_video" in plan
+
+
+# ---------------------------------------------------------------------------
+# Video main-subject share (video-support step 6): composed scope + plans
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def subj_lib(lib):
+    db, ids = lib
+    clip = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'CLIP.MP4'").fetchone()[0]
+    calvin = db.get_person_by_name("Calvin")["id"]
+    fid = db.add_face(clip, (0, 10, 10, 0), [], person_id=calvin)
+    db.conn.execute("UPDATE faces SET match_source = 'strict' WHERE id = ?", (fid,))
+    for ix, label, cat, face, share in ((0, "person", "person", fid, 0.6),
+                                        (1, "dog", "animal", None, 0.3)):
+        db.conn.execute(
+            "INSERT INTO video_subjects (photo_id, subject_ix, label, category, "
+            "face_id, focus_s, share) VALUES (?,?,?,?,?,?,?)",
+            (clip, ix, label, cat, face, share * 42.0, share))
+    db.conn.commit()
+    return db, clip
+
+
+SUBJECT_COMBOS = [
+    dict(person="Calvin", min_focus_share=0.5),
+    dict(person="Calvin", min_focus_share=0.5, date_from="2026-09-26",
+         date_to="2026-09-26"),
+    dict(person="Calvin", min_focus_seconds=10, camera="ILCE-7RM6"),
+    dict(person="Calvin", match_source="strict", sort="focus_desc",
+         location="Marin County"),
+    dict(subject="the dog"),
+    dict(subject="dog", date_from="2026-09-26", date_to="2026-09-27"),
+    dict(subject="dog", min_subject_share=0.2, camera="ILCE-7RM6"),
+    dict(subject="dog", person="Calvin", min_focus_share=0.1),
+    dict(subject="dog", keyword="soccer", sort="subject_desc"),
+    dict(subject="cat", camera="ILCE-7RM6"),
+]
+
+
+@pytest.mark.parametrize("kw", SUBJECT_COMBOS, ids=lambda kw: ",".join(sorted(kw)))
+def test_subject_share_scoped_results_match_unscoped(subj_lib, monkeypatch, kw):
+    db, clip = subj_lib
+
+    def run():
+        page, total = search_combined(db, limit=100, with_total=True,
+                                      **{"sort": "date_desc", **kw})
+        return total, sorted(p["id"] for p in page)
+
+    scoped = run()
+    monkeypatch.setattr(search_mod, "_SCOPE_MAX_IDS", -1)  # never scope
+    assert scoped == run()
+    if kw.get("subject") != "cat":
+        assert scoped[1] == [clip]
+
+
+def test_person_share_is_driven_from_the_faces_index(subj_lib):
+    db, _ = subj_lib
+    stmts = _traced(db, lambda: search_combined(
+        db, person="Calvin", min_focus_share=0.5, date_from="2026-09-26"))
+    plans = _plans_touching(db, stmts, "JOIN video_subjects")
+    assert plans
+    for plan in plans:
+        assert "SCAN f " not in plan + " " and "SCAN faces" not in plan, plan
+        assert "idx_video_subjects_face" in plan and "idx_faces_person" in plan, plan
+
+
+def test_subject_share_and_its_scope_use_the_label_index(subj_lib):
+    db, _ = subj_lib
+    stmts = _traced(db, lambda: search_combined(
+        db, subject="dog", camera="ILCE-7RM6", date_from="2026-09-26"))
+    label_stmts = [s for s in stmts if "video_subjects" in s]
+    assert len(label_stmts) >= 2  # the composed scope and the share query
+    for s in label_stmts:
+        assert "idx_video_subjects_label" in _plan(db, s), s
+    scope = [s for s in stmts if s.startswith("SELECT p.id FROM photos p")]
+    assert len(scope) == 1 and "idx_photos_camera_date" in _plan(db, scope[0])

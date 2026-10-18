@@ -127,6 +127,49 @@ def _visible(spec: ToolSpec, include_images: bool, include_writes: bool,
     return True
 
 
+def _gate_schema(parameters: dict) -> dict:
+    """A tool's advertised schema. While PHOTOSEARCH_VIDEO_SUBJECT_SHARE is
+    off (video-support step 6, D16) the video main-subject props and sorts
+    are removed, so the model is never offered a filter the eval has not
+    cleared; the handlers ignore them too (`_share_args`)."""
+    from .features import (VIDEO_SHARE_PARAMS, VIDEO_SHARE_SORTS,
+                           video_subject_share_enabled)
+    props = parameters.get("properties") or {}
+    if video_subject_share_enabled() or not (
+            set(props) & set(VIDEO_SHARE_PARAMS)
+            or set((props.get("sort") or {}).get("enum") or ()) & set(VIDEO_SHARE_SORTS)):
+        return parameters
+    out = dict(parameters)
+    out["properties"] = {k: v for k, v in props.items() if k not in VIDEO_SHARE_PARAMS}
+    sort = out["properties"].get("sort")
+    if sort and sort.get("enum"):
+        out["properties"]["sort"] = {
+            **sort, "enum": [x for x in sort["enum"] if x not in VIDEO_SHARE_SORTS]}
+    return out
+
+
+def _share_args(args: dict) -> dict:
+    """The video main-subject args a tool call may use: {} while the flag is
+    off (a model cannot know about them; a stray one is ignored, not an
+    error), else the cleaned values."""
+    from .features import video_subject_share_enabled
+    if not video_subject_share_enabled():
+        return {}
+    out: dict = {}
+    for k in ("min_focus_share", "min_subject_share"):
+        v = _opt_float(args.get(k))
+        if v is not None:
+            # A model may say 50 meaning 50%; the API is a 0-1 fraction.
+            out[k] = v / 100.0 if 1.0 < v <= 100.0 else v
+    v = _opt_float(args.get("min_focus_seconds"))
+    if v is not None and v >= 0:
+        out["min_focus_seconds"] = v
+    s = (args.get("subject") or "").strip() if isinstance(args.get("subject"), str) else ""
+    if s:
+        out["subject"] = s
+    return out
+
+
 def _resolve_consolidated(consolidated: Optional[bool]) -> bool:
     return consolidated_search_enabled() if consolidated is None else consolidated
 
@@ -149,7 +192,7 @@ def openai_tools(include_images: bool = True, include_writes: bool = False,
             "function": {
                 "name": spec.name,
                 "description": spec.description,
-                "parameters": spec.parameters,
+                "parameters": _gate_schema(spec.parameters),
             },
         })
     return out
@@ -169,7 +212,7 @@ def mcp_tools(include_images: bool = True, include_writes: bool = False,
         out.append({
             "name": spec.name,
             "description": spec.description,
-            "inputSchema": spec.parameters,
+            "inputSchema": _gate_schema(spec.parameters),
         })
     return out
 
@@ -253,7 +296,7 @@ def _json_array(raw: Optional[str]) -> list:
 def _compact_hit(photo: dict) -> dict:
     """The per-result shape handed to the model — small on purpose."""
     pid = photo.get("id") or photo.get("photo_id")
-    return {
+    hit = {
         "id": pid,
         "filename": photo.get("filename"),
         "date_taken": photo.get("date_taken"),
@@ -268,6 +311,12 @@ def _compact_hit(photo: dict) -> dict:
                  else photo.get("score"),
         "thumbnail_url": f"/api/photos/{pid}/thumbnail" if pid else None,
     }
+    # Video main-subject share, present only when that filter/sort ran.
+    for k in ("focus_share", "focus_seconds", "subject_label", "subject_share",
+              "subject_seconds"):
+        if photo.get(k) is not None:
+            hit[k] = photo[k]
+    return hit
 
 
 def _resolve_person_names(db: PhotoDB, names: list[str]) -> tuple[list[int], list[str]]:
@@ -569,6 +618,27 @@ _CURATION_FILTER_PROPS = {
                               "use a value returned by list_vocab(kind='style_tags') — "
                               "the pass has not run on every library, and an unlisted "
                               "value matches ZERO photos."},
+    # Video main-subject share (video-support step 6). Advertised only while
+    # PHOTOSEARCH_VIDEO_SUBJECT_SHARE is on (_gate_schema). These match
+    # VIDEOS ONLY: on the curation/book tools (stills by default) using one
+    # switches that call to videos.
+    "min_focus_share": {"type": "number", "minimum": 0, "maximum": 1,
+               "description": "VIDEOS: the named `people` must be the MAIN SUBJECT "
+                              "of the clip for at least this fraction of its whole "
+                              "running time, 0-1 (0.5 = half the video). Needs "
+                              "`people`. For 'videos mostly of Calvin'."},
+    "min_focus_seconds": {"type": "number", "minimum": 0,
+               "description": "VIDEOS: the named `people` must be the main subject "
+                              "for at least this many seconds — the natural bar on "
+                              "a long video ('at least 2 minutes of Calvin' = 120). "
+                              "Needs `people`."},
+    "subject": {"type": "string",
+               "description": "VIDEOS: a non-person main subject by label, e.g. "
+                              "'dog', 'mountain lake', 'waterfall'. Not for people "
+                              "(use `people`)."},
+    "min_subject_share": {"type": "number", "minimum": 0, "maximum": 1,
+               "description": "VIDEOS: with `subject`, the fraction of the clip (0-1) "
+                              "that subject must be the main subject for."},
 }
 
 _COLUMN_CACHE: dict = {}
@@ -589,7 +659,9 @@ def _has_column(db, col: str) -> bool:
 
 
 _VALID_SORTS = ("date_desc", "date_asc", "quality_desc", "aesthetic_desc",
-                "day_quality_desc", "relevance", "subject")
+                "day_quality_desc", "relevance", "subject",
+                # Video main-subject share (step 6, flag-gated by _gate_schema).
+                "focus_desc", "subject_desc")
 
 
 def _subject_ranked_search(db: PhotoDB, args: dict, person_ids: list, limit: int) -> dict:
@@ -647,6 +719,35 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         return _subject_ranked_search(db, args, person_ids, limit)
     sort = raw_sort if raw_sort in _VALID_SORTS and raw_sort != "subject" else None
 
+    # Video main-subject share (step 6): {} while the flag is off. A floor
+    # the call cannot satisfy (a person share with no `people`, a subject
+    # sort with no `subject`) is dropped with a note, not a failure.
+    share = _share_args(args)
+    share_notes = []
+    if not share and sort in ("focus_desc", "subject_desc"):
+        from .features import video_subject_share_enabled
+        if not video_subject_share_enabled():
+            sort = None
+    if not person_ids:
+        dropped = [k for k in ("min_focus_share", "min_focus_seconds") if k in share]
+        for k in dropped:
+            share.pop(k)
+        if sort == "focus_desc":
+            dropped.append("sort=focus_desc")
+            sort = None
+        if dropped:
+            share_notes.append(f"{', '.join(dropped)} ignored: needs `people`.")
+    if "subject" not in share:
+        dropped = []
+        if "min_subject_share" in share:
+            share.pop("min_subject_share")
+            dropped.append("min_subject_share")
+        if sort == "subject_desc":
+            dropped.append("sort=subject_desc")
+            sort = None
+        if dropped:
+            share_notes.append(f"{', '.join(dropped)} ignored: needs `subject`.")
+
     # If the model asked for people that don't exist, don't silently run an
     # unfiltered search — return the miss so it can correct via list_people.
     if people and not person_ids:
@@ -690,6 +791,7 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         limit=limit,
         with_total=True,
         media=_tool_media(args.get("media")),
+        **share,
     )
 
     # Face-framing filters don't flow through search_combined, so post-filter
@@ -714,6 +816,8 @@ def _h_search_photos(db: PhotoDB, args: dict) -> dict:
         out["face_filtered"] = True
     if unresolved:
         out["unresolved_people"] = unresolved
+    if share_notes:
+        out["note"] = " ".join(share_notes)
     return out
 
 
@@ -914,6 +1018,11 @@ def _build_filter_sql(db, args: dict, default_media: str = "photo") -> tuple[str
     params: list = []
 
     from .db import media_filter_sql
+    # A video main-subject filter (step 6, flag-gated) asks for videos, so it
+    # overrides a stills-only default rather than matching nothing.
+    share = _share_args(args)
+    if share and not args.get("media") and default_media == "photo":
+        default_media = "video"
     media = _tool_media(args["media"]) if args.get("media") else default_media
     media_frag = media_filter_sql(media, "photos.id")
     if media_frag:
@@ -1003,6 +1112,26 @@ def _build_filter_sql(db, args: dict, default_media: str = "photo") -> tuple[str
     if st and _has_column(db, "aes_style_tags"):
         clauses.append("aes_style_tags LIKE ?")
         params.append(f'%"{st}"%')
+
+    # Video main-subject share — same semantics as search_combined: a
+    # person's share is summed over their video_subjects rows via
+    # faces.person_id (so a relabel moves it), EACH named person must pass,
+    # and a subject label is normalized like the stored ones.
+    mfs, mfsec = share.get("min_focus_share"), share.get("min_focus_seconds")
+    if (mfs is not None or mfsec is not None) and person_ids:
+        for pid in person_ids:
+            clauses.append(
+                "photos.id IN (SELECT f.photo_id FROM faces f JOIN video_subjects vs "
+                "ON vs.face_id = f.id WHERE f.person_id = ? GROUP BY f.photo_id "
+                "HAVING TOTAL(vs.share) >= ? AND TOTAL(vs.focus_s) >= ?)")
+            params.extend([pid, mfs or 0.0, mfsec or 0.0])
+    if share.get("subject"):
+        from .video_subjects import normalize_label
+        clauses.append(
+            "photos.id IN (SELECT vs.photo_id FROM video_subjects vs WHERE vs.label = ? "
+            "GROUP BY vs.photo_id HAVING TOTAL(vs.share) >= ?)")
+        params.extend([normalize_label(share["subject"]),
+                       share.get("min_subject_share") or 0.0])
 
     # Pure-metadata face-framing filters: "only these people in frame" and
     # "nobody cropped at the edge". Appended last so their params line up.

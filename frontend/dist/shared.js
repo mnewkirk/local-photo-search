@@ -307,6 +307,169 @@
   //   onDetailLoaded   — callback when detail is fetched (for pages that need it)
   //   onDetailChanged  — callback when detail changes locally (face edits)
 
+  // =========================================================================
+  // Video subject strip (video-support step 6) — the owner's audit view of
+  // the main-subject metric. Always shown on a video (not flag-gated, D16):
+  // a timeline of segments coloured by primary subject, a legend, and per-
+  // person presence + focus bars. Click anywhere to seek the <video>.
+  // Data: GET /api/videos/{id}/subjects (names read through faces.person_id).
+  // =========================================================================
+  var SUBJECT_COLORS = ['#60a5fa', '#f472b6', '#34d399', '#fbbf24', '#a78bfa',
+                        '#f87171', '#22d3ee', '#a3e635', '#fb923c', '#e879f9'];
+  var NO_SUBJECT_COLOR = 'rgba(148,163,184,0.25)';
+
+  PS.subjectColor = function (ix) {
+    if (ix == null) return NO_SUBJECT_COLOR;
+    return SUBJECT_COLORS[Math.abs(ix) % SUBJECT_COLORS.length];
+  };
+
+  PS.VideoSubjectStrip = function VideoSubjectStrip(props) {
+    var photoId = props.photoId;
+    var videoRef = props.videoRef;
+    var _d = useState(null); var data = _d[0]; var setData = _d[1];
+    var _err = useState(''); var err = _err[0]; var setErr = _err[1];
+    var _t = useState(null); var now = _t[0]; var setNow = _t[1];
+
+    useEffect(function () {
+      setData(null); setErr('');
+      if (!photoId) return;
+      var dead = false;
+      fetch(API + '/api/videos/' + photoId + '/subjects')
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function (d) { if (!dead) setData(d); })
+        .catch(function (ex) { if (!dead) setErr(ex.message || String(ex)); });
+      return function () { dead = true; };
+    }, [photoId]);
+
+    // Playhead: follow the <video>'s clock.
+    useEffect(function () {
+      var v = videoRef && videoRef.current;
+      if (!v) return;
+      var tick = function () { setNow(v.currentTime); };
+      v.addEventListener('timeupdate', tick);
+      v.addEventListener('seeked', tick);
+      return function () {
+        v.removeEventListener('timeupdate', tick);
+        v.removeEventListener('seeked', tick);
+      };
+    }, [videoRef, data]);
+
+    var heading = e('h3', null, 'Main subject ',
+      e('span', { style: { fontSize: 10, padding: '1px 6px', borderRadius: 8, marginLeft: 4,
+                           background: 'var(--surface2)', color: 'var(--text-muted)',
+                           border: '1px solid var(--border)', verticalAlign: 'middle' } }, 'beta'));
+    if (err) return e('div', { className: 'detail-section' }, heading,
+      e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } }, 'Could not load subjects: ' + err));
+    if (!data) return e('div', { className: 'detail-section' }, heading,
+      e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } }, 'Loading…'));
+    if (data.subjects_version == null) return e('div', { className: 'detail-section' }, heading,
+      e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } },
+        'Not analysed yet — the video-subjects pass has not run on this clip.'));
+
+    var dur = data.duration || 0;
+    if (!dur && data.segments && data.segments.length) dur = data.segments[data.segments.length - 1].end;
+    var pct = function (t) { return dur ? Math.max(0, Math.min(100, 100 * t / dur)) : 0; };
+    var seek = function (t) {
+      var v = videoRef && videoRef.current;
+      if (!v || t == null || isNaN(t)) return;
+      try { v.currentTime = Math.max(0, t); } catch (_) {}
+    };
+    var seekFromEvent = function (ev) {
+      var r = ev.currentTarget.getBoundingClientRect();
+      if (!r.width || !dur) return;
+      seek(dur * (ev.clientX - r.left) / r.width);
+    };
+    var fmt = function (t) { return PS.formatDuration(t) || '0:00'; };
+    var bySix = {};
+    (data.subjects || []).forEach(function (s) { bySix[s.ix] = s; });
+
+    var playhead = (now != null && dur) && e('div', {
+      style: { position: 'absolute', top: -2, bottom: -2, width: 2, left: 'calc(' + pct(now) + '% - 1px)',
+               background: '#fff', boxShadow: '0 0 2px #000', pointerEvents: 'none' } });
+
+    var track = function (intervals, color, height, title) {
+      return e('div', {
+        title: title, onClick: seekFromEvent,
+        style: { position: 'relative', height: height, borderRadius: 3, cursor: 'pointer',
+                 background: 'rgba(148,163,184,0.12)', overflow: 'hidden' },
+      }, (intervals || []).map(function (iv, i) {
+        var a = iv[0], b = iv[1];
+        return e('div', { key: i, style: { position: 'absolute', top: 0, bottom: 0,
+          left: pct(a) + '%', width: Math.max(0.5, pct(b) - pct(a)) + '%', background: color } });
+      }));
+    };
+
+    // Timeline of primaries (merged runs).
+    var runs = data.timeline && data.timeline.length ? data.timeline
+      : (data.segments || []).map(function (sg) {
+          var s2 = sg.subject_ix != null ? bySix[sg.subject_ix] : null;
+          return { start: sg.start, end: sg.end, subject_ix: sg.subject_ix, display: s2 ? s2.display : null };
+        });
+    var timeline = e('div', {
+      onClick: seekFromEvent,
+      style: { position: 'relative', height: 22, borderRadius: 4, cursor: 'pointer',
+               background: NO_SUBJECT_COLOR, marginTop: 4 },
+    },
+      runs.map(function (r, i) {
+        var lab = r.display || 'no subject';
+        return e('div', {
+          key: i,
+          title: fmt(r.start) + '–' + fmt(r.end) + '  ' + lab,
+          style: { position: 'absolute', top: 0, bottom: 0, left: pct(r.start) + '%',
+                   width: Math.max(0.5, pct(r.end) - pct(r.start)) + '%',
+                   background: PS.subjectColor(r.subject_ix),
+                   borderRight: '1px solid rgba(0,0,0,0.35)' },
+        });
+      }),
+      playhead,
+    );
+
+    // Legend: every subject (biggest share first) plus "no subject".
+    var subs = (data.subjects || []).slice().sort(function (a, b) { return (b.share || 0) - (a.share || 0); });
+    var legend = e('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 10px', marginTop: 6, fontSize: 12 } },
+      subs.map(function (s2) {
+        return e('span', {
+          key: s2.ix, style: { display: 'inline-flex', alignItems: 'center', gap: 4, cursor: s2.rep_t != null ? 'pointer' : 'default' },
+          title: (s2.category || '') + (s2.n_segments != null ? ', ' + s2.n_segments + ' segment(s)' : '')
+                 + (s2.rep_t != null ? ' — click to see it' : ''),
+          onClick: function () { if (s2.rep_t != null) seek(s2.rep_t); },
+        },
+          e('span', { style: { width: 10, height: 10, borderRadius: 2, background: PS.subjectColor(s2.ix), display: 'inline-block' } }),
+          (s2.display || s2.label || '?') + ' ' + Math.round((s2.share || 0) * 100) + '%'
+            + (s2.focus_s != null ? ' (' + Math.round(s2.focus_s) + ' s)' : ''));
+      }),
+      e('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' } },
+        e('span', { style: { width: 10, height: 10, borderRadius: 2, background: NO_SUBJECT_COLOR, display: 'inline-block' } }),
+        'no subject'),
+    );
+
+    // Per-person rows: dense face-track presence above, main-subject focus below.
+    var personRows = subs.filter(function (s2) { return s2.face_id != null; }).map(function (s2) {
+      var col = PS.subjectColor(s2.ix);
+      return e('div', { key: 'p' + s2.ix, style: { marginTop: 6 } },
+        e('div', { style: { fontSize: 12, display: 'flex', justifyContent: 'space-between', gap: 6 } },
+          e('span', { style: { fontWeight: 600 } }, s2.display),
+          e('span', { style: { color: 'var(--text-muted)' } },
+            'subject ' + Math.round((s2.share || 0) * 100) + '% · '
+            + Math.round(s2.focus_s || 0) + ' s'
+            + (s2.presence_s != null ? ' · present ' + Math.round(s2.presence_s) + ' s' : ''))),
+        track(s2.presence_intervals, col + '66', 6, 'Present (face tracked) — click to seek'),
+        e('div', { style: { height: 2 } }),
+        track(s2.focus_intervals, col, 6, 'Main subject — click to seek'));
+    });
+
+    return e('div', { className: 'detail-section' },
+      heading,
+      e('div', { style: { fontSize: 11, color: 'var(--text-muted)' } },
+        'Share of the whole clip (' + fmt(dur) + ')' + (data.model ? ' · ' + data.model : '')),
+      timeline,
+      e('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' } },
+        e('span', null, '0:00'), e('span', null, fmt(dur))),
+      legend,
+      personRows.length > 0 && e('div', { style: { marginTop: 4 } }, personRows),
+    );
+  };
+
   PS.PhotoModal = function PhotoModal(props) {
     var photo = props.photo;
     var externalDetail = props.detail || null;
@@ -337,6 +500,8 @@
     // Videos (video-support step 2): played with <video>, no face overlays.
     var isVideo = PS.isVideo(photo) || PS.isVideo(detail);
     var videoPlayable = !isVideo || PS.videoBrowserPlayable(detail || photo);
+    // The subject strip seeks this element (video-support step 6).
+    var videoRef = useRef(null);
 
     useEffect(function () {
       if (!fetchDetailProp || !photo) return;
@@ -1568,6 +1733,7 @@
           isVideo && videoPlayable
             ? e('video', {
                 key: 'video-' + photo.id,
+                ref: videoRef,
                 src: API + '/api/photos/' + photo.id + '/full',
                 poster: API + '/api/photos/' + photo.id + '/preview',
                 controls: true,
@@ -1657,6 +1823,9 @@
               total > 1 && e('span', { style: { color: 'var(--text-muted)', fontSize: 13 } }, (index + 1) + ' / ' + total),
             ),
           ),
+
+          // Video main-subject timeline (step 6) — an audit tool, always on.
+          isVideo && e(PS.VideoSubjectStrip, { key: 'subj-' + photo.id, photoId: photo.id, videoRef: videoRef }),
 
           // Stack
           stackData && stackData.members && stackData.members.length > 1 && e('div', { className: 'detail-section' },
@@ -2388,6 +2557,8 @@
     aesthetic_desc: { label: 'Best aesthetics', icon: '\u2728' },  // sparkle - VLM percentile
     subject_aesthetic_desc: { label: 'Best subject', icon: '\ud83d\udfe2' },  // \ud83d\udfe2 - subject-crop percentile
     day_quality_desc: { label: 'Best of day', icon: '\ud83d\udcc5' },  // \ud83d\udcc5 - per-day percentile
+    focus_desc:   { label: 'Main subject',   icon: '\u25B6' },  // video: person's main-subject share
+    subject_desc: { label: 'Subject share',  icon: '\u25B6' },  // video: subject label's share
     name_asc:     { label: 'Name A\u2013Z',  icon: 'Az' },
   };
 
@@ -2499,6 +2670,35 @@
         pointerEvents: 'none',
       }, opts.style || {}),
     }, d ? '\u25B6 ' + d : '\u25B6');
+  };
+
+  // "Calvin 63%" / "dog 90%" on a search card, when the video subject-share
+  // filter or sort annotated the row (video-support step 6). null otherwise.
+  PS.subjectShareBadge = function (photo, opts) {
+    if (!photo) return null;
+    opts = opts || {};
+    var bits = [];
+    if (photo.focus_share != null) {
+      var people = photo.focus_people || [];
+      if (people.length) {
+        people.forEach(function (p) {
+          bits.push((p.name || 'person') + ' ' + Math.round((p.share || 0) * 100) + '%');
+        });
+      } else {
+        bits.push(Math.round(photo.focus_share * 100) + '%');
+      }
+    }
+    if (photo.subject_share != null) {
+      bits.push((photo.subject_label || 'subject') + ' ' + Math.round(photo.subject_share * 100) + '%');
+    }
+    if (!bits.length) return null;
+    var secs = photo.focus_seconds != null ? photo.focus_seconds : photo.subject_seconds;
+    return e('span', {
+      className: 'subject-share-badge',
+      title: 'Main subject of the video' + (secs != null ? ' for ' + Math.round(secs) + ' s' : '')
+             + ' (share of the whole clip; beta)',
+      style: Object.assign({ color: '#facc15', whiteSpace: 'nowrap', fontSize: 11 }, opts.style || {}),
+    }, '\u25B6 ' + bits.join(' \u00b7 '));
   };
 
   PS.cameraLabel = function (photo) {
@@ -2652,6 +2852,16 @@
       case 'name_asc':
         sorted.sort(function (a, b) {
           return (a.filename || '').localeCompare(b.filename || '');
+        });
+        break;
+      case 'focus_desc':
+      case 'subject_desc':
+        // Video main-subject share (server-annotated); rows without one last.
+        var shareKey = sortKey === 'focus_desc' ? 'focus_share' : 'subject_share';
+        sorted.sort(function (a, b) {
+          var av = a[shareKey] != null ? a[shareKey] : -1;
+          var bv = b[shareKey] != null ? b[shareKey] : -1;
+          return bv - av;
         });
         break;
       case 'relevance':

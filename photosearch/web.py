@@ -444,6 +444,15 @@ def api_search(
     camera: Optional[str] = Query(None, description="Filter by exact camera_model"),
     media: Optional[str] = Query(None, description="Media: all (default; photos + "
                                  "playable videos), photo, or video"),
+    min_focus_share: Optional[float] = Query(None, ge=0, le=1, description=(
+        "Video main-subject share floor for the person filter, 0-1 of the whole "
+        "clip (needs PHOTOSEARCH_VIDEO_SUBJECT_SHARE)")),
+    min_focus_seconds: Optional[float] = Query(None, ge=0, description=(
+        "Seconds the person was the video's main subject (needs the flag)")),
+    subject: Optional[str] = Query(None, description=(
+        "Non-person video subject label, e.g. dog (needs the flag)")),
+    min_subject_share: Optional[float] = Query(None, ge=0, le=1, description=(
+        "Share floor for `subject`, 0-1 (needs the flag)")),
     tag: Optional[str] = Query(None, deprecated=True, description="Deprecated; use category"),
 ):
     """Search photos using any combination of criteria."""
@@ -460,8 +469,22 @@ def api_search(
     if tag and not category:
         category = tag
 
+    # Video main-subject share (video-support step 6) is hidden until the
+    # holdout eval passes (D16): rejected, not ignored — a dropped filter
+    # would answer a broader question than the one asked.
+    from .features import video_subject_share_enabled, VIDEO_SUBJECT_SHARE_ENV
+    share_args = {"min_focus_share": min_focus_share,
+                  "min_focus_seconds": min_focus_seconds,
+                  "subject": subject, "min_subject_share": min_subject_share}
+    share_used = [k for k, v in share_args.items() if v not in (None, "")]
+    if sort in ("focus_desc", "subject_desc"):
+        share_used.append(f"sort={sort}")
+    if share_used and not video_subject_share_enabled():
+        raise HTTPException(400, f"{', '.join(share_used)}: the video subject "
+                                 f"share is disabled (set {VIDEO_SUBJECT_SHARE_ENV}=1)")
+
     if not any([q, person, color, place, category, visual_tag, keyword, camera,
-                min_quality is not None, date_from, date_to, location,
+                subject, min_quality is not None, date_from, date_to, location,
                 min_aesthetic is not None, min_technical is not None,
                 min_composition is not None, min_impact is not None, style_tag,
                 min_subject_aesthetic is not None, min_day_aesthetic is not None,
@@ -484,38 +507,44 @@ def api_search(
         raise HTTPException(400, str(e))
 
     with _get_db() as db:
-        results, total = search_combined(
-            db=db,
-            query=q,
-            person=person,
-            color=color,
-            place=place,
-            limit=limit,
-            offset=offset,
-            with_total=True,
-            sort=sort,
-            min_score=min_score,
-            min_quality=min_quality,
-            sort_quality=sort_quality,
-            text_match=text_match,
-            date_from=date_from,
-            date_to=date_to,
-            location=location,
-            match_source=match_source,
-            category=category,
-            visual_tag=visual_tag,
-            keyword=keyword,
-            min_aesthetic=min_aesthetic,
-            min_technical=min_technical,
-            min_composition=min_composition,
-            min_impact=min_impact,
-            style_tag=style_tag,
-            min_subject_aesthetic=min_subject_aesthetic,
-            min_day_aesthetic=min_day_aesthetic,
-            camera=camera,
-            media=media,
-        )
-
+        try:
+            results, total = search_combined(
+                db=db,
+                query=q,
+                person=person,
+                color=color,
+                place=place,
+                limit=limit,
+                offset=offset,
+                with_total=True,
+                sort=sort,
+                min_score=min_score,
+                min_quality=min_quality,
+                sort_quality=sort_quality,
+                text_match=text_match,
+                date_from=date_from,
+                date_to=date_to,
+                location=location,
+                match_source=match_source,
+                category=category,
+                visual_tag=visual_tag,
+                keyword=keyword,
+                min_aesthetic=min_aesthetic,
+                min_technical=min_technical,
+                min_composition=min_composition,
+                min_impact=min_impact,
+                style_tag=style_tag,
+                min_subject_aesthetic=min_subject_aesthetic,
+                min_day_aesthetic=min_day_aesthetic,
+                camera=camera,
+                media=media,
+                min_focus_share=min_focus_share,
+                min_focus_seconds=min_focus_seconds,
+                subject=subject or None,
+                min_subject_share=min_subject_share,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         logger.info(
             "SEARCH RESULTS  count=%d  total=%d  offset=%d  sort=%s  "
             "top_scores=%s",
@@ -569,6 +598,12 @@ def api_search(
                     item["colors"] = []
             else:
                 item["colors"] = []
+
+            # Video main-subject share, when that filter/sort ran (step 6).
+            for k in ("focus_share", "focus_seconds", "focus_people",
+                      "subject_label", "subject_share", "subject_seconds"):
+                if r.get(k) is not None:
+                    item[k] = r[k]
 
             # Stack info (if photo belongs to a stack)
             pid = r.get("id") or r.get("photo_id")
@@ -2488,6 +2523,22 @@ def api_label_health(
                        "faces": sum(p["count"] for p in carrying)}}
 
 
+def _mark_video_faces(conn, faces: list[dict]) -> list[dict]:
+    """Stamp ``media_type='video'`` on face records whose photo is a video,
+    so /faces can badge the tile (video-support step 6). One read of the
+    partial idx_photos_media_video set — the video rows only — not a join
+    per face; a library with no videos pays one empty index probe."""
+    if not faces:
+        return faces
+    from .db import VIDEO_IDS_SQL
+    videos = {r[0] for r in conn.execute(VIDEO_IDS_SQL)}
+    if videos:
+        for f in faces:
+            if f.get("photo_id") in videos:
+                f["media_type"] = "video"
+    return faces
+
+
 @app.get("/api/faces/unmatch-preview")
 def api_unmatch_preview(
     person: str = Query(..., description="Whose labels to preview removing."),
@@ -2525,6 +2576,7 @@ def api_unmatch_preview(
         rows, stats = bulk_unmatch.select(
             db, person=person, sources=src, date_from=date_from,
             date_to=date_to, min_dist=min_dist)
+        _mark_video_faces(db.conn, rows)
     # Farthest first: the most likely wrong faces land at the top of the grid,
     # so a reviewer can scan from the top and stop when they start recognising
     # the person. Unmeasured faces sort last — "unknown" is not "far".
@@ -2564,6 +2616,7 @@ def api_suggest_person(
                 max_dist=max_dist, exclude_closer_to_other=exclude_closer_to_other)
         except ValueError as exc:
             raise HTTPException(404, str(exc))
+        _mark_video_faces(db.conn, rows)
     return {"person": person, "faces": rows[:limit],
             "truncated": len(rows) > limit, "stats": stats}
 
@@ -2746,6 +2799,7 @@ def api_person_inspect(
             }
             for i in range(len(rows))
         ]
+        _mark_video_faces(db.conn, faces)
 
         # Sub-cluster summaries: size, rep (biggest-area), and median/max distance
         # to the core. Suspect sub-clusters (high median_dist) are whole groups
@@ -3791,6 +3845,10 @@ def _compute_stats(db: PhotoDB) -> dict:
     one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
 
     photo_count = one("SELECT COUNT(*) FROM photos")
+    # Videos (step 6: the status card splits photos vs videos). A COUNT over
+    # the partial idx_photos_media_video index — the few thousand video rows,
+    # never a pass over `photos`.
+    video_count = one("SELECT COUNT(*) FROM photos WHERE media_type IS NOT NULL")
     clip_count = one("SELECT COUNT(*) FROM clip_embeddings")
     face_count = one("SELECT COUNT(*) FROM faces")
     person_count = one("SELECT COUNT(*) FROM persons")
@@ -3861,6 +3919,8 @@ def _compute_stats(db: PhotoDB) -> dict:
 
     return {
         "photos": photo_count,
+        "stills": photo_count - video_count,
+        "videos": video_count,
         "clip_embedded": clip_count,
         "faces": face_count,
         "persons": person_count,
@@ -3928,6 +3988,11 @@ def _cached_stats() -> tuple[dict, float]:
         return payload, _stats_memo[db_path][0]
 
 
+def _video_subject_share_enabled() -> bool:
+    from .features import video_subject_share_enabled
+    return video_subject_share_enabled()
+
+
 @app.get("/api/stats")
 def api_stats():
     """Database statistics, at most ~_STATS_TTL_SECONDS old (see _cached_stats).
@@ -3944,6 +4009,9 @@ def api_stats():
         # because the search page already fetches it on mount. Read per
         # request, never cached.
         "ask_available": _ask_available(),
+        # Video main-subject share search controls (step 6, D16): hidden
+        # until the holdout eval passes. Read per request, never cached.
+        "video_subject_share": _video_subject_share_enabled(),
     }
 
 
@@ -6742,6 +6810,50 @@ def api_video_subjects(photo_id: int):
     if out is None:
         raise HTTPException(404, "Video not found")
     return out
+
+
+# Subject typeahead memo: {db_path: (computed_at_epoch, labels)}. The labels
+# change only when the video-subjects pass lands a result, so a short TTL is
+# plenty and a keystroke never re-groups the table.
+_SUBJECT_LABELS_TTL_SECONDS = 60.0
+_subject_labels_memo: dict = {}
+
+
+def _subject_labels(db: PhotoDB) -> list[dict]:
+    hit = _subject_labels_memo.get(_db_path)
+    if hit is not None and time.time() - hit[0] < _SUBJECT_LABELS_TTL_SECONDS:
+        return hit[1]
+    # Non-person subjects only — people are searched by the Person filter.
+    # Labels are stored normalized (video_subjects.normalize_label).
+    rows = db.conn.execute(
+        "SELECT label, COUNT(DISTINCT photo_id) AS n FROM video_subjects "
+        "WHERE label IS NOT NULL AND label != '' "
+        "AND COALESCE(category, '') != 'person' AND face_id IS NULL "
+        "GROUP BY label ORDER BY n DESC, label").fetchall()
+    labels = [{"label": r[0], "videos": r[1]} for r in rows]
+    _subject_labels_memo[_db_path] = (time.time(), labels)
+    return labels
+
+
+@app.get("/api/videos/subject-labels")
+def api_video_subject_labels(q: Optional[str] = Query(None),
+                             limit: int = Query(20, ge=1, le=200)):
+    """Distinct non-person video subject labels (with how many videos carry
+    each), for the search page's Subject typeahead. `q` is normalized the
+    same way the labels are, then prefix/substring matched. 404 while the
+    video subject share is disabled (PHOTOSEARCH_VIDEO_SUBJECT_SHARE)."""
+    from .features import video_subject_share_enabled
+    if not video_subject_share_enabled():
+        raise HTTPException(404, "the video subject share is disabled")
+    with _get_db() as db:
+        labels = _subject_labels(db)
+    if q:
+        from .video_subjects import normalize_label
+        needle = normalize_label(q) or q.strip().lower()
+        pre = [x for x in labels if x["label"].startswith(needle)]
+        sub = [x for x in labels if needle in x["label"] and x not in pre]
+        labels = pre + sub
+    return {"labels": labels[:limit]}
 
 
 @app.get("/api/admin/unreadable-videos")

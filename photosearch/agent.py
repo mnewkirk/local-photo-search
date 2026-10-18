@@ -547,6 +547,18 @@ _LOCKED_KEYS = ("people", "location", "date_from", "date_to", "color", "category
                 "min_day_aesthetic", "style_tag", "match_source", "camera", "sort",
                 "media")
 
+# Video main-subject share pins (video-support step 6): honoured only while
+# PHOTOSEARCH_VIDEO_SUBJECT_SHARE is on (D16), like the tool props they feed.
+_VIDEO_SHARE_LOCKED_KEYS = ("min_focus_share", "min_focus_seconds", "subject",
+                            "min_subject_share")
+
+
+def _locked_keys() -> tuple:
+    from .features import video_subject_share_enabled
+    if video_subject_share_enabled():
+        return _LOCKED_KEYS + _VIDEO_SHARE_LOCKED_KEYS
+    return _LOCKED_KEYS
+
 # Tool-SCOPED locked params: unlike _LOCKED_KEYS (generic filters injected into
 # every filter-consuming tool), these only apply where the param exists. `per_day`
 # is a daily_highlights knob, so pinning it must NOT leak onto search_photos etc.
@@ -563,7 +575,7 @@ def _normalize_locked(locked) -> dict:
     out: dict = {}
     if not isinstance(locked, dict):
         return out
-    for k in _LOCKED_KEYS:
+    for k in _locked_keys():
         v = locked.get(k)
         if v is None or (isinstance(v, str) and not v.strip()):
             continue
@@ -572,6 +584,11 @@ def _normalize_locked(locked) -> dict:
         out[k] = v
     # Media (video-support step 2): 'photo' | 'video' pin; 'all' is the
     # default and an unknown value is dropped rather than enforced.
+    # A pinned focus/subject sort while the flag is off is dropped, as the
+    # sort enum the model sees no longer offers it.
+    if out.get("sort") in ("focus_desc", "subject_desc") and \
+            "min_focus_share" not in _locked_keys():
+        del out["sort"]
     if "media" in out:
         from .db import normalize_media
         try:
@@ -628,6 +645,8 @@ _LOCKED_LABELS = {
     "min_day_aesthetic": "min per-day aesthetic pct", "style_tag": "style",
     "media": "media",
     "match_source": "match source", "camera": "camera", "sort": "sort",
+    "min_focus_share": "main subject share ≥", "min_focus_seconds": "main subject seconds ≥",
+    "subject": "video subject", "min_subject_share": "video subject share ≥",
 }
 
 

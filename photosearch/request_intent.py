@@ -92,11 +92,15 @@ def _filters(p: dict) -> str:
                        ("location", "place"), ("place", "place"),
                        ("category", "category"), ("visual_tag", "look"),
                        ("keyword", "keyword"), ("style_tag", "style"),
-                       ("color", "colour"), ("match_source", "label source")):
+                       ("color", "colour"), ("match_source", "label source"),
+                       ("subject", "video subject"), ("media", "media")):
         if p.get(key):
             bits.append(f"{label} {p[key]!r}" if key == "q" else f"{label} {p[key]}")
     for key, label in (("min_quality", "quality ≥"), ("min_aesthetic", "aesthetic pct ≥"),
-                       ("min_day_aesthetic", "day pct ≥")):
+                       ("min_day_aesthetic", "day pct ≥"),
+                       ("min_focus_share", "main subject share ≥"),
+                       ("min_focus_seconds", "main subject seconds ≥"),
+                       ("min_subject_share", "video subject share ≥")):
         if p.get(key):
             bits.append(f"{label} {p[key]}")
     d = _dates(p)
@@ -187,6 +191,9 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("GET", r"/api/admin/unreadable-videos", _fixed("List unreadable videos")),
     ("GET", r"/api/videos/(?P<id>\d+)/frames/(?P<name>[\w.-]+)",
      _fixed("Fetch keyframe {name} of video {id}")),
+    ("GET", r"/api/videos/subject-labels",
+     lambda m, p: "Suggest video subject labels" + (
+         f" matching {p['q']!r}" if p.get("q") else "")),
     ("GET", r"/api/videos/(?P<id>\d+)/subjects",
      _fixed("Read the subjects timeline of video {id}")),
 ]

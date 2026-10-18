@@ -1225,7 +1225,12 @@
             e(StatCard, {
               label: 'Photos indexed',
               value: total.toLocaleString(),
-              sub: 'Total in database'
+              // Stills vs videos (video-support step 6). Older servers send
+              // no `videos` field — say nothing rather than claim zero.
+              sub: stats.videos != null
+                ? (stats.stills != null ? stats.stills : total - stats.videos).toLocaleString()
+                  + ' photos · ' + stats.videos.toLocaleString() + ' videos'
+                : 'Total in database'
             }),
             e(StatCard, {
               label: 'CLIP embedded',
