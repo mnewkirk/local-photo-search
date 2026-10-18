@@ -854,19 +854,20 @@ PASS_ROLES = {
     "keywords":         "text",
     "category-visual":  "visual",
     "aesthetics":       "aesthetics",
+    # docs/plans/video-support.md step 3b: per-segment keyframe grounding.
+    "video-subjects":   "subject",
 }
 
 # Roles that must be configured explicitly on the OpenAI-compatible route —
 # no fallback to another role's model, no legacy single-model var.
 _STRICT_ROLES = frozenset({"video"})
 
-# The video passes' roles. Kept OUT of PASS_ROLES until the passes are wired:
+# The video passes' roles. A pass stays OUT of PASS_ROLES until it is wired:
 # tests/test_llm_provenance.py pins set(PASS_ROLES) == set(rerun._PASS_LLM)
-# and counts one `_provenance_kwargs(` call in worker.py per entry. When
-# worker/rerun gain `video-subjects` / `video-describe`, move these two
-# entries into PASS_ROLES (and add them to rerun._PASS_LLM) in that commit.
+# and counts one `_provenance_kwargs(` call in worker.py per entry.
+# `video-subjects` moved into PASS_ROLES with step 3b; when worker/rerun gain
+# `video-describe` (step 5), move it too (and add it to rerun._PASS_LLM).
 VIDEO_PASS_ROLES = {
-    "video-subjects": "subject",
     "video-describe": "video",
 }
 

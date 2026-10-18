@@ -359,3 +359,103 @@ def score_subjects(segments: Sequence[tuple[float, float]],
                            subjects=subjects, duration=duration, n_empty=n_empty,
                            n_ungrounded=n_ungrounded, credit=params.credit,
                            segment_boxes=prim_recs)
+
+
+# ---------------------------------------------------------------------------
+# The face layer as video-scan stores it (step 3b wiring)
+# ---------------------------------------------------------------------------
+#
+# The production worker never has the scan's full per-frame detections — the
+# scan keeps only the identities' summaries. So video-scan records, per
+# segment keyframe, each identity's detection NEAREST that keyframe within
+# the join window (``quality_json["frames"]["segments"][i]["faces"]``), and
+# the subjects pass rebuilds a minimal face layer from that plus the tracks'
+# presence intervals. ``join_face`` then sees exactly the detections it would
+# have chosen from the full set (it too takes the nearest within the window).
+
+def segment_face_window(sample_fps: Optional[float],
+                        params: SubjectParams = DEFAULT_SUBJECT_PARAMS) -> float:
+    """The window ``join_face`` uses: ``max(join_window_s, half a sample step)``."""
+    half = 0.5 / sample_fps if sample_fps and sample_fps > 0 else 0.0
+    return max(params.join_window_s, half)
+
+
+def segment_face_boxes(identities, t: float, window: float) -> list[dict]:
+    """Per identity, the detection nearest ``t`` within ``±window`` —
+    ``[{"ix", "t", "bbox": [x1, y1, x2, y2] (decoded px), "salience"}]``.
+    ``identities`` are :class:`video_analysis.Identity` (with detections)."""
+    out = []
+    for ident in identities or ():
+        near = [d for d in ident.detections if abs(d["t"] - t) <= window + 1e-6]
+        if not near:
+            continue
+        d = min(near, key=lambda d: abs(d["t"] - t))
+        out.append({"ix": int(ident.ix), "t": round(float(d["t"]), 4),
+                    "bbox": [round(float(v), 1) for v in d["bbox"]],
+                    "salience": round(float(d["salience"]), 6)})
+    return out
+
+
+@dataclass
+class _StoredIdentity:
+    ix: int
+    detections: list
+    presence_intervals: list
+
+
+@dataclass
+class StoredFaceLayer:
+    """Duck-typed stand-in for :class:`video_analysis.FaceAnalysis`, enough
+    for :func:`join_face` (``W``, ``H``, ``frame_times``, ``identities``) and
+    S2 credit (:meth:`present_intervals_within`)."""
+
+    W: float
+    H: float
+    frame_times: list
+    identities: list
+    by_ix: dict = field(default_factory=dict, repr=False)
+
+    def present_intervals_within(self, ix: int, start: float, end: float) -> list:
+        ident = self.by_ix.get(ix)
+        out = []
+        for a, b in (ident.presence_intervals if ident else ()):
+            lo, hi = max(a, start), min(b, end)
+            if hi > lo:
+                out.append([lo, hi])
+        return out
+
+
+def face_layer_from_manifest(segments_manifest: Sequence[dict], tracks: Sequence[dict],
+                             W: float, H: float,
+                             sample_fps: Optional[float] = None) -> Optional[StoredFaceLayer]:
+    """Rebuild the face layer from video-scan's stored manifest.
+
+    ``segments_manifest``: ``quality_json["frames"]["segments"]`` (each may
+    carry ``"faces"``); ``tracks``: ``[{"ident_ix", "presence_intervals"}]``.
+    Returns None when the scan predates per-segment face boxes (no segment has
+    a ``"faces"`` key) — person boxes then stay unidentified — or when the
+    video has no identities at all."""
+    if not tracks or not any("faces" in (s or {}) for s in segments_manifest):
+        return None
+    dets: dict[int, list] = {}
+    for s in segments_manifest:
+        for f in (s or {}).get("faces") or ():
+            dets.setdefault(int(f["ix"]), []).append(
+                {"t": float(f["t"]), "bbox": list(f["bbox"]),
+                 "salience": float(f.get("salience") or 0.0)})
+    by_ix = {}
+    for t in tracks:
+        ix = t.get("ident_ix")
+        if ix is None:
+            continue
+        pres = t.get("presence_intervals") or []
+        if isinstance(pres, str):
+            import json
+            pres = json.loads(pres)
+        by_ix[int(ix)] = _StoredIdentity(ix=int(ix), detections=dets.get(int(ix), []),
+                                         presence_intervals=[list(p) for p in pres])
+    if not by_ix:
+        return None
+    step = (1.0 / sample_fps) if sample_fps and sample_fps > 0 else 0.0
+    return StoredFaceLayer(W=float(W), H=float(H), frame_times=[0.0, step],
+                           identities=[by_ix[k] for k in sorted(by_ix)], by_ix=by_ix)

@@ -1759,6 +1759,11 @@ def api_photo_mirror_fields(photo_id: int):
                 for t in db.conn.execute(
                     "SELECT * FROM video_tracks WHERE photo_id = ? ORDER BY ident_ix",
                     (photo_id,)).fetchall()]
+            out["video_subjects"] = [
+                {k: t[k] for k in t.keys() if k not in ("id", "photo_id")}
+                for t in db.conn.execute(
+                    "SELECT * FROM video_subjects WHERE photo_id = ? ORDER BY subject_ix",
+                    (photo_id,)).fetchall()]
         return out
 
 
@@ -6709,6 +6714,23 @@ def api_video_frame(photo_id: int, name: str, v: Optional[int] = Query(
         raise HTTPException(404, "Frame not found")
     return FileResponse(str(path), media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/videos/{photo_id}/subjects")
+def api_video_subjects(photo_id: int):
+    """The video-subjects result (docs/plans/video-support.md step 3b) for
+    step 6's UI: linked subjects with person names resolved through
+    ``faces.person_id`` at read time (a relabel in /faces moves the name and
+    the per-person share with no recompute), per-person totals, the
+    per-segment primaries and the merged timeline, plus each identity's dense
+    face-track presence. ``subjects_version`` null = not analysed yet. Read
+    from the local DB (the replica mirrors video_subjects)."""
+    from .video_subjects_store import read_subjects
+    with _get_db() as db:
+        out = read_subjects(db.conn, photo_id)
+    if out is None:
+        raise HTTPException(404, "Video not found")
+    return out
 
 
 @app.get("/api/admin/unreadable-videos")

@@ -5229,9 +5229,10 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--passes", "-p", default="clip", show_default=True,
               help="Comma-separated pass types: clip, faces, quality, aesthetics, describe, "
                    "verify, category-content, keywords, category-visual, video-probe, "
-                   "video-scan (video-probe needs ffprobe: PATH, ~/.local/bin or "
-                   "PHOTOSEARCH_FFPROBE; video-scan needs cv2 + InsightFace + CLIP, and "
-                   "ffprobe only for ZIP-wrapped files).")
+                   "video-scan, video-subjects (video-probe needs ffprobe: PATH, "
+                   "~/.local/bin or PHOTOSEARCH_FFPROBE; video-scan needs cv2 + "
+                   "InsightFace + CLIP, and ffprobe only for ZIP-wrapped files; "
+                   "video-subjects needs a vision LLM, role `subject`).")
 @click.option("--collection", "collection_id", type=int, default=None,
               help="Scope work to a specific collection (by ID).")
 @click.option("--directory", "-d", default=None,
@@ -5290,13 +5291,16 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
               help="Ollama model for the keywords pass (text-only).")
 @click.option("--aesthetics-model", default="qwen2.5-vl", show_default=True,
               help="Vision model for the aesthetics scoring pass.")
+@click.option("--subjects-model", default="qwen2.5-vl", show_default=True,
+              help="Vision model for video-subjects grounding (Ollama route; on LM "
+                   "Studio PHOTOSEARCH_LLM_SUBJECT_MODEL decides).")
 def worker(server, passes, collection_id, directory,
            date_from, date_to, persons, location, min_quality, min_aesthetic,
            camera, category, visual_tag, keyword, style_tag,
            batch_size, model_batch_size, ttl,
            one_shot, stay_alive, sequential, dry_run, force, describe_model, tags_model, verify_model,
            category_content_model, category_visual_model, keywords_model,
-           aesthetics_model):
+           aesthetics_model, subjects_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -5369,6 +5373,8 @@ def worker(server, passes, collection_id, directory,
         "video-probe",
         # step 3: one rate-capped download per video, cv2 + InsightFace + CLIP
         "video-scan",
+        # step 3b: VLM grounding of each segment keyframe (role `subject`)
+        "video-subjects",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.
@@ -5420,6 +5426,7 @@ def worker(server, passes, collection_id, directory,
         category_visual_model=category_visual_model,
         keywords_model=keywords_model,
         aesthetics_model=aesthetics_model,
+        subjects_model=subjects_model,
     )
 
 

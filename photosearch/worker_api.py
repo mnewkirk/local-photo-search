@@ -272,6 +272,39 @@ class VideoScanResult(BaseModel):
     probe: Optional[dict] = None
 
 
+class VideoSubjectSpec(BaseModel):
+    """One linked subject of a video (``video_subjects.Subject.to_json`` plus
+    ``rep_frame``). ``face_ix`` is the WITHIN-VIDEO identity index; the server
+    maps it to that identity's ``faces`` row (video_tracks.ident_ix)."""
+    ix: int
+    label: Optional[str] = None
+    category: Optional[str] = None
+    face_ix: Optional[int] = None
+    focus_s: Optional[float] = None
+    share: Optional[float] = None
+    focus_intervals: Optional[list] = None
+    n_segments: Optional[int] = None
+    rep_t: Optional[float] = None
+    rep_seg: Optional[int] = None
+    rep_frame: Optional[int] = None
+    rep_bbox: Optional[list] = None
+
+
+class VideoSubjectsResult(BaseModel):
+    """One video's ``video-subjects`` result (docs/plans/video-support.md
+    step 3b). ``scan_version`` is the scan whose keyframes and identities it
+    was computed from — a result for a replaced scan is deferred, never
+    written. ``analysis`` is the per-segment groundings + primaries timeline
+    (stored as video_meta.subjects_json and the `generations` row)."""
+    photo_id: int
+    scan_version: int
+    subjects_version: int = 1
+    subjects: list[VideoSubjectSpec] = []
+    analysis: Optional[dict] = None
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
 class FailedResult(BaseModel):
     """A photo the WORKER tried and could not process — an unloadable image, a
     detection or verification that raised. Spends one attempt on the server
@@ -300,6 +333,8 @@ class SubmitRequest(BaseModel):
     video_probe_results: Optional[list[VideoProbeResult]] = None
     # video-scan (schema v35/v36). Optional, so older workers are unaffected.
     video_scan_results: Optional[list[VideoScanResult]] = None
+    # video-subjects (schema v37). Optional, so older workers are unaffected.
+    video_subjects_results: Optional[list[VideoSubjectsResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older
     # server ignores the unknown field (pydantic's default) and behaves as it
@@ -503,6 +538,12 @@ def claim_batch(req: ClaimRequest):
                 "media_type": d["media_type"] if d else None,
                 "duration_s": d["duration_s"] if d else None,
             })
+            if req.pass_type == "video-subjects":
+                # Step 3b: the segment manifest (keyframe names, times,
+                # per-segment face boxes) and the face tracks the worker
+                # joins the VLM boxes to — so it never needs a second call.
+                from .video_subjects_store import subjects_input
+                result_photos[-1]["subjects_input"] = subjects_input(db.conn, p["id"])
 
         return ClaimResponse(
             batch_id=batch_id,
@@ -1198,6 +1239,41 @@ def submit_results(req: SubmitRequest):
             _mark_processed(db, outcome, "video-scan", skip=scanned)
             video_scan_details = details
 
+        elif req.pass_type == "video-subjects":
+            # One transaction PER VIDEO: the subject rows, the marker, the
+            # analysis JSON and the generations row land together or not at
+            # all. A result computed from a scan that has since been replaced
+            # is DEFERRED (no attempt) — the predicate re-offers the video
+            # against the current scan. Success is its own marker
+            # (subjects_version), so only failures write the ledger.
+            from .video_subjects_store import StaleSubjects, apply_subjects_result
+            done_subj: set[int] = set()
+            for r in req.video_subjects_results or []:
+                try:
+                    info = apply_subjects_result(db.conn, r.model_dump())
+                    db.conn.commit()
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                    done_subj.add(r.photo_id)
+                    if info.get("unmapped_face_ix"):
+                        logger.warning("video-subjects %s: identity index(es) %s have no "
+                                       "video_tracks row — stored without a face link",
+                                       r.photo_id, info["unmapped_face_ix"])
+                except StaleSubjects as e:
+                    try:
+                        db.conn.rollback()
+                    except Exception:
+                        pass
+                    logger.warning("video-subjects: %s — deferring", e)
+                    outcome.defer(r.photo_id)
+                except Exception as e:
+                    try:
+                        db.conn.rollback()
+                    except Exception:
+                        pass
+                    _record_write_failure(db, outcome, "video-subjects", r.photo_id, e)
+            _mark_processed(db, outcome, "video-subjects", skip=done_subj)
+
         # Log activity for the chart
         if outcome.written > 0:
             try:
@@ -1453,6 +1529,20 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM worker_processed WHERE pass_type = 'video-scan' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
+        elif req.pass_type == "video-subjects":
+            # Re-queue: drop the subject rows and the marker (they are
+            # derived from the scan, carry no human input, and a name comes
+            # from faces.person_id at read time anyway).
+            db.conn.execute(
+                f"DELETE FROM video_subjects WHERE photo_id IN ({placeholders})", photo_ids)
+            cur = db.conn.execute(
+                f"UPDATE video_meta SET subjects_version = NULL, subjects_at = NULL, "
+                f"subjects_json = NULL WHERE photo_id IN ({placeholders})", photo_ids)
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'video-subjects' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         else:
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
@@ -1506,7 +1596,7 @@ def photo_detail(photo_id: int):
 # forever. Including it in queue_depth just showed a confusing dead counter.
 _ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
                "verify", "category-content", "keywords", "category-visual",
-               "video-probe", "video-scan")
+               "video-probe", "video-scan", "video-subjects")
 
 
 @router.get("/status")

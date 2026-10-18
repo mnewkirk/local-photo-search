@@ -1003,11 +1003,14 @@ def install_log_timestamps() -> None:
 # Passes whose claim size is fixed by the pass, not by --batch-size: the probe
 # is cheap per video (a 12-byte read, ffprobe, one frame), so 25 per claim
 # keeps the claim overhead down without holding many videos per worker.
-PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1}
+PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1,
+                     # ~9 grounding calls per typical video at 2-3 s each
+                     "video-subjects": 2}
 
 # Passes that read the NAS file themselves (over HTTP Range, or as one
 # rate-capped streamed download) instead of through _download_batch.
-SELF_READ_PASSES = {"video-probe", "video-scan"}
+# video-subjects reads only the scan's uploaded segment keyframes.
+SELF_READ_PASSES = {"video-probe", "video-scan", "video-subjects"}
 
 
 class TruncatedDownload(ConnectionError):
@@ -1247,6 +1250,141 @@ def _process_video_scan(client: "WorkerClient", photos: list[dict], workdir: str
     return out
 
 
+class PassHalted(RuntimeError):
+    """A CONFIGURATION failure that no retry of this pass can fix — the
+    request does not fit the model's context (``describe.ContextOverflow``)
+    or the role has no model (``RoleModelNotConfigured``). The worker
+    submits whatever finished (``results``), spends no attempts on the rest
+    (they are omitted, so the claim release re-queues them for free) and
+    stops claiming this pass."""
+
+    def __init__(self, message: str, results: list):
+        super().__init__(message)
+        self.results = results
+
+
+class _GroundingDeferred(ConnectionError):
+    """The grounding call came back with no answer (transport / unreadable
+    request) — the video is omitted and re-claimed, no attempt spent."""
+
+
+def _subjects_for_video(client: "WorkerClient", pid: int, inp: dict, model: str,
+                        label: str, credit: str = "S1") -> dict:
+    """Ground every segment keyframe of one scanned video and score it.
+
+    Returns a ``VideoSubjectsResult`` dict, or a failure row when more than
+    ``MAX_FAILED_SEGMENT_FRAC`` of the segments produced no usable answer.
+    Raises transport errors / :class:`_GroundingDeferred` (omit the video)
+    and ContextOverflow / RoleModelNotConfigured (stop the pass)."""
+    import io
+
+    from PIL import Image
+
+    from . import video_subjects as VSub
+    from .describe import UnusableAnswer
+    from .subjects import ground_frame_subjects
+    from .video_subjects_store import MAX_FAILED_SEGMENT_FRAC, SUBJECTS_VERSION
+
+    segs = list(inp.get("segments") or [])
+    W = float(inp.get("W") or 0) or 1.0
+    H = float(inp.get("H") or 0) or 1.0
+    groundings: list = []
+    failed: list = []
+    t0 = time.time()
+    for i, s in enumerate(segs):
+        r = client._request("GET", f"{client.server_url}/api/videos/{pid}/frames/{s['name']}",
+                            params={"v": inp["scan_version"]}, timeout=60)
+        if r.status_code != 200:
+            failed.append({"seg": i, "error": f"keyframe HTTP {r.status_code}"})
+            groundings.append(None)
+            continue
+        data = r.content
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                im.verify()
+        except Exception as e:  # noqa: BLE001 — a corrupt keyframe is this segment's problem
+            failed.append({"seg": i, "error": f"keyframe unreadable: {e}"})
+            groundings.append(None)
+            continue
+        try:
+            g = ground_frame_subjects(data, model=model, raise_unusable=True)
+        except UnusableAnswer as e:
+            failed.append({"seg": i, "error": str(e)[:200]})
+            groundings.append(None)
+            continue
+        if g is None:
+            raise _GroundingDeferred(f"segment {i}: no answer from the grounding model")
+        groundings.append(g)
+    if segs and len(failed) > MAX_FAILED_SEGMENT_FRAC * len(segs):
+        return _failure_row(pid, f"{len(failed)}/{len(segs)} segment keyframes had no "
+                                 f"usable grounding (first: {failed[0]['error']})")
+
+    segments = [(float(s["start"]), float(s["end"])) for s in segs]
+    kts = [float(s.get("t", (s["start"] + s["end"]) / 2.0)) for s in segs]
+    layer = VSub.face_layer_from_manifest(segs, inp.get("tracks") or [], W, H,
+                                          inp.get("sample_fps"))
+    if layer is None and inp.get("tracks"):
+        print(f"    {label}: scan has no per-segment face boxes — person subjects "
+              f"stay unidentified (re-scan to link them)")
+    an = VSub.score_subjects(segments, groundings, faces=layer, W=W, H=H,
+                             keyframe_times=kts, params=VSub.SubjectParams(credit=credit))
+    subjects = []
+    for sj in an.subjects:
+        d = sj.to_json()
+        d["rep_frame"] = segs[sj.rep_seg].get("frame_ix") if sj.rep_seg < len(segs) else None
+        subjects.append(d)
+    analysis = an.to_json()
+    analysis.update(groundings=groundings, keyframe_times=kts, failed_segments=failed,
+                    subjects_version=SUBJECTS_VERSION, scan_version=inp["scan_version"],
+                    face_layer=layer is not None, summary=an.summary_text(),
+                    seconds=round(time.time() - t0, 2))
+    print(f"    {label}: {len(segs)} segments in {time.time() - t0:.1f}s"
+          f"{f' ({len(failed)} failed)' if failed else ''} — {an.summary_text() or 'no subject'}")
+    return {"photo_id": pid, "scan_version": inp["scan_version"],
+            "subjects_version": SUBJECTS_VERSION, "subjects": subjects,
+            "analysis": analysis}
+
+
+def _process_video_subjects(client: "WorkerClient", photos: list[dict], model: str,
+                            credit: Optional[str] = None) -> list[dict]:
+    """video-subjects (docs/plans/video-support.md step 3b) for claimed videos:
+    one VLM grounding call per segment keyframe (``subjects.ground_frame_subjects``,
+    role ``subject``), scored with :func:`video_subjects.score_subjects` against
+    the scan's face tracks.
+
+    Outcomes, following the worker conventions:
+      * transport trouble, a grounding call with no answer -> OMITTED;
+      * an unusable answer (retried once inside) or unreadable keyframe ->
+        that segment counts "no subject", if at most 20% of segments failed;
+        more than that -> a failure row (one attempt spent);
+      * ContextOverflow / RoleModelNotConfigured -> :class:`PassHalted`
+        (configuration: no attempts spent, the pass stops);
+      * anything else -> a failure row.
+    """
+    from .describe import ContextOverflow, RoleModelNotConfigured
+    credit = credit or os.environ.get("PHOTOSEARCH_VIDEO_SUBJECTS_CREDIT") or "S1"
+    out: list[dict] = []
+    for photo in photos:
+        pid = photo["id"]
+        label = photo.get("filename") or str(pid)
+        inp = photo.get("subjects_input")
+        if not inp:
+            # an older server, or the scan was replaced since the claim
+            print(f"    {label}: no subjects input in the claim (no current scan) — skipped")
+            continue
+        try:
+            out.append(_subjects_for_video(client, pid, inp, model, label, credit))
+        except (ContextOverflow, RoleModelNotConfigured) as e:
+            raise PassHalted(f"{type(e).__name__}: {e}", out) from e
+        except (_TRANSIENT + (_GroundingDeferred,)) as e:
+            print(f"    {label}: transport ({e}) — will be retried")
+            continue
+        except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
+            print(f"    {label}: {type(e).__name__}: {e}")
+            out.append(_failure_row(pid, f"{type(e).__name__}: {e}"))
+    return out
+
+
 def run_worker(
     server: str,
     passes: list[str],
@@ -1267,6 +1405,7 @@ def run_worker(
     category_visual_model: str = "llava",
     keywords_model: str = "llama3.2:3b",
     aesthetics_model: str = "qwen2.5-vl",
+    subjects_model: str = "qwen2.5-vl",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
@@ -1303,6 +1442,8 @@ def run_worker(
         category_visual_model: Ollama model for category-visual vision pass (default: llava)
         keywords_model: Ollama model for keywords text pass (default: llama3.2:3b)
         aesthetics_model: Vision model for the aesthetics scoring pass (default: qwen2.5-vl)
+        subjects_model: Vision model for video-subjects grounding (default:
+            qwen2.5-vl; on LM Studio the `subject` role env var decides)
     """
     if "video-probe" in passes:
         from .video_probe import find_ffprobe
@@ -1378,6 +1519,7 @@ def run_worker(
         "keywords":         [(keywords_model, "text")],
         "category-visual":  [(category_visual_model, "visual")],
         "aesthetics":       [(aesthetics_model, "aesthetics")],
+        "video-subjects":   [(subjects_model, "subject")],
     }
     status_scope = {"collection_id": collection_id, "directory": directory,
                     "filters": filters}
@@ -1518,6 +1660,20 @@ def run_worker(
                 elif pass_type == "video-scan":
                     results = _process_video_scan(client, photos, batch_temp)
                     kwargs = _submit_kwargs("video_scan_results", results)
+                elif pass_type == "video-subjects":
+                    try:
+                        results = _process_video_subjects(client, photos, model=subjects_model)
+                    except PassHalted as e:
+                        # Configuration, not the videos: submit what finished
+                        # (the rest is omitted -> released, no attempt) and
+                        # stop claiming this pass.
+                        results = e.results
+                        print(f"  ✗ stopping {pass_type}: {e} — fix the model "
+                              f"configuration (context length / role model) and relaunch")
+                        if pass_type in active:
+                            active.remove(pass_type)
+                    _provenance_kwargs(pass_type, subjects_model, results)
+                    kwargs = _submit_kwargs("video_subjects_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)
@@ -1553,7 +1709,8 @@ def run_worker(
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
                 elif pass_type in ("describe", "category-content", "category-visual", "keywords",
-                                   "aesthetics", "video-probe", "video-scan"):
+                                   "aesthetics", "video-probe", "video-scan",
+                                   "video-subjects"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")

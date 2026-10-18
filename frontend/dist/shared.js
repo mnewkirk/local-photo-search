@@ -361,7 +361,7 @@
     // ---- Re-run-passes state (M28) ----
     // A video only has its own passes (db.PASS_MEDIA): the image passes
     // would never claim it, and a still has no video-probe.
-    var RERUN_PASSES = PS.isVideo(photo) ? ['video-probe', 'video-scan']
+    var RERUN_PASSES = PS.isVideo(photo) ? ['video-probe', 'video-scan', 'video-subjects']
       : ['describe', 'verify', 'category-content', 'keywords',
          'category-visual', 'clip', 'faces', 'quality', 'aesthetics'];
     var _rerunOpen = useState(false);

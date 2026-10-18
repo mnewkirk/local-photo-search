@@ -187,6 +187,8 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("GET", r"/api/admin/unreadable-videos", _fixed("List unreadable videos")),
     ("GET", r"/api/videos/(?P<id>\d+)/frames/(?P<name>[\w.-]+)",
      _fixed("Fetch keyframe {name} of video {id}")),
+    ("GET", r"/api/videos/(?P<id>\d+)/subjects",
+     _fixed("Read the subjects timeline of video {id}")),
 ]
 _COMPILED = [(m, re.compile(rx + r"/?$"), b) for m, rx, b in _RULES]
 

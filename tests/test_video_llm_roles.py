@@ -121,8 +121,10 @@ def test_existing_roles_are_unchanged(monkeypatch):
 
 
 def test_video_pass_roles_stay_out_of_pass_roles_until_wired():
-    assert d.VIDEO_PASS_ROLES == {"video-subjects": "subject",
-                                  "video-describe": "video"}
+    # video-subjects is wired (step 3b) and lives in PASS_ROLES now;
+    # video-describe waits for step 5.
+    assert d.VIDEO_PASS_ROLES == {"video-describe": "video"}
+    assert d.PASS_ROLES["video-subjects"] == "subject"
     assert not set(d.VIDEO_PASS_ROLES) & set(d.PASS_ROLES)
 
 

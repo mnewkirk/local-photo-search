@@ -272,6 +272,15 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
     # Replace: tracks, faces (+ their vec0 encodings, explicitly — vec0 has
     # no FK cascade), CLIP embedding.
     conn.execute("DELETE FROM video_tracks WHERE photo_id = ?", (pid,))
+    # The video-subjects result references THIS scan's identities (face ids)
+    # and segment keyframes, so a re-scan invalidates it: drop the rows and
+    # the marker in the same transaction, which re-queues the subjects pass
+    # (video_subjects_store.claimable_sql). Keyed on the scan landing, not on
+    # comparing versions, because a clear-pass re-scan keeps the same
+    # SCAN_VERSION while replacing every face row.
+    conn.execute("DELETE FROM video_subjects WHERE photo_id = ?", (pid,))
+    conn.execute("UPDATE video_meta SET subjects_version = NULL, subjects_at = NULL, "
+                 "subjects_json = NULL WHERE photo_id = ?", (pid,))
     old_ids = [o["face_id"] for o in old]
     for i in range(0, len(old_ids), 500):
         chunk = old_ids[i:i + 500]

@@ -61,7 +61,7 @@
       steps: ['verify', 'category-content', 'keywords'] },
     // Videos only (db.PASS_MEDIA); a batch with no videos reads it complete.
     { key: 'video',   label: 'Videos',
-      steps: ['video-probe', 'video-scan'] },
+      steps: ['video-probe', 'video-scan', 'video-subjects'] },
     { key: 'nas',     label: 'NAS stages',
       steps: ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
               'warm_crops', 'rank_measure', 'sharpness'] },
@@ -226,10 +226,10 @@
   // Frozen in batch_state.py: WORKER_PASSES and DEPENDS_ON's worker half.
   var WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
     'verify', 'category-content', 'keywords', 'category-visual', 'video-probe',
-    'video-scan'];
+    'video-scan', 'video-subjects'];
   var WORKER_DEPENDS_ON = {
     'category-content': 'describe', keywords: 'describe', verify: 'describe',
-    'video-scan': 'video-probe',
+    'video-scan': 'video-probe', 'video-subjects': 'video-scan',
   };
   // Dependency states that mean "satisfied without another launch".
   var UNDERWAY = ['completed', 'running', 'queued'];

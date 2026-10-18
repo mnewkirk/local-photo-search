@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -197,9 +197,10 @@ PASS_MEDIA: dict[str, str] = {
     "keywords": "still",
     # legacy pre-v23 pass, still accepted by the claim path for cleanup
     "tags": "still",
-    # video passes. video-probe (step 2b) and video-scan (step 3) are live;
-    # the others are placeholders so their claim predicates have an entry the
-    # day they land (NOT yet in WORKER_PASSES).
+    # video passes. video-probe (step 2b), video-scan (step 3) and
+    # video-subjects (step 3b) are live; video-describe is a placeholder so
+    # its claim predicate has an entry the day it lands (NOT yet in
+    # WORKER_PASSES).
     "video-probe": "video",
     "video-scan": "video",
     "video-subjects": "video",
@@ -384,6 +385,27 @@ _VIDEO_SCAN_NOT_EXHAUSTED = (
     "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-scan' "
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
+
+
+# video-subjects (docs/plans/video-support.md step 3b). Claimable once the
+# CURRENT scan landed without an error on a non-Live clip and no current
+# subjects result exists (video_subjects_store.claimable_sql, shared with
+# batch_state).
+def video_subjects_missing_sql(alias: str = "p") -> str:
+    from .video_subjects_store import claimable_sql
+    return claimable_sql(alias)
+
+
+_VIDEO_SUBJECTS_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-subjects' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+
+_VIDEO_CLAIM_SQL = {
+    "video-scan": (video_scan_missing_sql, _VIDEO_SCAN_NOT_EXHAUSTED),
+    "video-subjects": (video_subjects_missing_sql, _VIDEO_SUBJECTS_NOT_EXHAUSTED),
+}
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -1327,7 +1349,10 @@ class PhotoDB:
                 noise             REAL,
                 focus_consistency REAL,
                 quality_json      TEXT,
-                poster_version    INTEGER
+                poster_version    INTEGER,
+                subjects_version  INTEGER,
+                subjects_at       TEXT,
+                subjects_json     TEXT
             )
         """)
         # v36: video_meta.poster_version — the counter that names a video's
@@ -1344,6 +1369,18 @@ class PhotoDB:
             cur.execute("UPDATE video_meta SET poster_version = probe_version "
                         "WHERE poster_version IS NULL AND probe_version IS NOT NULL "
                         "AND probe_error IS NULL AND poster_t IS NOT NULL")
+        # v37: the video-subjects pass (docs/plans/video-support.md step 3b).
+        # subjects_version is its marker (NULL / stale = claimable; the scan
+        # store NULLs it on every re-scan, because the subjects reference the
+        # scan's identities and keyframes). subjects_json holds the
+        # per-segment groundings + primaries timeline the shares came from,
+        # so a re-score (S1 vs S2, new linking) needs no VLM call.
+        for col, typ in (("subjects_version", "INTEGER"), ("subjects_at", "TEXT"),
+                         ("subjects_json", "TEXT")):
+            try:
+                cur.execute(f"SELECT {col} FROM video_meta LIMIT 1")
+            except sqlite3.OperationalError:
+                cur.execute(f"ALTER TABLE video_meta ADD COLUMN {col} {typ}")
         # Main subject per video (person, animal, scenery), joined to a face
         # track for identity when it is a person.
         cur.execute("""
@@ -1360,9 +1397,19 @@ class PhotoDB:
                 rep_t           REAL,
                 rep_frame       INTEGER,
                 rep_bbox        TEXT,
-                n_segments      INTEGER
+                n_segments      INTEGER,
+                share           REAL,
+                rep_seg         INTEGER
             )
         """)
+        # v37: share (focus_s / whole-clip duration, D10) and the segment
+        # index of the representative box (rep_frame is the sampled-frame
+        # index of that segment's keyframe).
+        for col, typ in (("share", "REAL"), ("rep_seg", "INTEGER")):
+            try:
+                cur.execute(f"SELECT {col} FROM video_subjects LIMIT 1")
+            except sqlite3.OperationalError:
+                cur.execute(f"ALTER TABLE video_subjects ADD COLUMN {col} {typ}")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_video_subjects_photo ON video_subjects(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_video_subjects_face ON video_subjects(face_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_video_subjects_label ON video_subjects(label)")
@@ -3097,24 +3144,26 @@ class PhotoDB:
                         {media_clause(pass_type, 'p')} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
-        elif pass_type == "video-scan":
-            # Probed, playable (or ZIP-wrapped), not Live, scan missing or
-            # stale; capped by the attempts ledger.
+        elif pass_type in _VIDEO_CLAIM_SQL:
+            # video-scan: probed, playable (or ZIP-wrapped), not Live, scan
+            # missing or stale. video-subjects: scanned cleanly, not Live,
+            # subjects missing or stale. Both capped by the attempts ledger.
+            missing_fn, not_exhausted = _VIDEO_CLAIM_SQL[pass_type]
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 rows = self.conn.execute(
                     f"""SELECT p.id, p.filepath FROM photos p
                         WHERE p.id IN ({placeholders})
-                        AND {video_scan_missing_sql('p')}
-                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}
+                        AND {missing_fn('p')}
+                        AND {not_exhausted}
                         {media_clause(pass_type, 'p')} LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
                     f"""SELECT p.id, p.filepath FROM photos p
-                        WHERE {video_scan_missing_sql('p')}
-                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}
+                        WHERE {missing_fn('p')}
+                        AND {not_exhausted}
                         {media_clause(pass_type, 'p')} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
@@ -3290,21 +3339,22 @@ class PhotoDB:
                         WHERE {video_probe_missing_sql('p')}
                         AND {_VIDEO_PROBE_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}"""
                 ).fetchone()
-        elif pass_type == "video-scan":
+        elif pass_type in _VIDEO_CLAIM_SQL:
+            missing_fn, not_exhausted = _VIDEO_CLAIM_SQL[pass_type]
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
                         WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
-                        AND {video_scan_missing_sql('p')}
-                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}""",
+                        AND {missing_fn('p')}
+                        AND {not_exhausted}{media_clause(pass_type, 'p')}""",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
                     f"""SELECT COUNT(*) FROM photos p
-                        WHERE {video_scan_missing_sql('p')}
-                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}"""
+                        WHERE {missing_fn('p')}
+                        AND {not_exhausted}{media_clause(pass_type, 'p')}"""
                 ).fetchone()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")

@@ -125,6 +125,7 @@ _PASS_DOERS = {
     # these fixtures are stills-only: a video pass has nothing to do
     "video-probe": lambda db, ids: None,
     "video-scan": lambda db, ids: None,
+    "video-subjects": lambda db, ids: None,
 }
 
 # The worker passes a STILLS-only batch actually has work for.
@@ -1045,7 +1046,7 @@ class TestFleetLaunchPasses:
             "keywords": "waiting", "verify": "waiting"}))
         assert got == ["clip", "faces", "quality", "aesthetics",
                        "verify", "category-content", "keywords", "category-visual",
-                       "video-probe", "video-scan"]
+                       "video-probe", "video-scan", "video-subjects"]
 
     def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
         """Case 3. `describe` having given up on every photo means there will
@@ -1118,20 +1119,30 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
     # an unprobed video is real work: only video-probe asks for the fleet
     state = batch_state(db, batch_id)
     assert state["ready"] is False and state["next_action"] == "launch_fleet"
-    # video-scan waits on the probe, which this same launch queues
-    assert fleet_launch_passes(state) == ["video-probe", "video-scan"]
+    # video-scan waits on the probe, which this same launch queues (and
+    # video-subjects on the scan)
+    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects"]
     assert _step(state, "video-scan")["state"] == "waiting"
     from photosearch.video_probe import PROBE_VERSION
     db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
                     "WHERE photo_id = ?", (PROBE_VERSION, vid))
     db.conn.commit()
 
-    # probed and playable: now the scan is the work
+    # probed and playable: now the scan is the work (subjects follow it)
     state = batch_state(db, batch_id)
-    assert fleet_launch_passes(state) == ["video-scan"]
+    assert fleet_launch_passes(state) == ["video-scan", "video-subjects"]
     from photosearch.video_scan_store import SCAN_VERSION
     db.conn.execute("UPDATE video_meta SET scan_version = ? WHERE photo_id = ?",
                     (SCAN_VERSION, vid))
+    db.conn.commit()
+
+    # scanned: the subjects are the last video work
+    state = batch_state(db, batch_id)
+    assert fleet_launch_passes(state) == ["video-subjects"]
+    assert state["ready"] is False
+    from photosearch.video_subjects_store import SUBJECTS_VERSION
+    db.conn.execute("UPDATE video_meta SET subjects_version = ? WHERE photo_id = ?",
+                    (SUBJECTS_VERSION, vid))
     db.conn.commit()
 
     state = batch_state(db, batch_id)
@@ -1152,7 +1163,7 @@ def test_video_only_batch_asks_the_fleet_for_video_probe_only(db):
         assert _step(state, p)["state"] == "completed", _step(state, p)
     assert _step(state, "video-probe")["state"] == "needs_queue"
     assert state["next_action"] == "launch_fleet"
-    assert fleet_launch_passes(state) == ["video-probe", "video-scan"]
+    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects"]
     assert vid
 
 

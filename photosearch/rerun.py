@@ -39,13 +39,14 @@ from typing import Optional
 # precedes the text passes). Same order as batch_state.WORKER_PASSES.
 ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
               "verify", "category-content", "keywords", "category-visual",
-              "video-probe", "video-scan")
+              "video-probe", "video-scan", "video-subjects")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
 # Passes that read the original themselves over HTTP Range — never download it
 # whole (video-probe: ffprobe + one frame of a possibly multi-GB clip).
-RANGE_READ_PASSES = {"video-probe", "video-scan"}  # video-scan: its own hashed download
+# video-scan: its own hashed download; video-subjects: the uploaded keyframes.
+RANGE_READ_PASSES = {"video-probe", "video-scan", "video-subjects"}
 
 # pass -> (LLM role, Ollama-style default model). The role drives LM Studio model
 # selection (PHOTOSEARCH_LLM_<ROLE>_MODEL via describe._resolve_openai_model);
@@ -57,6 +58,8 @@ _PASS_LLM = {
     "keywords":         ("text",     "llama3.2:3b"),
     "category-visual":  ("visual",   "llava"),
     "aesthetics":       ("aesthetics", "qwen2.5-vl"),
+    # docs/plans/video-support.md step 3b: grounding per segment keyframe
+    "video-subjects":   ("subject",  "qwen2.5-vl"),
 }
 
 
@@ -92,7 +95,11 @@ FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      "verify":     "google/gemma-4-12b-qat",
                      "visual":     "minicpm-v-4_5",
                      "aesthetics": "qwen2.5-vl-7b-instruct",
-                     "text":       "google/gemma-4-12b-qat"}
+                     "text":       "google/gemma-4-12b-qat",
+                     # video-subjects (step 3b): the grounding model photos
+                     # already use for subject boxes (subjects.py), so the
+                     # aesthetics -> subject pass order loads it once.
+                     "subject":    "qwen2.5-vl-7b-instruct"}
 
 
 # Every model eval that picked FLEET_ROLE_MODELS ran with reasoning OFF
@@ -119,6 +126,7 @@ _LMSTUDIO_DEFAULTS = {"describe": "qwen2.5-vl-7b-instruct",
                       "verify":   "qwen2.5-vl-7b-instruct",
                       "visual":   "qwen2.5-vl-7b-instruct",
                       "aesthetics": "qwen2.5-vl-7b-instruct",
+                      "subject":  "qwen2.5-vl-7b-instruct",
                       "text":     "llama-3.2-3b-instruct"}
 
 
@@ -135,6 +143,12 @@ def _resolve_model(pass_type: str) -> str:
                or os.environ.get("PHOTOSEARCH_TEXT_LLM_MODEL"))
         if env:
             return env
+        if role == "subject":
+            # Same fallback chain as describe._resolve_openai_model: an unset
+            # SUBJECT var grounds with the aesthetics model, as photos do.
+            return (os.environ.get("PHOTOSEARCH_LLM_AESTHETICS_MODEL")
+                    or os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
+                    or _LMSTUDIO_DEFAULTS[role])
         if role in ("describe", "verify", "aesthetics"):
             return os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL") or _LMSTUDIO_DEFAULTS[role]
         return _LMSTUDIO_DEFAULTS[role]
@@ -295,6 +309,18 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
             info["duration_s"] = vm[0] if vm else None
             results = W._process_video_scan(client, [info], tmpdir)
             kwargs = W._submit_kwargs("video_scan_results", results)
+        elif pass_type == "video-subjects":
+            from .video_subjects_store import subjects_input
+            info["subjects_input"] = subjects_input(db.conn, photo_id)
+            if info["subjects_input"] is None:
+                raise RuntimeError(f"video {photo_id} has no current scan "
+                                   f"(run video-scan first)")
+            model = _resolve_model("video-subjects")
+            results = W._process_video_subjects(client, [info], model=model)
+            mv = _model_version(model)
+            for r in results:
+                r["model"], r["model_version"] = model, mv
+            kwargs = W._submit_kwargs("video_subjects_results", results)
         else:  # pragma: no cover - guarded above
             raise ValueError(f"unknown pass type: {pass_type}")
 
@@ -353,10 +379,16 @@ _VIDEO_META_MIRROR = (
     "bitrate", "has_audio", "probe_json", "probe_version", "probe_error", "kind",
     "live_of_photo_id", "poster_t", "poster_version", "scan_version", "scan_error",
     "scanned_at", "shake", "noise", "focus_consistency", "quality_json",
+    # video-subjects (step 3b, schema v37)
+    "subjects_version", "subjects_at", "subjects_json",
 )
 _VIDEO_TRACK_MIRROR = (
     "face_id", "ident_ix", "t_start", "t_end", "n_det", "presence_s", "focus_s",
     "focus_intervals", "rep_t", "rep_frame", "mean_salience", "presence_intervals",
+)
+_VIDEO_SUBJECT_MIRROR = (
+    "subject_ix", "label", "category", "face_id", "focus_s", "focus_intervals",
+    "rep_t", "rep_frame", "rep_bbox", "n_segments", "share", "rep_seg",
 )
 
 
@@ -474,4 +506,18 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
                 f"INSERT INTO video_tracks (photo_id, {', '.join(cols)}) "
                 f"VALUES (?, {', '.join('?' * len(cols))})",
                 (photo_id, *[t[c] for c in cols]))
+    if "video_subjects" in fields:
+        # After the faces above, so a subject's face_id (kept equal to the
+        # NAS id) resolves; a face missing locally drops the link, never the
+        # subject. An older NAS sends no key and nothing is touched.
+        db.conn.execute("DELETE FROM video_subjects WHERE photo_id=?", (photo_id,))
+        for v in fields["video_subjects"] or []:
+            cols = [c for c in _VIDEO_SUBJECT_MIRROR if c in v]
+            if v.get("face_id") is not None and not db.conn.execute(
+                    "SELECT 1 FROM faces WHERE id=?", (v["face_id"],)).fetchone():
+                v = dict(v, face_id=None)
+            db.conn.execute(
+                f"INSERT INTO video_subjects (photo_id, {', '.join(cols)}) "
+                f"VALUES (?, {', '.join('?' * len(cols))})",
+                (photo_id, *[v[c] for c in cols]))
     db.conn.commit()

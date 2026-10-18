@@ -15,7 +15,7 @@ const BF = require('../dist/batch-flow.js');
 // Mirrors batch_state.STEP_ORDER exactly (globals.md, frozen).
 const STEP_ORDER = ['ingest', 'clip', 'faces', 'quality', 'aesthetics', 'describe',
   'verify', 'category-content', 'keywords', 'category-visual', 'video-probe',
-  'video-scan', 'stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops',
+  'video-scan', 'video-subjects', 'stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops',
   'rank_measure', 'sharpness'];
 
 const STATES = ['completed', 'running', 'queued', 'needs_queue', 'waiting', 'blocked'];
@@ -100,7 +100,7 @@ describe('layout', () => {
       ['clip'],
       ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'],
       ['verify', 'category-content', 'keywords'],
-      ['video-probe', 'video-scan'],
+      ['video-probe', 'video-scan', 'video-subjects'],
       ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
         'warm_crops', 'rank_measure', 'sharpness'],
     ]);
@@ -668,7 +668,7 @@ describe('advanceLogLine', () => {
 
 const WORKER_PASSES = ['clip', 'faces', 'quality', 'aesthetics', 'describe',
   'verify', 'category-content', 'keywords', 'category-visual', 'video-probe',
-  'video-scan'];
+  'video-scan', 'video-subjects'];
 
 /** A state whose worker passes carry the given states (default needs_queue). */
 function workerState(over) {
@@ -696,7 +696,7 @@ describe('fleetLaunchPasses', () => {
       keywords: 'waiting', verify: 'waiting',
     }))).toEqual(['clip', 'faces', 'quality', 'aesthetics', 'verify',
       'category-content', 'keywords', 'category-visual', 'video-probe',
-      'video-scan']);
+      'video-scan', 'video-subjects']);
   });
 
   test('case 3 — a blocked dependency does NOT admit its dependents', () => {
@@ -746,18 +746,18 @@ describe('the "N passes" copy counts the launch set', () => {
 
   test('the button label', () => {
     expect(BF.advanceButton(workerState(gated)).label)
-      .toBe('Launch fleet — 11 passes');
+      .toBe('Launch fleet — 12 passes');
   });
 
   test('the headline', () => {
     expect(BF.summarize(workerState(gated)).headline)
-      .toBe('Launch the worker fleet for 11 passes');
+      .toBe('Launch the worker fleet for 12 passes');
   });
 
   test('a blocked describe drops its three dependents from both', () => {
     const s = workerState(Object.assign({}, gated, { describe: 'blocked' }));
-    // 11 passes - describe - its 3 dependents = 7.
-    expect(BF.advanceButton(s).label).toBe('Launch fleet — 7 passes');
-    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 7 passes');
+    // 12 passes - describe - its 3 dependents = 8.
+    expect(BF.advanceButton(s).label).toBe('Launch fleet — 8 passes');
+    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 8 passes');
   });
 });

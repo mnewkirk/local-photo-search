@@ -69,10 +69,12 @@ from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 #
 # `video-probe` (docs/plans/video-support.md step 2b) runs over the batch's
 # VIDEOS only (db.PASS_MEDIA) and depends on nothing; `video-scan` (step 3)
-# goes after it and depends on it (it only claims probed, playable clips).
+# goes after it and depends on it (it only claims probed, playable clips);
+# `video-subjects` (step 3b, the VLM grounding) goes after the scan and
+# depends on it (it reads the scan's keyframes and face identities).
 WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
                  "verify", "category-content", "keywords", "category-visual",
-                 "video-probe", "video-scan")
+                 "video-probe", "video-scan", "video-subjects")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
 # full native resolution to measure face sharpness, and only the NAS holds the
 # originals — the desktop replica has the DB and the thumbnails and no files at
@@ -97,7 +99,8 @@ DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "verify": "describe", "normalize_aesthetics": "aesthetics",
               "match_faces": "faces", "resolve_dups": "match_faces",
               "warm_crops": "faces", "rank_measure": "faces",
-              "sharpness": "faces", "video-scan": "video-probe"}
+              "sharpness": "faces", "video-scan": "video-probe",
+              "video-subjects": "video-scan"}
 # Second dependencies, for the job-only NAS steps that must also wait on a
 # pass DEPENDS_ON cannot name (it holds one). video-scan writes the video
 # faces rows, so matching them and warming crops waits on it too. A batch
@@ -157,6 +160,11 @@ _OUTPUT_MISSING = {
     # is a scan; unreadable and Live videos are never offered, so they count
     # done once probed (see _worker_step's `eligible`).
     "video-scan": "{video_scan_missing}",
+    # cleanly scanned, not Live, subjects missing or stale — the claim
+    # predicate (video_subjects_store.claimable_sql). Scan errors, unreadable
+    # and Live videos are never offered and count done once the scan is
+    # settled (see _worker_step's `eligible`).
+    "video-subjects": "{video_subjects_missing}",
 }
 
 # Passes for which "attempts exhausted and still no output" means the work is
@@ -206,6 +214,7 @@ _REMAINING_FILTERS_ATTEMPTS = {
     "verify": True,
     "video-probe": True,
     "video-scan": True,
+    "video-subjects": True,
 }
 
 
@@ -322,6 +331,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     elif pass_type == "video-scan":
         from .video_scan_store import claimable_sql
         missing = missing.format(video_scan_missing=claimable_sql("p"))
+    elif pass_type == "video-subjects":
+        from .video_subjects_store import claimable_sql as subjects_claimable
+        missing = missing.format(video_subjects_missing=subjects_claimable("p"))
     media = media_sql(pass_type, "p")
     if media:
         missing = f"({missing}) AND {media}"
@@ -351,6 +363,12 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         eligible = _count_where(db, ids, f"{probed_sql('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
         n_err = _count_where(db, ids, scan_error_sql("p")) if ids else 0
         detail = f"{n_err:,} unreadable" if n_err else None
+    elif pass_type == "video-subjects":
+        # Gated on the scan: a video video-scan has not settled (unprobed,
+        # unscanned, stale scan) is not claimable yet and must not read done.
+        from .video_subjects_store import eligible_sql as subjects_eligible
+        eligible = _count_where(
+            db, ids, f"{subjects_eligible('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
 
     # See _REMAINING_FILTERS_ATTEMPTS: for the passes whose claim predicate
     # has no attempts filter, `failed` is already counted inside `remaining`,

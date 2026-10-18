@@ -747,16 +747,27 @@ def build_scan_result(scan: ScanData, params: AnalysisParams = DEFAULT_PARAMS,
             clip_emb = mean_unit(embs)
 
         # ---- per-segment keyframes (video-subjects, step 3b) ------------
+        # Each entry also carries every identity's detection nearest the
+        # keyframe within the join window ("faces", decoded px): the subjects
+        # pass joins a VLM person box to a face identity with them
+        # (video_subjects.face_layer_from_manifest) without the full
+        # per-frame detections, which are not stored.
+        from .video_subjects import segment_face_boxes, segment_face_window
+        face_window = segment_face_window(scan.sample_fps)
+        manifest["segment_face_window_s"] = round(face_window, 4)
         for n, (i, (a, b)) in enumerate(zip(scan.segment_ix, scan.segments)):
             if not have_frames:
                 break
             j = scan.stored_index(i)
             name = segment_name(n)
+            t_kf = scan.frames[j]["t"]
             assets.append({"kind": "keyframe", "name": name,
                            "data": _jpeg(scan.frame_rgb(j, SEGMENT_EDGE))})
             manifest["segments"].append({"name": f"keyframe_{name}", "start": round(a, 3),
-                                         "end": round(b, 3), "t": scan.frames[j]["t"],
-                                         "frame_ix": j})
+                                         "end": round(b, 3), "t": t_kf,
+                                         "frame_ix": j,
+                                         "faces": segment_face_boxes(
+                                             fa.identities, float(t_kf), face_window)})
 
         # ---- identities --------------------------------------------------
         identities = []
