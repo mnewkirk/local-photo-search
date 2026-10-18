@@ -1,12 +1,39 @@
 # Video support (mp4/mov): main subject share (people, animals, scenery), description, quality
 
-Status: **planned** (2026-10-17). Built by plan-debate: two planners drafted
+Status: **built 2026-10-17, not yet deployed** (see "As built" below; the
+backfill runbook is Step 8). Planned 2026-10-17. Built by plan-debate: two planners drafted
 independently, critiqued each other over two rounds, and converged on every
 contested point. The owner then decided three things (recorded in "Decisions"):
 **skip Live Photo clips**, **the whole clip is the share denominator**, and
 **all work other than indexing runs on the desktop, never the NAS** — the NAS
 only registers rows, stores results and serves files. That last decision moved
 the probe and the poster frame off the NAS into a new `video-probe` worker pass.
+
+## As built (2026-10-17)
+
+All of Steps 0–7 landed in one day on `main` (`9015b61` … `461c7a0`), each step
+followed by a review-fix commit. Verified on `461c7a0`: `scripts/test-like-ci.sh`
+3,333 passed / 68 skipped, `node scripts/check-frontend-refs.js` clean, jest
+210/210. Operating notes and the traps live in CLAUDE.md "## Video"; the
+runbook is Step 8 below.
+
+| step | commits | as built — and where it deviates from the plan |
+|---|---|---|
+| 0 spike | `edbdcef` | Gate PASS: ffprobe over Range reads ~3–15% of a large file and < 1% of a moov-less one, so **no head+tail pre-check**. Found that ~58% of 2016–17 "moov missing" files are **ZIP-wrapped** playable videos. Dates need a **per-camera-family dispatch**, not one offset. Static ffmpeg 7.0.2 in `~/.local/bin` (no sudo; D20 deviation). HEVC browser playback still needs a human check (`playback.html`). |
+| 1 schema / isolation / registration | `9015b61`, `98099b2` | v35. `PASS_MEDIA` + coverage test; pixel readers guarded one by one. Review: `category-content`/`keywords` were briefly `still` so a batch with videos could reach `ready`; `add_photo` decides "existed" by `rowcount` (an ignored INSERT left `lastrowid` pointing at another row); NAS `#recycle`/`@eaDir` dirs excluded via the shared `index.is_excluded_dir`. |
+| 2 playback / filter | `ec3b5c7`, `f4be3a4` | Range + throttled `/full`, assets upload, `media=` filter, unreadable card. Added beyond plan: a concurrent worker-stream cap (`PHOTOSEARCH_VIDEO_WORKER_STREAMS`, 503 Retry-After), Ask keeps the Media pin, versioned replica poster cache, deterministic stream cleanup on client disconnect. |
+| 2b video-probe | `1a28451` | `probe_error='zip_wrapped'` hands those to scan; date dispatch = Apple creationdate / Android `creation_time − duration` in `PHOTOSEARCH_TZ` / Sony XAVC + Kodak `Z` as local wall time / else mtime. Live pairing server-side (stem, ±1-day sibling folder, ≤ 4 s, within 3 s). `PROBE_VERSION = 1`. |
+| 3 core + scan | `efc3dfa`, `dcc25f7`, `abee54c` | Pure-numpy tracker, with an **IoU veto** the plan lacked: an IoU match is refused when the embeddings are > 1.2 apart (`track_iou_veto_l2`). **ZIP unwrap in scan** (one video member, ≤ 16 GiB and ≤ 1.2× the ZIP). v36 `poster_version` + `presence_intervals`. Review: face bbox moved to **native display px**; **staged uploads** (v38 `scan_generation` — a deferred re-scan can no longer clobber live files); exclusions carried for every matched face; KNN `similar_by_photo` stills-only; mirror remaps colliding face ids. |
+| 3b video-subjects | `c6e272a`, `ff5ab5a` | Role `subject` (falls back to the aesthetics model); `ground_frame_subjects` adds a category per box; S1 credit by default. v37 shares. `ContextOverflow`/unset strict role → `PassHalted`, not attempts. |
+| 4 eval harness | `2710398` | `evals/video_eval.py` + `/eval/models` "Video subject"/"Video quality" tabs. **Engineering only — no labels yet, no winner picked.** |
+| 5 video-describe | `21cfebd`, `461c7a0` | **Strict** role `video` (no fallback, `PHOTOSEARCH_LLM_VIDEO_MODEL`, fleet default qwen3.5-9b until the eval). **Pass order changed** from the plan: `clip, faces, quality, video-probe, video-scan, aesthetics, video-subjects, describe, video-describe, verify, category-content, keywords, category-visual` (shared model loads; text passes after video-describe). Not gated on video-subjects. Review: no forever-defer on a None answer; result for a replaced scan generation deferred; exhausted-describe videos leave text-pass totals. |
+| 6 subject share | `e4b20ec` | Behind `PHOTOSEARCH_VIDEO_SUBJECT_SHARE` (D16): off → `/api/search` **400s** the share params, tool schemas omit them. The modal timeline always shows (audit tool). |
+| 7 quality | `1f4b526` | Numbers only (D11) + `sort=steadiest|least_noisy` (two partial indexes on `video_meta`). |
+| 8 docs | this commit | CLAUDE.md "## Video", SKILL.md, this table + runbook. **Nothing deployed.** |
+
+**Smoke timings (desktop, 2026-10-17):** video-scan 6.7–43 s/video on CPU
+InsightFace; video-subjects 0.7–1.9 s/keyframe (qwen2.5-vl-7b); video-describe
+3–8 s/video (qwen3.5-9b, reasoning none).
 
 ## Why, and what the owner asked for
 
@@ -894,18 +921,159 @@ wins a flag, it becomes a `video-quality` LLM pass in step 5's shape.
 
 ### Step 8 — Backfill runbook, docs, deploy (1.5 d)
 
-- **Deploy the NAS first** (new endpoints and schema; the M28/batches lesson),
-  then the workers, together (the `failures` semantics).
-- Backfill: `register-videos --apply` per year starting with 2026 (a walk +
-  inserts) → fleet `-p video-probe -n 2` (header reads only; the spike says
-  how many bytes) → `-p video-scan -n 2` overnight (≈ 4,200 readable videos,
-  ≈ 300 GB at 30 MB/s ≈ 3 h transfer + 1–2 h analysis) → `-p video-subjects`
-  over two or three nights (≈ 36k grounding calls) → `video-describe` →
-  advance batches (match_faces; warm_crops skips videos). Report the cost up
-  front before each year, the way the gemma-4-26b one-off did.
-- CLAUDE.md gains a "Video" section: `PASS_MEDIA`, the unreadable rule, the
-  throttle, Live pairing, the focus metric, the "nothing decodes on the NAS"
-  rule, what not to simplify back.
+Docs done (CLAUDE.md "## Video", SKILL.md, "As built" above). **Nothing below
+has been run.** Order is fixed: **NAS first** (schema v35–v38 + the endpoints
+the workers call), **then the workers, together** (the `failures` semantics),
+then the backfill one year at a time, starting with 2026. Report each year's
+counts and cost estimate to the owner before starting it, the way the
+gemma-4-26b one-off did.
+
+**Cost estimate** (≈ 4,200 readable non-Live videos library-wide, ≈ 300 GB;
+smoke timings from the "As built" table; divide by the year's share of the
+`register-videos` dry run):
+
+| pass | per unit | library-wide, `-n 2` |
+|---|---|---|
+| video-probe | ffprobe reads ~3–15% of a file; < 1% when moov-less | ≈ 15–25 GB read → ≈ 10–15 min at the 30 MB/s cap |
+| video-scan | 6.7–43 s/video (CPU InsightFace) + its download | ≈ 3 h transfer at 30 MB/s, ≈ 4–25 h analysis (typical ≈ 8–12 h): **one or two nights** |
+| video-subjects | 0.7–1.9 s/keyframe, ≈ 8.6 keyframes/video | ≈ 36k calls → ≈ 7–19 GPU h (was 20–30 h at the plan's 2–3 s guess) |
+| video-describe | 3–8 s/video | ≈ 3.5–9 h |
+| category-content + keywords | as for photos | small |
+
+#### 1. Deploy the NAS
+
+Either the `/status` **Deployment** card (Fetch → Pull → Build → Restart), or
+on the NAS:
+
+```bash
+cd /volume1/docker/photosearch
+DC="docker compose -f docker-compose.nas.yml"
+DCPY="docker compose -f docker-compose.nas.yml run --rm --entrypoint python"
+git -c safe.directory=/volume1/docker/photosearch pull
+$DC build photosearch
+$DC up -d photosearch
+$DC up -d --force-recreate photosearch-mcp
+```
+
+Confirm the schema migrated (the web server migrates on first open) and the
+new endpoints answer:
+
+```bash
+$DCPY photosearch -c "
+import os, sqlite3
+c = sqlite3.connect(os.environ['PHOTOSEARCH_DB'])
+print(c.execute(\"SELECT value FROM schema_info WHERE key='version'\").fetchone())"
+# -> ('38',)
+curl -s -H 'X-Photosearch-Source: claude' \
+     -H 'X-Photosearch-Intent: Check the video endpoints after the v38 deploy' \
+     http://<NAS-IP>:8000/api/admin/unreadable-videos | head -c 300   # 200, not 404
+```
+
+Then restart the replica so the desktop UI and fleet launcher run the same
+code. **Check `/admin/maintenance` → fleet status first — restarting the
+replica kills a UI-launched fleet.**
+
+```bash
+git -C ~/local-photo-search pull && systemctl --user restart photosearch-replica
+```
+
+#### 2. Register (per year, NAS)
+
+```bash
+$DC run --rm photosearch register-videos --folder 2026            # dry run: counts per year
+$DC run --rm photosearch register-videos --folder 2026 --apply
+```
+
+A walk + inserts only (no ffprobe, no hash; commits every 25). New rows show
+as placeholder posters until probed. Later years: `--folder 2025`, … (omit
+`--folder` for the remainder once the per-year cadence is boring).
+
+#### 3. The fleet (desktop, `--native` only)
+
+ffprobe must be on the host (`~/.local/bin/ffprobe -version`); it is not in
+the Docker worker image. LM Studio needs JIT loading on and a ≥ 16384 context
+default for qwen2.5-vl and qwen3.5-9b. If the server is on this machine, use
+`127.0.0.1`, never `localhost` (the static ffprobe segfaults resolving it).
+
+```bash
+cd ~/local-photo-search
+export PHOTOSEARCH_TEXT_LLM_URL=http://127.0.0.1:1234/v1
+export PHOTOSEARCH_LLM_DESCRIBE_MODEL=qwen/qwen3.5-9b
+export PHOTOSEARCH_LLM_VERIFY_MODEL=google/gemma-4-12b-qat
+export PHOTOSEARCH_LLM_VISUAL_MODEL=minicpm-v-4_5
+export PHOTOSEARCH_LLM_AESTHETICS_MODEL=qwen2.5-vl-7b-instruct
+export PHOTOSEARCH_LLM_TEXT_MODEL=google/gemma-4-12b-qat
+export PHOTOSEARCH_LLM_SUBJECT_MODEL=qwen2.5-vl-7b-instruct
+export PHOTOSEARCH_LLM_VIDEO_MODEL=qwen/qwen3.5-9b      # strict: unset = pass refuses to start
+export PHOTOSEARCH_LLM_REASONING_EFFORT=none
+NAS=http://<NAS-IP>:8000
+
+./run-workers.sh --native -s $NAS -d /photos/2026 -p video-probe -n 2
+./run-workers.sh --status        # wait until it drains and exits
+./run-workers.sh --native -s $NAS -d /photos/2026 -p video-scan -n 2      # overnight
+./run-workers.sh --native -s $NAS -d /photos/2026 -p video-subjects -n 2
+./run-workers.sh --native -s $NAS -d /photos/2026 -p video-describe,category-content,keywords -n 2
+```
+
+Or one launch: `-p video-probe,video-scan,video-subjects,video-describe,category-content,keywords`
+(sequential drain is the default). Dry-run the queue depth first with
+`python cli.py worker -s $NAS -d /photos/2026 -p video-scan --dry-run`.
+Face labels: the nightly sweep's **strict** `match_faces` picks up the new
+video faces; to do it now, `$DC run --rm photosearch match-faces` (never
+`--temporal` on these). `warm_crops` skips video faces by design.
+
+#### 4. Watch the NAS while it runs
+
+The scan download is the 2026-09-19 incident's shape. On the first night:
+
+```bash
+vmstat 1                                   # NAS: b and wa columns; load >> cores with idle CPU = I/O wait
+$DC run --rm photosearch request-stats --since 2026-10-18 --slowest 10
+$DC run --rm photosearch request-stats --since 2026-10-18 --include-polling --source worker
+```
+
+If UI p95 climbs, lower the cap rather than the worker count:
+`PHOTOSEARCH_VIDEO_STREAM_MBPS=15` in the photosearch service's environment,
+then `$DC up -d --force-recreate photosearch`. Unreadable verdicts land on
+`/admin/maintenance` → **Unreadable videos** (ZIP-wrapped ones should mostly
+clear after video-scan unwraps them).
+
+#### 5. Eval (after the 2026 backfill, on the replica)
+
+Sync the replica (`/status` → **Sync from NAS**), then:
+
+```bash
+cd ~/local-photo-search
+python evals/video_eval.py sample --db photo_index.db.local
+python evals/video_eval.py fetch-originals --db photo_index.db.local --server http://<NAS-IP>:8000
+python evals/video_eval.py run-faces --db photo_index.db.local --variant F0 --approach F0
+python evals/video_eval.py run-faces --db photo_index.db.local --variant F1 --approach F1
+python evals/video_eval.py run-faces --db photo_index.db.local --variant S1 --approach S1 \
+    --grounding qwen25vl --model qwen2.5-vl-7b-instruct
+python evals/video_eval.py run-faces --db photo_index.db.local --variant S2 --approach S2 \
+    --grounding qwen25vl --model qwen2.5-vl-7b-instruct
+python evals/video_eval.py run-describe --variant D0 --approach D0 --model qwen/qwen3.5-9b
+python evals/video_eval.py run-describe --variant D1-q9b --approach D1 --model qwen/qwen3.5-9b --k 6 --px 768
+python evals/video_eval.py run-quality --variant Qm --approach Qm
+```
+
+Owner labels (≈ 3.1 h) on `http://localhost:8001/eval/models?tab=vsubject`
+and `?tab=vquality`, the recheck set included; then
+`python evals/video_eval.py agreement` (kappa) and
+`python evals/video_eval.py report` — holdout numbers decide every gate in
+Step 4. A failed gate leaves the flag off.
+
+#### 6. Turn the subject share on (only after the gates pass)
+
+The flag is read per process; nothing is recomputed. NAS: add
+`- PHOTOSEARCH_VIDEO_SUBJECT_SHARE=1` to the `environment:` of **both**
+`photosearch` and `photosearch-mcp` in `docker-compose.nas.yml`, then
+`$DC up -d --force-recreate photosearch photosearch-mcp`. Replica: add
+`export PHOTOSEARCH_VIDEO_SUBJECT_SHARE=1` to `run-local-replica.sh` and
+restart the service. Check: `/api/search?media=video&min_focus_share=0.5`
+returns 200 (it 400s while off), and the search page shows the share controls.
+If the eval picked a different `video`/`subject` model, update
+`rerun.FLEET_ROLE_MODELS` and re-run only the affected pass (`clear-pass`).
 
 ## Estimate and ordering
 

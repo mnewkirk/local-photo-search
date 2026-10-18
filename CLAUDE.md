@@ -22,7 +22,8 @@ Frontend is plain React (UMD, no build step) in `frontend/dist/`. Docker Compose
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). Schema version 34 (`SCHEMA_VERSION` in `db.py` is the source of truth).
+File is `photo_index.db` (not `photos.db`). Schema version 38 (`SCHEMA_VERSION` in `db.py` is the source of truth;
+v35–v38 are video — see "## Video").
 v34 is indexes only (`db._SEARCH_INDEXES`; `docs/plans/search-indexes.md`):
 camera+date, file_hash, covering tag composites, NOCASE location, /map GPS,
 quality expression indexes, worker-count partials, faces `(photo_id, person_id)`
@@ -441,8 +442,9 @@ is captured per artifact.
 
 The valid worker passes (`-p`/`--passes`, enforced by `valid_passes` in
 `cli.py`) are: `clip`, `faces`, `quality`, `describe`, `category-content`,
-`category-visual`, `keywords`, `verify`, `aesthetics`. The full LLM-backed
-pass list is:
+`category-visual`, `keywords`, `verify`, `aesthetics`, plus the four video
+passes `video-probe`, `video-scan`, `video-subjects`, `video-describe` (see
+"## Video"). The full LLM-backed still-photo pass list is:
 
 ```
 clip,faces,quality,describe,category-content,category-visual,keywords,verify,aesthetics
@@ -1443,6 +1445,146 @@ but don't let the message claim "nothing landed". The response gained
 `deferred` / `deferred_photo_ids` (additive; older workers read only
 `written`/`processed`). Deferrals mean a long-running writer (the sweep), not a
 bad photo. Tests: `tests/test_worker_submit_resilience.py`.
+
+## Video
+
+`docs/plans/video-support.md` (plan, Step 0 spike results, decisions D1–D21,
+as-built table, and the **Step 8 backfill runbook**). Built 2026-10-17, **not
+yet deployed or backfilled**. Corpus: 5,577 files, ~400 GB, median 3 s (mostly
+Live Photo clips), ~25% "unreadable".
+
+**Data model.** A video is a `photos` row with `media_type='video'`; **NULL
+means still**, so no existing row was rewritten (an `UPDATE … ='photo'` would
+have held the NAS write lock over the whole table). Side tables: `video_meta`
+(probe + scan + subjects state and quality numbers), `video_tracks` (one per
+within-video person identity), `video_subjects` (one per main subject). Schema
+v35 added `media_type` + the three tables; v36 `video_meta.poster_version` +
+`video_tracks.presence_intervals`; v37 `subjects_version/at/json` +
+`video_subjects.share/rep_seg`; v38 `video_meta.scan_generation` (staged
+uploads, below).
+
+**`db.PASS_MEDIA` says which rows each pass may claim** (`still` / `video` /
+`any`), and every claim/count branch appends its fragment. Image passes are
+`still`; `category-content`/`keywords` are `any` (they read
+`photos.description`, which `video-describe` writes); `verify` is `still` (it
+reads pixels and would otherwise claim a video once described, D18). A pass
+missing from the map **raises**, and `tests/test_pass_media.py` iterates every
+`WORKER_PASSES` entry — so a new pass cannot silently start claiming videos.
+`batch_state` derives per-pass totals from the same map, so a batch holding
+videos still completes its image passes. Every pixel reader that predates video
+skips them (purge-nonimage — the one data-loss risk — stacking, sharpness,
+rank_measure, team review, upscale, split, book export, Google upload, colors,
+orientation, cull, verify CLI, `similar_by_photo(media=…)`).
+
+**The NAS never decodes or probes (owner decision D19).** It walks the tree
+(`register-videos`, and `ingest-incoming` for new files), inserts rows, stores
+what workers upload (`POST /api/videos/{id}/assets`, atomic, validated before
+any write, under `<DB dir>/video_frames/{id}/v{ver}/g{gen}/`), serves files with
+HTTP Range, and does the Live-pairing SQL. No ffmpeg in the image; no decode on
+the N100 ever. Don't "simplify" by moving the probe back onto the NAS.
+
+**Four worker passes**, order (all mirrors of the pass list): `clip, faces,
+quality, video-probe, video-scan, aesthetics, video-subjects, describe,
+video-describe, verify, category-content, keywords, category-visual`.
+video-describe drains before the text passes that read it; aesthetics →
+video-subjects share one qwen2.5-vl load, describe → video-describe one qwen3.5.
+
+| pass | does | model / env |
+|---|---|---|
+| `video-probe` (claim 25) | 12-byte magic read, ffprobe over Range, per-camera date, GPS, rotation-corrected dims, one cv2 frame → poster ×3 | none (ffprobe) |
+| `video-scan` (claim 1) | one throttled download (hashed), dense decode at 4/3/2 fps by length, InsightFace + numpy tracker, CLIP mean, quality, keyframes, crops | none (CPU InsightFace) |
+| `video-subjects` (claim 2) | VLM grounding of one keyframe per 3 s segment (cap 40), joined to face tracks | role `subject`: `PHOTOSEARCH_LLM_SUBJECT_MODEL` (falls back to the aesthetics model) |
+| `video-describe` (claim 4) | K keyframes in ONE request + the subjects timeline → `photos.description` | role `video`: `PHOTOSEARCH_LLM_VIDEO_MODEL`, **strict — no fallback** |
+
+`rerun.FLEET_ROLE_MODELS`: subject `qwen2.5-vl-7b-instruct`, video
+`qwen/qwen3.5-9b` (until the eval picks). An unset strict role raises
+`RoleModelNotConfigured`; with `ContextOverflow` it halts the pass
+(`PassHalted`: finished results submitted, the rest released with no attempt)
+instead of burning attempts. **The video passes need `--native`**: ffprobe is
+not in the Docker worker image (`PHOTOSEARCH_FFPROBE`, else PATH, else
+`~/.local/bin/ffprobe`). The static ffprobe build **segfaults resolving
+`localhost`** — point workers at `127.0.0.1` when the server is local.
+
+**Unreadable is stored once, never re-decoded.** A probe verdict is a stored
+`probe_error` (the CLIP re-claim trap otherwise); transport errors are omitted
+(deferred), a tool failure is a failure row. Unreadable/Live rows count as
+done in batch state and are hidden from default search; they are listed at
+`GET /api/admin/unreadable-videos` (card on `/admin/maintenance`).
+
+**Most "moov atom not found" files are ZIPs, not corruption.** 23/40 sampled
+2016–17 `.mov`/`.mp4` start `PK\x03\x04` (the iOS Live-bundle bug CLAUDE.md
+already knew for `.JPG`), each wrapping one playable video. Probe stores
+`probe_error='zip_wrapped'`; **scan unwraps** inside its existing download
+(unwrapping costs a full decompress — DEFLATE over H.264 saves 0.03% — so it
+does not belong in the cheap probe). Safety: one video member only (ignores
+`__MACOSX/` and `._*`, takes the MOV of a JPG+MOV bundle, refuses 0 or 2+),
+member ≤ 16 GiB **and** ≤ 1.2× the ZIP's own size (so a `compress_size 0`
+header can't dodge the bomb check); dates/codec come from the inner file.
+
+**Dates are a per-camera-family dispatch, not one offset (D14 as built).**
+Apple `com.apple.quicktime.creationdate` verbatim; Android/Pixel
+`creation_time − duration` (the muxer stamps the END) in `PHOTOSEARCH_TZ`;
+Sony XAVC and Kodak PIXPRO write local wall time with a `Z` — treat as local,
+**never convert** (converting moves every clip a whole timezone the wrong
+way); else keep mtime. Measured on n≈10/family — re-validate on a bigger sample
+before bumping `PROBE_VERSION`.
+
+**Live pairing** is server-side at probe submit: same stem, same or ±1-day
+sibling folder, ≤ 4 s long, within 3 s of the still. Paired clips are hidden
+behind the still and never analysed (owner: skip them, D3).
+
+**Throttle.** `?purpose=worker` reads of `/full` go through a process-wide
+token bucket, `PHOTOSEARCH_VIDEO_STREAM_MBPS` (default 30 MB/s, ranged reads
+included), and at most `PHOTOSEARCH_VIDEO_WORKER_STREAMS` (default 4)
+concurrent worker streams — over the cap is `503 Retry-After: 10`, which
+`WorkerClient` already backs off on. This is the 2026-09-19 disk-starvation
+incident's shape (400 GB of reads); keep `-n 2` and watch `request-stats`.
+
+**Faces: one `faces` row per within-video identity**, so `/faces`,
+clustering, the strict matcher, verify-labels, the rival test and
+one-person-per-photo apply unchanged. The bbox is in **native display px**
+(the space of `photos.image_width/height`) — rep-frame px made 4K faces look
+tiny to `min_bbox_edge`. All video coordinate systems are documented once, in
+`video_scan_store`. Crops are **served from the uploaded crop / rep frame,
+never the video**; `warm_crops` skips video faces. A re-scan carries
+`manual`/`merge_review`/`rejected` labels one-to-one at L2 ≤ 0.6, plus every
+matched face's `face_person_exclusions`; unmatched labels are reported.
+**Uploads are staged** (v38): scan writes into a new generation dir and
+installs nothing; only the committed submit records the generation, bumps
+`poster_version` and installs posters + crops — so a deferred or failed
+re-scan leaves the live files untouched. video-subjects/-describe carry
+`scan_generation` and **defer** a result computed from a replaced one rather
+than mapping `face_ix` onto new tracks. The tracker vetoes an IoU match whose
+embeddings are > 1.2 apart (`track_iou_veto_l2`).
+
+**Subject share** (D10, D21): per segment, the VLM's most salient box is the
+primary subject (person / animal / landscape / object / activity); person
+boxes take a face identity. `share = Σ seg seconds where S is primary / whole
+clip duration`, `focus_s` beside it. Person shares are read `GROUP BY
+faces.person_id` **at query time**, so a relabel moves the share with no
+recompute. Search (`min_focus_share`, `min_focus_seconds`, `subject`,
+`min_subject_share`, `sort=focus_desc|subject_desc`) is behind
+**`PHOTOSEARCH_VIDEO_SUBJECT_SHARE`** (off until the eval passes, D16): off,
+`/api/search` **400s** on those params, tool schemas omit them, stray tool args
+are ignored. The modal's subject timeline (`GET /api/videos/{id}/subjects`)
+always shows — it is the audit tool.
+
+**Quality** (D11): shake / noise / focus consistency / exposure as **numbers
+only**, shown in the modal; `sort=steadiest|least_noisy` (ungated, implies
+`media=video`). No tag until a holdout eval gates one — the photo quality tag
+failed its eval twice.
+
+**Search.** `media=all|photo|video` (`/api/search`, Ask locked filters, tools).
+Default hides paired Live clips and unreadable rows via rowid-only predicates
+(`db.media_filter_sql`); curation/book tools default to stills.
+
+**Evals:** `evals/video_eval.py` (sample → fetch-originals → run-faces /
+run-describe / run-quality → report, holdout headline, CIs, `agreement`);
+labelling on `/eval/models?tab=vsubject` and `?tab=vquality`.
+
+**Deploy the NAS first** (schema v35–v38, new endpoints), **then the workers,
+together**, and run video passes `--native` only. The runbook with exact
+commands and cost estimates is Step 8 of the plan.
 
 ## Vec0 orphan cleanup
 
@@ -3876,16 +4018,9 @@ Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessStep` in
 
 ## Planned milestones (see `docs/plans/`)
 
-- `docs/plans/video-support.md` — **PLANNED 2026-10-17** (plan-debate, both
-  planners converged). Videos become `photos` rows (`media_type='video'`, NULL =
-  still) with `video_meta`/`video_tracks`; `db.PASS_MEDIA` keeps image passes off
-  them. NAS does ffprobe + one poster frame only; the desktop `video-scan` pass
-  downloads each file once at a 30 MB/s cap, tracks faces, and writes one
-  `faces` row per identity so `/faces` tooling applies unchanged. Main-focus
-  share = time-weighted salience (face size × centre weight) over the WHOLE
-  clip, hidden until a 90-video owner-labelled holdout eval passes its gates.
-  Corpus: 5,577 files, ~400 GB, 25% unreadable (`moov atom not found`), median
-  3 s (Live Photos, paired to the still and skipped).
+- `docs/plans/video-support.md` — **BUILT 2026-10-17, not yet deployed or
+  backfilled** (commits `9015b61`…`461c7a0`). See "## Video" above; the plan's
+  Step 8 is the copy-paste deploy + backfill runbook.
 
 - `docs/plans/search-indexes.md` — **SHIPPED 2026-10-04.** Schema v34 search
   indexes; `search_combined` composes date/camera/people into one id scope;

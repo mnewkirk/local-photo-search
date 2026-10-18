@@ -99,7 +99,7 @@ local-photo-search/
 
 ---
 
-## Database Schema (v34)
+## Database Schema (v38)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
@@ -107,9 +107,12 @@ local-photo-search/
 > percentile normalization (v28), `maintenance_runs` (v29), and
 > `ingest_sweeps`/`ingest_batches`/`ingest_batch_jobs` (v30),
 > `face_person_exclusions` (v31), `stacking_seen` (v32), the measured
-> `sharpness*` columns (v33), and the **search indexes (v34, indexes only — see
-> "Search performance" below)**. `SCHEMA_VERSION` in `db.py` is the source of
-> truth — currently **34**. See CLAUDE.md for the aesthetics + folder +
+> `sharpness*` columns (v33), the **search indexes (v34, indexes only — see
+> "Search performance" below)**, and **video** (v35 `photos.media_type` +
+> `video_meta`/`video_tracks`/`video_subjects`; v36 `poster_version`; v37
+> subject shares; v38 `scan_generation` — see "Video" below and CLAUDE.md
+> "## Video"). `SCHEMA_VERSION` in `db.py` is the source of
+> truth — currently **38**. See CLAUDE.md for the aesthetics + folder +
 > ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
@@ -321,7 +324,11 @@ MCP tool calls fill the optional `intent` argument instead.
   - Params: q, person, color, place, limit, offset, min_score, min_quality,
     sort_quality, sort, tag_match, date_from, date_to, location, match_source,
     camera, category, visual_tag, keyword, min_aesthetic, min_day_aesthetic,
-    style_tag (see "Search performance" for how combinations execute)
+    style_tag, media (`all|photo|video`; default hides Live clips + unreadable
+    videos), sort `steadiest|least_noisy` (videos), and — only while
+    `PHOTOSEARCH_VIDEO_SUBJECT_SHARE` is on, else **400** — min_focus_share,
+    min_focus_seconds, subject, min_subject_share, sort `focus_desc|subject_desc`
+    (see "Search performance" for how combinations execute)
   - **Name extraction from `q`** — `search.py:_extract_persons_from_query`
     pulls registered person names out of the free-text query and turns
     them into AND-intersected person filters via the same `result_sets`
@@ -334,6 +341,30 @@ MCP tool calls fill the optional `intent` argument instead.
 - `GET /api/photos/{id}/thumbnail` — Cached thumbnail
 - `GET /api/photos/{id}/full` — Full resolution
 - `GET /api/photos/{id}/preview` — Preview size
+
+### Video (built 2026-10-17, not yet deployed — CLAUDE.md "## Video")
+- `GET /api/photos/{id}/full` — for a video: single-range HTTP Range (206/416);
+  `?purpose=worker` is throttled (`PHOTOSEARCH_VIDEO_STREAM_MBPS`, default 30
+  MB/s) and capped at `PHOTOSEARCH_VIDEO_WORKER_STREAMS` (4) → 503 Retry-After.
+  Thumbnail/preview serve the uploaded poster (Live → the still, unprobed /
+  unreadable → SVG placeholder).
+- `POST /api/videos/{id}/assets` — worker upload of poster/keyframe/crop JPEGs
+  (base64 JSON, staged per scan generation)
+- `GET /api/videos/{id}/frames/{name}` — keyframes / rep frames (`?v=`, `?g=`)
+- `GET /api/videos/{id}/subjects` — subjects, per-person shares (names via
+  `faces.person_id` at read time), timeline, dense presence
+- `GET /api/videos/subject-labels` — Subject typeahead
+- `GET /api/admin/unreadable-videos` — unreadable / ZIP-wrapped list
+  (`/admin/maintenance` card)
+- CLI: `photosearch register-videos [--folder 2026] [--limit N] [--apply]`
+  (NAS; walk + insert only, dry run read-only)
+- Worker passes (`--native` only — ffprobe isn't in the Docker worker image):
+  `video-probe`, `video-scan`, `video-subjects` (role `subject`,
+  `PHOTOSEARCH_LLM_SUBJECT_MODEL`, `--llm-subject-model`), `video-describe`
+  (strict role `video`, `PHOTOSEARCH_LLM_VIDEO_MODEL`, `--llm-video-model`,
+  no fallback). `clear-pass` accepts all four. Runbook: Step 8 of
+  `docs/plans/video-support.md`.
+- Eval: `evals/video_eval.py`; labelling `/eval/models?tab=vsubject|vquality`.
 
 ### Faces
 - `GET /api/faces/groups` — All face groupings (paginated, similarity-sorted).
@@ -1345,6 +1376,10 @@ Collection-only options:
 | Stacking | (auto after CLIP) | — | Fast (DB only) | CLIP embeddings |
 | Geocoding | (auto) | GeoNames (offline) | Fast | GPS data in EXIF |
 | Verification | `--verify` | `llava` checker + `llama3.2-vision` regen | Slow (2 LLM passes) | Descriptions exist |
+| Video probe | worker `video-probe` only | ffprobe over Range + 1 cv2 frame (desktop) | header reads | `register-videos` row |
+| Video scan | worker `video-scan` only | InsightFace + tracker + CLIP (desktop CPU) | ~7–43 s/video | video-probe |
+| Video subjects | worker `video-subjects` only | role `subject` (qwen2.5-vl) | ~0.7–1.9 s/keyframe | video-scan |
+| Video describe | worker `video-describe` only | role `video` (qwen3.5-9b), strict | ~3–8 s/video | video-scan |
 
 The old single `tags` pass was removed and split into `category-visual`
 (vision), `category-content` (text), and `keywords` (text). The per-pass
