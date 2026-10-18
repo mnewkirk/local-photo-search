@@ -1,0 +1,37 @@
+{
+ "format": {
+  "bit_rate": "20459824",
+  "duration": "1.000000",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 2,
+  "tags": {
+   "major_brand": "qt  "
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30/1",
+   "bits_per_raw_sample": "8",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "duration": "1.000000",
+   "field_order": "progressive",
+   "height": 1080,
+   "index": 0,
+   "level": 41,
+   "pix_fmt": "yuv420p",
+   "profile": "High",
+   "r_frame_rate": "30/1",
+   "width": 1920
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "pcm_s16le",
+   "codec_type": "audio",
+   "duration": "1.000000",
+   "index": 1,
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

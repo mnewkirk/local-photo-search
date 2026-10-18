@@ -1,0 +1,42 @@
+{
+ "format": {
+  "bit_rate": "894963",
+  "duration": "26.168889",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 2,
+  "tags": {
+   "major_brand": "mp42"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "14951/500",
+   "bits_per_raw_sample": "8",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "color_primaries": "bt709",
+   "color_range": "tv",
+   "color_space": "bt709",
+   "color_transfer": "bt709",
+   "duration": "26.016654",
+   "field_order": "progressive",
+   "height": 720,
+   "index": 0,
+   "level": 31,
+   "pix_fmt": "yuv420p",
+   "profile": "High",
+   "r_frame_rate": "14951/500",
+   "width": 1280
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "duration": "26.168889",
+   "index": 1,
+   "profile": "LC",
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

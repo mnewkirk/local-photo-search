@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Passes this module can re-run, in DEPENDENCY order — the sync re-run and the
 # fleet launcher both sort by it (see batch_state.WORKER_PASSES for why verify
 # precedes the text passes). Same order as batch_state.WORKER_PASSES.
-ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-scan",
+ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
               "aesthetics", "video-subjects", "describe", "video-describe",
               "verify", "category-content", "keywords", "category-visual")
 
@@ -50,7 +50,9 @@ TEXT_ONLY_PASSES = {"category-content", "keywords"}
 # whole (video-probe: ffprobe + one frame of a possibly multi-GB clip).
 # video-scan: its own hashed download; video-subjects: the uploaded keyframes.
 # video-describe: the K uploaded keyframes.
-RANGE_READ_PASSES = {"video-probe", "video-scan", "video-subjects", "video-describe"}
+# video-proxy: its own rate-capped download + a streamed upload.
+RANGE_READ_PASSES = {"video-probe", "video-proxy", "video-scan", "video-subjects",
+                     "video-describe"}
 
 # pass -> (LLM role, Ollama-style default model). The role drives LM Studio model
 # selection (PHOTOSEARCH_LLM_<ROLE>_MODEL via describe._resolve_openai_model);
@@ -321,6 +323,16 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
         elif pass_type == "video-probe":
             results = W._process_video_probe(client, [info])
             kwargs = W._submit_kwargs("video_probe_results", results)
+        elif pass_type == "video-proxy":
+            vm = db.conn.execute(
+                "SELECT codec, container, width, height, has_audio, duration_s, "
+                "probe_json FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
+            if vm is None or vm["codec"] is None:
+                raise RuntimeError(f"video {photo_id} has no readable probe "
+                                   f"(run video-probe first)")
+            info["proxy_input"] = dict(vm)
+            results = W._process_video_proxy(client, [info], tmpdir)
+            kwargs = W._submit_kwargs("video_proxy_results", results)
         elif pass_type == "video-scan":
             vm = db.conn.execute("SELECT duration_s FROM video_meta WHERE photo_id = ?",
                                  (photo_id,)).fetchone()
@@ -423,6 +435,8 @@ _VIDEO_META_MIRROR = (
     "scan_generation",
     # video-subjects (step 3b, schema v37)
     "subjects_version", "subjects_at", "subjects_json",
+    # video-proxy (schema v39)
+    "proxy_needed", "proxy_version", "proxy_bytes", "proxy_w", "proxy_h", "proxy_at",
 )
 _VIDEO_TRACK_MIRROR = (
     "face_id", "ident_ix", "t_start", "t_end", "n_det", "presence_s", "focus_s",

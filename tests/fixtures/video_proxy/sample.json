@@ -1,0 +1,35 @@
+{
+ "format": {
+  "bit_rate": "16340425",
+  "duration": "18.048000",
+  "format_name": "mpegts",
+  "nb_streams": 3,
+  "tags": {}
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30000/1001",
+   "bits_per_raw_sample": "8",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "duration": "17.934578",
+   "field_order": "tt",
+   "height": 1080,
+   "index": 0,
+   "level": 40,
+   "pix_fmt": "yuv420p",
+   "profile": "High",
+   "r_frame_rate": "60000/1001",
+   "width": 1920
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "ac3",
+   "codec_type": "audio",
+   "duration": "18.048000",
+   "index": 1,
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

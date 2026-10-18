@@ -385,21 +385,32 @@ def proxy_video(nas_url: str, photo_id: int, range_header: Optional[str],
     """Stream /full of a video from the NAS, forwarding Range and returning
     the NAS's status (200/206/416) and range headers. The body is iterated
     (`iter_content`), never read whole: a clip can be gigabytes."""
-    import requests
-    from .request_intent import outbound_headers
-
     params = {}
     if purpose:
         params["purpose"] = purpose
     if download:
         params["download"] = "1"
-    hdrs = outbound_headers(f"Stream video {photo_id} from the NAS"
+    return proxy_nas_stream(
+        f"{nas_url}/api/photos/{photo_id}/full", params, range_header,
+        f"Stream video {photo_id} from the NAS", session=session, timeout=timeout)
+
+
+def proxy_nas_stream(url: str, params: Optional[dict], range_header: Optional[str],
+                     purpose_text: str, session=None, timeout: float = 30.0):
+    """Stream any Range-capable NAS media URL through the replica: forwards
+    ``Range``, returns the NAS's status (200/206/404/416) and range headers,
+    iterates the body (never ``.read()``). Shared by ``/full`` of a video and
+    ``/api/videos/{id}/proxy``."""
+    import requests
+    from .request_intent import outbound_headers
+
+    hdrs = outbound_headers(purpose_text
                             + (f" (range {range_header})" if range_header else ""))
     if range_header:
         hdrs["Range"] = range_header
     sess = session or requests
-    upstream = sess.get(f"{nas_url}/api/photos/{photo_id}/full", params=params,
-                        headers=hdrs, stream=True, timeout=timeout)
+    upstream = sess.get(url, params=params or {}, headers=hdrs, stream=True,
+                        timeout=timeout)
     out_headers = {k: v for k, v in upstream.headers.items()
                    if k.lower() in _PROXY_HEADERS}
 

@@ -1,0 +1,38 @@
+{
+ "format": {
+  "bit_rate": "1707421",
+  "duration": "4.938267",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 2,
+  "tags": {
+   "major_brand": "FACE"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30000/1001",
+   "bits_per_raw_sample": "8",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "duration": "4.904900",
+   "field_order": "progressive",
+   "height": 720,
+   "index": 0,
+   "level": 31,
+   "pix_fmt": "yuv420p",
+   "profile": "High",
+   "r_frame_rate": "30000/1001",
+   "width": 1280
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "duration": "4.852971",
+   "index": 1,
+   "profile": "LC",
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

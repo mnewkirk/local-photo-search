@@ -1,0 +1,32 @@
+{
+ "format": {
+  "bit_rate": "11023753",
+  "duration": "12.637625",
+  "format_name": "avi",
+  "nb_streams": 2,
+  "tags": {}
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "24000/1001",
+   "codec_name": "mpeg4",
+   "codec_type": "video",
+   "duration": "12.637625",
+   "height": 1080,
+   "index": 0,
+   "level": 5,
+   "pix_fmt": "yuv420p",
+   "profile": "Advanced Simple Profile",
+   "r_frame_rate": "24000/1001",
+   "width": 1920
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "pcm_s16le",
+   "codec_type": "audio",
+   "index": 1,
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

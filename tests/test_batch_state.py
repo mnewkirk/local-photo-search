@@ -126,6 +126,7 @@ _PASS_DOERS = {
     "verify": lambda db, ids: _set_col(db, ids, "verified_at", "2091-09-19 12:00:00"),
     # these fixtures are stills-only: a video pass has nothing to do
     "video-probe": lambda db, ids: None,
+    "video-proxy": lambda db, ids: None,
     "video-scan": lambda db, ids: None,
     "video-subjects": lambda db, ids: None,
     "video-describe": lambda db, ids: None,
@@ -1047,7 +1048,7 @@ class TestFleetLaunchPasses:
         got = fleet_launch_passes(_fake_state({
             "describe": "completed", "category-content": "waiting",
             "keywords": "waiting", "verify": "waiting"}))
-        assert got == ["clip", "faces", "quality", "video-probe", "video-scan",
+        assert got == ["clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
                        "aesthetics", "video-subjects", "video-describe",
                        "verify", "category-content", "keywords", "category-visual"]
 
@@ -1125,8 +1126,9 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
     # video-scan waits on the probe, which this same launch queues (and
     # video-subjects / video-describe on the scan, the text passes on
     # video-describe)
-    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects",
-                                          "video-describe", "category-content", "keywords"]
+    assert fleet_launch_passes(state) == ["video-probe", "video-proxy", "video-scan",
+                                          "video-subjects", "video-describe",
+                                          "category-content", "keywords"]
     assert _step(state, "category-content")["waiting_on"] == "video-describe"
     assert _step(state, "video-scan")["state"] == "waiting"
     from photosearch.video_probe import PROBE_VERSION
@@ -1186,8 +1188,9 @@ def test_video_only_batch_asks_the_fleet_for_video_probe_only(db):
             assert _step(state, p)["state"] == "completed", _step(state, p)
     assert _step(state, "video-probe")["state"] == "needs_queue"
     assert state["next_action"] == "launch_fleet"
-    assert fleet_launch_passes(state) == ["video-probe", "video-scan", "video-subjects",
-                                          "video-describe", "category-content", "keywords"]
+    assert fleet_launch_passes(state) == ["video-probe", "video-proxy", "video-scan",
+                                          "video-subjects", "video-describe",
+                                          "category-content", "keywords"]
     assert vid
 
 

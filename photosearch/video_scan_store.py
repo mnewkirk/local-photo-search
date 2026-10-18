@@ -268,6 +268,11 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
             from .video_probe import PROBE_VERSION
             p["probe_version"] = PROBE_VERSION
         info = apply_probe_result(conn, p)
+        # The file on the NAS is still the ZIP: nothing can play it, whatever
+        # the inner codec — so it needs a proxy (video_proxy; the worker
+        # unwraps it before transcoding). A later unwrap + re-probe
+        # recomputes this from the real file.
+        conn.execute("UPDATE video_meta SET proxy_needed = 1 WHERE photo_id = ?", (pid,))
         out["probe_applied"] = {k: info.get(k) for k in ("kind", "date_taken")}
 
     fh = r.get("file_hash")

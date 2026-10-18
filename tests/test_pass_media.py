@@ -34,12 +34,13 @@ def _make_eligible(db, pass_type, ids):
                             "scan_version = ? WHERE photo_id = ?",
                             (PROBE_VERSION, SCAN_VERSION, pid))
         db.conn.commit()
-    if pass_type == "video-scan":
+    if pass_type in ("video-scan", "video-proxy"):
         from photosearch.video_probe import PROBE_VERSION
         for pid in ids:
             db.conn.execute("INSERT OR IGNORE INTO video_meta (photo_id) VALUES (?)", (pid,))
-            db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
-                            "WHERE photo_id = ?", (PROBE_VERSION, pid))
+            # video-proxy: an HEVC original the browser cannot play.
+            db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip', "
+                            "proxy_needed = 1 WHERE photo_id = ?", (PROBE_VERSION, pid))
         db.conn.commit()
     if pass_type in ("describe", "video-describe"):
         db.conn.execute(
@@ -183,7 +184,7 @@ def test_still_passes_complete_with_unprocessed_videos_in_the_batch(mixed):
     for p in WORKER_PASSES:
         if PASS_MEDIA[p] == "still":
             assert steps[p]["state"] == "completed", (p, steps[p])
-        elif p == "video-scan":
+        elif p in ("video-scan", "video-proxy"):
             # unprobed videos are not claimable yet: it waits on the probe
             assert steps[p]["state"] == "waiting", steps[p]
             assert steps[p]["waiting_on"] == "video-probe"

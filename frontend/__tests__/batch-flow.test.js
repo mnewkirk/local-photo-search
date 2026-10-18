@@ -13,7 +13,7 @@
 const BF = require('../dist/batch-flow.js');
 
 // Mirrors batch_state.STEP_ORDER exactly (globals.md, frozen).
-const STEP_ORDER = ['ingest', 'clip', 'faces', 'quality', 'video-probe', 'video-scan',
+const STEP_ORDER = ['ingest', 'clip', 'faces', 'quality', 'video-probe', 'video-proxy', 'video-scan',
   'aesthetics', 'video-subjects', 'describe', 'video-describe',
   'verify', 'category-content', 'keywords', 'category-visual', 'stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops',
   'rank_measure', 'sharpness'];
@@ -100,7 +100,7 @@ describe('layout', () => {
       ['clip'],
       ['faces', 'quality', 'aesthetics', 'describe', 'category-visual'],
       ['verify', 'category-content', 'keywords'],
-      ['video-probe', 'video-scan', 'video-subjects', 'video-describe'],
+      ['video-probe', 'video-proxy', 'video-scan', 'video-subjects', 'video-describe'],
       ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
         'warm_crops', 'rank_measure', 'sharpness'],
     ]);
@@ -749,7 +749,7 @@ describe('rerunResultLine', () => {
 // tests/test_batch_state.py::TestFleetLaunchPasses — change one side and the
 // other's test fails.
 
-const WORKER_PASSES = ['clip', 'faces', 'quality', 'video-probe', 'video-scan',
+const WORKER_PASSES = ['clip', 'faces', 'quality', 'video-probe', 'video-proxy', 'video-scan',
   'aesthetics', 'video-subjects', 'describe', 'video-describe', 'verify',
   'category-content', 'keywords', 'category-visual'];
 
@@ -777,7 +777,7 @@ describe('fleetLaunchPasses', () => {
     expect(BF.fleetLaunchPasses(workerState({
       describe: 'completed', 'category-content': 'waiting',
       keywords: 'waiting', verify: 'waiting',
-    }))).toEqual(['clip', 'faces', 'quality', 'video-probe', 'video-scan',
+    }))).toEqual(['clip', 'faces', 'quality', 'video-probe', 'video-proxy', 'video-scan',
       'aesthetics', 'video-subjects', 'video-describe', 'verify',
       'category-content', 'keywords', 'category-visual']);
   });
@@ -829,18 +829,18 @@ describe('the "N passes" copy counts the launch set', () => {
 
   test('the button label', () => {
     expect(BF.advanceButton(workerState(gated)).label)
-      .toBe('Launch fleet — 13 passes');
+      .toBe('Launch fleet — 14 passes');
   });
 
   test('the headline', () => {
     expect(BF.summarize(workerState(gated)).headline)
-      .toBe('Launch the worker fleet for 13 passes');
+      .toBe('Launch the worker fleet for 14 passes');
   });
 
   test('a blocked describe drops its three dependents from both', () => {
     const s = workerState(Object.assign({}, gated, { describe: 'blocked' }));
-    // 13 passes - describe - its 3 dependents = 9.
-    expect(BF.advanceButton(s).label).toBe('Launch fleet — 9 passes');
-    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 9 passes');
+    // 14 passes - describe - its 3 dependents = 9.
+    expect(BF.advanceButton(s).label).toBe('Launch fleet — 10 passes');
+    expect(BF.summarize(s).headline).toBe('Launch the worker fleet for 10 passes');
   });
 });

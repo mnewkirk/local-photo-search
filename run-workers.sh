@@ -159,6 +159,8 @@ Start workers:
   -p, --passes PASSES     Comma-separated passes (default: clip)
                           video-probe needs ffprobe on the host: use --native
                           (the Docker image has none; the worker drops the pass)
+                          video-proxy makes H.264 720p playable copies of
+                          HEVC/HDR/avi/mts clips (ffmpeg on the host: --native)
                           video-scan downloads each video once (30 MB/s cap on
                           the NAS); keep -n 2 for it
                           video-subjects grounds each segment keyframe with a

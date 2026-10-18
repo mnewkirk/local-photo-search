@@ -1,0 +1,39 @@
+{
+ "format": {
+  "bit_rate": "536913166",
+  "duration": "2.002000",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 3,
+  "tags": {
+   "major_brand": "XAVC"
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30000/1001",
+   "codec_name": "hevc",
+   "codec_type": "video",
+   "color_primaries": "bt709",
+   "color_range": "tv",
+   "color_space": "bt709",
+   "color_transfer": "bt709",
+   "duration": "2.002000",
+   "height": 4320,
+   "index": 0,
+   "level": 183,
+   "pix_fmt": "yuv420p10le",
+   "profile": "Main 10",
+   "r_frame_rate": "30000/1001",
+   "width": 7680
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "pcm_s16be",
+   "codec_type": "audio",
+   "duration": "2.002000",
+   "index": 1,
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

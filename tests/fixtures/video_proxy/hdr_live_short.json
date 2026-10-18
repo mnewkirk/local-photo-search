@@ -1,0 +1,63 @@
+{
+ "format": {
+  "bit_rate": "10526387",
+  "duration": "3.038333",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 6,
+  "tags": {
+   "major_brand": "qt  "
+  }
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30/1",
+   "codec_name": "hevc",
+   "codec_type": "video",
+   "color_primaries": "bt2020",
+   "color_range": "tv",
+   "color_space": "bt2020nc",
+   "color_transfer": "arib-std-b67",
+   "duration": "3.038333",
+   "height": 1080,
+   "index": 0,
+   "level": 120,
+   "pix_fmt": "yuv420p10le",
+   "profile": "Main 10",
+   "r_frame_rate": "30/1",
+   "side_data_list": [
+    {
+     "bl_present_flag": 1,
+     "dv_bl_signal_compatibility_id": 4,
+     "dv_level": 4,
+     "dv_profile": 8,
+     "dv_version_major": 1,
+     "dv_version_minor": 0,
+     "el_present_flag": 0,
+     "rpu_present_flag": 1,
+     "side_data_type": "DOVI configuration record"
+    },
+    {
+     "rotation": -90,
+     "side_data_type": "Display Matrix"
+    },
+    {
+     "ambient_illuminance": "3140000/10000",
+     "ambient_light_x": "15635/50000",
+     "ambient_light_y": "16450/50000",
+     "side_data_type": "Ambient viewing environment"
+    }
+   ],
+   "width": 1920
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "channels": 2,
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "duration": "3.036667",
+   "index": 2,
+   "profile": "LC",
+   "r_frame_rate": "0/0"
+  }
+ ]
+}

@@ -545,4 +545,4 @@ def test_v36_db_migrates_to_v37_subjects_columns(tmp_path):
         cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(video_subjects)")}
         assert {"share", "rep_seg"} <= cols
         v = db.conn.execute("SELECT value FROM schema_info WHERE key='version'").fetchone()[0]
-        assert int(v) == SCHEMA_VERSION == 38
+        assert int(v) == SCHEMA_VERSION == 39

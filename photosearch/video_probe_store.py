@@ -146,7 +146,7 @@ def apply_probe_result(conn, r: dict) -> dict:
             "probe_json = ?, kind = NULL, live_of_photo_id = NULL, "
             "duration_s = NULL, fps = NULL, codec = NULL, container = NULL, "
             "width = NULL, height = NULL, rotation = NULL, bitrate = NULL, "
-            "has_audio = NULL, poster_t = NULL WHERE photo_id = ?",
+            "has_audio = NULL, poster_t = NULL, proxy_needed = NULL WHERE photo_id = ?",
             (str(r["probe_error"])[:500], version, probe_json, pid))
         return {"photo_id": pid, "probe_error": r["probe_error"], "kind": None}
 
@@ -161,6 +161,12 @@ def apply_probe_result(conn, r: dict) -> dict:
         + ", ".join(f"{c} = ?" for c in _META_COLUMNS)
         + ", probe_error = NULL, probe_version = ?, probe_json = ? WHERE photo_id = ?",
         (*vals, version, probe_json, pid))
+    # video-proxy (schema v39): does the browser need a playable copy?
+    # Decided here, from the probe that just landed, so the claim predicate
+    # and batch_state read one column instead of parsing probe_json.
+    from .video_proxy import needs_proxy
+    conn.execute("UPDATE video_meta SET proxy_needed = ? WHERE photo_id = ?",
+                 (1 if needs_proxy({**r, "probe_json": probe_json}) else 0, pid))
     if r.get("poster_t") is not None:
         # A new poster was uploaded with this probe: bump the name the
         # replica caches it under (schema v36, video_api.poster_version).

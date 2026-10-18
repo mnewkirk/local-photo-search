@@ -568,9 +568,26 @@
     var detail = fetchDetailProp ? internalDetail : externalDetail;
     // Videos (video-support step 2): played with <video>, no face overlays.
     var isVideo = PS.isVideo(photo) || PS.isVideo(detail);
-    var videoPlayable = !isVideo || PS.videoBrowserPlayable(detail || photo);
     // The subject strip seeks this element (video-support step 6).
     var videoRef = useRef(null);
+    // Original vs the H.264 proxy (video-proxy pass). `videoErrored` flips
+    // when the ORIGINAL fails to play, which switches to the proxy if there
+    // is one, else to the "preparing / download" panel.
+    var _videoErr = useState(false);
+    var videoErrored = _videoErr[0];     var setVideoErrored = _videoErr[1];
+    useEffect(function () { setVideoErrored(false); }, [photo && photo.id]);
+    var videoInfo = detail && detail.video;
+    var videoChoice = isVideo && photo
+      ? PS.chooseVideoSource(videoInfo, API + '/api/photos/' + photo.id + '/full',
+                             PS.canPlayVideo(videoInfo && videoInfo.playback), API,
+                             (detail || photo).filename)
+      : null;
+    if (videoChoice && videoChoice.mode === 'original' && videoErrored) {
+      videoChoice = videoChoice.fallback
+        ? { mode: 'proxy', src: videoChoice.fallback, fallback: null }
+        : { mode: 'preparing', src: null, fallback: null };
+    }
+    var videoPlayable = !isVideo || !!(videoChoice && videoChoice.mode !== 'preparing');
 
     useEffect(function () {
       if (!fetchDetailProp || !photo) return;
@@ -597,7 +614,7 @@
     // would never claim it, and a still has no video-probe. category-content
     // and keywords read any description, a video's included (step 5).
     var RERUN_PASSES = PS.isVideo(photo)
-      ? ['video-probe', 'video-scan', 'video-subjects', 'video-describe',
+      ? ['video-probe', 'video-proxy', 'video-scan', 'video-subjects', 'video-describe',
          'category-content', 'keywords']
       : ['describe', 'verify', 'category-content', 'keywords',
          'category-visual', 'clip', 'faces', 'quality', 'aesthetics'];
@@ -1804,13 +1821,15 @@
                    onMouseLeave: function () { if (addingBox) { dragStartRef.current = null; setDragBox(null); } } },
           isVideo && videoPlayable
             ? e('video', {
-                key: 'video-' + photo.id,
+                key: 'video-' + photo.id + '-' + videoChoice.mode,
                 ref: videoRef,
-                src: API + '/api/photos/' + photo.id + '/full',
+                src: videoChoice.src,
                 poster: API + '/api/photos/' + photo.id + '/preview',
                 controls: true,
                 preload: 'metadata',
                 playsInline: true,
+                onError: videoChoice.mode === 'original'
+                  ? function () { setVideoErrored(true); } : undefined,
                 style: { maxWidth: '100%', maxHeight: '100%', background: '#000' },
               })
             : e('img', {
@@ -1821,7 +1840,8 @@
                 onLoad: updateImgRect,
                 draggable: false,
               }),
-          // .avi / .mts: no browser plays them — say so and offer the file.
+          // Nothing playable yet (HEVC / avi / mts and no proxy made): say
+          // so and offer the original instead of a broken player.
           isVideo && !videoPlayable && e('div', {
             style: { position: 'absolute', left: 0, right: 0, bottom: 16,
                      textAlign: 'center' },
@@ -1832,9 +1852,20 @@
               style: { padding: '6px 14px', borderRadius: 6, background: 'var(--surface2)',
                        color: 'var(--text)', border: '1px solid var(--border)',
                        textDecoration: 'none', fontSize: 13 },
-            }, '\u2193 This format does not play in the browser \u2014 download ' +
-               (photo.filename || 'the video')),
+            }, (videoInfo && videoInfo.needs_proxy === false
+                  ? '\u2193 This browser cannot play this video \u2014 download '
+                  : 'Preparing a playable copy \u2014 or \u2193 download ') +
+               (photo.filename || 'the original')),
           ),
+          // Playing the 720p copy: the original stays one click away.
+          isVideo && videoPlayable && videoChoice.mode === 'proxy' && e('a', {
+            href: API + '/api/photos/' + photo.id + '/full?download=1',
+            download: photo.filename || '',
+            title: 'Playing a 720p H.264 copy; this downloads the original file',
+            style: { position: 'absolute', right: 8, top: 8, padding: '2px 8px',
+                     borderRadius: 4, background: 'rgba(0,0,0,0.55)', color: '#ddd',
+                     textDecoration: 'none', fontSize: 11 },
+          }, '720p copy \u00b7 \u2193 original'),
           // Face bounding box overlays (hovered face, or ALL while arming a box
           // so the user sees what already exists before drawing a new one).
           // None on a video: the boxes belong to one frame, not the clip.
@@ -2730,6 +2761,97 @@
     if (photo && photo.video && photo.video.browser_playable === false) return false;
     var name = ((photo && photo.filename) || '').toLowerCase();
     return !/\.(avi|mts|m2ts)$/.test(name);
+  };
+
+  // ---- Video playback: original vs the H.264 proxy (video-proxy pass) ----
+  // The owner's Windows Chrome/Edge decode NO HEVC (measured 2026-10-18), so
+  // most clips need the desktop-made H.264 copy (/api/videos/{id}/proxy).
+  // These three are pure (environment injectable) so jest pins them.
+
+  // RFC 6381 codec string for MediaSource.isTypeSupported, from the probe's
+  // playback block (detail.video.playback: codec / profile / level). null
+  // when it cannot be built — "unknown", never a guess.
+  var H264_PROFILE_IDC = { 'baseline': '42', 'constrained baseline': '42', 'main': '4d',
+                           'extended': '58', 'high': '64', 'high 10': '6e',
+                           'high 4:2:2': '7a', 'high 4:4:4 predictive': 'f4' };
+  PS.videoCodecString = function (pb) {
+    if (!pb || !pb.codec) return null;
+    var codec = String(pb.codec).toLowerCase();
+    var level = parseInt(pb.level, 10);
+    if (codec === 'h264') {
+      var idc = H264_PROFILE_IDC[String(pb.profile || '').toLowerCase()];
+      if (!idc || !(level > 0)) return null;
+      var constraint = /^constrained baseline$/i.test(pb.profile || '') ? 'e0' : '00';
+      var hex = level.toString(16);
+      return 'avc1.' + idc + constraint + (hex.length < 2 ? '0' : '') + hex;
+    }
+    if (codec === 'hevc') {
+      if (!(level > 0)) return null;
+      var main10 = /10/.test(pb.profile || '') || (pb.bit_depth || 8) > 8;
+      return main10 ? 'hvc1.2.4.L' + level + '.B0' : 'hvc1.1.6.L' + level + '.B0';
+    }
+    if (codec === 'av1') return 'av01.0.08M.' + ((pb.bit_depth || 8) > 8 ? '10' : '08');
+    if (codec === 'vp9') return 'vp09.00.10.' + ((pb.bit_depth || 8) > 8 ? '10' : '08');
+    return null;
+  };
+
+  var MP4_CONTAINERS = ['mp4', 'mov', 'm4v'];
+
+  // Can THIS browser play the original? true / false / null (unknown).
+  // env = { isTypeSupported(mime), canPlayType(mime) } for tests; defaults to
+  // window.MediaSource and a scratch <video>. A non-mp4/mov container (avi,
+  // mpegts) is false outright; so is a long edge over 3840 (the proxy rule).
+  PS.canPlayVideo = function (pb, env) {
+    if (!pb) return null;
+    var container = String(pb.container || '').toLowerCase();
+    if (container && MP4_CONTAINERS.indexOf(container) < 0) return false;
+    if (pb.long_edge && pb.long_edge > 3840) return false;
+    var codecs = PS.videoCodecString(pb);
+    if (!codecs) return null;
+    var mime = 'video/mp4; codecs="' + codecs + '"';
+    env = env || {};
+    var its = env.isTypeSupported;
+    var cpt = env.canPlayType;
+    if (!its && !cpt && typeof window !== 'undefined') {
+      if (window.MediaSource && typeof window.MediaSource.isTypeSupported === 'function') {
+        its = function (m) { return window.MediaSource.isTypeSupported(m); };
+      } else if (typeof document !== 'undefined') {
+        var probe = document.createElement('video');
+        if (probe && typeof probe.canPlayType === 'function') {
+          cpt = function (m) { return probe.canPlayType(m); };
+        }
+      }
+    }
+    try {
+      if (its) return !!its(mime);
+      if (cpt) { var r = cpt(mime); return r === 'probably' || r === 'maybe'; }
+    } catch (err) { return null; }
+    return null;
+  };
+
+  // Which source the modal plays. Returns {mode, src, fallback}:
+  //   'proxy'     — the H.264 copy (the original can't play here, or its
+  //                 container is not mp4/mov, or unknown + the server says
+  //                 it needs one);
+  //   'original'  — the file itself; `fallback` is the proxy to switch to
+  //                 if the <video> errors;
+  //   'preparing' — nothing playable yet: say so and offer the download.
+  // `video` is detail.video (may be null before the detail loads);
+  // `canPlay` is PS.canPlayVideo's answer; `api` prefixes the proxy URL.
+  PS.chooseVideoSource = function (video, originalUrl, canPlay, api, filename) {
+    var pb = video && video.playback;
+    var proxy = video && video.proxy_url ? (api || '') + video.proxy_url : null;
+    var containerOk = pb && pb.container
+      ? MP4_CONTAINERS.indexOf(String(pb.container).toLowerCase()) >= 0
+      : PS.videoBrowserPlayable({ video: video, filename: filename || '' });
+    var needs = !!(video && video.needs_proxy);
+    if (proxy && (canPlay === false || !containerOk || (canPlay == null && needs))) {
+      return { mode: 'proxy', src: proxy, fallback: null };
+    }
+    if (!proxy && (canPlay === false || !containerOk)) {
+      return { mode: 'preparing', src: null, fallback: null };
+    }
+    return { mode: 'original', src: originalUrl, fallback: proxy };
   };
 
   // The grid-card badge: "▶ 0:42" once the probe has filled the duration,

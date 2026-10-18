@@ -95,7 +95,8 @@ async def _reject_worker_traffic_during_shutdown(request: Request, call_next):
             and path.endswith("/full")
         )
         is_asset_upload = (path.startswith("/api/videos/")
-                           and path.endswith("/assets"))
+                           and (path.endswith("/assets")
+                                or (path.endswith("/proxy") and request.method == "PUT")))
         if path.startswith("/api/worker/") or is_worker_full_fetch or is_asset_upload:
             return JSONResponse(
                 {"detail": "server shutting down, retry shortly"},
@@ -1908,9 +1909,26 @@ def api_photo_detail(photo_id: int):
             vm = db.conn.execute(
                 "SELECT duration_s, fps, codec, container, width, height, rotation, "
                 "has_audio, kind, live_of_photo_id, probe_version, probe_error, "
-                "scan_version, scan_error, shake, noise, focus_consistency, quality_json "
+                "scan_version, scan_error, shake, noise, focus_consistency, quality_json, "
+                "probe_json, proxy_needed, proxy_version, proxy_w, proxy_h, proxy_bytes "
                 "FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
             video = dict(vm) if vm else {}
+            # video-proxy (D12 fallback): what decides browser playback
+            # (codec / pix_fmt / profile / level / HDR, from the stored probe)
+            # for the modal's PS.canPlayVideo, and the playable H.264 copy
+            # when one exists. probe_json itself is not shipped (bulky).
+            from .video_proxy import playback_info
+            video["playback"] = playback_info(video) if video.get("probe_version") else None
+            video.pop("probe_json", None)
+            pv = video.pop("proxy_version", None)
+            pn = video.pop("proxy_needed", None)
+            pw, ph, pb = (video.pop("proxy_w", None), video.pop("proxy_h", None),
+                          video.pop("proxy_bytes", None))
+            video["needs_proxy"] = bool(pn) if pn is not None else None
+            video["proxy_url"] = (f"/api/videos/{photo_id}/proxy?v={int(pv)}"
+                                  if pv is not None else None)
+            video["proxy"] = ({"version": pv, "width": pw, "height": ph, "bytes": pb}
+                              if pv is not None else None)
             # Video quality (step 7, D11): always NUMBERS — shown in the modal
             # with plain-language bands as display text only. No tag is ever
             # derived or written from these (D11 gates a tag behind a holdout
@@ -6822,6 +6840,109 @@ def api_video_frame(photo_id: int, name: str, v: Optional[int] = Query(
         raise HTTPException(404, "Frame not found")
     return FileResponse(str(path), media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.put("/api/videos/{photo_id}/proxy")
+async def api_video_proxy_upload(photo_id: int, request: Request,
+                                 version: int = Query(..., ge=1, le=10_000),
+                                 w: Optional[int] = Query(None, ge=1, le=20000),
+                                 h: Optional[int] = Query(None, ge=1, le=20000)):
+    """Store the playable H.264 copy a worker made of a video
+    (``video-proxy`` pass, photosearch/video_proxy.py).
+
+    The body is the raw ``video/mp4`` file, STREAMED — never the base64 JSON
+    of ``/assets``: proxies are 10-300 MB. It is written to a temp file
+    beside ``<DB dir>/video_proxies/{id}.v{version}.mp4`` as it arrives
+    (size cap 2 GB, ``ftyp`` magic checked on the first bytes), fsynced and
+    ``os.replace``d into place, then ``video_meta.proxy_version`` /
+    ``proxy_bytes`` / ``proxy_w`` / ``proxy_h`` are recorded. A rejected or
+    interrupted upload leaves nothing behind. Guarded like the worker
+    endpoints (LAN-trusted, 503 during a server shutdown); 404 unless the id
+    is a video. The replica refuses (409): the NAS owns the files and the
+    worker uploads to it directly.
+    """
+    from . import video_proxy as VPx
+    if _nas_url:
+        raise HTTPException(409, "upload proxies to the NAS directly")
+    with _get_db() as db:
+        row = db.conn.execute(
+            "SELECT p.media_type, vm.photo_id AS vm FROM photos p "
+            "LEFT JOIN video_meta vm ON vm.photo_id = p.id WHERE p.id = ?",
+            (photo_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Photo not found")
+    if row["media_type"] != "video" or row["vm"] is None:
+        raise HTTPException(404, f"Photo {photo_id} is not a video")
+    try:
+        writer = VPx.ProxyWriter(_db_path, photo_id, version)
+    except VPx.ProxyUploadError as e:
+        raise HTTPException(400, str(e))
+    try:
+        async for chunk in request.stream():
+            writer.write(chunk)
+        n = writer.commit()
+    except VPx.ProxyUploadError as e:
+        writer.abort()
+        status = 413 if "exceeds" in str(e) else 400
+        raise HTTPException(status, str(e))
+    except BaseException:
+        writer.abort()
+        raise
+    import sqlite3
+    try:
+        with _get_db() as db:
+            VPx.record_proxy(db.conn, photo_id, version, n, w, h)
+            db.conn.commit()
+    except sqlite3.OperationalError as e:
+        # The file is in place under its versioned name; only the pointer
+        # did not land. A lock is worth a retry (WorkerClient backs off on
+        # 503 + Retry-After); anything else is the worker's failure row.
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            raise HTTPException(503, f"database busy: {e}",
+                                headers={"Retry-After": "10"})
+        raise
+    return {"photo_id": photo_id, "version": version, "bytes": n,
+            "path": str(VPx.proxy_path(_db_path, photo_id, version).relative_to(
+                VPx.proxies_root(_db_path).parent))}
+
+
+@app.get("/api/videos/{photo_id}/proxy")
+def api_video_proxy(request: Request, photo_id: int,
+                    v: Optional[int] = Query(None, ge=1, le=10_000,
+                                             description="proxy version (cache key); "
+                                             "default the current one")):
+    """The playable H.264 copy of a video, with single-range HTTP Range (206)
+    so the browser can seek. Not throttled: this is browser playback, and a
+    720p proxy is ~1-3 MB per second of footage. ``?v=`` names the version, so
+    a re-made proxy is a new URL and the response may be cached. The replica
+    streams it through from the NAS, forwarding Range (not cached locally:
+    a browser reads a proxy in ranged pieces, and the NAS is one LAN hop)."""
+    from . import video_api
+    from . import video_proxy as VPx
+    with _get_db() as db:
+        row = db.conn.execute(
+            "SELECT p.media_type, vm.proxy_version FROM photos p "
+            "LEFT JOIN video_meta vm ON vm.photo_id = p.id WHERE p.id = ?",
+            (photo_id,)).fetchone()
+    if not row or row["media_type"] != "video":
+        raise HTTPException(404, "Video not found")
+    version = v or row["proxy_version"]
+    range_header = request.headers.get("range")
+    if version is not None:
+        path = VPx.proxy_path(_db_path, photo_id, int(version))
+        if path.exists():
+            return video_api.serve_video_file(
+                range_header, str(path), f"{photo_id}.mp4", None,
+                {"Cache-Control": "public, max-age=86400" if v else "no-cache"})
+    if _nas_url:
+        try:
+            return video_api.proxy_nas_stream(
+                f"{_nas_url}/api/videos/{photo_id}/proxy",
+                {"v": int(version)} if version is not None else None, range_header,
+                f"Stream the playable copy of video {photo_id} from the NAS")
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"NAS proxy fetch failed: {e}")
+    raise HTTPException(404, "No playable copy of this video yet")
 
 
 @app.get("/api/videos/{photo_id}/subjects")

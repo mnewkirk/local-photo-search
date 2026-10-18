@@ -69,6 +69,9 @@ from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 #
 # The video passes (docs/plans/video-support.md) run over the batch's VIDEOS
 # only (db.PASS_MEDIA). `video-probe` (step 2b) depends on nothing;
+# `video-proxy` (the D12 fallback: an H.264 playable copy of a video the
+# browser cannot play) on the probe only — it sits right after it so a new
+# shoot's clips become playable before the long scan / LLM passes;
 # `video-scan` (step 3) on the probe; `video-subjects` (step 3b, VLM
 # grounding) and `video-describe` (step 5) on the scan.
 #
@@ -83,7 +86,7 @@ from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 # The cost: a batch's videos are downloaded and scanned before its stills'
 # LLM passes begin (videos are a few per batch; the scan is what makes them
 # searchable at all, the same reason clip runs first).
-WORKER_PASSES = ("clip", "faces", "quality", "video-probe", "video-scan",
+WORKER_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
                  "aesthetics", "video-subjects", "describe", "video-describe",
                  "verify", "category-content", "keywords", "category-visual")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
@@ -111,6 +114,7 @@ DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "match_faces": "faces", "resolve_dups": "match_faces",
               "warm_crops": "faces", "rank_measure": "faces",
               "sharpness": "faces", "video-scan": "video-probe",
+              "video-proxy": "video-probe",
               "video-subjects": "video-scan", "video-describe": "video-scan"}
 # Second dependencies, for the job-only NAS steps that must also wait on a
 # pass DEPENDS_ON cannot name (it holds one). video-scan writes the video
@@ -179,6 +183,11 @@ _OUTPUT_MISSING = {
     # is a scan; unreadable and Live videos are never offered, so they count
     # done once probed (see _worker_step's `eligible`).
     "video-scan": "{video_scan_missing}",
+    # probed readable, not Live, needs a proxy, proxy missing/stale — the
+    # claim predicate (video_proxy.claimable_sql). A video the browser plays
+    # as-is (proxy_needed = 0), an unreadable / ZIP-wrapped one and a Live
+    # clip are never offered and count done once probed.
+    "video-proxy": "{video_proxy_missing}",
     # cleanly scanned, not Live, subjects missing or stale — the claim
     # predicate (video_subjects_store.claimable_sql). Scan errors, unreadable
     # and Live videos are never offered and count done once the scan is
@@ -236,6 +245,7 @@ _REMAINING_FILTERS_ATTEMPTS = {
     "keywords": True,
     "verify": True,
     "video-probe": True,
+    "video-proxy": True,
     "video-scan": True,
     "video-subjects": True,
     "video-describe": True,
@@ -344,6 +354,9 @@ def _failed_sql(pass_type: str) -> tuple[str, tuple]:
     elif pass_type == "video-scan":
         from .video_scan_store import claimable_sql
         missing = missing.format(video_scan_missing=claimable_sql("p"))
+    elif pass_type == "video-proxy":
+        from .video_proxy import claimable_sql as proxy_claimable
+        missing = missing.format(video_proxy_missing=proxy_claimable("p"))
     elif pass_type == "video-subjects":
         from .video_subjects_store import claimable_sql as subjects_claimable
         missing = missing.format(video_subjects_missing=subjects_claimable("p"))
@@ -400,6 +413,19 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         eligible = _count_where(db, ids, f"{probed_sql('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
         n_err = _count_where(db, ids, scan_error_sql("p")) if ids else 0
         detail = f"{n_err:,} unreadable" if n_err else None
+    elif pass_type == "video-proxy":
+        # Gated on the probe (it decides proxy_needed). Videos that play as-is
+        # are eligible and never claimable, so they count done.
+        from .video_proxy import proxied_sql
+        from .video_scan_store import probed_sql
+        eligible = _count_where(db, ids, f"{probed_sql('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
+        if ids:
+            n_px = _count_where(db, ids, proxied_sql("p"))
+            n_asis = _count_where(
+                db, ids, "p.id IN (SELECT photo_id FROM video_meta WHERE proxy_needed = 0)")
+            parts = ([f"{n_px:,} proxied"] if n_px else []) + \
+                    ([f"{n_asis:,} play as-is"] if n_asis else [])
+            detail = ", ".join(parts) or None
     elif pass_type == "video-subjects":
         # Gated on the scan: a video video-scan has not settled (unprobed,
         # unscanned, stale scan) is not claimable yet and must not read done.

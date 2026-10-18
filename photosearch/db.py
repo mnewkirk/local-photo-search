@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -206,6 +206,9 @@ PASS_MEDIA: dict[str, str] = {
     # video passes: video-probe (step 2b), video-scan (step 3),
     # video-subjects (step 3b), video-describe (step 5).
     "video-probe": "video",
+    # video-proxy: an H.264 playable copy of a video the browser cannot play
+    # (photosearch/video_proxy.py, D12 fallback).
+    "video-proxy": "video",
     "video-scan": "video",
     "video-subjects": "video",
     "video-describe": "video",
@@ -426,6 +429,37 @@ _VIDEO_CLAIM_SQL = {
     "video-subjects": (video_subjects_missing_sql, _VIDEO_SUBJECTS_NOT_EXHAUSTED),
     "video-describe": (video_describe_missing_sql, _VIDEO_DESCRIBE_NOT_EXHAUSTED),
 }
+
+
+def _backfill_proxy_needed(cur) -> int:
+    """Set video_meta.proxy_needed for probed, readable rows that predate it
+    (schema v39). Pure Python over the stored probe — no file access."""
+    from .video_proxy import needs_proxy
+    rows = cur.execute(
+        "SELECT photo_id, codec, container, width, height, probe_json FROM video_meta "
+        "WHERE proxy_needed IS NULL AND probe_version IS NOT NULL "
+        "AND probe_error IS NULL").fetchall()
+    for r in rows:
+        meta = {"codec": r[1], "container": r[2], "width": r[3], "height": r[4],
+                "probe_json": r[5]}
+        cur.execute("UPDATE video_meta SET proxy_needed = ? WHERE photo_id = ?",
+                    (1 if needs_proxy(meta) else 0, r[0]))
+    return len(rows)
+
+
+# video-proxy (photosearch/video_proxy.py). Probed readable non-Live videos
+# whose original the browser cannot play and whose proxy is missing/stale.
+def video_proxy_missing_sql(alias: str = "p") -> str:
+    from .video_proxy import claimable_sql
+    return claimable_sql(alias)
+
+
+_VIDEO_PROXY_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-proxy' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+_VIDEO_CLAIM_SQL["video-proxy"] = (video_proxy_missing_sql, _VIDEO_PROXY_NOT_EXHAUSTED)
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -1373,7 +1407,13 @@ class PhotoDB:
                 subjects_version  INTEGER,
                 subjects_at       TEXT,
                 subjects_json     TEXT,
-                scan_generation   TEXT
+                scan_generation   TEXT,
+                proxy_needed      INTEGER,
+                proxy_version     INTEGER,
+                proxy_bytes       INTEGER,
+                proxy_w           INTEGER,
+                proxy_h           INTEGER,
+                proxy_at          TEXT
             )
         """)
         # v36: video_meta.poster_version — the counter that names a video's
@@ -1412,6 +1452,29 @@ class PhotoDB:
             cur.execute("SELECT scan_generation FROM video_meta LIMIT 1")
         except sqlite3.OperationalError:
             cur.execute("ALTER TABLE video_meta ADD COLUMN scan_generation TEXT")
+        # v39: the video-proxy pass (photosearch/video_proxy.py, D12
+        # fallback). proxy_needed is decided from the stored probe when it
+        # lands (video_probe_store) — 1 when the browser cannot play the
+        # original (HEVC, 10-bit, avi/mts, > 4K); proxy_version / bytes / w /
+        # h / at describe the playable H.264 copy the desktop uploaded to
+        # <DB dir>/video_proxies/{id}.v{N}.mp4.
+        added_proxy = False
+        for col, typ in (("proxy_needed", "INTEGER"), ("proxy_version", "INTEGER"),
+                         ("proxy_bytes", "INTEGER"), ("proxy_w", "INTEGER"),
+                         ("proxy_h", "INTEGER"), ("proxy_at", "TEXT")):
+            try:
+                cur.execute(f"SELECT {col} FROM video_meta LIMIT 1")
+            except sqlite3.OperationalError:
+                cur.execute(f"ALTER TABLE video_meta ADD COLUMN {col} {typ}")
+                added_proxy = True
+        if added_proxy:
+            # Rows probed before v39: decide from their stored probe_json.
+            # Logged, never raised — this runs inside the constructor, and a
+            # failure here only leaves those videos without a proxy queue.
+            try:
+                _backfill_proxy_needed(cur)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("v39 proxy_needed backfill failed: %s", e)
         # Main subject per video (person, animal, scenery), joined to a face
         # track for identity when it is a person.
         cur.execute("""
