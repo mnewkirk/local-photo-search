@@ -432,6 +432,11 @@ def _upload_raw_bytes(access_token: str, file_path: str) -> str:
         uploadToken string (valid for 24 hours).
     """
     filename = Path(file_path).name
+    from .ingest import VIDEO_EXTENSIONS
+    if Path(file_path).suffix.lower() in VIDEO_EXTENSIONS:
+        # Stills only (schema v35): this reads the whole file into RAM and
+        # labels it image/jpeg — wrong for a clip of hundreds of MB.
+        raise ValueError(f"{filename} is a video; Google Photos upload is stills-only")
     with open(file_path, "rb") as f:
         data = f.read()
 

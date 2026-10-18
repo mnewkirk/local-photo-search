@@ -231,7 +231,9 @@ def _stage_infer(db, apply, emit, check_abort,
 def _stage_colors(db, apply, emit, check_abort, batch_size=100):
     """Extract dominant colors for rows missing them."""
     rows = db.conn.execute(
-        "SELECT id, filepath FROM photos WHERE dominant_colors IS NULL"
+        # Stills only (schema v35): colors are decoded from image pixels.
+        "SELECT id, filepath FROM photos WHERE dominant_colors IS NULL "
+        "AND media_type IS NULL"
     ).fetchall()
     would = len(rows)
     if would == 0 or not apply:

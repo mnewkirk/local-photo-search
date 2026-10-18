@@ -141,7 +141,7 @@ def test_v33_db_migrates_to_v34_indexes(tmp_path):
                                (pid,)).fetchone()[0] == "X"
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'").fetchone()[0]
-        assert int(version) == SCHEMA_VERSION == 34
+        assert int(version) == SCHEMA_VERSION == 35
 
 
 def test_fresh_db_has_v34_indexes_and_no_superseded_ones(tmp_path):

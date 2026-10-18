@@ -78,6 +78,9 @@ def build_gphotos_records(
         row = rows.get(int(pid))
         if not row:
             continue
+        if row.get("media_type") == "video":
+            # Stills only (schema v35): the upload path sends image bytes.
+            continue
         orig = row.get("filename")
         records.append({
             "_resolved_filepath": resolve(row.get("filepath", "")),

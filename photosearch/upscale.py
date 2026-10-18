@@ -604,6 +604,9 @@ def upscale_photo(db, photo_id: int, *,
     row = db.get_photo(photo_id)
     if not row:
         raise ValueError(f"photo {photo_id} not found")
+    from .db import is_video_row
+    if is_video_row(row):
+        raise ValueError(f"photo {photo_id} is a video; Topaz upscaling is stills-only")
 
     src_name = os.path.basename(row["filepath"])
     dest_dir = _dest_dir(row)

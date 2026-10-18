@@ -1187,3 +1187,112 @@ def test_no_clip_still_registers_the_photo(tmp_path, tmp_db_path, monkeypatch):
         assert rows[0][1]  # hash populated -> future dedup works
         n_emb = db.conn.execute("SELECT COUNT(*) FROM clip_embeddings").fetchone()[0]
         assert n_emb == 0
+
+
+# --- videos get a photos row (schema v35, video-support step 1) -------------
+
+def _video_rows(db_path):
+    with PhotoDB(db_path) as db:
+        return [dict(r) for r in db.conn.execute(
+            "SELECT p.id, p.filepath, p.file_hash, p.media_type, p.date_taken, "
+            "m.photo_id AS meta_id FROM photos p "
+            "LEFT JOIN video_meta m ON m.photo_id = p.id "
+            "WHERE p.media_type = 'video'")]
+
+
+def test_moved_video_is_registered_with_ingests_hash(tmp_path, tmp_db_path, monkeypatch):
+    from photosearch.index import file_hash
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "matt" / "PXL_0001.mp4"
+    _touch(src, b"video-bytes")
+    h = file_hash(str(src))
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    target = photos / "2026" / "2026-04-12_phone-matt" / "PXL_0001.mp4"
+    assert target.exists()
+    s = result["sources"]["matt"]
+    assert s["companions_moved"] == 1 and s["videos_registered"] == 1
+    assert s["imported"] == 0
+    # a video-only folder joins new_dirs so register_batch sees it
+    assert s["new_dirs"] == [str(target.parent)]
+    rows = _video_rows(tmp_db_path)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["filepath"] == "2026/2026-04-12_phone-matt/PXL_0001.mp4"
+    assert r["file_hash"] == h
+    assert r["date_taken"] == "2026-04-12 09:30:15"
+    assert r["meta_id"] == r["id"]
+
+
+def test_video_hash_already_in_db_is_archived_not_moved(tmp_path, tmp_db_path, monkeypatch):
+    incoming, photos = _setup_dirs(tmp_path)
+    src = incoming / "matt" / "PXL_0001.mp4"
+    _touch(src, b"same-video")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+    ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    # The same clip arrives again under another name and date.
+    again = incoming / "nicole" / "COPY.mp4"
+    _touch(again, b"same-video")
+    _patch_exif(monkeypatch, "2026-05-01 10:00:00")
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+
+    assert result["totals"]["companions_deduped"] == 1
+    assert result["totals"]["companions_moved"] == 0
+    assert (incoming / "nicole" / ".processed" / "COPY.mp4").exists()
+    assert not list(photos.rglob("COPY.mp4"))
+    assert len(_video_rows(tmp_db_path)) == 1
+
+
+def test_raw_is_still_not_registered(tmp_path, tmp_db_path, monkeypatch):
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "ILCE-7M4" / "DSC1.ARW", b"raw")
+    _patch_exif(monkeypatch, "2026-06-19 14:00:00")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path)
+    assert result["totals"]["videos_registered"] == 0
+    with PhotoDB(tmp_db_path) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0] == 0
+
+
+def test_dry_run_registers_no_video(tmp_path, tmp_db_path, monkeypatch):
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "PXL_0001.mp4", b"video-bytes")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+    result = ingest_incoming(str(incoming), str(photos), tmp_db_path, dry_run=True)
+    assert result["totals"]["companions_moved"] == 1
+    assert result["totals"]["videos_registered"] == 0
+    assert _video_rows(tmp_db_path) == []
+
+
+def test_cli_registers_a_batch_for_a_video_only_folder(tmp_path, tmp_db_path, monkeypatch):
+    """The CLIP index pass walks the folder and finds no JPEG/HEIC (it never
+    touches the video), then register_batch finds the video row."""
+    from click.testing import CliRunner
+    from cli import cli
+    from photosearch.ingest_batches import list_batches
+
+    incoming, photos = _setup_dirs(tmp_path)
+    _touch(incoming / "matt" / "PXL_0001.mp4", b"video-bytes")
+    _patch_exif(monkeypatch, "2026-04-12 09:30:15")
+    with PhotoDB(tmp_db_path) as db:
+        db.set_photo_root(str(photos))
+
+    result = CliRunner().invoke(cli, [
+        "ingest-incoming", "--incoming-root", str(incoming),
+        "--photo-root", str(photos), "--db", tmp_db_path,
+    ])
+    assert result.exit_code == 0, result.output
+    with PhotoDB(tmp_db_path) as db:
+        batches = list_batches(db)
+        n_still = db.conn.execute(
+            "SELECT COUNT(*) FROM photos WHERE media_type IS NULL").fetchone()[0]
+    assert [b["directory"] for b in batches] == ["2026/2026-04-12_phone-matt"]
+    assert n_still == 0

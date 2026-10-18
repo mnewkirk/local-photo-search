@@ -780,18 +780,8 @@ async def api_review_team(request: Request):
         started = time.monotonic()
         try:
             with _get_db() as db:
-                rows = db.conn.execute("""
-                    SELECT f.id, f.photo_id, f.person_id, pe.name AS person_name,
-                           f.bbox_top, f.bbox_bottom, f.bbox_left, f.bbox_right,
-                           p.image_width
-                      FROM faces f
-                      JOIN photos p ON p.id = f.photo_id
-                      LEFT JOIN persons pe ON pe.id = f.person_id
-                     WHERE date(p.date_taken) = ?
-                       AND (f.det_score IS NULL OR f.det_score >= ?)
-                       AND MIN(f.bbox_bottom - f.bbox_top,
-                               f.bbox_right - f.bbox_left) >= ?
-                """, (date_, min_det, min_edge)).fetchall()
+                rows = db.conn.execute(
+                    face_review.TEAM_FACES_SQL, (date_, min_det, min_edge)).fetchall()
                 faces = [dict(r) for r in rows]
                 if not faces:
                     _emit({"type": "fatal",
@@ -4994,7 +4984,11 @@ def _full_image_fetcher(pdb, kind: str = "full"):
 
     def fetch(pid: int):
         img = None
-        row = pdb.conn.execute("SELECT filepath FROM photos WHERE id = ?", (pid,)).fetchone()
+        row = pdb.conn.execute("SELECT filepath, media_type FROM photos WHERE id = ?",
+                               (pid,)).fetchone()
+        if row is not None and row["media_type"] == "video":
+            # Stills only (schema v35): a print export cannot place a clip.
+            return None
         fp = pdb.resolve_filepath(row["filepath"]) if row and row["filepath"] else None
         try:
             if kind == "full" and fp and os.path.exists(fp):
@@ -6238,6 +6232,10 @@ async def api_google_upload(body: dict, request: Request):
             if not photo:
                 continue
             photo = dict(photo)
+            if photo.get("media_type") == "video":
+                # Stills only (schema v35): the upload sends the whole file
+                # as image/jpeg, read into RAM.
+                continue
             photo["_resolved_filepath"] = db.resolve_filepath(photo.get("filepath", ""))
             fp = photo["_resolved_filepath"]
             if fp in ledger and ledger[fp] and pid not in force_reupload_ids:

@@ -433,6 +433,7 @@ def ingest_incoming(
     per_source: dict[str, dict] = {}
     _zero = lambda: {"scanned": 0, "imported": 0, "deduped": 0,
                      "companions_moved": 0, "companions_deduped": 0,
+                     "videos_registered": 0,
                      "non_image_reclassified": 0, "vanished": 0, "errors": 0}
     totals = _zero()
 
@@ -507,6 +508,10 @@ def ingest_incoming(
                         _heartbeat()
                         continue
                     is_photo = src_file.suffix.lower() in INGEST_EXTENSIONS
+                    # Videos are still companions (moved, never indexed by the
+                    # CLIP pass) but since schema v35 they get a `photos` row
+                    # (media_type='video') — so they dedup against the DB too.
+                    is_video = src_file.suffix.lower() in VIDEO_EXTENSIONS
                     # An image-extension file whose content isn't a decodable image
                     # (e.g. a ZIP-wrapped iOS Live Photo saved as .JPG) is moved into
                     # the library like a companion but never gets a DB row / CLIP pass
@@ -533,7 +538,7 @@ def ingest_incoming(
                         _heartbeat()
                         continue
 
-                    if is_photo:
+                    if is_photo or is_video:
                         # Dedup by content hash against the photos table. The
                         # file_hash column has been populated on every newly-indexed
                         # photo for a long time; an older un-hashed match would just
@@ -543,7 +548,7 @@ def ingest_incoming(
                             (h,),
                         ).fetchone()
                         if existing is not None:
-                            stats["deduped"] += 1
+                            stats["deduped" if is_photo else "companions_deduped"] += 1
                             if not dry_run:
                                 _start_sweep_if_needed()
                                 _archive(source_root, src_file, source, stats)
@@ -599,6 +604,8 @@ def ingest_incoming(
                             new_dirs.add(tdir)
                         else:
                             stats["companions_moved"] += 1
+                            if is_video:
+                                new_dirs.add(tdir)
                         continue
 
                     try:
@@ -628,6 +635,14 @@ def ingest_incoming(
                         stats["imported"] += 1
                     else:
                         stats["companions_moved"] += 1
+                        if is_video and _register_moved_video(
+                                db, photo_dir, target, h, taken, source):
+                            # The folder joins new_dirs so register_batch sees
+                            # it. The CLIP index pass that also walks new_dirs
+                            # only picks up JPEG/HEIC (index.find_photos), so a
+                            # video-only folder costs it nothing.
+                            stats["videos_registered"] += 1
+                            new_dirs.add(tdir)
                     sweep_files_moved += 1
                     _heartbeat()
 
@@ -656,6 +671,30 @@ def ingest_incoming(
             raise
 
     return {"sources": per_source, "totals": totals, "dry_run": dry_run, "run_id": run_id}
+
+
+def _register_moved_video(db, photo_dir: Path, target: Path, h: str,
+                          taken: Optional[datetime], source: str) -> bool:
+    """Give a just-moved video its `photos` row (schema v35).
+
+    Uses the hash ingest already computed and the date the file was routed by
+    (provisional — the desktop `video-probe` pass replaces it). Bookkeeping
+    must never abort a file-moving sweep: a failure is printed and the
+    `register-videos` backfill picks the file up later.
+    """
+    from .video_registry import register_video
+    try:
+        if not db.photo_root:
+            # Same root the files were routed under, so the stored path is
+            # relative like every other row (index_directory would otherwise
+            # adopt the first dated folder it is handed as the root).
+            db.set_photo_root(str(photo_dir))
+        register_video(db, str(target), h,
+                       date_taken=taken.strftime("%Y-%m-%d %H:%M:%S") if taken else None)
+        return True
+    except Exception as exc:
+        print(f"  [{source}] VIDEO REGISTER FAIL {target.name}: {exc}")
+        return False
 
 
 def _archive(source_root: Path, src_file: Path, source: str, stats: dict) -> None:

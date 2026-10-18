@@ -139,6 +139,9 @@ def _chunks(ids: list):
         yield ids[i:i + _ID_CHUNK]
 
 
+# Stills only (schema v35): a video's face rows point at a clip, which the
+# full-resolution decode below cannot open.
+_STILL = "p.media_type IS NULL"
 _FACE_SELECT = """SELECT f.id AS face_id, f.photo_id, f.bbox_top, f.bbox_bottom,
                          f.bbox_left, f.bbox_right, p.filepath
                     FROM faces f JOIN photos p ON p.id = f.photo_id"""
@@ -156,11 +159,12 @@ def _face_rows(db, date_, photo_ids):
         for chunk in _chunks(list(photo_ids)):
             ph = ",".join("?" * len(chunk))
             rows.extend(db.conn.execute(
-                f"{_FACE_SELECT} WHERE f.photo_id IN ({ph}) "
+                f"{_FACE_SELECT} WHERE f.photo_id IN ({ph}) AND {_STILL} "
                 f"ORDER BY f.photo_id, f.id", list(chunk)).fetchall())
         return rows
     return db.conn.execute(
-        f"{_FACE_SELECT} WHERE date(p.date_taken) = ? ORDER BY f.photo_id, f.id",
+        f"{_FACE_SELECT} WHERE date(p.date_taken) = ? AND {_STILL} "
+        f"ORDER BY f.photo_id, f.id",
         (date_,)).fetchall()
 
 

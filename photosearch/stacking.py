@@ -108,9 +108,10 @@ def detect_stacks(
     _check_abort()
 
     # 1. Fetch photos with timestamps
+    # Stills only (schema v35): a video row is never part of a burst stack.
     rows = db.conn.execute(
         "SELECT id, filepath, date_taken, aesthetic_score FROM photos "
-        "WHERE date_taken IS NOT NULL "
+        "WHERE date_taken IS NOT NULL AND media_type IS NULL "
         "ORDER BY date_taken"
     ).fetchall()
 
@@ -441,7 +442,7 @@ def run_incremental_stacking(
     eligible_rows = conn.execute(
         "SELECT p.id, p.date_taken, s.photo_id AS seen_id, s.date_taken AS seen_date "
         "FROM photos p LEFT JOIN stacking_seen s ON s.photo_id = p.id "
-        "WHERE p.date_taken IS NOT NULL "
+        "WHERE p.date_taken IS NOT NULL AND p.media_type IS NULL "
         "AND p.id IN (SELECT photo_id FROM clip_embeddings)"
     ).fetchall()
     eligible = {r["id"]: r["date_taken"] for r in eligible_rows}

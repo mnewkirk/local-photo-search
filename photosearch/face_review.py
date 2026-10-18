@@ -48,6 +48,25 @@ MIN_COHERENCE = 0.60        # fraction of saturated pixels that must agree
 MIN_SAT = 90                # 0-255; below this hue is meaningless
 
 
+
+# One day's reviewable faces: the query behind both the `review-faces` CLI and
+# the /faces team-review panel. Stills only (schema v35) — the jersey sample is
+# read from the photo's preview below the face, and a video's preview is a
+# poster frame that has nothing to do with where its face rows were found.
+# Params: (date, min_det_score, min_bbox_edge).
+TEAM_FACES_SQL = """
+    SELECT f.id, f.photo_id, f.person_id, pe.name AS person_name,
+           f.bbox_top, f.bbox_bottom, f.bbox_left, f.bbox_right,
+           p.image_width
+      FROM faces f
+      JOIN photos p ON p.id = f.photo_id
+      LEFT JOIN persons pe ON pe.id = f.person_id
+     WHERE date(p.date_taken) = ?
+       AND p.media_type IS NULL
+       AND (f.det_score IS NULL OR f.det_score >= ?)
+       AND MIN(f.bbox_bottom - f.bbox_top, f.bbox_right - f.bbox_left) >= ?
+"""
+
 def _hue_delta(a: float, b: float) -> float:
     """Circular distance between two hues in degrees (0-180)."""
     d = abs(a - b) % 360.0

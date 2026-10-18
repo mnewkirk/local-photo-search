@@ -156,6 +156,9 @@ def export_panels(db, photo_id: int, *, pw: float, ph: float,
     row = db.get_photo(photo_id)
     if not row:
         raise ValueError(f"photo {photo_id} not found")
+    from .db import is_video_row
+    if is_video_row(row):
+        raise SplitError(f"photo {photo_id} is a video; split prints are stills-only")
     if cols < 1 or rows < 1:
         raise SplitError("cols and rows must both be at least 1")
     if fmt not in ("jpg", "jpeg", "png", "tif", "tiff"):

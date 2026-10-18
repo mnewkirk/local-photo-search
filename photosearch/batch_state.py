@@ -59,7 +59,7 @@ from __future__ import annotations
 import json
 
 from . import ingest_batches
-from .db import MAX_PROCESS_ATTEMPTS
+from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 
 # Dependency order, which is also the fleet's drain order: verify runs right
 # after describe because a verify rewrite REPLACES the description, and
@@ -277,8 +277,15 @@ def _ingest_step(batch: dict, sweep: dict | None, total: int) -> dict:
 
 def _worker_step(db, pass_type: str, ids: list[int], total: int,
                  described: int, running: set[str], open_steps: set[str],
-                 completed: set[str]) -> dict:
+                 completed: set[str], batch_total: int | None = None) -> dict:
+    """`total` / `described` are already scoped to the pass's media
+    (db.PASS_MEDIA — a still pass never counts the batch's videos), so a
+    batch holding videos can still read `completed` on its image passes.
+    `batch_total` is the whole batch; a pass with nothing of its media in a
+    non-empty batch is trivially complete."""
     from . import worker_api  # deferred: pulls in FastAPI
+    if batch_total is None:
+        batch_total = total
 
     # The `if ids else 0` guard is load-bearing, not defensive tidiness:
     # every branch of db.count_unprocessed_photos tests `if photo_ids:`, so an
@@ -289,6 +296,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     remaining = worker_api._count_scoped(db, pass_type, ids) if ids else 0
 
     missing = _OUTPUT_MISSING[pass_type]
+    media = media_sql(pass_type, "p")
+    if media:
+        missing = f"({missing}) AND {media}"
     failed = _count_where(
         db, ids,
         f"({missing}) AND EXISTS (SELECT 1 FROM worker_processed wp "
@@ -336,7 +346,7 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     depends_on = DEPENDS_ON.get(pass_type)
     if pass_type in running:
         state, waiting_on = "running", None
-    elif total > 0 and done == total:
+    elif batch_total > 0 and done == total:
         state, waiting_on = "completed", None
     elif stuck and failed > 0:
         # Every photo the fleet would still claim for this pass is one it has
@@ -373,10 +383,12 @@ def _stacking_step(db, ids: list[int], total: int, open_steps: set[str],
                    closed: set[str]) -> dict:
     """Every dated photo should land in a stack — but a shoot with no bursts
     legitimately produces none, so a *closed* job row also counts as done."""
-    eligible = _count_where(db, ids, "p.date_taken IS NOT NULL")
+    # Stills only: stacking.detect_stacks never considers a video row, so
+    # counting one here would leave the step `remaining` forever.
+    eligible = _count_where(db, ids, "p.date_taken IS NOT NULL AND p.media_type IS NULL")
     remaining = _count_where(
         db, ids,
-        "p.date_taken IS NOT NULL AND NOT EXISTS "
+        "p.date_taken IS NOT NULL AND p.media_type IS NULL AND NOT EXISTS "
         "(SELECT 1 FROM stack_members sm WHERE sm.photo_id = p.id)")
     done = max(0, eligible - remaining)
 
@@ -589,8 +601,22 @@ def batch_state(db, batch_id: int) -> dict:
     running = _running_passes(db, id_set)
     open_steps = set(ingest_batches.open_jobs(db, batch_id))
     closed = ingest_batches.closed_jobs(db, batch_id)
-    described = _count_where(
-        db, ids, "p.description IS NOT NULL AND p.description != ''")
+    # Per-media totals (db.PASS_MEDIA): the image passes count only the
+    # batch's stills, the "any" passes everything. Cached per media kind so a
+    # batch costs at most two extra COUNTs.
+    media_totals: dict[str, tuple[int, int]] = {}
+
+    def _media_counts(pass_type: str) -> tuple[int, int]:
+        kind = PASS_MEDIA[pass_type]
+        if kind not in media_totals:
+            frag = media_sql(pass_type, "p")
+            desc = "p.description IS NOT NULL AND p.description != ''"
+            if frag is None:
+                media_totals[kind] = (total, _count_where(db, ids, desc))
+            else:
+                media_totals[kind] = (_count_where(db, ids, frag),
+                                      _count_where(db, ids, f"{desc} AND {frag}"))
+        return media_totals[kind]
 
     # STEP_ORDER is a valid topological order for DEPENDS_ON (every
     # dependency appears before its dependent), so one forward pass suffices
@@ -601,8 +627,9 @@ def batch_state(db, batch_id: int) -> dict:
         if step == "ingest":
             row = _ingest_step(batch, sweep, total)
         elif step in WORKER_PASSES:
-            row = _worker_step(db, step, ids, total, described, running,
-                               open_steps, completed)
+            p_total, p_described = _media_counts(step)
+            row = _worker_step(db, step, ids, p_total, p_described, running,
+                               open_steps, completed, batch_total=total)
         elif step == "stacking":
             row = _stacking_step(db, ids, total, open_steps, closed)
         elif step == "normalize_aesthetics":

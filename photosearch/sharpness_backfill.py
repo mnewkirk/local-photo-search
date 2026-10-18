@@ -96,9 +96,13 @@ _FACES_DONE_SQL = (
 
 
 def missing_sql(alias: str = "p") -> str:
-    """The missing-only predicate (one ``?``: the current version)."""
+    """The missing-only predicate (one ``?``: the current version).
+
+    Stills only (schema v35): a video row has no still pixels to measure, so
+    it is never a candidate and never counts as remaining."""
+    from .db import STILL_SQL
     return (f"({alias}.sharpness_version IS NULL "
-            f"OR {alias}.sharpness_version < ?)")
+            f"OR {alias}.sharpness_version < ?) AND {alias}.{STILL_SQL}")
 
 
 class _Busy(Exception):

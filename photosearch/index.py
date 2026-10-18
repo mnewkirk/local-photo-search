@@ -329,6 +329,12 @@ def _index_collection(
             return
 
         photo_pairs = db.get_collection_photo_pairs(collection_id)
+        # Stills only (schema v35): every pass below decodes image pixels. The
+        # partial idx_photos_media_video makes this a tiny index read.
+        video_ids = {r[0] for r in db.conn.execute(
+            "SELECT id FROM photos WHERE media_type IS NOT NULL")}
+        if video_ids:
+            photo_pairs = [pp for pp in photo_pairs if pp[0] not in video_ids]
         if not photo_pairs:
             print(f"Collection '{coll['name']}' (id={collection_id}) has no photos.")
             return

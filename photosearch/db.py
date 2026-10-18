@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -154,7 +154,80 @@ _SEARCH_INDEXES: list[tuple[str, str]] = [
     # "is person P in photo X" (search's EXISTS) and "P's photos"
     ("idx_faces_photo_person", "faces(photo_id, person_id)"),
     ("idx_faces_person_photo", "faces(person_id, photo_id)"),
+    # v35 (docs/plans/video-support.md): the video rows, a few thousand out of
+    # ~160k. Partial, so every still-only predicate (`media_type IS NULL`) is
+    # free and the video passes' claim/count drive from this tiny index.
+    ("idx_photos_media_video", "photos(id) WHERE media_type IS NOT NULL"),
 ]
+
+# ---------------------------------------------------------------------------
+# Media isolation (schema v35, docs/plans/video-support.md)
+# ---------------------------------------------------------------------------
+# A video is a `photos` row with media_type = 'video'; NULL means a still, so
+# no existing row was rewritten by the migration. Which passes may see which
+# media is ONE shared fact, the MATCHABLE_SQL pattern: every branch of
+# get_unprocessed_photos / count_unprocessed_photos appends
+# `media_clause(pass_type)`, and batch_state derives its per-pass totals from
+# the same map. A pass missing from PASS_MEDIA raises — tests/test_pass_media.py
+# iterates every WORKER_PASSES entry so a new pass cannot forget it.
+#
+# The fragments are unqualified on purpose: `photos` is the only table with a
+# media_type column in every query they are spliced into (aliased `p` or not).
+STILL_SQL = "media_type IS NULL"
+VIDEO_SQL = "media_type = 'video'"
+MEDIA_SQL = {"still": STILL_SQL, "video": VIDEO_SQL, "any": None}
+
+PASS_MEDIA: dict[str, str] = {
+    # image passes — a video row is never offered to them
+    "clip": "still",
+    "faces": "still",
+    "quality": "still",
+    "aesthetics": "still",
+    "describe": "still",
+    # verify checks a description against the PIXELS of one image; it would
+    # otherwise claim a video the moment a video description lands.
+    "verify": "still",
+    "category-visual": "still",
+    # text-only passes over photos.description — a video description is as
+    # good an input as a photo's.
+    "category-content": "any",
+    "keywords": "any",
+    # legacy pre-v23 pass, still accepted by the claim path for cleanup
+    "tags": "still",
+    # future video passes (steps 2b-5). Present here so their claim
+    # predicates have an entry the day they land; NOT yet in WORKER_PASSES.
+    "video-probe": "video",
+    "video-scan": "video",
+    "video-subjects": "video",
+    "video-describe": "video",
+}
+
+
+def media_sql(pass_type: str, alias: str = "") -> str | None:
+    """The media predicate for `pass_type` ("media_type IS NULL", ...), or
+    None for an "any" pass. `alias` qualifies the column ("p" -> p.media_type).
+    Raises KeyError for a pass with no PASS_MEDIA entry — deliberately loud."""
+    frag = MEDIA_SQL[PASS_MEDIA[pass_type]]
+    if frag is None:
+        return None
+    return f"{alias}.{frag}" if alias else frag
+
+
+def is_video_row(row) -> bool:
+    """True for a `photos` row (dict or sqlite3.Row) that is a video. Pixel
+    readers (upscale, split export, book/print export...) refuse these: the
+    file is a clip, not an image PIL can open."""
+    try:
+        return row["media_type"] == "video"
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def media_clause(pass_type: str, alias: str = "") -> str:
+    """`media_sql` as an `AND ...` suffix ('' for an "any" pass)."""
+    frag = media_sql(pass_type, alias)
+    return f" AND {frag}" if frag else ""
+
 
 # Dropped in v34: replaced by a composite/NOCASE index above, or an exact
 # duplicate of a PRIMARY KEY / UNIQUE autoindex.
@@ -973,6 +1046,15 @@ class PhotoDB:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_photos_sharpness_version "
                         "ON photos(sharpness_version)")
 
+        # v35: video rows (docs/plans/video-support.md). NULL = still, so no
+        # backfill UPDATE — a full-table rewrite under the NAS write lock is
+        # the percentile-refresh incident's shape. idx_photos_media_video is
+        # built by _create_search_indexes (_SEARCH_INDEXES).
+        try:
+            cur.execute("SELECT media_type FROM photos LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE photos ADD COLUMN media_type TEXT")
+
         # Upload ledger — tracks which photos have already been uploaded to which album.
         # Keyed by (album_id, filepath) so re-uploads are skipped without any API calls.
         cur.execute("""
@@ -1126,6 +1208,83 @@ class PhotoDB:
                 seen_at    TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+
+        # Video side tables (schema v35, docs/plans/video-support.md step 1).
+        # video_meta: one row per video photo, created EMPTY at registration
+        # (probe_version IS NULL is the video-probe queue); the probe, scan and
+        # quality columns are filled by the desktop worker passes.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS video_meta (
+                photo_id          INTEGER PRIMARY KEY
+                                  REFERENCES photos(id) ON DELETE CASCADE,
+                duration_s        REAL,
+                fps               REAL,
+                codec             TEXT,
+                container         TEXT,
+                width             INTEGER,
+                height            INTEGER,
+                rotation          INTEGER,
+                bitrate           INTEGER,
+                has_audio         INTEGER,
+                probe_json        TEXT,
+                probe_version     INTEGER,
+                probe_error       TEXT,
+                kind              TEXT,
+                live_of_photo_id  INTEGER REFERENCES photos(id) ON DELETE SET NULL,
+                poster_t          REAL,
+                scan_version      INTEGER,
+                scan_error        TEXT,
+                scanned_at        TEXT,
+                shake             REAL,
+                noise             REAL,
+                focus_consistency REAL,
+                quality_json      TEXT
+            )
+        """)
+        # Main subject per video (person, animal, scenery), joined to a face
+        # track for identity when it is a person.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS video_subjects (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id        INTEGER NOT NULL
+                                REFERENCES photos(id) ON DELETE CASCADE,
+                subject_ix      INTEGER,
+                label           TEXT,
+                category        TEXT,
+                face_id         INTEGER REFERENCES faces(id) ON DELETE SET NULL,
+                focus_s         REAL,
+                focus_intervals TEXT,
+                rep_t           REAL,
+                rep_frame       INTEGER,
+                rep_bbox        TEXT,
+                n_segments      INTEGER
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_subjects_photo ON video_subjects(photo_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_subjects_face ON video_subjects(face_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_subjects_label ON video_subjects(label)")
+        # One row per within-video face identity (its `faces` row is the
+        # identity's representative, so /faces tooling applies unchanged).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS video_tracks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id        INTEGER NOT NULL
+                                REFERENCES photos(id) ON DELETE CASCADE,
+                face_id         INTEGER REFERENCES faces(id) ON DELETE SET NULL,
+                ident_ix        INTEGER,
+                t_start         REAL,
+                t_end           REAL,
+                n_det           INTEGER,
+                presence_s      REAL,
+                focus_s         REAL,
+                focus_intervals TEXT,
+                rep_t           REAL,
+                rep_frame       INTEGER,
+                mean_salience   REAL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_tracks_photo ON video_tracks(photo_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_video_tracks_face ON video_tracks(face_id)")
 
         # Collections — named groups of photos (albums)
         cur.execute("""
@@ -2612,6 +2771,9 @@ class PhotoDB:
         Returns list of {id, filepath} dicts.
         """
         claimed = self.get_claimed_photo_ids(pass_type, commit_cleanup=commit_cleanup)
+        # Media isolation (schema v35): a still pass never sees a video row.
+        # Unknown passes fall through to the ValueError below.
+        m = media_clause(pass_type) if pass_type in PASS_MEDIA else ""
 
         # Build the "missing" condition per pass type.
         # For faces, we check worker_processed because photos with no faces
@@ -2629,7 +2791,7 @@ class PhotoDB:
                         WHERE p.id IN ({placeholders})
                         AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
                         AND {_CLIP_NOT_EXHAUSTED}
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
@@ -2637,7 +2799,7 @@ class PhotoDB:
                     f"""SELECT p.id, p.filepath FROM photos p
                        WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings)
                        AND {_CLIP_NOT_EXHAUSTED}
-                       LIMIT ?""",
+                       {m} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "faces":
@@ -2651,7 +2813,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
@@ -2661,7 +2823,7 @@ class PhotoDB:
                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                       LIMIT ?""",
+                       {m} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "quality":
@@ -2678,14 +2840,14 @@ class PhotoDB:
                 rows = self.conn.execute(
                     f"SELECT id, filepath FROM photos WHERE id IN ({placeholders}) "
                     f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
-                    f"AND {_QUALITY_NOT_EXHAUSTED} LIMIT ?",
+                    f"AND {_QUALITY_NOT_EXHAUSTED} {m} LIMIT ?",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
                 rows = self.conn.execute(
                     "SELECT id, filepath FROM photos "
                     "WHERE (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
-                    f"AND {_QUALITY_NOT_EXHAUSTED} LIMIT ?",
+                    f"AND {_QUALITY_NOT_EXHAUSTED} {m} LIMIT ?",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type in ("describe", "tags", "category-content", "keywords"):
@@ -2712,7 +2874,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     list(photo_ids) + [pass_type, limit + len(claimed)],
                 ).fetchall()
             else:
@@ -2722,7 +2884,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     (pass_type, limit + len(claimed)),
                 ).fetchall()
         elif pass_type == "category-visual":
@@ -2736,7 +2898,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
@@ -2746,7 +2908,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "verify":
@@ -2762,7 +2924,7 @@ class PhotoDB:
                         AND description IS NOT NULL
                         AND verified_at IS NULL
                         AND {_VERIFY_NOT_EXHAUSTED}
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
@@ -2771,7 +2933,7 @@ class PhotoDB:
                        WHERE description IS NOT NULL
                        AND verified_at IS NULL
                        AND {_VERIFY_NOT_EXHAUSTED}
-                       LIMIT ?""",
+                       {m} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
         elif pass_type == "aesthetics":
@@ -2787,7 +2949,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     list(photo_ids) + [limit + len(claimed)],
                 ).fetchall()
             else:
@@ -2797,7 +2959,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
                                           AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})
-                        LIMIT ?""",
+                        {m} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
         else:
@@ -2810,6 +2972,7 @@ class PhotoDB:
     def count_unprocessed_photos(self, pass_type: str,
                                  photo_ids: list[int] | None = None) -> int:
         """Count photos missing data for a given pass type (fast, no filepath fetch)."""
+        m = media_clause(pass_type) if pass_type in PASS_MEDIA else ""
         if pass_type == "clip":
             if photo_ids:
                 placeholders = ",".join("?" * len(photo_ids))
@@ -2817,14 +2980,14 @@ class PhotoDB:
                     f"""SELECT COUNT(*) FROM photos p
                         WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
                         AND p.id NOT IN (SELECT photo_id FROM clip_embeddings)
-                        AND {_CLIP_NOT_EXHAUSTED}""",
+                        AND {_CLIP_NOT_EXHAUSTED}{m}""",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
                     "SELECT COUNT(*) FROM photos p "
                     "WHERE p.id NOT IN (SELECT photo_id FROM clip_embeddings) "
-                    f"AND {_CLIP_NOT_EXHAUSTED}"
+                    f"AND {_CLIP_NOT_EXHAUSTED}{m}"
                 ).fetchone()
         elif pass_type == "faces":
             if photo_ids:
@@ -2835,7 +2998,7 @@ class PhotoDB:
                         AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}""",
                     list(photo_ids),
                 ).fetchone()
             else:
@@ -2844,7 +3007,7 @@ class PhotoDB:
                        WHERE NOT EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id)
                        AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                        WHERE wp.photo_id = p.id AND wp.pass_type = 'faces'
-                                         AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"""
+                                         AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}"""
                 ).fetchone()
         elif pass_type == "quality":
             if photo_ids:
@@ -2852,14 +3015,14 @@ class PhotoDB:
                 row = self.conn.execute(
                     f"SELECT COUNT(*) FROM photos WHERE {_scope_col('id', photo_ids)} IN ({placeholders}) "
                     f"AND (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
-                    f"AND {_QUALITY_NOT_EXHAUSTED}",
+                    f"AND {_QUALITY_NOT_EXHAUSTED}{m}",
                     list(photo_ids),
                 ).fetchone()
             else:
                 row = self.conn.execute(
                     "SELECT COUNT(*) FROM photos "
                     "WHERE (aesthetic_score IS NULL OR aesthetic_concepts IS NULL) "
-                    f"AND {_QUALITY_NOT_EXHAUSTED}"
+                    f"AND {_QUALITY_NOT_EXHAUSTED}{m}"
                 ).fetchone()
         elif pass_type in ("describe", "tags", "category-content", "keywords"):
             # All four passes gate on the same condition: photos.<col> IS NULL
@@ -2884,7 +3047,7 @@ class PhotoDB:
                         AND {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}""",
                     list(photo_ids) + [pass_type],
                 ).fetchone()
             else:
@@ -2893,7 +3056,7 @@ class PhotoDB:
                         WHERE {col} IS NULL{extra}
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = ?
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}""",
                     (pass_type,),
                 ).fetchone()
         elif pass_type == "category-visual":
@@ -2906,7 +3069,7 @@ class PhotoDB:
                         AND visual_tags IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}""",
                     list(photo_ids),
                 ).fetchone()
             else:
@@ -2915,7 +3078,7 @@ class PhotoDB:
                         WHERE visual_tags IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'category-visual'
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"""
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}"""
                 ).fetchone()
         elif pass_type == "verify":
             if photo_ids:
@@ -2925,7 +3088,7 @@ class PhotoDB:
                         WHERE {_scope_col('id', photo_ids)} IN ({placeholders})
                         AND description IS NOT NULL
                         AND verified_at IS NULL
-                        AND {_VERIFY_NOT_EXHAUSTED}""",
+                        AND {_VERIFY_NOT_EXHAUSTED}{m}""",
                     list(photo_ids),
                 ).fetchone()
             else:
@@ -2933,7 +3096,7 @@ class PhotoDB:
                     f"""SELECT COUNT(*) FROM photos
                        WHERE description IS NOT NULL
                        AND verified_at IS NULL
-                       AND {_VERIFY_NOT_EXHAUSTED}"""
+                       AND {_VERIFY_NOT_EXHAUSTED}{m}"""
                 ).fetchone()
         elif pass_type == "aesthetics":
             if photo_ids:
@@ -2944,7 +3107,7 @@ class PhotoDB:
                         AND aes_overall IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})""",
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}""",
                     list(photo_ids),
                 ).fetchone()
             else:
@@ -2953,7 +3116,7 @@ class PhotoDB:
                         WHERE aes_overall IS NULL
                         AND NOT EXISTS (SELECT 1 FROM worker_processed wp
                                         WHERE wp.photo_id = photos.id AND wp.pass_type = 'aesthetics'
-                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"""
+                                          AND wp.attempts >= {MAX_PROCESS_ATTEMPTS}){m}"""
                 ).fetchone()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")

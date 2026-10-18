@@ -1356,17 +1356,8 @@ def review_faces(db, date_, base_url, team_hue, tolerance, min_det, min_edge,
     base_url = base_url.rstrip("/")
 
     with PhotoDB(db) as photo_db:
-        rows = photo_db.conn.execute("""
-            SELECT f.id, f.photo_id, f.person_id, pe.name AS person_name,
-                   f.bbox_top, f.bbox_bottom, f.bbox_left, f.bbox_right,
-                   p.image_width
-              FROM faces f
-              JOIN photos p ON p.id = f.photo_id
-              LEFT JOIN persons pe ON pe.id = f.person_id
-             WHERE date(p.date_taken) = ?
-               AND (f.det_score IS NULL OR f.det_score >= ?)
-               AND MIN(f.bbox_bottom - f.bbox_top, f.bbox_right - f.bbox_left) >= ?
-        """, (date_, min_det, min_edge)).fetchall()
+        rows = photo_db.conn.execute(
+            face_review.TEAM_FACES_SQL, (date_, min_det, min_edge)).fetchall()
         faces = [dict(r) for r in rows]
         if not faces:
             raise click.ClickException(f"No faces on {date_} above the quality floor.")
@@ -2136,15 +2127,27 @@ def purge_nonimage_photos(db, apply, scan_all, audit_path, sample):
             click.echo("Refusing to scan — run this where the photo files are mounted (the NAS).")
             return
 
+        # Stills only, in BOTH scopes (schema v35). A video row is never
+        # CLIP-embedded and an old MOV (no leading `ftyp`) fails
+        # is_real_image, so without this every registered video would be
+        # "purged" — and the FK cascade would take its faces and collection
+        # links with it. See docs/plans/video-support.md step 1.
+        from photosearch.db import STILL_SQL
         if scan_all:
-            rows = photo_db.conn.execute("SELECT id, filepath, file_hash FROM photos").fetchall()
+            rows = photo_db.conn.execute(
+                f"SELECT id, filepath, file_hash FROM photos WHERE {STILL_SQL}"
+            ).fetchall()
         else:
             rows = photo_db.conn.execute(
                 "SELECT id, filepath, file_hash FROM photos "
-                "WHERE id NOT IN (SELECT photo_id FROM clip_embeddings)"
+                "WHERE id NOT IN (SELECT photo_id FROM clip_embeddings) "
+                f"AND {STILL_SQL}"
             ).fetchall()
+        n_videos = photo_db.conn.execute(
+            f"SELECT COUNT(*) FROM photos WHERE NOT ({STILL_SQL})").fetchone()[0]
         click.echo(f"Scanning {len(rows):,} candidate photos "
-                   f"({'all' if scan_all else 'no-CLIP-embedding'} set)…")
+                   f"({'all' if scan_all else 'no-CLIP-embedding'} set; "
+                   f"{n_videos:,} video rows never considered)…")
 
         bad = []  # (id, filepath, file_hash, magic)
         missing = 0
@@ -2379,7 +2382,9 @@ def backfill_image_orientation(db, apply, limit):
     from PIL import Image
     with PhotoDB(db) as pdb:
         c = pdb.conn
-        rows = c.execute("SELECT id, filepath, image_width, image_height FROM photos").fetchall()
+        # Stills only (schema v35): a video's display dims come from the probe.
+        rows = c.execute("SELECT id, filepath, image_width, image_height FROM photos "
+                         "WHERE media_type IS NULL").fetchall()
         if limit:
             rows = rows[:limit]
         checked = fixed = errs = 0
@@ -2700,6 +2705,59 @@ def sharpness_cmd(db, limit, apply_, pause, folder):
                + (f" -- {res['message']}" if res.get("message") else ""))
 
 
+@cli.command("register-videos")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--photo-root", default=None,
+              help="Library root. Precedence: this flag, then PHOTO_ROOT, then "
+                   "the root stored in the DB.")
+@click.option("--folder", default=None,
+              help="Only this folder (or below), relative to the photo root, "
+                   "e.g. 2026 or 2026/2026-09-19_phone-matt.")
+@click.option("--limit", default=None, type=int,
+              help="Register at most N new videos this run.")
+@click.option("--apply", "apply_", is_flag=True, default=False,
+              help="Insert the rows. Default: dry run (counts only, DB opened "
+                   "read-only).")
+def register_videos_cmd(db, photo_root, folder, limit, apply_):
+    """Give every video file under the photo root a photos row (schema v35).
+
+    Walks the library for VIDEO_EXTENSIONS files that have no row (matched by
+    stored filepath) and inserts media_type='video' rows plus an empty
+    video_meta row each — the queue the desktop video-probe pass drains. No
+    ffprobe, no decode, no hashing: file_hash stays NULL and date_taken is the
+    file mtime until the probe replaces it. Skips _incoming (and its
+    .processed archive), hidden dirs and AppleDouble ._ files. Commits every
+    25 rows. Run on the NAS, where the files are.
+    """
+    from photosearch.video_registry import register_videos
+
+    if limit is not None and limit <= 0:
+        raise click.BadParameter("must be positive", param_hint="--limit")
+
+    def on_prog(ev):
+        click.echo(f"  registered {ev['registered']:,} (files seen {ev['files']:,})")
+
+    try:
+        res = register_videos(db, photo_root=photo_root, folder=folder,
+                              limit=limit, apply=apply_, on_progress=on_prog)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+
+    click.echo(f"photo root: {res['root']}")
+    click.echo(f"video files: {res['files']:,}   already registered: {res['already']:,}")
+    if res["per_year"]:
+        click.echo("new by year: " + "  ".join(
+            f"{y} {n:,}" for y, n in res["per_year"].items()))
+    if not apply_:
+        click.echo(f"Dry run: {res['would_register']:,} video(s) would be registered. "
+                   f"Re-run with --apply.")
+        return
+    click.echo(f"Registered {res['registered']:,} video(s).")
+
+
 @cli.command("validate-data")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
@@ -2849,8 +2907,10 @@ def ingest_incoming_cmd(incoming_root, photo_root, db, dry_run, index, no_colors
 
     Photos (JPEG/HEIC) dedup against photos.file_hash and get CLIP-indexed.
     RAW + video are moved into the same folder but NOT indexed (every file
-    reaches the NAS; they dedup against the destination). Files that imported
-    successfully are physically moved, not copied.
+    reaches the NAS; they dedup against the destination). Videos also get a
+    photos row (media_type='video', schema v35) and dedup against file_hash
+    like photos. Files that imported successfully are physically moved, not
+    copied.
     """
     from photosearch.ingest import ingest_incoming, IngestAlreadyRunning
     from photosearch.ingest_batches import register_batch, set_sweep_status
@@ -6123,9 +6183,10 @@ def _photo_rows(pdb: PhotoDB, ids: list[int]) -> dict:
         return {}
     ph = ",".join("?" * len(ids))
     return {r["id"]: {"filepath": r["filepath"], "filename": r["filename"],
-                      "description": r["description"]}
+                      "description": r["description"],
+                      "media_type": r["media_type"]}
             for r in pdb.conn.execute(
-                f"SELECT id, filepath, filename, description FROM photos "
+                f"SELECT id, filepath, filename, description, media_type FROM photos "
                 f"WHERE id IN ({ph})", ids).fetchall()}
 
 

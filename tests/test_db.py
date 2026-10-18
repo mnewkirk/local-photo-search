@@ -1160,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 34
+        assert int(version) == SCHEMA_VERSION == 35
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1238,7 +1238,7 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 34
+        assert int(version) == SCHEMA_VERSION == 35
 
     # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
     # the tables intact (schema-version fast-path skips the DDL entirely).
@@ -1271,7 +1271,7 @@ def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 34
+        assert int(version) == SCHEMA_VERSION == 35
 
     # Idempotent: the version fast-path skips the DDL and the table survives.
     with PhotoDB(tmp_db_path) as again:
@@ -1306,7 +1306,7 @@ def test_v31_db_migrates_to_v32_stacking_seen(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 34
+        assert int(version) == SCHEMA_VERSION == 35
         assert reopened.conn.execute(
             "SELECT COUNT(*) FROM stack_members").fetchone()[0] == 2
 
@@ -1353,7 +1353,77 @@ def test_v32_db_migrates_to_v33_sharpness_columns(tmp_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 34
+        assert int(version) == SCHEMA_VERSION == 35
+
+
+def test_v34_db_migrates_to_v35_media_type_and_video_tables(tmp_path):
+    """A v34 DB gains photos.media_type (NULL on every existing row — NULL
+    means still, so nothing is rewritten), the partial video index, and the
+    three video side tables with their FKs; stamped 35."""
+    import sqlite3
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+
+    path = str(tmp_path / "v34.db")
+    with PhotoDB(path) as db:
+        pid = db.add_photo(filepath="a.jpg", filename="a.jpg",
+                           description="kept")
+    conn = sqlite3.connect(path)
+    conn.execute("DROP INDEX idx_photos_media_video")
+    for t in ("video_tracks", "video_subjects", "video_meta"):
+        conn.execute(f"DROP TABLE {t}")
+    conn.execute("ALTER TABLE photos DROP COLUMN media_type")
+    conn.execute("UPDATE schema_info SET value = '34' WHERE key = 'version'")
+    conn.commit()
+    conn.close()
+
+    with PhotoDB(path) as reopened:
+        c = reopened.conn
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(photos)")}
+        assert "media_type" in cols
+        row = c.execute("SELECT description, media_type FROM photos WHERE id = ?",
+                        (pid,)).fetchone()
+        assert row["description"] == "kept" and row["media_type"] is None
+        idx = c.execute("SELECT sql FROM sqlite_master WHERE type='index' "
+                        "AND name='idx_photos_media_video'").fetchone()
+        assert idx and "WHERE media_type IS NOT NULL" in idx["sql"]
+        for t, needed in {
+            "video_meta": {"photo_id", "duration_s", "probe_version", "probe_error",
+                           "kind", "live_of_photo_id", "scan_version", "quality_json"},
+            "video_subjects": {"id", "photo_id", "subject_ix", "label", "category",
+                               "face_id", "focus_s", "rep_bbox", "n_segments"},
+            "video_tracks": {"id", "photo_id", "face_id", "ident_ix", "t_start",
+                             "presence_s", "focus_s", "mean_salience"},
+        }.items():
+            got = {r["name"] for r in c.execute(f"PRAGMA table_info({t})")}
+            assert needed <= got, (t, needed - got)
+        for name in ("idx_video_subjects_photo", "idx_video_subjects_face",
+                     "idx_video_subjects_label", "idx_video_tracks_photo",
+                     "idx_video_tracks_face"):
+            assert c.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+                             "AND name=?", (name,)).fetchone(), name
+        version = c.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'"
+        ).fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 35
+
+        # FKs: deleting the photo cascades the side tables; deleting a face
+        # only NULLs the track/subject link.
+        vid = reopened.add_photo(filepath="v.mp4", filename="v.mp4",
+                                 media_type="video")
+        c.execute("INSERT INTO video_meta (photo_id) VALUES (?)", (vid,))
+        fid = c.execute(
+            "INSERT INTO faces (photo_id, bbox_top, bbox_right, bbox_bottom, "
+            "bbox_left) VALUES (?, 0, 10, 10, 0)", (vid,)).lastrowid
+        c.execute("INSERT INTO video_tracks (photo_id, face_id) VALUES (?, ?)",
+                  (vid, fid))
+        c.execute("INSERT INTO video_subjects (photo_id, face_id) VALUES (?, ?)",
+                  (vid, fid))
+        c.execute("DELETE FROM faces WHERE id = ?", (fid,))
+        assert c.execute("SELECT face_id FROM video_tracks").fetchone()[0] is None
+        assert c.execute("SELECT face_id FROM video_subjects").fetchone()[0] is None
+        c.execute("DELETE FROM photos WHERE id = ?", (vid,))
+        for t in ("video_meta", "video_tracks", "video_subjects"):
+            assert c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0
 
 
 class TestNormalizeDirectory:
