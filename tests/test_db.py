@@ -1160,7 +1160,7 @@ def test_v28_db_migrates_to_v29_maintenance_runs(tmp_path):
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 35
+        assert int(version) == SCHEMA_VERSION == 36
 
 
 def test_record_and_get_maintenance_runs(db):
@@ -1238,7 +1238,7 @@ def test_v29_db_migrates_to_v30_ingest_batches(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 35
+        assert int(version) == SCHEMA_VERSION == 36
 
     # Idempotent: re-opening an already-v30 DB is a no-op that still leaves
     # the tables intact (schema-version fast-path skips the DDL entirely).
@@ -1271,7 +1271,7 @@ def test_v30_db_migrates_to_v31_face_person_exclusions(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 35
+        assert int(version) == SCHEMA_VERSION == 36
 
     # Idempotent: the version fast-path skips the DDL and the table survives.
     with PhotoDB(tmp_db_path) as again:
@@ -1306,7 +1306,7 @@ def test_v31_db_migrates_to_v32_stacking_seen(db, tmp_db_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 35
+        assert int(version) == SCHEMA_VERSION == 36
         assert reopened.conn.execute(
             "SELECT COUNT(*) FROM stack_members").fetchone()[0] == 2
 
@@ -1353,7 +1353,7 @@ def test_v32_db_migrates_to_v33_sharpness_columns(tmp_path):
         version = reopened.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 35
+        assert int(version) == SCHEMA_VERSION == 36
 
 
 def test_v34_db_migrates_to_v35_media_type_and_video_tables(tmp_path):
@@ -1404,7 +1404,7 @@ def test_v34_db_migrates_to_v35_media_type_and_video_tables(tmp_path):
         version = c.execute(
             "SELECT value FROM schema_info WHERE key = 'version'"
         ).fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 35
+        assert int(version) == SCHEMA_VERSION == 36
 
         # FKs: deleting the photo cascades the side tables; deleting a face
         # only NULLs the track/subject link.
@@ -1442,3 +1442,42 @@ class TestNormalizeDirectory:
 
     def test_already_relative_path_unchanged(self, db):
         assert db.normalize_directory("2091/2091-09-19_ILCE-7RM6") == "2091/2091-09-19_ILCE-7RM6"
+
+
+def test_v35_db_migrates_to_v36_poster_version_and_presence_intervals(tmp_path):
+    """A v35 DB (video_meta without poster_version, video_tracks without
+    presence_intervals) gains both on open. An already-probed poster keeps
+    its old replica cache name: poster_version is backfilled from
+    probe_version, so nothing on the replica is invalidated."""
+    import sqlite3
+    from photosearch.db import PhotoDB, SCHEMA_VERSION
+    from photosearch import video_api
+
+    path = str(tmp_path / "v35.db")
+    with PhotoDB(path) as db:
+        a = db.add_photo(filepath="v/a.mov", filename="a.mov", media_type="video")
+        b = db.add_photo(filepath="v/b.mov", filename="b.mov", media_type="video")
+        db.conn.execute("INSERT INTO video_meta (photo_id, probe_version, poster_t) "
+                        "VALUES (?, 1, 0.0)", (a,))
+        db.conn.execute("INSERT INTO video_meta (photo_id, probe_version, probe_error) "
+                        "VALUES (?, 1, 'unreadable: x')", (b,))
+        db.conn.commit()
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE video_meta DROP COLUMN poster_version")
+    conn.execute("ALTER TABLE video_tracks DROP COLUMN presence_intervals")
+    conn.execute("UPDATE schema_info SET value = '35' WHERE key = 'version'")
+    conn.commit()
+    conn.close()
+
+    with PhotoDB(path) as db:
+        cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(video_meta)")}
+        assert "poster_version" in cols
+        cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(video_tracks)")}
+        assert "presence_intervals" in cols
+        pv = dict(db.conn.execute("SELECT photo_id, poster_version FROM video_meta"))
+        assert pv == {a: 1, b: None}
+        st = video_api.video_state(db.conn, a)
+        assert video_api.replica_poster_name(a, "thumb", st) == f"{a}_thumb.p1.jpg"
+        version = db.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'").fetchone()["value"]
+        assert int(version) == SCHEMA_VERSION == 36

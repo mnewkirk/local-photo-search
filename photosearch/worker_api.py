@@ -224,6 +224,54 @@ class VideoProbeResult(BaseModel):
     probe_json: Optional[dict] = None
 
 
+class VideoScanIdentity(BaseModel):
+    """One within-video person: becomes ONE `faces` row + one `video_tracks`
+    row. `bbox` is (top, right, bottom, left) in the coordinates of its
+    representative frame (`keyframe_rep_f{rep_frame:05d}.jpg`)."""
+    ident_ix: int
+    bbox: list[int]
+    det_score: Optional[float] = None
+    encoding: Optional[list[float]] = None
+    rep_t: Optional[float] = None
+    rep_frame: Optional[int] = None
+    t_start: Optional[float] = None
+    t_end: Optional[float] = None
+    n_det: Optional[int] = None
+    presence_s: Optional[float] = None
+    focus_s: Optional[float] = None
+    presence_intervals: Optional[list] = None
+    focus_intervals: Optional[list] = None
+    mean_salience: Optional[float] = None
+
+
+class VideoScanResult(BaseModel):
+    """One video's `video-scan` result (docs/plans/video-support.md step 3).
+
+    `scan_error` set IS the result for a complete file cv2 could not open
+    (or a ZIP that is not one safe video) — stored, never re-claimed until
+    SCAN_VERSION bumps. Otherwise the identities, CLIP mean embedding and
+    quality numbers; the assets were uploaded through /api/videos/{id}/assets
+    BEFORE this submit. `probe` is the ZIP-wrapped file's INNER probe (a
+    VideoProbeResult minus photo_id), which clears `probe_error`.
+    `file_hash` is the SHA-256 of the file as stored on the NAS, computed
+    while it streamed; the server fills `photos.file_hash` when NULL.
+    """
+    photo_id: int
+    scan_version: int
+    scan_error: Optional[str] = None
+    file_hash: Optional[str] = None
+    file_size: Optional[int] = None
+    shake: Optional[float] = None
+    noise: Optional[float] = None
+    focus_consistency: Optional[float] = None
+    quality_json: Optional[dict] = None
+    clip_embedding: Optional[list[float]] = None
+    identities: list[VideoScanIdentity] = []
+    poster_uploaded: bool = False
+    poster_t: Optional[float] = None
+    probe: Optional[dict] = None
+
+
 class FailedResult(BaseModel):
     """A photo the WORKER tried and could not process — an unloadable image, a
     detection or verification that raised. Spends one attempt on the server
@@ -250,6 +298,8 @@ class SubmitRequest(BaseModel):
     aesthetics_results: Optional[list[AestheticsResult]] = None
     # video-probe (schema v35). Optional, so older workers are unaffected.
     video_probe_results: Optional[list[VideoProbeResult]] = None
+    # video-scan (schema v35/v36). Optional, so older workers are unaffected.
+    video_scan_results: Optional[list[VideoScanResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older
     # server ignores the unknown field (pydantic's default) and behaves as it
@@ -433,18 +483,25 @@ def claim_batch(req: ClaimRequest):
         photo_id_list = [p["id"] for p in photos]
         placeholders = ",".join("?" * len(photo_id_list))
         desc_rows = db.conn.execute(
-            f"SELECT id, description FROM photos WHERE id IN ({placeholders})",
+            f"SELECT p.id, p.description, p.media_type, vm.duration_s "
+            f"FROM photos p LEFT JOIN video_meta vm ON vm.photo_id = p.id "
+            f"WHERE p.id IN ({placeholders})",
             photo_id_list,
         ).fetchall()
-        desc_by_id = {row["id"]: row["description"] for row in desc_rows}
+        desc_by_id = {row["id"]: row for row in desc_rows}
 
         result_photos = []
         for p in photos:
+            d = desc_by_id.get(p["id"])
             result_photos.append({
                 "id": p["id"],
                 "filepath": p["filepath"],
                 "filename": Path(p["filepath"]).name,
-                "description": desc_by_id.get(p["id"]),
+                "description": d["description"] if d else None,
+                # video-support step 3: the video passes size their work by
+                # the probe's duration (sampling rate, segment schedule).
+                "media_type": d["media_type"] if d else None,
+                "duration_s": d["duration_s"] if d else None,
             })
 
         return ClaimResponse(
@@ -778,6 +835,7 @@ def submit_results(req: SubmitRequest):
                 logger.warning(f"Claim {req.batch_id} expired and was cleaned up, but accepting results anyway")
 
         outcome = _SubmitOutcome()
+        video_scan_details = None
 
         if req.failures:
             _record_worker_failures(db, outcome, req.pass_type, req.failures)
@@ -1106,6 +1164,40 @@ def submit_results(req: SubmitRequest):
                     _record_write_failure(db, outcome, "video-probe", r.photo_id, e)
             _mark_processed(db, outcome, "video-probe", skip=probed)
 
+        elif req.pass_type == "video-scan":
+            # One transaction PER VIDEO (faces, encodings, tracks, CLIP,
+            # video_meta, the hash and a ZIP's inner probe land together or
+            # not at all). A stored scan_error is a result. Success is its own
+            # marker (scan_version), so only failures write the ledger.
+            from .video_api import frames_root
+            from .video_scan_store import apply_scan_result, install_crops
+            from .face_crop import face_crop_cache_dir
+            scanned: set[int] = set()
+            details = []
+            for r in req.video_scan_results or []:
+                try:
+                    info = apply_scan_result(
+                        db.conn, r.model_dump(),
+                        crop_cache_dir=face_crop_cache_dir(db.db_path),
+                        frames_root=frames_root(db.db_path))
+                    db.conn.commit()
+                    install_crops(info.pop("_install", []))
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                    scanned.add(r.photo_id)
+                    details.append(info)
+                    if info.get("duplicate_of"):
+                        logger.warning("video-scan %s: same SHA-256 as photo %s "
+                                       "(left alone)", r.photo_id, info["duplicate_of"])
+                except Exception as e:
+                    try:
+                        db.conn.rollback()
+                    except Exception:
+                        pass
+                    _record_write_failure(db, outcome, "video-scan", r.photo_id, e)
+            _mark_processed(db, outcome, "video-scan", skip=scanned)
+            video_scan_details = details
+
         # Log activity for the chart
         if outcome.written > 0:
             try:
@@ -1117,7 +1209,7 @@ def submit_results(req: SubmitRequest):
         # Release the claim — deferred photos must become claimable again.
         db.release_claim(req.batch_id)
 
-        return {
+        resp = {
             # `status` / `written` / `processed` / `batch_id` are what older
             # workers read; `deferred*` is additive.
             "status": outcome.status(),
@@ -1127,6 +1219,11 @@ def submit_results(req: SubmitRequest):
             "deferred": len(outcome.deferred),
             "deferred_photo_ids": outcome.deferred,
         }
+        if video_scan_details is not None:
+            # D13: carried labels and the ones that found no identity, plus
+            # any duplicate SHA-256 — reported, never silently dropped.
+            resp["video_scan"] = video_scan_details
+        return resp
 
 
 class RenewClaimRequest(BaseModel):
@@ -1187,6 +1284,24 @@ def clear_pass(req: ClearPassRequest):
                     raise HTTPException(400, "photo_ids list is empty")
             else:
                 raise HTTPException(400, "collection_id, directory, filters, or photo_ids is required for clear-pass (safety)")
+
+        # A pass only ever clears rows of its own media (db.PASS_MEDIA): a
+        # `faces` / `clip` clear over a folder must not delete a video's
+        # scan-made faces or CLIP mean, and a video pass touches no still.
+        from .db import PASS_MEDIA, media_sql
+        if req.pass_type in PASS_MEDIA:
+            frag = media_sql(req.pass_type)
+            if frag is not None:
+                kept = []
+                for i in range(0, len(photo_ids), 900):
+                    chunk = list(photo_ids[i:i + 900])
+                    ph = ",".join("?" * len(chunk))
+                    kept += [r[0] for r in db.conn.execute(
+                        f"SELECT id FROM photos WHERE id IN ({ph}) AND {frag}", chunk)]
+                photo_ids = kept
+                if not photo_ids:
+                    return {"status": "ok", "pass_type": req.pass_type, "cleared": 0,
+                            "photo_count": 0}
 
         placeholders = ",".join("?" * len(photo_ids))
         cleared = 0
@@ -1326,6 +1441,18 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM worker_processed WHERE pass_type = 'video-probe' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
+        elif req.pass_type == "video-scan":
+            # Re-queue the scan. The faces / tracks / CLIP mean stay until the
+            # re-scan REPLACES them, which is also what carries the human
+            # labels across (D13) — deleting them here would lose those.
+            cur = db.conn.execute(
+                f"UPDATE video_meta SET scan_version = NULL, scan_error = NULL, "
+                f"scanned_at = NULL WHERE photo_id IN ({placeholders})", photo_ids)
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'video-scan' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         else:
             raise HTTPException(400, f"Unknown pass type: {req.pass_type}")
 
@@ -1379,7 +1506,7 @@ def photo_detail(photo_id: int):
 # forever. Including it in queue_depth just showed a confusing dead counter.
 _ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
                "verify", "category-content", "keywords", "category-visual",
-               "video-probe")
+               "video-probe", "video-scan")
 
 
 @router.get("/status")

@@ -185,6 +185,8 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("POST", r"/api/videos/(?P<id>\d+)/assets",
      _fixed("Worker fleet: upload poster/keyframes of video {id}")),
     ("GET", r"/api/admin/unreadable-videos", _fixed("List unreadable videos")),
+    ("GET", r"/api/videos/(?P<id>\d+)/frames/(?P<name>[\w.-]+)",
+     _fixed("Fetch keyframe {name} of video {id}")),
 ]
 _COMPILED = [(m, re.compile(rx + r"/?$"), b) for m, rx, b in _RULES]
 

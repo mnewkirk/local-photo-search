@@ -39,13 +39,13 @@ from typing import Optional
 # precedes the text passes). Same order as batch_state.WORKER_PASSES.
 ALL_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
               "verify", "category-content", "keywords", "category-visual",
-              "video-probe")
+              "video-probe", "video-scan")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
 # Passes that read the original themselves over HTTP Range — never download it
 # whole (video-probe: ffprobe + one frame of a possibly multi-GB clip).
-RANGE_READ_PASSES = {"video-probe"}
+RANGE_READ_PASSES = {"video-probe", "video-scan"}  # video-scan: its own hashed download
 
 # pass -> (LLM role, Ollama-style default model). The role drives LM Studio model
 # selection (PHOTOSEARCH_LLM_<ROLE>_MODEL via describe._resolve_openai_model);
@@ -289,6 +289,12 @@ def run_pass_sync(db, photo_id: int, pass_type: str,
         elif pass_type == "video-probe":
             results = W._process_video_probe(client, [info])
             kwargs = W._submit_kwargs("video_probe_results", results)
+        elif pass_type == "video-scan":
+            vm = db.conn.execute("SELECT duration_s FROM video_meta WHERE photo_id = ?",
+                                 (photo_id,)).fetchone()
+            info["duration_s"] = vm[0] if vm else None
+            results = W._process_video_scan(client, [info], tmpdir)
+            kwargs = W._submit_kwargs("video_scan_results", results)
         else:  # pragma: no cover - guarded above
             raise ValueError(f"unknown pass type: {pass_type}")
 
@@ -336,6 +342,21 @@ _MIRROR_COLUMNS = (
     # targeted mirror doesn't leave the replica's copy staler than the rest.
     # An older NAS omits them, and `if c in fields` below skips the absent.
     "sharpness", "sharpness_json", "sharpness_version", "sharpness_scored_at",
+    # video-scan (step 3) can fill a NULL file_hash
+    "file_hash",
+)
+
+# video_meta columns mirrored for a video (video-probe + video-scan). An older
+# NAS sends no "video_meta" key and nothing is touched.
+_VIDEO_META_MIRROR = (
+    "duration_s", "fps", "codec", "container", "width", "height", "rotation",
+    "bitrate", "has_audio", "probe_json", "probe_version", "probe_error", "kind",
+    "live_of_photo_id", "poster_t", "poster_version", "scan_version", "scan_error",
+    "scanned_at", "shake", "noise", "focus_consistency", "quality_json",
+)
+_VIDEO_TRACK_MIRROR = (
+    "face_id", "ident_ix", "t_start", "t_end", "n_det", "presence_s", "focus_s",
+    "focus_intervals", "rep_t", "rep_frame", "mean_salience", "presence_intervals",
 )
 
 
@@ -402,13 +423,55 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
             db.conn.execute(f"DELETE FROM face_encodings WHERE face_id IN ({ph})", old)
             db.conn.execute("DELETE FROM faces WHERE photo_id=?", (photo_id,))
         for f in faces:
-            fid = db.add_face(photo_id=photo_id, bbox=tuple(f["bbox"]),
-                              encoding=f["encoding"], det_score=f.get("det_score"),
-                              person_id=f.get("person_id"),
-                              cluster_id=f.get("cluster_id"))
+            # Keep the NAS face id when it is free locally: video_tracks
+            # (and every later sync) reference faces by id.
+            want = f.get("id")
+            if want is not None and db.conn.execute(
+                    "SELECT 1 FROM faces WHERE id=?", (want,)).fetchone():
+                want = None
+            if want is not None:
+                bb = tuple(f["bbox"])
+                db.conn.execute(
+                    "INSERT INTO faces (id, photo_id, person_id, bbox_top, bbox_right, "
+                    "bbox_bottom, bbox_left, cluster_id, det_score) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (want, photo_id, f.get("person_id"), bb[0], bb[1], bb[2], bb[3],
+                     f.get("cluster_id"), f.get("det_score")))
+                fid = want
+                if f.get("encoding"):
+                    from .db import HAS_SQLITE_VEC, _serialize_float_list
+                    if HAS_SQLITE_VEC:
+                        db.conn.execute("DELETE FROM face_encodings WHERE face_id=?", (fid,))
+                        db.conn.execute(
+                            "INSERT INTO face_encodings (face_id, encoding) VALUES (?, ?)",
+                            (fid, _serialize_float_list(f["encoding"])))
+            else:
+                fid = db.add_face(photo_id=photo_id, bbox=tuple(f["bbox"]),
+                                  encoding=f["encoding"], det_score=f.get("det_score"),
+                                  person_id=f.get("person_id"),
+                                  cluster_id=f.get("cluster_id"))
             # match_source isn't an add_face param — set it so mirrored manual /
             # temporal assignments keep their provenance locally.
             if f.get("match_source") is not None:
                 db.conn.execute("UPDATE faces SET match_source=? WHERE id=?",
                                 (f["match_source"], fid))
+
+    vm = fields.get("video_meta")
+    if vm:
+        cols = [c for c in _VIDEO_META_MIRROR if c in vm]
+        db.conn.execute("INSERT OR IGNORE INTO video_meta (photo_id) VALUES (?)", (photo_id,))
+        if cols:
+            db.conn.execute(
+                f"UPDATE video_meta SET {', '.join(f'{c} = ?' for c in cols)} "
+                f"WHERE photo_id = ?", (*[vm[c] for c in cols], photo_id))
+    if "video_tracks" in fields:
+        db.conn.execute("DELETE FROM video_tracks WHERE photo_id=?", (photo_id,))
+        for t in fields["video_tracks"] or []:
+            cols = [c for c in _VIDEO_TRACK_MIRROR if c in t]
+            if t.get("face_id") is not None and not db.conn.execute(
+                    "SELECT 1 FROM faces WHERE id=?", (t["face_id"],)).fetchone():
+                t = dict(t, face_id=None)
+            db.conn.execute(
+                f"INSERT INTO video_tracks (photo_id, {', '.join(cols)}) "
+                f"VALUES (?, {', '.join('?' * len(cols))})",
+                (photo_id, *[t[c] for c in cols]))
     db.conn.commit()

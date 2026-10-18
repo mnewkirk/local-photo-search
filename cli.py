@@ -2222,16 +2222,31 @@ def cleanup_orphans(db, dry_run):
     removes any leftover vector rows whose photo_id (or face_id) no longer
     exists. AUTOINCREMENT prevents ID reuse, so deletion is always safe.
     """
+    import shutil
+    from photosearch.video_api import frames_root
+    from photosearch.video_scan_store import stale_frame_dirs
+
     with PhotoDB(db) as photo_db:
         result = photo_db.cleanup_vec_orphans(dry_run=dry_run)
+        # video_frames/{pid}/v* asset dirs of deleted videos, or of versions
+        # neither the current scan nor the current probe uses (a SCAN_VERSION
+        # bump leaves the old keyframes/crops behind).
+        stale = stale_frame_dirs(photo_db.conn, frames_root(photo_db.db_path))
         click.echo(f"  clip_embeddings orphans: {result['clip_orphans']}")
         click.echo(f"  face_encodings  orphans: {result['face_orphans']}")
+        click.echo(f"  stale video_frames dirs: {len(stale)}")
+        for d in stale[:10]:
+            click.echo(f"    {d}")
         if dry_run:
             click.echo("\nDry run — no changes written. Re-run without --dry-run to delete.")
-        elif result["clip_deleted"] or result["face_deleted"]:
+            return
+        for d in stale:
+            shutil.rmtree(d, ignore_errors=True)
+        if result["clip_deleted"] or result["face_deleted"] or stale:
             click.echo(
                 f"\nDeleted {result['clip_deleted']} clip_embeddings "
-                f"and {result['face_deleted']} face_encodings rows."
+                f"and {result['face_deleted']} face_encodings rows, "
+                f"and {len(stale)} stale video_frames dirs."
             )
         else:
             click.echo("\nNo orphans found — nothing to delete.")
@@ -5213,8 +5228,10 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--server", "-s", required=True, help="NAS server URL (e.g. http://nas.local:8000).")
 @click.option("--passes", "-p", default="clip", show_default=True,
               help="Comma-separated pass types: clip, faces, quality, aesthetics, describe, "
-                   "verify, category-content, keywords, category-visual, video-probe "
-                   "(video-probe needs ffprobe: PATH, ~/.local/bin or PHOTOSEARCH_FFPROBE).")
+                   "verify, category-content, keywords, category-visual, video-probe, "
+                   "video-scan (video-probe needs ffprobe: PATH, ~/.local/bin or "
+                   "PHOTOSEARCH_FFPROBE; video-scan needs cv2 + InsightFace + CLIP, and "
+                   "ffprobe only for ZIP-wrapped files).")
 @click.option("--collection", "collection_id", type=int, default=None,
               help="Scope work to a specific collection (by ID).")
 @click.option("--directory", "-d", default=None,
@@ -5350,6 +5367,8 @@ def worker(server, passes, collection_id, directory,
         "category-content", "category-visual", "keywords", "aesthetics",
         # docs/plans/video-support.md step 2b: needs ffprobe on this machine
         "video-probe",
+        # step 3: one rate-capped download per video, cv2 + InsightFace + CLIP
+        "video-scan",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.

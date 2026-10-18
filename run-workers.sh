@@ -157,6 +157,8 @@ Start workers:
   -p, --passes PASSES     Comma-separated passes (default: clip)
                           video-probe needs ffprobe on the host: use --native
                           (the Docker image has none; the worker drops the pass)
+                          video-scan downloads each video once (30 MB/s cap on
+                          the NAS); keep -n 2 for it
   -d, --directory DIR      Scope to directory on NAS (e.g. /photos/2026)
   -c, --collection ID     Scope to collection ID
       --from DATE         Filter scope: photos on/after DATE (YYYY-MM-DD)

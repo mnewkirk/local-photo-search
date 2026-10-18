@@ -161,6 +161,11 @@ def apply_probe_result(conn, r: dict) -> dict:
         + ", ".join(f"{c} = ?" for c in _META_COLUMNS)
         + ", probe_error = NULL, probe_version = ?, probe_json = ? WHERE photo_id = ?",
         (*vals, version, probe_json, pid))
+    if r.get("poster_t") is not None:
+        # A new poster was uploaded with this probe: bump the name the
+        # replica caches it under (schema v36, video_api.poster_version).
+        conn.execute("UPDATE video_meta SET poster_version = COALESCE(poster_version, 0) + 1 "
+                     "WHERE photo_id = ?", (pid,))
 
     sets, params = [], []
     if r.get("width") and r.get("height"):

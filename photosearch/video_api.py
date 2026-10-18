@@ -70,8 +70,9 @@ def video_mime(filename: str) -> str:
 def video_state(conn, photo_id: int) -> dict:
     """The video_meta fields the serving routes branch on ({} if no row)."""
     row = conn.execute(
-        "SELECT kind, live_of_photo_id, probe_version, probe_error, duration_s "
-        "FROM video_meta WHERE photo_id = ?", (photo_id,)).fetchone()
+        "SELECT kind, live_of_photo_id, probe_version, probe_error, duration_s, "
+        "poster_version, scan_version FROM video_meta WHERE photo_id = ?",
+        (photo_id,)).fetchone()
     return dict(row) if row else {}
 
 
@@ -88,12 +89,13 @@ def image_source(state: dict) -> str:
 
 
 def poster_version(state: dict):
-    """The version that names a poster: today the probe pass's
-    `probe_version` (the probe uploads the poster). A later pass that
-    REPLACES the poster (e.g. video-scan picking a better frame) must bump
-    what this returns — a `poster_version` column — or the replica keeps
-    serving the old one. This is the single place to change."""
-    return state.get("probe_version")
+    """The version that names a poster: `video_meta.poster_version` (schema
+    v36), bumped by every poster upload that lands — the probe's first frame,
+    then video-scan's most salient keyframe — so the replica re-fetches a
+    replaced poster instead of serving its stale cache. Falls back to the
+    probe_version for a row the v36 backfill had no poster_t for."""
+    v = state.get("poster_version")
+    return v if v is not None else state.get("probe_version")
 
 
 def replica_poster_name(photo_id: int, size: str, state: dict) -> str:

@@ -135,9 +135,20 @@ def _select_face_providers() -> tuple[list[str], int]:
     return ["CPUExecutionProvider"], -1
 
 
-def _get_face_app() -> "FaceAnalysis":
-    """Lazy-load and return the InsightFace app."""
-    global _face_app
+_face_app_det_size = (640, 640)
+
+
+def _get_face_app(det_size: Optional[tuple] = None) -> "FaceAnalysis":
+    """Lazy-load and return the InsightFace app. ``det_size`` (the RetinaFace
+    input resolution; default 640x640) re-prepares the detector when it
+    differs from the loaded one — the video eval sweeps it."""
+    global _face_app, _face_app_det_size
+    if _face_app is not None and det_size is not None:
+        want = (int(det_size[0]), int(det_size[1]))
+        if want != _face_app_det_size:
+            _, ctx_id = _select_face_providers()
+            _face_app.prepare(ctx_id=ctx_id, det_size=want)
+            _face_app_det_size = want
     if _face_app is None:
         check_available()
         import time as _time
@@ -162,8 +173,10 @@ def _get_face_app() -> "FaceAnalysis":
         )
         # det_size controls the internal resolution of the RetinaFace detector.
         # 640×640 is the standard setting and handles most face sizes well.
-        app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+        want = (640, 640) if det_size is None else (int(det_size[0]), int(det_size[1]))
+        app.prepare(ctx_id=ctx_id, det_size=want)
         _face_app = app
+        _face_app_det_size = want
         print(f" ready ({_time.time() - t0:.1f}s)")
     return _face_app
 
@@ -249,6 +262,55 @@ def _scale_trbl(bbox: tuple, scale: float) -> tuple:
 # Core detection / encoding
 # ---------------------------------------------------------------------------
 
+def detect_faces_bgr(img_bgr: np.ndarray, *, verbose: bool = False,
+                     det_size: Optional[tuple] = None) -> list[dict]:
+    """Detect faces in an already-decoded BGR array (a video frame, or an
+    image ``detect_faces`` has read). Same output as :func:`detect_faces`.
+
+    **Raises on any error** — unlike ``detect_faces``, which swallows and
+    returns ``[]``. A video frame's detection error must become a worker
+    failure row (one attempt), never "nobody here": the server retires a clean
+    empty result in one submit (docs/plans/video-support.md step 3).
+
+    Large frames are downsampled to ``DETECTION_MAX_DIM`` and the boxes scaled
+    back to ``img_bgr``'s own pixel coordinates. ``det_size`` overrides the
+    detector's input resolution (default 640x640, what stills use).
+    """
+    check_available()
+    if img_bgr is None or getattr(img_bgr, "ndim", 0) != 3:
+        raise ValueError("detect_faces_bgr needs an HxWx3 BGR array")
+
+    h, w = img_bgr.shape[:2]
+    small_img, scale = _downsample(img_bgr)
+    if verbose and scale > 1.0:
+        print(
+            f"    Downsampled {w}×{h} → {small_img.shape[1]}×{small_img.shape[0]} "
+            f"(scale 1/{scale:.1f})",
+            end="",
+            flush=True,
+        )
+
+    app = _get_face_app(det_size)
+    faces = app.get(small_img)
+    if not faces:
+        return []
+
+    results = []
+    for face in faces:
+        emb = _normed_embedding(face)
+        if emb is None:
+            continue
+        bbox = _insightface_bbox_to_trbl(face.bbox)
+        if scale > 1.0:
+            bbox = _scale_trbl(bbox, scale)
+        results.append({
+            "encoding": emb.tolist(),
+            "bbox": bbox,
+            "det_score": float(face.det_score) if hasattr(face, "det_score") else 1.0,
+        })
+    return results
+
+
 def detect_faces(image_path: str, use_cnn: bool = False) -> list[dict]:
     """Detect all faces in an image and return their encodings and bounding boxes.
 
@@ -262,6 +324,9 @@ def detect_faces(image_path: str, use_cnn: bool = False) -> list[dict]:
     coordinates. InsightFace crops and encodes each face from the downsampled
     image (high enough quality for 128→512-dim ArcFace embeddings).
 
+    The detection itself is :func:`detect_faces_bgr`; this wrapper reads the
+    file and keeps the historical "warn and return []" behaviour on error.
+
     Returns a list of dicts:
       {
         "encoding": list[float],   # 512-dim ArcFace encoding (L2-normalized)
@@ -270,51 +335,13 @@ def detect_faces(image_path: str, use_cnn: bool = False) -> list[dict]:
       }
     """
     check_available()
-    import cv2
-    import time as _time
 
     try:
         img_bgr = _read_image_bgr(image_path)
         if img_bgr is None:
             print(f"  Warning: could not read image: {image_path}")
             return []
-
-        h, w = img_bgr.shape[:2]
-        small_img, scale = _downsample(img_bgr)
-
-        if scale > 1.0:
-            print(
-                f"    Downsampled {w}×{h} → {small_img.shape[1]}×{small_img.shape[0]} "
-                f"(scale 1/{scale:.1f})",
-                end="",
-                flush=True,
-            )
-
-        app = _get_face_app()
-
-        t0 = _time.time()
-        faces = app.get(small_img)
-        elapsed = _time.time() - t0
-
-        if not faces:
-            return []
-
-        results = []
-        for face in faces:
-            emb = _normed_embedding(face)
-            if emb is None:
-                continue
-            bbox = _insightface_bbox_to_trbl(face.bbox)
-            if scale > 1.0:
-                bbox = _scale_trbl(bbox, scale)
-            results.append({
-                "encoding": emb.tolist(),
-                "bbox": bbox,
-                "det_score": float(face.det_score) if hasattr(face, "det_score") else 1.0,
-            })
-
-        return results
-
+        return detect_faces_bgr(img_bgr, verbose=True)
     except Exception as e:
         print(f"  Warning: face detection failed for {image_path}: {e}")
         return []

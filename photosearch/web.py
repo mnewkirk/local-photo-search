@@ -1011,7 +1011,7 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     with _get_db() as db:
         row = db.conn.execute(
             """SELECT f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
-                      ph.filepath, ph.image_width, ph.image_height
+                      ph.filepath, ph.image_width, ph.image_height, ph.media_type
                FROM faces f
                JOIN photos ph ON ph.id = f.photo_id
                WHERE f.id = ?""",
@@ -1020,6 +1020,35 @@ def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
         if not row:
             raise HTTPException(404, "Face not found")
         filepath = db.resolve_filepath(row["filepath"])
+        vsrc = None
+        if row["media_type"] == "video":
+            # A video face: never decode the video. Its crop was uploaded by
+            # video-scan (installed into this cache at submit); otherwise
+            # render it from the uploaded representative frame its bbox is
+            # relative to (photosearch/video_scan_store.py).
+            from .video_api import frames_root
+            from .video_scan_store import video_face_source
+            vsrc = video_face_source(db.conn, face_id, frames_root(_db_path))
+
+    if vsrc is not None:
+        from photosearch.face_crop import render_face_crops, write_crop_atomic
+        src = vsrc["crop_paths"].get(size)
+        if src and os.path.exists(src):
+            return FileResponse(src, media_type="image/jpeg",
+                                headers={"Cache-Control": "public, max-age=86400"})
+        rep = vsrc.get("rep_path")
+        if rep and os.path.exists(rep) and row["bbox_top"] is not None:
+            from PIL import Image
+            with Image.open(rep) as im:
+                w, h = im.size
+            bbox = (row["bbox_top"], row["bbox_right"], row["bbox_bottom"], row["bbox_left"])
+            crops = render_face_crops(rep, bbox, w, h, [size])
+            write_crop_atomic(cache_path, crops[size])
+            return FileResponse(cache_path, media_type="image/jpeg",
+                                headers={"Cache-Control": "public, max-age=86400"})
+        if not _nas_url:
+            raise HTTPException(404, "Video face has no uploaded frame")
+        filepath = None   # replica: fall through to the NAS proxy below
 
     if not filepath or not os.path.exists(filepath):
         # Replica mode: no local originals — proxy the rendered crop from the NAS
@@ -1671,7 +1700,7 @@ def api_photo_mirror_fields(photo_id: int):
                       aesthetic_score, aesthetic_concepts, aesthetic_critique,
                       {', '.join(_aes_cols)},
                       sharpness, sharpness_json, sharpness_version,
-                      sharpness_scored_at
+                      sharpness_scored_at, file_hash, media_type
                  FROM photos WHERE id = ?""",
             (photo_id,),
         ).fetchone()
@@ -1706,6 +1735,7 @@ def api_photo_mirror_fields(photo_id: int):
                 # person_id/cluster_id mirror verbatim — the replica is a full DB
                 # copy so ids match — preserving assignments across a face mirror.
                 faces.append({
+                    "id": fr["id"],
                     "bbox": [fr["bbox_top"], fr["bbox_right"],
                              fr["bbox_bottom"], fr["bbox_left"]],
                     "encoding": enc,
@@ -1717,6 +1747,18 @@ def api_photo_mirror_fields(photo_id: int):
         except Exception:
             pass
         out["faces"] = faces
+        if out.get("media_type") == "video":
+            # video-probe / video-scan state (schema v35/v36), so a re-run
+            # mirrors the probe, scan, poster version and tracks too.
+            vm = db.conn.execute("SELECT * FROM video_meta WHERE photo_id = ?",
+                                 (photo_id,)).fetchone()
+            out["video_meta"] = ({k: vm[k] for k in vm.keys() if k != "photo_id"}
+                                 if vm else None)
+            out["video_tracks"] = [
+                {k: t[k] for k in t.keys() if k not in ("id", "photo_id")}
+                for t in db.conn.execute(
+                    "SELECT * FROM video_tracks WHERE photo_id = ? ORDER BY ident_ix",
+                    (photo_id,)).fetchall()]
         return out
 
 
@@ -6620,6 +6662,53 @@ async def api_video_assets(photo_id: int, request: Request):
             thumb_dir=_ensure_thumb_dir(), preview_dir=_ensure_preview_dir())
     except video_api.AssetError as e:
         raise HTTPException(400, str(e))
+
+
+@app.get("/api/videos/{photo_id}/frames/{name}")
+def api_video_frame(photo_id: int, name: str, v: Optional[int] = Query(
+        None, ge=1, le=10_000, description="asset version; default the current scan_version")):
+    """One uploaded keyframe / face crop of a video:
+    ``video_frames/{id}/v{version}/{name}`` (``keyframe_k00.jpg``,
+    ``keyframe_s003.jpg``, ``keyframe_rep_f00012.jpg``, ``crop_i000_200.jpg``
+    — see photosearch/video_scan_store.py). ``video_meta.quality_json["frames"]``
+    is the manifest; this is how video-subjects (step 3b) and the modal read
+    a segment keyframe. The replica fetches through from the NAS and caches
+    under its own video_frames dir (the files are immutable per version)."""
+    from . import video_api
+    if not video_api._NAME_RE.match(name) or ".." in name or "/" in name:
+        raise HTTPException(400, "bad frame name")
+    with _get_db() as db:
+        row = db.conn.execute(
+            "SELECT p.media_type, vm.scan_version FROM photos p "
+            "LEFT JOIN video_meta vm ON vm.photo_id = p.id WHERE p.id = ?",
+            (photo_id,)).fetchone()
+    if not row or row["media_type"] != "video":
+        raise HTTPException(404, "Video not found")
+    version = v or row["scan_version"]
+    if version is None:
+        raise HTTPException(404, "Video has not been scanned")
+    root = video_api.frames_root(_db_path)
+    path = root / str(int(photo_id)) / f"v{int(version)}" / name
+    if path.resolve().parent != (root / str(int(photo_id)) / f"v{int(version)}").resolve():
+        raise HTTPException(400, "bad frame name")
+    if not path.exists() and _nas_url:
+        try:
+            import urllib.request
+            from .request_intent import outbound_headers
+            url = (f"{_nas_url.rstrip('/')}/api/videos/{photo_id}/frames/{name}"
+                   f"?v={int(version)}")
+            req = urllib.request.Request(url, headers=outbound_headers(
+                f"Fetch keyframe {name} of video {photo_id} (not cached on the replica)"))
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            if data[:3] == b"\xff\xd8\xff":
+                video_api.atomic_write(path, data)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"NAS keyframe fetch failed: {e}")
+    if not path.exists():
+        raise HTTPException(404, "Frame not found")
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/api/admin/unreadable-videos")

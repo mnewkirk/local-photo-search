@@ -124,6 +124,7 @@ _PASS_DOERS = {
     "verify": lambda db, ids: _set_col(db, ids, "verified_at", "2091-09-19 12:00:00"),
     # these fixtures are stills-only: a video pass has nothing to do
     "video-probe": lambda db, ids: None,
+    "video-scan": lambda db, ids: None,
 }
 
 # The worker passes a STILLS-only batch actually has work for.
@@ -1044,7 +1045,7 @@ class TestFleetLaunchPasses:
             "keywords": "waiting", "verify": "waiting"}))
         assert got == ["clip", "faces", "quality", "aesthetics",
                        "verify", "category-content", "keywords", "category-visual",
-                       "video-probe"]
+                       "video-probe", "video-scan"]
 
     def test_a_blocked_dependency_does_not_admit_its_dependents(self, db):
         """Case 3. `describe` having given up on every photo means there will
@@ -1117,10 +1118,20 @@ def test_stills_plus_a_video_reads_ready_once_the_stills_are_done(db):
     # an unprobed video is real work: only video-probe asks for the fleet
     state = batch_state(db, batch_id)
     assert state["ready"] is False and state["next_action"] == "launch_fleet"
-    assert fleet_launch_passes(state) == ["video-probe"]
+    # video-scan waits on the probe, which this same launch queues
+    assert fleet_launch_passes(state) == ["video-probe", "video-scan"]
+    assert _step(state, "video-scan")["state"] == "waiting"
     from photosearch.video_probe import PROBE_VERSION
     db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
                     "WHERE photo_id = ?", (PROBE_VERSION, vid))
+    db.conn.commit()
+
+    # probed and playable: now the scan is the work
+    state = batch_state(db, batch_id)
+    assert fleet_launch_passes(state) == ["video-scan"]
+    from photosearch.video_scan_store import SCAN_VERSION
+    db.conn.execute("UPDATE video_meta SET scan_version = ? WHERE photo_id = ?",
+                    (SCAN_VERSION, vid))
     db.conn.commit()
 
     state = batch_state(db, batch_id)
@@ -1141,5 +1152,68 @@ def test_video_only_batch_asks_the_fleet_for_video_probe_only(db):
         assert _step(state, p)["state"] == "completed", _step(state, p)
     assert _step(state, "video-probe")["state"] == "needs_queue"
     assert state["next_action"] == "launch_fleet"
-    assert fleet_launch_passes(state) == ["video-probe"]
+    assert fleet_launch_passes(state) == ["video-probe", "video-scan"]
     assert vid
+
+
+# --- video-scan (video-support step 3) ---------------------------------------
+
+def _video_batch(db, specs):
+    """specs: [(name, probe_error, kind)] -> (batch_id, ids). probe_error=None
+    and kind='clip' is a playable clip; a spec of None leaves it unprobed."""
+    from photosearch.video_probe import PROBE_VERSION
+    directory = "2091/2091-09-21_phone-matt"
+    ids = []
+    for i, spec in enumerate(specs):
+        vid = db.add_photo(filepath=f"{directory}/V{i}.MOV", filename=f"V{i}.MOV",
+                           media_type="video", date_taken="2091-09-21T11:00:00")
+        db.conn.execute("INSERT INTO video_meta (photo_id) VALUES (?)", (vid,))
+        if spec is not None:
+            err, kind = spec
+            db.conn.execute("UPDATE video_meta SET probe_version = ?, probe_error = ?, "
+                            "kind = ? WHERE photo_id = ?", (PROBE_VERSION, err, kind, vid))
+        ids.append(vid)
+    db.conn.commit()
+    return register_batch(db, directory), ids
+
+
+def test_video_scan_counts_unreadable_and_live_as_done(db):
+    from photosearch.video_scan_store import SCAN_VERSION
+    bid, ids = _video_batch(db, [(None, "clip"), ("unreadable: moov", None),
+                                 (None, "live"), ("zip_wrapped", None)])
+    step = _step(batch_state(db, bid), "video-scan")
+    # the clip and the ZIP are claimable; unreadable + Live are done
+    assert (step["total"], step["eligible"], step["remaining"], step["done"]) == (4, 4, 2, 2)
+    assert step["state"] == "needs_queue"
+    db.conn.execute("UPDATE video_meta SET scan_version = ? WHERE photo_id = ?",
+                    (SCAN_VERSION, ids[0]))
+    db.conn.execute("UPDATE video_meta SET scan_version = ?, scan_error = 'unreadable: x' "
+                    "WHERE photo_id = ?", (SCAN_VERSION, ids[3]))
+    db.conn.commit()
+    step = _step(batch_state(db, bid), "video-scan")
+    assert step["state"] == "completed" and step["detail"] == "1 unreadable"
+
+
+def test_video_scan_waits_on_the_probe_and_blocks_on_exhaustion(db):
+    from photosearch.db import MAX_PROCESS_ATTEMPTS
+    bid, ids = _video_batch(db, [None, (None, "clip")])
+    step = _step(batch_state(db, bid), "video-scan")
+    assert step["state"] == "waiting" and step["waiting_on"] == "video-probe"
+    assert step["done"] == 0
+    from photosearch.video_probe import PROBE_VERSION
+    db.conn.execute("UPDATE video_meta SET probe_version = ?, probe_error = "
+                    "'unreadable: x' WHERE photo_id = ?", (PROBE_VERSION, ids[0]))
+    db.conn.execute("INSERT INTO worker_processed (photo_id, pass_type, attempts) "
+                    "VALUES (?, 'video-scan', ?)", (ids[1], MAX_PROCESS_ATTEMPTS))
+    db.conn.commit()
+    step = _step(batch_state(db, bid), "video-scan")
+    assert step["state"] == "blocked" and step["failed"] == 1
+
+
+def test_match_faces_and_warm_crops_wait_on_video_scan(db):
+    bid, ids = _video_batch(db, [(None, "clip")])
+    db.mark_processed(ids, "faces", terminal=True)
+    state = batch_state(db, bid)
+    for step in ("match_faces", "warm_crops"):
+        row = _step(state, step)
+        assert row["state"] == "waiting" and row["waiting_on"] == "video-scan", row

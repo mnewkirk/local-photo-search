@@ -142,10 +142,13 @@ def _scoped_face_rows(db, *, photo_ids=None, person_ids=None, matched_only=False
     if photo_ids is not None and not photo_ids:
         return []
 
+    # Stills only: a VIDEO face's crops were uploaded by video-scan and
+    # installed into the cache at submit (video_scan_store.install_crops), so
+    # warming is a no-op for it — and its filepath is a video, not an image.
     select = ("SELECT f.id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
               "       ph.filepath, ph.image_width, ph.image_height "
               "FROM faces f JOIN photos ph ON ph.id = f.photo_id "
-              "WHERE f.bbox_top IS NOT NULL")
+              "WHERE f.bbox_top IS NOT NULL AND ph.media_type IS NULL")
     tail, tail_params = "", []
     if person_ids is not None:
         tail += f" AND f.person_id IN ({','.join('?' * len(person_ids))})"

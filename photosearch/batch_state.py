@@ -69,10 +69,10 @@ from .db import MAX_PROCESS_ATTEMPTS, PASS_MEDIA, media_sql
 #
 # `video-probe` (docs/plans/video-support.md step 2b) runs over the batch's
 # VIDEOS only (db.PASS_MEDIA) and depends on nothing; `video-scan` (step 3)
-# goes after it and will depend on it.
+# goes after it and depends on it (it only claims probed, playable clips).
 WORKER_PASSES = ("clip", "faces", "quality", "aesthetics", "describe",
                  "verify", "category-content", "keywords", "category-visual",
-                 "video-probe")
+                 "video-probe", "video-scan")
 # `rank_measure` is a NAS step, not a desktop one. It decodes every photo at
 # full native resolution to measure face sharpness, and only the NAS holds the
 # originals — the desktop replica has the DB and the thumbnails and no files at
@@ -97,7 +97,12 @@ DEPENDS_ON = {"category-content": "describe", "keywords": "describe",
               "verify": "describe", "normalize_aesthetics": "aesthetics",
               "match_faces": "faces", "resolve_dups": "match_faces",
               "warm_crops": "faces", "rank_measure": "faces",
-              "sharpness": "faces"}
+              "sharpness": "faces", "video-scan": "video-probe"}
+# Second dependencies, for the job-only NAS steps that must also wait on a
+# pass DEPENDS_ON cannot name (it holds one). video-scan writes the video
+# faces rows, so matching them and warming crops waits on it too. A batch
+# with no videos reads video-scan completed, so this never holds it up.
+EXTRA_DEPENDS_ON = {"match_faces": ("video-scan",), "warm_crops": ("video-scan",)}
 STATES = ("completed", "running", "queued", "needs_queue", "waiting", "blocked")
 
 # Steps whose only completion evidence is a closed ingest_batch_jobs row —
@@ -147,6 +152,11 @@ _OUTPUT_MISSING = {
     # a stored probe ERROR is a probe — it counts done, named in `detail`
     "video-probe": "NOT EXISTS (SELECT 1 FROM video_meta vm "
                    "WHERE vm.photo_id = p.id AND vm.probe_version >= {probe_version})",
+    # probed, playable (or ZIP-wrapped), not Live, scan missing — the claim
+    # predicate itself (video_scan_store.claimable_sql). A stored scan error
+    # is a scan; unreadable and Live videos are never offered, so they count
+    # done once probed (see _worker_step's `eligible`).
+    "video-scan": "{video_scan_missing}",
 }
 
 # Passes for which "attempts exhausted and still no output" means the work is
@@ -195,6 +205,7 @@ _REMAINING_FILTERS_ATTEMPTS = {
     "keywords": True,
     "verify": True,
     "video-probe": True,
+    "video-scan": True,
 }
 
 
@@ -308,6 +319,9 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
     if pass_type == "video-probe":
         from .video_probe import PROBE_VERSION
         missing = missing.format(probe_version=int(PROBE_VERSION))
+    elif pass_type == "video-scan":
+        from .video_scan_store import claimable_sql
+        missing = missing.format(video_scan_missing=claimable_sql("p"))
     media = media_sql(pass_type, "p")
     if media:
         missing = f"({missing}) AND {media}"
@@ -330,6 +344,13 @@ def _worker_step(db, pass_type: str, ids: list[int], total: int,
         detail = _probe_error_detail(db, ids)
 
     eligible = described if pass_type in _DESCRIPTION_GATED else total
+    if pass_type == "video-scan":
+        # Gated on the probe, like the description-gated passes: an unprobed
+        # video is not claimable yet, and must not read as done.
+        from .video_scan_store import probed_sql, scan_error_sql
+        eligible = _count_where(db, ids, f"{probed_sql('p')} AND {media_sql(pass_type, 'p')}") if ids else 0
+        n_err = _count_where(db, ids, scan_error_sql("p")) if ids else 0
+        detail = f"{n_err:,} unreadable" if n_err else None
 
     # See _REMAINING_FILTERS_ATTEMPTS: for the passes whose claim predicate
     # has no attempts filter, `failed` is already counted inside `remaining`,
@@ -499,12 +520,14 @@ def _job_only_step(step: str, kind: str, total: int, open_steps: set[str],
     """match_faces / resolve_dups / warm_crops / rank_measure — these write no
     per-photo column this module can count, so a closed job row is the only
     completion evidence there is."""
-    depends_on = DEPENDS_ON.get(step)
+    deps = [d for d in ((DEPENDS_ON.get(step),) + EXTRA_DEPENDS_ON.get(step, ()))
+            if d is not None]
+    pending = next((d for d in deps if d not in completed), None)
     waiting_on = None
     if step in closed:
         state = "completed"
-    elif depends_on is not None and depends_on not in completed:
-        state, waiting_on = "waiting", depends_on
+    elif pending is not None:
+        state, waiting_on = "waiting", pending
     elif step in open_steps:
         state = "queued"
     else:

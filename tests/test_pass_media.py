@@ -22,7 +22,15 @@ _DIR = "2091/2091-10-17_phone-matt"
 
 def _make_eligible(db, pass_type, ids):
     """The fixture describes everything (so the gated passes are eligible);
-    describe itself then needs the description cleared."""
+    describe itself then needs the description cleared; video-scan needs a
+    current probe (it only claims probed, playable clips)."""
+    if pass_type == "video-scan":
+        from photosearch.video_probe import PROBE_VERSION
+        for pid in ids:
+            db.conn.execute("INSERT OR IGNORE INTO video_meta (photo_id) VALUES (?)", (pid,))
+            db.conn.execute("UPDATE video_meta SET probe_version = ?, kind = 'clip' "
+                            "WHERE photo_id = ?", (PROBE_VERSION, pid))
+        db.conn.commit()
     if pass_type == "describe":
         db.conn.execute(
             f"UPDATE photos SET description = NULL WHERE id IN ({','.join('?' * len(ids))})",
@@ -77,10 +85,10 @@ def test_an_any_pass_gets_no_media_fragment(monkeypatch):
     for p in ("video-probe", "video-scan", "video-subjects", "video-describe"):
         assert PASS_MEDIA[p] == "video"
         assert media_sql(p, "p") == f"p.{VIDEO_SQL}"
-    # video-probe (step 2b) is live; the rest are placeholders until their
-    # step lands
-    assert "video-probe" in WORKER_PASSES
-    for p in ("video-scan", "video-subjects", "video-describe"):
+    # video-probe (step 2b) and video-scan (step 3) are live; the rest are
+    # placeholders until their step lands
+    assert "video-probe" in WORKER_PASSES and "video-scan" in WORKER_PASSES
+    for p in ("video-subjects", "video-describe"):
         assert p not in WORKER_PASSES
 
 
@@ -164,6 +172,10 @@ def test_still_passes_complete_with_unprocessed_videos_in_the_batch(mixed):
     for p in WORKER_PASSES:
         if PASS_MEDIA[p] == "still":
             assert steps[p]["state"] == "completed", (p, steps[p])
+        elif p == "video-scan":
+            # unprobed videos are not claimable yet: it waits on the probe
+            assert steps[p]["state"] == "waiting", steps[p]
+            assert steps[p]["waiting_on"] == "video-probe"
         else:
             assert steps[p]["remaining"] == len(videos)
 

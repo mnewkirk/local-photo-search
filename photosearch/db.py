@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -197,9 +197,9 @@ PASS_MEDIA: dict[str, str] = {
     "keywords": "still",
     # legacy pre-v23 pass, still accepted by the claim path for cleanup
     "tags": "still",
-    # video passes. video-probe (step 2b) is live; the others are
-    # placeholders so their claim predicates have an entry the day they land
-    # (NOT yet in WORKER_PASSES).
+    # video passes. video-probe (step 2b) and video-scan (step 3) are live;
+    # the others are placeholders so their claim predicates have an entry the
+    # day they land (NOT yet in WORKER_PASSES).
     "video-probe": "video",
     "video-scan": "video",
     "video-subjects": "video",
@@ -364,6 +364,24 @@ def video_probe_missing_sql(alias: str = "p") -> str:
 _VIDEO_PROBE_NOT_EXHAUSTED = (
     "NOT EXISTS (SELECT 1 FROM worker_processed wp "
     "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-probe' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+
+
+# video-scan (docs/plans/video-support.md step 3). Claimable once the CURRENT
+# probe has run and said the file is a playable clip — or a ZIP-wrapped one,
+# which the scan unwraps — and not a paired Live clip (D3: never analysed).
+# A stored scan ERROR sets scan_version, so a file cv2 cannot open is never
+# re-downloaded until SCAN_VERSION bumps. The predicate is shared with
+# batch_state (video_scan_store.claimable_sql) so the two cannot drift.
+def video_scan_missing_sql(alias: str = "p") -> str:
+    from .video_scan_store import claimable_sql
+    return claimable_sql(alias)
+
+
+_VIDEO_SCAN_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'video-scan' "
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
 
@@ -1308,9 +1326,24 @@ class PhotoDB:
                 shake             REAL,
                 noise             REAL,
                 focus_consistency REAL,
-                quality_json      TEXT
+                quality_json      TEXT,
+                poster_version    INTEGER
             )
         """)
+        # v36: video_meta.poster_version — the counter that names a video's
+        # poster for the replica's cache. The probe pass uploads the first
+        # frame; video-scan (step 3) REPLACES it with the most salient
+        # keyframe, so the name can no longer be the probe_version alone.
+        # Bumped by every poster upload that lands (video_probe_store /
+        # video_scan_store). Existing probed posters keep their old name
+        # (= probe_version), so no replica cache entry is invalidated.
+        try:
+            cur.execute("SELECT poster_version FROM video_meta LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE video_meta ADD COLUMN poster_version INTEGER")
+            cur.execute("UPDATE video_meta SET poster_version = probe_version "
+                        "WHERE poster_version IS NULL AND probe_version IS NOT NULL "
+                        "AND probe_error IS NULL AND poster_t IS NOT NULL")
         # Main subject per video (person, animal, scenery), joined to a face
         # track for identity when it is a person.
         cur.execute("""
@@ -1350,9 +1383,16 @@ class PhotoDB:
                 focus_intervals TEXT,
                 rep_t           REAL,
                 rep_frame       INTEGER,
-                mean_salience   REAL
+                mean_salience   REAL,
+                presence_intervals TEXT
             )
         """)
+        # v36: the dense presence intervals beside focus_intervals (video-scan
+        # stores both; the modal timeline and the eval read presence).
+        try:
+            cur.execute("SELECT presence_intervals FROM video_tracks LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE video_tracks ADD COLUMN presence_intervals TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_video_tracks_photo ON video_tracks(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_video_tracks_face ON video_tracks(face_id)")
 
@@ -3057,6 +3097,27 @@ class PhotoDB:
                         {media_clause(pass_type, 'p')} LIMIT ?""",
                     (limit + len(claimed),),
                 ).fetchall()
+        elif pass_type == "video-scan":
+            # Probed, playable (or ZIP-wrapped), not Live, scan missing or
+            # stale; capped by the attempts ledger.
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                rows = self.conn.execute(
+                    f"""SELECT p.id, p.filepath FROM photos p
+                        WHERE p.id IN ({placeholders})
+                        AND {video_scan_missing_sql('p')}
+                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}
+                        {media_clause(pass_type, 'p')} LIMIT ?""",
+                    list(photo_ids) + [limit + len(claimed)],
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""SELECT p.id, p.filepath FROM photos p
+                        WHERE {video_scan_missing_sql('p')}
+                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}
+                        {media_clause(pass_type, 'p')} LIMIT ?""",
+                    (limit + len(claimed),),
+                ).fetchall()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")
 
@@ -3228,6 +3289,22 @@ class PhotoDB:
                     f"""SELECT COUNT(*) FROM photos p
                         WHERE {video_probe_missing_sql('p')}
                         AND {_VIDEO_PROBE_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}"""
+                ).fetchone()
+        elif pass_type == "video-scan":
+            if photo_ids:
+                placeholders = ",".join("?" * len(photo_ids))
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos p
+                        WHERE {_scope_col('p.id', photo_ids)} IN ({placeholders})
+                        AND {video_scan_missing_sql('p')}
+                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}""",
+                    list(photo_ids),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    f"""SELECT COUNT(*) FROM photos p
+                        WHERE {video_scan_missing_sql('p')}
+                        AND {_VIDEO_SCAN_NOT_EXHAUSTED}{media_clause(pass_type, 'p')}"""
                 ).fetchone()
         else:
             raise ValueError(f"Unknown pass type: {pass_type}")

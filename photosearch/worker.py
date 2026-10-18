@@ -137,6 +137,12 @@ def _unload_pass_models(pass_type: str) -> None:
         # Verify borrows clip_embed for its cross-check embeddings.
         from .clip_embed import unload_model as _unload
         _unload()
+    elif pass_type == "video-scan":
+        # InsightFace for the frames + CLIP for the keyframes.
+        from .faces import unload_model as _unload_faces
+        from .clip_embed import unload_model as _unload_clip
+        _unload_faces()
+        _unload_clip()
 
 
 def _llm_models_for(pass_type: str, pass_models: dict) -> set[str]:
@@ -997,7 +1003,58 @@ def install_log_timestamps() -> None:
 # Passes whose claim size is fixed by the pass, not by --batch-size: the probe
 # is cheap per video (a 12-byte read, ffprobe, one frame), so 25 per claim
 # keeps the claim overhead down without holding many videos per worker.
-PASS_CLAIM_LIMITS = {"video-probe": 25}
+PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1}
+
+# Passes that read the NAS file themselves (over HTTP Range, or as one
+# rate-capped streamed download) instead of through _download_batch.
+SELF_READ_PASSES = {"video-probe", "video-scan"}
+
+
+class TruncatedDownload(ConnectionError):
+    """The stream ended before Content-Length bytes arrived. A ConnectionError
+    so it is in _TRANSIENT: the video is omitted and re-claimed for free."""
+
+
+def _download_hashed(client: "WorkerClient", photo_id: int, dest_path: str) -> dict:
+    """Stream ``/full?purpose=worker`` to ``dest_path``, SHA-256 as it goes.
+
+    The NAS rate-caps the stream (PHOTOSEARCH_VIDEO_STREAM_MBPS) and answers
+    503 + Retry-After when its worker-stream slots are full;
+    ``WorkerClient._request`` backs off and retries. Returns ``{"status",
+    "sha256", "bytes"}``; raises :class:`TruncatedDownload` when fewer bytes
+    than Content-Length arrived."""
+    import hashlib
+    r = client._request("GET", f"{client.server_url}/api/photos/{photo_id}/full",
+                        params={"purpose": "worker"}, timeout=120, stream=True)
+    try:
+        if r.status_code != 200:
+            return {"status": r.status_code, "sha256": None, "bytes": 0}
+        expected = r.headers.get("Content-Length")
+        h = hashlib.sha256()
+        n = 0
+        try:
+            with open(dest_path, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    h.update(chunk)
+                    n += len(chunk)
+        except _TRANSIENT:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            raise
+        if expected is not None and expected.isdigit() and int(expected) != n:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            raise TruncatedDownload(f"got {n} of {expected} bytes")
+        return {"status": 200, "sha256": h.hexdigest(), "bytes": n}
+    finally:
+        r.close()
 
 
 def _process_video_probe(client: "WorkerClient", photos: list[dict],
@@ -1091,6 +1148,102 @@ def _process_video_probe(client: "WorkerClient", photos: list[dict],
         except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
             print(f"    {label}: {type(e).__name__}: {e}")
             out.append(_failure_row(pid, e))
+    return out
+
+
+def _process_video_scan(client: "WorkerClient", photos: list[dict], workdir: str,
+                        tz_name: Optional[str] = None) -> list[dict]:
+    """video-scan (docs/plans/video-support.md step 3) for claimed videos
+    (one per claim). Per video: one rate-capped, hashed download -> unwrap a
+    ZIP-wrapped file (and ffprobe the inner video) -> ``video_scan.scan_video``
+    (one sequential decode, InsightFace on sampled frames) ->
+    ``build_scan_result`` (tracks, identities, quality, CLIP mean) -> the
+    keyframes / segment keyframes / rep frames / face crops / poster uploaded
+    through ``/api/videos/{id}/assets`` -> a result row.
+
+    Outcomes, following the worker conventions:
+      * transport trouble, a truncated download -> OMITTED (retried free);
+      * cv2 cannot open the COMPLETE file, a bad ZIP, an unreadable inner
+        file -> a RESULT with ``scan_error``: stored, version set, never
+        re-claimed (counted "N unreadable");
+      * anything else (detection raising, an asset upload the NAS rejected,
+        a 404) -> a failure row: one of MAX_PROCESS_ATTEMPTS spent.
+    """
+    from . import video_scan as VS
+    from .video_scan_store import SCAN_VERSION
+
+    out: list[dict] = []
+    for photo in photos:
+        pid = photo["id"]
+        label = photo.get("filename") or str(pid)
+        vdir = tempfile.mkdtemp(prefix=f"vscan-{pid}-", dir=workdir)
+        scan = None
+        try:
+            t0 = time.time()
+            path = os.path.join(vdir, "video.bin")
+            dl = _download_hashed(client, pid, path)
+            if dl["status"] != 200:
+                print(f"    {label}: HTTP {dl['status']} downloading")
+                out.append(_failure_row(pid, f"HTTP {dl['status']} downloading the video"))
+                continue
+            t_dl = time.time() - t0
+            print(f"    {label}: {dl['bytes'] / 1e6:.1f} MB in {t_dl:.1f}s")
+            base = {"photo_id": pid, "scan_version": SCAN_VERSION,
+                    "file_hash": dl["sha256"], "file_size": dl["bytes"]}
+            duration = photo.get("duration_s")
+            probe = None
+            if VS.is_zip_file(path):
+                try:
+                    path = VS.unwrap_zip(path, vdir)
+                except VS.ZipRefused as e:
+                    print(f"    {label}: ZIP refused — {e}")
+                    out.append(dict(base, scan_error=f"zip: {e}"))
+                    continue
+                pr = VS.probe_local(path, tz_name=tz_name)
+                if "verdict" in pr:
+                    print(f"    {label}: ZIP inner file unreadable — {pr['verdict']}")
+                    out.append(dict(base, scan_error=f"zip inner {pr['verdict']}"))
+                    continue
+                probe = pr["ok"]
+                duration = probe.get("duration_s") or duration
+                print(f"    {label}: unwrapped ZIP -> {probe.get('codec')} "
+                      f"{probe.get('width')}x{probe.get('height')} {duration}s")
+            try:
+                scan = VS.scan_video(path, duration=duration)
+            except VS.ScanOpenError as e:
+                print(f"    {label}: {e}")
+                out.append(dict(base, scan_error=f"unreadable: {e}", probe=probe))
+                continue
+            t1 = time.time()
+            built = VS.build_scan_result(scan)
+            t_build = time.time() - t1
+            for body in VS.assets_bodies(built["assets"], built["poster"]):
+                up = client._request("POST", f"{client.server_url}/api/videos/{pid}/assets",
+                                     json=body, timeout=120)
+                if not up.ok:
+                    raise RuntimeError(f"asset upload HTTP {up.status_code}: {up.text[:200]}")
+            res = dict(base, **built["result"])
+            if probe:
+                res["probe"] = probe
+            res["quality_json"]["timings"].update(
+                download=round(t_dl, 3), build=round(t_build, 3),
+                total=round(time.time() - t0, 3))
+            n_id = len(res["identities"])
+            print(f"    {label}: {scan.duration:.1f}s {scan.width}x{scan.height}, "
+                  f"{len(scan.frames)} samples, {n_id} identit{'y' if n_id == 1 else 'ies'}, "
+                  f"{len(built['assets'])} assets, scan {scan.timings.get('total', 0):.1f}s "
+                  f"+ build {t_build:.1f}s")
+            out.append(res)
+        except (_TRANSIENT + (TruncatedDownload,)) as e:
+            print(f"    {label}: transport ({e}) — will be retried")
+            continue
+        except Exception as e:  # noqa: BLE001 — a per-video bug must not kill the batch
+            print(f"    {label}: {type(e).__name__}: {e}")
+            out.append(_failure_row(pid, f"{type(e).__name__}: {e}"))
+        finally:
+            if scan is not None:
+                scan.cleanup()
+            shutil.rmtree(vdir, ignore_errors=True)
     return out
 
 
@@ -1303,9 +1456,9 @@ def run_worker(
                 os.makedirs(batch_temp, exist_ok=True)
 
                 TEXT_ONLY_PASSES = {"category-content", "keywords"}
-                # video-probe reads the file itself over HTTP Range.
-                RANGE_READ_PASSES = {"video-probe"}
-                needs_images = pass_type not in TEXT_ONLY_PASSES | RANGE_READ_PASSES
+                # The video passes read the file themselves (Range / one
+                # rate-capped hashed download).
+                needs_images = pass_type not in TEXT_ONLY_PASSES | SELF_READ_PASSES
 
                 if needs_images:
                     print(f"\n  Downloading {len(photos)} photos...")
@@ -1362,6 +1515,9 @@ def run_worker(
                 elif pass_type == "video-probe":
                     results = _process_video_probe(client, photos)
                     kwargs = _submit_kwargs("video_probe_results", results)
+                elif pass_type == "video-scan":
+                    results = _process_video_scan(client, photos, batch_temp)
+                    kwargs = _submit_kwargs("video_scan_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)
@@ -1397,7 +1553,7 @@ def run_worker(
                 if pass_type == "faces":
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
                 elif pass_type in ("describe", "category-content", "category-visual", "keywords",
-                                   "aesthetics", "video-probe"):
+                                   "aesthetics", "video-probe", "video-scan"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")
