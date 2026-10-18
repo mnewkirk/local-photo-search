@@ -1,0 +1,9 @@
+# Skill-trigger prompts: pass = a Skill tool call whose `skill` contains "photo-search" appears in the transcript. These are the vague prompts the skill description promises to catch.
+{"id": "skill-index-2024", "prompt": "how do I index 2024?"}
+{"id": "skill-search-slow", "prompt": "why is search slow?"}
+{"id": "skill-upload-google", "prompt": "how would I upload the 2026-09-12 shoot to Google Photos?"}
+{"id": "skill-add-filter", "prompt": "I want to add a new search filter for lens model. Where do I start?"}
+{"id": "skill-last-queries", "prompt": "what were my last queries against the API?"}
+{"id": "skill-fleet-laptop", "prompt": "how do I run the worker fleet on my laptop against the NAS?"}
+{"id": "skill-recluster", "prompt": "recluster faces"}
+{"id": "skill-schema-question", "prompt": "what tables are in photo_index.db?"}

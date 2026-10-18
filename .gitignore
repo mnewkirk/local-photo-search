@@ -126,3 +126,6 @@ evals/aesthetics-bakeoff/
 
 # Persistent API request timing log (photosearch/request_log.py)
 request_log.jsonl*
+
+# context eval runs (model output + cost per run; regenerate with harness.py)
+evals/context_eval/results/
