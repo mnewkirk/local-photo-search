@@ -9,7 +9,9 @@ links here — it no longer carries a milestone table.
 **Status legend:** ✅ Shipped · 🟡 Partial / in progress · ⬜ Not started ·
 📐 Design only
 
-_Last reconciled: 2026-06-23._
+_Last reconciled: 2026-10-19_ (folded in the "Planned milestones" lists CLAUDE.md and the
+photo-search SKILL.md used to carry; their frozen copies are in
+`docs/notes/_archive-planned-milestones.md`).
 
 ---
 
@@ -24,6 +26,12 @@ These are the things actually left to do, roughly by impact-per-effort.
 | **Categories + keywords** (v22/v23) | 🟡 | Three-field tag model (`categories`/`visual_tags`/`keywords`) and worker passes shipped (schema v22/v23, replacing M9's single `tags`). **Remaining:** vocab curation + backfill via the `mine-vocab` → `group-vocab` → `/admin/vocab` pipeline. | [redesign](categories-keywords-redesign.md) · [implementation](categories-keywords-implementation.md) |
 | **Inferred-geotag refinements** | ⬜ | Post-M19 cascade tuning: cap hop depth (776-deep chains observed), downweight inferred anchors on re-scan so decay protects against cross-run compounding, drop the dead `--max-cascade-rounds` flag. Localized to `infer_location.py`. | [infer-location-refinements.md](infer-location-refinements.md) |
 | **Timeline view + LLM summaries** (M21) | ⬜ | Chronological UI grouping photos by period, each segment annotated with an LLM summary (where, from GPS/place; what, from descriptions/tags). No detail doc yet. | _(none)_ |
+| **Video backfill** | 🟡 | Built 2026-10-17, deployed 2026-10-18 (schema v39, NAS + replica). **Backfill not started** — nothing registered, no fleet run, no sampling until the owner asks. Step 8 of the plan is the runbook (incl. `unwrap-zip-videos` before registration). | [video-support.md](video-support.md) |
+| **Context diet** | 🟡 | Shrinking the per-session fixed context (CLAUDE.md, SKILL.md, MEMORY.md) into path-scoped rules, `docs/notes/` and skill `reference/`. In progress 2026-10-19; eval harness in `evals/context_eval/`. | [context-diet.md](context-diet.md) |
+| **Batch blocked re-run** | ⬜ | Planned 2026-10-18; nothing built. | [batch-blocked-rerun.md](batch-blocked-rerun.md) |
+| **Geocode R-tree** | ⬜ | Queued. Durable replacement for the in-memory KDTree (the OOM is already mitigated by the population gate + streaming). | [geocode-rtree.md](geocode-rtree.md) |
+| **Subject-aware quality** | 📐 | Prototype validated 2026-07-09 (subject-crop aesthetic re-score); design proposed, not built. | [subject-aware-quality.md](subject-aware-quality.md) |
+| **Search indexes — remainder** | 🟡 | v34 shipped 2026-10-04 (below). Open: date pushdown into the remaining standalone filters. | [search-indexes.md](search-indexes.md) |
 | **Test-isolation fixes** | ⬜ | 6 pre-existing test failures `@pytest.mark.skip`-ped 2026-06-20 so real regressions stay visible. Test-harness debt, not product bugs. | [test-isolation-fixes.md](test-isolation-fixes.md) |
 
 ---
@@ -56,6 +64,16 @@ Compact history — one line each. Detail docs linked where they exist.
 - **M25** ✅ — `maintenance-sweep` / `validate-data` / `repair-data` (CPU backfills, dependency-ordered, dry-run default) + SSE endpoint + `/status` card (shipped 2026-06-21; the detail doc's "DO NOT START" header is stale). [backfill-maintenance-sweep.md](backfill-maintenance-sweep.md)
 - **M27** ✅ — `/review` + `/geotag` folder-picker performance: indexed `photos.folder` column (schema v25) + `GROUP BY folder` rework (shipped 2026-06-23). [review-folders-perf.md](review-folders-perf.md)
 - **M26** ✅ — Local read-replica + write tools. M26a: replica sync (`sync-replica.sh`, consistent snapshot + atomic swap), lazy thumbnail proxy, sync/status endpoints + `/status` card, nightly Windows Task Scheduler pull, end-to-end serve-off-replica with local LM Studio (all verified 2026-06-23; optional thumbnail bulk pre-warm deferred). M26b: agent-facing `set_photo_location`/`set_photo_tags`/`add_to_collection` write tools with read-local / write-NAS-authoritative / mirror-local dual-write + guardrails (id-set scoping, dry-run→confirm, affected-count cap, reversible+audited). [local-replica-and-writes.md](local-replica-and-writes.md)
+**Since 2026-07 (by name; numbers M28–M32 were reused loosely)**
+
+- **Ingest-batch readiness** ✅ — `/batches` per-batch status flow, six step states, one-click `batch-advance` / fleet launch (shipped 2026-09-19). [ingest-batch-readiness.md](ingest-batch-readiness.md)
+- **Search indexes (v34)** ✅ — composed id scope in `search_combined`, request log with source + intent, face-encoding cache (shipped 2026-10-04). [search-indexes.md](search-indexes.md)
+- **Face-label verification** ✅ — `verify-face-labels`, per-pair calibration, the in-photo rival test + Swap. [face-label-verification.md](face-label-verification.md)
+- **Model evals for every LLM pass** ✅ — harnesses + `/eval/models`; final fleet models in `rerun.FLEET_ROLE_MODELS` (complete 2026-10-03). [model-eval-harnesses.md](model-eval-harnesses.md)
+- **Category-content grounding** ✅ — description-decided drops + recitation verdict; deployed on the NAS at `79a14f7`, gemma backfill applied, holdout 0.958 (2026-10-18). [category-grounding.md](category-grounding.md)
+- **Measured sharpness** ✅/closed — schema v33 column + throttled backfill built; the `blurry` gate failed its eval three times, so `sharp`/`blurry` stay FROZEN (closed 2026-09-26). [sharpness-measurement.md](sharpness-measurement.md)
+- **Video support** ✅ built + deployed (backfill open, above). [video-support.md](video-support.md)
+- **M28** ✅ on-demand pass re-runs + fleet launcher · **M29** ✅ `/book` photobook builder · **M30** ✅ local Topaz upscaling (also the photobook authoring wizard) · **M31** ✅ `/split` print planner · **M32** ✅ `/faces` review panels. No detail docs; history is in `docs/notes/`.
 
 ---
 
