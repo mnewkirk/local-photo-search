@@ -1,0 +1,170 @@
+# CLAUDE.md: 83 headings (## and ###, code fences excluded), snapshot 2026-10-19 before the context diet
+## Tech Stack
+## Key Patterns — Follow These
+## Database
+## Richer reverse geocoding (optional)
+### The memory cost is per-ROW, not the KDTree — and it OOM-killed the NAS
+## API request timing log
+## Debugging against the prod DB locally
+## NAS Docker Commands
+### Watching a long job: never `pgrep -f` a bare string
+## Distributed Indexing (Worker)
+### Worker passes
+### VLM aesthetic scoring (the `aesthetics` pass)
+### The percentile refresh is chunked — and must stay that way
+### Per-pass model strategy (Ollama defaults)
+### `category-visual`: derived capture facts vs perceived qualities
+### Routing LLM passes to LM Studio (OpenAI-compatible)
+### Model evals for every LLM pass (`/eval/models`)
+### A new description re-queues what was derived from it
+### Bad LLM output is a failure, not a result
+### category-content grounding: the description decides
+### Provenance: log the model that RAN, not the one configured
+### Ollama stall on the text passes — tight per-call timeout
+### GPU acceleration
+### A failed SERVER-side write must not burn a retry attempt
+## Video
+### Playback proxies (`video-proxy`, D12, owner-approved 2026-10-18)
+### ZIP-wrapped video unwrap (`unwrap-zip-videos`, NAS CLI)
+## Vec0 orphan cleanup
+## Non-image rows & the clip-claim infinite re-claim
+## Phone-photo daily ingest
+### Repairing the folders already misfiled — `refile-unknown-camera`
+### Scheduling / crontab perms on the NAS
+### Syncthing receiver
+## Adding Features
+## Name extraction in search queries
+## Inferred geotagging (M19)
+## Status page live actions
+## Replica freshness card + "Sync from NAS" (M26a UI)
+## On-demand pass re-runs + status-page fleet launcher (M28)
+## Running the tests the way CI does
+## Local Topaz upscaling (M30)
+### Artifacts: Autopilot merges its own passes in
+### Strength: Topaz has none, so we blend
+## Split — multi-panel print planner (M31)
+### Seam mode decides how the sheets must be MOUNTED
+### Seam misalignment in print (files were fine)
+## Deploy panel (Version / Build / Restart)
+## Face clustering
+### Quality pre-filter (schema v20)
+## Reviewing a shoot in the UI: person inspector + team review
+## Face-label integrity: is this face actually that person?
+### The rival test — the right face is usually in the same photo
+### The panel asks about TRUSTED labels only
+### Bulk-undoing one person's bad labels — `unmatch-person`
+### Finding more of one person: `➕ More of this kid` on `/faces`
+### The high-level view: `📊 Label health` on `/faces`
+### `match_source='rejected'` — a human "no" that survives auto-matching
+## Per-shoot "best of" curation — `scripts/rank_shoot.py`
+## Frontend has no linter — `scripts/check-frontend-refs.js`
+### Poll with `PS.poll`, never `setInterval`
+## Splitting attractor clusters (M18)
+## Face merge suggestions (M18)
+## Face over-matching cleanup & the one-person-per-photo invariant
+### Face-encoding cache
+### Desktop-as-client face recompute (heavy clustering off the NAS)
+### Face detection / matching gotchas
+### Reviewing never-clustered faces (the "Unclustered" bucket)
+### Searchable face clusters
+### EXIF-oriented image dimensions
+## Maintenance sweep & duplicate pruning (M25 + M28)
+### Scheduling + replica-mode maintenance (2026-07-17)
+## Ingest batches (`/batches`)
+### The six states, and the two ways `count_unprocessed == 0` lies
+### `faces` is the one pass where "no output" means done
+### Where "queued" comes from — never `/workers/fleet-status`
+### The non-blocking-lock cache — the incident it answers
+### `rank_measure` is a NAS step, and it is OPTIONAL
+### What's deliberately not in "ready" — and why
+### Endpoints and CLI
+### Deploy the NAS before the desktop
+## Measured sharpness (schema v33) — column + throttled backfill
+## Planned milestones (see `docs/plans/`)
+## Detailed Reference
+# .claude/skills/photo-search/SKILL.md: 85 headings (## and ###, code fences excluded), snapshot 2026-10-19 before the context diet
+## Tech Stack
+## Project Layout
+## Database Schema (v39)
+### Search performance — indexes (v34) and how search uses them
+## Key Patterns
+### 1. Streaming generators for long-running batch jobs
+### 2. PHOTOSEARCH_DB env var for --db defaults
+### 3. Filename auto-detection in search
+### 4. File exclusions in find_photos()
+### 5. Frontend — no build step
+### 6. Docker cache awareness
+### 7. SSE for long-running API operations
+### 8. Per-file ledger writes for cancel safety
+### 9. Face IDs are stable, cluster IDs are not
+### 10. Claude states the intent of every API call it makes
+## API Endpoints (50+)
+### Search & Photos
+### Video (built 2026-10-17, deployed 2026-10-18 — backfill not started — CLAUDE.md "## Video")
+### Faces
+### Merge suggestions (M18)
+### Persons
+### Collections
+### Stacks (Burst/Bracket Groups)
+### Review (Culling)
+### Ingest batches (`/batches`, M "ingest batch" — see CLAUDE.md for the traps)
+### Google Photos
+### Utility
+### Map view
+### Manual bulk geotagging
+### Inferred geotagging (M19)
+## Inferred geotagging (M19)
+## Google Photos Integration
+### Scope & Limitations
+### Upload Flow
+### Album ID Note
+## Stacking System
+## Shoot Review / Culling
+## Shared Frontend Components (shared.js)
+### /status page
+### /faces review panels (M32)
+### Face-encoding cache (suggest-person, verify-labels)
+### Frontend has no linter — run `scripts/check-frontend-refs.js`
+### /faces URL params (deep-linkable)
+### /merges page architecture
+## Per-shoot curation and label checking (CLI)
+## NAS Operations
+### Docker commands
+### Volume layout
+### Full indexing sequence for a new year
+### Phone-photo ingest (Syncthing + `ingest-incoming`)
+### Cron / scheduling on the NAS
+### Scheduling + replica-mode maintenance (2026-07-17)
+## Indexing Types — Detailed Reference
+### Pass details
+### Parallelization
+### Collection-based re-indexing
+### Key model details
+### Stacking parameters
+### Face management commands (post-indexing)
+### Unknown-face clustering & merge suggestions (M18)
+### Merge review page (`/merges`) — summary
+### Vec0 orphan cleanup
+### Face over-matching cleanup, dedup & desktop recompute
+### Frontend stack filtering behavior
+## Distributed Indexing (Worker System)
+### Architecture
+### Worker fleet — `run-workers.sh` (auto-picks mode)
+### Bare-Metal Worker CLI
+### Worker API Endpoints
+### Worker Loop
+### Key Files
+### DB Tables (Worker)
+## Troubleshooting
+### Request log — "why was that slow?" / "what was that for?"
+## MCP server (M24a)
+## In-app "Ask" agent (M24b)
+## Running off a local read-replica (M26a)
+## Planned milestones (see `docs/plans/`)
+## Adding New Features
+### New CLI command
+### New search type
+### New indexing pass
+### New API endpoint
+### Schema changes
+### New frontend page
