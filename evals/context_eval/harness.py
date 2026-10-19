@@ -200,6 +200,11 @@ def parse_stream(raw: str) -> dict:
     }
 
 
+# Set by cmd_run when ANTHROPIC_BASE_URL points at a non-Anthropic gateway:
+# the keep-alive proxy's URL, which children use instead (keepalive_proxy.py).
+_GATEWAY_PROXY: str | None = None
+
+
 def run_claude(prompt: str, cwd: Path, *, model: str, max_turns: int, budget: float,
                edit: bool, system: str, timeout: int) -> dict:
     cmd = claude_cmd(prompt, model=model, max_turns=max_turns, budget=budget,
@@ -211,6 +216,8 @@ def run_claude(prompt: str, cwd: Path, *, model: str, max_turns: int, budget: fl
     # retries it from zero forever. The run's own --timeout is the real cap.
     for var in ("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "API_TIMEOUT_MS"):
         env.setdefault(var, str(timeout * 1000))
+    if _GATEWAY_PROXY:
+        env["ANTHROPIC_BASE_URL"] = _GATEWAY_PROXY
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
@@ -373,6 +380,13 @@ def cmd_run(args) -> int:
         for suite, item, rep in jobs:
             print(f"  {suite:7s} {item['id']:34s} rep{rep}")
         return 0
+    global _GATEWAY_PROXY
+    gateway = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if gateway and "anthropic.com" not in gateway and not args.no_keepalive:
+        sys.path.insert(0, str(HERE))
+        import keepalive_proxy
+        _GATEWAY_PROXY, _ = keepalive_proxy.start(gateway)
+        print(f"gateway {gateway} via keep-alive proxy {_GATEWAY_PROXY}", file=sys.stderr)
     outdir = RESULTS / args.config
     outdir.mkdir(parents=True, exist_ok=True)
     passed = total = infra_n = infra_streak = 0
@@ -527,6 +541,8 @@ def main(argv=None) -> int:
     r.add_argument("--max-turns", type=int, default=25)
     r.add_argument("--budget", type=float, default=1.50, help="per-run --max-budget-usd")
     r.add_argument("--timeout", type=int, default=900, help="seconds per run")
+    r.add_argument("--no-keepalive", action="store_true",
+                   help="talk to ANTHROPIC_BASE_URL directly (no ping-injecting proxy)")
     r.add_argument("--dry-run", action="store_true", help="list the runs, call nothing")
     r.set_defaults(fn=cmd_run)
     p = sub.add_parser("report", help="compare configs")
