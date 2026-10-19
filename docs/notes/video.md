@@ -233,3 +233,10 @@ both the NAS and the replica — **then the workers, together**, and run video
 passes `--native` only. The runbook with exact commands and cost estimates
 (including `unwrap-zip-videos` before registration) is Step 8 of the plan;
 nothing has been registered or backfilled yet.
+
+### Corrections found while condensing (2026-10-19)
+
+Checked against the code while writing `.claude/rules/`; the text above is kept verbatim.
+
+- ZIP safety caps are now `ZIP_SIZE_SLACK = 2.0` with a `ZIP_SIZE_FLOOR` (16 MB) and a separate `ZIP_MAX_RATIO = 50` bomb guard in `zip_video.py`, not the "≤ 1.2×" described above.
+- A pass missing from `db.PASS_MEDIA` raises `KeyError` from `db.media_sql`.

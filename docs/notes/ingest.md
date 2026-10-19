@@ -593,3 +593,10 @@ reading a stale or absent local copy. That matters more here than in most
 M26b write paths: a stale local read would let `batch-launch-fleet`'s
 409-avoidance check pass on stale job rows and double-launch a fleet that's
 already running on the authoritative side.
+
+### Corrections found while condensing (2026-10-19)
+
+Checked against the code while writing `.claude/rules/`; the text above is kept verbatim.
+
+- Video is no longer move-only: since schema v35 `ingest.py` gives video a `photos` row (`media_type='video'`), dedups it against the DB and adds its folder to `new_dirs`. It is still never CLIP-indexed. RAW stays move-only.
+- `_EMPTY_OUTPUT_IS_DONE` is Python-only; `batch-flow.js` only mentions it in a comment. `fleet_launch_passes` ↔ `PS.BatchFlow.fleetLaunchPasses` is the real mirror (`tests/test_batch_state.py`).

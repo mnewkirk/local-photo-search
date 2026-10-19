@@ -154,3 +154,9 @@ but don't let the message claim "nothing landed". The response gained
 `deferred` / `deferred_photo_ids` (additive; older workers read only
 `written`/`processed`). Deferrals mean a long-running writer (the sweep), not a
 bad photo. Tests: `tests/test_worker_submit_resilience.py`.
+
+### Corrections found while condensing (2026-10-19)
+
+Checked against the code while writing `.claude/rules/`; the text above is kept verbatim.
+
+- `valid_passes` in `cli.py` has five video passes: `video-probe`, `video-proxy`, `video-scan`, `video-subjects`, `video-describe`.

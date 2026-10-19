@@ -192,3 +192,12 @@ Symptom to recognise next time: `load average` far above the core count while
 every container shows near-zero CPU = threads in uninterruptible I/O wait.
 `vmstat 1` (`b` and `wa` columns) confirms it; `ss -tni` on port 445 names the
 SMB client doing the reading.
+
+### Corrections found while condensing (2026-10-19)
+
+Checked against the code while writing `.claude/rules/`; the text above is kept verbatim.
+
+- `parseSSEChunk` is now `PS.parseSSEChunk` in `shared.js`.
+- In `PS.PhotoModal`, checking `verify` or `video-describe` also auto-selects `category-content` + `keywords`, not only `describe`.
+- The Workers panel and fleet launcher live on `/admin/maintenance` (`WorkersPanel`) and read `/api/admin/workers/queue-status`, which proxies the NAS's `/api/worker/status` in replica mode. A standalone `/admin/deploy` page also exists.
+- Restart sets each live claim's `expires_at` to now + 15 minutes (it does not add 15 minutes to the old value).

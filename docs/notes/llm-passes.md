@@ -850,3 +850,11 @@ photo is retried later instead of blocking the single Ollama slot. This
 caps blast radius, not the root cause. A restart-watchdog was rejected:
 it crashes workers (the un-retry-wrapped `check_available`) and only
 treats the symptom.
+
+### Corrections found while condensing (2026-10-19)
+
+Checked against the code while writing `.claude/rules/`; the text above is kept verbatim.
+
+- The four category-visual groups are `CAPTURE_FACT_TAGS` (derived), `RETIRED_TAGS`, `FROZEN_TAGS` and `PERCEIVED_VOCABULARY` in `visual_tags_derive.py`; "DERIVED"/"PERCEIVED" above are prose names.
+- The over-select guard constant is `_VISUAL_MAX_PLAUSIBLE_TAGS = _VISUAL_MAX_TAGS + 1` (`describe.py`).
+- The percentile UPDATE guard is generic: `WHERE id=? AND {score_col} IS ?` (overall and subject scores).

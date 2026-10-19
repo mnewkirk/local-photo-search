@@ -240,3 +240,10 @@ and indexes come with it); the server only picks up new **code** on restart
 (`systemctl --user restart photosearch-replica`, port **8001**). The service
 starts without `--sync`, so after a NAS deploy that changes the schema: sync,
 then restart. The replica writes its own `./request_log.jsonl`.
+
+### Corrections found while condensing (2026-10-19)
+
+Checked against the code while writing `.claude/rules/`; the text above is kept verbatim.
+
+- Write tools are ON unless `PHOTOSEARCH_ALLOW_WRITES` is set falsy (`mcp_server._writes_allowed`, `agent.py`); "gated by" above overstates it.
+- `PHOTOSEARCH_MCP_ALLOW_IMAGES` defaults off in `mcp_server.py`, but `docker-compose.nas.yml` sets it to `1`.
