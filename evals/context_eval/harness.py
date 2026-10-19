@@ -206,6 +206,11 @@ def run_claude(prompt: str, cwd: Path, *, model: str, max_turns: int, budget: fl
                      edit=edit, system=system)
     env = dict(os.environ)
     env.pop("CLAUDECODE", None)  # allow nesting when launched from inside a session
+    # A local gateway streams nothing while it prefills a ~100k-token prompt
+    # (~9 min on LM Studio), so Claude Code's 5-min first-byte wait kills and
+    # retries it from zero forever. The run's own --timeout is the real cap.
+    for var in ("CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS", "API_TIMEOUT_MS"):
+        env.setdefault(var, str(timeout * 1000))
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
