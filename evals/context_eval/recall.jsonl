@@ -1,5 +1,5 @@
 # Trap-recall questions. One per relocatable CLAUDE.md trap. `expect`: every regex must match the answer; `any`: each group needs one match; `reject`: none may match. Case-insensitive.
-{"id": "cli-db-envvar", "area": "patterns", "prompt": "In this repo, what must every CLI command's --db option carry, and why?", "expect": ["PHOTOSEARCH_DB", "envvar"]}
+{"id": "cli-db-envvar", "area": "patterns", "prompt": "In this repo, what must every CLI command's --db option carry, and why?", "expect": ["PHOTOSEARCH_DB", "envvar|environment[ -]variable"]}
 {"id": "db-filename-schema", "area": "database", "prompt": "What is the SQLite database file called, and which constant in which file is the source of truth for the schema version?", "expect": ["photo_index\\.db", "SCHEMA_VERSION", "db\\.py"]}
 {"id": "frontend-no-build", "area": "frontend", "prompt": "Can frontend pages use JSX? What does a frontend change require before it shows up on the NAS?", "expect": ["React\\.createElement"], "any": [["rebuild", "docker.*build", "image"]]}
 {"id": "sse-loop-and-events", "area": "patterns", "prompt": "For a long-running SSE endpoint in web.py, which asyncio call gets the loop, and which terminal event types must the stream always be able to emit?", "expect": ["get_running_loop", "done", "fatal", "cancelled"]}

@@ -218,6 +218,11 @@ def run_claude(prompt: str, cwd: Path, *, model: str, max_turns: int, budget: fl
         env.setdefault(var, str(timeout * 1000))
     if _GATEWAY_PROXY:
         env["ANTHROPIC_BASE_URL"] = _GATEWAY_PROXY
+        # The system prompt opens with a billing header carrying a per-prompt
+        # hash (char 48), so a local gateway's prefix cache missed on every item
+        # and re-prefilled ~100k tokens (~15 min each). Without it, items share
+        # ~97% of the request and only the question is new.
+        env.setdefault("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
