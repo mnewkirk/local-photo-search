@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import datetime as dt
 import fnmatch
 import json
@@ -338,15 +339,18 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
             # kept so a grader fix can re-grade without re-running the model
             row["added"] = {k: v[:400] for k, v in added.items()}
     else:
-        cwd = REPO
-        row["context"] = context_fingerprint(cwd)
         prompt = item["prompt"]
         if suite == "rules":
             prompt = (f"First read the whole file {item['read']} with the Read tool. "
                       f"Then answer: {item['prompt']}")
-        res = run_claude(prompt, cwd, model=args.model, max_turns=args.max_turns,
-                         budget=args.budget, edit=False, system=RECALL_SYSTEM,
-                         timeout=args.timeout)
+        # --isolate: answer from a worktree of --ref, so a config can be the
+        # context files at a tag (e.g. pre-context-diet) without touching the
+        # main checkout. Otherwise the main checkout's working tree is used.
+        with (Worktree(args.ref) if args.isolate else contextlib.nullcontext(REPO)) as cwd:
+            row["context"] = context_fingerprint(cwd)
+            res = run_claude(prompt, cwd, model=args.model, max_turns=args.max_turns,
+                             budget=args.budget, edit=False, system=RECALL_SYSTEM,
+                             timeout=args.timeout)
         if suite == "skills":
             ok = any("photo-search" in s for s in res["skills"])
             detail = {"skills_invoked": res["skills"],
@@ -558,6 +562,8 @@ def main(argv=None) -> int:
     r.add_argument("--max-turns", type=int, default=25)
     r.add_argument("--budget", type=float, default=1.50, help="per-run --max-budget-usd")
     r.add_argument("--timeout", type=int, default=900, help="seconds per run")
+    r.add_argument("--isolate", action="store_true",
+                   help="run every suite (not just tasks) in a worktree of --ref")
     r.add_argument("--no-keepalive", action="store_true",
                    help="talk to ANTHROPIC_BASE_URL directly (no ping-injecting proxy)")
     r.add_argument("--dry-run", action="store_true", help="list the runs, call nothing")
