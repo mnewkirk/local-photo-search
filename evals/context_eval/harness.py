@@ -115,6 +115,12 @@ def added_lines(worktree: Path) -> dict[str, list[str]]:
     return out
 
 
+def _strip_comments(text: str) -> str:
+    """Drop docstrings and `#` comments (bash and Python) from added code."""
+    text = re.sub(r'("""|\'\'\')[\s\S]*?\1', "", text)
+    return re.sub(r"(^|\s)#(?!!).*$", r"\1", text, flags=re.M)
+
+
 def grade_task(item: dict, added: dict[str, list[str]]) -> tuple[bool, dict]:
     """Checks: {type: added_grep|added_not_grep|any_added_grep, pattern|patterns,
     paths?: [globs]}. `paths` restricts which files' added lines are searched."""
@@ -130,7 +136,9 @@ def grade_task(item: dict, added: dict[str, list[str]]) -> tuple[bool, dict]:
         if t == "added_grep":
             ok = re.search(chk["pattern"], text, re.I | re.M) is not None
         elif t == "added_not_grep":
-            ok = re.search(chk["pattern"], text, re.I | re.M) is None
+            # A file that explains the trap ("# not pgrep -f: it matches
+            # itself") has avoided it, so prose in comments doesn't count.
+            ok = re.search(chk["pattern"], _strip_comments(text), re.I | re.M) is None
         elif t == "any_added_grep":
             ok = _any(chk["patterns"], text)
         else:
@@ -324,7 +332,10 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
             res = run_claude(item["prompt"], wt, model=args.model, max_turns=args.max_turns,
                              budget=args.budget, edit=True, system=TASK_SYSTEM,
                              timeout=args.timeout)
-            ok, detail = grade_task(item, added_lines(wt))
+            added = added_lines(wt)
+            ok, detail = grade_task(item, added)
+            # kept so a grader fix can re-grade without re-running the model
+            row["added"] = {k: v[:400] for k, v in added.items()}
     else:
         cwd = REPO
         row["context"] = context_fingerprint(cwd)
