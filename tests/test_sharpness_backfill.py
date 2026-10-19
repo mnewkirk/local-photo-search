@@ -548,31 +548,10 @@ def test_maintenance_stage_default_limit(lib, monkeypatch):
     assert seen["apply"] is False
 
 
-def test_batch_runner_skips_an_empty_batch_without_calling_the_backfill(monkeypatch):
+def test_batch_advance_has_no_sharpness_runner():
+    """Removed from the batch flow 2026-10-18 -- nothing reads the column."""
     from photosearch import batch_advance
-    monkeypatch.setattr(sb, "run_sharpness_backfill",
-                        lambda *a, **k: pytest.fail("must not be called"))
-    out = batch_advance.default_runners()["sharpness"](
-        None, {"photo_ids": [], "emit": lambda e: None,
-               "check_abort": lambda: None})
-    assert out == {"skipped": "empty batch"}
-
-
-def test_batch_runner_is_scoped_and_raises_when_refused(monkeypatch):
-    from photosearch import batch_advance
-    seen = {}
-
-    def fake(db_, **kw):
-        seen.update(kw)
-        return {"status": "refused", "message": "not started: ingest"}
-
-    monkeypatch.setattr(sb, "run_sharpness_backfill", fake)
-    with pytest.raises(RuntimeError, match="ingest"):
-        batch_advance.default_runners()["sharpness"](
-            None, {"photo_ids": [5, 6], "emit": lambda e: None,
-                   "check_abort": lambda: None})
-    assert seen["photo_ids"] == [5, 6] and seen["apply"] is True
-    assert seen["ignore_batch_steps"] == ("sharpness",)
+    assert "sharpness" not in batch_advance.default_runners()
 
 
 # ---------------------------------------------------------------------------

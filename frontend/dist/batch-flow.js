@@ -64,7 +64,7 @@
       steps: ['video-probe', 'video-proxy', 'video-scan', 'video-subjects', 'video-describe'] },
     { key: 'nas',     label: 'NAS stages',
       steps: ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
-              'warm_crops', 'rank_measure', 'sharpness'] },
+              'warm_crops', 'rank_measure'] },
   ];
 
   var OTHER_ROW_LABEL = 'Other steps';
@@ -74,10 +74,9 @@
   // its own "Desktop" row with nothing anywhere that could run it, so its box
   // read "Needs to be queued" forever; it runs on the NAS (it decodes the
   // originals, which only the NAS holds) and the advance button runs it.
-  // `sharpness` (schema v33) is the library-comparable measurement; it stays
-  // optional until the labelled eval lets a tag be derived from it.
-  var OPTIONAL_STEPS = { rank_measure: 'measure sharpness for ranking',
-                         sharpness: 'measure library sharpness' };
+  // `sharpness` (schema v33) was a step here until 2026-10-18; nothing reads
+  // its column, so it left the batch flow (batch_state.NAS_STEPS says why).
+  var OPTIONAL_STEPS = { rank_measure: 'measure sharpness for ranking' };
 
   function optionalNeedingQueue(steps) {
     return (steps || []).filter(function (s) {

@@ -3879,9 +3879,9 @@ becoming a phantom batch.
 `photosearch/batch_state.py` reports exactly one of `completed / running /
 queued / needs_queue / waiting / blocked` for every step — the 9 worker
 passes (`clip`, `faces`, `quality`, `aesthetics`, `describe`,
-`category-visual`, `category-content`, `keywords`, `verify`) and the 7 NAS
+`category-visual`, `category-content`, `keywords`, `verify`) and the 6 NAS
 steps (`stacking`, `normalize_aesthetics`, `match_faces`, `resolve_dups`,
-`warm_crops`, `rank_measure`, `sharpness`). The module exists because
+`warm_crops`, `rank_measure`). The module exists because
 `db.count_unprocessed_photos` — the fleet's **claim predicate**, not a
 progress bar — returns 0 in two situations that are not "done":
 
@@ -4178,14 +4178,16 @@ blocks it for up to the 6 h TTL), and re-checks every chunk, stopping as
   --sharpness [--sharpness-limit 5000]`, API `"sharpness": true` (or
   `do_sharpness`) + `"sharpness_limit"`, a checkbox on `/admin/maintenance`.
   Needs pixels, so like `colors` it is EXCLUDED on the replica (400).
-- Batch step `sharpness`: last in `NAS_STEPS`, in `OPTIONAL_STEPS` (never gates
-  `ready`), waits on `faces`, and is **derived from the column** (done =
-  current version; a stored error counts done and shows as "N unreadable") —
-  a closed job row proves nothing for it. A refused/yielded runner raises, so
-  the step reads failed and the next Advance resumes.
+- **Not a batch step any more** (removed 2026-10-18, owner decision). It was
+  an optional box on `/batches`, but nothing reads `photos.sharpness` — the
+  `blurry` tag it was built for failed its eval and the plan is CLOSED — so
+  every batch showed "Needs to be queued" for N100 work feeding nothing.
+  Bring it back (or make it a desktop worker pass, since the fleet already
+  pulls originals) only once something consumes the column. A leftover
+  `ingest_batch_jobs` row for it is ignored.
 - `mirror-fields` / `rerun._MIRROR_COLUMNS` carry the four columns.
 
-Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessStep` in
+Tests: `tests/test_sharpness_backfill.py`, `TestSharpnessIsNotABatchStep` in
 `tests/test_batch_state.py`, `test_v32_db_migrates_to_v33_sharpness_columns`.
 
 ## Planned milestones (see `docs/plans/`)

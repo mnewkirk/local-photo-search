@@ -143,8 +143,7 @@ class TestOrchestration:
         assert result["stopped_at"] == "match_faces"
         steps = _by_step(result)
         assert steps["match_faces"]["waiting_on"] == "faces"
-        for s in ("match_faces", "resolve_dups", "warm_crops", "rank_measure",
-                  "sharpness"):
+        for s in ("match_faces", "resolve_dups", "warm_crops", "rank_measure"):
             assert steps[s]["status"] == "deferred", s
 
     def test_face_steps_do_not_wait_on_the_aesthetics_pass(self, db):
@@ -158,7 +157,7 @@ class TestOrchestration:
             db, batch_id, apply=True, runners=_fake_runners(calls))
 
         assert calls == ["stacking", "match_faces", "resolve_dups",
-                         "warm_crops", "rank_measure", "sharpness"]
+                         "warm_crops", "rank_measure"]
         assert result["stopped_at"] == "normalize_aesthetics"
         assert _by_step(result)["normalize_aesthetics"]["status"] == "deferred"
         assert "normalize_aesthetics" not in ingest_batches.closed_jobs(db, batch_id)
@@ -171,7 +170,7 @@ class TestOrchestration:
 
         would = [r["step"] for r in result["steps"] if r["status"] == "would_run"]
         assert would == ["stacking", "match_faces", "resolve_dups",
-                         "warm_crops", "rank_measure", "sharpness"]
+                         "warm_crops", "rank_measure"]
         assert ingest_batches.open_jobs(db, batch_id) == {}
 
     def test_completed_steps_are_skipped_not_rerun(self, db):
@@ -188,7 +187,7 @@ class TestOrchestration:
 
         assert "match_faces" not in calls
         assert calls == ["stacking", "normalize_aesthetics",
-                         "resolve_dups", "warm_crops", "rank_measure", "sharpness"]
+                         "resolve_dups", "warm_crops", "rank_measure"]
 
     def test_job_rows_are_opened_then_closed(self, db):
         batch_id, ids = _make_batch(db)

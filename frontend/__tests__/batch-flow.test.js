@@ -16,13 +16,13 @@ const BF = require('../dist/batch-flow.js');
 const STEP_ORDER = ['ingest', 'clip', 'faces', 'quality', 'video-probe', 'video-proxy', 'video-scan',
   'aesthetics', 'video-subjects', 'describe', 'video-describe',
   'verify', 'category-content', 'keywords', 'category-visual', 'stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups', 'warm_crops',
-  'rank_measure', 'sharpness'];
+  'rank_measure'];
 
 const STATES = ['completed', 'running', 'queued', 'needs_queue', 'waiting', 'blocked'];
 
 const KIND = {
   ingest: 'ingest', stacking: 'nas', normalize_aesthetics: 'nas', match_faces: 'nas',
-  resolve_dups: 'nas', warm_crops: 'nas', rank_measure: 'nas', sharpness: 'nas',
+  resolve_dups: 'nas', warm_crops: 'nas', rank_measure: 'nas',
 };
 
 /** One step row in the shape batch_state emits. */
@@ -102,7 +102,7 @@ describe('layout', () => {
       ['verify', 'category-content', 'keywords'],
       ['video-probe', 'video-proxy', 'video-scan', 'video-subjects', 'video-describe'],
       ['stacking', 'normalize_aesthetics', 'match_faces', 'resolve_dups',
-        'warm_crops', 'rank_measure', 'sharpness'],
+        'warm_crops', 'rank_measure'],
     ]);
   });
 
@@ -176,18 +176,10 @@ describe('summarize — headline per next_action', () => {
       .toBe('Ready to review — optional: measure sharpness for ranking');
   });
 
-  test('both optional NAS steps are named when both are runnable', () => {
-    // batch_state.OPTIONAL_STEPS == ("rank_measure", "sharpness"): neither
-    // gates `ready`, and the headline accounts for every box left to queue.
-    const s = state({
-      ready: true,
-      next_action: 'advance_nas',
-      steps: STEP_ORDER.map((n) => step(n,
-        (n === 'rank_measure' || n === 'sharpness') ? 'needs_queue' : 'completed')),
-    });
-    expect(BF.summarize(s).headline).toBe('Ready to review — optional: '
-      + 'measure sharpness for ranking, measure library sharpness');
-    expect(Object.keys(BF.OPTIONAL_STEPS).sort()).toEqual(['rank_measure', 'sharpness']);
+  test('rank_measure is the only optional NAS step', () => {
+    // batch_state.OPTIONAL_STEPS == ("rank_measure",); sharpness left the
+    // batch flow on 2026-10-18 (nothing reads its column).
+    expect(Object.keys(BF.OPTIONAL_STEPS)).toEqual(['rank_measure']);
   });
 
   test('ingest running quotes the sweep progress', () => {
