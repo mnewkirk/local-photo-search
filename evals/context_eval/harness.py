@@ -273,6 +273,30 @@ class Worktree:
         shutil.rmtree(self.path, ignore_errors=True)
 
 
+INFRA_ABORT_STREAK = 3
+_INFRA_MARKERS = ("exceed_context_size", "exceeds the available context",
+                  "check your inference gateway", "connection refused",
+                  "overloaded_error", "rate_limit_error")
+
+
+def infra_error(res: dict) -> str | None:
+    """Why a run says nothing about the context under test (gateway down,
+    model context overflow, timeout), else None. These must not count as
+    task FAILs: they would read as the context regressing."""
+    text = res.get("text") or ""
+    if res.get("subtype") == "timeout":
+        return "timeout"
+    if res.get("is_error") and text.startswith("API Error"):
+        m = re.search(r'"message":"([^"]{0,160})', text)
+        return "api_error: " + (m.group(1) if m else text[:160])
+    if any(k in text.lower() for k in _INFRA_MARKERS):
+        return "gateway: " + text[:160]
+    if res.get("is_error") and not sum(int(v or 0) for v in (res.get("usage") or {}).values()
+                                       if isinstance(v, (int, float))):
+        return "no_usage: " + (res.get("stderr_tail") or "")[-160:].strip()
+    return None
+
+
 def run_one(suite: str, item: dict, rep: int, args) -> dict:
     row = {"suite": suite, "id": item["id"], "config": args.config, "rep": rep,
            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -301,8 +325,10 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
                       "photo_skills_offered": res["offered_skills"]}
         else:
             ok, detail = grade_text(item, res["text"])
+    infra = infra_error(res)
     row.update({
-        "pass": ok and not res["is_error"],
+        "infra_error": infra,
+        "pass": ok and not res["is_error"] and not infra,
         "detail": detail,
         "answer": res["text"][:4000],
         "tools": res["tools"],
@@ -316,7 +342,7 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
         "model": res["model"],
         "subtype": res["subtype"],
         "exit_code": res["exit_code"],
-        "error": res["stderr_tail"] if res["is_error"] else None,
+        "error": infra or (res["stderr_tail"] if res["is_error"] else None),
     })
     return row
 
@@ -344,7 +370,7 @@ def cmd_run(args) -> int:
         return 0
     outdir = RESULTS / args.config
     outdir.mkdir(parents=True, exist_ok=True)
-    passed = total = 0
+    passed = total = infra_n = infra_streak = 0
     cost = 0.0
 
     def work(job):
@@ -362,13 +388,25 @@ def cmd_run(args) -> int:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             total += 1
             passed += bool(row.get("pass"))
+            infra_n += bool(row.get("infra_error"))
             cost += row.get("cost_usd") or 0.0
-            mark = "PASS" if row.get("pass") else "FAIL"
+            mark = ("PASS" if row.get("pass")
+                    else "INFRA" if row.get("infra_error") else "FAIL")
             extra = f" ({row['error'][:80]})" if row.get("error") else ""
             print(f"[{total}/{len(jobs)}] {mark} {row['suite']}/{row['id']} rep{row['rep']} "
                   f"${(row.get('cost_usd') or 0):.3f} {row.get('num_turns') or '-'}t"
                   f" {row.get('wall_s') or '-'}s{extra}", file=sys.stderr)
-    print(f"\n{passed}/{total} passed, ${cost:.2f} total → {outdir}", file=sys.stderr)
+            # A broken gateway fails every job the same way; don't spend the
+            # whole batch proving it.
+            infra_streak = infra_streak + 1 if row.get("infra_error") else 0
+            if infra_streak >= INFRA_ABORT_STREAK:
+                print(f"\naborting: {infra_streak} infra errors in a row — fix the "
+                      f"gateway/model first ({row['infra_error'][:120]})", file=sys.stderr)
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
+    scored = total - infra_n
+    print(f"\n{passed}/{scored} passed ({infra_n} infra errors not scored), "
+          f"${cost:.2f} total → {outdir}", file=sys.stderr)
     return 0
 
 
@@ -390,11 +428,14 @@ def _input_tokens(u: dict) -> int:
 
 
 def _agg(rows):
+    infra = sum(bool(r.get("infra_error")) for r in rows)
+    rows = [r for r in rows if not r.get("infra_error")]
     n = len(rows)
     if not n:
-        return {"n": 0}
+        return {"n": 0, "infra": infra}
     return {
         "n": n,
+        "infra": infra,
         "pass_rate": sum(bool(r.get("pass")) for r in rows) / n,
         "cost": sum(r.get("cost_usd") or 0 for r in rows) / n,
         "input_tok": sum(_input_tokens(r.get("usage") or {}) for r in rows) / n,
@@ -423,9 +464,14 @@ def cmd_report(args) -> int:
     for suite in SUITES:
         for c, rows in data.items():
             a = _agg([r for r in rows if r.get("suite") == suite])
-            if a["n"]:
+            if a["n"] or a["infra"]:
+                if not a["n"]:
+                    print(f"| {suite} | {c} | 0 | — | — | — | — | — | {a['infra']} infra |")
+                    continue
+                infra_note = f" ({a['infra']} infra, unscored)" if a["infra"] else ""
                 print(f"| {suite} | {c} | {a['n']} | {a['pass_rate']:.0%} | {a['cost']:.3f} | "
-                      f"{a['input_tok']:,.0f} | {a['cache_read']:,.0f} | {a['turns']:.1f} | {a['errors']} |")
+                      f"{a['input_tok']:,.0f} | {a['cache_read']:,.0f} | {a['turns']:.1f} | "
+                      f"{a['errors']}{infra_note} |")
     print("\n## Per item (pass count / runs per config)\n")
     ids = sorted({(r["suite"], r["id"]) for rows in data.values() for r in rows})
     print("| suite | id | " + " | ".join(args.configs) + " | note |")
@@ -433,7 +479,8 @@ def cmd_report(args) -> int:
     for suite, iid in ids:
         cells, rates = [], []
         for c in args.configs:
-            rs = [r for r in data[c] if r["suite"] == suite and r["id"] == iid]
+            rs = [r for r in data[c] if r["suite"] == suite and r["id"] == iid
+                  and not r.get("infra_error")]
             if rs:
                 p = sum(bool(r.get("pass")) for r in rs)
                 cells.append(f"{p}/{len(rs)}")
@@ -450,7 +497,7 @@ def cmd_report(args) -> int:
         print("\n## Failure details\n")
         for c, rows in data.items():
             for r in rows:
-                if not r.get("pass"):
+                if not r.get("pass") and not r.get("infra_error"):
                     print(f"### {c} / {r['suite']} / {r['id']} rep{r.get('rep')}\n")
                     if r.get("error"):
                         print(f"error: `{r['error'][:300]}`\n")
