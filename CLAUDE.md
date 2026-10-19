@@ -1685,7 +1685,7 @@ already knew for `.JPG`), each wrapping one playable video. Probe stores
 (unwrapping costs a full decompress — DEFLATE over H.264 saves 0.03% — so it
 does not belong in the cheap probe). Safety: one video member only (ignores
 `__MACOSX/` and `._*`, takes the MOV of a JPG+MOV bundle, refuses 0 or 2+),
-member ≤ 16 GiB **and** ≤ 1.2× the ZIP's own size (so a `compress_size 0`
+member ≤ 16 GiB **and** ≤ 2× the ZIP's own size + 16 MB (1.2× refused four 2018 HTC Zoe clips that deflate ~1.3×) (so a `compress_size 0`
 header can't dodge the bomb check); dates/codec come from the inner file.
 
 **Dates are a per-camera-family dispatch, not one offset (D14 as built).**

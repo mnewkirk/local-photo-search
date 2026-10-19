@@ -124,14 +124,21 @@ def test_unwrap_refuses_oversized_and_bombs(tmp_path):
 
 def test_unwrap_caps_the_member_relative_to_the_zip_even_without_a_ratio(tmp_path):
     """With the ratio check out of the way (as when a header says
-    compress_size 0), the inner file may still be at most ~1.2 x the ZIP:
-    video does not compress."""
-    p = _zip(tmp_path / "z.mov", [("v.mov", b"\x00" * 300_000)])
+    compress_size 0), the inner file may still be at most 2 x the ZIP + 16 MB."""
+    p = _zip(tmp_path / "z.mov", [("v.mov", b"\x00" * 40_000_000)])
     with pytest.raises(VS.ZipRefused, match="bytes >"):
         VS.unwrap_zip(p, str(tmp_path), max_ratio=1e12)
     # incompressible payload of the same size passes the relative cap
     p = _zip(tmp_path / "ok.mov", [("v.mov", os.urandom(300_000))])
     assert os.path.getsize(VS.unwrap_zip(p, str(tmp_path), max_ratio=1e12)) == 300_000
+
+
+def test_unwrap_accepts_a_mildly_compressible_clip(tmp_path):
+    """HTC Zoe clips (2018) deflate ~1.3x; the old 1.2x cap refused four of
+    them on the NAS. A modest ratio must pass."""
+    payload = os.urandom(200_000) + b"\x00" * 100_000
+    p = _zip(tmp_path / "zoe.mp4", [("IMAG0046_ZOEVIDEO.mp4", payload)])
+    assert open(VS.unwrap_zip(p, str(tmp_path)), "rb").read() == payload
 
 
 def test_unwrap_ignores_mac_litter_and_takes_the_video_of_a_bundle(tmp_path):

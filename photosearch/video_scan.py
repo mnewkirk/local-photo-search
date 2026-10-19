@@ -385,7 +385,7 @@ def unwrap_zip(path: str, dest_dir: str, *, max_bytes: int = ZIP_MAX_BYTES,
     the ONE member with a video extension is taken (a JPG + MOV Live bundle
     gives the MOV). Refuses (ZipRefused) no video member, more than one, an
     unsafe name (absolute, ``..``, drive letter), an encrypted member, and
-    anything bigger than ``max_bytes`` OR 1.2 x the ZIP's own size (video does
+    anything bigger than ``max_bytes`` OR 2 x the ZIP's own size + 16 MB (video does
     not compress, so a member that inflates past that is not a video — this
     holds even when the header's compressed size is 0 and the ratio check
     cannot run). The caps are enforced on the bytes actually read, not the

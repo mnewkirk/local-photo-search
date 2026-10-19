@@ -21,7 +21,10 @@ from typing import BinaryIO, Callable, Iterable, Optional
 ZIP_MAGIC = b"PK\x03\x04"
 ZIP_MAX_BYTES = 16 * 1024 ** 3
 ZIP_MAX_RATIO = 50.0       # inflated / compressed — anything above is a bomb
-ZIP_SIZE_SLACK = 1.2       # inner <= 1.2 x the ZIP itself: video is incompressible
+ZIP_SIZE_SLACK = 2.0       # inner <= 2 x the ZIP + ZIP_SIZE_FLOOR. Video barely
+                           # compresses, but HTC Zoe clips (2018) deflate ~1.3x;
+                           # 1.2 refused them. ZIP_MAX_RATIO is the bomb guard.
+ZIP_SIZE_FLOOR = 16 * 1024 * 1024
 
 DEFAULT_VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".m4v", ".mov", ".avi", ".mts", ".m2ts", ".3gp"})
@@ -52,7 +55,7 @@ def safe_member_name(name: str) -> bool:
 
 
 def size_cap(zip_size: int, max_bytes: int = ZIP_MAX_BYTES) -> int:
-    return min(int(max_bytes), int(ZIP_SIZE_SLACK * int(zip_size)) + 65536)
+    return min(int(max_bytes), int(ZIP_SIZE_SLACK * int(zip_size)) + ZIP_SIZE_FLOOR)
 
 
 def select_video_member(zf: zipfile.ZipFile, zip_size: int, *,
@@ -66,7 +69,7 @@ def select_video_member(zf: zipfile.ZipFile, zip_size: int, *,
     exactly ONE member must carry a video extension (a JPG + MOV Live bundle
     gives the MOV). Refuses (ZipRefused) none or several, an unsafe name
     (absolute, ``..``, drive letter), an encrypted member, a header size over
-    ``max_bytes`` OR 1.2 x the ZIP's own size (video does not compress — this
+    ``max_bytes`` OR 2 x the ZIP's own size + 16 MB (video does not compress — this
     holds even when the header's compressed size is 0 and the ratio check
     cannot run), and a ratio above ``max_ratio``. Reads only the central
     directory. The cap must ALSO be enforced on the bytes actually inflated
