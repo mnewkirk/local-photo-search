@@ -281,7 +281,7 @@ def unwrap_zip_videos(db_path: str, *, photo_root: Optional[str] = None,
     what would be unwrapped. Raises ``ingest.IngestAlreadyRunning`` while an
     ingest sweep is running, ``UnwrapRefused`` for a missing/bad audit path.
     """
-    from .ingest import IngestAlreadyRunning, _sweep_lock, sweep_lock_held
+    from .ingest import IngestAlreadyRunning, _sweep_lock, sweep_lock_holder
 
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"database not found: {db_path}")
@@ -294,8 +294,9 @@ def unwrap_zip_videos(db_path: str, *, photo_root: Optional[str] = None,
         if not audit_path:
             raise UnwrapRefused("--apply requires --audit PATH (the audit is the undo)")
         _check_audit_path(audit_path, root)
-    if sweep_lock_held(db_path):
-        raise IngestAlreadyRunning("an ingest-incoming sweep is running — try later")
+    holder = sweep_lock_holder(db_path)
+    if holder:
+        raise IngestAlreadyRunning(f"{holder} is running — try later")
 
     counts = _new_counts(root, apply)
     if lower_priority:
@@ -307,7 +308,7 @@ def unwrap_zip_videos(db_path: str, *, photo_root: Optional[str] = None,
         return counts
 
     from .db import PhotoDB
-    with _sweep_lock(db_path), PhotoDB(db_path, photo_root=str(root)) as db:
+    with _sweep_lock(db_path, holder="unwrap-zip-videos"), PhotoDB(db_path, photo_root=str(root)) as db:
         audit = _Audit(audit_path)
         try:
             _walk(root, folder, limit, counts, db, audit, RateLimiter(mbps), on_progress)
@@ -588,7 +589,7 @@ def undo_unwrap(audit_path: str, db_path: Optional[str], *, apply: bool = False,
     file, then drops the extra ``.zip`` name only while ``st_nlink >= 2``
     proves the original name still holds the zip. Refused rows are left alone.
     DB rows are pointed back at "needs probe" and their old ``file_hash``."""
-    from .ingest import IngestAlreadyRunning, _no_lock, _sweep_lock, sweep_lock_held
+    from .ingest import IngestAlreadyRunning, _no_lock, _sweep_lock, sweep_lock_holder
     entries = read_audit(audit_path)
     res = {"dry_run": not apply, "entries": len(entries), "restored": 0,
            "would_restore": 0, "already_restored": 0, "interrupted_cleaned": 0,
@@ -596,14 +597,16 @@ def undo_unwrap(audit_path: str, db_path: Optional[str], *, apply: bool = False,
     if apply:
         if not db_path or not os.path.exists(db_path):
             raise FileNotFoundError(f"database not found: {db_path}")
-        if sweep_lock_held(db_path):
-            raise IngestAlreadyRunning("an ingest-incoming sweep is running — try later")
+        holder = sweep_lock_holder(db_path)
+        if holder:
+            raise IngestAlreadyRunning(f"{holder} is running — try later")
     if lower_priority:
         from .sharpness_backfill import lower_priority as _lower
         _lower()
     limiter = RateLimiter(mbps)
     db = None
-    lock = _sweep_lock(db_path) if apply else _no_lock()
+    lock = (_sweep_lock(db_path, holder="unwrap-zip-videos-undo")
+            if apply else _no_lock())
     with lock:
         if apply:
             from .db import PhotoDB

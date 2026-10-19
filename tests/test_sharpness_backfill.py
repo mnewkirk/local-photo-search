@@ -420,6 +420,28 @@ def test_refuses_to_start_while_ingest_holds_its_lock(lib):
     assert not sweep_lock_held(db.db_path)       # the probe held nothing
 
 
+def test_refusal_names_the_job_that_holds_the_lock(lib):
+    """2026-10-18: unwrap-zip-videos held the lock and sharpness said "an
+    ingest-incoming sweep is running" at 17:30. The refusal must name the
+    real holder, and a refused contender must not wipe that record."""
+    from photosearch.ingest import (IngestAlreadyRunning, _sweep_lock,
+                                    sweep_lock_holder)
+    db, root, add = lib
+    add("a.jpg")
+    assert sweep_lock_holder(db.db_path) is None
+    with _sweep_lock(db.db_path, holder="unwrap-zip-videos"):
+        with pytest.raises(IngestAlreadyRunning, match="unwrap-zip-videos"):
+            with _sweep_lock(db.db_path):     # a contender (ingest) loses...
+                pass
+        # ...without truncating the holder's record
+        assert sweep_lock_holder(db.db_path).startswith("unwrap-zip-videos")
+        res = _run(db, measure=Recorder())
+    assert res["status"] == "refused"
+    assert "unwrap-zip-videos" in res["message"]
+    assert "ingest-incoming" not in res["message"]
+    assert sweep_lock_holder(db.db_path) is None
+
+
 def test_the_probe_never_blocks_ingest(lib):
     from photosearch.ingest import _sweep_lock, sweep_lock_held
     db, root, add = lib

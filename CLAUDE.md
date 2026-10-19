@@ -4160,7 +4160,10 @@ between photos; commit every 25; `os.nice(10)` + the Linux IDLE I/O class via a
 raw `ioprio_set` syscall (no psutil; skipped where unavailable; per-THREAD on
 Linux, so inside the web server it only lowers the sweep/advance worker
 thread); **refuses to start** (`status: "refused"`) while `ingest-incoming`
-holds its lock — `ingest.sweep_lock_held` is a shared non-blocking PROBE,
+holds its lock — **or `unwrap-zip-videos --apply` / `refile-unknown-camera
+--apply`, which hold the same lock**; `_sweep_lock(holder=…)` records the job
+and the refusal names it (it used to call every holder "an ingest sweep") —
+`ingest.sweep_lock_held` is a shared non-blocking PROBE,
 never a hold, so it can't make the 04:00 cron fail — or while any open,
 unexpired batch-advance **NAS** job row exists (a crashed advance therefore
 blocks it for up to the 6 h TTL), and re-checks every chunk, stopping as

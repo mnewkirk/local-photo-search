@@ -103,14 +103,40 @@ def _no_lock() -> Iterator[None]:
     yield None
 
 
+def _read_lock_holder(fd: int) -> str:
+    """The job name a `_sweep_lock` holder wrote, or a generic fallback.
+
+    The file is `<pid> <holder> <started-utc>`. A lockfile written before the
+    holder was recorded holds only a pid, so that reads as the generic label.
+    """
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        parts = os.read(fd, 512).decode("utf-8", "replace").split()
+    except OSError:
+        parts = []
+    if len(parts) >= 2:
+        return parts[1] + (f" (since {parts[2]})" if len(parts) >= 3 else "")
+    return "ingest-incoming or another library-moving job"
+
+
 @contextmanager
-def _sweep_lock(db_path: str) -> Iterator[Optional[Path]]:
+def _sweep_lock(db_path: str,
+                holder: str = "ingest-incoming") -> Iterator[Optional[Path]]:
     """Hold an exclusive `flock` for one sweep; raise if another holds it.
 
     `flock` is per open-file-description and released by the kernel when the
     process exits, so a crashed/killed sweep never leaves a stale lock behind
     (unlike a PID file). It works across containers because the lockfile is one
     inode on the shared /data volume.
+
+    It is not only ingest's: `unwrap-zip-videos --apply` and
+    `refile-unknown-camera --apply` hold it too, because they move library
+    files. `holder` names the job so a refusal can say which one it waited on
+    (2026-10-18: an unwrap run was reported as "an ingest sweep is running").
+
+    The file is opened WITHOUT truncating and rewritten only once the lock is
+    ours. Opening it with "w" let every refused contender wipe the holder's
+    record before learning it had lost.
 
     If the lockfile can't be created (read-only dir, no fcntl), the sweep runs
     unguarded rather than failing — losing the mutex is better than losing the
@@ -121,7 +147,7 @@ def _sweep_lock(db_path: str) -> Iterator[Optional[Path]]:
         yield None
         return
     try:
-        fh = open(lock_path, "w")
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
         print(f"  [ingest] WARNING: no lockfile at {lock_path} ({exc}) — "
               f"running without a concurrency guard")
@@ -129,17 +155,43 @@ def _sweep_lock(db_path: str) -> Iterator[Optional[Path]]:
         return
     try:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise IngestAlreadyRunning(
-                f"another ingest-incoming sweep is already running "
+                f"{_read_lock_holder(fd)} is already running "
                 f"(lock held on {lock_path}) — wait for it to finish"
             ) from None
-        fh.write(f"{os.getpid()}\n")
-        fh.flush()
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, f"{os.getpid()} {holder.replace(' ', '-')} {started}\n"
+                 .encode())
         yield lock_path
     finally:
-        fh.close()  # closing the fd releases our flock (and only ours)
+        os.close(fd)  # closing the fd releases our flock (and only ours)
+
+
+def sweep_lock_holder(db_path: str) -> Optional[str]:
+    """Which job holds `_sweep_lock` right now, or None if nobody does.
+
+    Same probe as `sweep_lock_held`; use this one to word a refusal.
+    """
+    if fcntl is None or not db_path:
+        return None
+    lock_path = Path(db_path).expanduser().resolve().parent / LOCKFILE_NAME
+    try:
+        fd = os.open(str(lock_path), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return _read_lock_holder(fd)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
 
 
 def sweep_lock_held(db_path: str) -> bool:

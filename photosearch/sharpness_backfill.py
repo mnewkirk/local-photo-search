@@ -121,10 +121,12 @@ def busy_reason(db, *, ignore_batch_steps: tuple = ()) -> Optional[str]:
     steps that are open and unexpired. ``ignore_batch_steps`` lets the batch
     runner skip its OWN open ``sharpness`` row.
     """
-    from .ingest import sweep_lock_held
+    from .ingest import sweep_lock_holder
     db_path = getattr(db, "db_path", None)
-    if db_path and sweep_lock_held(db_path):
-        return "an ingest-incoming sweep is running"
+    holder = sweep_lock_holder(db_path) if db_path else None
+    if holder:
+        # Not always ingest: unwrap-zip-videos / refile hold the same lock.
+        return f"{holder} is running (it holds the library file-move lock)"
     try:
         sql = ("SELECT batch_id, step FROM ingest_batch_jobs "
                "WHERE job_kind = 'nas' AND closed_at IS NULL "

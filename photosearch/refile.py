@@ -764,7 +764,7 @@ def refile_unknown_camera(
                             infer_from_sibling, on_progress, sample_limit,
                             root_source, stored_note, checked)
 
-    with _sweep_lock(db_path), PhotoDB(db_path, photo_root=str(root)) as db:
+    with _sweep_lock(db_path, holder="refile-unknown-camera"), PhotoDB(db_path, photo_root=str(root)) as db:
         return _run(db, root, True, audit_path, only, limit, include_indexed,
                     infer_from_sibling, on_progress, sample_limit,
                     root_source, stored_note, checked)
