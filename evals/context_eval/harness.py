@@ -343,10 +343,10 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
         if suite == "rules":
             prompt = (f"First read the whole file {item['read']} with the Read tool. "
                       f"Then answer: {item['prompt']}")
-        # --isolate: answer from a worktree of --ref, so a config can be the
-        # context files at a tag (e.g. pre-context-diet) without touching the
-        # main checkout. Otherwise the main checkout's working tree is used.
-        with (Worktree(args.ref) if args.isolate else contextlib.nullcontext(REPO)) as cwd:
+        # --isolate: answer from the run's shared worktree of --ref (see
+        # cmd_run), so a config can be the context files at a tag (e.g.
+        # pre-context-diet) without touching the main checkout.
+        with contextlib.nullcontext(args.iso_path or REPO) as cwd:
             row["context"] = context_fingerprint(cwd)
             res = run_claude(prompt, cwd, model=args.model, max_turns=args.max_turns,
                              budget=args.budget, edit=False, system=RECALL_SYSTEM,
@@ -401,6 +401,19 @@ def cmd_run(args) -> int:
         for suite, item, rep in jobs:
             print(f"  {suite:7s} {item['id']:34s} rep{rep}")
         return 0
+    # One worktree for the whole run, shared by the read-only suites: the cwd is
+    # part of Claude Code's system prompt, so a fresh path per run would miss
+    # the prompt cache every time (a full cache write per run).
+    iso = Worktree(args.ref) if args.isolate else None
+    args.iso_path = iso.__enter__() if iso else None
+    try:
+        return _run_jobs(jobs, args)
+    finally:
+        if iso:
+            iso.__exit__(None, None, None)
+
+
+def _run_jobs(jobs, args) -> int:
     global _GATEWAY_PROXY
     gateway = os.environ.get("ANTHROPIC_BASE_URL", "")
     if gateway and "anthropic.com" not in gateway and not args.no_keepalive:
