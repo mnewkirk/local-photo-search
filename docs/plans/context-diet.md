@@ -1,6 +1,8 @@
 # Plan: shrinking the fixed per-session context for /home/mattn/local-photo-search
 
-Date 2026-10-18. Claude Code 2.1.302. Nothing in this plan has been executed.
+Date 2026-10-18. Claude Code 2.1.302.
+
+**Status 2026-10-19: steps 0-7 EXECUTED** (tag `pre-context-diet`; commits `8441ace`, `4fd6ee7`, `9bb2210`). CLAUDE.md 258,266 → 7,803 B; SKILL.md 147,932 → 5,905 B; MEMORY.md 18,218 → 6,719 B; nine rules 5.5-7.1 KB. Deviations: 168 headings (3 sections were newer than this plan: category-content grounding, playback proxies, ZIP unwrap); every section was COPIED verbatim to docs/notes/ or reference/ (nothing condensed in place), so reference/ holds runbooks rather than hand-written summaries; the optional PostToolUse hook (5d) was not added. Step 8 (measure) via `evals/context_eval/` before/after runs.
 
 ## 0. Mechanics verified (code.claude.com/docs/en/memory and /skills, fetched today)
 
