@@ -498,6 +498,39 @@ def _agg(rows):
     }
 
 
+def cmd_regrade(args) -> int:
+    """Re-score stored rows under the current graders, without re-running a model.
+    Text suites re-grade the stored answer; tasks need the stored `added` lines."""
+    items = {s: {i["id"]: i for i in load_items(s)} for s in SUITES}
+    for config in args.configs:
+        for suite in ("recall", "rules", "tasks"):
+            path = RESULTS / config / f"{suite}.jsonl"
+            if not path.exists():
+                continue
+            rows, changed = [json.loads(l) for l in path.read_text().splitlines() if l.strip()], 0
+            for r in rows:
+                item = items[suite].get(r["id"])
+                if not item or r.get("infra_error") or r.get("error"):
+                    continue
+                if str(r.get("subtype") or "").startswith("error"):  # e.g. max turns
+                    if r.get("pass"):
+                        changed += 1
+                    r["pass"] = False
+                    continue
+                if suite == "tasks":
+                    if "added" not in r:
+                        continue
+                    ok, detail = grade_task(item, r["added"])
+                else:
+                    ok, detail = grade_text(item, r.get("answer") or "")
+                if ok != bool(r.get("pass")):
+                    changed += 1
+                r["pass"], r["detail"] = ok, detail
+            path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+            print(f"{config}/{suite}: {changed} rows changed", file=sys.stderr)
+    return 0
+
+
 def cmd_report(args) -> int:
     data = {c: _load_results(c) for c in args.configs}
     for c, rows in data.items():
@@ -581,6 +614,9 @@ def main(argv=None) -> int:
                    help="talk to ANTHROPIC_BASE_URL directly (no ping-injecting proxy)")
     r.add_argument("--dry-run", action="store_true", help="list the runs, call nothing")
     r.set_defaults(fn=cmd_run)
+    g = sub.add_parser("regrade", help="re-score stored rows with the current graders")
+    g.add_argument("--configs", nargs="+", required=True)
+    g.set_defaults(fn=cmd_regrade)
     p = sub.add_parser("report", help="compare configs")
     p.add_argument("--configs", nargs="+", required=True)
     p.add_argument("--failures", action="store_true", help="append failure details")

@@ -37,6 +37,25 @@ One real regression was found and fixed: the workers rule had dropped the 404 sy
 `-d /photos`. Grader fixes along the way (schema-bump pinned to v39, comments counted as code,
 over-literal regexes) are in `evals/context_eval/`.
 
+## Repeated on Opus 5.5 (`opus-before` = tag `pre-context-diet`, `opus-after` = HEAD; `--isolate`)
+
+| suite | pass before → after | mean input tok before → after | mean cost before → after |
+|---|---|---|---|
+| recall | 100% → 100% | 205k → 94k | $0.434 → $0.107 |
+| rules | 100% → 100% | 392k → 160k | $0.519 → $0.239 |
+| skills | 0% → 0% | 426k → 131k | $0.454 → $0.122 |
+| tasks | 100% → 97% | 765k → 402k | $1.126 → $0.339 |
+| **total** | 207 → 206 of 231 | | **$125.90 → $36.27 (−71%)** |
+
+The single difference: one `task-register-pass` run hit the 25-turn cap while finding every place
+the pass list is mirrored (post-diet sessions take more turns: tasks 7.7 → 11.9). Opus never calls
+the Skill tool in either config, but post-diet 19 of 24 skills answers cite the right
+`reference/` or rule file (0 of 24 pre-diet, which answered from the preloaded CLAUDE.md).
+
+Two more over-literal graders surfaced (both also failed pre-diet runs) and were fixed;
+`harness.py regrade` re-scores stored rows without re-running, and all four configs were
+re-scored with the final graders. Sonnet totals above are unchanged by it.
+
 ## Local model (gemma-4-12b-qat via LM Studio)
 
 `local-before`: 10/10 recall, but ~15 min per item: the ~100k-token prompt is processed from scratch
