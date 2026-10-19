@@ -116,8 +116,9 @@ def added_lines(worktree: Path) -> dict[str, list[str]]:
 
 
 def _strip_comments(text: str) -> str:
-    """Drop docstrings and `#` comments (bash and Python) from added code."""
+    """Drop docstrings and `#` / `//` comments from added code."""
     text = re.sub(r'("""|\'\'\')[\s\S]*?\1', "", text)
+    text = re.sub(r"(^|\s)//.*$", r"\1", text, flags=re.M)  # JS (not http://)
     return re.sub(r"(^|\s)#(?!!).*$", r"\1", text, flags=re.M)
 
 

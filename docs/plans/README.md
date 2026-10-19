@@ -27,7 +27,6 @@ These are the things actually left to do, roughly by impact-per-effort.
 | **Inferred-geotag refinements** | ⬜ | Post-M19 cascade tuning: cap hop depth (776-deep chains observed), downweight inferred anchors on re-scan so decay protects against cross-run compounding, drop the dead `--max-cascade-rounds` flag. Localized to `infer_location.py`. | [infer-location-refinements.md](infer-location-refinements.md) |
 | **Timeline view + LLM summaries** (M21) | ⬜ | Chronological UI grouping photos by period, each segment annotated with an LLM summary (where, from GPS/place; what, from descriptions/tags). No detail doc yet. | _(none)_ |
 | **Video backfill** | 🟡 | Built 2026-10-17, deployed 2026-10-18 (schema v39, NAS + replica). **Backfill not started** — nothing registered, no fleet run, no sampling until the owner asks. Step 8 of the plan is the runbook (incl. `unwrap-zip-videos` before registration). | [video-support.md](video-support.md) |
-| **Context diet** | 🟡 | Shrinking the per-session fixed context (CLAUDE.md, SKILL.md, MEMORY.md) into path-scoped rules, `docs/notes/` and skill `reference/`. In progress 2026-10-19; eval harness in `evals/context_eval/`. | [context-diet.md](context-diet.md) |
 | **Batch blocked re-run** | ⬜ | Planned 2026-10-18; nothing built. | [batch-blocked-rerun.md](batch-blocked-rerun.md) |
 | **Geocode R-tree** | ⬜ | Queued. Durable replacement for the in-memory KDTree (the OOM is already mitigated by the population gate + streaming). | [geocode-rtree.md](geocode-rtree.md) |
 | **Subject-aware quality** | 📐 | Prototype validated 2026-07-09 (subject-crop aesthetic re-score); design proposed, not built. | [subject-aware-quality.md](subject-aware-quality.md) |
@@ -73,6 +72,7 @@ Compact history — one line each. Detail docs linked where they exist.
 - **Category-content grounding** ✅ — description-decided drops + recitation verdict; deployed on the NAS at `79a14f7`, gemma backfill applied, holdout 0.958 (2026-10-18). [category-grounding.md](category-grounding.md)
 - **Measured sharpness** ✅/closed — schema v33 column + throttled backfill built; the `blurry` gate failed its eval three times, so `sharp`/`blurry` stay FROZEN (closed 2026-09-26). [sharpness-measurement.md](sharpness-measurement.md)
 - **Video support** ✅ built + deployed (backfill open, above). [video-support.md](video-support.md)
+- **Context diet** ✅ — CLAUDE.md 258 KB → 8 KB, SKILL.md 148 KB → 6 KB, path-scoped `.claude/rules/`; Sonnet eval 207 → 210/231 at −70% cost (2026-10-19). [context-diet.md](context-diet.md) · [handoff](../HANDOFF-2026-10-19-context-diet.md)
 - **M28** ✅ on-demand pass re-runs + fleet launcher · **M29** ✅ `/book` photobook builder · **M30** ✅ local Topaz upscaling (also the photobook authoring wizard) · **M31** ✅ `/split` print planner · **M32** ✅ `/faces` review panels. No detail docs; history is in `docs/notes/`.
 
 ---
