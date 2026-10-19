@@ -65,8 +65,8 @@ def _handler(upstream: str):
                         if not b:
                             break
                         chunks.put(b)
-                except OSError:
-                    pass
+                except (OSError, ValueError, AttributeError):
+                    pass  # upstream closed under us after the client left
                 chunks.put(None)
 
             threading.Thread(target=pump, daemon=True).start()
