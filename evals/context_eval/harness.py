@@ -92,6 +92,11 @@ def grade_text(item: dict, text: str) -> tuple[bool, dict]:
     return ok, detail
 
 
+def _git_head(worktree: Path) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def added_lines(worktree: Path) -> dict[str, list[str]]:
     """Added lines per path: `+` lines of `git diff HEAD` for tracked files,
     whole content for untracked (non-ignored) files."""
@@ -151,11 +156,21 @@ def grade_task(item: dict, added: dict[str, list[str]]) -> tuple[bool, dict]:
 
 # ---------------------------------------------------------- claude runner --
 
+# Eval runs must never change the real repo. The project's settings.local.json
+# allowlists git commit/push and that reaches the eval worktrees; on 2026-10-19
+# Haiku task runs pushed 12 commits of task answers to origin/main. A disallow
+# rule beats the allowlist.
+NO_GIT_WRITES = ["Bash(git commit:*)", "Bash(git commit *)", "Bash(git push:*)",
+                 "Bash(git push *)", "Bash(git reset:*)", "Bash(git rebase:*)",
+                 "Bash(git merge:*)", "Bash(git tag:*)", "Bash(gh:*)", "Bash(gh *)"]
+
+
 def claude_cmd(prompt: str, *, model: str, max_turns: int, budget: float,
                edit: bool, system: str) -> list[str]:
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
            "--strict-mcp-config", "--max-turns", str(max_turns),
-           "--max-budget-usd", f"{budget:.2f}", "--append-system-prompt", system]
+           "--max-budget-usd", f"{budget:.2f}", "--append-system-prompt", system,
+           "--disallowedTools", *NO_GIT_WRITES]
     if model:
         cmd += ["--model", model]
     if edit:
@@ -333,11 +348,14 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
     if suite == "tasks":
         with Worktree(args.ref) as wt:
             row["context"] = context_fingerprint(wt)
+            head0 = _git_head(wt)
             res = run_claude(item["prompt"], wt, model=args.model, max_turns=args.max_turns,
                              budget=args.budget, edit=True, system=TASK_SYSTEM,
                              timeout=args.timeout)
             added = added_lines(wt)
             ok, detail = grade_task(item, added)
+            if _git_head(wt) != head0:  # backstop: a run that committed fails
+                ok, detail["committed"] = False, True
             # kept so a grader fix can re-grade without re-running the model
             row["added"] = {k: v[:400] for k, v in added.items()}
     else:
