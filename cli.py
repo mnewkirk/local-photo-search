@@ -4635,6 +4635,36 @@ def relocate_into_year_dirs(db, dry_run, conflicts_file):
         click.echo(f"Updated {len(planned)} filepath(s).")
 
 
+@cli.command("set-filepath")
+@click.argument("photo_id", type=int)
+@click.argument("new_relative_path")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+def set_filepath(photo_id, new_relative_path, db):
+    """Change the stored filepath of a photo.
+
+    Updates both the filepath and the derived folder column.
+
+    \b
+    Example:
+      photosearch set-filepath 42 "2026/2026-04-06/photo.jpg"
+    """
+    with PhotoDB(db) as photo_db:
+        photo = photo_db.conn.execute(
+            "SELECT id, filepath FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        if not photo:
+            click.echo(f"Photo {photo_id} not found.")
+            return
+
+        old_filepath = photo["filepath"]
+        from photosearch.db import set_photo_filepath
+        set_photo_filepath(photo_db.conn, photo_id, new_relative_path)
+        photo_db.conn.commit()
+        click.echo(f"✓ Updated photo {photo_id}:")
+        click.echo(f"  {old_filepath}")
+        click.echo(f"  → {new_relative_path}")
+
+
 @cli.command("diagnose-relocate-conflicts")
 @click.argument("conflicts_file", default="/data/relocate-conflicts.txt")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
