@@ -68,8 +68,8 @@ photo_index.db.local*
 photobooks.db.local*
 
 # Claude Code per-checkout config — never tracked
+# (.claude/settings.json IS tracked: it registers the rule-injection hook)
 .claude/settings.local.json
-.claude/settings.json
 .claude/launch.json
 
 # Local installer/binary downloads kept in the repo root for convenience

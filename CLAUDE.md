@@ -35,7 +35,7 @@ Test before appending here: would a session editing an unrelated file (say `cli.
 
 ## Subsystem traps
 
-Path-scoped rules load when you open matching code. If you only run commands (Bash, Grep) in a subsystem, read its rule file first.
+Path-scoped rules load when you open matching code; a `PreToolUse` hook (`scripts/hooks/inject_rules.py`, registered in `.claude/settings.json`) also injects the rule once per session when a Bash/Grep/Glob call names the subsystem. If it did not fire, read the rule file first.
 
 - faces → `.claude/rules/faces.md` (one-person-per-photo · `rejected` labels · rival test · trusted labels only · temporal matches are unreliable)
 - llm-passes → `.claude/rules/llm-passes.md` (fleet role models · reasoning effort · category-visual derived vs perceived · grounding · provenance · stop reasons)
