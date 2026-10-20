@@ -690,19 +690,6 @@
       cursor: pointer;
     }
     .fail-filter input[type="checkbox"] { cursor: pointer; }
-
-    .health-pill {
-      display: inline-block;
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      padding: 4px 10px;
-      border-radius: 4px;
-      letter-spacing: 0.04em;
-    }
-    .health-pill.ok { background: rgba(74,222,128,0.15); color: var(--green); }
-    .health-pill.down { background: rgba(248,113,113,0.15); color: #f87171; }
-    .health-pill.checking { background: rgba(136,136,136,0.15); color: var(--text-muted); }
   </style>
 </head>
 <body>
@@ -1042,28 +1029,6 @@
     // or null if the chunk is a keepalive or unrecognized.
 
 
-    // ── Health status ──────────────────────────────────────────────────────
-    // Small indicator that polls /api/health every 5 seconds and shows
-    // 'ok' or 'down' status.
-    function HealthStatus() {
-      var _h = useState('checking'); var health = _h[0]; var setHealth = _h[1];
-      var stopRef = useRef(null);
-
-      useEffect(function() {
-        function checkHealth() {
-          fetch('/api/health')
-            .then(function(r) { setHealth(r.ok ? 'ok' : 'down'); })
-            .catch(function() { setHealth('down'); });
-        }
-        checkHealth();
-        stopRef.current = PS.poll(checkHealth, 5000);
-        return function() { if (stopRef.current) stopRef.current(); };
-      }, []);
-
-      return e('span', { className: 'health-pill ' + health },
-        health === 'checking' ? 'checking…' : health);
-    }
-
     // ── Replica freshness + sync (M26a) ──────────────────────────────────
     // Rendered only when this instance runs off a synced read-replica
     // (PHOTOSEARCH_NAS_URL set → replica_mode from /api/admin/replica-status),
@@ -1206,38 +1171,6 @@
       );
     }
 
-    function HealthStatus() {
-      var _h = useState(null); var health = _h[0]; var setHealth = _h[1];
-
-      useEffect(function () {
-        var stop = PS.poll(function () {
-          return fetch('/api/health', {
-            headers: { 'X-Photosearch-Source': 'frontend', 'X-Photosearch-Intent': 'health_check' }
-          })
-            .then(function (r) { return setHealth(r.ok ? 'ok' : 'down'); })
-            .catch(function () { setHealth('down'); });
-        }, 5000);
-        return stop;
-      }, []);
-
-      var statusClass = health === 'ok' ? 'ok' : health === 'down' ? 'down' : 'loading';
-      var statusText = health === 'ok' ? 'ok' : health === 'down' ? 'down' : '—';
-      var statusColor = health === 'ok' ? 'var(--green)' : health === 'down' ? '#f87171' : 'var(--text-muted)';
-
-      return e('span', {
-        style: {
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          fontSize: 13,
-          color: statusColor,
-        }
-      },
-        e('span', { style: { width: 8, height: 8, borderRadius: '50%', background: statusColor, display: 'inline-block' } }),
-        'Health: ' + statusText
-      );
-    }
-
     function StatusPage() {
       var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
       var _e = useState(null); var error = _e[0]; var setError = _e[1];
@@ -1284,10 +1217,7 @@
 
         content = e(React.Fragment, null,
           e('div', { className: 'refresh-row' },
-            e(HealthStatus, null),
             lastUpdated && e('span', null, 'Updated ' + lastUpdated),
-            e('span', { style: { color: 'var(--text-muted)' } }, '·'),
-            e('span', null, 'Health: ', e(HealthStatus, null)),
             e('button', { className: 'btn', onClick: load }, loading ? 'Refreshing…' : 'Refresh')
           ),
           e(ReplicaCard, null),

@@ -575,17 +575,6 @@ def list_persons(db):
             click.echo(f"{row['id']:<6} {row['name']:<24} {row['photo_count']:<10} {row['face_count']}")
 
 
-@cli.command("count-videos")
-@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
-def count_videos(db):
-    """Count videos in the library."""
-    with PhotoDB(db) as photo_db:
-        count = photo_db.conn.execute(
-            "SELECT COUNT(*) FROM photos WHERE media_type = 'video'"
-        ).fetchone()[0]
-        click.echo(f"{count:,} video(s)")
-
-
 # ---------------------------------------------------------------------------
 # recluster-faces
 # ---------------------------------------------------------------------------
@@ -2489,37 +2478,6 @@ def backfill_folders(db, apply, force):
         pdb.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
         pdb.conn.commit()
         click.echo(f"Set folder on {n} photo(s).")
-
-
-@cli.command("set-filepath")
-@click.argument("photo_id", type=int)
-@click.argument("new_path")
-@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
-              help="Path to the SQLite database file.")
-def set_filepath(photo_id, new_path, db):
-    """Change the stored filepath of a single photo.
-
-    \b
-    Example:
-      python cli.py set-filepath 42 "2026/2026-04-06/photo.jpg"
-    """
-    from photosearch.db import set_photo_filepath
-
-    with PhotoDB(db) as pdb:
-        # Verify the photo exists
-        row = pdb.conn.execute(
-            "SELECT id, filepath FROM photos WHERE id = ?", (photo_id,)
-        ).fetchone()
-        if not row:
-            click.echo(f"Photo {photo_id} not found.")
-            return
-
-        old_path = row[1]
-        set_photo_filepath(pdb.conn, photo_id, new_path)
-        pdb.conn.commit()
-        click.echo(f"Photo {photo_id}:")
-        click.echo(f"  Old: {old_path}")
-        click.echo(f"  New: {new_path}")
 
 
 @cli.command("recompute-aesthetic-overall")
@@ -4664,36 +4622,6 @@ def relocate_into_year_dirs(db, dry_run, conflicts_file):
             )
         photo_db.conn.commit()
         click.echo(f"Updated {len(planned)} filepath(s).")
-
-
-@cli.command("set-filepath")
-@click.argument("photo_id", type=int)
-@click.argument("new_relative_path")
-@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
-def set_filepath(photo_id, new_relative_path, db):
-    """Change the stored filepath of a photo.
-
-    Updates both the filepath and the derived folder column.
-
-    \b
-    Example:
-      photosearch set-filepath 42 "2026/2026-04-06/photo.jpg"
-    """
-    with PhotoDB(db) as photo_db:
-        photo = photo_db.conn.execute(
-            "SELECT id, filepath FROM photos WHERE id = ?", (photo_id,)
-        ).fetchone()
-        if not photo:
-            click.echo(f"Photo {photo_id} not found.")
-            return
-
-        old_filepath = photo["filepath"]
-        from photosearch.db import set_photo_filepath
-        set_photo_filepath(photo_db.conn, photo_id, new_relative_path)
-        photo_db.conn.commit()
-        click.echo(f"✓ Updated photo {photo_id}:")
-        click.echo(f"  {old_filepath}")
-        click.echo(f"  → {new_relative_path}")
 
 
 @cli.command("diagnose-relocate-conflicts")
@@ -7073,41 +7001,6 @@ def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collectio
             + ". Re-run: clear-pass category-visual on this collection, then the fleet.")
         pdb.add_photos_to_collection(cid, ids)
     click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
-
-
-@cli.command("set-filepath")
-@click.argument("photo_id", type=int)
-@click.argument("new_relative_path", type=str)
-@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
-              help="Path to the SQLite database file.")
-def set_filepath(photo_id, new_relative_path, db):
-    """Change a photo's stored filepath.
-
-    Updates the filepath and automatically re-derives the folder column.
-    The new path should be relative to the photo root (e.g., 2026/2026-09-12/photo.jpg).
-
-    \b
-    Example:  photosearch set-filepath 12345 2026/2026-10-15/IMG_001.JPG
-    """
-    from photosearch.db import set_photo_filepath
-
-    with PhotoDB(db) as pdb:
-        # Verify the photo exists
-        row = pdb.conn.execute("SELECT id, filepath FROM photos WHERE id = ?",
-                               (photo_id,)).fetchone()
-        if not row:
-            raise click.ClickException(f"Photo {photo_id} not found in database.")
-
-        old_path = row["filepath"]
-
-        # Update the filepath and folder
-        set_photo_filepath(pdb.conn, photo_id, new_relative_path)
-        pdb.conn.commit()
-
-        click.echo(f"Updated photo {photo_id}:")
-        click.echo(f"  old: {old_path}")
-        click.echo(f"  new: {new_relative_path}")
-
 
 if __name__ == "__main__":
     cli()

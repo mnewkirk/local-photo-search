@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 39
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -1475,15 +1475,6 @@ class PhotoDB:
                 _backfill_proxy_needed(cur)
             except Exception as e:  # noqa: BLE001
                 logger.warning("v39 proxy_needed backfill failed: %s", e)
-
-        # v40: user-provided rating on a photo (nullable INTEGER, e.g. 0-5 or
-        # arbitrary). Allows simple custom scoring independent of the aesthetic
-        # and quality evaluation systems.
-        try:
-            cur.execute("SELECT rating FROM photos LIMIT 1")
-        except sqlite3.OperationalError:
-            cur.execute("ALTER TABLE photos ADD COLUMN rating INTEGER")
-
         # Main subject per video (person, animal, scenery), joined to a face
         # track for identity when it is a person.
         cur.execute("""
