@@ -227,7 +227,80 @@ session that ran only `ls run-workers.sh` then quoted a `valid_passes` rule that
 
 Recall at one rep is within noise (5 items flipped down and 2 up, different items each way).
 The new tree also carries the new skill description: recall runs called the skill on 20 of
-49 items, against 3. Not run: Sonnet/Opus recall and rules, and tasks.
+49 items, against 3. Sonnet and tasks, and Haiku at 3 reps, are re-measured below; Opus was not re-run.
+
+**Suggestions 1-3 re-measured at 3 reps, all three suites, two models.** Old = `c98beac`, new =
+`18260ff`, both arms of every pair on CLI 2.1.304, `--isolate --parallel 2`, `--repeat 3`, models
+pinned to `claude-haiku-4-5` and `claude-sonnet-5` (the `haiku`/`sonnet` aliases now resolve to the
+5.5 models). Runs alternated old/new per suite so drift in API speed hits both. Configs
+`ctx2-<model>-<old|new>`. "Judged" is after `regrade --judge` (38 judge calls, $0.03, 3 failures
+overturned, all in new arms); regex-only is the regexes alone. Costs are notional (Max plan).
+
+**Haiku 4.5**
+
+| suite | arm | pass judged | pass regex-only | mean cost | mean wall | mean turns | turn-cap hits |
+|---|---|---|---|---|---|---|---|
+| recall (49×3) | old | 139/147 (95%) | 139/147 (95%) | $0.039 | 16.8 s | 4.3 | 0 |
+| recall | new | 133/147 (90%) | 131/147 (89%) | $0.031 | 14.5 s | 3.2 | 0 |
+| rules (9×3) | old | 27/27 | 27/27 | $0.068 | 16.8 s | 2.3 | 0 |
+| rules | new | 27/27 | 27/27 | $0.065 | 17.7 s | 2.5 | 0 |
+| tasks (11×3) | old | 28/33 (85%) | 28/33 (85%) | $0.108 | 38.7 s | 10.2 | 3 |
+| tasks | new | 29/33 (88%) | 29/33 (88%) | $0.112 | 40.8 s | 10.1 | 0 |
+| **all (207)** | old | 194 | 194 | $0.054 ($11.08) | 20.3 s | | 3 |
+| **all** | new | 189 | 187 | $0.049 ($10.04) | 19.1 s | | 0 |
+
+**Sonnet**
+
+| suite | arm | pass judged | pass regex-only | mean cost | mean wall | mean turns | turn-cap hits |
+|---|---|---|---|---|---|---|---|
+| recall (49×3) | old | 141/147 (96%) | 141/147 (96%) | $0.072 | 12.4 s | 3.3 | 0 |
+| recall | new | 140/147 (95%) | 139/147 (95%) | $0.078 | 11.4 s | 3.1 | 0 |
+| rules (9×3) | old | 27/27 | 27/27 | $0.158 | 13.6 s | 2.6 | 0 |
+| rules | new | 27/27 | 27/27 | $0.163 | 12.8 s | 2.8 | 0 |
+| tasks (11×3) | old | 30/33 (91%) | 30/33 (91%) | $0.352 | 68.2 s | 13.3 | 0 |
+| tasks | new | 30/33 (91%) | 30/33 (91%) | $0.359 | 66.4 s | 12.6 | 0 |
+| **all (207)** | old | 198 | 198 | $0.128 ($26.46) | 21.5 s | | 0 |
+| **all** | new | 197 | 196 | $0.134 ($27.67) | 20.4 s | | 0 |
+
+What the numbers say:
+
+- **Rules and tasks: no measurable effect.** Rules is 27/27 in all four arms. Tasks moves by one
+  run on Haiku and none on Sonnet. Cost and wall time are within a few percent either way.
+- **Haiku recall is the one place the new arm is lower** (139 → 133 judged, 139 → 131 regex-only).
+  Sonnet recall is within one run (141 → 140 judged). Cost per recall run falls 21% on Haiku
+  ($0.039 → $0.031) and rises 8% on Sonnet; turns fall 4.3 → 3.2 on Haiku.
+- **Haiku recall, items whose pass count fell** (judged, old → new): `detect-stacks-empty-list`
+  3 → 1, `mirror-fields-needs-nas` 1 → 0, and 1 run each on `ps-poll-not-setinterval` (2 → 1),
+  `refile-link-not-rename` (3 → 2), `rival-test` (3 → 2), `vec0-orphans` (3 → 2),
+  `visual-frozen-sharp-blurry` (2 → 1). Two items rose: `clip-reclaim-cap` 2 → 3,
+  `ingest-no-index-trap` 2 → 3. Sonnet: `aesthetics-primary-signal` 3 → 1 (up: `tags-pass-removed`
+  1 → 2).
+- **Not the skill route.** No Haiku recall run in either arm called the `Skill` tool (0 of 294),
+  so none of the 7 fallen Haiku items did. Sonnet's new arm called it on 19 of 147 recall runs, none on
+  `aesthetics-primary-signal`. The skill was offered: the new arm's rows record `18260ff` and the
+  new SKILL.md, and a probe on 2.1.304 lists one `photo-search` skill. The one-rep run in the
+  paragraph above (skill on 20 of 49 items) was on CLI 2.1.226; the same arm on 2.1.226 called it on
+  2 of 12 items and on 2.1.304 on 0 of 36, so skill use on recall depends on the CLI version.
+- **Rules files:** the stored rows keep tool names but not tool inputs, and hook injections are not
+  tool calls, so whether a run read or was injected a `.claude/rules` file is not recorded. The proxy
+  is the answer text naming a rules file: Haiku recall 34 (old) vs 31 (new) of 147 answers overall;
+  across the 7 fallen items 4 of 21 old answers vs 5 of 21 new ones. Only `detect-stacks-empty-list`
+  looks rule-related (cites a rules file in 3 of 3 old answers, 1 of 3 new); its failing new answers
+  state that `[]` means the whole library but not that existing stacks get wiped.
+- **A pattern in the evidence is fewer lookups, not the skill.** Haiku recall runs with no tool call
+  rose from 29 to 41 of 147, and runs with a Bash/Grep/Glob call (the hook's matcher) fell from
+  107 to 69. Fewer such calls means fewer hook injections. That fits the inlined facts and the
+  imperative index letting Haiku answer without searching, which helps `ingest-no-index-trap` and
+  hurts questions whose answer is only in a rule file. It is a reading of counts, not a tested cause.
+- **Noise.** `mirror-fields-needs-nas` fails in both arms (the model blames an unset NAS URL in all
+  runs). Of the 8 other fallen runs, 5 are one-rep flips on items that pass 2 of 3 in the old arm.
+  A same-arm repeat was not run, so run-to-run spread on Haiku recall is unknown.
+- **Turn-cap hits:** Haiku tasks old arm 3, all `task-register-pass`; the new arm finished it 3 of
+  3 (34-44 turns). Sonnet tasks show no turn-cap hits but 3 budget-cap hits ($1.50,
+  `error_max_budget_usd`) on `task-register-pass` in each arm, which fails there in both.
+- **Tasks, Haiku:** `task-restack-folder` fell 3 → 1 in the new arm. One failure invoked
+  `superpowers:brainstorming` from the user-level plugin set instead of editing (an eval-environment
+  leak, not the repo's context); the other fixed the function without the empty-list guard.
 
 **Suggestions 7-8: harness** (`60cbb8d`). `tasks` now default to 40 turns (read-only suites
 keep 25), and `report` counts turn-cap hits as their own column. `regrade --judge` sends only
