@@ -35,17 +35,28 @@ Test before appending here: would a session editing an unrelated file (say `cli.
 
 ## Subsystem traps
 
-Path-scoped rules load when you open matching code. If you only run commands (Bash, Grep) in a subsystem, read its rule file first.
+Path-scoped rules load only when you open matching code; a session that just runs commands or answers questions never opens it. So before answering or running anything in a subsystem below, Read its rule file first:
 
-- faces → `.claude/rules/faces.md` (one-person-per-photo · `rejected` labels · rival test · trusted labels only · temporal matches are unreliable)
-- llm-passes → `.claude/rules/llm-passes.md` (fleet role models · reasoning effort · category-visual derived vs perceived · grounding · provenance · stop reasons)
-- ingest → `.claude/rules/ingest.md` (companions · refile-unknown-camera · six batch states · job rows · deploy NAS first)
-- maintenance → `.claude/rules/maintenance.md` (geocode memory per row · incremental stacking · STRICT-only matching · face exclusions · replica gating)
-- workers → `.claude/rules/workers.md` (retry attempts vs server write failures · `-d` gotcha · `/api/health` probe · sharpness backfill)
-- video → `.claude/rules/video.md` (NULL `media_type` = still · `PASS_MEDIA` · the NAS never decodes · backfill not started)
-- print → `.claude/rules/print.md` (Topaz CLI quirks · strength blend · split geometry exists twice · integer-dpi grid)
-- frontend → `.claude/rules/frontend.md` (no linter · `PS.poll` · deploy helper container · M28 re-run mirror)
-- search → `.claude/rules/search.md` (indexes match query TEXT · `_compose_scope` · request log intent · `set_photo_filepath`)
+- faces: before answering or running anything about faces, clusters, people labels or merges, Read `.claude/rules/faces.md` (one-person-per-photo · `rejected` labels · rival test · trusted labels only · temporal matches are unreliable)
+- llm-passes: before answering or running anything about describe/verify/category/keywords/aesthetics passes or LM Studio/Ollama models, Read `.claude/rules/llm-passes.md` (fleet role models · reasoning effort · category-visual derived vs perceived · grounding · provenance · stop reasons)
+- ingest: before answering or running anything about ingest, the SD importer, `_incoming`, batches or refile, Read `.claude/rules/ingest.md` (companions · refile-unknown-camera · six batch states · job rows · deploy NAS first)
+- maintenance: before answering or running anything about maintenance sweeps, geocoding, stacking, `sync-replica.sh` or the replica, Read `.claude/rules/maintenance.md` (geocode memory per row · incremental stacking · STRICT-only matching · face exclusions · replica gating)
+- workers: before answering or running anything about `run-workers.sh`, the worker fleet, `-d`, passes or `/api/worker/*`, Read `.claude/rules/workers.md` (retry attempts vs server write failures · `-d` gotcha · `/api/health` probe · sharpness backfill)
+- video: before answering or running anything about video, `media_type`, `--native` or ffprobe/ffmpeg, Read `.claude/rules/video.md` (NULL `media_type` = still · `PASS_MEDIA` · the NAS never decodes · backfill not started)
+- print: before answering or running anything about Topaz upscale, books, Shutterfly or split export, Read `.claude/rules/print.md` (Topaz CLI quirks · strength blend · split geometry exists twice · integer-dpi grid)
+- frontend: before answering or running anything about `frontend/dist/`, the admin deploy panel or a restart, Read `.claude/rules/frontend.md` (no linter · `PS.poll` · deploy helper container · M28 re-run mirror)
+- search: before answering or running anything about search, `search.py`, `web.py`, the MCP server or request logging, Read `.claude/rules/search.md` (indexes match query TEXT · `_compose_scope` · request log intent · `set_photo_filepath`)
+
+## Ops facts you need without opening code
+
+Copied from the rule files above; those stay the source of truth.
+
+- **Worker `-d`**: `-d` must be a real subdirectory; `-d /photos` (the root) matches nothing, so the server answers 404 "No photos found in directory /photos" and the fleet does no work. To process the whole library, omit `-d` entirely.
+- **Worker startup probe**: `GET /api/health` (no DB). Never probe `/api/stats` (full-library counts, the whole fleet at once). A 404 counts as reachable (older server).
+- **Reasoning models** (every fleet model thinks): set `PHOTOSEARCH_LLM_REASONING_EFFORT=none` (`rerun.FLEET_REASONING_EFFORT`) or they spend all of `max_tokens` on reasoning and return `''`.
+- **Video passes need `--native`**: ffprobe is not in the Docker worker image; the static ffprobe segfaults resolving `localhost`, so point workers at `127.0.0.1`.
+- **SD importer**: never `--no-index` (moved files become unclaimable, unsearchable and invisible to hash dedup); use `--no-clip` to register rows and leave CLIP to the fleet.
+- **Restarting photosearch**: never `docker compose up` it from inside its own container (it strands the new container in Created state); `POST /api/admin/restart` launches the detached restart helper. Git on the NAS needs per-call `-c safe.directory=...` (see NAS Docker Commands).
 
 History for every trap: `docs/notes/<subsystem>.md`. Runbooks: `.claude/skills/photo-search/reference/`. Plan status: `docs/plans/README.md`.
 
