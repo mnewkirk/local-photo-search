@@ -68,6 +68,24 @@
       margin-bottom: 24px;
     }
 
+    .health-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+    }
+    .health-line.ok { color: var(--green); }
+    .health-line.down { color: #f87171; }
+    .health-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -1171,6 +1189,27 @@
       );
     }
 
+    function HealthIndicator() {
+      var _h = useState('checking'); var health = _h[0]; var setHealth = _h[1];
+
+      useEffect(function() {
+        var poll = function() {
+          fetch('/api/health')
+            .then(function(r) { setHealth(r.ok ? 'ok' : 'down'); })
+            .catch(function() { setHealth('down'); });
+        };
+        poll();
+        var timer = setInterval(poll, 5000);
+        return function() { clearInterval(timer); };
+      }, []);
+
+      var cls = health === 'ok' ? 'ok' : health === 'down' ? 'down' : '';
+      return e('div', { className: 'health-line ' + cls },
+        e('span', { className: 'health-dot' }),
+        health === 'ok' ? 'Health: ok' : health === 'down' ? 'Health: down' : 'Health: checking'
+      );
+    }
+
     function StatusPage() {
       var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
       var _e = useState(null); var error = _e[0]; var setError = _e[1];
@@ -1331,6 +1370,7 @@
         header,
         e('div', { className: 'container' },
           e('h1', null, 'Indexing Status'),
+          e(HealthIndicator, null),
           content
         )
       );
