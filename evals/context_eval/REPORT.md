@@ -128,7 +128,7 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
    gemma ran one Grep, missed, and confabulated. The Skill tool was essentially never invoked by
    any model, before or after (0-12%), but after the diet 7/8 (Sonnet) and 19/24 (Opus) skill
    answers cited the right `reference/` file: models route through CLAUDE.md pointers, not the
-   skill mechanism.
+   skill mechanism. (Follow-up: a duplicate claude.ai skill was the likely cause; see below.)
 
 6. **Regex graders produce false failures on correct paraphrases.** Over the study, correct answers
    were failed by a stale constant (the grader expected `SCHEMA_VERSION = 39`, written when the
@@ -152,26 +152,26 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
 
 ## Further suggestions
 
-1. **Inline the highest-traffic operational facts as one-liners in CLAUDE.md**, not just pointers.
+1. **Inline the highest-traffic operational facts as one-liners in CLAUDE.md** *(Acted on 2026-10-20: see Follow-up.)*, not just pointers.
    This also cuts the extra lookup turns that made cloud sessions slower.
    The gemma miss (`-d /photos` → 404, omit `-d`) and Haiku's `dubious ownership` miss were both
    facts a session can need without opening code. Candidates: the `-d` gotcha, `/api/health` probe,
    reasoning-effort for thinking models. Keep the budget test as the brake.
-2. **Make the subsystem index imperative**: "Before answering a question about workers, Read
+2. **Make the subsystem index imperative** *(Acted on 2026-10-20: see Follow-up.)*: "Before answering a question about workers, Read
    `.claude/rules/workers.md`" helps weaker models more than a topic list.
-3. **Hook rules to Bash/Grep**: a `PreToolUse` hook that injects the matching rule when a command
+3. **Hook rules to Bash/Grep** *(Acted on 2026-10-20: see Follow-up.)*: a `PreToolUse` hook that injects the matching rule when a command
    names a subsystem (`run-workers.sh`, `maintenance-sweep`) would close the "rules only load on
    file open" gap for ops sessions.
-4. **Decide the skill's role.** It is almost never invoked. Either rewrite its description around
+4. **Decide the skill's role.** *(Acted on 2026-10-20: see Follow-up.)* It is almost never invoked. Either rewrite its description around
    concrete triggers and re-measure the skills suite, or drop the suite's Skill-call criterion and
    grade "cited/used the right reference file" instead. Also remove or update the claude.ai-synced
    duplicate (`anthropic-skills:photo-search`), which still carries the old 148 KB body.
 5. **Extend the local run** to all 49 recall items plus rules (now ~1 min/item, so ~1 h), and try
    one non-sliding-window model so cache reuse across items can be measured.
 6. **Investigate Haiku's pre-diet cache misses** before quoting its cost delta.
-7. **Raise `--max-turns` for tasks** (25 → 40) or report turn-cap hits separately; lookup-heavy
+7. **Raise `--max-turns` for tasks** *(Acted on 2026-10-20: see Follow-up.)* (25 → 40) or report turn-cap hits separately; lookup-heavy
    tasks are where the diet adds turns.
-8. **Replace brittle regexes with a rubric grader** (an LLM judge with the expected facts) for
+8. **Replace brittle regexes with a rubric grader** *(Acted on 2026-10-20: see Follow-up.)* (an LLM judge with the expected facts) for
    recall/rules, keeping regex as a cheap pre-filter; at minimum keep re-reading every failure.
 9. **Keep the guardrails**: `tests/test_context_budget.py`, the "Where knowledge goes" section,
    and the eval's git-write block for any new headless automation in this repo.
@@ -180,6 +180,65 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
 11. **Public-repo hygiene** (unrelated to the diet, found while checking): the repo already
     publishes children's names, another family's child's full name
     (`docs/HANDOFF-2026-09-18-rank-shoot.md`), the Tailscale IP and the NAS account name.
+
+## Follow-up (2026-10-20): suggestions 1-4, 7, 8 acted on
+
+Same-day before/after pairs on this Mac. "Old" = `c98beac` (the report above), "new" = the
+commits named below. Both arms of each pair ran on the same CLI version (Haiku/Sonnet on
+2.1.226, Opus on 2.1.304, which Opus 5.5 requires). Results stay in `results/<config>/`.
+
+**Confound found first.** In the runs above, every skills session was offered two skills named
+photo-search: the repo's and the claude.ai-synced `anthropic-skills:photo-search` (old 148 KB
+body). It was disabled on 2026-10-20 before these runs (every row records only `photo-search`
+offered). With it gone, the *old* description already triggered 81% on Haiku and Sonnet, against
+0-12% above, so the duplicate is the likely cause of the near-zero skill use reported in
+Insight 5. That was not measured directly (it would need the duplicate re-enabled).
+
+**Suggestion 4: skill description rewritten around concrete triggers** (`a53f15a`). It now
+opens "Invoke it FIRST, before Grep or Read" and lists the concrete request types (indexing,
+slow search / request log, worker fleet, faces, Google upload, NAS/Docker/ingest/replica,
+schema and tables, adding a filter/command/endpoint/pass/page, MCP/Ask, evals). The skills suite
+gained 10 held-out prompts, written by a separate model from the `reference/` headings only,
+without seeing SKILL.md or the 8 original prompts, so a tuned description can't overfit unseen.
+
+| model | 8 original (24 runs) old → new | 10 held-out (30 runs) old → new | mean cost old → new | mean wall old → new |
+|---|---|---|---|---|
+| Haiku 4.5 | 20 → 22 | 24 → 29 | $0.050 → $0.053 | 16.2 s → 14.8 s |
+| Sonnet | 18 → 22 | 26 → 30 | $0.153 → $0.148 | 18.9 s → 17.2 s |
+| Opus 5.5 | — → 21 (old not re-run) | **0 → 23** | $0.136 → $0.159 | 17.1 s → 15.9 s |
+
+The gains sit where the new text names something the old one did not: "what tables are in
+photo_index.db?" (Sonnet 0 → 3) and "which table holds the face encodings?" (Haiku 0 → 2,
+Sonnet 0 → 3). Opus still never invokes the skill for those two table questions (CLAUDE.md
+already points at `reference/schema.md`), nor for "which endpoints handle stacks and
+collections?". With the old description Opus invoked the skill on none of the held-out prompts.
+
+**Suggestions 1-3: ops facts inlined, imperative subsystem index, rule-injection hook**
+(`65e2558`, `a07cc0d`, merged at `18260ff`). CLAUDE.md grows 7.8 → 10.3 KB. The hook
+(`scripts/hooks/inject_rules.py`, registered in the now-tracked `.claude/settings.json`) adds a
+rule file's body once per session when a Bash/Grep/Glob call names its subsystem. A real Haiku
+session that ran only `ls run-workers.sh` then quoted a `valid_passes` rule that exists only in
+`.claude/rules/workers.md`, so the injection reaches the model. Haiku, old → new, judged:
+
+| suite | pass | mean cost | mean wall | mean turns |
+|---|---|---|---|---|
+| rules (9 items × 3) | 24 → 26 of 27 | $0.068 → $0.076 | 11.1 s → 11.8 s | 2.5 → 2.4 |
+| recall (49 items × 1) | 45 → 43 of 49 | $0.061 → $0.059 | 15.7 s → 15.0 s | 4.2 → 3.4 |
+
+Recall at one rep is within noise (5 items flipped down and 2 up, different items each way).
+The new tree also carries the new skill description: recall runs called the skill on 20 of
+49 items, against 3. Not run: Sonnet/Opus recall and rules, and tasks.
+
+**Suggestions 7-8: harness** (`60cbb8d`). `tasks` now default to 40 turns (read-only suites
+keep 25), and `report` counts turn-cap hits as their own column. `regrade --judge` sends only
+regex FAILs on recall/rules to a Haiku judge with the item's `facts` (added to 32 items) or a
+rubric rendered from its regexes. A regex pass is never judged. On the four Haiku configs
+above it made 15 calls ($0.013) and overturned 1 failure.
+
+**Not done:** 5 (the local run, paused as asked), 6 (needs the original Haiku result files,
+which are not on this Mac), 10 and 11 (owner decisions). Ad-hoc headless runs here also need
+`env -i` with `USER`/`LOGNAME` and a quoted `PATH` (it contains a space), and a Mac with the
+lid closed sleeps even under `caffeinate -i`.
 
 ## Reproduce
 

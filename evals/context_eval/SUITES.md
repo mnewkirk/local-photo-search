@@ -51,7 +51,7 @@ items, once each.
   This suite checks that opening a subsystem file still brings that subsystem's trap knowledge
   into the session.
 
-### skills (8 items)
+### skills (8 items + 10 held-out)
 
 - **What the model is asked:** one of the vague prompts that the photo-search skill's
   description promises to catch, such as "how do I index 2024?" or "recluster faces".
@@ -65,6 +65,9 @@ items, once each.
   that after the diet 7 of 8 Sonnet and 19 of 24 Opus skill answers cited the right
   `reference/` file without calling the skill. A low pass rate here therefore says the Skill
   tool went unused, not that the answer was wrong.
+- **Held-out prompts (added 2026-10-20):** 10 `heldout-*` items written by a separate model
+  from the `reference/` headings only, without seeing SKILL.md or the 8 prompts above. The
+  tables below cover the 8 originals only; REPORT.md's Follow-up section has both sets.
 
 ### tasks (11 items)
 
