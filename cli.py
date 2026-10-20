@@ -2491,6 +2491,37 @@ def backfill_folders(db, apply, force):
         click.echo(f"Set folder on {n} photo(s).")
 
 
+@cli.command("set-filepath")
+@click.argument("photo_id", type=int)
+@click.argument("new_path")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+def set_filepath(photo_id, new_path, db):
+    """Change the stored filepath of a single photo.
+
+    \b
+    Example:
+      python cli.py set-filepath 42 "2026/2026-04-06/photo.jpg"
+    """
+    from photosearch.db import set_photo_filepath
+
+    with PhotoDB(db) as pdb:
+        # Verify the photo exists
+        row = pdb.conn.execute(
+            "SELECT id, filepath FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        if not row:
+            click.echo(f"Photo {photo_id} not found.")
+            return
+
+        old_path = row[1]
+        set_photo_filepath(pdb.conn, photo_id, new_path)
+        pdb.conn.commit()
+        click.echo(f"Photo {photo_id}:")
+        click.echo(f"  Old: {old_path}")
+        click.echo(f"  New: {new_path}")
+
+
 @cli.command("recompute-aesthetic-overall")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
               help="Path to the SQLite database file.")
