@@ -56,6 +56,28 @@ Two more over-literal graders surfaced (both also failed pre-diet runs) and were
 `harness.py regrade` re-scores stored rows without re-running, and all four configs were
 re-scored with the final graders. Sonnet totals above are unchanged by it.
 
+## Repeated on Haiku 4.5 (`haiku-before` / `haiku-after`, `--isolate`)
+
+| suite | pass before → after | mean input tok before → after | mean cost before → after |
+|---|---|---|---|
+| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 |
+| rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 |
+| skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 |
+| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 |
+| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** |
+
+Haiku is where the trade-off shows: recall/rules lose a few single reps (it has to find the
+answer in a rule or reference file: recall turns 1.1 → 4.3), tasks gain clearly (73% → 88%;
+a 1.4M-token task context hurt it). Net equal.
+
+**Incident: eval task runs pushed to main.** The project's `.claude/settings.local.json`
+allowlists `git commit`/`git push`, which reaches the eval worktrees, and the owner's standing
+"commit and push" preference made Haiku commit and push 12 task answers (incl. a schema v40
+bump) to `origin/main`, 18:55-19:10 PT. Reverted in `f759330` (NAS was at `dced247`, never
+pulled). The harness now passes `--disallowedTools` for git commit/push/reset/rebase/merge/tag
+and gh (tested against a bare remote with an allowlist), and fails a task whose worktree HEAD
+moved. The Haiku task suites were discarded and re-run with the guard.
+
 ## Local model (gemma-4-12b-qat via LM Studio)
 
 `local-before`: 10/10 recall, but ~15 min per item: the ~100k-token prompt is processed from scratch
