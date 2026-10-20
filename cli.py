@@ -575,6 +575,17 @@ def list_persons(db):
             click.echo(f"{row['id']:<6} {row['name']:<24} {row['photo_count']:<10} {row['face_count']}")
 
 
+@cli.command("count-videos")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+def count_videos(db):
+    """Count videos in the library."""
+    with PhotoDB(db) as photo_db:
+        count = photo_db.conn.execute(
+            "SELECT COUNT(*) FROM photos WHERE media_type = 'video'"
+        ).fetchone()[0]
+        click.echo(f"{count:,} video(s)")
+
+
 # ---------------------------------------------------------------------------
 # recluster-faces
 # ---------------------------------------------------------------------------
