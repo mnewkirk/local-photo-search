@@ -7013,5 +7013,40 @@ def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collectio
         pdb.add_photos_to_collection(cid, ids)
     click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
 
+
+@cli.command("set-filepath")
+@click.argument("photo_id", type=int)
+@click.argument("new_relative_path", type=str)
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+def set_filepath(photo_id, new_relative_path, db):
+    """Change a photo's stored filepath.
+
+    Updates the filepath and automatically re-derives the folder column.
+    The new path should be relative to the photo root (e.g., 2026/2026-09-12/photo.jpg).
+
+    \b
+    Example:  photosearch set-filepath 12345 2026/2026-10-15/IMG_001.JPG
+    """
+    from photosearch.db import set_photo_filepath
+
+    with PhotoDB(db) as pdb:
+        # Verify the photo exists
+        row = pdb.conn.execute("SELECT id, filepath FROM photos WHERE id = ?",
+                               (photo_id,)).fetchone()
+        if not row:
+            raise click.ClickException(f"Photo {photo_id} not found in database.")
+
+        old_path = row["filepath"]
+
+        # Update the filepath and folder
+        set_photo_filepath(pdb.conn, photo_id, new_relative_path)
+        pdb.conn.commit()
+
+        click.echo(f"Updated photo {photo_id}:")
+        click.echo(f"  old: {old_path}")
+        click.echo(f"  new: {new_relative_path}")
+
+
 if __name__ == "__main__":
     cli()
