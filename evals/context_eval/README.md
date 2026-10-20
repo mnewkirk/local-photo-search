@@ -13,7 +13,7 @@ runs are billed to the account running it. Nothing here is mocked.
 
 | suite | items | what it measures | graded by |
 |---|---|---|---|
-| `recall` | `recall.jsonl`, 50 | can a cold session answer one trap question per relocated section | regexes on the answer (`expect` all / `any` groups / `reject`) |
+| `recall` | `recall.jsonl`, 49 | can a cold session answer one trap question per relocated section | regexes on the answer (`expect` all / `any` groups / `reject`) |
 | `rules` | `rule_triggers.jsonl`, 9 | after a `Read` of a subsystem file, does the subsystem's trap knowledge load (the path-scoped `.claude/rules/*.md` once they exist) | same |
 | `skills` | `skill_triggers.jsonl`, 8 | do the vague prompts in the skill description still trigger the photo-search skill | a `Skill` tool call naming photo-search |
 | `tasks` | `tasks.jsonl`, 11 | small coding tasks where a documented trap bites; the real adherence test | deterministic checks on the diff's added lines in a throwaway worktree |

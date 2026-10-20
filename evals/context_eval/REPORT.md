@@ -3,7 +3,8 @@
 Does moving ~95% of the always-loaded context (CLAUDE.md, the photo-search SKILL.md body, the
 auto-memory index) into path-scoped rules, `docs/notes/` and skill `reference/` files hurt Claude
 Code's behaviour in this repo, and what does it save? Plan: `docs/plans/context-diet.md`.
-Narrative handoff: `docs/HANDOFF-2026-10-19-context-diet.md`. Per-item reports (git-ignored):
+Narrative handoff: `docs/HANDOFF-2026-10-19-context-diet.md`. Every test item, in plain English, with
+per-item tables for each model: [SUITES.md](SUITES.md). Per-item reports (git-ignored):
 `results/report.md` (Sonnet), `results/report-opus.md`, `results/report-haiku.md`.
 
 **Bottom line.** Across Sonnet, Opus 5.5 and Haiku 4.5 the pass rate is unchanged (±3 of 231 runs)
