@@ -35,7 +35,7 @@ Test before appending here: would a session editing an unrelated file (say `cli.
 
 ## Subsystem traps
 
-Path-scoped rules load only when you open matching code; a session that just runs commands or answers questions never opens it. So before answering or running anything in a subsystem below, Read its rule file first:
+Path-scoped rules load only when you open matching code; a `PreToolUse` hook (`scripts/hooks/inject_rules.py`) also injects one once per session when a Bash/Grep/Glob call names its subsystem. A session that only answers questions gets neither, so before answering or running anything in a subsystem below, Read its rule file first:
 
 - faces: before answering or running anything about faces, clusters, people labels or merges, Read `.claude/rules/faces.md` (one-person-per-photo · `rejected` labels · rival test · trusted labels only · temporal matches are unreliable)
 - llm-passes: before answering or running anything about describe/verify/category/keywords/aesthetics passes or LM Studio/Ollama models, Read `.claude/rules/llm-passes.md` (fleet role models · reasoning effort · category-visual derived vs perceived · grounding · provenance · stop reasons)
