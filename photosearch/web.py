@@ -1035,6 +1035,63 @@ async def api_review_team(request: Request):
         "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.post("/api/admin/noop-stream")
+async def api_noop_stream(request: Request):
+    """SSE — emit five progress events one second apart, then finish.
+
+    Demonstrates the standard SSE pattern: background thread sends events to an
+    async generator queue via asyncio.run_coroutine_threadsafe, the generator
+    yields SSE-formatted JSON with keepalive on timeout, and terminal events
+    (done/fatal/cancelled) close the stream.
+
+    Terminal events: done / fatal / cancelled.
+    """
+    import asyncio
+    import threading
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    def run():
+        try:
+            for i in range(1, 6):
+                if cancel_event.is_set():
+                    _emit({"type": "cancelled", "message": "Stream cancelled"})
+                    return
+                _emit({"type": "progress", "count": i, "total": 5})
+                time.sleep(1)
+            _emit({"type": "done", "count": 5, "total": 5})
+        except Exception as exc:
+            logger.exception("noop-stream failed")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    threading.Thread(target=_carry_context(run), daemon=True).start()
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        break
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("done", "cancelled", "fatal"):
+                    break
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.get("/api/faces/crop/{face_id}")
 def api_face_crop(face_id: int, size: int = Query(200, ge=50, le=800)):
     """Serve a square crop of the face from the original photo.
