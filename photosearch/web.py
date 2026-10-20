@@ -5674,6 +5674,81 @@ async def api_detect_stacks_stream(request: Request):
     )
 
 
+@app.post("/api/admin/noop-stream")
+async def api_noop_stream(request: Request):
+    """Simple SSE endpoint for testing: emits five progress events one second apart.
+
+    Emits events of the form:
+      {"type": "start"}
+      {"type": "progress", "count": 1}, {"type": "progress", "count": 2}, ...
+      {"type": "done", "total": 5}
+
+    Client disconnect (AbortController, tab close) cancels the stream.
+    """
+    import asyncio
+    import threading
+    import time
+
+    loop = asyncio.get_running_loop()
+    aqueue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
+
+    def _emit(event: dict):
+        asyncio.run_coroutine_threadsafe(aqueue.put(event), loop)
+
+    def _should_abort() -> bool:
+        return cancel_event.is_set()
+
+    def run():
+        started = time.monotonic()
+        try:
+            _emit({"type": "start"})
+            for i in range(1, 6):
+                if _should_abort():
+                    raise InterruptedError("Stream cancelled")
+                time.sleep(1)
+                _emit({"type": "progress", "count": i})
+            _emit({
+                "type": "done",
+                "total": 5,
+                "duration_seconds": round(time.monotonic() - started, 2),
+            })
+        except InterruptedError:
+            _emit({"type": "cancelled", "message": "Stream cancelled"})
+        except Exception as exc:
+            logger.exception("NOOP stream failed")
+            _emit({"type": "fatal", "message": str(exc)})
+
+    threading.Thread(target=_carry_context(run), daemon=True).start()
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("NOOP stream client disconnected — cancelling")
+                    cancel_event.set()
+                    return
+                try:
+                    event = await asyncio.wait_for(aqueue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("done", "fatal", "cancelled"):
+                    return
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/admin/maintenance-sweep")
 async def api_maintenance_sweep(request: Request):
     """M25 — SSE stream of the dependency-ordered backfill sweep.
