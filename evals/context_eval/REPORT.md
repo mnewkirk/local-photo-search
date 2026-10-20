@@ -7,8 +7,9 @@ Narrative handoff: `docs/HANDOFF-2026-10-19-context-diet.md`. Per-item reports (
 `results/report.md` (Sonnet), `results/report-opus.md`, `results/report-haiku.md`.
 
 **Bottom line.** Across Sonnet, Opus 5.5 and Haiku 4.5 the pass rate is unchanged (±3 of 231 runs)
-while billed cost drops 60-71%. On a local 12B model it is 13× faster wall-clock, with the one real
-failure being a fact the model had to go and look up and didn't.
+while billed cost drops 60-71%, but cloud sessions get 6-34% *slower* wall-clock because answers
+take extra lookup turns. On a local 12B model it is the reverse: 13× faster, because prompt
+processing dominates there; its one real failure is a fact it had to look up and didn't.
 
 ## What changed
 
@@ -31,50 +32,51 @@ that should trigger the photo-search skill; pass = a Skill tool call), **tasks**
 tasks in a throwaway worktree, graded on the diff). 3 reps each = 231 runs per config.
 "before" = tag `pre-context-diet`, "after" = HEAD; Opus/Haiku/local runs use `--isolate` (every
 suite in a worktree of `--ref`). Costs are what `claude -p` reports at API prices; the runs were
-billed against a Max plan, so they are notional. Graders were fixed during the study (see
+billed against a Max plan, so they are notional. Wall clock is each `claude -p` run's elapsed time;
+totals are the per-run times summed (cloud configs ran 2 at a time, so elapsed was about half). Graders were fixed during the study (see
 Insights 6) and all configs were re-scored with the final graders (`harness.py regrade`).
 
 ## Results
 
 ### Sonnet
 
-| suite | pass before → after | mean input tok before → after | mean cost before → after |
-|---|---|---|---|
-| recall (49 items) | 100% → 100% | 138k → 82k | $0.210 → $0.056 |
-| rules (9) | 100% → 100% | 377k → 132k | $0.327 → $0.157 |
-| skills (8) | 0% → 12% | 340k → 100k | $0.246 → $0.060 |
-| tasks (11) | 100% → 100% | 649k → 302k | $0.569 → $0.169 |
-| **total** | 207 → 210 of 231 | | **$64.43 → $19.52 (−70%)** |
+| suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after |
+|---|---|---|---|---|
+| recall (49 items) | 100% → 100% | 138k → 82k | $0.210 → $0.056 | 6.3 s → 10.0 s |
+| rules (9) | 100% → 100% | 377k → 132k | $0.327 → $0.157 | 13.5 s → 14.2 s |
+| skills (8) | 0% → 12% | 340k → 100k | $0.246 → $0.060 | 13.5 s → 12.5 s |
+| tasks (11) | 100% → 100% | 649k → 302k | $0.569 → $0.169 | 26.1 s → 35.9 s |
+| **total** | 207 → 210 of 231 | | **$64.43 → $19.52 (−70%)** | **41 → 56 min** (summed) |
 
 ### Opus 5.5
 
-| suite | pass before → after | mean input tok before → after | mean cost before → after |
-|---|---|---|---|
-| recall | 100% → 100% | 205k → 94k | $0.434 → $0.107 |
-| rules | 100% → 100% | 392k → 160k | $0.519 → $0.239 |
-| skills | 0% → 0% | 426k → 131k | $0.454 → $0.122 |
-| tasks | 100% → 97% | 765k → 402k | $1.126 → $0.339 |
-| **total** | 207 → 206 of 231 | | **$125.90 → $36.27 (−71%)** |
+| suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after |
+|---|---|---|---|---|
+| recall | 100% → 100% | 205k → 94k | $0.434 → $0.107 | 9.0 s → 12.1 s |
+| rules | 100% → 100% | 392k → 160k | $0.519 → $0.239 | 13.7 s → 14.0 s |
+| skills | 0% → 0% | 426k → 131k | $0.454 → $0.122 | 15.0 s → 21.5 s |
+| tasks | 100% → 97% | 765k → 402k | $1.126 → $0.339 | 28.5 s → 37.2 s |
+| **total** | 207 → 206 of 231 | | **$125.90 → $36.27 (−71%)** | **50 → 65 min** (summed) |
 
 The one difference: a `task-register-pass` run hit the 25-turn cap while finding every place the
 pass list is mirrored.
 
 ### Haiku 4.5
 
-| suite | pass before → after | mean input tok before → after | mean cost before → after |
-|---|---|---|---|
-| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 |
-| rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 |
-| skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 |
-| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 |
-| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** |
+| suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after |
+|---|---|---|---|---|
+| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 | 12.7 s → 15.0 s |
+| rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 | 17.9 s → 16.2 s |
+| skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 | 12.6 s → 19.8 s |
+| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 | 41.1 s → 33.8 s |
+| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** | **67 → 70 min** (summed) |
 
 Haiku's pre-diet config never hit the prompt cache (~$0.18 every run), which inflates its "before"
 cost; treat the −60% as an upper bound.
 
 ### Local: gemma-4-12b-qat via LM Studio (first 10 recall items, 1 rep)
 
-| config | pass | wall per item (mean / median) | total | mean turns | tool calls |
+| config | pass | wall per item (mean / median) | total wall | mean turns | tool calls |
 |---|---|---|---|---|---|
 | local-before | 10/10 | 874 s / 887 s | 146 min | 1.0 | none |
 | local-after | 9/10 | 65 s / 33 s | 11 min | 1.5 | Grep/Read on 3 items |
@@ -86,12 +88,12 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
 
 ### Cross-model summary
 
-| model | pass before → after | cost / time |
-|---|---|---|
-| Sonnet | 207 → 210 | −70% |
-| Opus 5.5 | 207 → 206 | −71% |
-| Haiku 4.5 | 197 → 197 | −60% |
-| gemma-4-12b (local, 10 items) | 10 → 9 | 146 → 11 min (13×) |
+| model | pass before → after | cost | summed wall clock before → after |
+|---|---|---|---|
+| Sonnet | 207 → 210 | −70% | 41 → 56 min (+34%) |
+| Opus 5.5 | 207 → 206 | −71% | 50 → 65 min (+30%) |
+| Haiku 4.5 | 197 → 197 | −60% | 67 → 70 min (+6%) |
+| gemma-4-12b (local, 10 items) | 10 → 9 | — (local) | 146 → 11 min (13× faster) |
 
 ## Insights that generalize
 
@@ -105,9 +107,12 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
    did better. The trade is "recall by lookup" (slightly worse for weak models) against "less noise
    during multi-step work" (better for weak models).
 
-3. **More turns, still much cheaper.** Answers now take extra Grep/Read turns (Sonnet recall
-   1.0 → 3.4, tasks 6.2 → 12.1), yet cost fell 60-71% because every turn re-sends a far smaller
-   cached prefix. One Opus task run did hit the 25-turn cap, so lookup-heavy tasks need headroom.
+3. **More turns: much cheaper, but slower on cloud models.** Answers now take extra Grep/Read turns
+   (Sonnet recall 1.0 → 3.4, tasks 6.2 → 12.1). Cost fell 60-71% because every turn re-sends a far
+   smaller cached prefix, but each turn is a round trip, and cloud prefill of a cached 140k prompt
+   is fast, so summed wall clock rose 34% (Sonnet), 30% (Opus), 6% (Haiku). Mean recall went
+   6.3 s → 10.0 s on Sonnet. The diet trades seconds of latency for dollars and context headroom.
+   One Opus task run hit the 25-turn cap, so lookup-heavy tasks need headroom.
 
 4. **For local models the win is wall-clock, and prefill dominates.** Prompt processing slows as the
    prompt grows (~1,200 tok/s at the start, ~110 tok/s by mid-prompt), so a 100k-token prompt is
@@ -144,6 +149,7 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
 ## Further suggestions
 
 1. **Inline the highest-traffic operational facts as one-liners in CLAUDE.md**, not just pointers.
+   This also cuts the extra lookup turns that made cloud sessions slower.
    The gemma miss (`-d /photos` → 404, omit `-d`) and Haiku's `dubious ownership` miss were both
    facts a session can need without opening code. Candidates: the `-d` gotcha, `/api/health` probe,
    reasoning-effort for thinking models. Keep the budget test as the brake.

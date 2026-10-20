@@ -19,13 +19,13 @@ dated "Corrections found while condensing" heading. `tests/test_context_budget.p
 
 ## Measured (evals/context_eval, Sonnet, 3 reps, 231 runs per config)
 
-| suite | pass before → after | mean input tok before → after | mean cost before → after |
-|---|---|---|---|
-| recall (49 items) | 100% → 100% | 138k → 82k | $0.210 → $0.056 |
-| rules (9) | 100% → 100% | 377k → 132k | $0.327 → $0.157 |
-| skills (8) | 0% → 12% | 340k → 100k | $0.246 → $0.060 |
-| tasks (11) | 100% → 100% | 649k → 302k | $0.569 → $0.169 |
-| **total** | 207 → 210 of 231 | | **$64.43 → $19.52 (−70%)** |
+| suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after |
+|---|---|---|---|---|
+| recall (49 items) | 100% → 100% | 138k → 82k | $0.210 → $0.056 | 6.3 s → 10.0 s |
+| rules (9) | 100% → 100% | 377k → 132k | $0.327 → $0.157 | 13.5 s → 14.2 s |
+| skills (8) | 0% → 12% | 340k → 100k | $0.246 → $0.060 | 13.5 s → 12.5 s |
+| tasks (11) | 100% → 100% | 649k → 302k | $0.569 → $0.169 | 26.1 s → 35.9 s |
+| **total** | 207 → 210 of 231 | | **$64.43 → $19.52 (−70%)** | **41 → 56 min** (summed) |
 
 Costs are notional (Max plan). Turns rose (recall 1.0 → 3.4, tasks 6.2 → 12.1): sessions now
 read a rule or reference file instead of having everything preloaded, and it is still far cheaper.
@@ -39,13 +39,13 @@ over-literal regexes) are in `evals/context_eval/`.
 
 ## Repeated on Opus 5.5 (`opus-before` = tag `pre-context-diet`, `opus-after` = HEAD; `--isolate`)
 
-| suite | pass before → after | mean input tok before → after | mean cost before → after |
-|---|---|---|---|
-| recall | 100% → 100% | 205k → 94k | $0.434 → $0.107 |
-| rules | 100% → 100% | 392k → 160k | $0.519 → $0.239 |
-| skills | 0% → 0% | 426k → 131k | $0.454 → $0.122 |
-| tasks | 100% → 97% | 765k → 402k | $1.126 → $0.339 |
-| **total** | 207 → 206 of 231 | | **$125.90 → $36.27 (−71%)** |
+| suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after |
+|---|---|---|---|---|
+| recall | 100% → 100% | 205k → 94k | $0.434 → $0.107 | 9.0 s → 12.1 s |
+| rules | 100% → 100% | 392k → 160k | $0.519 → $0.239 | 13.7 s → 14.0 s |
+| skills | 0% → 0% | 426k → 131k | $0.454 → $0.122 | 15.0 s → 21.5 s |
+| tasks | 100% → 97% | 765k → 402k | $1.126 → $0.339 | 28.5 s → 37.2 s |
+| **total** | 207 → 206 of 231 | | **$125.90 → $36.27 (−71%)** | **50 → 65 min** (summed) |
 
 The single difference: one `task-register-pass` run hit the 25-turn cap while finding every place
 the pass list is mirrored (post-diet sessions take more turns: tasks 7.7 → 11.9). Opus never calls
@@ -58,13 +58,13 @@ re-scored with the final graders. Sonnet totals above are unchanged by it.
 
 ## Repeated on Haiku 4.5 (`haiku-before` / `haiku-after`, `--isolate`)
 
-| suite | pass before → after | mean input tok before → after | mean cost before → after |
-|---|---|---|---|
-| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 |
-| rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 |
-| skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 |
-| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 |
-| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** |
+| suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after |
+|---|---|---|---|---|
+| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 | 12.7 s → 15.0 s |
+| rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 | 17.9 s → 16.2 s |
+| skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 | 12.6 s → 19.8 s |
+| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 | 41.1 s → 33.8 s |
+| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** | **67 → 70 min** (summed) |
 
 Haiku is where the trade-off shows: recall/rules lose a few single reps (it has to find the
 answer in a rule or reference file: recall turns 1.1 → 4.3), tasks gain clearly (73% → 88%;
