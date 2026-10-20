@@ -1206,6 +1206,38 @@
       );
     }
 
+    function HealthStatus() {
+      var _h = useState(null); var health = _h[0]; var setHealth = _h[1];
+
+      useEffect(function () {
+        var stop = PS.poll(function () {
+          return fetch('/api/health', {
+            headers: { 'X-Photosearch-Source': 'frontend', 'X-Photosearch-Intent': 'health_check' }
+          })
+            .then(function (r) { return setHealth(r.ok ? 'ok' : 'down'); })
+            .catch(function () { setHealth('down'); });
+        }, 5000);
+        return stop;
+      }, []);
+
+      var statusClass = health === 'ok' ? 'ok' : health === 'down' ? 'down' : 'loading';
+      var statusText = health === 'ok' ? 'ok' : health === 'down' ? 'down' : '—';
+      var statusColor = health === 'ok' ? 'var(--green)' : health === 'down' ? '#f87171' : 'var(--text-muted)';
+
+      return e('span', {
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          fontSize: 13,
+          color: statusColor,
+        }
+      },
+        e('span', { style: { width: 8, height: 8, borderRadius: '50%', background: statusColor, display: 'inline-block' } }),
+        'Health: ' + statusText
+      );
+    }
+
     function StatusPage() {
       var _s = useState(null); var stats = _s[0]; var setStats = _s[1];
       var _e = useState(null); var error = _e[0]; var setError = _e[1];
@@ -1252,6 +1284,7 @@
 
         content = e(React.Fragment, null,
           e('div', { className: 'refresh-row' },
+            e(HealthStatus, null),
             lastUpdated && e('span', null, 'Updated ' + lastUpdated),
             e('span', { style: { color: 'var(--text-muted)' } }, '·'),
             e('span', null, 'Health: ', e(HealthStatus, null)),
