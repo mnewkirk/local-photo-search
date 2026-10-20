@@ -66,7 +66,7 @@ $DC run --rm photosearch <cmd>                     # CLI command
 DCPY="docker compose -f docker-compose.nas.yml run --rm --entrypoint python"
 DCSH="docker compose -f docker-compose.nas.yml run --rm --entrypoint bash"
 $DCPY photosearch -c "import os; from photosearch.db import PhotoDB; db = PhotoDB(os.environ['PHOTOSEARCH_DB'])"
-# Git on the NAS (UGOS owns the dir): per-call safe.directory; push through gh's credential helper.
+# Git on the NAS: bare git fails "dubious ownership" (UGOS owns the dir) → per-call safe.directory; push via gh's credential helper.
 git -c safe.directory=/volume1/docker/photosearch status
 git -c safe.directory=/volume1/docker/photosearch -c credential.helper='!gh auth git-credential' push origin main
 ```

@@ -316,7 +316,9 @@ def infra_error(res: dict) -> str | None:
     if res.get("is_error") and text.startswith("API Error"):
         m = re.search(r'"message":"([^"]{0,160})', text)
         return "api_error: " + (m.group(1) if m else text[:160])
-    if any(k in text.lower() for k in _INFRA_MARKERS):
+    # Only a FAILED run can be a gateway problem: a successful answer may
+    # legitimately say "connection refused" or "rate_limit_error".
+    if res.get("is_error") and any(k in text.lower() for k in _INFRA_MARKERS):
         return "gateway: " + text[:160]
     if res.get("is_error") and not sum(int(v or 0) for v in (res.get("usage") or {}).values()
                                        if isinstance(v, (int, float))):
