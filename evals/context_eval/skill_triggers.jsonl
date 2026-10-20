@@ -7,3 +7,14 @@
 {"id": "skill-fleet-laptop", "prompt": "how do I run the worker fleet on my laptop against the NAS?"}
 {"id": "skill-recluster", "prompt": "recluster faces"}
 {"id": "skill-schema-question", "prompt": "what tables are in photo_index.db?"}
+# Held-out prompts (written by a separate model from the reference/ headings only, without seeing SKILL.md or the prompts above), so a description tuned on the 8 above can't overfit unnoticed.
+{"id": "heldout-new-search-filter", "prompt": "Where do I start if I want a brand new search filter?", "reference": "adding-features.md"}
+{"id": "heldout-stack-collection-routes", "prompt": "Which endpoints handle stacks and collections again?", "reference": "api-endpoints.md"}
+{"id": "heldout-vision-model-compare", "prompt": "How do I compare which vision model describes photos best?", "reference": "evals.md"}
+{"id": "heldout-undo-bad-person-labels", "prompt": "How do I bulk-undo one person's bad face labels?", "reference": "face-management-cli.md"}
+{"id": "heldout-push-shoot-google", "prompt": "Can I push a finished shoot up to Google Photos?", "reference": "google-photos.md"}
+{"id": "heldout-redescribe-old-collection", "prompt": "How do I re-describe one older collection with a different model?", "reference": "indexing-passes.md"}
+{"id": "heldout-search-local-copy", "prompt": "How do I run search off a local copy of the database?", "reference": "mcp-ask-replica.md"}
+{"id": "heldout-face-embeddings-table", "prompt": "Which table holds the face encodings?", "reference": "schema.md"}
+{"id": "heldout-search-slow-why", "prompt": "Search felt really slow lately, how do I find out why?", "reference": "troubleshooting.md"}
+{"id": "heldout-extra-desktop-workers", "prompt": "How do I add extra indexing workers on my desktop?", "reference": "workers.md"}

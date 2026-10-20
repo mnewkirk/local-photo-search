@@ -1,21 +1,18 @@
 ---
 name: photo-search
 description: >
-  Expert knowledge for developing and operating the local-photo-search service — a
-  self-hosted photo library with CLIP semantic search, face recognition, LLaVA scene
-  descriptions, aesthetic quality scoring, Google Photos upload, and shoot review/culling,
-  deployed via Docker on a UGREEN NAS.
-
-  Use this skill whenever the user asks about: adding features to photo-search, running
-  indexing jobs, troubleshooting the NAS deployment, understanding the codebase
-  architecture, modifying the CLI or web API, updating the status page, managing face
-  references, finding duplicate photos, working with collections, stacking burst photos,
-  uploading to Google Photos, search performance and indexes, the API request log
-  (latency, who made a request and why), or any other task related to this project.
-
-  Trigger even for vague requests like "how do I index 2024?" or "why is search slow?"
-  or "what were my last queries?" or "I want to add a new filter" or "upload these to Google" — all of these relate
-  to this service.
+  Runbook navigator for this repo (local-photo-search). Invoke it FIRST, before Grep or
+  Read, whenever a request is about operating, fixing or extending the photo library:
+  indexing photos (a year, folder or collection; which passes to run); slow search,
+  indexes or the API request log (recent queries, latency, who called what and why);
+  the worker fleet on a desktop or laptop (run-workers.sh, LM Studio role models);
+  faces (recluster, merges, references, labels, review pages); Google Photos upload;
+  the NAS, Docker, cron, Syncthing, ingest or the desktop replica; the database schema
+  and its tables; adding a search filter, CLI command, API endpoint, indexing pass or
+  page; the MCP server or Ask agent; model evals. It returns the one reference/ file
+  that answers the question, which is faster and more reliable than searching the code.
+  Applies to vague asks too: "how do I index 2024?", "why is search slow?", "what were
+  my last queries?", "I want to add a new filter", "upload these to Google".
 ---
 
 # Photo Search Skill
