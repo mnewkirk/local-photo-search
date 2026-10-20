@@ -301,7 +301,7 @@ class Worktree:
 
 
 INFRA_ABORT_STREAK = 3
-_INFRA_MARKERS = ("exceed_context_size", "exceeds the available context",
+_INFRA_MARKERS = ("hit your session limit", "usage limit", "exceed_context_size", "exceeds the available context",
                   "check your inference gateway", "connection refused",
                   "overloaded_error", "rate_limit_error")
 
@@ -392,6 +392,12 @@ def cmd_run(args) -> int:
         for item in items:
             for rep in range(1, args.repeat + 1):
                 jobs.append((suite, item, rep))
+    if args.resume:  # skip runs already recorded with a scored (non-infra) result
+        done = {(r["suite"], r["id"], r["rep"]) for r in _load_results(args.config)
+                if not r.get("infra_error")}
+        skipped = sum((s, i["id"], rep) in done for s, i, rep in jobs)
+        jobs = [(s, i, rep) for s, i, rep in jobs if (s, i["id"], rep) not in done]
+        print(f"--resume: {skipped} runs already done", file=sys.stderr)
     if not jobs:
         print("nothing to run", file=sys.stderr)
         return 2
@@ -608,6 +614,8 @@ def main(argv=None) -> int:
     r.add_argument("--max-turns", type=int, default=25)
     r.add_argument("--budget", type=float, default=1.50, help="per-run --max-budget-usd")
     r.add_argument("--timeout", type=int, default=900, help="seconds per run")
+    r.add_argument("--resume", action="store_true",
+                   help="skip runs this config already has a scored row for")
     r.add_argument("--isolate", action="store_true",
                    help="run every suite (not just tasks) in a worktree of --ref")
     r.add_argument("--no-keepalive", action="store_true",
