@@ -83,7 +83,10 @@ moved. The Haiku task suites were discarded and re-run with the guard.
 `local-before`: 10/10 recall, but ~15 min per item: the ~100k-token prompt is processed from scratch
 each time (gemma's sliding-window cache can't reuse across items). Needs ≥128k context, the
 keep-alive proxy (`evals/context_eval/keepalive_proxy.py`) and `CLAUDE_CODE_ATTRIBUTION_HEADER=0`,
-which the harness sets. A `local-after` run would show the prompt-size win directly; not run yet.
+which the harness sets. `local-after` (same 10 items, `--isolate`): **9/10 in 11 min total vs 10/10 in
+146 min** (median 33 s vs 887 s per item). Gemma does call Grep/Read through LM Studio; its one miss
+(`worker-d-photo-root`) is a fact that lives only in the path-scoped workers rule, which it didn't find.
+Full write-up with all tables, insights and suggestions: `evals/context_eval/REPORT.md`.
 
 ## Open
 

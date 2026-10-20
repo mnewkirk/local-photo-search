@@ -1,0 +1,189 @@
+# Context diet — evaluation report (2026-10-19)
+
+Does moving ~95% of the always-loaded context (CLAUDE.md, the photo-search SKILL.md body, the
+auto-memory index) into path-scoped rules, `docs/notes/` and skill `reference/` files hurt Claude
+Code's behaviour in this repo, and what does it save? Plan: `docs/plans/context-diet.md`.
+Narrative handoff: `docs/HANDOFF-2026-10-19-context-diet.md`. Per-item reports (git-ignored):
+`results/report.md` (Sonnet), `results/report-opus.md`, `results/report-haiku.md`.
+
+**Bottom line.** Across Sonnet, Opus 5.5 and Haiku 4.5 the pass rate is unchanged (±3 of 231 runs)
+while billed cost drops 60-71%. On a local 12B model it is 13× faster wall-clock, with the one real
+failure being a fact the model had to go and look up and didn't.
+
+## What changed
+
+| File | Before | After |
+|---|---|---|
+| `CLAUDE.md` | 258,266 B | 7,803 B |
+| `.claude/skills/photo-search/SKILL.md` | 147,932 B | 5,905 B (navigator; same trigger description) |
+| `MEMORY.md` (auto-memory index) | 18,218 B, 62 lines | 6,719 B, 54 lines; 10 closed topics archived |
+| `.claude/rules/*.md` (new, path-scoped) | — | 9 files, 5.5-7.1 KB each |
+
+Every old section was copied verbatim to `docs/notes/` or `reference/` (168/168 headings,
+`scripts/check_headings_preserved.py`); `tests/test_context_budget.py` keeps the caps.
+Fixed tokens at session start (Opus, measured): ~142k → ~14k.
+
+## Method
+
+`harness.py` runs headless `claude -p` against four suites: **recall** (49 repo-fact questions),
+**rules** (9 subsystem traps, after a forced Read of a subsystem file), **skills** (8 vague prompts
+that should trigger the photo-search skill; pass = a Skill tool call), **tasks** (11 small coding
+tasks in a throwaway worktree, graded on the diff). 3 reps each = 231 runs per config.
+"before" = tag `pre-context-diet`, "after" = HEAD; Opus/Haiku/local runs use `--isolate` (every
+suite in a worktree of `--ref`). Costs are what `claude -p` reports at API prices; the runs were
+billed against a Max plan, so they are notional. Graders were fixed during the study (see
+Insights 6) and all configs were re-scored with the final graders (`harness.py regrade`).
+
+## Results
+
+### Sonnet
+
+| suite | pass before → after | mean input tok before → after | mean cost before → after |
+|---|---|---|---|
+| recall (49 items) | 100% → 100% | 138k → 82k | $0.210 → $0.056 |
+| rules (9) | 100% → 100% | 377k → 132k | $0.327 → $0.157 |
+| skills (8) | 0% → 12% | 340k → 100k | $0.246 → $0.060 |
+| tasks (11) | 100% → 100% | 649k → 302k | $0.569 → $0.169 |
+| **total** | 207 → 210 of 231 | | **$64.43 → $19.52 (−70%)** |
+
+### Opus 5.5
+
+| suite | pass before → after | mean input tok before → after | mean cost before → after |
+|---|---|---|---|
+| recall | 100% → 100% | 205k → 94k | $0.434 → $0.107 |
+| rules | 100% → 100% | 392k → 160k | $0.519 → $0.239 |
+| skills | 0% → 0% | 426k → 131k | $0.454 → $0.122 |
+| tasks | 100% → 97% | 765k → 402k | $1.126 → $0.339 |
+| **total** | 207 → 206 of 231 | | **$125.90 → $36.27 (−71%)** |
+
+The one difference: a `task-register-pass` run hit the 25-turn cap while finding every place the
+pass list is mirrored.
+
+### Haiku 4.5
+
+| suite | pass before → after | mean input tok before → after | mean cost before → after |
+|---|---|---|---|
+| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 |
+| rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 |
+| skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 |
+| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 |
+| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** |
+
+Haiku's pre-diet config never hit the prompt cache (~$0.18 every run), which inflates its "before"
+cost; treat the −60% as an upper bound.
+
+### Local: gemma-4-12b-qat via LM Studio (first 10 recall items, 1 rep)
+
+| config | pass | wall per item (mean / median) | total | mean turns | tool calls |
+|---|---|---|---|---|---|
+| local-before | 10/10 | 874 s / 887 s | 146 min | 1.0 | none |
+| local-after | 9/10 | 65 s / 33 s | 11 min | 1.5 | Grep/Read on 3 items |
+
+Setup that was required: model loaded at ≥128k context (262k used, parallel 1), the keep-alive
+proxy (`keepalive_proxy.py`; LM Studio sends no bytes during prefill and Claude Code drops the
+stream at 5 min), and `CLAUDE_CODE_ATTRIBUTION_HEADER=0` (else the prefix cache never hits). The
+harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
+
+### Cross-model summary
+
+| model | pass before → after | cost / time |
+|---|---|---|
+| Sonnet | 207 → 210 | −70% |
+| Opus 5.5 | 207 → 206 | −71% |
+| Haiku 4.5 | 197 → 197 | −60% |
+| gemma-4-12b (local, 10 items) | 10 → 9 | 146 → 11 min (13×) |
+
+## Insights that generalize
+
+1. **The fixed-context cut is model-independent; the accuracy effect is not.** The same files
+   shrink the starting prompt ~90% for every model. What it costs in accuracy scales with how well
+   the model *finds* things: Opus and Sonnet lost nothing; Haiku lost a few single reps on recall
+   and rules; gemma-12b failed the one item whose answer lives only in a path-scoped rule.
+
+2. **Preloaded context also hurts weaker models on long work.** Haiku's tasks went 73% → 88%:
+   with the old 258 KB CLAUDE.md a task run carried ~1.4M input tokens, and the smaller context
+   did better. The trade is "recall by lookup" (slightly worse for weak models) against "less noise
+   during multi-step work" (better for weak models).
+
+3. **More turns, still much cheaper.** Answers now take extra Grep/Read turns (Sonnet recall
+   1.0 → 3.4, tasks 6.2 → 12.1), yet cost fell 60-71% because every turn re-sends a far smaller
+   cached prefix. One Opus task run did hit the 25-turn cap, so lookup-heavy tasks need headroom.
+
+4. **For local models the win is wall-clock, and prefill dominates.** Prompt processing slows as the
+   prompt grows (~1,200 tok/s at the start, ~110 tok/s by mid-prompt), so a 100k-token prompt is
+   ~15 min before the first token, and gemma's sliding-window attention prevents reusing the
+   cache across items. A ~12k prompt is processed in seconds.
+
+5. **Path-scoped rules only fire when code is opened.** Q&A and ops sessions never open files, so
+   the CLAUDE.md index is the only route to a rule. Strong models follow "see rules/workers.md";
+   gemma ran one Grep, missed, and confabulated. The Skill tool was essentially never invoked by
+   any model, before or after (0-12%), but after the diet 7/8 (Sonnet) and 19/24 (Opus) skill
+   answers cited the right `reference/` file: models route through CLAUDE.md pointers, not the
+   skill mechanism.
+
+6. **Regex graders produce false failures on correct paraphrases.** Over the study, correct answers
+   were failed by a stale constant (the grader expected `SCHEMA_VERSION = 39`, written when the
+   repo was at v38; the correct bump is now 39 → 40), by
+   "don't do X" checks matching the model's own comment explaining why it avoided X, and by
+   literal-phrase lists missing a synonym ("own process", "new file", `{score_col} IS ?`). Each
+   was verified by reading the answer. Storing answers and added lines and re-scoring
+   (`harness.py regrade`) made this cheap to correct without re-running.
+
+7. **Eval hygiene matters as much as the change under test:**
+   - The cwd is part of Claude Code's system prompt: one worktree per run defeated the prompt
+     cache ($0.93 vs $0.04 per Opus recall run); share one per config.
+   - The project's `.claude/settings.local.json` allowlist reaches eval worktrees. Combined with a
+     "commit and push by default" preference, Haiku task runs pushed 12 commits to `origin/main`
+     (reverted `f759330`). Every eval run now passes `--disallowedTools` for git writes and `gh`,
+     and a task that moves HEAD fails.
+   - Plan session limits arrive as ordinary text answers; the harness classes them as infra, stops
+     after 3 in a row, and `--resume` continues without re-paying.
+   - Gateway failure markers must only apply to failed runs; a correct answer can say
+     "connection refused".
+
+## Further suggestions
+
+1. **Inline the highest-traffic operational facts as one-liners in CLAUDE.md**, not just pointers.
+   The gemma miss (`-d /photos` → 404, omit `-d`) and Haiku's `dubious ownership` miss were both
+   facts a session can need without opening code. Candidates: the `-d` gotcha, `/api/health` probe,
+   reasoning-effort for thinking models. Keep the budget test as the brake.
+2. **Make the subsystem index imperative**: "Before answering a question about workers, Read
+   `.claude/rules/workers.md`" helps weaker models more than a topic list.
+3. **Hook rules to Bash/Grep**: a `PreToolUse` hook that injects the matching rule when a command
+   names a subsystem (`run-workers.sh`, `maintenance-sweep`) would close the "rules only load on
+   file open" gap for ops sessions.
+4. **Decide the skill's role.** It is almost never invoked. Either rewrite its description around
+   concrete triggers and re-measure the skills suite, or drop the suite's Skill-call criterion and
+   grade "cited/used the right reference file" instead. Also remove or update the claude.ai-synced
+   duplicate (`anthropic-skills:photo-search`), which still carries the old 148 KB body.
+5. **Extend the local run** to all 49 recall items plus rules (now ~1 min/item, so ~1 h), and try
+   one non-sliding-window model so cache reuse across items can be measured.
+6. **Investigate Haiku's pre-diet cache misses** before quoting its cost delta.
+7. **Raise `--max-turns` for tasks** (25 → 40) or report turn-cap hits separately; lookup-heavy
+   tasks are where the diet adds turns.
+8. **Replace brittle regexes with a rubric grader** (an LLM judge with the expected facts) for
+   recall/rules, keeping regex as a cheap pre-filter; at minimum keep re-reading every failure.
+9. **Keep the guardrails**: `tests/test_context_budget.py`, the "Where knowledge goes" section,
+   and the eval's git-write block for any new headless automation in this repo.
+10. **Plan section 8 levers still open**: move the `photosearch` MCP server from user to project
+    scope (~2-3k tokens per session), and the optional PostToolUse budget hook.
+11. **Public-repo hygiene** (unrelated to the diet, found while checking): the repo already
+    publishes children's names, another family's child's full name
+    (`docs/HANDOFF-2026-09-18-rank-shoot.md`), the Tailscale IP and the NAS account name.
+
+## Reproduce
+
+```bash
+# cloud: one config per ref, same items, 3 reps
+python3 evals/context_eval/harness.py run --config opus-before --ref pre-context-diet --isolate --model claude-opus-5-5 --repeat 3 --parallel 2
+python3 evals/context_eval/harness.py run --config opus-after  --ref HEAD             --isolate --model claude-opus-5-5 --repeat 3 --parallel 2
+# local (LM Studio at :1234, model loaded ≥128k context)
+ANTHROPIC_BASE_URL=http://localhost:1234 ANTHROPIC_AUTH_TOKEN=lmstudio \
+  python3 evals/context_eval/harness.py run --config local-after --ref HEAD --isolate \
+  --model google/gemma-4-12b-qat --suite recall --limit 10 --repeat 1 --parallel 1 --timeout 1800
+python3 evals/context_eval/harness.py regrade --configs opus-before opus-after
+python3 evals/context_eval/harness.py report  --configs opus-before opus-after --failures
+```
+
+Run from a clean environment (`env -i HOME=$HOME PATH=$PATH …`) when launching from inside a Claude
+session, and use `--resume` after an interruption.
