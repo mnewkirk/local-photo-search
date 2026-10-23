@@ -7,8 +7,13 @@ per-segment keyframes, representative frames and face crops through
 ``worker_api.submit_results`` calls :func:`apply_scan_result` inside one
 transaction per video, commits, then :func:`install_crops`.
 
-**One ``faces`` row per within-video identity**; its encoding is the
-identity's mean top-k ArcFace embedding. So ``/faces``, clustering, the strict
+**One ``faces`` row per within-video identity that passes the gate**
+(``video_analysis.face_row_eligible``: >= 3 detections, or >= 0.5 s present
+with >= 2); its encoding is the identity's mean top-k ArcFace embedding.
+EVERY identity gets a ``video_tracks`` row; one below the gate has
+``face_id`` NULL (no faces row, no encoding), so presence, subject joins and
+the timeline still see it while /faces and recluster do not. A carried human
+label (below) promotes a gated identity to a faces row. So ``/faces``, clustering, the strict
 matcher, verify-labels and the rival test apply to videos unchanged, and a face
 crop is served from the uploaded crop (or the rep frame) — never from the
 video file.
@@ -231,6 +236,18 @@ def _json(v) -> Optional[str]:
     return v if isinstance(v, str) else json.dumps(v, sort_keys=True)
 
 
+def _insert_track(conn, pid: int, face_id: Optional[int], ix: int, ident: dict) -> None:
+    conn.execute(
+        "INSERT INTO video_tracks (photo_id, face_id, ident_ix, t_start, t_end, n_det, "
+        "presence_s, focus_s, focus_intervals, rep_t, rep_frame, mean_salience, "
+        "presence_intervals) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (pid, face_id, ix, ident.get("t_start"), ident.get("t_end"), ident.get("n_det"),
+         ident.get("presence_s"), ident.get("focus_s"),
+         _json(ident.get("focus_intervals")), ident.get("rep_t"),
+         ident.get("rep_frame"), ident.get("mean_salience"),
+         _json(ident.get("presence_intervals"))))
+
+
 def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
                       frames_root=None) -> dict:
     """Write one scan result (a ``VideoScanResult`` as a dict). Does NOT
@@ -241,6 +258,7 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
     the caller performs after the commit (:func:`install_crops`).
     """
     from .db import HAS_SQLITE_VEC, _serialize_float_list, record_face_person_exclusions
+    from .video_analysis import face_row_eligible
 
     pid = int(r["photo_id"])
     row = conn.execute("SELECT media_type, file_hash FROM photos WHERE id = ?",
@@ -252,7 +270,7 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
     version = int(r.get("scan_version") or SCAN_VERSION)
     now = _now()
     conn.execute("INSERT OR IGNORE INTO video_meta (photo_id) VALUES (?)", (pid,))
-    out: dict = {"photo_id": pid, "scan_error": None, "faces": 0, "carried": [],
+    out: dict = {"photo_id": pid, "scan_error": None, "faces": 0, "gated": 0, "carried": [],
                  "unmatched_labels": [], "duplicate_of": None, "_install": []}
 
     # A ZIP-wrapped file's inner probe: dates/dims/codec come from the inner
@@ -297,18 +315,31 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
         return out
 
     idents = list(r.get("identities") or [])
+    # The faces-row gate (video_analysis.face_row_eligible): the worker's
+    # verdict when it sent one, else the default gate on n_det/presence_s.
+    want_face = [bool(i["face_row"]) if i.get("face_row") is not None
+                 else face_row_eligible(i.get("n_det"), i.get("presence_s"))
+                 for i in idents]
 
     # D13 — match labelled old faces to new identities BEFORE deleting them.
+    # Matched against EVERY identity, gated or not: a human label outranks
+    # the gate, so the identity it lands on gets a faces row regardless.
     old = _old_faces(conn, pid)
     labelled = [o for o in old if o["match_source"] in CARRY_LABEL_SOURCES]
     new_encs = [i.get("encoding") for i in idents]
     carried, unmatched = match_labels(labelled, new_encs)
+    for ni in carried:
+        if not want_face[ni]:
+            want_face[ni] = True
+            out["promoted_by_label"] = out.get("promoted_by_label", 0) + 1
     # Then every OTHER old face that carries face/person exclusions (a strict
     # match the duplicate resolver stripped, a dedupe_unmatched loser) is
-    # matched one-to-one among the identities still free: the exclusions move
-    # with it, or the nightly match/resolve churn loop would restart on the
-    # new face ids. Only the exclusions travel — not the auto label.
-    free = [None if ni in carried else e for ni, e in enumerate(new_encs)]
+    # matched one-to-one among the identities still free that get a faces
+    # row: the exclusions move with it, or the nightly match/resolve churn
+    # loop would restart on the new face ids. Only the exclusions travel —
+    # not the auto label. (A gated identity has no face to bar.)
+    free = [None if (ni in carried or not want_face[ni]) else e
+            for ni, e in enumerate(new_encs)]
     excl_only, _ = match_labels(
         [o for o in old if o["match_source"] not in CARRY_LABEL_SOURCES and o["exclusions"]],
         free)
@@ -342,6 +373,13 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
         enc = ident.get("encoding")
         if enc is not None and len(enc) != 512:
             raise ValueError(f"identity {ni}: encoding must be 512-d")
+        ix = int(ident.get("ident_ix", ni))
+        if not want_face[ni]:
+            # Below the gate: a track (presence / share / subjects joins see
+            # it) with no faces row, no encoding, no crop install.
+            _insert_track(conn, pid, None, ix, ident)
+            out["gated"] += 1
+            continue
         lab = carried.get(ni)
         person_id = lab["person_id"] if lab else None
         source = lab["match_source"] if lab else None
@@ -368,16 +406,7 @@ def apply_scan_result(conn, r: dict, *, crop_cache_dir: Optional[str] = None,
             out.setdefault("exclusions_carried", []).append(
                 {"old_face_id": ex["face_id"], "face_id": fid,
                  "person_ids": list(ex["exclusions"])})
-        ix = int(ident.get("ident_ix", ni))
-        conn.execute(
-            "INSERT INTO video_tracks (photo_id, face_id, ident_ix, t_start, t_end, n_det, "
-            "presence_s, focus_s, focus_intervals, rep_t, rep_frame, mean_salience, "
-            "presence_intervals) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, fid, ix, ident.get("t_start"), ident.get("t_end"), ident.get("n_det"),
-             ident.get("presence_s"), ident.get("focus_s"),
-             _json(ident.get("focus_intervals")), ident.get("rep_t"),
-             ident.get("rep_frame"), ident.get("mean_salience"),
-             _json(ident.get("presence_intervals"))))
+        _insert_track(conn, pid, fid, ix, ident)
         out["faces"] += 1
         if frames_v is not None and crop_cache_dir:
             for size in CROP_SIZES:
@@ -529,3 +558,86 @@ def stale_frame_dirs(conn, frames_root, now: Optional[float] = None,
                 if age >= grace_s:
                     stale.append(str(gdir))
     return sorted(stale)
+
+
+# ---------------------------------------------------------------------------
+# Re-queue (clear-pass video-scan) + the faces-row gate's targeted re-scan
+# ---------------------------------------------------------------------------
+
+def requeue_scan(conn, photo_ids) -> int:
+    """Re-queue ``video-scan`` for exactly ``photo_ids`` (the clear-pass
+    branch). The faces / tracks / CLIP mean stay until the re-scan REPLACES
+    them, which is also what carries the human labels across (D13) — deleting
+    them here would lose those. Subjects are left alone too: the re-scan
+    landing deletes them (apply_scan_result), which re-queues video-subjects.
+    The description (video-describe) is never touched. Does NOT commit;
+    returns the video_meta rows reset. ``[]`` is no videos."""
+    ids = [int(i) for i in photo_ids or ()]
+    n = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        ph = ",".join("?" * len(chunk))
+        n += conn.execute(
+            f"UPDATE video_meta SET scan_version = NULL, scan_error = NULL, "
+            f"scanned_at = NULL WHERE photo_id IN ({ph})", chunk).rowcount
+        conn.execute(
+            f"DELETE FROM worker_processed WHERE pass_type = 'video-scan' "
+            f"AND photo_id IN ({ph})", chunk)
+    return n
+
+
+def below_gate_sql(alias: str = "vt") -> str:
+    """A ``video_tracks`` row that would NOT get a faces row under the gate
+    (``video_analysis.face_row_eligible``; params ``:min_det``, ``:min_pres``,
+    ``:min_pres_det``). Unknown n_det / presence pass, as in the gate."""
+    return (f"({alias}.n_det IS NOT NULL AND {alias}.presence_s IS NOT NULL "
+            f"AND NOT ({alias}.n_det >= :min_det OR ({alias}.presence_s >= :min_pres - 1e-9 "
+            f"AND {alias}.n_det >= :min_pres_det)))")
+
+
+def fragmented_videos(conn, min_detections: Optional[int] = None,
+                      min_presence_s: Optional[float] = None) -> dict:
+    """Videos holding a ``faces`` row whose track is below the faces-row gate
+    — the ones a re-scan under the gate would change. Read-only.
+
+    Returns ``{"photo_ids": [...], "videos", "rows_below_gate",
+    "rows_disappear", "human_labelled_kept", "strict_labelled",
+    "subjects_done", "described", "videos_scanned_with_faces"}``.
+    ``rows_disappear`` excludes faces carrying a human label (D13 carries
+    those onto the re-scanned identity and promotes it past the gate)."""
+    from .video_analysis import DEFAULT_PARAMS
+    p = {"min_det": int(DEFAULT_PARAMS.face_min_detections if min_detections is None
+                        else min_detections),
+         "min_pres": float(DEFAULT_PARAMS.face_min_presence_s if min_presence_s is None
+                           else min_presence_s),
+         "min_pres_det": int(DEFAULT_PARAMS.face_min_presence_detections)}
+    human = ",".join(f"'{s}'" for s in CARRY_LABEL_SOURCES)
+    base = (f"FROM video_tracks vt JOIN faces f ON f.id = vt.face_id "
+            f"JOIN video_meta vm ON vm.photo_id = vt.photo_id "
+            f"WHERE vm.scan_version IS NOT NULL AND vm.scan_error IS NULL "
+            f"AND {below_gate_sql('vt')}")
+    ids = [r[0] for r in conn.execute(
+        f"SELECT DISTINCT vt.photo_id {base} ORDER BY vt.photo_id", p)]
+    row = conn.execute(
+        f"SELECT COUNT(*), "
+        f"TOTAL(f.match_source IN ({human})), "
+        f"TOTAL(f.match_source = 'strict' AND f.person_id IS NOT NULL) {base}", p).fetchone()
+    out = {"photo_ids": ids, "videos": len(ids), "rows_below_gate": int(row[0]),
+           "human_labelled_kept": int(row[1]), "strict_labelled": int(row[2]),
+           "rows_disappear": int(row[0]) - int(row[1]),
+           "params": {"min_detections": p["min_det"], "min_presence_s": p["min_pres"],
+                      "min_presence_detections": p["min_pres_det"]}}
+    out["videos_scanned_with_faces"] = conn.execute(
+        "SELECT COUNT(DISTINCT vt.photo_id) FROM video_tracks vt "
+        "WHERE vt.face_id IS NOT NULL").fetchone()[0]
+    subj = desc = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        ph = ",".join("?" * len(chunk))
+        subj += conn.execute(f"SELECT COUNT(*) FROM video_meta WHERE photo_id IN ({ph}) "
+                             f"AND subjects_version IS NOT NULL", chunk).fetchone()[0]
+        desc += conn.execute(f"SELECT COUNT(*) FROM photos WHERE id IN ({ph}) "
+                             f"AND description IS NOT NULL", chunk).fetchone()[0]
+    out["subjects_done"] = subj
+    out["described"] = desc
+    return out

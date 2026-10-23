@@ -79,9 +79,50 @@ class AnalysisParams:
     segment_min_focus_frac: float = 0.3
     # Identity encoding = normalised mean of the top-k detections by salience.
     encoding_top_k: int = 5
+    # faces-row gate (face_row_eligible): an identity becomes a `faces` row
+    # only when it was detected at least face_min_detections times, OR it was
+    # present for face_min_presence_s AND detected at least
+    # face_min_presence_detections times. Below the gate it is still a
+    # video_tracks row (presence / share / subject joins see it), with
+    # face_id NULL.
+    face_min_detections: int = 3
+    face_min_presence_s: float = 0.5
+    face_min_presence_detections: int = 2
 
 
 DEFAULT_PARAMS = AnalysisParams()
+
+# The faces-row gate's defaults, by name (the CLI and the server read these).
+MIN_FACE_DETECTIONS = DEFAULT_PARAMS.face_min_detections
+MIN_FACE_PRESENCE_S = DEFAULT_PARAMS.face_min_presence_s
+MIN_FACE_PRESENCE_DETECTIONS = DEFAULT_PARAMS.face_min_presence_detections
+
+
+def face_row_eligible(n_det, presence_s, params: AnalysisParams = DEFAULT_PARAMS,
+                      *, min_detections: Optional[int] = None,
+                      min_presence_s: Optional[float] = None) -> bool:
+    """Does a within-video identity earn a ``faces`` row?
+
+    Measured after the 2026-10-22 backfill: 49,451 of 88,997 video faces rows
+    were identities present < 0.5 s (55,144 seen ONCE) — distant crowd faces
+    and film-grain fragments whose noisy embeddings never merge. They flooded
+    /faces' Unclustered bucket and recluster. Below the gate the identity is
+    kept as a ``video_tracks`` row with ``face_id`` NULL.
+
+    ``n_det >= min_detections`` OR (``presence_s >= min_presence_s`` AND
+    ``n_det >= face_min_presence_detections``). The second clause needs two
+    detections because presence is counted in sample cells: at the 2 fps
+    used for clips over 5 min ONE detection is a 0.5 s cell, so presence
+    alone would admit every singleton of a long clip (5,952 on the NAS).
+    Unknown values (None, an older worker) pass: never drop a face on
+    missing data."""
+    if n_det is None or presence_s is None:
+        return True
+    md = params.face_min_detections if min_detections is None else int(min_detections)
+    mp = params.face_min_presence_s if min_presence_s is None else float(min_presence_s)
+    n = int(n_det)
+    return n >= md or (float(presence_s) >= mp - 1e-9
+                       and n >= params.face_min_presence_detections)
 
 # Schedules
 SEGMENT_S = 3.0

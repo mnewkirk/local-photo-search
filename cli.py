@@ -7002,5 +7002,82 @@ def visual_tag_collapse(db, folder, min_photos, min_share, limit, save_collectio
         pdb.add_photos_to_collection(cid, ids)
     click.echo(f"\nSaved {len(ids):,} photos as collection {cid}.")
 
+
+@cli.command("video-rescan-fragmented")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--min-detections", type=int, default=None,
+              help="Gate: detections that earn a faces row (default "
+                   "video_analysis.MIN_FACE_DETECTIONS, 3).")
+@click.option("--min-presence", type=float, default=None,
+              help="Gate: seconds present that earn a faces row with >= 2 detections "
+                   "(default video_analysis.MIN_FACE_PRESENCE_S, 0.5).")
+@click.option("--save-collection", "save_collection", default=None, metavar="NAME",
+              help="Also save the affected videos as a collection (created, or added to).")
+@click.option("--apply", is_flag=True,
+              help="Re-queue video-scan for exactly these videos (clear-pass semantics).")
+def video_rescan_fragmented(db, min_detections, min_presence, save_collection, apply):
+    """Find videos whose scan wrote faces rows for identities below the
+    faces-row gate, and (with --apply) re-queue video-scan for exactly those.
+
+    The gate (video_analysis.face_row_eligible) keeps one-off crowd faces and
+    film-grain fragments out of `faces`: a re-scan writes them as video_tracks
+    rows with face_id NULL. The faces/tracks stay until the re-scan replaces
+    them; human labels (manual / merge_review / rejected) and face/person
+    exclusions carry across (D13); strict labels come back with the nightly
+    matcher. The re-scan drops video-subjects for each video (re-queued);
+    the video-describe description is NOT cleared.
+
+    DRY RUN by default, opened READ-ONLY. Run on the NAS.
+
+    \b
+    Then run the fleet (desktop, --native):
+      ./run-workers.sh --native -s http://<NAS>:8000 -p video-scan,video-subjects -n 2
+    """
+    import sqlite3 as _sqlite3
+    from photosearch import video_scan_store as VSS
+
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+    conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        info = VSS.fragmented_videos(conn, min_detections, min_presence)
+    finally:
+        conn.close()
+    g = info["params"]
+    click.echo(f"faces-row gate: n_det >= {g['min_detections']} OR "
+               f"(presence >= {g['min_presence_s']} s AND n_det >= "
+               f"{g['min_presence_detections']})")
+    click.echo(f"  videos with video faces rows:     {info['videos_scanned_with_faces']:,}")
+    click.echo(f"  videos to re-scan:                {info['videos']:,}")
+    click.echo(f"  faces rows below the gate:        {info['rows_below_gate']:,}")
+    click.echo(f"    would disappear:                {info['rows_disappear']:,}")
+    click.echo(f"    human-labelled (carried, kept): {info['human_labelled_kept']:,}")
+    click.echo(f"    strict-labelled (rematched):    {info['strict_labelled']:,}")
+    click.echo(f"  of those videos, video-subjects done (will re-run): {info['subjects_done']:,}")
+    click.echo(f"  of those videos, described (kept, NOT cleared):      {info['described']:,}")
+    ids = info["photo_ids"]
+    if not apply and not save_collection:
+        click.echo("\nDry run — nothing written. --apply to re-queue video-scan.")
+        return
+    if not ids:
+        click.echo("\nNothing to do.")
+        return
+    from photosearch.db import PhotoDB
+    with PhotoDB(db) as pdb:
+        if save_collection:
+            c = pdb.get_collection_by_name(save_collection)
+            cid = c["id"] if c else pdb.create_collection(
+                save_collection,
+                "Videos with video-scan faces rows below the faces-row gate "
+                "(video-rescan-fragmented).")
+            added = pdb.add_photos_to_collection(cid, ids)
+            click.echo(f"\nCollection {cid} ({save_collection}): {added:,} video(s) added.")
+        if apply:
+            n = VSS.requeue_scan(pdb.conn, ids)
+            pdb.conn.commit()
+            click.echo(f"\nRe-queued video-scan for {n:,} video(s). The fleet re-scans "
+                       f"them; video-subjects re-queues as each scan lands.")
+
 if __name__ == "__main__":
     cli()

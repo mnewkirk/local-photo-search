@@ -240,3 +240,36 @@ Checked against the code while writing `.claude/rules/`; the text above is kept 
 
 - ZIP safety caps are now `ZIP_SIZE_SLACK = 2.0` with a `ZIP_SIZE_FLOOR` (16 MB) and a separate `ZIP_MAX_RATIO = 50` bomb guard in `zip_video.py`, not the "≤ 1.2×" described above.
 - A pass missing from `db.PASS_MEDIA` raises `KeyError` from `db.media_sql`.
+
+### The faces-row gate and the targeted re-scan (2026-10-23)
+
+After the full backfill (2026-10-22) video-scan had written 88,997 `faces`
+rows over 3,523 videos: `n_det` 1 → 55,144, 2–3 → 13,969; 49,451 identities
+present < 0.5 s; identities per video p50 5 / p90 45 / max 2,537. They
+flooded `/faces`' Unclustered bucket and recluster. Only 1,943 were named,
+all `strict`; no human label sat on a sub-gate identity.
+
+The gate (`video_analysis.face_row_eligible`, tunables on `AnalysisParams`):
+`n_det >= 3` OR (`presence_s >= 0.5` AND `n_det >= 2`). The two-detection
+clause is not in the original ask and is load-bearing: clips over 5 min are
+sampled at 2 fps, so ONE detection is a 0.5 s presence cell and a pure
+presence rule would admit 5,952 singletons. The worker sends its verdict per
+identity (`face_row`); the server applies the default gate when it is absent
+(an older worker). Below the gate the identity is a `video_tracks` row with
+`face_id` NULL — subjects, describe names, share, mirror and the read
+endpoint all take NULL — and its rep frame is not uploaded (crops are, so a
+carried human label can promote it).
+
+The 2,537-identity video is `Home Movies II.mp4`: 79 min of digitised film,
+708×478, sampled at 2 fps (9,510 frames). Faces are ~38 px with det_score
+~0.65 and film grain, so their ArcFace embeddings are too noisy to clear the
+0.9 merge; 1,716 are single detections. The 4K soccer clips (C0152: 1,199
+identities, 897 singletons) are the same shape — distant crowd faces seen
+once, several in one frame. Not a tracker bug: complete-linkage merge and the
+time-overlap veto behave as designed; the gate is the fix.
+
+`photosearch video-rescan-fragmented` (NAS; dry run, read-only by default)
+finds videos with a faces row below the gate; `--apply` re-queues video-scan
+for exactly those (`video_scan_store.requeue_scan`, the clear-pass branch).
+The re-scan carries human labels and exclusions (D13), deletes the subjects
+(re-queued), and leaves the description alone. `SCAN_VERSION` was not bumped.

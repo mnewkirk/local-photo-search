@@ -239,8 +239,8 @@ class VideoProxyResult(BaseModel):
 
 
 class VideoScanIdentity(BaseModel):
-    """One within-video person: becomes ONE `faces` row + one `video_tracks`
-    row. `bbox` is (top, right, bottom, left) in the coordinates of its
+    """One within-video person: ONE `video_tracks` row, plus one `faces` row
+    when it passes the gate (`face_row`). `bbox` is (top, right, bottom, left) in the coordinates of its
     representative frame (`keyframe_rep_f{rep_frame:05d}.jpg`)."""
     ident_ix: int
     bbox: list[int]
@@ -256,6 +256,10 @@ class VideoScanIdentity(BaseModel):
     presence_intervals: Optional[list] = None
     focus_intervals: Optional[list] = None
     mean_salience: Optional[float] = None
+    # The worker's faces-row gate verdict (video_analysis.face_row_eligible
+    # with its AnalysisParams). None = an older worker: the server applies
+    # the default gate. False = a video_tracks row with face_id NULL.
+    face_row: Optional[bool] = None
 
 
 class VideoScanResult(BaseModel):
@@ -1752,14 +1756,8 @@ def clear_pass(req: ClearPassRequest):
             # Re-queue the scan. The faces / tracks / CLIP mean stay until the
             # re-scan REPLACES them, which is also what carries the human
             # labels across (D13) — deleting them here would lose those.
-            cur = db.conn.execute(
-                f"UPDATE video_meta SET scan_version = NULL, scan_error = NULL, "
-                f"scanned_at = NULL WHERE photo_id IN ({placeholders})", photo_ids)
-            cleared = cur.rowcount
-            db.conn.execute(
-                f"DELETE FROM worker_processed WHERE pass_type = 'video-scan' AND photo_id IN ({placeholders})",
-                photo_ids,
-            )
+            from .video_scan_store import requeue_scan
+            cleared = requeue_scan(db.conn, photo_ids)
         elif req.pass_type == "video-describe":
             # Re-queue: drop the description (and what was derived from it —
             # the next description re-queues those anyway, but a cleared

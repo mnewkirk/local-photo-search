@@ -760,17 +760,23 @@ def build_scan_result(scan: ScanData, params: AnalysisParams = DEFAULT_PARAMS,
             if ident.encoding is None:
                 continue
             fi = int(ident.rep_frame_ix)
+            # Below the gate the identity is a video_tracks row only (no
+            # faces row): its crops still upload (tiny, and a carried human
+            # label can promote it server-side) but not its rep frame.
+            face_row = VA.face_row_eligible(ident.n_det, ident.presence_s, params)
             if have_frames and scan.frame_path(fi) is not None:
-                if fi not in rep_done:
+                if face_row and fi not in rep_done:
                     assets.append({"kind": "keyframe", "name": rep_name(fi),
                                    "data": _jpeg(scan.frame_rgb(fi), quality=JPEG_QUALITY)})
                     rep_done.add(fi)
                 for size, data in _identity_crops(scan, ident, workdir).items():
                     assets.append({"kind": "crop", "name": crop_name(ident.ix, size),
                                    "data": data})
-                manifest["reps"][str(ident.ix)] = f"keyframe_{rep_name(fi)}"
+                if face_row:
+                    manifest["reps"][str(ident.ix)] = f"keyframe_{rep_name(fi)}"
             identities.append({
                 "ident_ix": ident.ix,
+                "face_row": face_row,
                 # native display px — photos.image_width/height's space
                 # (coordinate systems: video_scan_store's module docstring)
                 "bbox": trbl_from_xyxy(ident.rep_bbox, 1.0, scan.width, scan.height),

@@ -173,9 +173,12 @@ def apply_subjects_result(conn, r: dict) -> dict:
         fix = s.get("face_ix")
         face_id = None
         if fix is not None:
-            face_id = ident_face.get(int(fix))
-            if face_id is None:
+            # An identity below the faces-row gate has a track with face_id
+            # NULL: the subject is kept, unlinked ("unidentified person") —
+            # that is the gate working, not an unmapped index.
+            if int(fix) not in ident_face:
                 unmapped.append(int(fix))
+            face_id = ident_face.get(int(fix))
         conn.execute(
             "INSERT INTO video_subjects (photo_id, subject_ix, label, category, face_id, "
             "focus_s, focus_intervals, rep_t, rep_frame, rep_bbox, n_segments, share, "
