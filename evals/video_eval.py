@@ -515,12 +515,12 @@ def s2_keys(an, fa, names):
 # ==========================================================================
 
 def default_grounder(image_path, model):
-    """Adapter over `subjects.ground_photo_subjects` (qwen2.5-vl grounding,
-    the photo subject model). Step 3b extends its prompt to return a category;
-    until then boxes carry none and video_subjects falls back to label-based
-    categories. Stub this in tests."""
+    """The production video-subjects call (`subjects.ground_frame_subjects`,
+    role ``subject``, with categories), so the eval scores what ships. An
+    unusable answer comes back None and is scored as "no subject", as the
+    worker's <=20% segment tolerance does. Stub this in tests."""
     from photosearch import subjects
-    return subjects.ground_photo_subjects(str(image_path), model=model)
+    return subjects.ground_frame_subjects(str(image_path), model=model)
 
 
 def ground_video(pid, duration, *, model, grounder=None, max_px=768):
@@ -543,8 +543,8 @@ def ground_video(pid, duration, *, model, grounder=None, max_px=768):
 
 def run_grounding(variant, *, model=None, limit=None, force=False, grounder=None, log=log):
     from photosearch import describe, subjects
-    me.pin_role_model("aesthetics", model)
-    eff = describe.effective_model(model or subjects.AES_MODEL, "aesthetics")
+    me.pin_role_model("subject", model)
+    eff = describe.effective_model(model or subjects.AES_MODEL, "subject")
     run = me.open_run(PASS_GROUND, variant, force=force, effective_model=eff,
                       seg_version=me.video_seg_version())
     todo = [p for p in me.load_video_sample()["photos"]
@@ -1628,7 +1628,7 @@ def main(argv=None):
     rf.add_argument("--variant", required=True)
     rf.add_argument("--approach", required=True, choices=SIMPLICITY)
     rf.add_argument("--grounding", help="grounding cache name (S1/S2)")
-    rf.add_argument("--model", help="grounding model (LM Studio id; pins the aesthetics role)")
+    rf.add_argument("--model", help="grounding model (LM Studio id; pins the subject role)")
     rf.add_argument("--det-tag", default=DET_TAG)
     rf.add_argument("--det-size", type=int)
     for n in ("--sigma", "--a-min", "--merge-l2", "--join-window", "--link-sim"):
