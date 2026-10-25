@@ -7079,5 +7079,86 @@ def video_rescan_fragmented(db, min_detections, min_presence, save_collection, a
             click.echo(f"\nRe-queued video-scan for {n:,} video(s). The fleet re-scans "
                        f"them; video-subjects re-queues as each scan lands.")
 
+
+@cli.command("video-redecode-black")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--ext", "exts", default="",
+              help="Also take every scanned video with these extensions "
+                   "(comma-separated, e.g. m2ts,mts,avi), interlaced or not.")
+@click.option("--empty-only", is_flag=True,
+              help="Only videos whose stored subjects are [] (the visible symptom).")
+@click.option("--save-collection", "save_collection", default=None, metavar="NAME",
+              help="Also save the affected videos as a collection (created, or added to).")
+@click.option("--apply", is_flag=True,
+              help="Re-queue video-scan AND video-describe for exactly these videos.")
+def video_redecode_black(db, exts, empty_only, save_collection, apply):
+    """Re-run the video passes for videos scanned on BLACK frames.
+
+    OpenCV returns all-black (or the previous video's) frames for interlaced
+    H.264 in MPEG-TS (AVCHD .m2ts / .mts) instead of failing, so their scan
+    (faces, CLIP, keyframes, quality, poster), subjects and description were
+    computed on black. video_decode now reads interlaced streams with ffmpeg.
+    Candidates: scanned non-Live videos whose stored probe says interlaced,
+    plus any --ext extension.
+
+    --apply re-queues video-scan (requeue_scan: faces/tracks/labels carried
+    across by the re-scan; the re-scan replaces the black probe poster with
+    its best keyframe and re-queues video-subjects) and clears the
+    description (video-describe clear-pass: category-content/keywords
+    re-queue with it). Probe metadata is unaffected and kept.
+
+    DRY RUN by default, opened READ-ONLY. Run on the NAS.
+
+    \b
+    Then run the fleet (desktop, --native, LM Studio role env exported):
+      ./run-workers.sh --native -s http://<NAS>:8000 \\
+        -p video-scan,video-subjects,video-describe,category-content,keywords -n 2
+    """
+    import sqlite3 as _sqlite3
+    from photosearch import video_scan_store as VSS
+    from photosearch.video_describe_store import requeue_describe
+
+    if not os.path.exists(db):
+        raise click.ClickException(f"database not found: {db}")
+    ext_list = [e.strip() for e in exts.split(",") if e.strip()]
+    conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        info = VSS.black_decode_candidates(conn, ext_list, empty_only=empty_only)
+    finally:
+        conn.close()
+    click.echo("candidates: scanned non-Live videos, interlaced per probe"
+               + (f" or extension in {','.join(ext_list)}" if ext_list else "")
+               + (", subjects [] only" if empty_only else ""))
+    click.echo(f"  {'ext':<6} {'videos':>7} {'interlaced':>11} {'subjects []':>12} "
+               f"{'described':>10} {'scan_error':>11}")
+    for ext, b in sorted(info["by_ext"].items(), key=lambda kv: -kv[1]["videos"]):
+        click.echo(f"  {ext:<6} {b['videos']:>7,} {b['interlaced']:>11,} "
+                   f"{b['subjects_empty']:>12,} {b['described']:>10,} {b['scan_error']:>11,}")
+    click.echo(f"  total  {info['videos']:>7,}")
+    ids = info["photo_ids"]
+    if not apply and not save_collection:
+        click.echo("\nDry run — nothing written. --apply to re-queue video-scan + video-describe.")
+        return
+    if not ids:
+        click.echo("\nNothing to do.")
+        return
+    from photosearch.db import PhotoDB
+    with PhotoDB(db) as pdb:
+        if save_collection:
+            c = pdb.get_collection_by_name(save_collection)
+            cid = c["id"] if c else pdb.create_collection(
+                save_collection,
+                "Videos scanned on black OpenCV frames (video-redecode-black).")
+            added = pdb.add_photos_to_collection(cid, ids)
+            click.echo(f"\nCollection {cid} ({save_collection}): {added:,} video(s) added.")
+        if apply:
+            n = VSS.requeue_scan(pdb.conn, ids)
+            d = requeue_describe(pdb.conn, ids)
+            pdb.conn.commit()
+            click.echo(f"\nRe-queued video-scan for {n:,} video(s) and cleared {d:,} "
+                       f"description(s). video-subjects re-queues as each scan lands; "
+                       f"video-describe waits for it.")
+
 if __name__ == "__main__":
     cli()

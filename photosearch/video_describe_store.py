@@ -158,3 +158,25 @@ def is_stale(conn, photo_id: int, scan_version, scan_generation) -> bool:
     if scan_version is not None and vm[0] != scan_version:
         return True
     return scan_generation is not None and vm[1] != scan_generation
+
+
+def requeue_describe(conn, photo_ids) -> int:
+    """Re-queue ``video-describe`` for exactly ``photo_ids`` (the clear-pass
+    branch): drop the description and what was derived from it (categories,
+    keywords) with their ledger rows — a cleared video must not keep
+    categories about text that is gone; the next description re-queues those
+    anyway. Callers narrow ``photo_ids`` to videos. Does NOT commit; returns
+    the rows reset. ``[]`` is no videos."""
+    ids = [int(i) for i in photo_ids or ()]
+    n = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        ph = ",".join("?" * len(chunk))
+        n += conn.execute(
+            f"UPDATE photos SET description = NULL, categories = NULL, "
+            f"keywords = NULL WHERE id IN ({ph})", chunk).rowcount
+        conn.execute(
+            f"DELETE FROM worker_processed WHERE pass_type IN "
+            f"('video-describe', 'category-content', 'keywords') "
+            f"AND photo_id IN ({ph})", chunk)
+    return n

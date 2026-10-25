@@ -537,24 +537,27 @@ def run_ffprobe(url: str, ffprobe: Optional[str] = None,
     raise ProbeToolError(f"ffprobe exit {proc.returncode}: {_first_error_line(stderr)}")
 
 
-def grab_first_frame(url: str, attempts: int = 2):
+def video_stream_interlaced(data: dict) -> bool:
+    """ffprobe JSON -> is the first video stream interlaced (field_order)?"""
+    from .video_decode import is_interlaced
+    for st in (data or {}).get("streams") or []:
+        if st.get("codec_type") == "video":
+            return is_interlaced(st.get("field_order"))
+    return False
+
+
+def grab_first_frame(url: str, attempts: int = 2, interlaced: bool = False):
     """(RGB numpy frame, t_seconds) of the first decodable frame, or
-    (None, None). cv2 is imported lazily (CI mocks it) and applies the
-    container rotation itself (CAP_PROP_ORIENTATION_AUTO is on)."""
-    import cv2  # noqa: WPS433 — lazy on purpose
+    (None, None) — ``video_decode.grab_frame``: cv2 (lazy; CI mocks it; it
+    applies the container rotation) with an ffmpeg fallback for a black or
+    missing frame, and ffmpeg only for an interlaced stream (cv2 returns
+    black or a stale buffer on AVCHD .m2ts, 2026-10-25)."""
+    from .video_decode import grab_frame
 
     for _ in range(max(1, attempts)):
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        try:
-            if not cap.isOpened():
-                continue
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                t = cap.get(cv2.CAP_PROP_POS_MSEC)
-                t = (t / 1000.0) if t and t > 0 else 0.0
-                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), round(t, 3)
-        finally:
-            cap.release()
+        frame, t = grab_frame(url, 0.0, seek=False, interlaced=bool(interlaced))
+        if frame is not None:
+            return frame, t
     return None, None
 
 

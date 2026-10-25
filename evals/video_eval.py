@@ -1677,20 +1677,34 @@ def _save_jpeg(im, path, quality=85):
 
 
 def _frames_cv2(path, times):
-    """Yield (t, BGR frame or None) for sorted `times`, one capture per video."""
+    """Yield (t, BGR frame or None) for sorted `times`, one capture per video.
+    Interlaced streams (AVCHD .m2ts: cv2 gives black or a stale buffer) are
+    read with ffmpeg only; a black/missing cv2 frame is re-read with ffmpeg."""
     import cv2
-    cap = cv2.VideoCapture(str(path))
+    import numpy as np
+    from photosearch import video_decode as VD
+    path = str(path)
+    interlaced = VD.is_interlaced(VD.ffprobe_basics(path)["field_order"])
+
+    def ff(t):
+        im = VD.ffmpeg_frame(path, t)
+        return None if im is None else np.ascontiguousarray(im[:, :, ::-1])
+
+    if interlaced:
+        for t in times:
+            yield t, ff(t)
+        return
+    cap = cv2.VideoCapture(path)
     try:
         if not cap.isOpened():
             raise RuntimeError("cv2 cannot open this video")
         for t in times:
             cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t) * 1000.0)
             ok, fr = cap.read()
-            if not ok or fr is None or float(fr.mean()) < me.BLACK_FRAME_MEAN:
-                im = me.ffmpeg_frame(path, t)       # cv2 seeks AVCHD .m2ts to black
-                if im is not None:
-                    import numpy as np
-                    ok, fr = True, np.ascontiguousarray(np.asarray(im)[:, :, ::-1])
+            if not ok or VD.frame_is_black(fr):
+                alt = ff(t)
+                if alt is not None and (not ok or not VD.frame_is_black(alt)):
+                    ok, fr = True, alt
             yield t, (fr if ok else None)
     finally:
         cap.release()

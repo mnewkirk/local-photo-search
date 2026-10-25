@@ -1759,18 +1759,10 @@ def clear_pass(req: ClearPassRequest):
             from .video_scan_store import requeue_scan
             cleared = requeue_scan(db.conn, photo_ids)
         elif req.pass_type == "video-describe":
-            # Re-queue: drop the description (and what was derived from it —
-            # the next description re-queues those anyway, but a cleared
-            # video must not keep categories about text that is gone).
+            # Re-queue: drop the description (and what was derived from it).
             # (photo_ids is already narrowed to videos via PASS_MEDIA above.)
-            cur = db.conn.execute(
-                f"UPDATE photos SET description = NULL, categories = NULL, "
-                f"keywords = NULL WHERE id IN ({placeholders})", photo_ids)
-            cleared = cur.rowcount
-            db.conn.execute(
-                f"DELETE FROM worker_processed WHERE pass_type IN "
-                f"('video-describe', 'category-content', 'keywords') "
-                f"AND photo_id IN ({placeholders})", photo_ids)
+            from .video_describe_store import requeue_describe
+            cleared = requeue_describe(db.conn, photo_ids)
         elif req.pass_type == "video-subjects":
             # Re-queue: drop the subject rows and the marker (they are
             # derived from the scan, carry no human input, and a name comes

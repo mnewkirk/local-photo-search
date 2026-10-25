@@ -586,6 +586,68 @@ def requeue_scan(conn, photo_ids) -> int:
     return n
 
 
+def _video_field_order(probe_json) -> Optional[str]:
+    try:
+        data = json.loads(probe_json) if isinstance(probe_json, str) else (probe_json or {})
+    except (TypeError, ValueError):
+        return None
+    for st in (data or {}).get("streams") or []:
+        if isinstance(st, dict) and st.get("codec_type") == "video":
+            return st.get("field_order")
+    return None
+
+
+def _subjects_empty(subjects_json) -> bool:
+    try:
+        d = json.loads(subjects_json) if subjects_json else None
+    except (TypeError, ValueError):
+        return False
+    return isinstance(d, dict) and d.get("subjects") == []
+
+
+def black_decode_candidates(conn, exts=(), empty_only: bool = False) -> dict:
+    """Videos whose scan may have run on black / stale frames — OpenCV hands
+    back all-zero (or the previous video's) BGR for INTERLACED streams
+    (AVCHD .m2ts/.mts) instead of failing (video_decode, 2026-10-25). Read-only.
+
+    A candidate is a non-Live video the scan has already visited
+    (``scan_version`` set, with or without ``scan_error``) that is interlaced
+    per its stored probe (``field_order`` tt/bb/tb/bt) OR whose extension is
+    in ``exts``. ``empty_only`` keeps only those whose stored subjects are
+    ``[]`` (the visible symptom; interlaced clips with subjects may have been
+    scanned on a stale buffer and are wrong too).
+
+    Returns ``{"photo_ids", "videos", "by_ext": {ext: {"videos",
+    "interlaced", "subjects_empty", "described", "scan_error"}}}``."""
+    from .video_decode import is_interlaced
+    want = {e.lower().lstrip(".") for e in exts or () if e}
+    by_ext: dict = {}
+    ids: list[int] = []
+    rows = conn.execute(
+        "SELECT p.id, p.filepath, p.description, v.probe_json, v.subjects_json, "
+        "v.scan_error FROM photos p JOIN video_meta v ON v.photo_id = p.id "
+        "WHERE p.media_type = 'video' AND v.scan_version IS NOT NULL "
+        "AND v.live_of_photo_id IS NULL AND COALESCE(v.kind, '') != 'live' "
+        "ORDER BY p.id")
+    for pid, fp, desc, pj, sj, serr in rows:
+        ext = os.path.splitext(fp or "")[1].lower().lstrip(".")
+        inter = is_interlaced(_video_field_order(pj))
+        if not (inter or ext in want):
+            continue
+        empty = _subjects_empty(sj)
+        if empty_only and not empty:
+            continue
+        b = by_ext.setdefault(ext or "?", {"videos": 0, "interlaced": 0, "subjects_empty": 0,
+                                           "described": 0, "scan_error": 0})
+        b["videos"] += 1
+        b["interlaced"] += int(inter)
+        b["subjects_empty"] += int(empty)
+        b["described"] += int(desc is not None)
+        b["scan_error"] += int(serr is not None)
+        ids.append(int(pid))
+    return {"photo_ids": ids, "videos": len(ids), "by_ext": by_ext}
+
+
 def below_gate_sql(alias: str = "vt") -> str:
     """A ``video_tracks`` row that would NOT get a faces row under the gate
     (``video_analysis.face_row_eligible``; params ``:min_det``, ``:min_pres``,

@@ -158,6 +158,7 @@ class ScanData:
     store_scale: float = 1.0
     timings: dict = field(default_factory=dict)
     det_size: Optional[tuple] = None
+    decoder: str = "cv2"          # video_decode backend: "cv2" | "ffmpeg"
     scan_version: int = SCAN_VERSION
     _summary: Optional[dict] = field(default=None, repr=False)
     # internal: sampled-frame index -> stored JPEG path; (frame, det) -> native crop
@@ -467,20 +468,18 @@ def scan_video(path: str, params: AnalysisParams = DEFAULT_PARAMS,
     t_start = time.time()
     timings = {"decode": 0.0, "detect": 0.0, "measure": 0.0, "store": 0.0}
 
-    cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        cap.release()
-        raise ScanOpenError("cv2 could not open the file")
+    from . import video_decode as VD
+    try:
+        src = VD.open_video(path, duration=duration, log=progress)
+    except VD.DecodeOpenError as e:
+        raise ScanOpenError(str(e)) from e
     store_dir = tempfile.mkdtemp(prefix="vscan-") if want_frames else None
     try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        if not math.isfinite(fps) or fps <= 0 or fps > 1000:
-            fps = 0.0
-        nframes = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        fps = src.fps
+        nframes = src.nframes
         est = float(duration) if duration and duration > 0 else (
             nframes / fps if fps > 0 and nframes > 0 else None)
         sfps = VA.sample_fps(est or 0.0)
-        half_frame = 0.5 / fps if fps > 0 else 0.0
         need = needed_times(est) if est else None
         window = VA.KEYFRAME_NUDGE_S + 1.0 / sfps
 
@@ -491,26 +490,8 @@ def scan_video(path: str, params: AnalysisParams = DEFAULT_PARAMS,
         prev_small = None
         W = H = 0
         scale = 1.0
-        next_t = 0.5 / sfps
-        idx = -1
-        last_t = 0.0
         t0 = time.time()
-        while True:
-            if not cap.grab():
-                break
-            idx += 1
-            pos = cap.get(cv2.CAP_PROP_POS_MSEC)
-            t = (pos / 1000.0) if (pos and pos > 0) else (idx / fps if fps > 0 else 0.0)
-            if idx > 0 and fps > 0 and t <= 0:
-                t = idx / fps
-            last_t = max(last_t, t)
-            if t + half_frame < next_t:
-                continue
-            ok, frame = cap.retrieve()
-            if not ok or frame is None:
-                continue
-            while next_t <= t + half_frame:
-                next_t += 1.0 / sfps
+        for t, idx, frame in src.samples(sfps):
             timings["decode"] += time.time() - t0
 
             if not W:
@@ -596,7 +577,8 @@ def scan_video(path: str, params: AnalysisParams = DEFAULT_PARAMS,
         timings["decode"] += time.time() - t0
 
         if not frames:
-            raise ScanOpenError("cv2 opened the file but decoded no frames")
+            raise ScanOpenError(f"{src.backend} opened the file but decoded no frames")
+        last_t = src.last_t
         dur = float(duration) if duration and duration > 0 else max(
             est or 0.0, last_t + (1.0 / fps if fps > 0 else 0.0))
         ft = [f["t"] for f in frames]
@@ -606,18 +588,19 @@ def scan_video(path: str, params: AnalysisParams = DEFAULT_PARAMS,
         six = VA.nudge_to_sharpest(VA.segment_keyframe_times(segs), ft, gs)
         timings["total"] = round(time.time() - t_start, 3)
         return ScanData(path=path, width=int(W), height=int(H), duration=round(dur, 4),
-                        fps=fps, sample_fps=sfps, n_decoded=idx + 1, frames=frames,
+                        fps=fps, sample_fps=sfps, n_decoded=src.n_decoded, frames=frames,
                         frame_measures=measures, keyframe_ix=kix, segments=segs,
                         segment_ix=six, store_dir=store_dir, store_scale=scale,
                         timings={k: round(v, 3) for k, v in timings.items()},
                         det_size=tuple(det_size) if det_size else None,
+                        decoder=src.backend,
                         _stored=stored, _native_crops=native)
     except BaseException:
         if store_dir:
             shutil.rmtree(store_dir, ignore_errors=True)
         raise
     finally:
-        cap.release()
+        src.close()
 
 
 # ---------------------------------------------------------------------------
@@ -812,7 +795,7 @@ def build_scan_result(scan: ScanData, params: AnalysisParams = DEFAULT_PARAMS,
         "scan_version": SCAN_VERSION,
         "width": scan.width, "height": scan.height, "duration": scan.duration,
         "fps": scan.fps, "sample_fps": scan.sample_fps, "n_samples": len(scan.frames),
-        "n_decoded": scan.n_decoded, "store_scale": round(scan.store_scale, 4),
+        "n_decoded": scan.n_decoded, "decoder": getattr(scan, "decoder", "cv2"), "store_scale": round(scan.store_scale, 4),
         "shake": shake, "noise": noise, "focus_consistency": focus_c,
         "tenengrad_max": max(ten) if ten else None,
         "exposure": exposure, "frames": manifest,

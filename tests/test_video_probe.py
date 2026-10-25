@@ -377,7 +377,7 @@ def _photos(*ids):
 def _patch_tools(monkeypatch, data=None, frame=True):
     monkeypatch.setattr(VP, "run_ffprobe", lambda url: copy.deepcopy(data or _fx("apple_live_hevc_rot")))
     monkeypatch.setattr(VP, "grab_first_frame",
-                        lambda url: (("FRAME", 0.0) if frame else (None, None)))
+                        lambda url, **k: (("FRAME", 0.0) if frame else (None, None)))
     monkeypatch.setattr(VP, "poster_jpegs",
                         lambda f: {"thumb": b"\xff\xd8\xffT", "preview": b"\xff\xd8\xffP",
                                    "full": b"\xff\xd8\xffF"})
@@ -411,7 +411,7 @@ def test_worker_zip_is_a_verdict_and_never_probed(monkeypatch):
 def test_worker_unreadable_is_a_verdict_without_poster(monkeypatch):
     from photosearch import worker as W
     monkeypatch.setattr(VP, "run_ffprobe", lambda url: {"_verdict": "unreadable: moov atom not found"})
-    monkeypatch.setattr(VP, "grab_first_frame", lambda url: pytest.fail("decoded a corrupt file"))
+    monkeypatch.setattr(VP, "grab_first_frame", lambda url, **k: pytest.fail("decoded a corrupt file"))
     c = _Client()
     (r,) = W._process_video_probe(c, _photos(3))
     assert r["probe_error"] == "unreadable: moov atom not found" and not c.uploads

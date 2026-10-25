@@ -1150,9 +1150,10 @@ def _process_video_probe(client: "WorkerClient", photos: list[dict],
                             "probe_json": probe_json})
                 continue
 
-            frame, t = VP.grab_first_frame(url)
+            frame, t = VP.grab_first_frame(
+                url, interlaced=VP.video_stream_interlaced(data))
             if frame is None:
-                probe_json["poster_error"] = "cv2 could not decode a first frame"
+                probe_json["poster_error"] = "could not decode a first frame"
             else:
                 jpegs = VP.poster_jpegs(frame)
                 up = client._request(
@@ -1719,6 +1720,19 @@ def run_worker(
                   "PHOTOSEARCH_FFMPEG / PHOTOSEARCH_FFPROBE) — dropping the pass.",
                   file=sys.stderr)
             passes = [p for p in passes if p != "video-proxy"]
+            if not passes:
+                return
+    if "video-scan" in passes:
+        from .video_probe import find_ffprobe
+        from .video_proxy import find_ffmpeg
+        if not (find_ffmpeg() and find_ffprobe()):
+            # video_decode reads field_order with ffprobe and decodes
+            # interlaced / cv2-black videos with ffmpeg; without them an
+            # AVCHD .m2ts would be scanned on black (or stale) frames.
+            print("Error: video-scan needs ffmpeg + ffprobe (PATH, ~/.local/bin, or "
+                  "PHOTOSEARCH_FFMPEG / PHOTOSEARCH_FFPROBE) — dropping the pass.",
+                  file=sys.stderr)
+            passes = [p for p in passes if p != "video-scan"]
             if not passes:
                 return
     if "video-probe" in passes:
