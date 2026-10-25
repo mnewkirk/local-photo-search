@@ -25,10 +25,11 @@ import random
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from . import model_eval as me
+from . import video_eval_people as vp
 
 router = APIRouter(prefix="/api/eval/models", tags=["eval"])
 
@@ -579,6 +580,7 @@ def get_video_subject(set: str = Query("main")):  # noqa: A002 - query name
     label_set = _label_set(set)
     seg_v = me.video_seg_version()
     labels = me.load_video_subject_labels(label_set)
+    clusters, names = vp.load_clusters(), vp.load_names()
     videos, done_n = [], 0
     for p in _video_entries(label_set):
         pid = int(p["photo_id"])
@@ -589,16 +591,33 @@ def get_video_subject(set: str = Query("main")):  # noqa: A002 - query name
         seg_labels = me.video_segment_labels(labels, pid, seg_v, len(segs))
         done = bool(who and who.get("done") and (live or who.get("seg_version") == seg_v))
         done_n += done
+        sigs = vp.segment_signatures(clusters, names, pid, seg_v, len(segs))
+        mids = [(a + b) / 2.0 for a, b in segs]
         videos.append({
             "photo_id": pid, "stratum": p["stratum"], "kind": "live" if live else "clip",
             "duration_s": p.get("duration_s"), "live_still_id": p.get("live_still_id"),
-            "seg_version": seg_v,
+            "seg_version": seg_v, "video": vp.page_video_info(pid, router.prefix),
             "segments": [{"ix": i, "start": a, "end": b, "choices": chips[i],
-                          "label": seg_labels[i]} for i, (a, b) in enumerate(segs)],
+                          "label": seg_labels[i], "people": _sig_people(sigs[i]),
+                          "faces": sigs[i][1],
+                          "frame_url": f"{router.prefix}/video/frame/{pid}?t={mids[i]:.3f}"
+                                       f"&max_px={vp_strip_px}"}
+                         for i, (a, b) in enumerate(segs)],
+            "runs": [{"segs": r, "people": _sig_people(sigs[r[0]]), "faces": sigs[r[0]][1]}
+                     for r in vp.group_runs(sigs)],
             "who": who, "done": done})
     return {"videos": videos, "persons": _persons(), "notes": _video_notes(),
             "set": label_set, "progress": {"done": done_n, "total": len(videos)},
+            "clusters_ready": clusters is not None,
             "hint": None if videos else _VIDEO_HINT}
+
+
+vp_strip_px = 320
+
+
+def _sig_people(sig) -> list[int]:
+    """Named people (persons.id) in one segment signature."""
+    return [int(t[1]) for t in sig[0] if t[0] == "p"]
 
 
 @router.put("/video/subject/{photo_id}")
@@ -641,7 +660,8 @@ def get_video_quality(set: str = Query("main")):  # noqa: A002
     for p in _video_entries(label_set, clips_only=True):
         pid = int(p["photo_id"])
         videos.append({"photo_id": pid, "stratum": p["stratum"],
-                       "duration_s": p.get("duration_s"), "label": labels.get(str(pid))})
+                       "duration_s": p.get("duration_s"), "label": labels.get(str(pid)),
+                       "video": vp.page_video_info(pid, router.prefix)})
     done = sum(1 for v in videos if (v["label"] or {}).get("done"))
     return {"videos": videos, "notes": _video_notes(), "set": label_set,
             "progress": {"done": done, "total": len(videos)},
@@ -728,6 +748,15 @@ def get_video_frame(photo_id: int, t: float = Query(0.0, ge=0.0),
     path = me.cached_original(photo_id)
     if me.video_sample_entry(photo_id) is None or path is None:
         raise HTTPException(404, "not in the local video originals cache")
+    if max_px:
+        # Downscaled frames (the run strips) are cached on disk —
+        # `cluster-faces` pre-writes the keyframes at the strip size.
+        try:
+            return FileResponse(str(me.cached_frame_jpeg(photo_id, t, max_px)),
+                                media_type="image/jpeg",
+                                headers={"Cache-Control": "max-age=3600"})
+        except Exception as exc:
+            raise HTTPException(500, f"could not grab a frame: {exc}")
     try:
         im = me.grab_frame(path, t, max_px)
         buf = io.BytesIO()
@@ -736,3 +765,98 @@ def get_video_frame(photo_id: int, t: float = Query(0.0, ge=0.0),
         raise HTTPException(500, f"could not grab a frame: {exc}")
     return Response(buf.getvalue(), media_type="image/jpeg",
                     headers={"Cache-Control": "max-age=3600"})
+
+
+@router.get("/video/info/{photo_id}")
+def get_video_info(photo_id: int):
+    """What the page needs to pick proxy vs original (PS.chooseVideoSource)."""
+    if me.video_sample_entry(photo_id) is None:
+        raise HTTPException(404, "not in the video sample")
+    return vp.page_video_info(photo_id, router.prefix)
+
+
+@router.get("/video/proxy/{photo_id}")
+def get_video_proxy(photo_id: int, request: Request):
+    """The cached H.264 proxy (fetched from the NAS by `video_eval.py
+    fetch-proxies`), Range-served. The page plays it when the browser cannot
+    play the original (PS.chooseVideoSource); analysis never uses it."""
+    from . import video_api
+    path = vp.cached_proxy(photo_id)
+    if me.video_sample_entry(photo_id) is None or path is None:
+        raise HTTPException(404, "no proxy cached — run `python evals/video_eval.py fetch-proxies`")
+    return video_api.serve_video_file(request.headers.get("range"), str(path),
+                                      f"{photo_id}.mp4", None,
+                                      {"Cache-Control": "max-age=3600"})
+
+
+# ---- "Video people": name each face cluster once --------------------------
+
+_CLUSTER_HINT = ("No face clusters yet. Build them with: "
+                 "HSA_ENABLE_DXG_DETECTION=1 python evals/video_eval.py cluster-faces --db <db>")
+
+
+@router.get("/video/people")
+def get_video_people():
+    """One card per cross-sample face cluster (largest first), plus the pool
+    of crops the owner ejected from a card. Names are keyed by face id."""
+    clusters, names = vp.load_clusters(), vp.load_names()
+    persons = _persons()
+    if not clusters:
+        return {"clusters": [], "persons": persons, "hint": _CLUSTER_HINT,
+                "progress": {"done": 0, "total": 0}}
+    faces = clusters.get("faces") or {}
+    by_id = {p["id"]: p["name"] for p in persons}
+    cards, done = [], 0
+    for c in clusters.get("clusters") or []:
+        st = vp.cluster_status(c, names)
+        done += st["done"]
+        sug = c.get("suggestion")
+        cards.append({
+            "key": c["key"], "size": len(c["faces"]),
+            "videos": len({faces[f]["photo_id"] for f in c["faces"] if f in faces}),
+            "faces": [{"id": f, "name": names.get(f)} for f in c["faces"]],
+            "suggestion": ({"person_id": sug["person_id"],
+                            "name": by_id.get(sug["person_id"]) or sug.get("name")}
+                           if sug else None),
+            "status": st})
+    ejected = sorted(f for f, n in names.items()
+                     if (n.get("kind") == "ejected" or n.get("ejected")) and f in faces)
+    return {"clusters": cards, "persons": persons,
+            "ejected": [{"id": f, "name": names.get(f)} for f in ejected],
+            "stats": clusters.get("stats"), "hint": None,
+            "progress": {"done": done, "total": len(cards)}}
+
+
+class FaceNamesBody(BaseModel):
+    faces: List[str]
+    kind: Optional[str] = None          # person | someone_else | junk | ejected | null = clear
+    person_id: Optional[int] = None
+    pool: bool = False                  # naming crops from the ejected pool
+
+
+@router.put("/video/people/names")
+def put_video_people_names(body: FaceNamesBody):
+    clusters = vp.load_clusters() or {}
+    known = clusters.get("faces") or {}
+    unknown = [f for f in body.faces if f not in known]
+    if unknown:
+        raise HTTPException(404, f"unknown face ids {unknown[:3]}")
+    ids = {p["id"] for p in _persons()}
+    try:
+        return vp.save_names(body.faces, body.kind, body.person_id,
+                             known_person=(lambda i: i in ids) if ids else None,
+                             keep_ejected=body.pool)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/video/face-crop/{face_id}")
+def get_video_face_crop(face_id: str):
+    try:
+        path = vp.crop_path(face_id)
+    except ValueError:
+        raise HTTPException(400, "bad face id")
+    if not path.exists():
+        raise HTTPException(404, "no such crop")
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=86400"})

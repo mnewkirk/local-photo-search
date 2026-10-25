@@ -117,6 +117,21 @@
     .chip.wrong { background: rgba(248,113,113,0.16); border-color: var(--red); }
     .chip.wrong .tag, .chip.wrong .mark { color: var(--red); text-decoration: line-through; }
     .add { display: flex; gap: 6px; margin-bottom: 12px; }
+    .q.run { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 10px; cursor: pointer; }
+    .q.run.focused { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .q.run.seg { cursor: default; margin: 6px 0 6px 14px; }
+    .q.run .chips { margin-bottom: 6px; }
+    .q.run .add { margin-bottom: 0; }
+    .frames { display: flex; gap: 4px; margin: 6px 0; overflow-x: auto; }
+    .frames img { height: 72px; border-radius: 4px; cursor: pointer; flex: none; background: var(--surface2); }
+    .crops { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
+    .crops img { width: 72px; height: 72px; object-fit: cover; border-radius: 4px; cursor: pointer;
+                 border: 2px solid transparent; background: var(--surface2); }
+    .crops img.ejected { opacity: 0.3; border-color: var(--red); }
+    .crops img.sel { border-color: var(--accent); }
+    .people-card { margin-bottom: 14px; }
+    .people-card.done { opacity: 0.75; }
+    .people-card .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
     .add input { flex: 1; background: var(--surface2); color: var(--text); border: 1px solid var(--border);
       border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px; }
     .q { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
@@ -154,6 +169,7 @@
       { id: 'categories', label: 'Categories' },
       { id: 'keywords', label: 'Keywords' },
       { id: 'planted', label: 'Planted' },
+      { id: 'vpeople', label: 'Video people' },
       { id: 'vsubject', label: 'Video subject' },
       { id: 'vquality', label: 'Video quality' },
     ];
@@ -232,7 +248,7 @@
           else if (ev.key === 'Enter' && L.save) {
             ev.preventDefault();
             if (Date.now() - L.shownAt.current > 600) L.save();
-          } else if (L.digit && /^[1-3]$/.test(ev.key)) {
+          } else if (L.digit && /^[1-9]$/.test(ev.key) && Number(ev.key) <= (L.maxDigit || 3)) {
             ev.preventDefault();
             if (Date.now() - L.shownAt.current > 600) L.digit(Number(ev.key));
           }
@@ -935,15 +951,45 @@
 
     function fmtS(x) { return (Math.round(x * 10) / 10).toFixed(1) + 's'; }
 
+    // Original vs the cached H.264 proxy, chosen by the photo modal's own
+    // helper (PS.chooseVideoSource + PS.canPlayVideo): the owner's browser
+    // plays no HEVC / 10-bit / avi / mts. If the original errors anyway,
+    // switch to the proxy. `info` comes with the tab's data, else is fetched.
     function VideoPane(props) {
+      var infoS = useState(props.info || null); var info = infoS[0]; var setInfo = infoS[1];
+      var errS = useState(false); var errored = errS[0]; var setErrored = errS[1];
+      useEffect(function () {
+        setErrored(false);
+        if (props.info) { setInfo(props.info); return; }
+        setInfo(null);
+        fetch(API + '/video/info/' + props.photoId).then(jsonOrThrow).then(setInfo)
+          .catch(function () { setInfo({}); });
+      }, [props.photoId, props.info]);
+      var original = API + '/video/original/' + props.photoId;
+      var choice = info ? PS.chooseVideoSource(info, original, PS.canPlayVideo(info.playback), '',
+                                               info.filename || '')
+                        : null;
+      if (choice && choice.mode === 'original' && errored) {
+        choice = choice.fallback ? { mode: 'proxy', src: choice.fallback, fallback: null }
+                                 : { mode: 'preparing', src: null, fallback: null };
+      }
+      var player = !choice ? e('div', { className: 'muted' }, 'Loading…')
+        : choice.mode === 'preparing'
+          ? e('div', { className: 'muted', style: { padding: 20 } },
+              'This browser cannot play this clip and no playable copy is cached. Run ',
+              e('code', null, 'python evals/video_eval.py fetch-proxies'), ' — or ',
+              e('a', { href: original, download: '' }, 'download it'), '.')
+          : e('video', {
+              key: props.photoId + choice.mode, ref: props.videoRef, controls: true, preload: 'metadata',
+              src: choice.src,
+              onError: function () { if (choice.mode === 'original') setErrored(true); },
+              style: { maxWidth: '100%', maxHeight: '100%', display: 'block' },
+            });
       return e('div', { className: 'photo-pane' },
-        e('div', { className: 'photo-frame' },
-          e('video', {
-            key: props.photoId, ref: props.videoRef, controls: true, preload: 'metadata',
-            src: API + '/video/original/' + props.photoId,
-            style: { maxWidth: '100%', maxHeight: '100%', display: 'block' },
-          })),
-        e('div', { className: 'photo-meta' }, props.children));
+        e('div', { className: 'photo-frame' }, player),
+        e('div', { className: 'photo-meta' },
+          choice && choice.mode === 'proxy' ? e('span', { className: 'pill' }, 'playable copy') : null,
+          props.children));
     }
 
     // "Does it say what happens over the clip?" — one 3-state answer per
@@ -995,6 +1041,59 @@
       return { people: people, someoneElse: !!w.someone_else, segs: segs, livePair: w.live_pair || null };
     }
 
+    // ---- Run-grouped segment labelling (video_eval_people.group_runs) ----
+    // The server groups consecutive label segments whose frames show the same
+    // named people into runs; one click labels every segment of a run (the
+    // stored labels stay per segment). Nothing is pre-selected.
+    function sameLab(a, b) {
+      if (!a || !b || a.kind !== b.kind) return false;
+      if (a.kind === 'person') return a.person_id === b.person_id;
+      if (a.kind === 'subject') return a.label === b.label;
+      return true;
+    }
+    function runState(segLabels, ixs) {
+      var labs = ixs.map(function (i) { return segLabels[i] || null; });
+      var n = labs.filter(Boolean).length;
+      if (!n) return { state: 'unanswered' };
+      if (n < labs.length) return { state: 'partial' };
+      return labs.every(function (l) { return sameLab(l, labs[0]); })
+        ? { state: 'answered', label: labs[0] } : { state: 'mixed' };
+    }
+    function segChips(v, ixs) {
+      var out = [];
+      ixs.forEach(function (ix) {
+        (v.segments[ix].choices || []).forEach(function (c) { if (out.indexOf(c) < 0) out.push(c); });
+      });
+      return out;
+    }
+    // People the clusters saw anywhere in the clip, most segments first.
+    function videoPresent(v) {
+      var n = {};
+      v.segments.forEach(function (s) { (s.people || []).forEach(function (id) { n[id] = (n[id] || 0) + 1; }); });
+      return Object.keys(n).map(Number).sort(function (a, b) { return n[b] - n[a] || a - b; });
+    }
+    function runChoices(v, run, picked, byId, segLabels, notes) {
+      var out = [];
+      var ids = (run.people || []).slice();
+      picked.forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
+      ids.forEach(function (id) {
+        out.push({ key: 'p' + id, label: byId[id] || ('#' + id), lab: { kind: 'person', person_id: id } });
+      });
+      out.push({ key: 'else', label: 'Someone else', lab: { kind: 'someone_else' } });
+      var pool = segChips(v, run.segs);
+      var shown = pool.slice();
+      run.segs.forEach(function (ix) {
+        var l = segLabels[ix];
+        if (l && l.kind === 'subject' && shown.indexOf(l.label) < 0) shown.push(l.label);
+      });
+      shown.forEach(function (l) {
+        out.push({ key: 's' + l, label: l, lab: { kind: 'subject', label: l, free_text: pool.indexOf(l) < 0 } });
+      });
+      out.push({ key: 'none', label: 'No subject', lab: { kind: 'none' }, title: (notes || {})['no-subject'] });
+      out.push({ key: 'cant', label: "Can't tell", lab: { kind: 'cant_tell' } });
+      return out;
+    }
+
     function VideoSubjectTab(props) {
       var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
       var idxS = useState(0); var idx = idxS[0]; var setIdx = idxS[1];
@@ -1002,10 +1101,12 @@
       var dirtyS = useState(false); var dirty = dirtyS[0]; var setDirty = dirtyS[1];
       var qS = useState(''); var q = qS[0]; var setQ = qS[1];
       var freeS = useState({}); var free = freeS[0]; var setFree = freeS[1];
+      var curRunS = useState(0); var curRun = curRunS[0]; var setCurRun = curRunS[1];
+      var openS = useState({}); var open = openS[0]; var setOpen = openS[1];
       var videoRef = useRef(null);
       var live = useRef(null);
       var shownAt = useRef(0);
-      useEffect(function () { shownAt.current = Date.now(); }, [idx]);
+      useEffect(function () { shownAt.current = Date.now(); setCurRun(0); setOpen({}); }, [idx]);
 
       function load(keepAt) {
         return fetch(API + '/video/subject' + VQS).then(jsonOrThrow).then(function (d) {
@@ -1033,10 +1134,22 @@
         if (i < 0 || i >= videos.length || i === idx) return;
         if (dirty && !window.confirm('Unsaved answers on this video. Leave without saving?')) return;
         setIdx(i); setDraft(subjectDraft(videos[i])); setDirty(false); setQ(''); setFree({});
+        setCurRun(0); setOpen({});
       }
       function upd(patch) { setDraft(Object.assign({}, draft, patch)); setDirty(true); }
-      function setSeg(ix, lab) {
-        var segs = Object.assign({}, draft.segs); segs[ix] = lab; upd({ segs: segs });
+      function setRun(ixs, lab) {
+        var segs = Object.assign({}, draft.segs);
+        ixs.forEach(function (ix) { segs[ix] = Object.assign({}, lab); });
+        var patch = { segs: segs };
+        // Naming someone as a segment's subject means they are in the video.
+        if (lab.kind === 'person' && !draft.people[lab.person_id]) {
+          var p = Object.assign({}, draft.people); p[lab.person_id] = true; patch.people = p;
+        }
+        upd(patch);
+      }
+      function vRuns(x) {
+        return x.runs && x.runs.length ? x.runs
+          : x.segments.map(function (s) { return { segs: [s.ix], people: [], faces: 'none' }; });
       }
       function togglePerson(id) {
         var p = Object.assign({}, draft.people);
@@ -1082,12 +1195,32 @@
         }).catch(function (ex) { props.onError('Save failed: ' + ex.message); });
       }
 
-      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      var notes = (data && data.notes) || {};
+      // Enter: the next unanswered run; once every run is answered, save.
+      function enter() {
+        if (!v || !draft) return;
+        if (v.kind === 'live') { if (draft.livePair) save(); return; }
+        var rs = vRuns(v);
+        for (var k = 1; k <= rs.length; k++) {
+          var r = (curRun + k) % rs.length;
+          if (runState(draft.segs, rs[r].segs).state !== 'answered') { setCurRun(r); return; }
+        }
+        save();
+      }
+      function digit(n) {
+        if (!v || !draft) return;
+        if (v.kind === 'live') { upd({ livePair: ['yes', 'no', 'cant_tell'][n - 1] || draft.livePair }); return; }
+        var rs = vRuns(v);
+        var r = rs[Math.min(curRun, rs.length - 1)];
+        var c = runChoices(v, r, Object.keys(draft.people).map(Number), byId, draft.segs, notes)[n - 1];
+        if (c) setRun(r.segs, c.lab);
+      }
+      live.current = { move: function (d) { goTo(idx + d); }, save: enter, digit: digit, maxDigit: 9,
+                       shownAt: shownAt };
       useKeys(live);
 
       if (!data) return e('div', { className: 'muted' }, 'Loading…');
       if (!videos.length) return e(Hint, { text: data.hint });
-      var notes = data.notes || {};
 
       function chip(key, label, on, onClick, title) {
         return e(PS.Chip, { key: key, label: label, wide: false, state: on ? 'yes' : 'no',
@@ -1113,12 +1246,89 @@
       } else {
         var picked = Object.keys(draft.people).map(Number);
         var answeredN = v.segments.filter(function (s) { return draft.segs[s.ix]; }).length;
+        var present = videoPresent(v);
+        var runs = v.runs && v.runs.length ? v.runs
+          : v.segments.map(function (s) { return { segs: [s.ix], people: [], faces: 'none' }; });
+        var runAt = Math.min(curRun, runs.length - 1);
+
+        function runRow(run, ri, isSeg) {
+          var segs = run.segs.map(function (ix) { return v.segments[ix]; });
+          var choices = runChoices(v, run, picked, byId, draft.segs, notes);
+          var st = runState(draft.segs, run.segs);
+          var focused = !isSeg && ri === runAt;
+          var key = run.segs.join('-');
+          var isOpen = !isSeg && !!open[key];
+          function pick(c) {
+            if (!isSeg) setCurRun(ri);
+            setRun(run.segs, c.lab);
+          }
+          var strip = segs.length > 6
+            ? [0, 1, 2, 3, 4, 5].map(function (k) { return segs[Math.round(k * (segs.length - 1) / 5)]; })
+            : segs;
+          var a = segs[0].start; var b = segs[segs.length - 1].end;
+          var peopleTxt = run.people.map(function (id) { return byId[id] || ('#' + id); }).join(', ');
+          return e('div', { key: (isSeg ? 's' : 'r') + key,
+                            className: 'q run' + (focused ? ' focused' : '') + (isSeg ? ' seg' : ''),
+                            onClick: isSeg ? null : function () { setCurRun(ri); } },
+            e('div', { className: 'q-title' },
+              e('button', { type: 'button', className: 'btn small', style: { marginRight: 8 },
+                            onClick: function (ev) { ev.stopPropagation(); seek(a); } }, '▶'),
+              fmtS(a) + ' – ' + fmtS(b),
+              isSeg ? null : e('span', { className: 'muted', style: { marginLeft: 8 } },
+                segs.length + (segs.length === 1 ? ' segment' : ' segments')),
+              e('span', { className: 'muted', style: { marginLeft: 8 } },
+                run.faces === 'none' ? '· no face' : peopleTxt ? '· faces: ' + peopleTxt
+                  : '· faces (no one named)'),
+              st.state === 'answered' ? null
+                : e('span', { className: 'pill dirty', style: { marginLeft: 8 } },
+                    st.state === 'mixed' ? 'mixed — expand' : st.state === 'partial' ? 'partly answered' : 'unanswered'),
+              isSeg || segs.length < 2 ? null
+                : e('button', { type: 'button', className: 'btn small', style: { marginLeft: 8 },
+                                onClick: function (ev) {
+                                  ev.stopPropagation();
+                                  var o = Object.assign({}, open); o[key] = !o[key]; setOpen(o);
+                                } }, isOpen ? 'Collapse' : 'Label one by one')),
+            isSeg ? null : e('div', { className: 'frames' },
+              strip.map(function (s) {
+                return e('img', { key: s.ix, src: s.frame_url, loading: 'lazy', alt: '',
+                                  title: fmtS(s.start) + ' – ' + fmtS(s.end) + ' (click to play)',
+                                  onClick: function (ev) { ev.stopPropagation(); seek(s.start); } });
+              })),
+            e('div', { className: 'chips' },
+              choices.map(function (c, n) {
+                var on = st.state === 'answered' && sameLab(st.label, c.lab);
+                return chip(c.key, (focused && n < 9 ? (n + 1) + ' · ' : '') + c.label, on,
+                            function (ev) { if (ev) ev.stopPropagation(); pick(c); }, c.title);
+              })),
+            e('div', { className: 'add' },
+              e('input', { value: free[key] || '', placeholder: 'Other subject (dog, mountain lake…) + Enter',
+                           onClick: function (ev) { ev.stopPropagation(); },
+                           onChange: function (ev) { var f = Object.assign({}, free); f[key] = ev.target.value; setFree(f); },
+                           onKeyDown: function (ev) {
+                             if (ev.key !== 'Enter') return;
+                             ev.preventDefault();
+                             var t = (free[key] || '').trim().toLowerCase();
+                             var pool = segChips(v, run.segs);
+                             if (t) pick({ lab: { kind: 'subject', label: t, free_text: pool.indexOf(t) < 0 } });
+                           } })),
+            isOpen ? e('div', { className: 'subruns' },
+              run.segs.map(function (ix) {
+                var s = v.segments[ix];
+                return runRow({ segs: [ix], people: s.people || [], faces: s.faces || 'none' }, ri, true);
+              })) : null);
+        }
+
         body = e('div', { className: 'card' },
           e('div', { className: 'q' },
             e('div', { className: 'q-title' }, '1. Who is in this video?'),
             e('div', { className: 'chips' },
               picked.map(function (id) {
                 return chip('p' + id, byId[id] || ('#' + id), true, function () { togglePerson(id); });
+              }),
+              present.filter(function (id) { return !draft.people[id]; }).map(function (id) {
+                return e(PS.Chip, { key: 'q' + id, label: '+ ' + (byId[id] || ('#' + id)), wide: false,
+                                    state: 'no', title: 'Seen in this clip by face clustering — click to add',
+                                    onClick: function () { togglePerson(id); } });
               }),
               chip('else', 'Someone else', draft.someoneElse,
                    function () { upd({ someoneElse: !draft.someoneElse }); }, notes['someone-else'])),
@@ -1130,53 +1340,17 @@
                 return e('option', { key: p.id, value: p.name });
               })),
               e('button', { className: 'btn', type: 'button', onClick: addPerson }, 'Add'))),
-          e('div', { className: 'q-title' }, '2. Main subject of each segment'),
+          e('div', { className: 'q-title' }, '2. Main subject — one answer per run of similar segments'),
           e('div', { className: 'muted', style: { marginBottom: 10 } }, notes['main-subject'] || ''),
-          v.segments.map(function (s) {
-            var cur = draft.segs[s.ix] || null;
-            function is(kind, extra) {
-              if (!cur || cur.kind !== kind) return false;
-              if (kind === 'person') return cur.person_id === extra;
-              if (kind === 'subject') return cur.label === extra;
-              return true;
-            }
-            var labelsShown = s.choices.slice();
-            if (cur && cur.kind === 'subject' && labelsShown.indexOf(cur.label) < 0) labelsShown.push(cur.label);
-            return e('div', { className: 'q', key: s.ix },
-              e('div', { className: 'q-title' },
-                e('button', { type: 'button', className: 'btn small', style: { marginRight: 8 },
-                              onClick: function () { seek(s.start); } }, '▶'),
-                fmtS(s.start) + ' – ' + fmtS(s.end),
-                cur ? null : e('span', { className: 'pill dirty', style: { marginLeft: 8 } }, 'unanswered')),
-              e('div', { className: 'chips' },
-                picked.map(function (id) {
-                  return chip('p' + id, byId[id] || ('#' + id), is('person', id),
-                              function () { setSeg(s.ix, { kind: 'person', person_id: id }); });
-                }),
-                chip('else', 'Someone else', is('someone_else'),
-                     function () { setSeg(s.ix, { kind: 'someone_else' }); }),
-                labelsShown.map(function (l) {
-                  return chip('s' + l, l, is('subject', l),
-                              function () { setSeg(s.ix, { kind: 'subject', label: l,
-                                                           free_text: s.choices.indexOf(l) < 0 }); });
-                }),
-                chip('none', 'No subject', is('none'), function () { setSeg(s.ix, { kind: 'none' }); },
-                     notes['no-subject']),
-                chip('cant', "Can't tell", is('cant_tell'), function () { setSeg(s.ix, { kind: 'cant_tell' }); })),
-              e('div', { className: 'add' },
-                e('input', { value: free[s.ix] || '', placeholder: 'Other subject (dog, mountain lake…)',
-                             onChange: function (ev) { var f = Object.assign({}, free); f[s.ix] = ev.target.value; setFree(f); },
-                             onKeyDown: function (ev) {
-                               if (ev.key !== 'Enter') return;
-                               ev.preventDefault();
-                               var t = (free[s.ix] || '').trim().toLowerCase();
-                               if (t) setSeg(s.ix, { kind: 'subject', label: t, free_text: s.choices.indexOf(t) < 0 });
-                             } })));
-          }),
+          e('div', { className: 'muted', style: { marginBottom: 10 } },
+            'Keys: 1–9 pick a choice for the highlighted run · Enter = next run (saves when all are answered) · ← → videos.' +
+            (data.clusters_ready ? '' : ' (No face clusters yet — every segment is its own run.)')),
+          runs.map(function (r, ri) { return runRow(r, ri, false); }),
           e('div', { className: 'actions' },
             e('button', { className: 'btn primary', type: 'button', onClick: save,
-                          disabled: answeredN < v.segments.length }, 'Save & next (Enter)'),
-            e('span', { className: 'muted' }, answeredN + ' / ' + v.segments.length + ' segments answered')));
+                          disabled: answeredN < v.segments.length }, 'Save & next'),
+            e('span', { className: 'muted' }, answeredN + ' / ' + v.segments.length + ' segments answered · ' +
+              runs.length + (runs.length === 1 ? ' run' : ' runs'))));
       }
 
       return e('div', null,
@@ -1186,7 +1360,7 @@
                    isDone: function (x) { return x.done; },
                    title: function (x) { return '#' + x.photo_id + ' · ' + x.stratum; } }),
         e('div', { className: 'work' },
-          e(VideoPane, { photoId: v.photo_id, videoRef: videoRef },
+          e(VideoPane, { photoId: v.photo_id, videoRef: videoRef, info: v.video },
             e('button', { className: 'btn', type: 'button', disabled: idx === 0,
                           onClick: function () { goTo(idx - 1); } }, '← Prev'),
             e('span', { className: 'muted' }, (idx + 1) + ' of ' + videos.length +
@@ -1197,6 +1371,126 @@
             dirty ? e('span', { className: 'pill dirty' }, '● unsaved')
                   : v.done ? e('span', { className: 'pill saved' }, '✓ saved') : null),
           body));
+    }
+
+    // ------------------------------------------------------------------
+    // Video people: name each cross-sample face cluster ONCE (largest
+    // first). Names are saved per face crop -> persons.id, so a re-cluster
+    // never loses them. A name SUGGESTION from the library's trusted
+    // references is offered, never applied until confirmed.
+    // ------------------------------------------------------------------
+    var CROPS_SHOWN = 48;
+
+    function PeopleCard(props) {
+      var c = props.card;
+      var qS = useState(''); var q = qS[0]; var setQ = qS[1];
+      var allS = useState(false); var all = allS[0]; var setAll = allS[1];
+      var selS = useState({}); var sel = selS[0]; var setSel = selS[1];
+      var byId = props.byId;
+      var pool = !!props.pool;
+      var faces = c.faces;
+      function isEj(f) { return !!(f.name && (f.name.kind === 'ejected' || f.name.ejected)); }
+      var kept = faces.filter(function (f) { return !isEj(f); });
+      var st = c.status || {};
+      function answerText(a) {
+        if (!a) return 'not named yet';
+        if (a[0] === 'p') return byId[Number(a.slice(1))] || ('#' + a.slice(1));
+        return a === 'someone_else' ? 'someone else (unnamed)' : a === 'junk' ? 'not a face / junk' : a;
+      }
+      function targets() {
+        if (pool) return Object.keys(sel).filter(function (k) { return sel[k]; });
+        return kept.map(function (f) { return f.id; });
+      }
+      function apply(kind, personId) {
+        var ids = targets();
+        if (!ids.length) return;
+        props.save(ids, kind, personId, pool).then(function () { setSel({}); setQ(''); });
+      }
+      function nameTyped() {
+        var t = q.trim().toLowerCase();
+        var hit = props.persons.find(function (p) { return p.name.toLowerCase() === t; });
+        if (!hit) { props.onError('No person named "' + q + '" — pick one from the list.'); return; }
+        apply('person', hit.id);
+      }
+      function clickCrop(f) {
+        if (pool) { var s2 = Object.assign({}, sel); s2[f.id] = !s2[f.id]; setSel(s2); return; }
+        if (isEj(f)) {
+          // Back into the cluster: take the cluster's answer, else unnamed.
+          var a = st.answer;
+          if (a && a[0] === 'p') props.save([f.id], 'person', Number(a.slice(1)));
+          else if (a) props.save([f.id], a);
+          else props.save([f.id], null);
+        } else {
+          props.save([f.id], 'ejected');
+        }
+      }
+      var shown = all ? faces : faces.slice(0, CROPS_SHOWN);
+      var dl = 'vp-persons';
+      return e('div', { className: 'card people-card' + (st.done && !pool ? ' done' : '') },
+        e('div', { className: 'head' },
+          e('strong', null, pool ? 'Ejected crops' : ('Cluster ' + (props.n + 1))),
+          e('span', { className: 'muted' }, faces.length + ' faces' + (c.videos ? ' · ' + c.videos + ' videos' : '')),
+          pool ? e('span', { className: 'muted' }, 'click crops to select, then name them')
+               : e('span', { className: 'pill' + (st.done ? ' saved' : '') }, answerText(st.answer))),
+        e('div', { className: 'crops' },
+          shown.map(function (f) {
+            var ej = isEj(f);
+            return e('img', { key: f.id, src: API + '/video/face-crop/' + f.id, loading: 'lazy', alt: '',
+                              className: (pool ? (sel[f.id] ? 'sel' : '') : (ej ? 'ejected' : '')),
+                              title: pool ? (f.name ? answerText(f.name.kind === 'person' ? 'p' + f.name.person_id : f.name.kind) : '')
+                                          : (ej ? 'Ejected — click to put back' : 'Not this person? Click to eject'),
+                              onClick: function () { clickCrop(f); } });
+          }),
+          faces.length > CROPS_SHOWN ? e('button', { type: 'button', className: 'btn small',
+            onClick: function () { setAll(!all); } }, all ? 'Show fewer' : 'Show all ' + faces.length) : null),
+        c.suggestion && !st.done ? e('div', { className: 'q-actions', style: { marginBottom: 8 } },
+          e('span', { className: 'muted' }, 'Suggestion from library faces (unconfirmed): '),
+          e('button', { type: 'button', className: 'btn small',
+                        onClick: function () { apply('person', c.suggestion.person_id); } },
+            'Yes, ' + (c.suggestion.name || ('#' + c.suggestion.person_id)))) : null,
+        e('div', { className: 'add' },
+          e('input', { list: dl, value: q, placeholder: pool ? 'Name the selected crops…' : 'Who is this? (type a name)',
+                       onChange: function (ev) { setQ(ev.target.value); },
+                       onKeyDown: function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); nameTyped(); } } }),
+          e('button', { className: 'btn', type: 'button', onClick: nameTyped }, 'Name'),
+          e('button', { className: 'btn', type: 'button', onClick: function () { apply('someone_else'); } }, 'Someone else'),
+          e('button', { className: 'btn', type: 'button', onClick: function () { apply('junk'); } }, 'Not a face'),
+          pool ? null : e('button', { className: 'btn', type: 'button', onClick: function () { apply(null); } }, 'Clear')));
+    }
+
+    function VideoPeopleTab(props) {
+      var dataS = useState(null); var data = dataS[0]; var setData = dataS[1];
+      function load() {
+        return fetch(API + '/video/people').then(jsonOrThrow).then(setData)
+          .catch(function (ex) { props.onError('Could not load clusters: ' + ex.message); });
+      }
+      useEffect(function () { load(); }, []);
+      if (!data) return e('div', { className: 'muted' }, 'Loading…');
+      if (!data.clusters.length) return e(Hint, { text: data.hint });
+      var byId = {};
+      data.persons.forEach(function (p) { byId[p.id] = p.name; });
+      function save(ids, kind, personId, pool) {
+        return fetch(API + '/video/people/names', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ faces: ids, kind: kind || null, person_id: personId == null ? null : personId,
+                                 pool: !!pool }),
+        }).then(jsonOrThrow).then(function () { props.onError(null); return load(); })
+          .catch(function (ex) { props.onError('Save failed: ' + ex.message); });
+      }
+      return e('div', null,
+        e(Progress, { progress: data.progress },
+          e('span', { className: 'muted' }, 'Name each cluster once; the Video subject tab then groups segments by who is in them.')),
+        e('datalist', { id: 'vp-persons' }, data.persons.map(function (p) {
+          return e('option', { key: p.id, value: p.name });
+        })),
+        data.clusters.map(function (c, n) {
+          return e(PeopleCard, { key: c.key, card: c, n: n, byId: byId, persons: data.persons,
+                                 save: save, onError: props.onError });
+        }),
+        data.ejected && data.ejected.length
+          ? e(PeopleCard, { key: 'ejected', pool: true, card: { faces: data.ejected, status: {} }, n: 0,
+                            byId: byId, persons: data.persons, save: save, onError: props.onError })
+          : null);
     }
 
     var QUALITY_QS = [
@@ -1262,12 +1556,32 @@
         setLoupe({ t: t });
       }
 
-      live.current = { move: function (d) { goTo(idx + d); }, save: save, shownAt: shownAt };
+      var notes = (data && data.notes) || {};
+      // Enter: the next unanswered run; once every run is answered, save.
+      function enter() {
+        if (!v || !draft) return;
+        if (v.kind === 'live') { if (draft.livePair) save(); return; }
+        var rs = vRuns(v);
+        for (var k = 1; k <= rs.length; k++) {
+          var r = (curRun + k) % rs.length;
+          if (runState(draft.segs, rs[r].segs).state !== 'answered') { setCurRun(r); return; }
+        }
+        save();
+      }
+      function digit(n) {
+        if (!v || !draft) return;
+        if (v.kind === 'live') { upd({ livePair: ['yes', 'no', 'cant_tell'][n - 1] || draft.livePair }); return; }
+        var rs = vRuns(v);
+        var r = rs[Math.min(curRun, rs.length - 1)];
+        var c = runChoices(v, r, Object.keys(draft.people).map(Number), byId, draft.segs, notes)[n - 1];
+        if (c) setRun(r.segs, c.lab);
+      }
+      live.current = { move: function (d) { goTo(idx + d); }, save: enter, digit: digit, maxDigit: 9,
+                       shownAt: shownAt };
       useKeys(live);
 
       if (!data) return e('div', { className: 'muted' }, 'Loading…');
       if (!videos.length) return e(Hint, { text: data.hint });
-      var notes = data.notes || {};
 
       return e('div', null,
         loupe ? e(PS.Loupe, { key: v.photo_id + ':' + loupe.t,
@@ -1278,7 +1592,7 @@
                    isDone: function (x) { return !!(x.label && x.label.done); },
                    title: function (x) { return '#' + x.photo_id + ' · ' + x.stratum; } }),
         e('div', { className: 'work' },
-          e(VideoPane, { photoId: v.photo_id, videoRef: videoRef },
+          e(VideoPane, { photoId: v.photo_id, videoRef: videoRef, info: v.video },
             e('span', { className: 'muted' }, (idx + 1) + ' of ' + videos.length),
             e('span', { className: 'spacer' }),
             e('button', { className: 'btn', type: 'button', onClick: grab,
@@ -1323,6 +1637,7 @@
       }
 
       var body = tab === 'diffs' ? e(DiffsTab, { key: 'd' + dpass, dpass: dpass, onPass: pickPass, onError: setError })
+        : tab === 'vpeople' ? e(VideoPeopleTab, { key: 'vp', onError: setError })
         : tab === 'vsubject' ? e(VideoSubjectTab, { key: 'vs', onError: setError })
         : tab === 'vquality' ? e(VideoQualityTab, { key: 'vq', onError: setError })
         : tab === 'claims' ? e(ClaimsTab, { key: 'c', onError: setError })

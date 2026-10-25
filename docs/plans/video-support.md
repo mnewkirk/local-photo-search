@@ -781,6 +781,26 @@ subject", or "can't tell". `LABELLER_NOTES`: "what the camera operator is
 framing or following: a person, an animal, a thing, or the scenery; if two are
 framed equally, can't tell is fine". About 75 min for 90 videos.
 
+**Faster labelling (2026-10-25, `photosearch/video_eval_people.py`).** Owner
+feedback: some clips did not play, and most were tedious (same subject in every
+segment). Three helpers, all files under `video/`, none changing the label
+keys: (1) `fetch-proxies [--make-missing]` caches the NAS's H.264 proxy (or
+transcodes one from the cached original — the NAS never proxies Live clips) and
+the page picks proxy vs original with `PS.chooseVideoSource`; analysis keeps
+the originals. (2) `cluster-faces` runs InsightFace on each label segment's
+midpoint keyframe plus two more frames, clusters ALL sampled faces with
+average linkage (L2 1.0 — DBSCAN chained Calvin and a team of other kids into
+one 261-face, 31-video cluster at eps 0.95), and attaches a conservative
+library-reference name SUGGESTION; the owner names clusters once on the
+**Video people** tab (names keyed by face id, so a re-cluster never orphans
+them; strangers can stay unnamed). (3) The Video subject tab groups
+consecutive segments whose frames show the same NAMED people (and the same
+no-face / unnamed-faces state) into runs; one click labels a run, still
+written per segment. Nothing is pre-selected and no prediction is shown.
+cv2 seeks AVCHD `.m2ts` to black frames, so `grab_frame` re-reads a black or
+missing frame with ffmpeg (the S1 grounding cache for 254431 was computed on
+black frames).
+
 Non-person labels are scored by normalized label match (lowercase, lemmatized,
 articles stripped); when the owner typed free text, the comparer model
 (gemma-4-26b-a4b, not a candidate) judges "same subject?" and the owner

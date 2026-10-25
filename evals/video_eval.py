@@ -37,6 +37,17 @@ Subcommands:
                    model, not a candidate), and same-subject judgements for
                    free-text subject labels:
                        python evals/video_eval.py disputes --model gemma-4-26b-a4b
+  fetch-proxies    cache the NAS's H.264 proxy for every sampled video that
+                   has one (the owner's browser plays no HEVC / 10-bit / avi /
+                   mts) + each original's playback facts; analysis keeps
+                   using the originals:
+                       python evals/video_eval.py fetch-proxies --server http://<nas>:8000
+  cluster-faces    InsightFace on every label segment's keyframe (+2 frames
+                   per segment), average-link clustering across the WHOLE sample, a
+                   conservative name suggestion per cluster from the library's
+                   trusted references (read-only). The owner names clusters
+                   once on /eval/models?tab=vpeople:
+                       HSA_ENABLE_DXG_DETECTION=1 python evals/video_eval.py cluster-faces --db <db>
   report           every gate, holdout headline with dev beside it, CIs:
                        python evals/video_eval.py report [--db <db>]
   agreement        owner self-agreement on the recheck set (kappa < 0.4 =
@@ -1590,6 +1601,274 @@ def render(rep, log=log):
 # CLI
 # ==========================================================================
 
+# ==========================================================================
+# Faster labelling: proxies + cross-sample face clusters
+# (photosearch/video_eval_people.py)
+# ==========================================================================
+
+FACE_MIN_SCORE = 0.6
+FACE_MIN_EDGE = 36            # px at native resolution
+CLUSTER_THRESHOLD = 1.0       # average-linkage L2 (see video_eval_people.cluster_embeddings)
+CLUSTER_MIN_SIZE = 2
+REF_CAP_PER_PERSON = 400
+EXTRA_FRAME_FRACS = (0.2, 0.8)   # besides the midpoint keyframe
+STRIP_PX = 320
+
+
+def fetch_proxies(*, server, ids=None, fetcher=None, make_missing=False,
+                  intent="Fetch playable proxies for the video eval"):
+    from photosearch import video_eval_people as vp
+    have = bad = 0
+    for pid in (ids if ids is not None else [int(p["photo_id"]) for p in me.load_video_sample()["photos"]]):
+        try:
+            e = (fetcher or vp.fetch_proxy)(pid, server, intent=intent)
+            if make_missing and e.get("needs_proxy") and not e.get("proxy_bytes"):
+                n = vp.make_local_proxy(pid)
+                e = dict(e, proxy_bytes=n)
+                log(f"  {pid}: transcoded locally ({n} B)")
+            have += bool(e.get("proxy_bytes"))
+            log(f"  {pid}: {'proxy ' + str(e['proxy_bytes']) + ' B' if e.get('proxy_bytes') else 'no proxy'}"
+                f"{' (needs one)' if e.get('needs_proxy') and not e.get('proxy_bytes') else ''}")
+        except Exception as ex:
+            bad += 1
+            log(f"  ! {pid}: {ex}")
+    log(f"[proxies] {have} cached, {bad} failed")
+    return have, bad
+
+
+def segment_frame_times(segments, extra=EXTRA_FRAME_FRACS):
+    """[(seg_ix, t, is_keyframe)]: the label segment's midpoint keyframe (what
+    the page shows) plus a couple of frames inside it, so a face turned away
+    at the keyframe still lands."""
+    from photosearch import video_analysis as va
+    out = []
+    for ix, ((a, b), mid) in enumerate(zip(segments, va.segment_keyframe_times(segments))):
+        out.append((ix, float(mid), True))
+        for f in extra:
+            out.append((ix, a + (b - a) * f, False))
+    return out
+
+
+def _crop(img_rgb, ltrb, size=128, pad=0.3):
+    from PIL import Image
+    l, t, r, b = ltrb
+    w, h = r - l, b - t
+    side = max(w, h) * (1 + 2 * pad)
+    cx, cy = (l + r) / 2, (t + b) / 2
+    box = (int(max(0, cx - side / 2)), int(max(0, cy - side / 2)),
+           int(min(img_rgb.width, cx + side / 2)), int(min(img_rgb.height, cy + side / 2)))
+    c = img_rgb.crop(box)
+    c.thumbnail((size, size), Image.LANCZOS)
+    return c
+
+
+def _save_jpeg(im, path, quality=85):
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".c", suffix=".jpg")
+    os.close(fd)
+    try:
+        im.save(tmp, "JPEG", quality=quality)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _frames_cv2(path, times):
+    """Yield (t, BGR frame or None) for sorted `times`, one capture per video."""
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise RuntimeError("cv2 cannot open this video")
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t) * 1000.0)
+            ok, fr = cap.read()
+            if not ok or fr is None or float(fr.mean()) < me.BLACK_FRAME_MEAN:
+                im = me.ffmpeg_frame(path, t)       # cv2 seeks AVCHD .m2ts to black
+                if im is not None:
+                    import numpy as np
+                    ok, fr = True, np.ascontiguousarray(np.asarray(im)[:, :, ::-1])
+            yield t, (fr if ok else None)
+    finally:
+        cap.release()
+
+
+def detect_video_faces(pid, duration, *, detect=None, frames=None, force=False):
+    """Per-video detection cache (video/face_dets/<pid>.json + .npz): faces
+    on the label segments' frames, crops written, embeddings kept so
+    re-clustering never re-detects."""
+    import numpy as np
+    from PIL import Image
+    from photosearch import video_eval_people as vp
+    seg_v = me.video_seg_version()
+    d = vp.video_dir() / "face_dets"
+    js, npz = d / f"{pid}.json", d / f"{pid}.npz"
+    meta = me.read_json(js, None)
+    if meta and npz.exists() and meta.get("seg_version") == seg_v and not force:
+        return meta, np.load(npz)["emb"]
+    src = me.cached_original(pid)
+    if src is None:
+        raise FileNotFoundError(f"video {pid} not cached — run fetch-originals")
+    segs = me.video_label_segments(duration)
+    plan = segment_frame_times(segs)
+    by_t: dict = {}
+    for ix, t, key in plan:
+        by_t.setdefault(round(t, 3), []).append((ix, key))
+    if detect is None:
+        from photosearch import faces
+        detect = faces.detect_faces_bgr
+    faces_meta, embs, n_frames = [], [], 0
+    for t, fr in (frames or _frames_cv2)(src, sorted(by_t)):
+        if fr is None:
+            continue
+        n_frames += 1
+        rgb = Image.fromarray(np.ascontiguousarray(fr[:, :, ::-1]))
+        ix = by_t[t][0][0]
+        if any(k for _, k in by_t[t]):
+            p = vp.frame_path(pid, t, STRIP_PX)
+            if not p.exists():
+                th = rgb.copy()
+                th.thumbnail((STRIP_PX, STRIP_PX), Image.LANCZOS)
+                _save_jpeg(th, p)
+        for det in detect(fr):
+            top, right, bottom, left = det["bbox"]
+            if det.get("det_score", 1.0) < FACE_MIN_SCORE or min(right - left, bottom - top) < FACE_MIN_EDGE:
+                continue
+            fid = vp.face_id(pid, t, (left, top, right, bottom))
+            cp = vp.crop_path(fid)
+            if not cp.exists():
+                _save_jpeg(_crop(rgb, (left, top, right, bottom)), cp)
+            faces_meta.append({"id": fid, "photo_id": int(pid), "t": t, "seg_ix": ix,
+                               "seg_version": seg_v, "bbox": [left, top, right, bottom],
+                               "det_score": round(float(det.get("det_score", 1.0)), 3)})
+            embs.append(det["encoding"])
+    emb = np.asarray(embs, np.float32).reshape(-1, 512)
+    d.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(npz, emb=emb)
+    meta = {"seg_version": seg_v, "faces": faces_meta, "n_frames": n_frames,
+            "n_planned": len(by_t), "saved": me.now_iso()}
+    me.write_json_atomic(js, meta)
+    return meta, emb
+
+
+def trusted_references(conn, cap=REF_CAP_PER_PERSON, seed=SEED):
+    """(person_ids, encodings, {id: name}) from the library's TRUSTED labels
+    (manual / merge_review / strict) + face_references, capped per person.
+    Read-only."""
+    import struct
+    import numpy as np
+    from photosearch import video_eval_people as vp
+    by: dict = {}
+    ph = ",".join("?" * len(vp.TRUSTED_SOURCES))
+    try:
+        rows = list(conn.execute(
+            "SELECT f.person_id, e.encoding FROM faces f JOIN face_encodings e ON e.face_id = f.id "
+            f"WHERE f.person_id IS NOT NULL AND f.match_source IN ({ph})", vp.TRUSTED_SOURCES))
+        try:
+            rows += list(conn.execute(
+                "SELECT fr.person_id, e.encoding FROM face_references fr "
+                "JOIN face_ref_encodings e ON e.ref_id = fr.id"))
+        except Exception:
+            pass
+    except Exception as ex:
+        log(f"[refs] cannot read encodings ({ex}); no name suggestions")
+        rows = []
+    for pid, blob in rows:
+        by.setdefault(int(pid), []).append(blob)
+    rnd = random.Random(seed)
+    pids, encs = [], []
+    for pid, blobs in sorted(by.items()):
+        if len(blobs) > cap:
+            blobs = rnd.sample(blobs, cap)
+        for b in blobs:
+            pids.append(pid)
+            encs.append(struct.unpack(f"{len(b) // 4}f", b))
+    names = {}
+    try:
+        names = {int(r[0]): r[1] for r in conn.execute("SELECT id, name FROM persons")}
+    except Exception:
+        pass
+    return pids, (np.asarray(encs, np.float32) if encs else np.zeros((0, 512), np.float32)), names
+
+
+def cluster_faces(*, conn=None, threshold=CLUSTER_THRESHOLD, min_size=CLUSTER_MIN_SIZE,
+                  detect=None, frames=None, force_detect=False, refs=None, log=log):
+    """Detect (cached per video), cluster across the whole sample, suggest
+    names, write video/face_clusters.json. Returns the saved file."""
+    import hashlib
+    import numpy as np
+    from photosearch import video_eval_people as vp
+    clips = [p for p in me.load_video_sample()["photos"] if me.is_labelled_clip(p)]
+    all_meta, all_emb, t0 = [], [], time.time()
+    for n, p in enumerate(clips, 1):
+        pid = int(p["photo_id"])
+        try:
+            meta, emb = detect_video_faces(pid, p.get("duration_s") or 0, detect=detect,
+                                           frames=frames, force=force_detect)
+        except Exception as ex:
+            log(f"  ! {pid}: {ex}")
+            continue
+        all_meta += meta["faces"]
+        all_emb.append(emb)
+        log(f"  [{n}/{len(clips)}] {pid}: {len(meta['faces'])} faces on {meta['n_frames']} frames "
+            f"({time.time() - t0:.0f}s)")
+    emb = np.concatenate(all_emb) if all_emb else np.zeros((0, 512), np.float32)
+    labels = vp.cluster_embeddings(emb, threshold=threshold, min_size=min_size)
+    if refs is None:
+        refs = trusted_references(conn) if conn is not None else ([], np.zeros((0, 512)), {})
+    rpids, remb, pnames = refs
+    groups: dict = {}
+    for i, lab in enumerate(labels):
+        if lab >= 0:
+            groups.setdefault(int(lab), []).append(i)
+    ordered = sorted(groups.values(), key=lambda ix: (-len(ix), all_meta[ix[0]]["id"]))
+    version = hashlib.sha256(json.dumps({
+        "threshold": threshold, "min_size": min_size, "linkage": "average",
+        "faces": [m["id"] for m in all_meta]},
+        sort_keys=True).encode()).hexdigest()[:12]
+    clusters = []
+    for k, ix in enumerate(ordered):
+        sug = vp.suggest_person(emb[ix], rpids, remb)
+        if sug:
+            sug["name"] = pnames.get(sug["person_id"])
+        clusters.append({"key": f"{version}-{k}", "faces": [all_meta[i]["id"] for i in ix],
+                         "suggestion": sug})
+    noise = [all_meta[i]["id"] for i, lab in enumerate(labels) if lab < 0]
+    sizes = [len(c["faces"]) for c in clusters]
+    stats = {"faces": len(all_meta), "clusters": len(clusters), "noise": len(noise),
+             "sizes_top": sizes[:15], "clusters_ge5": sum(s >= 5 for s in sizes),
+             "suggested": sum(1 for c in clusters if c["suggestion"]),
+             "suggested_faces": sum(len(c["faces"]) for c in clusters if c["suggestion"])}
+    data = vp.save_clusters({
+        "version": version, "params": {"threshold": threshold, "min_size": min_size,
+                                       "linkage": "average",
+                                       "min_score": FACE_MIN_SCORE, "min_edge": FACE_MIN_EDGE,
+                                       "suggest_max_dist": vp.SUGGEST_MAX_DIST,
+                                       "suggest_margin": vp.SUGGEST_MARGIN},
+        "faces": {m["id"]: {k: v for k, v in m.items() if k != "id"} for m in all_meta},
+        "clusters": clusters, "noise": noise, "stats": stats})
+    log(f"[clusters] {stats}")
+    return data
+
+
+def run_stats():
+    """How many runs the labelled clips collapse to, with the current names."""
+    from photosearch import video_eval_people as vp
+    cl, names = vp.load_clusters(), vp.load_names()
+    seg_v = me.video_seg_version()
+    segs = runs = 0
+    for p in me.load_video_sample()["photos"]:
+        if not me.is_labelled_clip(p):
+            continue
+        n = len(me.video_label_segments(p.get("duration_s") or 0))
+        segs += n
+        runs += len(vp.group_runs(vp.segment_signatures(cl, names, int(p["photo_id"]), seg_v, n)))
+    return {"segments": segs, "runs": runs}
+
+
 def _params(args):
     from photosearch import video_analysis as va
     from photosearch import video_subjects as vs
@@ -1662,6 +1941,19 @@ def main(argv=None):
     dp.add_argument("--force", action="store_true")
     dp.add_argument("--no-labels", action="store_true", help="skip same-subject judgements")
 
+    fp = sub.add_parser("fetch-proxies")
+    fp.add_argument("--server", default=os.environ.get("PHOTOSEARCH_NAS_URL") or me.DEFAULT_SERVER)
+    fp.add_argument("--make-missing", action="store_true",
+                    help="transcode a local proxy (from the cached original) when the NAS has none")
+
+    cf = sub.add_parser("cluster-faces")
+    cf.add_argument("--db", **db_kw)
+    cf.add_argument("--threshold", type=float, default=CLUSTER_THRESHOLD,
+                    help="average-linkage L2 distance threshold")
+    cf.add_argument("--min-size", type=int, default=CLUSTER_MIN_SIZE)
+    cf.add_argument("--force-detect", action="store_true")
+    sub.add_parser("run-stats")
+
     rp = sub.add_parser("report")
     rp.add_argument("--json", action="store_true")
     sub.add_parser("agreement")
@@ -1701,6 +1993,15 @@ def main(argv=None):
                              variants=a.variants.split(",") if a.variants else None)
         if not a.no_labels:
             judge_same_labels(model=a.model)
+    elif a.cmd == "fetch-proxies":
+        fetch_proxies(server=a.server, make_missing=a.make_missing)
+    elif a.cmd == "cluster-faces":
+        conn = me.open_db_readonly(a.db) if a.db else None
+        cluster_faces(conn=conn, threshold=a.threshold, min_size=a.min_size,
+                      force_detect=a.force_detect)
+        log(f"[runs] {run_stats()}")
+    elif a.cmd == "run-stats":
+        log(f"[runs] {run_stats()}")
     elif a.cmd == "report":
         rep = build_report()
         if a.json:

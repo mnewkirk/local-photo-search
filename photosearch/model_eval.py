@@ -27,6 +27,7 @@ this generalises rather than copies:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -1334,25 +1335,57 @@ def copy_video_original(photo_id: int, src: str) -> Path:
     return dest
 
 
+BLACK_FRAME_MEAN = 3.0
+
+
+def ffmpeg_frame(path, t: float):
+    """One frame via the ffmpeg CLI (PIL RGB, auto-rotated), or None. The
+    fallback for what cv2 seeks badly: on an AVCHD .m2ts it returned BLACK
+    frames at every timestamp (2026-10-25, video 254431)."""
+    import subprocess
+    from PIL import Image
+    from .video_proxy import find_ffmpeg
+    exe = find_ffmpeg()
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run([exe, "-v", "error", "-ss", f"{max(0.0, float(t)):.3f}",
+                               "-i", str(path), "-frames:v", "1", "-f", "image2pipe",
+                               "-vcodec", "png", "-"], capture_output=True, timeout=180)
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    try:
+        return Image.open(io.BytesIO(proc.stdout)).convert("RGB")
+    except Exception:
+        return None
+
+
 def grab_frame(path, t: float, max_px: int = 0):
     """One frame at `t` seconds as a PIL RGB image (cv2, imported lazily —
-    never on the NAS). max_px 0 = native resolution (for the loupe)."""
+    never on the NAS). max_px 0 = native resolution (for the loupe). A
+    missing or all-black cv2 frame is re-read with ffmpeg (`ffmpeg_frame`)."""
     import cv2
     from PIL import Image
     cap = cv2.VideoCapture(str(path))
+    im = None
     try:
         if not cap.isOpened():
             raise RuntimeError("cv2 cannot open this video")
         cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t)) * 1000.0)
         ok, frame = cap.read()
-        if not ok or frame is None:
+        if not ok or frame is None or float(frame.mean()) < BLACK_FRAME_MEAN:
+            im = ffmpeg_frame(path, t)
+        if im is None and (not ok or frame is None):
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = cap.read()
-        if not ok or frame is None:
+        if im is None and (not ok or frame is None):
             raise RuntimeError(f"no frame at {t:.2f}s")
     finally:
         cap.release()
-    im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    if im is None:
+        im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     if max_px and max(im.size) > max_px:
         im.thumbnail((max_px, max_px), Image.LANCZOS)
     return im
