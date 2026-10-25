@@ -148,14 +148,57 @@ def _http_400(body):
 
 def test_a_context_overflow_400_is_its_own_exception(monkeypatch):
     monkeypatch.setenv("PHOTOSEARCH_LLM_VIDEO_MODEL", "vid-m")
-    bodies = _openai(monkeypatch, [_http_400('{"error":"Context size has been exceeded."}')])
+    monkeypatch.setattr(d, "_CONTEXT_CONTENTION_DELAY", 0)
+    over = '{"error":"Context size has been exceeded."}'
+    bodies = _openai(monkeypatch, [_http_400(over) for _ in range(d._MAX_RETRIES)])
     with pytest.raises(d.ContextOverflow) as ei:
         d._ollama_chat_with_retry(model="m", messages=[{"role": "user", "content": "x"}],
                                   timeout=5, role="video")
-    assert len(bodies) == 1                       # not retried as transient
+    # Retried (LM Studio's KV cache is shared, so it may be contention), and
+    # only a PERSISTENT overflow becomes the configuration failure.
+    assert len(bodies) == d._MAX_RETRIES
     assert "Context size" in ei.value.detail
     assert not isinstance(ei.value, (d.UnusableAnswer, TimeoutError, ConnectionError))
     assert not d._is_timeout(ei.value)
+
+
+def test_a_transient_context_overflow_is_retried(monkeypatch):
+    """2026-10-25: two video requests + a concurrent /api/ask call jointly
+    overflowed qwen3.5-9b's shared 16k KV cache. Once the other requests
+    drain, the same request fits — it must not halt the pass."""
+    monkeypatch.setenv("PHOTOSEARCH_LLM_VIDEO_MODEL", "vid-m")
+    slept = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: slept.append(s))
+    bodies = _openai(monkeypatch, [_http_400('{"error":"Context size has been exceeded."}'),
+                                   ("A dog runs.", "stop")])
+    out = d._ollama_chat_with_retry(model="m", messages=[{"role": "user", "content": "x"}],
+                                    timeout=5, role="video")
+    assert out == "A dog runs."
+    assert len(bodies) == 2
+    assert slept == [d._CONTEXT_CONTENTION_DELAY]
+
+
+def test_describe_video_downscales_1080p_keyframes(monkeypatch):
+    """Request size must never follow the source resolution: a 1920x1080
+    keyframe set is capped to VIDEO_FRAME_MAX_EDGE before it is sent."""
+    import base64
+    calls = _script(monkeypatch, [GOOD])
+    frames = [_jpeg_bytes(1920, 1080) for _ in range(8)]
+    d.describe_video(frames, [float(i) for i in range(8)], 9.0)
+    imgs = calls[0]["messages"][0]["images"]
+    assert len(imgs) == 8
+    for b64 in imgs:
+        with Image.open(io.BytesIO(base64.b64decode(b64))) as im:
+            assert max(im.size) == d.VIDEO_FRAME_MAX_EDGE
+            assert im.size == (1024, 576)
+
+
+def test_describe_video_small_keyframes_are_sent_untouched(monkeypatch):
+    import base64
+    calls = _script(monkeypatch, [GOOD])
+    raw = _jpeg_bytes(1024, 576)
+    d.describe_video([raw], [1.0], 2.0)
+    assert base64.b64decode(calls[0]["messages"][0]["images"][0]) == raw
 
 
 def test_an_unrelated_400_is_not_an_overflow(monkeypatch):

@@ -220,6 +220,10 @@ def check_available(model: str = MODEL) -> None:
 
 _MAX_RETRIES = 3
 _RETRY_DELAY = 5  # seconds between retries
+# Backoff before re-sending a request that overflowed the context. On LM
+# Studio the context is shared across parallel slots, so an overflow is often
+# another in-flight request's tokens; those finish in seconds.
+_CONTEXT_CONTENTION_DELAY = 20
 
 # Per-call wall-clock cap for ollama.chat. Without this, a wedged Ollama
 # runner can hang an `ollama.chat()` call indefinitely — observed in the
@@ -787,6 +791,21 @@ def _openai_chat_attempts(
                         finish_reason=None)
         detail = _context_overflow_detail(e)
         if detail is not None:
+            # LM Studio shares ONE KV cache (context_length) across its
+            # parallel slots, so an overflow can be CONTENTION, not size:
+            # 2026-10-25 two video-describe requests (~3-4k tokens each) plus
+            # a concurrent /api/ask agent call (tool schemas) on the same
+            # qwen3.5-9b jointly exceeded 16,384 and all three 500'd "Context
+            # size has been exceeded" — halting the pass on keyframes the same
+            # size the 4,685-video backfill used. Wait for the other requests
+            # to drain and retry; only an overflow that persists is a
+            # configuration failure.
+            if attempt < retries:
+                print(f" [context overflow (attempt {attempt}/{retries}) — likely "
+                      f"concurrent requests sharing the KV cache; retry in "
+                      f"{_CONTEXT_CONTENTION_DELAY}s]", end="", flush=True)
+                time.sleep(_CONTEXT_CONTENTION_DELAY)
+                continue
             raise _context_overflow(role, model, detail) from e
         transient = any(k in es for k in [
             "timeout", "timed out", "exceeded", "connection", "refused", "reset",
@@ -1198,12 +1217,39 @@ def build_video_prompt(timestamps, duration_s: float,
                .replace("{subjects}", subjects))
 
 
+# Long-edge cap for every video keyframe sent to the model. video-scan stores
+# keyframes at video_scan.KEYFRAME_EDGE (1024) — measured on the NAS for both
+# the cv2 path (IMG_*.MOV 576x1024, C0102.MP4 4K -> 1024x576) and the ffmpeg
+# path (m2ts 1024x576) — so this is a no-op today. It exists so the request
+# size (~600 tokens/frame on qwen3.5) can never follow the SOURCE resolution
+# if a scan path ever stores larger keyframes.
+VIDEO_FRAME_MAX_EDGE = 1024
+
+
+def _cap_frame_bytes(data: bytes, max_edge: int = VIDEO_FRAME_MAX_EDGE) -> bytes:
+    """Encoded keyframe bytes, re-encoded to JPEG with the long edge <=
+    ``max_edge`` when larger; bytes already within the cap (or unreadable —
+    the backend reports those) are returned untouched."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            if max(im.size) <= max_edge:
+                return data
+            im = im.convert("RGB")
+            im.thumbnail((max_edge, max_edge), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
+    except Exception:  # noqa: BLE001 — not decodable here: send as-is
+        return data
+
+
 def _frame_to_b64(frame) -> str:
     """A keyframe as bare base64 JPEG. Accepts raw bytes (already-encoded
     JPEG/PNG from video-scan's upload, sent as-is) or a file path (resized to
     _MAX_IMAGE_PX like a photo)."""
     if isinstance(frame, (bytes, bytearray, memoryview)):
-        return base64.b64encode(bytes(frame)).decode("utf-8")
+        return base64.b64encode(_cap_frame_bytes(bytes(frame))).decode("utf-8")
     path = Path(frame)
     if not path.exists():
         raise FileNotFoundError(f"keyframe not found: {frame}")
