@@ -37,3 +37,7 @@ Traps these exist to catch — don't undo them:
   The verify model must not be the describe model — `run` refuses.
 - Pixels come from a local **originals cache** (`fetch-originals`), so neither a
   run nor the labelling page depends on the NAS staying up.
+
+### Ask prompt eval (`evals/ask_eval/`)
+
+Before/after check for trimming the Ask agent's ~11.7k-token prompt (system prompt + tool list); runbook in `evals/ask_eval/README.md`. `harness.py run` refuses while the worker fleet is busy (local worker pids, worker containers, NAS active claims; fails closed) and has no override. `measure` calls no model.

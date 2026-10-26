@@ -129,3 +129,6 @@ request_log.jsonl*
 
 # context eval runs (model output + cost per run; regenerate with harness.py)
 evals/context_eval/results/
+
+# ask eval runs (model output per run; regenerate with harness.py)
+evals/ask_eval/results/
