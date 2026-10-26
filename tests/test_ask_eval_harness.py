@@ -21,6 +21,7 @@ def _load(name, path):
 
 
 checks = _load("ask_checks", EVAL / "checks.py")
+mutants = _load("ask_mutants", EVAL / "mutants.py")
 h = _load("ask_harness", EVAL / "harness.py")
 runner = _load("ask_runner", EVAL / "runner.py")
 
@@ -189,21 +190,33 @@ def test_run_rechecks_the_fleet_before_every_chunk(monkeypatch, tmp_path):
 
 # --------------------------------------------------------------- runner --
 
-def test_runner_blocks_confirmed_writes_and_stubs_rerank(monkeypatch):
+def test_runner_blocks_confirmed_writes_and_fakes_rerank(monkeypatch):
     from photosearch import agent
     from photosearch import tools as toolmod
 
     monkeypatch.setattr(agent, "_chat", agent._chat)  # restored after the test
-    real = []
-    monkeypatch.setattr(toolmod, "call_tool", lambda db, name, args=None: real.append(name) or {})
+    monkeypatch.setenv("PHOTOSEARCH_LLM_RERANK_MODEL", "vision-model")
+    real, seen_env = [], []
+
+    def fake_call(db, name, args=None):
+        real.append(name)
+        if name == "rerank_photos":
+            seen_env.append(os.environ.get("PHOTOSEARCH_LLM_RERANK_MODEL"))
+            return {"reranked": False, "criteria": "x", "results": [{"id": 1}, {"id": 2}]}
+        return {}
+    monkeypatch.setattr(toolmod, "call_tool", fake_call)
     rec = runner._Recorder()
     runner._install_wrappers(rec, allow_rerank=False)
 
     out = toolmod.call_tool(None, "set_photo_tags", {"photo_ids": [1], "confirm": True})
     assert "disabled" in out["error"] and rec.blocked_writes[0]["tool"] == "set_photo_tags"
     toolmod.call_tool(None, "set_photo_tags", {"photo_ids": [1]})  # dry run executes
-    assert "error" in toolmod.call_tool(None, "rerank_photos", {"photo_ids": [1], "criteria": "x"})
-    assert real == ["set_photo_tags"] and rec.stubbed == ["rerank_photos"]
+    out = toolmod.call_tool(None, "rerank_photos", {"photo_ids": [1, 2], "criteria": "x"})
+    # The real handler ran with no vision model, and its result is dressed as scored.
+    assert seen_env == [None] and os.environ["PHOTOSEARCH_LLM_RERANK_MODEL"] == "vision-model"
+    assert out["reranked"] is True and [h["id"] for h in out["results"]] == [1, 2]
+    assert all(isinstance(h["rerank_score"], float) for h in out["results"])
+    assert real == ["set_photo_tags", "rerank_photos"] and rec.stubbed == ["rerank_photos"]
 
 
 def test_runner_records_lm_studio_error_body(monkeypatch):
@@ -250,3 +263,194 @@ def test_runner_row_feeds_the_grader(db, monkeypatch):
     assert row["prompt"]["n_tools"] > 0 and row["prompt"]["system_chars"] > 0
     ok, detail = checks.grade(item, row)
     assert ok, detail
+
+
+
+# ---------------------------------------------------------- new checks --
+
+def test_allowed_args_catches_the_june_false_passes():
+    """Two June bakeoff traces the first graders passed: qwen set a quality floor
+    for "good photos", gemma added the family to "our best photos"."""
+    items = {i["id"]: i for i in h.load_items()}
+    qwen = _row([("search_photos", {"people": ["Calvin", "Ellie"], "category": "soccer",
+                                    "sort": "quality_desc", "min_quality": 6, "limit": 30})])
+    ok, d = checks.grade(items["r05-kids-soccer"], qwen)
+    assert not ok and any("min_quality" in c["name"] for c in d["checks"] if not c["ok"])
+    gemma = _row([("search_photos", {"date_from": "2025-06-01", "date_to": "2025-08-31",
+                                     "people": ["Calvin", "Ellie", "Nicole", "Matt"],
+                                     "sort": "quality_desc"})], ran_at="2026-06-20")
+    assert not checks.grade(items["r03-best-last-summer"], gemma)[0]
+
+
+def test_allowed_args_ignores_pinned_filters():
+    item = {"allowed_args": ["sort"], "locked": {"camera": "X"}}
+    assert checks.grade(item, _row([("search_photos", {"sort": "quality_desc", "camera": "X"})]))[0]
+
+
+def test_default_counts_an_omitted_arg_as_the_tool_default():
+    spec = {"op": "eq", "tool": "representatives", "arg": "bucket", "value": "year", "default": "year"}
+    assert checks.check_trace(spec, [{"tool": "representatives", "args": {}}], {})
+    assert not checks.check_trace(spec, [{"tool": "representatives", "args": {"bucket": "month"}}], {})
+
+
+def test_every_has_needs_every_call():
+    spec = {"op": "every_has", "tool": "search_photos", "arg": "people", "value": ["Calvin"]}
+    one = {"tool": "search_photos", "args": {"people": ["Calvin"]}}
+    none = {"tool": "search_photos", "args": {}}
+    assert checks.check_trace(spec, [one, one], {})
+    assert not checks.check_trace(spec, [one, none], {})
+    assert not checks.check_trace(spec, [], {})
+
+
+def test_called_after_and_num_between():
+    calls = [{"tool": "search_photos", "args": {}}, {"tool": "rerank_photos", "args": {"top_n": "3"}}]
+    after = {"op": "called_after", "tool": "rerank_photos", "value": ["search_photos"]}
+    assert checks.check_trace(after, calls, {})
+    assert not checks.check_trace(after, calls[::-1], {})
+    num = {"op": "num_between", "tool": "rerank_photos", "arg": "top_n", "value": [3, 3]}
+    assert checks.check_trace(num, calls, {})
+
+
+def test_count_with_match():
+    spec = {"op": "count_ge", "tool": "search_photos", "arg": "date_from", "match": "-04-27$", "n": 2}
+    calls = [{"tool": "search_photos", "args": {"date_from": f"{y}-04-27"}} for y in (2019, 2020)]
+    assert checks.check_trace(spec, calls, {})
+    assert not checks.check_trace(spec, calls[:1], {})
+
+
+# -------------------------------------------------------------- mutants --
+
+@pytest.fixture
+def prompt(db):
+    from photosearch import agent
+    from photosearch import tools as toolmod
+    tools = toolmod.openai_tools(include_images=False, include_writes=True, consolidated=False)
+    return agent._system_prompt(db, allow_writes=True, consolidated=False), tools
+
+
+def test_every_registered_mutant_finds_its_text(prompt):
+    """mutants.RULES/BLOCKS track the prompt's wording. After a trim rewrites a
+    rule, update its regex here so the baseline's mutants stay addressable."""
+    system, tools = prompt
+    for mid in list(mutants.RULES) + list(mutants.BLOCKS):
+        if mid in ("block.facts", "block.hints"):
+            continue  # depend on the DB and the env, checked below
+        new, _, removed = mutants.apply(mid, system, tools)
+        assert removed > 0 and len(new) < len(system), mid
+    assert len(mutants.example_ids(system)) >= 9
+
+
+def test_rule_mutants_remove_exactly_one_line(prompt):
+    system, tools = prompt
+    for mid in mutants.RULES:
+        new, _, _ = mutants.apply(mid, system, tools)
+        assert len(system.split("\n")) - len(new.split("\n")) == 1, mid
+
+
+def test_examples_block_removes_every_example(prompt):
+    system, tools = prompt
+    new, _, _ = mutants.apply("block.examples", system, tools)
+    assert "Examples:" not in new and not mutants.example_ids(new)
+    assert "Rules:" in new and "WRITES" in new
+
+
+def test_param_mutant_does_not_leak_through_shared_schemas(prompt):
+    """openai_tools() splices the same filter-prop dicts into several tools; a
+    mutant on one tool must not strip the others (or the caller's copy)."""
+    system, tools = prompt
+    before = json.dumps(tools)
+    _, out, _ = mutants.apply("paramdesc.representatives", system, tools)
+    assert json.dumps(tools) == before
+    by = {t["function"]["name"]: t for t in out}
+    assert "description" in by["search_photos"]["function"]["parameters"]["properties"]["people"]
+    assert "description" not in by["representatives"]["function"]["parameters"]["properties"]["people"]
+
+
+def test_filter_descriptions_keep_one_copy(prompt):
+    system, tools = prompt
+    _, out, removed = mutants.apply("tools.filter-descriptions", system, tools)
+    by = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in out}
+    assert removed > 0
+    assert "description" in by["search_photos"]["people"]
+    assert "description" not in by["daily_highlights"]["people"]
+
+
+def test_absent_mutant_removes_nothing():
+    _, _, removed = mutants.apply("rule.foreground", "no rules here", [])
+    assert removed == 0
+    with pytest.raises(KeyError):
+        mutants.apply("nope", "", [])
+
+
+def test_runner_applies_the_mutant_only_to_tool_calling_requests(monkeypatch):
+    from photosearch import agent
+    from photosearch import tools as toolmod
+
+    sent = []
+    monkeypatch.setattr(agent, "_chat", lambda messages, tools, *a, **kw: sent.append(
+        (messages[0]["content"], tools)) or {"content": "x", "tool_calls": []})
+    monkeypatch.setattr(toolmod, "call_tool", toolmod.call_tool)
+    rec = runner._Recorder()
+    runner._install_wrappers(rec, allow_rerank=False, mutant="drop.get_photo")
+    tools = [{"type": "function", "function": {"name": n, "description": "", "parameters": {}}}
+             for n in ("search_photos", "get_photo")]
+    agent._chat([{"role": "system", "content": "s"}], tools)
+    agent._chat([{"role": "system", "content": "s"}], None)  # single-shot: untouched
+    assert [t["function"]["name"] for t in sent[0][1]] == ["search_photos"]
+    assert sent[1][1] is None and rec.mutant_removed > 0
+
+
+# ------------------------------------------------------ mutation report --
+
+def _write_rows(root, config, rows):
+    d = root / config
+    d.mkdir(parents=True)
+    (d / "m.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def _r(item, passed, **kw):
+    return {"model": "m", "item_id": item, "passed": passed, "suite": "s", "rep": 0,
+            "detail": {"checks_passed": int(passed), "checks_total": 1, "checks": []}, **kw}
+
+
+def test_mutation_kills_on_a_half_drop(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(h, "RESULTS", tmp_path)
+    _write_rows(tmp_path, "before", [_r("a", True)] * 3 + [_r("b", True), _r("b", True), _r("b", False)])
+    _write_rows(tmp_path, "abl-rule.x", [_r("a", False, mutant_removed=120), _r("b", True)])
+    _write_rows(tmp_path, "abl-rule.y", [_r("a", True, mutant_removed=900), _r("b", True)])
+    assert h.main(["mutation", "--baseline", "before"]) == 0
+    out = capsys.readouterr().out
+    assert "| rule.x | 120 | 2 | yes | a |" in out
+    assert "| rule.y | 900 | 2 | no |" in out
+    assert "Mutation score: 1/2" in out and "rule.y: 900 chars" in out
+
+
+def test_sign_test():
+    assert h.sign_test(0, 0) == 1.0
+    assert h.sign_test(6, 0) == pytest.approx(0.03125)
+    assert h.sign_test(3, 3) == 1.0
+
+
+# ------------------------------------------------------------- coverage --
+
+def test_every_cover_id_is_known():
+    for i in h.load_items():
+        assert i.get("covers"), i["id"]
+        for c in i["covers"]:
+            assert (c in mutants.RULES or c in mutants.BLOCKS or c in mutants.USAGE
+                    or c.startswith("example.")), (i["id"], c)
+
+
+def test_real_asks_and_behaviours(tmp_path):
+    (tmp_path / "ask-2026-01-01.md").write_text(
+        "**Ask:** best photo of Matt, one for each year, in the foreground\n"
+        "**Ask:** test ask from today\nnoise\n")
+    asks = h.real_asks(tmp_path)
+    assert asks == ["best photo of Matt, one for each year, in the foreground"]
+    assert {"rule.representatives", "rule.foreground", "rule.best-quality"} <= h.behaviours(asks[0])
+
+
+def test_covering_rolls_rules_up_into_their_block():
+    cov = h._covering([{"id": "a", "covers": ["rule.dates"]},
+                       {"id": "b", "covers": ["example.photos-of-calvin"]}])
+    assert cov["block.rules"] == ["a"] and cov["block.examples"] == ["b"]

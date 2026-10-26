@@ -7,7 +7,13 @@ a check changes without calling a model.
 
 Items are data (asks.jsonl), not lambdas. Each item carries:
 
-  checks         trace checks: [{name, tool, op, arg?, value?, min?, n?}]
+  checks         trace checks: [{name, tool, op, arg?, value?, min?, n?, match?,
+                 default?}] — `default` is the tool's value for an omitted arg
+  allowed_args   the only filter args the search-family / summarize calls may
+                 set (plus ALWAYS_ALLOWED); anything else fails the run. This is
+                 "fill ONLY the filters you inferred" checked on every call.
+  covers         rule / behaviour ids (mutants.RULES, mutants.USAGE) the item
+                 exercises; used by `harness.py coverage`, never graded
   answer_expect  regexes that must all match the final answer
   answer_any     groups of regexes; each group needs one match
   answer_reject  regexes that must not match
@@ -39,7 +45,14 @@ WRITE_TOOLS = {"set_photo_location", "set_photo_tags", "add_to_collection"}
 
 OPS = ("called", "not_called", "count_ge", "count_le", "set_eq", "set_has",
        "set_disjoint", "eq", "in", "contains", "contains_any", "not_contains",
-       "absent", "present", "date_between", "max_calls", "first_tool")
+       "absent", "present", "date_between", "max_calls", "first_tool", "matches",
+       "num_between", "called_after", "every_has")
+
+# Tools whose args are filters, so `allowed_args` applies to them.
+FILTER_TOOLS = {"search_photos", "summarize", "representatives", "daily_highlights",
+                "group_into_chapters", "daily_scene_breakdown"}
+# Args that are never an unrequested filter.
+ALWAYS_ALLOWED = {"limit", "dedupe", "match_source"}
 
 
 # ------------------------------------------------------------------ dates --
@@ -132,6 +145,13 @@ def _empty(v) -> bool:
     return v is None or v == "" or v == [] or v == {}
 
 
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _date10(v) -> str:
     return v[:10] if isinstance(v, str) and len(v) >= 10 else ""
 
@@ -161,6 +181,13 @@ def _arg_pred(op: str, value) -> Callable[[Any], bool]:
     if op == "date_between":
         lo, hi = value
         return lambda v: bool(_date10(v)) and lo <= _date10(v) <= hi
+    if op == "matches":
+        rx = re.compile(str(value), re.I)
+        return lambda v: any(rx.search(str(x)) for x in (v if isinstance(v, list) else [v])
+                             if x is not None)
+    if op == "num_between":
+        lo, hi = value
+        return lambda v: _num(v) is not None and lo <= _num(v) <= hi
     raise ValueError(f"no arg predicate for op {op!r}")
 
 
@@ -186,6 +213,11 @@ def check_trace(spec: dict, calls: list[dict], tokens: dict) -> bool:
     mine = [c for c in calls if not tools or c["tool"] in tools]
     arg = spec.get("arg")
     value = fill(spec.get("value"), tokens)
+    if "default" in spec:
+        # The tool's own default for an omitted arg (representatives bucket=year,
+        # n=1; daily_highlights per_day=20): leaving it out IS asking for it.
+        mine = [{**c, "args": {**c["args"], arg: spec["default"]}}
+                if _empty(c["args"].get(arg)) else c for c in mine]
 
     if op == "called":
         return len(mine) >= int(spec.get("min", 1))
@@ -196,15 +228,30 @@ def check_trace(spec: dict, calls: list[dict], tokens: dict) -> bool:
     if op == "first_tool":
         real = [c for c in calls if c["tool"] not in GROUNDING_TOOLS]
         return bool(real) and real[0]["tool"] in tools
+    if op == "called_after":
+        # `tool` is called at some point after a call to one of `value` tools.
+        before = set(value if isinstance(value, list) else [value])
+        seen = False
+        for c in calls:
+            if seen and c["tool"] in tools:
+                return True
+            seen = seen or c["tool"] in before
+        return False
     if op in ("count_ge", "count_le"):
-        n = len([c for c in mine
-                 if arg is None or _arg_pred("eq", value)(_get(c["args"], arg))])
+        if "match" in spec:
+            pred = _arg_pred("matches", spec["match"])
+        elif arg is not None:
+            pred = _arg_pred("eq", value)
+        n = len([c for c in mine if arg is None or pred(_get(c["args"], arg))])
         return n >= int(spec["n"]) if op == "count_ge" else n <= int(spec["n"])
     if op == "not_contains":
         pred = _arg_pred("contains_any", value if isinstance(value, list) else [value])
         return bool(mine) and not any(pred(_get(c["args"], arg)) for c in mine)
     if op == "absent":
         return bool(mine) and all(_empty(_get(c["args"], arg)) for c in mine)
+    if op == "every_has":
+        pred = _arg_pred("set_has", value)
+        return bool(mine) and all(pred(_get(c["args"], arg)) for c in mine)
     pred = _arg_pred(op, value)
     return any(pred(_get(c["args"], arg)) for c in mine)
 
@@ -232,6 +279,14 @@ def grade(item: dict, row: dict, sql: Optional[Callable[[str], Any]] = None,
     for spec in item.get("checks", []):
         results.append((spec.get("name") or f"{spec['op']} {spec.get('tool')}",
                         bool(check_trace(spec, calls, tokens)), "trace"))
+
+    if "allowed_args" in item:
+        # Pinned filters are merged into the call by the agent, not chosen by the model.
+        allowed = set(item["allowed_args"]) | ALWAYS_ALLOWED | set(item.get("locked") or {})
+        extra = sorted({k for c in calls if c["tool"] in FILTER_TOOLS
+                        for k, v in c["args"].items() if k not in allowed and not _empty(v)})
+        results.append(("no unrequested filters" + (f" (set {', '.join(extra)})" if extra else ""),
+                         not extra, "trace"))
 
     answer = row.get("answer") or ""
     for p in item.get("answer_expect", []):
@@ -304,12 +359,17 @@ def validate_item(item: dict) -> list[str]:
             errs.append(f"unknown op {op!r}")
             continue
         if op not in ("called", "not_called", "max_calls", "first_tool", "count_ge",
-                      "count_le") and not spec.get("arg"):
+                      "count_le", "called_after") and not spec.get("arg"):
             errs.append(f"op {op} needs arg")
         if op in ("count_ge", "count_le") and "n" not in spec:
             errs.append(f"op {op} needs n")
         if op == "max_calls" and "value" not in spec:
             errs.append("max_calls needs value")
+        if op in ("num_between",) and not (isinstance(spec.get("value"), list)
+                                           and len(spec["value"]) == 2):
+            errs.append("num_between needs value [lo, hi]")
+        if op == "called_after" and not spec.get("value"):
+            errs.append("called_after needs value (the earlier tool)")
         if op == "date_between" and not (isinstance(spec.get("value"), list)
                                          and len(spec["value"]) == 2):
             errs.append("date_between needs value [lo, hi]")
@@ -323,6 +383,7 @@ def validate_item(item: dict) -> list[str]:
         except re.error as e:
             errs.append(f"bad regex {p!r}: {e}")
     if not (item.get("checks") or item.get("answer_expect") or item.get("answer_any")
-            or item.get("answer_sql") or item.get("results_sql") or "results_min" in item):
+            or item.get("answer_sql") or item.get("results_sql") or "results_min" in item
+            or "allowed_args" in item):
         errs.append("item grades nothing")
     return errs

@@ -19,7 +19,13 @@ to results/<config>/, `report` compares configs, `regrade` re-scores stored rows
   python evals/ask_eval/harness.py report --configs before after [--failures]
   python evals/ask_eval/harness.py regrade --configs before after [--judge]
 
-`run` refuses to start, and stops between chunks, while the worker fleet is
+Is the eval itself any good (README "Its test coverage"):
+  python evals/ask_eval/harness.py coverage --ref pre-ask-diet   # rule/usage/param coverage, no LLM
+  python evals/ask_eval/harness.py mutants  --ref pre-ask-diet   # prompt mutants and sizes, no LLM
+  python evals/ask_eval/harness.py ablate [--items covering]      # mutation testing (guarded)
+  python evals/ask_eval/harness.py mutation --baseline before     # kill table + cut candidates
+
+`run` and `ablate` refuse to start, and stop between chunks, while the worker fleet is
 busy (fleet_busy()). There is no override flag: the fleet shares LM Studio, and
 a run during a batch both slows the batch and measures contention, not prompts.
 """
@@ -53,6 +59,7 @@ AGENT_MAX_TOKENS = 3000  # agent._MAX_TOKENS: the reply budget a round reserves
 
 sys.path.insert(0, str(HERE))
 import checks  # noqa: E402
+import mutants  # noqa: E402
 
 
 # ------------------------------------------------------------- the guard --
@@ -244,65 +251,81 @@ def cmd_measure(args) -> int:
 
 # ------------------------------------------------------------------- run --
 
-def cmd_run(args) -> int:
-    items = load_items(args.suite, args.only)
+def _validated(items) -> list:
     bad = {i["id"]: e for i in items if (e := checks.validate_item(i))}
     if bad:
         raise SystemExit(f"invalid items: {bad}")
-    models = args.model or DEFAULT_MODELS
-    print(f"config {args.config}: ref {args.ref}, {len(items)} items x {args.repeat} reps "
-          f"x {len(models)} model(s) = {len(items) * args.repeat * len(models)} runs")
+    return items
 
+
+def _guard(args) -> bool:
+    """True when the fleet is idle. Prints the reasons when it is not."""
     busy = fleet_busy(args.nas)
     if busy:
         print("REFUSING TO RUN: the worker fleet is busy.\n  " + "\n  ".join(busy))
-        if args.dry_run:
-            print("(dry run: nothing would have been called anyway)")
-        return 2
+    return not busy
+
+
+def cmd_run(args) -> int:
+    items = _validated(load_items(args.suite, args.only))
+    models = args.model or DEFAULT_MODELS
+    print(f"config {args.config}: ref {args.ref}, {len(items)} items x {args.repeat} reps "
+          f"x {len(models)} model(s) = {len(items) * args.repeat * len(models)} runs"
+          + (f", mutant {args.ablate}" if args.ablate else ""))
+    idle = _guard(args)
     if args.dry_run:
         for i in items:
-            print(f"  {i['suite']:9} {i['id']:24} {i['prompt'][:70]}")
-        print("fleet idle; dry run, nothing called")
-        return 0
+            print(f"  {i['suite']:9} {i['id']:28} {i['prompt'][:70]}")
+        print("dry run, nothing called" + ("" if idle else " (and the fleet is busy: a real run would refuse)"))
+        return 0 if idle else 2
+    if not idle:
+        return 2
+    with Tree(args.ref) as tree:
+        return _run_config(tree, args, items, models, args.config, args.repeat, args.ablate)
 
-    out_dir = RESULTS / args.config
+
+def _run_config(tree, args, items, models, config, repeat, mutant=None) -> int:
+    """Run items x repeat x models into results/<config>/. Re-checks the fleet
+    before every chunk (one model x one rep) and stops (2) if it became busy."""
+    out_dir = RESULTS / config
     out_dir.mkdir(parents=True, exist_ok=True)
     scalar = ro_sql(args.db)
-    with Tree(args.ref) as tree:
-        meta_path = out_dir / "meta.json"
-        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {"runs": []}
-        meta["runs"].append({
-            "started": dt.datetime.now().isoformat(timespec="seconds"), "ref": args.ref,
-            "sha": tree.sha, "dirty": tree.dirty, "models": models, "repeat": args.repeat,
-            "consolidated": args.consolidated, "reasoning_effort": args.reasoning_effort,
-            "db": str(args.db), "db_mtime": dt.datetime.fromtimestamp(
-                args.db.stat().st_mtime).isoformat(timespec="seconds"),
-            "measure": measure_tree(tree, args), "lmstudio": lmstudio_models(args.lm)})
-        meta_path.write_text(json.dumps(meta, indent=1))
+    meta_path = out_dir / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {"runs": []}
+    meta["runs"].append({
+        "started": dt.datetime.now().isoformat(timespec="seconds"), "ref": args.ref,
+        "sha": tree.sha, "dirty": tree.dirty, "models": models, "repeat": repeat,
+        "mutant": mutant, "consolidated": args.consolidated,
+        "reasoning_effort": args.reasoning_effort,
+        "db": str(args.db), "db_mtime": dt.datetime.fromtimestamp(
+            args.db.stat().st_mtime).isoformat(timespec="seconds"),
+        "measure": measure_tree(tree, args), "lmstudio": lmstudio_models(args.lm)})
+    meta_path.write_text(json.dumps(meta, indent=1))
 
-        for model in models:
-            for rep in range(args.repeat):
-                busy = fleet_busy(args.nas)
-                if busy:
-                    print("STOPPING: the worker fleet became busy.\n  " + "\n  ".join(busy))
-                    return 2
-                ctx = (lmstudio_models(args.lm).get(model) or {}).get("loaded_context_length")
-                jobs = [{"item": i, "rep": rep, "model": model} for i in items]
-                rc = _run_chunk(tree, args, jobs, out_dir / f"{slug(model)}.jsonl",
-                                scalar, {"config": args.config, "ref": args.ref,
-                                         "sha": tree.sha, "loaded_context": ctx})
-                if rc:
-                    return rc
+    for model in models:
+        for rep in range(repeat):
+            busy = fleet_busy(args.nas)
+            if busy:
+                print("STOPPING: the worker fleet became busy.\n  " + "\n  ".join(busy))
+                return 2
+            ctx = (lmstudio_models(args.lm).get(model) or {}).get("loaded_context_length")
+            jobs = [{"item": i, "rep": rep, "model": model, "mutant": mutant} for i in items]
+            rc = _run_chunk(tree, args, jobs, out_dir / f"{slug(model)}.jsonl", scalar,
+                            {"config": config, "ref": args.ref, "sha": tree.sha,
+                             "loaded_context": ctx}, mutant)
+            if rc:
+                return rc
     print(f"rows in {out_dir}")
     return 0
 
 
-def _run_chunk(tree, args, jobs, out_path, scalar, stamp) -> int:
+def _run_chunk(tree, args, jobs, out_path, scalar, stamp, mutant=None) -> int:
     items = {j["item"]["id"]: j["item"] for j in jobs}
     with tempfile.TemporaryDirectory(prefix="askeval-") as tmp:
         jobs_file = Path(tmp) / "jobs.json"
         jobs_file.write_text(json.dumps(jobs))
-        extra = ["--jobs", str(jobs_file)] + (["--allow-rerank"] if args.allow_rerank else [])
+        extra = (["--jobs", str(jobs_file)] + (["--allow-rerank"] if args.allow_rerank else [])
+                 + (["--ablate", mutant] if mutant else []))
         p = run_runner(tree, args, extra, out_path.parent / "ask-logs")
         with open(out_path, "a") as out:
             for line in p.stdout:
@@ -318,12 +341,280 @@ def _run_chunk(tree, args, jobs, out_path, scalar, stamp) -> int:
                       f"{'PASS' if ok else 'FAIL'} {detail['checks_passed']}/{detail['checks_total']}"
                       f"  {row['seconds']}s  prompt {ctx} tok"
                       + ("  FALLBACK" if row.get("single_shot") else "")
+                      + ("  MUTANT ABSENT" if mutant and not row.get("mutant_removed") else "")
                       + (f"  ERR {row['error'][:80]}" if row.get("error") else ""), flush=True)
         err = p.stderr.read()
         p.wait()
     if p.returncode != 0:
         print(f"runner exited {p.returncode}:\n{err[-2000:]}")
         return 1
+    return 0
+
+
+# ---------------------------------------------------------- mutation --
+
+def list_mutants_tree(tree: Tree, args) -> dict:
+    with tempfile.TemporaryDirectory(prefix="askeval-log-") as logs:
+        p = run_runner(tree, args, ["--list-mutants"], Path(logs))
+        out, err = p.communicate(timeout=600)
+    if p.returncode != 0:
+        raise SystemExit(f"list-mutants failed in {tree.path}:\n{err[-2000:]}")
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def _covering(items) -> dict:
+    """{rule/behaviour/mutant id: [item ids]}. A block counts as covered by the
+    items of the rules or examples inside it."""
+    cov: dict = {}
+    for i in items:
+        for c in i.get("covers", []):
+            cov.setdefault(c, []).append(i["id"])
+            if c.startswith("rule."):
+                cov.setdefault("block.rules", []).append(i["id"])
+            if c.startswith("example."):
+                cov.setdefault("block.examples", []).append(i["id"])
+    return {k: sorted(set(v)) for k, v in cov.items()}
+
+
+SUITE_WIDE = ("tools.filter-descriptions", "tools.all-param-descriptions",
+              "drop.grounding-tools", "block.rules", "block.examples", "block.facts")
+
+
+def items_for_mutant(mid: str, items: list, cov: dict) -> list:
+    """The items a `--items covering` ablation runs. Rule/block/example mutants:
+    the items that declare it in `covers`. Per-tool mutants (drop./tooldesc./
+    paramdesc.): items whose checks name that tool. Suite-wide trims: all."""
+    if mid in SUITE_WIDE:
+        return items
+    if mid.split(".", 1)[0] in ("drop", "tooldesc", "paramdesc"):
+        tool = mid.split(".", 1)[1]
+        return [i for i in items if any(
+            tool in (c["tool"] if isinstance(c.get("tool"), list) else [c.get("tool")])
+            for c in i.get("checks", []))]
+    return [i for i in items if i["id"] in cov.get(mid, [])]
+
+
+def cmd_mutants(args) -> int:
+    with Tree(args.ref) as tree:
+        m = list_mutants_tree(tree, args)
+    items = load_items()
+    cov = _covering(items)
+    total = m["total_chars"]
+    print(f"ref {args.ref} ({tree.sha[:10]}): prompt {total:,} chars\n")
+    print(f"{'mutant':44} {'chars':>7} {'%':>5}  items covering")
+    for mid, n in sorted(m["mutants"].items(), key=lambda kv: -kv[1]):
+        if n == 0 and not args.all:
+            continue
+        mark = "" if n else "  (absent in this tree)"
+        k = len(items_for_mutant(mid, items, cov))
+        print(f"{mid:44} {n:7,} {100 * n / total:5.1f}  {k}{mark}")
+    return 0
+
+
+def _select_mutants(args, available: dict) -> list:
+    if args.mutant:
+        return args.mutant
+    if args.set == "all":
+        return [k for k, v in available.items() if v]
+    return [k for k in mutants.CORE if available.get(k)]
+
+
+def cmd_ablate(args) -> int:
+    items_all = _validated(load_items())
+    models = args.model or DEFAULT_MODELS
+    cov = _covering(items_all)
+    idle = _guard(args)
+    if not idle and not args.dry_run:
+        return 2
+    with Tree(args.ref) as tree:
+        available = list_mutants_tree(tree, args)["mutants"]
+        chosen = _select_mutants(args, available)
+        plan = []
+        for mid in chosen:
+            if not available.get(mid):
+                print(f"skip {mid}: its text is absent from {args.ref}")
+                continue
+            items = (items_for_mutant(mid, items_all, cov)
+                     if args.items == "covering" else items_all)
+            done = (RESULTS / f"abl-{mid}").exists()
+            if done and not args.rerun:
+                print(f"skip {mid}: results/abl-{mid} exists (--rerun to add samples)")
+                continue
+            plan.append((mid, items))
+        n = sum(len(it) for _, it in plan) * args.repeat * len(models)
+        print(f"{len(plan)} mutant(s), {n} runs (~{n * 30 / 3600:.1f} h at 30 s/run)")
+        if args.dry_run:
+            for mid, it in plan:
+                print(f"  {mid:44} {available[mid]:7,} chars  {len(it)} items")
+            print("dry run, nothing called" + ("" if idle else " (and the fleet is busy: a real run would refuse)"))
+            return 0 if idle else 2
+        for mid, items in plan:
+            print(f"\n== mutant {mid} ({available[mid]:,} chars removed)")
+            rc = _run_config(tree, args, items, models, f"abl-{mid}", args.repeat, mid)
+            if rc:
+                return rc
+    return 0
+
+
+def _rates(rows) -> dict:
+    """{(model, item): (passes, runs, mean check fraction)}"""
+    acc: dict = {}
+    for r in rows:
+        k = (r["model"], r["item_id"])
+        p, n, f = acc.get(k, (0, 0, 0.0))
+        d = r["detail"]
+        acc[k] = (p + bool(r["passed"]), n + 1, f + d["checks_passed"] / max(1, d["checks_total"]))
+    return {k: (p, n, f / n) for k, (p, n, f) in acc.items()}
+
+
+KILL_DROP = 0.5  # pass-rate drop (baseline − mutant) that counts as a kill
+
+
+def cmd_mutation(args) -> int:
+    base = _rates(_rows(args.baseline))
+    if not base:
+        raise SystemExit(f"no rows in results/{args.baseline}")
+    configs = sorted(d.name for d in RESULTS.glob("abl-*") if d.is_dir())
+    if not configs:
+        raise SystemExit("no results/abl-* configs: run `harness.py ablate` first")
+    print(f"# Mutation report (baseline `{args.baseline}`)\n")
+    print("A mutant is KILLED when some item's pass rate drops by >= "
+          f"{KILL_DROP:.0%} against the baseline (same model). Survivors are either "
+          "untested by the suite or text the agent does not need.\n")
+    print("| mutant | chars | runs | killed | killers | improved | check-fraction Δ |")
+    print("|---|---|---|---|---|---|---|")
+    killed, tested, survivors = 0, 0, []
+    for c in configs:
+        rows = _rows(c)
+        mut = _rates(rows)
+        removed = next((r.get("mutant_removed") for r in rows if r.get("mutant_removed")), 0)
+        killers, better, deltas = [], [], []
+        for k, (p, n, f) in mut.items():
+            if k not in base:
+                continue
+            bp, bn, bf = base[k]
+            drop = bp / bn - p / n
+            deltas.append(f - bf)
+            if drop >= KILL_DROP:
+                killers.append(k[1])
+            elif -drop >= KILL_DROP:
+                better.append(k[1])
+        tested += 1
+        killed += bool(killers)
+        if not killers:
+            survivors.append((c[4:], removed))
+        dmean = sum(deltas) / len(deltas) if deltas else 0
+        print(f"| {c[4:]} | {removed:,} | {len(rows)} | {'yes' if killers else 'no'} "
+              f"| {', '.join(sorted(killers)) or '–'} | {', '.join(sorted(better)) or '–'} "
+              f"| {100 * dmean:+.0f} pts |")
+    print(f"\n**Mutation score: {killed}/{tested}**")
+    if survivors:
+        print("\nSurvivors by size (cut candidates, or coverage gaps — check `coverage`):")
+        for mid, n in sorted(survivors, key=lambda x: -x[1]):
+            print(f"- {mid}: {n:,} chars")
+    return 0
+
+
+# ---------------------------------------------------------- coverage --
+
+def real_asks(log_dir: Path) -> list[str]:
+    """Distinct-or-not real asks from the replica's Ask logs (ask-*.md)."""
+    out = []
+    for f in sorted(log_dir.glob("ask-*.md")):
+        for line in f.read_text(errors="replace").splitlines():
+            if line.startswith("**Ask:**"):
+                a = line.split("**Ask:**", 1)[1].strip()
+                if a and not a.lower().startswith("test ask"):
+                    out.append(a)
+    return out
+
+
+def behaviours(text: str) -> set:
+    low = text.lower()
+    return {b for b, rx in mutants.USAGE.items() if re.search(rx, low)}
+
+
+def _checked_params(items) -> set:
+    got = set()
+    for i in items:
+        for c in i.get("checks", []):
+            tools = c.get("tool")
+            tools = tools if isinstance(tools, list) else [tools]
+            argl = c.get("arg")
+            argl = argl if isinstance(argl, list) else [argl]
+            got |= {(t, a) for t in tools for a in argl if t and a}
+    return got
+
+
+def cmd_coverage(args) -> int:
+    items = load_items()
+    cov = _covering(items)
+    with Tree(args.ref) as tree:
+        m = list_mutants_tree(tree, args)
+    total = m["total_chars"]
+    asks = real_asks(Path(args.ask_logs))
+    need = [behaviours(a) for a in asks]
+
+    print(f"# Ask eval coverage ({len(items)} items; ref {args.ref}, prompt {total:,} chars; "
+          f"{len(asks)} real asks from {args.ask_logs})\n")
+
+    print("## 1. Rule coverage (the 'line coverage' of the prompt)\n")
+    print("| rule / block | chars | items | real asks needing it |\n|---|---|---|---|")
+    rule_ids = list(mutants.RULES) + list(mutants.BLOCKS)
+    covered = 0
+    for rid in rule_ids:
+        n = m["mutants"].get(rid, 0)
+        k = len(cov.get(rid, []))
+        covered += k > 0 and n > 0
+        share = (f"{100 * sum(rid in s for s in need) / len(asks):.0f}%"
+                 if asks and rid in mutants.USAGE else "–")
+        print(f"| {rid} | {n:,} | {k} | {share} |")
+    present = sum(1 for r in rule_ids if m["mutants"].get(r))
+    ex = [k for k in m["mutants"] if k.startswith("example.")]
+    ex_cov = sum(1 for k in ex if cov.get(k))
+    print(f"\nRules/blocks with >= 1 item: **{covered}/{present}**; "
+          f"worked examples with an item: **{ex_cov}/{len(ex)}**")
+
+    print("\n## 2. Usage coverage (items weighted by what is really asked)\n")
+    print("| behaviour | share of real asks | items | share of items |\n|---|---|---|---|")
+    for b in mutants.USAGE:
+        k = len(cov.get(b, []))
+        share = f"{100 * sum(b in s for s in need) / len(asks):.0f}%" if asks else "–"
+        print(f"| {b} | {share} | {k} | {100 * k / len(items):.0f}% |")
+    if asks:
+        each = sum(1 for s in need if all(cov.get(b) for b in s))
+        sets = [set(i.get("covers", [])) for i in items]
+        # Combination coverage: ONE item exercises everything the ask needs.
+        # Real asks combine 3+ behaviours; per-behaviour coverage hides that.
+        # rule.best-quality and rule.dates are left out of the combination:
+        # nearly every ask says "best" and names a date.
+        common = {"rule.best-quality", "rule.dates"}
+        combo = [s - common for s in need]
+        whole = sum(1 for s in combo if any(s <= t for t in sets))
+        print(f"\nReal asks whose every behaviour has >= 1 item: {each}/{len(asks)} "
+              f"({100 * each / len(asks):.0f}%)")
+        print(f"Real asks with ONE item covering their whole combination "
+              f"(ignoring best/dates): **{whole}/{len(asks)} ({100 * whole / len(asks):.0f}%)**")
+        miss: dict = {}
+        for a, s in zip(asks, combo):
+            if not any(s <= t for t in sets):
+                miss.setdefault(tuple(sorted(s)), []).append(a)
+        if miss:
+            print("\nUncovered combinations (count, behaviours, an example ask):")
+            for k, v in sorted(miss.items(), key=lambda kv: -len(kv[1]))[:12]:
+                print(f"- {len(v)} × {' + '.join(k)} — \"{v[0][:90]}\"")
+
+    print("\n## 3. Tool and parameter coverage\n")
+    checked = _checked_params(items)
+    tot = sum(len(v) for v in m["params"].values())
+    hit = sum(1 for t, ps in m["params"].items() for p in ps if (t, p) in checked)
+    print(f"Parameters some check reads: **{hit}/{tot}**\n")
+    called = {t for i in items for c in i.get("checks", [])
+              for t in (c["tool"] if isinstance(c.get("tool"), list) else [c.get("tool")]) if t}
+    for t, ps in m["params"].items():
+        miss = [p for p in ps if (t, p) not in checked]
+        print(f"- `{t}`{'' if t in called else ' (no item expects this tool)'}: "
+              f"{len(ps) - len(miss)}/{len(ps)}" + (f" — unchecked: {', '.join(miss)}" if miss else ""))
     return 0
 
 
@@ -426,6 +717,17 @@ def _fmt(x, nd=0):
     return f"{x:,.{nd}f}"
 
 
+def sign_test(worse: int, better: int) -> float:
+    """Two-sided exact sign test on the items that changed."""
+    from math import comb
+    n = worse + better
+    if n == 0:
+        return 1.0
+    k = min(worse, better)
+    p = sum(comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * p)
+
+
 def cmd_report(args) -> int:
     data = {c: _rows(c) for c in args.configs}
     print("# Ask prompt eval\n")
@@ -471,8 +773,26 @@ def cmd_report(args) -> int:
             cells.append(f"{sum(r['passed'] for r in rs)}/{len(rs)}" if rs else "–")
         flag = ""
         if len(rates) >= 2 and None not in (rates[0], rates[-1]):
-            flag = "REGRESSED" if rates[-1] < rates[0] else ("improved" if rates[-1] > rates[0] else "")
+            # One flipped run in three is noise at temperature 0 on LM Studio;
+            # flag only a drop of half the runs or more.
+            d = rates[-1] - rates[0]
+            flag = "REGRESSED" if d <= -KILL_DROP else ("improved" if d >= KILL_DROP else "")
         print(f"| {i} | " + " | ".join(cells) + f" | {flag} |")
+
+    if len(args.configs) >= 2:
+        a, b = args.configs[0], args.configs[-1]
+        ra, rb = _rates(data[a]), _rates(data[b])
+        print(f"\n## Paired: {a} → {b}\n")
+        for model in sorted({k[0] for k in ra} & {k[0] for k in rb}):
+            keys = [k for k in ra if k[0] == model and k in rb]
+            worse = sum(1 for k in keys if rb[k][0] / rb[k][1] < ra[k][0] / ra[k][1])
+            better = sum(1 for k in keys if rb[k][0] / rb[k][1] > ra[k][0] / ra[k][1])
+            print(f"- {model}: {len(keys)} paired items, {worse} worse, {better} better, "
+                  f"{len(keys) - worse - better} unchanged; sign test p = "
+                  f"{sign_test(worse, better):.3f}")
+        print("\nThe sign test asks whether more items got worse than better beyond "
+              "chance; with temperature 0 the reps of one item are correlated, so items, "
+              "not runs, are the sample.")
 
     for c in args.configs:
         meta = RESULTS / c / "meta.json"
@@ -534,6 +854,35 @@ def main(argv=None) -> int:
     r.add_argument("--allow-rerank", action="store_true")
     r.add_argument("--dry-run", action="store_true")
 
+    r.add_argument("--ablate", help="apply one prompt mutant (see `mutants`)")
+
+    mu = sub.add_parser("mutants", help="list prompt mutants and their size; calls no model")
+    common(mu)
+    mu.add_argument("--ref", default="HEAD")
+    mu.add_argument("--all", action="store_true", help="include mutants absent from the ref")
+
+    ab = sub.add_parser("ablate", help="mutation testing: one config per mutant (refuses while the fleet is busy)")
+    common(ab)
+    ab.add_argument("--ref", default="pre-ask-diet")
+    ab.add_argument("--mutant", action="append")
+    ab.add_argument("--set", choices=["core", "all"], default="core")
+    ab.add_argument("--items", choices=["all", "covering"], default="all",
+                    help="covering = only items whose `covers` names the mutant (fast, misses surprises)")
+    ab.add_argument("--repeat", type=int, default=1)
+    ab.add_argument("--model", action="append")
+    ab.add_argument("--nas", default=os.environ.get("PHOTOSEARCH_NAS_URL") or DEFAULT_NAS)
+    ab.add_argument("--allow-rerank", action="store_true")
+    ab.add_argument("--rerun", action="store_true")
+    ab.add_argument("--dry-run", action="store_true")
+
+    mr = sub.add_parser("mutation", help="kill table for results/abl-* against a baseline config")
+    mr.add_argument("--baseline", required=True)
+
+    cv = sub.add_parser("coverage", help="rule, usage and parameter coverage; calls no model")
+    common(cv)
+    cv.add_argument("--ref", default="HEAD")
+    cv.add_argument("--ask-logs", default=str(REPO / "ask-logs"))
+
     g = sub.add_parser("regrade", help="re-score stored rows; --judge for answer-only fails")
     g.add_argument("--configs", nargs="+", required=True)
     g.add_argument("--db", type=Path, default=DEFAULT_DB.resolve())
@@ -547,7 +896,8 @@ def main(argv=None) -> int:
 
     args = ap.parse_args(argv)
     return {"measure": cmd_measure, "run": cmd_run, "regrade": cmd_regrade,
-            "report": cmd_report}[args.cmd](args)
+            "report": cmd_report, "mutants": cmd_mutants, "ablate": cmd_ablate,
+            "mutation": cmd_mutation, "coverage": cmd_coverage}[args.cmd](args)
 
 
 if __name__ == "__main__":
