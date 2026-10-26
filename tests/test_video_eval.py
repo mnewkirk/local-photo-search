@@ -528,3 +528,35 @@ def test_sample_draws_strata_from_prescan_facts(tmp_path):
     assert data["shortfall"] == {"sports-long": 3, "sports-short": 4}
     assert all(p["split"] in ("dev", "holdout") for p in data["photos"])
     assert ve.draw_sample(conn, strata={"sports-long": 5, "sports-short": 5}) == data
+
+
+def test_report_marks_out_of_scope_gates_not_evaluated_never_failed():
+    """Quality is out of scope by owner decision (2026-10-25, D11), and the
+    describe gate has no labels: both print "not evaluated", neither a fail."""
+    _sample([1, 2])
+    me.save_video_quality_label(1, {"in_focus": "yes", "shaky": "no", "noisy": "no",
+                                    "keeper": "keep"})
+    rep = ve.build_report()
+    assert set(rep["not_evaluated"]) == {"quality", "describe"}
+    assert "owner decision 2026-10-25" in rep["not_evaluated"]["quality"]
+    assert rep["quality"] == {} and rep["keeper"] == {}
+    assert rep["describe_winner"]["gate_vs_D0"] == {"not_evaluated": ve.DESCRIBE_NO_LABELS}
+    assert rep["agreement"] == {"not_measured": "recheck set not labelled"}
+    lines = []
+    ve.render(rep, log=lambda *a: lines.append(" ".join(map(str, a))))
+    out = "\n".join(lines)
+    assert "not evaluated (owner decision 2026-10-25" in out
+    assert "gate vs D0: not evaluated" in out and "not measured" in out
+    assert "fail" not in out.split("== Description")[1]
+
+    # Opting back in scores the quality gate as before.
+    rep = ve.build_report(not_evaluated={})
+    assert "quality" not in rep["not_evaluated"]
+    assert set(rep["quality"]) == set(me.QUALITY_FLAGS)
+
+
+def test_describe_gate_is_evaluated_once_it_has_labels():
+    _sample([1])
+    me.save_temporal_label("abc", 1, "yes")
+    rep = ve.build_report()
+    assert "describe" not in rep["not_evaluated"]

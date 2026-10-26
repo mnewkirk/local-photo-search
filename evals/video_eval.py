@@ -121,6 +121,15 @@ SHARE_RETRIEVAL = 0.5
 # Simplicity order for tie-breaks (earlier = simpler/cheaper).
 SIMPLICITY = ("F0", "F1", "S1", "S2")
 
+# Gates the owner has taken out of scope. `report` prints them as
+# "not evaluated (<reason>)" — never as a fail, never as a pass. Pass
+# `--evaluate quality` to score one anyway.
+NOT_EVALUATED = {
+    "quality": "owner decision 2026-10-25: sample has no positives; numbers-only per D11",
+}
+DESCRIBE_NO_LABELS = ("no Differences / temporal labels "
+                      "(?tab=diffs&dpass=video-describe) and no describe runs")
+
 
 def log(*a):
     print(*a, flush=True)
@@ -1499,7 +1508,11 @@ def _f(v, d=2):
     return f"{v:.{d}f}"
 
 
-def build_report():
+def build_report(not_evaluated=None):
+    """`not_evaluated` maps a gate ("quality", "describe") to the reason it is
+    out of scope; default NOT_EVALUATED. The describe gate is also not
+    evaluated, automatically, while it has no labels at all."""
+    skip = dict(NOT_EVALUATED if not_evaluated is None else not_evaluated)
     sample = me.load_video_sample()
     labels = me.load_video_subject_labels()
     judged = me.read_pass_file(me.VIDEO, "label_judgements.json", {})
@@ -1514,6 +1527,8 @@ def build_report():
     s_cands = [v for v, r in runs.items() if r.get("approach") in ("S1", "S2")]
     winner, tied = pick_winner(rep["subject"], s_cands)
     f1s = [v for v, r in runs.items() if r.get("approach") == "F1"]
+    dev_winner, dev_tied = pick_winner(rep["subject_dev"], s_cands)
+    rep["subject_dev_winner"] = {"winner": dev_winner, "tied": dev_tied}
     rep["subject_winner"] = {"winner": winner, "tied": tied,
                              "gates": subject_gates(rep["subject"][winner]) if winner else None,
                              "beats_F1_on_people": f1_vs_s1(rep["subject"], f1s[0], winner)
@@ -1523,6 +1538,9 @@ def build_report():
     dlabels = me.load_dispute_labels(PASS_DESCRIBE)
     temporal = me.load_temporal_labels()
     rep["describe"] = {}
+    if "describe" not in skip and not (dlabels or temporal):
+        skip["describe"] = DESCRIBE_NO_LABELS
+    rep["not_evaluated"] = skip
     for v, r in druns.items():
         rep["describe"][v] = {"approach": r.get("approach"), "screen": describe_screen(r),
                               **describe_scores(r, disputes, dlabels, temporal, sample)}
@@ -1537,13 +1555,15 @@ def build_report():
     rep["describe_winner"] = {"winner": dw, "baseline": d0,
                               "gate_vs_D0": describe_gate(rep["describe"].get(dw), rep["describe"].get(d0))
                               if dw and d0 and dw != d0 else None}
+    if "describe" in skip:
+        rep["describe_winner"]["gate_vs_D0"] = {"not_evaluated": skip["describe"]}
     qruns = {v: me.load_run(PASS_QUALITY, v) for v in me.list_variants(PASS_QUALITY)}
     qlabels = me.load_video_quality_labels()
-    rep["quality"] = quality_scores(qruns, qlabels, sample)
+    rep["quality"] = {} if "quality" in skip else quality_scores(qruns, qlabels, sample)
     keeper_val = {"keep": 2, "meh": 1, "delete": 0}
     hold = [p["photo_id"] for p in sample["photos"] if p.get("split") == "holdout"]
     rep["keeper"] = {}
-    for v, r in qruns.items():
+    for v, r in ({} if "quality" in skip else qruns).items():
         if r.get("approach") != "Qm":
             continue
         for mname in ("shake", "noise", "focus_consistency", "tenengrad_max"):
@@ -1557,6 +1577,8 @@ def build_report():
             rep["keeper"][f"{v}:{mname}"] = spearman(xs, ys)
     rep["probe_check"] = probe_check(sample)
     rep["live_pairing"] = live_pairing(sample, labels)
+    ag = self_agreement()["segments"]
+    rep["agreement"] = ag if ag["n"] else {"not_measured": "recheck set not labelled"}
     return rep
 
 
@@ -1574,6 +1596,16 @@ def render(rep, log=log):
             f"{_f(s['top'])} {_f(s['top_ci'])}", f"{_f(s['mae'])} {_f(s['mae_ci'])}",
             f"{_f(s['presence_p'])} {_f(s['presence_p_ci'])}", _f(s["presence_r"]),
             f"{_f(s['retr_p'])}/{_f(s['retr_r'])}", _f(s["s_per_video"], 1)]))
+    log("  -- DEV --")
+    for v, d in sorted(rep["subject_dev"].items()):
+        log("  " + " | ".join([
+            v, str(d.get("approach")), str(d["videos"]),
+            f"{_f(d['seg_acc']['all'])} {_f(d['seg_ci']['all'])}",
+            _f(d["seg_acc"]["person"]), _f(d["seg_acc"]["non-person"]),
+            f"{_f(d['top'])} {_f(d['top_ci'])}", f"{_f(d['mae'])} {_f(d['mae_ci'])}",
+            f"{_f(d['presence_p'])} {_f(d['presence_p_ci'])}", _f(d["presence_r"])]))
+    dvw = rep.get("subject_dev_winner") or {}
+    log(f"  dev winner: {dvw.get('winner')} (tied: {', '.join(dvw.get('tied') or []) or '-'})")
     w = rep["subject_winner"]
     log(f"  winner: {w['winner']} (tied: {', '.join(w['tied']) or '-'}; < {TIE_SEG:.0%} is a tie, "
         f"simpler wins); beats F1 on people by >= 5 pts: {w['beats_F1_on_people']}")
@@ -1590,8 +1622,14 @@ def render(rep, log=log):
             f"{_f(sc.get('format_leak'))}, words p50 {_f(sc.get('words_p50'), 0)}, "
             f"s/video {_f(sc.get('s_per_video'), 1)}{'  SCREENED OUT' if sc.get('screened_out') else ''}")
     dw = rep["describe_winner"]
-    log(f"  winner: {dw['winner']} vs baseline {dw['baseline']}: {dw['gate_vs_D0']}")
+    ne = rep.get("not_evaluated") or {}
+    if "describe" in ne:
+        log(f"  gate vs D0: not evaluated ({ne['describe']})")
+    else:
+        log(f"  winner: {dw['winner']} vs baseline {dw['baseline']}: {dw['gate_vs_D0']}")
     log("\n== Quality (HOLDOUT; a tag needs P >= 0.8 at R >= 0.5) ==")
+    if "quality" in ne:
+        log(f"  not evaluated ({ne['quality']})")
     for flag, res in rep["quality"].items():
         for v, c in sorted(res.items()):
             log(f"  {flag:9} {v:30} P {_f(c['p'])} R {_f(c['r'])} "
@@ -1601,6 +1639,10 @@ def render(rep, log=log):
     log("\n== Registration checks ==")
     log(f"  probe check: {rep['probe_check']}")
     log(f"  live pairing: {rep['live_pairing']}")
+    ag = rep.get("agreement") or {}
+    log("\n== Owner self-agreement (recheck) ==")
+    log(f"  not measured ({ag['not_measured']})" if "not_measured" in ag else
+        f"  segments: n={ag['n']} agreement {_f(ag['agreement'])} kappa {_f(ag['kappa'])}")
 
 
 # ==========================================================================
@@ -2112,6 +2154,8 @@ def main(argv=None):
 
     rp = sub.add_parser("report")
     rp.add_argument("--json", action="store_true")
+    rp.add_argument("--evaluate", action="append", default=[], choices=sorted(NOT_EVALUATED),
+                    help="score a gate the owner took out of scope (NOT_EVALUATED) anyway")
     sub.add_parser("agreement")
 
     a = ap.parse_args(argv)
@@ -2168,7 +2212,7 @@ def main(argv=None):
     elif a.cmd == "run-stats":
         log(f"[runs] {run_stats()}")
     elif a.cmd == "report":
-        rep = build_report()
+        rep = build_report({k: v for k, v in NOT_EVALUATED.items() if k not in a.evaluate})
         if a.json:
             print(json.dumps(_jsonable(rep), indent=1, default=str))
         else:
