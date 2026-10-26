@@ -67,14 +67,18 @@ pass list is mirrored.
 
 | suite | pass before → after | mean input tok before → after | mean cost before → after | mean wall per run before → after | $ per second before → after |
 |---|---|---|---|---|---|
-| recall | 99% → 97% | 108k → 111k | $0.076 → $0.035 | 12.7 s → 15.0 s | $0.0060 → $0.0024 |
+| recall | 100% → 98% (146/146 → 142/145) | 108k → 111k | $0.076 → $0.035 | 12.7 s → 15.0 s | $0.0060 → $0.0024 |
 | rules | 100% → 96% | 280k → 99k | $0.151 → $0.064 | 17.9 s → 16.2 s | $0.0084 → $0.0039 |
 | skills | 0% → 0% | 135k → 182k | $0.073 → $0.048 | 12.6 s → 19.8 s | $0.0058 → $0.0024 |
-| tasks | 73% → 88% | 1,365k → 402k | $0.335 → $0.097 | 41.1 s → 33.8 s | $0.0081 → $0.0029 |
-| **total** | 197 → 197 of 231 | | **$28.05 → $11.28 (−60%)** | **67 → 70 min** (summed) | **$0.0070 → $0.0027** (2.6× less) |
+| tasks | 73% → 88% (checks only: 85% → 91%) | 1,365k → 402k | $0.335 → $0.097 | 41.1 s → 33.8 s | $0.0081 → $0.0029 |
+| **total** | 197 of 230 → 197 of 229 | | **$28.05 → $11.28 (−60%)** | **67 → 70 min** (summed) | **$0.0070 → $0.0027** (2.6× less) |
 
 Haiku's pre-diet config never hit the prompt cache (~$0.18 every run), which inflates its "before"
-cost; treat the −60% as an upper bound.
+cost; treat the −60% as an upper bound. Corrected 2026-10-25 (see Grader audit): three recall rows
+were session-limit answers scored as FAILs, now unscored infra (1 before, 2 after), so recall reads
+100% → 98%, not 99% → 97%. Of the tasks' 24 → 29, three runs are turn caps: 4 before-runs and 1
+after-run passed every check but ran out of turns, so on checks alone tasks went 28 → 30 of 33
+(Fisher p = 0.21 on the scored 24 → 29; not significant).
 
 ### Local: gemma-4-12b-qat via LM Studio (first 10 recall items, 1 rep)
 
@@ -94,7 +98,7 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
 |---|---|---|---|---|
 | Sonnet | 207 → 210 | −70% | 41 → 56 min (+34%) | $0.0260 → $0.0059 (4.4× less) |
 | Opus 5.5 | 207 → 206 | −71% | 50 → 65 min (+30%) | $0.0420 → $0.0093 (4.5× less) |
-| Haiku 4.5 | 197 → 197 | −60% | 67 → 70 min (+6%) | $0.0070 → $0.0027 (2.6× less) |
+| Haiku 4.5 | 197 → 197 (of 230 → 229 scored) | −60% | 67 → 70 min (+6%) | $0.0070 → $0.0027 (2.6× less) |
 | gemma-4-12b (local, 10 items) | 10 → 9 | — (local) | 146 → 11 min (13× faster) | — (local) |
 
 ## Insights that generalize
@@ -104,9 +108,10 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
    the model *finds* things: Opus and Sonnet lost nothing; Haiku lost a few single reps on recall
    and rules; gemma-12b failed the one item whose answer lives only in a path-scoped rule.
 
-2. **Preloaded context also hurts weaker models on long work.** Haiku's tasks went 73% → 88%:
-   with the old 258 KB CLAUDE.md a task run carried ~1.4M input tokens, and the smaller context
-   did better. The trade is "recall by lookup" (slightly worse for weak models) against "less noise
+2. **Preloaded context may also hurt weaker models on long work (weak evidence).** Haiku's tasks
+   went 73% → 88%: with the old 258 KB CLAUDE.md a task run carried ~1.4M input tokens, and the
+   smaller context did better. But most of that gain is turn caps, not conventions: on checks
+   alone it is 85% → 91% (28 → 30 of 33), and 24 → 29 has Fisher p = 0.21 (see Grader audit). The trade is "recall by lookup" (slightly worse for weak models) against "less noise
    during multi-step work" (better for weak models).
 
 3. **More turns: much cheaper, but slower on cloud models.** Answers now take extra Grep/Read turns
@@ -146,7 +151,8 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
      (reverted `f759330`). Every eval run now passes `--disallowedTools` for git writes and `gh`,
      and a task that moves HEAD fails.
    - Plan session limits arrive as ordinary text answers; the harness classes them as infra, stops
-     after 3 in a row, and `--resume` continues without re-paying.
+     after 3 in a row, and `--resume` continues without re-paying. Three stored Haiku rows from
+     before that fix were still scored as FAILs until `regrade` re-ran the check (2026-10-25).
    - Gateway failure markers must only apply to failed runs; a correct answer can say
      "connection refused".
 
@@ -312,6 +318,81 @@ above it made 15 calls ($0.013) and overturned 1 failure.
 which are not on this Mac), 10 and 11 (owner decisions). Ad-hoc headless runs here also need
 `env -i` with `USER`/`LOGNAME` and a quoted `PATH` (it contains a space), and a Mac with the
 lid closed sleeps even under `caffeinate -i`.
+
+## Grader audit (2026-10-25)
+
+A review found the graders lenient in the other direction from Insight 6: they passed answers
+that assert the opposite of the fact. Hand-written contradicting answers ("Yes, it burns one
+attempt", "the NAS runs ffprobe", "an empty list is a no-op, nothing wiped", "use
+`get_event_loop()`") passed 8 of 8; `visual-derived-wins` passed 22% of the answers to *other*
+items. Six of eight task mutants passed too. Everything below was measured offline on the stored
+answers and diffs: no model was run.
+
+**What changed.**
+
+- `recall.jsonl` / `rule_triggers.jsonl`: bare negations (`not`, `\bno\b`) and single generic
+  words (`library`, `attempt`, `user`, `guard`, `40`) are gone from `expect` / `any`; each pattern
+  names the fact, often with word-distance bounds. Items gained `reject` patterns for the
+  contradicting claim (written to skip negated forms such as "not root's crontab"), a `counter`
+  field (114 short wrong answers, 1-2 per item) and a `pass_example` (the shortest real stored
+  answer that passed). `tests/test_context_eval_harness.py` grades both on every run, without
+  `results/`.
+- `tasks.jsonl` / `grade_task`: comments and docstrings are stripped (per file type: `#` for
+  Python/shell, `//`, `/* */`, `<!-- -->` for JS/HTML) before *every* check, not only the negative
+  ones. `task-restack-folder` must return/raise on the empty list and fails a `photo_ids = None`
+  fallback, `ids or None`, or an unscoped `detect_stacks(db)`. `task-schema-bump` uses a new
+  `added_gt_baseline` check: the added `SCHEMA_VERSION` must exceed the one in `photosearch/db.py`
+  at the run's starting commit (`git show HEAD:` in the worktree; the row's `git_sha` on a regrade),
+  and the `ADD COLUMN rating` must be code. `task-register-pass` requires a `db.PASS_MEDIA` entry
+  (`"exif-rescan": "still"`).
+- `regrade` re-runs `infra_error()` on every stored row (rows written before `is_error` was stored
+  fall back to the exit code), so infra rows are unscored as `run` would have left them. Turn-capped
+  rows stay FAILs but record `detail.checks_passed`; `report` adds a "checks passed but hit turn
+  cap" column and tags per-item cells `[N turn-cap, M checks ok]`.
+- `report` flags an item `REGRESSED` / `improved` only when its pass rate moves by at least half its
+  runs (2 of 3); smaller moves read `lower (noise)` / `higher (noise)`. A new table gives each
+  suite's pass rate with a Wilson 95% interval per config, a two-sided Fisher exact p (first vs
+  last config, over runs) and a sign test over items.
+
+**Before → after the audit.**
+
+| measure | old graders | new graders |
+|---|---|---|
+| counter answers that pass (recall + rules, 114) | 51 (on 47 of 58 items) | 0 |
+| task mutants that pass (8) | 6 | 0 (correct versions still pass) |
+| stored PASS rows (recall + rules, all configs) that flip to FAIL | — | 0 |
+| stored PASS task rows that flip to FAIL | — | 0 |
+| highest cross-item pass rate (an item's grader on other items' answers) | 22% | 6% |
+| Haiku recall rows mis-scored as FAIL that are session-limit infra | 3 | 0 (unscored) |
+
+The first draft of the tightened patterns failed 66 stored PASS rows (then 3, then 1). Every one
+was read: all were correct answers phrased in a negated or caveated form ("not root's crontab and
+not `/etc/cron.d`", "clip stays uncapped against old workers", "**No JSX allowed**", "Any other DB
+error still spends an attempt", "instead of a no-op"), so each pattern was loosened rather than
+kept. None was a genuine false pass: no stored PASS in these configs asserted a wrong fact, and
+the old graders' leniency had not yet produced a wrong headline number. It would have on a weaker
+model or a regressed context, which is what the eval exists to catch.
+
+**Corrected numbers.** Haiku recall 99% → 97% becomes 100% → 98% (146/146 → 142/145; Fisher
+p = 0.12, sign test 3 items down / 0 up, p = 0.25). Haiku tasks stay 73% → 88% as scored, but 5 of
+the 15 failed runs passed every check and only hit the turn cap (4 before, 1 after): on checks alone
+it is 85% → 91% (p = 0.21 for the scored change). Under the new flag rule no Haiku, Sonnet or Opus
+item is `REGRESSED`; the old rule flagged 7 Haiku items (5 single-rep drops, 2 of them infra rows)
+and Opus's `task-register-pass` (one turn-capped run whose checks all passed). Sonnet and Opus
+numbers are unchanged.
+
+**Limits of the stored runs.**
+
+- **Stale "after" arms.** The stored after-runs were made at `e9ccd99` (Sonnet), `c21eba4` (Opus)
+  and `777916b` and neighbours (Haiku). Since `e9ccd99`, 11 commits have touched `CLAUDE.md` or
+  `.claude/` (8 of them `CLAUDE.md` / `.claude/rules/`), including the 2026-10-20 inlined ops facts,
+  imperative subsystem index and rule-injection hook. The after numbers describe that older tree;
+  re-run the after arms before quoting them for HEAD.
+- **Ceiling for strong models.** Sonnet and Opus pass every recall and rules item in every run,
+  before and after (147/147, 27/27; Wilson lower bound 97% / 88%). The suite cannot tell a good
+  context from a better one for them: it measures only that nothing broke. Discriminating items
+  (or a weaker model, or an ablation such as the "rules hidden" config in README) are needed to
+  show an effect.
 
 ## Reproduce
 

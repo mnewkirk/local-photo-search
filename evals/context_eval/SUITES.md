@@ -31,8 +31,11 @@ items, once each.
   or flags, without changing any file. It may use Read, Grep, Glob, Skill, Task and read-only
   Bash (`grep`, `cat`, `sed`, `git log`, ...).
 - **How a pass is decided:** case-insensitive regexes run over the final answer. Every `expect`
-  pattern must match, and each `any` group needs at least one match. A run that ends in an
-  error (for example, hitting the turn cap) fails.
+  pattern must match, each `any` group needs at least one match, and no `reject` pattern (the
+  contradicting claim, e.g. "yes, it burns an attempt") may match. A run that ends in an error
+  (for example, hitting the turn cap) fails. Since the 2026-10-25 grader audit each item also
+  carries `counter` wrong answers its regexes must fail and a real `pass_example` they must
+  pass; the harness tests check both.
 - **Why it matters for the diet:** before, the answer was already in the prompt; after, the
   model must notice it does not know and look the fact up. This suite measures whether the
   pointers in the slim `CLAUDE.md` still lead to the moved text.
@@ -79,9 +82,13 @@ items, once each.
   not commit and not ask questions, and to follow the repository's conventions. It may also use
   Edit and Write (`--permission-mode acceptEdits`), with a cap of 25 turns, $1.50 and 900 s.
 - **How a pass is decided:** deterministic checks on the lines the run added (the `+` lines of
-  `git diff HEAD` plus any new untracked file), optionally limited to named files. An
-  `added_grep` pattern must appear, an `added_not_grep` pattern must not appear outside comments
-  and docstrings, and an `any_added_grep` needs one of its patterns. A run fails if it moved
+  `git diff HEAD` plus any new untracked file), optionally limited to named files, with
+  comments and docstrings removed first (so `# envvar="PHOTOSEARCH_DB"` does not count). An
+  `added_grep` pattern must appear, an `added_not_grep` pattern must not, an `any_added_grep`
+  needs one of its patterns, and `added_gt_baseline` (the schema task) needs a `SCHEMA_VERSION`
+  above the one at the starting commit. `task-restack-folder` also fails a `None` fallback or an
+  unscoped call, and `task-register-pass` needs a `db.PASS_MEDIA` entry (both since 2026-10-25;
+  no stored run changed verdict). A run fails if it moved
   HEAD (committed) or ended in an error such as hitting the turn cap. The checks test the
   convention, not whether the code works.
 - **Why it matters for the diet:** this is the real adherence test. Conventions that used to be
@@ -103,11 +110,16 @@ How to read the tables:
   ↑N× is an increase, after ÷ before; `=` means no change at one decimal. Factors are computed
   from unrounded values, so they can differ slightly from the ratio of the displayed numbers.
 - The subtotal and total rows use the same formulas over all runs in the suite or config.
-  There were no infrastructure failures left in the stored rows; every item has 3 runs per
-  config (1 for gemma).
+  Every item has 3 runs per config (1 for gemma). Three Haiku recall rows are infrastructure
+  failures, not answers ("You've hit your session limit"), and are unscored since the grader
+  audit of 2026-10-25 (`regrade` now re-runs the infra check on stored rows): before
+  `clip-reclaim-cap` rep 3, after `server-write-failure-attempt` rep 3 and
+  `faces-empty-terminal` rep 2. Their cost and wall time are still in the cells.
+- A task cell can pass every check and still FAIL because the run hit the turn cap. The
+  report counts those separately ("checks passed but hit turn cap"); see Reading the tables.
 
 The four totals match REPORT.md: Sonnet 207 → 210 of 231 and $64.43 → $19.52; Opus 5.5
-207 → 206 and $125.90 → $36.27; Haiku 4.5 197 → 197 and $28.05 → $11.28; gemma 10/10 → 9/10.
+207 → 206 and $125.90 → $36.27; Haiku 4.5 197 → 197 (of 230 → 229 scored runs) and $28.05 → $11.28; gemma 10/10 → 9/10.
 
 ### Sonnet
 
@@ -310,12 +322,12 @@ The four totals match REPORT.md: Sonnet 207 → 210 of 231 and $64.43 → $19.52
 | recall | `provenance-effective-model` | `effective_model` logs the model that actually ran | 3/3 → 3/3 | $0.068 → $0.041 ↓1.7× | 11.4 s → 21.9 s ↑1.9× | $0.0059 → $0.0018 ↓3.2× |
 | recall | `text-pass-timeout` | 10 s timeout on text passes bounds Ollama stalls | 3/3 → 3/3 | $0.067 → $0.037 ↓1.8× | 11.7 s → 16.9 s ↑1.5× | $0.0058 → $0.0022 ↓2.7× |
 | recall | `attempts-cap` | 3-attempt cap in `worker_processed.attempts` | 3/3 → 3/3 | $0.067 → $0.035 ↓1.9× | 10.9 s → 14.0 s ↑1.3× | $0.0061 → $0.0025 ↓2.5× |
-| recall | `server-write-failure-attempt` | A transient DB lock on submit defers; no attempt spent | 3/3 → 2/3 ▼ | $0.073 → $0.068 ↓1.1× | 30.3 s → 26.3 s ↓1.2× | $0.0024 → $0.0026 ↑1.1× |
-| recall | `faces-empty-terminal` | Empty faces result is terminal; detection errors are failure rows | 3/3 → 2/3 ▼ | $0.067 → $0.055 ↓1.2× | 11.2 s → 16.6 s ↑1.5× | $0.0060 → $0.0033 ↓1.8× |
+| recall | `server-write-failure-attempt` | A transient DB lock on submit defers; no attempt spent | 3/3 → 2/2 (1 infra) | $0.073 → $0.068 ↓1.1× | 30.3 s → 26.3 s ↓1.2× | $0.0024 → $0.0026 ↑1.1× |
+| recall | `faces-empty-terminal` | Empty faces result is terminal; detection errors are failure rows | 3/3 → 2/2 (1 infra) | $0.067 → $0.055 ↓1.2× | 11.2 s → 16.6 s ↑1.5× | $0.0060 → $0.0033 ↓1.8× |
 | recall | `video-nas-never-decodes` | NAS never probes video; native workers run ffprobe | 3/3 → 3/3 | $0.069 → $0.043 ↓1.6× | 14.6 s → 14.2 s = | $0.0047 → $0.0030 ↓1.5× |
 | recall | `pass-media-map` | `PASS_MEDIA` limits passes by media; a missing pass raises | 3/3 → 3/3 | $0.066 → $0.037 ↓1.8× | 8.5 s → 14.7 s ↑1.7× | $0.0078 → $0.0025 ↓3.1× |
 | recall | `video-passes-native` | Video passes need `--native`: no ffprobe in the Docker image | 3/3 → 3/3 | $0.121 → $0.021 ↓5.8× | 11.3 s → 12.1 s ↑1.1× | $0.0106 → $0.0017 ↓6.2× |
-| recall | `clip-reclaim-cap` | Unloadable photos were re-claimed forever; clip now attempt-capped | 2/3 → 3/3 ▲ | $0.064 → $0.063 = | 14.5 s → 23.9 s ↑1.6× | $0.0044 → $0.0027 ↓1.6× |
+| recall | `clip-reclaim-cap` | Unloadable photos were re-claimed forever; clip now attempt-capped | 2/2 (1 infra) → 3/3 | $0.064 → $0.063 = | 14.5 s → 23.9 s ↑1.6× | $0.0044 → $0.0027 ↓1.6× |
 | recall | `ingest-no-index-trap` | `--no-index` leaves moved photos with no row; use `--no-clip` | 3/3 → 3/3 | $0.178 → $0.032 ↓5.6× | 13.0 s → 11.2 s ↓1.2× | $0.0138 → $0.0028 ↓4.9× |
 | recall | `refile-link-not-rename` | `os.link` fails with EEXIST instead of overwriting | 3/3 → 3/3 | $0.069 → $0.066 = | 16.0 s → 16.0 s = | $0.0043 → $0.0041 = |
 | recall | `maintenance-cron-time` | Nightly sweep runs at 18:30 from the NAS user's crontab | 3/3 → 3/3 | $0.069 → $0.031 ↓2.2× | 13.6 s → 11.1 s ↓1.2× | $0.0050 → $0.0028 ↓1.8× |
@@ -364,11 +376,11 @@ The four totals match REPORT.md: Sonnet 207 → 210 of 231 and $64.43 → $19.52
 | tasks | `task-filepath-writer` | Path change goes through `set_photo_filepath`, never a bare UPDATE | 3/3 → 2/3 ▼ | $0.436 → $0.159 ↓2.7× | 64.4 s → 65.2 s = | $0.0068 → $0.0024 ↓2.8× |
 | tasks | `task-restack-folder` | Restack passes `photo_ids` and guards the empty list | 2/3 → 3/3 ▲ | $0.249 → $0.079 ↓3.2× | 32.2 s → 32.9 s = | $0.0077 → $0.0024 ↓3.2× |
 | tasks | `task-nas-git-pull` | NAS git-pull script uses `safe.directory` | 3/3 → 3/3 | $0.210 → $0.032 ↓6.5× | 20.2 s → 13.4 s ↓1.5× | $0.0104 → $0.0024 ↓4.3× |
-| **recall** | **subtotal** |  | 146/147 → 142/147 ▼ | $0.076 → $0.035 ↓2.2× | 12.7 s → 15.0 s ↑1.2× | $0.0060 → $0.0024 ↓2.5× |
+| **recall** | **subtotal** |  | 146/146 → 142/145 ▼ (1 → 2 infra) | $0.076 → $0.035 ↓2.2× | 12.7 s → 15.0 s ↑1.2× | $0.0060 → $0.0024 ↓2.5× |
 | **rules** | **subtotal** |  | 27/27 → 26/27 ▼ | $0.151 → $0.064 ↓2.4× | 17.9 s → 16.2 s ↓1.1× | $0.0084 → $0.0039 ↓2.1× |
 | **skills** | **subtotal** |  | 0/24 → 0/24 | $0.073 → $0.048 ↓1.5× | 12.6 s → 19.8 s ↑1.6× | $0.0058 → $0.0024 ↓2.4× |
 | **tasks** | **subtotal** |  | 24/33 → 29/33 ▲ | $0.335 → $0.097 ↓3.4× | 41.1 s → 33.8 s ↓1.2× | $0.0081 → $0.0029 ↓2.8× |
-| **all** | **total** |  | 197/231 → 197/231 | $0.121 → $0.049 ↓2.5× | 17.3 s → 18.3 s ↑1.1× | $0.0070 → $0.0027 ↓2.6× |
+| **all** | **total** |  | 197/230 → 197/229 | $0.121 → $0.049 ↓2.5× | 17.3 s → 18.3 s ↑1.1× | $0.0070 → $0.0027 ↓2.6× |
 
 ### gemma-4-12b-qat (local, LM Studio)
 
@@ -393,16 +405,22 @@ The four totals match REPORT.md: Sonnet 207 → 210 of 231 and $64.43 → $19.52
   only per-item changes are Sonnet's `skill-last-queries` (0/3 → 3/3, the only skills item any
   model ever passed) and Opus's `task-register-pass` (3/3 → 2/3; the failing run hit the
   25-turn cap).
-- **Recall and rules regressions appear only for the weaker models.** Haiku lost one of three
-  runs on six items (`tags-pass-removed`, `visual-retired-tag`, `server-write-failure-attempt`,
-  `faces-empty-terminal`, `ps-poll-not-setinterval`, `rule-maintenance-stacking-incremental`)
-  and gained one on `clip-reclaim-cap`. gemma failed `worker-d-photo-root`, the fact REPORT.md
-  traces to a path-scoped rule that a Q&A session never opens.
-- **Haiku's tasks improved on four items** (`task-frontend-poll`, `task-sse-endpoint`,
-  `task-curl-intent-headers`, `task-restack-folder`) and regressed on one
+- **Recall and rules regressions appear only for the weaker models, and none is beyond noise.**
+  Haiku lost one of three runs on four items (`tags-pass-removed`, `visual-retired-tag`,
+  `ps-poll-not-setinterval`, `rule-maintenance-stacking-incremental`). The drops once listed on
+  `server-write-failure-attempt` and `faces-empty-terminal`, and the gain on `clip-reclaim-cap`,
+  were session-limit answers scored as FAILs (now infra). A single-rep drop is within run-to-run
+  noise: Haiku recall is 146/146 → 142/145, Fisher p = 0.12, sign test over items 3 down / 0 up,
+  p = 0.25. gemma failed `worker-d-photo-root`, the fact REPORT.md traces to a path-scoped rule
+  that a Q&A session never opens.
+- **Haiku's task gain is mostly turn caps.** It improved on four items (`task-frontend-poll`,
+  `task-sse-endpoint`, `task-curl-intent-headers`, `task-restack-folder`) and dropped on one
   (`task-filepath-writer`). Six of its nine failed task runs before the diet ended at the turn
-  cap. `task-register-pass` failed all three runs on Haiku both before and after, every time at
-  the turn cap.
+  cap, and four of those six had passed every check (`task-frontend-poll` 1, `task-sse-endpoint`
+  2, `task-register-pass` 1); after the diet one of four turn-capped runs had
+  (`task-filepath-writer`). On checks alone tasks went 28/33 → 30/33, against 24/33 → 29/33
+  as scored. `task-register-pass` failed all three runs on Haiku both before and after, every
+  time at the turn cap.
 - **`task-register-pass` is the most expensive item in every cloud config, and the diet barely
   cut it.** Per run it went $0.733 → $0.663 on Sonnet and $1.390 → $1.196 on Opus, while its
   wall time tripled on Sonnet (48.9 s → 147.6 s) and doubled on Opus (62.6 s → 126.4 s). Every

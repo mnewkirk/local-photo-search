@@ -36,6 +36,7 @@ import contextlib
 import datetime as dt
 import fnmatch
 import json
+import math
 import os
 import re
 import shutil
@@ -137,37 +138,102 @@ def added_lines(worktree: Path) -> dict[str, list[str]]:
     return out
 
 
-def _strip_comments(text: str) -> str:
-    """Drop docstrings and `#` / `//` comments from added code."""
-    text = re.sub(r'("""|\'\'\')[\s\S]*?\1', "", text)
-    text = re.sub(r"(^|\s)//.*$", r"\1", text, flags=re.M)  # JS (not http://)
-    return re.sub(r"(^|\s)#(?!!).*$", r"\1", text, flags=re.M)
+_HASH_EXT = (".py", ".sh", ".bash", ".yml", ".yaml", ".toml")
+_SLASH_EXT = (".js", ".jsx", ".mjs", ".ts", ".html", ".css")
 
 
-def grade_task(item: dict, added: dict[str, list[str]]) -> tuple[bool, dict]:
-    """Checks: {type: added_grep|added_not_grep|any_added_grep, pattern|patterns,
-    paths?: [globs]}. `paths` restricts which files' added lines are searched."""
+def _strip_docstrings(text: str) -> str:
+    """Drop Python docstrings: a triple-quoted block that opens a line right
+    after a `def`/`class` line (one ending in `:`) or at the top. A triple-
+    quoted SQL argument (`execute(\\n \"\"\"ALTER ...\"\"\")`) is code and stays."""
+    out, prev, quote = [], "", None
+    for line in text.splitlines():
+        if quote:
+            if quote in line:
+                quote = None
+            continue
+        m = re.match(r"\s*[rRbBuU]{0,2}(\"\"\"|''')", line)
+        if m and (not prev or prev.rstrip().endswith(":")):
+            if line.count(m.group(1)) < 2:
+                quote = m.group(1)
+            continue
+        out.append(line)
+        if line.strip() and not line.lstrip().startswith("#"):  # a shebang/comment keeps "top"
+            prev = line
+    return "\n".join(out)
+
+
+def _strip_comments(text: str, path: str = "") -> str:
+    """Drop comments from added code so prose about a convention never counts as
+    following it (or breaking it): docstrings and `#` for Python/shell, `//`,
+    `/* */` and `<!-- -->` for JS/HTML. An unknown extension gets all of them."""
+    p = path.lower()
+    hash_ok = p.endswith(_HASH_EXT) or not p.endswith(_SLASH_EXT)
+    slash_ok = p.endswith(_SLASH_EXT) or not p.endswith(_HASH_EXT)
+    if p.endswith(".py") or not p.endswith(_SLASH_EXT + _HASH_EXT):
+        text = _strip_docstrings(text)
+    if slash_ok:
+        text = re.sub(r"/\*[\s\S]*?\*/|<!--[\s\S]*?-->", "", text)
+        text = re.sub(r"(^|\s)//.*$", r"\1", text, flags=re.M)  # JS (not http://)
+    if hash_ok:
+        text = re.sub(r"(^|\s)#(?!!).*$", r"\1", text, flags=re.M)
+    return text
+
+
+def _baseline_int(chk: dict, baseline) -> int | None:
+    """The integer `chk["baseline"]["pattern"]` captures in the unmodified file."""
+    spec = chk["baseline"]
+    src = baseline(spec["path"]) if baseline else None
+    m = re.search(spec["pattern"], src or "", re.M)
+    return int(m.group(1)) if m else None
+
+
+def grade_task(item: dict, added: dict[str, list[str]], baseline=None) -> tuple[bool, dict]:
+    """Checks: {type: added_grep|added_not_grep|any_added_grep|added_gt_baseline,
+    pattern|patterns, paths?: [globs]}. `paths` restricts which files' added
+    lines are searched. Every check runs on the added code with comments and
+    docstrings removed: `# envvar="PHOTOSEARCH_DB"` does not add the envvar,
+    and `# not pgrep -f` does not use pgrep.
+
+    `added_gt_baseline` passes when an integer `pattern` captures in the added
+    lines is greater than the one `baseline.pattern` captures in the file
+    `baseline.path` before the run; `baseline(rel)` returns that file's text
+    (the worktree's HEAD, or the row's git sha on a regrade), else None, and an
+    unknown baseline fails the check."""
     results = []
     for chk in item["checks"]:
         globs = chk.get("paths")
         text = "\n".join(
-            l for path, lines in added.items()
+            _strip_comments("\n".join(lines), path) for path, lines in added.items()
             if not globs or any(fnmatch.fnmatch(path, g) for g in globs)
-            for l in lines
         )
         t = chk["type"]
+        res = {"check": chk}
         if t == "added_grep":
             ok = re.search(chk["pattern"], text, re.I | re.M) is not None
         elif t == "added_not_grep":
-            # A file that explains the trap ("# not pgrep -f: it matches
-            # itself") has avoided it, so prose in comments doesn't count.
-            ok = re.search(chk["pattern"], _strip_comments(text), re.I | re.M) is None
+            ok = re.search(chk["pattern"], text, re.I | re.M) is None
         elif t == "any_added_grep":
-            ok = _any(chk["patterns"], text)
+            ok = any(re.search(p, text, re.I | re.M) for p in chk["patterns"])
+        elif t == "added_gt_baseline":
+            base = _baseline_int(chk, baseline)
+            new = [int(m.group(1)) for m in re.finditer(chk["pattern"], text, re.M)]
+            ok = base is not None and any(n > base for n in new)
+            res.update(baseline=base, found=new)
         else:
             raise ValueError(f"unknown check type {t!r} in task {item['id']}")
-        results.append({"check": chk, "ok": ok})
+        res["ok"] = ok
+        results.append(res)
     return all(r["ok"] for r in results), {"checks": results, "files_touched": sorted(added)}
+
+
+def git_baseline(root: Path, rev: str = "HEAD"):
+    """`baseline` for grade_task: a file's text at `rev` in the repo at `root`."""
+    def read(rel: str) -> str | None:
+        p = subprocess.run(["git", "show", f"{rev}:{rel}"], cwd=root,
+                           capture_output=True, text=True)
+        return p.stdout if p.returncode == 0 else None
+    return read
 
 
 # ---------------------------------------------------------- claude runner --
@@ -488,6 +554,18 @@ def infra_error(res: dict) -> str | None:
     return None
 
 
+def stored_result(row: dict) -> dict:
+    """A stored row in the shape infra_error() reads. Rows written before
+    `is_error` was stored fall back to the exit code: the 2026-10-19 Haiku
+    session-limit answers exited 1 and were scored as ordinary FAILs."""
+    is_error = row.get("is_error")
+    if is_error is None:
+        is_error = row.get("exit_code") not in (0, None) or row.get("subtype") == "timeout"
+    return {"text": row.get("answer") or "", "subtype": row.get("subtype"),
+            "is_error": bool(is_error), "usage": row.get("usage") or {},
+            "stderr_tail": row.get("error") or ""}
+
+
 def run_one(suite: str, item: dict, rep: int, args) -> dict:
     row = {"suite": suite, "id": item["id"], "config": args.config, "rep": rep,
            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -501,7 +579,7 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
                              budget=args.budget, edit=True, system=TASK_SYSTEM,
                              timeout=args.timeout)
             added = added_lines(wt)
-            ok, detail = grade_task(item, added)
+            ok, detail = grade_task(item, added, baseline=git_baseline(wt, head0))
             if _git_head(wt) != head0:  # backstop: a run that committed fails
                 ok, detail["committed"] = False, True
             # kept so a grader fix can re-grade without re-running the model
@@ -528,6 +606,9 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
         else:
             ok, detail = grade_text(item, res["text"])
     infra = infra_error(res)
+    # A run that hit the turn cap can still have passed every check; kept so
+    # the report can tell "ran out of turns" from "missed the convention".
+    detail["checks_passed"] = ok
     row.update({
         "infra_error": infra,
         "pass": ok and not res["is_error"] and not infra,
@@ -543,6 +624,7 @@ def run_one(suite: str, item: dict, rep: int, args) -> dict:
         "wall_s": res["wall_s"],
         "model": res["model"],
         "subtype": res["subtype"],
+        "is_error": res["is_error"],
         "exit_code": res["exit_code"],
         "error": infra or (res["stderr_tail"] if res["is_error"] else None),
     })
@@ -666,6 +748,47 @@ def _regex_pass(r: dict) -> bool:
     return bool(d["regex_pass"]) if "regex_pass" in d else bool(r.get("pass"))
 
 
+def _cap_checks_ok(r: dict) -> bool:
+    """Turn-capped, yet every check passed: ran out of turns, didn't miss the trap."""
+    return is_turn_cap(r) and bool((r.get("detail") or {}).get("checks_passed"))
+
+
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score 95% interval for k passes out of n."""
+    if not n:
+        return 0.0, 1.0
+    p, z2 = k / n, z * z
+    mid = (p + z2 / (2 * n)) / (1 + z2 / n)
+    half = z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / (1 + z2 / n)
+    return max(0.0, mid - half), min(1.0, mid + half)
+
+
+def fisher_exact(a: int, b: int, c: int, d: int) -> float:
+    """Two-sided Fisher exact p for the 2x2 table [[a, b], [c, d]]
+    (pass/fail in config 1, pass/fail in config 2)."""
+    r1, c1, n = a + b, a + c, a + b + c + d
+    if not n:
+        return 1.0
+    def prob(x):
+        return math.comb(c1, x) * math.comb(n - c1, r1 - x) / math.comb(n, r1)
+    p0 = prob(a)
+    lo, hi = max(0, r1 + c1 - n), min(r1, c1)
+    return min(1.0, sum(prob(x) for x in range(lo, hi + 1) if prob(x) <= p0 * (1 + 1e-7)))
+
+
+def sign_test(up: int, down: int) -> float:
+    """Two-sided sign test p over items that moved (ties dropped)."""
+    n = up + down
+    if not n:
+        return 1.0
+    return min(1.0, 2 * sum(math.comb(n, i) for i in range(min(up, down) + 1)) / 2 ** n)
+
+
+# An item is flagged REGRESSED / improved only when its pass rate moved by at
+# least half its runs (2 of 3 reps): a single-rep flip is within run-to-run noise.
+ITEM_FLAG_DELTA = 0.5
+
+
 def _agg(rows):
     infra = sum(bool(r.get("infra_error")) for r in rows)
     rows = [r for r in rows if not r.get("infra_error")]
@@ -680,6 +803,8 @@ def _agg(rows):
         "judged": sum(_judge_verdict(r) is not None for r in rows),
         "judge_errors": sum("judge_error" in (r.get("detail") or {}) for r in rows),
         "turn_cap": sum(is_turn_cap(r) for r in rows),
+        "cap_checks_ok": sum(_cap_checks_ok(r) for r in rows),
+        "passed": sum(bool(r.get("pass")) for r in rows),
         "cost": sum(r.get("cost_usd") or 0 for r in rows) / n,
         "input_tok": sum(_input_tokens(r.get("usage") or {}) for r in rows) / n,
         "cache_read": sum(int((r.get("usage") or {}).get("cache_read_input_tokens") or 0) for r in rows) / n,
@@ -697,34 +822,53 @@ def cmd_regrade(args) -> int:
 
     With --judge, a recall/rules row the regexes fail is sent to the LLM judge,
     which may overturn it. A regex pass is never judged. Judge verdicts already
-    stored on a row are reused (no new call) unless --rejudge."""
+    stored on a row are reused (no new call) unless --rejudge.
+
+    Every row (skills too) is first re-checked with infra_error(): a stored
+    session-limit or gateway answer becomes an unscored infra row, as `run`
+    would have recorded it. A turn-capped row stays a FAIL, but its checks are
+    graded and kept as `detail.checks_passed` for the report."""
     items = {s: {i["id"]: i for i in load_items(s)} for s in SUITES}
     judge_calls = judge_streak = 0
     judge_cost = 0.0
+    baselines: dict[str, object] = {}
     for config in args.configs:
-        for suite in ("recall", "rules", "tasks"):
+        for suite in SUITES:
             path = RESULTS / config / f"{suite}.jsonl"
             if not path.exists():
                 continue
             rows, changed = [json.loads(l) for l in path.read_text().splitlines() if l.strip()], 0
-            overturned = 0
+            overturned = reclassified = 0
             for r in rows:
+                if not r.get("infra_error"):
+                    infra = infra_error(stored_result(r))
+                    if infra:
+                        changed += bool(r.get("pass"))
+                        reclassified += 1
+                        r["infra_error"], r["pass"] = infra, False
+                        r["error"] = r.get("error") or infra
+                        continue
                 item = items[suite].get(r["id"])
-                if not item or r.get("infra_error") or r.get("error"):
-                    continue
-                if str(r.get("subtype") or "").startswith("error"):  # e.g. max turns
-                    if r.get("pass"):
-                        changed += 1
-                    r["pass"] = False
+                if suite == "skills" or not item or r.get("infra_error"):
                     continue
                 if suite == "tasks":
                     if "added" not in r:
                         continue
-                    ok, detail = grade_task(item, r["added"])
-                    final = ok
+                    sha = (r.get("context") or {}).get("git_sha") or "HEAD"
+                    base = baselines.setdefault(sha, git_baseline(REPO, sha))
+                    ok, detail = grade_task(item, r["added"], baseline=base)
                 else:
                     ok, detail = grade_text(item, r.get("answer") or "")
-                    final = ok
+                if is_turn_cap(r) or str(r.get("subtype") or "").startswith("error"):
+                    # e.g. max turns: a FAIL whatever the checks say
+                    detail["checks_passed"] = ok
+                    changed += bool(r.get("pass"))
+                    r["pass"], r["detail"] = False, {**(r.get("detail") or {}), **detail}
+                    continue
+                if r.get("error"):
+                    continue
+                final = ok
+                if suite != "tasks":
                     detail["regex_pass"] = ok
                     if not ok:
                         prev = _judge_verdict(r)
@@ -749,13 +893,55 @@ def cmd_regrade(args) -> int:
                                 overturned += final
                 if final != bool(r.get("pass")):
                     changed += 1
+                detail["checks_passed"] = ok
                 r["pass"], r["detail"] = final, detail
             path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
             extra = f", {overturned} overturned by the judge" if overturned else ""
+            extra += f", {reclassified} reclassified as infra (unscored)" if reclassified else ""
             print(f"{config}/{suite}: {changed} rows changed{extra}", file=sys.stderr)
     if judge_calls:
         print(f"judge: {judge_calls} calls ({args.judge_model}), ${judge_cost:.4f}", file=sys.stderr)
     return 0
+
+
+def _print_significance(data: dict, configs: list[str]) -> None:
+    """Per-suite pass rate with a Wilson 95% interval for every config, and the
+    first config against the last: Fisher exact over runs, sign test over items."""
+    if len(configs) < 2:
+        return
+    first, last = configs[0], configs[-1]
+    print(f"\n## Pass rates with 95% intervals ({first} vs {last})\n")
+    print("Fisher: two-sided exact test on pass/fail runs. Sign test: items whose pass "
+          "rate went down vs up (ties dropped). Runs within an item are not independent, "
+          "so read the sign test before the Fisher p.\n")
+    print("| suite | " + " | ".join(configs) + " | Fisher p | items down / up | sign-test p |")
+    print("|---|" + "---|" * len(configs) + "---|---|---|")
+    for suite in SUITES:
+        aggs = {c: _agg([r for r in data[c] if r.get("suite") == suite]) for c in configs}
+        if not aggs[first]["n"] or not aggs[last]["n"]:
+            continue
+        cells = []
+        for c in configs:
+            a = aggs[c]
+            if not a["n"]:
+                cells.append("—")
+                continue
+            lo, hi = wilson(a["passed"], a["n"])
+            cells.append(f"{a['passed']}/{a['n']} {a['passed'] / a['n']:.0%} [{lo:.0%}–{hi:.0%}]")
+        a1, a2 = aggs[first], aggs[last]
+        fp = fisher_exact(a1["passed"], a1["n"] - a1["passed"], a2["passed"], a2["n"] - a2["passed"])
+        up = down = 0
+        for iid in {r["id"] for r in data[first] if r.get("suite") == suite}:
+            rates = []
+            for c in (first, last):
+                rs = [r for r in data[c] if r.get("suite") == suite and r["id"] == iid
+                      and not r.get("infra_error")]
+                rates.append(sum(bool(r.get("pass")) for r in rs) / len(rs) if rs else None)
+            if None not in rates and rates[0] != rates[1]:
+                up += rates[1] > rates[0]
+                down += rates[1] < rates[0]
+        print(f"| {suite} | " + " | ".join(cells)
+              + f" | {fp:.2f} | {down} / {up} | {sign_test(up, down):.2f} |")
 
 
 def cmd_report(args) -> int:
@@ -776,14 +962,14 @@ def cmd_report(args) -> int:
     print("\n## Per suite\n")
     rate_cols = "pass rate (judged) | regex-only pass rate | judged rows" if judged_any else "pass rate"
     print(f"| suite | config | runs | {rate_cols} | mean cost $ | mean input tok | mean cache-read tok "
-          "| mean turns | turn-cap hits | errors |")
-    print("|---|---|---|" + "---|" * (3 if judged_any else 1) + "---|---|---|---|---|---|")
+          "| mean turns | turn-cap hits | checks passed but hit turn cap | errors |")
+    print("|---|---|---|" + "---|" * (3 if judged_any else 1) + "---|---|---|---|---|---|---|")
     for suite in SUITES:
         for c, rows in data.items():
             a = _agg([r for r in rows if r.get("suite") == suite])
             if a["n"] or a["infra"]:
                 if not a["n"]:
-                    dashes = " | ".join(["—"] * (8 if judged_any else 6))
+                    dashes = " | ".join(["—"] * (9 if judged_any else 7))
                     print(f"| {suite} | {c} | 0 | {dashes} | {a['infra']} infra |")
                     continue
                 infra_note = f" ({a['infra']} infra, unscored)" if a["infra"] else ""
@@ -793,7 +979,8 @@ def cmd_report(args) -> int:
                     rate += f" | {a['regex_pass_rate']:.0%} | {jn}"
                 print(f"| {suite} | {c} | {a['n']} | {rate} | {a['cost']:.3f} | "
                       f"{a['input_tok']:,.0f} | {a['cache_read']:,.0f} | {a['turns']:.1f} | "
-                      f"{a['turn_cap']} | {a['errors']}{infra_note} |")
+                      f"{a['turn_cap']} | {a['cap_checks_ok']} | {a['errors']}{infra_note} |")
+    _print_significance(data, args.configs)
     print("\n## Per item (pass count / runs per config)\n")
     ids = sorted({(r["suite"], r["id"]) for rows in data.values() for r in rows})
     print("| suite | id | " + " | ".join(args.configs) + " | note |")
@@ -811,16 +998,19 @@ def cmd_report(args) -> int:
                     cell += f" (regex {rx}/{len(rs)})"
                 caps = sum(is_turn_cap(r) for r in rs)
                 if caps:
-                    cell += f" [{caps} turn-cap]"
+                    ok_caps = sum(_cap_checks_ok(r) for r in rs)
+                    cell += f" [{caps} turn-cap" + (f", {ok_caps} checks ok]" if ok_caps else "]")
                 cells.append(cell)
                 rates.append(p / len(rs))
             else:
                 cells.append("—")
         note = ""
-        if len(rates) >= 2 and rates[-1] < rates[0]:
-            note = "REGRESSED"
-        elif len(rates) >= 2 and rates[-1] > rates[0]:
-            note = "improved"
+        if len(rates) >= 2 and rates[-1] != rates[0]:
+            delta = rates[-1] - rates[0]
+            if abs(delta) >= ITEM_FLAG_DELTA - 1e-9:
+                note = "REGRESSED" if delta < 0 else "improved"
+            else:
+                note = "lower (noise)" if delta < 0 else "higher (noise)"
         print(f"| {suite} | {iid} | " + " | ".join(cells) + f" | {note} |")
     if args.failures:
         caps = [(c, r) for c, rows in data.items() for r in rows

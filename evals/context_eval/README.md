@@ -13,10 +13,10 @@ runs are billed to the account running it. Nothing here is mocked.
 
 | suite | items | what it measures | graded by |
 |---|---|---|---|
-| `recall` | `recall.jsonl`, 49 | can a cold session answer one trap question per relocated section | regexes on the answer (`expect` all / `any` groups / `reject`); optional LLM judge on regex fails (`facts`) |
+| `recall` | `recall.jsonl`, 49 | can a cold session answer one trap question per relocated section | regexes on the answer (`expect` all / `any` groups / `reject`); optional LLM judge on regex fails (`facts`); every item's `counter` answers must fail and its `pass_example` pass (tested) |
 | `rules` | `rule_triggers.jsonl`, 9 | after a `Read` of a subsystem file, does the subsystem's trap knowledge load (the path-scoped `.claude/rules/*.md` once they exist) | same |
 | `skills` | `skill_triggers.jsonl`, 8 + 10 held-out | do the vague prompts in the skill description still trigger the photo-search skill | a `Skill` tool call naming photo-search |
-| `tasks` | `tasks.jsonl`, 11 | small coding tasks where a documented trap bites; the real adherence test | deterministic checks on the diff's added lines in a throwaway worktree |
+| `tasks` | `tasks.jsonl`, 11 | small coding tasks where a documented trap bites; the real adherence test | deterministic checks on the diff's added lines (comments stripped) in a throwaway worktree; some compare against the file at the starting commit (`added_gt_baseline`) |
 
 Every run also records `total_cost_usd`, token usage (input, cache creation,
 cache read), turns, wall time, the model that answered, the git sha and the
@@ -62,13 +62,24 @@ which is itself part of what the eval measures.
   `error_max_turns`). They are still FAILs in the pass rate, but counted in their
   own column, tagged `[N turn-cap]` in the per-item table, and listed under
   "Turn-cap hits" with `--failures`, so "the context lost a rule" and "the task
-  needed more turns than the cap" stay distinguishable.
+  needed more turns than the cap" stay distinguishable. The "checks passed but
+  hit turn cap" column (`[N turn-cap, M checks ok]` per item) counts capped runs
+  whose diff or answer passed every check: those ran out of turns, they did not
+  miss the convention.
+- **Infra rows** (session limit, gateway down, timeout) are unscored, by `run`
+  and by `regrade`, which re-checks every stored row.
 - **Judged runs**: once any row carries a judge verdict (below), the per-suite
   table shows the judged pass rate, the regex-only pass rate and the number of
   judged rows; per-item cells add `(regex p/n)` where the judge changed the
   count.
-- **Per item**: pass count per config with `REGRESSED` / `improved` flags. A
-  regression on a `recall` item usually means the pointer that replaced the
+- **Pass rates with 95% intervals**: each suite's pass rate per config with a
+  Wilson interval, a two-sided Fisher exact p (first vs last config, over runs)
+  and a sign test over items that moved. Runs of one item are correlated, so
+  the sign test is the safer read; at 3 reps a 49-item suite needs several
+  items to move the same way before p drops below 0.05.
+- **Per item**: pass count per config. `REGRESSED` / `improved` only when the
+  pass rate moved by at least half the runs (2 of 3); a single-rep flip reads
+  `lower (noise)` / `higher (noise)`. A regression on a `recall` item usually means the pointer that replaced the
   section is not findable; on a `tasks` item it means a rule that used to be
   in CLAUDE.md is now only path-scoped and the task never opened a matching
   file. Fix the pointer or the rule's `paths:`, not the eval.
@@ -85,7 +96,10 @@ python evals/context_eval/harness.py regrade --configs before after
 python evals/context_eval/harness.py regrade --configs before after --judge [--judge-model haiku] [--rejudge]
 ```
 
-`regrade` never re-runs the model under test. With `--judge`, only `recall` and
+`regrade` never re-runs the model under test. It also re-runs the infra check on every
+stored row (skills too) and unscores session-limit / gateway rows that an
+older harness scored as FAILs; task checks are graded against the file at the
+row's `git_sha`. With `--judge`, only `recall` and
 `rules` rows are eligible, and only those the regexes **fail**: a regex PASS is
 never sent to the judge, and a judge never turns a pass into a fail. The judge
 may overturn a regex fail.
@@ -115,13 +129,28 @@ may overturn a regex fail.
 
 ## Caveats
 
-- Regex grading is lenient on purpose and still produces some false fails on
-  phrasing. Compare pass *rates between configs*, read `--failures` before
+- Regex grading must fail wrong answers as well as pass right ones. When you
+  add or edit an item, add a `counter` (a short plausible wrong answer, e.g.
+  the opposite claim) and keep a real passing answer as `pass_example`; the
+  tests grade both. A `reject` pattern must skip the negated form ("not root's
+  crontab"), so check it against stored answers with `regrade` before
+  committing (it rewrites `results/`; copy them first).
+- Regex grading still produces some false fails on phrasing. Compare pass *rates between configs*, read `--failures` before
   acting on a single item, and use `regrade --judge` to see how many fails are
   phrasing only. The judge is itself a model: report both numbers.
 - `tasks` graders check for the convention, not for working code. A task can
   pass with a broken implementation; the question is only whether the trap was
-  avoided.
+  avoided. Comments never count either way.
+- **Ceiling.** Sonnet and Opus pass every recall and rules item in every run,
+  before and after the diet, so for them the suite only shows nothing broke.
+  A future **rules-hidden ablation** would test whether items actually depend
+  on `.claude/rules/`: a config that runs `--isolate` on a ref (or a throwaway
+  commit) where `.claude/rules/*.md` are deleted and the `PreToolUse`
+  rule-injection hook is disabled, with CLAUDE.md unchanged; compare it with
+  the plain `after` config. Items whose pass rate drops are the ones carried
+  by a rule file; items that do not move are answerable from CLAUDE.md or the
+  code and say nothing about the rules. Rows record `rules_files`, so the
+  report header shows the ablation took effect (0 files).
 - Read-only suites run in the repo root so the real memory directory loads;
   `tasks` run in a `/tmp` worktree with no project memory. Both configs see
   the same treatment, so the comparison holds, but absolute numbers differ
@@ -143,7 +172,9 @@ may overturn a regex fail.
   other tool call is denied and the model adapts.
 - Long-session compaction behaviour is out of scope here.
 
-`tests/test_context_eval_harness.py` covers the grading, transcript parsing,
-per-suite turn caps, turn-cap counting and the judge (prompt, JSON parsing,
-overturn, failure handling) without calling Claude; an autouse fixture fails any
+`tests/test_context_eval_harness.py` covers the grading (including every
+item's `counter` and `pass_example`, and a correct and a mutant diff per task),
+transcript parsing, per-suite turn caps, turn-cap counting, infra
+reclassification on regrade, the report's statistics and the judge (prompt,
+JSON parsing, overturn, failure handling) without calling Claude; an autouse fixture fails any
 test that tries to start the real `claude` CLI.

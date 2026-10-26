@@ -35,7 +35,8 @@ def test_item_files_parse_and_have_unique_ids():
     for it in h.load_items("tasks"):
         assert it["checks"], it["id"]
         for chk in it["checks"]:
-            assert chk["type"] in ("added_grep", "added_not_grep", "any_added_grep"), (it["id"], chk)
+            assert chk["type"] in ("added_grep", "added_not_grep", "any_added_grep",
+                                   "added_gt_baseline"), (it["id"], chk)
     for it in h.load_items("rules"):
         assert (ROOT / it["read"]).exists(), f"{it['id']}: {it['read']} missing"
 
@@ -377,3 +378,227 @@ def test_judged_items_have_facts_or_regexes():
             assert h.rubric_text(it).strip(), it["id"]
             if "facts" in it:
                 assert isinstance(it["facts"], str) and len(it["facts"]) > 30, it["id"]
+
+
+# ------------------------------------- grader audit (2026-10-25) ----------
+# Every recall/rules item carries `counter` (plausible WRONG answers its grader
+# must fail) and `pass_example` (a real stored answer that passed, so CI can
+# check a tightened grader still passes right answers without results/).
+
+def _text_items():
+    return [(s, it) for s in ("recall", "rules") for it in h.load_items(s)]
+
+
+@pytest.mark.parametrize("suite,item", _text_items(), ids=lambda v: v["id"] if isinstance(v, dict) else v)
+def test_counter_answers_fail(suite, item):
+    assert item.get("counter"), f"{item['id']}: no counter answers"
+    for wrong in item["counter"]:
+        ok, d = h.grade_text(item, wrong)
+        assert not ok, f"{item['id']}: grader passes a wrong answer: {wrong!r}"
+
+
+@pytest.mark.parametrize("suite,item", _text_items(), ids=lambda v: v["id"] if isinstance(v, dict) else v)
+def test_pass_example_still_passes(suite, item):
+    assert item.get("pass_example"), f"{item['id']}: no pass_example"
+    ok, d = h.grade_text(item, item["pass_example"])
+    assert ok, (item["id"], d)
+
+
+def test_contradicting_answers_from_the_review_fail():
+    items = {it["id"]: it for _, it in _text_items()}
+    for iid, wrong in [
+        ("server-write-failure-attempt", "Yes, it burns one attempt; the batch is deferred."),
+        ("video-nas-never-decodes", "The NAS runs ffprobe on new videos; the workers don't, it's not native."),
+        ("detect-stacks-empty-list", "An empty list is a no-op, nothing wiped; the library is safe."),
+        ("sse-loop-and-events", "Use get_event_loop(), not get_running_loop; emit done, fatal, cancelled."),
+    ]:
+        assert not h.grade_text(items[iid], wrong)[0], iid
+
+
+# --- task mutants: a correct change passes; the convention-breaking one fails ---
+
+_BASE = {"photosearch/db.py": "SCHEMA_VERSION = 39\n"}
+_DB = ["PASS_MEDIA_EXTRA = 1"]
+TASK_CASES = {
+    "task-cli-envvar": (
+        {"cli.py": ['@cli.command("count-videos")',
+                    '@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB")',
+                    "def count_videos(db):"]},
+        {"cli.py": ['@cli.command("count-videos")',
+                    '@click.option("--db", default="photo_index.db")  # envvar="PHOTOSEARCH_DB"',
+                    "def count_videos(db):"]}),
+    "task-frontend-poll": (
+        {"frontend/dist/status.html": ["const h = PS.poll(() => fetch('/api/health').then(show), 5000);"]},
+        {"frontend/dist/status.html": ["// PS.poll would be nicer here",
+                                       "fetchHealth(); setTimeout(loop, 5000);"]}),
+    "task-sse-endpoint": (
+        {"photosearch/web.py": ['@app.post("/api/admin/noop-stream")',
+                                "    loop = asyncio.get_running_loop()",
+                                '        yield _sse({"type": "done"})']},
+        {"photosearch/web.py": ['@app.post("/api/admin/noop-stream")',
+                                "    loop = asyncio.get_running_loop()",
+                                '        yield _sse({"type": "progress"})  # done']}),
+    "task-restack-folder": (
+        {"photosearch/stacking.py": [
+            "def restack_folder(db, folder):",
+            '    photo_ids = [r[0] for r in db.conn.execute("SELECT id FROM photos WHERE folder = ?", (folder,))]',
+            "    if not photo_ids:",
+            '        logger.info("no photos in %s", folder)',
+            "        return []",
+            "    return run_stacking(db, photo_ids=photo_ids)"]},
+        {"photosearch/stacking.py": [
+            "def restack_folder(db, folder):",
+            '    photo_ids = [r[0] for r in db.conn.execute("SELECT id FROM photos WHERE folder = ?", (folder,))]',
+            "    if not photo_ids:",
+            "        photo_ids = None",
+            "    return run_stacking(db, photo_ids=photo_ids)"]}),
+    "task-schema-bump": (
+        {"photosearch/db.py": ["SCHEMA_VERSION = 40",
+                               '            self.conn.execute("ALTER TABLE photos ADD COLUMN rating INTEGER")']},
+        {"photosearch/db.py": ["SCHEMA_VERSION = 12",
+                               "            # ALTER TABLE photos ADD COLUMN rating INTEGER"]}),
+    "task-register-pass": (
+        {"photosearch/db.py": ['    "exif-rescan",', '    "exif-rescan": "still",'],
+         "photosearch/batch_state.py": ['    "exif-rescan",'],
+         "frontend/dist/batch-flow.js": ["  'exif-rescan',"],
+         "cli.py": ['    "exif-rescan",']},
+        {"photosearch/db.py": ['    "exif-rescan",'],
+         "photosearch/batch_state.py": ['    "exif-rescan",'],
+         "frontend/dist/batch-flow.js": ["  'exif-rescan',"],
+         "cli.py": ['    "exif-rescan",']}),
+    "task-filepath-writer": (
+        {"cli.py": ["def set_filepath(db, photo_id, path):", "    db.set_photo_filepath(photo_id, path)"]},
+        {"cli.py": ["def set_filepath(db, photo_id, path):",
+                    '    db.conn.execute("UPDATE photos SET filepath = ? WHERE id = ?", (path, photo_id))',
+                    "    # not db.set_photo_filepath"]}),
+    "task-watcher-no-pgrep": (
+        {"scripts/wait_recluster.sh": ["python cli.py recluster-faces --dry-run > /tmp/recluster.log 2>&1 &",
+                                       "pid=$!", 'while kill -0 "$pid" 2>/dev/null; do sleep 2; done', "echo DONE"]},
+        {"scripts/wait_recluster.sh": ["python cli.py recluster-faces --dry-run > /tmp/recluster.log 2>&1 &",
+                                       "while pgrep -f recluster-faces >/dev/null; do sleep 2; done",
+                                       "echo DONE  # wait $!"]}),
+}
+
+
+@pytest.mark.parametrize("tid", sorted(TASK_CASES))
+def test_task_mutant_fails_and_correct_change_passes(tid):
+    item = {it["id"]: it for it in h.load_items("tasks")}[tid]
+    good, mutant = TASK_CASES[tid]
+    ok, d = h.grade_task(item, good, baseline=_BASE.get)
+    assert ok, (tid, [c for c in d["checks"] if not c["ok"]])
+    ok, _ = h.grade_task(item, mutant, baseline=_BASE.get)
+    assert not ok, f"{tid}: mutant passes"
+
+
+def test_restack_rejects_inline_none_fallback_and_unscoped_call():
+    item = {it["id"]: it for it in h.load_items("tasks")}["task-restack-folder"]
+    good = TASK_CASES["task-restack-folder"][0]["photosearch/stacking.py"]
+    inline = [l.replace("photo_ids=photo_ids)", "photo_ids=photo_ids or None)") for l in good]
+    unscoped = good + ["    run_stacking(db)"]
+    for lines in (inline, unscoped):
+        assert not h.grade_task(item, {"photosearch/stacking.py": lines})[0]
+
+
+def test_schema_bump_needs_a_known_baseline_and_a_higher_version():
+    item = {it["id"]: it for it in h.load_items("tasks")}["task-schema-bump"]
+    good = TASK_CASES["task-schema-bump"][0]
+    assert not h.grade_task(item, good)[0]                          # no baseline -> fail
+    assert not h.grade_task(item, good, baseline=lambda rel: "SCHEMA_VERSION = 40\n")[0]
+    ok, d = h.grade_task(item, good, baseline=lambda rel: "SCHEMA_VERSION = 39\n")
+    assert ok and d["checks"][0]["baseline"] == 39 and d["checks"][0]["found"] == [40]
+
+
+def test_git_baseline_reads_the_committed_file(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    (tmp_path / "db.py").write_text("SCHEMA_VERSION = 7\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "init"], check=True)
+    (tmp_path / "db.py").write_text("SCHEMA_VERSION = 8\n")         # the run's edit
+    read = h.git_baseline(tmp_path)
+    assert read("db.py") == "SCHEMA_VERSION = 7\n" and read("missing.py") is None
+
+
+def test_strip_comments_by_file_type():
+    py = '#!/usr/bin/env python3\n"""Uses envvar="PHOTOSEARCH_DB"."""\nx = a // b  # PS.poll\nconn.execute(\n    """ALTER TABLE t ADD COLUMN r"""\n)'
+    out = h._strip_comments(py, "x.py")
+    assert "PHOTOSEARCH_DB" not in out and "PS.poll" not in out
+    assert "a // b" in out and "ADD COLUMN r" in out               # floor division and SQL stay
+    js = "/* PS.poll(\n f) */ fetch(u); // PS.poll\nlet c = '#fff'; <!-- PS.poll -->"
+    out = h._strip_comments(js, "frontend/dist/status.html")
+    assert "PS.poll" not in out and "#fff" in out
+
+
+# --- regrade: infra reclassification and turn caps ---
+
+def test_regrade_reclassifies_stored_session_limit_as_infra(tmp_path, monkeypatch, capsys):
+    _items(monkeypatch)
+    usage = {"input_tokens": 10, "cache_read_input_tokens": 100}
+    path = _write_rows(tmp_path, monkeypatch, [
+        {"suite": "recall", "id": "q1", "rep": 1, "pass": False, "subtype": "success", "exit_code": 1,
+         "usage": usage, "answer": "You've hit your session limit · resets 4:50pm"},
+        {"suite": "recall", "id": "q1", "rep": 2, "pass": True, "subtype": "success", "exit_code": 0,
+         "usage": usage, "answer": "PHOTOSEARCH_DB"},
+    ])
+    _regrade()
+    r1, r2 = [json.loads(l) for l in path.read_text().splitlines()]
+    assert r1["infra_error"].startswith("gateway:") and r1["pass"] is False
+    assert not r2.get("infra_error") and r2["pass"] is True
+    assert "1 reclassified as infra" in capsys.readouterr().err
+    a = h._agg([r1, r2])
+    assert a["n"] == 1 and a["infra"] == 1 and a["pass_rate"] == 1.0
+
+
+def test_infra_needs_a_failed_run_even_for_stored_rows():
+    ok_row = {"answer": "the server returns rate_limit_error to callers", "exit_code": 0,
+              "subtype": "success", "usage": {"input_tokens": 5}}
+    assert h.infra_error(h.stored_result(ok_row)) is None
+
+
+def test_regrade_keeps_turn_cap_fail_but_records_checks_passed(tmp_path, monkeypatch, capsys):
+    item = {"id": "t1", "prompt": "p", "checks": [{"type": "added_grep", "pattern": "PS\\.poll"}]}
+    real = h.load_items
+    monkeypatch.setattr(h, "load_items", lambda s: [item] if s == "tasks" else real(s))
+    _write_rows(tmp_path, monkeypatch, [
+        _row(subtype="error_max_turns", exit_code=1, usage={"input_tokens": 9}, added={"a.js": ["PS.poll(f, 5)"]}),
+        _row(rid="t1", ok=True, exit_code=0, usage={"input_tokens": 9}, added={"a.js": ["PS.poll(f, 5)"]}),
+    ], suite="tasks")
+    _regrade()
+    capsys.readouterr()
+    h.main(["report", "--configs", "cfg"])
+    out = capsys.readouterr().out
+    assert "checks passed but hit turn cap" in out
+    assert "| 50% |" in out and "| 1 | 1 | 0 |" in out              # 1 turn-cap hit, 1 with checks ok
+    assert "[1 turn-cap, 1 checks ok]" in out
+
+
+# --- report: power ---
+
+def test_regressed_needs_a_drop_of_half_the_runs(tmp_path, monkeypatch, capsys):
+    rows = {"a": [], "b": []}
+    for rep in (1, 2, 3):
+        rows["a"] += [{"suite": "recall", "id": "one", "rep": rep, "pass": True},
+                      {"suite": "recall", "id": "two", "rep": rep, "pass": True}]
+        rows["b"] += [{"suite": "recall", "id": "one", "rep": rep, "pass": rep != 1},
+                      {"suite": "recall", "id": "two", "rep": rep, "pass": rep == 3}]
+    for c, rs in rows.items():
+        (tmp_path / c).mkdir()
+        (tmp_path / c / "recall.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rs))
+    monkeypatch.setattr(h, "RESULTS", tmp_path)
+    h.main(["report", "--configs", "a", "b"])
+    out = capsys.readouterr().out
+    assert "| recall | one | 3/3 | 2/3 | lower (noise) |" in out
+    assert "| recall | two | 3/3 | 1/3 | REGRESSED |" in out
+    assert "## Pass rates with 95% intervals (a vs b)" in out
+    assert "6/6 100% [61%–100%]" in out and "3/6 50%" in out
+    assert "| 0.18 | 2 / 0 | 0.50 |" in out
+
+
+def test_stats_helpers():
+    lo, hi = h.wilson(146, 147)
+    assert 0.96 < lo < 0.97 and hi > 0.998
+    assert h.wilson(0, 0) == (0.0, 1.0)
+    assert abs(h.fisher_exact(3, 0, 0, 3) - 0.1) < 1e-9          # textbook 2x2
+    assert h.fisher_exact(5, 5, 5, 5) == 1.0
+    assert abs(h.sign_test(0, 5) - 0.0625) < 1e-9 and h.sign_test(0, 0) == 1.0
