@@ -236,7 +236,11 @@ def _chat_openai(base_url: str, messages: list, tools: Optional[list],
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
-    if reasoning_effort:
+    # Same skip-list as describe.py's OpenAI route: a model with no reasoning
+    # mode (e.g. the agent model pointed at a plain vision/text model) doesn't
+    # need the field and LM Studio logs a WARN for every call that carries it.
+    from .describe import _model_has_no_reasoning_mode
+    if reasoning_effort and not _model_has_no_reasoning_mode(body["model"]):
         body["reasoning_effort"] = reasoning_effort
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(

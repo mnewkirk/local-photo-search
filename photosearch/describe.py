@@ -390,6 +390,35 @@ _OPENAI_MAX_TOKENS = {
 }
 _DEFAULT_OPENAI_MAX_TOKENS = 768
 
+# Model-id patterns (case-insensitive substrings) known to have NO reasoning
+# mode. `reasoning_effort` is an OpenAI-style switch meant for thinking models
+# (gemma-4*, qwen3*, minicpm-v-4_5 — see FLEET_ROLE_MODELS); sending it to a
+# plain vision/text model like qwen2.5-vl-7b-instruct (the aesthetics/subject
+# role) does nothing useful and LM Studio logs a WARN on every call ("No valid
+# custom reasoning fields found ... cannot be converted to any custom KVs").
+# Harmless but noisy, so the field is skipped for a model matching one of
+# these. Extend via PHOTOSEARCH_LLM_NO_REASONING_MODELS (comma-separated,
+# also substrings) rather than editing this list for a one-off model.
+_NO_REASONING_MODEL_PATTERNS = (
+    "qwen2.5-vl",
+    "qwen2.5",
+    "llama-3.2",
+    "llama3.2",
+    "llava",
+)
+
+
+def _model_has_no_reasoning_mode(model: str) -> bool:
+    """True when `model` (the RESOLVED/effective id actually being called,
+    not a role name) is known to have no reasoning mode and should never
+    receive `reasoning_effort`."""
+    name = (model or "").lower()
+    patterns = list(_NO_REASONING_MODEL_PATTERNS)
+    extra = os.environ.get("PHOTOSEARCH_LLM_NO_REASONING_MODELS", "")
+    patterns += [p.strip().lower() for p in extra.split(",") if p.strip()]
+    return any(p in name for p in patterns)
+
+
 # The stop reason both backends report when generation ran out of tokens.
 _LENGTH = "length"
 
@@ -721,9 +750,12 @@ def _openai_chat_attempts(
     # tokens reasoning, '' back, ~80 s/photo, every photo UNANSWERED.
     # `reasoning_effort: "none"` is the OpenAI-style switch LM Studio honours
     # (3.6 s and a real answer); `chat_template_kwargs.enable_thinking` did
-    # nothing. Opt-in via env so non-reasoning backends never see the field.
+    # nothing. Opt-in via env so non-reasoning backends never see the field —
+    # and even with it set, skip it for a model with no reasoning mode at all
+    # (e.g. qwen2.5-vl-7b-instruct on the aesthetics/subject role): sending it
+    # there is a no-op that just makes LM Studio log a WARN on every call.
     effort = os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
-    if effort:
+    if effort and not _model_has_no_reasoning_mode(model):
         body["reasoning_effort"] = effort
     payload = json.dumps(body).encode("utf-8")
     for attempt in range(1, retries + 1):

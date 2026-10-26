@@ -53,7 +53,7 @@ Copied from the rule files above; those stay the source of truth.
 
 - **Worker `-d`**: `-d` must be a real subdirectory; `-d /photos` (the root) matches nothing, so the server answers 404 "No photos found in directory /photos" and the fleet does no work. To process the whole library, omit `-d` entirely.
 - **Worker startup probe**: `GET /api/health` (no DB). Never probe `/api/stats` (full-library counts, the whole fleet at once). A 404 counts as reachable (older server).
-- **Reasoning models** (every fleet model thinks): set `PHOTOSEARCH_LLM_REASONING_EFFORT=none` (`rerun.FLEET_REASONING_EFFORT`) or they spend all of `max_tokens` on reasoning and return `''`.
+- **Reasoning models** (every fleet model thinks): set `PHOTOSEARCH_LLM_REASONING_EFFORT=none` (`rerun.FLEET_REASONING_EFFORT`) or they spend all of `max_tokens` on reasoning and return `''`. The field is skipped for a model matching `describe._NO_REASONING_MODEL_PATTERNS` (qwen2.5-vl, llava, ...) — extend via `PHOTOSEARCH_LLM_NO_REASONING_MODELS`.
 - **Video passes need `--native`**: ffprobe is not in the Docker worker image; the static ffprobe segfaults resolving `localhost`, so point workers at `127.0.0.1`.
 - **SD importer**: never `--no-index` (moved files become unclaimable, unsearchable and invisible to hash dedup); use `--no-clip` to register rows and leave CLIP to the fleet.
 - **Restarting photosearch**: never `docker compose up` it from inside its own container (it strands the new container in Created state); `POST /api/admin/restart` launches the detached restart helper. Git on the NAS needs per-call `-c safe.directory=...` (see NAS Docker Commands).
