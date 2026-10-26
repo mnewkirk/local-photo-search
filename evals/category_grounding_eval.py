@@ -24,6 +24,12 @@ Queries:
       category-content generation, eligible when stored set <= generation set
   Q4  the committed fixtures (251357 at temp 0 / 0.4, 251356, 251358)
 
+Answers logged after grounding shipped are already grounded, so re-grounding
+them shows nothing. Each query therefore reads the `category-content-raw`
+generation (the answer before grounding, logged by worker_api.submit_results
+in the same batch, immediately before the grounded row: id = g.id - 1) in
+place of the logged list wherever one exists (`_RAW_JOIN`, `_ANSWER`).
+
 Writes evals/category-grounding/summary.md (committed) and samples.json
 (git-ignored). Never SELECTs from the vec0 tables.
 """
@@ -39,6 +45,13 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+# The model's answer before grounding, where the server logged one (see the
+# module docstring); else the logged list. Grounded rows from after the ship
+# then still show what the rules removed.
+_RAW_JOIN = ("LEFT JOIN generations r ON r.photo_id = g.photo_id "
+             "AND r.text_type = 'category-content-raw' AND r.id = g.id - 1 ")
+_ANSWER = "COALESCE(r.generated_text, g.generated_text)"
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -384,13 +397,20 @@ def cmd_score(argv=None):
 
     def _row(name, c):
         prec = "—" if c["precision"] is None else f"{c['precision']:.1%}"
+        low = c.get("precision_lower_95")
+        low = "—" if low is None else f"{low:.1%}"
         return [name, c["n"], c["labelled"], c["correct"], c["wrong"], c["debatable"],
-                c["unlabelled"], prec, "PASS" if c["passes"] else "no"]
+                c["unlabelled"], prec, low, "PASS" if c["passes"] else "no",
+                "yes" if c.get("lower_clears_bar") else "no"]
 
     rows = [_row(g, result["per_group"][g]) for g in EVAL_GROUPS]
     rows.append(_row("OVERALL", result["overall"]))
     rep.table(["group", "n", "labelled", "correct", "wrong", "debatable", "unlabelled",
-               "precision", "ships?"], rows)
+               "precision", "95% lower", "ships?", "lower >= bar?"], rows)
+    rep()
+    rep("`ships?` is the bar as decided (point estimate). `95% lower` is the Wilson "
+        "lower bound: where it is below the bar, the labels cannot rule out a true "
+        "precision under it.")
     return result
 
 
@@ -426,14 +446,16 @@ def main():
 
     # Q1 ------------------------------------------------------------------
     q1 = conn.execute(
-        "SELECT DISTINCT p.id, p.description, p.categories FROM photos p "
+        "SELECT DISTINCT p.id, p.description, " + _ANSWER + " FROM photos p "
         "JOIN generations g ON g.photo_id = p.id AND g.text_type = 'category-content' "
-        "AND g.generated_text = p.categories WHERE g.model_used LIKE 'google/gemma%'"
+        "AND g.generated_text = p.categories " + _RAW_JOIN
+        + "WHERE g.model_used LIKE 'google/gemma%'"
     ).fetchall()
     gemma_cur = [(pid, d, c) for pid, d, raw in q1 if (c := _load(raw)) is not None]
     q1b = conn.execute(
-        "SELECT g.photo_id, p.description, g.generated_text FROM generations g "
-        "JOIN photos p ON p.id = g.photo_id WHERE g.text_type = 'category-content' "
+        "SELECT g.photo_id, p.description, " + _ANSWER + " FROM generations g "
+        "JOIN photos p ON p.id = g.photo_id " + _RAW_JOIN
+        + "WHERE g.text_type = 'category-content' "
         "AND g.model_used LIKE 'google/gemma%'").fetchall()
     gemma_gen = [(pid, d, c) for pid, d, raw in q1b if (c := _load(raw)) is not None]
 
@@ -448,9 +470,9 @@ def main():
 
     # Q2 ------------------------------------------------------------------
     q2 = conn.execute(
-        "SELECT g.photo_id, p.description, g.generated_text, g.model_used "
-        "FROM generations g LEFT JOIN photos p ON p.id = g.photo_id "
-        "WHERE g.text_type = 'category-content' AND g.model_used IN (?, ?)", LLAMA).fetchall()
+        "SELECT g.photo_id, p.description, " + _ANSWER + ", g.model_used "
+        "FROM generations g LEFT JOIN photos p ON p.id = g.photo_id " + _RAW_JOIN
+        + "WHERE g.text_type = 'category-content' AND g.model_used IN (?, ?)", LLAMA).fetchall()
     llama_rows = [(pid, d, c, m) for pid, d, raw, m in q2 if (c := _load(raw)) is not None]
 
     recitation_section(rep, gemma_cur, gemma_gen, llama_rows, samples)

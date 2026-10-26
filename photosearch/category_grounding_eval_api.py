@@ -240,7 +240,23 @@ def _group_score(items: list[dict]) -> dict:
     c["precision"] = c["correct"] / judged if judged else None
     c["passes"] = bool(c["precision"] is not None and c["precision"] >= PASS_PRECISION
                        and judged >= MIN_JUDGED)
+    # Shown NEXT TO the gate, not instead of it: `passes` is the owner's
+    # point-estimate bar. At n=25, 24/25 (96%) has a 95% lower bound of 0.80,
+    # so a pass says little about whether the true precision clears 90%.
+    c["precision_lower_95"] = wilson_lower(c["correct"], judged)
+    c["lower_clears_bar"] = bool(c["precision_lower_95"] is not None
+                                 and c["precision_lower_95"] >= PASS_PRECISION)
     return c
+
+
+def wilson_lower(successes: int, n: int, z: float = 1.96) -> Optional[float]:
+    """Lower end of the Wilson score interval (95% by default); None for n=0."""
+    if n <= 0:
+        return None
+    p = successes / n
+    centre = p + z * z / (2 * n)
+    margin = z * ((p * (1 - p) + z * z / (4 * n)) / n) ** 0.5
+    return (centre - margin) / (1 + z * z / n)
 
 
 def compute_score(data: Optional[dict] = None) -> dict:

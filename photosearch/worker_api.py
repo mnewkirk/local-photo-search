@@ -153,6 +153,10 @@ class CategoryContentResult(BaseModel):
     categories: list[str]
     model: Optional[str] = None
     model_version: Optional[str] = None
+    # The model's answer BEFORE grounding, sent only when grounding changed it.
+    # The server grounds this (not the worker's list) and logs it as the
+    # `category-content-raw` generation. Older workers omit it.
+    raw_categories: Optional[list[str]] = None
 
 
 class CategoryVisualResult(BaseModel):
@@ -906,6 +910,12 @@ def _record_worker_failures(db, outcome: _SubmitOutcome, pass_type: str,
 _GROUND_READ_CHUNK = 500
 
 
+def _raw_category_answer(r: CategoryContentResult) -> list[str]:
+    """The list as the model answered it: the worker's pre-grounding
+    `raw_categories` when sent, else the list it submitted."""
+    return list(r.raw_categories or r.categories or [])
+
+
 def _ground_category_results(db, outcome: _SubmitOutcome,
                              results: list[CategoryContentResult]) -> dict[int, list[str]]:
     """Re-ground category-content answers against the CURRENT description.
@@ -925,6 +935,11 @@ def _ground_category_results(db, outcome: _SubmitOutcome,
 
     Runs BEFORE `begin_batch`: `db.log_error` commits unconditionally and
     would otherwise flush a half-written batch.
+
+    When the worker sent `raw_categories` (its answer before grounding), that
+    is what gets grounded here, so the server's current rules decide; the
+    caller logs the pre-grounding list as `category-content-raw` whenever
+    grounding changed it (`_raw_category_answer`).
 
     A NULL description stores the list unchanged (nothing to judge against).
     A transient lock on the read defers every result in the batch (no attempt
@@ -961,6 +976,7 @@ def _ground_category_results(db, outcome: _SubmitOutcome,
         if not cats or not desc:
             keep[r.photo_id] = cats
             continue
+        cats = _raw_category_answer(r)
         g = ground(desc, cats)
         if g.recitation:
             st = recitation_stats(desc, cats)
@@ -1205,6 +1221,13 @@ def submit_results(req: SubmitRequest):
                     # still equals its latest generation.
                     cats_json = json.dumps(cats)
                     db.update_photo(r.photo_id, categories=cats_json)
+                    raw = _raw_category_answer(r)
+                    if raw and raw != cats:
+                        # What grounding removed stays measurable on data
+                        # written after it shipped (evals/category_grounding_
+                        # eval.py reads these). Absent = nothing was dropped.
+                        db.log_generation(r.photo_id, "category-content-raw",
+                                          json.dumps(raw), r.model, r.model_version)
                     if cats:
                         db.log_generation(r.photo_id, "category-content", cats_json,
                                           r.model, r.model_version)

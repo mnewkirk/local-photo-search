@@ -705,7 +705,13 @@ def _process_category_content(
             continue
         print(f" ({elapsed:.1f}s) {_grounding_summary(cats, report.get('dropped'))}: "
               f"{', '.join(cats) if cats else 'no categories'}")
-        results.append({"photo_id": photo["id"], "categories": cats})
+        row = {"photo_id": photo["id"], "categories": cats}
+        raw = report.get("raw_terms")
+        if raw and raw != cats:
+            # The answer before grounding; the server logs it as the
+            # category-content-raw generation. An older server ignores it.
+            row["raw_categories"] = raw
+        results.append(row)
     return results
 
 

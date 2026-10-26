@@ -313,7 +313,10 @@
         e('div', { className: 'num' }, s.labelled + ' / ' + s.n, e('span', { className: 'sub' }, ' labelled')),
         e('div', { className: 'sub' },
           'correct ' + s.correct + ' · wrong ' + s.wrong + ' · debatable ' + s.debatable
-          + ' · judged ' + judged + ' (bar: 90% of ≥20)'));
+          + ' · judged ' + judged + ' (bar: 90% of ≥20)'),
+        s.precision_lower_95 == null ? null : e('div', { className: 'sub' },
+          '95% lower bound ' + (100 * s.precision_lower_95).toFixed(0) + '%'
+          + (s.lower_clears_bar ? ' — clears the bar' : ' — below the bar')));
     }
 
     function Page() {

@@ -1560,11 +1560,14 @@ def extract_categories_from_description(
     would empty ("no grounded categories"). An empty or off-vocabulary answer
     used to be stored as '[]' — done, for good, with no categories.
 
-    `report`, when given, is filled with `raw` (terms before grounding) and
-    `dropped` ({term: reason}) for the worker's log line.
+    `report`, when given, is filled with `raw` (how many terms before
+    grounding), `raw_terms` (those terms, in answer order) and `dropped`
+    ({term: reason}). `raw_terms` is what callers persist as the
+    `category-content-raw` generation, so grounding stays measurable on data
+    written after it shipped.
     """
     if report is not None:
-        report.update(raw=0, dropped={})
+        report.update(raw=0, raw_terms=[], dropped={})
     if not description or not description.strip():
         return []
     from .vocab_content import CONTENT_VOCABULARY
@@ -1612,7 +1615,7 @@ def extract_categories_from_description(
         return out
     g = cg.ground(description, out)
     if report is not None:
-        report.update(raw=len(out), dropped=dict(g.dropped))
+        report.update(raw=len(out), raw_terms=list(out), dropped=dict(g.dropped))
     return g.kept
 
 

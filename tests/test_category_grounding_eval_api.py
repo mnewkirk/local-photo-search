@@ -186,8 +186,11 @@ def test_score_precision_excludes_debatable_and_unlabelled():
                        "setting": [], "light": [], "weather": []}}
     score = api.compute_score(data)
     sport = score["per_group"]["sport"]
+    lower = sport.pop("precision_lower_95")
     assert sport == {"n": 25, "labelled": 25, "unlabelled": 0, "correct": 18, "wrong": 2,
-                     "debatable": 5, "precision": 0.9, "passes": True}
+                     "debatable": 5, "precision": 0.9, "passes": True,
+                     "lower_clears_bar": False}
+    assert lower == pytest.approx(0.699, abs=0.005)   # 18/20: passes, but barely evidence
 
 
 def test_score_floor_requires_20_judged():
@@ -300,3 +303,14 @@ def test_request_log_records_the_inferred_intent(client, sample, tmp_path, monke
     rec = next(r for r in lines if r["path"] == f"{API}/items")
     assert rec["intent"] == "Load the category-grounding eval sample"
     request_log.reset()
+
+
+def test_wilson_lower_bound_is_reported_next_to_the_gate():
+    from photosearch.category_grounding_eval_api import _group_score, wilson_lower
+    items = [{"label": "correct"}] * 24 + [{"label": "wrong"}]
+    c = _group_score(items)
+    assert c["passes"] is True                      # the owner's point-estimate bar
+    assert c["precision_lower_95"] == pytest.approx(0.805, abs=0.005)
+    assert c["lower_clears_bar"] is False
+    assert wilson_lower(0, 0) is None
+    assert wilson_lower(200, 200) > 0.98

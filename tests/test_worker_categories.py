@@ -279,3 +279,94 @@ def test_an_explicit_empty_answer_is_still_done(client):
     stored, _ = _stored_and_logged(3)
     assert stored == "[]"
     assert body["processed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The answer before grounding is kept (category-content-raw), so grounding can
+# still be measured on data written after it shipped: the grounded list alone
+# re-grounds to itself.
+# ---------------------------------------------------------------------------
+
+def _raw_logged(photo_id):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        return [(r[0], json.loads(r[1])) for r in db.conn.execute(
+            "SELECT id, generated_text FROM generations WHERE photo_id=? "
+            "AND text_type='category-content-raw' ORDER BY id", (photo_id,))]
+
+
+def _grounded_id(photo_id):
+    from photosearch.db import PhotoDB
+    with PhotoDB(os.environ["PHOTOSEARCH_DB"]) as db:
+        return db.conn.execute(
+            "SELECT MAX(id) FROM generations WHERE photo_id=? "
+            "AND text_type='category-content'", (photo_id,)).fetchone()[0]
+
+
+def test_the_workers_raw_answer_is_grounded_and_logged(client):
+    _seed(3, "Two boys play soccer on an outdoor grass field.")
+    raw = ["soccer", "basketball", "grass", "artificial lighting"]
+    _submit_categories(client, [{"photo_id": 3, "model": "m", "categories": ["soccer", "grass"],
+                                 "raw_categories": raw}])
+    stored, _ = _stored_and_logged(3)
+    assert json.loads(stored) == ["soccer", "grass"]
+    [(rid, logged)] = _raw_logged(3)
+    assert logged == raw
+    # The eval pairs the two rows by id (raw is logged immediately before).
+    assert rid == _grounded_id(3) - 1
+
+
+def test_the_server_grounds_the_raw_answer_not_the_workers_list(client):
+    """An older worker's rules let `basketball` through; the server's current
+    rules decide from the raw answer."""
+    _seed(3, "Two boys play soccer on an outdoor grass field.")
+    _submit_categories(client, [{"photo_id": 3, "categories": ["soccer", "basketball"],
+                                 "raw_categories": ["soccer", "basketball"]}])
+    stored, _ = _stored_and_logged(3)
+    assert json.loads(stored) == ["soccer"]
+
+
+def test_an_old_worker_without_raw_still_gets_its_drops_recorded(client):
+    _seed(3, "Two boys play soccer on an outdoor grass field.")
+    _submit_categories(client, [{"photo_id": 3, "categories": ["soccer", "basketball"]}])
+    assert [r for _, r in _raw_logged(3)] == [["soccer", "basketball"]]
+
+
+def test_nothing_dropped_logs_no_raw_row(client):
+    _seed(3, "Two boys play soccer on an outdoor grass field.")
+    _submit_categories(client, [{"photo_id": 3, "categories": ["soccer", "grass"]}])
+    assert _raw_logged(3) == []
+
+
+def test_the_worker_sends_raw_categories_only_when_grounding_changed_them(monkeypatch):
+    from photosearch import describe, worker
+
+    answers = {1: (["soccer", "grass"], ["soccer", "basketball", "grass"]),
+               2: (["beach"], ["beach"])}
+
+    def fake_extract(description, model=None, report=None):
+        kept, raw = answers[int(description)]
+        report.update(raw=len(raw), raw_terms=list(raw), dropped={})
+        return kept
+    monkeypatch.setattr(describe, "extract_categories_from_description", fake_extract)
+    monkeypatch.setattr(describe, "check_available", lambda model: None)
+    rows = worker._process_category_content(
+        [{"id": 1, "filename": "a", "description": "1"},
+         {"id": 2, "filename": "b", "description": "2"}], model="m")
+    assert rows[0] == {"photo_id": 1, "categories": ["soccer", "grass"],
+                       "raw_categories": ["soccer", "basketball", "grass"]}
+    assert rows[1] == {"photo_id": 2, "categories": ["beach"]}
+
+
+def test_the_extractor_reports_the_terms_before_grounding(monkeypatch):
+    from photosearch import describe
+
+    monkeypatch.setattr(describe, "HAS_OLLAMA", True)
+    monkeypatch.setattr(describe, "_text_pass_answer",
+                        lambda *a, **k: ["soccer", "basketball", "grass"])
+    report: dict = {}
+    kept = describe.extract_categories_from_description(
+        "Two boys play soccer on an outdoor grass field.", model="m", report=report)
+    assert kept == ["soccer", "grass"]
+    assert report["raw_terms"] == ["soccer", "basketball", "grass"]
+    assert report["raw"] == 3 and "basketball" in report["dropped"]

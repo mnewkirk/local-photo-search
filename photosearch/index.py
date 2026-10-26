@@ -688,8 +688,17 @@ def _index_collection(
                         print(f"  [{idx}/{total}] photo {photo_id} ...", end="", flush=True)
                         try:
                             t_photo = time.time()
-                            cats = extract_categories_from_description(description, model=category_content_model)
+                            cat_report: dict = {}
+                            cats = extract_categories_from_description(
+                                description, model=category_content_model, report=cat_report)
                             elapsed_photo = time.time() - t_photo
+                            raw = cat_report.get("raw_terms")
+                            if raw and raw != cats:
+                                # Same as worker_api.submit_results: the answer
+                                # before grounding, so grounding stays measurable.
+                                db.log_generation(photo_id, "category-content-raw",
+                                                  _json.dumps(raw),
+                                                  model_used=category_content_model)
                             if cats:
                                 db.update_photo(photo_id, categories=_json.dumps(cats))
                                 db.conn.commit()
@@ -1487,8 +1496,17 @@ def index_directory(
                         print(f"  [{idx}/{total}] photo {photo_id} ...", end="", flush=True)
                         try:
                             t_photo = time.time()
-                            cats = extract_categories_from_description(description, model=category_content_model)
+                            cat_report: dict = {}
+                            cats = extract_categories_from_description(
+                                description, model=category_content_model, report=cat_report)
                             elapsed_photo = time.time() - t_photo
+                            raw = cat_report.get("raw_terms")
+                            if raw and raw != cats:
+                                # Same as worker_api.submit_results: the answer
+                                # before grounding, so grounding stays measurable.
+                                db.log_generation(photo_id, "category-content-raw",
+                                                  _json.dumps(raw),
+                                                  model_used=category_content_model)
                             if cats:
                                 db.update_photo(photo_id, categories=_json.dumps(cats))
                                 db.conn.commit()  # release write lock immediately

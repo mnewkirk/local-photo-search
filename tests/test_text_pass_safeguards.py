@@ -328,7 +328,8 @@ def test_the_worker_logs_kept_and_dropped(monkeypatch, real_vocab, capsys):
     _text(monkeypatch, ["soccer, basketball, grass"])
     out = W._process_category_content([{"id": 7, "filename": "a.jpg",
                                         "description": SOCCER}])
-    assert out == [{"photo_id": 7, "categories": ["soccer", "grass"]}]
+    assert out == [{"photo_id": 7, "categories": ["soccer", "grass"],
+                    "raw_categories": ["soccer", "basketball", "grass"]}]
     line = capsys.readouterr().out
     assert "kept 2, dropped 1 (sport: soccer cued, basketball not: basketball)" in line
 
