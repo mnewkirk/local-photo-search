@@ -113,8 +113,10 @@ def draw_sample(conn, *, text_n=10, seed=11, exclude=(), text_ids=(), visual_sam
 # --------------------------------------------------------------------------
 
 def production_describer(path, model, prompt=None):
+    """The worker's call: an answered-but-unusable result RAISES (with its
+    reason) instead of returning None, so the cache records why."""
     from photosearch import describe
-    return describe.describe_photo(path, model=model, prompt=prompt)
+    return describe.describe_photo(path, model=model, prompt=prompt, raise_unusable=True)
 
 
 def describe_one(path, nominal, prompt=None, describer=None):
@@ -124,15 +126,27 @@ def describe_one(path, nominal, prompt=None, describer=None):
     describer = describer or production_describer
     rec = me.Recorder()
     t0 = time.time()
+    unusable = None
     with rec.active():
-        text = describer(path, nominal, prompt)
+        try:
+            text = describer(path, nominal, prompt)
+        except describe.UnusableAnswer as e:
+            # Answered, but every answer failed the guards: a real outcome.
+            text, unusable = None, str(e)
     latency = time.time() - t0
-    rec.check(text is None, "describe_photo")
+    if unusable is None:
+        rec.check(text is None, "describe_photo")
+    if text is None and unusable is None:
+        # describe_photo returns None for "empty response" / "not a
+        # description" even with raise_unusable — name it from the last answer.
+        raws = [c.get("raw") for c in rec.calls if "error" not in c]
+        unusable = describe._description_problem(raws[-1] if raws else None)
     describe_calls = [c for c in rec.calls if c.get("model") != "llava"]
     first_raw = rec.calls[0].get("raw") if rec.calls else None
     item = {
         "text": text,
         "text_sha": me.text_sha(text),
+        "unusable": unusable,
         "latency_s": round(latency, 3),
         "calls": len(rec.calls),
         "attempts": rec.attempts(),
@@ -149,8 +163,8 @@ def describe_one(path, nominal, prompt=None, describer=None):
 
 
 def run_variant(variant, *, model=None, prompt_file=None, server=me.DEFAULT_SERVER,
-                limit=None, force=False, solo=False, describer=None, fetch=None,
-                log=print):
+                limit=None, force=False, force_stale=False, solo=False, describer=None,
+                fetch=None, log=print):
     from photosearch import describe
     me.pin_role_model("describe", model)
     nominal = describe.MODEL
@@ -161,10 +175,14 @@ def run_variant(variant, *, model=None, prompt_file=None, server=me.DEFAULT_SERV
         with open(prompt_file, encoding="utf-8") as f:
             prompt = f.read()
         prompt_sha = me.text_sha(prompt)
-    run = me.open_run(PASS, variant, force=force, effective_model=effective,
-                      prompt_sha=prompt_sha)
+    effort = me.sent_reasoning_effort(effective)
+    spec = me.make_spec(me.spec_parts(PASS, nominal=nominal, prompt_sha=prompt_sha,
+                                      reasoning_effort=effort))
+    run = me.open_run(PASS, variant, force=force, spec=spec, force_stale=force_stale,
+                      effective_model=effective, prompt_sha=prompt_sha)
     run.setdefault("model", model or nominal)
     run.setdefault("prompt_file", prompt_file)
+    run.setdefault("reasoning_effort", effort)
 
     todo = [pid for pid in me.sample_ids(PASS) if str(pid) not in run["items"]]
     if limit is not None:
@@ -266,6 +284,61 @@ def clip_flags(conn, pid, text, cache):
     return cache[key]
 
 
+def bad_outputs(row):
+    """The screen's bad-output count: unanswered + degenerate + truncated +
+    badly formatted. ONE definition, shared by the report and the summary."""
+    return ((row["n"] - row["answered"]) + row["degenerate_final"] + row["truncated"]
+            + row.get("format", 0))
+
+
+def dispute_tally(items, strata_ids=None):
+    """Right / wrong / silent on the disputed points, over all points and over
+    the ORIGINAL questions only, plus one record per sample photo for the
+    bootstrap. A photo the model gave no usable text for is `answered: False`
+    (fair_score charges it as wrong)."""
+    disputes, dlabels = me.load_disputes(), me.load_dispute_labels()
+    tally = {f"disp_{p}{k}": 0 for p in ("", "orig_") for k in ("right", "wrong", "silent")}
+    records = []
+    ids = sorted({str(k) for k in items} | {str(k) for k in (strata_ids or [])}, key=int)
+    for pid in ids:
+        it = items.get(pid) or items.get(int(pid)) or {}
+        d = disputes.get(pid) or {}
+        qs = d.get("questions") or []
+        rec = {"pid": int(pid), "answered": bool(it.get("text")), "right": 0, "wrong": 0,
+               "orig_right": 0, "orig_wrong": 0,
+               "orig_q": sum(1 for q in qs if not q.get("added_by")), "all_q": len(qs)}
+        sha = it.get("text_sha") or me.text_sha(it.get("text"))
+        if rec["answered"] and sha in d.get("shas", []):
+            for q in qs:
+                v = me.dispute_verdict(q["answers"].get(sha), dlabels.get(q["key"]))
+                if not v:
+                    continue
+                tally[f"disp_{v}"] += 1
+                if v != "silent":
+                    rec[v] += 1
+                if not q.get("added_by"):
+                    tally[f"disp_orig_{v}"] += 1
+                    if v != "silent":
+                        rec[f"orig_{v}"] += 1
+        records.append(rec)
+    return {**tally, "disp_records": records}
+
+
+def fair_score(records, original=True):
+    """Right / (right + wrong) on the disputed points, over the FULL sample:
+    a photo with no usable description counts its questions (at least one)
+    as wrong — an unanswered photo must not raise a model's score."""
+    p = "orig_" if original else ""
+    right = wrong = 0
+    for r in records:
+        if r["answered"]:
+            right += r[f"{p}right"]
+            wrong += r[f"{p}wrong"]
+        else:
+            wrong += max(1, r["orig_q" if original else "all_q"])
+    return right / (right + wrong) if right + wrong else None
+
+
 def summarize(run, *, strata=None, truth=None, conn=None, clip_cache=None, use_clip=True):
     from photosearch import describe
     items = run["items"]
@@ -286,25 +359,39 @@ def summarize(run, *, strata=None, truth=None, conn=None, clip_cache=None, use_c
         "lat_p50": me.median(me.latencies(items)),
         "lat_p90": me.percentile(me.latencies(items), 0.9),
         "latency_label": run.get("latency_label", "unknown"),
+        "spec": me.spec_status(PASS, run),
     }
     row["format"] = sum(1 for t in answered if format_problem(t))
-    bad = (n - row["answered"]) + row["degenerate_final"] + row["truncated"] + row["format"]
-    row["screen_out"] = n >= me.MIN_N and bad / n > SCREEN_MAX_BAD
+    row["bad"] = bad_outputs(row)
+    row["screen_out"] = n >= me.MIN_N and row["bad"] / n > SCREEN_MAX_BAD
+    # Why the unanswered ones failed (recorded since 2026-10-25; older runs
+    # cached a bare null).
+    reasons = {}
+    for it in items.values():
+        if not it.get("text"):
+            k = it.get("unusable") or "reason not recorded"
+            reasons[k] = reasons.get(k, 0) + 1
+    row["unusable_reasons"] = reasons
+
+    # Replayed with the CURRENT guards: each cached final text judged again by
+    # describe._description_problem + the format screen. A text they reject
+    # would not be stored today (production would retry, then fail the photo).
+    replay = {}
+    for t in answered:
+        p = describe._description_problem(t) or ("markdown/list format" if format_problem(t)
+                                                 else None)
+        if p:
+            replay[p] = replay.get(p, 0) + 1
+    row["replay_reasons"] = replay
+    row["replay_bad"] = (n - row["answered"]) + sum(replay.values())
+    row["replay_screen_out"] = n >= me.MIN_N and row["replay_bad"] / n > SCREEN_MAX_BAD
 
     # Disputed facts: each description is right / wrong / silent on each point
-    # its sibling descriptions disagreed on (describe_eval.py disputes).
-    disputes, dlabels = me.load_disputes(), me.load_dispute_labels()
-    tally = {"right": 0, "wrong": 0, "silent": 0}
-    for pid, it in items.items():
-        d = disputes.get(str(pid))
-        sha = it.get("text_sha") or me.text_sha(it.get("text"))
-        if not d or sha not in d.get("shas", []):
-            continue
-        for q in d["questions"]:
-            v = me.dispute_verdict(q["answers"].get(sha), dlabels.get(q["key"]))
-            if v:
-                tally[v] += 1
-    row.update({f"disp_{k}": v for k, v in tally.items()})
+    # its sibling descriptions disagreed on (describe_eval.py disputes). The
+    # ORIGINAL questions are the fair comparison: a question added for one
+    # model (`added_by`, describe_eval disputes --add-variant) scrutinises only
+    # that model's own extra details.
+    row.update(dispute_tally(items, strata_ids=list(strata) if strata else None))
 
     claims = me.load_claims()
     errs = [me.claim_errors(claims.get(it.get("text_sha") or me.text_sha(t)))
@@ -709,19 +796,37 @@ def render(rows):
             f"{r['timeouts']:>4} {me.fmt_ratio(r['format'], n):>4} "
             f"{_f(r['words_p50'], 0) + '/' + _f(r['words_p90'], 0):>9} "
             f"{_f(r['lat_p50']) + '/' + _f(r['lat_p90']):>11} {clip:>10} {tr:>8}  "
-            f"{r['latency_label']}{'   ✗ SCREEN OUT' if r['screen_out'] else ''}")
+            f"{r['latency_label']}{'   ✗ SCREEN OUT' if r['screen_out'] else ''}"
+            f"{'   ' + me.stale_tag(r.get('spec')) if me.stale_tag(r.get('spec')) else ''}")
+    out.append("")
+    out.append("Replayed with CURRENT guards (describe._description_problem + format) over "
+               "the cached texts:")
+    out.append(f"  {'variant':<18} {'bad (stored)':>12} {'bad (replayed)':>14}  reasons")
+    for r in rows:
+        n = r["n"]
+        why = ", ".join(f"{k} {v}" for k, v in sorted(r.get("replay_reasons", {}).items()))
+        unans = ", ".join(f"{k} {v}" for k, v in sorted(r.get("unusable_reasons", {}).items()))
+        out.append(f"  {str(r['variant']):<18} {str(r['bad']) + '/' + str(n):>12} "
+                   f"{str(r['replay_bad']) + '/' + str(n):>14}  "
+                   f"{why or '—'}{'; unanswered: ' + unans if unans else ''}"
+                   f"{'   ✗ SCREEN OUT (replayed)' if r.get('replay_screen_out') else ''}")
+    out.append("  replayed = the final text a run cached, judged by today's guards; production "
+               "would retry such an answer, then record a failure.")
     disp = [r for r in rows if r.get("disp_right") or r.get("disp_wrong")]
     if disp:
         out.append("")
         out.append(f"{'variant':<18} {'disputed pts':>12} {'right':>6} {'wrong':>6} {'silent':>6} "
-                   f"{'right when it answered':>22}")
+                   f"{'right when it answered':>22} {'ORIGINAL qs only':>16}")
         for r in disp:
             ans = r["disp_right"] + r["disp_wrong"]
+            o_ans = r["disp_orig_right"] + r["disp_orig_wrong"]
+            orig = f"{me.fmt_ratio(r['disp_orig_right'], o_ans)} ({r['disp_orig_right']}/{o_ans})"
             out.append(f"{str(r['variant']):<18} {ans + r['disp_silent']:>12} {r['disp_right']:>6} "
                        f"{r['disp_wrong']:>6} {r['disp_silent']:>6} "
-                       f"{me.fmt_ratio(r['disp_right'], ans):>22}")
+                       f"{me.fmt_ratio(r['disp_right'], ans):>22} {orig:>16}")
         out.append("disputed pts = facts the descriptions disagreed on, labelled on the "
-                   "Differences tab; wrong = a claim the photo contradicts.")
+                   "Differences tab; wrong = a claim the photo contradicts. ORIGINAL qs = the "
+                   "questions every model faced (not ones added for one model) — the fair column.")
     labelled = [r for r in rows if r.get("claims_n")]
     if labelled:
         out.append("")
@@ -744,7 +849,9 @@ def render(rows):
     out.append("")
     out.append(f"ratios are shares of n; words and s/photo are p50/p90; 'n<3' = too few. "
                f"fmt = markdown/list structure in the prose. SCREEN OUT = more than "
-               f"{SCREEN_MAX_BAD:.0%} unanswered/degenerate/truncated/badly formatted.")
+               f"{SCREEN_MAX_BAD:.0%} unanswered/degenerate/truncated/badly formatted. "
+               f"{me.STALE} = the run's spec hash (production prompt + guards + options) is "
+               "missing or differs from the current code: its numbers measure old code.")
     return "\n".join(out)
 
 
@@ -778,6 +885,9 @@ def main(argv=None):
     r.add_argument("--server", default=me.DEFAULT_SERVER)
     r.add_argument("--limit", type=int)
     r.add_argument("--force", action="store_true")
+    r.add_argument("--force-stale", action="store_true",
+                   help="append to a run cached under a different production spec "
+                        "(it stays marked STALE)")
     r.add_argument("--solo", action="store_true")
 
     dp = sub.add_parser("disputes", help="find the facts each photo's descriptions disagree on")
@@ -820,7 +930,7 @@ def main(argv=None):
     elif args.cmd == "run":
         run_variant(args.variant, model=args.model, prompt_file=args.prompt_file,
                     server=args.server, limit=args.limit, force=args.force,
-                    solo=args.solo)
+                    force_stale=args.force_stale, solo=args.solo)
     elif args.cmd == "disputes" and args.add_variant:
         add_variant_to_disputes(args.add_variant, model=args.model)
     elif args.cmd == "disputes":

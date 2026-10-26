@@ -190,3 +190,102 @@ def test_category_api_adds_vocabulary_terms(client, db):
     photo = client.get("/api/eval/models/text/categories").json()["photos"][0]
     assert "sail boat" in photo["pool"]
     assert X.vocabulary_gaps() == [("sail boat", 1)]
+
+
+SOCCER = "Two kids kick a soccer ball across a grass field outdoors."
+
+
+def _frozen(texts):
+    me.save_inputs("main", "somevariant", "m", texts)
+    return me.load_inputs()
+
+
+def _cat_run(variant, inputs, tags_by_pid, created=None, raw=None):
+    run = me.open_run("category-content", variant, effective_model=variant,
+                      input_source=me.inputs_identity(inputs))
+    if created:
+        run["created"] = created
+    for pid, tags in tags_by_pid.items():
+        run["items"][str(pid)] = {"tags": tags, "deferred": tags is None,
+                                  "text_sha": inputs["items"][str(pid)]["text_sha"],
+                                  **({"raw": raw[pid]} if raw else {})}
+    me.save_run("category-content", variant, run)
+    return run
+
+
+def test_unseen_tags_are_unjudged_not_false_positives():
+    inputs = _frozen({1: SOCCER})
+    key = me.label_key(1, inputs["items"]["1"]["text_sha"])
+    early = _cat_run("early", inputs, {1: ["soccer", "outdoor"]}, created="2026-09-01T00:00:00+00:00")
+    me.save_category_label(key, ["soccer", "field"])          # no pool: an old-style label
+    late = _cat_run("late", inputs, {1: ["soccer", "outdoor", "grass"]},
+                    created="2099-01-01T00:00:00+00:00")
+    pool_runs = [early, late]
+    e = X.summarize("category-content", early, inputs, pool_runs)
+    assert (e["tp"], e["fp"], e["fn"], e["unjudged"], e["precision_approx"]) == (1, 1, 1, 0, False)
+    # "grass" was never on screen (the late run came after the label): unjudged,
+    # and the reconstructed checklist makes the precision approximate.
+    lt = X.summarize("category-content", late, inputs, pool_runs)
+    assert (lt["tp"], lt["fp"], lt["unjudged"], lt["precision_approx"]) == (1, 1, 1, True)
+    # A label that RECORDS its pool is exact.
+    me.save_category_label(key, ["soccer", "field"], pool=["soccer", "outdoor", "field"])
+    lt = X.summarize("category-content", late, inputs, pool_runs)
+    assert (lt["fp"], lt["unjudged"], lt["precision_approx"]) == (1, 1, False)
+
+
+def test_full_sample_denominator_and_f1():
+    inputs = _frozen({1: SOCCER, 2: SAIL})
+    run = _cat_run("v", inputs, {1: ["soccer", "outdoor"], 2: None})   # 2 deferred
+    for pid, yes in ((1, ["soccer"]), (2, ["boat"])):
+        me.save_category_label(me.label_key(pid, inputs["items"][str(pid)]["text_sha"]), yes)
+    r = X.summarize("category-content", run, inputs, [run])
+    assert (r["labelled"], r["answered_labelled"], r["tp"], r["fp"], r["fn"]) == (2, 1, 1, 1, 1)
+    p, rc, f1 = X.category_scores(r["records"])
+    assert (p, rc, f1) == (0.5, 0.5, 0.5)
+    # Keywords: an unanswered photo scores 0 in the per-photo mean.
+    assert X.keyword_photo_precision([{"answered": True, "right": 3, "wrong": 1},
+                                      {"answered": False, "right": 0, "wrong": 0},
+                                      {"answered": True, "right": 0, "wrong": 0}]) == 0.375
+
+
+def test_replay_applies_current_grounding_to_cached_raw(monkeypatch):
+    def no_model(*a, **kw):
+        raise AssertionError("replay must not call a model")
+    monkeypatch.setattr(urllib.request, "urlopen", no_model)
+    inputs = _frozen({1: SOCCER})
+    raw = {1: "soccer, basketball, outdoor, field"}
+    run = _cat_run("v", inputs, {1: ["soccer", "basketball", "outdoor", "field"]}, raw=raw)
+    real_chat = describe._text_chat_with_retry
+    rep = X.replay_item("category-content", SOCCER, run["items"]["1"])
+    assert rep["tags"] == ["soccer", "outdoor", "field"]          # basketball contradicted
+    assert describe._text_chat_with_retry is real_chat            # stub restored
+    assert X.replay_item("category-content", SOCCER, {"tags": None, "deferred": True}) is None
+    me.save_category_label(me.label_key(1, inputs["items"]["1"]["text_sha"]),
+                           ["soccer", "outdoor", "field"])
+    rows = [r for r in X.build_report() if r["pass"] == "category-content"]
+    r = rows[0]
+    assert r["fp"] == 1 and r["replay"]["fp"] == 0 and r["replay"]["replayed"] == 1
+    assert "replayed" in X.render(rows) and "STALE" in X.render(rows)   # no spec hash
+    # An answer today's guards reject is unusable on replay, and counts as unanswered.
+    rep = X.replay_item("keywords", SOCCER, {"raw": "i can't see any image, please provide one"})
+    assert rep["tags"] is None and "refusal" in rep["unusable"]
+
+
+def test_text_run_records_spec(tmp_path, monkeypatch):
+    X.freeze(db=_inputs(tmp_path))
+    _transport(monkeypatch, ["sailboat, bay"])
+    run = X.run_variant("keywords", "v", model="gemma-e4b", limit=1, log=lambda *_: None)
+    assert run["spec_hash"] and not me.spec_status("keywords", run)["stale"]
+    monkeypatch.setattr(describe, "_KEYWORDS_MAX_PLAUSIBLE", 99)
+    with pytest.raises(SystemExit, match="force-stale"):
+        X.run_variant("keywords", "v", model="gemma-e4b", log=lambda *_: None)
+
+
+def test_category_api_records_the_pool_shown(client, db):
+    ids = [r[0] for r in db.conn.execute("SELECT id FROM photos ORDER BY id LIMIT 1")]
+    inputs = _frozen({ids[0]: SOCCER})
+    _cat_run("secretA", inputs, {ids[0]: ["soccer", "basketball"]})
+    assert client.put(f"/api/eval/models/text/categories/{ids[0]}",
+                      json={"yes": ["soccer", "field"]}).status_code == 200
+    lab = me.load_category_labels()[me.label_key(ids[0], inputs["items"][str(ids[0])]["text_sha"])]
+    assert set(lab["pool"]) >= {"soccer", "basketball", "field"}

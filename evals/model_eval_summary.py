@@ -17,12 +17,17 @@ model is both better on the headline metric and faster).
                     python evals/model_eval_summary.py report \\
                         --assign describe=qwen/qwen3.5-9b,verify=google/gemma-4-e2b,...
 
-Headline metric per role (higher is better; s/photo is always solo when
-measured that way — check the latency column):
-  describe          clean-description rate (owner) — else 1 - bad-output share
-  category-content  precision (owner) — else 1 - unsupported share (lenient)
-  keywords          precision (owner) — else 1 - unsupported share
-  verify            matched planted catch rate - false-rejection rate
+Headline metric per role (higher is better; over the FULL sample, so a
+deferred / unusable / failed item counts against the model; 95% CI from a
+seeded per-photo bootstrap; s/photo is always solo when measured that way —
+check the latency column):
+  describe          right on the ORIGINAL disputed questions (owner; an
+                    unanswered photo's questions count wrong) — else claims
+                    clean rate — else 1 - bad-output share (the report's screen)
+  category-content  F1 of precision / pooled recall (owner), replayed with the
+                    current guards — else 1 - unsupported share (lenient)
+  keywords          per-photo precision (owner), replayed — else 1 - unsupported
+  verify            matched planted catch rate - clean not-passed rate
   visual            F1 of precision / recall on the owner's 60 labels
   aesthetics        Spearman ρ vs the hand ranking (a gap < 0.1 is a tie)
 """
@@ -61,53 +66,95 @@ def _ratio(num, den):
 
 
 # --------------------------------------------------------------------------
-# Collect: {role: [{"model", "variant", "headline", "s_per_photo", "latency",
-#                   "detail", "flags"}]}
+# Collect: {role: [{"model", "variant", "headline", "ci", "n_answered",
+#                   "n_full", "s_per_photo", "latency", "detail", "flags",
+#                   "stale"}]}
+#
+# Every headline is over the FULL sample (a deferred / unusable / failed item
+# counts against the model), with a seeded per-photo bootstrap 95% CI.
 # --------------------------------------------------------------------------
 
+def _stale_flags(r):
+    tag = me.stale_tag(r.get("spec"))
+    return [tag] if tag else []
+
+
 def collect_describe(db):
+    D = _script("describe_eval")
     rows = []
-    for r in _script("describe_eval").build_report(db=db, use_clip=False):
+    for r in D.build_report(db=db, use_clip=False):
         if r["variant"] == me.STORED:
             continue
         n = r["n"] or 0
-        bad = (n - r["answered"]) + r["degenerate_final"] + r["truncated"]
-        answered = (r.get("disp_right") or 0) + (r.get("disp_wrong") or 0)
-        if answered:
-            head = _ratio(r["disp_right"], answered)
-            basis = f"right on disputed pts {r['disp_right']}/{answered}"
+        recs = r.get("disp_records") or []
+        orig = r.get("disp_orig_right", 0) + r.get("disp_orig_wrong", 0)
+        ci = None
+        if orig:
+            # The ORIGINAL questions are the ones every model faced; points
+            # added for one model scrutinise only its extra details
+            # (qwenvl7b: 0.60 on all points, 0.50 on the original ones).
+            head = D.fair_score(recs, original=True)
+            ci = me.bootstrap_ci(recs, lambda s: D.fair_score(s, original=True))
+            allp = D.fair_score(recs, original=False)
+            basis = (f"orig qs right {r['disp_orig_right']}/{orig}"
+                     f" (all pts {allp:.2f})" if allp is not None else "")
         elif r.get("claims_n"):
             head, basis = _ratio(r["clean"], r["claims_n"]), f"clean {r['clean']}/{r['claims_n']}"
         else:
-            head, basis = (1 - bad / n) if n else None, "no labels: 1 - bad output"
+            head, basis = (1 - r["bad"] / n) if n else None, "no labels: 1 - bad output"
+        flags = ["SCREEN OUT"] if r["screen_out"] else []
+        if r.get("replay_screen_out"):
+            flags.append(f"SCREEN OUT replayed ({r['replay_bad']}/{n} bad now)")
         rows.append({"model": r["effective_model"], "variant": r["variant"], "headline": head,
+                     "ci": ci, "n_answered": r["answered"], "n_full": len(recs) or n,
                      "s_per_photo": r["lat_p50"], "latency": r["latency_label"],
-                     "detail": basis, "flags": ["SCREEN OUT"] if r["screen_out"] else []})
+                     "detail": basis, "flags": flags + _stale_flags(r),
+                     "stale": bool((r.get("spec") or {}).get("stale"))})
     return rows
 
 
 def collect_text(db):
+    X = _script("text_passes_eval")
     out = {"category-content": [], "keywords": []}
-    for r in _script("text_passes_eval").build_report(db=db):
+    for r in X.build_report(db=db):
         if r["variant"] == me.STORED:
             continue
+        flags = []
+        ci = None
+        n_ans, n_full = r["n"] - r["deferred"], r["n_full"]
+        # Score what TODAY's code would store from the cached answers when it
+        # can be replayed; the as-run number goes in the basis.
+        g = r.get("replay") or r
+        how = "replayed" if r.get("replay") else "as run"
         if r["pass"] == "category-content" and r.get("labelled"):
-            head = _ratio(r["tp"], r["tp"] + r["fp"])
-            basis = f"precision, {r['labelled']} labelled"
+            recs = g["records"]
+            p, rc, head = X.category_scores(recs)
+            ci = me.bootstrap_ci(recs, X.category_f1)
+            raw_f1 = X.category_scores(r["records"])[2]
+            basis = (f"F1 {how}: P {p and round(p, 2)} R {rc and round(rc, 2)}"
+                     f" (as run F1 {raw_f1 and round(raw_f1, 2)})")
+            n_ans, n_full = g["answered_labelled"], g["labelled"]
+            if g.get("precision_approx"):
+                flags.append(f"precision approx ({g['unjudged']} unjudged)")
         elif r["pass"] == "keywords" and r.get("labelled"):
-            head = _ratio(r["kw_right"], r["kw_right"] + r["kw_wrong"])
-            basis = f"precision, {r['labelled']} labelled"
+            recs = g["records"]
+            head = X.keyword_photo_precision(recs)
+            ci = me.bootstrap_ci(recs, X.keyword_photo_precision)
+            pooled = _ratio(g["kw_right"], g["kw_right"] + g["kw_wrong"])
+            basis = f"per-photo precision {how} (pooled {pooled and round(pooled, 2)})"
+            n_ans, n_full = g["answered_labelled"], g["labelled"]
         else:
             key = "unsupported_lenient" if r["pass"] == "category-content" else "unsupported"
             head = 1 - r[key] / r["tags"] if r["tags"] else None
             basis = "no labels: 1 - unsupported"
-        flags = []
         if r["attempts"] and r["timeouts"] / r["attempts"] > 0.05:
             flags.append(f"{100 * r['timeouts'] / r['attempts']:.0f}% attempts time out")
         out[r["pass"]].append({"model": r["effective_model"], "variant": r["variant"],
-                               "headline": head, "s_per_photo": r["lat_p50"],
+                               "headline": head, "ci": ci, "n_answered": n_ans,
+                               "n_full": n_full, "s_per_photo": r["lat_p50"],
                                "latency": r["latency_label"], "detail": basis,
-                               "flags": flags})
+                               "flags": flags + _stale_flags(r),
+                               "stale": bool((r.get("spec") or {}).get("stale"))})
     return out
 
 
@@ -117,13 +164,19 @@ def collect_verify():
     out = []
     for r in rows:
         p, c = r["planted"], r["clean"]
-        catch, reject = _ratio(p[2], p[0]), _ratio(c[1], c[0])
-        head = catch - reject if catch is not None and reject is not None else None
+        recs = r["records"]
+        head = V.headline(recs)
+        ci = me.bootstrap_ci(recs, V.headline, strata=lambda x: x["kind"])
+        failed = sum(r["failed"].values()) + sum(r["missing"].values())
+        flags = [f"{failed} failed/not run"] if failed else []
         out.append({"model": r["effective_model"], "variant": r["variant"], "headline": head,
+                    "ci": ci, "n_answered": len(recs) - failed, "n_full": len(recs),
                     "s_per_photo": r["lat_p50"], "latency": r["latency_label"],
-                    "detail": f"{r['mode']}: catch {catch if catch is None else round(catch, 2)}"
-                              f" − reject {reject if reject is None else round(reject, 2)}",
-                    "flags": [], "describe_source": sets["source_effective_model"]})
+                    "detail": f"{r['mode']}: catch {p[2]}/{p[0]} − reject {c[1]}/{c[0]}"
+                              f", {_ratio(r['clean_flags'], c[0]) or 0:.2f} flags/clean",
+                    "flags": flags + _stale_flags(r),
+                    "stale": bool((r.get("spec") or {}).get("stale")),
+                    "describe_source": sets["source_effective_model"]})
     return out
 
 
@@ -144,6 +197,7 @@ def collect_visual():
         f1 = 2 * prec * rec / (prec + rec) if prec and rec else None
         lat = me.latencies(run.get("predictions", {}))
         out.append({"model": run.get("effective_model"), "variant": v, "headline": f1,
+                    "ci": None,          # visual_tags_eval reports no per-photo CI
                     "s_per_photo": me.median(lat),
                     "latency": run.get("latency_label", "not recorded"),
                     "detail": f"P {prec and round(prec, 2)} / R {rec and round(rec, 2)}"
@@ -164,7 +218,8 @@ def collect_aesthetics(out_dir):
         if r["n"] and r["final_fail"] / r["n"] > 0.05:
             flags.append(f"{r['final_fail']}/{r['n']} unparsed")
         out.append({"model": entry.get("effective_model"), "variant": variant,
-                    "headline": r["rho"], "s_per_photo": r["lat_median"],
+                    "headline": r["rho"], "ci": r.get("rho_ci"),
+                    "s_per_photo": r["lat_median"],
                     "latency": r["latency_label"],
                     "detail": f"spread std {r['spread']['std'] and round(r['spread']['std'], 2)}",
                     "flags": flags})
@@ -185,18 +240,39 @@ def collect(db=None, aesthetics_dir=None):
 # Analysis
 # --------------------------------------------------------------------------
 
+def _sig_better(o, r):
+    """o's headline beats r's by more than the uncertainty: the CIs do not
+    overlap. With a CI missing on either side, a plain > (the old rule)."""
+    if o.get("ci") and r.get("ci"):
+        return o["ci"][0] > r["ci"][1]
+    return o["headline"] > r["headline"]
+
+
 def pareto(rows):
-    """Rows no other row beats on headline AND s/photo (ties don't dominate)."""
+    """Rows no other row beats on headline AND s/photo. A headline lead
+    inside the 95% CI is not a lead: a row within the CI of a faster one is
+    dominated, so no star is awarded on noise."""
     ok = [r for r in rows if r["headline"] is not None and r["s_per_photo"] is not None]
     keep = []
     for r in ok:
-        dominated = any(o is not r and o["headline"] >= r["headline"]
+        dominated = any(o is not r and not _sig_better(r, o)
                         and o["s_per_photo"] <= r["s_per_photo"]
-                        and (o["headline"] > r["headline"] or o["s_per_photo"] < r["s_per_photo"])
+                        and (_sig_better(o, r) or o["s_per_photo"] < r["s_per_photo"])
                         for o in ok)
         if not dominated:
             keep.append(r)
     return keep
+
+
+def ties_with_best(rows):
+    """{id(row)} of rows whose CI overlaps the best headline's (not the best
+    itself): a statistical tie, not a loss."""
+    ok = [r for r in rows if r["headline"] is not None]
+    if not ok:
+        return set()
+    best = max(ok, key=lambda r: r["headline"])
+    return {id(r) for r in ok if r is not best and r.get("ci") and best.get("ci")
+            and me.ci_overlap(r["ci"], best["ci"])}
 
 
 def fits_alone(model, models, headroom):
@@ -238,6 +314,10 @@ def schedule(assign, roles, models, photos=DEFAULT_BATCH):
     return total, lines, problems
 
 
+def _ci(ci):
+    return f"[{ci[0]:.2f},{ci[1]:.2f}]" if ci else "—"
+
+
 def render(roles, models, *, headroom=1.5, assign=None, photos=DEFAULT_BATCH):
     out = []
     for role in ["describe", "category-content", "keywords", "verify", "visual", "aesthetics"]:
@@ -248,24 +328,34 @@ def render(roles, models, *, headroom=1.5, assign=None, photos=DEFAULT_BATCH):
             out.append("")
             continue
         front = {id(r) for r in pareto(rows)}
-        out.append(f"  {'model':<30} {'variant':<16} {'headline':>8} {'s/photo':>8} "
-                   f"{'VRAM':>6} {'fits':>5}  {'basis':<34} flags")
+        tied = ties_with_best(rows)
+        out.append(f"  {'model':<30} {'variant':<16} {'headline':>9} {'95% CI':>13} {'ans/n':>7} "
+                   f"{'s/photo':>8} {'VRAM':>6} {'fits':>5}  {'basis':<44} flags")
         for r in sorted(rows, key=lambda r: -(r["headline"] if r["headline"] is not None else -9)):
             vram = (models.get(r["model"]) or {}).get("vram_gb")
             fit = fits_alone(r["model"], models, headroom)
             flags = list(r["flags"])
             if role == "verify" and r.get("describe_source") == r["model"]:
                 flags.append("SAME AS DESCRIBE")
+            head = ("%.3f" % r["headline"]) if r["headline"] is not None else "—"
+            if id(r) in tied:
+                head = "≈" + head
+            ansn = (f"{r['n_answered']}/{r['n_full']}" if r.get("n_full") is not None else "—")
             out.append(
                 f"{'*' if id(r) in front else ' '} {str(r['model'])[:30]:<30} {str(r['variant'])[:16]:<16} "
-                f"{('%.3f' % r['headline']) if r['headline'] is not None else '—':>8} "
+                f"{head:>9} {_ci(r.get('ci')):>13} {ansn:>7} "
                 f"{('%.2f' % r['s_per_photo']) if r['s_per_photo'] is not None else '—':>8} "
                 f"{('%.1f' % vram) if vram is not None else '?':>6} "
-                f"{'?' if fit is None else 'yes' if fit else 'NO':>5}  {r['detail'][:34]:<34} "
+                f"{'?' if fit is None else 'yes' if fit else 'NO':>5}  {r['detail'][:44]:<44} "
                 f"{'; '.join(flags)}  [{r['latency']}]")
         out.append("")
-    out.append("* = Pareto (nothing is both better and faster). fits = VRAM alone ≤ "
-               f"{GPU_GB:.0f} GB - {headroom} GB headroom; '?' = fill in models.json.")
+    out.append("* = Pareto (nothing is both better and faster; a lead inside the 95% CI is not "
+               "better). ≈ = CI overlaps the best headline's: a tie, not a loss. 95% CI = per-photo "
+               "bootstrap (seeded). ans/n = answered / full sample — failures count against the "
+               "model. fits = VRAM alone ≤ "
+               f"{GPU_GB:.0f} GB - {headroom} GB headroom; '?' = fill in models.json. "
+               f"{me.STALE} = measured against older production prompts/guards — re-run before "
+               "trusting it.")
     if assign is None:
         assign = {}
         for role, rows in roles.items():
@@ -274,7 +364,8 @@ def render(roles, models, *, headroom=1.5, assign=None, photos=DEFAULT_BATCH):
                   and not (role == "verify" and r.get("describe_source") == r["model"])]
             if ok:
                 assign[role] = max(ok, key=lambda r: r["headline"])["model"]
-        label = "EXAMPLE — best headline per role, not a recommendation"
+        label = ("EXAMPLE — best headline per role, not a recommendation; check the ≈ ties "
+                 "and STALE flags above")
     else:
         label = "as assigned"
     total, lines, problems = schedule(assign, roles, models, photos)

@@ -214,11 +214,19 @@ def production_checker(path, text, emb, nominal, llm_all):
 
 
 def check_one(path, text, emb, nominal, mode, checker=None):
+    from photosearch import describe
     checker = checker or production_checker
     rec = me.Recorder()
     t0 = time.time()
     with rec.active():
-        chk = checker(path, text, emb, nominal, mode == "llm")
+        try:
+            chk = checker(path, text, emb, nominal, mode == "llm")
+        except describe.UnusableAnswer as e:
+            # The model answered, but no verdict can be stored (cut off at
+            # the token limit): production records a failure row. Cached, so
+            # it COUNTS in the denominators instead of silently shrinking them.
+            return {"stage": "unusable", "unusable": str(e), "flagged": [], "raw_wrong": [],
+                    "latency_s": round(time.time() - t0, 3), "attempts": rec.attempts()}
     latency = time.time() - t0
     # llm_verify_description returns [] on ANY error — the same as "ALL
     # CORRECT". A cleared result whose call errored is a dead backend, not a
@@ -232,7 +240,8 @@ def check_one(path, text, emb, nominal, mode, checker=None):
 
 
 def run_variant(variant, *, model=None, mode="llm", db=None, server=me.DEFAULT_SERVER,
-                limit=None, force=False, solo=False, checker=None, fetch=None, log=print):
+                limit=None, force=False, force_stale=False, solo=False, checker=None,
+                fetch=None, log=print):
     from photosearch import describe
     if mode not in MODES:
         raise SystemExit(f"--mode must be one of {MODES}")
@@ -245,8 +254,12 @@ def run_variant(variant, *, model=None, mode="llm", db=None, server=me.DEFAULT_S
         raise SystemExit(f"verify model {effective!r} wrote these descriptions; the check "
                          "must be independent. Pick a different verify model.")
     conn = me.open_db_readonly(db) if mode == "pipeline" else None
-    run = me.open_run(PASS, variant, force=force, effective_model=effective, mode=mode,
+    effort = me.sent_reasoning_effort(effective)
+    spec = me.make_spec(me.spec_parts(PASS, mode=mode, reasoning_effort=effort))
+    run = me.open_run(PASS, variant, force=force, spec=spec, force_stale=force_stale,
+                      effective_model=effective, mode=mode,
                       source_variant=sets["source_variant"])
+    run.setdefault("reasoning_effort", effort)
     todo = [it for it in scored_items(sets) if it["id"] not in run["items"]]
     if limit is not None:
         todo = todo[:limit]
@@ -279,46 +292,123 @@ def run_variant(variant, *, model=None, mode="llm", db=None, server=me.DEFAULT_S
 # Report
 # --------------------------------------------------------------------------
 
+# Words that never say WHAT is wrong: dispute answers like "yes" / "no",
+# counts, pronouns, prepositions, and nouns so generic that any two claims
+# share them. Matching on these is how "post" once matched a thermometer flag.
+_MATCH_IGNORE = frozenset("""
+    yes no not none both either neither all any each
+    one two three four five six seven eight nine ten several many few
+    he him his she her hers they them their it its we us you i me my our
+    behind beside near next above below under over front back left right top bottom
+    into onto from off out up down through across along around between against
+    as if while but also just only very appears appear seems seem visible present shown
+    seen there here this that these those what which who something someone
+    image photo picture scene background foreground frame side edge area part
+    thing things object objects
+    """.split()) | _STOP
+_SUBPHRASE = re.compile(r"\s*(?:[,;/]|\band\b|\bor\b|\bwith\b|\bwhile\b|\bbut\b)\s*", re.I)
+
+
+def _sing(w):
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if w == "children":
+        return "child"
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def _match_words(phrase):
+    """Content words of a phrase, singular, minus `_MATCH_IGNORE`."""
+    return [_sing(w) for w in re.findall(r"[a-z]+", (phrase or "").lower())
+            if len(w) > 2 and w not in _MATCH_IGNORE]
+
+
+def head_nouns(phrase):
+    """The last content word of each sub-phrase ("red collar and striped" ->
+    {collar, striped}) — a crude head noun, no tagger needed."""
+    heads = set()
+    for sub in _SUBPHRASE.split(phrase or ""):
+        ws = _match_words(sub)
+        if ws:
+            heads.add(ws[-1])
+    return heads
+
+
+def matchable(spans):
+    """Can a flag name this error at all? "yes", "five" or "no" alone say
+    nothing a verifier could repeat."""
+    return any(head_nouns(s) for s in spans or ())
+
+
 def matched(result, spans):
-    """A flag names the error: any content word shared between a flagged noun
-    (or the raw WRONG: line) and a labelled/planted span."""
-    want = set().union(*(_content(s) for s in spans)) if spans else set()
-    if not want:
+    """Does a flag NAME the error? Only the shipped `flagged` nouns count (the
+    raw WRONG: sentences share words with anything), and a flag matches a span
+    when the head noun of one is a content word of the other: "lighthouse"
+    names "with a lighthouse behind him"; "two children" does not name "red
+    collar and striped"."""
+    flags = list(result.get("flagged") or [])
+    if not flags or not spans:
         return False
-    said = set().union(*(_content(x) for x in result["flagged"] + result["raw_wrong"])) \
-        if (result["flagged"] or result["raw_wrong"]) else set()
-    return bool(want & said)
+    for f in flags:
+        f_heads, f_words = head_nouns(f), set(_match_words(f))
+        for s in spans:
+            if (f_heads & set(_match_words(s))) or (head_nouns(s) & f_words):
+                return True
+    return False
 
 
 def summarize(run, sets):
-    by_id = {it["id"]: it for it in scored_items(sets)}
-    rows = {"clean": [0, 0], "real": [0, 0, 0]}
-    planted = {}
+    """Every scored item counts, whatever happened to it: an item the run
+    never cached (a transport failure, `missing`) or could not judge (an
+    unusable verdict, `failed`) stays in the denominator as not caught — and,
+    on the clean set, as not passed."""
+    records = []
     lat = []
-    for iid, res in run["items"].items():
-        it = by_id.get(iid)
-        if it is None:
-            continue                 # a plant the owner has since rejected
-        flagged = bool(res["flagged"])
-        lat.append(res.get("latency_s"))
-        if it["kind"] == "clean":
-            rows["clean"][0] += 1
-            rows["clean"][1] += flagged
-        elif it["kind"] == "real":
-            rows["real"][0] += 1
-            rows["real"][1] += flagged
-            rows["real"][2] += flagged and matched(res, it["spans"])
-        else:
-            p = planted.setdefault(it["type"], [0, 0, 0])
-            p[0] += 1
-            p[1] += flagged
-            p[2] += flagged and matched(res, it["spans"])
-    tot = [sum(v[i] for v in planted.values()) for i in range(3)]
+    for it in scored_items(sets):
+        res = run["items"].get(it["id"])
+        failed = res is not None and res.get("stage") == "unusable"
+        answered = res is not None and not failed
+        flags = list(res.get("flagged") or []) if answered else []
+        if answered:
+            lat.append(res.get("latency_s"))
+        records.append({"kind": it["kind"], "type": it.get("type"),
+                        "flagged": bool(flags), "n_flags": len(flags),
+                        "matched": bool(flags) and matched(res, it["spans"]),
+                        "matchable": it["kind"] == "clean" or matchable(it["spans"]),
+                        "failed": failed, "missing": res is None})
+
+    def tally(rs):
+        return [len(rs), sum(r["flagged"] for r in rs), sum(r["matched"] for r in rs)]
+    by = {k: [r for r in records if r["kind"] == k] for k in ("clean", "planted", "real")}
+    planted_by_type = {}
+    for r in by["planted"]:
+        planted_by_type.setdefault(r["type"], []).append(r)
     return {"variant": run.get("variant"), "effective_model": run.get("effective_model"),
-            "mode": run.get("mode"), "planted": tot, "planted_by_type": planted,
-            "real": rows["real"], "clean": rows["clean"],
+            "mode": run.get("mode"), "planted": tally(by["planted"]),
+            "planted_by_type": {t: tally(rs) for t, rs in planted_by_type.items()},
+            "real": tally(by["real"]), "clean": tally(by["clean"])[:2],
+            "real_matchable": sum(r["matchable"] for r in by["real"]),
+            "clean_flags": sum(r["n_flags"] for r in by["clean"]),
+            "failed": {k: sum(r["failed"] for r in rs) for k, rs in by.items()},
+            "missing": {k: sum(r["missing"] for r in rs) for k, rs in by.items()},
+            "records": records,
             "lat_p50": me.median(lat[1:] if len(lat) > 1 else lat),
-            "latency_label": run.get("latency_label", "unknown")}
+            "latency_label": run.get("latency_label", "unknown"),
+            "spec": me.spec_status(PASS, run)}
+
+
+def headline(records):
+    """Matched planted catch rate minus the share of clean descriptions that
+    did not pass (flagged, failed or never run), both over the full set."""
+    planted = [r for r in records if r["kind"] == "planted"]
+    clean = [r for r in records if r["kind"] == "clean"]
+    if not planted or not clean:
+        return None
+    catch = sum(r["matched"] for r in planted) / len(planted)
+    reject = sum(r["flagged"] or r["failed"] or r["missing"] for r in clean) / len(clean)
+    return catch - reject
 
 
 def build_report():
@@ -343,24 +433,34 @@ def render(sets, rows):
     out = [f"descriptions by {sets['source_effective_model']} ({sets['source_variant']}): "
            f"{kinds.get('clean', 0)} clean, {kinds.get('planted', 0)} planted "
            f"({unconf} awaiting confirmation), {kinds.get('real', 0)} with real errors", ""]
-    out.append(f"{'variant':<14} {'verify model':<26} {'mode':<8} {'planted caught':>14} "
-               f"{'matched':>7} {'real caught':>11} {'matched':>7} {'false reject':>12} "
-               f"{'s/ph':>5}  latency")
+    out.append(f"{'variant':<16} {'verify model':<24} {'mode':<8} {'planted caught':>14} "
+               f"{'matched':>7} {'real caught':>11} {'matched':>12} {'false reject':>12} "
+               f"{'flags/clean':>11} {'failed':>6} {'s/ph':>5}  latency")
     for r in rows:
         p, rl, c = r["planted"], r["real"], r["clean"]
-        out.append(f"{str(r['variant']):<14} {str(r['effective_model'])[:26]:<26} {r['mode']:<8} "
+        failed = sum(r["failed"].values()) + sum(r["missing"].values())
+        tag = me.stale_tag(r.get("spec"))
+        out.append(f"{str(r['variant']):<16} {str(r['effective_model'])[:24]:<24} {r['mode']:<8} "
                    f"{me.fmt_ratio(p[1], p[0]):>14} {me.fmt_ratio(p[2], p[0]):>7} "
-                   f"{me.fmt_ratio(rl[1], rl[0]):>11} {me.fmt_ratio(rl[2], rl[0]):>7} "
-                   f"{me.fmt_ratio(c[1], c[0]):>12} "
+                   f"{me.fmt_ratio(rl[1], rl[0]):>11} "
+                   f"{me.fmt_ratio(rl[2], r['real_matchable']) + ' of ' + str(r['real_matchable']):>12} "
+                   f"{me.fmt_ratio(c[1], c[0]):>12} {me.fmt_ratio(r['clean_flags'], c[0]):>11} "
+                   f"{failed:>6} "
                    f"{('%.1f' % r['lat_p50']) if r['lat_p50'] is not None else '—':>5}  "
-                   f"{r['latency_label']}")
+                   f"{r['latency_label']}{'   ' + tag if tag else ''}")
         for t, (n, f, m) in sorted(r["planted_by_type"].items()):
-            out.append(f"{'':<14} {'  planted ' + t:<26} {'':<8} {me.fmt_ratio(f, n):>14} "
-                       f"{me.fmt_ratio(m, n):>7}")
+            out.append(f"{'':<16} {'  planted ' + t + ' (n=' + str(n) + ')':<24} {'':<8} "
+                       f"{me.fmt_ratio(f, n):>14} {me.fmt_ratio(m, n):>7}")
     out.append("")
-    out.append("caught = flagged anything; matched = a flag names the actual error. "
-               "false reject = a clean description flagged. Only same-source pairings are "
-               "shown, and run refuses a verify model that wrote the descriptions.")
+    out.append("caught = flagged anything; matched = a SHIPPED flag (the cleaned `flagged` noun, "
+               "never the raw WRONG: sentence) names the error by head noun, ignoring yes/no, "
+               "counts and generic words. Real matched is over the errors a flag could name at "
+               "all (\"of N\"; a bare \"yes\" or \"five\" cannot be). false reject = a clean "
+               "description flagged; flags/clean = flags per clean description (a verifier that "
+               "flags everything also 'catches' everything). failed = unusable verdicts + items "
+               "never cached; both stay in every denominator. Only same-source pairings are "
+               f"shown, and run refuses a verify model that wrote the descriptions. {me.STALE} = "
+               "the run's spec hash is missing or differs from the current code.")
     return "\n".join(out)
 
 
@@ -381,6 +481,9 @@ def main(argv=None):
     r.add_argument("--server", default=me.DEFAULT_SERVER)
     r.add_argument("--limit", type=int)
     r.add_argument("--force", action="store_true")
+    r.add_argument("--force-stale", action="store_true",
+                   help="append to a run cached under a different production spec "
+                        "(it stays marked STALE)")
     r.add_argument("--solo", action="store_true")
     sub.add_parser("report")
     args = ap.parse_args(argv)
@@ -394,7 +497,8 @@ def main(argv=None):
               "/eval/models?tab=planted")
     elif args.cmd == "run":
         run_variant(args.variant, model=args.model, mode=args.mode, db=args.db,
-                    server=args.server, limit=args.limit, force=args.force, solo=args.solo)
+                    server=args.server, limit=args.limit, force=args.force,
+                    force_stale=args.force_stale, solo=args.solo)
     else:
         print(render(*build_report()))
 

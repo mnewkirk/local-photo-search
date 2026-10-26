@@ -348,11 +348,17 @@ def put_category(photo_id: int, body: CategoryBody, inputs: str = Query("main"))
         from .vocab_content import CONTENT_VOCABULARY
         vocab = set(CONTENT_VOCABULARY)
         terms = {" ".join(t.lower().split()) for t in body.yes} - {""}
+        # The checklist as served (pooled runs + stored + the prior label):
+        # a term outside it was never judged, so a model added later is not
+        # charged a false positive for it.
+        key = me.label_key(photo_id, item["text_sha"])
+        prior = me.load_category_labels().get(key) or {}
+        shown = (set(text_pool("category-content", inp).get(str(photo_id), []))
+                 | set(prior.get("pool") or []) | set(prior.get("yes") or []))
         # Split, don't reject: a right category the vocabulary lacks is a
         # vocabulary gap, recorded but never scored.
-        label = me.save_category_label(me.label_key(photo_id, item["text_sha"]),
-                                       sorted(terms & vocab), body.done,
-                                       missing=sorted(terms - vocab))
+        label = me.save_category_label(key, sorted(terms & vocab), body.done,
+                                       missing=sorted(terms - vocab), pool=shown)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"photo_id": photo_id, "label": label}

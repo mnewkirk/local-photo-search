@@ -224,3 +224,103 @@ def test_failure_counter_warns_on_a_streak():
     fc.summary()
     assert any("in a row" in l for l in lines)
     assert any("NOT cached" in l for l in lines)
+
+
+# --------------------------------------------------------------------------
+# Spec hash: a cached run records WHICH production prompt + guards it measured
+# --------------------------------------------------------------------------
+
+def _spec(pass_="describe", **kw):
+    return me.make_spec(me.spec_parts(pass_, **kw))
+
+
+@pytest.mark.parametrize("pass_,kw", [("describe", {}), ("category-content", {}),
+                                      ("keywords", {}), ("verify", {"mode": "llm"}),
+                                      ("verify", {"mode": "pipeline"})])
+def test_spec_is_deterministic_and_built_without_a_model(pass_, kw, monkeypatch):
+    monkeypatch.setattr(describe, "_ollama_chat_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no model calls")))
+    a, b = _spec(pass_, **kw), _spec(pass_, **kw)
+    assert a == b and len(a["hash"]) == 16 and a["parts"]
+
+
+def test_spec_changes_with_prompt_guards_and_effort(monkeypatch):
+    base = _spec()
+    monkeypatch.setattr(describe, "DESCRIBE_PROMPT", describe.DESCRIBE_PROMPT + " Be brief.")
+    p = _spec()
+    assert p["hash"] != base["hash"] and me.changed_parts(base["parts"], p["parts"]) == ["prompt"]
+    monkeypatch.undo()
+    monkeypatch.setattr(describe, "_description_problem", lambda text: None)
+    assert me.changed_parts(base["parts"], _spec()["parts"]) == ["guards"]
+    monkeypatch.undo()
+    assert me.changed_parts(base["parts"], _spec(reasoning_effort="none")["parts"]) == \
+        ["reasoning_effort"]
+    # The verify modes measure different code: the CLIP stages only in pipeline.
+    assert _spec("verify", mode="llm")["hash"] != _spec("verify", mode="pipeline")["hash"]
+
+
+def test_resume_refuses_a_run_cached_under_another_spec():
+    old = me.open_run("describe", "v1", effective_model="m1", prompt_sha=None)  # legacy: no spec
+    old["items"]["5"] = {"text": "hi"}
+    me.save_run("describe", "v1", old)
+    spec = _spec()
+    with pytest.raises(SystemExit, match="--force-stale"):
+        me.open_run("describe", "v1", spec=spec, effective_model="m1", prompt_sha=None)
+    run = me.open_run("describe", "v1", spec=spec, force_stale=True, effective_model="m1",
+                      prompt_sha=None)
+    assert run["items"] == {"5": {"text": "hi"}} and run["stale_appends"]
+    # A new run stores the spec and resumes under it.
+    fresh = me.open_run("describe", "v2", spec=spec, effective_model="m1", prompt_sha=None)
+    assert fresh["spec_hash"] == spec["hash"]
+    me.save_run("describe", "v2", fresh)
+    assert me.open_run("describe", "v2", spec=spec, effective_model="m1",
+                       prompt_sha=None)["spec_hash"] == spec["hash"]
+    other = dict(spec, hash="0" * 16, parts=dict(spec["parts"], guards="ffffffff"))
+    with pytest.raises(SystemExit, match="changed: guards"):
+        me.open_run("describe", "v2", spec=other, effective_model="m1", prompt_sha=None)
+
+
+def test_spec_status_marks_missing_changed_and_forced_runs_stale(monkeypatch):
+    assert me.spec_status("describe", {"variant": "x"}) == {
+        "stale": True, "why": "no spec hash (run predates spec hashing)"}
+    spec = _spec()
+    run = {"variant": "x", "spec_hash": spec["hash"], "spec_parts": spec["parts"]}
+    assert me.spec_status("describe", run) == {"stale": False, "why": ""}
+    assert me.stale_tag(me.spec_status("describe", run)) == ""
+    assert me.spec_status("describe", {**run, "stale_appends": [{}]})["stale"]
+    monkeypatch.setattr(describe, "_is_degenerate", lambda text: False)
+    st = me.spec_status("describe", run)
+    assert st["stale"] and "guards" in st["why"]
+    assert me.stale_tag(st).startswith("STALE")
+    assert me.spec_status("describe", {"variant": me.STORED})["stale"] is False
+
+
+def test_sent_reasoning_effort(monkeypatch):
+    assert me.sent_reasoning_effort("google/gemma-4-12b-qat") is None      # no LM Studio route
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://x/v1")
+    monkeypatch.setenv("PHOTOSEARCH_LLM_REASONING_EFFORT", "none")
+    assert me.sent_reasoning_effort("google/gemma-4-12b-qat") == "none"
+    assert me.sent_reasoning_effort("qwen2.5-vl-7b-instruct") is None      # no reasoning mode
+
+
+def test_bootstrap_ci_is_seeded_stratified_and_needs_data():
+    recs = [1, 0, 1, 1, 0, 1, 1, 1, 0, 1]
+    mean = lambda s: sum(s) / len(s)  # noqa: E731
+    a, b = me.bootstrap_ci(recs, mean), me.bootstrap_ci(recs, mean)
+    assert a == b and a[0] <= 0.7 <= a[1]
+    assert me.bootstrap_ci([1, 0], mean) is None                          # too few
+    assert me.bootstrap_ci(recs, lambda s: None) is None                  # undefined stat
+    # Stratified: every resample keeps the group sizes.
+    sizes = set()
+    me.bootstrap_ci([("a", 1)] * 3 + [("b", 0)] * 5,
+                    lambda s: sizes.add(sum(1 for k, _ in s if k == "a")) or 0.0,
+                    strata=lambda r: r[0], n_boot=50)
+    assert sizes == {3}
+    assert me.ci_overlap((0.1, 0.5), (0.4, 0.9)) and not me.ci_overlap((0.1, 0.3), (0.4, 0.9))
+    assert me.ci_overlap(None, (0.4, 0.9))
+
+
+def test_category_label_records_the_pool_shown():
+    lab = me.save_category_label("1:abc", ["outdoor"], pool=["outdoor", "soccer", "not a term"])
+    assert lab["pool"] == ["outdoor", "soccer"]
+    assert "pool" not in me.save_category_label("2:abc", ["outdoor"])     # old callers unchanged

@@ -168,12 +168,19 @@ def list_variants(pass_: str) -> list[str]:
     return sorted(p.stem for p in d.glob("*.json") if not p.name.startswith("."))
 
 
-def open_run(pass_: str, variant: str, *, force: bool = False, **identity) -> dict:
+def open_run(pass_: str, variant: str, *, force: bool = False,
+             spec: Optional[dict] = None, force_stale: bool = False, **identity) -> dict:
     """Load `variant`'s cached run, or start a new one.
 
     `identity` is what makes a run ONE experiment (effective_model,
     prompt_sha, input_source, ...). Resuming under different values would mix
-    two experiments in a file that reports as one, so it refuses."""
+    two experiments in a file that reports as one, so it refuses.
+
+    `spec` ({"hash", "parts"} from `make_spec`) is the production prompt and
+    guard code the run measures. A run cached under another spec (or before
+    specs were recorded) refuses to resume too — appending would report old
+    numbers as current. `force_stale` appends anyway and records it, so every
+    report keeps showing the run as STALE."""
     check_variant(variant)
     run = None if force else load_run(pass_, variant)
     if run is not None:
@@ -183,9 +190,186 @@ def open_run(pass_: str, variant: str, *, force: bool = False, **identity) -> di
                     f"{pass_} variant {variant!r} was run with {key}={run.get(key)!r}, "
                     f"now {now!r}. Use a new --variant name, or --force to "
                     "discard the cached run.")
+        if spec is not None and run.get("spec_hash") != spec["hash"]:
+            if not force_stale:
+                changed = changed_parts(run.get("spec_parts"), spec["parts"])
+                raise SystemExit(
+                    f"{pass_} variant {variant!r} was cached under spec "
+                    f"{run.get('spec_hash') or '(none recorded)'}; the production "
+                    f"prompt/guards now hash {spec['hash']}"
+                    + (f" (changed: {', '.join(changed)})" if changed else "")
+                    + ". Start a new --variant name, or --force-stale to append "
+                    "anyway (the run then stays marked STALE).")
+            run.setdefault("stale_appends", []).append(
+                {"spec_hash": spec["hash"], "at": now_iso()})
         return run
-    return {"pass": pass_, "variant": variant, "created": now_iso(),
-            "items": {}, **identity}
+    run = {"pass": pass_, "variant": variant, "created": now_iso(),
+           "items": {}, **identity}
+    if spec is not None:
+        run["spec_hash"], run["spec_parts"] = spec["hash"], spec["parts"]
+    return run
+
+
+# --------------------------------------------------------------------------
+# Spec hash — WHICH production prompt + guard code a run measured
+# --------------------------------------------------------------------------
+#
+# A run cache outlives the code it measured: every stored run is from
+# 2026-09-26..28, and the text-pass guards (6e7b4fd, 10-06) and category
+# grounding (b7e5b03, 10-18) changed what production does with the same model
+# output. The spec is built from the prompt text production ACTUALLY builds
+# (the real builders, on a fixed dummy input — no model), the source of the
+# functions that decide an answer's fate, and the options / reasoning effort
+# as sent. Any edit to those makes old runs STALE in every report.
+
+SPEC_DUMMY_DESCRIPTION = ("Two children in red jackets kick a soccer ball across "
+                          "a grass field in a park on a sunny afternoon.")
+STALE = "STALE"
+
+
+def _src(*objs) -> str:
+    import inspect
+    out = []
+    for o in objs:
+        try:
+            out.append(inspect.getsource(o))
+        except (OSError, TypeError):
+            out.append(repr(o))
+    return "\n".join(out)
+
+
+def _jsonish(v) -> str:
+    return json.dumps(v, sort_keys=True, default=repr)
+
+
+def sent_reasoning_effort(effective: Optional[str]) -> Optional[str]:
+    """The `reasoning_effort` the OpenAI route would send for `effective`
+    (describe._openai_chat_attempts), or None when none is sent."""
+    from . import describe
+    effort = os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
+    if not effort or not os.environ.get("PHOTOSEARCH_TEXT_LLM_URL"):
+        return None
+    if describe._model_has_no_reasoning_mode(effective or ""):
+        return None
+    return effort
+
+
+def spec_parts(pass_: str, *, nominal: Optional[str] = None, prompt_sha: Optional[str] = None,
+               mode: Optional[str] = None, reasoning_effort: Optional[str] = None) -> dict:
+    """{name: text} of everything in production that decides `pass_`'s
+    result for a given model answer. Pure: builds prompts, reads source."""
+    from . import describe
+    parts = {"reasoning_effort": _jsonish(reasoning_effort)}
+    if pass_ == "describe":
+        nominal = nominal or describe.MODEL
+        parts.update({
+            # A --prompt-file run is identified by its file's hash.
+            "prompt": prompt_sha or text_sha(describe._get_describe_prompt(nominal)),
+            "options": _jsonish({"ollama": describe._options_for_model(nominal),
+                                 "max_tokens": describe._OPENAI_MAX_TOKENS.get("describe"),
+                                 "max_image_px": describe._MAX_IMAGE_PX}),
+            "describe_photo": _src(describe.describe_photo),
+            "guards": _src(describe._description_problem, describe._is_valid_description,
+                           describe._is_degenerate, describe.ends_mid_sentence),
+            "is_truncated": _src(__import__("photosearch.stale_descriptions",
+                                            fromlist=["is_truncated"]).is_truncated),
+        })
+    elif pass_ in ("category-content", "keywords"):
+        parts.update({
+            "answer_loop": _src(describe._text_pass_answer, describe._is_explicit_empty_answer),
+            "options": _jsonish({"num_ctx": describe._TEXT_NUM_CTX,
+                                 "timeout_s": describe._TEXT_OLLAMA_TIMEOUT_S,
+                                 "max_tokens": describe._OPENAI_MAX_TOKENS.get("text"),
+                                 "empty": sorted(describe._VISUAL_EMPTY_ANSWERS)}),
+        })
+        if pass_ == "category-content":
+            from . import category_grounding
+            from .vocab_content import CONTENT_VOCABULARY
+            parts.update({
+                "prompt": describe._build_category_prompt(SPEC_DUMMY_DESCRIPTION,
+                                                          CONTENT_VOCABULARY),
+                "extractor": _src(describe.extract_categories_from_description),
+                "grounding": _src(category_grounding),
+            })
+        else:
+            from . import bakeoff, stale_descriptions as sd
+            parts.update({
+                "prompt": bakeoff.build_keyword_prompt(SPEC_DUMMY_DESCRIPTION),
+                "extractor": _src(describe.extract_keywords_from_description,
+                                  bakeoff.parse_keywords_response),
+                "guards": _src(sd.keyword_match_ratio, sd._tokens) + _jsonish({
+                    "refusal": sd._REFUSAL.pattern, "match_min": sd.KEYWORD_MATCH_MIN,
+                    "max": describe._KEYWORDS_MAX_PLAUSIBLE,
+                    "max_words": describe._KEYWORD_MAX_WORDS}),
+            })
+    elif pass_ == "verify":
+        from . import verify
+        parts.update({
+            "mode": _jsonish(mode),
+            "prompt": verify.VERIFY_PROMPT.format(description=SPEC_DUMMY_DESCRIPTION),
+            "options": _jsonish({"max_tokens": describe._OPENAI_MAX_TOKENS.get("verify")}),
+            "parser": _src(verify.llm_verify_description, verify._clean_wrong_item) + _jsonish({
+                "meta": verify._META_WRONG_PATTERNS,
+                "boundary": verify._WRONG_CLAUSE_BOUNDARY.pattern,
+                "generic": sorted(verify._GENERIC_DROP)}),
+            "pipeline": _src(verify.check_description),
+        })
+        if mode == "pipeline":
+            parts["clip_stages"] = _src(verify._flag_by_clip, verify._extract_nouns,
+                                        verify.clip_score_description) + _jsonish({
+                "stop": sorted(verify._STOP_WORDS), "abstract": sorted(verify._ABSTRACT_PHRASES)})
+    else:
+        raise ValueError(f"no spec for pass {pass_!r}")
+    return parts
+
+
+def make_spec(parts: dict) -> dict:
+    """{"hash": 16 hex, "parts": {name: 8 hex}} — the per-part digests let a
+    report say WHAT changed, not just that something did."""
+    import hashlib
+    digests = {k: hashlib.sha256(str(v).encode("utf-8")).hexdigest()[:8]
+               for k, v in sorted(parts.items())}
+    h = hashlib.sha256(_jsonish(digests).encode("utf-8")).hexdigest()[:16]
+    return {"hash": h, "parts": digests}
+
+
+def current_spec(pass_: str, run: dict) -> dict:
+    """The spec the CURRENT code would record for `run` (same model, mode,
+    prompt file and reasoning effort as the run itself)."""
+    from . import describe
+    return make_spec(spec_parts(
+        pass_, nominal=describe.MODEL if pass_ == "describe" else None,
+        prompt_sha=run.get("prompt_sha"), mode=run.get("mode"),
+        reasoning_effort=run.get("reasoning_effort")))
+
+
+def changed_parts(old: Optional[dict], new: dict) -> list[str]:
+    if not old:
+        return []
+    return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+
+
+def spec_status(pass_: str, run: dict) -> dict:
+    """{"stale": bool, "why": str} for one cached run against the current
+    code. A run with no recorded spec is stale by definition: nothing says
+    what it measured. The `stored` pseudo-variant is production output, not
+    a run, and is never stale."""
+    if run.get("variant") == STORED:
+        return {"stale": False, "why": ""}
+    have = run.get("spec_hash")
+    if not have:
+        return {"stale": True, "why": "no spec hash (run predates spec hashing)"}
+    cur = current_spec(pass_, run)
+    if have != cur["hash"]:
+        changed = changed_parts(run.get("spec_parts"), cur["parts"])
+        return {"stale": True, "why": "spec changed: " + (", ".join(changed) or "?")}
+    if run.get("stale_appends"):
+        return {"stale": True, "why": "items appended under --force-stale"}
+    return {"stale": False, "why": ""}
+
+
+def stale_tag(status: Optional[dict]) -> str:
+    return f"{STALE} ({status['why']})" if status and status.get("stale") else ""
 
 
 class FailureCounter:
@@ -546,6 +730,44 @@ def percentile(xs, p: float):
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
+BOOT_N = 1000
+BOOT_SEED = 7
+
+
+def bootstrap_ci(records: list, stat: Callable, *, n_boot: int = BOOT_N,
+                 seed: int = BOOT_SEED, strata: Optional[Callable] = None):
+    """95% percentile-bootstrap CI of `stat(records)`, resampling RECORDS
+    (one per photo / item) with replacement — within each stratum when
+    `strata(record)` is given, so a verify resample keeps 20 clean and 20
+    planted. Seeded stdlib random: a report is reproducible. None when there
+    are too few records or the statistic is undefined."""
+    import random
+    if len(records) < MIN_N:
+        return None
+    groups: dict = {}
+    for r in records:
+        groups.setdefault(strata(r) if strata else None, []).append(r)
+    rnd = random.Random(seed)
+    vals = []
+    for _ in range(n_boot):
+        sample = [rnd.choice(g) for g in groups.values() for _ in range(len(g))]
+        v = stat(sample)
+        if v is not None:
+            vals.append(v)
+    if len(vals) < n_boot // 2:
+        return None
+    vals.sort()
+    return (vals[int(0.025 * len(vals))], vals[min(len(vals) - 1, int(0.975 * len(vals)))])
+
+
+def ci_overlap(a, b) -> bool:
+    """Do two (lo, hi) intervals overlap? Unknown counts as overlapping:
+    with no CI a difference cannot be called real."""
+    if not a or not b:
+        return True
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
 def latencies(items: dict, skip_first: bool = True) -> list[float]:
     """Per-item latency in insertion order; the first call pays the JIT load,
     so it is dropped by default."""
@@ -712,11 +934,17 @@ def load_category_labels() -> dict:
 
 
 def save_category_label(key: str, yes: Iterable[str], done: bool = True,
-                        missing: Iterable[str] = ()) -> dict:
+                        missing: Iterable[str] = (),
+                        pool: Optional[Iterable[str]] = None) -> dict:
     """`yes` = right categories from the vocabulary (scored). `missing` = right
     categories the owner added that the vocabulary LACKS: no model may emit
     them, so scoring them would charge every model the same miss. They are
-    kept as vocabulary-gap evidence instead (text_passes_eval report)."""
+    kept as vocabulary-gap evidence instead (text_passes_eval report).
+
+    `pool` = the checklist the owner was SHOWN. A term outside it was never
+    judged, so a model added later that emits it is not charged a false
+    positive for it (text_passes_eval scores it "unjudged"). Labels saved
+    before the pool was recorded have none; the report reconstructs it."""
     from .vocab_content import CONTENT_VOCABULARY
     vocab = set(CONTENT_VOCABULARY)
     yes = sorted(set(yes))
@@ -724,9 +952,12 @@ def save_category_label(key: str, yes: Iterable[str], done: bool = True,
     if bad:
         raise ValueError(f"not in the content vocabulary: {bad}")
     missing = sorted({" ".join(str(t).lower().split()) for t in missing} - vocab - {""})
+    entry = {"yes": yes, "missing": missing, "done": bool(done), "updated_at": now_iso()}
+    if pool is not None:
+        entry["pool"] = sorted((set(pool) & vocab) | set(yes))
+
     def put(data):
-        data[key] = {"yes": yes, "missing": missing, "done": bool(done),
-                     "updated_at": now_iso()}
+        data[key] = entry
         return data[key]
     return update_pass_file("text", "category_labels.json", {}, put)
 

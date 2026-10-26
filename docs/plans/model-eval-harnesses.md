@@ -659,3 +659,39 @@ soccer field). Worth adding before the next re-tag.
 | category-visual | minicpm-v-4_5 | qwen2.5-vl-7b |
 | category-content + keywords | google/gemma-4-12b-qat | llama-3.2-3b |
 | aesthetics | qwen2.5-vl-7b-instruct | unchanged (tie) |
+
+### Grading fixes (2026-10-25)
+
+A review found the reports trusted stale caches and graded loosely. Fixed offline,
+from stored data only (no model run):
+
+- **Spec hash.** New runs store `spec_hash` + per-part digests
+  (`model_eval.spec_parts`): the prompt the production builders build on a fixed
+  dummy input, the source of the guards/parsers (`describe_photo`,
+  `_description_problem`, `extract_*`, `category_grounding`, verify's parser and,
+  in pipeline mode, the CLIP stages), options and reasoning effort as sent. A
+  resume under another spec refuses (`--force-stale` appends, stays STALE). Every
+  stored run (09-26..28) predates this and the 10-06 guards / 10-18 grounding, so
+  **all are STALE** until re-run.
+- **Replayed with current guards.** Describe: today's `_description_problem` +
+  format screen on the cached texts — minicpm 1/70 bad as stored, **8/70 (11%)
+  replayed** (7 end mid-sentence), over the 10% screen. Text passes: the cached raw
+  answer through today's extractor (grounding, recitation, keyword guards; a retry
+  is assumed to repeat): category F1 unchanged to 2 places; minicpm keywords 5/70
+  now unusable.
+- **Unusable reasons are cached** (describe `unusable`, verify `stage: unusable`)
+  and count in every denominator.
+- **Summary headlines** over the full sample, with bootstrap CIs and ties.
+  Category = F1 (was precision): g12b 0.74 [0.71,0.76], minicpm 0.57 ≈ e4b 0.57,
+  **llama 0.39** (it was the precision pick at 0.828). Describe = right on the
+  ORIGINAL questions: qwenvl7b **0.50** (was 0.597). Verify = matched planted −
+  clean not passed.
+- **Category labels record the pool shown**; a tag outside it is unjudged. Old
+  labels reconstruct the pool from runs created before them; the stored column of
+  the time is unknown, so precision there is marked approximate (`~`).
+- **Verify `matched`**: shipped `flagged` nouns only, head-noun overlap,
+  yes/no/counts/generic words ignored, real errors scored over the matchable ones.
+  e2b-llm real matched 12/50 → **8/45**. Planted matched for e2b fell 0.25 → 0.20
+  partly because `verify._clean_wrong_item` clips "Off to one side sits a horse" to
+  "Off to one side" (cuts at "sits", keeps the wrong half): a production parser bug,
+  not fixed here.

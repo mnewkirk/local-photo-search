@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -206,7 +207,7 @@ def extract_one(pass_, text, nominal, extractor=None):
 
 
 def run_variant(pass_, variant, *, model=None, inputs_name="main", limit=None,
-                force=False, solo=False, extractor=None, log=print):
+                force=False, force_stale=False, solo=False, extractor=None, log=print):
     from photosearch import describe
     if pass_ not in PASSES:
         raise SystemExit(f"--pass must be one of {PASSES}")
@@ -216,9 +217,12 @@ def run_variant(pass_, variant, *, model=None, inputs_name="main", limit=None,
     me.pin_role_model("text", model)
     nominal = nominal_model(pass_)
     effective = describe.effective_model(model or nominal, "text")
-    run = me.open_run(pass_, variant, force=force, effective_model=effective,
-                      input_source=me.inputs_identity(inputs))
+    effort = me.sent_reasoning_effort(effective)
+    spec = me.make_spec(me.spec_parts(pass_, reasoning_effort=effort))
+    run = me.open_run(pass_, variant, force=force, spec=spec, force_stale=force_stale,
+                      effective_model=effective, input_source=me.inputs_identity(inputs))
     run.setdefault("model", model or nominal)
+    run.setdefault("reasoning_effort", effort)
     todo = [pid for pid in inputs["items"] if pid not in run["items"]]
     if limit is not None:
         todo = todo[:limit]
@@ -271,73 +275,6 @@ def stored_run(conn, pass_, inputs):
             "latency_label": "—"}
 
 
-def summarize(pass_, run, inputs):
-    items = run["items"]
-    n = len(items)
-    answered = {pid: it for pid, it in items.items() if not it.get("deferred")}
-    tags_n = unsup = unsup_len = 0
-    for pid, it in answered.items():
-        desc = inputs["items"].get(pid, {}).get("text", "")
-        for t in it["tags"]:
-            tags_n += 1
-            unsup += not supported(t, desc)
-            unsup_len += not supported(t, desc, lenient=True)
-    attempts = [a for it in items.values() for a in it.get("attempts") or []]
-    ok_lat = [a["elapsed_s"] for a in attempts if a.get("outcome") == "ok"]
-    row = {"pass": pass_, "variant": run.get("variant"),
-           "effective_model": run.get("effective_model"), "n": n,
-           "deferred": n - len(answered),
-           "attempts": len(attempts),
-           "timeouts": sum(1 for a in attempts if a.get("outcome") == "timeout"),
-           "lat_p50": me.median(ok_lat), "lat_p95": me.percentile(ok_lat, 0.95),
-           "tags": tags_n, "tags_per": tags_n / len(answered) if answered else None,
-           "unsupported": unsup, "unsupported_lenient": unsup_len,
-           "off_vocab": sum(it.get("off_vocab") or 0 for it in items.values()),
-           "latency_label": run.get("latency_label", "unknown")}
-    row.update(score_labels(pass_, answered, inputs))
-    return row
-
-
-def score_labels(pass_, answered, inputs):
-    """Precision + pooled recall (categories) or precision (keywords) over the
-    owner's done labels, and the describe-vs-text split of wrong categories."""
-    if pass_ == "category-content":
-        labels = me.load_category_labels()
-        tp = fp = fn = fp_desc = 0
-        labelled = 0
-        for pid, it in answered.items():
-            lab = labels.get(me.label_key(pid, it["text_sha"]))
-            if not lab or not lab.get("done"):
-                continue
-            labelled += 1
-            yes = set(lab["yes"])
-            got = set(it["tags"])
-            tp += len(got & yes)
-            fn += len(yes - got)
-            desc = inputs["items"].get(pid, {}).get("text", "")
-            for t in got - yes:
-                fp += 1
-                fp_desc += supported(t, desc, lenient=True)
-        return {"labelled": labelled, "tp": tp, "fp": fp, "fn": fn,
-                "fp_from_description": fp_desc}
-    labels = me.load_keyword_labels()
-    right = wrong = unjudged = labelled = 0
-    for pid, it in answered.items():
-        lab = labels.get(me.label_key(pid, it["text_sha"]))
-        if not lab or not lab.get("done"):
-            continue
-        labelled += 1
-        judged, bad = set(lab["judged"]), set(lab["wrong"])
-        for k in it["tags"]:
-            if k in bad:
-                wrong += 1
-            elif k in judged:
-                right += 1
-            else:
-                unjudged += 1
-    return {"labelled": labelled, "kw_right": right, "kw_wrong": wrong, "kw_unjudged": unjudged}
-
-
 def vocabulary_gaps(inputs_name="main"):
     """[(term, photos)] the owner marked right that the content vocabulary
     lacks — most frequent first. Evidence for growing the vocabulary; never
@@ -354,7 +291,209 @@ def vocabulary_gaps(inputs_name="main"):
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
-def build_report(*, db=None, inputs_name="main"):
+def summarize(pass_, run, inputs, pool_runs=()):
+    items = run["items"]
+    n = len(items)
+    answered = {pid: it for pid, it in items.items()
+                if not it.get("deferred") and it.get("tags") is not None}
+    tags_n = unsup = unsup_len = 0
+    for pid, it in answered.items():
+        desc = inputs["items"].get(pid, {}).get("text", "")
+        for t in it["tags"]:
+            tags_n += 1
+            unsup += not supported(t, desc)
+            unsup_len += not supported(t, desc, lenient=True)
+    attempts = [a for it in items.values() for a in it.get("attempts") or []]
+    ok_lat = [a["elapsed_s"] for a in attempts if a.get("outcome") == "ok"]
+    row = {"pass": pass_, "variant": run.get("variant"),
+           "effective_model": run.get("effective_model"), "n": n,
+           "n_full": len(inputs["items"]),
+           "deferred": n - len(answered),
+           "unusable": sum(1 for it in items.values() if it.get("unusable")),
+           "attempts": len(attempts),
+           "timeouts": sum(1 for a in attempts if a.get("outcome") == "timeout"),
+           "lat_p50": me.median(ok_lat), "lat_p95": me.percentile(ok_lat, 0.95),
+           "tags": tags_n, "tags_per": tags_n / len(answered) if answered else None,
+           "unsupported": unsup, "unsupported_lenient": unsup_len,
+           "off_vocab": sum(it.get("off_vocab") or 0 for it in items.values()),
+           "latency_label": run.get("latency_label", "unknown"),
+           "spec": me.spec_status(pass_, run)}
+    row.update(score_labels(pass_, run, inputs, pool_runs))
+    return row
+
+
+def _shown_pool(lab, pid, pool_runs):
+    """(pool, how) — the categories the owner was shown for this photo.
+
+    `recorded`: the label stores its pool (saved since 2026-10-25).
+    `reconstructed`: the label's yes-set plus the tags of every run created
+    before the label was saved. That covers every tag those runs emitted, but
+    the stored column on screen at the time is unknown, so a tag outside it
+    is unjudged AND makes the precision approximate."""
+    if lab.get("pool") is not None:
+        return set(lab["pool"]) | set(lab.get("yes") or []), "recorded"
+    at = lab.get("updated_at") or ""
+    pool = set(lab.get("yes") or [])
+    for r in pool_runs:
+        if r.get("created") and at and r["created"] <= at:
+            pool |= set(((r.get("items") or {}).get(pid) or {}).get("tags") or [])
+    return pool, "reconstructed"
+
+
+def score_labels(pass_, run, inputs, pool_runs=()):
+    """Owner-label scores over the FULL labelled sample: a labelled photo the
+    run deferred / found unusable / never cached scores as no tags (every
+    right category a miss), so a failure never raises a score. Returns the
+    pooled counts plus one record per labelled photo (for the bootstrap).
+
+    Categories: precision + pooled recall, the describe-vs-text split of
+    wrong ones, and `unjudged` — tags outside the checklist the owner saw,
+    excluded from precision (a model added after labelling is not charged
+    for terms nobody judged). Keywords: precision; `judged` was always
+    recorded, so unjudged is exact."""
+    items = run["items"]
+    pool_runs = list(pool_runs) or [run]      # a run's own tags were on screen
+
+    def got_of(pid):
+        it = items.get(pid) or {}
+        if it.get("deferred") or it.get("tags") is None:
+            return None
+        return set(it["tags"])
+
+    records = []
+    if pass_ == "category-content":
+        labels = me.load_category_labels()
+        fp_desc = 0
+        approx = False
+        for pid, inp in inputs["items"].items():
+            lab = labels.get(me.label_key(pid, inp["text_sha"]))
+            if not lab or not lab.get("done"):
+                continue
+            got = got_of(pid)
+            yes = set(lab["yes"])
+            pool, how = _shown_pool(lab, pid, pool_runs)
+            r = {"pid": pid, "answered": got is not None, "tp": 0, "fp": 0, "unjudged": 0,
+                 "fn": len(yes)}
+            if got is not None:
+                r["tp"], r["fn"] = len(got & yes), len(yes - got)
+                for t in got - yes:
+                    if t not in pool:
+                        r["unjudged"] += 1
+                        approx |= how == "reconstructed"
+                        continue
+                    r["fp"] += 1
+                    fp_desc += supported(t, inp.get("text", ""), lenient=True)
+            records.append(r)
+        out = {k: sum(r[k] for r in records) for k in ("tp", "fp", "fn", "unjudged")}
+        return {"labelled": len(records),
+                "answered_labelled": sum(r["answered"] for r in records),
+                **out, "fp_from_description": fp_desc, "precision_approx": approx,
+                "records": records}
+    labels = me.load_keyword_labels()
+    for pid, inp in inputs["items"].items():
+        lab = labels.get(me.label_key(pid, inp["text_sha"]))
+        if not lab or not lab.get("done"):
+            continue
+        got = got_of(pid)
+        judged, bad = set(lab["judged"]), set(lab["wrong"])
+        r = {"pid": pid, "answered": got is not None, "right": 0, "wrong": 0, "unjudged": 0}
+        for k in got or ():
+            if k in bad:
+                r["wrong"] += 1
+            elif k in judged:
+                r["right"] += 1
+            else:
+                r["unjudged"] += 1
+        records.append(r)
+    return {"labelled": len(records), "answered_labelled": sum(r["answered"] for r in records),
+            "kw_right": sum(r["right"] for r in records),
+            "kw_wrong": sum(r["wrong"] for r in records),
+            "kw_unjudged": sum(r["unjudged"] for r in records), "records": records}
+
+
+def category_scores(records):
+    """(precision, pooled recall, F1) from per-photo category records."""
+    tp = sum(r["tp"] for r in records)
+    fp = sum(r["fp"] for r in records)
+    fn = sum(r["fn"] for r in records)
+    p = tp / (tp + fp) if tp + fp else None
+    rc = tp / (tp + fn) if tp + fn else None
+    f1 = 2 * p * rc / (p + rc) if p and rc else (0.0 if p is not None and rc is not None else None)
+    return p, rc, f1
+
+
+def category_f1(records):
+    return category_scores(records)[2]
+
+
+def keyword_photo_precision(records):
+    """Mean per-photo keyword precision over the full labelled sample; a
+    photo with no usable answer scores 0 (one with only unjudged keywords is
+    skipped — there is nothing to score)."""
+    vals = []
+    for r in records:
+        if not r["answered"]:
+            vals.append(0.0)
+        elif r["right"] + r["wrong"]:
+            vals.append(r["right"] / (r["right"] + r["wrong"]))
+    return sum(vals) / len(vals) if vals else None
+
+
+# --------------------------------------------------------------------------
+# Replay: today's guards on the cached answers
+# --------------------------------------------------------------------------
+
+@contextmanager
+def _canned_answer(raw):
+    """Every production text call returns `raw` — the retry included, so a
+    replay assumes the model would answer the same way twice. No model, no
+    network."""
+    real_chat, real_has = describe._text_chat_with_retry, describe.HAS_OLLAMA
+    describe._text_chat_with_retry = lambda *a, **kw: raw
+    describe.HAS_OLLAMA = True
+    try:
+        yield
+    finally:
+        describe._text_chat_with_retry, describe.HAS_OLLAMA = real_chat, real_has
+
+
+def replay_item(pass_, description, item):
+    """The cached RAW answer run through the CURRENT production extractor
+    (category grounding + recitation / runaway guards, or the keyword
+    guards): {"tags", "unusable"}, or None when there is nothing to replay (a
+    deferral, the stored pseudo-variant)."""
+    raw = item.get("raw")
+    if raw is None:
+        return None
+    fn = (describe.extract_categories_from_description if pass_ == "category-content"
+          else describe.extract_keywords_from_description)
+    with _canned_answer(raw):
+        try:
+            tags = fn(description, model="replay")
+        except describe.UnusableAnswer as e:
+            return {"tags": None, "deferred": True, "unusable": str(e)}
+    if tags is None:
+        return None
+    return {"tags": list(tags), "deferred": False, "unusable": None}
+
+
+def replay_run(pass_, run, inputs):
+    """A copy of `run` with every replayable item re-judged by today's code,
+    or None when nothing could be replayed."""
+    items, replayed = {}, 0
+    for pid, it in run["items"].items():
+        rep = replay_item(pass_, inputs["items"].get(pid, {}).get("text", ""), it)
+        if rep is None:
+            items[pid] = it
+            continue
+        replayed += 1
+        items[pid] = {**it, **rep, "off_vocab": it.get("off_vocab")}
+    if not replayed:
+        return None
+    return {**run, "items": items, "replayed": replayed}
+
+
+def build_report(*, db=None, inputs_name="main", replay=True):
     inputs = me.load_inputs(inputs_name)
     if inputs is None:
         return []
@@ -364,14 +503,42 @@ def build_report(*, db=None, inputs_name="main"):
     for pass_ in PASSES:
         runs = [me.load_run(pass_, v) for v in me.list_variants(pass_)]
         runs = [r for r in runs if r.get("input_source") == ident]
+        pool_runs = list(runs)
         if conn is not None and inputs.get("source") == me.STORED:
             runs.append(stored_run(conn, pass_, inputs))
-        rows += [summarize(pass_, r, inputs) for r in runs]
+        for r in runs:
+            row = summarize(pass_, r, inputs, pool_runs)
+            rep = replay_run(pass_, r, inputs) if replay else None
+            if rep is not None:
+                g = summarize(pass_, rep, inputs, pool_runs)
+                row["replay"] = {k: g[k] for k in (
+                    "deferred", "unusable", "tags", "tags_per", "labelled", "answered_labelled",
+                    "tp", "fp", "fn", "unjudged", "kw_right", "kw_wrong", "kw_unjudged",
+                    "records", "precision_approx") if k in g}
+                row["replay"]["replayed"] = rep["replayed"]
+            rows.append(row)
     return rows
 
 
 def _f(v, d=2):
     return "—" if v is None else f"{v:.{d}f}"
+
+
+def _label_cols(pass_, r):
+    """The owner-label columns for one row (raw or replayed)."""
+    rec = r.get("records") or []
+    if pass_ == "category-content":
+        p, rc, f1 = category_scores(rec)
+        ci = me.bootstrap_ci(rec, category_f1)
+        return (f"{r['answered_labelled']:>3}/{r['labelled']:<3} "
+                f"{_f(p):>5}{'~' if r.get('precision_approx') else ' '} {_f(rc):>6} "
+                f"{_f(f1):>5} {('[' + _f(ci[0]) + ',' + _f(ci[1]) + ']') if ci else '—':>11} "
+                f"{r['unjudged']:>8}")
+    prec = r["kw_right"] / (r["kw_right"] + r["kw_wrong"]) if r["kw_right"] + r["kw_wrong"] else None
+    pp = keyword_photo_precision(rec)
+    ci = me.bootstrap_ci(rec, keyword_photo_precision)
+    return (f"{r['answered_labelled']:>3}/{r['labelled']:<3} {_f(prec):>9} {_f(pp):>9} "
+            f"{('[' + _f(ci[0]) + ',' + _f(ci[1]) + ']') if ci else '—':>11} {r['kw_unjudged']:>8}")
 
 
 def render(rows):
@@ -386,30 +553,45 @@ def render(rows):
                    f"{'unsupp':>6} {'lenient':>7} {'offvoc':>6}  latency")
         for r in rs:
             to = (f"{100 * r['timeouts'] / r['attempts']:.1f}" if r["attempts"] else "—")
+            tag = me.stale_tag(r.get("spec"))
             out.append(
                 f"{str(r['variant']):<16} {str(r['effective_model'])[:26]:<26} {r['n']:>3} "
                 f"{me.fmt_ratio(r['deferred'], r['n']):>5} {to:>15} "
                 f"{_f(r['lat_p50'], 1) + '/' + _f(r['lat_p95'], 1):>11} {_f(r['tags_per'], 1):>9} "
                 f"{me.fmt_ratio(r['unsupported'], r['tags']):>6} "
                 f"{me.fmt_ratio(r['unsupported_lenient'], r['tags']):>7} {r['off_vocab']:>6}  "
-                f"{r['latency_label']}")
+                f"{r['latency_label']}{'   ' + tag if tag else ''}")
         lab = [r for r in rs if r.get("labelled")]
         if lab and pass_ == "category-content":
-            out.append(f"  {'variant':<16} {'labelled':>8} {'precision':>9} "
-                       f"{'pooled recall':>13} {'wrong: desc said so / text model':>34}")
+            out.append(f"  {'variant':<16} {'':<9} {'ans/lab':>7} {'prec':>6} {'recall':>6} "
+                       f"{'F1':>5} {'F1 95% CI':>11} {'unjudged':>8} "
+                       f"{'wrong: desc said so / text model':>34}")
             for r in lab:
-                out.append(f"  {str(r['variant']):<16} {r['labelled']:>8} "
-                           f"{me.fmt_ratio(r['tp'], r['tp'] + r['fp']):>9} "
-                           f"{me.fmt_ratio(r['tp'], r['tp'] + r['fn']):>13} "
+                out.append(f"  {str(r['variant']):<16} {'as run':<9} {_label_cols(pass_, r)} "
                            f"{r['fp_from_description']:>17} / {r['fp'] - r['fp_from_description']:<16}")
+                if r.get("replay"):
+                    g = r["replay"]
+                    out.append(f"  {'':<16} {'replayed':<9} {_label_cols(pass_, g)}   "
+                               f"unusable now {g['unusable']}, tags/desc {_f(g['tags_per'], 1)}")
             out.append("  pooled recall = recall against every category ANY model proposed "
-                       "plus those the owner added — not true recall.")
+                       "plus those the owner added — not true recall. Unanswered labelled photos "
+                       "count as all misses. unjudged = tags outside the checklist the owner saw "
+                       "(excluded from precision); prec~ = that checklist was reconstructed "
+                       "(label predates recorded pools), so precision is approximate. replayed = "
+                       "the cached raw answer re-judged with CURRENT guards (category_grounding."
+                       "ground, recitation/runaway checks; a retry is assumed to repeat the "
+                       "answer).")
         elif lab:
-            out.append(f"  {'variant':<16} {'labelled':>8} {'precision':>9} {'unjudged':>8}")
+            out.append(f"  {'variant':<16} {'':<9} {'ans/lab':>7} {'precision':>9} "
+                       f"{'per-photo':>9} {'95% CI':>11} {'unjudged':>8}")
             for r in lab:
-                out.append(f"  {str(r['variant']):<16} {r['labelled']:>8} "
-                           f"{me.fmt_ratio(r['kw_right'], r['kw_right'] + r['kw_wrong']):>9} "
-                           f"{r['kw_unjudged']:>8}")
+                out.append(f"  {str(r['variant']):<16} {'as run':<9} {_label_cols(pass_, r)}")
+                if r.get("replay"):
+                    g = r["replay"]
+                    out.append(f"  {'':<16} {'replayed':<9} {_label_cols(pass_, g)}   "
+                               f"unusable now {g['unusable']}")
+            out.append("  per-photo = mean keyword precision per labelled photo, an unanswered "
+                       "photo scoring 0. replayed = re-judged with CURRENT keyword guards.")
         out.append("")
     gaps = vocabulary_gaps()
     if gaps:
@@ -417,10 +599,11 @@ def render(rows):
                    "by photos): " + ", ".join(f"{t} ({n})" for t, n in gaps[:30]))
         out.append("")
     out.append(f"defer = extractor returned None (timed out every attempt at the {TEXT_TIMEOUT_S}s "
-               "limit): production retries the photo later. unsupp = share of tags with no "
-               "word in the description — a SCREEN, not a verdict: abstract categories "
-               "(landscape, natural beauty) are often fair inferences. The owner labels "
-               "decide.")
+               "limit) or the answer was unusable: production retries the photo later. unsupp = "
+               "share of tags with no word in the description — a SCREEN, not a verdict: "
+               "abstract categories (landscape, natural beauty) are often fair inferences. The "
+               f"owner labels decide. {me.STALE} = the run's spec hash (production prompt + "
+               "guards + options) is missing or differs from the current code.")
     return "\n".join(out)
 
 
@@ -442,6 +625,9 @@ def main(argv=None):
     r.add_argument("--inputs", default="main")
     r.add_argument("--limit", type=int)
     r.add_argument("--force", action="store_true")
+    r.add_argument("--force-stale", action="store_true",
+                   help="append to a run cached under a different production spec "
+                        "(it stays marked STALE)")
     r.add_argument("--solo", action="store_true")
     p = sub.add_parser("report")
     p.add_argument("--db", default=db_default)
@@ -453,7 +639,8 @@ def main(argv=None):
               f"→ inputs {data['name']!r}")
     elif args.cmd == "run":
         run_variant(args.pass_, args.variant, model=args.model, inputs_name=args.inputs,
-                    limit=args.limit, force=args.force, solo=args.solo)
+                    limit=args.limit, force=args.force, force_stale=args.force_stale,
+                    solo=args.solo)
     else:
         print(render(build_report(db=args.db, inputs_name=args.inputs)))
 

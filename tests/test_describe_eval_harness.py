@@ -168,3 +168,72 @@ def test_report_includes_stored_with_its_model(tmp_path, monkeypatch):
     assert stored["text_n"] == 1 and stored["text_recall"] == 1.0
     run = D.stored_run(me.open_db_readonly(db))
     assert run["items"]["1"]["stored_model"] == "qwen/qwen3.5-9b"
+
+
+CUT = "A sailboat with a white sail glides across a calm blue bay under a clear sky and"
+
+
+def test_unusable_answers_are_cached_with_their_reason(tmp_path, monkeypatch):
+    _setup(tmp_path, [1, 2])
+    _chat(monkeypatch, [CUT, CUT, CUT, CUT,     # 1: cut off every time, llava too
+                        ""])                    # 2: empty
+    run = D.run_variant("v", model="gemma", log=lambda *_: None)
+    one, two = run["items"]["1"], run["items"]["2"]
+    assert one["text"] is None and "ends mid-sentence" in one["unusable"]
+    assert two["text"] is None and two["unusable"] == "not a description"
+    r = D.summarize(run, use_clip=False)
+    assert r["unusable_reasons"] == {"describe: ends mid-sentence": 1, "not a description": 1}
+    # An old run's bare null still loads.
+    old = {"variant": "o", "items": {"1": {"text": None}}}
+    assert D.summarize(old, use_clip=False)["unusable_reasons"] == {"reason not recorded": 1}
+
+
+def test_run_records_spec_and_refuses_a_stale_resume(tmp_path, monkeypatch):
+    _setup(tmp_path, [1, 2])
+    _chat(monkeypatch, [GOOD])
+    run = D.run_variant("v", model="gemma", limit=1, log=lambda *_: None)
+    assert run["spec_hash"] and me.spec_status("describe", run)["stale"] is False
+    monkeypatch.setattr(describe, "DESCRIBE_PROMPT", describe.DESCRIBE_PROMPT + " Be brief.")
+    with pytest.raises(SystemExit, match="changed: prompt"):
+        D.run_variant("v", model="gemma", log=lambda *_: None)
+    assert me.spec_status("describe", me.load_run("describe", "v"))["why"] == \
+        "spec changed: prompt"
+    _chat(monkeypatch, [GOOD])
+    run = D.run_variant("v", model="gemma", force_stale=True, log=lambda *_: None)
+    assert set(run["items"]) == {"1", "2"} and me.spec_status("describe", run)["stale"]
+    assert "STALE" in D.render([D.summarize(run, use_clip=False)])
+
+
+def test_report_replays_current_guards_over_cached_texts():
+    """A text cached before `ends mid-sentence` existed is bad today."""
+    run = {"variant": "v", "effective_model": "m", "items": {
+        str(i): {"text": CUT if i < 2 else GOOD, "latency_s": 1.0} for i in range(10)}}
+    r = D.summarize(run, use_clip=False)
+    assert r["bad"] == 0 and not r["screen_out"]                 # as stored
+    assert r["replay_bad"] == 2 and r["replay_screen_out"]       # 20% > 10%
+    assert r["replay_reasons"] == {"ends mid-sentence": 2}
+    # Format problems count in the stored screen AND in the summary's bad count.
+    run["items"]["5"]["text"] = "**Search Index Description:** " + GOOD
+    r = D.summarize(run, use_clip=False)
+    assert r["format"] == 1 and r["bad"] == D.bad_outputs(r) == 1
+    assert "replayed" in D.render([r])
+
+
+def test_fair_score_uses_original_questions_and_charges_unanswered_photos():
+    a, b = me.text_sha(GOOD), me.text_sha("Other text.")
+    me.save_disputes({
+        "1": {"shas": [a, b], "questions": [
+            {"key": "q1", "question": "Boat?", "answers": {a: "sailboat", b: "canoe"}},
+            {"key": "q2", "question": "Dock?", "answers": {a: "yes", b: None},
+             "added_by": "v"}]},
+        "2": {"shas": [b], "questions": [
+            {"key": "q3", "question": "Sky?", "answers": {b: "clear"}}]}})
+    for k, c in (("q1", ["canoe"]), ("q2", ["yes"]), ("q3", ["clear"])):
+        me.save_dispute_label(k, c)
+    items = {"1": {"text": GOOD, "text_sha": a}, "2": {"text": None}}
+    t = D.dispute_tally(items)
+    assert (t["disp_right"], t["disp_wrong"], t["disp_orig_right"], t["disp_orig_wrong"]) == \
+        (1, 1, 0, 1)
+    # Photo 2 is unanswered: its one original question counts as wrong.
+    assert D.fair_score(t["disp_records"], original=True) == 0.0
+    assert D.fair_score(t["disp_records"], original=False) == pytest.approx(1 / 3)

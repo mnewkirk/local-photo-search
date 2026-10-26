@@ -185,3 +185,78 @@ def test_rebuild_keeps_confirmations_for_unchanged_plants():
             me.confirm_planted(it["id"], True)
     again = V.build_sets("src")
     assert all(it["confirmed"] is True for it in again["items"] if it["kind"] == "planted")
+
+
+@pytest.mark.parametrize("flag,spans", [
+    ("a visible thermometer", ["wooden structure/post"]),       # raw said "...on its post"
+    ("Two children", ["red collar and striped", "gravel path"]),
+    ("one", ["blue"]),
+    ("a backpack", ["contains 'coast 4u'", "purple top"]),
+    ("the photo", ["yes"]),
+    ("two dogs", ["two"]),
+])
+def test_matched_rejects_spurious_word_overlaps(flag, spans):
+    assert not V.matched({"flagged": [flag], "raw_wrong": [f"{flag} on its post, yes"]}, spans)
+
+
+@pytest.mark.parametrize("flag,spans", [
+    ("a lighthouse", ["with a lighthouse behind him."]),
+    ("four children", ["four children"]),
+    ("green slide", ["green slide"]),
+    ("open mouth", ["mouth open as if speaking"]),
+    ("A person wearing dark clothing", ["a person", "gravel"]),
+])
+def test_matched_accepts_a_flag_naming_the_error(flag, spans):
+    assert V.matched({"flagged": [flag], "raw_wrong": []}, spans)
+
+
+def test_matched_ignores_raw_sentences_and_unmatchable_spans():
+    # Only the shipped flag counts — not the WRONG: sentence it was cut from.
+    assert not V.matched({"flagged": [], "raw_wrong": ["a horse sits here"]}, ["horse"])
+    assert V.matchable(["small branch"]) and not V.matchable(["yes", "five", "no"])
+
+
+def _scored_sets():
+    _describe_run()
+    data = V.build_sets("src")
+    for it in data["items"]:
+        if it["kind"] == "planted":
+            me.confirm_planted(it["id"], True)
+    return me.load_verify_sets()
+
+
+def test_failed_and_missing_items_stay_in_the_denominators(monkeypatch):
+    sets = _scored_sets()
+    items = {it["id"]: it for it in V.scored_items(sets)}
+    run = {"variant": "v", "effective_model": "m", "mode": "llm", "items": {}}
+    for iid, it in items.items():
+        if it["kind"] == "planted":
+            run["items"][iid] = {"stage": "confirmed", "flagged": list(it["spans"]),
+                                 "raw_wrong": [], "latency_s": 1.0}
+    run["items"]["clean-1"] = {"stage": "unusable", "unusable": "cut off", "flagged": [],
+                               "raw_wrong": []}
+    run["items"]["clean-2"] = {"stage": "confirmed", "flagged": ["the park", "a slide"],
+                               "raw_wrong": [], "latency_s": 1.0}
+    r = V.summarize(run, sets)                 # clean-3 and real-4 never cached
+    assert r["planted"] == [3, 3, 3] and r["clean"] == [3, 1] and r["real"] == [1, 0, 0]
+    assert r["failed"]["clean"] == 1 and r["missing"] == {"clean": 1, "planted": 0, "real": 1}
+    assert r["clean_flags"] == 2
+    # 3/3 matched catch − 3/3 clean not passed (flagged, failed, never run).
+    assert V.headline(r["records"]) == pytest.approx(0.0)
+    text = V.render(sets, [r])
+    assert "flags/clean" in text and "STALE" in text
+
+
+def test_an_unusable_verdict_is_cached_and_the_run_records_spec(monkeypatch):
+    _scored_sets()
+
+    def cut(*a, **kw):
+        raise describe.TruncatedOutput("verify: cut off", text="WRONG: a")
+    monkeypatch.setattr(describe, "_ollama_chat_with_retry", cut)
+    run = V.run_variant("e2b", model="google/gemma-4-e2b", log=lambda *_: None)
+    assert run["items"] and all(r["stage"] == "unusable" for r in run["items"].values())
+    assert run["spec_hash"] and not me.spec_status("verify", run)["stale"]
+    from photosearch import verify
+    monkeypatch.setattr(verify, "VERIFY_PROMPT", "Changed: {description}")
+    with pytest.raises(SystemExit, match="changed: prompt"):
+        V.run_variant("e2b", model="google/gemma-4-e2b", log=lambda *_: None)
