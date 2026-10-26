@@ -365,3 +365,22 @@ def test_sheet_writes_html_naming_the_tag_with_keywords_and_predictions(tmp_path
         U.main(["sheet", "--tag", "not-a-tag"])
     with pytest.raises(SystemExit):
         U.main(["sheet", "--tag", "harsh-light"])      # nobody in the fake set
+
+
+def test_report_carries_recite_all_and_a_same_budget_constant_baseline():
+    """Positive-only labels: reciting the vocabulary is recall 1.00, so a
+    variant's recall only means something against an answer of its size."""
+    sample = _hand_sample()
+    two = {pid: ["overcast", "colorful"] for pid in sample["photos"]}
+    report = U.build_report({"v": two}, sample)
+    assert report["results"]["baseline:recite-all"]["overall"]["recall"] == 1.0
+    # Budget 2 -> the two perceived tags with the most positives.
+    assert report["baseline_tags"]["baseline:top2"] == ["overcast", "sunny"]
+    b = report["vs_budget"]["v"]
+    assert b["k"] == 2
+    # overcast 4 + sunny 2 found of 4+2+1+1 perceived positives (action not offered).
+    assert b["baseline_recall"] == pytest.approx(6 / 8)
+    assert "baseline:" not in "".join(report["variants"])
+    text = U.render_text(report)
+    assert "RANK ANSWERS OF THE SAME SIZE" in text
+    assert "baseline:recite-all" in text and "(top2), Δ" in text

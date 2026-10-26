@@ -357,8 +357,13 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
     owner._pin_model(model)
     nominal = model or describe.TAGS_MODEL
     effective = describe.effective_model(nominal, "visual")
+    # Same rule as the owner harness: no --prompt-file = the LIVE production
+    # prompt, hashed; plus the guard/parser source, so a resume after a
+    # describe.py edit is refused instead of mixing two experiments.
     prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:12] \
-        if prompt_text is not None else None
+        if prompt_text is not None else owner.production_prompt_sha()
+    code_sha = owner.guard_parser_sha()
+    settings = owner.run_settings(nominal, effective)
 
     extra_vocab = sorted(set(extra_vocab))
     unknown = [t for t in extra_vocab if t not in store.CANDIDATE_TAGS]
@@ -374,8 +379,11 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
         # One variant = one (model, prompt). Resuming under a different one
         # would mix two experiments in a file that reports as one.
         for key, now in (("effective_model", effective), ("prompt_sha", prompt_sha),
-                         ("extra_vocab", extra_vocab)):
-            if (run.get(key) or ([] if key == "extra_vocab" else None)) != now:
+                         ("extra_vocab", extra_vocab), ("code_sha", code_sha),
+                         ("temperature", settings["temperature"]),
+                         ("reasoning_effort", settings["reasoning_effort"])):
+            then = (run.get(key) or []) if key == "extra_vocab" else run.get(key)
+            if then != now:
                 raise SystemExit(
                     f"variant {variant!r} was run with {key}={run.get(key)!r}, "
                     f"now {now!r}. Use a new --variant name, or --force to "
@@ -383,6 +391,8 @@ def run_variant(variant, *, model=None, prompt_text=None, prompt_file=None,
     else:
         run = {"variant": variant, "model": nominal, "effective_model": effective,
                "prompt_file": prompt_file, "prompt_sha": prompt_sha,
+               "prompt_source": "file" if prompt_text is not None else "production",
+               "code_sha": code_sha, **settings,
                "extra_vocab": extra_vocab, "pixels": "unsplash-thumb-400px",
                "created": datetime.now(timezone.utc).isoformat(),
                "predictions": {}}
@@ -512,12 +522,51 @@ def sample_positives(sample):
     return counts
 
 
+BASELINE_PREFIX = "baseline:"
+
+
+def constant_answer(sample, k):
+    """The k perceived tags with the most positives in the sample — the best
+    a k-tag answer that never looks at the photo can do on recall here."""
+    pos = sample_positives(sample)
+    ranked = sorted((t for t in pos if t in _PERCEIVED and pos[t]),
+                    key=lambda t: (-pos[t], t))
+    return ranked[:k]
+
+
+def budget(avg_tags):
+    """A variant's tag budget: its mean tags per answered photo, rounded."""
+    return None if avg_tags is None else int(round(avg_tags))
+
+
 def build_report(variant_predictions, sample=None, extras=None):
+    """Variants plus the two baselines a recall-only set needs: `recite-all`
+    (recall 1.00 by construction — what recall alone rewards) and a constant
+    top-k answer at each variant's own budget k. Recall is only comparable
+    between answers of the SAME size, so each variant is also shown against
+    the constant answer of its size."""
     sample = load_sample() if sample is None else sample
+    results = {name: score(pred, sample, (extras or {}).get(name, ()))
+               for name, pred in variant_predictions.items()}
+    pids = list(sample["photos"])
+    baselines = {f"{BASELINE_PREFIX}recite-all": list(PERCEIVED_VOCABULARY)}
+    for name in variant_predictions:
+        k = budget(results[name]["avg_tags"])
+        if k:
+            baselines.setdefault(f"{BASELINE_PREFIX}top{k}", constant_answer(sample, k))
+    base_results = {name: score({pid: list(tags) for pid in pids}, sample)
+                    for name, tags in baselines.items()}
+    vs_budget = {}
+    for name in variant_predictions:
+        k = budget(results[name]["avg_tags"])
+        ref = base_results.get(f"{BASELINE_PREFIX}top{k}") if k else None
+        vs_budget[name] = {"k": k, "baseline_recall":
+                           ref["overall"]["recall"] if ref else None}
     return {"variants": list(variant_predictions), "sampled": len(sample["photos"]),
             "positives": sample_positives(sample),
-            "results": {name: score(pred, sample, (extras or {}).get(name, ()))
-                        for name, pred in variant_predictions.items()}}
+            "results": {**results, **base_results},
+            "baselines": list(baselines), "baseline_tags": baselines,
+            "vs_budget": vs_budget}
 
 
 def _tag_order(report):
@@ -535,15 +584,27 @@ def report_tables(report):
     tables = []
 
     rows = []
-    for n in names:
+    budgets = report.get("vs_budget", {})
+    for n in names + report.get("baselines", []):
         r = res[n]
         avg = "—" if r["avg_tags"] is None else f"{r['avg_tags']:.2f}"
         o = r["overall"]
+        b = budgets.get(n)
+        if b and b["baseline_recall"] is not None and o["recall"] is not None:
+            at_k = (f"{b['baseline_recall']:.2f} (top{b['k']}), "
+                    f"Δ {o['recall'] - b['baseline_recall']:+.2f}")
+        elif n in budgets:
+            at_k = "—"
+        else:
+            at_k = ", ".join(report["baseline_tags"][n]) \
+                if len(report["baseline_tags"][n]) <= 5 else "all perceived"
         rows.append([n, r["photos_scored"], r["unanswered"], avg,
                      fmt_ratio(o["found"], o["scored"]),
-                     fmt_ratio(o["contradiction"], o["scored"])])
-    tables.append(("Overall", ["variant", "photos", "unanswered", "tags/photo",
-                               "recall (all tags)", "contradiction"], rows))
+                     fmt_ratio(o["contradiction"], o["scored"]), at_k])
+    tables.append(("Overall (baseline rows answer the same tags on every photo)",
+                   ["variant", "photos", "unanswered", "tags/photo",
+                    "recall (all tags)", "contradiction",
+                    "constant answer of the same size: recall, Δ / baseline tags"], rows))
 
     head = ["tag", "positives"]
     for n in names:
@@ -567,7 +628,11 @@ _HEADER = ("RECALL ONLY. Photographer keywords are positive-only labels: a photo
            "without a keyword is not a \"no\", so NO PRECISION is reported here — "
            "the owner-labelled set is the one that measures it. Pixels are 400-px "
            "Unsplash thumbs, not the fleet's 1024-px encode, so these numbers are "
-           "not comparable to the owner-set numbers, only to each other.")
+           "not comparable to the owner-set numbers, only to each other. "
+           "Reciting the whole vocabulary scores recall 1.00 (baseline:recite-all), "
+           "so recall here can only RANK ANSWERS OF THE SAME SIZE: read each "
+           "variant's recall against the constant answer with its own tags/photo "
+           "(the last column), never on its own.")
 
 
 def render_text(report):
@@ -632,9 +697,11 @@ def cmd_report(args):
                              f"(have: {', '.join(list_variants()) or 'none'}).")
         preds[name] = predictions_of(run)
         extras[name] = run.get("extra_vocab") or []
+        st = owner.run_staleness(run)
         print(f"[report] {name}: model={run.get('effective_model')} "
               f"prompt={run.get('prompt_file') or 'production'} "
-              f"({len(run['predictions'])} cached)")
+              f"({len(run['predictions'])} cached)"
+              + (f"  STALE ({st['prompt']}; guard/parser {st['code']})" if st["stale"] else ""))
     if not preds:
         raise SystemExit("Nothing to report — no runs cached.")
     report = build_report(preds, sample, extras=extras)

@@ -163,3 +163,68 @@ def test_one_vlm_per_process_on_the_lmstudio_route(monkeypatch):
                                      "--photos-dir", "."])
     with pytest.raises(SystemExit, match="One --vlm per process"):
         B.main()
+
+
+def test_score_vlm_stores_dimension_and_sub_scores_and_old_entries_still_read(tmp_path):
+    def scorer(path, model):
+        describe._ollama_chat_with_retry(model=model, messages=[], role="aesthetics")
+        return {"overall": 6.5, "dim_scores": {"technical": 7.0},
+                "sub_scores": {"sharpness": 7.5}, "critiques": {"technical": "ok"}}
+
+    import photosearch.describe as d
+    orig = d._ollama_chat_with_retry
+    d._ollama_chat_with_retry = lambda *a, **kw: '{"x": 1}'
+    try:
+        entry = B.score_vlm("m", [("a.jpg", str(tmp_path / "a.jpg"))], {"items": {}},
+                            scorer=scorer, log=lambda *_: None)
+    finally:
+        d._ollama_chat_with_retry = orig
+    item = entry["items"]["a.jpg"]
+    assert item["overall"] == 6.5
+    assert item["dim_scores"] == {"technical": 7.0}
+    assert item["sub_scores"] == {"sharpness": 7.5}
+    assert "critiques" not in item                       # scores only
+    # An entry from before the breakdowns were stored still summarises.
+    old = {"items": {"a": {"overall": 7.0, "first_parse_ok": True, "latency_s": 1.0}}}
+    assert B.vlm_summary(old, {})["n"] == 1
+
+
+def test_ground_truth_ranks_reports_missing_and_duplicate_ranks(tmp_path):
+    p = tmp_path / "r.csv"
+    p.write_text("filename,rank\na,1\nb,2\nc,4\nd,4\ne,6\n")
+    info = B.ground_truth_ranks(str(p))
+    assert info["n"] == 5 and info["missing"] == [3, 5] and info["duplicates"] == [4]
+    assert B.ground_truth_ranks(str(tmp_path / "nope.csv")) is None
+
+
+def test_baseline_scores_read_file_size_and_resolution(tmp_path):
+    from PIL import Image
+    small, big = tmp_path / "s.jpg", tmp_path / "b.jpg"
+    Image.new("RGB", (100, 50)).save(small)
+    Image.new("RGB", (400, 300), (200, 10, 10)).save(big)
+    b = B.baseline_scores([("s", str(small)), ("b", str(big))])
+    assert b["baseline:megapixels"] == {"s": pytest.approx(0.005), "b": pytest.approx(0.12)}
+    assert b["baseline:file-size"]["b"] > b["baseline:file-size"]["s"]
+
+
+def test_gt_analysis_splits_halves_and_marks_ties():
+    names = [f"p{i}" for i in range(12)]
+    gt = {n: -i for i, n in enumerate(names)}            # p0 best
+    perfect = {n: -i for i, n in enumerate(names)}
+    # Right on the bottom half only: the headline ρ hides a random top half.
+    tail = {n: (v if i >= 6 else [3, -5, 1, 0, -2, 4][i])
+            for i, (n, v) in enumerate(perfect.items())}
+    analysis = B.gt_analysis({"perfect": perfect, "tail": tail,
+                              "baseline:size": tail}, gt, reference="perfect", n_boot=300)
+    r = analysis["rows"]
+    assert analysis["halves"] == (6, 6) and analysis["best_baseline"] == "baseline:size"
+    assert r["perfect"]["rho"] == pytest.approx(1.0) and r["perfect"]["top"] == pytest.approx(1.0)
+    assert r["tail"]["bottom"] == pytest.approx(1.0) and r["tail"]["top"] < 0.5
+    assert r["perfect"]["vs_reference"] is None
+    # Identical scorers can never be told apart.
+    assert B._tie(r["tail"]["vs_best_baseline"]).startswith("TIE")
+    lo, hi = r["tail"]["ci"]
+    assert lo <= r["tail"]["rho"] <= hi
+    lines = B.gt_analysis_lines(analysis, {"n": 12, "ranks": list(range(1, 13)),
+                                           "missing": [], "duplicates": []}, {})
+    assert any("NO stored results" in line for line in lines)

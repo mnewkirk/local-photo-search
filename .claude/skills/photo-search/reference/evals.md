@@ -37,7 +37,30 @@ Traps these exist to catch — don't undo them:
   The verify model must not be the describe model — `run` refuses.
 - Pixels come from a local **originals cache** (`fetch-originals`), so neither a
   run nor the labelling page depends on the NAS staying up.
+- **A run records the production spec it measured** (`model_eval.spec_parts` →
+  `make_spec`: the prompt the real builders produce, guard/parser source,
+  options, reasoning effort as sent). Resuming under a different spec refuses
+  (`--force-stale` appends and stays STALE); every report and the summary mark
+  a run whose hash is missing or differs as **STALE**. All runs before
+  2026-10-25 are STALE. Reports also **replay current guards** over cached
+  outputs (describe `_description_problem`; text passes re-run the extractor
+  on the cached raw answer). Headlines in `model_eval_summary.py` are over the
+  full sample with a seeded per-photo bootstrap CI; `≈` = tie with the best,
+  and no Pareto star on a lead inside the CI. Category labels record the pool
+  shown; tags outside it are unjudged. Verify `matched` uses shipped `flagged`
+  nouns by head noun only. History: docs/plans/model-eval-harnesses.md
+  ("Grading fixes (2026-10-25)").
 
 ### Ask prompt eval (`evals/ask_eval/`)
 
 Before/after check for trimming the Ask agent's ~11.7k-token prompt (system prompt + tool list); runbook in `evals/ask_eval/README.md`. `harness.py run` refuses while the worker fleet is busy (local worker pids, worker containers, NAS active claims; fails closed) and has no override. `measure` calls no model.
+
+### Visual-tag + aesthetics eval statistics (`visual_tags_eval.py`, `visual_tags_unsplash.py`, `aesthetics_bakeoff.py`)
+
+- **A constant answer is the bar.** `report` adds `baseline:top1..3` (most-labelled tags on every photo), `recite-all` and `empty`; on the 60 labels `colorful, soft-light, sunny` scores micro-F1 0.517 and only the shipped prompt on minicpm (attrD) beats it (paired-bootstrap CI above 0). Read the "verdict" column, not P/R alone.
+- **Rows compare only on one photo set**: by default every variant is scored on the intersection of cached photos (`--all-photos` opts out, with a warning). F1/macro/CIs are perceived-vocabulary only; macro averages tags with >= 5 positives.
+- **STALE**: a run records `prompt_sha` (live `_build_visual_prompt` when no `--prompt-file`), `code_sha` (guard/parser source), temperature and reasoning effort; `run` refuses to resume on any mismatch, `report` marks runs that lack or mismatch them. All runs before 2026-10-25 are STALE.
+- **The guard/parser are invisible in scored runs** (models answer clean comma lists), so `spec` / the report's spec section mutates cached answers through the production code; `tests/test_visual_tags_eval_harness.py` fails if the parser or guard regresses.
+- **Labels**: recheck kappa < 0.4 flags a tag "unreliable label"; the report warns when main labels were re-saved after the blind recheck (true for all 60 as of 2026-09-27).
+- **Unsplash is recall-only**: compare a variant with the constant answer of its own size (recite-all = recall 1.00).
+- **Aesthetics**: the 28-photo ordering (ranks 10 and 28 absent) is between-shoot; read top-half/bottom-half ρ, the file-size/megapixels baselines and the Δρ ties. `scores-v2.json` items now also store `dim_scores`/`sub_scores` for offline `DIMENSION_WEIGHTS` tuning.

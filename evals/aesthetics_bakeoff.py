@@ -122,6 +122,11 @@ def _production_scorer(path, model):
     return score_photo_aesthetics(path, model=model)
 
 
+#: Per-photo score breakdowns `score_photo_aesthetics` returns, stored beside
+#: `overall` (scores-v2.json entries before 2026-10-25 lack them).
+STORED_SCORE_KEYS = ("dim_scores", "sub_scores")
+
+
 def score_vlm(model, photos, entry, *, scorer=None, save=None, log=print):
     """Score every photo not yet in `entry["items"]` with the PRODUCTION
     `score_photo_aesthetics`, through a Recorder so a dead backend is not
@@ -151,6 +156,12 @@ def score_vlm(model, photos, entry, *, scorer=None, save=None, log=print):
             "calls": len(rec.calls),
             "latency_s": round(time.time() - t0, 3),
         }
+        # The dimension and sub-attribute scores too, so DIMENSION_WEIGHTS can
+        # be retuned offline against the ground truth without a re-run. Older
+        # entries carry only `overall`; every reader keys on `overall` alone.
+        for key in STORED_SCORE_KEYS:
+            if res and isinstance(res.get(key), dict):
+                items[name][key] = dict(res[key])
         if save:
             save()
         if i % 10 == 0 or i == len(todo):
@@ -312,6 +323,195 @@ def vlm_summary(entry, gt):
             "latency_label": entry.get("latency_label", "unknown"),
             "rho": rho, "n_gt": n_gt,
             "rho_ci": spearman_ci(rho, n_gt) if rho is not None else None}
+
+
+# --------------------------------------------------------------------------
+# How much the 28-photo ρ can say: CIs, halves, baselines
+# --------------------------------------------------------------------------
+#
+# The ground truth is ONE owner ordering of 28 photos spanning 2018 phone
+# snaps to a7R VI frames, so the headline ρ (0.71-0.78) is carried by the easy
+# tail: on the top half qwen's ρ was 0.22, on the bottom half 0.66-0.73, and
+# file size alone scores 0.37. Production uses the score to pick WITHIN a
+# shoot, which this set does not test. These rows say what the headline ρ can
+# and cannot support; nothing here calls a model.
+
+BOOT_N = 2000
+BOOT_SEED = 1
+BASELINE_PREFIX = "baseline:"
+
+
+def ground_truth_ranks(path):
+    """{"n", "ranks": sorted ranks, "missing": ranks absent from 1..max,
+    "duplicates": ranks used twice} for a `filename,rank` CSV, else None."""
+    if not path or not os.path.exists(path):
+        return None
+    ranks = []
+    with open(path, newline="") as f:
+        for row in csv.reader(f):
+            if len(row) < 2 or row[1].strip().lower() in ("rank", "score"):
+                continue
+            try:
+                ranks.append(float(row[1]))
+            except ValueError:
+                continue
+    if not ranks or not all(r.is_integer() for r in ranks):
+        return None
+    ints = sorted(int(r) for r in ranks)
+    return {"n": len(ints), "ranks": ints,
+            "missing": sorted(set(range(1, max(ints) + 1)) - set(ints)),
+            "duplicates": sorted({r for r in ints if ints.count(r) > 1})}
+
+
+def baseline_scores(photos):
+    """Scorers that look at no pixels' content: file size, and resolution
+    (megapixels, from the header only) where the image opens."""
+    size, mp = {}, {}
+    try:
+        from PIL import Image
+        try:
+            import photosearch  # noqa: F401 — registers the HEIF/HEIC opener
+        except Exception:
+            pass
+    except ImportError:
+        Image = None
+    for name, path in photos:
+        try:
+            size[name] = float(os.path.getsize(path))
+        except OSError:
+            continue
+        if Image is not None:
+            try:
+                with Image.open(path) as im:
+                    mp[name] = im.size[0] * im.size[1] / 1e6
+            except Exception:
+                pass
+    out = {f"{BASELINE_PREFIX}file-size": size}
+    if mp:
+        out[f"{BASELINE_PREFIX}megapixels"] = mp
+    return out
+
+
+def _rho_on(scores, gt, names):
+    names = [n for n in names if scores.get(n) is not None and n in gt]
+    return spearman([scores[n] for n in names], [gt[n] for n in names]), len(names)
+
+
+def bootstrap_rho(scores, gt, names, n_boot=BOOT_N, seed=BOOT_SEED):
+    """Percentile 95% CI of ρ from resampling photos."""
+    names = [n for n in names if scores.get(n) is not None and n in gt]
+    rng = random.Random(seed)
+    vals = []
+    for _ in range(n_boot):
+        s = [names[rng.randrange(len(names))] for _ in names]
+        r = spearman([scores[n] for n in s], [gt[n] for n in s])
+        if r == r:
+            vals.append(r)
+    if not vals:
+        return (float("nan"), float("nan"))
+    vals.sort()
+    return vals[int(0.025 * len(vals))], vals[min(len(vals) - 1, int(0.975 * len(vals)))]
+
+
+def paired_rho_bootstrap(a, b, gt, names, n_boot=BOOT_N, seed=BOOT_SEED):
+    """ρ(a) − ρ(b) on the photos both scored, same resample for both."""
+    names = [n for n in names if a.get(n) is not None and b.get(n) is not None and n in gt]
+    if len(names) < 4:
+        return None
+    rng = random.Random(seed)
+    ds = []
+    for _ in range(n_boot):
+        s = [names[rng.randrange(len(names))] for _ in names]
+        y = [gt[n] for n in s]
+        d = spearman([a[n] for n in s], y) - spearman([b[n] for n in s], y)
+        if d == d:
+            ds.append(d)
+    if not ds:
+        return None
+    ds.sort()
+    return {"delta": _rho_on(a, gt, names)[0] - _rho_on(b, gt, names)[0],
+            "lo": ds[int(0.025 * len(ds))], "hi": ds[min(len(ds) - 1, int(0.975 * len(ds)))],
+            "n": len(names)}
+
+
+def _tie(ci):
+    if ci is None:
+        return "—"
+    return "better" if ci["lo"] > 0 else "worse" if ci["hi"] < 0 else "TIE (CI spans 0)"
+
+
+def pick_reference(v2):
+    """The v2 variant the fleet runs (rerun.FLEET_ROLE_MODELS["aesthetics"])."""
+    try:
+        from photosearch.rerun import FLEET_ROLE_MODELS
+        fleet = FLEET_ROLE_MODELS.get("aesthetics")
+    except Exception:
+        return None
+    hits = [v for v, e in v2.items() if e.get("effective_model") == fleet]
+    return hits[0] if hits else None
+
+
+def gt_analysis(scores, gt, reference=None, n_boot=BOOT_N, seed=BOOT_SEED):
+    """One row per scorer: ρ full set + bootstrap CI, ρ on the GT's top and
+    bottom halves, and Δρ (paired bootstrap) vs `reference` and vs the best
+    `baseline:*` scorer. {"rows", "best_baseline", "reference", "halves"}."""
+    ordered = sorted(gt, key=lambda n: -gt[n])           # best first
+    half = len(ordered) // 2
+    top, bottom = ordered[:half], ordered[half:]
+    rows = {}
+    for name, sc in scores.items():
+        rho, n = _rho_on(sc, gt, ordered)
+        rows[name] = {"n": n, "rho": rho, "ci": bootstrap_rho(sc, gt, ordered, n_boot, seed),
+                      "top": _rho_on(sc, gt, top)[0], "bottom": _rho_on(sc, gt, bottom)[0]}
+    bases = [n for n in scores if n.startswith(BASELINE_PREFIX) and rows[n]["rho"] == rows[n]["rho"]]
+    best = max(bases, key=lambda n: rows[n]["rho"]) if bases else None
+    if reference not in scores:
+        reference = None
+    for name, r in rows.items():
+        r["vs_reference"] = (paired_rho_bootstrap(scores[name], scores[reference], gt,
+                                                  ordered, n_boot, seed)
+                             if reference and name != reference else None)
+        r["vs_best_baseline"] = (paired_rho_bootstrap(scores[name], scores[best], gt,
+                                                      ordered, n_boot, seed)
+                                 if best and name != best else None)
+    return {"rows": rows, "best_baseline": best, "reference": reference,
+            "halves": (len(top), len(bottom))}
+
+
+def _ci_txt(ci):
+    if ci is None:
+        return "—"
+    return f"{ci['delta']:+.2f} [{ci['lo']:+.2f},{ci['hi']:+.2f}] {_tie(ci)}"
+
+
+def gt_analysis_lines(analysis, gt_info=None, v2=None):
+    """Console lines for `gt_analysis`, notes first."""
+    out = []
+    if gt_info:
+        miss = ", ".join(map(str, gt_info["missing"])) or "none"
+        out.append(f"  ground truth: ONE owner ordering of {gt_info['n']} photos, ranks "
+                   f"{gt_info['ranks'][0]}..{gt_info['ranks'][-1]}; missing ranks: {miss}"
+                   + (f"; duplicated: {gt_info['duplicates']}" if gt_info["duplicates"] else ""))
+    sel = sum(1 for e in (v2 or {}).values() for k in e.get("items", {}) if k.startswith("pid:"))
+    out.append("  production uses the score to pick WITHIN a shoot; this set spans "
+               "cameras and years, so ρ here is mostly between-shoot. The within-shoot "
+               "check is --selections-gt, and "
+               + ("it has NO stored results (no pid: items in scores-v2.json)."
+                  if not sel else f"scores-v2.json holds {sel} selection photos."))
+    t, b = analysis["halves"]
+    out.append(f"  {'scorer':<34} {'n':>3} {'ρ':>6} {'95% boot CI':>14} "
+               f"{'top' + str(t):>6} {'bot' + str(b):>6}  Δρ vs {analysis['reference'] or '—'}"
+               f"  |  Δρ vs best baseline {analysis['best_baseline'] or '—'}")
+    for name, r in sorted(analysis["rows"].items(), key=lambda kv: -(kv[1]["rho"]
+                                                                     if kv[1]["rho"] == kv[1]["rho"]
+                                                                     else -9)):
+        ci = f"[{_fmt(r['ci'][0], 2)},{_fmt(r['ci'][1], 2)}]"
+        out.append(f"  {name:<34} {r['n']:>3} {_fmt(r['rho'], 2):>6} {ci:>14} "
+                   f"{_fmt(r['top'], 2):>6} {_fmt(r['bottom'], 2):>6}  "
+                   f"{_ci_txt(r['vs_reference'])}  |  {_ci_txt(r['vs_best_baseline'])}")
+    out.append("  TIE = the paired-bootstrap CI of Δρ spans 0: the ordering cannot tell "
+               "the two scorers apart.")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -662,6 +862,7 @@ def main():
     for variant, entry in v2.items():
         scores[variant] = {k: v["overall"] for k, v in entry["items"].items()
                            if not k.startswith("pid:")}
+    scores.update(baseline_scores(photos))
 
     out_html, rows = write_report(args.out, photos, scores, gt, top_n=args.top_n)
 
@@ -701,6 +902,11 @@ def main():
                 print(f"{'':<26} culling agreement: {me.fmt_ratio(agree, total)} "
                       f"of {int(total)} kept-vs-other pairs (0.50 = chance)")
         print("On 28 photos a ρ gap under ~0.1 is a tie.")
+    if gt:
+        analysis = gt_analysis(scores, gt, reference=pick_reference(v2))
+        print("\n=== What the ranking can support (bootstrap over photos, "
+              f"{BOOT_N} resamples, seed {BOOT_SEED}) ===")
+        print("\n".join(gt_analysis_lines(analysis, ground_truth_ranks(args.ground_truth), v2)))
     print(f"\n[report] {out_html}")
 
 

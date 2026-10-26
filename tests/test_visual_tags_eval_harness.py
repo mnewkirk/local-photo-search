@@ -457,9 +457,10 @@ def test_report_tables_sort_by_false_positives_and_apply_the_n_rule(tmp_path):
     head, rows = tables["Per tag (sorted by false positives)"]
     assert [r[0] for r in rows] == ["centered", "colorful", "sunny", "moody", "peaceful"]
     by_tag = {r[0]: r for r in rows}
-    assert by_tag["centered"][1:] == ["0/3/0/0", "0.00 (0/3)", "—"]
-    assert by_tag["sunny"][1:] == ["1/0/1/0", "n<3 (1/1)", "n<3 (1/2)"]
-    assert by_tag["peaceful"][1:] == ["0/0/0/1", "—", "—"]
+    # tag, labelled pos/neg, kappa (no recheck here), then per variant.
+    assert by_tag["centered"][1:] == ["0/4", "—", "0/3/0/0", "0.00 (0/3)", "—"]
+    assert by_tag["sunny"][1:] == ["2/2", "—", "1/0/1/0", "n<3 (1/1)", "n<3 (1/2)"]
+    assert by_tag["peaceful"][3:] == ["0/0/0/1", "—", "—"]
     # Untouched vocabulary is left out rather than padding the table.
     assert "aerial" not in by_tag
 
@@ -498,3 +499,207 @@ def test_vocab_override_lets_the_parser_accept_a_candidate_and_restores(monkeypa
     with harness.vocab_override(["action"]):
         assert "action" in vtd.PERCEIVED_VOCABULARY
     assert vtd.PERCEIVED_VOCABULARY == before and "action" not in before
+
+
+# ---------------------------------------------------------------------------
+# Code fingerprint: a resumed run must answer the same prompt + guard/parser
+# ---------------------------------------------------------------------------
+
+def test_run_records_the_live_production_prompt_and_guard_parser_hashes(monkeypatch):
+    from photosearch import describe
+    _seed_labels()
+    run = H.run_variant("v1", tagger=_Tagger({1: [], 2: [], 3: []}), fetch=_fetch,
+                        limit=1, log=lambda *_: None)
+    live = describe._build_visual_prompt(list(H.PERCEIVED_VOCABULARY))
+    # No --prompt-file is NOT "no prompt": it is the shipped one, hashed.
+    assert run["prompt_sha"] == hashlib.sha256(live.encode()).hexdigest()[:12]
+    assert run["prompt_source"] == "production"
+    assert run["code_sha"] == H.guard_parser_sha()
+    assert run["temperature"] == 0 and "reasoning_effort" in run
+
+    # A describe.py prompt edit between two resumes is refused...
+    real_prompt = describe._build_visual_prompt
+    monkeypatch.setattr(describe, "_build_visual_prompt", lambda vocab: "EDITED")
+    with pytest.raises(SystemExit, match="prompt_sha"):
+        H.run_variant("v1", tagger=_Tagger({}), fetch=_fetch, log=lambda *_: None)
+    # (not monkeypatch.undo(): that would also drop the autouse eval-dir pin)
+    monkeypatch.setattr(describe, "_build_visual_prompt", real_prompt)
+
+    # ...and so is a parser change, though the prompt is untouched.
+    monkeypatch.setattr(describe, "_parse_visual_response",
+                        lambda raw, vocab: [t.strip() for t in raw.split(",")])
+    assert H.guard_parser_sha() != run["code_sha"]
+    with pytest.raises(SystemExit, match="code_sha"):
+        H.run_variant("v1", tagger=_Tagger({}), fetch=_fetch, log=lambda *_: None)
+
+
+def test_a_run_from_before_the_hashes_cannot_be_resumed_and_reports_stale():
+    _seed_labels()
+    old = {"variant": "prod", "effective_model": "llava", "prompt_file": None,
+           "prompt_sha": None, "extra_vocab": [], "predictions": {"1": {"tags": []}}}
+    H.save_run("prod", old)
+    with pytest.raises(SystemExit, match="prompt_sha"):
+        H.run_variant("prod", tagger=_Tagger({}), fetch=_fetch, log=lambda *_: None)
+    st = H.run_staleness(old)
+    assert st["stale"] and st["prompt"].startswith("STALE") and st["code"].startswith("STALE")
+
+    fresh = {**old, "prompt_sha": H.production_prompt_sha(), "code_sha": H.guard_parser_sha()}
+    assert H.run_staleness(fresh) == {"prompt": "production (current)", "code": "current",
+                                      "stale": False}
+    assert H.run_staleness({**fresh, "code_sha": "0" * 12})["code"] == \
+        "STALE: guard/parser changed"
+
+
+# ---------------------------------------------------------------------------
+# Baselines, F1, bootstrap, coverage
+# ---------------------------------------------------------------------------
+
+def test_baselines_f1_and_macro(tmp_path):
+    _report_fixture(tmp_path)
+    labels = store.scoreable_labels()
+    base = H.baseline_predictions(labels)
+    # Labelled yes: sunny x2, colorful x1, moody x1 -> top1 is sunny.
+    assert base["baseline:top1"][1] == ["sunny"]
+    assert base["baseline:top2"][1] == ["sunny", "colorful"]
+    assert base["baseline:recite-all"][1] == list(H.PERCEIVED_VOCABULARY)
+    assert base["baseline:empty"][1] == []
+
+    rep = H.build_report({"a": H.predictions_of(H.load_run("a"))}, n_boot=200)
+    a = rep["results"]["a"]
+    assert a["f1"] == pytest.approx(2 * 2 / (2 * 2 + 3 + 2))     # tp 2, fp 3, fn 2
+    assert a["macro_f1"] is None                    # no tag has 5 positives here
+    assert H.macro_f1(a["perceived_per_tag"], H.label_counts(labels), min_pos=2) == \
+        pytest.approx(2 * 1 / (2 * 1 + 0 + 1))      # sunny only: tp 1, fn 1
+    assert rep["results"]["baseline:recite-all"]["overall"]["recall"] == 1.0
+    assert rep["best_baseline"] in rep["baselines"]
+    assert "baseline:top1" not in rep["variants"]
+    titles = [t for t, _h, _r in H.report_tables(rep)]
+    assert any(t.startswith("micro-F1 vs reference") for t in titles)
+    assert any(t.startswith("Spec coverage") for t in titles)
+
+
+def test_paired_bootstrap_is_deterministic_and_signed():
+    a = {i: (1, 0, 0) for i in range(30)}                # perfect
+    b = {i: (0, 1, 1) for i in range(30)}                # useless
+    ci = H.paired_bootstrap(a, b, n_boot=300, seed=0)
+    assert ci == H.paired_bootstrap(a, b, n_boot=300, seed=0)
+    assert ci["delta"] == pytest.approx(1.0) and ci["lo"] > 0 and H.verdict(ci) == "beats"
+    same = H.paired_bootstrap(a, a, n_boot=300)
+    assert (same["lo"], same["hi"]) == (0, 0) and H.verdict(same).startswith("tie")
+    assert H.verdict(H.paired_bootstrap(b, a, n_boot=300)) == "worse"
+    assert H.paired_bootstrap(a, {}, n_boot=10) is None
+
+
+def test_report_scores_every_variant_on_the_photos_all_of_them_cover(tmp_path, capsys):
+    _report_fixture(tmp_path)
+    H.save_run("b", {"variant": "b", "effective_model": "m", "prompt_file": None,
+                     "predictions": {"1": {"tags": ["sunny"]}, "2": {"tags": ["moody"]}}})
+    H.main(["report", "--no-spec"])
+    text = capsys.readouterr().out
+    assert "incomplete run(s) {'b': 2} of 4 labelled" in text
+    assert "2 labelled (done)" in text                 # intersection = photos 1, 2
+    H.main(["report", "--no-spec", "--all-photos"])
+    assert "DIFFERENT photo sets" in capsys.readouterr().out
+
+
+def test_labels_re_saved_after_the_blind_recheck_are_flagged():
+    store.save_sample([{"photo_id": i, "stratum": "random"} for i in (1, 2)], seed=1)
+    store.save_label(1, ["sunny"], [])                       # first answer
+    store.save_label(1, ["sunny"], [], label_set="recheck")  # blind recheck
+    store.save_label(2, ["moody"], [], label_set="recheck")
+    store.save_label(2, ["moody"], [])                       # main re-saved AFTER
+    c = H.recheck_contamination()
+    assert c["rechecked"] == 2 and c["resaved"] == [2]
+    assert "re-saved AFTER the blind recheck" in H.contamination_note(c)
+    assert H.contamination_note({"rechecked": 2, "resaved": [], "main_span_min": 0}) is None
+
+
+# ---------------------------------------------------------------------------
+# Guard / parser spec — fails when the production guard or parser regresses
+# ---------------------------------------------------------------------------
+
+#: Answer shapes copied from the cached runs (evals/visual-tags/runs/*.json).
+SPEC_FIXTURE_RUNS = {
+    "prod-like": {"predictions": {
+        "1": {"tags": ["sunny", "colorful", "peaceful"],
+              "calls": [{"raw": "sunny, colorful, peaceful", "temperature": 0}]},
+        "2": {"tags": ["soft-light", "muted"],
+              "calls": [{"raw": "soft-light, muted", "temperature": 0}]},
+        "3": {"tags": ["close-up", "vibrant", "colorful"],
+              "calls": [{"raw": "close-up, vibrant, colorful", "temperature": 0}]},
+        "4": {"tags": ["overcast", "dramatic", "moody", "harsh-light"],
+              "calls": [{"raw": "overcast, dramatic, moody, harsh-light", "temperature": 0}]},
+        "5": {"tags": [], "calls": [{"raw": "none", "temperature": 0}]},
+        "6": {"tags": None, "calls": [{"raw": "I cannot tell.", "temperature": 0}]},
+    }},
+}
+
+
+def test_spec_passes_on_the_production_guard_and_parser():
+    spec = H.guard_parser_spec(SPEC_FIXTURE_RUNS)
+    assert spec["seeds"] == 4 and spec["ok"], {k: v for k, v in spec["checks"].items()
+                                              if v["pass"] != v["cases"]}
+    assert spec["replay"] == {"answers": 4, "differ": 0, "example": None}
+    title, _head, rows = H.spec_table(spec)
+    assert "ALL PASS" in title and all(r[3] in ("PASS", "info") for r in rows)
+
+
+def _failing(spec):
+    return {k for k, v in spec["checks"].items() if v["pass"] != v["cases"]}
+
+
+def test_spec_fails_when_the_parser_is_reduced_to_a_comma_split(monkeypatch):
+    from photosearch import describe
+
+    def naive(raw, vocab):
+        return [t.strip().lower() for t in (raw or "").split(",") if t.strip().lower() in vocab]
+    monkeypatch.setattr(describe, "_parse_visual_response", naive)
+    bad = _failing(H.guard_parser_spec(SPEC_FIXTURE_RUNS))
+    assert {"parse: bullets", "parse: json", "parse: label-prefix",
+            "parse: newlines"} <= bad
+    assert "parse: comma" not in bad
+
+
+def test_spec_fails_when_the_guard_stops_flagging(monkeypatch):
+    from photosearch import describe
+    monkeypatch.setattr(describe, "_visual_answer_problem", lambda tags: None)
+    bad = _failing(H.guard_parser_spec(SPEC_FIXTURE_RUNS))
+    assert "guard: flags a contradictory pair" in bad
+    assert "flow: contradiction twice -> drop both members" in bad
+    assert f"guard: rejects {describe._VISUAL_MAX_PLAUSIBLE_TAGS} tags (over-selection)" in bad
+    assert "flow: recite-all -> no answer (None)" in bad
+
+
+def test_spec_fails_when_a_contradiction_keeps_one_member(monkeypatch):
+    from photosearch import describe
+    real = describe._drop_visual_contradictions
+
+    def keep_first(tags):
+        pairs = describe._visual_contradictions(tags)
+        return real(tags) + [a for a, _b in pairs]       # "keeps the better one"
+    monkeypatch.setattr(describe, "_drop_visual_contradictions", keep_first)
+    bad = _failing(H.guard_parser_spec(SPEC_FIXTURE_RUNS))
+    assert bad == {"flow: contradiction twice -> drop both members"}
+
+
+def test_spec_restores_the_chat_and_needs_no_network():
+    from photosearch import describe
+    before = describe._ollama_chat_with_retry, describe.HAS_OLLAMA
+    H.guard_parser_spec(SPEC_FIXTURE_RUNS)
+    assert (describe._ollama_chat_with_retry, describe.HAS_OLLAMA) == before
+
+
+_REAL_RUNS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "evals", "visual-tags", "runs")
+
+
+@pytest.mark.skipif(not os.path.isdir(_REAL_RUNS),
+                    reason="cached runs are git-ignored; present only on a dev box")
+def test_spec_passes_on_the_real_cached_runs():
+    runs = {}
+    for fn in sorted(os.listdir(_REAL_RUNS)):
+        if fn.endswith(".json") and not fn.startswith("."):
+            with open(os.path.join(_REAL_RUNS, fn), encoding="utf-8") as f:
+                runs[fn[:-5]] = json.load(f)
+    spec = H.guard_parser_spec(runs)
+    assert spec["seeds"] > 0 and spec["ok"], _failing(spec)
