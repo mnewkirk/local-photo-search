@@ -544,6 +544,27 @@ def _persons() -> list[dict]:
         return []
 
 
+def _video_dates(ids) -> dict:
+    """{photo_id: 'YYYY-MM-DD HH:MM'} from the DB (capture date, else file
+    date). Missing DB / rows -> {} (the page just shows no date)."""
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        return {}
+    try:
+        with _get_db() as db:
+            out = {}
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k + 500]
+                for r in db.conn.execute(
+                        "SELECT id, COALESCE(date_taken, date_created) FROM photos WHERE id IN (%s)"
+                        % ",".join("?" * len(chunk)), chunk):
+                    if r[1]:
+                        out[int(r[0])] = str(r[1]).replace("T", " ")[:16]
+            return out
+    except Exception:
+        return {}
+
+
 def candidate_labels(photo_id: int, n_segments: int) -> list[list[str]]:
     """Per label segment, every NON-PERSON subject label any run predicted,
     normalized and de-duplicated, in a seeded shuffled order. Unattributed:
@@ -582,7 +603,10 @@ def get_video_subject(set: str = Query("main")):  # noqa: A002 - query name
     labels = me.load_video_subject_labels(label_set)
     clusters, names = vp.load_clusters(), vp.load_names()
     videos, done_n = [], 0
-    for p in _video_entries(label_set):
+    entries = _video_entries(label_set)
+    positions = vp.sample_positions()
+    dates = _video_dates(p["photo_id"] for p in entries)
+    for p in entries:
         pid = int(p["photo_id"])
         live = not me.is_labelled_clip(p)
         segs = [] if live else me.video_label_segments(p.get("duration_s") or 0)
@@ -605,7 +629,8 @@ def get_video_subject(set: str = Query("main")):  # noqa: A002 - query name
                          for i, (a, b) in enumerate(segs)],
             "runs": [{"segs": r, "people": _sig_people(sigs[r[0]]), "faces": sigs[r[0]][1]}
                      for r in vp.group_runs(sigs)],
-            "who": who, "done": done})
+            "who": who, "done": done,
+            "ident": vp.video_ident(pid, positions, dates)})
     return {"videos": videos, "persons": _persons(), "notes": _video_notes(),
             "set": label_set, "progress": {"done": done_n, "total": len(videos)},
             "clusters_ready": clusters is not None,
@@ -806,14 +831,22 @@ def get_video_people():
                 "progress": {"done": 0, "total": 0}}
     faces = clusters.get("faces") or {}
     by_id = {p["id"]: p["name"] for p in persons}
+    positions = vp.sample_positions()
+    dates = _video_dates({m["photo_id"] for m in faces.values()})
     cards, done = [], 0
     for c in clusters.get("clusters") or []:
         st = vp.cluster_status(c, names)
         done += st["done"]
         sug = c.get("suggestion")
+        per: dict = {}
+        for f in c["faces"]:
+            if f in faces:
+                per[int(faces[f]["photo_id"])] = per.get(int(faces[f]["photo_id"]), 0) + 1
+        video_list = [dict(vp.video_ident(pid, positions, dates), faces=n)
+                      for pid, n in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))]
         cards.append({
             "key": c["key"], "size": len(c["faces"]),
-            "videos": len({faces[f]["photo_id"] for f in c["faces"] if f in faces}),
+            "videos": len(per), "video_list": video_list,
             "faces": [{"id": f, "name": names.get(f)} for f in c["faces"]],
             "suggestion": ({"person_id": sug["person_id"],
                             "name": by_id.get(sug["person_id"]) or sug.get("name")}

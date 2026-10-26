@@ -57,6 +57,10 @@
     .progress-fill { height: 100%; background: var(--green); transition: width 0.2s; }
     .pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border);
       color: var(--text-muted); white-space: nowrap; }
+    .video-ident-bar { margin: 6px 0; }
+    .video-ident a { color: var(--accent); }
+    .video-list { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 6px; }
+    .video-list a.pill { text-decoration: none; }
     .pill.stratum { color: var(--accent); border-color: rgba(74,158,255,0.5); }
     .pill.saved { color: var(--green); border-color: rgba(74,222,128,0.5); }
     .pill.dirty { color: var(--yellow); border-color: rgba(250,204,21,0.6); font-weight: 600; }
@@ -951,6 +955,22 @@
 
     function fmtS(x) { return (Math.round(x * 10) / 10).toFixed(1) + 's'; }
 
+    // Which video this is: its place in the sample, photo id, file, date,
+    // and a link that opens it in the main app (index.html ?photo=<id>).
+    function identText(id) {
+      if (!id) return '';
+      return (id.position ? '#' + id.position + ' of ' + id.of + ' · ' : '') + 'photo ' + id.photo_id +
+        (id.filename ? ' · ' + id.filename : '') + (id.date ? ' · ' + id.date : '');
+    }
+    function VideoIdent(props) {
+      var id = props.ident;
+      if (!id) return null;
+      return e('span', { className: 'video-ident' },
+        e('span', { className: 'muted' }, identText(id)), ' ',
+        e('a', { href: id.app_url, target: '_blank', rel: 'noopener',
+                 title: 'Open photo ' + id.photo_id + ' in the main app' }, 'open in app ↗'));
+    }
+
     // Original vs the cached H.264 proxy, chosen by the photo modal's own
     // helper (PS.chooseVideoSource + PS.canPlayVideo): the owner's browser
     // plays no HEVC / 10-bit / avi / mts. If the original errors anyway,
@@ -1358,7 +1378,8 @@
           VSET === 'recheck' ? e('span', { className: 'pill stratum' }, 'recheck — first answers hidden') : null),
         e(Strip, { items: videos, idx: idx, onPick: goTo,
                    isDone: function (x) { return x.done; },
-                   title: function (x) { return '#' + x.photo_id + ' · ' + x.stratum; } }),
+                   title: function (x) { return identText(x.ident) || ('#' + x.photo_id) + ' · ' + x.stratum; } }),
+        e('div', { className: 'video-ident-bar' }, e(VideoIdent, { ident: v.ident })),
         e('div', { className: 'work' },
           e(VideoPane, { photoId: v.photo_id, videoRef: videoRef, info: v.video },
             e('button', { className: 'btn', type: 'button', disabled: idx === 0,
@@ -1380,6 +1401,7 @@
     // references is offered, never applied until confirmed.
     // ------------------------------------------------------------------
     var CROPS_SHOWN = 48;
+    var VIDEOS_SHOWN = 8;
 
     function PeopleCard(props) {
       var c = props.card;
@@ -1429,9 +1451,21 @@
       return e('div', { className: 'card people-card' + (st.done && !pool ? ' done' : '') },
         e('div', { className: 'head' },
           e('strong', null, pool ? 'Ejected crops' : ('Cluster ' + (props.n + 1))),
-          e('span', { className: 'muted' }, faces.length + ' faces' + (c.videos ? ' · ' + c.videos + ' videos' : '')),
+          e('span', { className: 'muted', title: (c.video_list || []).map(function (x) {
+              return identText(x) + ' — ' + x.faces + (x.faces === 1 ? ' face' : ' faces');
+            }).join('\n') },
+            faces.length + ' faces' + (c.videos ? ' · from ' + c.videos + (c.videos === 1 ? ' video' : ' videos') : '')),
           pool ? e('span', { className: 'muted' }, 'click crops to select, then name them')
                : e('span', { className: 'pill' + (st.done ? ' saved' : '') }, answerText(st.answer))),
+        !pool && c.video_list && c.video_list.length ? e('div', { className: 'video-list' },
+          c.video_list.slice(0, VIDEOS_SHOWN).map(function (x) {
+            return e('a', { key: x.photo_id, className: 'pill', href: x.app_url, target: '_blank', rel: 'noopener',
+                            title: identText(x) + ' — ' + x.faces + ' faces here · open in app' },
+              (x.position ? '#' + x.position + ' ' : '') + x.photo_id + ' ×' + x.faces);
+          }),
+          c.video_list.length > VIDEOS_SHOWN
+            ? e('span', { className: 'muted', title: c.video_list.slice(VIDEOS_SHOWN).map(identText).join('\n') },
+                '+' + (c.video_list.length - VIDEOS_SHOWN) + ' more') : null) : null,
         e('div', { className: 'crops' },
           shown.map(function (f) {
             var ej = isEj(f);

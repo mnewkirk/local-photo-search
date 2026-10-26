@@ -48,6 +48,12 @@ Subcommands:
                    trusted references (read-only). The owner names clusters
                    once on /eval/models?tab=vpeople:
                        HSA_ENABLE_DXG_DETECTION=1 python evals/video_eval.py cluster-faces --db <db>
+                   --incremental [--ids a,b] adds faces not yet clustered to the
+                   EXISTING clusters (nearest by mean L2, same threshold) and
+                   makes new clusters for the rest — no key, id or name changes.
+  drop-faces       remove some videos' faces from the clusters + names (backed
+                   up; crops moved aside) — e.g. faces cut from corrupt frames:
+                       python evals/video_eval.py drop-faces --ids 254461,254431
   report           every gate, holdout headline with dev beside it, CIs:
                        python evals/video_eval.py report [--db <db>]
   agreement        owner self-agreement on the recheck set (kappa < 0.4 =
@@ -1868,6 +1874,137 @@ def cluster_faces(*, conn=None, threshold=CLUSTER_THRESHOLD, min_size=CLUSTER_MI
     return data
 
 
+def drop_faces(photo_ids, *, backup_suffix=None, log=log):
+    """Remove every face of `photo_ids` from face_clusters.json and
+    face_names.json (both backed up first) and move their crops aside, so a
+    re-detection can never reuse a crop cut from a bad frame. Other names
+    are untouched. Returns the report."""
+    import shutil
+    from photosearch import video_eval_people as vp
+    d = vp.video_dir()
+    suffix = backup_suffix or ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    cl, names = vp.load_clusters(), vp.load_names()
+    if not cl:
+        raise SystemExit("no face_clusters.json to repair")
+    for name in (vp.CLUSTERS_FILE, vp.NAMES_FILE):
+        if (d / name).exists():
+            shutil.copy2(d / name, d / (name + suffix))
+    gone = [f for f, m in cl["faces"].items() if int(m["photo_id"]) in {int(p) for p in photo_ids}]
+    new_cl, _new_names, rep = vp.drop_video_faces(cl, names, photo_ids)
+    vp.save_clusters(new_cl)
+
+    def put(data):          # under the names lock: drop exactly those faces
+        for f in gone:
+            data.pop(f, None)
+        return None
+    me.update_pass_file(me.VIDEO, vp.NAMES_FILE, {}, put)
+    aside = d / ("face_crops" + suffix)
+    moved = 0
+    for f in gone:
+        cp = vp.crop_path(f)
+        if cp.exists():
+            aside.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(cp), str(aside / cp.name))
+            moved += 1
+    rep["crops_moved"] = moved
+    rep["backup_suffix"] = suffix
+    log(f"[drop-faces] {rep}")
+    return rep
+
+
+def cluster_faces_incremental(*, ids=None, conn=None, threshold=CLUSTER_THRESHOLD,
+                              min_size=CLUSTER_MIN_SIZE, detect=None, frames=None,
+                              force_detect=False, refs=None, log=log):
+    """Add faces to the EXISTING clustering without renumbering it.
+
+    Faces not yet in face_clusters.json (only those of `ids`, when given)
+    join the existing cluster whose kept members sit closest on average,
+    within `threshold`; the rest are clustered among themselves (same
+    average linkage) into NEW clusters appended after the old ones, and
+    whatever is left is noise. Every existing cluster key, face id and name
+    is untouched — the owner's naming survives by construction."""
+    import hashlib
+    import numpy as np
+    from photosearch import video_eval_people as vp
+    old = vp.load_clusters()
+    if not old:
+        raise SystemExit("no face_clusters.json yet — run cluster-faces without --incremental")
+    names = vp.load_names()
+    want = None if ids is None else {int(i) for i in ids}
+    clips = [p for p in me.load_video_sample()["photos"] if me.is_labelled_clip(p)]
+    emb_by: dict = {}
+    new_meta, new_emb = [], []
+    for n, p in enumerate(clips, 1):
+        pid = int(p["photo_id"])
+        need_new = want is None or pid in want
+        try:
+            meta, emb = detect_video_faces(pid, p.get("duration_s") or 0, detect=detect,
+                                           frames=frames, force=force_detect and need_new)
+        except Exception as ex:
+            log(f"  ! {pid}: {ex}")
+            continue
+        for m, e in zip(meta["faces"], emb):
+            emb_by[m["id"]] = e
+            if need_new and m["id"] not in old["faces"]:
+                new_meta.append(m)
+                new_emb.append(e)
+        if need_new:
+            log(f"  [{n}/{len(clips)}] {pid}: {len(meta['faces'])} faces on {meta['n_frames']} frames")
+    members = {}
+    for c in old.get("clusters") or []:
+        keep = [emb_by[f] for f in c["faces"] if f in emb_by
+                and (names.get(f) or {}).get("kind") not in ("junk", "ejected")
+                and not (names.get(f) or {}).get("ejected")]
+        if keep:
+            members[c["key"]] = np.stack(keep)
+    new_emb = np.asarray(new_emb, np.float32).reshape(-1, 512)
+    picks = vp.assign_incremental(members, new_emb, threshold=threshold)
+    data = json.loads(json.dumps(old))
+    by_key = {c["key"]: c for c in data["clusters"]}
+    for m in new_meta:
+        data["faces"][m["id"]] = {k: v for k, v in m.items() if k != "id"}
+    assigned = 0
+    for m, key in zip(new_meta, picks):
+        if key is not None:
+            by_key[key]["faces"].append(m["id"])
+            assigned += 1
+    rest = [i for i, k in enumerate(picks) if k is None]
+    labels = vp.cluster_embeddings(new_emb[rest], threshold=threshold, min_size=min_size) \
+        if rest else np.zeros(0, int)
+    groups: dict = {}
+    for j, lab in enumerate(labels):
+        if lab >= 0:
+            groups.setdefault(int(lab), []).append(rest[j])
+    tag = "inc" + hashlib.sha256(json.dumps(sorted(m["id"] for m in new_meta)).encode()).hexdigest()[:8]
+    if refs is None:
+        refs = trusted_references(conn) if conn is not None else ([], np.zeros((0, 512)), {})
+    rpids, remb, pnames = refs
+    made = 0
+    for k, ix in enumerate(sorted(groups.values(), key=lambda ix: (-len(ix), new_meta[ix[0]]["id"]))):
+        sug = vp.suggest_person(new_emb[ix], rpids, remb)
+        if sug:
+            sug["name"] = pnames.get(sug["person_id"])
+        data["clusters"].append({"key": f"{tag}-{k}", "faces": [new_meta[i]["id"] for i in ix],
+                                 "suggestion": sug})
+        made += 1
+    in_new = {i for ix in groups.values() for i in ix}
+    data["noise"] = list(data.get("noise") or []) + [new_meta[i]["id"] for i in rest if i not in in_new]
+    sizes = sorted((len(c["faces"]) for c in data["clusters"]), reverse=True)
+    data["stats"] = {"faces": len(data["faces"]), "clusters": len(data["clusters"]),
+                     "noise": len(data["noise"]), "sizes_top": sizes[:15],
+                     "clusters_ge5": sum(s >= 5 for s in sizes),
+                     "suggested": sum(1 for c in data["clusters"] if c.get("suggestion")),
+                     "suggested_faces": sum(len(c["faces"]) for c in data["clusters"] if c.get("suggestion"))}
+    step = {"at": me.now_iso(), "tag": tag, "faces_added": len(new_meta), "assigned": assigned,
+            "new_clusters": made, "noise": len(rest) - len(in_new), "threshold": threshold}
+    data["params"] = dict(data.get("params") or {})
+    data["params"]["incremental"] = list(data["params"].get("incremental") or []) + [step]
+    data["version"] = hashlib.sha256((old["version"] + tag).encode()).hexdigest()[:12]
+    vp.save_clusters(data)
+    log(f"[clusters+] {step}")
+    return data
+
+
 def run_stats():
     """How many runs the labelled clips collapse to, with the current names."""
     from photosearch import video_eval_people as vp
@@ -1966,6 +2103,11 @@ def main(argv=None):
                     help="average-linkage L2 distance threshold")
     cf.add_argument("--min-size", type=int, default=CLUSTER_MIN_SIZE)
     cf.add_argument("--force-detect", action="store_true")
+    cf.add_argument("--incremental", action="store_true",
+                    help="add new faces to the existing clusters (keys, ids and names untouched)")
+    cf.add_argument("--ids", help="comma-separated photo ids (with --incremental: only these videos)")
+    df = sub.add_parser("drop-faces", help="remove a video's faces from the clusters + names (backed up)")
+    df.add_argument("--ids", required=True, help="comma-separated photo ids")
     sub.add_parser("run-stats")
 
     rp = sub.add_parser("report")
@@ -2011,9 +2153,18 @@ def main(argv=None):
         fetch_proxies(server=a.server, make_missing=a.make_missing)
     elif a.cmd == "cluster-faces":
         conn = me.open_db_readonly(a.db) if a.db else None
-        cluster_faces(conn=conn, threshold=a.threshold, min_size=a.min_size,
-                      force_detect=a.force_detect)
+        ids = [int(x) for x in a.ids.split(",")] if a.ids else None
+        if a.incremental:
+            cluster_faces_incremental(ids=ids, conn=conn, threshold=a.threshold,
+                                      min_size=a.min_size, force_detect=a.force_detect)
+        else:
+            if ids:
+                raise SystemExit("--ids needs --incremental (a full run clusters every video)")
+            cluster_faces(conn=conn, threshold=a.threshold, min_size=a.min_size,
+                          force_detect=a.force_detect)
         log(f"[runs] {run_stats()}")
+    elif a.cmd == "drop-faces":
+        drop_faces([int(x) for x in a.ids.split(",")])
     elif a.cmd == "run-stats":
         log(f"[runs] {run_stats()}")
     elif a.cmd == "report":

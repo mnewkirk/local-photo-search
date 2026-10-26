@@ -438,3 +438,81 @@ def suggest_person(cluster_emb, ref_pids, ref_emb, *, max_dist: float = SUGGEST_
     if best > max_dist or second - best < margin:
         return None
     return {"person_id": pid, "dist": round(best, 3), "margin": round(second - best, 3)}
+
+
+# --------------------------------------------------------------------------
+# Repair: drop a video's faces / add faces to an existing clustering
+# --------------------------------------------------------------------------
+
+def drop_video_faces(clusters: dict, names: dict, photo_ids: Iterable[int]):
+    """(clusters, names, report) with every face of `photo_ids` removed —
+    from the face table, every cluster, the noise list and the names. Pure:
+    returns new dicts. A cluster left with no faces is dropped; every other
+    cluster keeps its key, and every other face keeps its name.
+
+    For faces detected on frames that were never the video (2026-10-25: cv2
+    returned a frozen buffer for interlaced .m2ts, so 254461 got 35 "faces"
+    sharing one box and the owner named the cluster)."""
+    drop = {int(p) for p in photo_ids}
+    faces = (clusters or {}).get("faces") or {}
+    gone = {f for f, m in faces.items() if int(m["photo_id"]) in drop}
+    out = dict(clusters)
+    out["faces"] = {f: m for f, m in faces.items() if f not in gone}
+    kept, emptied = [], []
+    for c in clusters.get("clusters") or []:
+        fs = [f for f in c["faces"] if f not in gone]
+        if fs:
+            kept.append(dict(c, faces=fs))
+        else:
+            emptied.append(c["key"])
+    out["clusters"] = kept
+    out["noise"] = [f for f in clusters.get("noise") or [] if f not in gone]
+    new_names = {f: n for f, n in (names or {}).items() if f not in gone}
+    return out, new_names, {"faces_removed": len(gone),
+                            "names_removed": len(names or {}) - len(new_names),
+                            "clusters_emptied": emptied}
+
+
+def assign_incremental(member_emb: dict, new_emb, *, threshold: float):
+    """For each new face (rows of `new_emb`), the existing cluster key whose
+    members sit closest on AVERAGE (mean L2 to every member — the criterion
+    the average-linkage clustering merges on, so the same `threshold` means
+    the same thing), or None when no cluster is within `threshold`.
+
+    `member_emb`: {cluster_key: (n, 512) array} — the members that speak for
+    the cluster (callers leave out junk / ejected faces)."""
+    import numpy as np
+    x = np.asarray(new_emb, np.float32).reshape(-1, 512) if len(new_emb) else np.zeros((0, 512), np.float32)
+    x = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-9)
+    best = [(None, 9.0)] * len(x)
+    for key, m in member_emb.items():
+        m = np.asarray(m, np.float32)
+        if not len(m) or not len(x):
+            continue
+        m = m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-9)
+        d = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * x @ m.T)).mean(axis=1)
+        for i, di in enumerate(d):
+            if di <= threshold and di < best[i][1]:
+                best[i] = (key, float(di))
+    return [k for k, _ in best]
+
+
+def sample_positions() -> dict:
+    """{photo_id: (n, N)} — each video's 1-based place in the sample."""
+    photos = me.load_video_sample()["photos"]
+    return {int(p["photo_id"]): (i + 1, len(photos)) for i, p in enumerate(photos)}
+
+
+def video_ident(photo_id: int, positions: Optional[dict] = None,
+                dates: Optional[dict] = None) -> dict:
+    """What identifies a sampled video to the owner: its place in the sample
+    (#n of N), the photo id, the file name and date, and the main-app deep
+    link (index.html opens PS.PhotoModal for ?photo=<id>). Never the
+    dev/holdout split, never a model."""
+    pid = int(photo_id)
+    entry = me.video_sample_entry(pid) or {}
+    pos = (positions if positions is not None else sample_positions()).get(pid)
+    return {"photo_id": pid, "filename": entry.get("filename"),
+            "date": (dates or {}).get(pid),
+            "position": pos[0] if pos else None, "of": pos[1] if pos else None,
+            "app_url": f"/?photo={pid}"}

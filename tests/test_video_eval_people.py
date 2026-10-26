@@ -300,3 +300,98 @@ def test_downscaled_frames_come_from_the_disk_cache(people_env, monkeypatch, tmp
     monkeypatch.setattr(me, "cached_frame_jpeg", lambda pid, t, px=768, grab=None: got.append((pid, t, px)) or jpg)
     r = client.get(f"{API}/video/frame/{ids[0]}?t=1.5&max_px=320")
     assert r.status_code == 200 and got == [(ids[0], 1.5, 320)]
+
+
+# --------------------------------------------------------------------------
+# Repair: drop a video's faces, incremental clustering, video identification
+# --------------------------------------------------------------------------
+
+def test_drop_video_faces_keeps_every_other_name_and_key():
+    a = _clusters(41, {0: ["c1", "c1"], 1: ["c2", None]})
+    b = _clusters(42, {0: ["c1"], 1: ["c3", "c3", None]})
+    cl = {"version": "v1", "faces": {**a["faces"], **b["faces"]}, "noise": a["noise"] + b["noise"],
+          "clusters": [{"key": k, "suggestion": None,
+                        "faces": [f for x in (a, b) for c in x["clusters"] if c["key"] == k for f in c["faces"]]}
+                       for k in ("c1", "c2", "c3")]}
+    names = {f: {"kind": "person", "person_id": 1} for f in cl["faces"]}
+    out, new_names, rep = vp.drop_video_faces(cl, names, [42])
+    assert all(m["photo_id"] == 41 for m in out["faces"].values())
+    assert [c["key"] for c in out["clusters"]] == ["c1", "c2"]          # c3 emptied, keys kept
+    assert rep["clusters_emptied"] == ["c3"] and rep["faces_removed"] == len(b["faces"])
+    assert new_names == {f: n for f, n in names.items() if f.startswith("41-")}
+    assert all(f.startswith("41-") for f in out["noise"])
+    assert len(cl["faces"]) == len(a["faces"]) + len(b["faces"])        # input not mutated
+
+
+def test_incremental_clustering_adds_faces_without_renumbering(monkeypatch):
+    _sample([51, 52], durations={51: 9.0, 52: 9.0})
+    for pid in (51, 52):
+        _cache_original(pid)
+    calvin, ellie, stranger = _unit(11), _unit(12), _unit(13)
+    phase = {"v": "old", "n": 0}
+
+    def frames(path, times):
+        for t in times:
+            yield t, np.zeros((120, 160, 3), np.uint8)
+
+    def detect(fr):
+        phase["n"] += 1
+        k = phase["n"]
+        if phase["v"] == "old":
+            return [{"bbox": (10, 70, 70, 10), "det_score": 0.9, "encoding": _near(calvin, k).tolist()},
+                    {"bbox": (10, 150, 70, 90), "det_score": 0.9, "encoding": _near(ellie, 900 + k).tolist()}]
+        return [{"bbox": (20, 75, 80, 15), "det_score": 0.9, "encoding": _near(calvin, 2000 + k).tolist()},
+                {"bbox": (90, 75, 150, 15), "det_score": 0.9, "encoding": _near(stranger, 3000 + k).tolist()}]
+
+    no_refs = ([], np.zeros((0, 512), np.float32), {})
+    _sample([51])
+    ve.cluster_faces(detect=detect, frames=frames, refs=no_refs, log=lambda *a: None)
+    _sample([51, 52], durations={51: 9.0, 52: 9.0})
+    old = vp.load_clusters()
+    # bbox is stored [left, top, right, bottom]: the old Calvin faces sit at left 10.
+    calvin_key = next(c["key"] for c in old["clusters"] if old["faces"][c["faces"][0]]["bbox"][0] == 10)
+    vp.save_names(next(c for c in old["clusters"] if c["key"] == calvin_key)["faces"], "person", 7)
+    names_before = vp.load_names()
+
+    phase["v"] = "new"
+    data = ve.cluster_faces_incremental(ids=[52], detect=detect, frames=frames, refs=no_refs,
+                                        log=lambda *a: None)
+    # Old clusters: same keys, same order, old faces still there.
+    assert [c["key"] for c in data["clusters"][:len(old["clusters"])]] == [c["key"] for c in old["clusters"]]
+    for c_old, c_new in zip(old["clusters"], data["clusters"]):
+        assert c_new["faces"][:len(c_old["faces"])] == c_old["faces"]
+    assert vp.load_names() == names_before                    # names untouched
+    calvin_c = next(c for c in data["clusters"] if c["key"] == calvin_key)
+    added = [f for f in calvin_c["faces"] if f.startswith("52-")]
+    assert added and all(data["faces"][f]["bbox"][1] == 20 for f in added)
+    # The stranger is not forced into an old cluster: a new one is appended.
+    new = data["clusters"][len(old["clusters"]):]
+    assert len(new) == 1 and all(data["faces"][f]["bbox"][1] == 90 for f in new[0]["faces"])
+    assert data["params"]["incremental"][-1]["new_clusters"] == 1
+    # Running it again adds nothing.
+    again = ve.cluster_faces_incremental(ids=[52], detect=detect, frames=frames, refs=no_refs,
+                                         log=lambda *a: None)
+    assert again["params"]["incremental"][-1]["faces_added"] == 0
+    assert [c["faces"] for c in again["clusters"]] == [c["faces"] for c in data["clusters"]]
+
+
+def test_labelling_pages_identify_videos_and_stay_blind(people_env):
+    client, ids, person, cl = people_env
+    body = client.get(API + "/video/subject").text
+    for s in SECRETS:
+        assert s not in body, s
+    d = json.loads(body)
+    n = len(d["videos"])
+    for i, v in enumerate(d["videos"]):
+        idt = v["ident"]
+        assert idt["photo_id"] == v["photo_id"] and idt["position"] == i + 1 and idt["of"] == n
+        assert idt["filename"] == f"V{v['photo_id']}.MP4"
+        assert idt["app_url"] == f"/?photo={v['photo_id']}"
+        assert set(idt) == {"photo_id", "filename", "date", "position", "of", "app_url"}
+    body = client.get(API + "/video/people").text
+    for s in SECRETS:
+        assert s not in body, s
+    card = json.loads(body)["clusters"][0]
+    assert card["videos"] == 1
+    assert [(x["photo_id"], x["faces"], x["position"]) for x in card["video_list"]] == [(ids[0], 2, 1)]
+    assert card["video_list"][0]["app_url"] == f"/?photo={ids[0]}"
