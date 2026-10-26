@@ -36,8 +36,10 @@ from __future__ import annotations
 import io
 import json
 import math
+import socket
 import subprocess
 from typing import Callable, Iterator, Optional, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -48,6 +50,73 @@ CHECK_FRAMES = 12
 # Clip fractions where ffmpeg is asked for a frame when cv2's were all black.
 CONFIRM_FRACTIONS = (0.0, 0.25, 0.5, 0.75)
 FFMPEG_TIMEOUT_S = 180
+
+# Per-process cache of hostname -> resolved IP, so a probe pass that hits
+# the same NAS host for dozens of videos pays for DNS once.
+_HOST_IP_CACHE: dict[str, str] = {}
+
+
+class HostResolutionError(RuntimeError):
+    """A hostname in an ffmpeg/ffprobe URL could not be resolved via DNS --
+    transient (the caller should defer, never spend an attempt or treat it
+    as a verdict about the video)."""
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        return True
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+        return True
+    except OSError:
+        return False
+
+
+def ffmpeg_url(url: str) -> str:
+    """Rewrite ``url``'s hostname to an IP literal (IPv4 preferred),
+    keeping scheme/port/path/query/credentials untouched.
+
+    The desktop's ffmpeg/ffprobe are a static build in ``~/.local/bin`` (no
+    apt/sudo) that SEGFAULTS (exit -11) resolving ANY hostname through
+    glibc's static NSS -- measured 2026-10-25: both ``localhost`` and a real
+    DNS name (``dxp4800-f976``) crash; an IP literal works. So every URL
+    handed to the ffmpeg/ffprobe CLI must have its host pre-resolved in
+    Python first.
+
+    A bare local file path (no ``scheme://``) or a URL whose host is already
+    an IP literal passes through unchanged. Resolutions are cached per
+    process (see :data:`_HOST_IP_CACHE`).
+
+    Raises :class:`HostResolutionError` on a DNS failure -- the caller must
+    treat that as transient, not a verdict."""
+    s = str(url)
+    if "://" not in s:
+        return s
+    parts = urlsplit(s)
+    host = parts.hostname
+    if not host or _is_ip_literal(host):
+        return s
+    ip = _HOST_IP_CACHE.get(host)
+    if ip is None:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError as e:
+            raise HostResolutionError(f"could not resolve {host!r}: {e}") from e
+        ip = next((i[4][0] for i in infos if i[0] == socket.AF_INET), None) \
+            or (infos[0][4][0] if infos else None)
+        if not ip:
+            raise HostResolutionError(f"could not resolve {host!r}: no addresses")
+        _HOST_IP_CACHE[host] = ip
+    netloc = f"[{ip}]" if ":" in ip else ip
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    if parts.username:
+        creds = parts.username + (f":{parts.password}" if parts.password else "")
+        netloc = f"{creds}@{netloc}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 class DecodeOpenError(Exception):
@@ -116,14 +185,16 @@ def _vf(extra: Sequence[str] = ()) -> str:
 def ffmpeg_frame(path: str, t: float, ffmpeg: Optional[str] = None,
                  run: Callable = subprocess.run):
     """One RGB uint8 frame at ``t`` seconds (deinterlaced, autorotated), or
-    None. ``path`` may be an http URL (use 127.0.0.1: the static build
-    segfaults resolving ``localhost``)."""
+    None. ``path`` may be an http URL -- its hostname is resolved to an IP
+    via :func:`ffmpeg_url` first (the static ffmpeg build segfaults
+    resolving any hostname, including ``localhost``)."""
     exe = ffmpeg or find_ffmpeg()
     if not exe:
         return None
     try:
+        url = ffmpeg_url(str(path))
         proc = run([exe, "-v", "error", "-nostdin", "-ss", f"{max(0.0, float(t)):.3f}",
-                    "-i", str(path), "-an", "-sn", "-dn", "-vf", "yadif=deint=interlaced",
+                    "-i", url, "-an", "-sn", "-dn", "-vf", "yadif=deint=interlaced",
                     "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
                    capture_output=True, timeout=FFMPEG_TIMEOUT_S)
     except Exception:
@@ -146,9 +217,10 @@ def ffprobe_basics(path: str, run: Callable = subprocess.run) -> dict:
         exe = find_ffprobe()
         if not exe:
             return out
+        url = ffmpeg_url(str(path))
         proc = run([exe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                     "stream=avg_frame_rate,r_frame_rate,field_order:format=duration",
-                    "-of", "json", str(path)], capture_output=True, timeout=60)
+                    "-of", "json", url], capture_output=True, timeout=60)
         data = json.loads(proc.stdout or b"{}")
         st = (data.get("streams") or [{}])[0]
         fps = parse_rate(st.get("avg_frame_rate")) or parse_rate(st.get("r_frame_rate")) or 0.0

@@ -1105,11 +1105,16 @@ def _process_video_probe(client: "WorkerClient", photos: list[dict],
     row. Nothing is downloaded whole.
 
     Outcomes, following the worker conventions:
-      * transport trouble (timeout, refused, 5xx) -> OMITTED: no attempt
-        spent, re-claimed after the TTL;
+      * transport trouble (timeout, refused, 5xx, a DNS failure resolving
+        the server host) -> OMITTED: no attempt spent, re-claimed after
+        the TTL;
       * ffprobe read the bytes and they are not a playable video -> a RESULT
         with `probe_error` (`zip_wrapped` / `unreadable: ...`): stored, the
         row exists for exactly this, never re-probed;
+      * ffprobe itself CRASHED (a signal, e.g. SIGSEGV) -> raises
+        `PassHalted`: not a verdict about the video and not an attempt —
+        whatever broke the tool breaks on every later video too, so the
+        caller submits what finished and stops claiming this pass;
       * anything else (404, unknown ffprobe failure, a poster the NAS
         rejected) -> a failure row: one of MAX_PROCESS_ATTEMPTS spent.
     A readable video whose first frame cv2 cannot decode still gets its
@@ -1182,6 +1187,12 @@ def _process_video_probe(client: "WorkerClient", photos: list[dict],
         except (_TRANSIENT + (VP.ProbeTransportError,)) as e:
             print(f"    {label}: transport ({e}) — will be retried")
             continue
+        except VP.ProbeCrashError as e:
+            # The tool crashed, not the video. Don't spend an attempt and
+            # don't keep feeding it videos it will crash on one by one —
+            # submit what finished and let the dispatcher stop this pass.
+            print(f"    {label}: {e} — halting video-probe")
+            raise PassHalted(str(e), out) from e
         except VP.ProbeToolError as e:
             print(f"    {label}: {e}")
             out.append(_failure_row(pid, e))
@@ -1952,7 +1963,18 @@ def run_worker(
                     _provenance_kwargs(pass_type, keywords_model, results)
                     kwargs = _submit_kwargs("keywords_results", results)
                 elif pass_type == "video-probe":
-                    results = _process_video_probe(client, photos)
+                    try:
+                        results = _process_video_probe(client, photos)
+                    except PassHalted as e:
+                        # The tool crashed (e.g. a segfault resolving a
+                        # hostname), not the videos: submit what finished
+                        # (the rest is omitted -> released, no attempt) and
+                        # stop claiming this pass.
+                        results = e.results
+                        print(f"  ✗ stopping {pass_type}: {e} — fix the ffmpeg/ffprobe "
+                              f"install and relaunch")
+                        if pass_type in active:
+                            active.remove(pass_type)
                     kwargs = _submit_kwargs("video_probe_results", results)
                 elif pass_type == "video-proxy":
                     results = _process_video_proxy(client, photos, batch_temp)

@@ -9,11 +9,13 @@ public landmark.
 
 import copy
 import json
+import socket
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from photosearch import video_decode as VD
 from photosearch import video_probe as VP
 
 FIX = Path(__file__).parent / "fixtures" / "video_probe"
@@ -21,6 +23,20 @@ FIX = Path(__file__).parent / "fixtures" / "video_probe"
 
 def _fx(name):
     return json.loads((FIX / f"{name}.json").read_text())
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dns(monkeypatch):
+    """CI has no network and these tests' URLs name a fake host ("nas") —
+    stub DNS resolution so `run_ffprobe` -> `video_decode.ffmpeg_url` never
+    hits a real resolver. Tests of `ffmpeg_url` itself override this."""
+    VD._HOST_IP_CACHE.clear()
+
+    def fake_getaddrinfo(host, *a, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.5", 0))]
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    yield
+    VD._HOST_IP_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +308,55 @@ def test_ffprobe_command_reads_over_http_with_worker_headers():
     assert any("X-Photosearch-Source: worker" in c for c in cmd)
 
 
+def test_ffprobe_hostname_is_rewritten_to_an_ip(monkeypatch):
+    """The static ffprobe build segfaults resolving a hostname (2026-10-25);
+    run_ffprobe must hand it an IP literal, never the hostname, with
+    scheme/port/path/query unchanged."""
+    def fake_getaddrinfo(host, *a, **kw):
+        assert host == "dxp4800-f976"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.237", 0))]
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    seen = {}
+
+    def fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(_fx("kodak_pixpro")), "")
+    VP.run_ffprobe("http://dxp4800-f976:8000/api/photos/9/full?purpose=worker",
+                   ffprobe="ffprobe", run=fake)
+    url = seen["cmd"][-1]
+    assert url == "http://192.168.1.237:8000/api/photos/9/full?purpose=worker"
+    assert "dxp4800-f976" not in url
+
+
+def test_ffprobe_hostname_unresolvable_is_transport_not_tool_error(monkeypatch):
+    """A DNS failure is transient (omit, retry free) — never ProbeToolError
+    and never spends an attempt."""
+    def fail_getaddrinfo(host, *a, **kw):
+        raise socket.gaierror("Name or service not known")
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
+
+    with pytest.raises(VP.ProbeTransportError):
+        VP.run_ffprobe("http://dxp4800-f976:8000/api/photos/9/full?purpose=worker",
+                       ffprobe="ffprobe",
+                       run=lambda cmd, **kw: pytest.fail("ffprobe should not run"))
+
+
+def test_ip_literal_url_is_left_alone():
+    assert VD.ffmpeg_url("http://192.168.1.237:8000/x?y=1") == "http://192.168.1.237:8000/x?y=1"
+    assert VD.ffmpeg_url("/local/path/video.mov") == "/local/path/video.mov"
+
+
+def test_segfault_returncode_is_a_crash_not_a_tool_error_or_verdict():
+    """A negative returncode (killed by a signal, e.g. SIGSEGV = -11) must
+    never be classified as a per-video verdict or ProbeToolError — the tool
+    crashed, not the file (2026-10-25: all 31 videos in a batch were wrongly
+    retired this way)."""
+    with pytest.raises(VP.ProbeCrashError):
+        VP.run_ffprobe("u", ffprobe="x", run=lambda cmd, **kw:
+                       subprocess.CompletedProcess(cmd, -11, "", ""))
+
+
 def test_no_video_stream_is_unreadable():
     data = _fx("generic_2016")
     data["streams"] = [s for s in data["streams"] if s["codec_type"] != "video"]
@@ -433,6 +498,31 @@ def test_worker_404_and_rejected_poster_are_failure_rows(monkeypatch):
     assert W._is_failure_row(r)
     (r,) = W._process_video_probe(_Client(upload_status=400), _photos(4))
     assert W._is_failure_row(r) and "poster upload" in r["error"]
+
+
+def test_worker_ffprobe_crash_halts_the_pass_without_spending_an_attempt(monkeypatch):
+    """A segfaulting ffprobe must not become a failure row (attempt spent)
+    or a stored verdict — it halts the pass, submitting whatever already
+    succeeded (2026-10-25 regression)."""
+    from photosearch import worker as W
+
+    calls = []
+
+    def flaky_run_ffprobe(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return copy.deepcopy(_fx("apple_live_hevc_rot"))
+        raise VP.ProbeCrashError("ffprobe crashed (signal 11): no stderr")
+    monkeypatch.setattr(VP, "run_ffprobe", flaky_run_ffprobe)
+    monkeypatch.setattr(VP, "grab_first_frame", lambda url, **k: ("FRAME", 0.0))
+    monkeypatch.setattr(VP, "poster_jpegs",
+                        lambda f: {"thumb": b"\xff\xd8\xffT", "preview": b"\xff\xd8\xffP",
+                                   "full": b"\xff\xd8\xffF"})
+    with pytest.raises(W.PassHalted) as exc_info:
+        W._process_video_probe(_Client(), _photos(7, 8))
+    results = exc_info.value.results
+    assert len(results) == 1 and results[0]["photo_id"] == 7
+    assert not W._is_failure_row(results[0])
 
 
 def test_worker_undecodable_first_frame_still_stores_the_probe(monkeypatch):

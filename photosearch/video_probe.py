@@ -103,6 +103,15 @@ class ProbeToolError(Exception):
     (unknown stderr). Reported as a worker failure: one attempt spent."""
 
 
+class ProbeCrashError(RuntimeError):
+    """ffprobe exited via a signal (SIGSEGV etc — ``returncode < 0``,
+    measured 2026-10-25 when the static ffprobe build resolved a hostname).
+    This says nothing about the file: it is not a verdict and not a
+    per-video failure, and whatever broke the tool will break on every
+    later video too. The worker halts the pass (``PassHalted``) rather than
+    spending an attempt per video."""
+
+
 # ---------------------------------------------------------------------------
 # Error classification
 # ---------------------------------------------------------------------------
@@ -503,12 +512,20 @@ def run_ffprobe(url: str, ffprobe: Optional[str] = None,
                 run=subprocess.run) -> dict:
     """ffprobe JSON for `url`.
 
-    Raises ProbeTransportError (omit, retry free), ProbeToolError (worker
-    failure, one attempt), and returns ``{"_verdict": "<error>"}`` when the
-    bytes were read and are not a playable container."""
+    Raises ProbeTransportError (omit, retry free — includes a DNS failure
+    resolving the URL's host), ProbeCrashError (the tool itself crashed —
+    halt the pass, no attempt spent), ProbeToolError (worker failure, one
+    attempt), and returns ``{"_verdict": "<error>"}`` when the bytes were
+    read and are not a playable container."""
+    from .video_decode import HostResolutionError, ffmpeg_url
+
     exe = ffprobe or find_ffprobe()
     if not exe:
         raise ProbeToolError("ffprobe not found (set PHOTOSEARCH_FFPROBE)")
+    try:
+        resolved_url = ffmpeg_url(url)
+    except HostResolutionError as e:
+        raise ProbeTransportError(str(e)) from e
     cmd = [exe, "-v", "error", "-print_format", "json", "-show_format",
            "-show_streams",
            # Label the reads in the NAS request log; reconnect on a dropped
@@ -516,7 +533,7 @@ def run_ffprobe(url: str, ffprobe: Optional[str] = None,
            "-headers", "X-Photosearch-Source: worker\r\n",
            "-user_agent", "photosearch-worker-ffprobe",
            "-reconnect", "1", "-reconnect_streamed", "0",
-           url]
+           resolved_url]
     try:
         proc = run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -529,6 +546,16 @@ def run_ffprobe(url: str, ffprobe: Optional[str] = None,
         data = None
     if proc.returncode == 0 and data and (data.get("format") or data.get("streams")):
         return data
+    # A negative returncode is the process dying to a signal (SIGSEGV = -11)
+    # — the tool crashed, not a verdict about this file. stderr from a
+    # segfault is typically empty, so this must be checked before falling
+    # through to classify_ffprobe_failure's "unknown" bucket, which used to
+    # raise ProbeToolError here and spend an attempt on a perfectly good
+    # video (2026-10-25: all 31 videos in 2026-10-25_ILCE-7RM6).
+    if proc.returncode < 0:
+        raise ProbeCrashError(
+            f"ffprobe crashed (signal {-proc.returncode}): "
+            f"{_first_error_line(stderr) if stderr else 'no stderr'}")
     kind = classify_ffprobe_failure(stderr)
     if kind == "transport":
         raise ProbeTransportError(_first_error_line(stderr))
