@@ -46,13 +46,13 @@ WRITE_TOOLS = {"set_photo_location", "set_photo_tags", "add_to_collection"}
 OPS = ("called", "not_called", "count_ge", "count_le", "set_eq", "set_has",
        "set_disjoint", "eq", "in", "contains", "contains_any", "not_contains",
        "absent", "present", "date_between", "max_calls", "first_tool", "matches",
-       "num_between", "called_after", "every_has")
+       "num_between", "called_after", "every_has", "never_true")
 
 # Tools whose args are filters, so `allowed_args` applies to them.
 FILTER_TOOLS = {"search_photos", "summarize", "representatives", "daily_highlights",
                 "group_into_chapters", "daily_scene_breakdown"}
 # Args that are never an unrequested filter.
-ALWAYS_ALLOWED = {"limit", "dedupe", "match_source"}
+ALWAYS_ALLOWED = {"limit", "dedupe", "match_source", "group_by"}  # group_by: a dimension, not a filter
 
 
 # ------------------------------------------------------------------ dates --
@@ -249,6 +249,11 @@ def check_trace(spec: dict, calls: list[dict], tokens: dict) -> bool:
         return bool(mine) and not any(pred(_get(c["args"], arg)) for c in mine)
     if op == "absent":
         return bool(mine) and all(_empty(_get(c["args"], arg)) for c in mine)
+    if op == "never_true":
+        # A write's `confirm`: an explicit false IS the dry run, only true is a write.
+        return bool(mine) and not any(
+            str(_get(c["args"], arg)).strip().lower() in ("1", "true", "yes", "on")
+            for c in mine)
     if op == "every_has":
         pred = _arg_pred("set_has", value)
         return bool(mine) and all(pred(_get(c["args"], arg)) for c in mine)
