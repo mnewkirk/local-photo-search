@@ -111,8 +111,11 @@ def docker_workers() -> list[str]:
 
 def nas_claims(nas: str) -> list[str]:
     """Active claims on the authoritative queue. Unreachable = busy: the guard
-    fails closed. `passes=clip` keeps the status call to one cheap count."""
-    url = nas.rstrip("/") + "/api/worker/status?passes=clip"
+    fails closed. The claims list is returned whatever `passes` asks for; the
+    pass only picks which queue count the NAS computes alongside it, and
+    `video-describe` is the cheapest (0.02 s against 37 s for `clip`, a
+    library-wide scan that loads the N100 while it runs batch steps)."""
+    url = nas.rstrip("/") + "/api/worker/status?passes=video-describe"
     req = urllib.request.Request(url, headers=_intent_headers(
         "ask-eval fleet guard: refuse to run while workers hold claims"))
     try:

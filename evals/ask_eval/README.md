@@ -27,7 +27,7 @@ chunk (one model × one rep × one mutant). They refuse (exit 2) if any of these
   `/tmp/photosearch-worker-fleet*/worker-*.pid` file;
 - a `docker ps` container name contains `worker` (other than the Ollama one);
 - the NAS (`--nas`, default `$PHOTOSEARCH_NAS_URL` or `http://dxp4800-f976:8000`)
-  reports active claims on `/api/worker/status?passes=clip`, **or cannot be
+  reports active claims on `/api/worker/status?passes=video-describe` (the cheapest queue count to ask for; `clip` is a 37 s library scan), **or cannot be
   reached** (the guard fails closed).
 
 There is no override flag. The fleet shares LM Studio: an eval run during a
