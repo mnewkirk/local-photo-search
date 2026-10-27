@@ -219,8 +219,26 @@ _META_WRONG_PATTERNS = (
 # would mangle legitimate noun phrases.
 _WRONG_CLAUSE_BOUNDARY = re.compile(
     r"\b(?:that|which|who|whom|with|runs|ran|flies|flew|walks|stands|sits|"
-    r"holds|is|are|was|were|in|on|at|near|above|below|over|under|"
+    r"holds|rests|lies|hangs|is|are|was|were|in|on|at|near|above|below|over|under|"
     r"beside|behind|next\s+to)\b",
+    re.IGNORECASE,
+)
+
+# Inverted sentences put the place first and the object after the verb:
+# "Off to one side sits a horse", "Behind the fence stands a tall oak tree",
+# "In the background is a red barn". Clipping at the first boundary kept the
+# place ("Off to one side") or nothing at all, so a correct catch shipped
+# without its noun. When a line opens with a locative and has one of these
+# verbs, the object is what follows the verb.
+_LOCATIVE_START = re.compile(
+    r"^(?:off|behind|beside|next\s+to|in|on|at|near|nearby|above|below|over|"
+    r"under|across|along|beyond|inside|outside|among|between|around|there|here|"
+    r"to\s+the\s+(?:left|right))\b",
+    re.IGNORECASE,
+)
+_INVERSION_VERB = re.compile(
+    r"\b(?:sits|sit|stands|stand|is|are|was|were|lies|lie|hangs|hang|flies|fly|"
+    r"runs|walks|rests|grows|appears|perches|looms|rises|waits|lays|lay)\s+",
     re.IGNORECASE,
 )
 
@@ -260,6 +278,17 @@ def _clean_wrong_item(raw: str) -> Optional[str]:
     )
     if neg:
         s = neg.group(1).strip()
+    elif _LOCATIVE_START.match(s):
+        lead = re.match(r"^[^,]{1,40},\s*(?=\S)", s)
+        inv = _INVERSION_VERB.search(s)
+        if lead:
+            # "Nearby, a kite rests on the ground": the place is set off by a
+            # comma and the sentence after it is in normal order.
+            s = s[lead.end():]
+        elif inv and s[inv.end():].strip() and not _WRONG_CLAUSE_BOUNDARY.match(
+                s[inv.end():]):
+            # Inverted: the object follows the verb (not a preposition).
+            s = s[inv.end():].strip()
     # Clip at the first clause/verb/preposition boundary -> keep the head noun.
     # Leading articles are intentionally KEPT ("a flying saucer" stays as-is).
     s = _WRONG_CLAUSE_BOUNDARY.split(s, maxsplit=1)[0].strip().rstrip(",;:").strip()

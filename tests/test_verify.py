@@ -385,6 +385,25 @@ class TestCleanWrongItem:
     def test_normalizes_to_head_noun(self, raw, expected):
         assert _clean_wrong_item(raw) == expected
 
+    @pytest.mark.parametrize("raw,expected", [
+        # Inverted: the object follows the verb (found by the model-eval
+        # review, 2026-10-25: "Off to one side" shipped as the caught object).
+        ("Off to one side sits a horse", "a horse"),
+        ("Behind the fence stands a tall oak tree", "a tall oak tree"),
+        ("In the background is a red barn", "a red barn"),
+        ("There is a cat on the sofa", "a cat"),
+        ("On the table sits a vase of flowers", "a vase of flowers"),
+        ("Next to the boy stands a large brown dog", "a large brown dog"),
+        # A place set off by a comma, then normal order (stored verify runs).
+        ("Nearby, a kite rests on the ground", "a kite"),
+        ("Nearby, an umbrella rests on the ground", "an umbrella"),
+        # Normal order is untouched, even with a locative later on.
+        ("A red car is parked by the curb", "A red car"),
+        ("a bright red kite flies in the sky above the water", "a bright red kite"),
+    ])
+    def test_inverted_sentence_keeps_the_object(self, raw, expected):
+        assert _clean_wrong_item(raw) == expected
+
     def test_extracts_object_from_negation_sentence(self):
         assert _clean_wrong_item("There are no other people visible in the image") == "people"
 
