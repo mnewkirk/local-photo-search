@@ -454,3 +454,27 @@ def test_covering_rolls_rules_up_into_their_block():
     cov = h._covering([{"id": "a", "covers": ["rule.dates"]},
                        {"id": "b", "covers": ["example.photos-of-calvin"]}])
     assert cov["block.rules"] == ["a"] and cov["block.examples"] == ["b"]
+
+
+def test_mutation_discounts_items_that_flip_under_a_control(tmp_path, monkeypatch, capsys):
+    """An item that flips under an edit that removes nothing is noise: its flip
+    under a real mutant is not a kill."""
+    monkeypatch.setattr(h, "RESULTS", tmp_path)
+    _write_rows(tmp_path, "before", [_r("a", True)] * 3 + [_r("b", True)] * 3)
+    _write_rows(tmp_path, "abl-control.newline", [_r("a", False), _r("b", True)])
+    _write_rows(tmp_path, "abl-rule.x", [_r("a", False, mutant_removed=50), _r("b", True)])
+    _write_rows(tmp_path, "abl-rule.y", [_r("a", True, mutant_removed=70), _r("b", False)])
+    assert h.main(["mutation", "--baseline", "before"]) == 0
+    out = capsys.readouterr().out
+    assert "Fragile items (flip under a control, so excluded as killers): a." in out
+    assert "| rule.x | 50 | 2 | no |" in out          # only the fragile item flipped
+    assert "| rule.y | 70 | 2 | yes | b |" in out
+    assert "Mutation score: 1/2" in out
+
+
+def test_controls_remove_nothing():
+    system = "You are a photo-library search assistant.\nExamples:\n  'a' -> x\n  'b' -> y"
+    for mid in mutants.CONTROLS:
+        new, tools, removed = mutants.apply(mid, system, [])
+        assert removed == 0 and new != system
+        assert sorted(new.split()) == sorted(system.split()) or mid == "control.reword"

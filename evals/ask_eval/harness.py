@@ -415,6 +415,8 @@ def cmd_mutants(args) -> int:
 
 
 def _select_mutants(args, available: dict) -> list:
+    if args.set == "controls":
+        return list(mutants.CONTROLS)
     if args.mutant:
         return args.mutant
     if args.set == "all":
@@ -434,7 +436,7 @@ def cmd_ablate(args) -> int:
         chosen = _select_mutants(args, available)
         plan = []
         for mid in chosen:
-            if not available.get(mid):
+            if not available.get(mid) and mid not in mutants.CONTROLS:
                 print(f"skip {mid}: its text is absent from {args.ref}")
                 continue
             items = (items_for_mutant(mid, items_all, cov)
@@ -445,14 +447,15 @@ def cmd_ablate(args) -> int:
                 continue
             plan.append((mid, items))
         n = sum(len(it) for _, it in plan) * args.repeat * len(models)
-        print(f"{len(plan)} mutant(s), {n} runs (~{n * 30 / 3600:.1f} h at 30 s/run)")
+        print(f"{len(plan)} mutant(s), {n} runs (~{n * 4 / 3600:.1f} h at ~4 s/run, "
+              "the measured qwen3.5-9b pace)")
         if args.dry_run:
             for mid, it in plan:
-                print(f"  {mid:44} {available[mid]:7,} chars  {len(it)} items")
+                print(f"  {mid:44} {available.get(mid, 0):7,} chars  {len(it)} items")
             print("dry run, nothing called" + ("" if idle else " (and the fleet is busy: a real run would refuse)"))
             return 0 if idle else 2
         for mid, items in plan:
-            print(f"\n== mutant {mid} ({available[mid]:,} chars removed)")
+            print(f"\n== mutant {mid} ({available.get(mid, 0):,} chars removed)")
             rc = _run_config(tree, args, items, models, f"abl-{mid}", args.repeat, mid)
             if rc:
                 return rc
@@ -480,10 +483,26 @@ def cmd_mutation(args) -> int:
     configs = sorted(d.name for d in RESULTS.glob("abl-*") if d.is_dir())
     if not configs:
         raise SystemExit("no results/abl-* configs: run `harness.py ablate` first")
+    controls = [c for c in configs if c[4:] in mutants.CONTROLS]
+    configs = [c for c in configs if c not in controls]
+    # Items that flip under an edit that removes nothing are fragile: a flip
+    # under a real mutant says nothing about that item's dependence on it.
+    fragile: set = set()
+    for c in controls:
+        for k, (p, n, f) in _rates(_rows(c)).items():
+            if k in base and abs(base[k][0] / base[k][1] - p / n) >= KILL_DROP:
+                fragile.add(k[1])
     print(f"# Mutation report (baseline `{args.baseline}`)\n")
     print("A mutant is KILLED when some item's pass rate drops by >= "
           f"{KILL_DROP:.0%} against the baseline (same model). Survivors are either "
           "untested by the suite or text the agent does not need.\n")
+    if controls:
+        print(f"Controls run: {', '.join(c[4:] for c in controls)}. Fragile items (flip "
+              f"under a control, so excluded as killers): "
+              f"{', '.join(sorted(fragile)) or 'none'}.\n")
+    else:
+        print("**No control mutants run** (`ablate --set controls`): kills below include "
+              "noise from items that flip under any prompt edit.\n")
     print("| mutant | chars | runs | killed | killers | improved | check-fraction Δ |")
     print("|---|---|---|---|---|---|---|")
     killed, tested, survivors = 0, 0, []
@@ -498,6 +517,8 @@ def cmd_mutation(args) -> int:
             bp, bn, bf = base[k]
             drop = bp / bn - p / n
             deltas.append(f - bf)
+            if k[1] in fragile:
+                continue
             if drop >= KILL_DROP:
                 killers.append(k[1])
             elif -drop >= KILL_DROP:
@@ -868,7 +889,8 @@ def main(argv=None) -> int:
     common(ab)
     ab.add_argument("--ref", default="pre-ask-diet")
     ab.add_argument("--mutant", action="append")
-    ab.add_argument("--set", choices=["core", "all"], default="core")
+    ab.add_argument("--set", choices=["core", "all", "controls"], default="core",
+                    help="controls = edits that remove nothing, to measure noise")
     ab.add_argument("--items", choices=["all", "covering"], default="all",
                     help="covering = only items whose `covers` names the mutant (fast, misses surprises)")
     ab.add_argument("--repeat", type=int, default=1)

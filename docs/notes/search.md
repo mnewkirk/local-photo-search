@@ -123,3 +123,32 @@ filters. `?q=Calvin and Ellie` matches photos containing both people
 residual to CLIP. `(?<!-)` lookbehind keeps `-Calvin` as a CLIP exclusion.
 Stacks cleanly with dates/locations/explicit `person=` via `search_combined`'s
 existing result-set intersection — no special casing.
+
+## Ask agent prompt
+
+### 2026-10-26 — Ask eval baseline and mutation testing (evals/ask_eval)
+
+Baseline at tag `pre-ask-diet`, qwen/qwen3.5-9b, 16,384-token context, fleet
+idle: 154/189 pass (63 items x 3). First-round prompt 11,697 tokens on
+average, largest round 16,318, and 9 runs failed on LM Studio "Context size has
+been exceeded" with nothing else running: the multi-round chapter asks
+(b01, b02, b05) overflow on their own. Items are 3/3 or 0/3 (temperature 0),
+so items, not runs, are the sample.
+
+Failing on the shipped prompt: no `sort=subject` for "in the foreground"; no
+rerank for eyes/mouth or short hair; "last year" read as the past 12 months;
+"top 40% per day" sent as `min_day_aesthetic` 40; pinned dates ignored;
+no retry after a 0-hit search; "last summer" taken from the example as last
+year's (owner: the most recent summer — example fixed after this run).
+
+Mutation testing (one rep per mutant, all items) killed 23/23, but four items
+(r10, w01, w02, x04) also flip under control edits that remove nothing (a
+newline, a reworded first sentence, two examples swapped). Discounting them:
+18/23. Survivors: rule.framing-flags (680 chars), rule.summarize (338),
+rule.mood-visual-tag (252), grounding (220) — their behaviour passes without
+them, likely because the tool schemas say the same — and rule.explain-answer
+(271), which no item grades (a coverage gap, not a cut). x01, b04 and b06
+still recur as killers of unrelated mutants and are probably fragile too;
+firm attribution needs 3 reps per mutant. The two big tool trims both cost
+behaviour: dropping all parameter descriptions (16,288 chars) broke 6 items,
+de-duplicating the filter descriptions (6,520) broke d05 (and x01).

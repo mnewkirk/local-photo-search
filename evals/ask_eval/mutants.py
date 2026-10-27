@@ -70,6 +70,13 @@ CORE = (list(RULES) + list(BLOCKS) + ["tools.filter-descriptions",
                                        "drop.grounding-tools"])
 
 
+# Control mutants: edits that remove nothing. At temperature 0 any change to
+# the prompt text can flip a fragile item, so an item that flips under a
+# control is noise, not evidence that it depends on the text a real mutant
+# deleted. `harness.py mutation` discounts them.
+CONTROLS = ("control.newline", "control.reword", "control.swap-examples")
+
+
 def slug(text: str, n: int = 32) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:n].strip("-")
 
@@ -86,7 +93,7 @@ def example_ids(system: str) -> dict:
 
 def all_ids(system: str, tools: list) -> list[str]:
     names = [t["function"]["name"] for t in tools]
-    return (list(RULES) + list(BLOCKS) + list(example_ids(system))
+    return (list(CONTROLS) + list(RULES) + list(BLOCKS) + list(example_ids(system))
             + ["tools.filter-descriptions", "tools.all-param-descriptions",
                "drop.grounding-tools"]
             + [f"tooldesc.{n}" for n in names] + [f"paramdesc.{n}" for n in names]
@@ -149,6 +156,18 @@ def apply(mutant: str, system: str, tools: list, *, shared_props=None) -> tuple[
     def size(s, t):
         return before - (len(s) + len(json.dumps(t, ensure_ascii=False)))
 
+    if mutant == "control.newline":
+        return system + "\n", tools, 0
+    if mutant == "control.reword":
+        new = system.replace("You are a photo-library search assistant.",
+                             "You are a search assistant for a photo library.", 1)
+        return new, tools, 0
+    if mutant == "control.swap-examples":
+        lines = system.split("\n")
+        ex = [i for i, l in enumerate(lines) if _EXAMPLE.match(l)]
+        if len(ex) >= 2:
+            lines[ex[0]], lines[ex[1]] = lines[ex[1]], lines[ex[0]]
+        return "\n".join(lines), tools, 0
     if mutant in RULES:
         rx = re.compile(RULES[mutant])
         system, _ = _drop_lines(system, lambda l: bool(rx.search(l)))
