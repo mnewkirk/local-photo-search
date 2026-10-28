@@ -476,8 +476,11 @@ def test_mutation_discounts_items_that_flip_under_a_control(tmp_path, monkeypatc
 
 
 def test_controls_remove_nothing():
-    system = "You are a photo-library search assistant.\nExamples:\n  'a' -> x\n  'b' -> y"
+    system = ("You are a photo-library search assistant. find the matching photos\n"
+              "Rules:\n- one\n- two\n- three\nExamples:\n  'a' -> x\n  'b' -> y")
+    tools = [{"type": "function", "function": {"name": n}} for n in ("t1", "t2")]
     for mid in mutants.CONTROLS:
-        new, tools, removed = mutants.apply(mid, system, [])
-        assert removed == 0 and new != system
-        assert sorted(new.split()) == sorted(system.split()) or mid == "control.reword"
+        new, new_tools, removed = mutants.apply(mid, system, tools)
+        assert removed == 0, mid
+        assert (new, new_tools) != (system, tools), f"{mid} changed nothing"
+        assert sorted(t["function"]["name"] for t in new_tools) == ["t1", "t2"]

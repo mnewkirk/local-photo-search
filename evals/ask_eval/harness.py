@@ -441,9 +441,9 @@ def cmd_ablate(args) -> int:
                 continue
             items = (items_for_mutant(mid, items_all, cov)
                      if args.items == "covering" else items_all)
-            done = (RESULTS / f"abl-{mid}").exists()
+            done = (RESULTS / f"{args.prefix}{mid}").exists()
             if done and not args.rerun:
-                print(f"skip {mid}: results/abl-{mid} exists (--rerun to add samples)")
+                print(f"skip {mid}: results/{args.prefix}{mid} exists (--rerun to add samples)")
                 continue
             plan.append((mid, items))
         n = sum(len(it) for _, it in plan) * args.repeat * len(models)
@@ -456,7 +456,7 @@ def cmd_ablate(args) -> int:
             return 0 if idle else 2
         for mid, items in plan:
             print(f"\n== mutant {mid} ({available.get(mid, 0):,} chars removed)")
-            rc = _run_config(tree, args, items, models, f"abl-{mid}", args.repeat, mid)
+            rc = _run_config(tree, args, items, models, f"{args.prefix}{mid}", args.repeat, mid)
             if rc:
                 return rc
     return 0
@@ -480,10 +480,11 @@ def cmd_mutation(args) -> int:
     base = _rates(_rows(args.baseline))
     if not base:
         raise SystemExit(f"no rows in results/{args.baseline}")
-    configs = sorted(d.name for d in RESULTS.glob("abl-*") if d.is_dir())
+    pre = args.prefix
+    configs = sorted(d.name for d in RESULTS.glob(f"{pre}*") if d.is_dir())
     if not configs:
-        raise SystemExit("no results/abl-* configs: run `harness.py ablate` first")
-    controls = [c for c in configs if c[4:] in mutants.CONTROLS]
+        raise SystemExit(f"no results/{pre}* configs: run `harness.py ablate` first")
+    controls = [c for c in configs if c[len(pre):] in mutants.CONTROLS]
     configs = [c for c in configs if c not in controls]
     # Items that flip under an edit that removes nothing are fragile: a flip
     # under a real mutant says nothing about that item's dependence on it.
@@ -497,7 +498,7 @@ def cmd_mutation(args) -> int:
           f"{KILL_DROP:.0%} against the baseline (same model). Survivors are either "
           "untested by the suite or text the agent does not need.\n")
     if controls:
-        print(f"Controls run: {', '.join(c[4:] for c in controls)}. Fragile items (flip "
+        print(f"Controls run: {', '.join(c[len(pre):] for c in controls)}. Fragile items (flip "
               f"under a control, so excluded as killers): "
               f"{', '.join(sorted(fragile)) or 'none'}.\n")
     else:
@@ -526,9 +527,9 @@ def cmd_mutation(args) -> int:
         tested += 1
         killed += bool(killers)
         if not killers:
-            survivors.append((c[4:], removed))
+            survivors.append((c[len(pre):], removed))
         dmean = sum(deltas) / len(deltas) if deltas else 0
-        print(f"| {c[4:]} | {removed:,} | {len(rows)} | {'yes' if killers else 'no'} "
+        print(f"| {c[len(pre):]} | {removed:,} | {len(rows)} | {'yes' if killers else 'no'} "
               f"| {', '.join(sorted(killers)) or '–'} | {', '.join(sorted(better)) or '–'} "
               f"| {100 * dmean:+.0f} pts |")
     print(f"\n**Mutation score: {killed}/{tested}**")
@@ -898,10 +899,14 @@ def main(argv=None) -> int:
     ab.add_argument("--nas", default=os.environ.get("PHOTOSEARCH_NAS_URL") or DEFAULT_NAS)
     ab.add_argument("--allow-rerank", action="store_true")
     ab.add_argument("--rerun", action="store_true")
+    ab.add_argument("--prefix", default="abl-",
+                    help="config prefix, so ablation series on different refs/models stay apart")
     ab.add_argument("--dry-run", action="store_true")
 
     mr = sub.add_parser("mutation", help="kill table for results/abl-* against a baseline config")
     mr.add_argument("--baseline", required=True)
+    mr.add_argument("--prefix", default="abl-",
+                    help="config prefix of one ablation series (`ablate --prefix`)")
 
     cv = sub.add_parser("coverage", help="rule, usage and parameter coverage; calls no model")
     common(cv)

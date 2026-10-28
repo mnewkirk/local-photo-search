@@ -79,7 +79,8 @@ CORE = (list(RULES) + list(BLOCKS) + ["tools.filter-descriptions",
 # the prompt text can flip a fragile item, so an item that flips under a
 # control is noise, not evidence that it depends on the text a real mutant
 # deleted. `harness.py mutation` discounts them.
-CONTROLS = ("control.newline", "control.reword", "control.swap-examples")
+CONTROLS = ("control.newline", "control.reword", "control.swap-examples",
+            "control.swap-rules", "control.pictures", "control.tool-order")
 
 
 def slug(text: str, n: int = 32) -> str:
@@ -173,6 +174,16 @@ def apply(mutant: str, system: str, tools: list, *, shared_props=None) -> tuple[
         if len(ex) >= 2:
             lines[ex[0]], lines[ex[1]] = lines[ex[1]], lines[ex[0]]
         return "\n".join(lines), tools, 0
+    if mutant == "control.swap-rules":
+        lines = system.split("\n")
+        rl = [i for i, l in enumerate(lines) if l.startswith("- ")]
+        if len(rl) >= 3:
+            lines[rl[1]], lines[rl[2]] = lines[rl[2]], lines[rl[1]]
+        return "\n".join(lines), tools, 0
+    if mutant == "control.pictures":
+        return system.replace("find the matching photos", "find the matching pictures", 1), tools, 0
+    if mutant == "control.tool-order":
+        return system, list(reversed(tools)), 0
     if mutant in RULES:
         rx = re.compile(RULES[mutant])
         system, _ = _drop_lines(system, lambda l: bool(rx.search(l)))
