@@ -74,7 +74,7 @@ import re
 import sys
 import time
 from dataclasses import replace
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
@@ -119,7 +119,7 @@ QUALITY_P = 0.80
 QUALITY_R = 0.50
 SHARE_RETRIEVAL = 0.5
 # Simplicity order for tie-breaks (earlier = simpler/cheaper).
-SIMPLICITY = ("F0", "F1", "S1", "S2")
+SIMPLICITY = ("F0", "F1", "S1", "S2", "H1")
 
 # Gates the owner has taken out of scope. `report` prints them as
 # "not evaluated (<reason>)" — never as a fail, never as a pass. Pass
@@ -437,14 +437,57 @@ def load_references(conn):
     return pids, (np.asarray(encs, float) if encs else np.zeros((0, 512)))
 
 
-def name_identity(encoding, refs, tolerance=None):
+def name_identity(encoding, refs, tolerance=None, margin=0.0):
+    """The strict matcher (nearest reference within ``tolerance``). With
+    ``margin`` > 0 (round 2), the nearest OTHER person's reference must also
+    be at least ``margin`` farther — a stranger between two kids is left
+    unnamed instead of taking whichever is a hair closer."""
     from photosearch import faces
     pids, encs = refs
     if encoding is None or not pids:
         return None
-    m = faces.match_face(list(encoding), encs.tolist(),
-                         faces.MATCH_TOLERANCE if tolerance is None else tolerance)
-    return pids[m[0][0]] if m else None
+    import numpy as np
+    tol = faces.MATCH_TOLERANCE if tolerance is None else tolerance
+    q = np.asarray(encoding, float)
+    d = np.sqrt(((encs - q) ** 2).sum(1))          # == faces.match_face's distances
+    if not margin:
+        i = int(np.argmin(d))
+        return pids[i] if d[i] <= tol else None
+    per: dict = {}
+    for pid, dist in zip(pids, d):
+        if dist < per.get(pid, 9.0):
+            per[pid] = float(dist)
+    ranked = sorted(per.items(), key=lambda kv: kv[1])
+    if not ranked or ranked[0][1] > tol:
+        return None
+    if len(ranked) > 1 and ranked[1][1] - ranked[0][1] < margin:
+        return None
+    return ranked[0][0]
+
+
+class NamingRule(NamedTuple):
+    """Which identities may carry a library name (round 2, item 1).
+    ``eligible_only``: only identities that earn a production ``faces`` row
+    (``video_analysis.face_row_eligible``) — below the gate production has no
+    row to name. ``min_presence_s``: the presence list's duration floor."""
+    tolerance: Optional[float] = None
+    margin: float = 0.0
+    eligible_only: bool = False
+    min_presence_s: float = 0.0
+
+
+LEGACY_NAMING = NamingRule()
+
+
+def name_identities(fa, refs, naming=LEGACY_NAMING):
+    from photosearch import video_analysis as va
+    out = {}
+    for i in fa.identities:
+        if naming.eligible_only and not va.face_row_eligible(i.n_det, i.presence_s):
+            out[i.ix] = None
+            continue
+        out[i.ix] = name_identity(i.encoding, refs, naming.tolerance, naming.margin)
+    return out
 
 
 # ==========================================================================
@@ -466,11 +509,11 @@ def _present_named(fa, names, min_presence_s=0.0):
                    if names.get(i.ix) is not None and i.presence_s > min_presence_s})
 
 
-def face_item(approach, frames, meta, params, refs):
+def face_item(approach, frames, meta, params, refs, naming=LEGACY_NAMING):
     from photosearch import video_analysis as va
     W, H, dur = meta["W"], meta["H"], meta["duration"]
     fa = (va.analyze_faces_f0 if approach == "F0" else va.analyze_faces)(frames, W, H, dur, params)
-    names = {i.ix: name_identity(i.encoding, refs) for i in fa.identities}
+    names = name_identities(fa, refs, naming)
     prod = me.video_production_segments(dur)
     keys = [_face_key(ix, names) for ix in va.segment_focus(fa, prod)]
     return fa, names, prod, keys
@@ -492,12 +535,47 @@ def subject_keys(analysis, names):
     return out
 
 
-def predict(approach, pid, frames, meta, *, params, sparams=None, refs, grounding=None):
+def h1_keys(segs, hybrid, names):
+    out = []
+    for h in hybrid:
+        if h is None:
+            out.append(["none"])
+        elif h.category == "person":
+            out.append(_face_key(h.face_ix, names) if h.face_ix is not None else ["else"])
+        else:
+            out.append(["s", h.label])
+    return out
+
+
+def predict(approach, pid, frames, meta, *, params, sparams=None, refs, grounding=None,
+            naming=LEGACY_NAMING, hparams=None, fa_cache=None):
     """The cached run item for one video: per label segment a key, plus the
-    named people present (faces layer)."""
+    named people present (faces layer). ``fa_cache`` (a dict) reuses face
+    analyses across a parameter sweep."""
+    from photosearch import video_analysis as va
     from photosearch import video_subjects as vs
     dur = meta["duration"]
-    fa, names, prod, keys = face_item("F0" if approach == "F0" else "F1", frames, meta, params, refs)
+    fkey = (pid, "F0" if approach == "F0" else "F1", params)
+    if fa_cache is not None and fkey in fa_cache:
+        fa = fa_cache[fkey]
+        prod = me.video_production_segments(dur)
+        names = name_identities(fa, refs, naming)
+        keys = [_face_key(ix, names) for ix in va.segment_focus(fa, prod)]
+    else:
+        fa, names, prod, keys = face_item("F0" if approach == "F0" else "F1", frames, meta,
+                                          params, refs, naming)
+        if fa_cache is not None:
+            fa_cache[fkey] = fa
+    if approach == "H1":
+        if grounding is None or grounding.get("status") != "ok":
+            raise ValueError("no grounding for this video")
+        hp = hparams or vs.DEFAULT_HYBRID_PARAMS
+        segs = [tuple(s) for s in grounding["segments"]]
+        hy = vs.score_hybrid(segs, grounding["boxes"], faces=fa, W=meta["W"], H=meta["H"],
+                             keyframe_times=grounding.get("keyframe_t"),
+                             segment_faces=va.segment_focus(fa, segs), params=hp)
+        hy = vs.propagate_identity(hy, segs, names, hp.propagate_min_share)
+        prod, keys = segs, h1_keys(segs, hy, names)
     if approach in ("S1", "S2"):
         if grounding is None or grounding.get("status") != "ok":
             raise ValueError("no grounding for this video")
@@ -512,7 +590,7 @@ def predict(approach, pid, frames, meta, *, params, sparams=None, refs, groundin
     return {"approach": approach, "seg_version": me.video_seg_version(),
             "duration": dur, "label_segments": [list(s) for s in label_segs],
             "pred": me.coarsen_keys(prod, keys, label_segs),
-            "present": _present_named(fa, names),
+            "present": _present_named(fa, names, naming.min_presence_s),
             "identities": [{"ix": i.ix, "person_id": names.get(i.ix), "focus_s": i.focus_s,
                             "presence_s": i.presence_s} for i in fa.identities]}
 
@@ -540,16 +618,20 @@ def s2_keys(an, fa, names):
 # Grounding (one VLM call per production segment keyframe)
 # ==========================================================================
 
-def default_grounder(image_path, model):
+def default_grounder(image_path, model, prompt=None):
     """The production video-subjects call (`subjects.ground_frame_subjects`,
     role ``subject``, with categories), so the eval scores what ships. An
     unusable answer comes back None and is scored as "no subject", as the
-    worker's <=20% segment tolerance does. Stub this in tests."""
+    worker's <=20% segment tolerance does. ``prompt`` swaps only the prompt
+    (``--prompt-file``; the production prompt stays untouched). Stub this in
+    tests."""
     from photosearch import subjects
-    return subjects.ground_frame_subjects(str(image_path), model=model)
+    if prompt is None:
+        return subjects.ground_frame_subjects(str(image_path), model=model)
+    return subjects.ground_frame_subjects(str(image_path), model=model, prompt=prompt)
 
 
-def ground_video(pid, duration, *, model, grounder=None, max_px=768):
+def ground_video(pid, duration, *, model, grounder=None, max_px=768, prompt=None):
     from photosearch import video_analysis as va
     grounder = grounder or default_grounder
     segs = me.video_production_segments(duration)
@@ -559,7 +641,7 @@ def ground_video(pid, duration, *, model, grounder=None, max_px=768):
         img = me.cached_frame_jpeg(pid, t, max_px)
         rec = me.Recorder()
         with rec.active():
-            ans = grounder(img, model)
+            ans = grounder(img, model) if prompt is None else grounder(img, model, prompt)
         rec.check(ans is None, "ground_photo_subjects")
         boxes.append([{"label": b.get("label"), "category": b.get("category"),
                        "bbox": [float(x) for x in b["bbox"]]} for b in ans or []])
@@ -567,14 +649,26 @@ def ground_video(pid, duration, *, model, grounder=None, max_px=768):
             "boxes": boxes, "latency_s": round(time.time() - t0, 3)}
 
 
-def run_grounding(variant, *, model=None, limit=None, force=False, grounder=None, log=log):
+def run_grounding(variant, *, model=None, limit=None, force=False, grounder=None, log=log,
+                  prompt_file=None, split=None):
+    """One grounding answer per production-segment keyframe, cached per
+    variant. ``prompt_file`` swaps the prompt (its sha is part of the run's
+    identity); ``split`` grounds only that split's videos (round 2 tunes on
+    dev and grounds holdout once, for the chosen variant only)."""
     from photosearch import describe, subjects
     me.pin_role_model("subject", model)
     eff = describe.effective_model(model or subjects.AES_MODEL, "subject")
+    prompt = None
+    ident = {}
+    if prompt_file:
+        with open(prompt_file, encoding="utf-8") as fh:
+            prompt = fh.read().strip()
+        ident["prompt_sha"] = me.text_sha(prompt)
     run = me.open_run(PASS_GROUND, variant, force=force, effective_model=eff,
-                      seg_version=me.video_seg_version())
+                      seg_version=me.video_seg_version(), **ident)
     todo = [p for p in me.load_video_sample()["photos"]
-            if me.is_labelled_clip(p) and str(p["photo_id"]) not in run["items"]]
+            if me.is_labelled_clip(p) and str(p["photo_id"]) not in run["items"]
+            and (split is None or p.get("split") == split)]
     todo = todo[:limit] if limit is not None else todo
     log(f"[grounding] {variant}: model={eff} — {len(todo)} to do, {len(run['items'])} cached")
     fc = me.FailureCounter(log)
@@ -582,7 +676,7 @@ def run_grounding(variant, *, model=None, limit=None, force=False, grounder=None
         pid = p["photo_id"]
         try:
             item = ground_video(pid, p["duration_s"], model=model or subjects.AES_MODEL,
-                                grounder=grounder)
+                                grounder=grounder, prompt=prompt)
         except me.TransportError as e:
             if me.classify_failure(e) == "rejected":
                 run["items"][str(pid)] = {"status": "rejected", "error": str(e)}
@@ -605,23 +699,33 @@ def run_grounding(variant, *, model=None, limit=None, force=False, grounder=None
 
 def run_faces(variant, approach, *, conn, grounding=None, model=None, params=None,
               sparams=None, det_tag=DET_TAG, det_size=None, force=False, scanner=None,
-              grounder=None, limit=None, log=log):
+              grounder=None, limit=None, log=log, naming=None, hparams=None, split=None,
+              prompt_file=None):
     from photosearch import video_analysis as va
     if approach not in SIMPLICITY:
         raise SystemExit(f"--approach must be one of {SIMPLICITY}")
     params = params or va.DEFAULT_PARAMS
+    naming = naming or LEGACY_NAMING
     gvar = None
-    if approach in ("S1", "S2"):
+    if approach in ("S1", "S2", "H1"):
         if not grounding:
-            raise SystemExit("S1/S2 need --grounding <variant> (the grounding cache name)")
-        gvar = run_grounding(grounding, model=model, limit=limit, grounder=grounder, log=log)
+            raise SystemExit("S1/S2/H1 need --grounding <variant> (the grounding cache name)")
+        gvar = run_grounding(grounding, model=model, limit=limit, grounder=grounder, log=log,
+                             prompt_file=prompt_file, split=split)
     ident = {"approach": approach, "det_tag": det_tag, "grounding": grounding,
              "grounding_model": (gvar or {}).get("effective_model"),
              "params": json.dumps(_jsonable(params.__dict__), sort_keys=True),
              "sparams": json.dumps(_jsonable((sparams.__dict__ if sparams else {})), sort_keys=True)}
+    if naming != LEGACY_NAMING:
+        ident["naming"] = json.dumps(_jsonable(naming._asdict()), sort_keys=True)
+    if approach == "H1":
+        from photosearch import video_subjects as vs
+        ident["hparams"] = json.dumps(_jsonable((hparams or vs.DEFAULT_HYBRID_PARAMS).__dict__),
+                                      sort_keys=True)
     run = me.open_run(PASS_SUBJECT, variant, force=force, **ident)
     refs = load_references(conn) if conn is not None else ([], None)
-    todo = [p for p in me.load_video_sample()["photos"] if me.is_labelled_clip(p)]
+    todo = [p for p in me.load_video_sample()["photos"] if me.is_labelled_clip(p)
+            and (split is None or p.get("split") == split)]
     todo = todo[:limit] if limit is not None else todo
     fc = me.FailureCounter(log)
     for p in todo:
@@ -631,7 +735,7 @@ def run_faces(variant, approach, *, conn, grounding=None, model=None, params=Non
             frames, meta = ensure_detections(pid, tag=det_tag, det_size=det_size, scanner=scanner)
             g = (gvar or {"items": {}})["items"].get(str(pid))
             item = predict(approach, pid, frames, meta, params=params, sparams=sparams,
-                           refs=refs, grounding=g)
+                           refs=refs, grounding=g, naming=naming, hparams=hparams)
             item["latency_s"] = round(time.time() - t0 + ((g or {}).get("latency_s") or 0), 3)
         except Exception as e:
             fc.fail(pid, e)
@@ -1524,7 +1628,7 @@ def build_report(not_evaluated=None):
             s = summarize_subject(subject_metrics(r, labels, sample, split=split, same=same))
             s["approach"] = r.get("approach")
             rep[slot][v] = s
-    s_cands = [v for v, r in runs.items() if r.get("approach") in ("S1", "S2")]
+    s_cands = [v for v, r in runs.items() if r.get("approach") in ("S1", "S2", "H1")]
     winner, tied = pick_winner(rep["subject"], s_cands)
     f1s = [v for v, r in runs.items() if r.get("approach") == "F1"]
     dev_winner, dev_tied = pick_winner(rep["subject_dev"], s_cands)
@@ -2105,8 +2209,26 @@ def main(argv=None):
     rf.add_argument("--det-size", type=int)
     for n in ("--sigma", "--a-min", "--merge-l2", "--join-window", "--link-sim"):
         rf.add_argument(n, type=float)
+    rf.add_argument("--prompt-file", help="the grounding variant's prompt (must match its cache)")
+    rf.add_argument("--split", choices=("dev", "holdout"), help="score (and ground) one split only")
+    rf.add_argument("--name-tol", type=float, help="naming: strict-matcher tolerance")
+    rf.add_argument("--name-margin", type=float, default=0.0,
+                    help="naming: nearest other person must be this much farther")
+    rf.add_argument("--name-eligible-only", action="store_true",
+                    help="naming: only identities that earn a production faces row")
+    rf.add_argument("--min-presence", type=float, default=0.0,
+                    help="presence list: seconds an identity must be present")
+    rf.add_argument("--hparams", help="H1 HybridParams as JSON")
     rf.add_argument("--limit", type=int)
     rf.add_argument("--force", action="store_true")
+
+    rg = sub.add_parser("run-grounding", help="ground segment keyframes only (one cache per variant)")
+    rg.add_argument("--variant", required=True)
+    rg.add_argument("--model", help="grounding model (LM Studio id; pins the subject role)")
+    rg.add_argument("--prompt-file", help="swap the grounding prompt (production prompt untouched)")
+    rg.add_argument("--split", choices=("dev", "holdout"))
+    rg.add_argument("--limit", type=int)
+    rg.add_argument("--force", action="store_true")
 
     rd = sub.add_parser("run-describe")
     rd.add_argument("--variant", required=True)
@@ -2179,9 +2301,16 @@ def main(argv=None):
     elif a.cmd == "run-faces":
         p, sp = _params(a)
         conn = me.open_db_readonly(a.db) if a.db else None
+        from photosearch import video_subjects as vs
+        naming = NamingRule(a.name_tol, a.name_margin, a.name_eligible_only, a.min_presence)
+        hp = replace(vs.DEFAULT_HYBRID_PARAMS, **json.loads(a.hparams)) if a.hparams else None
         run_faces(a.variant, a.approach, conn=conn, grounding=a.grounding, model=a.model,
                   params=p, sparams=sp, det_tag=a.det_tag, det_size=a.det_size,
-                  force=a.force, limit=a.limit)
+                  force=a.force, limit=a.limit, naming=naming, hparams=hp, split=a.split,
+                  prompt_file=a.prompt_file)
+    elif a.cmd == "run-grounding":
+        run_grounding(a.variant, model=a.model, limit=a.limit, force=a.force,
+                      prompt_file=a.prompt_file, split=a.split)
     elif a.cmd == "run-describe":
         run_describe(a.variant, a.approach, model=a.model, k=a.k, px=a.px, force=a.force,
                      limit=a.limit, solo=a.solo)

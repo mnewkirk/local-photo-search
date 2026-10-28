@@ -560,3 +560,16 @@ def test_describe_gate_is_evaluated_once_it_has_labels():
     me.save_temporal_label("abc", 1, "yes")
     rep = ve.build_report()
     assert "describe" not in rep["not_evaluated"]
+
+
+def test_name_identity_margin_leaves_a_between_two_people_face_unnamed():
+    import numpy as np
+    a = np.zeros(512); a[0] = 1.0
+    b = np.zeros(512); b[1] = 1.0
+    refs = ([1, 2], np.stack([a, b]))
+    q = (a + b * 0.95) / np.linalg.norm(a + b * 0.95)      # nearly equidistant
+    assert ve.name_identity(q.tolist(), refs) == 1            # legacy: nearest wins
+    assert ve.name_identity(q.tolist(), refs, margin=0.1) is None
+    assert ve.name_identity(a.tolist(), refs, margin=0.1) == 1
+    assert ve.name_identity(a.tolist(), refs, tolerance=1e-6) == 1
+    assert ve.name_identity(b.tolist(), ([1], a[None, :]), tolerance=1.0) is None

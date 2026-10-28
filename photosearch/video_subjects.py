@@ -459,3 +459,160 @@ def face_layer_from_manifest(segments_manifest: Sequence[dict], tracks: Sequence
     step = (1.0 / sample_fps) if sample_fps and sample_fps > 0 else 0.0
     return StoredFaceLayer(W=float(W), H=float(H), frame_times=[0.0, step],
                            identities=[by_ix[k] for k in sorted(by_ix)], by_ix=by_ix)
+
+
+# ---------------------------------------------------------------------------
+# H1 — hybrid: person-ness from the VLM OR a salient tracked face
+# ---------------------------------------------------------------------------
+#
+# Video eval round 2 (docs/plans/video-eval-round2-2026-10-27.md). S1 lost
+# most person segments because the highest-salience box was often the
+# scenery (a whole-frame "landscape"/"field" box always out-salients a person
+# box), and F1 said "no subject" whenever no face was in focus. H1 decides
+# person vs not-person first, from EITHER signal, and only then picks:
+#
+# * person segment = a VLM person box (the primary, or any person box at
+#   least ``person_box_min_a`` big when ``person_mode == "any"``), OR the
+#   segment's focus face (``segment_faces``, precomputed by the caller from
+#   the face layer's focus — ``video_analysis.segment_focus`` in the eval,
+#   the stored ``focus_intervals`` in production);
+# * identity = the face joined to the person box (``join_face``), else the
+#   segment's focus face; neither -> an unidentified person;
+# * otherwise the VLM's non-person primary (``nonperson_rule``: highest
+#   salience, or the first box the model listed), else no subject.
+#
+# Naming (which identities may carry a library name) is the caller's job.
+
+@dataclass(frozen=True)
+class HybridParams:
+    sigma: Optional[float] = DEFAULT_PARAMS.sigma
+    join_window_s: float = 1.0
+    join_contain: float = 0.6
+    person_mode: str = "any"          # "primary" | "any"
+    person_box_min_a: float = 0.10    # sqrt(box area) as a fraction of min(W, H)
+    use_faces: bool = True            # a focus face alone makes a person segment
+    nonperson_rule: str = "salience"  # "salience" | "first"
+    # propagate_identity(): an unidentified person segment takes the clip's
+    # dominant NAMED person when that person holds at least this share of the
+    # clip's identified-person time. None = off.
+    propagate_min_share: Optional[float] = None
+
+
+DEFAULT_HYBRID_PARAMS = HybridParams()
+
+
+@dataclass
+class HybridSegment:
+    category: str                     # person | animal | landscape | object | activity
+    label: str
+    face_ix: Optional[int]
+    source: str                       # vlm+face | vlm | face | vlm-nonperson
+
+
+def _box_a(bbox: Sequence[float]) -> float:
+    x1, y1, x2, y2 = bbox
+    return float(np.sqrt(max(0.0, x2 - x1) * max(0.0, y2 - y1)))
+
+
+def score_hybrid(segments: Sequence[tuple[float, float]],
+                 groundings: Sequence[Optional[Sequence[dict]]],
+                 faces: Optional[FaceAnalysis] = None,
+                 W: Optional[float] = None, H: Optional[float] = None,
+                 keyframe_times: Optional[Sequence[float]] = None,
+                 segment_faces: Optional[Sequence[Optional[int]]] = None,
+                 params: HybridParams = DEFAULT_HYBRID_PARAMS) -> list[Optional[HybridSegment]]:
+    """One :class:`HybridSegment` (or None = no subject) per segment."""
+    if len(segments) != len(groundings):
+        raise ValueError("one grounding answer per segment")
+    if W is None or H is None:
+        W, H = (faces.W, faces.H) if faces is not None else (1.0, 1.0)
+    kts = list(keyframe_times) if keyframe_times is not None else segment_keyframe_times(segments)
+    sf = list(segment_faces) if segment_faces is not None else [None] * len(segments)
+    sp = SubjectParams(sigma=params.sigma, join_window_s=params.join_window_s,
+                       join_contain=params.join_contain)
+    out: list[Optional[HybridSegment]] = []
+    for boxes, t, focus_ix in zip(groundings, kts, sf):
+        boxes = [b for b in (boxes or ()) if b.get("bbox") and len(b["bbox"]) == 4]
+        primary = choose_primary(boxes, W, H, sp)
+        person_box = None
+        if primary is not None and _category(primary) == "person":
+            person_box = primary
+        elif params.person_mode == "any":
+            pb = [b for b in boxes if _category(b) == "person"
+                  and _box_a(b["bbox"]) >= params.person_box_min_a]
+            person_box = choose_primary(pb, W, H, sp)
+        face_focus = focus_ix if params.use_faces else None
+        if person_box is not None or face_focus is not None:
+            ix = join_face(person_box, t, faces, sp) if person_box is not None else None
+            src = "vlm+face" if ix is not None else ("vlm" if person_box is not None else "face")
+            if ix is None and focus_ix is not None:
+                ix = focus_ix
+                src = "face" if person_box is None else "vlm+focus"
+            label = (person_box or {}).get("label") or "person"
+            out.append(HybridSegment("person", normalize_label(label) or "person", ix, src))
+            continue
+        np_boxes = [b for b in boxes if _category(b) != "person"]
+        if not np_boxes:
+            out.append(None)
+            continue
+        if params.nonperson_rule == "first":
+            b = np_boxes[0]
+        else:
+            b = choose_primary(np_boxes, W, H, sp)
+        cat = _category(b)
+        out.append(HybridSegment(cat, normalize_label(b.get("label")) or cat, None,
+                                 "vlm-nonperson"))
+    return out
+
+
+def focus_from_intervals(tracks: Sequence[dict], segments: Sequence[tuple[float, float]],
+                         min_frac: float = DEFAULT_PARAMS.segment_min_focus_frac
+                         ) -> list[Optional[int]]:
+    """Per segment, the identity whose stored ``focus_intervals`` cover the
+    most of it (>= ``min_frac``), else None — the production stand-in for
+    ``video_analysis.segment_focus`` (video_tracks rows carry the intervals)."""
+    out = []
+    for a, b in segments:
+        best, best_cov = None, 0.0
+        for tr in tracks or ():
+            iv = tr.get("focus_intervals") or []
+            if isinstance(iv, str):
+                import json
+                iv = json.loads(iv)
+            cov = sum(max(0.0, min(hi, b) - max(lo, a)) for lo, hi in iv)
+            if cov > best_cov:
+                best, best_cov = tr.get("ident_ix"), cov
+        out.append(best if b > a and best_cov / (b - a) >= min_frac - 1e-9 else None)
+    return out
+
+
+def propagate_identity(hybrid: Sequence[Optional[HybridSegment]],
+                       segments: Sequence[tuple[float, float]],
+                       named: dict, min_share: Optional[float]) -> list[Optional[HybridSegment]]:
+    """Fill unidentified person segments with the clip's dominant named person.
+
+    ``named`` maps a face identity ix to a person id (None = unnamed). The
+    dominant person is the one whose identified-person segments cover the
+    most time; it must hold >= ``min_share`` of all identified-person time
+    (named or not). The camera usually follows one person through a clip, and
+    their face is often turned away for whole segments. Off when
+    ``min_share`` is None."""
+    if min_share is None:
+        return list(hybrid)
+    per: dict = {}
+    total = 0.0
+    for h, (a, b) in zip(hybrid, segments):
+        if h is None or h.category != "person" or h.face_ix is None:
+            continue
+        total += b - a
+        pid = named.get(h.face_ix)
+        if pid is not None:
+            per[h.face_ix] = per.get(h.face_ix, 0.0) + (b - a)
+    if not per or total <= 0:
+        return list(hybrid)
+    best = max(per, key=lambda k: per[k])
+    if per[best] / total < min_share - 1e-9:
+        return list(hybrid)
+    return [HybridSegment(h.category, h.label, best, "propagated")
+            if h is not None and h.category == "person" and h.face_ix is None else h
+            for h in hybrid]

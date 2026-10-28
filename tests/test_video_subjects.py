@@ -154,3 +154,66 @@ def test_forty_segment_cap_on_a_29_minute_clip():
     assert sa.subjects[0].focus_s == pytest.approx(435.0)
     with pytest.raises(ValueError):
         vs.score_subjects(segs, g[:-1], W=W, H=H)
+
+
+# ---------------------------------------------------------------------------
+# H1 hybrid (video eval round 2)
+# ---------------------------------------------------------------------------
+
+FIELD = {"label": "soccer field", "category": "landscape", "bbox": [0.0, 0.0, 1.0, 1.0]}
+
+
+def _fa(duration=6.0):
+    frames = _face_frames(duration, lambda t: True)
+    return va.analyze_faces(frames, W, H, duration)
+
+
+def test_hybrid_person_box_beats_a_whole_frame_landscape():
+    segs = [(0.0, 3.0), (3.0, 6.0)]
+    fa = _fa()
+    s1 = vs.score_subjects(segs, [[FIELD, PERSON]] * 2, faces=fa, W=W, H=H)
+    assert s1.subjects[s1.primaries[0]].category == "landscape"     # the S1 failure
+    hy = vs.score_hybrid(segs, [[FIELD, PERSON]] * 2, faces=fa, W=W, H=H)
+    assert all(h.category == "person" and h.face_ix == 0 for h in hy)
+
+
+def test_hybrid_primary_mode_keeps_the_s1_choice():
+    segs = [(0.0, 3.0)]
+    hp = dataclasses.replace(vs.DEFAULT_HYBRID_PARAMS, person_mode="primary", use_faces=False)
+    hy = vs.score_hybrid(segs, [[FIELD, PERSON]], faces=_fa(3.0), W=W, H=H, params=hp)
+    assert hy[0].category == "landscape" and hy[0].label == "soccer field"
+
+
+def test_hybrid_focus_face_alone_makes_a_person_segment():
+    segs = [(0.0, 3.0)]
+    hy = vs.score_hybrid(segs, [[DOG]], faces=_fa(3.0), W=W, H=H, segment_faces=[0])
+    assert hy[0].category == "person" and hy[0].face_ix == 0 and hy[0].source == "face"
+    off = dataclasses.replace(vs.DEFAULT_HYBRID_PARAMS, use_faces=False)
+    hy = vs.score_hybrid(segs, [[DOG]], faces=_fa(3.0), W=W, H=H, segment_faces=[0], params=off)
+    assert hy[0].category == "animal" and hy[0].label == "dog"
+
+
+def test_hybrid_small_person_box_is_ignored_in_any_mode():
+    tiny = {"label": "man", "category": "person", "bbox": [0.5, 0.5, 0.52, 0.53]}
+    hy = vs.score_hybrid([(0.0, 3.0)], [[FIELD, tiny]], W=W, H=H)
+    assert hy[0].category == "landscape"
+    assert vs.score_hybrid([(0.0, 3.0)], [[]], W=W, H=H) == [None]
+
+
+def test_propagate_identity_fills_unidentified_person_segments():
+    segs = [(0, 3), (3, 6), (6, 9)]
+    hy = [vs.HybridSegment("person", "boy", 0, "vlm+face"),
+          vs.HybridSegment("person", "boy", None, "vlm"),
+          vs.HybridSegment("animal", "dog", None, "vlm-nonperson")]
+    assert vs.propagate_identity(hy, segs, {0: 7}, None) == hy
+    out = vs.propagate_identity(hy, segs, {0: 7}, 0.5)
+    assert out[1].face_ix == 0 and out[1].source == "propagated"
+    assert out[2] is hy[2]
+    # an unnamed dominant identity never propagates
+    assert vs.propagate_identity(hy, segs, {0: None}, 0.5) == hy
+
+
+def test_focus_from_intervals():
+    tracks = [{"ident_ix": 0, "focus_intervals": [[0, 2.5]]},
+              {"ident_ix": 1, "focus_intervals": json.dumps([[3, 3.5]])}]
+    assert vs.focus_from_intervals(tracks, [(0, 3), (3, 6)], 0.3) == [0, None]
