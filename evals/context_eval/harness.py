@@ -511,15 +511,62 @@ def context_fingerprint(root: Path) -> dict:
     }
 
 
+# Context ablations: what a worktree loses before the model sees it. The
+# question each answers: does the model still find / obey the knowledge with
+# this layer gone? `bare` is the floor (code only). The deletion is committed
+# inside the detached worktree, so task grading diffs against the ablated tree.
+ABLATIONS = {
+    "no-rules": [".claude/rules", "HOOK"],
+    "no-notes": ["docs/notes"],
+    "no-rules-notes": [".claude/rules", "HOOK", "docs/notes"],
+    "no-reference": [".claude/skills/photo-search/reference"],
+    "no-claude-md": ["CLAUDE.md"],
+    "bare": ["CLAUDE.md", ".claude/rules", "HOOK", "docs/notes",
+             ".claude/skills/photo-search/reference"],
+}
+
+
+def apply_ablation(path: Path, name: str | None) -> list[str]:
+    """Delete an ablation's context from a worktree and commit it there.
+    "HOOK" drops the PreToolUse rule-injection hook from .claude/settings.json
+    (it would otherwise inject the deleted rules). Returns what was removed."""
+    if not name:
+        return []
+    removed = []
+    for rel in ABLATIONS[name]:
+        if rel == "HOOK":
+            sp = path / ".claude" / "settings.json"
+            if sp.exists():
+                cfg = json.loads(sp.read_text())
+                if cfg.pop("hooks", None) is not None:
+                    sp.write_text(json.dumps(cfg, indent=2) + "\n")
+                    removed.append("hook")
+            continue
+        target = path / rel
+        if target.is_dir():
+            shutil.rmtree(target)
+            removed.append(rel)
+        elif target.exists():
+            target.unlink()
+            removed.append(rel)
+    subprocess.run(["git", "-c", "user.name=ctxeval", "-c", "user.email=ctxeval@localhost",
+                    "commit", "-qam", f"ctxeval ablation: {name}", "--no-verify"],
+                   cwd=path, capture_output=True, text=True)
+    return removed
+
+
 class Worktree:
-    def __init__(self, ref: str):
+    def __init__(self, ref: str, ablate: str | None = None):
         self.ref = ref
+        self.ablate = ablate
         self.path: Path | None = None
+        self.removed: list[str] = []
 
     def __enter__(self) -> Path:
         self.path = Path(tempfile.mkdtemp(prefix="ctxeval-"))
         subprocess.run(["git", "worktree", "add", "--detach", "--quiet", str(self.path), self.ref],
                        cwd=REPO, check=True, capture_output=True, text=True)
+        self.removed = apply_ablation(self.path, self.ablate)
         return self.path
 
     def __exit__(self, *exc):
@@ -568,10 +615,11 @@ def stored_result(row: dict) -> dict:
 
 def run_one(suite: str, item: dict, rep: int, args) -> dict:
     row = {"suite": suite, "id": item["id"], "config": args.config, "rep": rep,
+           "ablate": getattr(args, "ablate", None),
            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
            "requested_model": args.model, "max_turns": max_turns_for(suite, args.max_turns)}
     if suite == "tasks":
-        with Worktree(args.ref) as wt:
+        with Worktree(args.ref, getattr(args, "ablate", None)) as wt:
             row["context"] = context_fingerprint(wt)
             head0 = _git_head(wt)
             res = run_claude(item["prompt"], wt, model=args.model,
@@ -661,7 +709,9 @@ def cmd_run(args) -> int:
     # One worktree for the whole run, shared by the read-only suites: the cwd is
     # part of Claude Code's system prompt, so a fresh path per run would miss
     # the prompt cache every time (a full cache write per run).
-    iso = Worktree(args.ref) if args.isolate else None
+    if getattr(args, "ablate", None):
+        args.isolate = True    # an ablation must never touch the main checkout
+    iso = Worktree(args.ref, getattr(args, "ablate", None)) if args.isolate else None
     args.iso_path = iso.__enter__() if iso else None
     try:
         return _run_jobs(jobs, args)
@@ -1065,6 +1115,8 @@ def main(argv=None) -> int:
                    help="skip runs this config already has a scored row for")
     r.add_argument("--isolate", action="store_true",
                    help="run every suite (not just tasks) in a worktree of --ref")
+    r.add_argument("--ablate", choices=sorted(ABLATIONS),
+                   help="delete a context layer in the worktree first (implies --isolate)")
     r.add_argument("--no-keepalive", action="store_true",
                    help="talk to ANTHROPIC_BASE_URL directly (no ping-injecting proxy)")
     r.add_argument("--dry-run", action="store_true", help="list the runs, call nothing")

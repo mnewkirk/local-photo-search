@@ -602,3 +602,19 @@ def test_stats_helpers():
     assert abs(h.fisher_exact(3, 0, 0, 3) - 0.1) < 1e-9          # textbook 2x2
     assert h.fisher_exact(5, 5, 5, 5) == 1.0
     assert abs(h.sign_test(0, 5) - 0.0625) < 1e-9 and h.sign_test(0, 0) == 1.0
+
+
+def test_ablation_removes_layers_and_the_hook_in_a_worktree_only(tmp_path):
+    (tmp_path / ".claude" / "rules").mkdir(parents=True)
+    (tmp_path / ".claude" / "rules" / "x.md").write_text("rule")
+    (tmp_path / ".claude" / "settings.json").write_text(
+        json.dumps({"hooks": {"PreToolUse": []}, "other": 1}))
+    (tmp_path / "docs" / "notes").mkdir(parents=True)
+    (tmp_path / "CLAUDE.md").write_text("x")
+    removed = h.apply_ablation(tmp_path, "no-rules")
+    assert removed == [".claude/rules", "hook"]
+    assert not (tmp_path / ".claude" / "rules").exists()
+    assert json.loads((tmp_path / ".claude" / "settings.json").read_text()) == {"other": 1}
+    assert (tmp_path / "docs" / "notes").exists() and (tmp_path / "CLAUDE.md").exists()
+    assert h.apply_ablation(tmp_path, None) == []
+    assert set(h.ABLATIONS["bare"]) >= {"CLAUDE.md", ".claude/rules", "HOOK", "docs/notes"}
