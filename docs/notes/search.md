@@ -152,3 +152,26 @@ still recur as killers of unrelated mutants and are probably fragile too;
 firm attribution needs 3 reps per mutant. The two big tool trims both cost
 behaviour: dropping all parameter descriptions (16,288 chars) broke 6 items,
 de-duplicating the filter descriptions (6,520) broke d05 (and x01).
+
+### 2026-10-27 — the Ask prompt trim, measured (evals/ask_eval)
+
+Shipped: (1) `_lean_for_model` caps chapter / day / scene / bucket summaries
+at 20 compact entries — the real cause of the overflows (one chapters call
+sent 114 summaries, ~8k tokens); (2) the three long shared filter
+descriptions (`min_aesthetic`, `min_day_aesthetic`, `style_tag`) are full on
+search_photos only and hand-shortened elsewhere (`tools.SHORT_DESCRIPTIONS`),
+each keeping its routing hint; (3) "last summer" = the most recent summer.
+Result, 63 items x 3, qwen3.5-9b: 154/189 -> 162/189, context errors 9 -> 0,
+first round 11,697 -> 10,918 tokens, peak 16,318 -> 15,724. Worse: only
+x04 (fragile under control edits). Better: b01, b02, b05 (no overflow, and
+"top 40% of each day" now = 60), s05.
+
+Rejected, with evidence: single-search-tool mode (`--consolidated`) — 7,244
+first-round tokens but 9 items regressed (134/189, sign p 0.057). Automatic
+first-clause shortening of shared descriptions — dropped "a plain 'best' is
+sort='quality_desc' with NO floor" from five schemas and moved d02/d05 off
+the flat search. Cutting the four rules the mutation run marked unneeded
+(framing flags, summarize, mood tag, grounding; ~1.5k chars) — a
+single-factor run showed it cost b06 (Lake Como recovery) and d01. Items flip
+chaotically under small prompt edits at temperature 0: localise every change
+with one-factor configs before believing it.

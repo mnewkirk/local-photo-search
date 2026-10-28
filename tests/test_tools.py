@@ -903,3 +903,29 @@ def test_server_instructions_consolidated_swaps_guidance():
     con = tools.server_instructions(consolidated=True)
     assert tools.ROUTING_GUIDANCE in plain
     assert tools.CONSOLIDATED_GUIDANCE in con and tools.ROUTING_GUIDANCE not in con
+
+
+def test_shared_filters_carry_full_text_once_and_keep_routing_hints():
+    """search_photos keeps the long shared descriptions; the other search-like
+    tools get SHORT_DESCRIPTIONS, each keeping its routing hint. An automatic
+    first-clause cut dropped "plain 'best' = sort='quality_desc', no floor"
+    and moved two Ask-eval items off the flat search (2026-10-27)."""
+    by = {t["function"]["name"]: t["function"]["parameters"]["properties"]
+          for t in tools.openai_tools(include_images=False, include_writes=True,
+                                      consolidated=False)}
+    full = tools._CURATION_FILTER_PROPS
+    for k in tools.SHORT_DESCRIPTIONS:
+        assert by["search_photos"][k]["description"] == full[k]["description"]
+        for name in ("representatives", "daily_highlights", "group_into_chapters",
+                     "daily_scene_breakdown", "summarize"):
+            if k in by[name]:
+                assert by[name][k]["description"] == tools.SHORT_DESCRIPTIONS[k]
+    assert "sort='quality_desc'" in tools.SHORT_DESCRIPTIONS["min_aesthetic"]
+    assert "NO floor" in tools.SHORT_DESCRIPTIONS["min_aesthetic"]
+    assert "= 60" in tools.SHORT_DESCRIPTIONS["min_day_aesthetic"]
+    assert "visual_tag" in tools.SHORT_DESCRIPTIONS["style_tag"]
+    # The MCP projection gets the same schemas.
+    mcp = {t["name"]: t["inputSchema"]["properties"]
+           for t in tools.mcp_tools(include_images=False, include_writes=True,
+                                    consolidated=False)}
+    assert mcp["representatives"]["min_aesthetic"] == by["representatives"]["min_aesthetic"]

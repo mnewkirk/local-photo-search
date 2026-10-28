@@ -170,6 +170,38 @@ def _share_args(args: dict) -> dict:
     return out
 
 
+# One full description per filter: `search_photos` carries the long text of
+# every filter it shares with the other search-like tools; the other five get
+# the short version below, written by hand so each keeps its ROUTING hint. An
+# automatic first-clause cut dropped "a plain 'best' is sort='quality_desc'
+# with NO floor" from five schemas and moved two Ask-eval items off the flat
+# search (evals/ask_eval, 2026-10-27; docs/notes/search.md).
+_FULL_DESCRIPTION_TOOL = "search_photos"
+SHORT_DESCRIPTIONS = {
+    "min_aesthetic": ("Minimum aesthetic PERCENTILE, 0-100 (90 = top 10%), only for an "
+                      "explicit bar; a plain 'best'/'top' is sort='quality_desc' with NO floor."),
+    "min_day_aesthetic": ("Minimum PER-DAY aesthetic percentile, 0-100 (rank within the same "
+                          "day): 'top 40% of each day' = 60."),
+    "style_tag": ("VLM style tag (golden-hour, black-and-white); mood words go in "
+                  "`visual_tag`. Only values from list_vocab(kind='style_tags')."),
+}
+
+
+def _compact_schema(name: str, parameters: dict) -> dict:
+    """A tool's schema with SHORT_DESCRIPTIONS in place of the long shared
+    texts (search_photos keeps the full ones)."""
+    if name == _FULL_DESCRIPTION_TOOL:
+        return parameters
+    props = parameters.get("properties") or {}
+    if not any(k in SHORT_DESCRIPTIONS for k in props):
+        return parameters
+    out = dict(parameters)
+    out["properties"] = {k: ({**v, "description": SHORT_DESCRIPTIONS[k]}
+                             if k in SHORT_DESCRIPTIONS and isinstance(v, dict) else v)
+                         for k, v in props.items()}
+    return out
+
+
 def _resolve_consolidated(consolidated: Optional[bool]) -> bool:
     return consolidated_search_enabled() if consolidated is None else consolidated
 
@@ -192,7 +224,7 @@ def openai_tools(include_images: bool = True, include_writes: bool = False,
             "function": {
                 "name": spec.name,
                 "description": spec.description,
-                "parameters": _gate_schema(spec.parameters),
+                "parameters": _compact_schema(spec.name, _gate_schema(spec.parameters)),
             },
         })
     return out
@@ -212,7 +244,7 @@ def mcp_tools(include_images: bool = True, include_writes: bool = False,
         out.append({
             "name": spec.name,
             "description": spec.description,
-            "inputSchema": _gate_schema(spec.parameters),
+            "inputSchema": _compact_schema(spec.name, _gate_schema(spec.parameters)),
         })
     return out
 

@@ -43,6 +43,11 @@ RULES = {
     "grounding": r"^You are given LIBRARY FACTS",
 }
 
+# Rules a trim has removed from HEAD (kept in RULES so `ablate` can still run
+# them against an older ref). Empty: the 2026-10-27 cuts were reverted after
+# a single-factor run showed they cost b06 and d01.
+RETIRED: set = set()
+
 BLOCKS = {
     "block.rules": {"start": r"^Rules:$", "end": r"^Examples:$"},
     "block.examples": {"start": r"^Examples:$", "end": r"^\s*$|^WRITES|^LIBRARY FACTS:|^USER NOTES:|^Today's date"},

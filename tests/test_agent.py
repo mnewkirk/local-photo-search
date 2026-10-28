@@ -577,6 +577,9 @@ def test_lean_for_model_caps_group_summaries():
     c = lean["chapters"][0]
     assert c["title"] == "Place 0" and c["photo_count"] == 40
     assert c["places"] == ["A", "B"] and c["representative_ids"] == [0, 1, 2]
+    # A place equal to the chapter's title is not repeated.
+    same = agent._lean_group({"title": "Varenna", "places": ["Varenna"]})
+    assert same == {"title": "Varenna"}
     assert "debug" not in c
     assert lean["day_summary"] == result["day_summary"] and "day_summary_note" not in lean
     assert len(result["chapters"]) == 114        # the caller's (UI's) copy is untouched

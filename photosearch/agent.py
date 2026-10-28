@@ -181,12 +181,13 @@ def _system_prompt(db=None, allow_writes: bool = False,
     # list_* tools" directive; an MCP client without the facts gets the opposite
     # one. That conditional is exactly why the tool descriptions themselves must
     # stay neutral about whether to ground first.
+    grounding = toolmod.GROUNDING_WITH_FACTS if ctx else toolmod.GROUNDING_WITHOUT_FACTS
     base = (
         "You are a photo-library search assistant. The user describes what they "
         "want in natural language; find the matching photos with the tools, then "
         "give a one- or two-sentence answer.\n\n"
-        + (toolmod.GROUNDING_WITH_FACTS if ctx else toolmod.GROUNDING_WITHOUT_FACTS)
-        + "\n\n" + toolmod.routing_guidance(consolidated)
+        + (grounding + "\n\n" if grounding else "")
+        + toolmod.routing_guidance(consolidated)
     )
     hints = os.environ.get("PHOTOSEARCH_AGENT_HINTS", "").strip()
     out = base + (toolmod.WRITE_GUIDANCE if allow_writes else "")
@@ -335,7 +336,7 @@ _MODEL_RESULT_CAP = 15  # photo hits fed back to the model per tool call
 # `day_summary`, `scenes`, `buckets`. Untrimmed, one chapters call added ~8k
 # tokens and the next round overflowed a 16k context (Ask eval b01/b02/b05,
 # 2026-10-26). The UI groups from the raw result, not this copy.
-_MODEL_GROUP_CAP = 30
+_MODEL_GROUP_CAP = 20
 _GROUP_KEYS = ("chapters", "scenes", "day_summary", "buckets")
 _GROUP_FIELDS = ("index", "title", "label", "day", "date", "date_from", "date_to",
                  "days", "photo_count", "count", "start", "end", "bucket", "n")
@@ -384,7 +385,9 @@ def _lean_group(g):
         return g
     t = {k: g[k] for k in _GROUP_FIELDS if g.get(k) is not None}
     if isinstance(g.get("places"), list) and g["places"]:
-        t["places"] = g["places"][:2]
+        places = [p for p in g["places"][:2] if p != g.get("title")]
+        if places:
+            t["places"] = places
     for k in ("representative_ids", "photo_ids", "ids"):
         if isinstance(g.get(k), list):
             t[k] = g[k][:3]

@@ -336,13 +336,16 @@ def test_every_registered_mutant_finds_its_text(prompt):
         if mid in ("block.facts", "block.hints"):
             continue  # depend on the DB and the env, checked below
         new, _, removed = mutants.apply(mid, system, tools)
-        assert removed > 0 and len(new) < len(system), mid
+        if mid in mutants.RETIRED:
+            assert removed == 0, f"{mid} is retired but its text is back"
+        else:
+            assert removed > 0 and len(new) < len(system), mid
     assert len(mutants.example_ids(system)) >= 9
 
 
 def test_rule_mutants_remove_exactly_one_line(prompt):
     system, tools = prompt
-    for mid in mutants.RULES:
+    for mid in set(mutants.RULES) - mutants.RETIRED:
         new, _, _ = mutants.apply(mid, system, tools)
         assert len(system.split("\n")) - len(new.split("\n")) == 1, mid
 
