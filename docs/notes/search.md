@@ -175,3 +175,21 @@ the flat search. Cutting the four rules the mutation run marked unneeded
 single-factor run showed it cost b06 (Lake Como recovery) and d01. Items flip
 chaotically under small prompt edits at temperature 0: localise every change
 with one-factor configs before believing it.
+
+### 2026-10-28 — Ask ablations on the shipped prompt; local model comparison
+
+qwen3.5-9b, 23 deletions + 6 controls on HEAD: 10 of 63 items flip under
+edits that remove nothing (newline, one word, two rules swapped, tool order
+reversed) — about 16% of asks depend on incidental prompt details at
+temperature 0. Discounting them, 12/23 deletions are caught: the tool
+descriptions, the rules block, examples, facts, hints, and the foreground /
+read-total / representatives / rerank rules. Eleven single rules do not move
+qwen beyond noise; it routes mainly from the tool descriptions.
+
+gemma-4-12b-qat as the Ask model: 77/189 vs qwen 162/189, 17.7 s vs 3.4 s
+per Ask. 129 of its 506 tool calls (25%) arrive with invalid argument keys —
+gemma's native tool-call tokens (`<|"|>`, `<|tool_call>`) leak through
+LM Studio's parser (`{"people=[<|"|>Nicole<|"|>,...": 1}`); 45 of its 112
+failing runs contain one, the rest are worse routing. Do not use gemma-4 for
+tool calling on this LM Studio setup; it stays fine for the text passes,
+which use no tools. Its ablation series was stopped as uninformative.

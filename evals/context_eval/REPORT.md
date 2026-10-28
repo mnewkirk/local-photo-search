@@ -410,3 +410,66 @@ python3 evals/context_eval/harness.py report  --configs opus-before opus-after -
 
 Run from a clean environment (`env -i HOME=$HOME PATH=$PATH …`) when launching from inside a Claude
 session, and use `--resume` after an interruption.
+
+
+## Context ablations across models (2026-10-28)
+
+`harness.py run --ablate <layer>` deletes a context layer in an isolated
+worktree of HEAD (35dcc9e..), then runs the suites. Baseline: `--isolate`,
+3 reps; ablations: 1 rep. Isolated runs do not load the owner's memory
+directory, so these numbers differ from the repo-root runs above. Model ids
+recorded: claude-haiku-5-5, Sonnet and Opus via the `sonnet` / `opus` aliases.
+
+| model | layer removed | recall | rules | skills | tasks | turns | input tok | $/run |
+|---|---|---|---|---|---|---|---|---|
+| haiku | (none) | 95% | 100% | 52% | 100% | 5.8 | 176k | 0.010 |
+| haiku | no-rules | 100% | 89% | 61% | 91% | 6.3 | 156k | 0.008 |
+| haiku | no-notes | 98% | 100% | 50% | 100% | 5.7 | 184k | 0.011 |
+| haiku | no-rules-notes | 100% | 100% | 61% | 100% | 6.5 | 174k | 0.009 |
+| haiku | no-reference | 94% | 100% | 44% | 100% | 6.0 | 176k | 0.011 |
+| haiku | no-claude-md | 98% | 100% | 89% | 100% | 6.2 | 155k | 0.008 |
+| haiku | bare | 96% | 100% | 94% | 100% | 7.6 | 179k | 0.007 |
+| sonnet | (none) | 98% | 100% | 46% | 100% | 5.0 | 130k | 0.098 |
+| sonnet | no-rules | 98% | 100% | 33% | 91% | 5.3 | 120k | 0.115 |
+| sonnet | no-notes | 96% | 100% | 39% | 91% | 4.6 | 122k | 0.127 |
+| sonnet | no-rules-notes | 98% | 100% | 39% | 91% | 5.9 | 134k | 0.118 |
+| sonnet | no-reference | 96% | 100% | 39% | 100% | 5.1 | 127k | 0.130 |
+| sonnet | no-claude-md | 96% | 100% | 83% | 91% | 4.7 | 112k | 0.111 |
+| sonnet | bare | 94% | 100% | 89% | 91% | 6.0 | 129k | 0.105 |
+| opus | (none) | 100% | 100% | 41% | 100% | 4.9 | 141k | 0.196 |
+| opus | no-rules | 100% | 100% | 22% | 100% | 5.2 | 143k | 0.243 |
+| opus | no-notes | 98% | 100% | 33% | 100% | 4.9 | 132k | 0.264 |
+| opus | no-rules-notes | 96% | 100% | 39% | 100% | 5.7 | 153k | 0.247 |
+| opus | no-reference | 100% | 100% | 17% | 100% | 4.9 | 149k | 0.264 |
+| opus | no-claude-md | 98% | 100% | 89% | 100% | 4.9 | 136k | 0.230 |
+| opus | bare | 94% | 100% | 89% | 91% | 6.1 | 165k | 0.224 |
+
+**What the layers buy is cost and turns, not correctness, on most items.**
+With everything removed (`bare`), recall stays at 94-96% for all three models
+and rules at 100%: the answers are findable in the code (comments, tests,
+scripts, git history). `bare` costs more turns (Haiku 5.8 -> 7.6, Sonnet 5.0
+-> 6.0, Opus 4.9 -> 6.1). The suites cannot show most docs are *needed*.
+
+**Real dependencies** (items that pass every baseline rep and fail under an
+ablation, repeated across layers or models):
+- `task-nas-git-pull` (safe.directory on the NAS): Sonnet fails it without
+  notes, without CLAUDE.md, and bare.
+- `detect-stacks-empty-list` (`[]` = whole library): Haiku without the
+  reference, Sonnet without CLAUDE.md and bare.
+- `task-restack-folder`: Haiku without rules, Opus bare.
+- `task-curl-intent-headers` (X-Photosearch-Intent): Sonnet without rules.
+- `mirror-fields-needs-nas`: Sonnet and Opus without CLAUDE.md.
+- `batch-queued-source`: Sonnet and Opus without rules + notes.
+- `maintenance-cron-time`, `video-passes-native`: Sonnet/Opus bare, Opus
+  without notes.
+All single-rep: confirm with reps before acting on one.
+
+**Skill triggering moves the most, and the wrong way.** Removing CLAUDE.md
+raises photo-search skill use from 41-52% to 83-89% on all three models:
+CLAUDE.md answers the question first, so the skill is skipped.
+
+**Model differences.** Baseline noise: items with mixed reps Haiku 7/69,
+Sonnet 3/69, Opus 0/69. Opus is the most robust (recall 100%, tasks 100%
+under every ablation but bare) and the most expensive ($0.20-0.26/run vs
+Sonnet $0.10-0.13, Haiku $0.007-0.011). Sonnet shows the most task-level
+dependence on the docs (3 tasks); Haiku fails one rule item without the rules.
