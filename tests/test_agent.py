@@ -560,3 +560,23 @@ def test_non_identical_calls_both_run(db, monkeypatch):
     ))
     _run(db, "x")
     assert ran["n"] == 2
+
+
+def test_lean_for_model_caps_group_summaries():
+    """group_into_chapters returned 114 chapter summaries (27.5k chars) on top
+    of the capped hits, and the next round overflowed a 16k context."""
+    chapters = [{"index": i, "title": f"Place {i}", "date_from": "2026-07-01",
+                 "date_to": "2026-07-02", "days": 2, "photo_count": 40,
+                 "places": ["A", "B", "C"], "representative_ids": list(range(10)),
+                 "debug": "x" * 500} for i in range(114)]
+    result = {"chapters": chapters, "results": [{"id": i} for i in range(400)],
+              "day_summary": [{"day": f"d{i}", "count": 3} for i in range(5)]}
+    lean = agent._lean_for_model(result)
+    assert len(lean["chapters"]) == agent._MODEL_GROUP_CAP
+    assert lean["chapters_note"] == f"showing {agent._MODEL_GROUP_CAP} of 114 chapters"
+    c = lean["chapters"][0]
+    assert c["title"] == "Place 0" and c["photo_count"] == 40
+    assert c["places"] == ["A", "B"] and c["representative_ids"] == [0, 1, 2]
+    assert "debug" not in c
+    assert lean["day_summary"] == result["day_summary"] and "day_summary_note" not in lean
+    assert len(result["chapters"]) == 114        # the caller's (UI's) copy is untouched

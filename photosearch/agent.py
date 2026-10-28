@@ -330,6 +330,15 @@ def _assistant_tool_msg(reply: dict) -> dict:
 
 
 _MODEL_RESULT_CAP = 15  # photo hits fed back to the model per tool call
+# Group summaries ride along with the hits: group_into_chapters' `chapters`
+# (114 entries, 27.5k chars, for the 2026 Europe trip), daily_highlights'
+# `day_summary`, `scenes`, `buckets`. Untrimmed, one chapters call added ~8k
+# tokens and the next round overflowed a 16k context (Ask eval b01/b02/b05,
+# 2026-10-26). The UI groups from the raw result, not this copy.
+_MODEL_GROUP_CAP = 30
+_GROUP_KEYS = ("chapters", "scenes", "day_summary", "buckets")
+_GROUP_FIELDS = ("index", "title", "label", "day", "date", "date_from", "date_to",
+                 "days", "photo_count", "count", "start", "end", "bucket", "n")
 
 
 def _lean_for_model(result):
@@ -358,7 +367,28 @@ def _lean_for_model(result):
     lean["results"] = trimmed
     if len(result["results"]) > len(trimmed):
         lean["results_note"] = f"showing {len(trimmed)} of {len(result['results'])} (use these ids)"
+    for key in _GROUP_KEYS:
+        groups = result.get(key)
+        if not isinstance(groups, list):
+            continue
+        lean[key] = [_lean_group(g) for g in groups[:_MODEL_GROUP_CAP]]
+        if len(groups) > _MODEL_GROUP_CAP:
+            lean[f"{key}_note"] = f"showing {_MODEL_GROUP_CAP} of {len(groups)} {key}"
     return lean
+
+
+def _lean_group(g):
+    """One chapter / scene / day / bucket summary, compact: its label, span and
+    size, the first two places and three representative ids."""
+    if not isinstance(g, dict):
+        return g
+    t = {k: g[k] for k in _GROUP_FIELDS if g.get(k) is not None}
+    if isinstance(g.get("places"), list) and g["places"]:
+        t["places"] = g["places"][:2]
+    for k in ("representative_ids", "photo_ids", "ids"):
+        if isinstance(g.get(k), list):
+            t[k] = g[k][:3]
+    return t
 
 
 def _tool_result_msg(call: dict, result) -> dict:
