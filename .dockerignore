@@ -7,6 +7,9 @@ venv/
 env/
 
 # Development
+# frontend/ is COPY'd whole; its node_modules is jest-only dev tooling, inert
+# without Node and noise for image scanners.
+frontend/node_modules/
 .git/
 .gitignore
 .vscode/
