@@ -163,3 +163,17 @@ def test_collect_verify_counts_failures_and_stratifies_the_ci(monkeypatch):
     assert (r["n_answered"], r["n_full"]) == (17, 20)
     assert r["ci"] and r["ci"][0] <= r["headline"] <= r["ci"][1]
     assert "3 failed/not run" in r["flags"]
+
+
+def test_unlabelled_proxy_rows_never_outrank_labelled_ones():
+    """2026-10-26: an unlabelled describe re-run scored 1.000 (1 - bad output)
+    against 0.75 for the labelled best and became the example pick."""
+    labelled = {"model": "qwen", "variant": "a", "headline": 0.75, "ci": (0.71, 0.80),
+                "s_per_photo": 1.5, "proxy": False}
+    proxy = {"model": "g12b", "variant": "b", "headline": 1.0, "ci": None,
+             "s_per_photo": 1.2, "proxy": True}
+    assert S.rankable([labelled, proxy]) == [labelled]
+    assert S.pareto([labelled, proxy]) == [labelled]
+    assert S.ties_with_best([labelled, proxy]) == set()
+    # With nothing labelled, proxies still rank among themselves.
+    assert S.rankable([proxy]) == [proxy]

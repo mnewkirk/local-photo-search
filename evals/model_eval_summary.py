@@ -106,6 +106,7 @@ def collect_describe(db):
         if r.get("replay_screen_out"):
             flags.append(f"SCREEN OUT replayed ({r['replay_bad']}/{n} bad now)")
         rows.append({"model": r["effective_model"], "variant": r["variant"], "headline": head,
+                     "proxy": not orig and not r.get("claims_n"),
                      "ci": ci, "n_answered": r["answered"], "n_full": len(recs) or n,
                      "s_per_photo": r["lat_p50"], "latency": r["latency_label"],
                      "detail": basis, "flags": flags + _stale_flags(r),
@@ -150,7 +151,8 @@ def collect_text(db):
         if r["attempts"] and r["timeouts"] / r["attempts"] > 0.05:
             flags.append(f"{100 * r['timeouts'] / r['attempts']:.0f}% attempts time out")
         out[r["pass"]].append({"model": r["effective_model"], "variant": r["variant"],
-                               "headline": head, "ci": ci, "n_answered": n_ans,
+                               "headline": head, "proxy": basis.startswith("no labels"),
+                               "ci": ci, "n_answered": n_ans,
                                "n_full": n_full, "s_per_photo": r["lat_p50"],
                                "latency": r["latency_label"], "detail": basis,
                                "flags": flags + _stale_flags(r),
@@ -248,11 +250,22 @@ def _sig_better(o, r):
     return o["headline"] > r["headline"]
 
 
+def rankable(rows):
+    """The rows a role's ranking may use. A proxy headline (no owner labels:
+    1 - bad output, 1 - unsupported) is not on the same scale as a labelled
+    one: an unlabelled re-run scored 1.000 for describe against 0.75 for the
+    labelled best and became the example pick. When any row is labelled, the
+    proxies are shown but not ranked; with none labelled, proxies rank among
+    themselves."""
+    real = [r for r in rows if r["headline"] is not None and not r.get("proxy")]
+    return real or [r for r in rows if r["headline"] is not None]
+
+
 def pareto(rows):
     """Rows no other row beats on headline AND s/photo. A headline lead
     inside the 95% CI is not a lead: a row within the CI of a faster one is
     dominated, so no star is awarded on noise."""
-    ok = [r for r in rows if r["headline"] is not None and r["s_per_photo"] is not None]
+    ok = [r for r in rankable(rows) if r["s_per_photo"] is not None]
     keep = []
     for r in ok:
         dominated = any(o is not r and not _sig_better(r, o)
@@ -267,7 +280,7 @@ def pareto(rows):
 def ties_with_best(rows):
     """{id(row)} of rows whose CI overlaps the best headline's (not the best
     itself): a statistical tie, not a loss."""
-    ok = [r for r in rows if r["headline"] is not None]
+    ok = rankable(rows)
     if not ok:
         return set()
     best = max(ok, key=lambda r: r["headline"])
@@ -340,6 +353,8 @@ def render(roles, models, *, headroom=1.5, assign=None, photos=DEFAULT_BATCH):
             head = ("%.3f" % r["headline"]) if r["headline"] is not None else "—"
             if id(r) in tied:
                 head = "≈" + head
+            if r.get("proxy") and r not in rankable(rows):
+                flags.append("UNLABELLED: proxy score, not ranked")
             ansn = (f"{r['n_answered']}/{r['n_full']}" if r.get("n_full") is not None else "—")
             out.append(
                 f"{'*' if id(r) in front else ' '} {str(r['model'])[:30]:<30} {str(r['variant'])[:16]:<16} "
@@ -359,8 +374,8 @@ def render(roles, models, *, headroom=1.5, assign=None, photos=DEFAULT_BATCH):
     if assign is None:
         assign = {}
         for role, rows in roles.items():
-            ok = [r for r in rows if r["headline"] is not None
-                  and fits_alone(r["model"], models, headroom) is not False
+            ok = [r for r in rankable(rows)
+                  if fits_alone(r["model"], models, headroom) is not False
                   and not (role == "verify" and r.get("describe_source") == r["model"])]
             if ok:
                 assign[role] = max(ok, key=lambda r: r["headline"])["model"]
