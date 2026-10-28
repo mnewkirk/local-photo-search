@@ -761,3 +761,22 @@ def test_subject_share_and_its_scope_use_the_label_index(subj_lib):
         assert "idx_video_subjects_label" in _plan(db, s), s
     scope = [s for s in stmts if s.startswith("SELECT p.id FROM photos p")]
     assert len(scope) == 1 and "idx_photos_camera_date" in _plan(db, scope[0])
+
+
+def test_person_presence_floor_stays_on_indexes(lib):
+    """Owner decision 2026-10-28: a video matches person=X only with >= 2 s of
+    X's tracked presence (video_presence.present_face_sql). The check rides
+    every person filter, so it must be seeks, never a video_tracks scan."""
+    db, _ = lib
+    stmts = _traced(db, lambda: search_combined(
+        db, person="Calvin", camera="ILCE-7RM6",
+        date_from="2026-09-26", date_to="2026-09-27"))
+    stmts += _traced(db, lambda: search_combined(db, query="Calvin and Ellie",
+                                                 location="San Rafael"))
+    stmts += _traced(db, lambda: search_combined(db, person="Calvin"))
+    plans = _plans_touching(db, stmts, "video_tracks")
+    assert len(plans) >= 3
+    for plan in plans:
+        assert "idx_video_tracks_face" in plan, plan
+        assert "SCAN video_tracks" not in plan and "SCAN vt" not in plan, plan
+        assert "SCAN fp" not in plan, plan

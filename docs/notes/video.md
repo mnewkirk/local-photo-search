@@ -273,3 +273,19 @@ finds videos with a faces row below the gate; `--apply` re-queues video-scan
 for exactly those (`video_scan_store.requeue_scan`, the clear-pass branch).
 The re-scan carries human labels and exclusions (D13), deletes the subjects
 (re-queued), and leaves the description alone. `SCAN_VERSION` was not bumped.
+
+### Margin naming, 2 s presence, subject share parked (2026-10-28)
+
+Owner decisions after round 2 (`docs/plans/video-eval-round2-2026-10-27.md`):
+- **Margin rule** in `faces.match_faces_to_persons` for faces on
+  `media_type='video'` rows (`pick_person_with_margin`, `VIDEO_MATCH_MARGIN`
+  0.15). On the replica copy (2026-10-28; 35,535 video faces, 4 people with
+  references): of 1,813 strict-named video faces the rule would keep 1,779
+  and unname 34. It would rename none. Of 33,722 unnamed, matchable video
+  faces, the old rule names 0 and the new rule names 0, so the nightly sweep
+  changes nothing today. The 34 are hypothetical: the matcher never touches
+  a named face.
+- **Presence ≥ 2 s** (`video_presence`). This is a definition, applied by
+  re-deriving cached eval runs. H1-r2 holdout presence P went 0.58 → 0.86 [0.49, 0.97]
+  at R 0.30; dev went 0.62 → 0.66.
+- **Subject share parked**: flag stays off. See video-support.md "Outcome".

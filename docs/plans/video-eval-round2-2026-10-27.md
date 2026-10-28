@@ -250,3 +250,27 @@ prompt or threshold change, no deploy):
    can feed it the stored `video_tracks.focus_intervals` through
    `focus_from_intervals`. The S1 "highest-salience box" rule loses every
    person to a whole-frame scenery box.
+
+## Addendum 2026-10-28: presence = at least 2 s (owner definition)
+
+The owner defined presence on 2026-10-28: a person is *present* in a video
+only with **≥ 2.0 s of tracked face presence**, summed over their identities
+(`photosearch/video_presence.py`, `VIDEO_PRESENCE_MIN_S`, env
+`PHOTOSEARCH_VIDEO_PRESENCE_MIN_S`). This is a definition, not a tuned knob,
+so no new holdout look was spent: `report` re-derives every cached variant's
+presence list from its stored identities (`video_eval.item_present`), with no
+re-run. The gate truth ("who") is unchanged.
+
+| variant | dev P [CI] | dev R | holdout P [CI] | holdout R |
+|---|---|---|---|---|
+| **H1-r2**, no floor | 0.62 [0.48, 0.75] (28/45) | 0.54 | 0.58 [0.32, 0.81] (7/12) | 0.35 |
+| **H1-r2**, ≥ 2 s | **0.66** [0.47, 0.80] (19/29) | 0.37 | **0.86** [0.49, 0.97] (6/7) | 0.30 |
+| F1 (round 1), ≥ 2 s | 0.17 [0.12, 0.24] | 0.58 | 0.17 [0.10, 0.28] | 0.55 |
+| S2 (round 1), ≥ 2 s | 0.17 [0.12, 0.24] | 0.58 | 0.17 [0.10, 0.28] | 0.55 |
+
+The floor removes 5 of H1-r2's 6 holdout false positives (and 7 of 17 on
+dev) for one true positive. The presence gate (≥ 0.95) still fails, and the
+holdout CI is wide (7 predictions). Round-1 variants name with the legacy
+no-margin rule, so the floor alone barely helps them. Production now applies
+the same floor to the person search filter and the subjects endpoint; the
+subject share stays parked (see `video-support.md` "Outcome").

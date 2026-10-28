@@ -473,7 +473,7 @@ class NamingRule(NamedTuple):
     tolerance: Optional[float] = None
     margin: float = 0.0
     eligible_only: bool = False
-    min_presence_s: float = 0.0
+    min_presence_s: Optional[float] = None
 
 
 LEGACY_NAMING = NamingRule()
@@ -504,9 +504,24 @@ def _face_key(ix, names):
     return ["p", pid] if pid is not None else ["else"]
 
 
-def _present_named(fa, names, min_presence_s=0.0):
-    return sorted({names[i.ix] for i in fa.identities
-                   if names.get(i.ix) is not None and i.presence_s > min_presence_s})
+def _present_named(fa, names, min_presence_s=None):
+    """Named people present for at least ``min_presence_s`` (default: the
+    production floor ``video_presence.VIDEO_PRESENCE_MIN_S``), summed over a
+    person's identities — the same rule production applies."""
+    from photosearch.video_presence import present_people
+    return present_people(({"person_id": names.get(i.ix), "presence_s": i.presence_s}
+                           for i in fa.identities), min_presence_s)
+
+
+def item_present(it, min_presence_s=None):
+    """The presence list for one cached run item, re-derived from its
+    identities under the CURRENT presence floor (owner decision 2026-10-28:
+    present = >= 2 s), so cached runs need no re-run. Items without
+    identities fall back to the list cached at run time."""
+    from photosearch.video_presence import present_people
+    if it.get("identities") is None:
+        return it.get("present")
+    return present_people(it["identities"], min_presence_s)
 
 
 def face_item(approach, frames, meta, params, refs, naming=LEGACY_NAMING):
@@ -1182,8 +1197,10 @@ def presence_counts(pred_present, owner_people):
     return {"tp": len(pp & op), "fp": len(pp - op), "fn": len(op - pp)}
 
 
-def subject_metrics(run, labels, sample, *, split="holdout", same=None, strata=None):
-    """Every subject metric for one variant over one split."""
+def subject_metrics(run, labels, sample, *, split="holdout", same=None, strata=None,
+                    min_presence_s=None):
+    """Every subject metric for one variant over one split. Presence uses
+    ``min_presence_s`` (default the production 2 s floor)."""
     same = same or make_same()
     seg_v = me.video_seg_version()
     items = (run or {}).get("items", {})
@@ -1222,7 +1239,7 @@ def subject_metrics(run, labels, sample, *, split="holdout", same=None, strata=N
             out["retr"]["tp"] += po and pp
             out["retr"]["fp"] += pp and not po
             out["retr"]["fn"] += po and not pp
-        pc = presence_counts(it.get("present"), who.get("people"))
+        pc = presence_counts(item_present(it, min_presence_s), who.get("people"))
         for k in pc:
             out["presence"][k] += pc[k]
         if it.get("latency_s") is not None:
@@ -2216,8 +2233,9 @@ def main(argv=None):
                     help="naming: nearest other person must be this much farther")
     rf.add_argument("--name-eligible-only", action="store_true",
                     help="naming: only identities that earn a production faces row")
-    rf.add_argument("--min-presence", type=float, default=0.0,
-                    help="presence list: seconds an identity must be present")
+    rf.add_argument("--min-presence", type=float, default=None,
+                    help="presence list: seconds a person must be present "
+                         "(default: production VIDEO_PRESENCE_MIN_S, 2 s)")
     rf.add_argument("--hparams", help="H1 HybridParams as JSON")
     rf.add_argument("--limit", type=int)
     rf.add_argument("--force", action="store_true")

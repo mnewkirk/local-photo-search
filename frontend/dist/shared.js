@@ -362,7 +362,16 @@
       e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } }, 'Could not load subjects: ' + err));
     if (!data) return e('div', { className: 'detail-section' }, heading,
       e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } }, 'Loading…'));
+    // Who is present: named people with >= presence_min_s of tracked face
+    // (owner decision 2026-10-28; server-side, from the scan's tracks).
+    var minS = data.presence_min_s != null ? data.presence_min_s : 2;
+    var presentLine = (data.present && data.present.length)
+      ? e('div', { style: { fontSize: 12, marginTop: 4 } },
+          e('span', { style: { color: 'var(--text-muted)' } }, 'Present (\u2265 ' + minS + ' s): '),
+          data.present.map(function (p) { return p.name + ' ' + Math.round(p.presence_s) + ' s'; }).join(', '))
+      : null;
     if (data.subjects_version == null) return e('div', { className: 'detail-section' }, heading,
+      presentLine,
       e('p', { style: { color: 'var(--text-muted)', fontSize: 12 } },
         'Not analysed yet — the video-subjects pass has not run on this clip.'));
 
@@ -444,7 +453,7 @@
     );
 
     // Per-person rows: dense face-track presence above, main-subject focus below.
-    var personRows = subs.filter(function (s2) { return s2.face_id != null; }).map(function (s2) {
+    var personRows = subs.filter(function (s2) { return s2.face_id != null && s2.present !== false; }).map(function (s2) {
       var col = PS.subjectColor(s2.ix);
       return e('div', { key: 'p' + s2.ix, style: { marginTop: 6 } },
         e('div', { style: { fontSize: 12, display: 'flex', justifyContent: 'space-between', gap: 6 } },
@@ -462,6 +471,7 @@
       heading,
       e('div', { style: { fontSize: 11, color: 'var(--text-muted)' } },
         'Share of the whole clip (' + fmt(dur) + ')' + (data.model ? ' · ' + data.model : '')),
+      presentLine,
       timeline,
       e('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' } },
         e('span', null, '0:00'), e('span', null, fmt(dur))),

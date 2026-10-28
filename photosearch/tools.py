@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .db import PhotoDB
+from .video_presence import present_face_sql
 
 # How long a description we hand back per search hit. The model pays for every
 # token; full LLaVA descriptions run several hundred chars. 240 keeps the gist.
@@ -1076,8 +1077,9 @@ def _build_filter_sql(db, args: dict, default_media: str = "photo") -> tuple[str
         if person_ids:
             ph = ",".join("?" * len(person_ids))
             clauses.append(
-                f"photos.id IN (SELECT photo_id FROM faces WHERE person_id IN ({ph}) "
-                f"GROUP BY photo_id HAVING COUNT(DISTINCT person_id) = ?)")
+                f"photos.id IN (SELECT pf.photo_id FROM faces pf WHERE pf.person_id IN ({ph}) "
+                f"AND {present_face_sql('pf')} "
+                f"GROUP BY pf.photo_id HAVING COUNT(DISTINCT pf.person_id) = ?)")
             params.extend(person_ids)
             params.append(len(person_ids))
         else:

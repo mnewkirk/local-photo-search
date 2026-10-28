@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from .video_presence import present_face_sql
 from .clip_embed import embed_text
 from .db import (PhotoDB, HIDDEN_VIDEO_IDS_SQL, VIDEO_IDS_SQL,
                  media_filter_sql, normalize_media)
@@ -1050,7 +1051,8 @@ def search_by_person(db: PhotoDB, name: str, limit: int = 10, match_source: str 
     # de-duplicated whole rows in a temp B-tree.
     sql = f"""SELECT {columns}
            FROM photos p
-           WHERE p.id IN (SELECT f.photo_id FROM faces f WHERE f.person_id = ?"""
+           WHERE p.id IN (SELECT f.photo_id FROM faces f WHERE f.person_id = ?
+           AND {present_face_sql("f")}"""
     params: list = [person["id"]]
 
     if match_source:
@@ -1101,7 +1103,8 @@ def search_by_all_persons(
     placeholders = ",".join("?" * len(person_ids))
     sql = (
         f"SELECT {columns} FROM photos p WHERE p.id IN ("
-        f"SELECT f.photo_id FROM faces f WHERE f.person_id IN ({placeholders})"
+        f"SELECT f.photo_id FROM faces f WHERE f.person_id IN ({placeholders}) "
+        f"AND {present_face_sql('f')}"
     )
     params: list = list(person_ids)
 
@@ -1619,7 +1622,7 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
     def person_exists(alias: str, pid: int) -> str:
         params.append(pid)
         sql = (f"EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = {alias} "
-               f"AND f.person_id = ?")
+               f"AND f.person_id = ? AND {present_face_sql('f')}")
         if match_source:
             sql += " AND f.match_source = ?"
             params.append(match_source)
@@ -1642,7 +1645,8 @@ def _compose_scope(db: PhotoDB, *, date_from: Optional[str], date_to: Optional[s
         sql = "SELECT p.id FROM photos p WHERE " + " AND ".join(clauses)
     else:
         first, rest = person_ids[0], person_ids[1:]
-        sql = "SELECT DISTINCT f0.photo_id FROM faces f0 WHERE f0.person_id = ?"
+        sql = ("SELECT DISTINCT f0.photo_id FROM faces f0 WHERE f0.person_id = ? "
+               f"AND {present_face_sql('f0')}")
         params.append(first)
         if match_source:
             sql += " AND f0.match_source = ?"

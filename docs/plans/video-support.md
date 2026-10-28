@@ -11,6 +11,12 @@ contested point. The owner then decided three things (recorded in "Decisions"):
 only registers rows, stores results and serves files. That last decision moved
 the probe and the poster frame off the NAS into a new `video-probe` worker pass.
 
+**Main-subject share: PARKED 2026-10-28** (owner decision). Two eval rounds
+failed every holdout gate; `PHOTOSEARCH_VIDEO_SUBJECT_SHARE` stays off and no
+code is removed. Two pieces of the eval did ship: the strict matcher's
+nearest-other-person margin for video faces (0.15), and presence = ≥ 2 s on
+screen. See "Outcome" below.
+
 ## As built (2026-10-17)
 
 All of Steps 0–7 landed in one day on `main` (`9015b61` … `461c7a0`), each step
@@ -42,6 +48,56 @@ on schema v39 the same day; the backfill itself has not started.
 **Smoke timings (desktop, 2026-10-17):** video-scan 6.7–43 s/video on CPU
 InsightFace; video-subjects 0.7–1.9 s/keyframe (qwen2.5-vl-7b); video-describe
 3–8 s/video (qwen3.5-9b, reasoning none).
+
+## Outcome (2026-10-28): subject share parked; margin and 2 s presence shipped
+
+**Round 1** (`video-eval-results-2026-10-25.md`, holdout, 25 clips / 205
+segments). Best segment accuracy was F1 0.31: S1 0.23, S2 0.26, F0 0.28.
+Person segments were 0.24–0.33 and non-person 0.18–0.22. Top subject was at
+most 0.40, share MAE at least 0.32, and named-presence precision 0.09–0.10.
+Every gate failed for every variant.
+
+**Round 2** (`video-eval-round2-2026-10-27.md`, one holdout look). H1-r2 is
+the hybrid with margin naming. Holdout: segment accuracy 0.37 (person 0.42,
+non-person 0.18), top 0.40, MAE 0.44, presence P 0.58. Under the owner's
+2 s presence definition, presence P is 0.86 [0.49, 0.97] at R 0.30 (dev
+0.66). Gates: top ≥ 0.80, presence P ≥ 0.95, segment ≥ 0.70 for person and
+non-person, MAE ≤ 0.15. **Every gate still fails**; the ladder gives "ships:
+nothing". The H1 dev surface is flat: 0.44–0.52 over 124 configs.
+
+**Owner decisions 2026-10-28.**
+1. **Park the subject share.** The flag stays off and nothing is removed. The
+   modal's subject timeline still shows (it is the audit view).
+2. **Margin rule for video faces in production.** The strict matcher
+   (`faces.match_faces_to_persons`) names a face on a `media_type='video'`
+   row only if:
+   - its best person is within 1.15, AND
+   - the nearest other person is at least `VIDEO_MATCH_MARGIN` (0.15, env
+     `PHOTOSEARCH_VIDEO_MATCH_MARGIN`) farther.
+
+   A field with no other person passes. Barred persons
+   (`face_person_exclusions`) leave the field first, so a barred best falls
+   through to the next best, which must pass both tests against the remaining
+   field. Stills are unchanged. `photosearch video-match-margin-report`
+   (read-only) counts what the rule changes.
+3. **Presence = ≥ 2 s on screen** (`video_presence.VIDEO_PRESENCE_MIN_S`,
+   summed over a person's identities). It applies to the person search filter,
+   the Ask/MCP `people` filter, the `present` list of
+   `GET /api/videos/{id}/subjects` and the modal's person rows, and the eval.
+   `faces` rows are unchanged; sub-2 s identities stay for /faces review.
+
+**What would unpark it.** The largest dev error bucket is an owner-named
+person predicted as an unnamed person: 113 of 374 segments. 68 of those have
+no face in the segment or the clip. That needs:
+- **face-less re-identification**: a body/appearance tracker (F3), or a VLM
+  asked "is this the same person as <reference crop>";
+- **a label-synonym judge** for non-person subjects. Run the comparer
+  judgements (`video_eval.py disputes`) and an owner spot-check of 20; 28 of
+  44 non-person misses are synonyms ("coral reef" vs "underwater scene");
+- more `face_references` for the people who appear in videos (recall).
+
+Re-open only with a fresh holdout, or with these changes measured on dev
+first.
 
 ## Why, and what the owner asked for
 

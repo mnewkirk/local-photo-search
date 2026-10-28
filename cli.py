@@ -465,6 +465,50 @@ def add_persons(config_path, db):
 # match-faces
 # ---------------------------------------------------------------------------
 
+@cli.command("video-match-margin-report")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
+@click.option("--tolerance", type=float, default=None, help="Default: faces.MATCH_TOLERANCE (1.15).")
+@click.option("--margin", type=float, default=None,
+              help="Default: faces.VIDEO_MATCH_MARGIN (0.15; PHOTOSEARCH_VIDEO_MATCH_MARGIN).")
+@click.option("--json", "as_json", is_flag=True, help="Print the raw counts as JSON.")
+def video_match_margin_report(db, tolerance, margin, as_json):
+    """READ-ONLY: what the video-face margin rule changes.
+
+    The strict matcher names a VIDEO face only when its best person is within
+    tolerance AND the nearest other person is >= margin farther. This opens
+    the DB mode=ro and counts, for video faces: currently strict-named ones the
+    rule would keep / unname / rename (hypothetical — the matcher never touches
+    a named face), and unnamed matchable ones the old rule would name but the
+    new rule leaves unnamed (what the nightly sweep will now decline).
+    """
+    import json as _json
+    from photosearch import faces as F
+    from photosearch.model_eval import open_db_readonly
+
+    conn = open_db_readonly(db)
+    try:
+        r = F.video_match_margin_report(
+            conn, F.MATCH_TOLERANCE if tolerance is None else tolerance,
+            F.VIDEO_MATCH_MARGIN if margin is None else margin)
+    finally:
+        conn.close()
+    if as_json:
+        click.echo(_json.dumps(r, indent=1))
+        return
+    click.echo(f"video faces: {r['video_faces']:,}  (tolerance {r['tolerance']}, margin "
+               f"{r['margin']}, {r['reference_people']} people with references)")
+    click.echo("named, by source: " + (", ".join(f"{k} {v:,}" for k, v in sorted(r["named"].items()))
+                                       or "none"))
+    click.echo(f"  strict re-checked: keep {r['strict_keep']:,} · would unname "
+               f"{r['strict_would_unname']:,} · would rename {r['strict_would_change']:,} "
+               "(hypothetical: the matcher never touches a named face)")
+    click.echo(f"unnamed + matchable: {r['unnamed_matchable']:,} — old rule would name "
+               f"{r['legacy_would_name']:,}, margin rule names {r['margin_would_name']:,}, "
+               f"left unnamed by the margin {r['left_unnamed_by_margin']:,}")
+    click.echo(f"rejected (never auto-matched): {r['unnamed_not_matchable']:,}; "
+               f"no encoding: {r['no_encoding']:,}")
+
+
 @cli.command("match-faces")
 @click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB", help="Path to the SQLite database file.")
 @click.option("--collection", "collection_id", type=int, default=None,

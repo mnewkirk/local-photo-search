@@ -42,6 +42,25 @@ FACE_ENCODING_DIM = 512
 # Using 1.15 captures all confirmed matches with a 0.16+ gap before the false-positive floor.
 MATCH_TOLERANCE = 1.15
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# VIDEO faces only (owner decision 2026-10-28): the strict matcher names a
+# face of a `media_type='video'` row only when its best person is within
+# MATCH_TOLERANCE AND the nearest OTHER person is at least this much farther.
+# Measured in docs/plans/video-eval-round2-2026-10-27.md item 1: against 49
+# people's labels, tolerance alone names strangers (identity precision 0.33
+# at 1.15, 0.56 even at 0.90); a 0.15 margin gives 0.97 dev / 0.83 holdout.
+# Video identities are small, blurry, many-frame aggregates of other people's
+# kids — exactly the population a single global radius cannot separate.
+# Stills are unchanged. `PHOTOSEARCH_VIDEO_MATCH_MARGIN` overrides.
+VIDEO_MATCH_MARGIN = _env_float("PHOTOSEARCH_VIDEO_MATCH_MARGIN", 0.15)
+
 # Slightly stricter tolerance used when grouping unknown faces into clusters.
 CLUSTER_TOLERANCE = 0.75
 
@@ -1062,6 +1081,139 @@ def split_cluster(
     return summary
 
 
+def _load_reference_encodings(conn) -> list[tuple[int, str, list[float]]]:
+    """(person_id, name, encoding) for every face reference that has one."""
+    import struct
+    from .db import FACE_DIMENSIONS
+    out = []
+    for row in conn.execute(
+            """SELECT fr.id, fr.person_id, p.name
+               FROM face_references fr
+               JOIN persons p ON p.id = fr.person_id""").fetchall():
+        enc_row = conn.execute(
+            "SELECT encoding FROM face_ref_encodings WHERE ref_id = ?", (row[0],)
+        ).fetchone()
+        if enc_row:
+            out.append((row[1], row[2],
+                        list(struct.unpack(f"{FACE_DIMENSIONS}f", enc_row[0]))))
+    return out
+
+
+def video_face_ids(conn, photo_ids: list[int] | None = None) -> set[int]:
+    """Ids of faces on `media_type='video'` rows (driven from the partial
+    idx_photos_media_video set — a few thousand photos)."""
+    sql = ("SELECT f.id FROM faces f JOIN photos p ON p.id = f.photo_id "
+           "WHERE p.media_type = 'video'")
+    if photo_ids is None:
+        return {r[0] for r in conn.execute(sql)}
+    out: set[int] = set()
+    for i in range(0, len(photo_ids), 500):
+        chunk = photo_ids[i:i + 500]
+        out.update(r[0] for r in conn.execute(
+            sql + f" AND p.id IN ({','.join('?' * len(chunk))})", chunk))
+    return out
+
+
+def person_distances(face_enc, ref_np, person_ids: list[int]) -> dict[int, float]:
+    """{person_id: min L2 distance over that person's references}."""
+    d = np.sqrt(((ref_np - np.asarray(face_enc)) ** 2).sum(axis=1))
+    out: dict[int, float] = {}
+    for pid, dist in zip(person_ids, d):
+        dist = float(dist)
+        if pid not in out or dist < out[pid]:
+            out[pid] = dist
+    return out
+
+
+def pick_person_with_margin(
+    dists: dict[int, float],
+    barred: set[int] | None = None,
+    tolerance: float = MATCH_TOLERANCE,
+    margin: float = VIDEO_MATCH_MARGIN,
+) -> int | None:
+    """The video-face naming rule. Barred persons (`face_person_exclusions`)
+    leave the field first — strict's fall-through semantics — so a barred
+    best falls to the next best, which must itself be within `tolerance` AND
+    beat every REMAINING person by `margin`. With no other person in the
+    field (one person has references, or every rival is barred) there is
+    nothing to be ambiguous against and the margin passes: production holds
+    references for only 4 people, and requiring a rival would make a
+    single-reference library unable to name any video face."""
+    field = sorted((d, pid) for pid, d in dists.items()
+                   if not (barred and pid in barred))
+    if not field or field[0][0] > tolerance:
+        return None
+    if len(field) > 1 and field[1][0] - field[0][0] < margin:
+        return None
+    return field[0][1]
+
+
+def video_match_margin_report(conn, tolerance: float = MATCH_TOLERANCE,
+                              margin: float = VIDEO_MATCH_MARGIN) -> dict:
+    """READ-ONLY: what the video margin rule does to the library's video faces.
+
+    - `named`: video faces carrying a person, by match_source. For `strict`
+      ones the rule is re-evaluated: `strict_keep` (same person),
+      `strict_would_unname` (the rule names nobody) and `strict_would_change`
+      (the rule names someone else). The matcher only ever touches UNMATCHED
+      faces, so these are hypothetical — the nightly sweep does not unname
+      anything; clearing them is a separate decision.
+    - `unnamed_matchable`: video faces the sweep will consider. `legacy_would_name`
+      is the old rule (nearest reference in tolerance, exclusion fall-through);
+      `margin_would_name` the new one; `left_unnamed_by_margin` the difference
+      — what the sweep will now decline to name.
+    """
+    import struct
+    from .db import FACE_DIMENSIONS, load_face_person_exclusions
+
+    refs = _load_reference_encodings(conn)
+    out = {"tolerance": tolerance, "margin": margin,
+           "reference_people": len({r[0] for r in refs}),
+           "video_faces": 0, "named": {}, "strict_keep": 0,
+           "strict_would_unname": 0, "strict_would_change": 0,
+           "unnamed_matchable": 0, "legacy_would_name": 0,
+           "margin_would_name": 0, "left_unnamed_by_margin": 0,
+           "unnamed_not_matchable": 0, "no_encoding": 0}
+    person_ids = [r[0] for r in refs]
+    ref_np = np.array([r[2] for r in refs]) if refs else None
+    exclusions = load_face_person_exclusions(conn)
+    rows = conn.execute(
+        "SELECT f.id, f.person_id, f.match_source FROM faces f "
+        "JOIN photos p ON p.id = f.photo_id WHERE p.media_type = 'video'").fetchall()
+    for face_id, person_id, source in rows:
+        out["video_faces"] += 1
+        if person_id is not None:
+            out["named"][source or "NULL"] = out["named"].get(source or "NULL", 0) + 1
+            if source != "strict":
+                continue
+        elif (source or "") == REJECTED_MATCH_SOURCE:
+            out["unnamed_not_matchable"] += 1
+            continue
+        if ref_np is None:
+            continue
+        enc_row = conn.execute(
+            "SELECT encoding FROM face_encodings WHERE face_id = ?", (face_id,)).fetchone()
+        if not enc_row:
+            out["no_encoding"] += 1
+            continue
+        enc = struct.unpack(f"{FACE_DIMENSIONS}f", enc_row[0])
+        dists = person_distances(enc, ref_np, person_ids)
+        barred = exclusions.get(face_id)
+        new = pick_person_with_margin(dists, barred, tolerance, margin)
+        if person_id is not None:
+            key = ("strict_keep" if new == person_id else
+                   "strict_would_unname" if new is None else "strict_would_change")
+            out[key] += 1
+            continue
+        out["unnamed_matchable"] += 1
+        legacy = next((pid for d, pid in sorted((d, pid) for pid, d in dists.items())
+                       if d <= tolerance and not (barred and pid in barred)), None)
+        out["legacy_would_name"] += legacy is not None
+        out["margin_would_name"] += new is not None
+        out["left_unnamed_by_margin"] += legacy is not None and new is None
+    return out
+
+
 def match_faces_to_persons(
     db,
     tolerance: float = MATCH_TOLERANCE,
@@ -1141,6 +1293,10 @@ def match_faces_to_persons(
         return 0
 
     exclusions = load_match_exclusions(db)
+    # Video faces take the margin rule (VIDEO_MATCH_MARGIN); stills below are
+    # byte-for-byte the old path.
+    video_faces = video_face_ids(db.conn, photo_ids)
+    ref_np = np.array(ref_encodings) if video_faces else None
 
     matched = 0
     for face_row in face_rows:
@@ -1152,6 +1308,14 @@ def match_faces_to_persons(
             continue
 
         face_enc = list(struct.unpack(f"{FACE_DIMENSIONS}f", enc_row["encoding"]))
+        if face_id in video_faces:
+            pid = pick_person_with_margin(
+                person_distances(face_enc, ref_np, person_ids),
+                exclusions.get(face_id), tolerance, VIDEO_MATCH_MARGIN)
+            if pid is not None:
+                db.assign_face_to_person(face_id, pid, match_source="strict")
+                matched += 1
+            continue
         best_matches = match_face(face_enc, ref_encodings, tolerance=tolerance)
 
         # match_face returns EVERY reference inside tolerance, closest first,

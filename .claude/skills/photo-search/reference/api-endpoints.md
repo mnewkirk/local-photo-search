@@ -13,7 +13,7 @@ Read when you need a route's path, parameters or response shape.
     camera, category, visual_tag, keyword, min_aesthetic, min_day_aesthetic,
     style_tag, media (`all|photo|video`; default hides Live clips + unreadable
     videos), sort `steadiest|least_noisy` (videos), and — only while
-    `PHOTOSEARCH_VIDEO_SUBJECT_SHARE` is on, else **400** — min_focus_share,
+    `PHOTOSEARCH_VIDEO_SUBJECT_SHARE` is on (parked, off), else **400** — min_focus_share,
     min_focus_seconds, subject, min_subject_share, sort `focus_desc|subject_desc`
     (see "Search performance" for how combinations execute)
   - **Name extraction from `q`** — `search.py:_extract_persons_from_query`
@@ -40,7 +40,9 @@ Read when you need a route's path, parameters or response shape.
   (base64 JSON, staged per scan generation)
 - `GET /api/videos/{id}/frames/{name}` — keyframes / rep frames (`?v=`, `?g=`)
 - `GET /api/videos/{id}/subjects` — subjects, per-person shares (names via
-  `faces.person_id` at read time), timeline, dense presence
+  `faces.person_id` at read time), timeline, dense presence, and `present`
+  (named people with ≥ 2 s tracked presence; `presence_min_s`). A video
+  matches `person=` only with that ≥ 2 s presence
 - `GET /api/videos/subject-labels` — Subject typeahead
 - `GET /api/admin/unreadable-videos` — unreadable / ZIP-wrapped list
   (`/admin/maintenance` card)

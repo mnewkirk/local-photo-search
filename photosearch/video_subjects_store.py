@@ -215,6 +215,7 @@ def read_subjects(conn, photo_id: int) -> Optional[dict]:
     read time, the per-segment primaries timeline, and each person's dense
     face-track presence. None when the row is not a video."""
     from .video_analysis import summarize_runs
+    from .video_presence import VIDEO_PRESENCE_MIN_S, present_people
 
     p = conn.execute("SELECT media_type FROM photos WHERE id = ?", (photo_id,)).fetchone()
     if p is None or p[0] != "video":
@@ -230,7 +231,27 @@ def read_subjects(conn, photo_id: int) -> Optional[dict]:
            "subjects_at": vm[3] if vm else None,
            "model": (analysis or {}).get("model"),
            "credit": (analysis or {}).get("credit"),
-           "subjects": [], "people": [], "segments": [], "timeline": []}
+           "subjects": [], "people": [], "segments": [], "timeline": [],
+           "present": [], "presence_min_s": VIDEO_PRESENCE_MIN_S}
+    # Who is PRESENT (owner decision 2026-10-28): a named person with at least
+    # VIDEO_PRESENCE_MIN_S of tracked face presence, summed over their
+    # identities. From the scan's tracks, so it does not wait on the
+    # (parked) subjects pass.
+    tot: dict = {}
+    for pid, name, face_id, pres in conn.execute(
+            "SELECT f.person_id, pe.name, vt.face_id, vt.presence_s "
+            "FROM video_tracks vt JOIN faces f ON f.id = vt.face_id "
+            "JOIN persons pe ON pe.id = f.person_id "
+            "WHERE vt.photo_id = ? AND f.person_id IS NOT NULL", (photo_id,)):
+        g = tot.setdefault(pid, {"person_id": pid, "name": name,
+                                 "presence_s": 0.0, "face_ids": []})
+        g["presence_s"] += pres or 0.0
+        g["face_ids"].append(face_id)
+    present_ids = set(present_people(tot.values()))
+    out["present"] = sorted(
+        ({**g, "presence_s": round(g["presence_s"], 3)}
+         for pid, g in tot.items() if pid in present_ids),
+        key=lambda g: -g["presence_s"])
     if not vm or vm[2] is None:
         return out
 
@@ -265,7 +286,13 @@ def read_subjects(conn, photo_id: int) -> Optional[dict]:
              "focus_intervals": _loads(fiv, []) or [], "rep_t": rep_t,
              "rep_frame": rep_frame, "rep_seg": rep_seg, "rep_bbox": _loads(rep_bbox),
              "n_segments": n_seg, "presence_s": pres.get("presence_s"),
-             "presence_intervals": pres.get("presence_intervals")}
+             "presence_intervals": pres.get("presence_intervals"),
+             # Present >= VIDEO_PRESENCE_MIN_S: a named face by its person's
+             # summed presence, an unnamed one by its own track.
+             "present": (person_id in present_ids if person_id is not None
+                         else face_id is not None
+                         and (pres.get("presence_s") or 0.0)
+                         >= VIDEO_PRESENCE_MIN_S - 1e-9)}
         out["subjects"].append(s)
         by_ix[ix] = s
         if person_id is not None:
