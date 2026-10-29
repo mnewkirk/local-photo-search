@@ -67,4 +67,4 @@ Before/after check for trimming the Ask agent's ~11.7k-token prompt (system prom
 
 ### Ablation findings (2026-10-28)
 
-`evals/ablations-2026-10-28.md`: context-layer ablations on Haiku/Sonnet/Opus (docs mostly buy turns, six traps live only in docs, CLAUDE.md suppresses the skill) and Ask prompt ablations on the local models (16% of asks flip under no-op edits; gemma-4 tool calls malformed via LM Studio).
+`evals/context_eval/ABLATIONS.md`: context-layer ablations on Haiku/Sonnet/Opus (docs mostly buy turns, six traps live only in docs, CLAUDE.md suppresses the skill) and Ask prompt ablations on the local models (16% of asks flip under no-op edits; gemma-4 tool calls malformed via LM Studio).
