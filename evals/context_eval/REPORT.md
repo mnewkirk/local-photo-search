@@ -1,5 +1,9 @@
 # Context diet — evaluation report (2026-10-19)
 
+> This is the dated lab notebook: each section is kept as written, with a
+> one-line note where later evidence changed it. **For the current conclusions,
+> read [FINDINGS.md](FINDINGS.md) first.**
+
 Does moving ~95% of the always-loaded context (CLAUDE.md, the photo-search SKILL.md body, the
 auto-memory index) into path-scoped rules, `docs/notes/` and skill `reference/` files hurt Claude
 Code's behaviour in this repo, and what does it save? Plan: `docs/plans/context-diet.md`.
@@ -108,7 +112,8 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
    the model *finds* things: Opus and Sonnet lost nothing; Haiku lost a few single reps on recall
    and rules; gemma-12b failed the one item whose answer lives only in a path-scoped rule.
 
-2. **Preloaded context may also hurt weaker models on long work (weak evidence).** Haiku's tasks
+2. *(Superseded 2026-10-25: unproven, see Grader audit and FINDINGS.md section 2.)*
+   **Preloaded context may also hurt weaker models on long work (weak evidence).** Haiku's tasks
    went 73% → 88%: with the old 258 KB CLAUDE.md a task run carried ~1.4M input tokens, and the
    smaller context did better. But most of that gain is turn caps, not conventions: on checks
    alone it is 85% → 91% (28 → 30 of 33), and 24 → 29 has Fisher p = 0.21 (see Grader audit). The trade is "recall by lookup" (slightly worse for weak models) against "less noise
@@ -128,7 +133,8 @@ harness sets the last two for any non-Anthropic `ANTHROPIC_BASE_URL`.
    ~15 min before the first token, and gemma's sliding-window attention prevents reusing the
    cache across items. A ~12k prompt is processed in seconds.
 
-5. **Path-scoped rules only fire when code is opened.** Q&A and ops sessions never open files, so
+5. *(Skill-use part superseded 2026-10-20: a duplicate skill was the confound; see Follow-up.)*
+   **Path-scoped rules only fire when code is opened.** Q&A and ops sessions never open files, so
    the CLAUDE.md index is the only route to a rule. Strong models follow "see rules/workers.md";
    gemma ran one Grep, missed, and confabulated. The Skill tool was essentially never invoked by
    any model, before or after (0-12%), but after the diet 7/8 (Sonnet) and 19/24 (Opus) skill
@@ -420,30 +426,12 @@ worktree of HEAD (35dcc9e..), then runs the suites. Baseline: `--isolate`,
 directory, so these numbers differ from the repo-root runs above. Model ids
 recorded: claude-haiku-5-5, Sonnet and Opus via the `sonnet` / `opus` aliases.
 
-| model | layer removed | recall | rules | skills | tasks | turns | input tok | $/run |
-|---|---|---|---|---|---|---|---|---|
-| haiku | (none) | 95% | 100% | 52% | 100% | 5.8 | 176k | 0.010 |
-| haiku | no-rules | 100% | 89% | 61% | 91% | 6.3 | 156k | 0.008 |
-| haiku | no-notes | 98% | 100% | 50% | 100% | 5.7 | 184k | 0.011 |
-| haiku | no-rules-notes | 100% | 100% | 61% | 100% | 6.5 | 174k | 0.009 |
-| haiku | no-reference | 94% | 100% | 44% | 100% | 6.0 | 176k | 0.011 |
-| haiku | no-claude-md | 98% | 100% | 89% | 100% | 6.2 | 155k | 0.008 |
-| haiku | bare | 96% | 100% | 94% | 100% | 7.6 | 179k | 0.007 |
-| sonnet | (none) | 98% | 100% | 46% | 100% | 5.0 | 130k | 0.098 |
-| sonnet | no-rules | 98% | 100% | 33% | 91% | 5.3 | 120k | 0.115 |
-| sonnet | no-notes | 96% | 100% | 39% | 91% | 4.6 | 122k | 0.127 |
-| sonnet | no-rules-notes | 98% | 100% | 39% | 91% | 5.9 | 134k | 0.118 |
-| sonnet | no-reference | 96% | 100% | 39% | 100% | 5.1 | 127k | 0.130 |
-| sonnet | no-claude-md | 96% | 100% | 83% | 91% | 4.7 | 112k | 0.111 |
-| sonnet | bare | 94% | 100% | 89% | 91% | 6.0 | 129k | 0.105 |
-| opus | (none) | 100% | 100% | 41% | 100% | 4.9 | 141k | 0.196 |
-| opus | no-rules | 100% | 100% | 22% | 100% | 5.2 | 143k | 0.243 |
-| opus | no-notes | 98% | 100% | 33% | 100% | 4.9 | 132k | 0.264 |
-| opus | no-rules-notes | 96% | 100% | 39% | 100% | 5.7 | 153k | 0.247 |
-| opus | no-reference | 100% | 100% | 17% | 100% | 4.9 | 149k | 0.264 |
-| opus | no-claude-md | 98% | 100% | 89% | 100% | 4.9 | 136k | 0.230 |
-| opus | bare | 94% | 100% | 89% | 91% | 6.1 | 165k | 0.224 |
+*(The 21-row results table that stood here moved to [FINDINGS.md](FINDINGS.md) section 3 on
+2026-10-28, same numbers, plus the baseline's rep-1 cost. It also had a mean input-token
+column: 112k-184k per run, `harness.py report` regenerates it.)*
 
+*(Superseded in part: `bare` keeps ~1.4 MB of other prose, including this eval's answer
+key, so "findable in the code" is overstated; FINDINGS.md 3b.)*
 **What the layers buy is cost and turns, not correctness, on most items.**
 With everything removed (`bare`), recall stays at 94-96% for all three models
 and rules at 100%: the answers are findable in the code (comments, tests,

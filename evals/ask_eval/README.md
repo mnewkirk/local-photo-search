@@ -1,5 +1,8 @@
 # Ask eval: does a smaller Ask prompt still plan searches right?
 
+This file is the harness manual. **Results and conclusions:
+[FINDINGS.md](FINDINGS.md)**; the exact text each mutant removes: [MUTANTS.md](MUTANTS.md).
+
 The in-app ✨ Ask agent (`photosearch/agent.py`) sends the same block before
 every round: a system prompt (routing rules, worked examples, library facts,
 household notes) and the whole tool list (`tools.openai_tools()`). On
@@ -77,7 +80,7 @@ Coverage on `pre-ask-diet` (`harness.py coverage --ref pre-ask-diet`):
 
 The combination figure depends on the `covers` tags and a keyword classifier,
 both written by hand, so it is a self-assessment. The mutation score is the
-independent check. Neither has been run yet.
+independent check. *(Both have since run: FINDINGS.md section 3.)*
 
 ## Suites (`asks.jsonl`, 63 items)
 

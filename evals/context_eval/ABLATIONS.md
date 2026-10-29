@@ -1,5 +1,10 @@
 # What the context and the prompt actually do (ablations, 2026-10-28)
 
+> Dated summary for the owner. The full evidence and caveats are in
+> [FINDINGS.md](FINDINGS.md) (context eval) and
+> [../ask_eval/FINDINGS.md](../ask_eval/FINDINGS.md) (Ask eval). Exact deletions per
+> layer: [ABLATION_LAYERS.md](ABLATION_LAYERS.md).
+
 Two experiments:
 
 - **CLAUDE.md eval** (`evals/context_eval/`): removes one documentation layer
@@ -12,7 +17,8 @@ Two experiments:
 
 - **Docs buy speed, mostly.** With every doc removed, all three Claude models
   still answer 94–96% of recall questions and every rules question. The
-  answers can be found in the code. Without docs they take 1–2 more turns.
+  answers can be found in the code. *(Overstated: `bare` also keeps plans,
+  handoffs and this eval's answer key, and models cite them; FINDINGS.md 3b.)* Without docs they take 1–2 more turns.
 - **A few traps live only in the docs.** Six items fail repeatedly when a
   layer is gone (listed below).
 - **CLAUDE.md hides the skill.** Removing CLAUDE.md raises photo-search skill
@@ -32,29 +38,7 @@ the path-scoped rules and their injection hook, `docs/notes`, and the skill's
 runbooks. The baseline ran 3 times per model; each ablation ran once. One run
 of recall has a noise of about ±4 points; 91% on tasks is one task of 11.
 
-| Model | Layer removed | Recall | Rules | Skill use | Tasks | Turns | Wall s/run | Task wall s | $/run |
-|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| Haiku | none | 95% | 100% | 52% | 100% | 5.8 | 17.3 | 48 | 0.010 |
-|  | rules | 100% | **89%** | 61% | **91%** | 6.3 | 15.9 | 32 | 0.008 |
-|  | notes | 98% | 100% | 50% | 100% | 5.7 | 16.2 | 41 | 0.011 |
-|  | rules + notes | 100% | 100% | 61% | 100% | 6.5 | 17.0 | 39 | 0.009 |
-|  | runbooks | 94% | 100% | 44% | 100% | 6.0 | 16.7 | 37 | 0.011 |
-|  | CLAUDE.md | 98% | 100% | **89%** | 100% | 6.2 | 16.0 | 36 | 0.008 |
-|  | everything (bare) | 96% | 100% | **94%** | 100% | **7.6** | 18.6 | 37 | 0.007 |
-| Sonnet | none | 98% | 100% | 46% | 100% | 5.0 | 17.5 | 27 | 0.098 |
-|  | rules | 98% | 100% | 33% | **91%** | 5.3 | 15.8 | 25 | 0.115 |
-|  | notes | 96% | 100% | 39% | **91%** | 4.6 | 18.8 | 28 | 0.127 |
-|  | rules + notes | 98% | 100% | 39% | **91%** | 5.9 | 19.3 | 34 | 0.118 |
-|  | runbooks | 96% | 100% | 39% | 100% | 5.1 | 19.0 | 35 | 0.130 |
-|  | CLAUDE.md | 96% | 100% | **83%** | **91%** | 4.7 | 18.8 | 27 | 0.111 |
-|  | everything (bare) | 94% | 100% | **89%** | **91%** | **6.0** | 19.7 | 34 | 0.105 |
-| Opus | none | 100% | 100% | 41% | 100% | 4.9 | 17.4 | 35 | 0.196 |
-|  | rules | 100% | 100% | 22% | 100% | 5.2 | 17.7 | 32 | 0.243 |
-|  | notes | 98% | 100% | 33% | 100% | 4.9 | 16.5 | 32 | 0.264 |
-|  | rules + notes | 96% | 100% | 39% | 100% | 5.7 | 18.8 | 34 | 0.247 |
-|  | runbooks | 100% | 100% | 17% | 100% | 4.9 | 16.8 | 35 | 0.264 |
-|  | CLAUDE.md | 98% | 100% | **89%** | 100% | 4.9 | 17.7 | 35 | 0.230 |
-|  | everything (bare) | 94% | 100% | **89%** | **91%** | **6.1** | 20.4 | 43 | 0.224 |
+*(The 21-row table moved to [FINDINGS.md](FINDINGS.md) section 3, same numbers. Its task-wall column: Haiku 32-48 s, Sonnet 25-35 s, Opus 32-43 s per task run.)*
 
 Wall s/run is the mean over all four suites; task wall s is the mean for the 11 coding tasks, where the time goes. Costs are what `claude -p` reports at API prices; the runs were billed to a
 Max plan. Skill use counts how often the model invoked the photo-search skill
@@ -96,7 +80,7 @@ list reversed) measure the noise.
 | Finding | Value |
 |---|--:|
 | Asks that change result under an edit that removes nothing | 10 of 63 |
-| Deletions caught after discounting those | 12 of 23 |
+| Deletions caught after discounting those | 12 of 23 (8 if b06, a likely-fragile item, is also discounted; ask_eval/FINDINGS.md section 3) |
 | Single rules whose removal stays within the noise | 11 |
 
 qwen relies on the tool descriptions, the rules block as a whole, the worked

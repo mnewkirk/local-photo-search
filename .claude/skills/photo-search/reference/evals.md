@@ -65,6 +65,7 @@ Before/after check for trimming the Ask agent's ~11.7k-token prompt (system prom
 - **Unsplash is recall-only**: compare a variant with the constant answer of its own size (recite-all = recall 1.00).
 - **Aesthetics**: the 28-photo ordering (ranks 10 and 28 absent) is between-shoot; read top-half/bottom-half ρ, the file-size/megapixels baselines and the Δρ ties. `scores-v2.json` items now also store `dim_scores`/`sub_scores` for offline `DIMENSION_WEIGHTS` tuning.
 
-### Ablation findings (2026-10-28)
+### Eval findings: start here
 
-`evals/context_eval/ABLATIONS.md`: context-layer ablations on Haiku/Sonnet/Opus (docs mostly buy turns, six traps live only in docs, CLAUDE.md suppresses the skill) and Ask prompt ablations on the local models (16% of asks flip under no-op edits; gemma-4 tool calls malformed via LM Studio).
+- CLAUDE.md / context eval: `evals/context_eval/FINDINGS.md` (before/after, grader audit, Haiku/Sonnet/Opus ablations, limits, next steps).
+- Ask prompt eval: `evals/ask_eval/FINDINGS.md` (16k overflow, trim 154→162/189, no-op-edit noise floor, qwen vs gemma).

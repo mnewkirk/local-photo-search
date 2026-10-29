@@ -1,5 +1,8 @@
 # Context eval: does a trimmed CLAUDE.md still steer Claude Code?
 
+This file is the harness manual: what it runs, how to run it, how to read its
+output. **Results and conclusions: [FINDINGS.md](FINDINGS.md).**
+
 `docs/plans/context-diet.md` moves ~90% of CLAUDE.md and SKILL.md out of the
 per-session context. Its own checks prove the text was *relocated*. This
 harness checks that a fresh Claude Code session can still *find* the
@@ -141,7 +144,8 @@ may overturn a regex fail.
 - `tasks` graders check for the convention, not for working code. A task can
   pass with a broken implementation; the question is only whether the trap was
   avoided. Comments never count either way.
-- **Ceiling.** Sonnet and Opus pass every recall and rules item in every run,
+- **Ceiling.** *(The ablation proposed here ran on 2026-10-28 as `--ablate`; results in FINDINGS.md section 3. Ablation worktrees still contain `evals/context_eval/`, the answer key: FINDINGS.md 3b.)*
+  Sonnet and Opus pass every recall and rules item in every run,
   before and after the diet, so for them the suite only shows nothing broke.
   A future **rules-hidden ablation** would test whether items actually depend
   on `.claude/rules/`: a config that runs `--isolate` on a ref (or a throwaway
@@ -155,7 +159,8 @@ may overturn a regex fail.
   `tasks` run in a `/tmp` worktree with no project memory. Both configs see
   the same treatment, so the comparison holds, but absolute numbers differ
   between suites.
-- `skills` can legitimately read 0% on the `before` config: in the two smoke
+- *(2026-10-20: the near-0% below was mostly a duplicate claude.ai skill being offered; see REPORT.md "Follow-up".)*
+  `skills` can legitimately read 0% on the `before` config: in the two smoke
   runs the `Skill` tool and both photo-search skills were offered, and the
   model still answered straight from the 62k-token CLAUDE.md without invoking
   one. Each row records `skill_tool_offered` and `photo_skills_offered` so

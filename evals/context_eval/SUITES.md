@@ -7,8 +7,9 @@ is HEAD, where those are ~8 KB and ~6 KB and the detail lives in path-scoped
 `.claude/rules/*.md`, `docs/notes/*.md` and `.claude/skills/photo-search/reference/*.md`.
 Every number comes from the stored run rows in `results/<config>/<suite>.jsonl`, written by
 `harness.py` and re-scored with the final graders. Costs are what `claude -p` reports at API
-prices; the runs were billed to a Max plan, so the dollar figures are notional. For the
-method, the per-model summaries and the conclusions, read [REPORT.md](REPORT.md).
+prices; the runs were billed to a Max plan, so the dollar figures are notional. These tables cover the 2026-10-19 before/after arms only, which predate the
+2026-10-20 CLAUDE.md changes. For the conclusions across all runs since (grader audit,
+ablations), start at [FINDINGS.md](FINDINGS.md); the dated record is [REPORT.md](REPORT.md).
 
 ## What each suite tests
 
