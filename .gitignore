@@ -132,3 +132,8 @@ evals/context_eval/results/
 
 # ask eval runs (model output per run; regenerate with harness.py)
 evals/ask_eval/results/
+
+# people-bind eval: generated artefacts (labels.json / sample.json are committed)
+evals/people-bind/sheet/
+evals/people-bind/runs/
+evals/people-bind/originals/

@@ -526,7 +526,9 @@ def test_pass_order_roles_and_models():
         assert lst.index("video-describe") > lst.index("video-scan")
         assert lst.index("video-describe") < lst.index("category-content")
         assert lst.index("video-describe") < lst.index("keywords")
-    assert tuple(bs.WORKER_PASSES) == tuple(rerun.ALL_PASSES) == tuple(worker_api._ALL_PASSES)
+    from photosearch.db import NON_BATCH_PASSES
+    assert (tuple(bs.WORKER_PASSES) + NON_BATCH_PASSES
+            == tuple(rerun.ALL_PASSES) == tuple(worker_api._ALL_PASSES))
     assert bs.DEPENDS_ON["video-describe"] == "video-scan"
     assert "video-subjects" not in (bs.DEPENDS_ON["video-describe"],)
     assert D.PASS_ROLES["video-describe"] == "video"

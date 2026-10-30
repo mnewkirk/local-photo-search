@@ -1,6 +1,6 @@
 # Names in photo descriptions that follow the face labels
 
-**Status: 📐 design approved 2026-10-30, nothing built.** (Status lives in `README.md`; this header is a convenience.)
+**Status: 🟡 built 2026-10-30 up to the eval gate; no model run, nothing deployed, no backfill.** (Status lives in `README.md`; this header is a convenience.)
 
 Produced by a plan-debate (two independent planners, two critique rounds). Both agreed on almost everything; the
 three points that stayed open are decided in the table below. No code, schema or live data was touched.
@@ -170,3 +170,17 @@ Points the debate resolved by agreement are in the "Resolved in debate" list; th
 | Stored template shape | Spans over the raw text, rendered at read time (no stored display column) | LLM-written `{face:id}` template in a stored display column | **A** | 2026-10-30 |
 
 Resolved in debate (no decision needed): rule tier kept but requires `subject_boxes` and is gated separately; VLM returns `could_be` sets and code decides abstention, with a shuffled second call; render-time face validation + sweep instead of `faces_changed` write hooks; non-gating pass whose claim waits for verify; crowd cap in the claim predicate; a person on two faces is never named; `render_changed` audit events dropped; bind model chosen by the eval; table `description_subjects`, flag `PHOTOSEARCH_DISPLAY_DESCRIPTIONS`. Left to the eval: group size (2-3 faces) and whether groups ship at all.
+
+## Build status (2026-10-30)
+
+Built on branch `claude/silly-shaw-64bd05`, all tests green, **nothing deployed and no model run** (LM Studio was busy).
+Differences from the plan above, all deliberate:
+
+- `people-bind` is in `rerun.ALL_PASSES` / `worker_api._ALL_PASSES` but NOT in `batch_state.WORKER_PASSES`; the spike resolved to `db.NON_BATCH_PASSES` (no `OPTIONAL_STEPS` use). It sits last in the fleet order, after verify.
+- The claim predicate uses `p.id IN (SELECT photo_id FROM faces WHERE <trusted>)`, not a correlated EXISTS (the EXISTS form scanned all of `photos`); `test_scoped_queue_counts` exempts this pass for that reason.
+- Ask/MCP names are applied once in `tools.call_tool` (`_with_display_names`), not by a `_compact_hits` wrapper at the ~9 call sites. The Google caption is raw by simply not reading the display text; the per-upload opt-in is not built.
+- The VLM-slot subject-box guard is not implemented (it can only lower coverage); revisit if the eval shows a wrong bind it would catch.
+- Fleet role model for `bind` is provisional (`qwen2.5-vl-7b-instruct`); the eval picks it.
+- **Schema v40 is claimed twice**: the per-photo audit branch (`claude/stoic-kapitsa-99628c`) also adds v40 (`photo_audit`). Whichever merges second renumbers to v41 and bumps the `== 40` test assertions. `description_audit.record` is the only seam to change when the audit module lands.
+
+Still to do before any backfill (needs the GPU box and ~2 h of the owner's labelling): `evals/people_bind_eval.py sample` / `sheet` / label / `run` / `report --split holdout`; fresh live scope counts; deploy NAS first, then replica, then workers (flag off).

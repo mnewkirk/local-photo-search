@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 39
+SCHEMA_VERSION = 40
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -154,6 +154,12 @@ _SEARCH_INDEXES: list[tuple[str, str]] = [
     # "is person P in photo X" (search's EXISTS) and "P's photos"
     ("idx_faces_photo_person", "faces(photo_id, person_id)"),
     ("idx_faces_person_photo", "faces(person_id, photo_id)"),
+    # v40 (docs/plans/description-names.md): the people-bind claim/count
+    # predicate and the "which photos can show a name" scope. The predicate
+    # text in PEOPLE_BIND_TRUSTED_FACE_SQL must stay verbatim.
+    ("idx_faces_trusted_photo",
+     "faces(photo_id) WHERE person_id IS NOT NULL "
+     "AND match_source IN ('manual','strict','merge_review')"),
     # v35 (docs/plans/video-support.md): the video rows, a few thousand out of
     # ~160k. Partial, so every still-only predicate (`media_type IS NULL`) is
     # free and the video passes' claim/count drive from this tiny index.
@@ -212,7 +218,18 @@ PASS_MEDIA: dict[str, str] = {
     "video-scan": "video",
     "video-subjects": "video",
     "video-describe": "video",
+    # people-bind (docs/plans/description-names.md): binds phrases of the
+    # description to face boxes of ONE image.
+    "people-bind": "still",
 }
+
+# Worker passes that are NOT batch steps: batch_state.WORKER_PASSES (and so
+# the batch UI, `ready` and the fleet launcher) never see them, but the
+# claim API, rerun and the CLI accept them. people-bind is here because
+# labels keep arriving after a batch is done, so a gating step would flip
+# between waiting and blocked. rerun.ALL_PASSES and worker_api._ALL_PASSES
+# are WORKER_PASSES + NON_BATCH_PASSES (tests/test_description_invalidation.py).
+NON_BATCH_PASSES = ("people-bind",)
 
 
 def media_sql(pass_type: str, alias: str = "") -> str | None:
@@ -357,6 +374,56 @@ _VERIFY_NOT_EXHAUSTED = (
 )
 
 
+# people-bind (docs/plans/description-names.md). A face "can show a name" when
+# a human or the strict matcher labelled it: the same set as
+# face_verify.TRUSTED_LABEL_SOURCES (pinned by a test, db cannot import it).
+# `temporal` is ~4% accurate on event shoots and never names anyone.
+DISPLAY_NAME_SOURCES = ("manual", "strict", "merge_review")
+_NAME_SOURCES_SQL = ",".join(f"'{s}'" for s in DISPLAY_NAME_SOURCES)
+# Verbatim the idx_faces_trusted_photo predicate (partial index, search.md).
+PEOPLE_BIND_TRUSTED_FACE_SQL = (
+    "f.person_id IS NOT NULL AND f.match_source IN ('manual','strict','merge_review')"
+)
+# The faces the pass would DRAW as numbered boxes: the clustering quality
+# floor (faces.CLUSTER_MIN_DET_SCORE / CLUSTER_MIN_BBOX_EDGE, pinned by a
+# test), labelled or not. det_score IS NULL is grandfathered.
+PEOPLE_BIND_MIN_DET_SCORE = 0.65
+PEOPLE_BIND_MIN_BBOX_EDGE = 60
+PEOPLE_BIND_MAX_FACES = 6
+_PEOPLE_BIND_OFFERED_FACE_SQL = (
+    f"(f2.det_score IS NULL OR f2.det_score >= {PEOPLE_BIND_MIN_DET_SCORE}) "
+    f"AND MIN(f2.bbox_bottom - f2.bbox_top, f2.bbox_right - f2.bbox_left) "
+    f">= {PEOPLE_BIND_MIN_BBOX_EDGE}"
+)
+# Crowd cap, one shared fragment (the MATCHABLE_SQL pattern): photos with
+# more offered faces are never claimed, so no row is written from a claim.
+PEOPLE_BIND_SCOPE_SQL = (
+    f"(SELECT COUNT(*) FROM faces f2 WHERE f2.photo_id = p.id AND "
+    f"{_PEOPLE_BIND_OFFERED_FACE_SQL}) <= {PEOPLE_BIND_MAX_FACES}"
+)
+_PEOPLE_BIND_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'people-bind' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
+)
+# The trusted-face test is an IN (not a correlated EXISTS) so the planner
+# enumerates the ~40k photos from the partial index and probes `photos` by
+# rowid; the EXISTS form scanned the whole photos table.
+# Claimable: a description that verify has finished with (or given up on — a
+# scoped or partial run must not bind spans to text verify then rewrites),
+# at least one trusted-label face, within the crowd cap, no row yet.
+# Alias `p`; `photos` columns are qualified.
+PEOPLE_BIND_MISSING_SQL = (
+    "p.description IS NOT NULL "
+    "AND (p.verified_at IS NOT NULL OR EXISTS (SELECT 1 FROM worker_processed vw "
+    "WHERE vw.photo_id = p.id AND vw.pass_type = 'verify' "
+    f"AND vw.attempts >= {MAX_PROCESS_ATTEMPTS})) "
+    f"AND p.id IN (SELECT f.photo_id FROM faces f WHERE {PEOPLE_BIND_TRUSTED_FACE_SQL}) "
+    f"AND {PEOPLE_BIND_SCOPE_SQL} "
+    "AND NOT EXISTS (SELECT 1 FROM description_subjects ds WHERE ds.photo_id = p.id)"
+)
+
+
 # video-probe (docs/plans/video-support.md step 2b). The output is the
 # video_meta row's probe_version — a probe ERROR is stored too (probe_error +
 # probe_version), so an unreadable file is never re-probed until
@@ -460,6 +527,10 @@ _VIDEO_PROXY_NOT_EXHAUSTED = (
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
 _VIDEO_CLAIM_SQL["video-proxy"] = (video_proxy_missing_sql, _VIDEO_PROXY_NOT_EXHAUSTED)
+# Not a video pass, but it has the same shape (an aliased-`p` missing predicate
+# + an attempts cap) and rides the same branch of the two claim functions.
+_VIDEO_CLAIM_SQL["people-bind"] = (lambda alias="p": PEOPLE_BIND_MISSING_SQL,
+                                   _PEOPLE_BIND_NOT_EXHAUSTED)
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -1704,6 +1775,23 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)")
 
+        # v40: which phrases of the RAW description are which face boxes
+        # (docs/plans/description-names.md). Label-free: names are joined at
+        # read time, so a relabel never touches this table. '[]' = "looked,
+        # nothing bindable" (a result). The sha pins the text the spans index.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS description_subjects (
+                photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+                description_sha TEXT NOT NULL,
+                slots_json TEXT NOT NULL,
+                method TEXT NOT NULL,
+                bind_version INTEGER NOT NULL,
+                model TEXT,
+                model_version TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
         # v34: search indexes (docs/plans/search-indexes.md).
         self._create_search_indexes(cur)
 
@@ -1862,7 +1950,18 @@ class PhotoDB:
         written is the verification of this description.
         """
         cols = ["categories = NULL", "keywords = NULL"]
-        passes = ["category-content", "keywords"]
+        passes = ["category-content", "keywords", "people-bind"]
+        # The spans index into the old text — ALWAYS dropped, even for verify's
+        # own rewrite (include_verify=False): that rewrite changes the text.
+        try:
+            dropped = self.conn.execute(
+                "DELETE FROM description_subjects WHERE photo_id = ?", (photo_id,)).rowcount
+            if dropped:
+                from . import description_audit
+                description_audit.record(self.conn, photo_id, description_audit.UNBOUND,
+                                         {"reason": "description changed"})
+        except sqlite3.OperationalError:
+            pass  # a DB that predates v40 (read-only replica copy)
         if include_verify:
             cols += ["verified_at = NULL", "verification_status = NULL",
                      "hallucination_flags = NULL"]

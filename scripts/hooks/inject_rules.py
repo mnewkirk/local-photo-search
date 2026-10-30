@@ -79,6 +79,11 @@ KEYWORDS: dict[str, list[str]] = {
         r"PHOTOSEARCH_TEXT_LLM", r"REASONING_EFFORT", r"model_eval",
         r"visual_tags", r"\bgenerations\b", r"rerun-passes",
     ],
+    "people-bind": [
+        r"people[-_]bind", r"description_subjects", r"description_display",
+        r"description_render", r"description-names", r"sweep-description-subjects",
+        r"PHOTOSEARCH_DISPLAY_(?:DESCRIPTIONS|NAME_SOURCES)",
+    ],
     "video": [
         r"register-videos", r"unwrap-zip-videos", r"video-(?:probe|proxy|scan|subjects|describe)",
         r"media_type", r"\bffprobe\b", r"\bffmpeg\b", r"PASS_MEDIA",

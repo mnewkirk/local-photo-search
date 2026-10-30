@@ -42,6 +42,7 @@ Path-scoped rules load only when you open matching code; a `PreToolUse` hook (`s
 - ingest: before answering or running anything about ingest, the SD importer, `_incoming`, batches or refile, Read `.claude/rules/ingest.md` (companions · refile-unknown-camera · six batch states · job rows · deploy NAS first)
 - maintenance: before answering or running anything about maintenance sweeps, geocoding, stacking, `sync-replica.sh` or the replica, Read `.claude/rules/maintenance.md` (geocode memory per row · incremental stacking · STRICT-only matching · face exclusions · replica gating)
 - workers: before answering or running anything about `run-workers.sh`, the worker fleet, `-d`, passes or `/api/worker/*`, Read `.claude/rules/workers.md` (retry attempts vs server write failures · `-d` gotcha · `/api/health` probe · sharpness backfill)
+- people-bind: before answering or running anything about names in descriptions, `people-bind`, `description_subjects`/`description_display` or the display flag, Read `.claude/rules/people-bind.md` (raw text untouched · spans not templates · label-free pass · trusted sources only · not a batch step)
 - video: before answering or running anything about video, `media_type`, `--native` or ffprobe/ffmpeg, Read `.claude/rules/video.md` (NULL `media_type` = still · `PASS_MEDIA` · the NAS never decodes · backfill not started)
 - print: before answering or running anything about Topaz upscale, books, Shutterfly or split export, Read `.claude/rules/print.md` (Topaz CLI quirks · strength blend · split geometry exists twice · integer-dpi grid)
 - frontend: before answering or running anything about `frontend/dist/`, the admin deploy panel or a restart, Read `.claude/rules/frontend.md` (no linter · `PS.poll` · deploy helper container · M28 re-run mirror)
@@ -62,7 +63,7 @@ History for every trap: `docs/notes/<subsystem>.md`. Runbooks: `.claude/skills/p
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). `SCHEMA_VERSION` in `photosearch/db.py` is the source of truth (v39).
+File is `photo_index.db` (not `photos.db`). `SCHEMA_VERSION` in `photosearch/db.py` is the source of truth (v40).
 Schema change: bump `SCHEMA_VERSION`, add the migration in `_init_schema()`; new indexes go in `db._SEARCH_INDEXES`.
 Write `filepath` only through `db.set_photo_filepath` (it re-derives `folder`).
 Table/column reference: `.claude/skills/photo-search/reference/schema.md`.

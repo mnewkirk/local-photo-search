@@ -345,6 +345,21 @@ class VideoDescribeResult(BaseModel):
     model_version: Optional[str] = None
 
 
+class PeopleBindResult(BaseModel):
+    """One photo's ``people-bind`` result (docs/plans/description-names.md):
+    which spans of the RAW description are which face boxes. Label-free.
+    ``description_sha`` pins the text the worker read; the server re-validates
+    every slot against the CURRENT description and faces. ``slots == []`` is a
+    result ("looked, nothing bindable"). ``method`` is ``rule`` (no model ran,
+    ``model`` is "rule") or ``vlm``."""
+    photo_id: int
+    description_sha: str
+    slots: list[dict] = []
+    method: str = "vlm"
+    model: Optional[str] = None
+    model_version: Optional[str] = None
+
+
 class FailedResult(BaseModel):
     """A photo the WORKER tried and could not process — an unloadable image, a
     detection or verification that raised. Spends one attempt on the server
@@ -379,6 +394,8 @@ class SubmitRequest(BaseModel):
     video_subjects_results: Optional[list[VideoSubjectsResult]] = None
     # video-describe (step 5). Optional, so older workers are unaffected.
     video_describe_results: Optional[list[VideoDescribeResult]] = None
+    # people-bind (schema v40). Optional, so older workers are unaffected.
+    people_bind_results: Optional[list[PeopleBindResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older
     # server ignores the unknown field (pydantic's default) and behaves as it
@@ -596,6 +613,11 @@ def claim_batch(req: ClaimRequest):
                     "SELECT codec, container, width, height, has_audio, duration_s, "
                     "probe_json FROM video_meta WHERE photo_id = ?", (p["id"],)).fetchone()
                 result_photos[-1]["proxy_input"] = dict(vm) if vm else None
+            elif req.pass_type == "people-bind":
+                # Label-free input: description + the faces that would be
+                # drawn (ids, boxes, scores) + subject boxes. NO names.
+                from .people_bind_store import claim_input
+                result_photos[-1]["people_bind_input"] = claim_input(db.conn, p["id"])
             elif req.pass_type == "video-describe":
                 # Step 5: the K keyframes of the current scan + the subjects
                 # timeline with person names resolved NOW (a /faces relabel
@@ -1519,6 +1541,64 @@ def submit_results(req: SubmitRequest):
             if committed:
                 _mark_processed(db, outcome, "video-describe", skip=done_vd)
 
+        elif req.pass_type == "people-bind":
+            # Re-validated against NOW before anything is written: the text or
+            # the faces may have changed since the claim. A stale sha DEFERS
+            # (no attempt; it terminates because a description only changes
+            # through describe / verify regen / video-describe, each capped by
+            # its own attempts, and each change re-queues this pass). An
+            # invalid binding is the worker's bad answer: one attempt +
+            # index_errors, nothing written. Runs BEFORE begin_batch because
+            # log_error commits.
+            from .people_bind import InvalidBinding, validate_slots
+            from .people_bind_store import current_state, store_row
+            good: list = []
+            bad: list[FailedResult] = []
+            for r in req.people_bind_results or []:
+                state = current_state(db.conn, r.photo_id)
+                if state is None or not state[0]:
+                    bad.append(FailedResult(photo_id=r.photo_id,
+                                            error="photo gone or has no description"))
+                    continue
+                desc, face_ids = state
+                from .people_bind import sha_of
+                if sha_of(desc) != r.description_sha:
+                    logger.warning("people-bind %s: description changed since the "
+                                   "claim — deferring", r.photo_id)
+                    outcome.defer(r.photo_id)
+                    continue
+                try:
+                    validate_slots(desc, r.slots, face_ids)
+                except InvalidBinding as e:
+                    bad.append(FailedResult(photo_id=r.photo_id,
+                                            error=f"invalid binding: {e}"))
+                    continue
+                good.append(r)
+            if bad:
+                _record_worker_failures(db, outcome, "people-bind", bad, origin="server")
+            db.begin_batch(batch_size=100)
+            done_pb: set[int] = set()
+            for r in good:
+                try:
+                    slots_json = store_row(db.conn, r.photo_id, r.description_sha,
+                                           r.slots, r.method, r.model, r.model_version)
+                    # the row is its own marker; provenance of the model that RAN
+                    if r.method == "vlm":
+                        db.log_generation(r.photo_id, "people-bind", slots_json,
+                                          r.model, r.model_version)
+                    from . import description_audit
+                    description_audit.record(
+                        db.conn, r.photo_id, description_audit.BOUND,
+                        {"method": r.method, "slots": len(r.slots), "model": r.model})
+                    outcome.written += 1
+                    outcome.persisted(r.photo_id)
+                    done_pb.add(r.photo_id)
+                except Exception as e:
+                    _record_write_failure(db, outcome, "people-bind", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "people-bind")
+            if committed:
+                _mark_processed(db, outcome, "people-bind", skip=done_pb)
+
         # Log activity for the chart
         if outcome.written > 0:
             try:
@@ -1786,6 +1866,16 @@ def clear_pass(req: ClearPassRequest):
             # (photo_ids is already narrowed to videos via PASS_MEDIA above.)
             from .video_describe_store import requeue_describe
             cleared = requeue_describe(db.conn, photo_ids)
+        elif req.pass_type == "people-bind":
+            # Re-queue: the row is the marker; the ledger holds failed attempts.
+            cur = db.conn.execute(
+                f"DELETE FROM description_subjects WHERE photo_id IN ({placeholders})",
+                photo_ids)
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'people-bind' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "video-subjects":
             # Re-queue: drop the subject rows and the marker (they are
             # derived from the scan, carry no human input, and a name comes
@@ -1853,7 +1943,8 @@ def photo_detail(photo_id: int):
 # forever. Including it in queue_depth just showed a confusing dead counter.
 _ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
                "aesthetics", "video-subjects", "describe", "video-describe",
-               "verify", "category-content", "keywords", "category-visual")
+               "verify", "category-content", "keywords", "category-visual",
+               "people-bind")
 
 
 @router.get("/status")

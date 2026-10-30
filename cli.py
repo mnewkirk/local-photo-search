@@ -5423,6 +5423,8 @@ def stack(db, collection_id, expand_stacks, time_window, clip_threshold, directo
 @click.option("--subjects-model", default="qwen2.5-vl", show_default=True,
               help="Vision model for video-subjects grounding (Ollama route; on LM "
                    "Studio PHOTOSEARCH_LLM_SUBJECT_MODEL decides).")
+@click.option("--bind-model", default="qwen2.5-vl", show_default=True,
+              help="Vision model for people-bind (phrase -> face box grounding; role `bind`).")
 @click.option("--video-describe-model", default="qwen2.5-vl", show_default=True,
               help="Multi-image vision model for video-describe (Ollama route; on LM "
                    "Studio PHOTOSEARCH_LLM_VIDEO_MODEL decides, with no fallback).")
@@ -5432,7 +5434,7 @@ def worker(server, passes, collection_id, directory,
            batch_size, model_batch_size, ttl,
            one_shot, stay_alive, sequential, dry_run, force, describe_model, tags_model, verify_model,
            category_content_model, category_visual_model, keywords_model,
-           aesthetics_model, subjects_model, video_describe_model):
+           aesthetics_model, subjects_model, bind_model, video_describe_model):
     """Run a remote indexing worker that processes photos from a NAS server.
 
     The worker claims batches of unprocessed photos from the server,
@@ -5511,6 +5513,9 @@ def worker(server, passes, collection_id, directory,
         "video-subjects",
         # step 5: one multi-image VLM call per clip (role `video`)
         "video-describe",
+        # docs/plans/description-names.md: phrase -> face box binding (role
+        # `bind`); not a batch step (db.NON_BATCH_PASSES)
+        "people-bind",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.
@@ -5563,6 +5568,7 @@ def worker(server, passes, collection_id, directory,
         keywords_model=keywords_model,
         aesthetics_model=aesthetics_model,
         subjects_model=subjects_model,
+        bind_model=bind_model,
         video_describe_model=video_describe_model,
     )
 
@@ -7203,6 +7209,33 @@ def video_redecode_black(db, exts, empty_only, save_collection, apply):
             click.echo(f"\nRe-queued video-scan for {n:,} video(s) and cleared {d:,} "
                        f"description(s). video-subjects re-queues as each scan lands; "
                        f"video-describe waits for it.")
+
+
+@cli.command("sweep-description-subjects")
+@click.option("--db", default="photo_index.db", envvar="PHOTOSEARCH_DB",
+              help="Path to the SQLite database file.")
+@click.option("--apply", "apply_", is_flag=True,
+              help="Write the changes. Without it this is a dry run that only counts.")
+@click.option("--limit", type=int, default=None, help="Only look at the first N rows.")
+def sweep_description_subjects(db, apply_, limit):
+    """Repair people-bind rows after a face re-detection.
+
+    A face re-detected with a new id but the same box is re-paired (IoU >= 0.7,
+    one to one). A row whose face is gone is deleted together with its
+    people-bind ledger entry, so the photo is re-queued. Render-time validation
+    already keeps a stale row from ever naming the wrong child; this makes the
+    repair persistent. Run it on the NAS (the only writer) after
+    clear-pass faces / redetect. docs/plans/description-names.md.
+    """
+    from photosearch.db import PhotoDB
+    from photosearch.description_render import sweep_subjects
+    pdb = PhotoDB(db)
+    try:
+        counts = sweep_subjects(pdb.conn, apply=apply_, limit=limit)
+    finally:
+        pdb.close()
+    click.echo(("APPLIED " if apply_ else "DRY RUN ") + json.dumps(counts))
+
 
 if __name__ == "__main__":
     cli()

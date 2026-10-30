@@ -549,6 +549,9 @@ def upload_photos(
                     "fileName": photo.get("filename", ""),
                 }
             }
+            # RAW on purpose (docs/plans/description-names.md): the named text
+            # would send children's names to Google. An opt-in per upload is a
+            # separate, explicit feature; nothing here reads description_display.
             if include_description and photo.get("description"):
                 # API max is 1000 chars; our descriptions are typically 100-200
                 item["description"] = photo["description"][:1000]

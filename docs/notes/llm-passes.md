@@ -858,3 +858,27 @@ Checked against the code while writing `.claude/rules/`; the text above is kept 
 - The four category-visual groups are `CAPTURE_FACT_TAGS` (derived), `RETIRED_TAGS`, `FROZEN_TAGS` and `PERCEIVED_VOCABULARY` in `visual_tags_derive.py`; "DERIVED"/"PERCEIVED" above are prose names.
 - The over-select guard constant is `_VISUAL_MAX_PLAUSIBLE_TAGS = _VISUAL_MAX_TAGS + 1` (`describe.py`).
 - The percentile UPDATE guard is generic: `WHERE id=? AND {score_col} IS ?` (overall and subject scores).
+
+
+### people-bind: names in descriptions (2026-10-30)
+
+Design decisions and the debate behind them live in `docs/plans/description-names.md`
+(two independent planners, two critique rounds; three decisions put to the owner). What
+was built before any model ran, and what is deliberately unmeasured:
+
+- Built: schema v40 `description_subjects`; `people_bind.py` (rule tier, prompt, parser,
+  decision, validator, overlay); `description_render.py` (read-time names, IoU re-pair,
+  sweep); worker pass `people-bind` (role `bind`, non-batch); surfaces behind
+  `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` (photo detail, Ask/MCP via `call_tool`, book captions,
+  M28 mirror, modal); eval harness `evals/people_bind_eval.py` + scoring + gates.
+- Not measured: VLM accuracy on small soccer faces, seconds per call, which model wins,
+  today's real scope and strict-vs-manual mix. The 29.5k-photo figure is from a stale
+  July replica snapshot. The backfill is gated on the holdout eval (0 wrong binds over
+  >= 150 bound mentions) and has not been started.
+- Subject-box guard on VLM slots (plan: "face centre inside a subject box for the first
+  sentence's subject") was NOT implemented: it can only lower coverage, and the could_be
+  count + shuffled second call are the safety. Revisit if the eval shows a wrong bind it
+  would have caught.
+- Query-plan finding: the correlated `EXISTS (trusted face)` claim predicate scanned the
+  whole `photos` table; `p.id IN (SELECT photo_id FROM faces WHERE <trusted>)` drives from
+  the faces list instead (`tests/test_people_bind_pass.py`).

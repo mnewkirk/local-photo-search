@@ -89,6 +89,7 @@ Collection-only options:
 | Video proxy | worker `video-proxy` only | ffmpeg transcode to H.264 720p-class (desktop); only clips `needs_proxy` | 0.1–0.25x real time (8K HEVC 1.4x) | video-probe |
 | Video scan | worker `video-scan` only | InsightFace + tracker + CLIP (desktop CPU) | ~7–43 s/video | video-probe |
 | Video subjects | worker `video-subjects` only | role `subject` (qwen2.5-vl) | ~0.7–1.9 s/keyframe | video-scan |
+| People bind | worker `people-bind` only (not a batch step; `db.NON_BATCH_PASSES`) | role `bind` (provisional qwen2.5-vl-7b; the eval picks), rule tier needs no model | ~0 s rule, ~2 calls VLM | verify settled; a trusted-label face; <=6 faces |
 | Video describe | worker `video-describe` only | role `video` (qwen3.5-9b), strict | ~3–8 s/video | video-scan |
 
 The old single `tags` pass was removed and split into `category-visual`

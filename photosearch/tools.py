@@ -27,6 +27,7 @@ Design notes:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,7 +89,40 @@ def call_tool(db: PhotoDB, name: str, args: Optional[dict] = None) -> Any:
     spec = _REGISTRY.get(name)
     if spec is None:
         raise KeyError(f"unknown tool: {name!r}")
-    return spec.handler(db, args or {})
+    return _with_display_names(db, spec.handler(db, args or {}))
+
+
+def _with_display_names(db: PhotoDB, result: Any) -> Any:
+    """Swap child names into the ``description`` of each hit (docs/plans/
+    description-names.md). ONE choke point for Ask and MCP: every tool returns
+    hits through ``_compact_hit`` (a truncated description), so rendering here
+    covers all ~9 call sites. The spans index the RAW text, so the raw
+    description is re-read and rendered whole, then truncated. Only when
+    ``PHOTOSEARCH_DISPLAY_DESCRIPTIONS`` is on; search itself stays on raw."""
+    from .description_render import attach_display_descriptions, display_enabled
+    if not display_enabled() or not isinstance(result, dict):
+        return result
+    hits = result.get("results")
+    if not isinstance(hits, list):
+        return result
+    ids = [h["id"] for h in hits if isinstance(h, dict) and h.get("id") and h.get("description")]
+    if not ids:
+        return result
+    try:
+        q = ",".join("?" * len(ids))
+        raw = {r["id"]: r["description"] for r in db.conn.execute(
+            f"SELECT id, description FROM photos WHERE id IN ({q})", ids)}
+        probe = [{"id": i, "description": raw[i]} for i in ids if raw.get(i)]
+        attach_display_descriptions(db.conn, probe)
+        shown = {p["id"]: p["description_display"] for p in probe
+                 if "description_display" in p}
+        for h in hits:
+            if isinstance(h, dict) and h.get("id") in shown:
+                h["description"] = _truncate(shown[h["id"]])
+                h["named"] = True
+    except Exception:                                      # noqa: BLE001 — raw is always safe
+        logging.getLogger(__name__).exception("display names failed; leaving raw")
+    return result
 
 
 # The 5 search-family tools the consolidated `search(mode=...)` tool subsumes.

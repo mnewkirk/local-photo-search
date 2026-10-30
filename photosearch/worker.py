@@ -1045,8 +1045,10 @@ PASS_CLAIM_LIMITS = {"video-probe": 25, "video-scan": 1,
 # rate-capped streamed download) instead of through _download_batch.
 # video-subjects reads only the scan's uploaded segment keyframes.
 # video-describe reads only the scan's K uploaded keyframes.
+# people-bind fetches the image itself and only for photos the rule tier could
+# not decide (no model, no download for the single-face case).
 SELF_READ_PASSES = {"video-probe", "video-proxy", "video-scan", "video-subjects",
-                    "video-describe"}
+                    "video-describe", "people-bind"}
 
 
 class TruncatedDownload(ConnectionError):
@@ -1520,6 +1522,66 @@ def _subjects_for_video(client: "WorkerClient", pid: int, inp: dict, model: str,
             "analysis": analysis}
 
 
+def _process_people_bind(client: "WorkerClient", photos: list[dict], model: str,
+                         workdir: str) -> list[dict]:
+    """people-bind (docs/plans/description-names.md): bind phrases of the RAW
+    description to anonymous numbered face boxes. Label-free: the claim carries
+    no names. Rule tier first (no model, no download); only an undecided photo
+    downloads its image and goes to the VLM tier.
+
+    Outcomes, following the worker conventions:
+      * a result (including ``slots == []``) -> a row;
+      * transport trouble, a call with no answer, a failed download -> OMITTED
+        (re-claimed for free);
+      * a truncated / unparseable / invalid-phrase answer -> a failure row
+        (one attempt + ``index_errors``, nothing written);
+      * ContextOverflow / RoleModelNotConfigured -> :class:`PassHalted`.
+    """
+    from . import people_bind as PB
+    from .describe import ContextOverflow, RoleModelNotConfigured, UnusableAnswer
+    out: list[dict] = []
+    for photo in photos:
+        pid = photo["id"]
+        label = photo.get("filename") or str(pid)
+        inp = photo.get("people_bind_input")
+        if not inp:
+            print(f"    {label}: no people-bind input in the claim (no description) — skipped")
+            continue
+        t0 = time.time()
+
+        def fetch(photo=photo):
+            dest = os.path.join(workdir, f"{photo['id']}_{photo['filename']}")
+            status = _retry(lambda: client.download_photo(photo["id"], dest),
+                            label=f"download {photo['filename']}")
+            return dest if status == 200 else None
+
+        try:
+            slots, method = PB.bind_photo(photo, fetch, model)
+        except (ContextOverflow, RoleModelNotConfigured) as e:
+            raise PassHalted(f"{type(e).__name__}: {e}", out) from e
+        except UnusableAnswer as e:
+            print(f"    {label}: unusable answer: {e}")
+            out.append(_failure_row(pid, e))
+            continue
+        except _TRANSIENT as e:
+            print(f"    {label}: transport ({e}) — will be retried")
+            continue
+        except Exception as e:  # noqa: BLE001 — a per-photo bug must not kill the batch
+            print(f"    {label}: {type(e).__name__}: {e}")
+            out.append(_failure_row(pid, f"{type(e).__name__}: {e}"))
+            continue
+        if slots is None:
+            print(f"    {label}: no answer — will be retried")
+            continue
+        names = "; ".join(f"{s['spans'][0]['text']!r} -> {[f['face_id'] for f in s['faces']]}"
+                          for s in slots)
+        print(f"    {label} ({time.time() - t0:.1f}s, {method}): "
+              f"{names or 'nothing bindable'}")
+        out.append({"photo_id": pid, "description_sha": inp["description_sha"],
+                    "slots": slots, "method": method})
+    return out
+
+
 def _process_video_subjects(client: "WorkerClient", photos: list[dict], model: str,
                             credit: Optional[str] = None) -> list[dict]:
     """video-subjects (docs/plans/video-support.md step 3b) for claimed videos:
@@ -1675,6 +1737,7 @@ def run_worker(
     aesthetics_model: str = "qwen2.5-vl",
     subjects_model: str = "qwen2.5-vl",
     video_describe_model: str = "qwen2.5-vl",
+    bind_model: str = "qwen2.5-vl",
 ):
     """Main worker loop. Connects to server and processes photos until queue is empty.
 
@@ -1828,6 +1891,7 @@ def run_worker(
         "aesthetics":       [(aesthetics_model, "aesthetics")],
         "video-subjects":   [(subjects_model, "subject")],
         "video-describe":   [(video_describe_model, "video")],
+        "people-bind":      [(bind_model, "bind")],
     }
     status_scope = {"collection_id": collection_id, "directory": directory,
                     "filters": filters}
@@ -2008,6 +2072,24 @@ def run_worker(
                             active.remove(pass_type)
                     _provenance_kwargs(pass_type, video_describe_model, results)
                     kwargs = _submit_kwargs("video_describe_results", results)
+                elif pass_type == "people-bind":
+                    try:
+                        results = _process_people_bind(client, photos, bind_model,
+                                                       batch_temp)
+                    except PassHalted as e:
+                        results = e.results
+                        print(f"  ✗ stopping {pass_type}: {e} — fix the model "
+                              f"configuration (context length / role model) and relaunch")
+                        if pass_type in active:
+                            active.remove(pass_type)
+                    # The rule tier ran no model: only VLM rows carry provenance
+                    # (the server logs a generation for those alone).
+                    for r in results:
+                        if r.get("method") == "rule":
+                            r["model"], r["model_version"] = "rule", None
+                    _provenance_kwargs(pass_type, bind_model,
+                                       [r for r in results if r.get("method") == "vlm"])
+                    kwargs = _submit_kwargs("people_bind_results", results)
                 elif pass_type == "aesthetics":
                     results = _process_aesthetics(downloaded, model=aesthetics_model)
                     _provenance_kwargs(pass_type, aesthetics_model, results)
@@ -2044,7 +2126,7 @@ def run_worker(
                     print(f"  Server processed {n_processed} photos ({n_written} faces found).")
                 elif pass_type in ("describe", "category-content", "category-visual", "keywords",
                                    "aesthetics", "video-probe", "video-proxy", "video-scan",
-                                   "video-subjects", "video-describe"):
+                                   "video-subjects", "video-describe", "people-bind"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
                 else:
                     print(f"  Server wrote {n_written} results.")

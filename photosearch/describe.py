@@ -387,6 +387,8 @@ _OPENAI_MAX_TOKENS = {
     # than a photo's because it narrates a sequence over K frames.
     "subject": 256,
     "video": 768,
+    # people-bind: a JSON array of {phrase, could_be} per person phrase
+    "bind": 384,
 }
 _DEFAULT_OPENAI_MAX_TOKENS = 768
 
@@ -863,6 +865,7 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
         aesthetics -> VLM aesthetic scoring           PHOTOSEARCH_LLM_AESTHETICS_MODEL
         subject    -> video-subjects grounding        PHOTOSEARCH_LLM_SUBJECT_MODEL
         video      -> video-describe                  PHOTOSEARCH_LLM_VIDEO_MODEL
+        bind       -> people-bind                     PHOTOSEARCH_LLM_BIND_MODEL
 
     So you point each role at whatever you actually loaded in LM Studio (Gemma,
     Qwen-VL, llava, ...) without the config keys pretending to be model names.
@@ -894,7 +897,7 @@ def _resolve_openai_model(model: str, role: Optional[str] = None) -> str:
         # "llama3.2-vision") are NOT valid LM Studio ids, so falling through to
         # `model` would 400 with "Invalid model identifier". Mirrors
         # rerun._resolve_model. `aesthetics` is the pass that surfaced this.
-        if role in ("describe", "verify", "visual", "aesthetics", "subject"):
+        if role in ("describe", "verify", "visual", "aesthetics", "subject", "bind"):
             visual = os.environ.get("PHOTOSEARCH_LLM_VISUAL_MODEL")
             if visual:
                 return visual
@@ -916,6 +919,9 @@ PASS_ROLES = {
     "video-subjects":   "subject",
     # step 5: one multi-image call per clip, strict role (no fallback, D8).
     "video-describe":   "video",
+    # docs/plans/description-names.md: phrase -> face box grounding. A vision
+    # role; the VISUAL fallback below must include it or an unset env var 400s.
+    "people-bind":      "bind",
 }
 
 # Roles that must be configured explicitly on the OpenAI-compatible route —

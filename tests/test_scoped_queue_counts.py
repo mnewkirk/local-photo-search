@@ -64,6 +64,13 @@ def test_large_scope_does_not_search_by_rowid(varied, monkeypatch, pass_type):
     photos_by_rowid = [r for r in rows
                        if r.startswith(("SEARCH p ", "SEARCH photos "))
                        and "INTEGER PRIMARY KEY" in r]
+    if pass_type == "people-bind":
+        # Deliberate exception: its rowid probes are driven by the trusted-
+        # label face list (the ~40k photos that can show a name), not by the
+        # scope size, and the alternative scanned the whole photos table.
+        # tests/test_people_bind_pass.py pins that shape.
+        assert "LIST SUBQUERY" in plan, plan
+        return
     assert not photos_by_rowid, plan
 
 

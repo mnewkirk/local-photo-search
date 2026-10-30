@@ -88,11 +88,14 @@ def test_empty_describe_result_leaves_downstream_alone(client):
 
 def test_fleet_order_runs_verify_before_the_text_passes():
     from photosearch import batch_state, rerun
+    from photosearch.db import NON_BATCH_PASSES
     for order in (batch_state.WORKER_PASSES, rerun.ALL_PASSES):
         i = order.index
         assert i("describe") < i("verify") < i("category-content")
         assert i("verify") < i("keywords")
-    assert tuple(rerun.ALL_PASSES) == tuple(batch_state.WORKER_PASSES)
+    # people-bind is a worker pass but not a batch step (db.NON_BATCH_PASSES):
+    # it runs LAST so verify has settled the text its spans index into
+    assert tuple(rerun.ALL_PASSES) == tuple(batch_state.WORKER_PASSES) + NON_BATCH_PASSES
 
 
 def test_workers_start_sorts_passes_into_dependency_order(monkeypatch, tmp_path):

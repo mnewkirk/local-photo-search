@@ -42,7 +42,10 @@ logger = logging.getLogger(__name__)
 # precedes the text passes). Same order as batch_state.WORKER_PASSES.
 ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
               "aesthetics", "video-subjects", "describe", "video-describe",
-              "verify", "category-content", "keywords", "category-visual")
+              "verify", "category-content", "keywords", "category-visual",
+              # not a batch step (db.NON_BATCH_PASSES): last, so it runs after
+              # verify has settled the description its spans index into
+              "people-bind")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}
@@ -69,6 +72,8 @@ _PASS_LLM = {
     # step 5: one multi-image call per clip. qwen2.5-vl is the Ollama default
     # because llama3.2-vision (describe's) takes a single image only.
     "video-describe":   ("video",    "qwen2.5-vl"),
+    # docs/plans/description-names.md: phrase -> numbered face box grounding
+    "people-bind":      ("bind",     "qwen2.5-vl"),
 }
 
 
@@ -113,7 +118,11 @@ FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      # the step 4 video eval picks one; same model as
                      # describe, so describe -> video-describe loads it once.
                      # Needs LM Studio's per-model context >= 16384 (Risk 8).
-                     "video":      "qwen/qwen3.5-9b"}
+                     "video":      "qwen/qwen3.5-9b",
+                     # people-bind: PROVISIONAL, the eval picks it
+                     # (evals/people_bind_eval.py). The box-grounding model
+                     # photos already use; no label-bearing input either way.
+                     "bind":       "qwen2.5-vl-7b-instruct"}
 
 
 # Every model eval that picked FLEET_ROLE_MODELS ran with reasoning OFF
@@ -141,6 +150,7 @@ _LMSTUDIO_DEFAULTS = {"describe": "qwen2.5-vl-7b-instruct",
                       "visual":   "qwen2.5-vl-7b-instruct",
                       "aesthetics": "qwen2.5-vl-7b-instruct",
                       "subject":  "qwen2.5-vl-7b-instruct",
+                      "bind":     "qwen2.5-vl-7b-instruct",
                       "text":     "llama-3.2-3b-instruct"}
 
 
@@ -551,6 +561,27 @@ def _apply_mirror(db, photo_id: int, fields: dict) -> None:
             if f.get("match_source") is not None:
                 db.conn.execute("UPDATE faces SET match_source=? WHERE id=?",
                                 (f["match_source"], fid))
+
+    if "description_subjects" in fields:
+        # NAS-authoritative people-bind row. Face ids inside it follow the
+        # remap above if a NAS id collided locally (usually identical).
+        db.conn.execute("DELETE FROM description_subjects WHERE photo_id=?", (photo_id,))
+        ds = fields["description_subjects"]
+        if ds:
+            slots_json = ds["slots_json"]
+            if id_map:
+                slots = json.loads(slots_json or "[]")
+                for s in slots:
+                    for f in s.get("faces", []):
+                        f["face_id"] = id_map.get(f["face_id"], f["face_id"])
+                slots_json = json.dumps(slots, separators=(",", ":"))
+            db.conn.execute(
+                "INSERT INTO description_subjects (photo_id, description_sha, slots_json, "
+                "method, bind_version, model, model_version, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (photo_id, ds["description_sha"], slots_json, ds["method"],
+                 ds["bind_version"], ds.get("model"), ds.get("model_version"),
+                 ds.get("created_at")))
 
     vm = fields.get("video_meta")
     if vm:

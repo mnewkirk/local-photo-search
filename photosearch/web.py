@@ -1794,6 +1794,17 @@ def api_photo_mirror_fields(photo_id: int):
         except Exception:
             pass
         out["faces"] = faces
+        # people-bind row (schema v40): the spans of the RAW description and
+        # the face ids they bind. Null when none (the mirror deletes the local
+        # row). Names are never stored in it, so a relabel needs no mirroring.
+        try:
+            ds = db.conn.execute(
+                "SELECT description_sha, slots_json, method, bind_version, model, "
+                "model_version, created_at FROM description_subjects WHERE photo_id = ?",
+                (photo_id,)).fetchone()
+            out["description_subjects"] = {k: ds[k] for k in ds.keys()} if ds else None
+        except Exception:
+            out["description_subjects"] = None
         if out.get("media_type") == "video":
             # video-probe / video-scan state (schema v35/v36), so a re-run
             # mirrors the probe, scan, poster version and tracks too.
@@ -1953,7 +1964,7 @@ def api_photo_detail(photo_id: int):
             video["browser_playable"] = (
                 Path(photo["filename"] or "").suffix.lower() not in NOT_BROWSER_PLAYABLE)
 
-        return {
+        detail = {
             "id": photo["id"],
             "filename": photo["filename"],
             "filepath": photo["filepath"],
@@ -1991,6 +2002,12 @@ def api_photo_detail(photo_id: int):
             "stack": db.get_photo_stack(photo_id),
             "current_models": current_models,
         }
+        # docs/plans/description-names.md: additive, flag-gated. `description`
+        # above stays the RAW text; the display text follows the current face
+        # labels at read time.
+        from .description_render import attach_display_descriptions
+        attach_display_descriptions(db.conn, [detail], detail=True)
+        return detail
 
 
 @app.get("/api/photos/{photo_id}/generations")

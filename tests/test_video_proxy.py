@@ -578,7 +578,7 @@ def test_v38_db_migrates_to_v39_proxy_columns(tmp_path):
         assert got == {hdr: 1, ok: 0, bad: None}
         assert db.conn.execute("SELECT proxy_version FROM video_meta LIMIT 1").fetchone()[0] is None
         v = db.conn.execute("SELECT value FROM schema_info WHERE key = 'version'").fetchone()[0]
-        assert int(v) == SCHEMA_VERSION == 39
+        assert int(v) == SCHEMA_VERSION == 40
 
 
 # ---------------------------------------------------------------------------

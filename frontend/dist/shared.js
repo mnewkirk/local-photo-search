@@ -932,6 +932,22 @@
     var liveFaces = _liveFaces[0];
     var setLiveFaces = _liveFaces[1];
 
+    // The named description follows the face labels (docs/plans/description-
+    // names.md). syncFaces re-fetches the photo after a face edit and keeps
+    // the server's rendered text here, so a relabel changes it without
+    // reopening the modal. null = use `detail`. Reset per photo.
+    var _liveNames = useState(null);
+    var liveNames = _liveNames[0];
+    var setLiveNames = _liveNames[1];
+    // Per-viewer convenience only: show the raw LLM text instead of the named
+    // one. localStorage can throw (private window), so wrap every access.
+    var _showRaw = useState(function () {
+      try { return window.localStorage.getItem('ps.descriptionRaw') === '1'; }
+      catch (e) { return false; }
+    });
+    var showRawDesc = _showRaw[0];
+    var setShowRawDesc = _showRaw[1];
+
     // ---- Image rect for face bounding boxes ----
     var _imgRect = useState(null);
     var imgRect = _imgRect[0];
@@ -1100,7 +1116,14 @@
       if (!photo) return;
       fetch(API + '/api/photos/' + photo.id)
         .then(function (r) { return r.json(); })
-        .then(function (d) { if (d && d.faces) setLiveFaces(d.faces); })
+        .then(function (d) {
+          if (d && d.faces) setLiveFaces(d.faces);
+          // description_display is absent when nothing is named (or the flag
+          // is off): that is a real answer, so the old named text must go.
+          if (d) setLiveNames({
+            display: d.description_display || null,
+            subjects: d.description_subjects || null });
+        })
         .catch(function () {});
     }, [photo]);
 
@@ -1291,6 +1314,7 @@
       setRemovedFaceIds({});
       setAddedFaces([]);
       setLiveFaces(null);
+      setLiveNames(null);
       dragStartRef.current = null;
     }, [photo && photo.id]);
 
@@ -2076,10 +2100,39 @@
             ),
           ),
 
-          // Description
+          // Description — the RAW LLM text, or (flag on, a face is labelled)
+          // the same text with the child's name filled in from the CURRENT
+          // face label. Never edited text: spans of the raw one, swapped.
           ((detail && detail.description) || photo.description) && e('div', { className: 'detail-section' },
             e('h3', null, 'Description', descriptionChip()),
-            e('p', null, (detail && detail.description) || photo.description),
+            (function () {
+              var raw = (detail && detail.description) || photo.description;
+              var named = liveNames ? liveNames.display
+                : (detail && detail.description_display) || null;
+              var subjects = liveNames ? liveNames.subjects
+                : (detail && detail.description_subjects) || null;
+              var shown = (named && !showRawDesc) ? named : raw;
+              var notNamed = (subjects || []).filter(function (s) { return s.state !== 'named'; });
+              return e('div', null,
+                e('p', null, shown),
+                named && e('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 2 } },
+                  showRawDesc ? 'Original text. ' : 'Names from face labels. ',
+                  e('a', { href: '#', style: { color: 'var(--text-muted)' },
+                    onClick: function (ev) {
+                      ev.preventDefault();
+                      var next = !showRawDesc;
+                      setShowRawDesc(next);
+                      try { window.localStorage.setItem('ps.descriptionRaw', next ? '1' : '0'); }
+                      catch (err) { /* private window: the toggle just does not persist */ }
+                    } }, showRawDesc ? 'Show names' : 'Show original')),
+                notNamed.length > 0 && e('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 2 } },
+                  notNamed.map(function (s) {
+                    return '\u201c' + s.generic + '\u201d not named: ' + ({
+                      unlabelled: 'no face label', untrusted_source: 'label is not trusted',
+                      rejected: 'label rejected', stale: 'face changed',
+                      ambiguous_name: 'name is ambiguous in this photo' }[s.state] || s.state);
+                  }).join(' \u00b7 ')));
+            })(),
           ),
 
           // Faces

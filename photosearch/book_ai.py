@@ -43,6 +43,14 @@ def _photo_context(pdb, photo_ids: list[int]) -> tuple[list[str], Optional[str],
         f"SELECT id, description, place_name, date_taken FROM photos WHERE id IN ({ph})",
         photo_ids).fetchall()
     by_id = {r["id"]: r for r in rows}
+    # Book captions use the NAMED text when PHOTOSEARCH_DISPLAY_DESCRIPTIONS is
+    # on (docs/plans/description-names.md): a family book wants "Zack", and the
+    # caption model runs locally. A photo with nothing bound keeps its raw text.
+    from .description_render import attach_display_descriptions
+    probe = [{"id": r["id"], "description": r["description"]} for r in rows
+             if r["description"]]
+    attach_display_descriptions(pdb.conn, probe)
+    shown = {p["id"]: p["description_display"] for p in probe if "description_display" in p}
     lines, place, date = [], None, None
     for pid in photo_ids:
         r = by_id.get(pid)
@@ -50,7 +58,7 @@ def _photo_context(pdb, photo_ids: list[int]) -> tuple[list[str], Optional[str],
             continue
         place = place or r["place_name"]
         date = date or (r["date_taken"] or "")[:10] or None
-        d = (r["description"] or "").strip()
+        d = (shown.get(pid) or r["description"] or "").strip()
         if d:
             lines.append("- " + d[:180])
     return lines[:8], place, date
