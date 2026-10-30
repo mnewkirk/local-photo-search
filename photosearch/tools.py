@@ -2017,6 +2017,64 @@ _register(ToolSpec(
 ))
 
 
+def _h_get_photo_audit(db: PhotoDB, args: dict) -> dict:
+    from . import audit
+    limit = max(1, min(int(args.get("limit") or 50), 500))
+    action = args.get("action") or None
+    pid, cid, cname = (args.get("photo_id"), args.get("collection_id"),
+                       (args.get("collection") or "").strip() or None)
+    if pid is None and cid is None and cname is None:
+        return {"error": "pass photo_id, collection_id or collection"}
+    out = {"events": audit.query(
+        db.conn, photo_id=pid, collection_id=cid, collection_name=cname,
+        action=action, limit=limit),
+        "note": "history starts when the audit log was deployed"
+                + ("; this is the last synced copy of the NAS log" if _nas_base() else "")}
+    # By name, a collection deleted and rebuilt has several ids; cover them all.
+    cids = [int(cid)] if cid is not None else []
+    if cname:
+        cids += [r[0] for r in db.conn.execute(
+            "SELECT id FROM collections WHERE name = ? COLLATE NOCASE "
+            "UNION SELECT collection_id FROM photo_audit "
+            "WHERE collection_name = ? COLLATE NOCASE AND collection_id IS NOT NULL",
+            (cname, cname))]
+    if cids:
+        out["removed_from_collection"] = [
+            r for i in dict.fromkeys(cids)
+            for r in audit.removed_from_collection(db.conn, i)]
+    return out
+
+
+_register(ToolSpec(
+    name="get_photo_audit",
+    description=(
+        "Change history. For a photo (photo_id): every time it was added to or "
+        "removed from a collection, had a face named / cleared / rejected, had "
+        "tags or location set, or was moved, newest first, with who asked "
+        "(source, intent). For a collection (collection_id or collection name): "
+        "its membership changes, plus `removed_from_collection` = photos whose "
+        "last event there is a removal and that are not in it now. A collection "
+        "that was deleted and rebuilt has a new id: query it by name to see both. "
+        "Only changes made after the audit log was deployed are recorded."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "photo_id": {"type": "integer", "description": "The photo id."},
+            "collection_id": {"type": "integer", "description": "A collection id."},
+            "collection": {"type": "string", "description": "A collection name (case-insensitive)."},
+            "action": {"type": "string", "description": (
+                "Only this kind of change: photo_added, photo_deleted, filepath_changed, "
+                "field_changed, location_set, tags_set, collection_added, "
+                "collection_removed, face_assigned, face_cleared, face_unmatched.")},
+            "limit": {"type": "integer", "description": "Max events (default 50, max 500)."},
+        },
+        "additionalProperties": False,
+    },
+    handler=_h_get_photo_audit,
+))
+
+
 # ---------------------------------------------------------------------------
 # Tool: rerank_photos  (VLM re-ranking — a vision model looks at each candidate)
 # ---------------------------------------------------------------------------

@@ -25,4 +25,4 @@ Condensed rule: `.claude/rules/search.md` ("`photo_audit` is the per-photo chang
 - Raw-SQL writers outside `PhotoDB`: `face_state` import/restore, `rerun` match_source stamps, `face_edit` `manual_box`, the cluster-only merge-review branch (cluster ids are ephemeral), `maintenance.repair_data` (date_taken/GPS repairs), recluster. Add a `photosearch.audit` call when touching them.
 - Rename, description and cover changes of a collection (collection-level, not photo-level).
 - Photo deletions report `source='db-trigger'` with no intent.
-- The Ask/MCP tool surface was left unchanged (no read tool); Claude reads the history through the HTTP endpoints.
+- `get_photo_audit` (read tool, so Ask and MCP both advertise it) reads the local DB: on a replica that is the last synced snapshot, and the result says so. The Ask evals were not re-run after adding a tool to its surface.

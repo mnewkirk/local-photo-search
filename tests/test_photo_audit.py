@@ -405,3 +405,18 @@ def test_the_cli_group_sets_its_context_and_does_not_leak_it():
         cli_mod.cli.commands.pop("audit-probe", None)
     assert (seen["source"], seen["intent"]) == ("cli", "photosearch audit-probe")
     assert audit.current()["source"] == "internal"
+
+
+def test_get_photo_audit_tool(clean):
+    from photosearch import tools
+    db = clean
+    c = db.create_collection("Soccer")
+    a = pid(db, "DSC04894.JPG")
+    db.add_photos_to_collection(c, [a])
+    db.remove_photos_from_collection(c, [a])
+    out = tools.call_tool(db, "get_photo_audit", {"collection": "soccer"})
+    assert [e["action"] for e in out["events"]] == ["collection_removed", "collection_added"]
+    assert [r["photo_id"] for r in out["removed_from_collection"]] == [a]
+    by_photo = tools.call_tool(db, "get_photo_audit", {"photo_id": a, "action": "collection_added"})
+    assert len(by_photo["events"]) == 1 and "removed_from_collection" not in by_photo
+    assert tools.call_tool(db, "get_photo_audit", {})["error"]

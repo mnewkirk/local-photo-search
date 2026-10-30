@@ -20,7 +20,7 @@ READ_TOOLS = {
     "get_library_overview", "list_people", "list_places", "list_vocab",
     "search_photos", "summarize", "representatives", "daily_highlights",
     "group_into_chapters", "daily_scene_breakdown", "suggest_layout",
-    "rerank_photos", "get_photo", "get_photo_image",
+    "rerank_photos", "get_photo", "get_photo_image", "get_photo_audit",
 }
 # M26b mutation tools — gated out of the default projections.
 WRITE_TOOLS = {"set_photo_location", "set_photo_tags", "add_to_collection"}
