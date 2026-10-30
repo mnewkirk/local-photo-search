@@ -79,6 +79,49 @@ def _pct_ranks(values):
     return out
 
 
+def iso_band(iso):
+    """One-stop ISO band (3200 and 4000 share one; 5000 and 6400 the next),
+    or None when the photo carries no ISO."""
+    import math
+    try:
+        v = float(iso)
+    except (TypeError, ValueError):
+        return None
+    return int(math.floor(math.log2(v))) if v > 0 else None
+
+
+def _pct_ranks_banded(values, bands, min_band=30):
+    """`_pct_ranks`, but each photo is ranked only against photos in its own
+    band. A band with fewer than `min_band` photos borrows the nearest big
+    band (a photo with no band ranks against the whole shoot), so a handful of
+    outliers is never ranked against itself.
+    """
+    sizes = defaultdict(int)
+    for b in bands:
+        sizes[b] += 1
+    big = sorted(b for b, n in sizes.items() if b is not None and n >= min_band)
+    if not big:
+        return _pct_ranks(values)
+    home = {}
+    for b in sizes:
+        home[b] = b if b in big else (
+            None if b is None else min(big, key=lambda g: abs(g - b)))
+    members = defaultdict(list)
+    for i, b in enumerate(bands):
+        members[home[b]].append(i)
+    out = [0.0] * len(values)
+    for g, idx in members.items():
+        if g is None:                       # no band: rank against everyone
+            ranked = _pct_ranks(values)
+            for i in idx:
+                out[i] = ranked[i]
+            continue
+        ranked = _pct_ranks([values[i] for i in idx])
+        for k, i in enumerate(idx):
+            out[i] = ranked[k]
+    return out
+
+
 def build_bursts(photos, gap_seconds):
     """Group time-ordered photos into bursts; a gap > `gap_seconds` starts one.
 
@@ -104,9 +147,10 @@ def build_bursts(photos, gap_seconds):
 
 
 def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
-           max_per_person=None, min_aes_coverage=0.80):
+           max_per_person=None, min_aes_coverage=0.80, iso_bands=True):
     rows = db.conn.execute(
-        """SELECT p.id, p.filename, p.date_taken, p.aesthetic_score, p.aes_overall
+        """SELECT p.id, p.filename, p.date_taken, p.aesthetic_score, p.aes_overall,
+                  p.iso
              FROM photos p WHERE date(p.date_taken) = ? ORDER BY p.date_taken""",
         (date_,)).fetchall()
     photos = {r["id"]: dict(r) for r in rows}
@@ -147,7 +191,15 @@ def select(db, date_, cache, *, best_n, next_n, min_per_person, burst_gap,
     have_laion = [v for v in laion if v is not None]
     med_laion = sorted(have_laion)[len(have_laion) // 2] if have_laion else 0.0
 
-    sharp = _pct_ranks([math.log1p(photos[i]["lap"]) for i in ids])
+    # Laplacian variance reads sensor noise as detail, so it climbs with ISO
+    # (2026-10-25: median 236 at ISO 2-5k, 312 at 8k+; ISO >= 6400 was 21% of
+    # the shoot and 46% of Best 50). Rank sharpness only against frames at a
+    # similar ISO so grain cannot buy a place.
+    log_lap = [math.log1p(photos[i]["lap"]) for i in ids]
+    if iso_bands:
+        sharp = _pct_ranks_banded(log_lap, [iso_band(photos[i]["iso"]) for i in ids])
+    else:
+        sharp = _pct_ranks(log_lap)
     size = _pct_ranks([photos[i]["edge"] for i in ids])
     det = _pct_ranks([photos[i]["det"] for i in ids])
     aest = _pct_ranks([
@@ -262,6 +314,9 @@ def build_parser():
                          "the album (Calvin took 16 of 50 uncapped on 2026-09-12).")
     ap.add_argument("--burst-gap", type=float, default=1.0,
                     help="Seconds between frames that still counts as one burst.")
+    ap.add_argument("--no-iso-bands", dest="iso_bands", action="store_false",
+                    help="Rank sharpness against the whole shoot (the old "
+                         "behaviour) instead of against frames at a similar ISO.")
     ap.add_argument("--label", default=None, help="Collection name prefix.")
     ap.add_argument("--apply", action="store_true", help="Create the collections.")
     return ap
@@ -296,7 +351,7 @@ def main():
         best, nxt, scored = select(
             db, args.date, cache, best_n=args.best, next_n=args.next_n,
             min_per_person=args.min_per_person, burst_gap=args.burst_gap,
-            max_per_person=args.max_per_person)
+            max_per_person=args.max_per_person, iso_bands=args.iso_bands)
 
         def coverage(sel):
             c = defaultdict(int)

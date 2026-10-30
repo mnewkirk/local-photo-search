@@ -344,6 +344,53 @@ class TestRankShootScript:
         assert args.measure is True
         assert args.cache is None
 
+    def test_iso_band_is_one_stop_and_tolerates_missing_iso(self):
+        mod = _load_script()
+        assert mod.iso_band(3200) == mod.iso_band(4000)
+        assert mod.iso_band(5000) == mod.iso_band(6400) == mod.iso_band(3200) + 1
+        assert mod.iso_band(None) is None and mod.iso_band(0) is None
+        assert mod.iso_band("junk") is None
+
+    def test_grain_cannot_buy_sharpness_rank(self):
+        """The same Laplacian value ranks lower among noisy frames than among
+        clean ones — a high-ISO frame must beat its own band, not the shoot."""
+        mod = _load_script()
+        clean = [(100 + i, 3200) for i in range(40)]      # laps 100..139
+        noisy = [(200 + i, 10000) for i in range(40)]     # laps 200..239
+        values = [v for v, _ in clean + noisy]
+        bands = [mod.iso_band(i) for _, i in clean + noisy]
+        flat = mod._pct_ranks(values)
+        banded = mod._pct_ranks_banded(values, bands)
+        # Flat: every noisy frame outranks every clean one. Banded: the best of
+        # each band ties at 1.0 and the worst at 0.0.
+        assert min(flat[40:]) > max(flat[:40])
+        assert max(banded[:40]) == max(banded[40:]) == 1.0
+        assert min(banded[:40]) == min(banded[40:]) == 0.0
+
+    def test_a_tiny_band_borrows_the_nearest_big_one(self):
+        mod = _load_script()
+        values = list(range(40)) + [5.0, 6.0]
+        bands = [12] * 40 + [20, 20]                       # 2-photo outlier band
+        out = mod._pct_ranks_banded(values, bands, min_band=30)
+        # Ranked inside band 12's population, not against itself (a 2-photo
+        # band would otherwise pin them at exactly 0.0 and 1.0).
+        assert 0.0 < out[40] < 1.0 and 0.0 < out[41] < 1.0
+
+    def test_no_iso_ranks_against_the_whole_shoot(self):
+        mod = _load_script()
+        values = list(range(60))
+        bands = [12] * 40 + [None] * 20
+        out = mod._pct_ranks_banded(values, bands, min_band=30)
+        assert out[59] == 1.0 and out[40] == mod._pct_ranks(values)[40]
+
+    def test_no_iso_bands_flag_restores_the_old_ranking(self):
+        mod = _load_script()
+        args = mod.build_parser().parse_args(["--date", "2026-09-19"])
+        assert args.iso_bands is True
+        args = mod.build_parser().parse_args(
+            ["--date", "2026-09-19", "--no-iso-bands"])
+        assert args.iso_bands is False
+
     def test_cache_default_follows_the_db(self):
         mod = _load_script()
         args = mod.build_parser().parse_args(["--date", "2026-09-19"])
