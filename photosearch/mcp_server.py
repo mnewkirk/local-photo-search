@@ -153,8 +153,12 @@ def call_tool_logged(db: PhotoDB, name: str, arguments: Optional[dict]):
     text = str(intent).strip()[:request_intent.MAX_INTENT] if intent else None
     t0 = time.perf_counter()
     status = 500
+    from . import audit
     try:
-        result = call_tool(db, name, arguments)
+        # Writes made by this call are attributed in the per-photo audit log.
+        with audit.context(source="claude-mcp",
+                           intent=text or f"MCP {name} (no intent given)"):
+            result = call_tool(db, name, arguments)
         status = 200
         return result
     finally:

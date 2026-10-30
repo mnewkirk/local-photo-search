@@ -619,6 +619,14 @@
     var _gensLoading = useState(false);
     var gensLoading = _gensLoading[0];   var setGensLoading = _gensLoading[1];
 
+    // ---- Change history (photo_audit), lazy-fetched on expand ----
+    var _aud = useState(null);           // {events: [...]} once loaded
+    var aud = _aud[0];                   var setAud = _aud[1];
+    var _audOpen = useState(false);
+    var audOpen = _audOpen[0];           var setAudOpen = _audOpen[1];
+    var _audLoading = useState(false);
+    var audLoading = _audLoading[0];     var setAudLoading = _audLoading[1];
+
     // ---- Re-run-passes state (M28) ----
     // A video only has its own passes (db.PASS_MEDIA): the image passes
     // would never claim it, and a still has no video-probe. category-content
@@ -696,6 +704,7 @@
     // Reset gen + re-run + upscale state when the focused photo changes
     useEffect(function () {
       setGens(null); setGensOpen(false); setGensLoading(false);
+      setAud(null); setAudOpen(false); setAudLoading(false);
       setRerunSel({}); setRerunMsg(null); setRerunBusy(false);
       setUpMsg(null); setUpBusy(false);
     }, [photo && photo.id]);
@@ -832,6 +841,42 @@
         .then(function (d) { setGens(d); })
         .catch(function () { setGens({ generations: [], error: true }); })
         .then(function () { setGensLoading(false); });
+    }
+
+    function toggleAudit() {
+      if (!photo) return;
+      if (audOpen) { setAudOpen(false); return; }
+      setAudOpen(true);
+      setAudLoading(true);   // refetch each expand: collection edits happen in this modal
+      fetch(API + '/api/photos/' + photo.id + '/audit?limit=100')
+        .then(function (r) { return r.json(); })
+        .then(function (d) { setAud(d); })
+        .catch(function () { setAud({ events: [], error: true }); })
+        .then(function () { setAudLoading(false); });
+    }
+
+    // One audit row as a sentence: what changed, with old -> new where known.
+    function describeAudit(ev) {
+      var coll = ev.collection_name ? '"' + ev.collection_name + '"' : 'collection #' + ev.collection_id;
+      switch (ev.action) {
+        case 'collection_added': return 'Added to ' + coll;
+        case 'collection_removed':
+          return (ev.field === 'collection_deleted' ? 'Removed (collection deleted) from '
+            : ev.field === 'photo_deleted' ? 'Removed (photo deleted) from ' : 'Removed from ') + coll;
+        case 'face_assigned': return 'Face ' + ev.face_id + ' named ' + (ev.new_value || '?') +
+          (ev.old_value ? ' (was ' + ev.old_value + ')' : '');
+        case 'face_cleared': return 'Face ' + ev.face_id + ' cleared' +
+          (ev.old_value ? ' (was ' + ev.old_value + ')' : '') + ' and marked rejected';
+        case 'face_unmatched': return 'Face ' + ev.face_id + ' unmatched' +
+          (ev.old_value ? ' (was ' + ev.old_value + ')' : '');
+        case 'filepath_changed': return 'Moved: ' + ev.old_value + ' → ' + ev.new_value;
+        case 'tags_set': return 'Tags (' + ev.field + ') changed';
+        case 'location_set': return 'Location set';
+        case 'field_changed': return ev.field + ': ' + (ev.old_value || '∅') + ' → ' + (ev.new_value || '∅');
+        case 'photo_added': return 'Added to the library';
+        case 'photo_deleted': return 'Photo deleted';
+        default: return ev.action;
+      }
     }
 
     // Inline "model: X" chip rendered next to a text section header. Takes a
@@ -2178,6 +2223,35 @@
                 e('div', { style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
                   g.generated_text
                 ));
+              })
+            )
+          ),
+
+          // Change history — collection adds/removals, face labels, tags,
+          // location, moves; who asked and why. Starts when the audit log was
+          // deployed, so an empty list does not mean nothing ever changed.
+          e('div', { className: 'detail-section' },
+            e('h3', {
+              onClick: toggleAudit,
+              style: { cursor: 'pointer', userSelect: 'none' },
+              title: 'What changed on this photo, when, and who asked',
+            }, (audOpen ? '▾ ' : '▸ ') + 'Change history'),
+            audOpen && e('div', null,
+              audLoading && e('p', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'Loading…'),
+              aud && aud.stale && e('p', { style: { fontSize: 12, color: 'var(--text-muted)' } }, aud.stale_reason),
+              aud && !audLoading && (aud.events || []).length === 0 &&
+                e('p', { style: { fontSize: 12, color: 'var(--text-muted)' } },
+                  aud.error ? 'Could not load the history.' : 'No changes recorded since the audit log started.'),
+              aud && (aud.events || []).map(function (ev) {
+                return e('div', {
+                  key: ev.id,
+                  style: {
+                    padding: '6px 10px', marginBottom: 4, borderRadius: 4, fontSize: 12,
+                    background: 'var(--surface2)', border: '1px solid var(--border)',
+                  },
+                }, e('div', null, describeAudit(ev)),
+                e('div', { style: { color: 'var(--text-muted)', fontSize: 11 } },
+                  ev.ts + ' UTC · ' + (ev.source || '?') + (ev.intent ? ' · ' + ev.intent : '')));
               })
             )
           ),

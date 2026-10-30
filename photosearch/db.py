@@ -15,6 +15,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from . import audit
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,14 +98,20 @@ def set_photo_filepath(conn, photo_id: int, filepath: str,
     that moves a photo goes through here so the two cannot drift.
 
     ``raw_filepath`` is left untouched unless passed (``None`` clears it).
+    Logs the move to ``photo_audit`` on the same connection.
     Does NOT commit — callers batch their own transaction.
     """
     cols = {"filepath": filepath, "folder": folder_for_path(filepath)}
     if raw_filepath is not _KEEP:
         cols["raw_filepath"] = raw_filepath
+    old = conn.execute("SELECT filepath FROM photos WHERE id = ?",
+                       (photo_id,)).fetchone()
     set_clause = ", ".join(f"{k} = ?" for k in cols)
     conn.execute(f"UPDATE photos SET {set_clause} WHERE id = ?",
                  list(cols.values()) + [photo_id])
+    if old is not None and old[0] != filepath:
+        audit.record(conn, photo_id, audit.FILEPATH_CHANGED, field="filepath",
+                     old=old[0], new=filepath)
 
 # sqlite-vec will be imported at init time so we can fail gracefully
 try:
@@ -116,7 +124,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 39
+SCHEMA_VERSION = 40
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -625,9 +633,16 @@ def unmatch_faces_as_duplicates(conn, face_ids, reason: str = "resolve_dups") ->
     # would overwrite a 'rejected' marker — a human "no" — with
     # 'dedupe_unmatched', which is matchable again, and would over-count the
     # return value (the sweep reports it as "applied").
-    for fid, _pid in pairs:
+    events = []
+    for fid, pid in pairs:
+        row = conn.execute("SELECT photo_id, match_source FROM faces WHERE id = ?",
+                           (fid,)).fetchone()
+        events += audit.face_label_events(
+            conn, [(fid, row["photo_id"], pid, row["match_source"])],
+            None, DEDUPE_UNMATCHED_SOURCE)
         conn.execute("UPDATE faces SET person_id = NULL, match_source = ? WHERE id = ?",
                      (DEDUPE_UNMATCHED_SOURCE, fid))
+    audit.record_many(conn, events)
     return len(pairs)
 
 
@@ -1733,6 +1748,54 @@ class PhotoDB:
                 )
             """)
 
+        # Per-photo audit log (schema v40, docs/notes/audit.md). Append-only, no
+        # FK to photos/collections on purpose: the history of a deleted
+        # collection or photo is exactly what someone will ask about later.
+        # Written only through photosearch/audit.py inside the writer's own
+        # transaction. Starts empty at deploy; nothing is backfilled.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS photo_audit (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT NOT NULL DEFAULT (datetime('now')),
+                photo_id        INTEGER NOT NULL,
+                action          TEXT NOT NULL,
+                field           TEXT,
+                old_value       TEXT,
+                new_value       TEXT,
+                collection_id   INTEGER,
+                collection_name TEXT,
+                face_id         INTEGER,
+                detail          TEXT,
+                source          TEXT,
+                intent          TEXT
+            )
+        """)
+        # Deleting a photo cascades its collection_photos rows away without
+        # going through remove_photos_from_collection, and six CLI commands plus
+        # the dedup sweep DELETE photos directly. A trigger is the one place all
+        # of them pass, so a photo that vanished from a collection is explained
+        # even when the delete was a raw statement. It cannot see the audit
+        # context (who/why), so those rows say source='db-trigger'.
+        cur.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_photo_audit_delete
+            BEFORE DELETE ON photos
+            BEGIN
+                INSERT INTO photo_audit (photo_id, action, field, collection_id,
+                                         collection_name, detail, source)
+                SELECT OLD.id, 'collection_removed', 'photo_deleted', cp.collection_id,
+                       c.name, 'photo row deleted', 'db-trigger'
+                FROM collection_photos cp JOIN collections c ON c.id = cp.collection_id
+                WHERE cp.photo_id = OLD.id;
+                INSERT INTO photo_audit (photo_id, action, field, old_value, detail, source)
+                VALUES (OLD.id, 'photo_deleted', 'filepath', OLD.filepath,
+                        'photo row deleted', 'db-trigger');
+            END
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_audit_photo "
+                    "ON photo_audit(photo_id, id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_photo_audit_collection "
+                    "ON photo_audit(collection_id, id) WHERE collection_id IS NOT NULL")
+
         # Set schema version
         cur.execute(
             "INSERT OR REPLACE INTO schema_info (key, value) VALUES (?, ?)",
@@ -1807,6 +1870,9 @@ class PhotoDB:
             f"INSERT OR IGNORE INTO photos ({columns}) VALUES ({placeholders})",
             list(kwargs.values()),
         )
+        if cur.rowcount > 0:
+            audit.record(self.conn, cur.lastrowid, audit.PHOTO_ADDED,
+                         field="filepath", new=kwargs.get("filepath"))
         self._maybe_commit()
         # rowcount, not lastrowid: an IGNORED insert leaves lastrowid at the
         # connection's PREVIOUS insert (non-zero once anything was inserted),
@@ -1836,14 +1902,28 @@ class PhotoDB:
 
         A ``filepath`` change also re-derives ``folder`` (unless the caller
         passes one), mirroring ``add_photo`` — see ``set_photo_filepath``.
+        Changes to ``audit.AUDITED_PHOTO_COLUMNS`` are logged to ``photo_audit``.
         """
         if "filepath" in kwargs and "folder" not in kwargs:
             kwargs["folder"] = folder_for_path(kwargs["filepath"])
+        watched = [c for c in audit.AUDITED_PHOTO_COLUMNS if c in kwargs]
+        old = None
+        if watched and audit.enabled():
+            old = self.conn.execute(
+                f"SELECT {', '.join(watched)} FROM photos WHERE id = ?",
+                (photo_id,)).fetchone()
         set_clause = ", ".join(f"{k} = ?" for k in kwargs.keys())
         self.conn.execute(
             f"UPDATE photos SET {set_clause} WHERE id = ?",
             list(kwargs.values()) + [photo_id],
         )
+        if old is not None:
+            audit.record_many(self.conn, [
+                dict(photo_id=photo_id,
+                     action=(audit.FILEPATH_CHANGED if c == "filepath"
+                             else audit.FIELD_CHANGED),
+                     field=c, old=old[c], new=kwargs[c])
+                for c in watched if old[c] != kwargs[c]])
         self._maybe_commit()
 
     def invalidate_description_dependents(self, photo_id: int, *,
@@ -2187,13 +2267,37 @@ class PhotoDB:
         bulk-assign, correct-face and the manual-assignment import — so the
         clear lives here rather than being re-implemented at each call site.
         """
-        self.conn.execute(
-            "UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
-            (person_id, match_source, face_id),
-        )
-        if person_id is not None and match_source not in AUTO_MATCH_SOURCES:
-            clear_face_person_exclusion(self.conn, face_id, person_id)
+        self.set_face_labels([face_id], person_id, match_source)
+
+    def set_face_labels(self, face_ids, person_id: Optional[int],
+                        match_source: Optional[str]) -> int:
+        """Write (person_id, match_source) on many faces — THE face-label write.
+
+        Logs each change to ``photo_audit`` (assigned / cleared when
+        ``match_source='rejected'`` / unmatched otherwise) in the same
+        transaction, and does what ``assign_face_to_person`` documents about
+        exclusions. Commits like any other writer (deferred in batch mode).
+        Returns the number of faces that existed.
+        """
+        face_ids = [int(f) for f in face_ids]
+        updated = 0
+        for i in range(0, len(face_ids), 500):
+            batch = face_ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            old = self.conn.execute(
+                f"SELECT id, photo_id, person_id, match_source FROM faces "
+                f"WHERE id IN ({ph})", batch).fetchall()
+            events = audit.face_label_events(self.conn, old, person_id, match_source)
+            self.conn.execute(
+                f"UPDATE faces SET person_id = ?, match_source = ? WHERE id IN ({ph})",
+                [person_id, match_source, *batch])
+            if person_id is not None and match_source not in AUTO_MATCH_SOURCES:
+                for fid in batch:
+                    clear_face_person_exclusion(self.conn, fid, person_id)
+            audit.record_many(self.conn, events)
+            updated += len(old)
         self._maybe_commit()
+        return updated
 
     # ------------------------------------------------------------------
     # Color search
@@ -2357,13 +2461,24 @@ class PhotoDB:
         self.conn.commit()
 
     def delete_collection(self, collection_id: int) -> None:
-        """Delete a collection (cascade removes collection_photos rows)."""
+        """Delete a collection (cascade removes collection_photos rows).
+
+        Every member is logged as removed (``field='collection_deleted'``) so
+        "what was in it" outlives the collection."""
+        coll = self.get_collection(collection_id)
+        if coll is not None and audit.enabled():
+            members = self.get_collection_photo_ids(collection_id)
+            audit.record_many(self.conn, [
+                dict(photo_id=pid, action=audit.COLLECTION_REMOVED,
+                     field="collection_deleted", collection_id=collection_id,
+                     collection_name=coll["name"]) for pid in members])
         self.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
         self.conn.commit()
 
     def add_photos_to_collection(self, collection_id: int, photo_ids: list[int]) -> int:
         """Add photos to a collection. Returns count of newly added photos."""
         added = 0
+        added_ids: list[int] = []
         # Get current max sort_order
         row = self.conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) FROM collection_photos WHERE collection_id = ?",
@@ -2378,6 +2493,7 @@ class PhotoDB:
                     (collection_id, pid, next_order),
                 )
                 added += 1
+                added_ids.append(pid)
                 next_order += 1
             except Exception:
                 # Already in collection (PRIMARY KEY conflict) — skip
@@ -2386,12 +2502,22 @@ class PhotoDB:
             "UPDATE collections SET updated_at = datetime('now') WHERE id = ?",
             (collection_id,),
         )
+        if added_ids and audit.enabled():
+            coll = self.get_collection(collection_id)
+            audit.record_many(self.conn, [
+                dict(photo_id=pid, action=audit.COLLECTION_ADDED,
+                     collection_id=collection_id,
+                     collection_name=coll["name"] if coll else None)
+                for pid in added_ids])
         self.conn.commit()
         return added
 
     def remove_photos_from_collection(self, collection_id: int, photo_ids: list[int]) -> int:
         """Remove photos from a collection. Returns count removed."""
         placeholders = ",".join("?" * len(photo_ids))
+        # Which of them are actually members: only those get a log row.
+        members = set(self.get_collection_photo_ids(collection_id)) if audit.enabled() else set()
+        gone = [p for p in dict.fromkeys(photo_ids) if p in members]
         cur = self.conn.execute(
             f"DELETE FROM collection_photos WHERE collection_id = ? AND photo_id IN ({placeholders})",
             [collection_id] + photo_ids,
@@ -2400,6 +2526,13 @@ class PhotoDB:
             "UPDATE collections SET updated_at = datetime('now') WHERE id = ?",
             (collection_id,),
         )
+        if gone:
+            coll = self.get_collection(collection_id)
+            audit.record_many(self.conn, [
+                dict(photo_id=pid, action=audit.COLLECTION_REMOVED,
+                     collection_id=collection_id,
+                     collection_name=coll["name"] if coll else None)
+                for pid in gone])
         self.conn.commit()
         return cur.rowcount
 
@@ -2914,7 +3047,11 @@ class PhotoDB:
                            *, overwrite: bool = False) -> bool:
         """Set GPS + place on one photo with location_source='manual'. With
         overwrite=False (default) a row that already has gps_lat is left
-        untouched. Returns True iff a row was written. Honors the active batch."""
+        untouched. Returns True iff a row was written. Honors the active batch.
+        Logged to ``photo_audit`` with the before/after location."""
+        _cols = ("gps_lat", "gps_lon", "place_name", "location_source")
+        old = (self.conn.execute(f"SELECT {', '.join(_cols)} FROM photos WHERE id=?",
+                                 (photo_id,)).fetchone() if audit.enabled() else None)
         if overwrite:
             cur = self.conn.execute(
                 "UPDATE photos SET gps_lat=?, gps_lon=?, place_name=?, "
@@ -2926,6 +3063,10 @@ class PhotoDB:
                 "location_source='manual', location_confidence=NULL "
                 "WHERE id=? AND gps_lat IS NULL",
                 (lat, lon, place_name, photo_id))
+        if cur.rowcount > 0 and old is not None:
+            audit.record(self.conn, photo_id, audit.LOCATION_SET,
+                         field="location", old={c: old[c] for c in _cols},
+                         new=dict(zip(_cols, (lat, lon, place_name, "manual"))))
         self._maybe_commit()
         return cur.rowcount > 0
 
@@ -2975,6 +3116,9 @@ class PhotoDB:
             final[col] = merged
             self.conn.execute(f"UPDATE photos SET {col}=? WHERE id=?",
                               (json.dumps(merged), photo_id))
+            if merged != current:
+                audit.record(self.conn, photo_id, audit.TAGS_SET, field=col,
+                             old=current, new=merged, detail=f"mode {mode}")
             if log_model is not None:
                 self.log_generation(photo_id, self._TAG_COLUMNS[col],
                                     json.dumps(merged), model_used=log_model,

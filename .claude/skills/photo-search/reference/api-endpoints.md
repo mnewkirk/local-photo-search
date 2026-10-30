@@ -182,6 +182,9 @@ Read when you need a route's path, parameters or response shape.
 - `DELETE /api/collections/{id}` — Delete
 - `POST /api/collections/{id}/photos` — Add photos
 - `POST /api/collections/{id}/photos/remove` — Remove photos
+- `GET /api/photos/{id}/audit` — Change history of one photo (newest first; `action`, `limit`, `before_id`)
+- `GET /api/collections/{id}/audit` — Membership history + `removed` (last event is a removal and not a member now); works after the collection is deleted
+- `GET /api/audit` — Whole log, filter by `photo_id`, `collection_id`, `collection_name` (follows a rebuilt collection), `action`, `source`, `since`
 
 <!-- moved verbatim from SKILL.md (line 492) on 2026-10-19 -->
 ### Stacks (Burst/Bracket Groups)

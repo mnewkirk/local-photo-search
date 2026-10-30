@@ -135,6 +135,12 @@ async def _log_request_timing(request: Request, call_next):
             inferred_intent = f"{request.method} {path}"
     # Calls this request makes to the NAS say what they are for.
     token = request_intent.set_current_intent(stated or inferred_intent)
+    # Who is writing, for the per-photo audit log (photosearch/audit.py). A
+    # replica only mirrors what the NAS already logged, so it logs nothing.
+    from . import audit
+    audit_token = audit.set_context(
+        source=request_intent.classify_source(path, headers),
+        intent=stated or inferred_intent, suppress=bool(_nas_url))
     t0 = time.perf_counter()
     status = 500
     streaming = False
@@ -149,6 +155,7 @@ async def _log_request_timing(request: Request, call_next):
         return response
     finally:
         request_intent.reset_current_intent(token)
+        audit.reset_context(audit_token)
         try:
             # A handler may know better (the Ask agent: the question).
             intent = stated or getattr(request.state, "log_intent", None)
@@ -2144,10 +2151,7 @@ def api_clear_face(face_id: int):
         # so the next `match-faces` run re-applies the very person the user
         # just removed. See faces.REJECTED_MATCH_SOURCE.
         from .faces import REJECTED_MATCH_SOURCE
-        db.conn.execute(
-            "UPDATE faces SET person_id = NULL, match_source = ? WHERE id = ?",
-            (REJECTED_MATCH_SOURCE, face_id),
-        )
+        db.set_face_labels([face_id], None, REJECTED_MATCH_SOURCE)
         db.conn.commit()
         return {"ok": True}
 
@@ -2452,12 +2456,7 @@ def api_bulk_assign_faces(data: dict):
         # inspector's whole purpose is removing faces a person should not have,
         # and a NULL marker let the next match-faces sweep put them straight back.
         from .faces import REJECTED_MATCH_SOURCE
-        for i in range(0, len(face_ids), 500):
-            batch = face_ids[i:i + 500]
-            ph = ",".join("?" * len(batch))
-            db.conn.execute(
-                f"UPDATE faces SET person_id = NULL, match_source = ? "
-                f"WHERE id IN ({ph})", [REJECTED_MATCH_SOURCE, *batch])
+        db.set_face_labels(face_ids, None, REJECTED_MATCH_SOURCE)
         db.conn.commit()
         logger.info("FACE BULK-CLEAR  %d faces", len(face_ids))
         return {"ok": True, "updated": len(face_ids), "person_id": None}
@@ -3318,9 +3317,14 @@ def api_apply_face_merge(data: dict):
                 # own UPDATE, so it clears the exclusions itself, scoped to the
                 # faces actually being moved (read BEFORE the update, which is
                 # what makes them identifiable).
-                moving = [r["id"] for r in db.conn.execute(
-                    "SELECT id FROM faces WHERE cluster_id = ? AND person_id IS NULL",
-                    (source_id,))]
+                moving_rows = db.conn.execute(
+                    "SELECT id, photo_id, person_id, match_source FROM faces "
+                    "WHERE cluster_id = ? AND person_id IS NULL",
+                    (source_id,)).fetchall()
+                moving = [r["id"] for r in moving_rows]
+                from . import audit
+                audit.record_many(db.conn, audit.face_label_events(
+                    db.conn, moving_rows, target_id, "merge_review"))
                 cur.execute(
                     """UPDATE faces
                        SET person_id = ?, cluster_id = NULL, match_source = 'merge_review'
@@ -4876,6 +4880,89 @@ def api_photo_collections(photo_id: int):
     with _get_db() as db:
         collections = db.get_photo_collections(photo_id)
     return {"collections": collections}
+
+
+# ---------------------------------------------------------------------------
+# Per-photo audit log (photosearch/audit.py, docs/notes/audit.md)
+# ---------------------------------------------------------------------------
+
+def _audit_read(local_fn, nas_path: str, params: dict) -> dict:
+    """Serve an audit read. The NAS is the only writer and the replica's copy
+    is a nightly snapshot, so a replica asks the NAS (fresh) and falls back to
+    its snapshot, saying so, when the NAS cannot be reached."""
+    from urllib.parse import urlencode
+    if _nas_url:
+        qs = urlencode({k: v for k, v in params.items() if v is not None})
+        try:
+            return _nas_json("GET", nas_path + (f"?{qs}" if qs else ""), timeout=15.0)
+        except HTTPException:
+            raise
+        except Exception as err:  # noqa: BLE001
+            with _get_db() as db:
+                out = local_fn(db)
+            out["stale"] = True
+            out["stale_reason"] = f"NAS unreachable ({type(err).__name__}); showing the last synced log"
+            return out
+    with _get_db() as db:
+        return local_fn(db)
+
+
+@app.get("/api/photos/{photo_id}/audit")
+def api_photo_audit(photo_id: int, action: Optional[str] = Query(None),
+                    limit: int = Query(200, ge=1, le=2000),
+                    before_id: Optional[int] = Query(None)):
+    """What changed on this photo, newest first: collection adds/removals, face
+    labels, tags, location, file moves, with who asked and why. History starts
+    when the audit log was deployed; nothing earlier is reconstructed."""
+    from . import audit
+
+    def local(db):
+        return {"photo_id": photo_id,
+                "events": audit.query(db.conn, photo_id=photo_id, action=action,
+                                      before_id=before_id, limit=limit)}
+    return _audit_read(local, f"/api/photos/{photo_id}/audit",
+                       {"action": action, "limit": limit, "before_id": before_id})
+
+
+@app.get("/api/collections/{collection_id}/audit")
+def api_collection_audit(collection_id: int, action: Optional[str] = Query(None),
+                         limit: int = Query(200, ge=1, le=2000),
+                         before_id: Optional[int] = Query(None)):
+    """Membership history of one collection, newest first, plus `removed`: the
+    photos whose last event here is a removal and that are not in it now.
+    Works for a deleted collection (its id is all that is needed)."""
+    from . import audit
+
+    def local(db):
+        coll = db.get_collection(collection_id)
+        return {"collection_id": collection_id,
+                "collection": ({"id": coll["id"], "name": coll["name"]} if coll else None),
+                "removed": audit.removed_from_collection(db.conn, collection_id),
+                "events": audit.query(db.conn, collection_id=collection_id,
+                                      action=action, before_id=before_id, limit=limit)}
+    return _audit_read(local, f"/api/collections/{collection_id}/audit",
+                       {"action": action, "limit": limit, "before_id": before_id})
+
+
+@app.get("/api/audit")
+def api_audit(photo_id: Optional[int] = Query(None),
+              collection_id: Optional[int] = Query(None),
+              collection_name: Optional[str] = Query(None),
+              action: Optional[str] = Query(None),
+              source: Optional[str] = Query(None),
+              since: Optional[str] = Query(None, description="UTC YYYY-MM-DD[ HH:MM:SS]"),
+              limit: int = Query(200, ge=1, le=2000),
+              before_id: Optional[int] = Query(None)):
+    """Filtered view of the whole audit log, newest first. Use collection_name
+    to follow a collection that was deleted and rebuilt under a new id."""
+    from . import audit
+    params = {"photo_id": photo_id, "collection_id": collection_id,
+              "collection_name": collection_name, "action": action, "source": source,
+              "since": since, "limit": limit, "before_id": before_id}
+
+    def local(db):
+        return {"events": audit.query(db.conn, **params)}
+    return _audit_read(local, "/api/audit", params)
 
 
 # ---------------------------------------------------------------------------

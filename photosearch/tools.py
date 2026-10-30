@@ -88,6 +88,12 @@ def call_tool(db: PhotoDB, name: str, args: Optional[dict] = None) -> Any:
     spec = _REGISTRY.get(name)
     if spec is None:
         raise KeyError(f"unknown tool: {name!r}")
+    if spec.writes:
+        # The per-photo audit log names the tool that wrote (keeping the
+        # caller's source: MCP, or the Ask request's).
+        from . import audit
+        with audit.tool_context(name):
+            return spec.handler(db, args or {})
     return spec.handler(db, args or {})
 
 
