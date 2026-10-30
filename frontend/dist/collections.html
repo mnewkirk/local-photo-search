@@ -1268,7 +1268,10 @@
       const [showRename, setShowRename] = useState(false);
       const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
       const [showGoogleUpload, setShowGoogleUpload] = useState(false);
-      const [modalIdx, setModalIdx] = useState(null);
+      // The open photo, by id. Its position is derived from displayItems (what the
+      // grid shows), so prev/next follow the grid under any sort, camera filter
+      // or expanded stack rather than the raw `photos` order.
+      const [modalId, setModalId] = useState(null);
       const [error, setError] = useState(null);
       const [persons, setPersons] = useState([]);
 
@@ -1482,7 +1485,8 @@
       }
       if (!collection) return e('div', { style: { padding: 40, textAlign: 'center', color: 'var(--text-muted)' } }, 'Loading...');
 
-      const modalPhoto = modalIdx !== null ? photos[modalIdx] : null;
+      const modalIdx = modalId !== null ? displayItems.findIndex(it => it.photo.id === modalId) : -1;
+      const modalPhoto = modalIdx >= 0 ? displayItems[modalIdx].photo : null;
 
       return e('div', null,
         e('a', { href: '/collections', className: 'back-link' }, '\u2190 All Collections'),
@@ -1558,9 +1562,7 @@
               className: `thumb-wrap ${selectedForRemoval.has(p.id) ? 'selected' : ''} ${item.isStackMember ? 'stack-member' : ''}`,
               onClick: (ev) => {
                 if (ev.shiftKey) { toggleRemoval(p.id); return; }
-                // Find index in original photos array for modal nav
-                const origIdx = photos.findIndex(pp => pp.id === p.id);
-                setModalIdx(origIdx >= 0 ? origIdx : 0);
+                setModalId(p.id);
               },
               onContextMenu: (ev) => { ev.preventDefault(); toggleRemoval(p.id); },
             },
@@ -1599,17 +1601,17 @@
         modalPhoto && e(PhotoDetailModal, {
           photo: modalPhoto,
           index: modalIdx,
-          total: photos.length,
-          onClose: () => setModalIdx(null),
-          onPrev: modalIdx > 0 ? () => setModalIdx(modalIdx - 1) : null,
-          onNext: modalIdx < photos.length - 1 ? () => setModalIdx(modalIdx + 1) : null,
+          total: displayItems.length,
+          onClose: () => setModalId(null),
+          onPrev: modalIdx > 0 ? () => setModalId(displayItems[modalIdx - 1].photo.id) : null,
+          onNext: modalIdx < displayItems.length - 1 ? () => setModalId(displayItems[modalIdx + 1].photo.id) : null,
           persons: persons,
           onFaceAssigned: (faceId, personName) => {
             fetch('/api/persons').then(r => r.json()).then(d => setPersons(d.persons || [])).catch(() => {});
           },
           onStackNavigate: (member) => {
-            const origIdx = photos.findIndex(pp => pp.id === member.id);
-            if (origIdx >= 0) setModalIdx(origIdx);
+            // Only jump to a member the grid is showing (its stack is expanded).
+            if (displayItems.some(it => it.photo.id === member.id)) setModalId(member.id);
           },
         }),
 
