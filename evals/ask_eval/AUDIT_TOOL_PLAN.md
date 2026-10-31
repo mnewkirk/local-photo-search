@@ -2,7 +2,7 @@
 
 Written 2026-10-31. Harness manual: [README.md](README.md). Results so far: [FINDINGS.md](FINDINGS.md).
 
-**Status: not run.** The change shipped to `main` (`b3d9a23`) without this check. An attempt on a Mac was thrown away on purpose: the numbers depend on the desktop's GPU, and the earlier results live there. Run this on the desktop (WSL, 24 GB AMD GPU).
+**Status: run 2026-10-31 on the desktop; clean, keep the tool as is.** `audit-before` and `audit-after` both 162/189, 0 context errors, 2 worse / 2 better (all fragile, sign p = 1.0), no `get_photo_audit` call on any item, +305 tokens per round. Each run took about 12 minutes, not 1.5 h. Details: FINDINGS.md, section 7. The "gap" items below are still not added.
 
 ## What `asks.jsonl` is
 
@@ -58,7 +58,7 @@ $PY evals/ask_eval/harness.py run --config audit-after  --ref b3d9a23 --repeat 3
 $PY evals/ask_eval/harness.py report --configs audit-before audit-after --failures
 ```
 
-- Run `audit-before` first. The "after" code opens the replica DB through `PhotoDB`, which migrates it from schema v39 to v40 and adds an empty `photo_audit` table. That is harmless, but the order keeps the baseline on the schema it was built against.
+- Run `audit-before` first. The "after" code opens the replica DB through `PhotoDB`, which migrates it from schema v39 to v40 and adds an empty `photo_audit` table. That is harmless, but the order keeps the baseline on the schema it was built against. Note that Step 1's `measure --ref b3d9a23` (and the `--dry-run`) already opens the DB with the "after" code, so the migration happens there, before either run; on 2026-10-31 both configs saw v40.
 - Sanity check after about 5 minutes: no row says `FALLBACK`, and prompt tokens are about 11–13k, not about 235. If not, stop and fix the context before spending the hours.
 - Optional afterwards: `harness.py regrade --configs audit-before audit-after --judge` re-scores answer checks with the judge model.
 

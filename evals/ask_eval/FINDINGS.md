@@ -215,3 +215,46 @@ tools.
    the agent is actually wrong today.
 6. **Record the prompt diff** (or commit it) for every config, so that trims
    stay reproducible.
+
+## 7. Later checks
+
+### 2026-10-31: the `get_photo_audit` tool (`b3d9a23`)
+
+Plan: [AUDIT_TOOL_PLAN.md](AUDIT_TOOL_PLAN.md). Desktop, the usual Ask model
+loaded alone at 16,384 context, 3 reps, fleet idle. `measure` showed only the
+new tool (tools 31,584 → 32,853 chars, 16 → 17 tools); `measure --ref f3254cd`
+matched `trim4` exactly.
+
+| config | ref | pass | context errors | fallbacks | first-round tokens | largest round | headroom |
+|---|---|--:|--:|--:|--:|--:|--:|
+| `trim4` | (2026-10-27) | 162/189 | 0 | 0 | 10,918 | 15,724 | −2,340 |
+| `audit-before` | `f3254cd` | 162/189 | 0 | 0 | 10,918 | 16,109 | −2,725 |
+| `audit-after` | `b3d9a23` | 162/189 | 0 | 0 | 11,223 | 15,542 | −2,158 |
+
+Source: `harness.py report --configs audit-before audit-after --failures`.
+
+- *Baseline.* The shortcut applied (sizes matched, snapshot 3 days old), but a
+  run took about 12 minutes, not 1.5 h (189 asks at ~3.7 s), so `audit-before`
+  ran too, on the same snapshot as `audit-after`. Both are compared below.
+- *Flips.* `audit-before` → `audit-after`: 2 worse (l03 3/3 → 0/3, flagged
+  REGRESSED; b01 1/3 → 0/3), 2 better (x04 0/3 → 3/3, w01 2/3 → 3/3), sign
+  test p = 1.0. Against `trim4`: 1 worse (b01), 1 better (x04), p = 1.0. Every
+  moved item is on the fragile list; **no non-fragile item moved**. In l03 the
+  agent now asks which dates to use instead of taking the pinned ones.
+- *Noise replicate.* `trim4` → `audit-before` is the same prompt on a newer
+  snapshot: 3 fragile items flipped (b01, l03, w01), as many as the tool did.
+- *Tool bleed.* 0 `get_photo_audit` calls in 189 `audit-after` rows.
+- *Headroom.* Each round costs +305 tokens (median over items, first round and
+  same-length runs alike). The report's peak fell only because w01, which sets
+  the peak in all three configs, took 4 rounds instead of 5. Like for like, the
+  headroom is about −2,645 against `trim4`'s −2,340, as the plan estimated.
+- *Side notes.* In `audit-before`, w01 r2 called `set_photo_tags` with
+  `confirm=true` (blocked by the harness). g01, a never-pass item, now fails by
+  calling `representatives` instead of `search_photos` without `sort=subject`.
+  The replica DB was already schema v40 (an empty `photo_audit` table) before
+  either run: the Step 1 `measure --ref b3d9a23` opened it with the new code.
+  `f3254cd` ignores the table.
+
+**Decision** (plan's table): clean on context errors, regressions, tool bleed
+and the aggregate, with headroom as predicted. Keep the tool as is. The
+positive items in the plan's "gap" section are still untested.
