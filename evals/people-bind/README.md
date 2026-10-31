@@ -63,7 +63,9 @@ For every phrase, mark what it refers to **in the pixels**, ignoring the names:
 - **box number(s)**: the person the phrase describes is that box. A phrase
   naming 2-3 people ("two boys") gets all their boxes.
 - **NONE**: the person has no box (back turned, face hidden or undetected,
-  out of frame), or the phrase is a crowd / more than 3 people.
+  out of frame), or the phrase is a crowd / more than 3 people. A group phrase
+  whose members are not ALL boxed ("three others" with two boxes) is NONE too:
+  groups are all-or-nothing.
 - **AMBIGUOUS**: the description does not say which of several boxes it means
   ("a player in green" with two players in green), or you cannot tell.
 
