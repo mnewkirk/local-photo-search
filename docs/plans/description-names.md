@@ -1,6 +1,6 @@
 # Names in photo descriptions that follow the face labels
 
-**Status: 🟡 built 2026-10-30 up to the eval gate; no model run, nothing deployed, no backfill.** (Status lives in `README.md`; this header is a convenience.)
+**Status: 🟡 v41 deployed flag-off 2026-10-31; the first dev eval failed (no model at 0 wrong binds); Revision 2 (person boxes, person attributes) planned.** (Status lives in `README.md`; this header is a convenience.)
 
 Produced by a plan-debate (two independent planners, two critique rounds). Both agreed on almost everything; the
 three points that stayed open are decided in the table below. No code, schema or live data was touched.
@@ -168,6 +168,8 @@ Points the debate resolved by agreement are in the "Resolved in debate" list; th
 | Which labels may name a child | Trusted incl. `strict` (manual+strict+merge_review), narrowable by env, strict kept only if the eval shows 0 strict-caused wrong names | `manual` + `merge_review` only (near-zero auto-match risk, far lower coverage) | **A** | 2026-10-30 |
 | Names in outbound/printed text | Books use named text; Google Photos and Shutterfly-export captions raw unless opted in per upload | Everything raw until opted in, books included | **A** | 2026-10-30 |
 | Stored template shape | Spans over the raw text, rendered at read time (no stored display column) | LLM-written `{face:id}` template in a stored display column | **A** | 2026-10-30 |
+| Faceless subjects | Record every person as a body box (detector) and bind over bodies (Revision 2) | Keep face-only binding; NONE phrases stay a coverage loss | **A** | 2026-10-31 |
+| Person attributes | Gender + birth year (approximate allowed), editable on /faces with multi-select, checked at render | Gender only | **A** | 2026-10-31 |
 
 Resolved in debate (no decision needed): rule tier kept but requires `subject_boxes` and is gated separately; VLM returns `could_be` sets and code decides abstention, with a shuffled second call; render-time face validation + sweep instead of `faces_changed` write hooks; non-gating pass whose claim waits for verify; crowd cap in the claim predicate; a person on two faces is never named; `render_changed` audit events dropped; bind model chosen by the eval; table `description_subjects`, flag `PHOTOSEARCH_DISPLAY_DESCRIPTIONS`. Left to the eval: group size (2-3 faces) and whether groups ship at all.
 
@@ -184,3 +186,95 @@ Differences from the plan above, all deliberate:
 - **Schema is v41**: the per-photo audit branch (`claude/stoic-kapitsa-99628c`) owns v40 (`photo_audit`), so this was renumbered 2026-10-31. If this merges first, that branch renumbers instead. `description_audit.record` is the only seam to change when the audit module lands.
 
 Still to do before any backfill (needs the GPU box and ~2 h of the owner's labelling): `evals/people_bind_eval.py sample` / `sheet` / label / `run` / `report --split holdout`; fresh live scope counts; deploy NAS first, then replica, then workers (flag off).
+
+## Revision 2 (2026-10-31): person boxes and person attributes
+
+**Why.** The first dev comparison (docs/notes/llm-passes.md, "people-bind dev comparison: no model passes") failed
+the 0-wrong-binds gate on every model. Matt's reading of the labels: every NONE (137 of 351 phrases) is a person in
+the frame with **no face box** (back or side of the head, face too small), and those phrases are where the wrong
+binds come from: shown only faces, the model gives the phrase the nearest face (6 of gemma's 9). Separately, the
+describe pass regularly calls Asa a girl (long hair), and nothing records a person's gender or age to check a phrase
+against. The spike (notes, "a person detector boxes the faceless subjects") showed a stock detector boxes the
+faceless subject on 91 of the 99 photos with a NONE phrase; the existing `subject_boxes` did on 16.
+
+### A. Person boxes (schema v42)
+
+```sql
+CREATE TABLE IF NOT EXISTS person_boxes (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    photo_id         INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    bbox_top INTEGER NOT NULL, bbox_right INTEGER NOT NULL,     -- EXIF-oriented px, the
+    bbox_bottom INTEGER NOT NULL, bbox_left INTEGER NOT NULL,   -- same frame as faces.bbox_*
+    score            REAL    NOT NULL,
+    detector_version INTEGER NOT NULL                           -- bump to re-detect
+);
+CREATE INDEX IF NOT EXISTS idx_person_boxes_photo ON person_boxes(photo_id);
+```
+
+- **Detector**: torchvision Faster R-CNN v2 (COCO `person`), already a dependency; no new package. Module
+  `photosearch/person_boxes.py`: `detect(image_path)` (lazy torch import, device from `PHOTOSEARCH_DEVICE` like
+  `clip_embed`) and the pure `link_faces(faces, bodies)` (each face to the smallest body containing its centre, one to
+  one). Keep score >= 0.3 in the table; consumers filter.
+- **The face link is computed, never stored**: face ids change on re-detection; geometry does not. One function,
+  used by the claim input, the eval and any UI.
+- **Worker pass `bodies`**: still media, after `faces` in the four equal pass lists plus `cli.py valid_passes`, a
+  batch step (label-independent, like faces). GPU passes need `--native`; the NAS never runs it (the N100 would take
+  seconds per photo). A clean empty result is terminal, as for faces; a detection exception is a failure row.
+  Backfill order: the people-bind scope first (~38k photos), then the rest only if something else wants it.
+- **people-bind claim waits for `bodies`** (rows present or attempts at the cap), as it waits for verify.
+
+### B. Binding over bodies (bump `BIND_VERSION`)
+
+- The overlay numbers **bodies**, not faces: every body containing an offered face, plus faceless bodies that pass a
+  prominence filter (start: height >= 10% of the frame; tuned on the dev labels, measured as "labelled faceless
+  subjects kept" vs "boxes drawn"), capped at 8 drawn boxes. An offered face with no body (6 of 555 in the sample) is
+  drawn as its own numbered box.
+- The prompt is unchanged in shape (`could_be` box numbers per phrase) but drops the worked example phrase (it leaked
+  verbatim) and states the box count.
+- **Code decides, as before, then maps body to face**: a chosen body with no offered face means "this person, no name",
+  so the phrase gets no slot (the correct abstain, for the right reason). A group binds only if every chosen body has
+  an offered face. `slots_json`, the render and the API keep their shape: slots still hold face ids.
+
+### C. Person attributes (schema v42)
+
+`persons` gains `gender TEXT` (`'female'`, `'male'`, `'other'`, NULL = not set) and `birth_year INTEGER` plus
+`birth_year_approx INTEGER NOT NULL DEFAULT 0` (1 = an estimate, checked at ±3 years; exact at ±1).
+
+- **Render rule 7 (pure, at read time):** a slot whose phrase head noun implies a gender or an age band must agree with
+  the person currently labelled on every face in it, at the photo's `date_taken`; otherwise the slot renders generic
+  and its `state` is `attribute_conflict` (with the reason, e.g. "phrase says girl; Asa is male"). Head nouns from a
+  closed list: boy/son/brother/man/father/... male; girl/daughter/sister/woman/mother/... female;
+  baby/infant/toddler 0-3; boy/girl/child/kid 0-17; teen/teenager 12-19; man/woman/adult/parent 18+. An unset
+  attribute, `other`, or a missing date skips that check. Checked at read time because labels and attributes change.
+- This does not correct Asa's description: the safe default keeps the generic (wrong) words and the modal shows the
+  conflict, which also points at describe errors. Letting a name replace a gendered phrase is a later, separate
+  decision with its own eval.
+- **Editing on /faces**: the multi-select bar gains **Set details** (gender: unchanged / female / male / other / clear;
+  birth year with an "approximate" box), applied to the persons of the selected named groups (unnamed groups skipped
+  and counted). The person inspect view edits one person. API: `/api/persons` returns the fields;
+  `PATCH /api/persons/{id}` and `POST /api/persons/bulk-attributes {person_ids, gender?, birth_year?,
+  birth_year_approx?}` (absent = unchanged, null = clear), each with a `request_intent._RULES` entry. Replica:
+  NAS-authoritative write, then mirror locally, like face labels. These attributes never leave the machine (not in
+  Google/Shutterfly captions or MCP output).
+
+### D. Eval v2
+
+- `evals/people-bind/bodies.json` (committed; ids, boxes, scores, no paths): the detector's boxes for the sample,
+  lettered A, B, ... left to right, so labels can name a body.
+- Labels gain `bodies` on NONE phrases: the letters of the person(s) the phrase means, or `"MISSING"` (in the frame,
+  no body box). Face-labelled phrases need nothing: their body comes from the link. `check` validates the letters.
+- Scoring adds, per NONE phrase: abstained by pointing at the right faceless body, abstained otherwise, or bound a
+  face (wrong bind, as now). The gates are unchanged.
+
+### Steps
+
+| # | Step | Est. |
+|---|---|---|
+| R1 | `person_boxes.py` (detect + link) + tests; eval `bodies` command, `bodies.json`; labelling page draws lettered bodies; Matt re-marks the 137 NONE phrases (~40 min) | 0.5 d + labelling |
+| R2 | Schema v42 (both tables), `bodies` worker pass, claim-input bodies, pass lists, `PASS_MEDIA`, `clear-pass` | 1 d |
+| R3 | Body overlay + prompt + body-to-face decide, `BIND_VERSION` bump; eval scoring v2; re-run the three models on dev | 1 d + GPU |
+| R4 | Person attributes: API, /faces Set details + inspect edit, replica mirror; render rule 7 + `attribute_conflict` state | 1.5 d |
+| R5 | Holdout report only if a model reaches 0 wrong binds on dev; then the holdout top-up and the existing rollout | - |
+
+R4 is independent of R1-R3 and can ship first (it only adds columns and a UI; rule 7 can land with it, dormant until
+attributes are set).
