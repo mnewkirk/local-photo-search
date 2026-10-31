@@ -189,7 +189,8 @@ def verdict(gate_rows: list) -> str:
 GOLD_WORDS = ("NONE", "AMBIGUOUS")
 
 
-def check_labels(labels: dict, sample: dict, photos: dict) -> dict:
+def check_labels(labels: dict, sample: dict, photos: dict,
+                 bodies: Optional[dict] = None) -> dict:
     """Validate a labels file before it is scored.
 
     ``photos`` maps photo id (str) -> ``{"description", "offered": {face ids
@@ -200,9 +201,15 @@ def check_labels(labels: dict, sample: dict, photos: dict) -> dict:
     Returns ``{"errors": [...], "warnings": [...], "photos", "mentions",
     "labelled", "unlabelled", "missing", "unreviewed"}``; ``missing`` = sampled
     photos with no labels entry; ``unreviewed`` = photos the labeller has not
-    ticked "every person phrase is listed" on (the sheet's ``reviewed``)."""
+    ticked "every person phrase is listed" on (the sheet's ``reviewed``).
+
+    ``bodies`` (photo id str -> set of body letters on that photo's sheet, from
+    ``bodies.json``) turns on the Revision 2 check: a NONE phrase may carry
+    ``"bodies"``, the letters of the person(s) it means or ``"MISSING"`` (in the
+    frame, no body box). ``none_without_bodies`` counts NONE phrases with none."""
     errors, warnings = [], []
     n_mentions = n_labelled = 0
+    none_without_bodies = 0
     for pid, lab in sorted(labels.items(), key=lambda kv: int(kv[0])):
         where = f"photo {pid}"
         meta = sample.get(pid)
@@ -233,6 +240,22 @@ def check_labels(labels: dict, sample: dict, photos: dict) -> dict:
             elif desc.count(phrase) > 1:
                 warnings.append(f"{where}: {phrase!r} occurs more than once "
                                 f"(the binder never binds it)")
+            if "bodies" in m:
+                bl = m["bodies"]
+                letters = (bodies or {}).get(pid, set())
+                if gold != "NONE":
+                    errors.append(f"{where}: bodies on {phrase!r} whose gold is not NONE "
+                                  f"(a face-labelled phrase's body comes from the face)")
+                elif bl != "MISSING" and (
+                        not isinstance(bl, list) or not bl or len(set(bl)) != len(bl)
+                        or len(bl) > 3 or not all(isinstance(x, str) for x in bl)):
+                    errors.append(f"{where}: bodies for {phrase!r} must be 1-3 distinct body "
+                                  f"letters or \"MISSING\"")
+                elif isinstance(bl, list) and set(bl) - letters:
+                    errors.append(f"{where}: bodies {sorted(set(bl) - letters)} for {phrase!r} "
+                                  f"are not lettered on this photo's sheet")
+            elif gold == "NONE" and bodies is not None:
+                none_without_bodies += 1
             if gold is None:
                 continue
             n_labelled += 1
@@ -269,6 +292,7 @@ def check_labels(labels: dict, sample: dict, photos: dict) -> dict:
     return {"errors": errors, "warnings": warnings, "photos": len(labels),
             "mentions": n_mentions, "labelled": n_labelled,
             "unlabelled": n_mentions - n_labelled,
+            "none_without_bodies": none_without_bodies,
             "missing": sorted((p for p in sample if p not in labels), key=int),
             "unreviewed": sorted((p for p, lab in labels.items() if lab.get("reviewed") is not True),
                                  key=int)}

@@ -168,6 +168,31 @@ def test_check_labels_reports_every_kind_of_mistake():
         assert needle in errs, needle
 
 
+def test_check_labels_validates_body_letters_on_none_phrases():
+    desc = "A goalkeeper in orange stands near one child in green and a coach."
+    sample = {"9": {"split": "dev", "stratum": "adversarial"}}
+    photos = {"9": {"description": desc, "offered": {1}, "faces": {1}}}
+    letters = {"9": {"A", "B"}}
+
+    def lab(*mentions):
+        return {"9": {"split": "dev", "stratum": "adversarial", "bad_labels": [], "reviewed": True,
+                      "mentions": list(mentions)}}
+    ok = lab({"phrase": "A goalkeeper", "gold": [1]},
+             {"phrase": "one child in green", "gold": "NONE", "bodies": ["B"]},
+             {"phrase": "a coach", "gold": "NONE", "bodies": "MISSING"})
+    r = E.check_labels(ok, sample, photos, bodies=letters)
+    assert r["errors"] == [] and r["none_without_bodies"] == 0
+    todo = lab({"phrase": "one child in green", "gold": "NONE"})
+    assert E.check_labels(todo, sample, photos, bodies=letters)["none_without_bodies"] == 1
+    assert E.check_labels(todo, sample, photos)["none_without_bodies"] == 0   # before `bodies` ran
+    bad = lab({"phrase": "A goalkeeper", "gold": [1], "bodies": ["A"]},          # not a NONE
+              {"phrase": "one child in green", "gold": "NONE", "bodies": ["C"]},  # no such letter
+              {"phrase": "a coach", "gold": "NONE", "bodies": ["A", "A"]})        # duplicate
+    errs = "\n".join(E.check_labels(bad, sample, photos, bodies=letters)["errors"])
+    for needle in ("not NONE", "not lettered", "distinct body"):
+        assert needle in errs, needle
+
+
 # --- the CLI's run step: a transport failure is never cached --------------------------------
 
 def _cli(tmp_path, monkeypatch):

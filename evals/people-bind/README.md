@@ -91,3 +91,18 @@ About 200 photos and ~325 phrases: budget 2 hours (half a minute a photo; the
 4-6-face photos take longer). Adversarial photos carry the heuristic reason
 they were picked (`lone_face_no_subject_boxes`, `counted_group_fewer_boxes`,
 ...); label them like the rest.
+
+## Round 2: place the NONE phrases on a body (Revision 2)
+
+`bodies` runs a person detector on the sample and letters every person on the sheet (tags at the
+bottom-left of each body box; orange = no numbered face inside, blue = holds face *n*, shown as
+`A·n`). `sheet --redraw` draws them. For every phrase you marked **NONE**, click the letter(s) of
+the person or people it means; a group gets every member, faced or not ("three others" with two
+faces boxed: all three letters). **MISSING** = the person is in the frame but has no letter. Leave
+face-labelled phrases alone: their body comes from the face. Tick "only NONE phrases still to
+place" to see just the photos that need it; the header counts "NONE placed n/137".
+
+    python evals/people_bind_eval.py bodies --db $DB          # GPU if present, ~1 min
+    python evals/people_bind_eval.py sheet  --db $DB --redraw
+    python evals/people_bind_eval.py serve  --host <tailscale-ip>
+    python evals/people_bind_eval.py check  --db $DB --import evals/people-bind/sheet/saved-labels.json

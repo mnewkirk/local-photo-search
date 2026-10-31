@@ -6,6 +6,7 @@ HAND labels. The harness calls the PRODUCTION functions (`people_bind.rule_bind`
   sample   stratified, seeded sample (+ heuristic adversarial picks) -> sample.json
   sheet    interactive labelling page (numbered boxes, names, click to label)
            + labels.json skeleton
+  bodies   person (body) boxes for the sample -> bodies.json (Revision 2; GPU if present)
   check    validate labels.json (or --import a file downloaded from the sheet)
   run      one variant's predictions (cached, resumable): --tier rule|vlm|both
   report   score + the pre-registered gates, per stratum and per tier
@@ -37,6 +38,8 @@ SAMPLE = HERE / "sample.json"
 LABELS = HERE / "labels.json"
 RUNS = HERE / "runs"
 SHEET = HERE / "sheet"
+BODIES = HERE / "bodies.json"
+SHEET_BODY_SCORE = 0.5   # bodies lettered on the sheet; the table keeps person_boxes.MIN_SCORE
 TRUSTED = ("manual", "strict", "merge_review")
 SHEET_PX = 1600          # the labelling overlay; the model sees PB._OVERLAY_MAX_PX
 
@@ -192,6 +195,58 @@ def cmd_sample(a):
 # sheet (interactive labelling page) + check
 # ---------------------------------------------------------------------------
 
+def cmd_bodies(a):
+    """Detect every person on each sample photo and letter them for the sheet.
+    bodies.json holds ids, boxes and scores only (it is committed)."""
+    from photosearch import person_boxes as PBX
+    con = ro(a.db)
+    sample = _jload(SAMPLE, {})
+    out = {"detector": {"version": PBX.DETECTOR_VERSION, "min_score": SHEET_BODY_SCORE,
+                        "max_px": PBX.DETECT_MAX_PX}, "photos": {}}
+    t0 = time.time()
+    for pid_s in sorted(sample, key=int):
+        inp = store.claim_input(con, int(pid_s))
+        raw = PBX.detect(str(_original(int(pid_s), a.server)))
+        out["photos"][pid_s] = [
+            {k: b[k] for k in ("b", "bbox", "score", "face_id")}
+            for b in PBX.letter_bodies(raw, SHEET_BODY_SCORE, inp["faces"] if inp else [])]
+    _jsave(BODIES, out)
+    n = sum(len(v) for v in out["photos"].values())
+    print(f"{n} bodies on {len(out['photos'])} photos in {time.time() - t0:.0f}s -> {BODIES}")
+
+
+def _body_letters():
+    """photo id str -> set of body letters, or None before `bodies` has run."""
+    data = _jload(BODIES, None)
+    return None if data is None else {p: {b["b"] for b in bs} for p, bs in data["photos"].items()}
+
+
+def _draw_bodies(jpg_b64, bodies, scale):
+    """Draw lettered body boxes onto a face overlay (tags bottom-left, so they
+    never sit on a face number). Orange = no offered face inside, blue = holds one."""
+    import base64
+    import io
+    from PIL import Image, ImageDraw, ImageFont
+    im = Image.open(io.BytesIO(base64.b64decode(jpg_b64))).convert("RGB")
+    d = ImageDraw.Draw(im)
+    size = max(14, im.size[1] // 36)
+    try:
+        font = ImageFont.load_default(size=size)
+    except TypeError:
+        font = ImageFont.load_default()
+    for b in bodies:
+        t, r, bt, l = (v * scale for v in b["bbox"])
+        col = (30, 120, 255) if b["face_id"] else (255, 140, 0)
+        d.rectangle([l, t, r, bt], outline=col, width=2)
+        ty = min(bt, im.size[1] - size - 8)   # a body cut by the frame edge: tag inside it
+        tb = d.textbbox((l, ty), b["b"], font=font)
+        d.rectangle(tb, fill=col)
+        d.text((l, ty), b["b"], fill=(255, 255, 255), font=font)
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=88)
+    return buf.getvalue()
+
+
 def candidate_phrases(description):
     """Phrases to pre-fill: the binder's singular person phrases plus counted
     groups ("two boys"). The labeller adds anything else ("the midfielder")."""
@@ -218,6 +273,7 @@ def cmd_sheet(a):
     con = ro(a.db)
     sample = _jload(SAMPLE, {})
     labels = _jload(LABELS, {})
+    bodies_all = (_jload(BODIES, None) or {}).get("photos")
     SHEET.mkdir(parents=True, exist_ok=True)
     items, failed = [], []
     for pid_s, meta in sorted(sample.items(), key=lambda kv: int(kv[0])):
@@ -229,19 +285,22 @@ def cmd_sheet(a):
         faces = inp["faces"]
         order = sorted(f["face_id"] for f in faces)
         jpg = SHEET / f"{pid}.jpg"
-        if not jpg.exists():
+        bodies = (bodies_all or {}).get(pid_s, [])
+        if a.redraw or not jpg.exists():
             try:
                 img = _original(pid, a.server)
-                jpg.write_bytes(base64.b64decode(PB.draw_overlay(str(img), faces, order,
-                                                                 max_px=SHEET_PX)))
+                b64 = PB.draw_overlay(str(img), faces, order, max_px=SHEET_PX)
+                scale = min(1.0, SHEET_PX / float(max(inp["image_width"], inp["image_height"])))
+                jpg.write_bytes(_draw_bodies(b64, bodies, scale) if bodies
+                                else base64.b64decode(b64))
             except Exception as e:                     # noqa: BLE001 - report, keep going
                 failed.append((pid, f"{type(e).__name__}: {e}"))
                 continue
+        fresh = pid_s not in labels
         lab = labels.setdefault(pid_s, {"split": meta["split"], "stratum": meta["stratum"],
                                         "mentions": [], "bad_labels": []})
-        have = {m["phrase"] for m in lab["mentions"]}
-        for ph in candidate_phrases(inp["description"]):
-            if ph not in have:
+        if fresh:   # suggest phrases once; never re-add one the labeller removed
+            for ph in candidate_phrases(inp["description"]):
                 lab["mentions"].append({"phrase": ph, "gold": None})   # fill in
         rows = _face_rows(con, pid)
         drawn = set(order)
@@ -252,13 +311,17 @@ def cmd_sheet(a):
                       for n, fid in enumerate(order, 1)],
             "unboxed": [r for fid, r in sorted(rows.items())
                         if fid not in drawn and r["name"] and r["source"] in TRUSTED],
+            "bodies": None if bodies_all is None else [
+                {"b": b["b"], "face_n": order.index(b["face_id"]) + 1 if b["face_id"] in order else None}
+                for b in bodies],
         })
     _jsave(LABELS, labels)
     page = (_SHEET_HTML
             .replace("__ITEMS__", json.dumps(items).replace("</", "<\\/"))
             .replace("__LABELS__", json.dumps(labels).replace("</", "<\\/"))
             .replace("__KEY__", _html.escape(hashlib.sha1(
-                json.dumps(sorted(sample)).encode()).hexdigest()[:10])))
+                (json.dumps(sorted(sample)) + json.dumps(bodies_all, sort_keys=True)).encode()
+            ).hexdigest()[:10])))
     (SHEET / "index.html").write_text(page)
     for pid, why in failed:
         print(f"  ! {pid}: {why}")
@@ -287,7 +350,7 @@ def cmd_check(a):
         raise SystemExit(f"no labels at {src}")
     sample = _jload(SAMPLE, {})
     con = ro(a.db)
-    res = E.check_labels(labels, sample, _photos_now(con, labels))
+    res = E.check_labels(labels, sample, _photos_now(con, labels), bodies=_body_letters())
     for w in res["warnings"]:
         print(f"  warn: {w}")
     for e in res["errors"]:
@@ -295,6 +358,7 @@ def cmd_check(a):
     print(f"{res['photos']} photos, {res['mentions']} phrases: {res['labelled']} labelled, "
           f"{res['unlabelled']} still blank; {len(res['missing'])} sampled photos missing; "
           f"{len(res['unreviewed'])} photos not ticked as complete; "
+          f"{res['none_without_bodies']} NONE phrases without a body; "
           f"{len(res['errors'])} error(s)")
     if res["errors"]:
         raise SystemExit(1)
@@ -486,7 +550,12 @@ def main():
     sh = sub.add_parser("sheet")
     sh.add_argument("--db", required=True)
     sh.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER", "http://localhost:8001"))
+    sh.add_argument("--redraw", action="store_true", help="re-render every overlay (after `bodies`)")
     sh.set_defaults(fn=cmd_sheet)
+    bo = sub.add_parser("bodies")
+    bo.add_argument("--db", required=True)
+    bo.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER", "http://localhost:8001"))
+    bo.set_defaults(fn=cmd_bodies)
     c = sub.add_parser("check")
     c.add_argument("--db", required=True)
     c.add_argument("--import", dest="import_file", default=None,
@@ -540,12 +609,15 @@ img{width:100%;height:auto;border-radius:4px;cursor:zoom-in}
 button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:4px;padding:2px 9px;margin:2px;cursor:pointer}
 button.on{background:var(--on);color:var(--onfg);border-color:var(--on)}
 button.x{color:var(--warn)}
+.bodies{margin:2px 0 0 18px}
+button.body{border-color:#ff8c00}button.body.held{border-color:#1e78ff}
 .err{color:var(--warn);font-size:13px}
 table{border-collapse:collapse;font-size:13px}td{padding:1px 6px}
 </style></head><body>
 <header>
  <b>people-bind labels</b><span id="prog"></span>
  <label><input type="checkbox" id="todo"> only unfinished</label>
+ <label><input type="checkbox" id="nonetodo"> only NONE phrases still to place</label>
  <button id="dl">Download labels.json</button>
  <button id="imp">Load labels.json</button><input type="file" id="impf" accept=".json,application/json" hidden>
  <button id="reset" class="x">Discard browser edits</button>
@@ -581,13 +653,18 @@ function lab(it) {
                               : {split: it.split, stratum: it.stratum, mentions: [], bad_labels: []};
   return L[it.pid];
 }
-function complete(it) { const l = lab(it); return l.mentions.every(m => m.gold !== null) && l.reviewed === true; }
+// Revision 2: a NONE phrase is placed once it names the person's body letter(s) or MISSING.
+const HAS_BODIES = ITEMS.some(it => Array.isArray(it.bodies));
+function unplaced(m) { return HAS_BODIES && m.gold === "NONE" && m.bodies === undefined; }
+function complete(it) { const l = lab(it); return l.mentions.every(m => m.gold !== null && !unplaced(m)) && l.reviewed === true; }
 function progress() {
-  let tot = 0, done = 0, ph = 0;
+  let tot = 0, done = 0, ph = 0, nn = 0, np = 0;
   for (const it of ITEMS) { const l = lab(it); tot += l.mentions.length;
-    done += l.mentions.filter(m => m.gold !== null).length; if (complete(it)) ph++; }
+    done += l.mentions.filter(m => m.gold !== null).length; if (complete(it)) ph++;
+    for (const m of l.mentions) if (m.gold === "NONE") { nn++; if (!unplaced(m)) np++; } }
   document.getElementById("prog").textContent =
-    `photos ${ph}/${ITEMS.length} done · phrases ${done}/${tot} labelled`;
+    `photos ${ph}/${ITEMS.length} done · phrases ${done}/${tot} labelled` +
+    (HAS_BODIES ? ` · NONE placed ${np}/${nn}` : "");
 }
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
@@ -600,8 +677,10 @@ function el(tag, attrs, ...kids) {
 function render() {
   const root = document.getElementById("root"); root.innerHTML = "";
   const onlyTodo = document.getElementById("todo").checked;
+  const onlyNone = document.getElementById("nonetodo").checked;
   for (const it of ITEMS) {
     if (onlyTodo && complete(it)) continue;
+    if (onlyNone && !lab(it).mentions.some(unplaced)) continue;
     root.append(card(it));
   }
 }
@@ -628,6 +707,10 @@ function card(it) {
       el("td", {}, b.name ? el("label", {cls: "mut"}, cb, " name wrong") : "")));
   }
   right.append(el("p", {cls: "mut"}, "Boxes (the model sees these numbers, not the names):"), tbl);
+  if (Array.isArray(it.bodies)) right.append(el("p", {cls: "mut"}, it.bodies.length
+      ? "Lettered boxes are people the person detector found (orange: no numbered face inside; blue: holds the face shown as A·n). " +
+        "For each NONE phrase, click the letter(s) of the person it means, or MISSING if they have no letter."
+      : "The person detector found nobody here: mark each NONE phrase MISSING."));
   if (it.unboxed.length) right.append(el("p", {cls: "mut"}, "Named but too small to box: " +
       it.unboxed.map(u => `${u.name} (${u.source})`).join(", ")));
   const ms = el("div");
@@ -686,16 +769,34 @@ function mention(it, l, m, i) {
   }
   for (const w of ["NONE", "AMBIGUOUS"]) {
     row.append(el("button", {cls: m.gold === w ? "on" : "", on: () => {
-      m.gold = m.gold === w ? null : w; save(); rerender(it);
+      m.gold = m.gold === w ? null : w; if (m.gold !== "NONE") delete m.bodies; save(); rerender(it);
     }}, w));
   }
   row.append(el("button", {cls: "x", title: "not a person phrase", on: () => {
     l.mentions.splice(i, 1); save(); rerender(it);
   }}, "remove"));
   if (m.gold === null) row.append(el("span", {cls: "err"}, " ← not labelled"));
+  if (m.gold === "NONE" && Array.isArray(it.bodies)) {
+    const picked = Array.isArray(m.bodies) ? m.bodies : [];
+    const br = el("div", {cls: "bodies"}, el("span", {cls: "mut"}, "which person? "));
+    for (const b of it.bodies) {
+      br.append(el("button", {cls: "body" + (b.face_n ? " held" : "") + (picked.includes(b.b) ? " on" : ""), on: () => {
+        let g = picked.filter(x => x !== b.b);
+        if (!picked.includes(b.b)) g = picked.concat([b.b]);
+        if (g.length) m.bodies = g.sort(); else delete m.bodies;
+        save(); rerender(it);
+      }}, b.face_n ? `${b.b}·${b.face_n}` : b.b));
+    }
+    br.append(el("button", {cls: m.bodies === "MISSING" ? "on" : "", on: () => {
+      if (m.bodies === "MISSING") delete m.bodies; else m.bodies = "MISSING"; save(); rerender(it);
+    }}, "MISSING"));
+    if (unplaced(m)) br.append(el("span", {cls: "err"}, " ← pick the person"));
+    row.append(br);
+  }
   return row;
 }
 document.getElementById("todo").addEventListener("change", render);
+document.getElementById("nonetodo").addEventListener("change", render);
 function exportLabels() {
   const out = {};
   for (const it of ITEMS) { const l = lab(it);
