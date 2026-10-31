@@ -234,12 +234,20 @@ def _draw_bodies(jpg_b64, bodies, scale):
         font = ImageFont.load_default(size=size)
     except TypeError:
         font = ImageFont.load_default()
+    tags = []
     for b in bodies:
         t, r, bt, l = (v * scale for v in b["bbox"])
         col = (30, 120, 255) if b["face_id"] else (255, 140, 0)
         d.rectangle([l, t, r, bt], outline=col, width=2)
         ty = min(bt, im.size[1] - size - 8)   # a body cut by the frame edge: tag inside it
-        tb = d.textbbox((l, ty), b["b"], font=font)
+        tx = l
+        tb = d.textbbox((tx, ty), b["b"], font=font)
+        # boxes sharing a corner would stack their tags (258115: F under G): step right
+        while any(tb[0] < o[2] and o[0] < tb[2] and tb[1] < o[3] and o[1] < tb[3] for o in tags):
+            tx += tb[2] - tb[0] + 3
+            tb = d.textbbox((tx, ty), b["b"], font=font)
+        tags.append(tb)
+        l = tx
         d.rectangle(tb, fill=col)
         d.text((l, ty), b["b"], fill=(255, 255, 255), font=font)
     buf = io.BytesIO()
