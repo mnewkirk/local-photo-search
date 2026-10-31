@@ -394,3 +394,29 @@ preview is `exif_transpose`d, so raw dims misplaced the overlay boxes on rotated
 photos (~18% of the library). `exif.py` swaps forward; `backfill-image-orientation`
 fixes existing rows (header-only read, run where the files live, idempotent).
 Face *data* was always correct — this was overlay-rendering only.
+
+### Year window for face comparisons (2026-10-31)
+
+"More of this kid" and bulk unmatch compared each face with every trusted
+label in the library. On the replica (synced 2026-10-31) 9,274 of 15,867
+trusted labels (`manual` + `merge_review`) are from 2026, nearly all the soccer
+team, so on older shoots the nearest labelled person was often a 2026 kid who
+was not yet born when the photo was taken:
+
+| Shoot | unmatched faces within 1.0 of someone | nearest label ≥5 years away |
+|---|---|---|
+| 2014-04-19 | 2,389 | 326 (14%), Beckham, Lucas, Asa, Adrian… |
+| 2017-08-12 | 1,132 | 135 (12%) |
+| 2011-08-06 | 642 | 66 (10%) |
+| 2023-10-14/21/28 | 183–602 | 0–2 |
+| 2026-10-25 (the reverse) | 1,553 | 3 |
+
+The problem runs one way: the 2026 labels flood older shoots, while 2026 faces
+almost never land nearest an old label. With `window_years=3`, Jane Canulla's
+More-of-this-kid grid on 2014-04-19 went from 20 "≈ <2026 kid>" rival badges to
+1 (an in-era rival). Per-year *models* were not built: a window around each
+face keeps every label from nearby years, so sparse years are not starved.
+The earlier "per-year references are worse than all-time" finding (above) was
+about lookalike kids at the same event, a different failure. The UI defaults
+the window on at ±3 years; it is per browser (localStorage) and can be turned
+off. `face_verify` (Verify labels) does not take the window yet.

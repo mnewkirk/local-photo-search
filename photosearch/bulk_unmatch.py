@@ -33,7 +33,13 @@ from .faces import REJECTED_MATCH_SOURCE
 
 REFERENCE_SOURCE = "manual"
 BURST_WINDOW_SECONDS = 3.0
+YEAR_SECONDS = 365.25 * 86400
 CHUNK = 512
+
+
+def _year(value):
+    s = str(value or "")[:4]
+    return int(s) if s.isdigit() else None
 
 
 def _epoch(value):
@@ -51,12 +57,18 @@ def _unit(mat):
 
 
 def select(db, *, person, sources=("temporal",), date_from=None, date_to=None,
-           min_dist=None, burst_window=BURST_WINDOW_SECONDS):
+           min_dist=None, burst_window=BURST_WINDOW_SECONDS, window_years=None):
     """Faces of `person` in `sources`, with their distance to the manual set.
 
     Returns (rows, stats). `min_dist` filters the rows; the stats describe the
     whole candidate set either way, so a dry run can show what a gate would
     keep as well as what it would clear.
+
+    `window_years` compares each face only with references taken within that
+    many years of it (see face_suggest's docstring: children change too much
+    for a 2014 face to be judged against 2026 labels). A face with no
+    reference inside the window is unmeasured (`dist` None), and a gate never
+    clears an unmeasured face. Undated faces and references are never excluded.
     """
     where = ["pe.name = ?"]
     params = [person]
@@ -84,7 +96,8 @@ def select(db, *, person, sources=("temporal",), date_from=None, date_to=None,
             WHERE pe.name = ? AND f.match_source = ?""",
         (person, REFERENCE_SOURCE)).fetchall()
 
-    stats = {"candidates": len(cand), "references": len(refs), "measured": 0}
+    stats = {"candidates": len(cand), "references": len(refs), "measured": 0,
+             "window_years": window_years}
     if not cand:
         return [], stats
 
@@ -94,11 +107,12 @@ def select(db, *, person, sources=("temporal",), date_from=None, date_to=None,
     refs = [r for r in refs if r["face_id"] in encs]
     stats["references"] = len(refs)
 
-    dist = {}
+    dist, ref_year = {}, {}
     if refs:
         R = _unit([encs[r["face_id"]] for r in refs])
         Rt = np.array([_epoch(r["date_taken"]) for r in refs])
         Rid = np.array([r["face_id"] for r in refs])
+        Ry = [_year(r["date_taken"]) for r in refs]
         X = _unit([encs[r["face_id"]] for r in cand])
         T = np.array([_epoch(r["date_taken"]) for r in cand])
         I = np.array([r["face_id"] for r in cand])
@@ -110,12 +124,20 @@ def select(db, *, person, sources=("temporal",), date_from=None, date_to=None,
             burst = np.nan_to_num(
                 np.abs(T[sl][:, None] - Rt[None, :]) <= burst_window, nan=False)
             D[same | burst] = np.inf
-            for j, m in enumerate(D.min(axis=1)):
-                dist[int(I[sl][j])] = None if not np.isfinite(m) else float(m)
+            if window_years is not None:
+                D[np.nan_to_num(np.abs(T[sl][:, None] - Rt[None, :]) > window_years * YEAR_SECONDS,
+                                nan=False)] = np.inf
+            nearest = D.argmin(axis=1)
+            for j, m in enumerate(D[np.arange(len(nearest)), nearest]):
+                fid = int(I[sl][j])
+                dist[fid] = None if not np.isfinite(m) else float(m)
+                if dist[fid] is not None:
+                    ref_year[fid] = Ry[nearest[j]]
 
     rows = [{"face_id": r["face_id"], "person_id": r["person_id"],
              "match_source": r["match_source"], "photo_id": r["photo_id"],
-             "date_taken": r["date_taken"], "dist": dist.get(r["face_id"])}
+             "date_taken": r["date_taken"], "dist": dist.get(r["face_id"]),
+             "ref_year": ref_year.get(r["face_id"])}
             for r in cand]
     measured = [r["dist"] for r in rows if r["dist"] is not None]
     stats["measured"] = len(measured)

@@ -2611,6 +2611,9 @@ def api_unmatch_preview(
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
     min_dist: Optional[float] = Query(None, ge=0.0, le=2.0),
+    window_years: Optional[float] = Query(
+        None, gt=0, le=50, description="Compare only with references this many "
+        "years from each face; omit for all years."),
     limit: int = Query(2000, ge=1, le=5000),
 ):
     """Candidate faces for a bulk unmatch, farthest-from-the-person first.
@@ -2640,7 +2643,7 @@ def api_unmatch_preview(
             raise HTTPException(404, f"no person named {person!r}")
         rows, stats = bulk_unmatch.select(
             db, person=person, sources=src, date_from=date_from,
-            date_to=date_to, min_dist=min_dist)
+            date_to=date_to, min_dist=min_dist, window_years=window_years)
         _mark_video_faces(db.conn, rows)
     # Farthest first: the most likely wrong faces land at the top of the grid,
     # so a reviewer can scan from the top and stop when they start recognising
@@ -2658,6 +2661,9 @@ def api_suggest_person(
     date_to: Optional[str] = Query(None),
     max_dist: Optional[float] = Query(None, ge=0.0, le=2.0),
     exclude_closer_to_other: bool = Query(False),
+    window_years: Optional[float] = Query(
+        None, gt=0, le=50, description="Compare only with labels (the person's "
+        "and rivals') this many years from each face; omit for all years."),
     limit: int = Query(2000, ge=1, le=5000),
 ):
     """"More of this kid": the scope's unmatched faces, nearest to `person` first.
@@ -2678,7 +2684,8 @@ def api_suggest_person(
         try:
             rows, stats = face_suggest.suggest(
                 db, person=person, date_from=date_from, date_to=date_to,
-                max_dist=max_dist, exclude_closer_to_other=exclude_closer_to_other)
+                max_dist=max_dist, exclude_closer_to_other=exclude_closer_to_other,
+                window_years=window_years)
         except ValueError as exc:
             raise HTTPException(404, str(exc))
         _mark_video_faces(db.conn, rows)

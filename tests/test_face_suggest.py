@@ -135,3 +135,36 @@ def test_endpoint_requires_a_date_scope():
     from photosearch.web import app
     r = TestClient(app).get("/api/faces/suggest-person?person=Kid")
     assert r.status_code == 400
+
+
+def test_the_year_window_drops_rivals_and_references_from_other_eras(sdb):
+    """A 2026 soccer kid was the nearest labelled person for 1 in 7 faces on a
+    2014 shoot. With a window, labels years from the face don't count."""
+    soccer = sdb.add_person("Soccer2026")
+    sbase = _vec(4)
+    sdb._face(_near(sbase, 80), soccer, "manual", day="2026-10-25")
+    old_face, _ = sdb._face(_near(sbase, 81), day="2014-04-19")
+    sdb._face(_near(sdb._kbase, 82), sdb._kid, "manual", day="2014-05-01")
+    sdb.conn.commit()
+
+    rows, _ = face_suggest.suggest(sdb, person="Kid", date_from="2014-04-19")
+    row = next(r for r in rows if r["face_id"] == old_face)
+    assert row["rival"] == "Soccer2026" and row["rival_year"] == 2026
+
+    rows, stats = face_suggest.suggest(sdb, person="Kid", date_from="2014-04-19",
+                                       window_years=3)
+    row = next(r for r in rows if r["face_id"] == old_face)
+    assert row["rival"] is None and not row["closer_to_other"]
+    assert row["ref_year"] == 2014                   # only the in-window reference
+    assert stats["window_years"] == 3
+
+
+def test_a_face_with_no_reference_in_the_window_is_dropped_and_counted(sdb):
+    lone, _ = sdb._face(_near(sdb._kbase, 90), day="2010-01-01")
+    sdb.conn.commit()
+    rows, stats = face_suggest.suggest(sdb, person="Kid", date_from="2010-01-01",
+                                       window_years=2)
+    assert lone not in [r["face_id"] for r in rows]
+    assert stats["outside_window"] == 1
+    rows, _ = face_suggest.suggest(sdb, person="Kid", date_from="2010-01-01")
+    assert [r["face_id"] for r in rows] == [lone]

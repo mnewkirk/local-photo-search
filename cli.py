@@ -925,13 +925,16 @@ def dedupe_person_faces(db, person, references, min_gap, apply, report):
 @click.option("--min-dist", default=None, type=float,
               help="Only clear faces farther than this from the person's MANUAL "
                    "references. Keeps the minority a bad source got right.")
+@click.option("--window-years", default=None, type=float,
+              help="Measure each face only against references taken within this "
+                   "many years of it (children change). Default: all years.")
 @click.option("--snapshot", default=None, metavar="PATH",
               help="Write the exact cleared set to JSON so restore-unmatch can "
                    "undo precisely this sweep. Required with --apply.")
 @click.option("--apply", "do_apply", is_flag=True, default=False,
               help="Actually write. Without it this is a preview.")
 def unmatch_person(db, person, sources, date_from, date_to, min_dist,
-                   snapshot, do_apply):
+                   window_years, snapshot, do_apply):
     """Bulk-remove one person's labels from a whole match_source.
 
     The case: `temporal` matching over-tags one kid onto everyone at an event —
@@ -962,7 +965,7 @@ def unmatch_person(db, person, sources, date_from, date_to, min_dist,
     with PhotoDB(db) as pdb:
         rows, stats = bulk_unmatch.select(
             pdb, person=person, sources=tuple(sources), date_from=date_from,
-            date_to=date_to, min_dist=min_dist)
+            date_to=date_to, min_dist=min_dist, window_years=window_years)
 
         click.echo(f"{person}: {stats['candidates']} face(s) in "
                    f"{'/'.join(sources)}, {stats['references']} manual "

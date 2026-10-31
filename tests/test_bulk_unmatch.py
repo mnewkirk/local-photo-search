@@ -302,3 +302,24 @@ def test_calibration_bar_comes_from_strict_not_manual(udb):
     assert cal["bar"] > 0.5
     assert cal["source_p50"] > cal["strict_p50"]
     assert cal["beyond"] == len(far)
+
+
+def test_the_year_window_leaves_faces_without_a_nearby_reference_unmeasured(udb):
+    """Children change: a face from 2016 is not judged against 2026 labels.
+    With no reference in the window it is unmeasured, and a gate never clears
+    an unmeasured face."""
+    ph = udb.add_photo(filepath="/p/old.jpg", filename="old.jpg",
+                       date_taken="2016-05-01 10:00:00")
+    old = udb.add_face(ph, (10, 90, 90, 10), _vec(777), det_score=0.9)
+    udb.assign_face_to_person(old, udb._pat, match_source="temporal")
+    udb.conn.commit()
+
+    rows, _ = bulk_unmatch.select(udb, person="Pat")
+    row = next(r for r in rows if r["face_id"] == old)
+    assert row["dist"] is not None and row["ref_year"] == 2026
+
+    rows, stats = bulk_unmatch.select(udb, person="Pat", window_years=3)
+    assert next(r for r in rows if r["face_id"] == old)["dist"] is None
+    assert stats["window_years"] == 3
+    rows, _ = bulk_unmatch.select(udb, person="Pat", window_years=3, min_dist=0.5)
+    assert old not in [r["face_id"] for r in rows]

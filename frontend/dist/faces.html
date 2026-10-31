@@ -724,6 +724,51 @@
     // 'YYYY-MM-DD HH:MM:SS' or ISO 'YYYY-MM-DDT...' — the first 10 chars either way.
     function bulkDay(f) { return (f && f.date_taken) ? String(f.date_taken).slice(0, 10) : ''; }
 
+    // Year window for "who does this face look like" comparisons: only labels
+    // taken within N years of the face count. Children change too much for a
+    // 2026 label to say anything about a 2014 face — before this, a 2026 soccer
+    // kid was the nearest labelled person for 1 in 7 faces on a 2014 shoot.
+    // One setting for every panel that compares faces, remembered per browser.
+    const YEAR_WINDOW_KEY = 'faces.yearWindow';
+    function loadYearWindow() {
+      try {
+        const v = JSON.parse(localStorage.getItem(YEAR_WINDOW_KEY) || 'null');
+        if (v && typeof v.on === 'boolean' && v.years > 0) return v;
+      } catch (x) { /* storage blocked: use the default */ }
+      return { on: true, years: 3 };
+    }
+    function useYearWindow() {
+      const [win, setWin] = useState(loadYearWindow);
+      const update = useCallback((patch) => setWin(prev => {
+        const next = Object.assign({}, prev, patch);
+        try { localStorage.setItem(YEAR_WINDOW_KEY, JSON.stringify(next)); } catch (x) { /* per-browser only */ }
+        return next;
+      }), []);
+      return [win, update];
+    }
+    const yearWindowParam = (win) => win.on ? '&window_years=' + encodeURIComponent(win.years) : '';
+    // Re-run `reload` when the window changes after a first load.
+    function useReloadOnWindow(win, hasData, reload) {
+      const first = useRef(true);
+      useEffect(() => {
+        if (first.current) { first.current = false; return; }
+        if (hasData) reload();
+      }, [win.on, win.years]);   // eslint-disable-line react-hooks/exhaustive-deps
+    }
+    function YearWindowControl({ win, onChange }) {
+      return e('label', { className: 'insp-sub',
+        style: { display: 'flex', alignItems: 'center', gap: 4, marginRight: 8 },
+        title: 'Compare each face only with labels taken within this many years of it. '
+             + 'Children change too much for a label from years away to mean anything. '
+             + 'Off = every label in the library.' },
+        e('input', { type: 'checkbox', checked: win.on, onChange: ev => onChange({ on: ev.target.checked }) }),
+        '±',
+        e('input', { type: 'number', min: 1, max: 30, step: 1, value: win.years, disabled: !win.on,
+          className: 'insp-btn', style: { width: 52, padding: '4px 6px' },
+          onChange: ev => { const v = parseInt(ev.target.value, 10); if (v > 0) onChange({ years: v }); } }),
+        'yr');
+    }
+
     function FaceTile({ f, selected, idx, onToggle }) {
       // `dist` may be null — a face whose every reference fell inside its own
       // burst has no measurable distance. Render it as unknown rather than
@@ -732,6 +777,9 @@
       const far = hasDist && f.dist > 1.0;
       return e('div', {
         className: 'face-tile' + (selected ? ' sel' : '') + (far ? ' far' : ''),
+        title: hasDist ? ('distance ' + f.dist.toFixed(3)
+                          + (f.ref_year ? ' to a ' + f.ref_year + ' reference' : ''))
+                       : 'no usable reference (none in the year window, or only its own burst)',
         onClick: (ev) => { if (ev.shiftKey) ev.preventDefault(); onToggle(f.face_id, idx, ev); },
       },
         e('img', { src: API + '/api/faces/crop/' + f.face_id + '?size=120', loading: 'lazy' }),
@@ -1399,20 +1447,22 @@
       const [page, setPage] = useState(0);
       const [working, setWorking] = useState(false);
       const [undo, setUndo] = useState(null);      // {person, face_ids} of the last apply
+      const [win, setWin] = useYearWindow();
       const lastIdx = useRef(null);
 
       const load = useCallback(() => {
         if (!person) return;
         setLoading(true); setErr(''); setSel(new Set()); setPage(0); setUndo(null);
         let u = API + '/api/faces/unmatch-preview?person=' + encodeURIComponent(person)
-              + '&sources=' + (includeStrict ? 'temporal,strict' : 'temporal');
+              + '&sources=' + (includeStrict ? 'temporal,strict' : 'temporal') + yearWindowParam(win);
         if (dateFrom) u += '&date_from=' + encodeURIComponent(dateFrom);
         if (dateTo || dateFrom) u += '&date_to=' + encodeURIComponent(dateTo || dateFrom);
         if (minDist) u += '&min_dist=' + encodeURIComponent(minDist);
         fetch(u).then(r => r.json())
           .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
           .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
-      }, [person, minDist, includeStrict, dateFrom, dateTo]);
+      }, [person, minDist, includeStrict, dateFrom, dateTo, win]);
+      useReloadOnWindow(win, !!data, load);
 
       // Arriving from Label health, the person and day are already chosen — so
       // load straight away rather than making the user press Preview again on
@@ -1520,9 +1570,12 @@
                 loading ? 'measuring…'
                   : st ? (faces.length.toLocaleString() + ' candidate face(s) · '
                           + st.references + ' manual reference(s)'
+                          + (st.window_years ? ' · references within ±' + st.window_years + ' yr' : '')
                           + (st.percentiles ? ' · distance p10 ' + st.percentiles['10']
                              + ', p50 ' + st.percentiles['50']
-                             + ', p90 ' + st.percentiles['90'] : ''))
+                             + ', p90 ' + st.percentiles['90'] : '')
+                          + (st.candidates > st.measured
+                             ? ' · ' + (st.candidates - st.measured) + ' unmeasured (—)' : ''))
                   : 'Pick a person. Grouped by day, farthest-from-them first within '
                     + 'each day, so you can scan a shoot from the top and stop when you '
                     + 'start recognising them.'),
@@ -1541,6 +1594,7 @@
               e('input', { type: 'checkbox', checked: includeStrict,
                 onChange: ev => setIncludeStrict(ev.target.checked) }),
               '+strict'),
+            e(YearWindowControl, { win, onChange: setWin }),
             e('input', { type: 'number', step: '0.05', min: '0', max: '2',
               placeholder: 'min dist', value: minDist, className: 'insp-btn',
               style: { width: 90, marginRight: 8 },
@@ -1628,19 +1682,21 @@
       const [page, setPage] = useState(0);
       const [working, setWorking] = useState(false);
       const [undo, setUndo] = useState(null);
+      const [win, setWin] = useYearWindow();
       const lastIdx = useRef(null);
 
       const load = useCallback((who) => {
         const name = who || person;
         if (!name) return;
         setLoading(true); setErr(''); setSel(new Set()); setPage(0);
-        let u = API + '/api/faces/suggest-person?person=' + encodeURIComponent(name);
+        let u = API + '/api/faces/suggest-person?person=' + encodeURIComponent(name) + yearWindowParam(win);
         if (dateFrom) u += '&date_from=' + encodeURIComponent(dateFrom);
         u += '&date_to=' + encodeURIComponent(dateTo || dateFrom || '');
         fetch(u).then(r => r.json())
           .then(d => { if (d.detail) throw new Error(d.detail); setData(d); setLoading(false); })
           .catch(e2 => { setErr(e2.message || String(e2)); setLoading(false); });
-      }, [person, dateFrom, dateTo]);
+      }, [person, dateFrom, dateTo, win]);
+      useReloadOnWindow(win, !!data, () => load());
 
       const all = (data && data.faces) || [];
       const faces = hideRivals ? all.filter(f => !f.closer_to_other) : all;
@@ -1701,20 +1757,21 @@
       const st = data && data.stats;
       const tile = (f, j) => {
         const idx = page * INSP_PAGE + j;
+        const yr = y => y ? ' [' + y + ']' : '';
         const warn = f.in_photo ? (person + ' is already tagged in this photo')
-          : f.closer_to_other ? ('closer to ' + f.rival + ' (' + f.rival_dist.toFixed(2) + ')') : null;
+          : f.closer_to_other ? ('closer to ' + f.rival + yr(f.rival_year) + ' (' + f.rival_dist.toFixed(2) + ')') : null;
         return e('div', {
           key: f.face_id,
           className: 'face-tile' + (sel.has(f.face_id) ? ' sel' : '') + (f.dist > cutoff ? ' beyond' : ''),
-          title: 'distance to ' + person + ': ' + f.dist.toFixed(3)
-               + (f.rival ? '\nnearest other labelled: ' + f.rival + ' ' + f.rival_dist.toFixed(3) : '')
+          title: 'distance to ' + person + yr(f.ref_year) + ': ' + f.dist.toFixed(3)
+               + (f.rival ? '\nnearest other labelled: ' + f.rival + yr(f.rival_year) + ' ' + f.rival_dist.toFixed(3) : '')
                + (warn ? '\n⚠ ' + warn : ''),
           onClick: (ev) => { if (ev.shiftKey) ev.preventDefault(); toggle(f.face_id, idx, ev); },
         },
           e('img', { src: API + '/api/faces/crop/' + f.face_id + '?size=120', loading: 'lazy' }),
           e('span', { className: 'dist-badge' }, f.dist.toFixed(2)),
           warn && e('span', { className: 'rival-badge' },
-            f.in_photo ? 'in photo' : '≈ ' + f.rival),
+            f.in_photo ? 'in photo' : '≈ ' + f.rival + (f.rival_year ? ' \u2019' + String(f.rival_year).slice(2) : '')),
           e('span', { className: 'checkmark' }, '✓'),
         );
       };
@@ -1730,7 +1787,10 @@
                   : st ? (all.length.toLocaleString() + ' unmatched face(s) · '
                           + st.references + ' labelled reference(s) of ' + person
                           + (st.within ? ' · within 0.8: ' + st.within['0.8']
-                             + ', 0.9: ' + st.within['0.9'] + ', 1.0: ' + st.within['1.0'] : ''))
+                             + ', 0.9: ' + st.within['0.9'] + ', 1.0: ' + st.within['1.0'] : '')
+                          + (st.window_years ? ' · labels within ±' + st.window_years + ' yr'
+                             + (st.outside_window ? ' (' + st.outside_window.toLocaleString()
+                                + ' face(s) have none of ' + person + ' that close — hidden)' : '') : ''))
                   : 'Pick a person. Nearest first — slide the cutoff to where the '
                     + 'crops stop being them.'),
               st && st.references < 3 && e('div', { className: 'insp-sub', style: { color: 'var(--warn, #db4)' } },
@@ -1742,6 +1802,7 @@
                                 if (ev.target.value) load(ev.target.value); } },
               e('option', { value: '' }, 'person…'),
               ...(persons || []).map(p => e('option', { key: p.id, value: p.name }, p.name))),
+            e(YearWindowControl, { win, onChange: setWin }),
             e('button', { className: 'insp-btn', onClick: () => load(), disabled: !person || loading },
               loading ? 'Loading…' : 'Reload'),
             e('button', { className: 'insp-btn', onClick: onClose }, '× Close'),
@@ -1772,7 +1833,10 @@
             data && faces.length === 0 && !loading &&
               e('div', { className: 'insp-sub' }, st && st.references === 0
                 ? person + ' has no hand-labelled faces yet — label one or two first.'
-                : 'No unmatched faces in this scope.'),
+                : st && st.outside_window
+                  ? person + ' has no labelled face within ±' + st.window_years + ' yr of this scope — '
+                    + 'widen the year window or turn it off.'
+                  : 'No unmatched faces in this scope.'),
             e('div', { className: 'insp-facegrid' }, ...pageFaces.map(tile)),
           ),
           e('div', { className: 'insp-actionbar' },
