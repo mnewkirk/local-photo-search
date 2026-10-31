@@ -44,8 +44,19 @@ Open `sheet/index.html` in a browser (from Windows:
 `\\wsl.localhost\Ubuntu\home\mattn\local-photo-search\evals\people-bind\sheet\index.html`).
 Each photo shows the image with numbered red boxes, the raw description, the
 name and label source behind each box, and the person phrases found
-automatically. Edits are saved in the browser as you go; "Download labels.json"
-any time, then `check --import` it.
+automatically, bolded in the description. Edits are saved in the browser as you go;
+"Download labels.json" any time, then `check --import` it. "Load labels.json"
+puts a downloaded file back into a browser.
+
+To label from another machine, serve the page instead of opening the file:
+`python evals/people_bind_eval.py serve --host <this machine's Tailscale IP>` and
+open `http://<that IP>:8765/`. The served page loads `sheet/saved-labels.json`
+and autosaves every edit to it (the header shows "saved to server" with the time),
+so any browser picks up where another stopped; `check --import
+evals/people-bind/sheet/saved-labels.json` when done. Keep one browser open at a
+time: the last one to save wins. To carry progress over from a browser that used the
+file page, download from it and copy that file to `sheet/saved-labels.json` before
+opening the served page.
 
 For every phrase, mark what it refers to **in the pixels**, ignoring the names:
 

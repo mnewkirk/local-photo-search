@@ -423,6 +423,48 @@ def cmd_report(a):
             print(f"   WRONG {w}")
 
 
+def cmd_serve(a):
+    """Serve the labelling page over HTTP so another machine (the Mac, over Tailscale) can label.
+    The page loads and autosaves sheet/saved-labels.json here; feed that file to `check --import`."""
+    import http.server
+    import shutil
+    saved = SHEET / "saved-labels.json"
+
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kw):
+            super().__init__(*args, directory=str(SHEET), **kw)
+
+        def do_PUT(self):
+            if self.path != "/saved-labels.json":
+                return self.send_error(404)
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 5_000_000:
+                return self.send_error(413)
+            try:
+                data = json.loads(self.rfile.read(n))
+                assert isinstance(data, dict) and all(
+                    isinstance(v, dict) and isinstance(v.get("mentions"), list) for v in data.values())
+            except Exception:  # anything unparseable is the client's error, not a crash
+                return self.send_error(400, "not a labels file")
+            if saved.exists():
+                shutil.copyfile(saved, saved.with_suffix(".json.bak"))
+            tmp = saved.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+            tmp.replace(saved)
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, fmt, *args):
+            if self.command == "PUT" or not str(args[1] if len(args) > 1 else "").startswith(("2", "3")):
+                super().log_message(fmt, *args)
+
+    if not (SHEET / "index.html").exists():
+        sys.exit("no sheet yet: run `sheet` first")
+    srv = http.server.ThreadingHTTPServer((a.host, a.port), H)
+    print(f"labelling page: http://{a.host}:{a.port}/   (labels autosave to {saved})")
+    srv.serve_forever()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -462,6 +504,11 @@ def main():
     r.add_argument("--force", action="store_true")
     r.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER", "http://localhost:8001"))
     r.set_defaults(fn=cmd_run)
+    sv = sub.add_parser("serve", help="serve the labelling page over HTTP; edits autosave here")
+    sv.add_argument("--host", default="127.0.0.1",
+                    help="bind address, e.g. this machine's Tailscale IP to label from another machine")
+    sv.add_argument("--port", type=int, default=8765)
+    sv.set_defaults(fn=cmd_serve)
     p = sub.add_parser("report")
     p.add_argument("--db", required=True)
     p.add_argument("--split", choices=("dev", "holdout"), default="dev")
@@ -489,6 +536,7 @@ img{width:100%;height:auto;border-radius:4px;cursor:zoom-in}
 .mut{color:var(--mut);font-size:13px}
 .m{border-top:1px solid var(--line);padding:6px 0}
 .ph{font-weight:600}
+.desc b{font-weight:700;background:rgba(255,193,7,.22);border-radius:2px;padding:0 1px}
 button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:4px;padding:2px 9px;margin:2px;cursor:pointer}
 button.on{background:var(--on);color:var(--onfg);border-color:var(--on)}
 button.x{color:var(--warn)}
@@ -499,8 +547,10 @@ table{border-collapse:collapse;font-size:13px}td{padding:1px 6px}
  <b>people-bind labels</b><span id="prog"></span>
  <label><input type="checkbox" id="todo"> only unfinished</label>
  <button id="dl">Download labels.json</button>
+ <button id="imp">Load labels.json</button><input type="file" id="impf" accept=".json,application/json" hidden>
  <button id="reset" class="x">Discard browser edits</button>
  <span class="mut">Edits are kept in this browser; download when done (or any time).</span>
+ <span id="srv" class="mut"></span>
 </header><main id="root"></main>
 <script>
 const ITEMS = __ITEMS__;
@@ -509,7 +559,23 @@ const KEY = "pb-labels-__KEY__";
 let L;
 try { L = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) { L = null; }
 if (!L) L = JSON.parse(JSON.stringify(FILE_LABELS));
-function save() { try { localStorage.setItem(KEY, JSON.stringify(L)); } catch (e) {} progress(); }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(L)); } catch (e) {} progress(); pushSoon(); }
+// Served by `people_bind_eval.py serve`: the server's saved-labels.json is the source of truth, so
+// another browser or machine picks up where this one stopped. Opened as a file, this is all a no-op.
+const SERVED = location.protocol.startsWith("http");
+let serverReady = false, pushTimer = null;
+function srv(msg) { document.getElementById("srv").textContent = msg; }
+function pushSoon() {
+  if (!SERVED || !serverReady) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    fetch("saved-labels.json", {method: "PUT", headers: {"Content-Type": "application/json"},
+                                body: JSON.stringify(exportLabels())})
+      .then(r => { if (!r.ok) throw new Error("HTTP " + r.status);
+                   srv("saved to server " + new Date().toLocaleTimeString()); })
+      .catch(e => srv("NOT saved to server (" + e.message + "); edits are still in this browser"));
+  }, 400);
+}
 function lab(it) {
   if (!L[it.pid]) L[it.pid] = FILE_LABELS[it.pid] ? JSON.parse(JSON.stringify(FILE_LABELS[it.pid]))
                               : {split: it.split, stratum: it.stratum, mentions: [], bad_labels: []};
@@ -546,7 +612,7 @@ function card(it) {
   const img = el("img", {src: it.pid + ".jpg", loading: "lazy", alt: "photo " + it.pid});
   img.addEventListener("click", () => window.open(it.pid + ".jpg"));
   const right = el("div");
-  const desc = el("div", {cls: "desc"}, it.description);
+  const desc = el("div", {cls: "desc"}, ...highlight(it.description, l.mentions.map(m => m.phrase)));
   right.append(desc);
   const tbl = el("table");
   for (const b of it.boxes) {
@@ -581,6 +647,24 @@ function card(it) {
   sec.append(el("div", {cls: "grid"}, img, right));
   return sec;
 }
+// Bold every occurrence of every listed phrase (overlaps merged) so the context is easy to find.
+function highlight(text, phrases) {
+  const iv = [];
+  for (const p of phrases) {
+    if (!p) continue;
+    for (let i = text.indexOf(p); i !== -1; i = text.indexOf(p, i + 1)) iv.push([i, i + p.length]);
+  }
+  iv.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [s, e] of iv) {
+    if (merged.length && s <= merged[merged.length - 1][1]) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+    else merged.push([s, e]);
+  }
+  const out = []; let at = 0;
+  for (const [s, e] of merged) { if (s > at) out.push(text.slice(at, s)); out.push(el("b", {}, text.slice(s, e))); at = e; }
+  if (at < text.length) out.push(text.slice(at));
+  return out;
+}
 function addPhrase(it, l, s, err) {
   s = (s || "").trim();
   if (!s) { err.textContent = "select part of the description first"; return; }
@@ -612,14 +696,33 @@ function mention(it, l, m, i) {
   return row;
 }
 document.getElementById("todo").addEventListener("change", render);
-document.getElementById("dl").addEventListener("click", () => {
+function exportLabels() {
   const out = {};
   for (const it of ITEMS) { const l = lab(it);
     out[it.pid] = {split: l.split, stratum: l.stratum, mentions: l.mentions,
                    bad_labels: l.bad_labels, reviewed: l.reviewed === true}; }
+  return out;
+}
+document.getElementById("dl").addEventListener("click", () => {
+  const out = exportLabels();
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], {type: "application/json"}));
   a.download = "labels.json"; a.click();
+});
+// Load a downloaded labels.json (e.g. to carry progress to another browser or machine).
+document.getElementById("imp").addEventListener("click", () => document.getElementById("impf").click());
+document.getElementById("impf").addEventListener("change", ev => {
+  const f = ev.target.files[0]; ev.target.value = "";
+  if (!f) return;
+  f.text().then(t => {
+    let data;
+    try { data = JSON.parse(t); } catch (e) { alert("Not valid JSON: " + e.message); return; }
+    const pids = ITEMS.map(it => String(it.pid)).filter(p => data[p] && Array.isArray(data[p].mentions));
+    if (!pids.length) { alert("No photos from this sample in that file."); return; }
+    if (!confirm(`Replace this browser's labels for ${pids.length} photos with the file's?`)) return;
+    for (const p of pids) L[p] = JSON.parse(JSON.stringify(data[p]));
+    save(); render();
+  });
 });
 document.getElementById("reset").addEventListener("click", () => {
   if (!confirm("Throw away this browser's edits and reload labels.json as generated?")) return;
@@ -627,6 +730,18 @@ document.getElementById("reset").addEventListener("click", () => {
   L = JSON.parse(JSON.stringify(FILE_LABELS)); render(); progress();
 });
 render(); progress();
+if (SERVED) {
+  srv("loading from server…");
+  fetch("saved-labels.json", {cache: "no-store"}).then(r => {
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }).then(data => {
+    if (data) for (const it of ITEMS) { const p = String(it.pid);
+      if (data[p] && Array.isArray(data[p].mentions)) L[p] = data[p]; }
+    serverReady = true; save(); render();
+  }).catch(e => srv("could not load from server (" + e.message + "); NOT saving to it — reload to retry"));
+}
 </script></body></html>
 """
 
