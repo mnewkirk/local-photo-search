@@ -882,3 +882,28 @@ was built before any model ran, and what is deliberately unmeasured:
 - Query-plan finding: the correlated `EXISTS (trusted face)` claim predicate scanned the
   whole `photos` table; `p.id IN (SELECT photo_id FROM faces WHERE <trusted>)` drives from
   the faces list instead (`tests/test_people_bind_pass.py`).
+
+### people-bind Step 0 spike and eval prep (2026-10-31)
+
+Replica copy (172,952 photos; schema already v40 when copied), no model run.
+
+- Scope (stills, description, verify done, >= 1 manual/strict/merge_review face): **37,789**
+  photos (+1,418 videos, out of scope). Photos with a strict face 30,065 (28,320 strict
+  only); manual 8,981 (7,080 manual only); merge_review 1,056. Trusted faces on stills:
+  strict 38,905, manual 14,272, merge_review 1,472 - strict dominates, so Decision 1's
+  strict-caused-wrong-name gate decides most of the coverage.
+- Offered faces (det >= 0.65, edge >= 60 px): 0 = 472, 1 = 12,369, 2-3 = 16,437,
+  4-6 = 5,849, > 6 (excluded) = 2,662; claimable 35,127.
+- The rule tier binds only **1,811 of 12,369** single-face photos (9,274 declined, mostly a
+  plural/other-person word elsewhere in the description; 1,284 have no `subject_boxes`). On
+  the soccer pilot it binds 11 of 270. The VLM tier carries almost everything.
+- Soccer pilot (union of the ~40 `%soccer%` collections, 2,495 photos): 1,689 in scope,
+  1,632 claimable (1 face 270, 2-3 = 847, 4-6 = 482, > 6 = 57).
+- Eval sample (`sample --collection '%soccer%' --adversarial 30`): 200 photos, 325
+  pre-filled phrases; holdout 75 photos. At ~1 singular + ~0.4 counted-group phrase per
+  photo, 75 holdout photos give roughly 40-60 bound mentions, so the ">= 150 bound" gate
+  reads INCOMPLETE until a holdout-only top-up (~175 more holdout photos).
+- Harness fixes before labelling: phrase matching by character overlap (labelled "One
+  child" vs model "One child in blue" scored as an unscored bind + a miss under exact
+  text); `run` cached a no-answer as a deferred prediction (now never cached); spec/STALE
+  check; `--max-px` / `--one-call` ablations; interactive labelling page + `check`.

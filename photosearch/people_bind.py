@@ -590,19 +590,25 @@ def ask_model(description: str, image_b64: str, n_boxes: int,
 
 
 def bind_with_model(image_path: str, description: str, faces: list[dict],
-                    photo_id: int, model: str) -> Optional[list[dict]]:
+                    photo_id: int, model: str, *, max_px: int = _OVERLAY_MAX_PX,
+                    second_call: bool = True) -> Optional[list[dict]]:
     """The VLM tier for one photo: one call for one offered face, two calls with
     re-shuffled numbering for two or more. Returns the slots (possibly ``[]``),
-    or ``None`` to defer (a call got no answer)."""
+    or ``None`` to defer (a call got no answer).
+
+    ``max_px`` / ``second_call=False`` exist for the eval's ablations
+    (overlay resolution, one call vs two); production uses the defaults."""
     offered = offered_faces(faces)
     by_id = {f["face_id"]: f for f in offered}
     if not offered or len(offered) > MAX_FACES:
         return []
     ids = [f["face_id"] for f in offered]
     orders = [ids] if len(ids) == 1 else list(shuffled_orders(ids, photo_id))
+    if not second_call:
+        orders = orders[:1]
     decided = []
     for order in orders:
-        b64 = draw_overlay(image_path, offered, order)
+        b64 = draw_overlay(image_path, offered, order, max_px=max_px)
         mentions = ask_model(description, b64, len(order), model)
         if mentions is None:
             return None

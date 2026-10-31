@@ -65,6 +65,10 @@ Before/after check for trimming the Ask agent's ~11.7k-token prompt (system prom
 - **Unsplash is recall-only**: compare a variant with the constant answer of its own size (recite-all = recall 1.00).
 - **Aesthetics**: the 28-photo ordering (ranks 10 and 28 absent) is between-shoot; read top-half/bottom-half ρ, the file-size/megapixels baselines and the Δρ ties. `scores-v2.json` items now also store `dim_scores`/`sub_scores` for offline `DIMENSION_WEIGHTS` tuning.
 
+### people-bind eval (`evals/people_bind_eval.py`)
+
+Runbook and labelling guide: `evals/people-bind/README.md`. Phrases score by character overlap (the model picks its own boundaries); `check --import` validates labels; ablations need their own variant name. Step 0 numbers: docs/notes/llm-passes.md ("people-bind Step 0 spike").
+
 ### Eval findings: start here
 
 - CLAUDE.md / context eval: `evals/context_eval/FINDINGS.md` (before/after, grader audit, Haiku/Sonnet/Opus ablations, limits, next steps).

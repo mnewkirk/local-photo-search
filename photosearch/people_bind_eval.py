@@ -32,12 +32,31 @@ COVERAGE_SINGLE = 0.80
 ABSTAIN_CORRECT = 0.95
 
 
-def _pred_for(slots: list, phrase: str) -> Optional[list]:
-    """Face ids of the slot whose span text is ``phrase`` (None = not bound)."""
-    for s in slots or []:
-        if any(sp["text"] == phrase for sp in s["spans"]):
-            return sorted(f["face_id"] for f in s["faces"])
-    return None
+def _overlaps(sp: dict, rng: tuple) -> bool:
+    return sp["start"] < rng[1] and rng[0] < sp["end"]
+
+
+def _pred_for(slots: list, phrase: str, rng: Optional[tuple] = None) -> Optional[list]:
+    """Face ids bound to ``phrase`` (None = not bound).
+
+    With ``rng`` (the phrase's character range in the description) a slot
+    counts when any of its spans OVERLAPS the phrase: the labeller's phrase
+    and the model's need not share boundaries ("One child" vs "One child in
+    blue"). Without it, exact span text. Several overlapping slots -> the
+    union of their faces (which then cannot equal a 1-face gold)."""
+    hit = [s for s in slots or []
+           if any((_overlaps(sp, rng) if rng else sp["text"] == phrase) for sp in s["spans"])]
+    if not hit:
+        return None
+    return sorted({f["face_id"] for s in hit for f in s["faces"]})
+
+
+def mention_range(description: Optional[str], phrase: str) -> Optional[tuple]:
+    """Character range of the phrase's first occurrence, or None."""
+    if not description:
+        return None
+    i = description.find(phrase)
+    return None if i < 0 else (i, i + len(phrase))
 
 
 def _score_mention(gold, pred) -> str:
@@ -49,12 +68,15 @@ def _score_mention(gold, pred) -> str:
 
 
 def score(labels: dict, preds: dict, face_sources: Optional[dict] = None,
-          split: Optional[str] = None) -> dict:
+          split: Optional[str] = None, descriptions: Optional[dict] = None) -> dict:
     """Metrics over the labelled photos that have a (non-deferred) prediction.
 
     ``face_sources`` maps face id -> its label's ``match_source`` so the
     user-visible wrong-name count (a correct bind on a WRONGLY labelled face)
-    can be split by source."""
+    can be split by source. ``descriptions`` (photo id str -> text) switches
+    phrase matching from exact span text to character overlap, which is what
+    the harness uses: the model chooses its own phrase boundaries."""
+    descriptions = descriptions or {}
     face_sources = face_sources or {}
     zero = lambda: {"correct_bind": 0, "wrong_bind": 0, "missed_abstain": 0,
                     "right_abstain": 0}
@@ -71,15 +93,17 @@ def score(labels: dict, preds: dict, face_sources: Optional[dict] = None,
             continue
         photos += 1
         stratum, method = lab.get("stratum", "?"), pr.get("method") or "?"
-        listed = {m["phrase"] for m in lab.get("mentions", [])}
+        desc = descriptions.get(str(pid))
+        rngs = {m["phrase"]: mention_range(desc, m["phrase"]) for m in lab.get("mentions", [])}
         for s in pr["slots"]:
-            if not any(sp["text"] in listed for sp in s["spans"]):
+            if not any((_overlaps(sp, r) if r else sp["text"] == ph)
+                       for sp in s["spans"] for ph, r in rngs.items()):
                 unscored_bind += 1
         bad = set(lab.get("bad_labels", []))
         for m in lab.get("mentions", []):
             if m.get("gold") is None:
                 continue                              # not labelled yet
-            pred = _pred_for(pr["slots"], m["phrase"])
+            pred = _pred_for(pr["slots"], m["phrase"], rngs.get(m["phrase"]))
             o = _score_mention(m["gold"], pred)
             for bucket in (total, by_stratum.setdefault(stratum, zero()),
                            by_method.setdefault(method, zero())):
@@ -160,6 +184,94 @@ def verdict(gate_rows: list) -> str:
     if any(ok is None for _, ok, _ in gate_rows):
         return "INCOMPLETE"
     return "PASS"
+
+
+GOLD_WORDS = ("NONE", "AMBIGUOUS")
+
+
+def check_labels(labels: dict, sample: dict, photos: dict) -> dict:
+    """Validate a labels file before it is scored.
+
+    ``photos`` maps photo id (str) -> ``{"description", "offered": {face ids
+    drawn as boxes}, "faces": {all face ids}}`` as of NOW, or ``None`` when
+    the photo is gone / has no description. ``gold`` may still be ``None``
+    (not labelled yet): that is progress, not an error.
+
+    Returns ``{"errors": [...], "warnings": [...], "photos", "mentions",
+    "labelled", "unlabelled", "missing", "unreviewed"}``; ``missing`` = sampled
+    photos with no labels entry; ``unreviewed`` = photos the labeller has not
+    ticked "every person phrase is listed" on (the sheet's ``reviewed``)."""
+    errors, warnings = [], []
+    n_mentions = n_labelled = 0
+    for pid, lab in sorted(labels.items(), key=lambda kv: int(kv[0])):
+        where = f"photo {pid}"
+        meta = sample.get(pid)
+        if meta is None:
+            errors.append(f"{where}: not in sample.json")
+            continue
+        for k in ("split", "stratum"):
+            if lab.get(k) != meta.get(k):
+                errors.append(f"{where}: {k} {lab.get(k)!r} != sample's {meta.get(k)!r}")
+        ph = photos.get(pid)
+        if ph is None:
+            errors.append(f"{where}: gone from the DB or has no description")
+            continue
+        desc, offered, all_faces = ph["description"], set(ph["offered"]), set(ph["faces"])
+        seen = set()
+        for m in lab.get("mentions", []):
+            n_mentions += 1
+            phrase, gold = m.get("phrase"), m.get("gold")
+            if not isinstance(phrase, str) or not phrase.strip():
+                errors.append(f"{where}: empty phrase")
+                continue
+            if phrase in seen:
+                errors.append(f"{where}: phrase listed twice: {phrase!r}")
+            seen.add(phrase)
+            if phrase not in desc:
+                errors.append(f"{where}: phrase is not an exact substring of the "
+                              f"description: {phrase!r}")
+            elif desc.count(phrase) > 1:
+                warnings.append(f"{where}: {phrase!r} occurs more than once "
+                                f"(the binder never binds it)")
+            if gold is None:
+                continue
+            n_labelled += 1
+            if isinstance(gold, str):
+                if gold not in GOLD_WORDS:
+                    errors.append(f"{where}: gold {gold!r} must be a list of face "
+                                  f"ids, \"NONE\" or \"AMBIGUOUS\"")
+                continue
+            if (not isinstance(gold, list) or not gold
+                    or not all(isinstance(f, int) and not isinstance(f, bool) for f in gold)):
+                errors.append(f"{where}: gold for {phrase!r} must be a non-empty list "
+                              f"of face ids")
+                continue
+            if len(set(gold)) != len(gold) or len(gold) > 3:
+                errors.append(f"{where}: gold for {phrase!r} must be 1-3 distinct faces "
+                              f"(a bigger group is NONE)")
+            not_drawn = sorted(set(gold) - offered)
+            if not_drawn:
+                errors.append(f"{where}: gold for {phrase!r} names face(s) {not_drawn} "
+                              f"that are not drawn boxes of this photo")
+        rngs = sorted(r + (m.get("phrase"),) for m in lab.get("mentions", [])
+                      if isinstance(m.get("phrase"), str)
+                      for r in [mention_range(desc, m["phrase"])] if r)
+        for (a0, a1, pa), (b0, b1, pb) in zip(rngs, rngs[1:]):
+            if b0 < a1:
+                errors.append(f"{where}: phrases overlap ({pa!r} / {pb!r}): list one "
+                              f"person reference once")
+        bad = lab.get("bad_labels", [])
+        if not isinstance(bad, list) or not all(isinstance(f, int) for f in bad):
+            errors.append(f"{where}: bad_labels must be a list of face ids")
+        elif set(bad) - all_faces:
+            errors.append(f"{where}: bad_labels {sorted(set(bad) - all_faces)} are not "
+                          f"faces of this photo")
+    return {"errors": errors, "warnings": warnings, "photos": len(labels),
+            "mentions": n_mentions, "labelled": n_labelled,
+            "unlabelled": n_mentions - n_labelled,
+            "missing": sorted((p for p in sample if p not in labels), key=int),
+            "unreviewed": sorted((p for p, lab in labels.items() if lab.get("reviewed") is not True),
+                                 key=int)}
 
 
 def split_of(photo_id: int) -> str:

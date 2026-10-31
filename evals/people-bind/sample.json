@@ -1,0 +1,832 @@
+{
+ "242216": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "242217": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242418": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242722": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "242794": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "242960": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243166": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243285": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243381": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243399": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243465": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243538": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243541": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243542": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243560": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "243595": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "243607": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "243624": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243737": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243876": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243887": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243891": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "goalkeeper_vs_players"
+ },
+ "243906": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244034": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "244045": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244047": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244212": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "244435": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244446": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244640": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "244684": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244861": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "244870": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244891": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "244893": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244913": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "goalkeeper_vs_players"
+ },
+ "244942": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "lone_face_no_subject_boxes"
+ },
+ "244964": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245121": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245169": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245205": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "245345": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "245395": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "245498": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "face_cut_by_frame_edge"
+ },
+ "245684": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245686": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "245748": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245786": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245909": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245916": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245947": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "lone_face_no_subject_boxes"
+ },
+ "245990": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246027": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246033": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246056": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246076": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246104": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246122": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246181": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246293": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246298": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246366": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246410": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246428": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246449": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246455": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "back_turned"
+ },
+ "246460": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246472": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246501": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246517": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246521": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246536": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246654": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246669": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246678": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246735": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246751": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246809": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246826": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246836": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246842": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "247017": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247137": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247239": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247245": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "lone_face_outside_main_subject"
+ },
+ "247279": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247379": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247393": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "247466": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "247577": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "247596": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247601": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "247627": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247644": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "lone_face_outside_main_subject"
+ },
+ "247650": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "back_turned"
+ },
+ "247741": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "247785": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247821": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247853": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247859": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "goalkeeper_vs_players"
+ },
+ "247899": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247988": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "248136": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248242": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "248253": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "face_cut_by_frame_edge"
+ },
+ "248330": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "248486": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "248540": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "lone_face_outside_main_subject"
+ },
+ "248650": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "248764": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "248775": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248861": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "248904": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248940": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249061": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "counted_group_fewer_boxes"
+ },
+ "249063": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249070": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "249072": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249085": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "249148": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "249250": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "back_turned"
+ },
+ "249261": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249272": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "249301": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "lone_face_no_subject_boxes"
+ },
+ "249378": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "lone_face_no_subject_boxes"
+ },
+ "249444": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249594": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249619": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "identical_kit"
+ },
+ "249639": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249665": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "249669": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249680": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "249699": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249761": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "249783": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249786": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249818": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "counted_group_fewer_boxes"
+ },
+ "249871": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "counted_group_fewer_boxes"
+ },
+ "249933": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249951": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249963": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249981": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250051": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250064": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "250101": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250111": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "counted_group_fewer_boxes"
+ },
+ "250115": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "counted_group_fewer_boxes"
+ },
+ "250175": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "250229": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250237": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250255": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "identical_kit"
+ },
+ "250265": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250302": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "face_cut_by_frame_edge"
+ },
+ "250366": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250402": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250415": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250440": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250455": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250495": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250509": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250514": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250540": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "back_turned"
+ },
+ "250708": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250742": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250790": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250869": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250887": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250893": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250900": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "250964": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251020": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251054": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251061": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "251086": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "goalkeeper_vs_players"
+ },
+ "251096": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "251102": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "251109": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "251111": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "251150": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "251237": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251298": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257365": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "identical_kit"
+ },
+ "257391": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "identical_kit"
+ },
+ "257406": {
+  "split": "holdout",
+  "stratum": "adversarial",
+  "why": "face_cut_by_frame_edge"
+ },
+ "257415": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257476": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "257480": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "lone_face_outside_main_subject"
+ },
+ "257916": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257995": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "258010": {
+  "split": "dev",
+  "stratum": "adversarial",
+  "why": "back_turned"
+ },
+ "258019": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "258115": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "258175": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "258190": {
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "258229": {
+  "split": "dev",
+  "stratum": "single"
+ },
+ "258231": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "258320": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "258795": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258798": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "258817": {
+  "split": "dev",
+  "stratum": "multi_2_3"
+ }
+}
