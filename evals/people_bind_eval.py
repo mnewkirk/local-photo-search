@@ -659,7 +659,15 @@ function pushSoon() {
       .then(r => { if (r.status === 409) throw new Error("this page is out of date: RELOAD it");
                    if (!r.ok) throw new Error("HTTP " + r.status);
                    srv("saved to server " + new Date().toLocaleTimeString()); })
-      .catch(e => srv("NOT saved to server (" + e.message + "); edits are still in this browser"));
+      .catch(e => {
+        srv("NOT saved to server (" + e.message + "); edits are still in this browser");
+        // An out-of-date page loses every edit on reload: say so where it cannot be missed.
+        if (/out of date/.test(e.message) && !document.getElementById("stale")) {
+          document.body.prepend(el("div", {id: "stale", style: "background:#b71c1c;color:#fff;padding:12px 16px;font-weight:700"},
+            "This page is out of date and is NOT saving. Reload it before labelling anything else."));
+          alert("This labelling page is out of date and is not saving. Reload it.");
+        }
+      });
   }, 400);
 }
 function lab(it) {
