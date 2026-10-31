@@ -907,3 +907,29 @@ Replica copy (172,952 photos; schema already v40 when copied), no model run.
   child" vs model "One child in blue" scored as an unscored bind + a miss under exact
   text); `run` cached a no-answer as a deferred prediction (now never cached); spec/STALE
   check; `--max-px` / `--one-call` ablations; interactive labelling page + `check`.
+
+### people-bind dev comparison: no model passes (2026-10-31)
+
+Owner's labels for the 200-photo sample (`aa08a09`, 351 phrases; five set to NONE on import by
+the group rules). Dev split only (125 photos); holdout untouched. Current prompt, 1024 px, two
+calls, reasoning `none`, one model resident in LM Studio at a time.
+
+| variant | bound | wrong binds | coverage | abstain-correct | unusable answers | s/photo |
+|---|--:|--:|--:|--:|--:|--:|
+| rule tier | 1 | 0 | 0.008 | 1.00 | 0 | - |
+| qwen2.5-vl-7b | 23 | 2 | 0.16 | 0.98 | 79 / 124 | 2.6 |
+| qwen3.5-9b | 27 | 3 | 0.18 | 0.97 | 76 / 124 | 9.9 |
+| gemma-4-12b-qat | 72 | 9 | 0.46 | 0.90 | 17 / 124 | 4.3 |
+
+- Every VLM variant fails the 0-wrong-binds gate; none is near it. User-visible wrong names
+  were 0 for all, only because the wrongly bound faces carried no trusted name.
+- Wrong-bind shapes: a lone or neighbouring face taken for a phrase the owner marked NONE
+  (the sideline/back-turned trap, 6 of gemma's 9), the neighbour of the right child, and a
+  group bound with one face too many.
+- Unusable answers are prompt/format failures, all fail-safe: "box number out of range" on
+  every model (qwen2.5-vl 28 of the first 66); the prompt's example "a young boy with reddish
+  hair" copied verbatim (qwen2.5-vl); qwen3.5 cut off at 768 tokens twice on 64 photos despite
+  reasoning `none`.
+- The rule tier binds 1 dev mention. The coverage targets (50% multi / 80% single) are out of
+  reach for every variant; the owner noted during labelling that soccer subjects are often
+  backs of heads, which are NONE by design.
