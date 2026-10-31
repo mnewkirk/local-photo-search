@@ -147,6 +147,15 @@ _RULES: list[tuple[Optional[str], str, Callable]] = [
     ("GET", r"/api/collections", _fixed("List collections")),
     ("GET", r"/api/stats(/.*)?", _fixed("Load library statistics")),
     ("GET", r"/api/health", _fixed("Check the server is reachable")),
+    ("GET", r"/api/logs", lambda m, p: "Read the Ask logs" + (
+        f" for {p['date']}" if p.get("date") else "")),
+    ("GET", r"/api/logs/requests", lambda m, p: "Read the {} {} log{}".format(
+        "NAS" if p.get("host") == "nas" else "local",
+        "MCP tool-call" if p.get("stream") == "mcp" else "API request",
+        f" matching {p['q']!r}" if p.get("q") else "")),
+    ("GET", r"/api/logs/sources", _fixed("List the logs this server can show")),
+    ("GET", r"/api/logs/fleet", _fixed("Read the worker fleet logs")),
+    ("GET", r"/api/logs/server", _fixed("Read the server journal")),
     ("GET", r"/api/photos/geojson", _fixed("Load map points")),
     ("GET", r"/api/photos/(?P<id>\d+)/thumbnail", _fixed("Show thumbnail of photo {id}")),
     ("GET", r"/api/photos/(?P<id>\d+)/preview", _fixed("Show preview of photo {id}")),

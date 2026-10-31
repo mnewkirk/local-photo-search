@@ -3,31 +3,64 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ask Logs · Photo Search</title>
+  <title>Logs · Photo Search</title>
   <link rel="stylesheet" href="/shared.css">
   <style>
-    :root { --bg:#0f1115; --surface:#1a1d24; --border:#2a2f3a; --muted:#8b93a7; --text:#e6e9ef; --accent:#4a9; }
+    :root { --bg:#0f1115; --surface:#1a1d24; --border:#2a2f3a; --muted:#8b93a7; --text:#e6e9ef; --accent:#4a9;
+            --err:#e66; --warn:#db4; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px system-ui,sans-serif; }
-    .container { max-width:1100px; margin:0 auto; padding:16px; }
-    .page-title { font-size:22px; font-weight:600; margin:8px 0 2px; }
-    .bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin:8px 0 14px; }
-    .bar button { background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:7px; padding:6px 12px; cursor:pointer; }
+    .container { max-width:1300px; margin:0 auto; padding:16px; }
+    .page-title { font-size:22px; font-weight:600; margin:8px 0 10px; }
+    .tabs { display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid var(--border); margin-bottom:10px; }
+    .tab { padding:8px 14px; cursor:pointer; color:var(--muted); border:1px solid transparent; border-bottom:none;
+           border-radius:8px 8px 0 0; text-decoration:none; font-size:13px; }
+    .tab:hover { color:var(--text); }
+    .tab.active { color:var(--text); background:var(--surface); border-color:var(--border); font-weight:600; }
+    .bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin:8px 0 12px; }
+    .bar button, .bar select, .bar input[type=text], .bar input[type=number] {
+      background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:7px; padding:6px 10px; font-size:12px; }
+    .bar button { cursor:pointer; }
     .bar button:hover { border-color:var(--accent); }
+    .bar input[type=text] { width:220px; }
+    .bar input[type=number] { width:80px; }
+    .bar label { display:flex; align-items:center; gap:4px; }
     .day-h { font-size:15px; font-weight:600; margin:18px 0 8px; color:var(--accent); }
     .entry { background:var(--surface); border:1px solid var(--border); border-radius:10px; margin:10px 0; overflow:hidden; }
-    .entry-h { padding:9px 12px; font:12px ui-monospace,monospace; color:var(--text); background:#20242d; border-bottom:1px solid var(--border); }
+    .entry-h { padding:9px 12px; font:12px ui-monospace,monospace; color:var(--text); background:#20242d; border-bottom:1px solid var(--border);
+               display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .entry-b { padding:10px 12px; margin:0; white-space:pre-wrap; word-break:break-word;
                font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; color:#c9d1e0; }
+    .entry-b.scroll { max-height:520px; overflow:auto; white-space:pre; }
     .empty { color:var(--muted); padding:20px 0; }
+    .err { color:var(--err); padding:8px 0; }
     .auto { color:var(--accent); }
-    /* Shared nav header (SharedHeader emits these classes; this page lacked the CSS) */
+    .tbl-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:10px; }
+    table.req { border-collapse:collapse; width:100%; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; }
+    table.req th { text-align:left; color:var(--muted); font-weight:600; background:#20242d; padding:7px 8px;
+                   position:sticky; top:0; white-space:nowrap; }
+    table.req td { padding:5px 8px; border-top:1px solid var(--border); vertical-align:top; }
+    table.req tr.row { cursor:pointer; }
+    table.req tr.row:hover td { background:#1e222b; }
+    td.num { text-align:right; white-space:nowrap; }
+    td.nowrap { white-space:nowrap; }
+    td.path { max-width:420px; min-width:160px; word-break:break-all; }
+    td.intent { max-width:380px; color:#c9d1e0; }
+    .bad { color:var(--err); font-weight:600; }
+    .slow { color:var(--warn); }
+    .dim { color:var(--muted); }
+    .pill { display:inline-block; padding:1px 7px; border-radius:9px; background:#262b36; color:var(--muted); font-size:11px; }
+    .pill.live { background:#1f3a2f; color:var(--accent); }
+    .pill.dead { background:#3a2323; color:var(--err); }
+    pre.detail { margin:0; white-space:pre-wrap; word-break:break-word; color:#c9d1e0; }
+    /* Shared nav header (SharedHeader emits these classes) */
     .header { background:var(--surface); border-bottom:1px solid var(--border); padding:14px 20px; position:sticky; top:0; z-index:100; }
-    .header-inner { max-width:1100px; margin:0 auto; display:flex; align-items:center; gap:16px; min-height:42px; flex-wrap:wrap; }
+    .header-inner { max-width:1300px; margin:0 auto; display:flex; align-items:center; gap:16px; min-height:42px; flex-wrap:wrap; }
     .logo { font-size:18px; font-weight:700; letter-spacing:-0.5px; }
     .logo span { color:var(--accent); }
     .nav-link { font-size:13px; color:var(--accent); text-decoration:none; margin-left:4px; }
     .nav-link:hover { text-decoration:underline; }
     .nav-link.active { color:var(--text); font-weight:600; }
+    @media (max-width: 600px) { .container { padding:12px 16px; } .bar input[type=text] { width:150px; } }
   </style>
 </head>
 <body>
@@ -41,6 +74,70 @@
     const API = '';
     const REFRESH_MS = 30000;
 
+    // One sub-tab per log. The hash keeps the tab across reloads and makes
+    // each one linkable (/logs#mcp).
+    const TABS = [
+      { id: 'ask',      label: 'Ask' },
+      { id: 'requests', label: 'API requests' },
+      { id: 'mcp',      label: 'MCP calls' },
+      { id: 'fleet',    label: 'Worker fleet' },
+      { id: 'server',   label: 'Server' },
+    ];
+    const tabFromHash = () => {
+      const h = (location.hash || '').replace('#', '');
+      return TABS.some(t => t.id === h) ? h : 'ask';
+    };
+
+    const getJSON = (url, signal) => fetch(url, signal ? { signal } : undefined).then(r =>
+      r.text().then(t => {
+        let d = null;
+        try { d = JSON.parse(t); } catch (x) { /* not JSON: report the status below */ }
+        if (!r.ok || d == null) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+        return d;
+      }));
+
+    // Load `url` now and every REFRESH_MS while `auto` is on. PS.poll re-arms
+    // only after the previous load settles, so a slow log read can't stack.
+    function usePolled(url, auto) {
+      const [data, setData] = useState(null);
+      const [err, setErr] = useState('');
+      const [loading, setLoading] = useState(false);
+      const [updated, setUpdated] = useState('');
+      const load = useCallback((signal) => {
+        if (!url) return Promise.resolve();
+        setLoading(true);
+        return getJSON(url, signal)
+          .then(d => { setData(d); setErr(''); setUpdated(new Date().toLocaleTimeString()); })
+          .catch(x => { if (x.name !== 'AbortError') setErr(x.message || String(x)); })
+          .finally(() => setLoading(false));
+      }, [url]);
+      useEffect(() => {
+        if (auto) return PS.poll(load, REFRESH_MS);
+        load();
+        return undefined;
+      }, [auto, load]);
+      return { data, err, loading, updated, reload: () => load() };
+    }
+
+    function RefreshBar({ p, auto, setAuto, children }) {
+      return e('div', { className: 'bar' },
+        e('button', { onClick: p.reload }, p.loading ? 'Loading…' : 'Refresh'),
+        e('label', null,
+          e('input', { type: 'checkbox', checked: auto, onChange: ev => setAuto(ev.target.checked) }),
+          'auto-refresh 30s'),
+        p.updated && e('span', { className: auto ? 'auto' : '' }, 'updated ' + p.updated),
+        children);
+    }
+
+    function HostSelect({ sources, host, setHost }) {
+      if (!sources || !sources.replica) return null;
+      return e('select', { value: host, onChange: ev => setHost(ev.target.value),
+        title: 'This page runs on the replica; the NAS keeps its own copy of this log.' },
+        e('option', { value: 'local' }, 'this server (replica)'),
+        e('option', { value: 'nas' }, 'NAS'));
+    }
+
+    // ---------------------------------------------------------------- Ask
     // Split a day's markdown log into individual query entries (separated by the
     // 78-char '=' rule), newest first. Each entry's first "## " line is the header.
     function parseEntries(content) {
@@ -54,53 +151,29 @@
         }
         return { head: head || '(entry)', body: lines.slice(bodyStart).join('\n').trim() };
       });
-      // Newest first by the entry's leading "YYYY-MM-DD HH:MM:SS" timestamp,
-      // robust to file concat / rotation order (not just a reverse).
       out.sort((a, b) => b.head.slice(0, 19).localeCompare(a.head.slice(0, 19)));
       return out;
     }
 
-    function App() {
-      const [data, setData] = useState(null);
-      const [updated, setUpdated] = useState('');
-      const [loading, setLoading] = useState(true);
+    function AskTab() {
       const [auto, setAuto] = useState(true);
-      const timer = useRef(null);
-
-      const load = useCallback(() => {
-        setLoading(true);
-        return fetch(API + '/api/logs').then(r => r.json()).then(d => {
-          setData(d); setLoading(false);
-          setUpdated(new Date().toLocaleTimeString());
-        }).catch(() => setLoading(false));
-      }, []);
-
-      // PS.poll re-arms only after the previous load settles (and runs at once),
-      // so auto-refresh can't stack requests; with auto off, load once.
-      useEffect(() => {
-        if (timer.current) { timer.current(); timer.current = null; }
-        if (auto) timer.current = PS.poll(load, REFRESH_MS);
-        else load();
-        return () => { if (timer.current) { timer.current(); timer.current = null; } };
-      }, [auto, load]);
-
-      const days = (data && data.days) || [];
-      return e(React.Fragment, null,
-        PS.SharedHeader ? e(PS.SharedHeader, { activePage: 'logs' }) : null,
-        e('div', { className: 'container' },
-        e('div', { className: 'page-title' }, 'Ask Logs'),
-        e('div', { className: 'bar' },
-          e('button', { onClick: load }, loading ? 'Loading…' : 'Refresh'),
-          e('label', null,
-            e('input', { type: 'checkbox', checked: auto, onChange: ev => setAuto(ev.target.checked) }),
-            ' auto-refresh 30s'),
-          updated && e('span', { className: auto ? 'auto' : '' }, 'updated ' + updated),
-          data && e('span', null, 'logs: ' + (data.dir || 'ask-logs'))),
+      const [date, setDate] = useState('');
+      const p = usePolled(API + '/api/logs' + (date ? '?date=' + date : ''), auto);
+      const days = (p.data && p.data.days) || [];
+      const avail = (p.data && p.data.available) || [];
+      const today = fmtTs(new Date().toISOString()).slice(0, 10);   // local, like the server's file names
+      return e('div', null,
+        e(RefreshBar, { p, auto, setAuto },
+          e('select', { value: date, onChange: ev => setDate(ev.target.value) },
+            e('option', { value: '' }, 'today + yesterday'),
+            ...avail.map(d => e('option', { key: d, value: d }, d))),
+          p.data && e('span', null, 'dir: ' + (p.data.dir || 'ask-logs'))),
+        p.err && e('div', { className: 'err' }, p.err),
         days.map(day => {
           const entries = parseEntries(day.content);
           return e('div', { key: day.date },
             e('div', { className: 'day-h' },
-              (day.date === days[0].date ? 'Today · ' : 'Yesterday · ') + day.date
+              (day.date === today ? 'Today · ' : '') + day.date
               + '  (' + entries.length + ' quer' + (entries.length === 1 ? 'y' : 'ies') + ')'),
             entries.length === 0
               ? e('div', { className: 'empty' }, 'No Ask queries logged.')
@@ -108,7 +181,183 @@
                   e('div', { className: 'entry', key: i },
                     e('div', { className: 'entry-h' }, en.head),
                     e('pre', { className: 'entry-b' }, en.body))));
-        })));
+        }));
+    }
+
+    // ------------------------------------------------- API / MCP requests
+    function fmtTs(ts) {
+      if (!ts) return '';
+      const d = new Date(ts);
+      if (isNaN(d)) return ts;
+      const p2 = n => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' '
+           + p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+    }
+
+    function RequestsTab({ stream, sources }) {
+      const mcp = stream === 'mcp';
+      // The MCP server runs on the NAS, so on the replica its log is there.
+      const [host, setHost] = useState(mcp && sources && sources.replica ? 'nas' : 'local');
+      const [auto, setAuto] = useState(true);
+      const [qDraft, setQDraft] = useState('');
+      const [q, setQ] = useState('');
+      const [source, setSource] = useState('');
+      const [minMs, setMinMs] = useState('');
+      const [errors, setErrors] = useState(false);
+      const [last, setLast] = useState(300);
+      const [open, setOpen] = useState(null);
+
+      // Typing settles for 400 ms before it becomes a query (a pure UI tick).
+      useEffect(() => {
+        const t = setTimeout(() => setQ(qDraft.trim()), 400);
+        return () => clearTimeout(t);
+      }, [qDraft]);
+
+      let url = API + '/api/logs/requests?stream=' + stream + '&host=' + host + '&last=' + last;
+      if (q) url += '&q=' + encodeURIComponent(q);
+      if (source) url += '&source=' + encodeURIComponent(source);
+      if (minMs) url += '&min_ms=' + encodeURIComponent(minMs);
+      if (errors) url += '&errors=true';
+      const p = usePolled(url, auto);
+      const recs = (p.data && p.data.records) || [];
+      const sourcesSeen = Array.from(new Set(recs.map(r => r.source).filter(Boolean))).sort();
+
+      return e('div', null,
+        e(RefreshBar, { p, auto, setAuto },
+          e(HostSelect, { sources, host, setHost }),
+          e('input', { type: 'text', placeholder: mcp ? 'search tool / args / intent' : 'search path / query / intent',
+            value: qDraft, onChange: ev => setQDraft(ev.target.value) }),
+          e('select', { value: source, onChange: ev => setSource(ev.target.value), title: 'Who made the call' },
+            e('option', { value: '' }, 'any source'),
+            ...Array.from(new Set(['ui', 'claude', 'claude-mcp', 'agent', 'worker', 'replica']
+              .concat(sourcesSeen, source ? [source] : []))).map(s => e('option', { key: s, value: s }, s))),
+          e('input', { type: 'number', min: 0, step: 100, placeholder: 'min ms', value: minMs,
+            onChange: ev => setMinMs(ev.target.value) }),
+          e('label', null, e('input', { type: 'checkbox', checked: errors,
+            onChange: ev => setErrors(ev.target.checked) }), 'errors only'),
+          e('select', { value: last, onChange: ev => setLast(parseInt(ev.target.value, 10)) },
+            [100, 300, 1000, 3000].map(n => e('option', { key: n, value: n }, 'last ' + n)))),
+        p.err && e('div', { className: 'err' }, p.err),
+        p.data && e('div', { className: 'bar' },
+          e('span', null, recs.length + ' shown · ' + (p.data.scanned || 0).toLocaleString()
+            + ' line(s) scanned' + (p.data.host === 'local' ? '' : ' · on the NAS')),
+          p.data.path && e('span', { className: 'dim' }, p.data.path),
+          p.data.enabled === false && e('span', { className: 'err' }, 'request logging is disabled here'),
+          p.data.exists === false && e('span', { className: 'dim' }, '(no log file yet)')),
+        recs.length === 0
+          ? (p.data && !p.err ? e('div', { className: 'empty' }, 'No matching records.') : null)
+          : e('div', { className: 'tbl-wrap' },
+              e('table', { className: 'req' },
+                e('thead', null, e('tr', null,
+                  e('th', null, 'time'), e('th', null, mcp ? 'tool' : 'request'),
+                  e('th', null, 'status'), e('th', null, 'ms'),
+                  e('th', null, 'source'), e('th', null, 'intent'))),
+                e('tbody', null, ...recs.flatMap((r, i) => {
+                  const key = (r.ts || '') + i;
+                  const bad = (r.status || 0) >= 400;
+                  const rows = [e('tr', { key, className: 'row', onClick: () => setOpen(open === key ? null : key) },
+                    e('td', { className: 'nowrap dim' }, fmtTs(r.ts)),
+                    e('td', { className: 'path' },
+                      mcp ? r.path : ((r.method || '') + ' ' + (r.path || '')),
+                      r.query && e('span', { className: 'dim' }, (mcp ? ' ' : '?') + r.query.slice(0, 160)
+                        + (r.query.length > 160 ? '…' : ''))),
+                    e('td', { className: 'num' + (bad ? ' bad' : '') }, r.status != null ? r.status : ''),
+                    e('td', { className: 'num' + ((r.ms || 0) >= 1000 ? ' slow' : '') },
+                      r.ms != null ? Math.round(r.ms).toLocaleString() : ''),
+                    e('td', { className: 'nowrap' }, r.source || ''),
+                    e('td', { className: 'intent' + (r.intent_inferred ? ' dim' : '') },
+                      r.intent || '', r.page ? e('span', { className: 'dim' }, ' · ' + r.page) : null))];
+                  if (open === key) rows.push(e('tr', { key: key + 'd' },
+                    e('td', { colSpan: 6 }, e('pre', { className: 'detail' }, JSON.stringify(r, null, 2)))));
+                  return rows;
+                })))));
+    }
+
+    // -------------------------------------------------------- Worker fleet
+    function FleetTab() {
+      const [auto, setAuto] = useState(true);
+      const [lines, setLines] = useState(200);
+      const p = usePolled(API + '/api/logs/fleet?lines=' + lines, auto);
+      const ws = (p.data && p.data.workers) || [];
+      return e('div', null,
+        e(RefreshBar, { p, auto, setAuto },
+          e('select', { value: lines, onChange: ev => setLines(parseInt(ev.target.value, 10)) },
+            [50, 200, 1000, 3000].map(n => e('option', { key: n, value: n }, 'last ' + n + ' lines'))),
+          p.data && e('span', { className: 'dim' }, p.data.glob)),
+        p.err && e('div', { className: 'err' }, p.err),
+        p.data && ws.length === 0 && e('div', { className: 'empty' },
+          'No native worker logs on this server. The fleet writes them on the machine that runs it '
+          + '(run-workers.sh --native); a Docker-mode fleet logs to `docker logs` instead.'),
+        ws.map(w => e(FleetLog, { key: w.path, w })));
+    }
+
+    function FleetLog({ w }) {
+      const ref = useRef(null);
+      // Start at the bottom: the newest lines are what you came for.
+      useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [w.lines.length, w.mtime]);
+      return e('div', { className: 'entry' },
+        e('div', { className: 'entry-h' },
+          e('strong', null, w.worker),
+          e('span', { className: 'pill' }, 'fleet ' + w.fleet),
+          w.alive === true ? e('span', { className: 'pill live' }, 'running')
+            : w.alive === false ? e('span', { className: 'pill dead' }, 'exited') : null,
+          e('span', { className: 'dim' }, 'updated ' + w.mtime + ' · ' + (w.size / 1024).toFixed(0) + ' KB')),
+        e('pre', { ref, className: 'entry-b scroll' }, w.lines.join('\n')));
+    }
+
+    // -------------------------------------------------------------- Server
+    function ServerTab({ sources }) {
+      const [auto, setAuto] = useState(true);
+      const [host, setHost] = useState('local');
+      const [lines, setLines] = useState(300);
+      const [filter, setFilter] = useState('');
+      const p = usePolled(API + '/api/logs/server?lines=' + lines + '&host=' + host, auto);
+      const ref = useRef(null);
+      const shown = ((p.data && p.data.lines) || []).filter(l => !filter || l.toLowerCase().includes(filter.toLowerCase()));
+      useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [shown.length, p.updated]);
+      return e('div', null,
+        e(RefreshBar, { p, auto, setAuto },
+          e(HostSelect, { sources, host, setHost }),
+          e('select', { value: lines, onChange: ev => setLines(parseInt(ev.target.value, 10)) },
+            [100, 300, 1000, 5000].map(n => e('option', { key: n, value: n }, 'last ' + n + ' lines'))),
+          e('input', { type: 'text', placeholder: 'filter lines', value: filter, onChange: ev => setFilter(ev.target.value) }),
+          p.data && e('span', { className: 'dim' }, 'journalctl --user -u ' + p.data.unit)),
+        p.err && e('div', { className: 'err' }, p.err),
+        p.data && !p.data.available && e('div', { className: 'empty' },
+          'No server journal here (' + (p.data.reason || 'unavailable') + '). '
+          + 'The NAS runs in Docker — its stdout is `docker logs photosearch`, and it is lost on every redeploy; '
+          + 'the API requests tab is the durable record.'),
+        p.data && p.data.available && e('div', { className: 'entry' },
+          e('pre', { ref, className: 'entry-b scroll', style: { maxHeight: '70vh' } }, shown.join('\n'))));
+    }
+
+    // ----------------------------------------------------------------- App
+    function App() {
+      const [tab, setTab] = useState(tabFromHash());
+      const [sources, setSources] = useState(null);
+      useEffect(() => {
+        const onHash = () => setTab(tabFromHash());
+        window.addEventListener('hashchange', onHash);
+        return () => window.removeEventListener('hashchange', onHash);
+      }, []);
+      useEffect(() => { getJSON(API + '/api/logs/sources').then(setSources).catch(() => setSources({})); }, []);
+
+      let body = null;
+      if (tab === 'ask') body = e(AskTab);
+      else if (!sources) body = e('div', { className: 'empty' }, 'Loading…');
+      else if (tab === 'requests') body = e(RequestsTab, { key: 'api', stream: 'api', sources });
+      else if (tab === 'mcp') body = e(RequestsTab, { key: 'mcp', stream: 'mcp', sources });
+      else if (tab === 'fleet') body = e(FleetTab);
+      else if (tab === 'server') body = e(ServerTab, { sources });
+
+      return e(React.Fragment, null,
+        PS.SharedHeader ? e(PS.SharedHeader, { activePage: 'logs' }) : null,
+        e('div', { className: 'container' },
+          e('div', { className: 'page-title' }, 'Logs'),
+          e('div', { className: 'tabs' },
+            TABS.map(t => e('a', { key: t.id, href: '#' + t.id,
+              className: 'tab' + (tab === t.id ? ' active' : '') }, t.label))),
+          body));
     }
 
     ReactDOM.createRoot(document.getElementById('root')).render(e(App));

@@ -15,7 +15,8 @@ would have stalled the whole event loop on it.
 
 MCP tool calls (photosearch/mcp_server.py, a separate process) go to their own
 file, `request_log.mcp.jsonl`: two processes rotating one file would corrupt
-it. `read_records` merges any number of logs by timestamp.
+it. `read_records` merges any number of logs by timestamp; `tail_records`
+serves the /logs page (newest first, reading backwards).
 
 Each line carries `source` and `intent` (photosearch/request_intent.py).
 """
@@ -125,6 +126,52 @@ def read_records(*paths: str, last: Optional[int] = None) -> list[dict]:
                     continue
     out.sort(key=lambda r: r.get("ts", ""))
     return out[-last:] if last else out
+
+
+def _reverse_lines(path: str, block: int = 256 * 1024):
+    """Lines of `path`, last first, reading backwards in blocks — the /logs
+    page asks for the newest few hundred, never the whole 20 MB file."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos, tail = fh.tell(), b""
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + tail
+            lines = buf.split(b"\n")
+            tail = lines[0]           # may be a partial line: finish it next block
+            for ln in reversed(lines[1:]):
+                if ln.strip():
+                    yield ln
+        if tail.strip():
+            yield tail
+
+
+def tail_records(path: str, last: int = 500, match=None,
+                 max_scan: int = 200_000) -> tuple[list[dict], int]:
+    """The newest `last` records of `path` (then its rotated backups) that
+    satisfy `match`, newest first. Stops after `max_scan` lines so a filter
+    that matches nothing cannot read every backup on each refresh. Returns
+    (records, lines_scanned)."""
+    out: list[dict] = []
+    scanned = 0
+    for f in [path] + [f"{path}.{i}" for i in range(1, BACKUPS + 1)]:
+        if not os.path.exists(f):
+            continue
+        for raw in _reverse_lines(f):
+            scanned += 1
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if match is None or match(rec):
+                out.append(rec)
+                if len(out) >= last:
+                    return out, scanned
+            if scanned >= max_scan:
+                return out, scanned
+    return out, scanned
 
 
 def reset() -> None:

@@ -39,6 +39,14 @@ $DC run --rm photosearch request-stats --source ui --slowest 20
 Page polling and worker traffic are hidden unless `--include-polling`. The
 container's own stdout log is discarded on every redeploy; this file is not.
 
+**In the browser: `/logs`** (`photosearch/logs_api.py`) has one tab per log —
+Ask (any day), API requests, MCP calls, Worker fleet (native
+`/tmp/photosearch-worker-fleet*/worker-*.log` tails, on the machine running the
+fleet) and Server (`journalctl --user -u $PHOTOSEARCH_SERVER_LOG_UNIT`, default
+`photosearch-replica`; none on the NAS). On the replica the API, MCP and Server
+tabs can read the NAS's copy (`host=nas`); the MCP server runs on the NAS, so
+its tab defaults there. A NAS older than the tabs answers 502 "redeploy the NAS".
+
 **"Error: No such command 'python'" / "'sh' / '-c'" when running ad-hoc commands** —
 `docker-entrypoint.sh` routes every non-"serve"/"index" first arg to `python cli.py <arg> …`,
 so `docker compose … run --rm photosearch python -c "…"` becomes `python cli.py python -c "…"`

@@ -45,6 +45,7 @@ from .batch_api import router as batches_router
 from .category_grounding_eval_api import router as category_grounding_eval_router
 from .eval_api import router as eval_router
 from .eval_api import sheet_router as eval_sheet_router
+from .logs_api import router as logs_router
 from .model_eval_api import router as model_eval_router
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,7 @@ app.include_router(eval_sheet_router)
 app.include_router(model_eval_router)
 app.include_router(category_grounding_eval_router)
 app.include_router(admin_router)
+app.include_router(logs_router)
 from .vocab_admin import router as vocab_admin_router  # noqa: E402
 app.include_router(vocab_admin_router)
 
@@ -6813,34 +6815,6 @@ async def api_google_upload(body: dict, request: Request):
             "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
         },
     )
-
-
-@app.get("/api/logs")
-def api_logs():
-    """Return the Ask query logs for today + yesterday (for the /logs page).
-
-    Reads the agent's per-query markdown logs (ask-YYYY-MM-DD.md plus any rotated
-    ask-YYYY-MM-DD.N.md) from PHOTOSEARCH_ASK_LOG_DIR (default ./ask-logs).
-    """
-    import glob
-    import time
-    log_dir = os.environ.get("PHOTOSEARCH_ASK_LOG_DIR") or "ask-logs"
-    today = time.strftime("%Y-%m-%d")
-    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
-    days = []
-    for day in (today, yesterday):
-        files = sorted(glob.glob(os.path.join(log_dir, f"ask-{day}.md"))
-                       + glob.glob(os.path.join(log_dir, f"ask-{day}.*.md")))
-        content = ""
-        for fp in files:
-            try:
-                with open(fp, encoding="utf-8") as fh:
-                    content += fh.read()
-            except Exception:
-                pass
-        days.append({"date": day, "content": content,
-                     "bytes": len(content), "files": [os.path.basename(f) for f in files]})
-    return {"days": days, "dir": log_dir, "generated": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 # ---------------------------------------------------------------------------
