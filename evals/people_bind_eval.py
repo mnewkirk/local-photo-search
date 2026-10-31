@@ -776,7 +776,8 @@ function mention(it, l, m, i) {
     l.mentions.splice(i, 1); save(); rerender(it);
   }}, "remove"));
   if (m.gold === null) row.append(el("span", {cls: "err"}, " ← not labelled"));
-  if (m.gold === "NONE" && Array.isArray(it.bodies)) {
+  // Letters show on unlabelled phrases too: picking one marks the phrase NONE (no numbered face).
+  if ((m.gold === "NONE" || m.gold === null) && Array.isArray(it.bodies)) {
     const picked = Array.isArray(m.bodies) ? m.bodies : [];
     const br = el("div", {cls: "bodies"}, el("span", {cls: "mut"}, "which person? "));
     for (const b of it.bodies) {
@@ -784,11 +785,14 @@ function mention(it, l, m, i) {
         let g = picked.filter(x => x !== b.b);
         if (!picked.includes(b.b)) g = picked.concat([b.b]);
         if (g.length) m.bodies = g.sort(); else delete m.bodies;
+        if (m.gold === null && m.bodies) m.gold = "NONE";
         save(); rerender(it);
       }}, b.face_n ? `${b.b}·${b.face_n}` : b.b));
     }
     br.append(el("button", {cls: m.bodies === "MISSING" ? "on" : "", on: () => {
-      if (m.bodies === "MISSING") delete m.bodies; else m.bodies = "MISSING"; save(); rerender(it);
+      if (m.bodies === "MISSING") delete m.bodies; else m.bodies = "MISSING";
+      if (m.gold === null && m.bodies) m.gold = "NONE";
+      save(); rerender(it);
     }}, "MISSING"));
     if (unplaced(m)) br.append(el("span", {cls: "err"}, " ← pick the person"));
     row.append(br);
