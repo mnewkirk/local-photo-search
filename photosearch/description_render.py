@@ -258,7 +258,7 @@ def render_many(conn, photos: list, sources: Optional[tuple] = None) -> dict:
     """``{photo_id: Rendered}`` for ``photos`` (dicts with ``id`` and
     ``description``) in three indexed queries per <= 500 ids: the rows, the
     photos' faces, and the (tiny) persons table. A DB without the table (a
-    replica copy of a pre-v40 NAS) renders nothing: callers fall back to raw."""
+    replica copy of a pre-v41 NAS) renders nothing: callers fall back to raw."""
     import sqlite3
     ids = [p["id"] for p in photos if p.get("description")]
     if not ids:

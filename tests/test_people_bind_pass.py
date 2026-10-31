@@ -1,4 +1,4 @@
-"""The people-bind pass: schema v40, the claim predicate, the claim payload,
+"""The people-bind pass: schema v41, the claim predicate, the claim payload,
 the submit re-validation and invalidation (docs/plans/description-names.md)."""
 import json
 import sqlite3
@@ -73,13 +73,14 @@ def test_bind_role_falls_back_to_the_visual_model(monkeypatch):
     assert describe._resolve_openai_model("qwen2.5-vl", "bind") == "some-vlm"
 
 
-def test_v39_db_migrates_to_v40(tmp_path):
-    path = str(tmp_path / "v39.db")
+def test_v40_db_migrates_to_v41(tmp_path):
+    # v40 is the audit branch's; a DB at v40 must gain our table and index
+    path = str(tmp_path / "v40.db")
     with PhotoDB(path) as d:
         pid = d.add_photo(filepath="a.jpg", filename="a.jpg", description="x")
     conn = sqlite3.connect(path)
     conn.executescript("DROP TABLE description_subjects; DROP INDEX idx_faces_trusted_photo; "
-                       "UPDATE schema_info SET value='39' WHERE key='version';")
+                       "UPDATE schema_info SET value='40' WHERE key='version';")
     conn.commit(); conn.close()
     with PhotoDB(path) as d:
         assert d.conn.execute("SELECT COUNT(*) FROM description_subjects").fetchone()[0] == 0
@@ -87,7 +88,7 @@ def test_v39_db_migrates_to_v40(tmp_path):
         assert "idx_faces_trusted_photo" in names
         assert d.conn.execute("SELECT description FROM photos WHERE id=?", (pid,)).fetchone()[0] == "x"
         assert int(d.conn.execute("SELECT value FROM schema_info WHERE key='version'"
-                                  ).fetchone()[0]) == SCHEMA_VERSION == 40
+                                  ).fetchone()[0]) == SCHEMA_VERSION == 41
 
 
 # --- the claim predicate ------------------------------------------------------------

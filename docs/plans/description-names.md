@@ -28,7 +28,7 @@ Matt's proposal (1) (separate display text, raw preserved) is accepted. Proposal
 is accepted in intent; the stored artefact is **span annotations**, not an LLM-written template with placeholders
 (Decision 3). The `{s1}` template form is a derived debug view of raw + spans.
 
-## Data model (schema v40)
+## Data model (schema v41)
 
 ```sql
 CREATE TABLE IF NOT EXISTS description_subjects (
@@ -107,14 +107,14 @@ rejected / stale / ambiguous_name, so the UI can say why a kid is not named. Fro
 - Submit branch (through `_SubmitOutcome`): recompute the sha of the *current* description and re-validate against the *current* faces; sha mismatch → `outcome.defer` with no attempt spent (precedent: video-describe `is_stale`, `worker_api.py` ~L1495; terminates because description changes are each capped by their own attempts and each re-queues via `invalidate_description_dependents`). Invalid → per-photo failure (one attempt + `index_errors`). Valid → upsert + `db.log_generation(pid, "people-bind", slots_json, …)` with provenance via `describe.effective_model` / `_provenance_kwargs`. `'[]'` is a result. Transient lock only defers (`_is_transient_db_error`, never a bare except). Truncated/unparseable/all-invalid output raises `TruncatedOutput` / `UnusableAnswer`. Fleet runs with `PHOTOSEARCH_LLM_REASONING_EFFORT=none`.
 - `invalidate_description_dependents` also deletes the `description_subjects` row and the `people-bind` ledger row, **including when `include_verify=False`** (verify's own rewrite changes the text the spans index into). `clear-pass people-bind` deletes rows + ledger.
 - Face ids die only on re-detection (`clear-pass faces`, `index.py` force, `face_edit.delete_face`, `rerun._apply_mirror`). No write hooks (rejected: fragile, miss future paths). Render-time validation (rule 2) is the safety net; a **maintenance sweep** calls the same re-pair function, rebinds by IoU ≥ 0.7, else deletes the row and ledger entry to re-queue; `validate-data` counts dangling slots.
-- Replica: the NAS is the only writer. The replica renders from its own copied tables; `_mirror_face_labels` already keeps labels current, and `rerun._apply_mirror` keeps NAS face ids when free locally, so no new mirror code for relabels. `/api/photos/{id}/mirror-fields` + `_apply_mirror` carry the `description_subjects` row for M28 re-runs. The replica must tolerate a NAS DB older than v40 (`no such table` → raw).
+- Replica: the NAS is the only writer. The replica renders from its own copied tables; `_mirror_face_labels` already keeps labels current, and `rerun._apply_mirror` keeps NAS face ids when free locally, so no new mirror code for relabels. `/api/photos/{id}/mirror-fields` + `_apply_mirror` carry the `description_subjects` row for M28 re-runs. The replica must tolerate a NAS DB older than v41 (`no such table` → raw).
 
 ## Steps
 
 | # | Step | Est. |
 |---|---|---|
 | 0 | Spikes: fresh replica counts (scope, strict vs manual share, faces-per-photo); read `batch_state.py` L260-460 + `fleet_launch_passes` to confirm a worker pass can sit outside `ready`; confirm LM Studio serves the candidate vision models at reasoning effort none | 0.5 d |
-| 1 | Schema v40 + index + `PASS_MEDIA` + claim/count predicates + `invalidate_description_dependents` (tests: migration from v39, invalidation both modes, EXPLAIN uses the index, pass-list equality) | 1 d |
+| 1 | Schema v41 + index + `PASS_MEDIA` + claim/count predicates + `invalidate_description_dependents` (tests: migration from v39, invalidation both modes, EXPLAIN uses the index, pass-list equality) | 1 d |
 | 2 | Pure modules `people_bind.py` (prompt, parser, validator, rule tier) and `description_render.py` + tests (accuracy cases from 248080; two-person refuse; possessive; plural groups; collisions; invariants) | 2.5 d |
 | 3 | Eval harness + hand-labelled sets (Step "Eval"); Matt labels ~2 h | 3 d |
 | 4 | Worker pass, submit branch, pass lists, role fallback, `clear-pass`, sweep | 2 d |
@@ -136,7 +136,7 @@ Gates (all on holdout unless noted): wrong-bind **0** across ≥150 bound mentio
 
 ## Rollout
 
-Deploy NAS (additive v40 migration, flag off) → replica → workers together (`workers.md`). Pilot: Windows GPU only (`--native`, LM Studio), scoped via the existing collection/date scope to the 2026 soccer collection (~1-2k photos), never `-d /photos`; Matt reviews 100 random renders with the flag on in his own view; **zero wrong names** required. Then widen: all collection photos → 2025-26 trusted-label photos → rest (optional). Not on Mac Ollama (wedges), not on the N100. Rollback: flag off / `clear-pass people-bind` / `DROP TABLE`; raw text was never changed.
+Deploy NAS (additive v41 migration, flag off) → replica → workers together (`workers.md`). Pilot: Windows GPU only (`--native`, LM Studio), scoped via the existing collection/date scope to the 2026 soccer collection (~1-2k photos), never `-d /photos`; Matt reviews 100 random renders with the flag on in his own view; **zero wrong names** required. Then widen: all collection photos → 2025-26 trusted-label photos → rest (optional). Not on Mac Ollama (wedges), not on the N100. Rollback: flag off / `clear-pass people-bind` / `DROP TABLE`; raw text was never changed.
 
 Backfill cost (re-measure in Step 0): the snapshot (stale, schema v28, 2026-07-10, 151k photos) had 29.5k photos with a trusted-source face (~1/3 single-face → rule tier, no GPU); today probably 35-55k. VLM tier ≈ 40-140 GPU-hours depending on seconds per call (unmeasured; an eval output).
 
@@ -181,6 +181,6 @@ Differences from the plan above, all deliberate:
 - Ask/MCP names are applied once in `tools.call_tool` (`_with_display_names`), not by a `_compact_hits` wrapper at the ~9 call sites. The Google caption is raw by simply not reading the display text; the per-upload opt-in is not built.
 - The VLM-slot subject-box guard is not implemented (it can only lower coverage); revisit if the eval shows a wrong bind it would catch.
 - Fleet role model for `bind` is provisional (`qwen2.5-vl-7b-instruct`); the eval picks it.
-- **Schema v40 is claimed twice**: the per-photo audit branch (`claude/stoic-kapitsa-99628c`) also adds v40 (`photo_audit`). Whichever merges second renumbers to v41 and bumps the `== 40` test assertions. `description_audit.record` is the only seam to change when the audit module lands.
+- **Schema is v41**: the per-photo audit branch (`claude/stoic-kapitsa-99628c`) owns v40 (`photo_audit`), so this was renumbered 2026-10-31. If this merges first, that branch renumbers instead. `description_audit.record` is the only seam to change when the audit module lands.
 
 Still to do before any backfill (needs the GPU box and ~2 h of the owner's labelling): `evals/people_bind_eval.py sample` / `sheet` / label / `run` / `report --split holdout`; fresh live scope counts; deploy NAS first, then replica, then workers (flag off).

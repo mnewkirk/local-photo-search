@@ -1794,7 +1794,7 @@ def api_photo_mirror_fields(photo_id: int):
         except Exception:
             pass
         out["faces"] = faces
-        # people-bind row (schema v40): the spans of the RAW description and
+        # people-bind row (schema v41): the spans of the RAW description and
         # the face ids they bind. Null when none (the mirror deletes the local
         # row). Names are never stored in it, so a relabel needs no mirroring.
         try:

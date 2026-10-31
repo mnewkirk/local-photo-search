@@ -63,7 +63,7 @@ History for every trap: `docs/notes/<subsystem>.md`. Runbooks: `.claude/skills/p
 
 ## Database
 
-File is `photo_index.db` (not `photos.db`). `SCHEMA_VERSION` in `photosearch/db.py` is the source of truth (v40).
+File is `photo_index.db` (not `photos.db`). `SCHEMA_VERSION` in `photosearch/db.py` is the source of truth (v41).
 Schema change: bump `SCHEMA_VERSION`, add the migration in `_init_schema()`; new indexes go in `db._SEARCH_INDEXES`.
 Write `filepath` only through `db.set_photo_filepath` (it re-derives `folder`).
 Table/column reference: `.claude/skills/photo-search/reference/schema.md`.

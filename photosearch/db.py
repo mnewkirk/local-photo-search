@@ -116,7 +116,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -154,7 +154,7 @@ _SEARCH_INDEXES: list[tuple[str, str]] = [
     # "is person P in photo X" (search's EXISTS) and "P's photos"
     ("idx_faces_photo_person", "faces(photo_id, person_id)"),
     ("idx_faces_person_photo", "faces(person_id, photo_id)"),
-    # v40 (docs/plans/description-names.md): the people-bind claim/count
+    # v41 (docs/plans/description-names.md): the people-bind claim/count
     # predicate and the "which photos can show a name" scope. The predicate
     # text in PEOPLE_BIND_TRUSTED_FACE_SQL must stay verbatim.
     ("idx_faces_trusted_photo",
@@ -1775,7 +1775,7 @@ class PhotoDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_review_photo ON review_selections(photo_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)")
 
-        # v40: which phrases of the RAW description are which face boxes
+        # v41: which phrases of the RAW description are which face boxes
         # (docs/plans/description-names.md). Label-free: names are joined at
         # read time, so a relabel never touches this table. '[]' = "looked,
         # nothing bindable" (a result). The sha pins the text the spans index.
@@ -1961,7 +1961,7 @@ class PhotoDB:
                 description_audit.record(self.conn, photo_id, description_audit.UNBOUND,
                                          {"reason": "description changed"})
         except sqlite3.OperationalError:
-            pass  # a DB that predates v40 (read-only replica copy)
+            pass  # a DB that predates v41 (read-only replica copy)
         if include_verify:
             cols += ["verified_at = NULL", "verification_status = NULL",
                      "hallucination_flags = NULL"]

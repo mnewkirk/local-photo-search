@@ -394,7 +394,7 @@ class SubmitRequest(BaseModel):
     video_subjects_results: Optional[list[VideoSubjectsResult]] = None
     # video-describe (step 5). Optional, so older workers are unaffected.
     video_describe_results: Optional[list[VideoDescribeResult]] = None
-    # people-bind (schema v40). Optional, so older workers are unaffected.
+    # people-bind (schema v41). Optional, so older workers are unaffected.
     people_bind_results: Optional[list[PeopleBindResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older

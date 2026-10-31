@@ -866,7 +866,7 @@ Design decisions and the debate behind them live in `docs/plans/description-name
 (two independent planners, two critique rounds; three decisions put to the owner). What
 was built before any model ran, and what is deliberately unmeasured:
 
-- Built: schema v40 `description_subjects`; `people_bind.py` (rule tier, prompt, parser,
+- Built: schema v41 `description_subjects`; `people_bind.py` (rule tier, prompt, parser,
   decision, validator, overlay); `description_render.py` (read-time names, IoU re-pair,
   sweep); worker pass `people-bind` (role `bind`, non-batch); surfaces behind
   `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` (photo detail, Ask/MCP via `call_tool`, book captions,

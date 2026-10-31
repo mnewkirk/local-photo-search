@@ -35,7 +35,7 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | review_selections | Culling selections per folder |
 | google_photos_uploads | Upload ledger (album_id, filepath, media_item_id) |
 | ignored_clusters | Face clusters marked to ignore |
-| description_subjects | Per photo: which spans of the RAW description are which face boxes (people-bind, label-free; names are joined at read time) (v40) |
+| description_subjects | Per photo: which spans of the RAW description are which face boxes (people-bind, label-free; names are joined at read time) (v41) |
 | generations | Provenance log for LLM text artifacts — describe / category-* / keywords / verify (v21) |
 | ingest_sweeps | One row per ingest-incoming move+index sweep run (v30) |
 | ingest_batches | One row per dated ingest folder — identity + lifecycle, membership derived live (v30) |
