@@ -74,26 +74,82 @@ def _face_box(f: dict) -> tuple:
     return (f["bbox_top"], f["bbox_right"], f["bbox_bottom"], f["bbox_left"])
 
 
+def _area(b) -> float:
+    t, r, bo, l = b
+    return max(0, r - l) * max(0, bo - t)
+
+
+def _inter(a, b) -> float:
+    return _area((max(a[0], b[0]), min(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3])))
+
+
+# Faster R-CNN's NMS (IoU 0.5) still leaves two shapes of double box on one person: a
+# narrower box with the same top and bottom (247644: two boxes on one player) and an
+# upper-body fragment (247988). Both lie inside the other box with the same top edge
+# and centre. An occluded second person (247644: a spectator behind a player, wholly
+# inside his box) does not share the centre, so containment alone is not the test.
+DUP_CONTAIN = 0.8     # of the smaller box inside the other
+DUP_CENTRE = 0.12     # |centre x difference| / the wider box's width
+DUP_TOP = 0.10        # |top difference| / the taller box's height
+
+
+def _same_person(x, y) -> bool:
+    small = min(_area(x), _area(y))
+    if small <= 0 or _inter(x, y) / small < DUP_CONTAIN:
+        return False
+    w = max(x[1] - x[3], y[1] - y[3])
+    h = max(x[2] - x[0], y[2] - y[0])
+    return (abs((x[1] + x[3]) - (y[1] + y[3])) / 2.0 <= DUP_CENTRE * w
+            and abs(x[0] - y[0]) <= DUP_TOP * h)
+
+
+def dedupe(bodies: list[dict]) -> tuple[list[int], dict[int, int]]:
+    """``(kept indices, {dropped index: the kept index it duplicates})``. The
+    higher-scoring box of a pair is kept; kept indices are in input order."""
+    kept: list[int] = []
+    merged: dict[int, int] = {}
+    for i in sorted(range(len(bodies)), key=lambda i: -bodies[i]["score"]):
+        j = next((k for k in kept if _same_person(bodies[i]["bbox"], bodies[k]["bbox"])), None)
+        if j is None:
+            kept.append(i)
+        else:
+            merged[i] = j
+    return sorted(kept), merged
+
+
+# A face is the head of a body: its centre inside the box, its top within the upper
+# HEAD_TOP_FRAC of the box. Cost = how far the face's top sits below the box's top,
+# with the horizontal offset only a tie-break: overlapping players share centres
+# (243560: a boy in front of another), but each head tops its own box.
+HEAD_TOP_FRAC = 0.4
+HEAD_CENTRE_WEIGHT = 0.25
+
+
+def _head_cost(face, body) -> Optional[float]:
+    t, r, b, l = face
+    bt, br, bb, bl = body
+    cx, cy = (l + r) / 2.0, (t + b) / 2.0
+    h, w = bb - bt, br - bl
+    if h <= 0 or w <= 0 or not (bl <= cx <= br and bt <= cy <= bb):
+        return None
+    dy = (t - bt) / h
+    if dy > HEAD_TOP_FRAC:
+        return None
+    return abs(dy) + HEAD_CENTRE_WEIGHT * abs(cx - (bl + br) / 2.0) / w
+
+
 def link_faces(faces: list[dict], bodies: list[dict]) -> dict[int, int]:
-    """``{face_id: body index}``: each face goes to the smallest body containing
-    its centre, one to one (a body holds at most one face). A face inside no
-    body, or whose bodies are all taken by smaller-area pairings, is unlinked.
-    Deterministic: ties break on face id, then body index."""
-    pairs = []
-    for f in faces:
-        t, r, b, l = _face_box(f)
-        cx, cy = (l + r) / 2.0, (t + b) / 2.0
-        for i, body in enumerate(bodies):
-            bt, br, bb, bl = body["bbox"]
-            if bl <= cx <= br and bt <= cy <= bb:
-                pairs.append(((br - bl) * (bb - bt), f["face_id"], i))
-    out: dict[int, int] = {}
-    used: set = set()
-    for _, fid, i in sorted(pairs):
-        if fid not in out and i not in used:
-            out[fid] = i
-            used.add(i)
-    return out
+    """``{face_id: body index}``: one to one, minimising the total head cost
+    (the "smallest box" rule let a fragment steal the face from its own body).
+    A face that is nobody's head stays unlinked. Deterministic."""
+    from scipy.optimize import linear_sum_assignment
+    if not faces or not bodies:
+        return {}
+    big = 1e6
+    cost = [[(c if (c := _head_cost(_face_box(f), b["bbox"])) is not None else big)
+             for b in bodies] for f in faces]
+    rows, cols = linear_sum_assignment(cost)
+    return {faces[i]["face_id"]: int(j) for i, j in zip(rows, cols) if cost[i][j] < big}
 
 
 def body_letter(i: int) -> str:
@@ -108,9 +164,12 @@ def body_letter(i: int) -> str:
 
 def letter_bodies(bodies: list[dict], min_score: float,
                   faces: Optional[list[dict]] = None) -> list[dict]:
-    """Bodies at or above ``min_score``, ordered left to right and lettered,
-    each with the ``face_id`` of the offered face it holds (or None)."""
-    keep = sorted((b for b in bodies if b["score"] >= min_score), key=lambda b: (b["bbox"][3], b["bbox"][0]))
+    """Bodies at or above ``min_score``, duplicates removed (:func:`dedupe`),
+    ordered left to right and lettered, each with the ``face_id`` of the
+    offered face whose head it is (or None)."""
+    above = [b for b in bodies if b["score"] >= min_score]
+    kept, _ = dedupe(above)
+    keep = sorted((above[i] for i in kept), key=lambda b: (b["bbox"][3], b["bbox"][0]))
     link = link_faces(faces or [], keep)
     by_body = {i: fid for fid, i in link.items()}
     return [dict(b, b=body_letter(i), face_id=by_body.get(i)) for i, b in enumerate(keep)]

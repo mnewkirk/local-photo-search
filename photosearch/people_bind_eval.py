@@ -23,6 +23,7 @@ gate: the labeller must list every person phrase of a sampled description.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 STRATA = ("single", "multi_2_3", "multi_4_6", "adversarial")
@@ -187,6 +188,7 @@ def verdict(gate_rows: list) -> str:
 
 
 GOLD_WORDS = ("NONE", "AMBIGUOUS")
+_COUNT_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "both": 2}
 
 
 def check_labels(labels: dict, sample: dict, photos: dict,
@@ -248,12 +250,18 @@ def check_labels(labels: dict, sample: dict, photos: dict,
                                   f"(a face-labelled phrase's body comes from the face)")
                 elif bl != "MISSING" and (
                         not isinstance(bl, list) or not bl or len(set(bl)) != len(bl)
-                        or len(bl) > 3 or not all(isinstance(x, str) for x in bl)):
-                    errors.append(f"{where}: bodies for {phrase!r} must be 1-3 distinct body "
+                        or not all(isinstance(x, str) for x in bl)):
+                    errors.append(f"{where}: bodies for {phrase!r} must be distinct body "
                                   f"letters or \"MISSING\"")
                 elif isinstance(bl, list) and set(bl) - letters:
                     errors.append(f"{where}: bodies {sorted(set(bl) - letters)} for {phrase!r} "
                                   f"are not lettered on this photo's sheet")
+                elif isinstance(bl, list):
+                    n = _COUNT_WORDS.get(next((w for w in re.findall(r"[a-z]+", phrase.lower())
+                                               if w in _COUNT_WORDS), ""))
+                    if n and n != len(bl):
+                        warnings.append(f"{where}: {phrase!r} counts {n} but has {len(bl)} "
+                                        f"bodies {bl}: check the picks")
             elif gold == "NONE" and bodies is not None:
                 none_without_bodies += 1
             if gold is None:

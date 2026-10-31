@@ -191,6 +191,12 @@ def test_check_labels_validates_body_letters_on_none_phrases():
     errs = "\n".join(E.check_labels(bad, sample, photos, bodies=letters)["errors"])
     for needle in ("not NONE", "not lettered", "distinct body"):
         assert needle in errs, needle
+    photos2 = {"9": {"description": "Two boys and five players.", "offered": set(), "faces": set()}}
+    letters2 = {"9": set("ABCDEFG")}
+    group = lab({"phrase": "Two boys", "gold": "NONE", "bodies": ["A", "B", "C"]},   # one too many
+                {"phrase": "five players", "gold": "NONE", "bodies": list("CDEFG")})  # a big group is fine
+    r = E.check_labels(group, sample, photos2, bodies=letters2)
+    assert r["errors"] == [] and len(r["warnings"]) == 1 and "counts 2" in r["warnings"][0]
 
 
 # --- the CLI's run step: a transport failure is never cached --------------------------------

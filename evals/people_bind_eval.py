@@ -501,6 +501,11 @@ def cmd_serve(a):
         def do_PUT(self):
             if self.path != "/saved-labels.json":
                 return self.send_error(404)
+            # A page built before the last `sheet` run letters bodies differently: its
+            # save would put old letters on the new boxes. The key changes with them.
+            m = re.search(r'const KEY = "([^"]+)"', (SHEET / "index.html").read_text())
+            if not m or self.headers.get("X-Sheet-Key") != m.group(1):
+                return self.send_error(409, "page out of date: reload it")
             n = int(self.headers.get("Content-Length") or 0)
             if not 0 < n <= 5_000_000:
                 return self.send_error(413)
@@ -641,9 +646,10 @@ function pushSoon() {
   if (!SERVED || !serverReady) return;
   clearTimeout(pushTimer);
   pushTimer = setTimeout(() => {
-    fetch("saved-labels.json", {method: "PUT", headers: {"Content-Type": "application/json"},
+    fetch("saved-labels.json", {method: "PUT", headers: {"Content-Type": "application/json", "X-Sheet-Key": KEY},
                                 body: JSON.stringify(exportLabels())})
-      .then(r => { if (!r.ok) throw new Error("HTTP " + r.status);
+      .then(r => { if (r.status === 409) throw new Error("this page is out of date: RELOAD it");
+                   if (!r.ok) throw new Error("HTTP " + r.status);
                    srv("saved to server " + new Date().toLocaleTimeString()); })
       .catch(e => srv("NOT saved to server (" + e.message + "); edits are still in this browser"));
   }, 400);
