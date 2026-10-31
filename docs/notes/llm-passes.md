@@ -933,3 +933,25 @@ calls, reasoning `none`, one model resident in LM Studio at a time.
 - The rule tier binds 1 dev mention. The coverage targets (50% multi / 80% single) are out of
   reach for every variant; the owner noted during labelling that soccer subjects are often
   backs of heads, which are NONE by design.
+
+### people-bind: a person detector boxes the faceless subjects (2026-10-31)
+
+Owner, reviewing the dev comparison: every NONE in the labels is a person in the frame with no
+face box (back or side of the head, face too small), and those are where gemma's wrong binds
+come from (6 of 9: the phrase's subject had no face, the model took a nearby one).
+`evals/people-bind/person_spike.py` (read-only, torchvision Faster R-CNN v2 COCO `person`,
+1600 px, 81 s for 200 photos on the 7900 XTX) links each offered face to the smallest body box
+containing its centre.
+
+- 99 sample photos have a NONE phrase. Existing `subject_boxes` (the aesthetics pass's "main
+  subjects") give a faceless person box on 37 of them and enough for every NONE phrase on 16;
+  41 have none. The detector at score >= 0.5: a faceless body on 98, enough for every NONE
+  phrase on 91. The one miss (247596, "five visible players") is a > 3 group, not a missing box.
+- 549 of 555 offered faces fall inside a detected body. 6.1 bodies per photo on average, many
+  of them background spectators (243541: 12 under the tents), so the overlay needs a size or
+  prominence filter.
+- Spot-checked sheets: 258229 "One boy" (back turned, #23), 250064 "A young female soccer
+  player" (corner kicker, long hair), 250115 "a third player" all get their own box; gemma had
+  given each a nearby face.
+- Gender: the owner notes Asa is regularly described as a girl (long hair); `persons` has no
+  gender or birth year, so nothing can check a phrase's gender or age against the label.
