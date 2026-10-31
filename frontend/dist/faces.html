@@ -720,6 +720,10 @@
     // person never draws all crops at once.
     // -----------------------------------------------------------------------
     const INSP_PAGE = 120;
+    // The calendar day of a face's photo ('' when undated). date_taken is
+    // 'YYYY-MM-DD HH:MM:SS' or ISO 'YYYY-MM-DDT...' — the first 10 chars either way.
+    function bulkDay(f) { return (f && f.date_taken) ? String(f.date_taken).slice(0, 10) : ''; }
+
     function FaceTile({ f, selected, idx, onToggle }) {
       // `dist` may be null — a face whose every reference fell inside its own
       // burst has no measurable distance. Render it as unknown rather than
@@ -1418,9 +1422,35 @@
         if (initialPerson && !auto.current) { auto.current = true; load(); }
       }, [initialPerson, load]);
 
-      const faces = (data && data.faces) || [];
+      // Grouped by day (oldest first, undated last), then farthest-first within
+      // the day — a range spans several shoots, and each shoot's wrong faces
+      // are easiest to judge side by side. Sorting `faces` itself keeps
+      // shift-click ranges and paging in the order the grid shows.
+      const faces = useMemo(() => {
+        const rows = ((data && data.faces) || []).slice();
+        rows.sort((a, b) => {
+          const da = bulkDay(a), db_ = bulkDay(b);
+          if (da !== db_) return !da ? 1 : !db_ ? -1 : (da < db_ ? -1 : 1);
+          const ha = typeof a.dist === 'number', hb = typeof b.dist === 'number';
+          if (ha !== hb) return ha ? -1 : 1;     // unmeasured sorts last: unknown is not far
+          return ha ? b.dist - a.dist : 0;
+        });
+        return rows;
+      }, [data]);
+      const dayCounts = useMemo(() => {
+        const m = {};
+        faces.forEach(f => { const d = bulkDay(f); m[d] = (m[d] || 0) + 1; });
+        return m;
+      }, [faces]);
       const nPages = Math.max(1, Math.ceil(faces.length / INSP_PAGE));
       const pageFaces = faces.slice(page * INSP_PAGE, (page + 1) * INSP_PAGE);
+      // The page split into runs of one day each, so every run gets a header.
+      const pageDays = [];
+      pageFaces.forEach((f, j) => {
+        const d = bulkDay(f), last = pageDays[pageDays.length - 1];
+        if (last && last.day === d) last.items.push({ f, idx: page * INSP_PAGE + j });
+        else pageDays.push({ day: d, items: [{ f, idx: page * INSP_PAGE + j }] });
+      });
 
       const toggle = useCallback((fid, idx, ev) => {
         if (ev && ev.shiftKey && lastIdx.current != null) {
@@ -1493,8 +1523,9 @@
                           + (st.percentiles ? ' · distance p10 ' + st.percentiles['10']
                              + ', p50 ' + st.percentiles['50']
                              + ', p90 ' + st.percentiles['90'] : ''))
-                  : 'Pick a person. Farthest-from-them first, so you can scan from '
-                    + 'the top and stop when you start recognising them.'),
+                  : 'Pick a person. Grouped by day, farthest-from-them first within '
+                    + 'each day, so you can scan a shoot from the top and stop when you '
+                    + 'start recognising them.'),
               data && data.truncated && e('div', { className: 'insp-sub', style: { color: 'var(--warn, #db4)' } },
                 'Showing the first ' + faces.length.toLocaleString()
                 + ' — narrow the date range to see the rest.'),
@@ -1534,11 +1565,29 @@
               e('span', { className: 'insp-sub' }, 'Page ' + (page + 1) + ' / ' + nPages),
               e('button', { className: 'insp-btn', disabled: page >= nPages - 1, onClick: () => setPage(p => p + 1) }, 'Next →'),
             ),
-            e('div', { className: 'insp-facegrid' },
-              ...pageFaces.map((f, j) => e(FaceTile, {
-                key: f.face_id, f, selected: sel.has(f.face_id),
-                idx: page * INSP_PAGE + j, onToggle: toggle })),
-            ),
+            ...pageDays.map(g => {
+              const dayIds = faces.filter(f => bulkDay(f) === g.day).map(f => f.face_id);
+              const allSel = dayIds.every(id => sel.has(id));
+              const cont = g.items[0].idx > 0 && bulkDay(faces[g.items[0].idx - 1]) === g.day;
+              return e('div', { key: g.day || 'undated', style: { marginBottom: 14 } },
+                e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0 6px' } },
+                  e('strong', null, g.day || 'Undated'),
+                  e('span', { className: 'insp-sub' },
+                    dayCounts[g.day].toLocaleString() + ' face(s)' + (cont ? ' · continued' : '')),
+                  e('button', { className: 'insp-btn',
+                    onClick: () => setSel(prev => {
+                      const n = new Set(prev);
+                      dayIds.forEach(id => allSel ? n.delete(id) : n.add(id));
+                      return n;
+                    }) },
+                    (allSel ? 'Deselect day ' : 'Select day ') + dayIds.length),
+                ),
+                e('div', { className: 'insp-facegrid' },
+                  ...g.items.map(({ f, idx }) => e(FaceTile, {
+                    key: f.face_id, f, selected: sel.has(f.face_id), idx, onToggle: toggle })),
+                ),
+              );
+            }),
           ),
           e('div', { className: 'insp-actionbar' },
             e('strong', null, sel.size + ' selected'),
