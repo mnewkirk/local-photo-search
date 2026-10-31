@@ -1,0 +1,3461 @@
+{
+ "242216": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     500066
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "242217": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242418": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     500630
+    ],
+    "phrase": "A young soccer player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242722": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     501507
+    ],
+    "phrase": "One player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "242794": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "242960": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     502051
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "three others"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243166": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243285": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     502887
+    ],
+    "phrase": "one adult"
+   },
+   {
+    "gold": "AMBIGUOUS",
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243381": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     503162
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243399": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three children"
+   },
+   {
+    "gold": [
+     503245
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "The third child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243465": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     503350
+    ],
+    "phrase": "A young boy"
+   },
+   {
+    "gold": [
+     503350
+    ],
+    "phrase": "a blue goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243538": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     503577
+    ],
+    "phrase": "another in green"
+   },
+   {
+    "gold": [
+     503578
+    ],
+    "phrase": "one player in blue"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243541": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three children"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two other children"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "One child in a blue jersey with the number \"13\""
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243542": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three children"
+   },
+   {
+    "gold": [
+     503594
+    ],
+    "phrase": "The child in the blue jersey"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a person in red"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243560": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     503664
+    ],
+    "phrase": "One child in a green jersey"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Five children are playing soccer on a grassy field, wearing blue and green jerseys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "243595": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "A group of children"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "243607": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     503805
+    ],
+    "phrase": "A young boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "another person stands near a goalpost"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "243624": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     503837
+    ],
+    "phrase": "A man"
+   },
+   {
+    "gold": [
+     503837
+    ],
+    "phrase": "a coach"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A group of children"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243737": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243876": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Four young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243887": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     504468
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     504467,
+     504469
+    ],
+    "phrase": "others in blue jerseys run around the field"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "243891": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     504482
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     504483
+    ],
+    "phrase": "A goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "243906": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Six children"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two in blue jerseys and navy shorts"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244034": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     504802,
+     504803
+    ],
+    "phrase": "Two young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "244045": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     504828,
+     504830
+    ],
+    "phrase": "Two players"
+   },
+   {
+    "gold": [
+     504832
+    ],
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244047": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244212": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "244435": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     505834
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     505834
+    ],
+    "phrase": "a referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244446": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     505870,
+     505871
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     505871
+    ],
+    "phrase": "The other player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244640": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "244684": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244861": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Four young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "244870": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     506978
+    ],
+    "phrase": "An adult"
+   },
+   {
+    "gold": [
+     506978
+    ],
+    "phrase": "a coach"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "244891": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "244893": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244913": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     507131,
+     507132,
+     507133
+    ],
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "244942": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     507187
+    ],
+    "phrase": "A young boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "244964": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Five young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245121": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "three children"
+   },
+   {
+    "gold": [
+     507530
+    ],
+    "phrase": "one adult"
+   },
+   {
+    "gold": [
+     507531
+    ],
+    "phrase": "An older man"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245169": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245205": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     507842
+    ],
+    "phrase": "A young person"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "245345": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three boys"
+   },
+   {
+    "gold": [
+     508223
+    ],
+    "phrase": "The boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two other players"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "245395": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "245498": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "The player"
+   },
+   {
+    "gold": [
+     508666
+    ],
+    "phrase": "A goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "245684": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     509188
+    ],
+    "phrase": "One player"
+   },
+   {
+    "gold": [
+     509189
+    ],
+    "phrase": "the ball towards another player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245686": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     509194
+    ],
+    "phrase": "a young boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "245748": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245786": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     509463
+    ],
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245909": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     509866
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "245916": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245947": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     510031
+    ],
+    "phrase": "A goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "245990": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     510161,
+     510162,
+     510163
+    ],
+    "phrase": "Three children"
+   },
+   {
+    "gold": [
+     510164
+    ],
+    "phrase": "A child"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "an adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246027": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     510219
+    ],
+    "phrase": "The boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "the other boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246033": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "The boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two other boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246056": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three children"
+   },
+   {
+    "gold": [
+     510389
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     510390
+    ],
+    "phrase": "The third child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246076": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     510343
+    ],
+    "phrase": "one player"
+   },
+   {
+    "gold": [
+     510344
+    ],
+    "phrase": "a person"
+   },
+   {
+    "gold": [
+     510344
+    ],
+    "phrase": "a coach"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246104": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One player"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "the referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246122": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     510499,
+     510500,
+     510501
+    ],
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     510499
+    ],
+    "phrase": "The boy"
+   },
+   {
+    "gold": [
+     510500,
+     510501
+    ],
+    "phrase": "two other boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246181": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     510668
+    ],
+    "phrase": "an adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246293": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two children"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246298": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246366": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "The fourth child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246410": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246428": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246449": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246455": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "246460": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     511477
+    ],
+    "phrase": "A young soccer player"
+   },
+   {
+    "gold": [
+     511476
+    ],
+    "phrase": "A person"
+   },
+   {
+    "gold": [
+     511476
+    ],
+    "phrase": "a referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246472": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     511400
+    ],
+    "phrase": "A young boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A person"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246501": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young children"
+   },
+   {
+    "gold": [
+     511551
+    ],
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246517": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     511595
+    ],
+    "phrase": "One player"
+   },
+   {
+    "gold": [
+     511598
+    ],
+    "phrase": "another referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246521": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246536": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     511634,
+     511635
+    ],
+    "phrase": "Two children"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "another child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "246654": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246669": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     512030
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246678": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     512061
+    ],
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246735": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     512195
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246751": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246809": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246826": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     512490
+    ],
+    "phrase": "one child"
+   },
+   {
+    "gold": [
+     512489
+    ],
+    "phrase": "An adult"
+   },
+   {
+    "gold": [
+     512489
+    ],
+    "phrase": "a coach"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "246836": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     512506
+    ],
+    "phrase": "one running towards the ball"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "other standing in the background"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "246842": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     512522,
+     512523
+    ],
+    "phrase": "Two of the boys"
+   },
+   {
+    "gold": [
+     512524
+    ],
+    "phrase": "The fourth child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "247017": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     512983
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": [
+     512982
+    ],
+    "phrase": "A man"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247137": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247239": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     513675,
+     513676,
+     513678
+    ],
+    "phrase": "three players"
+   },
+   {
+    "gold": [
+     513679
+    ],
+    "phrase": "One player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247245": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "The third player"
+   },
+   {
+    "gold": [
+     513697
+    ],
+    "phrase": "the fourth boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "247279": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young men"
+   },
+   {
+    "gold": [
+     513803
+    ],
+    "phrase": "A coach"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247379": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247393": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     514152
+    ],
+    "phrase": "A young soccer player"
+   },
+   {
+    "gold": [
+     514150
+    ],
+    "phrase": "an adult"
+   },
+   {
+    "gold": [
+     514151
+    ],
+    "phrase": "another child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "247466": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     514307
+    ],
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "247577": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "247596": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "five visible players"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247601": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     514696
+    ],
+    "phrase": "A young boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two other players"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "247627": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two children"
+   },
+   {
+    "gold": "AMBIGUOUS",
+    "phrase": "One child"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "The other child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247644": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "247650": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three children"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Two of the boys"
+   },
+   {
+    "gold": [
+     514815
+    ],
+    "phrase": "The third child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "247741": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "247785": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "two young boys"
+   },
+   {
+    "gold": [
+     515183
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": [
+     515184
+    ],
+    "phrase": "A man"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247821": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     515255
+    ],
+    "phrase": "One player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247853": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     515431
+    ],
+    "phrase": "A young person"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "247859": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     515442
+    ],
+    "phrase": "One player"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "247899": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247988": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "one boy"
+   },
+   {
+    "gold": [
+     516481
+    ],
+    "phrase": "A third player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "248136": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248242": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "the boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "248253": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     517179
+    ],
+    "phrase": "one boy"
+   },
+   {
+    "gold": [
+     517180
+    ],
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "248330": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     517419,
+     517420
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     517419
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "248486": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     517869
+    ],
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "248540": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two others"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "248650": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "A boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "248764": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A third boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "248775": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     518826,
+     518827
+    ],
+    "phrase": "Two boys"
+   },
+   {
+    "gold": [
+     518828
+    ],
+    "phrase": "A man"
+   },
+   {
+    "gold": [
+     518829,
+     518830
+    ],
+    "phrase": "two other children"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248861": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     519078
+    ],
+    "phrase": "One child"
+   },
+   {
+    "gold": [
+     519075
+    ],
+    "phrase": "A person"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "248904": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248940": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     519404,
+     519406
+    ],
+    "phrase": "two boys"
+   },
+   {
+    "gold": [
+     519405
+    ],
+    "phrase": "one adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249061": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     519806
+    ],
+    "phrase": "A third boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two adults"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "249063": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     519814
+    ],
+    "phrase": "one player"
+   },
+   {
+    "gold": [
+     519810
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249070": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     519841,
+     519842,
+     519843
+    ],
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     519842
+    ],
+    "phrase": "The central player"
+   },
+   {
+    "gold": [
+     519841,
+     519843
+    ],
+    "phrase": "two other players"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two adults"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "249072": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     519849
+    ],
+    "phrase": "a boy"
+   },
+   {
+    "gold": [
+     519852
+    ],
+    "phrase": "a girl"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249085": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     519891
+    ],
+    "phrase": "A goalkeeper"
+   },
+   {
+    "gold": [
+     519892
+    ],
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "249148": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one wears a blue jersey and black shorts"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "249250": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young players"
+   },
+   {
+    "gold": [
+     520294
+    ],
+    "phrase": "a referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "249261": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     520473
+    ],
+    "phrase": "one adult"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Three boys"
+   },
+   {
+    "gold": "AMBIGUOUS",
+    "phrase": "the fourth boy"
+   },
+   {
+    "gold": [
+     520473
+    ],
+    "phrase": "The adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249272": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     520516,
+     520517,
+     520518
+    ],
+    "phrase": "Three people"
+   },
+   {
+    "gold": [
+     520518
+    ],
+    "phrase": "a boy"
+   },
+   {
+    "gold": [
+     520516
+    ],
+    "phrase": "an adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "249301": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "249378": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     520722
+    ],
+    "phrase": "one goalkeeper"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "one boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "249444": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     520871,
+     520872,
+     520873
+    ],
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     520871,
+     520873
+    ],
+    "phrase": "Two wear orange jerseys"
+   },
+   {
+    "gold": [
+     520872
+    ],
+    "phrase": "one wears a blue jersey"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249594": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521243,
+     521244
+    ],
+    "phrase": "Two children"
+   },
+   {
+    "gold": [
+     521243
+    ],
+    "phrase": "The girl"
+   },
+   {
+    "gold": [
+     521244
+    ],
+    "phrase": "the boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249619": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521340,
+     521341
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     521340
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "249639": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     521318
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249665": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521420
+    ],
+    "phrase": "one player"
+   },
+   {
+    "gold": [
+     521419,
+     521420
+    ],
+    "phrase": "two players"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "249669": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249680": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "249699": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521512
+    ],
+    "phrase": "A young boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249761": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521707
+    ],
+    "phrase": "one boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "249783": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521775,
+     521776
+    ],
+    "phrase": "Two children"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249786": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     521653
+    ],
+    "phrase": "One wears a red jersey"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "another a navy blue jersey"
+   },
+   {
+    "gold": [
+     521654
+    ],
+    "phrase": "third an orange jersey"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249818": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     521844
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two others"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "249871": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     521936
+    ],
+    "phrase": "one adult"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Three boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "the fourth boy"
+   },
+   {
+    "gold": [
+     521936
+    ],
+    "phrase": "The adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "249933": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522156
+    ],
+    "phrase": "one boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two others"
+   },
+   {
+    "gold": [
+     522155
+    ],
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249951": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522258
+    ],
+    "phrase": "one boy"
+   },
+   {
+    "gold": [
+     522259,
+     522260
+    ],
+    "phrase": "Two wear orange jerseys"
+   },
+   {
+    "gold": [
+     522257,
+     522258
+    ],
+    "phrase": "two wear navy blue jerseys"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249963": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three children"
+   },
+   {
+    "gold": [
+     522287
+    ],
+    "phrase": "The boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two girls"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249981": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522341
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250051": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young athletes"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two boys"
+   },
+   {
+    "gold": [
+     522489
+    ],
+    "phrase": "one girl"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "The boy"
+   },
+   {
+    "gold": [
+     522490
+    ],
+    "phrase": "the boy"
+   },
+   {
+    "gold": [
+     522489
+    ],
+    "phrase": "the girl"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250064": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "A young female soccer player"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Three people"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "250101": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522626,
+     522627
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     522628
+    ],
+    "phrase": "A third boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250111": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "250115": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young athletes"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Two players"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a third player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "250175": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522726
+    ],
+    "phrase": "A young boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "250229": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522901,
+     522902
+    ],
+    "phrase": "Two wear dark blue jerseys"
+   },
+   {
+    "gold": [
+     522903
+    ],
+    "phrase": "one wears an orange jersey"
+   },
+   {
+    "gold": [
+     522904
+    ],
+    "phrase": "another is partially visible behind them"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250237": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     522978
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250255": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     522934
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a third player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "250265": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     522965,
+     522966
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A third child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250302": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523143
+    ],
+    "phrase": "one child"
+   },
+   {
+    "gold": [
+     523142,
+     523145
+    ],
+    "phrase": "Two children"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "250366": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523221
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250402": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523425
+    ],
+    "phrase": "A young boy"
+   },
+   {
+    "gold": [
+     523426,
+     523427
+    ],
+    "phrase": "two adult men"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250415": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250440": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one player"
+   },
+   {
+    "gold": [
+     523543
+    ],
+    "phrase": "a referee"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a spectator"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250455": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250495": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523653,
+     523654,
+     523656
+    ],
+    "phrase": "Three young children"
+   },
+   {
+    "gold": [
+     523654
+    ],
+    "phrase": "One girl"
+   },
+   {
+    "gold": [
+     523653,
+     523656
+    ],
+    "phrase": "two boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250509": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523703
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250514": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523716
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250540": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     523818
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     523817
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "250708": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one player"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250742": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "250790": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     524572
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": [
+     524573
+    ],
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "250869": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     524698,
+     524699
+    ],
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A third child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250887": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one adult"
+   },
+   {
+    "gold": [
+     524767,
+     524768,
+     524769
+    ],
+    "phrase": "three young boys"
+   },
+   {
+    "gold": [
+     524767
+    ],
+    "phrase": "The central boy"
+   },
+   {
+    "gold": [
+     524769
+    ],
+    "phrase": "a soccer ball while another boy"
+   },
+   {
+    "gold": [
+     524768
+    ],
+    "phrase": "the third boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250893": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": [
+     524787
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two others"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250900": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "one boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "250964": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     524987
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251020": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525092
+    ],
+    "phrase": "A referee"
+   },
+   {
+    "gold": [
+     525090
+    ],
+    "phrase": "a running player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251054": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525321
+    ],
+    "phrase": "one older male referee"
+   },
+   {
+    "gold": [
+     525318
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": [
+     525319,
+     525320
+    ],
+    "phrase": "two others"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a fifth player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251061": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525246
+    ],
+    "phrase": "A referee"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "251086": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525215
+    ],
+    "phrase": "One player"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "a goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "251096": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525338,
+     525339
+    ],
+    "phrase": "Two boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "251102": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525351,
+     525352
+    ],
+    "phrase": "Two boys"
+   },
+   {
+    "gold": [
+     525352
+    ],
+    "phrase": "The boy"
+   },
+   {
+    "gold": [
+     525351
+    ],
+    "phrase": "another boy in a bright yellow shirt"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "251109": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one player"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "251111": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "two others"
+   },
+   {
+    "gold": [
+     525412
+    ],
+    "phrase": "one boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "251150": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525451,
+     525452
+    ],
+    "phrase": "Two children"
+   },
+   {
+    "gold": [
+     525452
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "251237": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525622,
+     525624
+    ],
+    "phrase": "Two adult men"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "251298": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     525883
+    ],
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257365": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     648590
+    ],
+    "phrase": "one goalkeeper"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "257391": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     648619
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two others"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "257406": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     648665
+    ],
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two adults"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "adversarial"
+ },
+ "257415": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257476": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     648818
+    ],
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "257480": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "257916": {
+  "bad_labels": [],
+  "mentions": [],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257995": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     650175
+    ],
+    "phrase": "A young boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "258010": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two people"
+   },
+   {
+    "gold": [
+     650197
+    ],
+    "phrase": "a young boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "an older adult"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "adversarial"
+ },
+ "258019": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One boy"
+   },
+   {
+    "gold": [
+     650345
+    ],
+    "phrase": "a fourth player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "258115": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     650557
+    ],
+    "phrase": "A referee"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "two adult spectators"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "258175": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     650732,
+     650733,
+     650734
+    ],
+    "phrase": "Three boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "Two adults"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "258190": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "A young boy"
+   },
+   {
+    "gold": [
+     650768,
+     650769
+    ],
+    "phrase": "Two adult men"
+   },
+   {
+    "gold": [
+     650770,
+     650771
+    ],
+    "phrase": "Two younger boys"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_4_6"
+ },
+ "258229": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "One boy"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "A fourth player"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "single"
+ },
+ "258231": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": "NONE",
+    "phrase": "One boy"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "258320": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     651085,
+     651086,
+     651087
+    ],
+    "phrase": "Three young boys"
+   },
+   {
+    "gold": [
+     651087
+    ],
+    "phrase": "the boy"
+   },
+   {
+    "gold": [
+     651085,
+     651087
+    ],
+    "phrase": "Two wear neon green jerseys with navy shorts"
+   },
+   {
+    "gold": [
+     651086
+    ],
+    "phrase": "one wears a dark blue jersey"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ },
+ "258795": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": [
+     652643,
+     652644
+    ],
+    "phrase": "Two adult men"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258798": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "Two young children"
+   },
+   {
+    "gold": [
+     652649
+    ],
+    "phrase": "One child"
+   }
+  ],
+  "reviewed": true,
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "258817": {
+  "bad_labels": [],
+  "mentions": [
+   {
+    "gold": "NONE",
+    "phrase": "one child"
+   }
+  ],
+  "reviewed": true,
+  "split": "dev",
+  "stratum": "multi_2_3"
+ }
+}
