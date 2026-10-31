@@ -26,3 +26,7 @@ Condensed rule: `.claude/rules/search.md` ("`photo_audit` is the per-photo chang
 - Rename, description and cover changes of a collection (collection-level, not photo-level).
 - Photo deletions report `source='db-trigger'` with no intent.
 - `get_photo_audit` (read tool, so Ask and MCP both advertise it) reads the local DB: on a replica that is the last synced snapshot, and the result says so. The Ask evals were not re-run after adding a tool to its surface.
+
+### Deployed (2026-10-31)
+
+Live on the NAS from 2026-10-31 18:58 UTC (`9e38e8d`, schema v39 → v41 in one restart; pre-migration copy `/data/photo_index.db.bak-v39-20261031`). `photo_audit` starts empty there: no event before that time exists. MCP `photosearch-mcp` was force-recreated the same minute and advertises `get_photo_audit`.
