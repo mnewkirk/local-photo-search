@@ -26,6 +26,8 @@ import re
 import time
 from typing import Callable, Optional, Sequence
 
+from . import audit
+
 logger = logging.getLogger("photosearch.maintenance")
 
 # Stages that run by default in dependency order. ``stacking`` and ``colors``
@@ -222,6 +224,12 @@ def _stage_infer(db, apply, emit, check_abort,
             (c["lat"], c["lon"], place, c["confidence"], c["photo_id"]),
         )
         applied += cur.rowcount
+        if cur.rowcount:
+            audit.record(db.conn, c["photo_id"], audit.LOCATION_SET, field="location",
+                         old=None, new={"gps_lat": c["lat"], "gps_lon": c["lon"],
+                                        "location_source": "inferred",
+                                        "location_confidence": c["confidence"]},
+                         detail="maintenance infer-locations sweep")
     db.conn.commit()
     emit({"phase": "sweep", "stage": "infer", "status": "running",
           "done": would, "total": would})
@@ -923,7 +931,10 @@ def run_maintenance_sweep(
         check_abort()
         emit({"phase": "sweep", "stage": name, "status": "scanning"})
         t0 = time.monotonic()
-        result = fn()
+        # The sweep runs in a thread that lost the request's audit context.
+        with audit.context(source="maintenance",
+                           intent=f"maintenance sweep stage {name} ({source})"):
+            result = fn()
         result["seconds"] = round(time.monotonic() - t0, 2)
         stage_results.append(result)
         # Stamp the watermark only for stages that actually did work. A skipped

@@ -27,9 +27,14 @@ from photosearch import shutterfly_export as sfx
 
 @click.group()
 @click.version_option(version="0.1.0")
-def cli():
+@click.pass_context
+def cli(ctx):
     """Local photo search — find photos by person, place, description, or color."""
-    pass
+    # Changes this command makes are attributed to it in the per-photo audit log.
+    from photosearch import audit
+    token = audit.set_context(
+        source="cli", intent=f"photosearch {ctx.invoked_subcommand or ''}".strip())
+    ctx.call_on_close(lambda: audit.reset_context(token))
 
 
 # ---------------------------------------------------------------------------

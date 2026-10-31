@@ -134,12 +134,7 @@ def select(db, *, person, sources=("temporal",), date_from=None, date_to=None,
 def apply(db, rows):
     """Clear the labels, marked `rejected` so auto-matching cannot undo it."""
     ids = [r["face_id"] for r in rows]
-    for i in range(0, len(ids), 500):
-        batch = ids[i:i + 500]
-        db.conn.execute(
-            f"UPDATE faces SET person_id = NULL, match_source = ? "
-            f"WHERE id IN ({','.join('?' * len(batch))})",
-            [REJECTED_MATCH_SOURCE, *batch])
+    db.set_face_labels(ids, None, REJECTED_MATCH_SOURCE)
     db.conn.commit()
     return len(ids)
 
@@ -161,11 +156,11 @@ def restore(db, rows):
         if cur["person_id"] is not None:
             skipped += 1
             continue
-        db.conn.execute(
-            "UPDATE faces SET person_id = ?, match_source = ? WHERE id = ?",
-            (r["person_id"], r["match_source"], r["face_id"]))
-        # Putting a label back also spends any duplicate-resolver exclusion for
-        # that pairing — same rule as restore-unmatched-faces.
+        # set_face_labels logs the restore and, for a non-automatic source,
+        # spends the duplicate-resolver exclusion for the pairing; an automatic
+        # one (strict/temporal) still needs it cleared — same rule as
+        # restore-unmatched-faces.
+        db.set_face_labels([r["face_id"]], r["person_id"], r["match_source"])
         clear_face_person_exclusion(db.conn, r["face_id"], r["person_id"])
         restored += 1
     db.conn.commit()

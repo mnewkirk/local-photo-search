@@ -31,7 +31,7 @@ The agent's tools never see `intent`.
 collapsed, chronological), **`group_into_chapters`** (split a trip into
 place-based book chapters), **`daily_scene_breakdown`** (split one day into
 sub-scenes), **`suggest_layout`** (a house-style spread/layout plan for an
-explicit photo set), `get_photo`, `rerank_photos` (VLM re-rank of a candidate
+explicit photo set), `get_photo`, `get_photo_audit` (change history of a photo or collection), `rerank_photos` (VLM re-rank of a candidate
 set), `get_photo_image` (image-gated), plus the M26b **write** tools
 `set_photo_location` / `set_photo_tags` / `add_to_collection` (gated by
 `PHOTOSEARCH_ALLOW_WRITES`; dry-run→`confirm=true`). The last three

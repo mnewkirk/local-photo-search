@@ -69,3 +69,4 @@ Before/after check for trimming the Ask agent's ~11.7k-token prompt (system prom
 
 - CLAUDE.md / context eval: `evals/context_eval/FINDINGS.md` (before/after, grader audit, Haiku/Sonnet/Opus ablations, limits, next steps).
 - Ask prompt eval: `evals/ask_eval/FINDINGS.md` (16k overflow, trim 154→162/189, no-op-edit noise floor, qwen vs gemma).
+- Ask eval for the `get_photo_audit` tool (not yet run; desktop only): `evals/ask_eval/AUDIT_TOOL_PLAN.md`.

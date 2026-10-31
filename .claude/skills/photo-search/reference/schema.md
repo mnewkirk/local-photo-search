@@ -3,7 +3,7 @@
 Read when you need table/column details or how search uses the v34 indexes.
 
 <!-- moved verbatim from SKILL.md (line 102) on 2026-10-19 -->
-## Database Schema (v39)
+## Database Schema (v40)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
@@ -15,8 +15,9 @@ Read when you need table/column details or how search uses the v34 indexes.
 > "Search performance" below)**, and **video** (v35 `photos.media_type` +
 > `video_meta`/`video_tracks`/`video_subjects`; v36 `poster_version`; v37
 > subject shares; v38 `scan_generation`; v39 `video_meta.proxy_*` playback
-> proxies — see "Video" below and CLAUDE.md "## Video"). `SCHEMA_VERSION` in
-> `db.py` is the source of truth — currently **39**. See CLAUDE.md for the
+> proxies — see "Video" below and CLAUDE.md "## Video"; v40 `photo_audit`, the
+> per-photo change log, `docs/notes/audit.md`). `SCHEMA_VERSION` in
+> `db.py` is the source of truth — currently **40**. See CLAUDE.md for the
 > aesthetics + folder + ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
@@ -35,11 +36,13 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 | review_selections | Culling selections per folder |
 | google_photos_uploads | Upload ledger (album_id, filepath, media_item_id) |
 | ignored_clusters | Face clusters marked to ignore |
+| description_subjects | Per photo: which spans of the RAW description are which face boxes (people-bind, label-free; names are joined at read time) (v41) |
 | generations | Provenance log for LLM text artifacts — describe / category-* / keywords / verify (v21) |
 | ingest_sweeps | One row per ingest-incoming move+index sweep run (v30) |
 | ingest_batches | One row per dated ingest folder — identity + lifecycle, membership derived live (v30) |
 | ingest_batch_jobs | Per-(batch, step) job intent (worker fleet / NAS stage), TTL-gated (v30) |
 | stacking_seen | Which photos incremental stacking has considered, at which date_taken (v32) |
+| photo_audit | Per-photo change log — one row per collection add/remove, face label, tags, location, file move, photo add/delete, with old/new value, source and intent (v40). Append-only, no FKs; written only via `photosearch/audit.py`. See `docs/notes/audit.md` |
 | schema_info | Schema version + photo_root path |
 
 Important columns on `photos`: `date_taken` (TEXT, "YYYY-MM-DD HH:MM:SS", indexed),
