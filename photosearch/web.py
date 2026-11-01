@@ -2044,14 +2044,146 @@ def api_persons():
     with _get_db() as db:
         rows = db.conn.execute(
             """SELECT p.id, p.name,
-                      COUNT(DISTINCT f.photo_id) as photo_count
+                      COUNT(DISTINCT f.photo_id) as photo_count,
+                      p.gender, p.birth_year, p.birth_year_approx
                FROM persons p
                LEFT JOIN faces f ON f.person_id = p.id
                GROUP BY p.id
                ORDER BY p.name"""
         ).fetchall()
 
-    return {"persons": [dict(r) for r in rows]}
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["birth_year_approx"] = bool(d["birth_year_approx"])
+        out.append(d)
+    return {"persons": out}
+
+
+# ---------------------------------------------------------------------------
+# Person attributes (schema v42, docs/plans/description-names.md Revision 2 C).
+# Gender and birth year feed description_render's rule 7 only. They never
+# leave the machine: not in Google/Shutterfly captions, not in MCP/Ask output.
+# ---------------------------------------------------------------------------
+
+_NAS_TOO_OLD_FOR_ATTRIBUTES = (
+    "The NAS does not support person attributes yet (its image predates schema "
+    "v42). Deploy the NAS first; nothing was written.")
+
+
+def _attribute_fields(data: dict) -> dict:
+    """The attribute keys PRESENT in a request body (absent = unchanged), 400
+    on a bad value. Returns the raw values; the DB layer normalises them."""
+    from .db import PERSON_ATTRIBUTE_FIELDS, validate_person_attributes
+    fields = {k: data[k] for k in PERSON_ATTRIBUTE_FIELDS if k in data}
+    try:
+        validate_person_attributes(fields)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not fields:
+        raise HTTPException(400, "nothing to change: send gender, birth_year "
+                                 "and/or birth_year_approx")
+    return fields
+
+
+def _nas_person_attributes(method: str, path: str, body: dict) -> dict:
+    """Forward an attribute write to the NAS. An image older than v42 has no
+    such route (405 on /api/persons/{id}, 404/405 on bulk-attributes): say so,
+    instead of letting the replica write locally only — the next
+    sync-replica.sh would silently drop that write."""
+    try:
+        return _nas_json(method, path, body)
+    except HTTPException as exc:
+        detail = str(exc.detail or "")
+        if exc.status_code == 405 or (exc.status_code == 404
+                                      and '"Not Found"' in detail):
+            raise HTTPException(409, _NAS_TOO_OLD_FOR_ATTRIBUTES)
+        raise
+
+
+def _mirror_person_attributes(persons: list) -> dict:
+    """Replica mode: copy the NAS's resulting attribute values (authoritative)
+    onto the local rows, so the page shows them before the next sync. Matched
+    by id AND name (a person the replica minted locally can hold another id);
+    falls back to the name."""
+    import sqlite3
+    n = 0
+    try:
+        with _get_db() as db:
+            for p in persons or []:
+                vals = (p.get("gender"), p.get("birth_year"),
+                        1 if p.get("birth_year_approx") else 0)
+                cur = db.conn.execute(
+                    "UPDATE persons SET gender = ?, birth_year = ?, birth_year_approx = ? "
+                    "WHERE id = ? AND LOWER(name) = LOWER(?)",
+                    (*vals, p.get("id"), p.get("name") or ""))
+                if cur.rowcount == 0 and p.get("name"):
+                    cur = db.conn.execute(
+                        "UPDATE persons SET gender = ?, birth_year = ?, "
+                        "birth_year_approx = ? WHERE LOWER(name) = LOWER(?)",
+                        (*vals, p["name"]))
+                n += cur.rowcount
+            db.conn.commit()
+    except sqlite3.OperationalError as exc:
+        logger.warning("person-attribute mirror failed: %s", exc)
+        return {"mirrored": 0, "error": str(exc)}
+    return {"mirrored": n}
+
+
+def _person_attrs(row) -> dict:
+    """``{id, name, gender, birth_year, birth_year_approx}`` of a persons row."""
+    return {"id": row["id"], "name": row["name"], "gender": row["gender"],
+            "birth_year": row["birth_year"],
+            "birth_year_approx": bool(row["birth_year_approx"])}
+
+
+@app.patch("/api/persons/{person_id}")
+def api_patch_person(person_id: int, data: dict = Body(...)):
+    """Set one person's ``gender`` / ``birth_year`` / ``birth_year_approx``.
+    An absent key is unchanged; an explicit ``null`` clears it.
+
+    Replica mode: NAS-authoritative write, then mirrored locally."""
+    fields = _attribute_fields(data)
+    if _nas_url:
+        resp = _nas_person_attributes("PATCH", f"/api/persons/{person_id}", fields)
+        resp["mirror"] = _mirror_person_attributes(
+            [resp["person"]] if resp.get("person") else [])
+        return resp
+    with _get_db() as db:
+        out = db.set_person_attributes([person_id], fields)
+    if out["unknown"]:
+        raise HTTPException(404, "Person not found")
+    logger.info("PERSON ATTRIBUTES  person_id=%d  %s", person_id, sorted(fields))
+    return {"ok": True, "person": out["persons"][0]}
+
+
+@app.post("/api/persons/bulk-attributes")
+def api_bulk_person_attributes(data: dict = Body(...)):
+    """Body ``{person_ids, gender?, birth_year?, birth_year_approx?}``: the same
+    partial update on several persons (absent = unchanged, null = clear).
+    Returns ``{updated, unknown, unknown_ids, persons}``; 404 when none of the
+    ids exists.
+
+    Replica mode: NAS-authoritative write, then mirrored locally."""
+    raw_ids = data.get("person_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(400, "person_ids must be a non-empty list")
+    if not all(isinstance(i, int) and not isinstance(i, bool) for i in raw_ids):
+        raise HTTPException(400, "person_ids must be integers")
+    person_ids = sorted(set(raw_ids))
+    fields = _attribute_fields(data)
+    if _nas_url:
+        resp = _nas_person_attributes("POST", "/api/persons/bulk-attributes",
+                                      {"person_ids": person_ids, **fields})
+        resp["mirror"] = _mirror_person_attributes(resp.get("persons") or [])
+        return resp
+    with _get_db() as db:
+        out = db.set_person_attributes(person_ids, fields)
+    if not out["persons"]:
+        raise HTTPException(404, f"No such person id(s): {out['unknown']}")
+    logger.info("PERSON ATTRIBUTES BULK  %d persons  %s", out["updated"], sorted(fields))
+    return {"ok": True, "updated": out["updated"], "unknown": len(out["unknown"]),
+            "unknown_ids": out["unknown"], "persons": out["persons"]}
 
 
 @app.delete("/api/persons/{person_id}")
@@ -2756,7 +2888,8 @@ def api_person_inspect(
 
     with _get_db() as db:
         prow = db.conn.execute(
-            "SELECT id, name FROM persons WHERE id = ?", (person_id,)).fetchone()
+            "SELECT id, name, gender, birth_year, birth_year_approx "
+            "FROM persons WHERE id = ?", (person_id,)).fetchone()
         if not prow:
             raise HTTPException(404, "Person not found")
 
@@ -2775,7 +2908,7 @@ def api_person_inspect(
         ).fetchall()
 
         if not rows:
-            return {"person": {"id": person_id, "name": prow["name"], "face_count": 0},
+            return {"person": {**_person_attrs(prow), "face_count": 0},
                     "faces": [], "sub_clusters": [], "params": {"eps": eps, "min_samples": min_samples}}
 
         X_all = np.stack([np.frombuffer(r["encoding"], dtype=np.float32)
@@ -2811,7 +2944,7 @@ def api_person_inspect(
             scope = list(range(len(rows)))
 
         if not scope:
-            return {"person": {"id": person_id, "name": prow["name"], "face_count": 0},
+            return {"person": {**_person_attrs(prow), "face_count": 0},
                     "faces": [], "sub_clusters": [], "n_outliers": 0, "n_dup_faces": 0,
                     "scope": {"date_from": date_from, "date_to": date_to,
                               "in_scope": 0, "total": len(rows)},
@@ -2893,7 +3026,7 @@ def api_person_inspect(
         sub_clusters.sort(key=lambda s: (s["sub_id"] == -1, -s["size"]))
 
         return {
-            "person": {"id": person_id, "name": prow["name"], "face_count": len(rows)},
+            "person": {**_person_attrs(prow), "face_count": len(rows)},
             "faces": faces,
             "sub_clusters": sub_clusters,
             "n_outliers": sum(1 for l in labels if int(l) == -1),
