@@ -42,7 +42,8 @@ validated against the witness labels. The raw `photos.description` stays name-fr
 - **Order of work: evals before wiring.** G0 (identity eval) and G1 (describe prototype eval) run on offline data
   before any schema or pass wiring; every people-bind model failed its first eval, so this is the cheaper failure.
 - **Legacy batches**: a cutover constant keeps pre-cutover batches `ready` when the new gating passes land.
-- **Schema**: one unshipped v43 migration: `person_boxes` (+ keypoints, facing), `body_attrs`, `body_identity`
+- **Schema** (renumbered 2026-11-01: `person_boxes` with keypoints + facing shipped alone as v43, with a non-batch
+  `bodies` pass, to ship people-bind; the rest is one v44 migration): `body_attrs`, `body_identity`
   (recomputable cache with witnesses), `body_labels`, `description_subjects.hints_json`.
 - **Describe call shape**: G1 tests both (clean photo + numbered overlay as two images, vs one overlay image); dev
   picks on quality, overlay leakage and the hint-injection test.
@@ -64,9 +65,9 @@ validated against the witness labels. The raw `photos.description` stays name-fr
 | 1 | `body_attrs.py` (crop, closed-vocab JSON schema) + eval `attrs` over the soccer pilot scope | self-supervised number agreement; parser tests | 2 d |
 | 2 | `identify.py` / `body_identity.py` (pure): tiers, conflict rules, per-photo assignment; owner "who" labels for faceless bodies (~25-50 min); leave-face-out eval split by shoot | **G0** per tier: 0 wrong among owner-labelled faceless holdout bodies (>= 50 named), leave-face-out wrong <= 0.5%; for a tier to feed hints <= 0.2%; link gate GL: 0 wrong links on the owner-checked contested set incl. the 3 known | 3 d |
 | 3 | Grounded describe prototype + eval: `{description, people:[{boxes, phrase}]}`, guards (no names, no overlay words, exact substrings), both call shapes, hint-injection test (flip gender on ~40 photos; > 2% obeyed -> hints restricted); owner confirms pre-filled phrase->body letters on dev | **G1**: 0 wrong binds on dev then holdout; >= 150 named holdout mentions or INCOMPLETE + top-up; coverage clearly above 17-25%; quality non-regression (unusable/degenerate within +2 pts, 0 leakage, blind pairwise 40 photos at parity, no new category/keyword errors, people-word recall not lower); fewer rule-7 conflicts | 3 d |
-| 4 | Schema v43, `bodies` + `body-attrs` passes, pass lists, PASS_MEDIA, roles, clear-pass, cutover constant | migration test, list equality, old batches stay ready, scoped dry run | 2.5 d |
+| 4 | Schema v44 (v43 `person_boxes` + `bodies` shipped 2026-11-01 as a non-batch pass: move it into the batch flow here), `body-attrs` pass, pass lists, PASS_MEDIA, roles, clear-pass, cutover constant | migration test, list equality, old batches stay ready, scoped dry run | 2.5 d |
 | 5 | Describe v2 in the worker behind `PHOTOSEARCH_GROUNDED_DESCRIBE` (off): claim input, submit order (write text, invalidate, then upsert spans), verify regen through the same function | flag off = byte-identical describe; no-names guard | 3 d |
-| 6 | Render v2 (body slots, witness validation, `identity_conflict` / `contested_link` / `stale` states), NAS resolver step + sweep, UI states, `syncFaces` | relabel-follow test; render p95 < 5 ms/100 photos; pre-v43 replica -> raw | 2 d |
+| 6 | Render v2 (body slots, witness validation, `identity_conflict` / `contested_link` / `stale` states), NAS resolver step + sweep, UI states, `syncFaces` | relabel-follow test; render p95 < 5 ms/100 photos; pre-v44 replica -> raw | 2 d |
 | 7 | Pilot: one soccer shoot re-described (scoped, `--native`), owner reviews 100 renders | 0 wrong names | 1 d + GPU |
 | 8 | Widen per the owner's scope decision; docs (rules, notes, plan status) | - | 1 d |
 
