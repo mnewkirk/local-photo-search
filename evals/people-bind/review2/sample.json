@@ -1,0 +1,1838 @@
+{
+ "242151": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242166": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242178": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242205": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242241": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242253": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242271": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242274": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242322": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242331": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242349": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242382": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242388": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242520": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242556": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242604": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242619": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242664": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242769": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242778": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242817": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242841": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242892": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "242949": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "242955": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "242979": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243303": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243357": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243372": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243378": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243384": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243432": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243468": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243474": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243504": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243507": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243510": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243543": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243549": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243561": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243582": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243636": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243639": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243645": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243657": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243669": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243672": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243681": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243738": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243822": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243825": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243831": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "243927": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "243960": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "243987": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "244128": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244140": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244149": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "244176": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "244233": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244236": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "244245": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244257": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244284": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244287": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244293": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244338": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244359": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244467": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244479": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244482": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "244524": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244560": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "244584": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244620": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244677": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "244755": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "244941": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "244962": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "244968": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245025": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245130": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245175": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245187": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245196": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245208": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245211": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "245220": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245238": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245304": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245319": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245325": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245343": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245355": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245394": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245400": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245403": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "245406": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245463": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245481": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245484": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245499": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245505": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245580": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245676": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245691": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "245718": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245757": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245802": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245865": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245874": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245892": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245913": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "245922": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245928": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245931": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245958": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245961": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "245985": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "245997": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246000": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246015": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246042": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246114": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246120": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246126": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246150": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246180": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246183": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246201": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246219": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246237": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246243": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246264": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246267": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246303": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246336": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246345": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246378": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246393": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246399": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246411": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246417": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246423": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246429": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246435": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246495": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246516": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246519": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246552": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246570": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246573": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246579": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246588": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246627": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246660": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246663": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246723": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246783": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246804": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246807": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246810": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246825": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246915": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "246936": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246945": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "246975": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "246999": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247020": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247035": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247062": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247098": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247110": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247131": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247155": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247218": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247221": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247230": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247254": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247260": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247275": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247281": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247284": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247287": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247302": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247308": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247350": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247359": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247365": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247368": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247389": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247401": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247449": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247458": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247479": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247515": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247530": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247545": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247554": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247557": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247566": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247587": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247599": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247614": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247623": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247629": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247632": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247659": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247662": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247665": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247671": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247704": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247710": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247713": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247725": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247758": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247770": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247788": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247791": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247806": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247812": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247830": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247839": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247845": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247881": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247884": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247896": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247956": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247959": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "247965": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247974": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "247980": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "247986": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248079": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248085": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248088": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248124": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248127": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248202": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248214": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248244": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248274": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248289": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248331": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248337": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248343": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248352": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248382": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248427": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248463": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248481": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248493": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248496": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248505": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248511": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248544": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248559": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248568": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248571": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248580": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248637": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248667": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248670": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248673": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248691": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248694": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248697": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248742": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248811": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248814": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248865": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "248892": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248898": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248907": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248928": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248958": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "248967": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "248976": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249048": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249051": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249093": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249099": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249105": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249111": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249114": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249123": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249126": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249144": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249153": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249168": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249177": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249183": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249189": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249225": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249243": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249258": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249270": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249279": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249294": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249306": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249309": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249336": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249417": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249423": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249426": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249477": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249489": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249495": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249564": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249585": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249600": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249618": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249678": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249690": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249693": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249735": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249765": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249774": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249837": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249852": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249858": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249864": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "249879": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249936": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "249960": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249972": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249978": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249987": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "249999": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250002": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250017": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250023": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250029": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250032": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250035": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250047": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250062": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250068": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250083": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250089": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250110": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250122": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250134": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250143": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250152": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250170": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250191": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250197": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250206": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250224": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250227": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250233": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250245": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250251": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250257": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250266": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250275": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250281": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250305": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250314": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250320": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250401": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250416": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250419": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250422": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250431": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250467": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250473": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250479": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250533": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250548": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250557": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250608": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250617": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250641": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250644": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250647": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250677": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250692": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250698": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250710": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250731": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250734": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250737": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250743": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250761": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250773": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250782": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250788": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250791": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250797": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250812": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250818": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250821": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250836": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250848": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250878": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250902": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250920": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250938": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250965": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "250974": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "250980": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250983": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "250998": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "251043": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "251064": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "251073": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "251124": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "251127": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "251145": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "251175": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "251214": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "251220": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "251322": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "251334": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "251346": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "251391": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257244": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257247": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257274": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257358": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257388": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257427": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257460": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "257490": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257493": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257496": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "257559": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257580": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257631": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257766": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "257769": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "257772": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257805": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257841": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257952": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "257997": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258021": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "258030": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258045": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "258081": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258195": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "258222": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258249": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258303": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "258327": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258342": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258450": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258456": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258468": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258474": {
+  "split": "holdout",
+  "stratum": "single"
+ },
+ "258525": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258645": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258657": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258738": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258759": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ },
+ "258792": {
+  "split": "holdout",
+  "stratum": "multi_2_3"
+ },
+ "258807": {
+  "split": "holdout",
+  "stratum": "multi_4_6"
+ }
+}

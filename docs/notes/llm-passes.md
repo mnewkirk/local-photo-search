@@ -1062,3 +1062,30 @@ person only). Applied to both tiers (`5b4ff58`). Bound = labelled phrases bound.
   #10 in front of him (facing away), who is the kicker.
 - Every wrong bind seen since body mode is one shape: two people's boxes overlap and a face
   belongs to the other one. Geometry and a yes/no link question both fail to catch it.
+
+### people-bind: the 150-bound review (2026-11-01)
+
+The >= 150-bound gate needed ~860 more blindly labelled photos at qwen3.5's bind rate, so the owner
+judged only what was bound (`--set review`: right person / wrong person / wrong name label). Review
+set: all 459 unlabelled soccer holdout photos with 1-6 faces (457 answered), qwen3.5 body mode,
+current prompt, bare-phrase rule "everyone".
+
+- Run 1: 138 bound, **137 right, 1 wrong** (246150: the navy boy's face, 46% outside the box of the
+  boy in yellow in front of him, facing away, was credited to that body). With the 13 labelled
+  holdout binds: 150 right, 1 wrong. Gate failed.
+- Owner's rule added (`2a88b6d`): a face links to a body only if wholly inside it (2 of 185 review
+  links had any part outside: that error and one correct link). It cannot catch 247627 / 244870 /
+  249761: their faces lie wholly inside the wrong body.
+- Run 2 with the rule (`--set review2`): 140 bound, 136 verdicts carried, 4 new: **139 right,
+  1 wrong** (250737: the back boy's detector box is only his upper body and sits over the front
+  boy's head and jersey; both calls chose it for "One boy in a green jersey ... chasing the ball";
+  the front boy's own faceless body was drawn but not chosen). 152 right, 1 wrong. Gate failed.
+- An overlap guard (the chosen box mostly inside another drawn person box -> no bind) is not a
+  clean separator: at 30% it drops 28 of 139 right review binds and catches 5 of 6 known wrong
+  binds; at 50%, 10 and 3; it cannot catch 249250 (gemma filling a count with the referee). Not
+  built.
+- **Both review sets are now contaminated as holdout**: the containment rule was chosen after
+  seeing 246150. A gate pass needs fresh photos scored after the last rule change.
+- Precision as measured: 152 of 153 owner-verified binds right (99.3%). Every wrong bind seen has
+  overlapping people; the plan's keypoint link (docs/plans/people-context-describe.md, Step 0) is the
+  untried remedy.
