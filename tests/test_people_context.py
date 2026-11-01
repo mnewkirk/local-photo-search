@@ -179,3 +179,23 @@ def test_hint_lines_carry_no_names():
     assert GD.hint_line(1, None, None) is None
     p = GD.build_prompt(2, "two", True, [GD.hint_line(2, "female", 40)])
     assert "box 2: female, an adult" in p and "first image" in p
+
+
+@pytest.mark.parametrize("phrase,n,bad", [("two boys in blue", 1, True), ("two boys", 2, False),
+                                          ("a boy", 2, True), ("boys in blue", 1, True),
+                                          ("the goalkeeper", 1, False), ("three others", 3, False)])
+def test_count_problem(phrase, n, bad):
+    assert bool(GD.count_problem(phrase, n)) is bad
+
+
+def test_count_mismatch_drops_the_span_keeps_the_text():
+    r = GD.parse("[Two boys in blue](5) run.", 5)
+    assert r["spans"] == [] and r["description"] == "Two boys in blue run."
+
+
+def test_degenerate_marks():
+    r = GD.parse("A young boy [a boy in a blue jersey](1) kicks.", 2)
+    assert r["degenerate"]
+    r = GD.parse("Four of them [a boy](1), [a boy](2) and [a boy](3) stand.", 3)
+    assert r["degenerate"]
+    assert GD.parse("[A boy in blue](1) kicks while [a girl](2) watches.", 2)["degenerate"] is None

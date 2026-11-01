@@ -123,7 +123,10 @@ Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `ev
 
 - **Burst tier** (camera motion from phase correlation, IoU >= 0.7): leave-face-out holdout 1,773 right,
   5 wrong (0.28%): passes <= 0.5%, fails the <= 0.2% hint bar. Owner-labelled faceless gate pending.
-- **Kit tier**: attributes being read; pending.
+- **Kit tier fails on tune**: 8 right, 3 wrong leave-face-out; the same kid reads the same number in only
+  54% (preview) / 64% (full resolution) of crops. Not run on holdout. Revisit only with jersey OCR.
+- **Burst tier reach**: names 2 of the 156 owner-placed bodies that have no trusted face (0 on holdout):
+  the faceless-identity gate (>= 50 named holdout bodies) cannot be met; cue names stay off.
 - **Hints**: fail the injection test (flipped gender obeyed ~4 points over baseline; true hints fix
   nothing) -> describe stays label-free (Decision row "Gender / age-band hints" falls back to B).
 - **Call shape**: two images (clean + numbered overlay) with inline `[phrase](n)` anchors, a length line,

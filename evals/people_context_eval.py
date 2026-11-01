@@ -500,7 +500,7 @@ def cmd_attrs(a):
     os.environ.setdefault("PHOTOSEARCH_LLM_REASONING_EFFORT", "none")
     base = os.environ.get("PHOTOSEARCH_TEXT_LLM_URL", "http://localhost:1234/v1")
     ev = load_evidence()
-    have = load_attrs(a.out)
+    have = load_attrs("attrs")       # every reader's file: never read a body twice
     days = set(a.days.split(",")) if a.days else None
     keys = [k for k in attrs_targets(ev, days, a.min_h) if k not in have]
     if a.select == "anchors":
@@ -1074,6 +1074,7 @@ def _people_words(text):
 
 def cmd_g1_report(a):
     """Automatic G1 numbers per variant (+ the owner's verdicts when present)."""
+    from photosearch import grounded_describe as GD
     from photosearch import people_bind as PB
     con = ro(a.db)
     sample = _jload(HERE / "sample.json", {})
@@ -1106,6 +1107,14 @@ def cmd_g1_report(a):
             recall_num += len(sw & nw)
             if len(d) < 120:
                 c["short<120"] += 1
+            if r.get("raw") and "fallback" not in r and pid_s and not r.get("degenerate_checked"):
+                try:
+                    re_p = GD.parse(r["raw"], len(r["targets"]))
+                    c["degenerate"] += bool(re_p["degenerate"])
+                    c["count_mismatch_dropped"] += sum(1 for d_ in re_p["dropped"] if d_.get("why"))
+                    r = dict(r, spans=re_p["spans"])          # score under the current guards
+                except Exception:                              # noqa: BLE001 - counted elsewhere
+                    pass
             c["spans"] += len(r["spans"])
             c["retried"] += bool(r.get("retried"))
             c["fallback_no_spans"] += bool(r.get("fallback"))
@@ -1138,6 +1147,17 @@ def cmd_g1_report(a):
         out[v] = dict(c, len_median=med(lens), stored_len_median=med(slens), s_per_photo=med(secs),
                       people_word_recall=round(recall_num / recall_den, 3) if recall_den else None)
         print(f"== {v} ({a.splits}): " + json.dumps(out[v], sort_keys=True))
+    key = _jload(PAIR / "key.json", None)
+    votes = _jload(PAIR / "sheet" / "saved-labels.json", {})
+    if key and votes:
+        pc = Counter()
+        for pid_s, v in votes.items():
+            if not v.get("v"):
+                continue
+            a_is = key["A_is"][pid_s]
+            pc["same" if v["v"] == "same" else ("new" if (v["v"] == "A") == (a_is == "new") else "stored")] += 1
+        out["pairwise"] = {"variant": key["variant"], **pc}
+        print(f"== blind pairwise {key['variant']} vs stored: {dict(pc)}")
     _jsave(G1 / f"report-{a.splits.replace(',', '+')}.json", out)
 
 

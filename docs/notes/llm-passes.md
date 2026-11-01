@@ -1129,11 +1129,20 @@ head-top rule and a unique keypoint owner agree. Tune shoots 08-29..09-27, holdo
 - **Holdout, read once: 1,773 right, 5 wrong (0.28%)**, 36% of 4,947 hidden faces named. Passes the
   <= 0.5% leave-face-out bar, fails the <= 0.2% bar for feeding hints. Wrong is "disagrees with
   the face label"; some may be label errors (not checked, to keep the holdout unread).
-- **Kit tier** (jersey number + kit, anchors = face- or burst-identified bodies with >= 2 other
-  bursts, 0 contradicting, duplicate signature in a photo voids it): front-facing kids show no
-  number (it is on the back), so anchors come through burst tracks. Attributes are read only on
-  anchor-capable and target bodies >= 15% of the frame tall (~10k of ~70k bodies); qwen3.5-9b,
-  ~1.1 s/body alone, ~2 s shared. Numbers pending.
+- **Kit tier fails (tune).** Jersey number + kit per session, anchors = face- or burst-identified
+  bodies with >= 2 other bursts, 0 contradicting, a duplicate signature in a photo voids it.
+  qwen3.5-9b per body crop (closed vocabulary, JSON schema), ~1.1 s/body alone. On 2,994 reads
+  (tune shoots) 9% have a number: front-facing kids show none (it is on the back). The anchor map
+  contradicts itself (blue #14 anchored to 7 kids on 09-26/27), and leave-face-out gives 8 right,
+  3 wrong. Self-supervised number agreement (the same face-identified kid in one shoot reads the
+  same number): 73 of 136 from preview crops, 67 of 105 from full-resolution crops: the crop
+  often shows another player's number, so resolution is not the fix. Reads stopped; holdout not
+  run. The plan's fallback (dedicated jersey OCR) is the only route left for this tier.
+- **Burst tracks do not reach faceless bodies.** Of the 214 bodies the owner placed for NONE
+  phrases, 58 own a trusted face through the keypoint link (faces the round-1 sheet did not
+  offer) and the burst tier names 2 of the other 156 (0 on holdout). Leave-face-out coverage
+  (36%) measures faced bodies, whose siblings show the same face; a back-turned body rarely
+  lines up (IoU >= 0.7) with a sibling body whose face shows.
 - **Grounded describe (G1, dev 125, qwen3.5-9b)**: inline anchors `[phrase](n)` were ignored with
   the instructions after the describe prompt; leading with the two-image framing and a mark rule
   works. 20% wrote `a boy [1]` at first; a firmer syntax line, one corrective retry, then
@@ -1155,5 +1164,11 @@ Stored descriptions: median 410 chars. Recall = share of the stored text's peopl
   a female phrase on that box in 14 of 107 photos vs 10 with the true hint and 11 with none, and
   true hints do not fix "a girl" for a labelled boy (11 vs 12 of ~120 spans). Hints off.
 - One overlay image leaks overlay words and is shorter: the two-image shape wins.
+- **The marks bend the text.** 11 of 119 dev answers (15 with hints) put a mark where it reads badly:
+  right after a person noun ("A young boy [a boy in a blue jersey](1)", "Four of them [a boy](1),
+  [a boy](2) and [a boy](3)") or on a head-less fragment ("the boy [in the foreground](3)").
+  `grounded_describe.degenerate` flags them; a count check (`count_problem`) drops a span whose
+  count disagrees with its boxes ("[Two boys in blue jerseys](5)": 3 on dev). The blind pairwise
+  page decides whether the text lost quality.
 - Owner judgments pending: who-is-this-body (215 faceless bodies, 101 holdout), confirm marks
   (two images + length, no hints: 415 dev marks), blind pairwise vs stored (40 dev photos).

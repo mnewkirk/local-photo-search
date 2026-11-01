@@ -21,6 +21,44 @@ MAX_GROUP = 3
 LEAK_RE = re.compile(r"\b(box|boxes|boxed|bounding|rectangles?|outlined|numbered|"
                      r"second image|first image|image 2|label(?:l)?ed \d|marked \d)\b", re.I)
 _BRACKET_RE = re.compile(r"[\[\]]")
+_COUNT_WORDS = {"two": 2, "both": 2, "pair": 2, "three": 3, "four": 4, "five": 5, "several": 9,
+                "group": 9, "others": 9}
+_SINGULAR_RE = re.compile(r"^(?:a|an|one|the|another)\b", re.I)
+_PLURAL_RE = re.compile(r"\b(?:boys|girls|children|kids|players|men|women|people|teammates|"
+                        r"adults|teens|others)\b", re.I)
+
+
+def count_problem(phrase: str, n_boxes: int) -> Optional[str]:
+    """Why a phrase cannot name exactly ``n_boxes`` people, or None. "Two boys" on one box,
+    "a boy" on two boxes, a plural with no count on one box."""
+    words = re.findall(r"[a-z]+", phrase.lower())
+    for w in words:
+        if w in _COUNT_WORDS:
+            return None if _COUNT_WORDS[w] == n_boxes else f"count {w} vs {n_boxes} boxes"
+    if n_boxes > 1 and _SINGULAR_RE.match(phrase) and not _PLURAL_RE.search(phrase):
+        return f"singular phrase on {n_boxes} boxes"
+    if n_boxes == 1 and _PLURAL_RE.search(phrase) and not _SINGULAR_RE.match(phrase):
+        return "plural phrase on one box"
+    return None
+
+
+_PERSON_NOUN_RE = re.compile(r"(?:boy|girl|man|woman|child|kid|player|person|teen|toddler|baby|"
+                             r"adult|coach|referee|goalkeeper|teammate)s?", re.I)
+
+
+def degenerate(description: str, spans: list[dict]) -> Optional[str]:
+    """Text bent to fit the marks: one phrase marked 3+ times ("[a boy](1), [a boy](2),
+    [a boy](3)"), or a mark right after a person noun ("A young boy [a boy in blue](1)")."""
+    c = {}
+    for sp in spans:
+        k = sp["phrase"].lower()
+        c[k] = c.get(k, 0) + 1
+        if c[k] >= 3:
+            return f"phrase {sp['phrase']!r} marked 3+ times"
+        prev = re.findall(r"[A-Za-z]+", description[max(0, sp["start"] - 30):sp["start"]])
+        if prev and _PERSON_NOUN_RE.fullmatch(prev[-1]):
+            return f"mark follows a person noun: {prev[-1]!r} [{sp['phrase']}]"
+    return None
 
 _PHOTO_RULES = """\
 Describe the first image in 2-4 concise sentences for a search index. Include:
@@ -118,6 +156,8 @@ def parse(raw: str, n_boxes: int) -> dict:
         boxes = sorted({int(x) for x in inner.split(",")}) if _BOXES_RE.match(inner) else None
         if boxes is None or len(boxes) > MAX_GROUP or any(b < 1 or b > n_boxes for b in boxes):
             dropped.append({"phrase": phrase, "inner": inner})
+        elif count_problem(phrase, len(boxes)):
+            dropped.append({"phrase": phrase, "inner": inner, "why": count_problem(phrase, len(boxes))})
         else:
             spans.append({"start": length, "end": length + len(phrase), "phrase": phrase, "boxes": boxes})
         out.append(phrase)
@@ -134,4 +174,4 @@ def parse(raw: str, n_boxes: int) -> dict:
     leak = LEAK_RE.search(desc)
     if leak:
         raise UnusableAnswer(f"grounded describe: overlay words: {leak.group(0)!r}")
-    return {"description": desc, "spans": spans, "dropped": dropped}
+    return {"description": desc, "spans": spans, "dropped": dropped, "degenerate": degenerate(desc, spans)}
