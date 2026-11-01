@@ -55,6 +55,20 @@ describe('PS.formatFocalLength', () => {
 });
 
 
+describe('PS.personAttributeHint', () => {
+  test('is empty when nothing is set', () => {
+    expect(PS.personAttributeHint(null)).toBe('');
+    expect(PS.personAttributeHint({ gender: null, birth_year: null })).toBe('');
+  });
+  test('shows gender and birth year, ~ for an estimate', () => {
+    expect(PS.personAttributeHint({ gender: 'female', birth_year: 2014, birth_year_approx: true }))
+      .toBe('♀ · ~2014');
+    expect(PS.personAttributeHint({ gender: 'male', birth_year: null })).toBe('♂');
+    expect(PS.personAttributeHint({ gender: null, birth_year: 2010, birth_year_approx: false }))
+      .toBe('2010');
+  });
+});
+
 describe('PS.formatFNumber', () => {
   test('formats fractional f-number', () => {
     expect(PS.formatFNumber('28/10')).toBe('2.8');

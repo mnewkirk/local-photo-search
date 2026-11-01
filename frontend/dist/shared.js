@@ -2175,7 +2175,9 @@
                     return '\u201c' + s.generic + '\u201d not named: ' + ({
                       unlabelled: 'no face label', untrusted_source: 'label is not trusted',
                       rejected: 'label rejected', stale: 'face changed',
-                      ambiguous_name: 'name is ambiguous in this photo' }[s.state] || s.state);
+                      ambiguous_name: 'name is ambiguous in this photo',
+                      attribute_conflict: s.reason || 'phrase disagrees with the person\u2019s details'
+                    }[s.state] || s.state);
                   }).join(' \u00b7 ')));
             })(),
           ),
@@ -3036,6 +3038,17 @@
              + ' (share of the whole clip; beta)',
       style: Object.assign({ color: '#facc15', whiteSpace: 'nowrap', fontSize: 11 }, opts.style || {}),
     }, '\u25B6 ' + bits.join(' \u00b7 '));
+  };
+
+  // A person's gender / birth year (schema v42) as a short hint, e.g.
+  // "♀ · ~2014"; '' when nothing is set. Shown on /faces only.
+  PS.personAttributeHint = function (p) {
+    if (!p) return '';
+    var bits = [];
+    var g = { female: '♀', male: '♂', other: '⚧' }[p.gender];
+    if (g) bits.push(g);
+    if (p.birth_year != null) bits.push((p.birth_year_approx ? '~' : '') + p.birth_year);
+    return bits.join(' · ');
   };
 
   PS.cameraLabel = function (photo) {

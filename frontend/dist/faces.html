@@ -1854,7 +1854,77 @@
         ));
     }
 
-    function PersonInspector({ person, persons, dateFrom, dateTo, onClose, onChanged }) {
+    // One person's gender / birth year (schema v42), edited via PATCH. Used
+    // only to check a description's "girl" / "baby" phrase before a name
+    // replaces it; never shared off the machine.
+    function PersonDetails({ person, onSaved }) {
+      const init = useCallback(() => ({
+        gender: person.gender || '',
+        year: person.birth_year != null ? String(person.birth_year) : '',
+        approx: !!person.birth_year_approx,
+      }), [person.gender, person.birth_year, person.birth_year_approx]);
+      const [form, setForm] = useState(init);
+      const [saving, setSaving] = useState(false);
+      const [msg, setMsg] = useState('');
+      useEffect(() => { setForm(init()); }, [init]);
+      const base = init();
+      const dirty = form.gender !== base.gender || form.year.trim() !== base.year
+        || (form.year.trim() !== '' && form.approx !== base.approx);
+
+      const save = () => {
+        const yr = form.year.trim();
+        if (yr && (!/^\d{4}$/.test(yr) || +yr < 1900 || +yr > new Date().getFullYear())) {
+          setMsg('Birth year must be a four-digit year between 1900 and this year.');
+          return;
+        }
+        setSaving(true); setMsg('');
+        fetch(API + '/api/persons/' + person.id, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            gender: form.gender || null,
+            birth_year: yr ? parseInt(yr, 10) : null,
+            birth_year_approx: yr ? form.approx : false,
+          }),
+        })
+          .then(r => r.json().then(d => ({ ok: r.ok, d: d })))
+          .then(({ ok, d }) => {
+            setSaving(false);
+            if (!ok) { setMsg(d.detail || 'Save failed'); return; }
+            setMsg('Saved.');
+            if (onSaved) onSaved(d.person);
+          })
+          .catch(err => { setSaving(false); setMsg(String(err && err.message || err)); });
+      };
+
+      const field = { background: 'var(--bg2, #222)', color: 'inherit',
+                      border: '1px solid var(--border, #444)', borderRadius: '4px', padding: '2px 4px' };
+      return e('div', {
+        className: 'insp-sub',
+        style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 4 },
+        title: 'Checked against gendered / age words in descriptions ("girl", "baby") '
+             + 'before a name replaces them. Stays on this machine.',
+      },
+        'Details:',
+        e('select', { value: form.gender, style: field,
+          onChange: ev => { setForm(Object.assign({}, form, { gender: ev.target.value })); setMsg(''); } },
+          e('option', { value: '' }, 'gender not set'),
+          e('option', { value: 'female' }, 'female'),
+          e('option', { value: 'male' }, 'male'),
+          e('option', { value: 'other' }, 'other')),
+        e('input', { type: 'number', min: 1900, max: new Date().getFullYear(),
+          value: form.year, placeholder: 'birth year', style: Object.assign({ width: 100 }, field),
+          onChange: ev => { setForm(Object.assign({}, form, { year: ev.target.value })); setMsg(''); } }),
+        e('label', { style: { display: 'flex', alignItems: 'center', gap: 4 } },
+          e('input', { type: 'checkbox', checked: form.approx, disabled: !form.year.trim(),
+            onChange: ev => setForm(Object.assign({}, form, { approx: ev.target.checked })) }),
+          'approximate'),
+        e('button', { className: 'insp-btn', disabled: !dirty || saving, onClick: save },
+          saving ? 'Saving…' : 'Save details'),
+        msg && e('span', { style: { color: msg === 'Saved.' ? 'var(--text-muted)' : '#f87171' } }, msg),
+      );
+    }
+
+    function PersonInspector({ person, persons, dateFrom, dateTo, onClose, onChanged, onDetailsChanged }) {
       const [data, setData] = useState(null);
       const [loading, setLoading] = useState(true);
       const [err, setErr] = useState('');
@@ -1995,6 +2065,13 @@
           e('div', { className: 'insp-header' },
             e('div', { style: { flex: 1 } },
               e('div', { className: 'insp-title' }, 'Inspect: ' + person.name),
+              data && data.person && e(PersonDetails, {
+                person: data.person,
+                onSaved: (p) => {
+                  setData(prev => prev ? Object.assign({}, prev, { person: Object.assign({}, prev.person, p) }) : prev);
+                  if (onDetailsChanged) onDetailsChanged();
+                },
+              }),
               data && e('div', { className: 'insp-sub' },
                 data.person.face_count.toLocaleString() + ' faces · ' +
                 data.sub_clusters.filter(s => s.sub_id !== -1).length + ' sub-clusters · ' +
@@ -2530,6 +2607,12 @@
       const [multiError, setMultiError] = useState('');
       const [multiWorking, setMultiWorking] = useState(false);
       const multiInputRef = useRef(null);
+      // Set details (gender / birth year, schema v42). '' = unchanged.
+      const [detGender, setDetGender] = useState('');      // '' | female | male | other | clear
+      const [detYear, setDetYear] = useState('');          // '' = unchanged
+      const [detYearClear, setDetYearClear] = useState(false);
+      const [detApprox, setDetApprox] = useState(false);
+      const [multiNote, setMultiNote] = useState('');
 
       const groupKey = (g) => (g.type === 'unclustered' ? 'u' :
         (g.type === 'person' ? 'p' : 'c') + (g.person_id || g.cluster_id));
@@ -2570,6 +2653,7 @@
         setMultiName('');
         setMultiMergeTarget('');
         setMultiError('');
+        setMultiNote('');
         lastSelectedIdx.current = null;
       }, []);
 
@@ -2610,6 +2694,13 @@
       const selectedGroups = useMemo(() => {
         return groups.filter(g => selected.has(groupKey(g)));
       }, [groups, selected]);
+
+      // person_id -> /api/persons row (gender / birth year for the hints).
+      const personById = useMemo(() => {
+        const m = {};
+        for (const p of persons) m[p.id] = p;
+        return m;
+      }, [persons]);
 
       // Named persons for multi-merge (exclude any selected named persons). Full
       // persons list, not paginated groups — unloaded pages still count.
@@ -2678,6 +2769,56 @@
           }).catch(() => setMultiWorking(false));
         });
       }, [multiName, groups, selected, runMultiAction, exitMultiSelect, loadGroups]);
+
+      // Set details: gender / birth year on the PERSONS of the selected named
+      // groups (unnamed clusters have no person to hold them: skipped, counted).
+      const startSetDetails = useCallback(() => {
+        setMultiAction('details'); setMultiError(''); setMultiNote('');
+        setDetGender(''); setDetYear(''); setDetYearClear(false); setDetApprox(false);
+      }, []);
+
+      const doMultiSetDetails = useCallback(() => {
+        const personIds = selectedGroups.filter(g => g.type === 'person').map(g => g.person_id);
+        const skipped = selectedGroups.length - personIds.length;
+        if (personIds.length === 0) {
+          setMultiError('None of the selected groups is named. Name them first; details belong to a person.');
+          return;
+        }
+        const body = { person_ids: personIds };
+        if (detGender === 'clear') body.gender = null;
+        else if (detGender) body.gender = detGender;
+        if (detYearClear) body.birth_year = null;
+        else if (detYear.trim()) {
+          const y = parseInt(detYear, 10);
+          if (!/^\d{4}$/.test(detYear.trim()) || y < 1900 || y > new Date().getFullYear()) {
+            setMultiError('Birth year must be a four-digit year between 1900 and this year.');
+            return;
+          }
+          body.birth_year = y;
+          body.birth_year_approx = detApprox;
+        }
+        if (Object.keys(body).length === 1) {
+          setMultiError('Nothing to change: pick a gender or enter a birth year.');
+          return;
+        }
+        setMultiError(''); setMultiWorking(true);
+        fetch(API + '/api/persons/bulk-attributes', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+          .then(r => r.json().then(d => ({ ok: r.ok, d: d })))
+          .then(({ ok, d }) => {
+            setMultiWorking(false);
+            if (!ok) { setMultiError(d.detail || 'Save failed'); return; }
+            let msg = 'Updated details of ' + d.updated + ' person' + (d.updated !== 1 ? 's' : '');
+            if (skipped) msg += '; skipped ' + skipped + ' unnamed group' + (skipped !== 1 ? 's' : '');
+            if (d.unknown) msg += '; ' + d.unknown + ' person id(s) no longer exist';
+            setMultiNote(msg + '.');
+            setMultiAction(null);
+            loadPersons();
+          })
+          .catch(err => { setMultiWorking(false); setMultiError(String(err && err.message || err)); });
+      }, [selectedGroups, detGender, detYear, detYearClear, detApprox, loadPersons]);
 
       const doMultiClear = useCallback(() => {
         runMultiAction((faceIds) => {
@@ -2874,6 +3015,11 @@
               onClick: () => { setMultiAction('setname'); setMultiName(''); setMultiError(''); },
             }, 'Set Name'),
             !multiAction && selected.size > 0 && e('button', {
+              onClick: startSetDetails,
+              title: 'Set gender / birth year on the people of the selected named groups '
+                   + '(unnamed groups are skipped). Used only to check name phrases; never shared.',
+            }, 'Set details'),
+            !multiAction && selected.size > 0 && e('button', {
               className: 'danger',
               onClick: () => { setMultiAction('clear'); },
             }, 'Clear Name'),
@@ -2922,6 +3068,46 @@
             }, multiWorking ? 'Saving\u2026' : 'Save'),
             multiAction === 'setname' && e('button', { onClick: () => { setMultiAction(null); setMultiError(''); } }, 'Back'),
 
+            // Set details sub-action
+            multiAction === 'details' && e('select', {
+              value: detGender,
+              onChange: (ev) => { setDetGender(ev.target.value); setMultiError(''); },
+              title: 'Gender',
+            },
+              e('option', { value: '' }, 'Gender: unchanged'),
+              e('option', { value: 'female' }, 'female'),
+              e('option', { value: 'male' }, 'male'),
+              e('option', { value: 'other' }, 'other'),
+              e('option', { value: 'clear' }, 'clear'),
+            ),
+            multiAction === 'details' && e('input', {
+              className: 'inline-input',
+              type: 'number', min: 1900, max: new Date().getFullYear(),
+              value: detYear,
+              disabled: detYearClear,
+              onChange: (ev) => { setDetYear(ev.target.value); setMultiError(''); },
+              onKeyDown: (ev) => {
+                if (ev.key === 'Enter') doMultiSetDetails();
+                if (ev.key === 'Escape') { ev.stopPropagation(); setMultiAction(null); setMultiError(''); }
+              },
+              placeholder: 'Birth year: unchanged',
+              style: { width: 170 },
+            }),
+            multiAction === 'details' && e('label', { style: { fontSize: 13, display: 'flex', alignItems: 'center', gap: 4 } },
+              e('input', { type: 'checkbox', checked: detApprox, disabled: detYearClear,
+                onChange: (ev) => setDetApprox(ev.target.checked) }),
+              'approximate'),
+            multiAction === 'details' && e('label', { style: { fontSize: 13, display: 'flex', alignItems: 'center', gap: 4 } },
+              e('input', { type: 'checkbox', checked: detYearClear,
+                onChange: (ev) => { setDetYearClear(ev.target.checked); setMultiError(''); } }),
+              'clear birth year'),
+            multiAction === 'details' && e('button', {
+              className: 'primary',
+              onClick: doMultiSetDetails,
+              disabled: multiWorking,
+            }, multiWorking ? 'Saving…' : 'Save'),
+            multiAction === 'details' && e('button', { onClick: () => { setMultiAction(null); setMultiError(''); } }, 'Back'),
+
             // Clear Name confirmation
             multiAction === 'clear' && e('span', { style: { fontSize: 13 } },
               'Clear names from ' + selected.size + ' group(s)?'),
@@ -2939,6 +3125,9 @@
               className: 'name-error',
               style: { marginTop: 8 },
             }, multiError),
+            multiSelect && !multiError && multiNote && e('div', {
+              style: { marginTop: 8, fontSize: 13, color: 'var(--text-muted)' },
+            }, multiNote),
           ),
 
           loading && e('div', { className: 'loading' },
@@ -2980,7 +3169,10 @@
                   e('div', { className: 'face-card-info' },
                     e('div', { className: 'face-card-name' }, g.label),
                     e('div', { className: 'face-card-count' },
-                      g.photo_count + ' photo' + (g.photo_count !== 1 ? 's' : '')),
+                      g.photo_count + ' photo' + (g.photo_count !== 1 ? 's' : ''),
+                      g.type === 'person' && PS.personAttributeHint(personById[g.person_id]) &&
+                        e('span', { title: 'Gender / birth year (Set details)' },
+                          ' · ' + PS.personAttributeHint(personById[g.person_id]))),
                   ),
                 );
               }),
@@ -3061,7 +3253,10 @@
                     )
                   : e('div', { className: 'detail-name' }, selectedGroup.label),
                 !editing && !merging && e('div', { className: 'detail-stats' },
-                  groupPhotos.length + ' photo' + (groupPhotos.length !== 1 ? 's' : '')),
+                  groupPhotos.length + ' photo' + (groupPhotos.length !== 1 ? 's' : ''),
+                  selectedGroup.type === 'person' && PS.personAttributeHint(personById[selectedGroup.person_id]) &&
+                    e('span', { title: 'Gender / birth year (edit in Inspect)' },
+                      ' · ' + PS.personAttributeHint(personById[selectedGroup.person_id]))),
               ),
               !editing && !merging && !splitting && e('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
                 selectedGroup.type !== 'unclustered' && e('button', { className: 'rename-btn', onClick: startRename },
@@ -3270,6 +3465,7 @@
           dateTo: cf.date_to,
           onClose: () => setInspectPerson(null),
           onChanged: () => { loadGroups(); loadPersons(); },
+          onDetailsChanged: loadPersons,
         }),
 
         modalPhoto && e(PhotoModal, {
