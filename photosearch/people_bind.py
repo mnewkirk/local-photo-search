@@ -335,17 +335,25 @@ Description:
 {description}
 
 Rules:
+- A phrase is only the words that name the person or group: the noun with its \
+article, describing words and what they wear or hold. Never copy a whole \
+sentence or clause, what the person is doing, or the setting.
 - Copy each phrase EXACTLY as written in the description: the same words in the \
-same case, from the phrase's first word.
+same case.
 - Use only box numbers from 1 to {n}.
 - List every box the phrase could describe. If the description does not \
 distinguish between several boxes, list all of them.
 - Leave out crowds, "the team", "others" and pronouns (he, she, they).
 - If the phrase refers to several people, set "all_members_boxed" to false \
 unless every one of them has a box.
-Answer with only a JSON array, one object per phrase:
-[{{"phrase": "...", "could_be": [1, 2], "kind": "person", "all_members_boxed": true}}]
-Use "kind": "group" for two or three people. Answer [] if no phrase qualifies."""
+Answer with only a JSON object, one entry per phrase:
+{{"mentions": [{{"phrase": "...", "could_be": [1, 2], "kind": "person", "all_members_boxed": true}}]}}
+Use "kind": "group" for two or three people. Answer {{"mentions": []}} if no phrase qualifies."""
+
+# A phrase is the span a name replaces at render time, so a model that copies a whole
+# sentence (qwen3.5 did) must not bind: the name would swallow the sentence. The
+# owner's 211 face-labelled phrases are at most 8 words.
+MAX_PHRASE_WORDS = 10
 
 # Which detector bodies are drawn in body mode. Tuned on the dev labels only
 # (docs/notes/llm-passes.md, "people-bind: body mode").
@@ -427,6 +435,8 @@ def parse_answer(raw: Optional[str], description: str, n_boxes: int) -> list[dic
     not a result."""
     from .describe import UnusableAnswer
     obj = _json_array(raw or "")
+    if isinstance(obj, dict) and isinstance(obj.get("mentions"), list):
+        obj = obj["mentions"]        # the json_schema shape (describe._OPENAI_RESPONSE_SCHEMAS)
     if obj is None or not isinstance(obj, list):
         raise UnusableAnswer("people-bind: not a JSON array")
     out = []
@@ -494,6 +504,8 @@ def decide(description: str, mentions: list[dict], order: list[int],
     out: dict = {}
     for m in mentions:
         phrase = m["phrase"]
+        if len(phrase.split()) > MAX_PHRASE_WORDS:
+            continue                 # a sentence, not a name's span
         n = phrase_people_count(phrase)
         if n is None or n > MAX_GROUP:
             continue

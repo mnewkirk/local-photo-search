@@ -140,3 +140,19 @@ def test_fleet_role_models_get_expected_reasoning_effort_behaviour(
     else:
         assert "reasoning_effort" not in seen, (
             f"role={role!r} model={model!r} should NOT get reasoning_effort")
+
+
+def test_the_bind_role_asks_for_its_json_schema_and_other_roles_do_not(monkeypatch):
+    # qwen3.5 wrote prose before the JSON (22 of 124 dev photos unusable); LM Studio's
+    # json_schema response_format constrains the answer to the shape parse_answer reads.
+    from photosearch import describe
+    monkeypatch.setenv("PHOTOSEARCH_TEXT_LLM_URL", "http://lm/v1")
+    seen = _capture_payload(monkeypatch)
+    describe._openai_chat_with_retry(base_url="http://lm/v1", model="m", role="bind",
+                                     messages=[{"role": "user", "content": "x"}])
+    rf = seen["response_format"]
+    assert rf["type"] == "json_schema" and rf["json_schema"]["schema"]["required"] == ["mentions"]
+    seen = _capture_payload(monkeypatch)
+    describe._openai_chat_with_retry(base_url="http://lm/v1", model="m", role="describe",
+                                     messages=[{"role": "user", "content": "x"}])
+    assert "response_format" not in seen

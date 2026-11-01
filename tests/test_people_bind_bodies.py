@@ -65,3 +65,17 @@ def test_the_body_prompt_states_the_box_count_and_has_no_example_phrase():
     p = PB.build_prompt("A boy.", 4, bodies=True)
     assert "4 numbered boxes, 1 to 4" in p and "from 1 to 4" in p
     assert "reddish" not in p
+
+
+def test_the_json_schema_answer_shape_parses_like_a_bare_array():
+    raw = '{"mentions": [{"phrase": "A boy", "could_be": [1], "kind": "person", "all_members_boxed": true}]}'
+    assert PB.parse_answer(raw, "A boy runs.", 2) == PB.parse_answer(raw[13:-1], "A boy runs.", 2)
+
+
+def test_a_whole_sentence_copied_as_a_phrase_never_binds():
+    desc = "A young boy in a blue soccer jersey and dark shorts is kicking a soccer ball on a field."
+    sentence = {"phrase": desc[:-1], "could_be": [1], "kind": "person", "all_members_boxed": True}
+    noun = dict(sentence, phrase="A young boy in a blue soccer jersey")
+    by_id = {1: FACE}
+    assert PB.decide(desc, [sentence], [1], by_id) == {}
+    assert PB.decide(desc, [noun], [1], by_id) == {"A young boy in a blue soccer jersey": ("person", [1])}

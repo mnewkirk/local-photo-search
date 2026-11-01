@@ -392,6 +392,22 @@ _OPENAI_MAX_TOKENS = {
 }
 _DEFAULT_OPENAI_MAX_TOKENS = 768
 
+# Roles whose answer is a fixed JSON shape get LM Studio's grammar-constrained
+# output (OpenAI `response_format` json_schema). Without it qwen3.5 wrote a prose
+# analysis before the JSON even at reasoning "none": 22 of 124 dev photos were
+# unusable (cut off, or no array) on the people-bind eval (docs/notes/llm-passes.md,
+# "people-bind: body mode"). The Ollama route sends nothing; its parser stays tolerant.
+_OPENAI_RESPONSE_SCHEMAS = {
+    "bind": {"type": "object", "additionalProperties": False, "required": ["mentions"],
+             "properties": {"mentions": {"type": "array", "items": {
+                 "type": "object", "additionalProperties": False,
+                 "required": ["phrase", "could_be", "kind", "all_members_boxed"],
+                 "properties": {"phrase": {"type": "string"},
+                                "could_be": {"type": "array", "items": {"type": "integer"}},
+                                "kind": {"type": "string", "enum": ["person", "group"]},
+                                "all_members_boxed": {"type": "boolean"}}}}}},
+}
+
 # Model-id patterns (case-insensitive substrings) known to have NO reasoning
 # mode. `reasoning_effort` is an OpenAI-style switch meant for thinking models
 # (gemma-4*, qwen3*, minicpm-v-4_5 — see FLEET_ROLE_MODELS); sending it to a
@@ -759,6 +775,9 @@ def _openai_chat_attempts(
     effort = os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
     if effort and not _model_has_no_reasoning_mode(model):
         body["reasoning_effort"] = effort
+    if role in _OPENAI_RESPONSE_SCHEMAS:
+        body["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": role, "strict": True, "schema": _OPENAI_RESPONSE_SCHEMAS[role]}}
     payload = json.dumps(body).encode("utf-8")
     for attempt in range(1, retries + 1):
         t0 = time.time()
