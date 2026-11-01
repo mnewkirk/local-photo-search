@@ -1,6 +1,6 @@
 # People context in describe: identify bodies and faces, then describe with spans
 
-**Status: 🟡 planned 2026-10-31 (plan-debate); nothing built. Step 0 next.** (Status lives in `README.md`.)
+**Status: 🟡 planned 2026-10-31 (plan-debate); Step 0 done 2026-11-01 (results below); G0 next.** (Status lives in `README.md`.)
 
 Supersedes docs/plans/description-names.md Revision 2 R3 (the after-the-fact body binder as the production path).
 Source: plan-debate 2026-10-31, Planner A (plan-A.md) and Planner B (plan-B.md), two critique rounds.
@@ -81,5 +81,37 @@ validated against the witness labels. The raw `photos.description` stays name-fr
 | Wrong-name bar for faceless tiers | Per tier: 0 wrong among >= 50 owner-labelled faceless holdout bodies and <= 0.5% leave-face-out; flag-gated with a "from kit/number" chip | Face-linked names only | **A** | 2026-10-31 |
 | Re-describe scope | One soccer shoot pilot (100 renders reviewed, 0 wrong) -> 2026 soccer collections -> decide the rest from measured GPU time | All trusted-label photos after the pilot | **A** | 2026-10-31 |
 
-Open, low priority: run `match_faces` earlier so strict labels reach a batch's first describe (strict was ~5% of
-trusted labels in the sample; Step 0 measures the claim-time cost).
+| Precision bar for names | 0 wrong binds across >= 150 (rule of three) | Owner accepts the measured ~99% precision (152 of 153 owner-verified people-bind binds right), with the overlap checks below | **B** | 2026-11-01 |
+
+Dropped after Step 0: running `match_faces` earlier so strict labels reach a batch's first describe: cheap (~30 ms per
+claim on the N100) but useless today (face references exist for 4 people; ~1 unlabelled match per shoot).
+
+## Step 0 results (2026-11-01)
+
+Notes: docs/notes/llm-passes.md, "people context: Step 0".
+
+- **Keypoint-verified link** (torchvision Keypoint R-CNN; a body owns a face only if its nose or an eye
+  falls inside the face box, no padding): flags all three wrong links (247627, 244870, 246150) as
+  ambiguous or owned by another body; of 185 owner-verified right links, 178 agree and 7 are ambiguous
+  (4% coverage cost); never "no owner". Use it.
+- **Overlap second call** (owner's idea): when a chosen box is >= 30% inside another person's box (not a
+  member of the same group), crop the two, label them A/B, ask a forced choice twice with letters swapped,
+  keep only if both answers pick the chosen box. Singular phrases: 14 of 15 right binds kept, 3 of 4 wrong
+  rejected (250737, 244870, 249761; the miss is the link error the keypoint check catches). Add it as a
+  step; both checks together caught all five wrong qwen3.5 binds seen. Measured on spent holdout: confirm
+  on fresh photos.
+- **Sessions** = folder + day split at 45-min gaps (12-119 min all equivalent), never collections (curated,
+  overlapping, one spans the season; they hold ~23% of each shoot). 10 soccer sessions; the 10-03 team
+  photo splits from the game, correctly (kit change).
+- **Legacy batches**: a `CUTOVER_PASSES` map in `batch_state.py` keyed on `ingest_batches.created_at`;
+  describe's `eligible` needs its own branch (described OR bodies settled) or it reads a false `completed`;
+  `bodies` needs empty-is-done semantics; new passes need `_OUTPUT_MISSING`, `_REMAINING_FILTERS_ATTEMPTS`,
+  `PASS_MEDIA` and JS `ROWS` entries.
+- **Burst tracks**: 82 of 91 photos with a faceless subject have a frame within 3 s holding a trusted face
+  (median 5 such frames): a high upper bound for the burst tier (G0 measures same-kid recall).
+- **Grounded describe try** (20 dev photos, qwen3.5, clean photo + numbered overlay, JSON
+  `{description, people}`): 0 overlay leakage, 2.0 s/photo, box numbers always valid; but 14 of 47
+  phrases were not in the text (people listed with new details or paraphrased) and descriptions were half
+  as long (median 224 vs 408 chars). G1 should test **inline anchors** (the model writes
+  `[phrase](box)` in the text; code strips the markup, so spans match by construction) and a length
+  instruction.

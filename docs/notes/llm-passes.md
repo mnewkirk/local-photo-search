@@ -1089,3 +1089,24 @@ current prompt, bare-phrase rule "everyone".
 - Precision as measured: 152 of 153 owner-verified binds right (99.3%). Every wrong bind seen has
   overlapping people; the plan's keypoint link (docs/plans/people-context-describe.md, Step 0) is the
   untried remedy.
+
+### people context: Step 0 (2026-11-01)
+
+Plan: docs/plans/people-context-describe.md. Scripts: read-only spikes, numbers only (not committed).
+
+- Keypoint link (keypointrcnn_resnet50_fpn, head keypoints nose/eyes with logit >= 2, face box unpadded):
+  wrong links 247627 (4 bodies' heads in the face box), 244870 (2), 246150 (another body) all flagged;
+  249761 agrees (its error is a box choice, not a link). Owner-verified right links: 178/185 agree, 7
+  ambiguous, 0 without an owner. Padding 25%: 174/185.
+- Overlap forced choice (qwen3.5, crop of the two people as A/B, letters swapped, keep only if both
+  answers pick the chosen box; a box of the same group slot is not a rival): singular 14/15 right kept,
+  3/4 wrong dropped; group 1/2 right kept. Without the same-group exclusion the question was ill-posed for
+  groups (15/33 kept).
+- Sessions: 40 soccer collections are curated subsets of 10 folder-day sessions; gap thresholds 12-119 min
+  give the same 10 sessions; 8,324 of 10,819 stills in those folders are in no soccer collection.
+- Claim-time strict match: ~7-8 ms per 16-photo claim on the desktop (12 references, 4 persons; 6,336
+  exclusions reloaded per call), ~30 ms estimated on the N100; finds ~1 unlabelled face per shoot. Dropped.
+- Burst siblings (BURST_WINDOW_SECONDS 3): 89/91 photos with a faceless subject have a sibling frame, 82
+  have one with a trusted face.
+- Grounded describe, 20 dev photos: 0 leakage, 2.0 s/photo, 47 people entries (14 not in the text, 0 bad
+  box numbers), descriptions median 224 chars vs 408 stored.
