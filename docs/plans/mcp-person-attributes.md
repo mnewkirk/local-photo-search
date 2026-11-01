@@ -268,7 +268,8 @@ Files touched: `photosearch/tools.py` (`_subject_ranked_search`, `representative
    in a search result therefore costs Ask context and costs MCP nothing. The fix is loading the Ask model at 32k
    context (more VRAM, so it competes with the fleet on the shared GPU), or giving the fleet its own instance. The
    Ask side of Steps B and C waits for it; MCP can ship first.
-5. **Per-face sharpness: open, pending this cost estimate.**
+5. **Per-face sharpness: offline test first, and not yet** (owner, 2026-11-01). No backfill until that test passes; the
+   test itself is not scheduled. Cost estimate and recommendation as given:
    - Measured: `sharpness.measure_photo` takes a median 0.23 s/photo on the desktop. The NAS target was
      ≤ 0.4 s/photo, plus the 0.2 s throttle pause.
    - About 102k photos have faces, so the backlog is ~17 h on the NAS (throttled, at night) or ~7 h of desktop CPU.
@@ -288,4 +289,8 @@ Files touched: `photosearch/tools.py` (`_subject_ranked_search`, `representative
    - (a) a rule on words describe already writes ("collage", "split-screen", "composite", "side-by-side"): cheap and
      instant, unknown recall;
    - (b) a vision pass.
-   - Recommendation: (a), measured on a sample first. Still the owner's call: keep it or drop it.
+   - **Keep** (owner, 2026-11-01): build (a), measured on a sample first.
+7. **Context-window work needs its own MCP eval first** (owner, 2026-11-01). The eval follows the prior evals
+   (`evals/ask_eval`: fixed items, repeats, no-op control mutants for the noise floor, and ablations per field and per
+   tool description). It is how the per-field token costs above get judged before the Ask side, or the 32k fix, ships.
+   Not started; do not build it until the owner asks.
