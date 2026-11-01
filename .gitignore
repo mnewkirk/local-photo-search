@@ -139,3 +139,6 @@ evals/people-bind/runs/
 evals/people-bind/*/sheet/
 evals/people-bind/*/runs/
 evals/people-bind/originals/
+# people-context evals (G0/G1): cached previews, evidence, model runs, generated pages
+evals/people-bind/g0/
+evals/people-bind/g1/runs/
