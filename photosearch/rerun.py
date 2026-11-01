@@ -120,10 +120,10 @@ FLEET_ROLE_MODELS = {"describe":   "qwen/qwen3.5-9b",
                      # describe, so describe -> video-describe loads it once.
                      # Needs LM Studio's per-model context >= 16384 (Risk 8).
                      "video":      "qwen/qwen3.5-9b",
-                     # people-bind: PROVISIONAL, the eval picks it
-                     # (evals/people_bind_eval.py). The box-grounding model
-                     # photos already use; no label-bearing input either way.
-                     "bind":       "qwen2.5-vl-7b-instruct"}
+                     # people-bind: the eval winner (docs/notes/llm-passes.md,
+                     # "people-bind: body mode", "the 150-bound review"): body
+                     # mode, JSON-schema answers, two reshuffled calls.
+                     "bind":       "qwen/qwen3.5-9b"}
 
 
 # Every model eval that picked FLEET_ROLE_MODELS ran with reasoning OFF

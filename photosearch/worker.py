@@ -1573,8 +1573,9 @@ def _process_people_bind(client: "WorkerClient", photos: list[dict], model: str,
                             label=f"download {photo['filename']}")
             return dest if status == 200 else None
 
+        trace: list = []
         try:
-            slots, method = PB.bind_photo(photo, fetch, model)
+            slots, method = PB.bind_photo(photo, fetch, model, trace=trace)
         except (ContextOverflow, RoleModelNotConfigured) as e:
             raise PassHalted(f"{type(e).__name__}: {e}", out) from e
         except UnusableAnswer as e:
@@ -1593,8 +1594,12 @@ def _process_people_bind(client: "WorkerClient", photos: list[dict], model: str,
             continue
         names = "; ".join(f"{s['spans'][0]['text']!r} -> {[f['face_id'] for f in s['faces']]}"
                           for s in slots)
-        print(f"    {label} ({time.time() - t0:.1f}s, {method}): "
-              f"{names or 'nothing bindable'}")
+        checks = [t["overlap"] for t in trace if "overlap" in t]
+        dropped = [c["phrase"] for c in checks if not c["kept"]]
+        mode = "body" if inp.get("bodies") is not None else "face"
+        print(f"    {label} ({time.time() - t0:.1f}s, {method}, {mode} mode): "
+              f"{names or 'nothing bindable'}"
+              + (f" [overlap checks {len(checks)}, dropped {dropped}]" if checks else ""))
         out.append({"photo_id": pid, "description_sha": inp["description_sha"],
                     "slots": slots, "method": method})
     return out

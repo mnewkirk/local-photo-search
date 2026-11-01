@@ -383,6 +383,38 @@ def contested_faces(faces: list[dict], bodies: list[dict], margin: Optional[floa
     return out
 
 
+def keypoint_contested(faces: list[dict], bodies: list[dict]) -> set:
+    """Offered face ids the keypoint-verified link (docs/notes/llm-passes.md,
+    "people context: Step 0") forbids naming anyone. A body owns a face when one
+    of its head keypoints (nose, eyes) lies inside the UNPADDED face box
+    (:func:`person_boxes.head_in_face`). A face linked to a body names someone
+    only if that body, and no other, owns it; an unlinked face (drawn as its own
+    box) is contested when two or more bodies own it. A duplicate box of a kept
+    body counts as that body. Off (empty) when no body carries a ``keypoints``
+    key: bodies from before the keypoint detector, as in the eval files."""
+    if not any("keypoints" in b for b in bodies):
+        return set()
+    from .person_boxes import dedupe, head_in_face, link_faces
+    offered = offered_faces(faces)
+    above = [b for b in bodies if b["score"] >= BODY_MIN_SCORE]
+    kept, merged = dedupe(above)
+    pos = {k: n for n, k in enumerate(kept)}
+    link = link_faces(offered, [above[i] for i in kept])
+    above_ix = {id(b): i for i, b in enumerate(above)}
+    out = set()
+    for f in offered:
+        owners = set()
+        for b in bodies:
+            if not head_in_face(b, _bbox(f)):
+                continue
+            ai = above_ix.get(id(b))
+            owners.add(("below", id(b)) if ai is None else pos[merged.get(ai, ai)])
+        linked = link.get(f["face_id"])
+        if (owners != {linked}) if linked is not None else len(owners) >= 2:
+            out.add(f["face_id"])
+    return out
+
+
 def build_prompt(description: str, n_boxes: int, bodies: bool = False) -> str:
     if bodies:
         return PEOPLE_BIND_BODY_PROMPT.format(description=description, n=n_boxes)
@@ -406,7 +438,7 @@ def body_targets(faces: list[dict], bodies: list[dict], image_h: int) -> list[di
     bs = [above[i] for i in kept]
     link = link_faces(offered, bs)
     held = set(link.values())
-    contested = contested_faces(faces, bodies, LINK_MARGIN)
+    contested = contested_faces(faces, bodies, LINK_MARGIN) | keypoint_contested(faces, bodies)
     targets = [{"bbox": list(bs[link[f["face_id"]]]["bbox"]) if f["face_id"] in link
                 else list(_bbox(f)),
                 "face_id": None if f["face_id"] in contested else f["face_id"]} for f in offered]
@@ -698,6 +730,7 @@ def validate_slots(description: str, slots: list, photo_face_ids: set) -> list:
 # ---------------------------------------------------------------------------
 
 _OVERLAY_MAX_PX = 1024
+_OVERLAP_MAX_PX = 1024
 
 
 def draw_overlay(image_path: str, faces: list[dict], order: list[int],
@@ -848,11 +881,151 @@ def link_checked(image_path: str, slots: list[dict], targets: list[dict], model:
     return kept
 
 
+# The overlap second call (the owner's idea; docs/notes/llm-passes.md, "people
+# context: Step 0"): a bound box that lies OVERLAP_MIN or more inside another drawn
+# person's box (not a member of the same slot) is checked by a forced choice
+# between the two cropped people, asked twice with the letters swapped. The slot
+# is kept only if both answers pick the chosen box.
+OVERLAP_MIN = 0.30
+OVERLAP_PROMPT = """\
+The image shows two people marked with boxes: person A in a {ca} box and person B in a {cb} box. \
+Their boxes overlap. Here is a description of the whole photo:
+
+{description}
+
+{question}
+Judge by what you can see: clothing, colours, numbers, what each person is doing. Answer "neither" if \
+the phrase describes someone else, and "unsure" if you cannot tell.
+Answer with only a JSON object: {{"choice": "A"}}, {{"choice": "B"}},{both} {{"choice": "neither"}} or {{"choice": "unsure"}}"""
+_OVERLAP_Q_ONE = 'Which person does this phrase from the description refer to: "{phrase}"?'
+_OVERLAP_Q_GROUP = ('This phrase from the description refers to a group of people: "{phrase}". '
+                    'Which of these two is one of the people it refers to?')
+_OVERLAP_COLOURS = (("GREEN", (0, 200, 0)), ("MAGENTA", (230, 0, 200)))
+_CHOICES = ("A", "B", "both", "neither", "unsure")
+
+
+def _choice_schema(group: bool) -> tuple:
+    enum = [c for c in _CHOICES if group or c != "both"]
+    return ("bind_choice", {"type": "object", "additionalProperties": False,
+                            "required": ["choice"],
+                            "properties": {"choice": {"type": "string", "enum": enum}}})
+
+
+def overlap_rivals(slot: dict, targets: list[dict]) -> list[tuple]:
+    """``[(chosen bbox, rival bbox)]`` for each face of ``slot`` whose drawn box
+    lies at least ``OVERLAP_MIN`` (share of its own area) inside the box of a
+    drawn person who is not a member of the slot."""
+    from .person_boxes import _area, _inter
+    box_of = {t["face_id"]: tuple(t["bbox"]) for t in targets if t["face_id"] is not None}
+    own = {box_of.get(f["face_id"]) for f in slot["faces"]}
+    out = []
+    for f in slot["faces"]:
+        mine = box_of.get(f["face_id"])
+        if mine is None:
+            continue
+        for t in targets:
+            other = tuple(t["bbox"])
+            if other in own:
+                continue
+            if _inter(mine, other) / max(1.0, _area(mine)) >= OVERLAP_MIN:
+                out.append((list(mine), list(other)))
+    return out
+
+
+def draw_pair_crop(image_path: str, boxes: list, max_px: int = _OVERLAP_MAX_PX) -> str:
+    """Base64 JPEG crop around two boxes (padded), the first boxed GREEN and
+    lettered A, the second MAGENTA and B."""
+    import base64
+    import io
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+    with Image.open(image_path) as im0:
+        im = ImageOps.exif_transpose(im0).convert("RGB")
+    t = min(b[0] for b in boxes); r = max(b[1] for b in boxes)
+    bo = max(b[2] for b in boxes); l = min(b[3] for b in boxes)
+    pw, ph = (r - l) * 0.3, (bo - t) * 0.2
+    box = (max(0, int(l - pw)), max(0, int(t - ph)), min(im.width, int(r + pw)), min(im.height, int(bo + ph)))
+    c = im.crop(box)
+    s = min(1.0, max_px / float(max(c.size)))
+    c = c.resize((max(1, round(c.width * s)), max(1, round(c.height * s))), Image.LANCZOS)
+    d = ImageDraw.Draw(c)
+    try:
+        font = ImageFont.load_default(size=max(16, c.height // 22))
+    except TypeError:                      # old Pillow: no size argument
+        font = ImageFont.load_default()
+    for (_, col), b, letter in zip(_OVERLAP_COLOURS, boxes, "AB"):
+        x1, y1 = (b[3] - box[0]) * s, (b[0] - box[1]) * s
+        x2, y2 = (b[1] - box[0]) * s, (b[2] - box[1]) * s
+        d.rectangle([x1, y1, x2, y2], outline=col, width=4)
+        tb = d.textbbox((x1 + 3, y1 + 3), letter, font=font)
+        d.rectangle(tb, fill=col)
+        d.text((x1 + 3, y1 + 3), letter, fill=(255, 255, 255), font=font)
+    buf = io.BytesIO()
+    c.save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def ask_choice(image_path: str, chosen, other, description: str, phrase: str,
+               group: bool, model: str) -> Optional[list[str]]:
+    """The two forced-choice calls, the chosen box as A then as B. Returns each
+    answer as ``chosen`` / ``other`` / ``both`` / ``neither`` / ``unsure``, or
+    ``None`` when a call got no answer (defer). Raises ``UnusableAnswer`` for an
+    answer that is not one of the offered choices."""
+    from .describe import UnusableAnswer, _ollama_chat_with_retry
+    q = (_OVERLAP_Q_GROUP if group else _OVERLAP_Q_ONE).format(phrase=phrase)
+    msg = OVERLAP_PROMPT.format(ca=_OVERLAP_COLOURS[0][0], cb=_OVERLAP_COLOURS[1][0],
+                                description=description, question=q,
+                                both=' {"choice": "both"},' if group else "")
+    out = []
+    for first, second in ((chosen, other), (other, chosen)):
+        raw = _ollama_chat_with_retry(
+            model=model,
+            messages=[{"role": "user", "content": msg,
+                       "images": [draw_pair_crop(image_path, [first, second])]}],
+            options={"temperature": 0.0, "num_ctx": 8192, "num_predict": 64,
+                     "json_schema": _choice_schema(group)},
+            role="bind")
+        if raw is None:
+            return None
+        obj = _json_array(raw)
+        ch = obj.get("choice") if isinstance(obj, dict) else None
+        if ch not in _CHOICES or (ch == "both" and not group):
+            raise UnusableAnswer(f"people-bind overlap check: not a choice: {raw[:80]!r}")
+        mine = "A" if first is chosen else "B"
+        out.append("chosen" if ch == mine else ("other" if ch in ("A", "B") else ch))
+    return out
+
+
+def overlap_checked(image_path: str, description: str, slots: list[dict],
+                    targets: list[dict], model: str,
+                    trace: Optional[list] = None) -> Optional[list[dict]]:
+    """Keep a slot only if, for every overlap rival (:func:`overlap_rivals`), both
+    forced-choice answers pick the chosen box. ``None`` = a call got no answer."""
+    kept = []
+    for s in slots:
+        ok = True
+        phrase = s["spans"][0]["text"]
+        for mine, other in overlap_rivals(s, targets):
+            ans = ask_choice(image_path, mine, other, description, phrase,
+                             s["kind"] == "group", model)
+            if ans is None:
+                return None
+            if trace is not None:
+                trace.append({"overlap": {"phrase": phrase, "answers": ans,
+                                          "kept": ans == ["chosen", "chosen"]}})
+            if ans != ["chosen", "chosen"]:
+                ok = False
+                break
+        if ok:
+            kept.append(s)
+    return kept
+
+
 def bind_with_model(image_path: str, description: str, faces: list[dict],
                     photo_id: int, model: str, *, max_px: int = _OVERLAY_MAX_PX,
                     second_call: bool = True, bodies: Optional[list] = None,
                     image_h: int = 0, trace: Optional[list] = None,
-                    link_check: bool = False) -> Optional[list[dict]]:
+                    link_check: bool = False,
+                    overlap_check: bool = False) -> Optional[list[dict]]:
     """The VLM tier for one photo: one call for one offered face, two calls with
     re-shuffled numbering for two or more. Returns the slots (possibly ``[]``),
     or ``None`` to defer (a call got no answer).
@@ -860,7 +1033,8 @@ def bind_with_model(image_path: str, description: str, faces: list[dict],
     ``bodies`` (detector boxes, ``[{"bbox", "score"}]``) switches to body mode:
     the boxes are :func:`body_targets` and a phrase whose box holds no face
     binds nothing; ``link_check`` then asks, per bound face, whether it is its
-    body's own (:func:`link_checked`). ``trace`` (a list) receives each call's
+    body's own (:func:`link_checked`); ``overlap_check`` asks the forced choice
+    of :func:`overlap_checked` for a bound box overlapping another person. ``trace`` (a list) receives each call's
     boxes, face ids and validated mentions, for the eval. ``max_px`` / ``second_call=False`` exist
     for the eval's ablations (overlay resolution, one call vs two)."""
     offered = offered_faces(faces)
@@ -887,7 +1061,9 @@ def bind_with_model(image_path: str, description: str, faces: list[dict],
                                   people=people_in_photo(faces, bodies), bare_rule=BARE_PHRASE_RULE))
         slots = merge_calls(description, decided, by_id)
         if link_check and slots:
-            return link_checked(image_path, slots, targets, model, trace=None)
+            slots = link_checked(image_path, slots, targets, model, trace=None)
+        if overlap_check and slots:
+            slots = overlap_checked(image_path, description, slots, targets, model, trace=trace)
         return slots
     ids = [f["face_id"] for f in offered]
     orders = [ids] if len(ids) == 1 else list(shuffled_orders(ids, photo_id))
@@ -904,21 +1080,33 @@ def bind_with_model(image_path: str, description: str, faces: list[dict],
 
 
 def bind_photo(photo: dict, image_path: Optional[str], model: str,
-               ) -> tuple[Optional[list], str]:
+               trace: Optional[list] = None) -> tuple[Optional[list], str]:
     """Both tiers for one claimed photo (``photo['people_bind_input']`` is the
     claim payload). Returns ``(slots, method)`` or ``(None, '')`` to defer.
     The rule tier needs no image; ``image_path`` may be ``None`` until the VLM
-    tier is actually needed (pass a callable to fetch lazily)."""
+    tier is actually needed (pass a callable to fetch lazily).
+
+    With ``bodies`` in the input (the stored person boxes; ``None`` = none
+    stored) the VLM tier runs in body mode with the overlap check, and the rule
+    tier's bare phrases must pass ``BARE_PHRASE_RULE``; otherwise face mode."""
     inp = photo["people_bind_input"]
     description = inp["description"]
     faces = inp["faces"]
+    bodies = inp.get("bodies")
     rb = rule_bind(description, faces, inp.get("subject_boxes"),
                    inp.get("image_width") or 0, inp.get("image_height") or 0)
+    if rb is not None and bodies is not None:
+        rb = filter_bare(rb, people_in_photo(faces, bodies), BARE_PHRASE_RULE)
     if rb is not None:
         return rb, "rule"
     if callable(image_path):
         image_path = image_path()
     if not image_path:
         return None, ""
-    slots = bind_with_model(image_path, description, faces, photo["id"], model)
+    if bodies is not None:
+        slots = bind_with_model(image_path, description, faces, photo["id"], model,
+                                bodies=bodies, image_h=inp.get("image_height") or 0,
+                                trace=trace, overlap_check=True)
+    else:
+        slots = bind_with_model(image_path, description, faces, photo["id"], model)
     return slots, "vlm"

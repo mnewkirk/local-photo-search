@@ -124,7 +124,7 @@ def _photo(pid=1):
 
 
 def _patch_bind(monkeypatch, fn):
-    monkeypatch.setattr(PB, "bind_photo", lambda photo, fetch, model: fn(photo))
+    monkeypatch.setattr(PB, "bind_photo", lambda photo, fetch, model, trace=None: fn(photo))
 
 
 def test_worker_row_shape_and_empty_result_is_a_row(monkeypatch, tmp_path):
