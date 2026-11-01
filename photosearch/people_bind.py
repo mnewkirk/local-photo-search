@@ -319,10 +319,72 @@ Answer with only a JSON array, one object per phrase:
 Use "kind": "group" for two or three people. Answer [] if no phrase qualifies."""
 
 
-def build_prompt(description: str, n_boxes: int) -> str:
+# Body mode (plan Revision 2): every person gets a box, faced or not, so the phrase
+# about a boy seen from behind points at HIS box instead of borrowing a neighbour's
+# face. No worked example phrase: the face-mode example was copied into answers
+# verbatim. The box count is stated twice: "box number out of range" was the most
+# common unusable answer on every model.
+PEOPLE_BIND_BODY_PROMPT = """\
+The image has {n} numbered boxes, 1 to {n}, each drawn around one person. People \
+who face away from the camera or whose face is hidden still have a box. Below is \
+a description of the photo. For every phrase in the description that refers to \
+ONE individual person or a small group of 2 or 3 people, list the numbers of \
+EVERY box that phrase could equally describe.
+
+Description:
+{description}
+
+Rules:
+- Copy each phrase EXACTLY as written in the description: the same words in the \
+same case, from the phrase's first word.
+- Use only box numbers from 1 to {n}.
+- List every box the phrase could describe. If the description does not \
+distinguish between several boxes, list all of them.
+- Leave out crowds, "the team", "others" and pronouns (he, she, they).
+- If the phrase refers to several people, set "all_members_boxed" to false \
+unless every one of them has a box.
+Answer with only a JSON array, one object per phrase:
+[{{"phrase": "...", "could_be": [1, 2], "kind": "person", "all_members_boxed": true}}]
+Use "kind": "group" for two or three people. Answer [] if no phrase qualifies."""
+
+# Which detector bodies are drawn in body mode. Tuned on the dev labels only
+# (docs/notes/llm-passes.md, "people-bind: body mode").
+BODY_MIN_SCORE = 0.5
+BODY_MIN_HEIGHT_FRAC = 0.10   # a faceless body shorter than this share of the frame is not drawn
+MAX_TARGETS = 10
+
+
+def build_prompt(description: str, n_boxes: int, bodies: bool = False) -> str:
+    if bodies:
+        return PEOPLE_BIND_BODY_PROMPT.format(description=description, n=n_boxes)
     return PEOPLE_BIND_PROMPT.format(
         description=description,
         box_numbers=", ".join(str(i) for i in range(1, n_boxes + 1)))
+
+
+def body_targets(faces: list[dict], bodies: list[dict], image_h: int) -> list[dict]:
+    """The boxes drawn in body mode, ``[{"bbox", "face_id" or None}]``.
+
+    Every offered face is a target: the body it heads (:func:`person_boxes.link_faces`)
+    or, when no body has it, the face box itself. Faceless bodies at least
+    ``BODY_MIN_HEIGHT_FRAC`` of the frame tall follow, tallest first, up to
+    ``MAX_TARGETS``. A phrase whose box has no face is "this person, no name":
+    :func:`decide` drops it, because ``None`` is nobody's face id."""
+    from .person_boxes import dedupe, link_faces
+    offered = offered_faces(faces)
+    above = [b for b in bodies if b["score"] >= BODY_MIN_SCORE]
+    kept, _ = dedupe(above)
+    bs = [above[i] for i in kept]
+    link = link_faces(offered, bs)
+    held = set(link.values())
+    targets = [{"bbox": list(bs[link[f["face_id"]]]["bbox"]) if f["face_id"] in link
+                else list(_bbox(f)), "face_id": f["face_id"]} for f in offered]
+    tall = sorted((b for i, b in enumerate(bs)
+                   if i not in held and b["bbox"][2] - b["bbox"][0] >= BODY_MIN_HEIGHT_FRAC * image_h),
+                  key=lambda b: (b["bbox"][0] - b["bbox"][2], b["bbox"][3]))
+    for b in tall[:max(0, MAX_TARGETS - len(targets))]:
+        targets.append({"bbox": list(b["bbox"]), "face_id": None})
+    return targets
 
 
 def shuffled_orders(face_ids: list[int], seed: int) -> tuple[list[int], list[int]]:
@@ -541,11 +603,18 @@ def draw_overlay(image_path: str, faces: list[dict], order: list[int],
     and numbered ``1..n``. Face bboxes are already in the oriented frame
     (faces rule, "EXIF-oriented image dimensions"); they are scaled with the
     resize. Draws ONLY the faces given, labelled or not."""
+    by_id = {f["face_id"]: f for f in faces}
+    return draw_boxes(image_path, [_bbox(by_id[fid]) for fid in order], max_px=max_px)
+
+
+def draw_boxes(image_path: str, boxes: list, max_px: int = _OVERLAY_MAX_PX) -> str:
+    """Base64 JPEG with ``boxes`` (top, right, bottom, left; oriented frame)
+    drawn and numbered ``1..n`` in list order. Number tags that would overlap
+    (boxes sharing a corner) step right."""
     import base64
     import io
     from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-    by_id = {f["face_id"]: f for f in faces}
     with Image.open(image_path) as im0:
         im = ImageOps.exif_transpose(im0).convert("RGB")
     ow, oh = im.size
@@ -559,12 +628,17 @@ def draw_overlay(image_path: str, faces: list[dict], order: list[int],
         font = ImageFont.load_default(size=max(14, im.size[1] // 28))
     except TypeError:                      # old Pillow: no size argument
         font = ImageFont.load_default()
-    for n, fid in enumerate(order, 1):
-        top, right, bottom, left = (v * scale for v in _bbox(by_id[fid]))
+    tags: list = []
+    for n, box in enumerate(boxes, 1):
+        top, right, bottom, left = (v * scale for v in box)
         draw.rectangle([left, top, right, bottom], outline=(255, 40, 40), width=3)
         label = str(n)
         tx, ty = left, max(0, top - max(14, im.size[1] // 28) - 4)
         tb = draw.textbbox((tx, ty), label, font=font)
+        while any(tb[0] < o[2] and o[0] < tb[2] and tb[1] < o[3] and o[1] < tb[3] for o in tags):
+            tx += tb[2] - tb[0] + 3
+            tb = draw.textbbox((tx, ty), label, font=font)
+        tags.append(tb)
         draw.rectangle(tb, fill=(255, 40, 40))
         draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
     buf = io.BytesIO()
@@ -573,13 +647,13 @@ def draw_overlay(image_path: str, faces: list[dict], order: list[int],
 
 
 def ask_model(description: str, image_b64: str, n_boxes: int,
-              model: str) -> Optional[list[dict]]:
+              model: str, bodies: bool = False) -> Optional[list[dict]]:
     """One VLM call. Returns validated mentions, ``None`` when the backend gave
     no answer (a transport problem: the caller defers, spending nothing).
     Raises :class:`describe.UnusableAnswer` / ``TruncatedOutput`` for an answer
     that cannot be stored. Role ``bind``; temperature 0."""
     from .describe import _ollama_chat_with_retry
-    messages = [{"role": "user", "content": build_prompt(description, n_boxes),
+    messages = [{"role": "user", "content": build_prompt(description, n_boxes, bodies),
                  "images": [image_b64]}]
     options = {"temperature": 0.0, "num_ctx": 8192, "num_predict": 384}
     raw = _ollama_chat_with_retry(model=model, messages=messages, options=options,
@@ -591,17 +665,39 @@ def ask_model(description: str, image_b64: str, n_boxes: int,
 
 def bind_with_model(image_path: str, description: str, faces: list[dict],
                     photo_id: int, model: str, *, max_px: int = _OVERLAY_MAX_PX,
-                    second_call: bool = True) -> Optional[list[dict]]:
+                    second_call: bool = True, bodies: Optional[list] = None,
+                    image_h: int = 0, trace: Optional[list] = None) -> Optional[list[dict]]:
     """The VLM tier for one photo: one call for one offered face, two calls with
     re-shuffled numbering for two or more. Returns the slots (possibly ``[]``),
     or ``None`` to defer (a call got no answer).
 
-    ``max_px`` / ``second_call=False`` exist for the eval's ablations
-    (overlay resolution, one call vs two); production uses the defaults."""
+    ``bodies`` (detector boxes, ``[{"bbox", "score"}]``) switches to body mode:
+    the boxes are :func:`body_targets` and a phrase whose box holds no face
+    binds nothing. ``trace`` (a list) receives each call's boxes, face ids and
+    validated mentions, for the eval. ``max_px`` / ``second_call=False`` exist
+    for the eval's ablations (overlay resolution, one call vs two)."""
     offered = offered_faces(faces)
     by_id = {f["face_id"]: f for f in offered}
     if not offered or len(offered) > MAX_FACES:
         return []
+    if bodies is not None:
+        targets = body_targets(faces, bodies, image_h)
+        idx = list(range(len(targets)))
+        orders = [idx] if len(idx) == 1 else list(shuffled_orders(idx, photo_id))
+        if not second_call:
+            orders = orders[:1]
+        decided = []
+        for order in orders:
+            boxes = [targets[i]["bbox"] for i in order]
+            face_order = [targets[i]["face_id"] for i in order]
+            b64 = draw_boxes(image_path, boxes, max_px=max_px)
+            mentions = ask_model(description, b64, len(order), model, bodies=True)
+            if mentions is None:
+                return None
+            if trace is not None:
+                trace.append({"boxes": boxes, "face_ids": face_order, "mentions": mentions})
+            decided.append(decide(description, mentions, face_order, by_id))
+        return merge_calls(description, decided, by_id)
     ids = [f["face_id"] for f in offered]
     orders = [ids] if len(ids) == 1 else list(shuffled_orders(ids, photo_id))
     if not second_call:

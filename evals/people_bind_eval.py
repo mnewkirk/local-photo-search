@@ -383,14 +383,20 @@ def _sha12(b):
     return hashlib.sha1(b).hexdigest()[:12]
 
 
-def run_spec(tier, model, max_px, second_call):
+def run_spec(tier, model, max_px, second_call, bodies=False):
     """What a run measured. Resuming under a different spec refuses; the
     report marks a run whose prompt/code differ from today's as STALE."""
-    return {"tier": tier, "model": model, "max_px": max_px, "second_call": second_call,
-            "prompt_sha": _sha12(PB.PEOPLE_BIND_PROMPT.encode()),
+    spec = {"tier": tier, "model": model, "max_px": max_px, "second_call": second_call,
+            "prompt_sha": _sha12((PB.PEOPLE_BIND_BODY_PROMPT if bodies
+                                  else PB.PEOPLE_BIND_PROMPT).encode()),
             "code_sha": _sha12(Path(PB.__file__).read_bytes()),
             "bind_version": PB.BIND_VERSION,
             "reasoning_effort": os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "")}
+    if bodies:
+        from photosearch import person_boxes as PBX
+        spec.update(bodies=True, bodies_sha=_sha12(BODIES.read_bytes()),
+                    person_boxes_sha=_sha12(Path(PBX.__file__).read_bytes()))
+    return spec
 
 
 def cmd_run(a):
@@ -403,9 +409,10 @@ def cmd_run(a):
         model_eval.pin_role_model("bind", a.model)
     max_px = getattr(a, "max_px", None) or PB._OVERLAY_MAX_PX
     second_call = not getattr(a, "one_call", False)
-    spec = run_spec(a.tier, a.model, max_px, second_call)
+    spec = run_spec(a.tier, a.model, max_px, second_call, bodies=a.bodies)
     con = ro(a.db)
     sample = _jload(SAMPLE, {})
+    bodies_all = _jload(BODIES, {}).get("photos", {}) if a.bodies else None
     out_path = RUNS / f"{a.variant}.json"
     runs = _jload(out_path, None)
     if runs is not None and runs.get("spec") != spec:
@@ -434,11 +441,14 @@ def cmd_run(a):
         else:
             method = "vlm"
             calls = 1 if len(inp["faces"]) == 1 or not second_call else 2
+            trace = [] if a.bodies else None
             try:
                 img = str(_original(pid, a.server))
+                extra = ({"bodies": bodies_all.get(pid_s, []), "image_h": inp["image_height"],
+                          "trace": trace} if a.bodies else {})
                 slots = PB.bind_with_model(img, inp["description"], inp["faces"], pid,
                                            a.model or "bind", max_px=max_px,
-                                           second_call=second_call)
+                                           second_call=second_call, **extra)
             except UnusableAnswer as e:
                 # production: an attempt spent, nothing written -> generic text. Scored as
                 # abstaining, counted as an error.
@@ -455,11 +465,49 @@ def cmd_run(a):
         fails = 0
         pred = {"method": method, "slots": slots, "secs": round(time.time() - t0, 2),
                 "calls": calls}
+        if method == "vlm" and a.bodies:
+            calls = len(trace) or calls
+            pred["calls"] = calls
+            # what each call pointed at, as drawn boxes: the report maps them to body letters
+            pred["trace"] = [[{"phrase": m["phrase"], "boxes": [c["boxes"][n - 1] for n in m["could_be"]]}
+                              for m in c["mentions"]] for c in trace]
         if error:
             pred["error"] = error
         runs["preds"][pid_s] = pred
         _jsave(out_path, runs)
         print(f"{pid}: {method} {len(slots)} slot(s)" + (f"  [{error}]" if error else ""))
+
+
+def none_pointing(labels, preds, split, descs):
+    """For each NONE phrase with labelled bodies: did every call point at exactly
+    the owner's bodies (``right_body``), at some other box (``other_box``), or not
+    list the phrase at all (``not_listed``)? Boxes map to letters by bbox."""
+    letters = {p: {tuple(b["bbox"]): b["b"] for b in bs}
+               for p, bs in (_jload(BODIES, {}).get("photos") or {}).items()}
+    out = {"right_body": 0, "other_box": 0, "not_listed": 0}
+    for pid, lab in labels.items():
+        pr = preds.get(pid)
+        if lab.get("split") != split or not pr or "trace" not in pr:
+            continue
+        desc = descs.get(pid) or ""
+        for m in lab["mentions"]:
+            if m.get("gold") != "NONE" or not isinstance(m.get("bodies"), list):
+                continue
+            r = E.mention_range(desc, m["phrase"])
+            picks = []
+            for call in pr["trace"]:
+                hit = [x for x in call if r and E.mention_range(desc, x["phrase"])
+                       and E._overlaps({"start": E.mention_range(desc, x["phrase"])[0],
+                                        "end": E.mention_range(desc, x["phrase"])[1]}, r)]
+                picks.append({letters.get(pid, {}).get(tuple(bb), "?") for x in hit for bb in x["boxes"]}
+                             if hit else None)
+            if any(p is None for p in picks):
+                out["not_listed"] += 1
+            elif all(p == set(m["bodies"]) for p in picks):
+                out["right_body"] += 1
+            else:
+                out["other_box"] += 1
+    return out
 
 
 def cmd_report(a):
@@ -470,8 +518,10 @@ def cmd_report(a):
     for path in sorted(RUNS.glob("*.json")):
         run = json.loads(path.read_text())
         sp = run.get("spec") or {}
-        now = run_spec(sp.get("tier"), sp.get("model"), sp.get("max_px"), sp.get("second_call"))
-        stale = any(sp.get(k) != now[k] for k in ("prompt_sha", "code_sha", "bind_version"))
+        now = run_spec(sp.get("tier"), sp.get("model"), sp.get("max_px"), sp.get("second_call"),
+                       bodies=sp.get("bodies", False))
+        stale = any(sp.get(k) != now.get(k) for k in ("prompt_sha", "code_sha", "bind_version",
+                                                       "bodies_sha", "person_boxes_sha"))
         rep = E.score(labels, run["preds"], srcs, split=a.split, descriptions=descs)
         rows = E.gates(rep)
         scored = {p: v for p, v in run["preds"].items()
@@ -489,6 +539,8 @@ def cmd_report(a):
               f"user-visible wrong names {rep['visible_wrong']}")
         for st, b in sorted(rep["by_stratum"].items()):
             print(f"   {st:12} {b}")
+        if sp.get("bodies"):
+            print(f"   NONE phrases (body mode): {none_pointing(labels, run['preds'], a.split, descs)}")
         for name, ok, detail in rows:
             print(f"   [{'ok' if ok else ('??' if ok is None else 'FAIL')}] {name}: {detail}")
         for w in rep["wrong_cases"][:10]:
@@ -583,6 +635,8 @@ def main():
                    help=f"overlay long edge (default {PB._OVERLAY_MAX_PX}; ablation: 1536)")
     r.add_argument("--one-call", dest="one_call", action="store_true",
                    help="ablation: skip the re-shuffled second call on multi-face photos")
+    r.add_argument("--bodies", action="store_true",
+                   help="body mode (plan Revision 2): number every person from bodies.json")
     r.add_argument("--force", action="store_true")
     r.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER", "http://localhost:8001"))
     r.set_defaults(fn=cmd_run)
