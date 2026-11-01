@@ -290,3 +290,33 @@ def test_one_call_ablation_skips_the_reshuffled_second_call(monkeypatch):
     calls.clear()
     PB.bind_with_model("x.jpg", "A boy.", faces, 7, "m", max_px=1536, second_call=False)
     assert calls == [1536]
+
+
+def test_from_db_picks_production_binds_that_render_a_name(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from photosearch import people_bind as PB
+    from photosearch.db import PhotoDB
+    cli = _cli(tmp_path, monkeypatch)
+    db_path, pid = _two_face_db(tmp_path)
+    desc = "A boy in blue and a girl in red play."
+    with PhotoDB(db_path) as d:
+        named, unnamed = [r[0] for r in d.conn.execute(
+            "SELECT id FROM faces WHERE photo_id=? ORDER BY id", (pid,))]
+        def slot(fid, text, start):
+            return {"slot": "s1", "kind": "person",
+                    "spans": [{"start": start, "end": start + len(text), "text": text}],
+                    "faces": [{"face_id": fid, "bbox": [100, 400, 400, 100]}]}
+        d.conn.execute("INSERT INTO description_subjects (photo_id, description_sha, slots_json, "
+                       "method, bind_version) VALUES (?,?,?,?,1)",
+                       (pid, PB.sha_of(desc), json.dumps([slot(named, "A boy in blue", 0)]), "vlm"))
+        other = d.add_photo(filepath="2026/x/b.JPG", filename="b.JPG", description=desc)
+        f = d.add_face(other, (100, 900, 400, 600), [], det_score=0.9)   # no label: renders raw
+        d.conn.execute("INSERT INTO description_subjects (photo_id, description_sha, slots_json, "
+                       "method, bind_version) VALUES (?,?,?,?,1)",
+                       (other, PB.sha_of(desc), json.dumps([slot(f, "A boy in blue", 0)]), "vlm"))
+        d.conn.commit()
+    cli.cmd_from_db(SimpleNamespace(db=db_path, variant="prod", folder=["2026/x"], n=10, seed=1))
+    run = json.loads((cli.RUNS / "prod.json").read_text())
+    assert list(run["preds"]) == [str(pid)] and run["preds"][str(pid)]["method"] == "vlm"
+    assert cli._display(cli.ro(db_path), pid, desc).startswith("Zack")

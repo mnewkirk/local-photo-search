@@ -733,6 +733,46 @@ def _draw_review(image_path, faces, bodies, max_px=SHEET_PX):
     return buf.getvalue()
 
 
+def _display(con, pid, description):
+    """The description as the UI would render it now (names from trusted labels),
+    or None on a DB without the render tables."""
+    from photosearch import description_render
+    try:
+        r = description_render.render_many(con, [{"id": pid, "description": description}]).get(pid)
+    except Exception:                          # noqa: BLE001 - a pre-v41 DB: no line
+        return None
+    return r.text if r and r.changed and r.text != description else None
+
+
+def cmd_from_db(a):
+    """A run file from PRODUCTION rows: ``n`` random photos in the scope whose stored
+    ``description_subjects`` row renders at least one name now. For the pre-launch
+    review (use with --set): ``review-sheet --variant <variant>`` then reads it."""
+    import random
+    from photosearch import description_render
+    con = ro(a.db)
+    like = [f.rstrip("/") for f in a.folder]
+    q = " OR ".join("p.folder = ?" for _ in like)
+    rows = con.execute(
+        f"SELECT p.id, p.description, ds.slots_json, ds.method FROM photos p "
+        f"JOIN description_subjects ds ON ds.photo_id = p.id "
+        f"WHERE ({q}) AND ds.slots_json != '[]' ORDER BY p.id", like).fetchall()
+    named = []
+    for pid, desc, slots_json, method in rows:
+        r = description_render.render_many(con, [{"id": pid, "description": desc}]).get(pid)
+        if r and r.changed and r.text != desc:
+            named.append((pid, json.loads(slots_json), method))
+    random.Random(a.seed).shuffle(named)
+    pick = sorted(named[:a.n])
+    RUNS.mkdir(parents=True, exist_ok=True)
+    out = {"variant": a.variant, "tier": "both", "model": "production",
+           "spec": {"from_db": like, "seed": a.seed, "n": a.n},
+           "preds": {str(pid): {"method": method, "slots": slots} for pid, slots, method in pick}}
+    _jsave(RUNS / f"{a.variant}.json", out)
+    print(f"{len(rows)} photos with bound slots, {len(named)} render a name; "
+          f"wrote {len(pick)} to {RUNS / (a.variant + '.json')}")
+
+
 def cmd_review_sheet(a):
     """One card per slot a run BOUND: the photo (bound faces red, their bodies green),
     the description with the span bold, and who the face is labelled as now."""
@@ -746,8 +786,10 @@ def cmd_review_sheet(a):
             inp = store.claim_input(con, int(pid_s))
             if not inp:
                 continue
+            # a production set has no bodies.json: the stored person boxes (v43)
+            bodies = bodies_all.get(pid_s) if pid_s in bodies_all else (inp.get("bodies") or [])
             body_of = {t["face_id"]: t["bbox"] for t in
-                       PB.body_targets(inp["faces"], bodies_all.get(pid_s, []), inp["image_height"])
+                       PB.body_targets(inp["faces"], bodies, inp["image_height"])
                        if t["face_id"] is not None}
             fids = [f["face_id"] for f in s["faces"]]
             key = f"{pid_s}-{s['slot']}"
@@ -760,6 +802,7 @@ def cmd_review_sheet(a):
             sp = s["spans"][0]
             items.append({"key": key, "pid": pid_s, "description": inp["description"],
                           "start": sp["start"], "end": sp["end"], "method": pr.get("method"),
+                          "display": _display(con, int(pid_s), inp["description"]),
                           "names": [f"{rows[f]['name'] or '(no name)'} ({rows[f]['source'] or '-'})"
                                     for f in fids if f in rows]})
     labels = _jload(LABELS, {})
@@ -858,6 +901,13 @@ def main():
     p.add_argument("--db", required=True)
     p.add_argument("--split", choices=("dev", "holdout"), default="dev")
     p.set_defaults(fn=cmd_report)
+    fd = sub.add_parser("from-db", help="a run file of N random production binds (use with --set)")
+    fd.add_argument("--db", required=True)
+    fd.add_argument("--variant", required=True)
+    fd.add_argument("--folder", action="append", required=True, help="photos.folder, repeatable")
+    fd.add_argument("--n", type=int, default=100)
+    fd.add_argument("--seed", type=int, default=20261101)
+    fd.set_defaults(fn=cmd_from_db)
     rs = sub.add_parser("review-sheet", help="page of a run's bound slots to judge (use with --set)")
     rs.add_argument("--db", required=True)
     rs.add_argument("--variant", required=True)
@@ -939,6 +989,7 @@ function card(it) {
   const right = el("div", {}, el("div", {cls: "desc"}, d.slice(0, it.start), el("b", {}, d.slice(it.start, it.end)), d.slice(it.end)),
     el("p", {}, "Red box(es) = the face this phrase would name: ", el("b", {}, it.names.join(" + "))),
     el("p", {cls: "mut"}, "Green = the body the face was linked to. Judge the PERSON: does the bold phrase describe the person in the red/green box?"));
+  if (it.display) right.append(el("p", {}, el("b", {}, "As it will read: "), it.display));
   const row = el("div");
   for (const [k, label] of VERDICTS)
     row.append(el("button", {cls: v === k ? "on" : "", on: () => { L[it.key] = {verdict: v === k ? null : k}; save(); sec.replaceWith(card(it)); }}, label));
