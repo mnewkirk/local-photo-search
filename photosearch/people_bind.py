@@ -335,13 +335,9 @@ Description:
 {description}
 
 Rules:
-- A phrase is the SHORTEST part of the description that tells this person or \
-group apart from everyone else in the photo: the person noun with its article \
-and the details that single them out, such as clothing colour, a number, where \
-they are or what they are doing. A phrase with only an article, a number, an \
-age word and a person noun fits anyone, so use it only when it names every \
-person in the photo. Never copy a whole sentence, the setting, or a phrase that \
-fits several people equally.
+- A phrase is only the words that name the person or group: the noun with its \
+article, describing words and what they wear or hold. Never copy a whole \
+sentence or clause, what the person is doing, or the setting.
 - Copy each phrase EXACTLY as written in the description: the same words in the \
 same case.
 - Use only box numbers from 1 to {n}.
@@ -534,6 +530,9 @@ def _single_occurrence(description: str, phrase: str) -> Optional[tuple]:
     return i, i + len(phrase)
 
 
+# Asking the model for "the shortest phrase that tells this person apart" was tried and
+# reverted: it bound more often in crowded scenes and made 2 wrong binds on dev
+# (overlapping players, a face credited to the wrong body). The code rule below does the job.
 # A BARE phrase says nothing that tells one person from another: an article or a
 # count, age/size words, a person noun ("One boy", "two young players"). With several
 # people in the photo it can only be resolved from the rest of the sentence, so the

@@ -1038,3 +1038,27 @@ faced boy (owner: ambiguous between the two).
   score exactly with the guard off (after skipping photos whose call failed).
 - qwen3.5's remaining unusable answers are paraphrased phrases ("a person" for "a man"); case
   and spacing differences are now resolved to the description's own text (17 of 29).
+
+### people-bind: the bare-phrase rule and a "distinguishing phrase" prompt (2026-10-31)
+
+Owner's rule: a bare phrase ("One boy", "two players": article or count, age words, person noun)
+tells nobody apart, so it binds only when it names everyone the detector found
+(`BARE_PHRASE_RULE = "everyone"`: "Two boys" in a two-person photo is fine; `strict` = a lone
+person only). Applied to both tiers (`5b4ff58`). Bound = labelled phrases bound.
+
+| qwen3.5-9b, body mode | rule | dev bound / wrong | dev coverage | holdout bound / wrong |
+|---|---|--:|--:|--:|
+| current prompt (`-k`) | off | 33 / 0 | 0.248 | 13 / 0 |
+| current prompt | **everyone** | **31 / 0** | 0.233 | **13 / 0** |
+| current prompt | strict | 30 / 0 | 0.226 | 13 / 0 |
+| "shortest distinguishing phrase" prompt (`-m`) | any | 31 / 2 | 0.216 | 13 / 0 |
+
+- The rule costs 2 dev binds (both bare phrases in 3- and 8-person photos); the holdout is
+  unchanged.
+- The prompt asking for the shortest phrase that tells the person apart was reverted: spans grew
+  (5.8 -> 6.8 words) and the model bound in crowded scenes the old prompt declined, where
+  overlapping players break the face-to-body link. 249761: the seated boy's box overlaps the
+  dribbler's torso and both calls chose it; 244870: the navy boy's face is credited to the box of
+  #10 in front of him (facing away), who is the kicker.
+- Every wrong bind seen since body mode is one shape: two people's boxes overlap and a face
+  belongs to the other one. Geometry and a yes/no link question both fail to catch it.
