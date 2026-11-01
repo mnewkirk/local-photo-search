@@ -409,10 +409,11 @@ def cmd_run(a):
         model_eval.pin_role_model("bind", a.model)
     max_px = getattr(a, "max_px", None) or PB._OVERLAY_MAX_PX
     second_call = not getattr(a, "one_call", False)
-    spec = run_spec(a.tier, a.model, max_px, second_call, bodies=a.bodies)
+    body_mode = getattr(a, "bodies", False)
+    spec = run_spec(a.tier, a.model, max_px, second_call, bodies=body_mode)
     con = ro(a.db)
     sample = _jload(SAMPLE, {})
-    bodies_all = _jload(BODIES, {}).get("photos", {}) if a.bodies else None
+    bodies_all = _jload(BODIES, {}).get("photos", {}) if body_mode else None
     out_path = RUNS / f"{a.variant}.json"
     runs = _jload(out_path, None)
     if runs is not None and runs.get("spec") != spec:
@@ -441,11 +442,11 @@ def cmd_run(a):
         else:
             method = "vlm"
             calls = 1 if len(inp["faces"]) == 1 or not second_call else 2
-            trace = [] if a.bodies else None
+            trace = [] if body_mode else None
             try:
                 img = str(_original(pid, a.server))
                 extra = ({"bodies": bodies_all.get(pid_s, []), "image_h": inp["image_height"],
-                          "trace": trace} if a.bodies else {})
+                          "trace": trace} if body_mode else {})
                 slots = PB.bind_with_model(img, inp["description"], inp["faces"], pid,
                                            a.model or "bind", max_px=max_px,
                                            second_call=second_call, **extra)
@@ -465,7 +466,7 @@ def cmd_run(a):
         fails = 0
         pred = {"method": method, "slots": slots, "secs": round(time.time() - t0, 2),
                 "calls": calls}
-        if method == "vlm" and a.bodies:
+        if method == "vlm" and body_mode:
             calls = len(trace) or calls
             pred["calls"] = calls
             # what each call pointed at, as drawn boxes: the report maps them to body letters
