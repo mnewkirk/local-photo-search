@@ -79,3 +79,42 @@ def test_a_whole_sentence_copied_as_a_phrase_never_binds():
     by_id = {1: FACE}
     assert PB.decide(desc, [sentence], [1], by_id) == {}
     assert PB.decide(desc, [noun], [1], by_id) == {"A young boy in a blue soccer jersey": ("person", [1])}
+
+
+def test_a_face_heading_two_bodies_equally_is_contested_and_names_nobody(monkeypatch):
+    # two boys side by side, one face between their heads: nearly equal head costs
+    left, right = _body(1000, 1000, 3000, 0), _body(1000, 2000, 3000, 1000)
+    between = _face(5, 1010, 1080, 1200, 920)
+    assert PB.contested_faces([between], [left, right], None) == set()
+    assert PB.contested_faces([between], [left, right], 0.05) == {5}
+    assert PB.contested_faces([FACE], [FACED, BACK], 0.05) == set()   # one body only
+    monkeypatch.setattr(PB, "LINK_MARGIN", 0.05)
+    assert all(t["face_id"] is None for t in PB.body_targets([between], [left, right], H))
+
+
+def test_the_link_check_drops_a_slot_whose_face_is_not_its_bodys_own(monkeypatch):
+    other = _face(2, 1000, 1700, 1200, 1500)      # drawn inside BACK's box but someone else's
+    targets = [{"bbox": FACED["bbox"], "face_id": 1}, {"bbox": BACK["bbox"], "face_id": 2},
+               {"bbox": other["bbox"], "face_id": 3}]       # a face drawn as its own box
+    slots = [{"slot": "s1", "kind": "person", "spans": [], "faces": [{"face_id": 1, "bbox": FACE["bbox"]}]},
+             {"slot": "s2", "kind": "person", "spans": [], "faces": [{"face_id": 2, "bbox": other["bbox"]}]},
+             {"slot": "s3", "kind": "person", "spans": [], "faces": [{"face_id": 3, "bbox": other["bbox"]}]}]
+    asked = []
+    monkeypatch.setattr(PB, "check_link", lambda img, body, face, model: asked.append(body) or body == FACED["bbox"])
+    kept = PB.link_checked("x.jpg", slots, targets, "m")
+    assert [s["slot"] for s in kept] == ["s1", "s3"] and len(asked) == 2   # s3 needs no check
+    monkeypatch.setattr(PB, "check_link", lambda *a: None)
+    assert PB.link_checked("x.jpg", slots, targets, "m") is None          # no answer: defer
+
+
+def test_a_recased_phrase_takes_the_descriptions_own_text_only_when_unique():
+    def ans(ph):
+        return '{"mentions": [{"phrase": "%s", "could_be": [1], "kind": "person", "all_members_boxed": true}]}' % ph
+    assert PB.parse_answer(ans("the kids"), "The kids run.", 1)[0]["phrase"] == "The kids"
+    assert PB.parse_answer(ans("a  boy"), "A boy runs.", 1)[0]["phrase"] == "A boy"
+    import pytest
+    from photosearch.describe import UnusableAnswer
+    with pytest.raises(UnusableAnswer):                     # twice: which one?
+        PB.parse_answer(ans("A BOY"), "A boy runs and a boy waits.", 1)
+    with pytest.raises(UnusableAnswer):                     # a paraphrase stays a failure
+        PB.parse_answer(ans("a person"), "A boy runs.", 1)

@@ -360,6 +360,27 @@ MAX_PHRASE_WORDS = 10
 BODY_MIN_SCORE = 0.5
 BODY_MIN_HEIGHT_FRAC = 0.10   # a faceless body shorter than this share of the frame is not drawn
 MAX_TARGETS = 10
+# A face that could be the head of two bodies (247627: a boy peeking past the head of
+# the boy in front) can be linked to the wrong one, and a correct body choice then
+# names the wrong child. A face whose runner-up body is within LINK_MARGIN of its best
+# head cost is CONTESTED: its box is still drawn but names nobody. None = off.
+LINK_MARGIN: Optional[float] = None
+
+
+def contested_faces(faces: list[dict], bodies: list[dict], margin: Optional[float]) -> set:
+    """Offered face ids whose two best head costs (:func:`person_boxes._head_cost`
+    over the deduplicated bodies) differ by at most ``margin``."""
+    if margin is None:
+        return set()
+    from .person_boxes import _head_cost, dedupe
+    above = [b for b in bodies if b["score"] >= BODY_MIN_SCORE]
+    kept, _ = dedupe(above)
+    out = set()
+    for f in offered_faces(faces):
+        costs = sorted(c for i in kept if (c := _head_cost(tuple(_bbox(f)), above[i]["bbox"])) is not None)
+        if len(costs) >= 2 and costs[1] - costs[0] <= margin:
+            out.add(f["face_id"])
+    return out
 
 
 def build_prompt(description: str, n_boxes: int, bodies: bool = False) -> str:
@@ -385,8 +406,10 @@ def body_targets(faces: list[dict], bodies: list[dict], image_h: int) -> list[di
     bs = [above[i] for i in kept]
     link = link_faces(offered, bs)
     held = set(link.values())
+    contested = contested_faces(faces, bodies, LINK_MARGIN)
     targets = [{"bbox": list(bs[link[f["face_id"]]]["bbox"]) if f["face_id"] in link
-                else list(_bbox(f)), "face_id": f["face_id"]} for f in offered]
+                else list(_bbox(f)),
+                "face_id": None if f["face_id"] in contested else f["face_id"]} for f in offered]
     tall = sorted((b for i, b in enumerate(bs)
                    if i not in held and b["bbox"][2] - b["bbox"][0] >= BODY_MIN_HEIGHT_FRAC * image_h),
                   key=lambda b: (b["bbox"][0] - b["bbox"][2], b["bbox"][3]))
@@ -424,6 +447,19 @@ def _json_array(raw: str):
     return None
 
 
+def _description_text(description: str, phrase: str) -> Optional[str]:
+    """The description's own text for a phrase the model re-cased or re-spaced
+    ("the kids" for "The kids": 17 of qwen3.5's 29 phrase failures), when it
+    occurs exactly once ignoring case and whitespace. Spans always come from
+    the description, never from the model's spelling."""
+    words = phrase.split()
+    if not words:
+        return None
+    pat = re.compile(r"\s+".join(re.escape(w) for w in words), re.IGNORECASE)
+    hits = list(pat.finditer(description))
+    return hits[0].group(0) if len(hits) == 1 else None
+
+
 def parse_answer(raw: Optional[str], description: str, n_boxes: int) -> list[dict]:
     """Parse and validate one VLM answer into mentions
     ``[{phrase, could_be:[int], kind, all_members_boxed}]``.
@@ -445,6 +481,8 @@ def parse_answer(raw: Optional[str], description: str, n_boxes: int) -> list[dic
             raise UnusableAnswer("people-bind: array item is not an object")
         phrase = it.get("phrase")
         cb = it.get("could_be")
+        if isinstance(phrase, str) and phrase not in description:
+            phrase = _description_text(description, phrase) or phrase
         if not isinstance(phrase, str) or phrase not in description:
             raise UnusableAnswer(f"people-bind: phrase not in the description: {phrase!r}")
         if not isinstance(cb, list) or not all(isinstance(n, int) and not isinstance(n, bool)
@@ -675,18 +713,102 @@ def ask_model(description: str, image_b64: str, n_boxes: int,
     return parse_answer(raw, description, n_boxes)
 
 
+# The link check (plan Revision 2): before a body-mode slot names anyone, ask whether
+# each bound face is that body's own face. Geometry cannot tell (247627: a boy behind
+# peeks out at the exact top centre of the front boy's box); appearance can.
+LINK_PROMPT = """\
+The image shows one person inside a large GREEN box and one face inside a small RED \
+box. Is the face in the red box this same person's own face, on this person's own \
+head? Answer "no" if the face belongs to someone else (for example a person behind \
+or beside them), or if you cannot tell.
+Answer with only a JSON object: {"same_person": true} or {"same_person": false}"""
+_LINK_SCHEMA = ("bind_link", {"type": "object", "additionalProperties": False,
+                              "required": ["same_person"],
+                              "properties": {"same_person": {"type": "boolean"}}})
+_LINK_PAD = 0.35         # crop margin around the body box, as a share of its size
+_LINK_MAX_PX = 768
+
+
+def draw_link_crop(image_path: str, body_bbox, face_bbox, max_px: int = _LINK_MAX_PX) -> str:
+    """Base64 JPEG crop around the body (padded) with the body boxed green and
+    the face boxed red, scaled so the face is large enough to judge."""
+    import base64
+    import io
+    from PIL import Image, ImageDraw, ImageOps
+    with Image.open(image_path) as im0:
+        im = ImageOps.exif_transpose(im0).convert("RGB")
+    t, r, b, l = body_bbox
+    pw, ph = (r - l) * _LINK_PAD, (b - t) * _LINK_PAD
+    box = (max(0, int(l - pw)), max(0, int(t - ph)), min(im.width, int(r + pw)), min(im.height, int(b + ph)))
+    crop = im.crop(box)
+    s = min(1.0, max_px / float(max(crop.size)))
+    crop = crop.resize((max(1, round(crop.width * s)), max(1, round(crop.height * s))), Image.LANCZOS)
+    d = ImageDraw.Draw(crop)
+    def tr(bb):
+        bt, br, bbm, bl = bb
+        return [(bl - box[0]) * s, (bt - box[1]) * s, (br - box[0]) * s, (bbm - box[1]) * s]
+    d.rectangle(tr(body_bbox), outline=(0, 200, 0), width=3)
+    d.rectangle(tr(face_bbox), outline=(255, 30, 30), width=3)
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def check_link(image_path: str, body_bbox, face_bbox, model: str) -> Optional[bool]:
+    """True only when the model says the face is the body's own. ``None`` = no
+    answer (defer). An unparseable answer raises ``UnusableAnswer``."""
+    from .describe import UnusableAnswer, _ollama_chat_with_retry
+    b64 = draw_link_crop(image_path, body_bbox, face_bbox)
+    raw = _ollama_chat_with_retry(
+        model=model, messages=[{"role": "user", "content": LINK_PROMPT, "images": [b64]}],
+        options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 64, "json_schema": _LINK_SCHEMA},
+        role="bind")
+    if raw is None:
+        return None
+    obj = _json_array(raw)
+    if not isinstance(obj, dict) or not isinstance(obj.get("same_person"), bool):
+        raise UnusableAnswer(f"people-bind link check: not a same_person answer: {raw[:80]!r}")
+    return obj["same_person"]
+
+
+def link_checked(image_path: str, slots: list[dict], targets: list[dict], model: str,
+                 trace: Optional[list] = None) -> Optional[list[dict]]:
+    """Keep a slot only if every face in it passes :func:`check_link` against
+    the body it was drawn as. A face drawn as its own box (no body) needs no
+    check. ``None`` = a check got no answer (defer the photo)."""
+    body_of = {t["face_id"]: t["bbox"] for t in targets if t["face_id"] is not None}
+    kept = []
+    for s in slots:
+        ok = True
+        for f in s["faces"]:
+            body = body_of.get(f["face_id"])
+            if body is None or list(body) == list(f["bbox"]):
+                continue
+            ans = check_link(image_path, body, f["bbox"], model)
+            if trace is not None:
+                trace.append({"link": {"face_id": f["face_id"], "same_person": ans}})
+            if ans is None:
+                return None
+            ok = ok and ans
+        if ok:
+            kept.append(s)
+    return kept
+
+
 def bind_with_model(image_path: str, description: str, faces: list[dict],
                     photo_id: int, model: str, *, max_px: int = _OVERLAY_MAX_PX,
                     second_call: bool = True, bodies: Optional[list] = None,
-                    image_h: int = 0, trace: Optional[list] = None) -> Optional[list[dict]]:
+                    image_h: int = 0, trace: Optional[list] = None,
+                    link_check: bool = False) -> Optional[list[dict]]:
     """The VLM tier for one photo: one call for one offered face, two calls with
     re-shuffled numbering for two or more. Returns the slots (possibly ``[]``),
     or ``None`` to defer (a call got no answer).
 
     ``bodies`` (detector boxes, ``[{"bbox", "score"}]``) switches to body mode:
     the boxes are :func:`body_targets` and a phrase whose box holds no face
-    binds nothing. ``trace`` (a list) receives each call's boxes, face ids and
-    validated mentions, for the eval. ``max_px`` / ``second_call=False`` exist
+    binds nothing; ``link_check`` then asks, per bound face, whether it is its
+    body's own (:func:`link_checked`). ``trace`` (a list) receives each call's
+    boxes, face ids and validated mentions, for the eval. ``max_px`` / ``second_call=False`` exist
     for the eval's ablations (overlay resolution, one call vs two)."""
     offered = offered_faces(faces)
     by_id = {f["face_id"]: f for f in offered}
@@ -709,7 +831,10 @@ def bind_with_model(image_path: str, description: str, faces: list[dict],
             if trace is not None:
                 trace.append({"boxes": boxes, "face_ids": face_order, "mentions": mentions})
             decided.append(decide(description, mentions, face_order, by_id))
-        return merge_calls(description, decided, by_id)
+        slots = merge_calls(description, decided, by_id)
+        if link_check and slots:
+            return link_checked(image_path, slots, targets, model, trace=None)
+        return slots
     ids = [f["face_id"] for f in offered]
     orders = [ids] if len(ids) == 1 else list(shuffled_orders(ids, photo_id))
     if not second_call:

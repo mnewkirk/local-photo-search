@@ -513,6 +513,95 @@ def none_pointing(labels, preds, split, descs):
     return out
 
 
+def cmd_redecide(a):
+    """Re-decide a body-mode run's saved answers under the contested-face guard,
+    for each ``--margins`` value, and score them: exactly what a live run would
+    give, because the guard only changes which face a drawn box maps to (never
+    what is drawn or how it is numbered). No model call."""
+    labels = _jload(LABELS, {})
+    con = ro(a.db)
+    srcs = {r[0]: r[1] for r in con.execute("SELECT id, match_source FROM faces")}
+    bodies_all = _jload(BODIES, {}).get("photos", {})
+    run = json.loads((RUNS / f"{a.variant}.json").read_text())
+    if not (run.get("spec") or {}).get("bodies"):
+        raise SystemExit(f"{a.variant} is not a body-mode run")
+    inps = {p: store.claim_input(con, int(p)) for p in run["preds"]}
+    descs = {p: (i or {}).get("description") for p, i in inps.items()}
+    for raw in a.margins.split(","):
+        margin = None if raw in ("off", "none") else float(raw)
+        preds = {}
+        for pid, pr in run["preds"].items():
+            if pr.get("method") != "vlm" or "trace" not in pr or not inps.get(pid):
+                preds[pid] = pr
+                continue
+            inp = inps[pid]
+            by_id = {f["face_id"]: f for f in PB.offered_faces(inp["faces"])}
+            cont = PB.contested_faces(inp["faces"], bodies_all.get(pid, []), margin)
+            targets = PB.body_targets(inp["faces"], bodies_all.get(pid, []), inp["image_height"])
+            face_of = {tuple(t["bbox"]): t["face_id"] for t in targets}
+            decided = []
+            for call in pr["trace"]:
+                drawn = []                       # the boxes this call mentioned, renumbered
+                for m in call:
+                    for bb in m["boxes"]:
+                        if tuple(bb) not in drawn:
+                            drawn.append(tuple(bb))
+                order = [None if face_of.get(b) in cont else face_of.get(b) for b in drawn]
+                ms = [{"phrase": m["phrase"], "kind": m["kind"], "all_members_boxed": m["all_members_boxed"],
+                       "could_be": sorted(drawn.index(tuple(bb)) + 1 for bb in m["boxes"])} for m in call]
+                decided.append(PB.decide(inp["description"], ms, order, by_id))
+            preds[pid] = dict(pr, slots=PB.merge_calls(inp["description"], decided, by_id))
+        rep = E.score(labels, preds, srcs, split=a.split, descriptions=descs)
+        n_cont = sum(1 for p, i in inps.items() if i and labels.get(p, {}).get("split") == a.split
+                     and PB.contested_faces(i["faces"], bodies_all.get(p, []), margin))
+        print(f"margin {raw:>5}: bound {rep['bound']:3}  wrong {rep['total']['wrong_bind']}  "
+              f"coverage {rep['coverage']}  abstain-correct {rep['abstain_correct']}  "
+              f"photos with a contested face {n_cont}  "
+              f"{[(w['photo_id'], w['phrase']) for w in rep['wrong_cases']]}")
+
+
+def cmd_linkcheck(a):
+    """Apply the link check (``people_bind.link_checked``) to a body-mode run's
+    BOUND slots only and save the result as ``<variant>-link``. Equivalent to a
+    live ``--link-check`` run: the check runs after the decision and changes
+    nothing before it. One call per bound face that sits in a body."""
+    from photosearch import model_eval
+    from photosearch.describe import UnusableAnswer
+    from photosearch.rerun import FLEET_REASONING_EFFORT
+    os.environ.setdefault("PHOTOSEARCH_LLM_REASONING_EFFORT", FLEET_REASONING_EFFORT)
+    model_eval.pin_role_model("bind", a.model)
+    con = ro(a.db)
+    bodies_all = _jload(BODIES, {}).get("photos", {})
+    src = json.loads((RUNS / f"{a.variant}.json").read_text())
+    if not (src.get("spec") or {}).get("bodies"):
+        raise SystemExit(f"{a.variant} is not a body-mode run")
+    out_path = RUNS / f"{a.variant}-link.json"
+    out = _jload(out_path, None) or {"variant": f"{a.variant}-link", "tier": src["tier"],
+                                     "model": src["model"], "link_model": a.model,
+                                     "spec": dict(src["spec"], link_check=a.model), "preds": {}}
+    for pid_s, pr in sorted(src["preds"].items(), key=lambda kv: int(kv[0])):
+        if pid_s in out["preds"]:
+            continue
+        if pr.get("method") != "vlm" or not pr.get("slots"):
+            out["preds"][pid_s] = pr
+            continue
+        inp = store.claim_input(con, int(pid_s))
+        targets = PB.body_targets(inp["faces"], bodies_all.get(pid_s, []), inp["image_height"])
+        trace = []
+        try:
+            slots = PB.link_checked(str(_original(int(pid_s), a.server)), pr["slots"], targets,
+                                    a.model, trace=trace)
+        except UnusableAnswer as e:
+            slots, trace = [], trace + [{"error": str(e)}]
+        if slots is None:
+            print(f"  {pid_s}: link check got no answer - not cached")
+            continue
+        out["preds"][pid_s] = dict(pr, slots=slots, links=trace)
+        _jsave(out_path, out)
+        print(f"{pid_s}: {len(pr['slots'])} -> {len(slots)} slot(s) {[t.get('link') for t in trace]}")
+    _jsave(out_path, out)
+
+
 def cmd_report(a):
     labels = _jload(LABELS, {})
     con = ro(a.db)
@@ -648,6 +737,18 @@ def main():
                     help="bind address, e.g. this machine's Tailscale IP to label from another machine")
     sv.add_argument("--port", type=int, default=8765)
     sv.set_defaults(fn=cmd_serve)
+    rd = sub.add_parser("redecide", help="re-score a body-mode run under the contested-face guard")
+    rd.add_argument("--db", required=True)
+    rd.add_argument("--variant", required=True)
+    rd.add_argument("--split", choices=("dev", "holdout"), default="dev")
+    rd.add_argument("--margins", default="off,0,0.05,0.1,0.2,0.5")
+    rd.set_defaults(fn=cmd_redecide)
+    lc = sub.add_parser("linkcheck", help="link-check a body-mode run's bound slots -> <variant>-link")
+    lc.add_argument("--db", required=True)
+    lc.add_argument("--variant", required=True)
+    lc.add_argument("--model", required=True)
+    lc.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER", "http://localhost:8001"))
+    lc.set_defaults(fn=cmd_linkcheck)
     p = sub.add_parser("report")
     p.add_argument("--db", required=True)
     p.add_argument("--split", choices=("dev", "holdout"), default="dev")

@@ -612,6 +612,9 @@ def _ollama_chat_with_retry(
     if base:
         return _openai_route(base, model, messages, retries, timeout, options, role)
 
+    # json_schema is an OpenAI-route request field, never an Ollama sampling option
+    if options and "json_schema" in options:
+        options = {k: v for k, v in options.items() if k != "json_schema"}
     text, done_reason = _ollama_chat_attempts(model, messages, retries, options, timeout)
     if done_reason != _LENGTH:
         return text
@@ -701,6 +704,7 @@ def _openai_chat_with_retry(
     temperature: float = 0.0,
     max_tokens: int = _DEFAULT_OPENAI_MAX_TOKENS,
     role: Optional[str] = None,
+    schema: Optional[tuple] = None,
 ) -> Optional[str]:
     """Call an OpenAI-compatible /chat/completions endpoint (LM Studio,
     llama-server, ...). Same return contract as _ollama_chat_with_retry: text on
@@ -714,14 +718,14 @@ def _openai_chat_with_retry(
     spends the whole budget thinking and returns '' (the 2026-10-03 batch).
     """
     text, finish = _openai_chat_attempts(base_url, model, messages, retries,
-                                         timeout, temperature, max_tokens, role)
+                                         timeout, temperature, max_tokens, role, schema)
     if finish != _LENGTH:
         return text
     print(f" [output cut off at {max_tokens} tokens; retrying at {max_tokens * 2}]",
           end="", flush=True)
     text, finish = _expanded_retry(
         lambda: _openai_chat_attempts(base_url, model, messages, retries,
-                                      timeout, temperature, max_tokens * 2, role),
+                                      timeout, temperature, max_tokens * 2, role, schema),
         max_tokens, role, model, text)
     if finish == _LENGTH:
         raise TruncatedOutput(
@@ -739,6 +743,7 @@ def _openai_chat_attempts(
     temperature: float,
     max_tokens: int,
     role: Optional[str],
+    schema: Optional[tuple] = None,
 ):
     """The transport-retry loop for one OpenAI-compatible call.
     Returns (text, finish_reason).
@@ -775,9 +780,12 @@ def _openai_chat_attempts(
     effort = os.environ.get("PHOTOSEARCH_LLM_REASONING_EFFORT", "").strip()
     if effort and not _model_has_no_reasoning_mode(model):
         body["reasoning_effort"] = effort
-    if role in _OPENAI_RESPONSE_SCHEMAS:
+    # A call may name its own (name, schema) via options["json_schema"]: people-bind's
+    # link check shares the bind role's model but answers a different shape.
+    name, sch = schema if schema else (role, _OPENAI_RESPONSE_SCHEMAS.get(role))
+    if sch is not None:
         body["response_format"] = {"type": "json_schema", "json_schema": {
-            "name": role, "strict": True, "schema": _OPENAI_RESPONSE_SCHEMAS[role]}}
+            "name": name, "strict": True, "schema": sch}}
     payload = json.dumps(body).encode("utf-8")
     for attempt in range(1, retries + 1):
         t0 = time.time()
@@ -1084,7 +1092,7 @@ def _openai_route(base, model, messages, retries, timeout, options, role=None):
         base, _resolve_openai_model(model, role), conv,
         retries=retries, timeout=timeout, temperature=temp,
         max_tokens=_OPENAI_MAX_TOKENS.get(role, _DEFAULT_OPENAI_MAX_TOKENS),
-        role=role)
+        role=role, schema=(options or {}).get("json_schema"))
 
 
 def _text_chat_with_retry(model, messages, options=None, timeout=None):
