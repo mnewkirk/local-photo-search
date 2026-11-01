@@ -1,6 +1,6 @@
 # People context in describe: identify bodies and faces, then describe with spans
 
-**Status: 🟡 planned 2026-10-31 (plan-debate); Step 0 done 2026-11-01; G0/G1 evals running 2026-11-01 (burst tier 0.28% wrong on holdout; gender/age hints fail the injection test; owner labels pending).** (Status lives in `README.md`.)
+**Status: 🔴 stopped at the evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies), hints fail the injection test, G1 fails on dev (named marks 93 right / 2 wrong with all guards). Steps 4-6 not started; the shared fallback applies (people-bind + v42 attributes).** (Status lives in `README.md`.)
 
 Supersedes docs/plans/description-names.md Revision 2 R3 (the after-the-fact body binder as the production path).
 Source: plan-debate 2026-10-31, Planner A (plan-A.md) and Planner B (plan-B.md), two critique rounds.
@@ -134,4 +134,10 @@ Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `ev
 - **Call shape**: two images (clean + numbered overlay) with inline `[phrase](n)` anchors, a length line,
   one corrective retry: 0 unusable on dev, descriptions 12-15% shorter than regenerated plain ones.
   One overlay image leaks. Bind precision pending the owner's confirmations.
+- **G1 verdicts (owner, dev)**: blind pairwise at parity (18 new / 17 stored / 5 same); marks 379 / 412
+  right; named marks with keypoint link + bare-phrase rule 93 right, 2 wrong (97.9%) -> **fails**; holdout
+  not run. Bare-phrase rule: on (it removed 1 wrong, 19 right).
+- **Recommendation**: no wiring of Steps 4-6. Keep people-bind + v42 attributes. Worth one more dev
+  experiment before closing: bind only marks that people-bind's binder, run on the new text, agrees with
+  (the plan's cross-check), or that pass the overlap forced choice.
 

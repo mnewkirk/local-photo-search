@@ -1178,4 +1178,14 @@ Stored descriptions: median 410 chars. Recall = share of the stored text's peopl
   (246056 scored "wrong" at first: the owner marked an opponent, and the face is Henry Marini, who
   plays for the other team). Burst tier: tune 1 right, 1 wrong (243906: Koa named Beckham); holdout
   0 named, so the >= 50-named faceless gate fails, and not for lack of sample.
+- **G1 owner verdicts (dev, two images + length line, no hints), 2026-11-01**: blind pairwise vs the
+  stored description, 40 photos: new 18, stored 17, same 5 (parity; the 4 flagged "degenerate"
+  answers split 2 / 1 / 1). Marks confirmed: 379 of 412 right (33 pointed at the wrong box, 1 not a
+  boxed person, 1 ambiguous). Marks that would show a name: 120 right, 6 wrong; with the keypoint
+  link required (uncontested) 112 / 3; plus the bare-phrase rule 93 / 2 (97.9%). The two left:
+  244964 "another boy in a green jersey" (box 1, owner: 2; two boys in green) and 246517 "two
+  other players" (2,5 vs 2,3). The bare rule removed one wrong (248650 "Two boys") and 19 right.
+  People-bind on the same dev photos: 31 bound, 0 wrong. **G1 fails on dev** (0-wrong gate and the
+  owner's ~99% bar); holdout not run. Grounded describe triples named coverage but picks the wrong
+  one of two similar players, the same failure people-bind's second call and overlap check exist for.
 
