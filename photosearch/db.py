@@ -124,7 +124,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -380,6 +380,51 @@ _VERIFY_NOT_EXHAUSTED = (
     "WHERE wp.photo_id = photos.id AND wp.pass_type = 'verify' "
     f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
+
+
+# Person attributes (schema v42, docs/plans/description-names.md Revision 2 C):
+# what description_render's rule 7 checks a "girl" / "baby" phrase against.
+# Local only: never in Google/Shutterfly captions or MCP/Ask output.
+PERSON_GENDERS = ("female", "male", "other")
+PERSON_ATTRIBUTE_FIELDS = ("gender", "birth_year", "birth_year_approx")
+PERSON_BIRTH_YEAR_MIN = 1900
+
+
+def validate_person_attributes(fields: dict) -> dict:
+    """Normalise a partial attribute update. Keys absent from ``fields`` stay
+    unchanged; a key present with ``None`` clears it (``birth_year_approx``
+    clears to 0). Clearing ``birth_year`` without an explicit approx also
+    resets approx. Raises ``ValueError`` with a human message."""
+    import datetime as _dt
+    out: dict = {}
+    unknown = set(fields) - set(PERSON_ATTRIBUTE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown attribute(s): {', '.join(sorted(unknown))}")
+    if "gender" in fields:
+        g = fields["gender"]
+        if g is not None and g not in PERSON_GENDERS:
+            raise ValueError(f"gender must be one of {', '.join(PERSON_GENDERS)} or null")
+        out["gender"] = g
+    if "birth_year" in fields:
+        y = fields["birth_year"]
+        if y is not None:
+            if isinstance(y, bool) or not isinstance(y, int):
+                raise ValueError("birth_year must be an integer year or null")
+            this_year = _dt.date.today().year
+            if not PERSON_BIRTH_YEAR_MIN <= y <= this_year:
+                raise ValueError(f"birth_year must be between {PERSON_BIRTH_YEAR_MIN} "
+                                 f"and {this_year}")
+        out["birth_year"] = y
+        if y is None and "birth_year_approx" not in fields:
+            out["birth_year_approx"] = 0
+    if "birth_year_approx" in fields:
+        a = fields["birth_year_approx"]
+        if a is None:
+            a = 0
+        if isinstance(a, float) or a not in (0, 1):
+            raise ValueError("birth_year_approx must be true/false (or 0/1)")
+        out["birth_year_approx"] = int(a)
+    return out
 
 
 # people-bind (docs/plans/description-names.md). A face "can show a name" when
@@ -1807,6 +1852,18 @@ class PhotoDB:
             )
         """)
 
+        # v42 (docs/plans/description-names.md, Revision 2 C): person
+        # attributes the render checks a gendered / age phrase against. NULL =
+        # not set; nothing is backfilled. Never sent off the machine.
+        try:
+            cur.execute("SELECT gender FROM persons LIMIT 1")
+        except sqlite3.OperationalError:
+            cur.execute("ALTER TABLE persons ADD COLUMN gender TEXT "
+                        "CHECK (gender IN ('female', 'male', 'other'))")
+            cur.execute("ALTER TABLE persons ADD COLUMN birth_year INTEGER")
+            cur.execute("ALTER TABLE persons ADD COLUMN birth_year_approx "
+                        "INTEGER NOT NULL DEFAULT 0")
+
         # v34: search indexes (docs/plans/search-indexes.md).
         self._create_search_indexes(cur)
 
@@ -2337,6 +2394,45 @@ class PhotoDB:
         self.conn.execute("DELETE FROM persons WHERE id = ?", (person_id,))
         self.conn.commit()
         return {"id": person_id, "name": row["name"], "references_removed": refs}
+
+    def get_person_attributes(self, person_ids) -> dict:
+        """``{person_id: {id, name, gender, birth_year, birth_year_approx}}``
+        for the ids that exist."""
+        ids = [int(i) for i in person_ids]
+        out: dict = {}
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            for r in self.conn.execute(
+                    f"SELECT id, name, gender, birth_year, birth_year_approx "
+                    f"FROM persons WHERE id IN ({ph})", batch):
+                out[r["id"]] = {"id": r["id"], "name": r["name"], "gender": r["gender"],
+                                "birth_year": r["birth_year"],
+                                "birth_year_approx": bool(r["birth_year_approx"])}
+        return out
+
+    def set_person_attributes(self, person_ids, fields: dict) -> dict:
+        """Apply a partial attribute update (``validate_person_attributes``:
+        absent = unchanged, ``None`` = clear) to the persons that exist. Unknown
+        ids are skipped and returned. Returns ``{updated, unknown, persons}``,
+        ``persons`` holding the new values of the updated rows."""
+        changes = validate_person_attributes(fields)
+        ids = sorted({int(i) for i in person_ids})
+        existing = self.get_person_attributes(ids)
+        unknown = [i for i in ids if i not in existing]
+        known = [i for i in ids if i in existing]
+        if changes and known:
+            cols = ", ".join(f"{k} = ?" for k in changes)
+            vals = list(changes.values())
+            for i in range(0, len(known), 500):
+                batch = known[i:i + 500]
+                ph = ",".join("?" * len(batch))
+                self.conn.execute(f"UPDATE persons SET {cols} WHERE id IN ({ph})",
+                                  [*vals, *batch])
+            self._maybe_commit()
+        after = self.get_person_attributes(known)
+        return {"updated": len(known), "unknown": unknown,
+                "persons": [after[i] for i in known]}
 
     def add_person(self, name: str) -> int:
         """Create a named person, or return the existing id if the name exists (case-insensitive)."""

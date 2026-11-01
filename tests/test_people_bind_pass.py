@@ -88,7 +88,7 @@ def test_v40_db_migrates_to_v41(tmp_path):
         assert "idx_faces_trusted_photo" in names
         assert d.conn.execute("SELECT description FROM photos WHERE id=?", (pid,)).fetchone()[0] == "x"
         assert int(d.conn.execute("SELECT value FROM schema_info WHERE key='version'"
-                                  ).fetchone()[0]) == SCHEMA_VERSION == 41
+                                  ).fetchone()[0]) == SCHEMA_VERSION == 42
 
 
 # --- the claim predicate ------------------------------------------------------------
