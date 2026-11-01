@@ -77,9 +77,9 @@ validated against the witness labels. The raw `photos.description` stays name-fr
 | Topic | Option A | Option B | Choice | Date |
 |---|---|---|---|---|
 | Bare-phrase rule in grounded describe | Keep the owner's rule on (a bare phrase binds only if it names everyone detected) | Off by default; a G1 dev ablation decides | **B: G1 ablation decides** | 2026-10-31 |
-| Gender / age-band hints to describe | Yes, for trusted-face, uncontested-link bodies, behind the hint-injection test (> 2% obeyed wrong hints -> restricted); hints recorded in  | No: describe stays label-free | **A** | 2026-10-31 |
+| Gender / age-band hints to describe | Yes, for trusted-face, uncontested-link bodies, behind the hint-injection test (> 2% obeyed wrong hints -> restricted); hints recorded in `hints_json` | No: describe stays label-free | **A** | 2026-10-31 |
 | Wrong-name bar for faceless tiers | Per tier: 0 wrong among >= 50 owner-labelled faceless holdout bodies and <= 0.5% leave-face-out; flag-gated with a "from kit/number" chip | Face-linked names only | **A** | 2026-10-31 |
 | Re-describe scope | One soccer shoot pilot (100 renders reviewed, 0 wrong) -> 2026 soccer collections -> decide the rest from measured GPU time | All trusted-label photos after the pilot | **A** | 2026-10-31 |
 
-Open, low priority: run  earlier so strict labels reach a batch's first describe (strict was ~5% of
+Open, low priority: run `match_faces` earlier so strict labels reach a batch's first describe (strict was ~5% of
 trusted labels in the sample; Step 0 measures the claim-time cost).
