@@ -5524,6 +5524,9 @@ def worker(server, passes, collection_id, directory,
         # docs/plans/description-names.md: phrase -> face box binding (role
         # `bind`); not a batch step (db.NON_BATCH_PASSES)
         "people-bind",
+        # schema v43: person boxes + keypoints (GPU, --native; people-bind
+        # waits for it); not a batch step either
+        "bodies",
     }
     # Note: "tags" is removed. Old clients that still pass --passes tags
     # will be rejected here with a clear error. They should be upgraded.

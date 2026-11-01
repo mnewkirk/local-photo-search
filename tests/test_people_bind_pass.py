@@ -25,11 +25,21 @@ def db(tmp_path):
     d.close()
 
 
-def _photo(db, name="a", desc=DESC, verified=True):
+BODY = (50, 600, 3000, 0)
+
+
+def _body(conn, pid, box=BODY):
+    conn.execute("INSERT INTO person_boxes (photo_id, bbox_top, bbox_right, bbox_bottom, "
+                 "bbox_left, score, detector_version) VALUES (?,?,?,?,?,0.99,1)", (pid, *box))
+
+
+def _photo(db, name="a", desc=DESC, verified=True, bodies=True):
     pid = db.add_photo(filepath=f"2026/x/{name}.JPG", filename=f"{name}.JPG",
                        description=desc, image_width=6000, image_height=4000)
     if verified:
         db.conn.execute("UPDATE photos SET verified_at='2026-10-04T00:00:00' WHERE id=?", (pid,))
+    if bodies:
+        _body(db.conn, pid)
     return pid
 
 
@@ -58,9 +68,11 @@ def test_constants_match_the_modules_they_mirror():
 
 def test_pass_is_registered_as_a_still_non_batch_pass():
     assert PASS_MEDIA["people-bind"] == "still"
-    assert NON_BATCH_PASSES == ("people-bind",)
+    assert NON_BATCH_PASSES == ("bodies", "people-bind")      # people-bind waits for bodies
     from photosearch import batch_state, describe, rerun, worker_api
     assert "people-bind" not in batch_state.WORKER_PASSES      # never gates a batch
+    assert "bodies" not in batch_state.WORKER_PASSES and PASS_MEDIA["bodies"] == "still"
+    assert "bodies" in rerun.ALL_PASSES and "bodies" in worker_api._ALL_PASSES
     assert "people-bind" in rerun.ALL_PASSES and "people-bind" in worker_api._ALL_PASSES
     assert describe.PASS_ROLES["people-bind"] == rerun._PASS_LLM["people-bind"][0] == "bind"
     assert "bind" in rerun.FLEET_ROLE_MODELS
@@ -88,7 +100,7 @@ def test_v40_db_migrates_to_v41(tmp_path):
         assert "idx_faces_trusted_photo" in names
         assert d.conn.execute("SELECT description FROM photos WHERE id=?", (pid,)).fetchone()[0] == "x"
         assert int(d.conn.execute("SELECT value FROM schema_info WHERE key='version'"
-                                  ).fetchone()[0]) == SCHEMA_VERSION == 42
+                                  ).fetchone()[0]) == SCHEMA_VERSION == 43
 
 
 # --- the claim predicate ------------------------------------------------------------
@@ -105,6 +117,21 @@ def test_claim_needs_description_verify_done_and_a_trusted_face(db):
     merge = _photo(db, "mr"); _face(db, merge, source="merge_review")
     assert sorted(_claimable(db)) == sorted([ok, strict, merge])
     assert db.count_unprocessed_photos("people-bind") == 3
+
+
+def test_claim_waits_for_bodies_rows_or_the_bodies_pass_at_its_cap(db):
+    pid = _photo(db, bodies=False); _face(db, pid)
+    assert _claimable(db) == [] and db.count_unprocessed_photos("people-bind") == 0
+    db.conn.execute("INSERT INTO worker_processed(photo_id, pass_type, attempts) "
+                    "VALUES (?, 'bodies', 1)", (pid,))
+    assert _claimable(db) == []                       # one failed attempt: still waiting
+    db.conn.execute("UPDATE worker_processed SET attempts=? WHERE photo_id=? "
+                    "AND pass_type='bodies'", (MAX_PROCESS_ATTEMPTS, pid))
+    assert _claimable(db) == [pid]                    # empty or given up: face mode
+    from photosearch.people_bind_store import claim_input
+    assert claim_input(db.conn, pid)["bodies"] is None
+    other = _photo(db, "o"); _face(db, other)
+    assert claim_input(db.conn, other)["bodies"][0]["bbox"] == list(BODY)
 
 
 def test_a_verify_that_gave_up_unblocks_the_photo(db):
@@ -203,6 +230,7 @@ def _seed_api(client_):
         fid = d.add_face(1, BOX, [], person_id=pid, det_score=0.9)
         d.conn.execute("UPDATE faces SET match_source='manual' WHERE id=?", (fid,))
         d.conn.execute("UPDATE photos SET description=? WHERE id=1", (DESC,))
+        _body(d.conn, 1)
         d.conn.commit()
     return fid
 

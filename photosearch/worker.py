@@ -616,6 +616,24 @@ def _process_faces(downloaded: list[tuple[dict, str]]) -> list[dict]:
     return results
 
 
+def _process_bodies(downloaded: list[tuple[dict, str]]) -> list[dict]:
+    """bodies (schema v43): person boxes + matched keypoints per photo
+    (``person_boxes.detect_people``). A clean empty result is terminal on the
+    server, so a detection ERROR is a failure row, never ``bodies: []``."""
+    from .person_boxes import DETECTOR_VERSION, detect_people
+    results = []
+    for photo_info, path in downloaded:
+        try:
+            bodies = detect_people(path)
+        except Exception as e:  # noqa: BLE001 — a per-photo failure must not kill the batch
+            print(f"    Body detection failed for {photo_info['filename']}: {e}")
+            results.append(_failure_row(photo_info["id"], e))
+            continue
+        results.append({"photo_id": photo_info["id"], "bodies": bodies,
+                        "detector_version": DETECTOR_VERSION})
+    return results
+
+
 def _process_describe(downloaded: list[tuple[dict, str]], model: str = "llama3.2-vision") -> list[dict]:
     """Generate scene descriptions via Ollama. Returns list of {photo_id, description}.
 
@@ -2000,6 +2018,9 @@ def run_worker(
                 elif pass_type == "faces":
                     results = _process_faces(downloaded)
                     kwargs = _submit_kwargs("face_results", results)
+                elif pass_type == "bodies":
+                    results = _process_bodies(downloaded)
+                    kwargs = _submit_kwargs("bodies_results", results)
                 elif pass_type == "describe":
                     results = _process_describe(downloaded, model=describe_model)
                     kwargs = {**_submit_kwargs("describe_results", results),
@@ -2128,6 +2149,8 @@ def run_worker(
                                    "aesthetics", "video-probe", "video-proxy", "video-scan",
                                    "video-subjects", "video-describe", "people-bind"):
                     print(f"  Server processed {n_processed} photos ({n_written} with {pass_type}).")
+                elif pass_type == "bodies":
+                    print(f"  Server processed {n_processed} photos ({n_written} person boxes).")
                 else:
                     print(f"  Server wrote {n_written} results.")
                 # The server defers a result blocked by a transient DB LOCK (a

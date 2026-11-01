@@ -124,7 +124,7 @@ except ImportError:
 CLIP_DIMENSIONS = 512
 FACE_DIMENSIONS = 512  # InsightFace ArcFace produces 512-dim L2-normalized vectors
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 
 # v34 search indexes, as (name, "<table>(<columns>) [WHERE ...]"). See
 # PhotoDB._create_search_indexes and docs/plans/search-indexes.md.
@@ -229,6 +229,9 @@ PASS_MEDIA: dict[str, str] = {
     # people-bind (docs/plans/description-names.md): binds phrases of the
     # description to face boxes of ONE image.
     "people-bind": "still",
+    # bodies (schema v43, docs/plans/people-context-describe.md): person boxes
+    # + keypoints for ONE image. GPU, --native; the NAS never runs it.
+    "bodies": "still",
 }
 
 # Worker passes that are NOT batch steps: batch_state.WORKER_PASSES (and so
@@ -237,7 +240,9 @@ PASS_MEDIA: dict[str, str] = {
 # labels keep arriving after a batch is done, so a gating step would flip
 # between waiting and blocked. rerun.ALL_PASSES and worker_api._ALL_PASSES
 # are WORKER_PASSES + NON_BATCH_PASSES (tests/test_description_invalidation.py).
-NON_BATCH_PASSES = ("people-bind",)
+# bodies is here for now (no legacy-batch cutover yet); the people-context plan
+# moves it into the batch flow. Order matters: people-bind waits for bodies.
+NON_BATCH_PASSES = ("bodies", "people-bind")
 
 
 def media_sql(pass_type: str, alias: str = "") -> str | None:
@@ -473,7 +478,24 @@ PEOPLE_BIND_MISSING_SQL = (
     f"AND vw.attempts >= {MAX_PROCESS_ATTEMPTS})) "
     f"AND p.id IN (SELECT f.photo_id FROM faces f WHERE {PEOPLE_BIND_TRUSTED_FACE_SQL}) "
     f"AND {PEOPLE_BIND_SCOPE_SQL} "
+    # bodies settled (rows, or the bodies pass is done with it), so the bind
+    # runs in body mode; a pass order does not protect scoped runs
+    "AND (EXISTS (SELECT 1 FROM person_boxes pb WHERE pb.photo_id = p.id) "
+    "OR EXISTS (SELECT 1 FROM worker_processed bw WHERE bw.photo_id = p.id "
+    f"AND bw.pass_type = 'bodies' AND bw.attempts >= {MAX_PROCESS_ATTEMPTS})) "
     "AND NOT EXISTS (SELECT 1 FROM description_subjects ds WHERE ds.photo_id = p.id)"
+)
+
+# bodies (schema v43): claimable while the photo has no person_boxes row. A
+# clean empty detection is terminal (the attempts cap), like faces; a
+# detection exception is a failure row (one attempt). Alias `p`.
+BODIES_MISSING_SQL = (
+    "NOT EXISTS (SELECT 1 FROM person_boxes pb WHERE pb.photo_id = p.id)"
+)
+_BODIES_NOT_EXHAUSTED = (
+    "NOT EXISTS (SELECT 1 FROM worker_processed wp "
+    "WHERE wp.photo_id = p.id AND wp.pass_type = 'bodies' "
+    f"AND wp.attempts >= {MAX_PROCESS_ATTEMPTS})"
 )
 
 
@@ -584,6 +606,7 @@ _VIDEO_CLAIM_SQL["video-proxy"] = (video_proxy_missing_sql, _VIDEO_PROXY_NOT_EXH
 # + an attempts cap) and rides the same branch of the two claim functions.
 _VIDEO_CLAIM_SQL["people-bind"] = (lambda alias="p": PEOPLE_BIND_MISSING_SQL,
                                    _PEOPLE_BIND_NOT_EXHAUSTED)
+_VIDEO_CLAIM_SQL["bodies"] = (lambda alias="p": BODIES_MISSING_SQL, _BODIES_NOT_EXHAUSTED)
 
 
 def _serialize_float_list(vec: list[float]) -> bytes:
@@ -1863,6 +1886,28 @@ class PhotoDB:
             cur.execute("ALTER TABLE persons ADD COLUMN birth_year INTEGER")
             cur.execute("ALTER TABLE persons ADD COLUMN birth_year_approx "
                         "INTEGER NOT NULL DEFAULT 0")
+
+        # v43 (docs/plans/people-context-describe.md): person (body) boxes from
+        # the `bodies` worker pass, in the EXIF-oriented frame of faces.bbox_*.
+        # keypoints_json: the matched Keypoint R-CNN detection's 17 COCO
+        # keypoints [[x, y, logit], ...] or NULL (none matched); facing:
+        # person_boxes.facing_of. The face-to-body link is computed, never stored.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS person_boxes (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id         INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                bbox_top         INTEGER NOT NULL,
+                bbox_right       INTEGER NOT NULL,
+                bbox_bottom      INTEGER NOT NULL,
+                bbox_left        INTEGER NOT NULL,
+                score            REAL    NOT NULL,
+                detector_version INTEGER NOT NULL,
+                keypoints_json   TEXT,
+                facing           TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_boxes_photo "
+                    "ON person_boxes(photo_id)")
 
         # v34: search indexes (docs/plans/search-indexes.md).
         self._create_search_indexes(cur)

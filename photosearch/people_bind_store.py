@@ -36,7 +36,43 @@ def claim_input(conn, photo_id: int) -> Optional[dict]:
             boxes = None
     return {"description": row[0], "description_sha": sha_of(row[0]),
             "faces": offered_faces(faces), "image_width": row[1] or 0,
-            "image_height": row[2] or 0, "subject_boxes": boxes}
+            "image_height": row[2] or 0, "subject_boxes": boxes,
+            "bodies": stored_bodies(conn, photo_id)}
+
+
+def stored_bodies(conn, photo_id: int) -> Optional[list[dict]]:
+    """The photo's person boxes (schema v43) as ``[{"bbox", "score", "keypoints",
+    "facing"}]``, or ``None`` when none are stored (the bind then runs in face
+    mode). A pre-v43 DB has no table: ``None``."""
+    import sqlite3
+    try:
+        rows = conn.execute(
+            "SELECT bbox_top, bbox_right, bbox_bottom, bbox_left, score, keypoints_json, "
+            "facing FROM person_boxes WHERE photo_id = ? ORDER BY score DESC, id",
+            (photo_id,)).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+    return [{"bbox": [r[0], r[1], r[2], r[3]], "score": r[4],
+             "keypoints": json.loads(r[5]) if r[5] else None, "facing": r[6]}
+            for r in rows]
+
+
+def store_bodies(conn, photo_id: int, bodies: list[dict], detector_version: int) -> int:
+    """Replace the photo's person boxes. Returns the number stored."""
+    conn.execute("DELETE FROM person_boxes WHERE photo_id = ?", (photo_id,))
+    for b in bodies:
+        t, r, bo, l = (int(round(v)) for v in b["bbox"])
+        kp = b.get("keypoints")
+        conn.execute(
+            "INSERT INTO person_boxes (photo_id, bbox_top, bbox_right, bbox_bottom, "
+            "bbox_left, score, detector_version, keypoints_json, facing) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (photo_id, t, r, bo, l, float(b["score"]), int(detector_version),
+             json.dumps(kp, separators=(",", ":")) if kp is not None else None,
+             b.get("facing")))
+    return len(bodies)
 
 
 def current_state(conn, photo_id: int) -> Optional[tuple]:

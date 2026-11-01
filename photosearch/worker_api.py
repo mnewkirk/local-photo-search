@@ -360,6 +360,16 @@ class PeopleBindResult(BaseModel):
     model_version: Optional[str] = None
 
 
+class BodiesResult(BaseModel):
+    """One photo's ``bodies`` result (schema v43, docs/plans/people-context-describe.md):
+    every person box with its matched keypoints and facing. ``bodies == []`` is a
+    clean "nobody detected" (terminal, like faces); a detection error comes as a
+    failure, never as ``[]``."""
+    photo_id: int
+    bodies: list[dict] = []
+    detector_version: int = 1
+
+
 class FailedResult(BaseModel):
     """A photo the WORKER tried and could not process — an unloadable image, a
     detection or verification that raised. Spends one attempt on the server
@@ -396,6 +406,8 @@ class SubmitRequest(BaseModel):
     video_describe_results: Optional[list[VideoDescribeResult]] = None
     # people-bind (schema v41). Optional, so older workers are unaffected.
     people_bind_results: Optional[list[PeopleBindResult]] = None
+    # bodies (schema v43). Optional, so older workers are unaffected.
+    bodies_results: Optional[list[BodiesResult]] = None
     # Genuine per-photo failures, separate from the per-pass result lists so
     # the payload stays backward compatible in BOTH directions: an older
     # server ignores the unknown field (pydantic's default) and behaves as it
@@ -1599,6 +1611,27 @@ def submit_results(req: SubmitRequest):
             if committed:
                 _mark_processed(db, outcome, "people-bind", skip=done_pb)
 
+        elif req.pass_type == "bodies":
+            # The rows are the marker. An empty list is a clean "nobody
+            # detected": terminal, straight to the attempts cap (as faces).
+            from .people_bind_store import store_bodies
+            db.begin_batch(batch_size=100)
+            done_b: set[int] = set()
+            for r in req.bodies_results or []:
+                if not r.bodies:
+                    outcome.finished_empty(r.photo_id)
+                    continue
+                try:
+                    outcome.written += store_bodies(db.conn, r.photo_id, r.bodies,
+                                                    r.detector_version)
+                    outcome.persisted(r.photo_id)
+                    done_b.add(r.photo_id)
+                except Exception as e:
+                    _record_write_failure(db, outcome, "bodies", r.photo_id, e)
+            committed = _commit_batch(db, outcome, "bodies")
+            if committed:
+                _mark_processed(db, outcome, "bodies", skip=done_b)
+
         # Log activity for the chart
         if outcome.written > 0:
             try:
@@ -1876,6 +1909,16 @@ def clear_pass(req: ClearPassRequest):
                 f"DELETE FROM worker_processed WHERE pass_type = 'people-bind' AND photo_id IN ({placeholders})",
                 photo_ids,
             )
+        elif req.pass_type == "bodies":
+            # Re-queue: the rows are the marker; the ledger holds empty /
+            # failed outcomes.
+            cur = db.conn.execute(
+                f"DELETE FROM person_boxes WHERE photo_id IN ({placeholders})", photo_ids)
+            cleared = cur.rowcount
+            db.conn.execute(
+                f"DELETE FROM worker_processed WHERE pass_type = 'bodies' AND photo_id IN ({placeholders})",
+                photo_ids,
+            )
         elif req.pass_type == "video-subjects":
             # Re-queue: drop the subject rows and the marker (they are
             # derived from the scan, carry no human input, and a name comes
@@ -1944,7 +1987,7 @@ def photo_detail(photo_id: int):
 _ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-scan",
                "aesthetics", "video-subjects", "describe", "video-describe",
                "verify", "category-content", "keywords", "category-visual",
-               "people-bind")
+               "bodies", "people-bind")
 
 
 @router.get("/status")

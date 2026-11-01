@@ -44,8 +44,9 @@ ALL_PASSES = ("clip", "faces", "quality", "video-probe", "video-proxy", "video-s
               "aesthetics", "video-subjects", "describe", "video-describe",
               "verify", "category-content", "keywords", "category-visual",
               # not a batch step (db.NON_BATCH_PASSES): last, so it runs after
-              # verify has settled the description its spans index into
-              "people-bind")
+              # verify has settled the description its spans index into;
+              # bodies before it (people-bind waits for bodies)
+              "bodies", "people-bind")
 
 # Passes that read the description from the photo row and need no image download.
 TEXT_ONLY_PASSES = {"category-content", "keywords"}

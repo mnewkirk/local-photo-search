@@ -41,7 +41,7 @@ def test_v41_db_migrates_to_v42_person_attributes(tmp_path):
         assert _attrs(db, pid) == (None, None, 0)          # nothing backfilled
         version = db.conn.execute(
             "SELECT value FROM schema_info WHERE key = 'version'").fetchone()["value"]
-        assert int(version) == SCHEMA_VERSION == 42
+        assert int(version) == SCHEMA_VERSION == 43
         with pytest.raises(sqlite3.IntegrityError):
             db.conn.execute("UPDATE persons SET gender = 'boy' WHERE id = ?", (pid,))
         db.conn.execute("UPDATE persons SET gender = 'male' WHERE id = ?", (pid,))

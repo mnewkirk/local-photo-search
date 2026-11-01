@@ -21,6 +21,15 @@ MIN_SCORE = 0.3
 DETECT_MAX_PX = 1600
 
 _model = None
+_kp_model = None
+
+# Keypoint R-CNN (COCO person keypoints): the face-to-body link is verified by
+# head keypoints (docs/notes/llm-passes.md, "people context: Step 0"). Indices
+# into the 17 COCO keypoints; a keypoint counts at logit >= KP_MIN.
+HEAD_KEYPOINTS = (0, 1, 2)       # nose, left eye, right eye
+KP_MIN = 2.0
+KP_MATCH_IOU = 0.5               # keypoint detection <-> body box
+KP_BOX_SCORE = 0.5               # keypoint detector's own person floor (as the spike)
 
 
 def _device():
@@ -42,19 +51,120 @@ def _get_model():
     return _model
 
 
-def detect(image_path: str) -> list[dict]:
-    """Every person the detector finds: ``[{"bbox": [top, right, bottom, left],
-    "score"}]`` in the oriented full-resolution frame, highest score first."""
-    import torch
-    import torchvision.transforms.functional as TF
-    from PIL import Image, ImageOps
+def _get_kp_model():
+    global _kp_model
+    if _kp_model is None:
+        import torchvision
+        w = torchvision.models.detection.KeypointRCNN_ResNet50_FPN_Weights.DEFAULT
+        m = torchvision.models.detection.keypointrcnn_resnet50_fpn(
+            weights=w, box_score_thresh=KP_BOX_SCORE)
+        _kp_model = m.to(_device()).eval()
+    return _kp_model
 
+
+def _load_scaled(image_path: str):
+    from PIL import Image, ImageOps
     with Image.open(image_path) as im0:
         im = ImageOps.exif_transpose(im0).convert("RGB")
     w, h = im.size
     s = min(1.0, DETECT_MAX_PX / float(max(w, h)))
     if s < 1.0:
         im = im.resize((max(1, round(w * s)), max(1, round(h * s))), Image.BILINEAR)
+    return im, s
+
+
+def detect_people(image_path: str) -> list[dict]:
+    """The ``bodies`` pass: every person the box detector finds, each with the
+    keypoints of the Keypoint R-CNN detection matched to it (:func:`attach_keypoints`)
+    and its :func:`facing_of`. ``[{"bbox", "score", "keypoints", "facing"}]``,
+    boxes and keypoints in the oriented full-resolution frame. Raises on a decode
+    or model error: the caller reports a failure, never ``[]``."""
+    import torch
+    import torchvision.transforms.functional as TF
+
+    im, s = _load_scaled(image_path)
+    t = TF.to_tensor(im).to(_device())
+    model, person = _get_model()
+    with torch.no_grad():
+        out = model([t])[0]
+        kout = _get_kp_model()([t])[0]
+    bodies = []
+    for (x1, y1, x2, y2), lab, sc in zip(out["boxes"].tolist(), out["labels"].tolist(),
+                                         out["scores"].tolist()):
+        if lab != person or sc < MIN_SCORE:
+            continue
+        bodies.append({"bbox": [round(y1 / s), round(x2 / s), round(y2 / s), round(x1 / s)],
+                       "score": round(float(sc), 4)})
+    kdets = []
+    for (x1, y1, x2, y2), kps, ksc in zip(kout["boxes"].tolist(), kout["keypoints"].tolist(),
+                                          kout["keypoints_scores"].tolist()):
+        kdets.append({"bbox": [y1 / s, x2 / s, y2 / s, x1 / s],
+                      "keypoints": [[round(k[0] / s, 1), round(k[1] / s, 1), round(float(c), 2)]
+                                    for k, c in zip(kps, ksc)]})
+    bodies = sorted(bodies, key=lambda b: -b["score"])
+    attach_keypoints(bodies, kdets)
+    for b in bodies:
+        b["facing"] = facing_of(b["keypoints"])
+    return bodies
+
+
+def iou(a, b) -> float:
+    i = _inter(a, b)
+    return i / (_area(a) + _area(b) - i) if i else 0.0
+
+
+def attach_keypoints(bodies: list[dict], kdets: list[dict]) -> list[dict]:
+    """Give each body the keypoints of at most one keypoint detection, one to one,
+    greedily by IoU (>= ``KP_MATCH_IOU``), highest first. A body no detection
+    matches gets ``keypoints: None``. Mutates and returns ``bodies``."""
+    pairs = sorted(((iou(b["bbox"], k["bbox"]), i, j) for i, b in enumerate(bodies)
+                    for j, k in enumerate(kdets)), reverse=True)
+    used_b, used_k = set(), set()
+    for b in bodies:
+        b["keypoints"] = None
+    for v, i, j in pairs:
+        if v < KP_MATCH_IOU:
+            break
+        if i in used_b or j in used_k:
+            continue
+        used_b.add(i)
+        used_k.add(j)
+        bodies[i]["keypoints"] = kdets[j]["keypoints"]
+    return bodies
+
+
+def head_points(keypoints) -> list[tuple]:
+    """(x, y) of the nose and eyes at logit >= ``KP_MIN``."""
+    if not keypoints:
+        return []
+    return [(k[0], k[1]) for j, k in enumerate(keypoints)
+            if j in HEAD_KEYPOINTS and j < len(keypoints) and k[2] >= KP_MIN]
+
+
+def facing_of(keypoints) -> Optional[str]:
+    """``front`` (nose and an eye visible), ``side`` (one of them), ``away`` (a
+    matched detection with neither), ``None`` (no keypoints)."""
+    if keypoints is None:
+        return None
+    seen = {j for j in HEAD_KEYPOINTS if j < len(keypoints) and keypoints[j][2] >= KP_MIN}
+    if 0 in seen and seen & {1, 2}:
+        return "front"
+    return "side" if seen else "away"
+
+
+def head_in_face(body: dict, face_box) -> bool:
+    """True when one of the body's head keypoints lies inside the UNPADDED face box."""
+    t, r, b, l = face_box
+    return any(l <= x <= r and t <= y <= b for x, y in head_points(body.get("keypoints")))
+
+
+def detect(image_path: str) -> list[dict]:
+    """Every person the detector finds: ``[{"bbox": [top, right, bottom, left],
+    "score"}]`` in the oriented full-resolution frame, highest score first."""
+    import torch
+    import torchvision.transforms.functional as TF
+
+    im, s = _load_scaled(image_path)
     model, person = _get_model()
     with torch.no_grad():
         out = model([TF.to_tensor(im).to(_device())])[0]
