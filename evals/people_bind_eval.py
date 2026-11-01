@@ -10,6 +10,12 @@ HAND labels. The harness calls the PRODUCTION functions (`people_bind.rule_bind`
   check    validate labels.json (or --import a file downloaded from the sheet)
   run      one variant's predictions (cached, resumable): --tier rule|vlm|both
   report   score + the pre-registered gates, per stratum and per tier
+  review-sheet / review-report   (with --set review) judge only what a run BOUND:
+           right person / wrong person / wrong name label. For the >= 150-bound gate,
+           which needs ~6x more photos than blind labelling can afford.
+
+`--set NAME` (before the command) keeps a separate sample, bodies, runs, sheet and
+labels under people-bind/NAME/, so a top-up never touches the labelled sample.
 
 The DB is only ever opened READ-ONLY (mode=ro), never through PhotoDB. See
 evals/people-bind/README.md.
@@ -152,8 +158,9 @@ def cmd_sample(a):
     rng = random.Random(a.seed)
     want = {"single": a.single, "multi_2_3": a.multi_2_3, "multi_4_6": a.multi_4_6}
     sample = _jload(SAMPLE, {})
+    labelled = _jload(HERE / "sample.json", {}) if SAMPLE != HERE / "sample.json" else {}
     for st, pool in strata.items():
-        pool = [p for p in pool if str(p) not in sample]
+        pool = [p for p in pool if str(p) not in sample and str(p) not in labelled]  # a set never reuses the labelled sample
         pick = rng.sample(pool, min(want[st], len(pool)))
         for pid in pick:
             sample[str(pid)] = {"stratum": st, "split": E.split_of(pid)}
@@ -675,8 +682,7 @@ def cmd_serve(a):
                 return self.send_error(413)
             try:
                 data = json.loads(self.rfile.read(n))
-                assert isinstance(data, dict) and all(
-                    isinstance(v, dict) and isinstance(v.get("mentions"), list) for v in data.values())
+                assert isinstance(data, dict) and all(isinstance(v, dict) for v in data.values())
             except Exception:  # anything unparseable is the client's error, not a crash
                 return self.send_error(400, "not a labels file")
             if saved.exists():
@@ -698,8 +704,93 @@ def cmd_serve(a):
     srv.serve_forever()
 
 
+def _use_set(name):
+    """Point every path at people-bind/<name>/ (a separate sample and its labels)."""
+    global SAMPLE, LABELS, RUNS, SHEET, BODIES
+    d = HERE / name
+    d.mkdir(parents=True, exist_ok=True)
+    SAMPLE, LABELS, RUNS, SHEET, BODIES = (d / "sample.json", d / "labels.json", d / "runs",
+                                           d / "sheet", d / "bodies.json")
+
+
+def _draw_review(image_path, faces, bodies, max_px=SHEET_PX):
+    """The photo with the bound faces boxed red and the bodies they head green."""
+    import io
+    from PIL import Image, ImageDraw, ImageOps
+    with Image.open(image_path) as im0:
+        im = ImageOps.exif_transpose(im0).convert("RGB")
+    s = min(1.0, max_px / float(max(im.size)))
+    im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.LANCZOS)
+    d = ImageDraw.Draw(im)
+    for bb in bodies:
+        t, r, b, l = (v * s for v in bb)
+        d.rectangle([l, t, r, b], outline=(0, 200, 0), width=3)
+    for bb in faces:
+        t, r, b, l = (v * s for v in bb)
+        d.rectangle([l, t, r, b], outline=(255, 30, 30), width=4)
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=88)
+    return buf.getvalue()
+
+
+def cmd_review_sheet(a):
+    """One card per slot a run BOUND: the photo (bound faces red, their bodies green),
+    the description with the span bold, and who the face is labelled as now."""
+    con = ro(a.db)
+    run = json.loads((RUNS / f"{a.variant}.json").read_text())
+    bodies_all = _jload(BODIES, {}).get("photos", {})
+    SHEET.mkdir(parents=True, exist_ok=True)
+    items = []
+    for pid_s, pr in sorted(run["preds"].items(), key=lambda kv: int(kv[0])):
+        for s in pr.get("slots") or []:
+            inp = store.claim_input(con, int(pid_s))
+            if not inp:
+                continue
+            body_of = {t["face_id"]: t["bbox"] for t in
+                       PB.body_targets(inp["faces"], bodies_all.get(pid_s, []), inp["image_height"])
+                       if t["face_id"] is not None}
+            fids = [f["face_id"] for f in s["faces"]]
+            key = f"{pid_s}-{s['slot']}"
+            jpg = SHEET / f"{key}.jpg"
+            if not jpg.exists():
+                jpg.write_bytes(_draw_review(str(_original(int(pid_s), a.server)),
+                                             [f["bbox"] for f in s["faces"]],
+                                             [body_of[f] for f in fids if f in body_of]))
+            rows = _face_rows(con, int(pid_s))
+            sp = s["spans"][0]
+            items.append({"key": key, "pid": pid_s, "description": inp["description"],
+                          "start": sp["start"], "end": sp["end"], "method": pr.get("method"),
+                          "names": [f"{rows[f]['name'] or '(no name)'} ({rows[f]['source'] or '-'})"
+                                    for f in fids if f in rows]})
+    labels = _jload(LABELS, {})
+    _jsave(LABELS, labels)
+    page = (_REVIEW_HTML
+            .replace("__ITEMS__", json.dumps(items).replace("</", "<\\/"))
+            .replace("__LABELS__", json.dumps(labels).replace("</", "<\\/"))
+            .replace("__KEY__", hashlib.sha1(json.dumps([i["key"] for i in items]).encode()).hexdigest()[:10]))
+    (SHEET / "index.html").write_text(page)
+    print(f"{len(items)} bound slots on {SHEET / 'index.html'}")
+
+
+def cmd_review_report(a):
+    """Verdicts on a run's bound slots: the >= 150-bound gate counts 'wrong' only;
+    'label' (right person, wrong face label) is a user-visible wrong name from the label."""
+    verdicts = _jload(LABELS, {})
+    c = {}
+    for v in verdicts.values():
+        c[v.get("verdict") or "unjudged"] = c.get(v.get("verdict") or "unjudged", 0) + 1
+    judged = c.get("right", 0) + c.get("wrong", 0) + c.get("label", 0)
+    print(f"{len(verdicts)} slots: {c}")
+    print(f"bound and judged {judged}; wrong person {c.get('wrong', 0)}; "
+          f"wrong face label (visible wrong name) {c.get('label', 0)}; can't tell {c.get('unsure', 0)}")
+    for k, v in sorted(verdicts.items()):
+        if v.get("verdict") in ("wrong", "label", "unsure"):
+            print(f"  {k}: {v['verdict']} {v.get('note', '')}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--set", default=None, help="a separate sample under people-bind/SET/ (e.g. review)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("sample")
     s.add_argument("--db", required=True)
@@ -767,9 +858,107 @@ def main():
     p.add_argument("--db", required=True)
     p.add_argument("--split", choices=("dev", "holdout"), default="dev")
     p.set_defaults(fn=cmd_report)
+    rs = sub.add_parser("review-sheet", help="page of a run's bound slots to judge (use with --set)")
+    rs.add_argument("--db", required=True)
+    rs.add_argument("--variant", required=True)
+    rs.add_argument("--server", default=os.environ.get("PHOTOSEARCH_EVAL_SERVER", "http://localhost:8001"))
+    rs.set_defaults(fn=cmd_review_sheet)
+    rr = sub.add_parser("review-report", help="count the verdicts on a run's bound slots")
+    rr.set_defaults(fn=cmd_review_report)
     a = ap.parse_args()
+    if a.set:
+        _use_set(a.set)
     a.fn(a)
 
+
+_REVIEW_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>people-bind review</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--line:#ddd;--on:#1565c0;--onfg:#fff;--warn:#b71c1c;--card:#f6f7f9}
+@media (prefers-color-scheme: dark){:root{--bg:#16181c;--fg:#e8e8e8;--mut:#9aa;--line:#333;--on:#64b5f6;--onfg:#000;--warn:#ef9a9a;--card:#1f2228}}
+body{background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif;margin:0}
+header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:8px 16px;z-index:2;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+main{max-width:1200px;margin:auto;padding:0 16px}
+section{border-bottom:2px solid var(--line);padding:18px 0}
+.grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px}
+@media (max-width:800px){.grid{grid-template-columns:1fr}}
+img{width:100%;height:auto;border-radius:4px;cursor:zoom-in}
+.desc{background:var(--card);padding:8px 10px;border-radius:4px}
+.desc b{background:rgba(255,193,7,.35);border-radius:2px;padding:0 1px}
+.mut{color:var(--mut);font-size:13px}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:4px;padding:4px 10px;margin:2px;cursor:pointer}
+button.on{background:var(--on);color:var(--onfg);border-color:var(--on)}
+#stale{background:#b71c1c;color:#fff;padding:12px 16px;font-weight:700}
+</style></head><body>
+<header><b>people-bind review</b><span id="prog"></span>
+ <label><input type="checkbox" id="todo"> only unjudged</label><span id="srv" class="mut"></span></header>
+<main id="root"></main>
+<script>
+const ITEMS = __ITEMS__;
+const FILE_LABELS = __LABELS__;
+const KEY = "pb-review-__KEY__";
+let L = JSON.parse(JSON.stringify(FILE_LABELS));
+const SERVED = location.protocol.startsWith("http");
+let ready = false, timer = null;
+const VERDICTS = [["right", "Right person"], ["wrong", "Wrong person"],
+                  ["label", "Right person, wrong name label"], ["unsure", "Can't tell"]];
+function srv(m) { document.getElementById("srv").textContent = m; }
+function save() {
+  progress();
+  if (!SERVED || !ready) return;
+  clearTimeout(timer);
+  timer = setTimeout(() => fetch("saved-labels.json", {method: "PUT",
+      headers: {"Content-Type": "application/json", "X-Sheet-Key": KEY}, body: JSON.stringify(L)})
+    .then(r => { if (r.status === 409) throw new Error("this page is out of date: RELOAD it");
+                 if (!r.ok) throw new Error("HTTP " + r.status); srv("saved " + new Date().toLocaleTimeString()); })
+    .catch(e => { srv("NOT saved (" + e.message + ")");
+      if (/out of date/.test(e.message) && !document.getElementById("stale")) {
+        const d = document.createElement("div"); d.id = "stale";
+        d.textContent = "This page is out of date and is NOT saving. Reload it.";
+        document.body.prepend(d); alert("This review page is out of date and is not saving. Reload it."); } }), 300);
+}
+function progress() {
+  const n = ITEMS.filter(it => (L[it.key] || {}).verdict).length;
+  document.getElementById("prog").textContent = `${n}/${ITEMS.length} judged`;
+}
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) { if (k === "on") e.addEventListener("click", v); else if (k === "cls") e.className = v; else e.setAttribute(k, v); }
+  for (const k of kids) e.append(k);
+  return e;
+}
+function card(it) {
+  const v = (L[it.key] || {}).verdict;
+  const sec = el("section", {id: "k" + it.key});
+  sec.append(el("h3", {}, `${it.pid} · ${it.method}`));
+  const img = el("img", {src: it.key + ".jpg", loading: "lazy", alt: "photo " + it.pid});
+  img.addEventListener("click", () => window.open(it.key + ".jpg"));
+  const d = it.description;
+  const right = el("div", {}, el("div", {cls: "desc"}, d.slice(0, it.start), el("b", {}, d.slice(it.start, it.end)), d.slice(it.end)),
+    el("p", {}, "Red box(es) = the face this phrase would name: ", el("b", {}, it.names.join(" + "))),
+    el("p", {cls: "mut"}, "Green = the body the face was linked to. Judge the PERSON: does the bold phrase describe the person in the red/green box?"));
+  const row = el("div");
+  for (const [k, label] of VERDICTS)
+    row.append(el("button", {cls: v === k ? "on" : "", on: () => { L[it.key] = {verdict: v === k ? null : k}; save(); sec.replaceWith(card(it)); }}, label));
+  right.append(row);
+  sec.append(el("div", {cls: "grid"}, img, right));
+  return sec;
+}
+function render() {
+  const root = document.getElementById("root"); root.innerHTML = "";
+  const todo = document.getElementById("todo").checked;
+  for (const it of ITEMS) if (!(todo && (L[it.key] || {}).verdict)) root.append(card(it));
+  progress();
+}
+document.getElementById("todo").addEventListener("change", render);
+render();
+if (SERVED) fetch("saved-labels.json", {cache: "no-store"}).then(r => r.status === 404 ? null : r.json())
+  .then(data => { if (data) L = data; ready = true; render(); srv("loaded from server"); })
+  .catch(e => srv("could not load from server (" + e.message + "); NOT saving"));
+</script></body></html>
+"""
 
 _SHEET_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
