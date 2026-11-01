@@ -118,3 +118,25 @@ def test_a_recased_phrase_takes_the_descriptions_own_text_only_when_unique():
         PB.parse_answer(ans("A BOY"), "A boy runs and a boy waits.", 1)
     with pytest.raises(UnusableAnswer):                     # a paraphrase stays a failure
         PB.parse_answer(ans("a person"), "A boy runs.", 1)
+
+
+def test_a_bare_phrase_binds_only_when_it_names_everyone_detected():
+    for bare in ("One boy", "two young players", "A man", "the other child"):
+        assert PB.is_bare_phrase(bare), bare
+    for detailed in ("One boy in a neon yellow jersey", "the goalkeeper", "two players in blue"):
+        assert not PB.is_bare_phrase(detailed), detailed
+    m = {"phrase": "One boy", "could_be": [1], "kind": "person", "all_members_boxed": True}
+    by_id = {1: FACE}
+    assert PB.decide("One boy runs.", [m], [1], by_id, people=1, bare_rule="everyone")
+    assert not PB.decide("One boy runs.", [m], [1], by_id, people=3, bare_rule="everyone")
+    assert PB.decide("One boy runs.", [m], [1], by_id, people=3, bare_rule=None)     # rule off
+    assert PB.bare_allowed("Two boys", 2, 2, "everyone") and not PB.bare_allowed("Two boys", 2, 2, "strict")
+    assert PB.bare_allowed("Two boys in blue", 2, 7, "strict")                     # not bare
+
+
+def test_the_rule_tier_drops_a_bare_slot_in_a_crowded_photo():
+    slot = {"slot": "s1", "kind": "person", "faces": [{"face_id": 1, "bbox": FACE["bbox"]}],
+            "spans": [{"start": 0, "end": 11, "text": "A young boy"}]}
+    assert PB.filter_bare([slot], 3, "everyone") == []
+    assert PB.filter_bare([slot], 1, "everyone") == [slot]
+    assert PB.filter_bare([slot], None, "everyone") == [slot]                       # no bodies known

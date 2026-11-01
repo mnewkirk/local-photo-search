@@ -335,9 +335,13 @@ Description:
 {description}
 
 Rules:
-- A phrase is only the words that name the person or group: the noun with its \
-article, describing words and what they wear or hold. Never copy a whole \
-sentence or clause, what the person is doing, or the setting.
+- A phrase is the SHORTEST part of the description that tells this person or \
+group apart from everyone else in the photo: the person noun with its article \
+and the details that single them out, such as clothing colour, a number, where \
+they are or what they are doing. A phrase with only an article, a number, an \
+age word and a person noun fits anyone, so use it only when it names every \
+person in the photo. Never copy a whole sentence, the setting, or a phrase that \
+fits several people equally.
 - Copy each phrase EXACTLY as written in the description: the same words in the \
 same case.
 - Use only box numbers from 1 to {n}.
@@ -530,15 +534,63 @@ def _single_occurrence(description: str, phrase: str) -> Optional[tuple]:
     return i, i + len(phrase)
 
 
+# A BARE phrase says nothing that tells one person from another: an article or a
+# count, age/size words, a person noun ("One boy", "two young players"). With several
+# people in the photo it can only be resolved from the rest of the sentence, so the
+# owner's rule (2026-10-31): it binds only when it names everyone the detector found
+# ("everyone": "Two boys" in a two-person photo), or with "strict" only a lone person.
+_BARE_RE = re.compile(
+    r"^(?:(?:a|an|the|one|two|three|both|another|other|the\s+other)\s+)?"
+    r"(?:(?:young|younger|little|small|older|teenage|adult|male|female)\s+)*"
+    r"(?:boy|girl|child|kid|player|man|woman|person|teen|teenager|toddler|baby|"
+    r"boys|girls|children|kids|players|men|women|people|teens|teenagers)$", re.IGNORECASE)
+BARE_PHRASE_RULE: Optional[str] = "everyone"     # "everyone" | "strict" | None (off)
+
+
+def is_bare_phrase(phrase: str) -> bool:
+    return bool(_BARE_RE.match(" ".join(phrase.split())))
+
+
+def people_in_photo(faces: list[dict], bodies: list[dict]) -> int:
+    """Everyone the detector found: deduplicated bodies at ``BODY_MIN_SCORE``
+    (drawn or not) plus offered faces that head no body."""
+    from .person_boxes import dedupe, link_faces
+    above = [b for b in bodies if b["score"] >= BODY_MIN_SCORE]
+    kept, _ = dedupe(above)
+    bs = [above[i] for i in kept]
+    offered = offered_faces(faces)
+    return len(bs) + len(offered) - len(link_faces(offered, bs))
+
+
+def bare_allowed(phrase: str, n: int, people: Optional[int], rule: Optional[str]) -> bool:
+    """False when ``rule`` forbids binding this phrase naming ``n`` people in a
+    photo where the detector found ``people``. Unknown ``people`` (no bodies)
+    or no rule allows it."""
+    if people is None or not rule or not is_bare_phrase(phrase):
+        return True
+    if rule == "strict":
+        return people == 1
+    return people == n                                 # "everyone"
+
+
+def filter_bare(slots: list[dict], people: Optional[int], rule: Optional[str]) -> list[dict]:
+    """The rule-tier counterpart of the check in :func:`decide`: drop slots whose
+    span is a bare phrase the rule forbids."""
+    return [s for s in slots
+            if all(bare_allowed(sp["text"], len(s["faces"]), people, rule) for sp in s["spans"])]
+
+
 def decide(description: str, mentions: list[dict], order: list[int],
-           faces_by_id: dict) -> dict:
+           faces_by_id: dict, people: Optional[int] = None,
+           bare_rule: Optional[str] = None) -> dict:
     """Mentions of ONE call -> ``{phrase: (kind, [face_id...])}`` for the phrases
     code accepts. ``order[i]`` is the face drawn as box ``i + 1``.
 
     Bind only when ``len(could_be) == people the phrase names`` (a 3-box
     answer for "a boy in blue" is ambiguous by construction and stays
     generic); the phrase must occur once, be a recognised count, and, for a
-    group, the model must say every member is boxed."""
+    group, the model must say every member is boxed. With ``people`` (everyone
+    detected, body mode) a bare phrase must also pass ``bare_rule``."""
     out: dict = {}
     for m in mentions:
         phrase = m["phrase"]
@@ -550,6 +602,8 @@ def decide(description: str, mentions: list[dict], order: list[int],
         if _single_occurrence(description, phrase) is None:
             continue
         if len(m["could_be"]) != n:
+            continue
+        if not bare_allowed(phrase, n, people, bare_rule):
             continue
         if n >= 2 and not m.get("all_members_boxed", True):
             continue
@@ -830,7 +884,8 @@ def bind_with_model(image_path: str, description: str, faces: list[dict],
                 return None
             if trace is not None:
                 trace.append({"boxes": boxes, "face_ids": face_order, "mentions": mentions})
-            decided.append(decide(description, mentions, face_order, by_id))
+            decided.append(decide(description, mentions, face_order, by_id,
+                                  people=people_in_photo(faces, bodies), bare_rule=BARE_PHRASE_RULE))
         slots = merge_calls(description, decided, by_id)
         if link_check and slots:
             return link_checked(image_path, slots, targets, model, trace=None)

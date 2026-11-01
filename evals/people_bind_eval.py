@@ -435,6 +435,10 @@ def cmd_run(a):
         t0, calls, error = time.time(), 0, None
         rb = PB.rule_bind(inp["description"], inp["faces"], inp.get("subject_boxes"),
                           inp["image_width"], inp["image_height"])
+        if a.tier in ("rule", "both") and rb is not None and body_mode:
+            # the owner's bare-phrase rule needs everyone the detector found
+            rb = PB.filter_bare(rb, PB.people_in_photo(inp["faces"], bodies_all.get(pid_s, [])),
+                                PB.BARE_PHRASE_RULE)
         if a.tier in ("rule", "both") and rb is not None:
             method, slots = "rule", rb
         elif a.tier == "rule":
@@ -531,6 +535,11 @@ def cmd_redecide(a):
         margin = None if raw in ("off", "none") else float(raw)
         preds = {}
         for pid, pr in run["preds"].items():
+            bare = None if a.bare == "off" else a.bare
+            if pr.get("method") == "rule" and pr.get("slots") and inps.get(pid):
+                people = PB.people_in_photo(inps[pid]["faces"], bodies_all.get(pid, []))
+                preds[pid] = dict(pr, slots=PB.filter_bare(pr["slots"], people, bare))
+                continue
             # a failed call leaves a partial trace: the live run wrote nothing for it
             if pr.get("method") != "vlm" or "trace" not in pr or pr.get("error") or not inps.get(pid):
                 preds[pid] = pr
@@ -550,7 +559,9 @@ def cmd_redecide(a):
                 order = [None if face_of.get(b) in cont else face_of.get(b) for b in drawn]
                 ms = [{"phrase": m["phrase"], "kind": m["kind"], "all_members_boxed": m["all_members_boxed"],
                        "could_be": sorted(drawn.index(tuple(bb)) + 1 for bb in m["boxes"])} for m in call]
-                decided.append(PB.decide(inp["description"], ms, order, by_id))
+                decided.append(PB.decide(inp["description"], ms, order, by_id,
+                                         people=PB.people_in_photo(inp["faces"], bodies_all.get(pid, [])),
+                                         bare_rule=None if a.bare == "off" else a.bare))
             preds[pid] = dict(pr, slots=PB.merge_calls(inp["description"], decided, by_id))
         rep = E.score(labels, preds, srcs, split=a.split, descriptions=descs)
         n_cont = sum(1 for p, i in inps.items() if i and labels.get(p, {}).get("split") == a.split
@@ -743,6 +754,8 @@ def main():
     rd.add_argument("--variant", required=True)
     rd.add_argument("--split", choices=("dev", "holdout"), default="dev")
     rd.add_argument("--margins", default="off,0,0.05,0.1,0.2,0.5")
+    rd.add_argument("--bare", choices=("off", "everyone", "strict"), default="off",
+                    help="the bare-phrase rule to re-decide under (people_bind.BARE_PHRASE_RULE)")
     rd.set_defaults(fn=cmd_redecide)
     lc = sub.add_parser("linkcheck", help="link-check a body-mode run's bound slots -> <variant>-link")
     lc.add_argument("--db", required=True)
