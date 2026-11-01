@@ -1185,7 +1185,8 @@ Stored descriptions: median 410 chars. Recall = share of the stored text's peopl
   link required (uncontested) 112 / 3; plus the bare-phrase rule 93 / 2 (97.9%). The two left:
   244964 "another boy in a green jersey" (box 1, owner: 2; two boys in green) and 246517 "two
   other players" (2,5 vs 2,3). The bare rule removed one wrong (248650 "Two boys") and 19 right.
-  People-bind on the same dev photos: 31 bound, 0 wrong. **G1 fails on dev** (0-wrong gate and the
-  owner's ~99% bar); holdout not run. Grounded describe triples named coverage but picks the wrong
-  one of two similar players, the same failure people-bind's second call and overlap check exist for.
+  People-bind on the same dev photos: 31 bound, 0 wrong. By target: no face 138 right / 10 wrong,
+  untrusted or unlabelled face 121 / 17, trusted face 120 / 6: 27 of the 33 wrong marks show no
+  name. The owner's precision decision (2026-11-01) accepted people-bind's measured ~99%; it is not
+  a minimum, and the owner does not fail G1 at 97.9% named (3x people-bind's coverage). Holdout next.
 

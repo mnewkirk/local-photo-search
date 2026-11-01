@@ -1,6 +1,6 @@
 # People context in describe: identify bodies and faces, then describe with spans
 
-**Status: 🔴 stopped at the evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies), hints fail the injection test, G1 fails on dev (named marks 93 right / 2 wrong with all guards). Steps 4-6 not started; the shared fallback applies (people-bind + v42 attributes).** (Status lives in `README.md`.)
+**Status: 🟡 evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies) -> no cue names; hints fail the injection test -> describe stays label-free; G1 dev: named marks 93 right / 2 wrong with all guards (97.9%, 3x people-bind's names), accepted by the owner; G1 holdout next.** (Status lives in `README.md`.)
 
 Supersedes docs/plans/description-names.md Revision 2 R3 (the after-the-fact body binder as the production path).
 Source: plan-debate 2026-10-31, Planner A (plan-A.md) and Planner B (plan-B.md), two critique rounds.
@@ -135,9 +135,8 @@ Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `ev
   one corrective retry: 0 unusable on dev, descriptions 12-15% shorter than regenerated plain ones.
   One overlay image leaks. Bind precision pending the owner's confirmations.
 - **G1 verdicts (owner, dev)**: blind pairwise at parity (18 new / 17 stored / 5 same); marks 379 / 412
-  right; named marks with keypoint link + bare-phrase rule 93 right, 2 wrong (97.9%) -> **fails**; holdout
-  not run. Bare-phrase rule: on (it removed 1 wrong, 19 right).
-- **Recommendation**: no wiring of Steps 4-6. Keep people-bind + v42 attributes. Worth one more dev
-  experiment before closing: bind only marks that people-bind's binder, run on the new text, agrees with
-  (the plan's cross-check), or that pass the overlap forced choice.
-
+  right; 27 of the 33 wrong marks are on people who get no name; named marks with keypoint link +
+  bare-phrase rule 93 right, 2 wrong (97.9%). The owner's precision decision is not a 99% minimum: G1 dev
+  is not failed. Bare-phrase rule: on (it removed 1 wrong, 19 right). Next: G1 holdout (75 photos).
+- **Scope if holdout holds**: a reduced Step 5-6 (describe writes marks; names only from keypoint-linked
+  trusted faces); no `body_attrs` / `body_identity`, no hints, no cue names.
