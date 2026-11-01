@@ -1,6 +1,6 @@
 # People context in describe: identify bodies and faces, then describe with spans
 
-**Status: 🟡 evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies) -> no cue names; hints fail the injection test -> describe stays label-free; G1 dev: named marks 93 right / 2 wrong with all guards (97.9%, 3x people-bind's names), accepted by the owner; G1 holdout next.** (Status lives in `README.md`.)
+**Status: 🟡 evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies) -> no cue names; hints fail the injection test -> describe stays label-free; G1: named marks with all guards dev 93 / 2, holdout 46 / 2 (97.2% together; 3.5x people-bind's names, which run at 99.3%). Go/no-go for a reduced Steps 5-6 is the owner's call on that trade.** (Status lives in `README.md`.)
 
 Supersedes docs/plans/description-names.md Revision 2 R3 (the after-the-fact body binder as the production path).
 Source: plan-debate 2026-10-31, Planner A (plan-A.md) and Planner B (plan-B.md), two critique rounds.
@@ -137,6 +137,8 @@ Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `ev
 - **G1 verdicts (owner, dev)**: blind pairwise at parity (18 new / 17 stored / 5 same); marks 379 / 412
   right; 27 of the 33 wrong marks are on people who get no name; named marks with keypoint link +
   bare-phrase rule 93 right, 2 wrong (97.9%). The owner's precision decision is not a 99% minimum: G1 dev
-  is not failed. Bare-phrase rule: on (it removed 1 wrong, 19 right). Next: G1 holdout (75 photos).
+  is not failed. Bare-phrase rule: on (it removed 1 wrong, 19 right).
+- **G1 holdout (owner, read once)**: named marks with all guards 46 right, 2 wrong (95.8%); both wrong are a
+  pick between two similar players. Dev + holdout 139 / 4 (97.2%).
 - **Scope if holdout holds**: a reduced Step 5-6 (describe writes marks; names only from keypoint-linked
   trusted faces); no `body_attrs` / `body_identity`, no hints, no cue names.

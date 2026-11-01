@@ -1189,4 +1189,11 @@ Stored descriptions: median 410 chars. Recall = share of the stored text's peopl
   untrusted or unlabelled face 121 / 17, trusted face 120 / 6: 27 of the 33 wrong marks show no
   name. The owner's precision decision (2026-11-01) accepted people-bind's measured ~99%; it is not
   a minimum, and the owner does not fail G1 at 97.9% named (3x people-bind's coverage). Holdout next.
+- **G1 holdout (owner, 69 photos, 251 marks), read once**: no face 96 right / 12 wrong, untrusted
+  face 75 / 7, trusted face 55 / 6; with the keypoint link and the bare-phrase rule **46 right, 2
+  wrong (95.8%)**: 242217 "a boy in a yellow jersey" (box 2, owner: 4) and 250101 "a boy in an
+  orange jersey" (1 vs 2), both a pick between two similar players. Dev + holdout: 139 right, 4
+  wrong (97.2%), about 1 wrong name in 35. People-bind on the holdout: 13 bound, 0 wrong; across
+  the 150-bound review 152 of 153 (99.3%). Grounded describe names ~3.5x as many people at a
+  higher error rate.
 
