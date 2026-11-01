@@ -136,4 +136,6 @@ evals/ask_eval/results/
 # people-bind eval: generated artefacts (labels.json / sample.json are committed)
 evals/people-bind/sheet/
 evals/people-bind/runs/
+evals/people-bind/*/sheet/
+evals/people-bind/*/runs/
 evals/people-bind/originals/
