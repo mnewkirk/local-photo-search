@@ -1008,3 +1008,33 @@ the `persons` columns only, so `person_boxes` moves to v43. Decisions made while
   written". A real NAS 404 ("Person not found") passes through.
 - Attributes are not added to MCP/Ask tool output or the Google/Shutterfly code; a grep test
   (`tests/test_person_attributes.py`) pins that.
+
+### people-bind: JSON-schema answers, link check, holdout (2026-10-31)
+
+Body mode, one model resident at a time, reasoning `none`. `-j` = LM Studio json_schema answers
+(`9cd1642`); `-k` adds the re-cased phrase fix (`7f1c3a2`). 248242 "the boy" relabelled to the
+faced boy (owner: ambiguous between the two).
+
+| dev split | bound | wrong | coverage | abstain-correct | unusable | s/photo |
+|---|--:|--:|--:|--:|--:|--:|
+| qwen3.5-9b bodies (prose before JSON) | 45 | 1 | 0.33 | 0.99 | 24 | 10.2 |
+| qwen3.5-9b `-j` | 27 | 0 | 0.20 | 1.00 | 20 | 5.0 |
+| **qwen3.5-9b `-k`** | **33** | **0** | 0.25 | 1.00 | 11 | 5.3 |
+| gemma-4-12b `-j` (121 photos: 4 HTTP 400) | 48 | 2 | 0.36 | 0.98 | 7 | 6.2 |
+
+- **Holdout, read once, `qwen35-k` only: 13 bound, 0 wrong**, coverage 0.17 (multi-face 0.12,
+  single 0.22), abstain-correct 1.00. Dev + holdout: 46 bound, 0 wrong. The >= 150-bound gate is
+  far off: at ~0.17 binds per holdout photo it needs ~860 more labelled photos.
+- The 1-wrong qwen3.5 run's error (248242) went with the relabel; JSON-only answers halved its
+  seconds per photo and removed every cut-off and "not a JSON array".
+- gemma's two remaining wrong binds: 247627 (a face linked to the wrong body; see "body mode")
+  and 249250 "Two young players": one player has no body box, and gemma made up the count with
+  the referee. qwen3.5 does neither.
+- **The link check does not work**: asked whether the face is the body's own, gemma said yes on
+  98 of 99 (including 247627) and qwen3.5 on 54 of 54. Left off (`link_check=False`).
+- **The contested-face guard does not help**: 247627's face lies outside the boy behind's box
+  and at the top centre of the front boy's, so no margin flags it; on qwen3.5 every margin
+  only removes a correct bind. Left off (`LINK_MARGIN = None`). `redecide` reproduces a run's
+  score exactly with the guard off (after skipping photos whose call failed).
+- qwen3.5's remaining unusable answers are paraphrased phrases ("a person" for "a man"); case
+  and spacing differences are now resolved to the description's own text (17 of 29).
