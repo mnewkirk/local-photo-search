@@ -184,7 +184,7 @@ def cmd_who_sheet(a):
                 else:
                     d.rectangle([l, t, r, b], outline=(160, 160, 160), width=1)
             xp.write_bytes(_jpeg(ctx, 80))
-        ppl = sorted(people_cache[s].items(), key=lambda kv: -kv[1][1])
+        ppl = sorted(people_cache[s].items(), key=lambda kv: (kv[1][0] or "").lower())   # alphabetical
         for per, (name, n, fid) in ppl:
             fp = sheet / f"f{fid}.jpg"
             if not fp.exists():
@@ -227,7 +227,7 @@ img.ph{width:100%;height:auto;border-radius:4px;cursor:zoom-in}
 .p{border:2px solid var(--line);background:var(--card);border-radius:6px;padding:3px;cursor:pointer;width:92px;text-align:center;font-size:12px;color:var(--fg)}
 .p img{width:84px;height:84px;object-fit:cover;border-radius:4px;display:block}
 .p.on,.x.on{border-color:var(--on);background:var(--on);color:var(--onfg)}
-.x{font:inherit;border:2px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:6px 12px;margin:6px 4px 0 0;cursor:pointer}
+.x{font:inherit;border:2px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:6px 12px;margin:8px 4px 0 0;cursor:pointer}
 #stale{background:#b71c1c;color:#fff;padding:12px 16px;font-weight:700}
 </style></head><body>
 <header><b>Who is this body?</b><span id="prog"></span>
@@ -291,7 +291,7 @@ function card(it) {
   }
   const xs = el("div");
   for (const [k, label] of OTHER) xs.append(el("button", {cls: "x" + (cur === k ? " on" : ""), on: () => pick(it, sec, k, null)}, label));
-  sec.append(el("div", {cls: "grid"}, crop, el("div", {}, ctx, ppl, xs)));
+  sec.append(el("div", {cls: "grid"}, crop, el("div", {}, ctx, xs, ppl)));
   return sec;
 }
 function render() {
@@ -1007,9 +1007,11 @@ function save() {
         d.textContent = "This page is out of date and is NOT saving. Reload it.";
         document.body.prepend(d); } }), 300);
 }
-const done = it => it.anchors.every(x => (L[x.key] || {}).v);
+// "fixing" = box numbers being picked: not judged until "use these boxes" turns it into "fix".
+const judged = x => ["right", "fix", "none", "ambiguous"].includes((L[x.key] || {}).v);
+const done = it => it.anchors.every(judged);
 function progress() {
-  const n = ITEMS.reduce((s, it) => s + it.anchors.filter(x => (L[x.key] || {}).v).length, 0);
+  const n = ITEMS.reduce((s, it) => s + it.anchors.filter(judged).length, 0);
   const t = ITEMS.reduce((s, it) => s + it.anchors.length, 0);
   document.getElementById("prog").textContent = `${n}/${t} marks judged · ${ITEMS.filter(done).length}/${ITEMS.length} photos done`;
 }
@@ -1037,12 +1039,17 @@ function card(it) {
     const cur = L[x.key] || {};
     const row = el("div", {cls: "a"}, el("div", {}, "“", el("b", {}, x.phrase), `” → box ${x.boxes.join(", ")}`));
     row.append(el("button", {cls: cur.v === "right" ? "on" : "", on: () => set(it, sec, x.key, cur.v === "right" ? {} : {v: "right"})}, "Right"));
-    const fix = cur.v === "fix" ? cur.boxes : [];
+    const fix = (cur.v === "fix" || cur.v === "fixing") ? cur.boxes : [];
+    row.append(el("span", {cls: "mut"}, " or the right box(es): "));
     for (let n = 1; n <= it.n; n++) {
       row.append(el("button", {cls: "n" + (fix.includes(n) ? " on" : ""), title: "the right box is " + n, on: () => {
         const b = fix.includes(n) ? fix.filter(z => z !== n) : fix.concat([n]).sort((p, q) => p - q);
-        set(it, sec, x.key, b.length ? {v: "fix", boxes: b} : {}); }}, String(n)));
+        set(it, sec, x.key, b.length ? {v: "fixing", boxes: b} : {}); }}, String(n)));
     }
+    if (cur.v === "fixing")
+      row.append(el("button", {cls: "on", on: () => set(it, sec, x.key, {v: "fix", boxes: cur.boxes})}, "use these boxes ✓"));
+    else if (cur.v === "fix")
+      row.append(el("span", {cls: "mut"}, " ✓ saved"));
     row.append(el("button", {cls: cur.v === "none" ? "on" : "", on: () => set(it, sec, x.key, cur.v === "none" ? {} : {v: "none"})}, "not a boxed person"));
     row.append(el("button", {cls: cur.v === "ambiguous" ? "on" : "", on: () => set(it, sec, x.key, cur.v === "ambiguous" ? {} : {v: "ambiguous"})}, "ambiguous"));
     right.append(row);

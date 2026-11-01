@@ -1172,3 +1172,10 @@ Stored descriptions: median 410 chars. Recall = share of the stored text's peopl
   page decides whether the text lost quality.
 - Owner judgments pending: who-is-this-body (215 faceless bodies, 101 holdout), confirm marks
   (two images + length, no hints: 415 dev marks), blind pairwise vs stored (40 dev photos).
+- **Owner-labelled bodies (G0 gate), 2026-11-01**: of 215 bodies placed for NONE phrases the owner
+  named 126 kids; 72 opponents, 16 adults, 1 unknown. Face tier (a trusted face the keypoint link
+  gives the body; round 1 had not offered it): holdout 33 right, 0 wrong; tune 25 right, 0 wrong
+  (246056 scored "wrong" at first: the owner marked an opponent, and the face is Henry Marini, who
+  plays for the other team). Burst tier: tune 1 right, 1 wrong (243906: Koa named Beckham); holdout
+  0 named, so the >= 50-named faceless gate fails, and not for lack of sample.
+

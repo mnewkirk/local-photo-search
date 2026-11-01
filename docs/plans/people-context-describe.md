@@ -127,6 +127,8 @@ Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `ev
   54% (preview) / 64% (full resolution) of crops. Not run on holdout. Revisit only with jersey OCR.
 - **Burst tier reach**: names 2 of the 156 owner-placed bodies that have no trusted face (0 on holdout):
   the faceless-identity gate (>= 50 named holdout bodies) cannot be met; cue names stay off.
+  Owner labels in: burst tier names 0 of 60 named holdout faceless bodies (tune: 1 right, 1 wrong);
+  the keypoint face link names 33 of them, all right (tune 25 right, 0 wrong).
 - **Hints**: fail the injection test (flipped gender obeyed ~4 points over baseline; true hints fix
   nothing) -> describe stays label-free (Decision row "Gender / age-band hints" falls back to B).
 - **Call shape**: two images (clean + numbered overlay) with inline `[phrase](n)` anchors, a length line,
