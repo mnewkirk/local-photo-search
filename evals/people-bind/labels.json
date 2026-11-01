@@ -1902,10 +1902,9 @@
     "phrase": "Two young boys"
    },
    {
-    "bodies": [
-     "B"
+    "gold": [
+     517142
     ],
-    "gold": "NONE",
     "phrase": "the boy"
    }
   ],

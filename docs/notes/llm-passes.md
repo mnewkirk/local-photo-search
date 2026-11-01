@@ -955,3 +955,33 @@ containing its centre.
   given each a nearby face.
 - Gender: the owner notes Asa is regularly described as a girl (long hair); `persons` has no
   gender or birth year, so nothing can check a phrase's gender or age against the label.
+
+### people-bind: body mode (2026-10-31)
+
+Round-2 labels (`484da08`): every NONE phrase placed on the detector body it means (137 phrases;
+1 MISSING). `bodies.json` after duplicate removal and head-based face linking: 1,158 bodies on
+200 photos (`5c06903`). Body mode (`c314be7`): every offered face's body plus faceless bodies
+>= 10% of the frame tall, capped at 10 boxes; on the dev split that draws all 100 faceless
+bodies the owner picked (median 5 boxes per photo). New prompt: no example phrase, box count
+stated twice. Same models, one resident at a time, reasoning `none`, dev split only.
+
+| variant | bound | wrong | coverage | abstain-correct | unusable | NONE pointed at the owner's body | s/photo |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| gemma-4-12b faces | 72 | 9 | 0.46 | 0.90 | 17 | - | 4.3 |
+| gemma-4-12b bodies | 63 | 4 | 0.44 | 0.95 | 3 | 54 / 84 | 5.6 |
+| qwen3.5-9b faces | 27 | 3 | 0.18 | 0.97 | 76 | - | 9.9 |
+| qwen3.5-9b bodies | 45 | 1 | 0.33 | 0.99 | 24 | 57 / 84 | 10.2 |
+| qwen2.5-vl-7b bodies | 20 | 1 | 0.14 | 0.99 | 56 | 46 / 84 | 3.2 |
+
+- Body mode more than halves wrong binds on every model and cuts unusable answers (gemma 17 -> 3,
+  qwen3.5 76 -> 24). Still no variant at 0; gemma and qwen3.5 agreeing: 29 bound, 1 wrong.
+- **The remaining wrong binds are face-to-body link errors, not phrase errors.** 247627: the
+  models rightly chose the body of the boy in black (running away), but face 1 is the boy behind
+  him peeking past his head (Asa Goldman, manual), and `link_faces` gave it to the front body:
+  a user-visible wrong name. 248242 ("the boy in the foreground"): the owner's body is the
+  faceless boy nearer the camera; all three models chose the faced boy, arguably ambiguous.
+- A "contested face" guard (a face in the head region of 2+ bodies names nobody) fires on 75
+  of 125 dev photos as first written: too broad. An offline re-decision from the traces did not
+  reproduce the as-run scores (the trace lacked each answer's kind), so it decides nothing; the
+  trace now keeps the whole answer.
+- qwen3.5's unusable answers: 14 "not a JSON array", 8 cut off at 768 tokens twice.

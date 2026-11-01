@@ -470,7 +470,9 @@ def cmd_run(a):
             calls = len(trace) or calls
             pred["calls"] = calls
             # what each call pointed at, as drawn boxes: the report maps them to body letters
-            pred["trace"] = [[{"phrase": m["phrase"], "boxes": [c["boxes"][n - 1] for n in m["could_be"]]}
+            # (the whole answer, so a rule change can be re-decided offline without a model)
+            pred["trace"] = [[{"phrase": m["phrase"], "boxes": [c["boxes"][n - 1] for n in m["could_be"]],
+                               "kind": m["kind"], "all_members_boxed": m["all_members_boxed"]}
                               for m in c["mentions"]] for c in trace]
         if error:
             pred["error"] = error
