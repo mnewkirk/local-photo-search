@@ -531,7 +531,8 @@ def cmd_redecide(a):
         margin = None if raw in ("off", "none") else float(raw)
         preds = {}
         for pid, pr in run["preds"].items():
-            if pr.get("method") != "vlm" or "trace" not in pr or not inps.get(pid):
+            # a failed call leaves a partial trace: the live run wrote nothing for it
+            if pr.get("method") != "vlm" or "trace" not in pr or pr.get("error") or not inps.get(pid):
                 preds[pid] = pr
                 continue
             inp = inps[pid]
