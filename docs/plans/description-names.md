@@ -191,6 +191,10 @@ Still to do before any backfill (needs the GPU box and ~2 h of the owner's label
 
 ## Revision 2 (2026-10-31): person boxes and person attributes
 
+**Superseded in part (2026-10-31):** the body-overlay binder as the production path (R3) is replaced by
+[people-context-describe.md](people-context-describe.md), where describe writes its own spans. R1, R4 and the
+bare-phrase rule carry over; people-bind stays runnable for old descriptions.
+
 **Why.** The first dev comparison (docs/notes/llm-passes.md, "people-bind dev comparison: no model passes") failed
 the 0-wrong-binds gate on every model. Matt's reading of the labels: every NONE (137 of 351 phrases) is a person in
 the frame with **no face box** (back or side of the head, face too small), and those phrases are where the wrong
