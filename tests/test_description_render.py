@@ -227,3 +227,168 @@ def test_sweep_rebinds_a_moved_face_and_requeues_a_lost_one(db):
     assert db.conn.execute("SELECT COUNT(*) FROM description_subjects").fetchone()[0] == 0
     assert db.conn.execute("SELECT COUNT(*) FROM worker_processed WHERE pass_type='people-bind'"
                            ).fetchone()[0] == 0
+
+
+# --- rule 7: the phrase must agree with the person's gender / age ---------------------
+
+@pytest.mark.parametrize("phrase,heads", [
+    ("A young boy with reddish hair", ["boy"]),
+    ("a woman holding a baby", ["woman"]),          # a noun after a post-modifier is not a head
+    ("a baby girl in pink", ["baby", "girl"]),
+    ("a boy's mother", ["mother"]),                 # a possessive is not the head
+    ("Two girls in blue", ["girl"]),
+    ("Two players in blue", []),
+    ("the goalkeeper", []),
+])
+def test_head_nouns(phrase, heads):
+    assert [canon for _, canon in R.head_nouns(phrase)] == heads
+
+
+def _at(gender=None, born=None, approx=False):
+    return {1: {"gender": gender, "birth_year": born, "birth_year_approx": approx}}
+
+
+def test_a_gender_conflict_keeps_the_generic_words():
+    r = R.render(D, _row(), [_face()], PERSONS, attrs=_at("female"), date_taken="2024-05-01")
+    assert r.text == D
+    assert r.slots[0]["state"] == R.ATTRIBUTE_CONFLICT
+    assert r.slots[0]["reason"] == "phrase says boy; Zack is female"
+    assert r.slots[0]["name"] is None
+
+
+@pytest.mark.parametrize("attrs", [_at("male"), _at("other"), _at(None), {}, None])
+def test_agreeing_other_or_unset_gender_still_names(attrs):
+    r = R.render(D, _row(), [_face()], PERSONS, attrs=attrs, date_taken="2024-05-01")
+    assert r.text.startswith("Zack walks") and r.slots[0]["state"] == R.NAMED
+    assert "reason" not in r.slots[0]
+
+
+def _single(phrase, rest=" sits on the grass."):
+    d = phrase + rest
+    return d, _row(d, spans=[{"start": 0, "end": len(phrase), "text": phrase}])
+
+
+@pytest.mark.parametrize("phrase,born,approx,year,conflict", [
+    ("A baby in a stroller", 2015, False, 2024, True),     # 9 is not 0-3
+    ("A baby in a stroller", 2022, False, 2024, False),
+    ("A baby in a stroller", 2019, False, 2024, True),     # 5: outside +-1
+    ("A baby in a stroller", 2019, True, 2024, False),     # 5: inside +-3 (an estimate)
+    ("A young boy", 2007, False, 2024, False),             # 17
+    ("A young boy", 2006, False, 2024, False),             # 18, may still be 17
+    ("A young boy", 2005, False, 2024, True),              # 19
+    ("A young boy", 2003, True, 2024, True),               # 21: outside +-3
+    ("A man in a hat", 2015, False, 2024, True),           # 9 is not an adult
+    ("A man in a hat", 1980, False, 2024, False),
+    ("A teenager", 2016, False, 2024, True),               # 8
+    ("A teenager", 2011, False, 2024, False),              # 13
+    ("A boy", 2015, False, None, False),                   # undated: no age check
+])
+def test_age_bands(phrase, born, approx, year, conflict):
+    d, row = _single(phrase)
+    r = R.render(d, row, [_face()], PERSONS, attrs=_at("male", born, approx),
+                 date_taken=f"{year}-06-01 10:00:00" if year else None)
+    assert (r.slots[0]["state"] == R.ATTRIBUTE_CONFLICT) is conflict
+    assert (r.text == d) is conflict
+    if conflict:
+        assert r.slots[0]["reason"].startswith("phrase says ")
+
+
+def test_age_reason_is_human():
+    d, row = _single("A baby in a stroller")
+    r = R.render(d, row, [_face()], PERSONS, attrs=_at(None, 2015, True), date_taken="2024-01-01")
+    assert r.slots[0]["reason"] == "phrase says baby; Zack was about 9 in 2024 (born ~2015)"
+
+
+def test_undated_photo_still_checks_gender():
+    r = R.render(D, _row(), [_face()], PERSONS, attrs=_at("female", 2015), date_taken=None)
+    assert r.slots[0]["state"] == R.ATTRIBUTE_CONFLICT
+
+
+def _two(src_a="manual", src_b="strict"):
+    f = lambda i, p, src, b: {"id": i, "person_id": p, "match_source": src, "bbox_top": b[0],
+                              "bbox_right": b[1], "bbox_bottom": b[2], "bbox_left": b[3]}
+    return [f(1, 1, src_a, (0, 100, 100, 0)), f(2, 2, src_b, (0, 300, 100, 200))]
+
+
+def test_a_group_must_agree_on_every_face():
+    d = "Two girls in blue chase the ball."
+    sp = [{"start": 0, "end": 17, "text": d[:17]}]
+    row = _row(d, faces=[{"face_id": 1, "bbox": [0, 100, 100, 0]},
+                         {"face_id": 2, "bbox": [0, 300, 100, 200]}], spans=sp, kind="group")
+    both_f = {1: {"gender": "female"}, 2: {"gender": "female"}}
+    assert R.render(d, row, _two(), PERSONS, attrs=both_f).text == "Zack and Calvin chase the ball."
+    one_m = {1: {"gender": "female"}, 2: {"gender": "male"}}
+    r = R.render(d, row, _two(), PERSONS, attrs=one_m)
+    assert r.text == d and r.slots[0]["reason"] == "phrase says girls; Calvin is male"
+
+
+def _two_slots():
+    d = "A girl in red passes to a boy in blue."
+    a, b = "A girl in red", "a boy in blue"
+    ib = d.index(b)
+    row = {"description_sha": sha_of(d), "slots_json": json.dumps([
+        {"slot": "s1", "kind": "person", "spans": [{"start": 0, "end": len(a), "text": a}],
+         "faces": [{"face_id": 1, "bbox": [0, 100, 100, 0]}]},
+        {"slot": "s2", "kind": "person", "spans": [{"start": ib, "end": ib + len(b), "text": b}],
+         "faces": [{"face_id": 2, "bbox": [0, 300, 100, 200]}]}])}
+    return d, row
+
+
+def test_a_conflict_in_one_slot_leaves_the_other_named():
+    d, row = _two_slots()
+    attrs = {1: {"gender": "male"}, 2: {"gender": "male"}}   # Zack is not a girl
+    r = R.render(d, row, _two(), PERSONS, attrs=attrs)
+    assert r.text == "A girl in red passes to Calvin."
+    assert [s["state"] for s in r.slots] == [R.ATTRIBUTE_CONFLICT, R.NAMED]
+
+
+def test_property_no_attributes_is_identical_and_conflicts_render_raw():
+    """Over a grid of photos: (1) no attributes -> byte-identical to the
+    pre-rule-7 render; (2) attributes contradicting every slot -> the raw
+    text (all-generic == raw still holds)."""
+    d, row = _two_slots()
+    cases = [(D, _row(), [_face(src=s)]) for s in ("manual", "strict", "temporal", None)]
+    cases += [(d, row, _two(sa, sb)) for sa in ("manual", "temporal") for sb in ("strict", None)]
+    nobody = {1: {"gender": None, "birth_year": None, "birth_year_approx": False}}
+    contra = {1: {"gender": "male", "birth_year": 1950},
+              2: {"gender": "female", "birth_year": 1950}}
+    for text, r_, faces in cases:
+        before = R.render(text, r_, faces, PERSONS)
+        for attrs in (None, {}, nobody):
+            again = R.render(text, r_, faces, PERSONS, attrs=attrs, date_taken="2024-01-01")
+            assert again.text == before.text and again.slots == before.slots
+        r = R.render(text, r_, faces, PERSONS, attrs=contra, date_taken="2024-01-01")
+        assert r.text == text
+        assert all(s["state"] != R.NAMED for s in r.slots)
+
+
+def test_loader_reads_attributes_and_date_in_the_batched_queries(db, monkeypatch):
+    pid, fid, zack = _seed(db)
+    db.conn.execute("UPDATE photos SET date_taken = '2024-05-01 10:00:00' WHERE id = ?", (pid,))
+    db.set_person_attributes([zack], {"gender": "female"})
+    monkeypatch.setenv(R.ENABLED_ENV, "1")
+    rows = [{"id": pid, "description": D}]
+    R.attach_display_descriptions(db.conn, rows, detail=True)
+    assert "description_display" not in rows[0]
+    s = rows[0]["description_subjects"][0]
+    assert s["state"] == R.ATTRIBUTE_CONFLICT and s["reason"] == "phrase says boy; Zack is female"
+    # age: an adult is not "a young boy" in 2024
+    db.set_person_attributes([zack], {"gender": "male", "birth_year": 1980})
+    rows = [{"id": pid, "description": D}]
+    R.attach_display_descriptions(db.conn, rows, detail=True)
+    assert rows[0]["description_subjects"][0]["state"] == R.ATTRIBUTE_CONFLICT
+    db.set_person_attributes([zack], {"birth_year": 2014})
+    rows = [{"id": pid, "description": D}]
+    R.attach_display_descriptions(db.conn, rows)
+    assert rows[0]["description_display"].startswith("Zack walks")
+
+
+def test_loader_on_a_pre_v42_db_renders_without_rule_7(db, monkeypatch):
+    pid, fid, zack = _seed(db)
+    for col in ("birth_year_approx", "birth_year", "gender"):
+        db.conn.execute(f"ALTER TABLE persons DROP COLUMN {col}")
+    db.conn.commit()
+    monkeypatch.setenv(R.ENABLED_ENV, "1")
+    rows = [{"id": pid, "description": D}]
+    R.attach_display_descriptions(db.conn, rows)
+    assert rows[0]["description_display"].startswith("Zack walks")

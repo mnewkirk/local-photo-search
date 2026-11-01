@@ -22,7 +22,13 @@ generic words and the slot reports why (``state``):
    rejected / dedupe_unmatched) is never named in that photo;
 5. a group slot is all-or-nothing, with distinct people;
 6. the name is the first name, or the full ``persons.name`` when another
-   registered person shares that first name.
+   registered person shares that first name;
+7. a phrase whose head noun implies a gender or an age band ("girl", "baby",
+   "man") agrees with every person it would name, at the photo's
+   ``date_taken`` (``persons.gender`` / ``birth_year``, schema v42), else the
+   slot is ``attribute_conflict`` with a human ``reason``. An unset
+   attribute, ``other`` or a missing date skips that check, so a library with
+   no attributes renders exactly as before.
 
 Properties the tests pin: all-generic render == raw, text differs from raw only
 inside spans, deterministic, never raises (any failure -> the raw text).
@@ -33,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -54,6 +61,37 @@ UNTRUSTED = "untrusted_source"
 REJECTED_STATE = "rejected"
 STALE = "stale"
 AMBIGUOUS = "ambiguous_name"
+ATTRIBUTE_CONFLICT = "attribute_conflict"
+
+# ---------------------------------------------------------------------------
+# Rule 7: head nouns that imply a gender or an age band. Closed lists on
+# purpose (a miss skips the check, never invents a conflict).
+# ---------------------------------------------------------------------------
+
+_MALE = ("boy", "son", "brother", "man", "father", "dad", "husband", "gentleman")
+_FEMALE = ("girl", "daughter", "sister", "woman", "mother", "mom", "lady", "wife")
+_AGE_BANDS = (
+    (("baby", "infant", "toddler"), (0, 3)),
+    (("boy", "girl", "child", "kid"), (0, 17)),
+    (("teen", "teenager"), (12, 19)),
+    (("man", "woman", "adult", "parent", "father", "mother"), (18, None)),
+)
+_PLURALS = {
+    "boys": "boy", "sons": "son", "brothers": "brother", "men": "man",
+    "fathers": "father", "dads": "dad", "husbands": "husband",
+    "gentlemen": "gentleman", "girls": "girl", "daughters": "daughter",
+    "sisters": "sister", "women": "woman", "mothers": "mother", "moms": "mom",
+    "ladies": "lady", "wives": "wife", "babies": "baby", "infants": "infant",
+    "toddlers": "toddler", "children": "child", "kids": "kid", "teens": "teen",
+    "teenagers": "teenager", "adults": "adult", "parents": "parent",
+}
+_NOUNS = {w: w for w in set(_MALE) | set(_FEMALE)
+          | {w for ws, _ in _AGE_BANDS for w in ws}}
+_NOUNS.update(_PLURALS)
+# Exact-year births are checked at +-1 (the birthday may not have come yet),
+# estimates at +-3.
+BIRTH_YEAR_TOLERANCE = 1
+BIRTH_YEAR_APPROX_TOLERANCE = 3
 
 
 def display_enabled(env=None) -> bool:
@@ -155,18 +193,90 @@ def _join_names(names: list) -> str:
 
 
 def render(description: str, row: Optional[dict], faces: list, persons: dict,
-           sources: Optional[tuple] = None, first_counts: Optional[dict] = None
+           sources: Optional[tuple] = None, first_counts: Optional[dict] = None,
+           attrs: Optional[dict] = None, date_taken: Optional[str] = None
            ) -> Rendered:
     """Pure render of one photo. ``row`` is its ``description_subjects`` row (or
     ``None``), ``faces`` its CURRENT faces rows (id, person_id, match_source,
-    bbox_*), ``persons`` ``{person_id: name}``. Never raises."""
+    bbox_*), ``persons`` ``{person_id: name}``, ``attrs`` ``{person_id:
+    {gender, birth_year, birth_year_approx}}`` (rule 7; omitted = no check) and
+    ``date_taken`` the photo's date. Never raises."""
     try:
         return _render(description, row, faces, persons,
                        sources if sources is not None else name_sources(),
-                       first_counts if first_counts is not None else _first_counts(persons))
+                       first_counts if first_counts is not None else _first_counts(persons),
+                       attrs or {}, date_taken)
     except Exception:                                  # noqa: BLE001 — raw is always safe
         logger.exception("description render failed; showing the raw text")
         return Rendered(description or "")
+
+
+_TOKEN_RE = re.compile(r"[a-z]+(?:['’]s\b)?")
+
+
+def head_nouns(phrase: str) -> list:
+    """The closed-list head noun(s) of a person phrase as ``(word, canonical)``:
+    the first listed noun that is not a possessive ("a boy's mother" -> mother),
+    plus listed nouns directly after it ("a baby girl" -> baby, girl). A noun
+    after a post-modifier ("a woman holding a baby") is not a head."""
+    low = (phrase or "").lower()
+    heads: list = []
+    prev_end = None
+    for m in _TOKEN_RE.finditer(low):
+        w = m.group(0)
+        if heads:
+            if w in _NOUNS and not low[prev_end:m.start()].strip(" -"):
+                heads.append((w, _NOUNS[w]))
+                prev_end = m.end()
+                continue
+            break
+        if w in _NOUNS:
+            heads.append((w, _NOUNS[w]))
+            prev_end = m.end()
+    return heads
+
+
+def _photo_year(date_taken) -> Optional[int]:
+    s = str(date_taken or "")[:4]
+    if len(s) == 4 and s.isdigit() and 1800 < int(s) < 3000:
+        return int(s)
+    return None
+
+
+def attribute_conflict(phrases: list, people: list, attrs: dict,
+                       date_taken: Optional[str]) -> Optional[str]:
+    """Rule 7. ``phrases`` are the slot's span texts, ``people`` its
+    ``[(person_id, display_name)]``. Returns the reason the phrase disagrees
+    with someone it would name ("phrase says girl; Asa is male"), else None.
+    Unset attributes, gender ``other`` and an undated photo skip their check."""
+    if not attrs:
+        return None
+    heads = [h for p in phrases for h in head_nouns(p)]
+    if not heads:
+        return None
+    year = _photo_year(date_taken)
+    for pid, name in people:
+        a = attrs.get(pid) or {}
+        gender = a.get("gender")
+        if gender in ("male", "female"):
+            for word, noun in heads:
+                said = "male" if noun in _MALE else "female" if noun in _FEMALE else None
+                if said and said != gender:
+                    return f"phrase says {word}; {name} is {gender}"
+        born = a.get("birth_year")
+        if year is None or not isinstance(born, int) or isinstance(born, bool):
+            continue
+        approx = bool(a.get("birth_year_approx"))
+        tol = BIRTH_YEAR_APPROX_TOLERANCE if approx else BIRTH_YEAR_TOLERANCE
+        age = year - born
+        for word, noun in heads:
+            for nouns, (lo, hi) in _AGE_BANDS:
+                if noun not in nouns:
+                    continue
+                if (hi is not None and age - tol > hi) or (lo is not None and age + tol < lo):
+                    return (f"phrase says {word}; {name} was about {max(age, 0)} in {year} "
+                            f"(born {'~' if approx else ''}{born})")
+    return None
 
 
 def _first_counts(persons: dict) -> dict:
@@ -178,7 +288,8 @@ def _first_counts(persons: dict) -> dict:
     return out
 
 
-def _render(description, row, faces, persons, sources, first_counts) -> Rendered:
+def _render(description, row, faces, persons, sources, first_counts,
+            attrs=None, date_taken=None) -> Rendered:
     if not description or not row:
         return Rendered(description or "")
     if row["description_sha"] != sha_of(description):
@@ -227,6 +338,12 @@ def _render(description, row, faces, persons, sources, first_counts) -> Rendered
         if state != NAMED or len(set(pids)) != len(pids):
             info["state"] = state if state != NAMED else AMBIGUOUS
             continue
+        reason = attribute_conflict([sp["text"] for sp in s["spans"]],
+                                    list(zip(pids, names)), attrs, date_taken)
+        if reason:                                    # rule 7: generic words
+            info["state"] = ATTRIBUTE_CONFLICT
+            info["reason"] = reason
+            continue
         info["state"] = NAMED
         info["name"] = _join_names(names)
         for sp in s["spans"]:
@@ -251,14 +368,35 @@ def _chunks(ids: list):
 
 
 def load_persons(conn) -> dict:
-    return {r[0]: r[1] for r in conn.execute("SELECT id, name FROM persons")}
+    return load_persons_with_attributes(conn)[0]
+
+
+def load_persons_with_attributes(conn) -> tuple:
+    """``({person_id: name}, {person_id: {gender, birth_year,
+    birth_year_approx}})`` in ONE query of the (tiny) persons table. Only
+    persons with an attribute set appear in the second dict. A pre-v42 DB has
+    no attribute columns: names only, rule 7 dormant."""
+    import sqlite3
+    try:
+        rows = conn.execute("SELECT id, name, gender, birth_year, birth_year_approx "
+                            "FROM persons").fetchall()
+    except sqlite3.OperationalError:
+        return {r[0]: r[1] for r in conn.execute("SELECT id, name FROM persons")}, {}
+    names, attrs = {}, {}
+    for r in rows:
+        names[r[0]] = r[1]
+        if r[2] is not None or r[3] is not None:
+            attrs[r[0]] = {"gender": r[2], "birth_year": r[3],
+                           "birth_year_approx": bool(r[4])}
+    return names, attrs
 
 
 def render_many(conn, photos: list, sources: Optional[tuple] = None) -> dict:
     """``{photo_id: Rendered}`` for ``photos`` (dicts with ``id`` and
-    ``description``) in three indexed queries per <= 500 ids: the rows, the
-    photos' faces, and the (tiny) persons table. A DB without the table (a
-    replica copy of a pre-v41 NAS) renders nothing: callers fall back to raw."""
+    ``description``) in three indexed queries per <= 500 ids: the rows (with
+    the photo's ``date_taken``, for rule 7), the photos' faces, and the (tiny)
+    persons table with its attributes. A DB without the table (a replica copy
+    of a pre-v41 NAS) renders nothing: callers fall back to raw."""
     import sqlite3
     ids = [p["id"] for p in photos if p.get("description")]
     if not ids:
@@ -268,9 +406,11 @@ def render_many(conn, photos: list, sources: Optional[tuple] = None) -> dict:
         for chunk in _chunks(ids):
             q = ",".join("?" * len(chunk))
             for r in conn.execute(
-                    f"SELECT photo_id, description_sha, slots_json FROM description_subjects "
-                    f"WHERE photo_id IN ({q})", chunk):
-                rows[r[0]] = {"description_sha": r[1], "slots_json": r[2]}
+                    f"SELECT ds.photo_id, ds.description_sha, ds.slots_json, ph.date_taken "
+                    f"FROM description_subjects ds LEFT JOIN photos ph ON ph.id = ds.photo_id "
+                    f"WHERE ds.photo_id IN ({q})", chunk):
+                rows[r[0]] = {"description_sha": r[1], "slots_json": r[2],
+                              "date_taken": r[3]}
     except sqlite3.OperationalError:
         return {}
     if not rows:
@@ -284,7 +424,7 @@ def render_many(conn, photos: list, sources: Optional[tuple] = None) -> dict:
             faces.setdefault(r[1], []).append(
                 {"id": r[0], "person_id": r[2], "match_source": r[3], "bbox_top": r[4],
                  "bbox_right": r[5], "bbox_bottom": r[6], "bbox_left": r[7]})
-    persons = load_persons(conn)
+    persons, attrs = load_persons_with_attributes(conn)
     fc = _first_counts(persons)
     srcs = sources if sources is not None else name_sources()
     out = {}
@@ -292,7 +432,8 @@ def render_many(conn, photos: list, sources: Optional[tuple] = None) -> dict:
         row = rows.get(p["id"])
         if row:
             out[p["id"]] = render(p["description"], row, faces.get(p["id"], []),
-                                  persons, srcs, fc)
+                                  persons, srcs, fc, attrs=attrs,
+                                  date_taken=row.get("date_taken"))
     return out
 
 
