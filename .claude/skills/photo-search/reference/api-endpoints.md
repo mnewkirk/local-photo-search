@@ -171,7 +171,14 @@ Read when you need a route's path, parameters or response shape.
 
 <!-- moved verbatim from SKILL.md (line 480) on 2026-10-19 -->
 ### Persons
-- `GET /api/persons` — List persons with photo counts
+- `GET /api/persons` — List persons with photo counts, plus `gender`, `birth_year`, `birth_year_approx` (v42)
+- `PATCH /api/persons/{id}` — Set one person's `gender` / `birth_year` / `birth_year_approx`. Absent key = unchanged,
+  `null` = clear. 400 on a bad value or an empty body, 404 for an unknown id. Returns `{ok, person}`.
+- `POST /api/persons/bulk-attributes` — `{person_ids, gender?, birth_year?, birth_year_approx?}`, same semantics on
+  many. Returns `{updated, unknown, unknown_ids, persons}`; 404 when no id exists. Used by /faces "Set details".
+  Replica mode for both: forwarded to the NAS, then the NAS's resulting values mirrored locally; a NAS older than
+  v42 gives 409 and nothing is written.
+- `DELETE /api/persons/{id}` — Delete a person no face is labelled as (409 while one is)
 
 <!-- moved verbatim from SKILL.md (line 483) on 2026-10-19 -->
 ### Collections

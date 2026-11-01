@@ -985,3 +985,26 @@ stated twice. Same models, one resident at a time, reasoning `none`, dev split o
   reproduce the as-run scores (the trace lacked each answer's kind), so it decides nothing; the
   trace now keeps the whole answer.
 - qwen3.5's unusable answers: 14 "not a JSON array", 8 cut off at 768 tokens twice.
+
+### people-bind R4: person attributes and render rule 7 (2026-10-31)
+
+Built Revision 2 C (docs/plans/description-names.md) ahead of R1-R3; not deployed. Schema v42 is
+the `persons` columns only, so `person_boxes` moves to v43. Decisions made while building:
+
+- **Head noun** = the first closed-list noun in a span that is not a possessive, plus listed
+  nouns directly after it. "a woman holding a baby" checks `woman` only (a noun after a
+  post-modifier is not a head); "a baby girl" checks both; "a boy's mother" checks `mother`.
+  Plurals map to the singular and a group checks every face. People-bind group slots are always
+  counted plurals ("two girls"), so a mixed phrase like "a man and a boy" never reaches rule 7.
+- **Ages** use the year only: age = photo year - birth year, exact at ±1 (the birthday may not
+  have come yet), estimate at ±3. Teen is 12-19, so a 17-year-old "boy" and "teen" both pass.
+- Rule 7 runs only on a slot that would otherwise be named; an untrusted or rejected label keeps
+  its own state. The reason is shown in the modal ("phrase says girl; Asa is male").
+- **No new query**: attributes come from the persons query the render already ran, and
+  `date_taken` from a join on the `description_subjects` query. A pre-v42 copy renders as before.
+- **Replica**: the write goes to the NAS; the mirror copies the NAS's resulting values (matched
+  by id and name), not the request. A NAS older than v42 answers 405 (or the default 404 "Not
+  Found") for these routes; the replica turns that into 409 "deploy the NAS first; nothing was
+  written". A real NAS 404 ("Person not found") passes through.
+- Attributes are not added to MCP/Ask tool output or the Google/Shutterfly code; a grep test
+  (`tests/test_person_attributes.py`) pins that.

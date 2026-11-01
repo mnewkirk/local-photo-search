@@ -188,7 +188,13 @@ Three panels, all opened from the filter bar:
   each by distance to their core, bulk unassign/reassign. Inherits the page's
   date filter; states its scope ("showing 196 of 20,575") because it
   bulk-unassigns and a hidden scope would be the wrong thing to hide. Radius
-  dropdown, since the useful eps is shoot-dependent.
+  dropdown, since the useful eps is shoot-dependent. Its header edits the
+  person's gender / birth year / approximate (`PATCH /api/persons/{id}`, v42).
+- **Set details** (multi-select bar) — gender / birth year on the persons of the
+  selected NAMED groups via `POST /api/persons/bulk-attributes`; unnamed groups
+  are skipped and the result line counts them. Cards and the detail header show
+  the values as a small hint (`PS.personAttributeHint`, e.g. "♀ · ~2014"). Used
+  only by render rule 7 (docs/plans/description-names.md).
 - **🔍 Verify labels** — any date range. One row per suspect: the disputed crop,
   the identity it CARRIES, the identity it LOOKS LIKE, nearest references first
   on each side. Reassign / Reject / Keep. Reject records `rejected`, so

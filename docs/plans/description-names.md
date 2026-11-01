@@ -1,6 +1,6 @@
 # Names in photo descriptions that follow the face labels
 
-**Status: 🟡 v41 deployed flag-off 2026-10-31; the first dev eval failed (no model at 0 wrong binds); Revision 2 (person boxes, person attributes) planned.** (Status lives in `README.md`; this header is a convenience.)
+**Status: 🟡 v41 deployed flag-off 2026-10-31; the first dev eval failed (no model at 0 wrong binds); Revision 2 (person boxes, person attributes) planned; R4 (person attributes, schema v42) built 2026-10-31, not deployed.** (Status lives in `README.md`; this header is a convenience.)
 
 Produced by a plan-debate (two independent planners, two critique rounds). Both agreed on almost everything; the
 three points that stayed open are decided in the table below. No code, schema or live data was touched.
@@ -58,6 +58,7 @@ A slot becomes a name only if ALL hold; otherwise its spans keep the generic wor
 4. **A person who owns two or more live faces in the photo (any source except rejected/dedupe_unmatched) is never named in that photo**, whichever slot the faces are in.
 5. A group is all-or-nothing ("Zack and Calvin"; never "Zack and another player").
 6. Name = first name; full `persons.name` if another person in the photo (or an ambiguous registered first name) shares it. Possessives keep their `'s`.
+7. (Revision 2 C, schema v42) A phrase whose head noun implies a gender or age band agrees with every person it would name at the photo's `date_taken`, else `attribute_conflict`.
 
 Properties (tested): all-generic render == raw; text differs from raw only inside spans; deterministic.
 
@@ -93,7 +94,8 @@ Two tiers, reported and gated **separately**; a tier is dropped if its wrong-bin
 
 API: an additive `description_display` key; `description` is unchanged key-for-key. The detail endpoint also returns
 `description_subjects: [{slot, generic, name, state, face_ids}]` with `state` ∈ named / unlabelled / untrusted_source /
-rejected / stale / ambiguous_name, so the UI can say why a kid is not named. Frontend trap: the modal's `syncFaces`
+rejected / stale / ambiguous_name / attribute_conflict (that one also carries `reason`), so the UI can say why a kid
+is not named. Frontend trap: the modal's `syncFaces`
 (`shared.js`) re-fetches `/api/photos/{id}` after a face edit but keeps only `d.faces`; it must also keep
 `description_display` / `description_subjects` or the text will not follow a relabel until reopened.
 
@@ -197,7 +199,9 @@ describe pass regularly calls Asa a girl (long hair), and nothing records a pers
 against. The spike (notes, "a person detector boxes the faceless subjects") showed a stock detector boxes the
 faceless subject on 91 of the 99 photos with a NONE phrase; the existing `subject_boxes` did on 16.
 
-### A. Person boxes (schema v42)
+### A. Person boxes (schema v43)
+
+Renumbered 2026-10-31: the person attributes (C) shipped first and own v42, so `person_boxes` is v43.
 
 ```sql
 CREATE TABLE IF NOT EXISTS person_boxes (
@@ -235,7 +239,7 @@ CREATE INDEX IF NOT EXISTS idx_person_boxes_photo ON person_boxes(photo_id);
   so the phrase gets no slot (the correct abstain, for the right reason). A group binds only if every chosen body has
   an offered face. `slots_json`, the render and the API keep their shape: slots still hold face ids.
 
-### C. Person attributes (schema v42)
+### C. Person attributes (schema v42) — built 2026-10-31 (R4)
 
 `persons` gains `gender TEXT` (`'female'`, `'male'`, `'other'`, NULL = not set) and `birth_year INTEGER` plus
 `birth_year_approx INTEGER NOT NULL DEFAULT 0` (1 = an estimate, checked at ±3 years; exact at ±1).
@@ -256,6 +260,14 @@ CREATE INDEX IF NOT EXISTS idx_person_boxes_photo ON person_boxes(photo_id);
   birth_year_approx?}` (absent = unchanged, null = clear), each with a `request_intent._RULES` entry. Replica:
   NAS-authoritative write, then mirror locally, like face labels. These attributes never leave the machine (not in
   Google/Shutterfly captions or MCP output).
+- **As built (R4):** the CHECK constraint enforces the gender set; `db.validate_person_attributes` the rest (birth
+  year 1900..this year; clearing the year resets approx). Head noun = the first listed noun that is not a
+  possessive, plus listed nouns directly after it ("baby girl"); "a woman holding a baby" checks `woman` only.
+  Plurals map to the singular ("two girls" checks every face). A replica write to a NAS older than v42 gets a 409
+  ("deploy the NAS first; nothing was written"), never a local-only write. The mirror copies the NAS's resulting
+  values (by id and name), not the request. The render reads the attributes in the persons query it already ran and
+  `date_taken` in the `description_subjects` query (joined), so no new query per slot. Notes:
+  docs/notes/llm-passes.md, "people-bind R4: person attributes and render rule 7".
 
 ### D. Eval v2
 
@@ -271,9 +283,9 @@ CREATE INDEX IF NOT EXISTS idx_person_boxes_photo ON person_boxes(photo_id);
 | # | Step | Est. |
 |---|---|---|
 | R1 | `person_boxes.py` (detect + link) + tests; eval `bodies` command, `bodies.json`; labelling page draws lettered bodies; Matt re-marks the 137 NONE phrases (~40 min) | 0.5 d + labelling |
-| R2 | Schema v42 (both tables), `bodies` worker pass, claim-input bodies, pass lists, `PASS_MEDIA`, `clear-pass` | 1 d |
+| R2 | Schema v43 (`person_boxes`; v42 went to R4's person attributes), `bodies` worker pass, claim-input bodies, pass lists, `PASS_MEDIA`, `clear-pass` | 1 d |
 | R3 | Body overlay + prompt + body-to-face decide, `BIND_VERSION` bump; eval scoring v2; re-run the three models on dev | 1 d + GPU |
-| R4 | Person attributes: API, /faces Set details + inspect edit, replica mirror; render rule 7 + `attribute_conflict` state | 1.5 d |
+| R4 | ✅ 2026-10-31 (schema v42, not deployed). Person attributes: API, /faces Set details + inspect edit, replica mirror; render rule 7 + `attribute_conflict` state | 1.5 d |
 | R5 | Holdout report only if a model reaches 0 wrong binds on dev; then the holdout top-up and the existing rollout | - |
 
 R4 is independent of R1-R3 and can ship first (it only adds columns and a UI; rule 7 can land with it, dormant until

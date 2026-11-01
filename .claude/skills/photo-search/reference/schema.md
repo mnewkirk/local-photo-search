@@ -3,7 +3,7 @@
 Read when you need table/column details or how search uses the v34 indexes.
 
 <!-- moved verbatim from SKILL.md (line 102) on 2026-10-19 -->
-## Database Schema (v40)
+## Database Schema (v42)
 
 > Version note: this section documents the v23 baseline; later migrations added
 > structured location columns (v19 in CLAUDE.md's numbering), `photos.folder`
@@ -16,8 +16,9 @@ Read when you need table/column details or how search uses the v34 indexes.
 > `video_meta`/`video_tracks`/`video_subjects`; v36 `poster_version`; v37
 > subject shares; v38 `scan_generation`; v39 `video_meta.proxy_*` playback
 > proxies — see "Video" below and CLAUDE.md "## Video"; v40 `photo_audit`, the
-> per-photo change log, `docs/notes/audit.md`). `SCHEMA_VERSION` in
-> `db.py` is the source of truth — currently **40**. See CLAUDE.md for the
+> per-photo change log, `docs/notes/audit.md`; v41 `description_subjects`; v42
+> `persons.gender` / `birth_year` / `birth_year_approx`). `SCHEMA_VERSION` in
+> `db.py` is the source of truth — currently **42**. See CLAUDE.md for the
 > aesthetics + folder + ingest-batch + face-exclusion details.
 
 The database file is `photo_index.db` (not `photos.db`). Key tables:
@@ -26,7 +27,7 @@ The database file is `photo_index.db` (not `photos.db`). Key tables:
 |---|---|
 | photos | Main photo records — path, date_taken, EXIF, description, tags, scores |
 | faces | Detected faces per photo (bbox, encoding, quality) |
-| persons | Named persons for face matching |
+| persons | Named persons for face matching. v42: `gender` (`'female'`/`'male'`/`'other'`/NULL, CHECK), `birth_year` (INTEGER, NULL = not set), `birth_year_approx` (0/1, 1 = estimate, checked at ±3 instead of ±1). Read only by `description_render` rule 7; never sent off the machine |
 | face_references | Reference photos/encodings for each person |
 | face_person_exclusions | (face, person) pairs the duplicate resolver unmatched — both matchers skip that pairing only (v31) |
 | collections | Named photo collections/albums |
