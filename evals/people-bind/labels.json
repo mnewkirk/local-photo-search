@@ -17,6 +17,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "one boy"
    }
@@ -70,6 +73,11 @@
     "phrase": "One child"
    },
    {
+    "bodies": [
+     "A",
+     "C",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "three others"
    }
@@ -82,6 +90,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "one child"
    }
@@ -126,18 +137,27 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three children"
    },
    {
-    "gold": [
-     503245
+    "bodies": [
+     "C"
     ],
-    "phrase": "One child"
-   },
-   {
     "gold": "NONE",
     "phrase": "The third child"
+   },
+   {
+    "bodies": [
+     "A"
+    ],
+    "gold": "NONE",
+    "phrase": "One child, wearing a blue jersey with the number 23"
    }
   ],
   "reviewed": true,
@@ -188,14 +208,26 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "F",
+     "G",
+     "P"
+    ],
     "gold": "NONE",
     "phrase": "Three children"
    },
    {
+    "bodies": [
+     "F",
+     "P"
+    ],
     "gold": "NONE",
     "phrase": "two other children"
    },
    {
+    "bodies": [
+     "G"
+    ],
     "gold": "NONE",
     "phrase": "One child in a blue jersey with the number \"13\""
    }
@@ -208,6 +240,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C",
+     "I"
+    ],
     "gold": "NONE",
     "phrase": "Three children"
    },
@@ -218,6 +255,9 @@
     "phrase": "The child in the blue jersey"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "a person in red"
    }
@@ -236,6 +276,13 @@
     "phrase": "One child in a green jersey"
    },
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "E",
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "Five children are playing soccer on a grassy field, wearing blue and green jerseys"
    }
@@ -248,6 +295,14 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D",
+     "E",
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "A group of children"
    }
@@ -266,6 +321,9 @@
     "phrase": "A young boy"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "another person stands near a goalpost"
    }
@@ -290,6 +348,12 @@
     "phrase": "a coach"
    },
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "A group of children"
    }
@@ -302,6 +366,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "one child"
    }
@@ -314,6 +381,12 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C",
+     "D",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "Four young boys"
    }
@@ -367,10 +440,22 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D",
+     "E",
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "Six children"
    },
    {
+    "bodies": [
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "two in blue jerseys and navy shorts"
    }
@@ -426,6 +511,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "One boy"
    }
@@ -479,6 +567,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "One player"
    }
@@ -491,6 +582,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "C",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    }
@@ -503,6 +598,12 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Four young boys"
    }
@@ -515,6 +616,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "I"
+    ],
     "gold": "NONE",
     "phrase": "One child"
    },
@@ -561,6 +665,9 @@
     "phrase": "Three young boys"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "A goalkeeper"
    }
@@ -587,6 +694,13 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "Five young boys"
    }
@@ -599,6 +713,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C",
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "three children"
    },
@@ -644,6 +763,12 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Three boys"
    },
@@ -654,6 +779,10 @@
     "phrase": "The boy"
    },
    {
+    "bodies": [
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "two other players"
    }
@@ -673,6 +802,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "The player"
    },
@@ -760,6 +892,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "H"
+    ],
     "gold": "NONE",
     "phrase": "One child"
    }
@@ -772,6 +907,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "One child"
    },
@@ -804,6 +942,9 @@
     "phrase": "A child"
    },
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "an adult"
    }
@@ -816,6 +957,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
@@ -826,6 +971,9 @@
     "phrase": "The boy"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "the other boy"
    }
@@ -838,14 +986,26 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
    {
+    "bodies": [
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "The boy"
    },
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "two other boys"
    }
@@ -858,6 +1018,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three children"
    },
@@ -908,12 +1073,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "One player"
-   },
-   {
-    "gold": "NONE",
-    "phrase": "the referee"
    }
   ],
   "reviewed": true,
@@ -967,6 +1131,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Two children"
    }
@@ -986,6 +1154,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "The fourth child"
    }
@@ -1005,6 +1176,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    }
@@ -1063,6 +1239,9 @@
     "phrase": "A young boy"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "A person"
    }
@@ -1075,6 +1254,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young children"
    },
@@ -1113,6 +1297,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "A referee"
    }
@@ -1132,6 +1319,9 @@
     "phrase": "Two children"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "another child"
    }
@@ -1185,6 +1375,9 @@
     "phrase": "One child"
    },
    {
+    "bodies": [
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "a goalkeeper"
    }
@@ -1197,6 +1390,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "One child"
    }
@@ -1242,6 +1438,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
@@ -1252,6 +1452,9 @@
     "phrase": "one running towards the ball"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "other standing in the background"
    }
@@ -1334,10 +1537,16 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "One boy"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "The third player"
    },
@@ -1356,6 +1565,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "Two young men"
    },
@@ -1428,8 +1641,15 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C",
+     "D",
+     "E"
+    ],
     "gold": "NONE",
-    "phrase": "five visible players"
+    "phrase": "There are five visible players"
    }
   ],
   "reviewed": true,
@@ -1446,6 +1666,10 @@
     "phrase": "A young boy"
    },
    {
+    "bodies": [
+     "D",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "two other players"
    }
@@ -1458,14 +1682,24 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two children"
    },
    {
-    "gold": "AMBIGUOUS",
+    "bodies": [
+     "B"
+    ],
+    "gold": "NONE",
     "phrase": "One child"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "The other child"
    }
@@ -1478,6 +1712,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "One player"
    }
@@ -1490,10 +1727,19 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three children"
    },
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Two of the boys"
    },
@@ -1519,6 +1765,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "two young boys"
    },
@@ -1577,6 +1827,9 @@
     "phrase": "One player"
    },
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "A goalkeeper"
    }
@@ -1596,10 +1849,18 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "one boy"
    },
@@ -1618,6 +1879,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "One player"
    }
@@ -1630,10 +1894,17 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "the boy"
    }
@@ -1701,10 +1972,19 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "H",
+     "N",
+     "O"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
    {
+    "bodies": [
+     "N",
+     "O"
+    ],
     "gold": "NONE",
     "phrase": "two others"
    }
@@ -1717,6 +1997,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "A boy"
    }
@@ -1729,10 +2012,17 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "A third boy"
    }
@@ -1793,6 +2083,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "One boy"
    }
@@ -1826,6 +2119,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
@@ -1836,6 +2134,10 @@
     "phrase": "A third boy"
    },
    {
+    "bodies": [
+     "D",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "two adults"
    }
@@ -1889,6 +2191,10 @@
     "phrase": "two other players"
    },
    {
+    "bodies": [
+     "D",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "two adults"
    }
@@ -1941,6 +2247,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "one wears a blue jersey and black shorts"
    }
@@ -1953,6 +2262,7 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": "MISSING",
     "gold": "NONE",
     "phrase": "Two young players"
    },
@@ -1977,6 +2287,11 @@
     "phrase": "one adult"
    },
    {
+    "bodies": [
+     "A",
+     "B",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "Three boys"
    },
@@ -2027,6 +2342,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    }
@@ -2045,6 +2365,9 @@
     "phrase": "one goalkeeper"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "one boy"
    }
@@ -2134,6 +2457,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
@@ -2230,6 +2557,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
@@ -2240,6 +2572,9 @@
     "phrase": "One wears a red jersey"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "another a navy blue jersey"
    },
@@ -2258,6 +2593,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
@@ -2268,6 +2608,10 @@
     "phrase": "One boy"
    },
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "two others"
    }
@@ -2286,12 +2630,13 @@
     "phrase": "one adult"
    },
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three boys"
-   },
-   {
-    "gold": "NONE",
-    "phrase": "the fourth boy"
    },
    {
     "gold": [
@@ -2314,6 +2659,10 @@
     "phrase": "one boy"
    },
    {
+    "bodies": [
+     "A",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "two others"
    },
@@ -2360,6 +2709,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B",
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Three children"
    },
@@ -2370,6 +2724,10 @@
     "phrase": "The boy"
    },
    {
+    "bodies": [
+     "C",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "two girls"
    }
@@ -2396,10 +2754,19 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young athletes"
    },
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "two boys"
    },
@@ -2410,6 +2777,9 @@
     "phrase": "one girl"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "The boy"
    },
@@ -2434,14 +2804,25 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "A young female soccer player"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "A boy"
    },
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three people"
    }
@@ -2475,6 +2856,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two boys"
    }
@@ -2487,14 +2872,26 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young athletes"
    },
    {
+    "bodies": [
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Two players"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "a third player"
    }
@@ -2548,6 +2945,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
@@ -2566,6 +2968,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
@@ -2576,6 +2983,9 @@
     "phrase": "One boy"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "a third player"
    }
@@ -2595,6 +3005,9 @@
     "phrase": "Two young boys"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "A third child"
    }
@@ -2670,6 +3083,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "one player"
    },
@@ -2680,6 +3096,9 @@
     "phrase": "a referee"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "a spectator"
    }
@@ -2692,6 +3111,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "G"
+    ],
     "gold": "NONE",
     "phrase": "One child"
    }
@@ -2781,10 +3203,16 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "one player"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "a goalkeeper"
    }
@@ -2831,6 +3259,9 @@
     "phrase": "Two young boys"
    },
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "A third child"
    }
@@ -2843,6 +3274,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "one adult"
    },
@@ -2881,6 +3315,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
@@ -2891,6 +3329,7 @@
     "phrase": "One boy"
    },
    {
+    "bodies": "MISSING",
     "gold": "NONE",
     "phrase": "two others"
    }
@@ -2903,10 +3342,17 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two young boys"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "one boy"
    }
@@ -2972,6 +3418,9 @@
     "phrase": "two others"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "a fifth player"
    }
@@ -3004,6 +3453,9 @@
     "phrase": "One player"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "a goalkeeper"
    }
@@ -3058,6 +3510,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "one player"
    }
@@ -3070,6 +3525,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "two others"
    },
@@ -3152,6 +3611,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
@@ -3162,6 +3626,10 @@
     "phrase": "One boy"
    },
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "two others"
    }
@@ -3180,6 +3648,10 @@
     "phrase": "One boy"
    },
    {
+    "bodies": [
+     "B",
+     "F"
+    ],
     "gold": "NONE",
     "phrase": "two adults"
    }
@@ -3192,6 +3664,11 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    }
@@ -3246,6 +3723,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two people"
    },
@@ -3256,6 +3737,9 @@
     "phrase": "a young boy"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "an older adult"
    }
@@ -3268,6 +3752,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "One boy"
    },
@@ -3292,6 +3779,7 @@
     "phrase": "A referee"
    },
    {
+    "bodies": "MISSING",
     "gold": "NONE",
     "phrase": "two adult spectators"
    }
@@ -3312,6 +3800,10 @@
     "phrase": "Three boys"
    },
    {
+    "bodies": [
+     "A",
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "Two adults"
    }
@@ -3324,6 +3816,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "A young boy"
    },
@@ -3350,10 +3845,16 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "D"
+    ],
     "gold": "NONE",
     "phrase": "One boy"
    },
    {
+    "bodies": [
+     "A"
+    ],
     "gold": "NONE",
     "phrase": "A fourth player"
    }
@@ -3366,10 +3867,18 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B",
+     "C"
+    ],
     "gold": "NONE",
     "phrase": "Three young boys"
    },
    {
+    "bodies": [
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "One boy"
    }
@@ -3432,6 +3941,10 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "A",
+     "B"
+    ],
     "gold": "NONE",
     "phrase": "Two young children"
    },
@@ -3450,6 +3963,9 @@
   "bad_labels": [],
   "mentions": [
    {
+    "bodies": [
+     "E"
+    ],
     "gold": "NONE",
     "phrase": "one child"
    }
