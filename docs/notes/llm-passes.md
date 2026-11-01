@@ -1110,3 +1110,50 @@ Plan: docs/plans/people-context-describe.md. Scripts: read-only spikes, numbers 
   have one with a trusted face.
 - Grounded describe, 20 dev photos: 0 leakage, 2.0 s/photo, 47 people entries (14 not in the text, 0 bad
   box numbers), descriptions median 224 chars vs 408 stored.
+
+### people context: G0 and G1 evals, first numbers (2026-11-01)
+
+Plan: docs/plans/people-context-describe.md (Steps 1-3). Harness: `evals/people_context_eval.py`;
+pure modules `photosearch/identify.py`, `body_attrs.py`, `grounded_describe.py` (not wired; no
+schema). Evidence: Faster R-CNN bodies + Keypoint R-CNN on the 1920-px previews of all 10,799
+stills of the 10 soccer sessions (63 min on the 7900 XTX); a face links to a body only when the
+head-top rule and a unique keypoint owner agree. Tune shoots 08-29..09-27, holdout 10-03..10-25.
+
+- **Burst tier needs camera-motion compensation.** Raw box IoU between burst frames named the coach
+  as a boy (242551 -> 242552: a pan). Body-box RANSAC is fooled by rows of same-size players. Now:
+  phase correlation on 512-px grayscale previews gives the pan; body pairs near it refine it; a
+  body is tracked only if it lands on one sibling body (IoU >= 0.7, 0.2 ahead of the runner-up).
+  Tune grid (leave-face-out, 10 folds): peak 0.03 / IoU 0.5: 1,410 right, 9 wrong; peak 0.1 /
+  IoU 0.7: 776 right, 0 wrong (chosen); 2-sibling consensus keeps < 130. The errors were large
+  reframings where the measured shift was wrong.
+- **Holdout, read once: 1,773 right, 5 wrong (0.28%)**, 36% of 4,947 hidden faces named. Passes the
+  <= 0.5% leave-face-out bar, fails the <= 0.2% bar for feeding hints. Wrong is "disagrees with
+  the face label"; some may be label errors (not checked, to keep the holdout unread).
+- **Kit tier** (jersey number + kit, anchors = face- or burst-identified bodies with >= 2 other
+  bursts, 0 contradicting, duplicate signature in a photo voids it): front-facing kids show no
+  number (it is on the back), so anchors come through burst tracks. Attributes are read only on
+  anchor-capable and target bodies >= 15% of the frame tall (~10k of ~70k bodies); qwen3.5-9b,
+  ~1.1 s/body alone, ~2 s shared. Numbers pending.
+- **Grounded describe (G1, dev 125, qwen3.5-9b)**: inline anchors `[phrase](n)` were ignored with
+  the instructions after the describe prompt; leading with the two-image framing and a mark rule
+  works. 20% wrote `a boy [1]` at first; a firmer syntax line, one corrective retry, then
+  stripping stray `[n]` marks (text kept, no spans) leaves 0 unusable. A JSON "segments" schema
+  degraded to whole sentences tagged with every box (rejected).
+
+| dev variant | unusable | no spans | spans (named) | length median | people-word recall | s/photo |
+|---|--:|--:|--:|--:|--:|--:|
+| plain (today's prompt, regenerated) | 0 | - | - | 424 | 0.67 | 2.4 |
+| two images + length line, no hints | 0 | 9 | 415 (126) | 362 | 0.62 | 2.2 |
+| two images + length + hints | 0 | 5 | 406 (125) | 335 | 0.65 | 2.8 |
+| one overlay image + length + hints | 3 (leak) | 5 | 429 (130) | 318 | 0.60 | 2.6 |
+| two images, no length line | 1 (leak) | 7 | 380 (118) | 296 | 0.65 | 3.1 |
+
+Stored descriptions: median 410 chars. Recall = share of the stored text's people concepts
+(boy, girl, child, man, player, ...) the new text keeps.
+
+- **Hints fail the injection test.** Flipping the largest trusted body's gender hint (168 photos):
+  a female phrase on that box in 14 of 107 photos vs 10 with the true hint and 11 with none, and
+  true hints do not fix "a girl" for a labelled boy (11 vs 12 of ~120 spans). Hints off.
+- One overlay image leaks overlay words and is shorter: the two-image shape wins.
+- Owner judgments pending: who-is-this-body (215 faceless bodies, 101 holdout), confirm marks
+  (two images + length, no hints: 415 dev marks), blind pairwise vs stored (40 dev photos).

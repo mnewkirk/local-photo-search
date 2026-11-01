@@ -1,6 +1,6 @@
 # People context in describe: identify bodies and faces, then describe with spans
 
-**Status: 🟡 planned 2026-10-31 (plan-debate); Step 0 done 2026-11-01 (results below); G0 next.** (Status lives in `README.md`.)
+**Status: 🟡 planned 2026-10-31 (plan-debate); Step 0 done 2026-11-01; G0/G1 evals running 2026-11-01 (burst tier 0.28% wrong on holdout; gender/age hints fail the injection test; owner labels pending).** (Status lives in `README.md`.)
 
 Supersedes docs/plans/description-names.md Revision 2 R3 (the after-the-fact body binder as the production path).
 Source: plan-debate 2026-10-31, Planner A (plan-A.md) and Planner B (plan-B.md), two critique rounds.
@@ -116,3 +116,17 @@ Notes: docs/notes/llm-passes.md, "people context: Step 0".
   as long (median 224 vs 408 chars). G1 should test **inline anchors** (the model writes
   `[phrase](box)` in the text; code strips the markup, so spans match by construction) and a length
   instruction.
+
+## G0 / G1 results (2026-11-01, in progress)
+
+Notes: docs/notes/llm-passes.md, "people context: G0 and G1 evals". Harness: `evals/people_context_eval.py`.
+
+- **Burst tier** (camera motion from phase correlation, IoU >= 0.7): leave-face-out holdout 1,773 right,
+  5 wrong (0.28%): passes <= 0.5%, fails the <= 0.2% hint bar. Owner-labelled faceless gate pending.
+- **Kit tier**: attributes being read; pending.
+- **Hints**: fail the injection test (flipped gender obeyed ~4 points over baseline; true hints fix
+  nothing) -> describe stays label-free (Decision row "Gender / age-band hints" falls back to B).
+- **Call shape**: two images (clean + numbered overlay) with inline `[phrase](n)` anchors, a length line,
+  one corrective retry: 0 unusable on dev, descriptions 12-15% shorter than regenerated plain ones.
+  One overlay image leaks. Bind precision pending the owner's confirmations.
+
