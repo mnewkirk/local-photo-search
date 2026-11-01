@@ -193,3 +193,24 @@ LM Studio's parser (`{"people=[<|"|>Nicole<|"|>,...": 1}`); 45 of its 112
 failing runs contain one, the rest are worse routing. Do not use gemma-4 for
 tool calling on this LM Studio setup; it stays fine for the text passes,
 which use no tools. Its ablation series was stopped as uninformative.
+
+### 2026-11-01 — person attributes for MCP/Ask: owner decisions and the "other face" size check
+
+Plan: docs/plans/mcp-person-attributes.md. Evidence: 22 curation requests in past sessions, 63 people asks in the Ask
+logs (27 want the person in the foreground, 18 want faces fully in frame), and a measured Ask headroom of -2.3k to
+-2.7k tokens at 16k.
+
+- **R4 reversed for MCP/Ask (owner).** Gender, age, jersey number, phrase linking and eyes/smile may appear in tool
+  output, so the agent stops guessing them from "boy"/"girl" text. Google Photos / Shutterfly code stays excluded.
+  `tests/test_person_attributes.py` and the people-bind rule change in the same commit as the code.
+- **"Foreground" means every named person is prominent** (`MIN` share across ≤ 4 names), not today's `MAX`.
+- **The size floor for "other people"** was checked on 1,417 replica photos that have ≥ 3 of the family on trusted
+  faces.
+  - 877 have no other face.
+  - Ratio of the largest other face to the smallest family face: < 0.1: 21, 0.1–0.25: 31, 0.25–0.5: 51,
+    0.5–1: 102, ≥ 1: 335.
+  - On a 15-photo boxed sheet, every face under 0.25 was a background stranger, 0.25–0.5 was mixed (167221 is a real
+    toddler), and ≥ 0.5 was nearly always a real person.
+  - 215959's "other" face is a `dedupe_unmatched` duplicate box on Matt.
+  - Result: floor 0.25 of the *median* named face, and drop other faces with IoU ≥ 0.5 against a named face.
+- **The Ask side waits for the 32k-context fix.**

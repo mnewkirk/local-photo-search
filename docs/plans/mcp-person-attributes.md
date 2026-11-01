@@ -1,6 +1,6 @@
 # Person-level attributes for the MCP tools and Ask
 
-Status: 📐 proposal (2026-11-01). Nothing built. Owner decisions are in the last section.
+Status: 📐 proposal (2026-11-01), owner decisions taken the same day (last section). Nothing built.
 
 The question is which facts about the *people in a photo* the photosearch MCP tools and the Ask agent (the same
 tools, a leaner result) should return or filter on. The answer comes from three kinds of evidence: what the owner
@@ -139,10 +139,11 @@ or a trim lands. In the proposal, MCP and Ask get different shapes from the same
 |---|---|---|
 | A: geometry and counts | face/body share, position, edge-clipping, face counts, burst ids, sharpness, facing | not personal beyond what an image shows; no decision needed |
 | B: names from trusted labels | names are already returned (`people` filter, `get_photo.people`, `list_people`) | allowed; this proposal **narrows** output to trusted sources |
-| C: person attributes (`gender`, `birth_year`, anything derived such as age or "the boy") | **R4 (2026-10-31): never in MCP/Ask output.** `tests/test_person_attributes.py` checks for the substrings `gender`/`birth_year` in `tools.py`, `agent.py`, `mcp_server.py`, `google_photos.py`, `shutterfly_export.py` | blocked; owner decision 1 |
+| C: person attributes (`gender`, `birth_year`, anything derived such as age or "the boy") | **R4 (2026-10-31) kept them out of MCP/Ask; reversed for MCP/Ask by the owner 2026-11-01** (decision 1). Still never in Google Photos / Shutterfly code. `tests/test_person_attributes.py` currently fails on the substrings `gender`/`birth_year` in `tools.py`, `agent.py`, `mcp_server.py`, `google_photos.py`, `shutterfly_export.py` | allowed in MCP/Ask once Step C ships with the test change |
 
-The R4 grep test only checks five files. An `age` computed in another module would get past it while breaking R4's
-intent. Whatever the owner decides, the test should also check for derived names (`age`, `born`) in tool output.
+When the attributes ship, the grep test narrows to `google_photos.py` / `shutterfly_export.py` (and should also
+check derived names, `age`/`born`, there), and the people-bind rule's "attributes never leave the machine" line
+changes to "never in outbound captions". Both changes ride with the code, not with this plan.
 
 ## Candidate attributes
 
@@ -156,14 +157,14 @@ Token cost is per call. "Ask" means after `_lean_for_model`. P0 means fix or shi
 | 4 | **Per-hit people summary (MCP only)** | 17 per-result `get_photo` calls; 13-call fan-out; book "who is in it" | `"people": "Calvin .06, Matt .09 +2"`: trusted names with face share, then `+n` other faces above the size floor. Not in Ask lean hits until the 32k fix | MCP ~+15/hit (~+450 per 30) | B | v42 now | **P1** |
 | 5 | **`get_photo` faces list** | crop safety (book 241161, Ellie crop), the get_photo fan-out | `faces:[{name|null, trusted:bool, share, box:[l,t,r,b] normalised, clipped:bool}]`; `people` filtered to trusted; `face_count` = faces above the size floor | ~+20/face, one call | A/B | v42 now | **P1** |
 | 6 | **Burst id on hits / `dedupe` everywhere** | 10 sessions (4 s / 1 s windows, 240528/9); 2 Ask asks | A `burst` id (`stack_id`, or the `_dedupe_ranked` group) on hits; `dedupe` default on for every people-filtered flat search, not only the subject paths | ~+3/hit | A | now (stacks exist) | **P1** |
-| 7 | **Per-subject face sharpness** | 5 sessions, each one re-implementing face-crop Laplacian from the originals | v33 `photos.sharpness` / `sharpness_json` already measures a noise-corrected Laplacian over **all face boxes pooled** (`regions.faces.lap_nc_*`), on 3,492 photos, and nothing reads it. What is missing is **per face** (the named person's face, not the sharpest of 16): store a per-box list in `sharpness_json` with a `SHARPNESS_VERSION` bump, backfill on the NAS (originals live there, throttled; `sharpness_backfill.py`). Then a tie-break in subject ranking and `min_subject_sharpness` | 0 per hit if it only ranks | A | v33 backfill extended to per-face; no new schema | **P2** |
+| 7 | **Per-subject face sharpness** | 5 sessions, each one re-implementing face-crop Laplacian from the originals | v33 `photos.sharpness` / `sharpness_json` already measures a noise-corrected Laplacian over **all face boxes pooled** (`regions.faces.lap_nc_*`), on 3,492 photos, and nothing reads it. What is missing is **per face** (the named person's face, not the sharpest of 16): store a per-box list in `sharpness_json` with a `SHARPNESS_VERSION` bump, backfill where decision 5 lands (eval first). Then a tie-break in subject ranking and `min_subject_sharpness` | 0 per hit if it only ranks | A | v33 backfill extended to per-face; no new schema | **P2** |
 | 8 | **Collage / photo-of-a-photo flag** (image-level) | ≥ 4 Ask asks; 135481 always wins | Excluded by default when ranking by subject; describe already says "split-screen"/"composite" (a rule tier is possible) | 0 | A | small pass or rule | **P2** (not a person attribute, but it blocks #1) |
 | 9 | **Body box share, truncation, facing** | 6 sessions (crop "more of Ellie", "legs-cropped", "backs") | `get_photo.faces[].body` (box, clipped, facing); `faces_in_frame` extended to bodies (`bodies_in_frame`); facing=back demotes in subject ranking | ~+15/person in get_photo | A | **v43 `person_boxes`** (other session) | **P2, after v43** |
-| 10 | **Age at photo time** | 6 sessions, all matching/newborn problems; 1 Ask ask ("Calvin on his birthday") | If allowed: filter-only `age_from/age_to` translated server-side into a date range per named person; never a field in hits | schema ~+80 | **C** | v42; **all 16 years are approximate** | **P3, owner decision** |
-| 11 | **Eyes visible / smile** | 3 Ask asks, 3 sessions | Needs the InsightFace landmark module (or a new model). Until then, rerank on a set already narrowed by #1 to #3 | — | A | new model pass | **P3** |
-| 12 | **Description-phrase linking** ("Zack is the boy dribbling") | 4 sessions, all describe work; 0 search asks | Already reaches hits as `description` + `named:true` when `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` is on. Nothing new for the tools | 0 | B | v41 rows (0 on the replica) and the flag | **P3, comes free with the flag** |
-| 13 | **Jersey number / kit** | 4 sessions, all identity work | An input to faceless identity (the people-context plan), not a search field. Its benefit reaches search as more trusted names | — | A | people-context plan | **P3, not a tool field** |
-| 14 | **Gender** | 0 search asks; 2 description/merge fixes | Nothing. Rule 7 already uses it at render | — | **C** | v42 | **Don't add** |
+| 10 | **Age at photo time** | 6 sessions (coaches as players, newborns, 2012 vs 2026 faces); 1 Ask ask ("Calvin on his birthday"); the agent otherwise guesses age from "boy"/"toddler" in descriptions | Field: `age:[lo,hi]` per *trusted* named person in `get_photo.faces` and the MCP hit summary (`Calvin 9-10 .06`). Exact birth year: photo year − birth year, −1..0. Approximate (all 16 today): ±3. No birth year: absent. Filter: `age_from/age_to` per named person, translated server-side into that person's date range (widened for approximate years) | ~+4/person in hits; schema ~+80 | C | v42 now | **P1** (Step C) |
+| 11 | **Eyes open / smile / looking at camera** | 3 Ask asks ("eyes and mouth visible"), 3 sessions ("isn't flattering to Nicole") | Per-face `expression` row: `eyes_open`, `smile`, `gaze_camera` (booleans + score). Built by a fleet pass on the face crop. Candidates: the 5 InsightFace keypoints already computed at detection (cheap; visibility only, not open/closed), or a small expression model or a VLM on the crop (needs an eval: owner labels on ~100 faces, P ≥ 0.9 per flag). Filters `eyes_open`, `smiling`; field in `get_photo.faces` | ~+3/face in get_photo; schema ~+60 | A | new fleet pass + eval + schema (after v44) | **P2** (eval first) |
+| 12 | **Description-phrase linking** ("Zack is the boy dribbling") | 4 sessions (describe work); Ask answers that say "a boy" for a named child | `get_photo.subjects:[{phrase, name|null, face_id}]` from `description_subjects` spans (and v44 describe spans when people-context lands), named only from trusted labels and only when the people-bind/people-context gate has passed. Hits keep `description` + `named:true` | ~+10/subject in get_photo; 0 in hits | B | v41 spans (0 rows on the replica) + `PHOTOSEARCH_DISPLAY_DESCRIPTIONS`; people-context render v2 | **P2** (follows the flag) |
+| 13 | **Jersey number / kit** | 4 sessions ("boys in the fluorescent yellow shirts", Beckham/Oliver/Franklin swaps) | From v44 `body_attrs` (people-context plan, VLM per body). Field `jersey` in `get_photo.faces[].body`; filter `jersey_number` + `kit` for "#7 in yellow" when no face is visible. Never used to *name* someone in tool output unless the people-context faceless-identity tier passed its gate | ~+4/body | A | **v44** `body_attrs` (people-context Step 4) | **P2** (after v44) |
+| 14 | **Gender** | 0 search asks; 2 description fixes ("Asa is regularly listed as a girl") and a merge veto | `gender` per trusted named person in `list_people`, `get_photo.faces` and the MCP hit summary, so the agent stops inferring it from "boy/girl" text. No gender filter (no ask for one) | ~+1/person; list_people +1/row | C | v42 now (64 of 65 set) | **P1** (Step C) |
 | 15 | Who-with-whom counts | 3 sessions (book) | `summarize(group_by='person', people=[X])` already counts co-occurrence. Document it in the tool description; no new field | 0 | B | now | **P3, documentation only** |
 
 ### Why this order
@@ -172,8 +173,11 @@ Token cost is per call. "Ask" means after `_lean_for_model`. P0 means fix or shi
 - **#4 to #6 remove the fan-out patterns.** These are the per-result `get_photo` calls and the combinatorial search
   calls, which are slower and costlier than one field.
 - **#7 to #9 need a pass or v43**, so they wait for their dependencies.
-- **Age (#10) and gender (#14) have almost no search evidence.** Every age failure was a *matching* error (coaches,
-  newborns, 2012 faces vs 2026), which belongs in `face_verify` / the year window, not in MCP output.
+- **Age (#10) and gender (#14) are owner-requested** (2026-11-01) for grounding rather than search: given the facts,
+  the agent doesn't have to turn "a boy" or "a toddler" in a description into a guess about who it is. Their
+  matching-side failures (coaches, newborns, 2012 vs 2026) still belong in `face_verify` / the year window.
+- **Jersey (#13), phrase linking (#12) and expressions (#11) are wanted too, but depend on data that does not exist
+  yet** (v44 `body_attrs`, the display flag and its gate, a new expression pass), so they are P2.
 
 ## Must-fail controls
 
@@ -185,11 +189,11 @@ so correctness controls need a fixture DB test (pytest, synthetic faces), as `te
 | 1 | A photo whose only "Calvin" face is `temporal` and covers 15% of the frame must **not** rank in `sort='subject'` for Calvin; a `rejected`/`dedupe_unmatched` face never counts. Two named people where one is 1% of the frame must rank below a photo where both are 6%. A photo with an unnamed face 3× larger than the named one ranks below one with no rival | pytest fixture |
 | 2 | A photo with the four named people plus one background face at `det_score 0.4` / 0.5% of frame **passes** the new `only_these_people`; the same photo with a fifth face 60% the size of the smallest named face **fails**. `min_people_matched=3` of 4 never returns a photo with only 2 of them | pytest |
 | 3 | `min_face_share` never counts an untrusted face. A photo with no `image_width` is excluded, never treated as share 0 or 1 | pytest |
-| 4/5 | `get_photo` and the hit summary never name a `temporal`, `rejected` or NULL-source face (it reads as `null` / `+n`). A person on two faces in one photo is not named (the people-bind rule). Output keys never include `gender`, `birth_year`, `age` (extend the R4 grep test to check the result keys at runtime, not just the source text) | pytest + grep test |
+| 4/5 | `get_photo` and the hit summary never name a `temporal`, `rejected` or NULL-source face (it reads as `null` / `+n`). A person on two faces in one photo is not named (the people-bind rule). Before Step C ships, output keys never include `gender`, `birth_year`, `age` | pytest + grep test |
 | 6 | Two frames 0.5 s apart share a `burst` id; two frames 10 min apart in the same place don't | pytest |
 | 7 | A face whose sharpness came from a downscaled thumbnail is NULL, never ranked | pytest on the pass |
 | 9 | Pre-v43 DB or a photo with no `bodies` row: the body fields are absent, never `false`; a body owned by a contested face link is never reported as that person | pytest (after v43) |
-| 10 | If age ships: with `birth_year_approx=1`, `age_from=5` widens to ±3 years and the answer must not state an exact age; a person with no birth year gets "unknown", never 0 results silently | pytest + an `honesty` ask |
+| 10/14 | With `birth_year_approx=1`, `age` is a ±3 range and `age_from=5` widens the date range by 3 years each side; an answer must not state an exact age from it. A person with no birth year has no `age` key (never 0, never a guess) and an age filter on them returns an explicit "no birth year" note, not 0 silent results. Attributes appear only on trusted named faces: a temporal Calvin face gets no age or gender. Google/Shutterfly code still never reads them (grep test) | pytest + an `honesty` ask |
 | 12 | With `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` off, no hit has `named:true` and no name appears in `description` (already a property test; re-assert it through MCP) | pytest |
 
 Ask-level controls (no-op mutants per `MUTANTS.md`) stay as the noise floor. A field change is judged on context
@@ -203,15 +207,16 @@ These follow the existing schema. They check routing and arguments only.
 {"id": "p01-k-of-n", "suite": "real", "prompt": "top 20 photos of 2026 with at least 3 of Matt, Ellie, Nicole, Calvin as the main focus", "why": "10-25 phone ask; was 13 combo searches", "covers": ["rule.min-people-matched"], "checks": [{"name": "no combo fan-out", "op": "max_calls", "tool": "search_photos", "value": 2}, {"name": "k=3", "op": "eq", "tool": "search_photos", "arg": "min_people_matched", "value": 3}, {"name": "four people", "op": "set_eq", "tool": "search_photos", "arg": "people", "value": ["Matt", "Ellie", "Nicole", "Calvin"]}, {"name": "subject sort", "op": "eq", "tool": "search_photos", "arg": "sort", "value": "subject"}], "allowed_args": ["people", "min_people_matched", "sort", "date_from", "date_to", "limit", "only_these_people", "max_other_people"]}
 {"id": "p02-face-share", "suite": "real", "prompt": "best photo of Matt each year where his face takes up at least 20% of the image", "why": "10-31 ask answered 'can't filter on face share'", "covers": ["rule.min-face-share"], "checks": [{"name": "spread", "op": "called", "tool": "representatives"}, {"name": "share 0.2", "op": "num_between", "tool": "representatives", "arg": "min_face_share", "value": [0.19, 0.21]}, {"name": "no get_photo fan-out", "op": "not_called", "tool": "get_photo"}, {"name": "no rerank", "op": "not_called", "tool": "rerank_photos"}], "allowed_args": ["people", "bucket", "n", "rank_by", "min_face_share", "faces_in_frame"]}
 {"id": "p03-plus-one", "suite": "routing", "prompt": "photos of just the four of us, it's fine if one other person is in the background", "why": "max_other_people vs only_these_people", "covers": ["rule.max-other-people"], "checks": [{"name": "max_other 1", "op": "eq", "tool": "search_photos", "arg": "max_other_people", "value": 1}, {"name": "not strict only", "op": "absent", "tool": "search_photos", "arg": "only_these_people"}], "allowed_args": ["people", "max_other_people", "sort"]}
-{"id": "p04-no-age-claim", "suite": "honesty", "prompt": "photos of Ellie when she was 3", "why": "Ellie has no birth year (and attributes are blocked by R4): must say so, never invent a date range", "covers": ["beh.honesty", "privacy.r4"], "checks": [{"name": "no fabricated range", "op": "absent", "tool": "search_photos", "arg": "date_from"}], "allowed_args": ["people"]}
+{"id": "p04-no-age-claim", "suite": "honesty", "prompt": "photos of Ellie when she was 3", "why": "Ellie has no birth year: must say so, never invent a date range", "covers": ["beh.honesty", "privacy.r4"], "checks": [{"name": "no fabricated range", "op": "absent", "tool": "search_photos", "arg": "date_from"}], "allowed_args": ["people"]}
 {"id": "p05-flags-kept-on-redo", "suite": "followup", "prompt": "oops, only 2026", "why": "10-25 redo dropped both flags", "covers": ["beh.followup-keeps-flags"], "history": [{"role": "user", "content": "best photos of only Matt, Ellie, Nicole and Calvin, everyone fully in frame"}, {"role": "assistant", "content": "Here are the best photos of just the four of you, everyone fully in frame."}], "checks": [{"name": "only_these kept", "op": "present", "tool": "search_photos", "arg": "only_these_people"}, {"name": "in_frame kept", "op": "present", "tool": "search_photos", "arg": "faces_in_frame"}, {"name": "2026", "op": "date_between", "tool": "search_photos", "arg": "date_from", "value": ["2026-01-01", "2026-01-01"]}], "allowed_args": ["people", "only_these_people", "faces_in_frame", "date_from", "date_to", "sort"]}
+{"id": "p06-age-range", "suite": "routing", "prompt": "best photos of Calvin when he was about 6", "why": "age filter instead of the model guessing a year from 'boy'/'kid' text; Calvin's birth year is approximate", "covers": ["rule.age-filter"], "checks": [{"name": "people=[Calvin]", "op": "set_eq", "tool": "search_photos", "arg": "people", "value": ["Calvin"]}, {"name": "age 6", "op": "num_between", "tool": "search_photos", "arg": "age_from", "value": [5, 6]}, {"name": "no hand-computed dates", "op": "absent", "tool": "search_photos", "arg": "date_from"}], "allowed_args": ["people", "age_from", "age_to", "sort"]}
 ```
 
 Every check op used here (`max_calls`, `eq`, `set_eq`, `num_between`, `present`, `absent`, `not_called`,
 `date_between`) is in `checks.py`. `p01` to `p03` fail today by design: they are the positive items `AUDIT_TOOL_PLAN.md`
 lacked. `p04` must pass both before and after any change, as the must-fail control on fabricated ages.
 
-## Build order (when approved)
+## Build order
 
 1. **Step A (P0, no schema change; ~1 d):**
    - Subject ranking fix (#1).
@@ -223,31 +228,64 @@ lacked. `p04` must pass both before and after any change, as the must-fail contr
    - MCP-only `people` summary (#4).
    - `get_photo.faces` (#5).
    - `burst` id (#6).
-   - Extend the R4 test to check the result keys.
-   - Gate: Ask largest round must not grow by more than ~+100 tokens; otherwise ship to MCP only.
-3. **Step C (after the v43 `bodies` backfill and the per-face sharpness backfill):** #7 and #9. #8 whenever a rule or pass is agreed.
-4. **Not scheduled:** #10 to #15, pending the decisions below.
+   - **Gated on the 32k-context fix** (decision 4) for the Ask side; MCP may ship first.
+3. **Step C (person attributes; v42 data, ~0.5 d):** `gender` and `age` (#14, #10) in `list_people`, `get_photo.faces`
+   and the hit summary, plus the `age_from/age_to` filter. Narrow the R4 grep test to the outbound files and update
+   the people-bind rule line in the same commit. Controls 10/14.
+4. **Step D (after their data exists):** body framing (#9, after the `bodies` backfill), jersey/kit (#13, v44),
+   phrase linking (#12, with the display flag), per-face sharpness (#7, decision 5), expressions (#11, after its eval),
+   collage flag (#8, decision 6).
+5. **Documentation only:** #15.
 
 Files touched: `photosearch/tools.py` (`_subject_ranked_search`, `representatives`, `_face_constraint_clauses`,
 `_compact_hit`, `get_photo`), `photosearch/agent.py` (`_lean_for_model`, `_LOCKED_KEYS`), tests, and
 `evals/ask_eval/asks.jsonl`. None of them belong to the people-bind / people-context sessions.
 
-## Owner decisions needed
+## Owner decisions (2026-11-01)
 
-1. **R4 stays or narrows?**
-   - Recommendation: **keep R4 for output**. Nothing in the evidence needs gender or age in hits, and the one age
-     use (#10, "Calvin at 5") can be a server-side date-range filter that never echoes the attribute.
-   - Trade-off: MCP goes to Claude over Tailscale, which already receives names and photos, so the marginal exposure
-     of "male, born ~2016" is small. But Ask answers and logs (`request_log.mcp.jsonl`) would start carrying
-     children's ages, and every birth year is approximate today.
-   - If #10 is wanted, R4 needs an exception for *filters* and the grep test must change.
-2. **Subject ranking semantics (#1):** should "foreground" require *every* named person to be prominent (`MIN`), or
-   *any* (today's `MAX`)? Recommendation: `MIN` for ≤ 4 names, `MAX` above.
-3. **Size floor for "other people" (#2):** the share of the smallest named face (proposed: 25%) or an absolute
-   `det_score`. This needs a quick hand check on 30 family photos before it is set.
-4. **MCP-only fields:** is it acceptable that MCP hits carry the `people` summary while Ask doesn't (context)? Or do
-   the 32k-context fix first and give both the same shape?
-5. **Per-face sharpness (#7):** extend the v33 sharpness backfill to a per-face list and run it library-wide on the
-   NAS (throttled, CPU, originals local)? It would retire `scripts/rank_shoot.py`'s ad-hoc Laplacian. Today only
-   3,492 photos are measured at all.
-6. **Collage flag (#8):** a rule on describe's text ("split-screen", "collage", "composite") or a model pass?
+1. **Person attributes in MCP/Ask: yes** ("worth including to avoid transformations that lead to mistakes"). R4 is
+   reversed for MCP/Ask output, and outbound captions stay excluded. Gender, age, jersey number, phrase linking and
+   eyes/smile are all in scope (#10 to #14).
+2. **Foreground means every named person is prominent:** `MIN` share across the named people (≤ 4 names; `MAX` above).
+3. **Size floor for "other people": checked on the replica.**
+   - Sample: 1,417 photos with ≥ 3 of Matt/Ellie/Nicole/Calvin on trusted faces. 877 have no other face.
+   - For the rest, the largest other face ÷ the smallest family face splits as: < 0.1: 21, 0.1–0.25: 31,
+     0.25–0.5: 51, 0.5–1: 102, ≥ 1: 335.
+   - A 15-photo contact sheet with boxes drawn:
+     - Every "other" face under 0.25 was a background stranger (plane seats, theatre, beach).
+     - 0.25–0.5 was mixed: a real toddler on the couch (167221, temporal) next to background diners.
+     - ≥ 0.5 was almost always a real extra person. The exception was 42023, an Eiffel Tower tourist, where the
+       family themselves are small.
+   - Two refinements came out of it:
+     - **A duplicate box of a family face is not another person.** 215959's "other" is a `dedupe_unmatched` second
+       box on Matt (ratio 7.5). Drop other faces with IoU ≥ 0.5 against a named face.
+     - **Compare against the median named face, not the smallest.** A small kid in the back otherwise makes every
+       bystander look big.
+   - Setting: floor 0.25 of the median named face. The 0.25–0.5 band errs towards "someone else is here".
+   - Before Step A ships, re-run the split with the median rule and look at one more sheet of 0.2–0.35.
+4. **The 32k-context fix comes first.** Background: the Ask tab runs a local model with a 16k-token window, and its
+   biggest step already overflows it by ~2.5k tokens. MCP (Claude over Tailscale) has no such limit. Every new field
+   in a search result therefore costs Ask context and costs MCP nothing. The fix is loading the Ask model at 32k
+   context (more VRAM, so it competes with the fleet on the shared GPU), or giving the fleet its own instance. The
+   Ask side of Steps B and C waits for it; MCP can ship first.
+5. **Per-face sharpness: open, pending this cost estimate.**
+   - Measured: `sharpness.measure_photo` takes a median 0.23 s/photo on the desktop. The NAS target was
+     ≤ 0.4 s/photo, plus the 0.2 s throttle pause.
+   - About 102k photos have faces, so the backlog is ~17 h on the NAS (throttled, at night) or ~7 h of desktop CPU.
+     Either way the NAS disk reads every original once. Per-face output adds almost nothing over today's pooled
+     faces region. New photos cost seconds per batch.
+   - Trust: the whole-photo `blurry` tag **failed** its eval (P ≥ 0.8 at R ≥ 0.5 not reached), so the column is
+     unproven. The use here is different: *ranking* the same person's faces within one shoot, which
+     `scripts/rank_shoot.py` already does by hand on the soccer picks.
+   - Recommendation: before any backfill, eval it offline. Does per-face sharpness predict the owner's Soccer
+     Best 50 vs Next 200 picks (collections 62–64) better than the aesthetic score? If it passes, run the backlog
+     as a **desktop fleet** item (faster, keeps CPU off the N100 that starved ingest before) and the incremental
+     part on the NAS.
+6. **Collage flag (what it is):** some library photos are collages or split-screens, two or more pictures in one frame
+   (phone "memories", a side-by-side). 135481, a Paris split-screen of Matt and Calvin, wins "best photo of Matt,
+   2025" in every run: Matt's face is big within its panel, so subject ranking and `faces_in_frame` both like it.
+   The flag would mark such photos so subject ranking skips them. Options:
+   - (a) a rule on words describe already writes ("collage", "split-screen", "composite", "side-by-side"): cheap and
+     instant, unknown recall;
+   - (b) a vision pass.
+   - Recommendation: (a), measured on a sample first. Still the owner's call: keep it or drop it.
