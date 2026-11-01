@@ -82,8 +82,8 @@ def test_a_whole_sentence_copied_as_a_phrase_never_binds():
 
 
 def test_a_face_heading_two_bodies_equally_is_contested_and_names_nobody(monkeypatch):
-    # two boys side by side, one face between their heads: nearly equal head costs
-    left, right = _body(1000, 1000, 3000, 0), _body(1000, 2000, 3000, 1000)
+    # two overlapping boys, one face inside both boxes near both heads: nearly equal costs
+    left, right = _body(1000, 1100, 3000, 0), _body(1000, 2000, 3000, 900)
     between = _face(5, 1010, 1080, 1200, 920)
     assert PB.contested_faces([between], [left, right], None) == set()
     assert PB.contested_faces([between], [left, right], 0.05) == {5}

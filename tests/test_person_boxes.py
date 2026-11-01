@@ -34,7 +34,7 @@ def test_a_fragment_no_longer_steals_the_face_from_its_own_body():
 def test_overlapping_players_each_keep_their_own_face():
     # 243560 (scaled from the sheet): a boy in green in front, a boy in blue behind,
     # their boxes overlapping and sharing a centre; each face tops its own box.
-    green, blue = _body(508, 695, 853, 472), _body(478, 737, 840, 587)
+    green, blue = _body(508, 695, 853, 472), _body(455, 737, 840, 587)
     f_green, f_blue = _face(1, 522, 672, 572, 632), _face(3, 465, 672, 510, 632)
     assert PBX.link_faces([f_green, f_blue], [green, blue]) == {1: 0, 3: 1}
 
@@ -69,3 +69,12 @@ def test_letter_bodies_orders_left_to_right_drops_low_scores_and_records_the_fac
     bodies = [_body(0, 900, 500, 700), _body(0, 300, 500, 100), _body(0, 600, 500, 400, score=0.2)]
     out = PBX.letter_bodies(bodies, 0.5, [_face(9, 50, 280, 120, 200)])
     assert [(b["b"], b["bbox"][3], b["face_id"]) for b in out] == [("A", 100, 9), ("B", 700, None)]
+
+
+def test_a_face_straddling_a_bodys_edge_is_not_its_head():
+    # 246150 (real boxes): the navy boy's face, half outside the box of the boy in
+    # yellow in front of him (facing away), must not be credited to that body.
+    yellow = _body(1710, 5363, 2973, 4750)
+    navy_face = _face(510578, 1825, 4815, 1967, 4694)
+    assert PBX._face_outside(navy_face["bbox"], yellow["bbox"]) > 0.4
+    assert PBX.link_faces([navy_face], [yellow]) == {}

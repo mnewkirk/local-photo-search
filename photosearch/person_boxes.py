@@ -125,12 +125,28 @@ HEAD_TOP_FRAC = 0.4
 HEAD_CENTRE_WEIGHT = 0.25
 
 
+# The whole face must lie inside the body (owner, 2026-10-31): a face straddling a body's
+# edge is usually the person behind or beside it (246150: 46% of the navy boy's face lay
+# outside the box of the boy in front, who was facing away). Of 185 face-to-body links in the
+# review binds, 2 had any part outside: that error and one correct link.
+FACE_OUTSIDE_TOL = 0.0      # share of the face's width or height allowed outside the body
+
+
+def _face_outside(face, body) -> float:
+    t, r, b, l = face
+    bt, br, bb, bl = body
+    w, h = max(1, r - l), max(1, b - t)
+    return max((max(0, bl - l) + max(0, r - br)) / w, (max(0, bt - t) + max(0, b - bb)) / h)
+
+
 def _head_cost(face, body) -> Optional[float]:
     t, r, b, l = face
     bt, br, bb, bl = body
     cx, cy = (l + r) / 2.0, (t + b) / 2.0
     h, w = bb - bt, br - bl
     if h <= 0 or w <= 0 or not (bl <= cx <= br and bt <= cy <= bb):
+        return None
+    if _face_outside(face, body) > FACE_OUTSIDE_TOL:
         return None
     dy = (t - bt) / h
     if dy > HEAD_TOP_FRAC:
