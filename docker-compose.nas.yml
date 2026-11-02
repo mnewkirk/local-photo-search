@@ -82,6 +82,9 @@ services:
       - PHOTO_ROOT=/photos
       # Video subject-share filters/sorts (D16): off until the video eval passes.
       - PHOTOSEARCH_VIDEO_SUBJECT_SHARE=${PHOTOSEARCH_VIDEO_SUBJECT_SHARE:-0}
+      # Names in descriptions (people-bind, read-time render; raw text untouched).
+      # On since 2026-11-01 (owner review of the soccer run); 0 turns it off.
+      - PHOTOSEARCH_DISPLAY_DESCRIPTIONS=${PHOTOSEARCH_DISPLAY_DESCRIPTIONS:-1}
       - PYTHONUNBUFFERED=1
       - PHOTOSEARCH_CACHE=/data/.cache/photosearch
       - HF_TOKEN=${HF_TOKEN}

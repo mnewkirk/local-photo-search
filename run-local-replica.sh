@@ -86,6 +86,8 @@ fi
 
 export PHOTOSEARCH_DB="${REPLICA_DB}"
 export PHOTOSEARCH_NAS_URL="${NAS_URL}"
+# Names in descriptions (people-bind read-time render), as on the NAS; 0 turns it off.
+export PHOTOSEARCH_DISPLAY_DESCRIPTIONS="${PHOTOSEARCH_DISPLAY_DESCRIPTIONS:-1}"
 # Photobook builder sidecar store (M29) — kept SEPARATE from the replica DB so a
 # `--sync` (which atomically swaps REPLICA_DB) can't wipe book/curation state.
 export PHOTOSEARCH_BOOKS_DB="${PHOTOSEARCH_BOOKS_DB:-./photobooks.db.local}"
