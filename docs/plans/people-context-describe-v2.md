@@ -1,7 +1,7 @@
 # People context in describe, v2: known people by person-id handle
 
 **Status: 📐 planned 2026-11-01 by plan-debate (two planners, two critique rounds). Evals before any wiring;
-two small gate choices are the owner's (see "Open for the owner"). Status lives in `README.md`.**
+owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation paused). Ready for Step 1. Status lives in `README.md`.**
 
 Amends docs/plans/people-context-describe.md (its Decisions table and "G0 / G1 results" stay binding; its
 "What describe knows" row is superseded by this plan: no names are sent). Measurements that led here:
@@ -208,7 +208,7 @@ leaking into the text of `v2-id-drawn` counts as an overlay leak.
 | G-C handle | `disagree` + `orphan` <= 10% of roster-box spans (above it the handle confuses the model and `v2-box` wins if it meets G-B); `omitted` reported | - |
 | G-D names | `named_precision` >= 97% on dev + fresh together with <= 2 wrong on fresh alone; coverage >= 90% of G1's (>= 84 named on dev) | G1 139 / 143, dev 93 named |
 | G-E quality | blind pairwise new >= stored - 3 of 40 | 18 / 17 / 5 |
-| G-F override | `flip_compliance` gate: **owner's choice, 60% or 80%** (see below); `flip_spill` <= 2 photos | names run 23 of 90 (26%) |
+| G-F override | `flip_compliance` >= 60% (80% reported as the target); `flip_spill` <= 2 photos | names run 23 of 90 (26%) |
 | overlap | becomes a guard only if on the fresh set it removes >= 1 wrong named mark and loses <= 10% of right ones; otherwise off | Step 0 (spent holdout): 14/15 right kept, 3/4 wrong dropped |
 
 If `v2-id`, `v2-box` and `v2-id-drawn` all miss G-B, the conclusion is "prompt context cannot fix the
@@ -281,7 +281,7 @@ holdout for decisions.
 
 ## Decisions
 
-Resolved by both planners (round 2); the two "owner" rows are open.
+Resolved by both planners (round 2); the last two rows were the owner's (2026-11-01).
 
 | Topic | Option A | Option B | Choice | Date |
 |---|---|---|---|---|
@@ -297,22 +297,14 @@ Resolved by both planners (round 2); the two "owner" rows are open.
 | Gender gate | <= 4 of ~126 marks on known people, Asa <= 1 | <= 2 photos | **A** (Asa was still "a girl" in 4 photos with names + "(boy, 10)") | 2026-11-01 |
 | Holdout | fresh seeded 75 as the gate; old 75 regression-only | same | **agreed** | 2026-11-01 |
 | Example | off-domain adults, impossible `P0`, echo gated | same | **agreed** | 2026-11-01 |
-| Flip-compliance gate (G-F) | >= 80% | >= 60% gate, 80% reported target | **owner** (recommendation: B) | - |
-| 40-photo two-turn ablation | run it on dev (never a candidate) | drop it | **owner** (recommendation: drop) | - |
+| Flip-compliance gate (G-F) | >= 80% | >= 60% gate, 80% reported target | **B** (owner: 60% to start) | 2026-11-01 |
+| 40-photo two-turn ablation | run it on dev (never a candidate) | drop it | **paused** (owner; not in the dev arm list, can be added later) | 2026-11-01 |
 
-## Open for the owner
+## Owner decisions on the open points (2026-11-01)
 
-1. **Flip-compliance gate: 60% or 80%?** The flip test flips one known kid's listed gender and measures
-   how often the text follows the list instead of appearance. High compliance is the goal. Planner A
-   wants >= 80% as the gate: the names run reached 26%, the bar should prove the instruction is
-   load-bearing, and a 60% bar would pass a prompt where appearance still wins 4 times in 10. Planner B
-   wants >= 60% as the gate with 80% reported: the real-world bar is G-B (<= 4 wrong gender marks from
-   15, which already needs ~75% of the errors fixed on true labels), and failing a prompt that passes G-B
-   on a synthetic flip would discard a working prompt. Consequence: at 80% a prompt that fixes the real
-   errors can still fail; at 60% a weaker override can pass if G-B happens to pass. Recommendation: B,
-   because G-B is the gate that measures the owner's outcome and G-F is a diagnostic of why.
-2. **Run the 40-photo two-turn ablation?** Planner A kept a 40-dev-photo arm (turn 1 writes id marks,
-   turn 2 rewrites without codes) as a measurement, never a candidate. Planner B drops it: rewrite turns
-   lost every mark in 14 of 42 retries and the JSON experiment halved length, so the evidence already
-   exists. Cost if run: ~2 GPU-min and no owner time. Recommendation: drop; the owner asked that
-   two-turn be considered, and this plan records why it is rejected.
+1. **Flip-compliance gate: 60% to start**, 80% reported as the target. The real-world gate is G-B (wrong
+   gender on known people <= 4 of ~126 marks); G-F diagnoses whether the override instruction is doing the
+   work. Raise it later if G-B passes with compliance far below 80%.
+2. **Two-turn ablation: paused.** Not in the dev arm list. The evidence against two-turn generation (the
+   rewrite turn dropped every mark in 14 of 42 retries; the JSON shape halved length) is recorded above;
+   the 40-photo arm can be added later at ~2 GPU-minutes if a candidate's text quality disappoints.
