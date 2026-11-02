@@ -956,7 +956,7 @@ def cmd_g1_sheet(a):
     model's boxes; the owner marks right / the right box(es) / not a boxed person / ambiguous."""
     from photosearch import people_bind as PB
     variants = a.variants.split(",")
-    runs = {v: _jload(G1 / "runs" / f"{v}.json", {}).get("preds", {}) for v in variants}
+    runs = {v: _load_arm(v) for v in variants}
     sample = _jload(HERE / "sample.json", {})
     sheet = CONFIRM / "sheet"
     sheet.mkdir(parents=True, exist_ok=True)
@@ -980,11 +980,15 @@ def cmd_g1_sheet(a):
                 k = _anchor_key(pid_s, sp)
                 if a.named_only and not (sp.get("name_agrees") or sp.get("named")):
                     continue
+                if a.checks and sp.get("check") not in a.checks.split(","):
+                    continue
                 if a.named_only and judged.get(k, {}).get("v") in ("right", "fix", "none", "ambiguous"):
                     continue
                 if k not in seen:
                     seen.add(k)
                     anchors.append({"key": k, "phrase": sp["phrase"], "boxes": sp["boxes"]})
+        if a.max and sum(len(i["anchors"]) for i in items) >= a.max:
+            break
         if anchors:
             items.append({"pid": pid_s, "split": sample[pid_s]["split"], "n": len(tg), "texts": texts,
                           "anchors": anchors})
@@ -1210,12 +1214,13 @@ def cmd_g1_pair_sheet(a):
     """Blind pairwise page: today's stored description vs the variant's, A/B shuffled."""
     import random
     con = ro(a.db)
-    preds = _jload(G1 / "runs" / f"{a.variant}.json", {})["preds"]
+    preds = _load_arm(a.variant)
     sample = _jload(HERE / "sample.json", {})
     pids = sorted((p for p, r in preds.items() if "description" in r and sample[p]["split"] == "dev"), key=int)
     rnd = random.Random(20261101)
     pick = sorted(rnd.sample(pids, min(a.n, len(pids))), key=int)
-    sheet = PAIR / "sheet"
+    pair = HERE / a.out if a.out else PAIR
+    sheet = pair / "sheet"
     sheet.mkdir(parents=True, exist_ok=True)
     items, key_map = [], {}
     for pid_s in pick:
@@ -1229,7 +1234,7 @@ def cmd_g1_pair_sheet(a):
         flip = rnd.random() < 0.5
         items.append({"pid": pid_s, "A": new if flip else stored, "B": stored if flip else new})
         key_map[pid_s] = "new" if flip else "stored"        # who is A
-    _jsave(PAIR / "key.json", {"variant": a.variant, "A_is": key_map})
+    _jsave(pair / "key.json", {"variant": a.variant, "A_is": key_map})
     k = hashlib.sha1(json.dumps(pick).encode()).hexdigest()[:10]
     (sheet / "index.html").write_text(_PAIR_HTML.replace("__ITEMS__", json.dumps(items).replace("</", "<\\/")).replace("__KEY__", k))
     print(f"{len(items)} pairs -> {sheet / 'index.html'}")
@@ -1290,6 +1295,7 @@ G1V2_VARIANTS = {
     "v2-id-last": dict(placement="last"),
     "v2-id-flip": dict(flip="gender"),       # the largest roster entry's gender flipped
     "v2-id-swap": dict(flip="swap"),         # two entries' boxes swapped (2+-roster photos)
+    "v2-box-flip": dict(handles=False, flip="gender"),   # G-F on the box arm (dev tuning, 2026-11-01)
 }
 G1V2_DERIVED = ("v2-id-fixroster", "v2-id-ovl")      # extra calls on v2-id answers, no new describe
 ECHO_RE = re.compile(r"\b(gr[ea]y coat|umbrella|bus stop)\b", re.I)
@@ -1493,7 +1499,7 @@ def cmd_g1v2_run(a):
                 _v2_finish(rec, GD.parse_v2(raw, n, sent, names), sent, handles, rec["people"])
             except D.UnusableAnswer as e:
                 rec["error"] = str(e)[:200]
-            kind, fix = _v2_fix_for(rec.get("error", ""), handles)
+            kind, fix = _v2_fix_for(rec.get("error", ""), handles and bool(sent))
             if fix:
                 rec["rewrite"] = kind
                 try:
@@ -1540,9 +1546,12 @@ def cmd_g1v2_derived(a):
     con = ro(a.db)
     bodies_all = _jload(HERE / "bodies.json", {})["photos"]
     ev = load_evidence()
-    base = _jload(G1 / "runs" / f"v2-id{a.suffix}.json", {})
-    runp = G1 / "runs" / f"{a.variant}{a.suffix}.json"
-    spec = dict(base["spec"], variant=a.variant)
+    base_name = a.base or f"v2-id{a.suffix}"
+    base = _jload(G1 / "runs" / f"{base_name}.json", {})
+    arm = base["spec"]["variant"]
+    handles = G1V2_VARIANTS[arm].get("handles", True)
+    runp = G1 / "runs" / f"{base_name}+{a.variant.replace('v2-id-', '')}.json"
+    spec = dict(base["spec"], variant=a.variant, base=base_name)
     run = _jload(runp, {"spec": spec, "preds": {}})
     if run["spec"] != spec:
         sys.exit(f"{runp} was made with {run['spec']}")
@@ -1577,18 +1586,25 @@ def cmd_g1v2_derived(a):
                 continue
             sp = bad[0]
             b = next(b for b in sp["boxes"] if b in sent)
-            g, _roster, sent2, prompt = v2_prepare(con, pid, bodies_all, ev, "v2-id")
-            msgs = [{"role": "user", "content": prompt, "images": v2_images(pid, g, sent2, False)},
+            g, _roster, sent2, prompt = v2_prepare(con, pid, bodies_all, ev, arm)
+            msgs = [{"role": "user", "content": prompt,
+                     "images": v2_images(pid, g, sent2, G1V2_VARIANTS[arm].get("drawn", False))},
                     {"role": "assistant", "content": r["raw"]},
-                    {"role": "user", "content": GD.fix_roster_prompt(b, sent[b], sp["phrase"])}]
+                    {"role": "user", "content": GD.fix_roster_prompt(b, sent[b], sp["phrase"], handles)}]
             rec.update(conflicts_before=len(bad), fix_box=b, fix_phrase=sp["phrase"])
             raw2 = _v2_chat(a.model, msgs)
             rec["raw"] = raw2
             try:
-                p2 = GD.parse_v2(raw2, len(r["targets"]), sent, [e["name"] for e in _roster.values()])
+                p2 = GD.parse_v2(raw2, len(r["targets"]), sent2, [e["name"] for e in _roster.values()])
                 rec.update(description=p2["description"], spans_after=len(p2["spans"]),
                            conflicts_after=sum(1 for s in p2["spans"] if not s["roster_ok"]),
                            fixed_target=not any(not s["roster_ok"] and b in s["boxes"] for s in p2["spans"]))
+                # adopted only when the marks survive (plan: >= 95% over the arm)
+                if rec["spans_after"] >= rec["base_spans"]:
+                    fin = {k: v for k, v in r.items() if k not in ("spans", "description", "assembled", "fallback")}
+                    _v2_finish(fin, p2, sent2, handles, r.get("people"))
+                    fin.update(raw_before_fix=r["raw"], raw=raw2, fixroster=True)
+                    rec["final"] = fin
             except D.UnusableAnswer as e:
                 rec["error"] = str(e)[:200]
         run["preds"][pid_s] = rec
@@ -1597,6 +1613,44 @@ def cmd_g1v2_derived(a):
             _jsave(runp, run)
     _jsave(runp, run)
     print(f"{a.variant}: {n_new} new photos -> {runp}")
+
+
+def cmd_g1v2_rescore(a):
+    """Re-apply the strip fallback to stored answers that failed after their corrective turn
+    (no model call; deterministic). For a fix to the fallback itself."""
+    from photosearch import describe as D
+    from photosearch import grounded_describe as GD
+    for v in a.variants.split(","):
+        runp = G1 / "runs" / f"{v}.json"
+        run = _jload(runp, {})
+        arm = run["spec"]["variant"]
+        handles = G1V2_VARIANTS[arm].get("handles", True)
+        n = 0
+        for pid_s, r in run["preds"].items():
+            if "description" in r or not r.get("raw_first") or not r.get("raw"):
+                continue
+            sent = {e["box"]: {"person_id": e["person_id"], "face_id": e["face_id"], "body_bbox": e["body_bbox"],
+                               "label_source": e["label_source"], "gender": e["gender_sent"], "age": e["age_sent"]}
+                    for e in r["roster"]}
+            try:
+                _v2_finish(r, GD.strip_marks_v2(r["raw"], len(r["targets"]), sent), sent, handles, r.get("people"))
+                r["fallback"] = r.pop("error")
+                n += 1
+            except D.UnusableAnswer:
+                pass
+        _jsave(runp, run)
+        print(f"{v}: {n} photos rescued by the strip fallback")
+
+
+def _load_arm(v):
+    """A run's preds; ``<base>+fix`` overlays the FIX_ROSTER answers that kept every mark."""
+    if v.endswith("+fix"):
+        preds = dict(_jload(G1 / "runs" / f"{v[:-4]}.json", {}).get("preds", {}))
+        for pid_s, f in _jload(G1 / "runs" / f"{v[:-4]}+fixroster.json", {}).get("preds", {}).items():
+            if f.get("final"):
+                preds[pid_s] = f["final"]
+        return preds
+    return _jload(G1 / "runs" / f"{v}.json", {}).get("preds", {})
 
 
 def _no_marks(raw):
@@ -1639,7 +1693,8 @@ def cmd_g1v2_report(a):
     stored, out, lists = {}, {}, defaultdict(list)
     med = lambda xs: sorted(xs)[len(xs) // 2] if xs else None
     for v in a.variants.split(","):
-        preds = _jload(G1 / "runs" / f"{v}.json", {}).get("preds", {})
+        preds = _load_arm(v)
+        flip_base = _load_arm(v.replace("-flip", "")) if "-flip" in v else id_run   # spill compares with the unflipped arm
         c, chk, rw = Counter(), Counter(), Counter()
         lens, secs, rn, rd = [], [], 0, 0
         for pid_s, r in sorted(preds.items(), key=lambda kv: int(kv[0])):
@@ -1649,6 +1704,7 @@ def cmd_g1v2_report(a):
             if r.get("rewrite") or r.get("retried"):
                 c["rewrite"] += 1
                 rw[r.get("rewrite") or "v1"] += 1
+            c["fixroster"] += bool(r.get("fixroster"))
             first = r.get("raw_first") or r.get("raw") or ""
             c["id_leak_first"] += bool(GD.ID_IN_PROSE_RE.search(_no_marks(first)))
             if "description" not in r:
@@ -1721,7 +1777,7 @@ def cmd_g1v2_report(a):
                     c["flip_spans"] += 1
                     c["flip_spans_gendered"] += bool(gs)
                     c["flip_compliant"] += gs == want
-                base = id_run.get(pid_s)
+                base = flip_base.get(pid_s)
                 if base and "description" in base:
                     _, bspans = _v2_view(pid_s, base, ev)
                     def per_box(ss):
@@ -1731,7 +1787,8 @@ def cmd_g1v2_report(a):
                                 o[s_["boxes"][0]] += _gender_set(s_["phrase"])
                         return {k: "".join(sorted(set(x))) for k, x in o.items()}
                     mine, theirs = per_box(spans), per_box(bspans)
-                    if any(mine[k] != theirs[k] for k in set(mine) & set(theirs) if k != b):
+                    # spill = another box takes on the flipped gender it did not have
+                    if any(want in mine[k] and want not in theirs[k] for k in set(mine) & set(theirs) if k != b):
                         c["flip_spill"] += 1
                         lists[f"{v} flip spill"].append(pid_s)
             if v == "v2-id" and pid_s in noctx and "description" in noctx[pid_s]:
@@ -1753,6 +1810,16 @@ def cmd_g1v2_report(a):
             res["flip_compliance_pct"] = round(100 * c["flip_compliant"] / c["flip_spans_gendered"], 1)
         out[v] = res
         print(f"== {v} ({a.splits}): " + json.dumps(res, sort_keys=True))
+    key = _jload(HERE / "g1pair-v2" / "key.json", None)
+    votes = _jload(HERE / "g1pair-v2" / "sheet" / "saved-labels.json", {})
+    if key and votes:
+        pc = Counter()
+        for pid_s, vv in votes.items():
+            if vv.get("v"):
+                a_is = key["A_is"][pid_s]
+                pc["same" if vv["v"] == "same" else ("new" if (vv["v"] == "A") == (a_is == "new") else "stored")] += 1
+        out["pairwise"] = {"variant": key["variant"], **pc}
+        print(f"== blind pairwise {key['variant']} vs stored: {dict(pc)}")
     for k, xs in lists.items():
         print(f"-- {k} ({len(xs)}): " + "; ".join(xs[:40]))
     _jsave(G1 / f"report-v2-{a.splits.replace(',', '+')}{a.suffix}.json", {"arms": out, "lists": lists})
@@ -1857,6 +1924,8 @@ def main():
     gs = sub.add_parser("g1-sheet")
     gs.add_argument("--variants", required=True)
     gs.add_argument("--splits", default="dev")
+    gs.add_argument("--checks", default="", help="v2: only spans of these cross-check classes (e.g. omitted)")
+    gs.add_argument("--max", type=int, default=0, help="stop after about this many marks")
     gs.add_argument("--named-only", action="store_true",
                     help="only marks whose name agrees with the box (would show a name), not yet judged")
     gr = sub.add_parser("g1-report")
@@ -1867,6 +1936,7 @@ def main():
     gp.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     gp.add_argument("--variant", required=True)
     gp.add_argument("--n", type=int, default=40)
+    gp.add_argument("--out", default="", help="folder under people-bind/ (default g1pair)")
     v2 = sub.add_parser("g1v2-run")
     v2.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     v2.add_argument("--variant", required=True, choices=sorted(G1V2_VARIANTS) + list(G1V2_DERIVED))
@@ -1877,6 +1947,9 @@ def main():
     v2.add_argument("--only", default="")
     v2.add_argument("--redo-errors", action="store_true")
     v2.add_argument("--dry-run", type=int, default=0, help="print N prompts, no model call")
+    v2.add_argument("--base", default="", help="derived arms: the base run file stem (default v2-id<suffix>)")
+    rs = sub.add_parser("g1v2-rescore")
+    rs.add_argument("--variants", required=True)
     vr = sub.add_parser("g1v2-report")
     vr.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     vr.add_argument("--variants", required=True)
@@ -1889,7 +1962,7 @@ def main():
     fs.add_argument("--n", type=int, default=FRESH_N)
     fs.add_argument("--force", action="store_true")
     a = ap.parse_args()
-    {"g1-fresh-sample": cmd_g1_fresh_sample, "g1v2-run": cmd_g1v2_run, "g1v2-report": cmd_g1v2_report, "g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
+    {"g1v2-rescore": cmd_g1v2_rescore, "g1-fresh-sample": cmd_g1_fresh_sample, "g1v2-run": cmd_g1v2_run, "g1v2-report": cmd_g1v2_report, "g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
 
 
 if __name__ == "__main__":

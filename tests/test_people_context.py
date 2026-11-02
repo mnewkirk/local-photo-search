@@ -284,6 +284,13 @@ def test_v2_strip_equals_unmarked_sentence():
 def test_v2_strip_fallback_drops_stray_marks():
     r = GD.strip_marks_v2("A boy [4:P39] runs past a girl [2].", 5, R2)
     assert r["description"] == "A boy runs past a girl." and r["spans"] == []
+    assert GD.strip_marks_v2("A referee (1) watches.", 5, R2)["description"] == "A referee watches."
+    r = GD.strip_marks_v2("[A boy](1) passes to a teammate (3) and two others ([4] and [5]).", 5, R2)
+    assert r["description"] == "A boy passes to a teammate and two others." and r["spans"] == []
+    r = GD.strip_marks_v2("One boy (box 2) waves, and a girl stands in box (5), smiling.", 5, R2)
+    assert r["description"] == "One boy waves, and a girl stands, smiling."
+    with pytest.raises(UnusableAnswer):                     # the id is never stripped silently
+        GD.strip_marks_v2("A referee (1:P39) watches.", 5, R2)
 
 
 @pytest.mark.parametrize("raw,ok", [
@@ -350,10 +357,11 @@ def test_v2_template_and_all_generic_identity():
 
 
 def test_v2_no_roster_prompt_is_the_no_context_prompt():
+    # nobody known: no KNOWN block, no reminder and no P-numbers (dev: P0 on unknown people)
     p = GD.build_prompt_v2(4, None)
     assert p == GD.build_prompt_v2(4, {}) == (GD.V2_HEAD.format(n=4) + GD.V2_PHOTO_RULES + GD._V2_MARK_OPEN
-                                             + GD._V2_MARK_ID + GD._V2_EXAMPLE_ID + GD._V2_RULES_ID)
-    assert "KNOWN" not in p and "Reminder" not in p
+                                             + GD._V2_EXAMPLE_BOX + GD._V2_RULES_BOX)
+    assert "KNOWN" not in p and "Reminder" not in p and "P0" not in p and "P-number" not in p
     assert GD.build_prompt_v2(4, None, drawn=True) == p
 
 

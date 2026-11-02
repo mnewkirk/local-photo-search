@@ -1293,3 +1293,40 @@ a new prompt needs a new `--suffix`.
 within 3 s of one in the same folder; 2,840 left with a trusted, keypoint-linked face; the first 75 of the
 shuffled pool with a roster entry (81 tried). All nine shoot days appear (3-14 photos each). A failed gate
 burns the set: redraw with `--force --seed <new>`.
+
+### people context v2: Step 4, dev arms (2026-11-01)
+
+Dev 125, qwen3.5-9b, ~2.8 s/photo, 105 photos with a roster. Runs `evals/people-bind/g1/runs/*-r2.json`
+(prompt `969a5f3b3cc7`); r1 (`v2-noctx.json`, `v2-id.json`) is the first prompt.
+
+- **r1: P-number rules with nobody known put P0 on unknown people** (v2-noctx: P0 in 32 photos, 8 unusable),
+  and the fix turns' `(4:P0)` demo spread it to every mark. Now a photo with no roster gets the handle-free
+  mark rules and fixes (no P-number anywhere); fix turns show no demo handle.
+- **The strip fallback stripped valid marks' brackets** (`(n)` removed before parsing); fixed, re-scored
+  offline (`g1v2-rescore`). It also drops box asides ("(box 2)", "in box (5)"): at temperature 0 the
+  leak turn often returned the same text.
+- **A handle in the marks lands on the wrong box**: `v2-id` disagree + orphan 28.6% (G-C <= 10%); 34 of
+  37 orphans are one kid's correct handle on a neighbouring box number. Drawing the handle on the box
+  (`v2-id-drawn`) halves it (17.3%); placing the roster last does not help.
+
+| arm | unusable | nospan | wrong g/a (Asa) | dis+orph | length | recall | echo | named |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| no context, v1 prompt (baseline) | 0 | 7% | 14 (10) | - | 362 | 0.62 | - | - |
+| v2-noctx | 0 | 7.2% | - | - | 371 | 0.64 | 0 | - |
+| v2-id | 0 | 4.8% | 8 (7) | 28.6% | 274 | 0.56 | 7 | 60 |
+| v2-box | 0 | 6.4% | 9 (8) | 0% | 330 | 0.62 | 0 | 90 |
+| v2-id-drawn | 2 | 3.3% | 11 (7) | 17.3% | 272 | 0.58 | 5 | 85 |
+| v2-id-last | 2 | 4.1% | 11 (9) | 20.3% | 339 | 0.58 | 12 | 40 |
+| v2-box + FIX_ROSTER | 0 | 6.4% | 0 (0) | 0% | 330 | 0.61 | 0 | 94 |
+
+- **FIX_ROSTER passes its adoption rule on every base** (id 7/8 targets fixed, box 9/9, drawn 11/11; marks
+  kept 27/27, 29/29, 38/38). G-B after it is partly circular: the turn targets the conflicts the metric
+  counts; the prompt alone takes the box arm 14 -> 9. Unmarked mentions ("she", an unmarked "a girl") are
+  not measured.
+- **Candidate: `v2-box` + FIX_ROSTER** (G-A, G-B, G-C pass on dev; corrective turns 8.0% plus roster turns
+  7.2%; degenerate 11; length 330 exactly at the bar).
+- **Override (G-F, before any fix turn)**: flip compliance `v2-box-flip` 52.7% (gate 60%), spill 1 photo;
+  `v2-id-flip` 50.6%, spill 9. `flip_spill` now counts another box TAKING ON the flipped gender (any change
+  in its gender words counted rephrasing).
+- Overlap second call on `v2-id`'s 60 named spans: 54 have no rival; of 6 with one, 4 dropped, 2 kept
+  (unjudged; the overlap decision is Step 6, on the fresh set).

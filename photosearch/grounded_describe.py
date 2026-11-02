@@ -337,12 +337,12 @@ REMINDER_BOX = "Reminder: {items}. Known people keep their listed gender and age
 
 FIX_MARKUP_V2 = (
     "Rewrite the same description with every mark in this form: describing words in square "
-    "brackets, then box number(s) in round brackets, with a colon and P-number for a known "
-    "person, like [a boy in a blue jersey](4:P0). No number or P-number in square brackets. "
-    "Keep every person mark. Answer with the description only.")
+    "brackets, then box number(s) in round brackets, like [a boy in a blue jersey](4). After the "
+    "box number of a known person from the list, add a colon and their P-number. No number or "
+    "P-number in square brackets. Keep every person mark. Answer with the description only.")
 FIX_IDS = (
     "Rewrite the same description so that P-numbers appear only inside the round brackets "
-    "after marked words, like [a boy in a blue jersey](4:P0). In the sentences, describe each "
+    "after marked words, after a colon behind the box number. In the sentences, describe each "
     "person by what they look like and do. Keep every person mark. Answer with the "
     "description only.")
 FIX_LEAK_V2 = FIX_LEAK + " Keep every person mark and P-number."
@@ -406,6 +406,7 @@ def build_prompt_v2(n_boxes: int, roster: Optional[dict] = None, placement: str 
     ``placement``: "first" (KNOWN block after the head, reminder last) or "last" (KNOWN
     block at the end, no reminder). With no roster the KNOWN block and the reminder are
     omitted: the production prompt for unlabelled shoots."""
+    handles = handles and bool(roster)         # nobody known: P-numbers are never mentioned
     head = V2_HEAD.format(n=n_boxes) + (V2_DRAWN_LINE if drawn and roster else "")
     known = ""
     if roster:
@@ -422,11 +423,13 @@ def build_prompt_v2(n_boxes: int, roster: Optional[dict] = None, placement: str 
     return p
 
 
-def fix_roster_prompt(box: int, e: dict, phrase: str) -> str:
+def fix_roster_prompt(box: int, e: dict, phrase: str, handles: bool = True) -> str:
+    """The FIX_ROSTER turn; without handles (the box arm) it says "The person (box 4)"."""
     facts = _roster_facts(e)
     noun = ("a " + ", ".join(facts)) if facts and facts[0] in ("boy", "girl", "man", "woman") \
         else (", ".join(facts) or "listed")
-    return FIX_ROSTER.format(handle=f"P{e['person_id']}", box=box, noun=noun, phrase=phrase)
+    return FIX_ROSTER.format(handle=f"P{e['person_id']}" if handles else "The person", box=box,
+                             noun=noun, phrase=phrase)
 
 
 _INNER_V2_RE = re.compile(r"^\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*,\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*$")
@@ -434,6 +437,12 @@ _INNER_ITEM_RE = re.compile(r"(\d{1,2})(?:\s*:\s*P(\d{1,6}))?")
 ID_IN_PROSE_RE = re.compile(r"\b(P\d{1,6}|[Pp]erson\s+\d+)\b")
 # A box group in round brackets left in the prose: "a boy (4:P39) runs".
 _STRAY_PAREN_RE = re.compile(r"\(\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*,\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*\)")
+# A handle-free box group in the prose ("a teammate (3)"), never a mark's own brackets.
+_STRAY_PAREN_NUM_RE = re.compile(r"(?<!\])\s*\(\s*\d{1,2}(?:\s*,\s*\d{1,2})*\s*\)")
+_EMPTY_PAREN_RE = re.compile(r"\s*\(\s*(?:and|,)?\s*\)")
+# A box reference the model wrote as an aside: "(box 2)", "in box (5)", "(boxes 3 and 4)".
+_BOX_ASIDE_RE = re.compile(r"\s*\(\s*box(?:es)?\s+\d{1,2}(?:\s*(?:,|and)\s*\d{1,2})*\s*\)"
+                           r"|\s+in\s+box(?:es)?\s*\(?\s*\d{1,2}\s*\)?(?=[\s,.;])", re.I)
 _STRAY_V2_RE = re.compile(r"\s*\[\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*[,-]\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*\]")
 
 FEMALE_WORDS_RE = re.compile(r"\b(girls?|wom[ae]n|she|her|hers|herself|female|lady|ladies|"
@@ -593,8 +602,13 @@ def parse_v2(raw: str, n_boxes: int, roster: Optional[dict] = None,
 def strip_marks_v2(raw: str, n_boxes: int, roster: Optional[dict] = None,
                    names: Optional[list[str]] = None) -> dict:
     """Last resort after a corrective turn: drop stray ``[n]`` / ``[n:P39]`` marks and
-    keep the text with NO spans (names nobody). Still raises on everything else."""
-    return dict(parse_v2(_STRAY_V2_RE.sub("", raw or ""), n_boxes, roster, names),
+    keep the text with NO spans (names nobody). Box asides ("(box 2)", "in box (5)") and
+    handle-free ``(n)`` groups left in the prose
+    go too; a group with a P-number stays and fails the photo (never strip an id silently).
+    Still raises on everything else."""
+    text = _BOX_ASIDE_RE.sub("", raw or "")
+    text = _EMPTY_PAREN_RE.sub("", _STRAY_PAREN_NUM_RE.sub("", _STRAY_V2_RE.sub("", text)))
+    return dict(parse_v2(text, n_boxes, roster, names),
                 spans=[], unanchored=True)
 
 

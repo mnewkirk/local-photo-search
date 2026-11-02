@@ -1,10 +1,10 @@
 # People context in describe, v2: known people by person-id handle
 
 **Status: 📐 planned 2026-11-01 by plan-debate (two planners, two critique rounds). Evals before any wiring;
-owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation paused). Steps 1-3 done 2026-11-01
-(`grounded_describe.py` v2 section; `g1v2-run` / `g1v2-report` / `g1-fresh-sample` in
-`evals/people_context_eval.py`; `PROMPT_VERSION` 78c6d7e177c3; fresh set `sample-fresh.json`, seed 20261101);
-Step 4 (dev runs) next. Status lives in `README.md`.**
+owner decided the two open gates 2026-11-01 (flip gate 60%, two-turn ablation paused). Steps 1-4 done 2026-11-01
+(`PROMPT_VERSION` 969a5f3b3cc7; fresh set `sample-fresh.json`, seed 20261101). Dev candidate: **`v2-box` +
+FIX_ROSTER** (passes G-A, G-B, G-C on dev; `v2-id` fails G-C at 28.6%); automatic G-F 52.7% < 60%.
+Step 5 (owner dev labels: named marks, pairwise, G-F) in progress. Status lives in `README.md`.**
 
 Amends docs/plans/people-context-describe.md (its Decisions table and "G0 / G1 results" stay binding; its
 "What describe knows" row is superseded by this plan: no names are sent). Measurements that led here:
@@ -251,7 +251,7 @@ sitting; ~20 s per pairwise item; the first sheet's wall-clock replaces these as
 | 5 | Owner dev labelling: named-only confirm sheet and the pair sheet | `g1confirm/`, `g1pair/` | G-D (dev part), G-E, G-F | ~25-35 owner min |
 | 6 | Freeze prompt + guards; fresh run once; old-holdout regression run; owner labels fresh named marks; overlap decision | run JSONs | G-D on dev + fresh; overlap condition | 0.25 d + ~0.2 GPU-h + ~11-15 owner min |
 | 7 | Docs: dated `###` in `docs/notes/llm-passes.md`; status line and Decisions row in the v1 plan and this file; one bullet in `.claude/rules/people-bind.md` (P-numbers never in raw text); `README.md` status | docs | caps test | 0.25 d |
-| 8 | Only after the gates, a separate plan (v44): describe v2 behind a flag; describe for a labelled shoot waits on labels (an owner trigger, not a batch step); spans + roster in `description_subjects`; the template column and its readers (display, search, captions decision); `description_render` fill; relabel marks the roster `stale_context` | - | - | - |
+| 8 | Only after the gates, a separate plan (v44): describe v2 behind a flag; the `{person:id|words}` fill goes through `description_render.display_edit` (a span may run past its noun phrase); describe for a labelled shoot waits on labels (an owner trigger, not a batch step); spans + roster in `description_subjects`; the template column and its readers (display, search, captions decision); `description_render` fill; relabel marks the roster `stale_context` | - | - | - |
 
 **Steps 1-7: ~3.5-4 dev days, ~1 GPU-hour, ~35-55 owner minutes.**
 
