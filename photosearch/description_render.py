@@ -236,6 +236,86 @@ def head_nouns(phrase: str) -> list:
     return heads
 
 
+# What a name replaces (owner review 2026-11-01): a bound span may run past its
+# noun phrase. "one boy is running" -> "William" lost the only verb; "A young boy,
+# wearing a blue jersey" before ", is kicking" left "Carson, is kicking". The
+# name replaces the words up to a finite verb (the verb stays), and a modifier
+# set off by commas takes its closing comma with it. Anything else (a trailing
+# "in a blue jersey") is replaced whole, as before.
+_AUX = frozenset("is are was were has have had appears appear seems seem stands stand "
+                 "sits sit looks look".split())
+# right after the head noun these read as verbs ("stands nearby", "runs", "run")
+_VERB_AFTER_HEAD = frozenset("run walk play stand sit watch look appear seem kick chase "
+                             "celebrate pose smile wait hold wear jump dribble".split())
+_NOT_VERBS = frozenset("jerseys shorts glasses sunglasses cleats pants shoes socks gloves "
+                       "colors colours stripes numbers letters its his this as".split())
+
+
+def _head_end(phrase: str) -> Optional[int]:
+    """Offset just past the phrase's head noun(s) (:func:`head_nouns`), or None."""
+    low = phrase.lower()
+    end = None
+    for m in _TOKEN_RE.finditer(low):
+        w = m.group(0)
+        if end is not None:
+            if w in _NOUNS and not low[end:m.start()].strip(" -"):
+                end = m.end()
+                continue
+            break
+        if w in _NOUNS:
+            end = m.end()
+    return end
+
+
+_RELATIVE = frozenset(("who", "that", "which"))
+
+
+def _is_verb(w: str, right_after_head: bool) -> bool:
+    return w in _AUX or (right_after_head and (w in _VERB_AFTER_HEAD
+                                               or (w.endswith("s") and w not in _NOT_VERBS)))
+
+
+def _first_verb(phrase: str, head_end: Optional[int]) -> Optional[tuple]:
+    """``(offset of the first finite verb after the head noun, offset of a who/that/
+    which right before it or None)``, or None. Without a recognised head noun
+    ("two other players sit") only an auxiliary from :data:`_AUX` counts."""
+    start = head_end or 0
+    rest = phrase.lower()[start:]
+    prev = None
+    for i, m in enumerate(_TOKEN_RE.finditer(rest)):
+        w = m.group(0)
+        right_after = head_end is not None and i == 0 and not rest[:m.start()].strip()
+        if _is_verb(w, right_after):
+            rel = start + prev.start() if prev is not None and prev.group(0) in _RELATIVE else None
+            return start + m.start(), rel
+        prev = m
+    return None
+
+
+def _verb_follows(text: str) -> bool:
+    """The next word of ``text`` reads as a finite verb ("is kicking", "sit")."""
+    m = _TOKEN_RE.search(text.lower())
+    return bool(m) and not text[:m.start()].strip() and _is_verb(m.group(0), True)
+
+
+def display_edit(description: str, start: int, end: int, name: str) -> tuple:
+    """``(a, b, replacement)``: the part of ``description`` a name replaces for the
+    span ``[start, end)``. Never reaches outside the span except for one comma
+    that closes a comma-set modifier when a verb follows it."""
+    phrase = description[start:end]
+    h = _head_end(phrase)
+    fv = _first_verb(phrase, h)
+    if fv is not None:
+        verb, rel = fv
+        if rel is not None:                              # "a coach who is gesturing"
+            return start, start + rel, name + ", "
+        return start, start + verb, name + " "
+    if (h is not None and phrase[h:].lstrip().startswith(",")
+            and description[end:end + 1] == "," and _verb_follows(description[end + 1:])):
+        return start, end + 1, name
+    return start, end, name
+
+
 def _photo_year(date_taken) -> Optional[int]:
     s = str(date_taken or "")[:4]
     if len(s) == 4 and s.isdigit() and 1800 < int(s) < 3000:
@@ -347,7 +427,7 @@ def _render(description, row, faces, persons, sources, first_counts,
         info["state"] = NAMED
         info["name"] = _join_names(names)
         for sp in s["spans"]:
-            edits.append((sp["start"], sp["end"], info["name"]))
+            edits.append(display_edit(description, sp["start"], sp["end"], info["name"]))
 
     text = description
     for a, b, rep in sorted(edits, reverse=True):

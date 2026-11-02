@@ -1214,8 +1214,11 @@ on the desktop (`--from 2026-08-29 --to 2026-10-25 --camera ILCE-7RM6`: the nine
   not in the text (whole sentences, paraphrases) or a box number out of range; they stay generic.
 - **Overlap check**: fired on 152 bound slots per the worker logs and dropped 28.
 - **Keypoint link**: the three known wrong links (247627, 244870, 246150) come out contested.
-- **Render note**: a span can include a verb ("An adult stands nearby" -> "Alan, observing ..."),
-  which drops words from the display text; the owner's review decides whether to cap that.
+- **Owner review**: every bind judged was the right person; the only problems were phrasing. A span
+  that runs on into its verb lost the verb ("one boy is running" -> "William"), and a comma-set
+  modifier left a stray comma ("Carson, is kicking"). Fixed at render time (`display_edit`, no
+  re-run): 98 of the 599 named renders change, all checked by hand; the old rule had broken
+  most of them.
 - Owner review: 113 slots on 100 random photos that render a name
   (`evals/people_bind_eval.py --set prod-soccer from-db / review-sheet / serve`, port 8765).
   `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` stays off until the owner has looked.

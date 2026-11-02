@@ -392,3 +392,38 @@ def test_loader_on_a_pre_v42_db_renders_without_rule_7(db, monkeypatch):
     rows = [{"id": pid, "description": D}]
     R.attach_display_descriptions(db.conn, rows)
     assert rows[0]["description_display"].startswith("Zack walks")
+
+
+# --- what a name replaces (owner review 2026-11-01) ------------------------------------------
+@pytest.mark.parametrize("text,phrase,want", [
+    # the span holds the only verb: keep it (244961, 245787)
+    ("They play, and one boy is running while the others walk.", "one boy is running",
+     "They play, and Zack is running while the others walk."),
+    ("Others wear yellow. One child is holding a soccer ball. Trees.", "One child is holding a soccer ball",
+     "Others wear yellow. Zack is holding a soccer ball. Trees."),
+    ("An adult stands nearby, observing.", "An adult stands nearby",
+     "Zack stands nearby, observing."),
+    # a comma-set modifier before the verb takes its closing comma (245378, 245809)
+    ("A young boy, wearing a blue soccer jersey and shorts, is kicking a ball.",
+     "A young boy, wearing a blue soccer jersey and shorts",
+     "Zack is kicking a ball."),
+    # ...but not when another modifier, not a verb, follows the comma
+    ("A young boy, approximately 8–12 years old, wearing a navy jersey, stands still.",
+     "A young boy, approximately 8–12 years old",
+     "Zack, wearing a navy jersey, stands still."),
+    # a relative clause stays a clause
+    ("They train under the guidance of an adult coach who is gesturing towards them.",
+     "an adult coach who is gesturing towards them",
+     "They train under the guidance of Zack, who is gesturing towards them."),
+    # no listed head noun: an auxiliary still keeps the verb
+    ("In the background, one other player sits on the sidelines watching.",
+     "one other player sits on the sidelines watching",
+     "In the background, Zack sits on the sidelines watching."),
+    # a plain noun phrase is replaced whole, as before
+    ("A boy in a blue jersey kicks the ball.", "A boy in a blue jersey", "Zack kicks the ball."),
+])
+def test_a_name_replaces_the_noun_phrase_not_the_verb(text, phrase, want):
+    from photosearch.description_render import display_edit
+    s = text.index(phrase)
+    a, b, rep = display_edit(text, s, s + len(phrase), "Zack")
+    assert text[:a] + rep + text[b:] == want
