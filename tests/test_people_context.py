@@ -203,7 +203,7 @@ def test_degenerate_marks():
 
 def test_names_as_context_are_never_written():
     p = GD.build_prompt(2, "two", True, context=[GD.context_line(1, "Asa Goldman", "male", 10)])
-    assert "box 1: Asa Goldman, a boy aged about 10" in p and "never write their names" in p
+    assert "box 1: Asa Goldman (boy, 10)" in p and "known and correct" in p
     with pytest.raises(UnusableAnswer, match="name in text"):
         GD.parse("[Asa](1) kicks the ball.", 2, ["Asa Goldman"])
     with pytest.raises(UnusableAnswer, match="name in text"):

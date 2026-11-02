@@ -750,6 +750,7 @@ G1_VARIANTS = {
     # owner decision 2026-11-01: names as context (after the shoot is labelled), never in the text
     "two-L-names": ("two", True, "names"),
     "two-L-names-flip": ("two", True, "names-flip"),   # the largest named box's gender flipped
+    "two-L-dual": ("two", True, "dual"),        # names in the marks: [plain words|Name](n)
 }
 
 
@@ -837,11 +838,12 @@ def cmd_g1_run(a):
         if not g:
             continue
         tg = g["targets"]
+        dual = hints_mode == "dual"
         flip = _flip_target(tg) if hints_mode in ("flip", "names-flip") else None
         if hints_mode in ("flip", "names-flip") and flip is None:
             continue
-        context, names = [], []
-        if hints_mode in ("names", "names-flip"):
+        context, names, box_names, box_person = [], [], {}, {}
+        if hints_mode in ("names", "names-flip", "dual"):
             for t in tg:
                 if t["hintable"] or (t["person"] and t["face_id"] in kp_ok(ev, pid)):
                     nm = con.execute("SELECT name FROM persons WHERE id=?", (t["person"],)).fetchone()[0]
@@ -850,6 +852,7 @@ def cmd_g1_run(a):
                         gen = {"male": "female", "female": "male"}.get(gen, gen)
                     context.append(GD.context_line(t["n"], nm, gen, t["age"]))
                     names.append(nm)
+                    box_names[t["n"]], box_person[t["n"]] = nm, t["person"]
             all_names = names          # the guard checks the names the model was told
         else:
             all_names = None
@@ -869,7 +872,7 @@ def cmd_g1_run(a):
         else:
             overlay = PB.draw_boxes(img, [t["bbox"] for t in tg])
             images = [_clean_b64(img), overlay] if shape == "two" else [overlay]
-            prompt = GD.build_prompt(len(tg), shape, length, hints, context)
+            prompt = GD.build_prompt(len(tg), shape, length, hints, context, dual=dual)
         t0 = time.time()
         rec = {"targets": tg, "hints": hints, "flip": flip, "context": context}
         try:
@@ -887,6 +890,7 @@ def cmd_g1_run(a):
         if raw is None and "error" not in rec:
             continue
         rec["secs"] = round(time.time() - t0, 2)
+        rec["box_person"] = box_person
         rec["raw"] = raw
         if raw is not None and shape == "plain":
             try:
@@ -897,7 +901,7 @@ def cmd_g1_run(a):
                 rec["error"] = str(e)
         elif raw is not None:
             try:
-                rec.update(GD.parse(raw, len(tg), all_names))
+                rec.update(GD.parse(raw, len(tg), all_names, box_names))
             except D.UnusableAnswer as e:
                 rec["error"] = str(e)[:200]
             if "error" in rec and any(w in rec["error"] for w in ("stray markup", "overlay words", "name in text")):
@@ -905,7 +909,7 @@ def cmd_g1_run(a):
                 msgs = [{"role": "user", "content": prompt, "images": images},
                         {"role": "assistant", "content": raw},
                         {"role": "user", "content": (GD.FIX_MARKUP if "stray" in rec["error"] else
-                                                     GD.FIX_NAMES if "name in text" in rec["error"] else GD.FIX_LEAK)}]
+                                                     (GD.FIX_DUAL if dual else GD.FIX_NAMES) if "name in text" in rec["error"] else GD.FIX_LEAK)}]
                 try:
                     raw2 = D._ollama_chat_with_retry(model=a.model, messages=msgs, role="describe",
                                                      options={"temperature": 0.0, "num_ctx": 16384})
@@ -915,7 +919,7 @@ def cmd_g1_run(a):
                 if raw2:
                     rec["retried"], rec["raw_first"], rec["raw"] = True, raw, raw2
                     try:
-                        rec.update(GD.parse(raw2, len(tg), all_names))
+                        rec.update(GD.parse(raw2, len(tg), all_names, box_names))
                         rec.pop("error", None)
                     except D.UnusableAnswer as e:
                         rec["error"] = str(e)[:200]
@@ -924,6 +928,8 @@ def cmd_g1_run(a):
                             rec["fallback"] = rec.pop("error")
                         except D.UnusableAnswer:
                             pass
+        if dual and "description" in rec:
+            rec["assembled"] = GD.assemble(rec["description"], rec["spans"], box_person)
         run["preds"][pid_s] = rec
         n_new += 1
         if n_new % 10 == 0:
@@ -954,6 +960,7 @@ def cmd_g1_sheet(a):
     sample = _jload(HERE / "sample.json", {})
     sheet = CONFIRM / "sheet"
     sheet.mkdir(parents=True, exist_ok=True)
+    judged = _jload(sheet / "saved-labels.json", {})
     items = []
     pids = sorted({p for r in runs.values() for p in r if sample[p]["split"] in a.splits.split(",")}, key=int)
     for pid_s in pids:
@@ -971,6 +978,10 @@ def cmd_g1_sheet(a):
                           "spans": [[sp["start"], sp["end"]] for sp in r["spans"]]})
             for sp in r["spans"]:
                 k = _anchor_key(pid_s, sp)
+                if a.named_only and not sp.get("name_agrees"):
+                    continue
+                if a.named_only and judged.get(k, {}).get("v") in ("right", "fix", "none", "ambiguous"):
+                    continue
                 if k not in seen:
                     seen.add(k)
                     anchors.append({"key": k, "phrase": sp["phrase"], "boxes": sp["boxes"]})
@@ -1300,6 +1311,8 @@ def main():
     gs = sub.add_parser("g1-sheet")
     gs.add_argument("--variants", required=True)
     gs.add_argument("--splits", default="dev")
+    gs.add_argument("--named-only", action="store_true",
+                    help="only marks whose name agrees with the box (would show a name), not yet judged")
     gr = sub.add_parser("g1-report")
     gr.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     gr.add_argument("--variants", required=True)

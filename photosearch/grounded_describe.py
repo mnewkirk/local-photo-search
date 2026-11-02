@@ -95,12 +95,27 @@ FIX_LEAK = ("Rewrite the same description without mentioning the boxes, the numb
             "drawing: describe only the people and the scene, keeping the [words](n) marks. "
             "Answer with the description only.")
 
-CONTEXT_INTRO = ("Who is in the boxes (this is known and correct: use it to describe them "
-                 "accurately, but never write their names):\n")
+CONTEXT_INTRO = ("Who is in the boxes (known and correct):\n")
+
+DUAL_MARK_RULES = """\
+Mark people: every time the description refers to one specific person, or a group of 2 or \
+3 people, who is inside a numbered box, put those words in square brackets and add the box \
+number(s) in parentheses right after, for example: [a boy in a yellow jersey](2) kicks the \
+ball while [two girls](1,4) watch. If the person's name is listed below, write it after a | \
+inside the brackets, after the plain words: [a boy in a yellow jersey|Sam](2). The plain \
+words must still describe what you see (age, clothing), as if you did not know the name; \
+names appear ONLY after a | inside the brackets, never anywhere else. The square brackets go \
+around the words and the box number(s) go in round brackets right after them; never write a \
+number in square brackets. Mark only people, never objects. Do not mark pronouns, crowds, or \
+people without a box. Never mention the boxes or the numbers outside the parentheses."""
 
 FIX_NAMES = ("Rewrite the same description without any person's name: describe each person by "
              "what they look like and do, keeping the [words](n) marks. Answer with the "
              "description only.")
+
+FIX_DUAL = ("Rewrite the same description so that a name appears ONLY after a | inside the "
+            "brackets, after plain words that describe the person: [a boy in a blue jersey|Sam](2). "
+            "Answer with the description only.")
 
 HINTS_INTRO = ("Known about some boxed people (if what you see clearly disagrees, describe "
                "what you see):\n")
@@ -137,8 +152,35 @@ def person_noun(gender: Optional[str], age: Optional[int]) -> Optional[str]:
 
 
 def context_line(n: int, name: str, gender: Optional[str], age: Optional[int]) -> str:
-    who = person_noun(gender, age)
-    return f"- box {n}: {name}" + (f", {who}" if who else "")
+    """"- box 1: Asa Goldman (boy, 10)": terse, so the model does not copy it into the text."""
+    parts = []
+    if gender in ("male", "female"):
+        kid = age is not None and age <= 17
+        parts.append(("boy" if gender == "male" else "girl") if kid else ("man" if gender == "male" else "woman")
+                     if age is not None else gender)
+    if age is not None:
+        parts.append(str(age))
+    return f"- box {n}: {name}" + (f" ({', '.join(parts)})" if parts else "")
+
+
+def name_matches(said: str, full: str) -> bool:
+    """The name written in a mark is the box's person: the full name or any part of it."""
+    said = said.strip().lower()
+    return bool(said) and (said == full.lower() or said in full.lower().replace("'", " ").split()
+                           or said in full.lower().split())
+
+
+def assemble(description: str, spans: list[dict], box_person: dict) -> str:
+    """The named template: each mark whose name agrees with its box becomes ``{person:ID}``;
+    every other span keeps its plain words. Names are filled in at read time."""
+    out, pos = [], 0
+    for sp in sorted(spans, key=lambda s: s["start"]):
+        if sp.get("name_agrees") and box_person.get(sp["boxes"][0]) is not None:
+            out.append(description[pos:sp["start"]])
+            out.append("{person:%d}" % box_person[sp["boxes"][0]])
+            pos = sp["end"]
+    out.append(description[pos:])
+    return "".join(out)
 
 
 def name_in_text(description: str, names: list[str]) -> Optional[str]:
@@ -151,13 +193,14 @@ def name_in_text(description: str, names: list[str]) -> Optional[str]:
 
 
 def build_prompt(n_boxes: int, shape: str = "two", length: bool = True,
-                 hints: Optional[list[str]] = None, context: Optional[list[str]] = None) -> str:
+                 hints: Optional[list[str]] = None, context: Optional[list[str]] = None,
+                 dual: bool = False) -> str:
     """``shape``: "two" (clean photo + overlay) or "one" (overlay only)."""
     rules = _PHOTO_RULES if shape == "two" else _PHOTO_RULES.replace("the first image", "this photo")
     p = (TWO_IMAGE_HEAD if shape == "two" else ONE_IMAGE_HEAD).format(n=n_boxes) + rules + "\n\n"
     if length:
         p += LENGTH_INSTRUCTION
-    p += _MARK_RULES
+    p += DUAL_MARK_RULES if dual else _MARK_RULES
     if hints:
         p += "\n\n" + HINTS_INTRO + "\n".join(hints)
     if context:
@@ -174,7 +217,8 @@ def strip_marks(raw: str, n_boxes: int, names: Optional[list[str]] = None) -> di
     return dict(parse(_STRAY_NUM_RE.sub("", raw or ""), n_boxes, names), spans=[], unanchored=True)
 
 
-def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None) -> dict:
+def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None,
+          box_names: Optional[dict] = None) -> dict:
     """``{"description", "spans": [{"start", "end", "phrase", "boxes"}], "dropped": [...]}``
     with the markup stripped. An anchor whose parentheses are not 1-3 box numbers in
     1..n is stripped WITHOUT a span (``dropped``): the text stays usable, the mention
@@ -188,6 +232,9 @@ def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None) -> dict:
         out.append(before)
         length += len(before)
         phrase = m.group(1).strip()
+        said = None
+        if "|" in phrase:                    # dual mark: [plain words|Name](n)
+            phrase, said = (x.strip() for x in phrase.split("|", 1))
         inner = m.group(2)
         boxes = sorted({int(x) for x in inner.split(",")}) if _BOXES_RE.match(inner) else None
         if boxes is None or len(boxes) > MAX_GROUP or any(b < 1 or b > n_boxes for b in boxes):
@@ -195,7 +242,13 @@ def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None) -> dict:
         elif count_problem(phrase, len(boxes)):
             dropped.append({"phrase": phrase, "inner": inner, "why": count_problem(phrase, len(boxes))})
         else:
-            spans.append({"start": length, "end": length + len(phrase), "phrase": phrase, "boxes": boxes})
+            sp = {"start": length, "end": length + len(phrase), "phrase": phrase, "boxes": boxes}
+            if said is not None:
+                sp["said"] = said
+                want = [(box_names or {}).get(b) for b in boxes]
+                sp["name_agrees"] = (len(boxes) == 1 and want[0] is not None
+                                     and name_matches(said, want[0]))
+            spans.append(sp)
         out.append(phrase)
         length += len(phrase)
         pos = m.end()

@@ -1223,3 +1223,29 @@ on the desktop (`--from 2026-08-29 --to 2026-10-25 --camera ILCE-7RM6`: the nine
   (`evals/people_bind_eval.py --set prod-soccer from-db / review-sheet / serve`, port 8765).
   `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` stays off until the owner has looked.
 
+### people context: names as describe context (2026-11-01)
+
+Owner decision (plan, Decisions "What describe knows"): describe runs after the shoot is labelled and
+gets each box's identity as context; raw text stays name-free; a named template is stored separately.
+Dev 125, qwen3.5-9b, two images + length line, context only for keypoint-linked trusted faces.
+
+| variant | unusable | rewrites | "girl" etc. on a labelled boy | median length |
+|---|--:|--:|--:|--:|
+| no context | 0 | 8 | 12 (Asa Goldman 10 of them) | 362 |
+| gender/age hint, "if what you see disagrees, describe what you see" | 0 | 5 | 11 | 335 |
+| names + "(boy, 10)" as context, "never write their names" | 14 | 28 | 6 | 337 |
+| dual marks `[plain words\|Name](n)` | 31 | 21 | 6 | 307 |
+
+- The soft hint wording told the model to trust its eyes over the label; that, not the idea of
+  context, is why the first hint test showed no gain. Firm context halves the "girl" errors; Asa is
+  still "a girl" in 4 photos with his name and "(boy, 10)" in the prompt.
+- Given names, the model writes them: `[Adrian Islas](3), a boy aged about 10, ...` (copying the
+  context wording), `[plain](1)|Finn Coupar`, `[Asa Goldman|Sam](4)` (the example name), even after a
+  corrective turn. Dual marks parsed: 41 named marks, 28 agree with the box's labelled person, 13 do
+  not (the name check catches them).
+- Flip test with names (one labelled kid's gender flipped): a female phrase on that kid in 23 of 90.
+- Prompt weaknesses (owner review): the roster comes last, after rules framed around "who is in the
+  photo"; the base prompt's "Who ... is in the photo" invites names; the example name leaks; nothing
+  says to prefer the listed gender/age over appearance. Owner's direction: send no names, refer to
+  known people by person id ("person 39: boy, 10"), be prescriptive. Next: plan-debate a path.
+
