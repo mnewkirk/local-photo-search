@@ -1249,3 +1249,20 @@ Dev 125, qwen3.5-9b, two images + length line, context only for keypoint-linked 
   says to prefer the listed gender/age over appearance. Owner's direction: send no names, refer to
   known people by person id ("person 39: boy, 10"), be prescriptive. Next: plan-debate a path.
 
+
+### people context v2: Step 1, handle grammar and guards (2026-11-01)
+
+Plan: docs/plans/people-context-describe-v2.md. Code: the v2 section of `photosearch/grounded_describe.py`
+(not wired); tests in `tests/test_people_context.py`. Choices the plan left open:
+
+- **The `roster_ok` window stops early**: 40 characters after the span, cut at the next mark or the
+  sentence end, so "[a boy](4:P39) runs past [a girl](2)" and "... runs. She smiles." do not veto P39.
+- **Groups are checked on plural nouns only** ("two girls" with a boy in it, "two men" with a 10-year-old);
+  "a boy and a girl" passes. A group names only when every box is a roster box that agrees; its template
+  is `{person:39,12|two boys}`.
+- **A box group left in prose is stray markup**: "a boy (4:P39) runs" raises like a stray bracket (the
+  model dropped the square brackets), so the id never reaches the raw text unnoticed.
+- **No-roster prompt keeps the P-number mark rules** (the draft omits only the KNOWN block and the
+  reminder), so `v2-noctx` measures exactly the unlabelled-shoot prompt; a P0 echo there shows as `foreign`.
+- `FIX_NAMES_V2` (= FIX_NAMES + "Keep every person mark and P-number.") added for a roster name guessed
+  into the text; the plan names no turn for it.

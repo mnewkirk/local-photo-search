@@ -215,3 +215,182 @@ def test_person_noun():
     assert GD.person_noun("male", 10) == "a boy aged about 10"
     assert GD.person_noun("female", 40) == "a woman"
     assert GD.person_noun("male", None) == "male"
+
+
+# --- grounded describe v2: person-id handles (docs/plans/people-context-describe-v2.md) ---
+
+R2 = {4: {"person_id": 39, "face_id": 901, "body_bbox": [1, 2, 3, 0], "gender": "male", "age": 10},
+      2: {"person_id": 12, "face_id": 902, "body_bbox": [5, 6, 7, 4], "gender": "female", "age": 9}}
+
+
+def test_v2_grammar_reads_boxes_and_handles():
+    r = GD.parse_v2("[A boy in green](4:P39) passes to [two players](1, 2:P12) on a field.", 5, R2)
+    a, b = r["spans"]
+    assert a["written"] == {4: 39} and a["boxes"] == [4] and a["check"] == "agree"
+    assert b["written"] == {1: None, 2: 12} and b["check"] == "agree"
+    assert r["description"] == "A boy in green passes to two players on a field."
+
+
+@pytest.mark.parametrize("inner,cls", [
+    ("4:P39", "agree"), ("4", "omitted"), ("4:P12", "disagree"), ("1:P39", "orphan"),
+    ("4:P7", "foreign"), ("2:P0", "foreign"), ("1", "none"), ("1,4:P39", "agree"),
+    ("2:P39", "disagree"), ("1:P0,4:P39", "foreign")])
+def test_v2_cross_check_classes(inner, cls):
+    sp = GD.parse_v2(f"[a child]({inner}) runs on the grass.", 5, R2)["spans"]
+    assert sp[0]["check"] == cls
+
+
+def test_v2_two_disagreements_flag_roster_confusion():
+    r = GD.parse_v2("[a boy](4:P12) and [a girl](2:P39) run.", 5, R2)
+    assert r["roster_confused"] and r["counts"] == {"disagree": 2}
+
+
+@pytest.mark.parametrize("raw", [
+    "P39 kicks the ball on a field.",
+    "[a boy](4:P39) passes to person 2 on a field.",
+    "[P39](4:P39) kicks the ball on a field.",          # a bare id in brackets
+    "A boy (4:P39) kicks the ball on a field.",           # a mark without square brackets
+])
+def test_v2_id_in_prose_raises(raw):
+    with pytest.raises(UnusableAnswer):
+        GD.parse_v2(raw, 5, R2)
+
+
+def test_v2_bare_id_message_is_id_in_text():
+    with pytest.raises(UnusableAnswer, match="id in text"):
+        GD.parse_v2("[P39](4:P39) kicks the ball.", 5, R2)
+
+
+def test_v2_bad_inner_is_dropped_text_kept():
+    r = GD.parse_v2("[a boy](P39) and [a girl](9) run.", 5, R2)
+    assert r["spans"] == [] and len(r["dropped"]) == 2
+    assert r["description"] == "A boy and a girl run."
+
+
+def test_v2_names_and_overlay_words_raise():
+    with pytest.raises(UnusableAnswer, match="name in text"):
+        GD.parse_v2("[Asa](4:P39) runs.", 5, R2, names=["Asa Goldman"])
+    with pytest.raises(UnusableAnswer, match="overlay"):
+        GD.parse_v2("[a boy](4:P39) in the red box runs.", 5, R2)
+
+
+def test_v2_strip_equals_unmarked_sentence():
+    marked = "[A boy in a green jersey](4:P39) dribbles past [two defenders](1,3) on a grass field."
+    plain = "A boy in a green jersey dribbles past two defenders on a grass field."
+    assert GD.parse_v2(marked, 5, R2)["description"] == plain
+    assert GD.parse_v2(plain, 5, R2)["description"] == plain
+
+
+def test_v2_strip_fallback_drops_stray_marks():
+    r = GD.strip_marks_v2("A boy [4:P39] runs past a girl [2].", 5, R2)
+    assert r["description"] == "A boy runs past a girl." and r["spans"] == []
+
+
+@pytest.mark.parametrize("raw,ok", [
+    ("[a girl in green](4:P39) runs.", False),
+    ("[a child in green](4:P39) runs as she smiles.", False),
+    ("[a child in green](4:P39) runs past [a girl](2:P12).", True),     # the window stops at the next mark
+    ("[a child in green](4:P39) runs. She smiles.", True),              # ... and at the sentence end
+    ("[a man in green](4:P39) runs.", False),                           # age 10
+    ("[a boy in green](4:P39) runs.", True),
+])
+def test_v2_roster_ok(raw, ok):
+    assert GD.parse_v2(raw, 5, R2)["spans"][0]["roster_ok"] is ok
+
+
+def test_v2_roster_ok_groups_read_plural_nouns_only():
+    sp = GD.parse_v2("[two girls](2:P12,4:P39) run.", 5, R2)["spans"][0]
+    assert not sp["roster_ok"]
+    sp = GD.parse_v2("[a boy and a girl](2:P12,4:P39) run.", 5, R2)["spans"][0]
+    assert sp["roster_ok"]
+    adult = {1: {"person_id": 5, "gender": "female", "age": 40}}
+    assert not GD.parse_v2("[a girl](1:P5) waves.", 3, adult)["spans"][0]["roster_ok"]
+
+
+def _named(raw, people=None, roster=R2):
+    r = GD.parse_v2(raw, 5, roster)
+    return r, GD.name_spans(r["spans"], roster, people=people)
+
+
+def test_v2_naming_rules():
+    r, sp = _named("[A boy in green](4:P39) passes to [a girl in red](2:P12) on a field.")
+    assert [s["named"] for s in sp] == [True, True]
+    assert sp[0]["person_ids"] == [39] and sp[0]["face_ids"] == [901] and sp[0]["body_bboxes"] == [[1, 2, 3, 0]]
+    _, sp = _named("[A boy in green](4) runs.")
+    assert sp[0]["why_generic"] == "omitted"
+    _, sp = _named("[A boy in green](4:P39) passes, and [the boy in green](4:P39) scores.")
+    assert [s["named"] for s in sp] == [True, False] and sp[1]["why_generic"] == "already named"
+    _, sp = _named("[a girl in green](4:P39) runs.")
+    assert sp[0]["why_generic"] == "roster conflict"
+
+
+def test_v2_groups_all_or_nothing():
+    _, sp = _named("[two kids](2:P12,4:P39) run.")
+    assert sp[0]["named"] and sp[0]["person_ids"] == [12, 39]
+    _, sp = _named("[two kids](1,4:P39) run.")             # an unknown member: generic
+    assert not sp[0]["named"] and sp[0]["why_generic"] == "unknown member"
+    _, sp = _named("[two kids](2,4:P39) run.")             # a member omitted: generic
+    assert sp[0]["why_generic"] == "omitted"
+
+
+def test_v2_bare_phrase_rule():
+    _, sp = _named("[A boy](4:P39) runs.", people=3)
+    assert sp[0]["why_generic"] == "bare phrase"
+    _, sp = _named("[A boy](4:P39) runs.", people=1, roster={4: R2[4]})
+    assert sp[0]["named"]
+
+
+def test_v2_template_and_all_generic_identity():
+    r, sp = _named("[A boy in green](4:P39) passes to [two kids](1,2:P12) on a field.")
+    assert GD.assemble_v2(r["description"], sp) == \
+        "{person:39|A boy in green} passes to two kids on a field."
+    r, sp = _named("[A boy in green](4:P12) passes to [two kids](1,3) on a field.")
+    assert not any(s["named"] for s in sp)
+    assert GD.assemble_v2(r["description"], sp) == r["description"]
+
+
+def test_v2_no_roster_prompt_is_the_no_context_prompt():
+    p = GD.build_prompt_v2(4, None)
+    assert p == GD.build_prompt_v2(4, {}) == (GD.V2_HEAD.format(n=4) + GD.V2_PHOTO_RULES + GD._V2_MARK_OPEN
+                                             + GD._V2_MARK_ID + GD._V2_EXAMPLE_ID + GD._V2_RULES_ID)
+    assert "KNOWN" not in p and "Reminder" not in p
+    assert GD.build_prompt_v2(4, None, drawn=True) == p
+
+
+def test_v2_prompt_roster_first_and_reminder():
+    p = GD.build_prompt_v2(5, R2)
+    assert p.index("KNOWN PEOPLE") < p.index("Describe the first image") < p.index("Reminder:")
+    assert "- box 2: P12, girl, 9\n- box 4: P39, boy, 10\n" in p
+    assert "P39 (box 4) is a boy, 10" in p
+    last = GD.build_prompt_v2(5, R2, placement="last")
+    assert "Reminder" not in last and last.index("Mark people") < last.index("KNOWN PEOPLE")
+    box = GD.build_prompt_v2(5, R2, handles=False)
+    assert "- box 4: boy, 10" in box and "P39" not in box and "P0" not in box
+    assert "grey coat" not in GD.build_prompt_v2(5, R2, example=False)
+
+
+def test_v2_roster_line_without_facts_keeps_the_handle():
+    assert GD.roster_line(4, {"person_id": 39}) == "- box 4: P39"
+    assert GD.roster_line(4, {"person_id": 39, "gender": "female", "age": 35}) == "- box 4: P39, woman, 35"
+    assert GD.roster_line(4, {"person_id": 39, "gender": "male"}, handles=False) == "- box 4: male"
+    assert "P39 is in box 4" in GD.build_prompt_v2(5, {4: {"person_id": 39}})
+
+
+def test_v2_prompt_version_is_stable_sha():
+    assert len(GD.PROMPT_VERSION) == 12 and GD.PROMPT_VERSION == GD._prompt_version()
+
+
+def test_v2_fix_roster_prompt():
+    s = GD.fix_roster_prompt(4, R2[4], "a girl in green")
+    assert s.startswith("P39 (box 4) is a boy, 10. You wrote 'a girl in green'")
+
+
+def test_v2_draw_boxes_labelled(tmp_path):
+    import base64
+    import io
+    from PIL import Image
+    p = tmp_path / "a.jpg"
+    Image.new("RGB", (400, 300), (0, 120, 0)).save(p)
+    b64 = GD.draw_boxes_labelled(str(p), [[50, 150, 250, 40], [60, 350, 280, 220]], {2: "P39"})
+    im = Image.open(io.BytesIO(base64.b64decode(b64)))
+    assert im.size == (400, 300)

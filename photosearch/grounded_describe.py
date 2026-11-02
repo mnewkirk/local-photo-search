@@ -267,3 +267,421 @@ def parse(raw: str, n_boxes: int, names: Optional[list[str]] = None,
     if hit:
         raise UnusableAnswer(f"grounded describe: name in text: {hit!r}")
     return {"description": desc, "spans": spans, "dropped": dropped, "degenerate": degenerate(desc, spans)}
+
+
+# ---------------------------------------------------------------------------
+# v2: known people by person-id handle (docs/plans/people-context-describe-v2.md).
+# No names are sent. A known person's box carries an opaque handle ``P<person_id>``
+# in the round brackets: ``[a boy in a green jersey](4:P39)``. Code strips the marks
+# (raw, name-free text), cross-checks each written handle against the roster entry for
+# that box, and names only spans that pass every guard (``name_spans``). The v1
+# functions above stay so old runs re-score.
+
+V2_HEAD = TWO_IMAGE_HEAD
+V2_DRAWN_LINE = ("A known person's box also shows their P-number next to the box number, "
+                 "like 4·P39.\n\n")
+
+KNOWN_INTRO = (
+    "KNOWN PEOPLE. These people have been identified by the family. Their gender and age below\n"
+    "are facts, not guesses: use them even when the person looks different (long hair, clothing\n"
+    "colour, build or pose can mislead). A person listed as a boy is \"a boy\", never \"a girl\",\n"
+    "\"she\" or \"her\"; a person listed as a girl is \"a girl\", never \"a boy\", \"he\" or \"him\"; a\n"
+    "person listed as aged 10 is a child, never \"a man\", \"a woman\" or \"a teenager\".\n")
+KNOWN_TAIL = ("Every other box is a person nobody has identified: describe them only from what "
+              "you see.\n\n")
+
+V2_PHOTO_RULES = (
+    "Describe the first image in 2-4 full sentences for a search index. Cover:\n"
+    "- The people: how many, approximate ages, clothing (for a known person, their listed\n"
+    "  gender and age)\n"
+    "- What they are doing (actions, poses)\n"
+    "- The setting (indoor/outdoor, location type such as field, park, street, home)\n"
+    "Be factual and describe only what you can clearly see. Do not start with \"The image shows\"\n"
+    "or similar. Write as much as you would for the photo alone.\n\n")
+
+_V2_MARK_OPEN = (
+    "Mark people: every time the description refers to one specific person, or a group of 2 or\n"
+    "3 people, who is inside a numbered box, put the describing words in square brackets and\n"
+    "the box number(s) in round brackets right after. ")
+_V2_MARK_ID = (
+    "For a known person, write the box number,\n"
+    "a colon and their P-number: [a boy in a red cap](2:P39). For a group, list each box, with\n"
+    "the P-number for any known member: [two men](1,3:P8). ")
+_V2_EXAMPLE_ID = (
+    "Example (a different photo):\n"
+    "[a woman in a grey coat](2:P0) hands an umbrella to [two men](1,3), who stand at a bus stop.\n"
+    "That sentence only shows the form; P0 is not a real person, and your people, scene and\n"
+    "P-numbers come from the photos and the list above. ")
+_V2_RULES_ID = (
+    "Inside the square brackets write only\n"
+    "ordinary describing words (age, gender, clothing, role); a bare P-number in brackets is\n"
+    "wrong, and a P-number appears ONLY after a colon inside the round brackets, never in the\n"
+    "sentence. Never use a P-number that is not in the list. Mark only people, never objects.\n"
+    "Do not mark pronouns, crowds, or people without a box. Never mention the boxes, the\n"
+    "numbers or the drawing outside the round brackets, and never write a person's name.")
+# The handle-free mark rules (the v2-box arm: the code maps box -> person).
+_V2_EXAMPLE_BOX = (
+    "Example (a different photo):\n"
+    "[a woman in a grey coat](2) hands an umbrella to [two men](1,3), who stand at a bus stop.\n"
+    "That sentence only shows the form; your people and scene come from the photos. ")
+_V2_RULES_BOX = (
+    "Inside the square brackets write only\n"
+    "ordinary describing words (age, gender, clothing, role); never write a number in square\n"
+    "brackets. Mark only people, never objects.\n"
+    "Do not mark pronouns, crowds, or people without a box. Never mention the boxes, the\n"
+    "numbers or the drawing outside the round brackets, and never write a person's name.")
+
+REMINDER = ("Reminder: {items}. Known people keep their\n"
+            "listed gender and age and are marked with their P-number.")
+REMINDER_BOX = "Reminder: {items}. Known people keep their listed gender and age."
+
+FIX_MARKUP_V2 = (
+    "Rewrite the same description with every mark in this form: describing words in square "
+    "brackets, then box number(s) in round brackets, with a colon and P-number for a known "
+    "person, like [a boy in a blue jersey](4:P39). No number or P-number in square brackets. "
+    "Keep every person mark. Answer with the description only.")
+FIX_IDS = (
+    "Rewrite the same description so that P-numbers appear only inside the round brackets "
+    "after marked words, like [a boy in a blue jersey](4:P39). In the sentences, describe each "
+    "person by what they look like and do. Keep every person mark. Answer with the "
+    "description only.")
+FIX_LEAK_V2 = FIX_LEAK + " Keep every person mark and P-number."
+FIX_NAMES_V2 = FIX_NAMES + " Keep every person mark and P-number."
+FIX_ROSTER = (
+    "{handle} (box {box}) is {noun}. You wrote '{phrase}' for them. Rewrite the same "
+    "description so every mention of that person agrees with the list, keeping every mark. "
+    "Answer with the description only.")
+
+
+def _frozen_text() -> str:
+    return "\x1e".join([V2_HEAD, V2_DRAWN_LINE, KNOWN_INTRO, KNOWN_TAIL, V2_PHOTO_RULES,
+                        _V2_MARK_OPEN, _V2_MARK_ID, _V2_EXAMPLE_ID, _V2_RULES_ID,
+                        _V2_EXAMPLE_BOX, _V2_RULES_BOX, REMINDER, REMINDER_BOX,
+                        FIX_MARKUP_V2, FIX_IDS, FIX_LEAK_V2, FIX_NAMES_V2, FIX_ROSTER])
+
+
+def _prompt_version() -> str:
+    import hashlib
+    return hashlib.sha256(_frozen_text().encode()).hexdigest()[:12]
+
+
+PROMPT_VERSION = _prompt_version()
+
+
+def roster_noun(gender: Optional[str], age: Optional[int]) -> Optional[str]:
+    """"boy" / "girl" (under 18), "man" / "woman", the bare gender when the age is unknown."""
+    if gender not in ("male", "female"):
+        return None
+    if age is None:
+        return gender
+    if age <= 17:
+        return "boy" if gender == "male" else "girl"
+    return "man" if gender == "male" else "woman"
+
+
+def _roster_facts(e: dict) -> list[str]:
+    return [p for p in (roster_noun(e.get("gender"), e.get("age")),
+                        None if e.get("age") is None else str(e["age"])) if p]
+
+
+def roster_line(box: int, e: dict, handles: bool = True) -> str:
+    """``- box 4: P39, boy, 10``; ``- box 4: P39`` with neither gender nor age (the handle
+    still names); ``- box 4: boy, 10`` without handles."""
+    parts = ([f"P{e['person_id']}"] if handles else []) + _roster_facts(e)
+    return f"- box {box}: {', '.join(parts)}" if parts else f"- box {box}"
+
+
+def _reminder_item(box: int, e: dict, handles: bool) -> str:
+    facts = _roster_facts(e)
+    noun = (("a " if facts[0] in ("boy", "girl", "man", "woman") else "")
+            + ", ".join(facts)) if facts else None
+    if handles:
+        return f"P{e['person_id']} (box {box}) is {noun}" if noun else f"P{e['person_id']} is in box {box}"
+    return f"box {box} is {noun}" if noun else f"box {box} is known"
+
+
+def build_prompt_v2(n_boxes: int, roster: Optional[dict] = None, placement: str = "first",
+                    example: bool = True, drawn: bool = False, handles: bool = True) -> str:
+    """The v2 describe prompt. ``roster``: ``{box: {person_id, gender, age, ...}}``.
+    ``placement``: "first" (KNOWN block after the head, reminder last) or "last" (KNOWN
+    block at the end, no reminder). With no roster the KNOWN block and the reminder are
+    omitted: the production prompt for unlabelled shoots."""
+    head = V2_HEAD.format(n=n_boxes) + (V2_DRAWN_LINE if drawn and roster else "")
+    known = ""
+    if roster:
+        known = (KNOWN_INTRO + "\n".join(roster_line(b, roster[b], handles) for b in sorted(roster))
+                 + "\n" + KNOWN_TAIL)
+    marks = _V2_MARK_OPEN + ((_V2_MARK_ID + (_V2_EXAMPLE_ID if example else "") + _V2_RULES_ID)
+                             if handles else ((_V2_EXAMPLE_BOX if example else "") + _V2_RULES_BOX))
+    if placement == "last":
+        return head + V2_PHOTO_RULES + marks + ("\n\n" + known.rstrip("\n") if known else "")
+    p = head + known + V2_PHOTO_RULES + marks
+    if roster:
+        items = "; ".join(_reminder_item(b, roster[b], handles) for b in sorted(roster))
+        p += "\n\n" + (REMINDER if handles else REMINDER_BOX).format(items=items)
+    return p
+
+
+def fix_roster_prompt(box: int, e: dict, phrase: str) -> str:
+    facts = _roster_facts(e)
+    noun = ("a " + ", ".join(facts)) if facts and facts[0] in ("boy", "girl", "man", "woman") \
+        else (", ".join(facts) or "listed")
+    return FIX_ROSTER.format(handle=f"P{e['person_id']}", box=box, noun=noun, phrase=phrase)
+
+
+_INNER_V2_RE = re.compile(r"^\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*,\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*$")
+_INNER_ITEM_RE = re.compile(r"(\d{1,2})(?:\s*:\s*P(\d{1,6}))?")
+ID_IN_PROSE_RE = re.compile(r"\b(P\d{1,6}|[Pp]erson\s+\d+)\b")
+# A box group in round brackets left in the prose: "a boy (4:P39) runs".
+_STRAY_PAREN_RE = re.compile(r"\(\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*,\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*\)")
+_STRAY_V2_RE = re.compile(r"\s*\[\s*\d{1,2}(?:\s*:\s*P\d{1,6})?(?:\s*[,-]\s*\d{1,2}(?:\s*:\s*P\d{1,6})?)*\s*\]")
+
+FEMALE_WORDS_RE = re.compile(r"\b(girls?|wom[ae]n|she|her|hers|herself|female|lady|ladies|"
+                             r"daughters?|mother|mom|sister)\b", re.I)
+MALE_WORDS_RE = re.compile(r"\b(boys?|m[ae]n|he|him|his|himself|male|gentleman|gentlemen|"
+                           r"sons?|father|dad|brother)\b", re.I)
+_ADULT_WORDS_RE = re.compile(r"\b(m[ae]n|wom[ae]n|teens?|teenagers?|teenage|adults?|lady|ladies|"
+                             r"gentlem[ae]n)\b", re.I)
+_CHILD_WORDS_RE = re.compile(r"\b(boys?|girls?|child|children|kids?|toddlers?|bab(?:y|ies))\b", re.I)
+_PLURAL_FEMALE_RE = re.compile(r"\b(girls|women|ladies)\b", re.I)
+_PLURAL_MALE_RE = re.compile(r"\b(boys|men|gentlemen)\b", re.I)
+ROSTER_WINDOW = 40
+
+
+def _trailing(desc: str, sp: dict, nxt: Optional[int]) -> str:
+    """Up to ROSTER_WINDOW characters after a span, stopping at the next span or the
+    sentence end (a following "[a girl](2)" describes someone else)."""
+    end = min(sp["end"] + ROSTER_WINDOW, nxt if nxt is not None else len(desc))
+    t = desc[sp["end"]:end]
+    cut = re.search(r"[.!?;]", t)
+    return t[:cut.start()] if cut else t
+
+
+def roster_conflict(phrase: str, trailing: str, members: list[dict]) -> Optional[str]:
+    """Why the words contradict a roster member's listed gender or age, else None. One
+    person: the phrase and the trailing words. A group: plural nouns in the phrase only
+    ("two girls" with a boy in it; "two men" with a 10-year-old)."""
+    if len(members) == 1:
+        e = members[0]
+        text = phrase + " " + trailing
+        g, age = e.get("gender"), e.get("age")
+        if g == "male" and FEMALE_WORDS_RE.search(text):
+            return f"female word {FEMALE_WORDS_RE.search(text).group(0)!r} on a male"
+        if g == "female" and MALE_WORDS_RE.search(text):
+            return f"male word {MALE_WORDS_RE.search(text).group(0)!r} on a female"
+        if age is not None and age <= 12 and _ADULT_WORDS_RE.search(phrase):
+            return f"{_ADULT_WORDS_RE.search(phrase).group(0)!r} on age {age}"
+        if age is not None and age >= 18 and _CHILD_WORDS_RE.search(phrase):
+            return f"{_CHILD_WORDS_RE.search(phrase).group(0)!r} on age {age}"
+        return None
+    fem, mal = _PLURAL_FEMALE_RE.search(phrase), _PLURAL_MALE_RE.search(phrase)
+    for e in members:
+        g, age = e.get("gender"), e.get("age")
+        if g == "male" and fem and not mal:
+            return f"{fem.group(0)!r} with a male member"
+        if g == "female" and mal and not fem:
+            return f"{mal.group(0)!r} with a female member"
+        if age is not None and age <= 12 and _ADULT_WORDS_RE.search(phrase) and not _CHILD_WORDS_RE.search(phrase):
+            return f"{_ADULT_WORDS_RE.search(phrase).group(0)!r} with a member aged {age}"
+        if age is not None and age >= 18 and _CHILD_WORDS_RE.search(phrase) and not _ADULT_WORDS_RE.search(phrase):
+            return f"{_CHILD_WORDS_RE.search(phrase).group(0)!r} with a member aged {age}"
+    return None
+
+
+def cross_check(written: dict, roster: dict) -> str:
+    """One class per span (plan table): ``foreign`` > ``disagree`` > ``orphan`` >
+    ``omitted`` > ``agree``; ``none`` for a span on no roster box that carries no handle."""
+    ids = {e["person_id"] for e in roster.values()}
+    classes = set()
+    for box, pid in written.items():
+        e = roster.get(box)
+        if pid is not None and pid not in ids:
+            classes.add("foreign")
+        elif e is not None:
+            classes.add("agree" if pid == e["person_id"] else "omitted" if pid is None else "disagree")
+        elif pid is not None:
+            classes.add("orphan")
+    for c in ("foreign", "disagree", "orphan", "omitted", "agree"):
+        if c in classes:
+            return c
+    return "none"
+
+
+def _degenerate_spans(desc: str, spans: list[dict]) -> dict:
+    """Span index -> why the text bent around it (as :func:`degenerate`, per span)."""
+    out, by_phrase = {}, {}
+    for i, sp in enumerate(spans):
+        by_phrase.setdefault(sp["phrase"].lower(), []).append(i)
+        prev = re.findall(r"[A-Za-z]+", desc[max(0, sp["start"] - 30):sp["start"]])
+        if prev and _PERSON_NOUN_RE.fullmatch(prev[-1]):
+            out[i] = f"mark follows a person noun: {prev[-1]!r}"
+    for k, idx in by_phrase.items():
+        if len(idx) >= 3:
+            for i in idx:
+                out.setdefault(i, f"phrase {k!r} marked 3+ times")
+    return out
+
+
+def parse_v2(raw: str, n_boxes: int, roster: Optional[dict] = None,
+             names: Optional[list[str]] = None) -> dict:
+    """``{"description", "spans", "dropped", "degenerate", "roster_confused", "counts"}``
+    with the markup stripped. Each span: ``start, end, phrase, boxes, written`` ({box:
+    person_id | None}), ``check`` (:func:`cross_check`), ``count_problem``,
+    ``degenerate``, ``roster_ok`` / ``roster_conflict``. A mark whose round brackets
+    break the grammar, or name a box outside 1..n, or more than ``MAX_GROUP`` boxes, is
+    stripped without a span (``dropped``). Raises ``describe.UnusableAnswer`` on an empty
+    text, stray markup, overlay words, a P-number or "person N" in the prose (never
+    stripped silently), or a roster name (code knows them; none were sent)."""
+    from .describe import UnusableAnswer
+    roster = roster or {}
+    text = (raw or "").strip()
+    out, spans, dropped, pos, length = [], [], [], 0, 0
+    for m in ANCHOR_RE.finditer(text):
+        before = text[pos:m.start()]
+        out.append(before)
+        length += len(before)
+        phrase, inner = m.group(1).strip(), m.group(2)
+        written = None
+        if _INNER_V2_RE.match(inner):
+            written = {}
+            for b, p in _INNER_ITEM_RE.findall(inner):
+                written[int(b)] = int(p) if p else None
+        if (written is None or len(written) > MAX_GROUP
+                or any(b < 1 or b > n_boxes for b in written)):
+            dropped.append({"phrase": phrase, "inner": inner})
+        else:
+            spans.append({"start": length, "end": length + len(phrase), "phrase": phrase,
+                          "boxes": sorted(written), "written": written,
+                          "check": cross_check(written, roster),
+                          "count_problem": count_problem(phrase, len(written))})
+        out.append(phrase)
+        length += len(phrase)
+        pos = m.end()
+    out.append(text[pos:])
+    desc = "".join(out)
+    if desc and desc[0].islower():
+        desc = desc[0].upper() + desc[1:]
+    if not desc.strip():
+        raise UnusableAnswer("grounded describe: empty description")
+    if _BRACKET_RE.search(desc) or _STRAY_PAREN_RE.search(desc):
+        raise UnusableAnswer(f"grounded describe: stray markup: {desc[:80]!r}")
+    hit = ID_IN_PROSE_RE.search(desc)
+    if hit:
+        raise UnusableAnswer(f"grounded describe: id in text: {hit.group(0)!r}")
+    leak = LEAK_RE.search(desc)
+    if leak:
+        raise UnusableAnswer(f"grounded describe: overlay words: {leak.group(0)!r}")
+    hit = name_in_text(desc, names or [])
+    if hit:
+        raise UnusableAnswer(f"grounded describe: name in text: {hit!r}")
+    deg = _degenerate_spans(desc, spans)
+    starts = [sp["start"] for sp in spans]
+    for i, sp in enumerate(spans):
+        sp["degenerate"] = deg.get(i)
+        members = [roster[b] for b in sp["boxes"] if b in roster]
+        why = roster_conflict(sp["phrase"], _trailing(desc, sp, starts[i + 1] if i + 1 < len(starts) else None),
+                              members) if members else None
+        sp["roster_ok"], sp["roster_conflict"] = why is None, why
+    counts = {}
+    for sp in spans:
+        counts[sp["check"]] = counts.get(sp["check"], 0) + 1
+    return {"description": desc, "spans": spans, "dropped": dropped,
+            "degenerate": degenerate(desc, spans), "counts": counts,
+            "roster_confused": counts.get("disagree", 0) >= 2}
+
+
+def strip_marks_v2(raw: str, n_boxes: int, roster: Optional[dict] = None,
+                   names: Optional[list[str]] = None) -> dict:
+    """Last resort after a corrective turn: drop stray ``[n]`` / ``[n:P39]`` marks and
+    keep the text with NO spans (names nobody). Still raises on everything else."""
+    return dict(parse_v2(_STRAY_V2_RE.sub("", raw or ""), n_boxes, roster, names),
+                spans=[], unanchored=True)
+
+
+def name_spans(spans: list[dict], roster: dict, people: Optional[int] = None,
+               bare_rule: Optional[str] = "everyone") -> list[dict]:
+    """Set ``named`` / ``why_generic`` / ``person_ids`` / ``face_ids`` / ``body_bboxes`` on
+    each span (in place; returns ``spans``). A span is named only if: ``agree``, every box
+    a roster box (groups all-or-nothing), ``roster_ok``, no count problem, not degenerate,
+    the bare-phrase rule (``people`` = everyone detected), template-safe words, and no
+    member already named in an earlier span of the photo."""
+    from .people_bind import bare_allowed
+    seen = set()
+    for sp in sorted(spans, key=lambda s: s["start"]):
+        members = [roster.get(b) for b in sp["boxes"]]
+        sp["person_ids"] = [e["person_id"] if e else None for e in members]
+        sp["face_ids"] = [e.get("face_id") if e else None for e in members]
+        sp["body_bboxes"] = [e.get("body_bbox") if e else None for e in members]
+        why = None
+        if sp["check"] != "agree":
+            why = sp["check"]
+        elif any(e is None for e in members):
+            why = "unknown member"
+        elif not sp.get("roster_ok", True):
+            why = "roster conflict"
+        elif sp.get("count_problem"):
+            why = "count"
+        elif sp.get("degenerate"):
+            why = "degenerate"
+        elif not bare_allowed(sp["phrase"], len(sp["boxes"]), people, bare_rule):
+            why = "bare phrase"
+        elif re.search(r"[{}|]", sp["phrase"]):
+            why = "template characters"
+        elif seen & set(sp["person_ids"]):
+            why = "already named"
+        sp["named"], sp["why_generic"] = why is None, why
+        if why is None:
+            seen |= set(sp["person_ids"])
+    return spans
+
+
+def assemble_v2(description: str, spans: list[dict]) -> str:
+    """The write-once named template: ``{person:39|a boy in a green jersey}`` (a group:
+    ``{person:39,12|two boys}``) for each named span; every other span stays plain words.
+    With no span named it equals ``description`` byte for byte."""
+    out, pos = [], 0
+    for sp in sorted(spans, key=lambda s: s["start"]):
+        if sp.get("named"):
+            out.append(description[pos:sp["start"]])
+            out.append("{person:%s|%s}" % (",".join(str(p) for p in sp["person_ids"]),
+                                           description[sp["start"]:sp["end"]]))
+            pos = sp["end"]
+    out.append(description[pos:])
+    return "".join(out)
+
+
+def draw_boxes_labelled(image_path: str, boxes: list, labels: dict, max_px: int = 1024) -> str:
+    """As ``people_bind.draw_boxes`` (left untouched), but box ``n`` in ``labels`` is
+    tagged ``"4·P39"`` instead of ``"4"`` (the ``v2-id-drawn`` arm)."""
+    import base64
+    import io
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+    with Image.open(image_path) as im0:
+        im = ImageOps.exif_transpose(im0).convert("RGB")
+    scale = 1.0
+    if max(im.size) > max_px:
+        scale = max_px / float(max(im.size))
+        im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
+    draw = ImageDraw.Draw(im)
+    fs = max(14, im.size[1] // 28)
+    try:
+        font = ImageFont.load_default(size=fs)
+    except TypeError:
+        font = ImageFont.load_default()
+    tags: list = []
+    for n, box in enumerate(boxes, 1):
+        top, right, bottom, left = (v * scale for v in box)
+        draw.rectangle([left, top, right, bottom], outline=(255, 40, 40), width=3)
+        label = f"{n}·{labels[n]}" if n in labels else str(n)
+        tx, ty = left, max(0, top - fs - 4)
+        tb = draw.textbbox((tx, ty), label, font=font)
+        while any(tb[0] < o[2] and o[0] < tb[2] and tb[1] < o[3] and o[1] < tb[3] for o in tags):
+            tx += tb[2] - tb[0] + 3
+            tb = draw.textbbox((tx, ty), label, font=font)
+        tags.append(tb)
+        draw.rectangle(tb, fill=(255, 40, 40))
+        draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
