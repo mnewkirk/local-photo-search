@@ -1759,6 +1759,72 @@ def cmd_g1v2_report(a):
 
 
 
+FRESH_SEED = 20261101
+FRESH_N = 75
+
+
+def _db_bodies(con, pid):
+    """Production bodies (person_boxes) in the eval body format, letters in row order. The
+    keypoints stay out, as in bodies.json: the keypoint link comes from g0/evidence."""
+    rows = con.execute("SELECT bbox_top, bbox_right, bbox_bottom, bbox_left, score FROM person_boxes "
+                       "WHERE photo_id = ? ORDER BY id", (pid,)).fetchall()
+    return [{"b": chr(65 + i) if i < 26 else f"Z{i}", "bbox": [t, r, b, l], "score": sc}
+            for i, (t, r, b, l, sc) in enumerate(rows)]
+
+
+def cmd_g1_fresh_sample(a):
+    """The fresh 75-photo gate set (plan, "Dev / holdout policy"): soccer stills with >= 1
+    roster entry, drawn with a recorded seed, excluding the 200-photo sample, the
+    people-bind review photos, the G0 "who" photos and the 3-s burst window of each."""
+    import random
+    con = ro(a.db)
+    ev = load_evidence()
+    out = HERE / "sample-fresh.json"
+    if out.exists() and not a.force:
+        sys.exit(f"{out} exists: a new draw replaces a burned set only with --force and a new --seed")
+    excluded = set(_jload(HERE / "sample.json", {}))
+    for d in ("review", "review2"):
+        excluded |= set(_jload(HERE / d / "sample.json", {}))
+    excluded |= {p for p, _b, _ph in who_targets()}
+    excluded = {int(p) for p in excluded}
+    when = {}
+    for pid, d in con.execute("SELECT id, date_taken FROM photos WHERE id IN (%s)" % ",".join(map(str, excluded))):
+        if d:
+            when[pid] = time.mktime(time.strptime(d[:19], "%Y-%m-%d %H:%M:%S"))
+    stills = soccer_session_photos(con)
+    near = set()
+    ex_times = sorted((t, stills.get(p, (None,))[0]) for p, t in when.items())
+    for pid, (folder, d, _w, _h) in stills.items():
+        if not d or pid in excluded:
+            continue
+        t = time.mktime(time.strptime(d[:19], "%Y-%m-%d %H:%M:%S"))
+        if any(abs(t - te) <= ID.BURST_S for te, f in ex_times if f == folder):
+            near.add(pid)
+    trusted_linked = {pid for pid, e in ev.items() if kp_ok(ev, pid) & {
+        f["face_id"] for f in e.get("faces", []) if f.get("person") and f.get("source") in TRUSTED}}
+    pool = sorted(p for p in stills if p not in excluded and p not in near and p in trusted_linked)
+    rnd = random.Random(a.seed)
+    rnd.shuffle(pool)
+    picked, bodies, tried = {}, {}, 0
+    for pid in pool:
+        tried += 1
+        b = _db_bodies(con, pid)
+        if not b:
+            continue
+        g = g1_inputs(con, pid, {str(pid): b}, ev)
+        if not g or not v2_roster(con, pid, g, ev):
+            continue
+        picked[str(pid)] = {"split": "fresh", "seed": a.seed, "rank": len(picked)}
+        bodies[str(pid)] = b
+        if len(picked) >= a.n:
+            break
+    _jsave(out, picked)
+    _jsave(HERE / "sample-fresh-bodies.json", {"detector": "person_boxes (photo_index.db.local)", "photos": bodies})
+    print(f"stills {len(stills)}, excluded {len(excluded)}, burst-near {len(near)}, trusted-linked pool {len(pool)}, "
+          f"tried {tried}, picked {len(picked)} (seed {a.seed}) -> {out}")
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1805,7 +1871,7 @@ def main():
     v2.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
     v2.add_argument("--variant", required=True, choices=sorted(G1V2_VARIANTS) + list(G1V2_DERIVED))
     v2.add_argument("--model", default="qwen/qwen3.5-9b")
-    v2.add_argument("--split", default="dev", choices=["dev", "holdout", "all"])
+    v2.add_argument("--split", default="dev", choices=["dev", "holdout", "fresh", "all"])
     v2.add_argument("--sample", default="", help="sample file (default people-bind/sample.json)")
     v2.add_argument("--suffix", default="", help="run file suffix (a new prompt version needs a new file)")
     v2.add_argument("--only", default="")
@@ -1817,8 +1883,13 @@ def main():
     vr.add_argument("--splits", default="dev")
     vr.add_argument("--sample", default="")
     vr.add_argument("--suffix", default="", help="suffix of the v2-id run that flip spill compares against")
+    fs = sub.add_parser("g1-fresh-sample")
+    fs.add_argument("--db", default=os.environ.get("PHOTOSEARCH_DB"), required=not os.environ.get("PHOTOSEARCH_DB"))
+    fs.add_argument("--seed", type=int, default=FRESH_SEED)
+    fs.add_argument("--n", type=int, default=FRESH_N)
+    fs.add_argument("--force", action="store_true")
     a = ap.parse_args()
-    {"g1v2-run": cmd_g1v2_run, "g1v2-report": cmd_g1v2_report, "g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
+    {"g1-fresh-sample": cmd_g1_fresh_sample, "g1v2-run": cmd_g1v2_run, "g1v2-report": cmd_g1v2_report, "g1-run": cmd_g1_run, "g1-pair-sheet": cmd_g1_pair_sheet, "g1-sheet": cmd_g1_sheet, "g1-report": cmd_g1_report, "who-sheet": cmd_who_sheet, "evidence": cmd_evidence, "attrs": cmd_attrs, "g0": cmd_g0}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -1283,3 +1283,12 @@ a new prompt needs a new `--suffix`.
   called Asa "a girl" once on a handle-less mark (`omitted`): the classes the cross-check was built for.
   The FIX_ROSTER turn fixed its target but repeated a handle on a group.
 - Arms added beyond the plan's list: `v2-id-swap` (the plan's "second flip" as its own run, reported).
+
+### people context v2: Step 3, the fresh gate set (2026-11-01)
+
+`g1-fresh-sample` (seed 20261101) -> `evals/people-bind/sample-fresh.json` + `sample-fresh-bodies.json`
+(bodies from `person_boxes`, keypoints left out as in `bodies.json`; the link comes from g0 evidence).
+10,819 soccer stills; 659 excluded (200 sample, the people-bind review photos, G0 "who" photos), 2,733 more
+within 3 s of one in the same folder; 2,840 left with a trusted, keypoint-linked face; the first 75 of the
+shuffled pool with a roster entry (81 tried). All nine shoot days appear (3-14 photos each). A failed gate
+burns the set: redraw with `--force --seed <new>`.
