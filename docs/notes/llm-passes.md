@@ -1197,3 +1197,26 @@ Stored descriptions: median 410 chars. Recall = share of the stored text's peopl
   the 150-bound review 152 of 153 (99.3%). Grounded describe names ~3.5x as many people at a
   higher error rate.
 
+### people-bind: first production run, 2026 soccer folders (2026-11-01)
+
+Deployed v43 (`person_boxes`, `bodies` pass) to the NAS (`cd141f0`, backup
+`/data/backup-pre-v43-2026-11-01.db`) and the replica, then ran `bodies` + `people-bind` natively
+on the desktop (`--from 2026-08-29 --to 2026-10-25 --camera ILCE-7RM6`: the nine soccer folders,
+10,819 stills). Bind model qwen/qwen3.5-9b, body mode, keypoint-verified link + overlap second call.
+
+- **bodies**: 10,819 photos in ~65 min on two GPU workers (0.24 s/photo detection; the rest is
+  download). 76,385 person boxes; 10 photos with nobody (terminal); 0 failures. Native torch on WSL
+  needs `HSA_ENABLE_DXG_DETECTION=1` or it silently runs on the CPU (~3 s/photo).
+- **people-bind**: 5,189 rows (25 rule tier, 5,164 VLM, all body mode) in ~5.5 h on three workers
+  (median 10 s/photo: two calls plus overlap calls). 1,220 photos bind at least one phrase
+  (1,325 slots, 345 of them groups); 599 of those render a name with today's trusted labels.
+  220 photos used all three attempts on unusable answers (4%): the model quotes a phrase that is
+  not in the text (whole sentences, paraphrases) or a box number out of range; they stay generic.
+- **Overlap check**: fired on 152 bound slots per the worker logs and dropped 28.
+- **Keypoint link**: the three known wrong links (247627, 244870, 246150) come out contested.
+- **Render note**: a span can include a verb ("An adult stands nearby" -> "Alan, observing ..."),
+  which drops words from the display text; the owner's review decides whether to cap that.
+- Owner review: 113 slots on 100 random photos that render a name
+  (`evals/people_bind_eval.py --set prod-soccer from-db / review-sheet / serve`, port 8765).
+  `PHOTOSEARCH_DISPLAY_DESCRIPTIONS` stays off until the owner has looked.
+
