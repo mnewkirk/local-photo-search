@@ -1,6 +1,6 @@
 # People context in describe: identify bodies and faces, then describe with spans
 
-**Status: 🟡 evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies) -> no cue names; hints fail the injection test -> describe stays label-free; G1: named marks with all guards dev 93 / 2, holdout 46 / 2 (97.2% together; 3.5x people-bind's names, which run at 99.3%). Go/no-go for a reduced Steps 5-6 is the owner's call on that trade.** (Status lives in `README.md`.)
+**Status: 🟡 evals 2026-11-01: G0 fails for faceless bodies (kit tier fails; burst tracks name 0 of 60 owner-named holdout bodies) -> no cue names; hints fail the injection test -> describe stays label-free; G1: named marks with all guards dev 93 / 2, holdout 46 / 2 (97.2% together; 3.5x people-bind's names, which run at 99.3%). Go/no-go for a reduced Steps 5-6 is the owner's call on that trade. Names-as-context failed (14 unusable); the person-id handle design is planned in `people-context-describe-v2.md` (2026-11-01).** (Status lives in `README.md`.)
 
 Supersedes docs/plans/description-names.md Revision 2 R3 (the after-the-fact body binder as the production path).
 Source: plan-debate 2026-10-31, Planner A (plan-A.md) and Planner B (plan-B.md), two critique rounds.
